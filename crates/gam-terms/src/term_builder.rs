@@ -6571,23 +6571,23 @@ mod tests {
         // per-group split adds exactly (L-1)·nw = (L-1) extra penalties on top of
         // fs's count.
         let nw = 1usize; // one marginal wiggliness penalty for the B-spline marginal
-        let expected_sz = fs_built.penalties.len() + (n_levels - 1) * nw;
+        let expected_sz = fs_built.active_penalties.len() + (n_levels - 1) * nw;
         assert_eq!(
-            sz_built.penalties.len(),
+            sz_built.active_penalties.len(),
             expected_sz,
             "sz must split its wiggliness penalty per level (#1074): expected \
              fs_count {} + (L-1)·nw {} = {}, but sz had {}",
-            fs_built.penalties.len(),
+            fs_built.active_penalties.len(),
             (n_levels - 1) * nw,
             expected_sz,
-            sz_built.penalties.len(),
+            sz_built.active_penalties.len(),
         );
         assert!(
-            sz_built.penalties.len() > fs_built.penalties.len(),
+            sz_built.active_penalties.len() > fs_built.active_penalties.len(),
             "sz must carry strictly more penalties than fs after the per-group \
              split (sz={}, fs={})",
-            sz_built.penalties.len(),
-            fs_built.penalties.len(),
+            sz_built.active_penalties.len(),
+            fs_built.active_penalties.len(),
         );
 
         // The null-space ridges must still be present (the #1605 property that
@@ -6597,11 +6597,11 @@ mod tests {
         // {const, linear} null space).
         let n_wiggliness = n_levels * nw; // L per-group blocks
         assert!(
-            sz_built.penalties.len() > n_wiggliness,
+            sz_built.active_penalties.len() > n_wiggliness,
             "sz deviation block carries no null-space ridge (penalties={}, \
              wiggliness blocks={}); the null space is unpenalized and REML \
              over-smooths the deviations",
-            sz_built.penalties.len(),
+            sz_built.active_penalties.len(),
             n_wiggliness,
         );
 
@@ -6617,11 +6617,15 @@ mod tests {
             fs_built.dim,
         );
 
-        // Every penalty/metadata vector must stay parallel (length invariant the
-        // downstream REML assembly relies on).
-        assert_eq!(sz_built.penalties.len(), sz_built.nullspaces.len());
-        assert_eq!(sz_built.penalties.len(), sz_built.penaltyinfo.len());
-        assert_eq!(sz_built.penalties.len(), sz_built.null_eigenvectors.len());
+        for penalty in &sz_built.active_penalties {
+            assert_eq!(
+                penalty
+                    .null_eigenvectors
+                    .as_ref()
+                    .map_or(0, |basis| basis.ncols()),
+                penalty.nullity
+            );
+        }
     }
 
     #[test]
@@ -6638,27 +6642,26 @@ mod tests {
         .expect("build multi-penalty sz smooth");
         let n_levels = spec.group_frozen_levels.as_ref().map(Vec::len).unwrap_or(4);
 
-        assert_eq!(built.penalties.len(), built.penaltyinfo.len());
-        assert!(built.penaltyinfo.len() >= 2 * n_levels);
-        for (idx, (penalty, info)) in built
-            .penalties
-            .iter()
-            .zip(built.penaltyinfo.iter())
-            .enumerate()
-        {
-            let analysis = crate::basis::analyze_penalty_block(penalty).expect("PSD penalty");
-            assert_eq!(info.original_index, idx);
-            assert_eq!(info.effective_rank, analysis.rank, "penalty {idx}");
+        assert!(built.active_penalties.len() >= 2 * n_levels);
+        for (idx, penalty) in built.active_penalties.iter().enumerate() {
+            let analysis = crate::basis::analyze_penalty_block(&penalty.matrix)
+                .expect("PSD penalty");
+            assert_eq!(penalty.info.original_index, idx);
+            assert_eq!(penalty.info.effective_rank, analysis.rank, "penalty {idx}");
+            assert_eq!(penalty.nullity, analysis.nullity, "penalty {idx}");
         }
         assert!(
-            built.penaltyinfo[..n_levels]
+            built.active_penalties[..n_levels]
                 .iter()
-                .all(|info| matches!(info.source, PenaltySource::Primary))
+                .all(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
         );
         assert!(
-            built.penaltyinfo[n_levels..2 * n_levels]
+            built.active_penalties[n_levels..2 * n_levels]
                 .iter()
-                .all(|info| matches!(info.source, PenaltySource::DoublePenaltyNullspace))
+                .all(|penalty| matches!(
+                    penalty.info.source,
+                    PenaltySource::DoublePenaltyNullspace
+                ))
         );
     }
 
@@ -6806,29 +6809,18 @@ mod tests {
             )
             .expect("build level-gated factor-by smooth");
 
-            let active_info = built
-                .penaltyinfo
-                .iter()
-                .filter(|info| info.active)
-                .collect::<Vec<_>>();
-            assert_eq!(active_info.len(), built.penalties.len());
-            for (idx, ((penalty, &nullity), null_basis)) in built
-                .penalties
-                .iter()
-                .zip(built.nullspaces.iter())
-                .zip(built.null_eigenvectors.iter())
-                .enumerate()
-            {
-                let analysis = crate::basis::analyze_penalty_block(penalty).expect("PSD block");
-                assert_eq!(analysis.rank + nullity, built.dim, "penalty {idx}");
-                assert_eq!(analysis.nullity, nullity, "penalty {idx}");
-                assert_eq!(active_info[idx].effective_rank, analysis.rank);
-                assert_eq!(active_info[idx].nullspace_dim_hint, nullity);
-                let basis = null_basis
+            for (idx, penalty) in built.active_penalties.iter().enumerate() {
+                let analysis = crate::basis::analyze_penalty_block(&penalty.matrix)
+                    .expect("PSD block");
+                assert_eq!(analysis.rank + penalty.nullity, built.dim, "penalty {idx}");
+                assert_eq!(analysis.nullity, penalty.nullity, "penalty {idx}");
+                assert_eq!(penalty.info.effective_rank, analysis.rank);
+                let basis = penalty
+                    .null_eigenvectors
                     .as_ref()
                     .expect("nontrivial factor-level null basis");
                 assert_eq!(basis.nrows(), built.dim);
-                assert_eq!(basis.ncols(), nullity);
+                assert_eq!(basis.ncols(), penalty.nullity);
             }
             let joint = built
                 .joint_null_rotation

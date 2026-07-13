@@ -5638,6 +5638,19 @@ pub fn build_tensor_bspline_basis(
             spec.marginalspecs.len()
         );
     }
+    if let Some((margin, marginal)) = spec
+        .marginalspecs
+        .iter()
+        .enumerate()
+        .find(|(_, marginal)| marginal.boundary_conditions.has_nonzero_anchor())
+    {
+        crate::bail_invalid_basis!(
+            "TensorBSpline margin {margin} has a non-zero endpoint anchor. An inhomogeneous \
+             marginal constraint cannot be represented by the tensor's homogeneous coefficient \
+             chart plus one scalar row offset; use a separate anchored 1-D smooth or an explicit \
+             model offset"
+        );
+    }
     if !spec.periods.is_empty() && spec.periods.len() != feature_cols.len() {
         crate::bail_dim_basis!(
             "TensorBSpline periods length {} does not match feature count {}",
@@ -6197,7 +6210,9 @@ pub fn build_tensor_bspline_basis(
 #[cfg(test)]
 mod tensor_function_space_runtime_tests {
     use super::*;
-    use crate::basis::{BSplineBoundaryConditions, OneDimensionalBoundary};
+    use crate::basis::{
+        BSplineBoundaryConditions, BSplineEndpointBoundaryCondition, OneDimensionalBoundary,
+    };
     use ndarray::array;
 
     fn marginal() -> BSplineBasisSpec {
@@ -6274,6 +6289,27 @@ mod tensor_function_space_runtime_tests {
         );
     }
 
+    #[test]
+    fn tensor_nonzero_anchor_is_rejected_before_its_affine_lift_can_be_dropped() {
+        let data = array![[0.0, 0.0], [0.25, 0.75], [0.75, 0.25], [1.0, 1.0]];
+        let mut anchored = marginal();
+        anchored.boundary_conditions.left =
+            BSplineEndpointBoundaryCondition::Anchored { value: 1.25 };
+        let spec = TensorBSplineSpec {
+            marginalspecs: vec![anchored, marginal()],
+            periods: Vec::new(),
+            double_penalty: false,
+            identifiability: TensorBSplineIdentifiability::None,
+            penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+        };
+
+        let error = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+            .expect_err("a tensor margin cannot silently discard an inhomogeneous lift");
+        let message = error.to_string();
+        assert!(message.contains("TensorBSpline margin 0"));
+        assert!(message.contains("non-zero endpoint anchor"));
+        assert!(message.contains("explicit model offset"));
+    }
 
     /// Tensor products must inherit affine-abscissa invariance independently
     /// from every margin. The crossed 3×3 scale matrix is the composed case:
@@ -7386,8 +7422,11 @@ mod pca_function_mass_tests {
             assert_close(left, right);
         }
         assert_close(
-            quadratic_form(&base.penalties[0], &base_coefficients),
-            quadratic_form(&transformed.penalties[0], &transformed_coefficients),
+            quadratic_form(&base.active_penalties[0].matrix, &base_coefficients),
+            quadratic_form(
+                &transformed.active_penalties[0].matrix,
+                &transformed_coefficients,
+            ),
         );
     }
 
@@ -7446,7 +7485,11 @@ mod pca_function_mass_tests {
         .expect("lazy PCA basis");
         std::fs::remove_file(&path).expect("remove test .npy");
 
-        for (&left, &right) in dense.penalties[0].iter().zip(lazy.penalties[0].iter()) {
+        for (&left, &right) in dense.active_penalties[0]
+            .matrix
+            .iter()
+            .zip(lazy.active_penalties[0].matrix.iter())
+        {
             assert_close(left, right);
         }
         for (&left, &right) in dense
@@ -7942,71 +7985,47 @@ pub fn build_factor_smooth(
     // λ per marginal penalty), the defining feature of a factor smooth. For
     // `Re` the marginal penalty is replaced by one ridge per parametric
     // coordinate so intercept and slope variances can be learned separately.
-    let marginal_penalties: Vec<Array2<f64>> = if matches!(spec.flavour, FactorSmoothFlavour::Re) {
-        (0..p)
-            .map(|j| {
-                let mut s = Array2::<f64>::zeros((p, p));
-                s[[j, j]] = 1.0;
-                s
-            })
-            .collect()
-    } else {
-        inner.penalties.clone()
-    };
-    let marginal_penaltyinfo: Vec<PenaltyInfo> = if matches!(spec.flavour, FactorSmoothFlavour::Re)
-    {
-        (0..p)
-            .map(|j| PenaltyInfo {
-                source: PenaltySource::Primary,
-                original_index: j,
-                active: true,
-                effective_rank: 1,
-                dropped_reason: None,
-                normalization_scale: 1.0,
-                kronecker_factors: None,
-            })
-            .collect()
-    } else {
-        inner.penaltyinfo.clone()
-    };
-    if marginal_penalties.len() != marginal_penaltyinfo.len() {
-        crate::bail_invalid_basis!(
-            "internal factor-smooth penalty metadata mismatch for term '{}': penalties={}, infos={}",
-            term_name,
-            marginal_penalties.len(),
-            marginal_penaltyinfo.len()
-        );
-    }
+    let marginal_penalties: Vec<(Array2<f64>, PenaltySource, f64)> =
+        if matches!(spec.flavour, FactorSmoothFlavour::Re) {
+            (0..p)
+                .map(|j| {
+                    let mut matrix = Array2::<f64>::zeros((p, p));
+                    matrix[[j, j]] = 1.0;
+                    (matrix, PenaltySource::Primary, 1.0)
+                })
+                .collect()
+        } else {
+            inner
+                .active_penalties
+                .iter()
+                .map(|penalty| {
+                    (
+                        penalty.matrix.clone(),
+                        penalty.info.source.clone(),
+                        penalty.info.normalization_scale,
+                    )
+                })
+                .collect()
+        };
 
-    let mut penalties = Vec::<Array2<f64>>::with_capacity(marginal_penalties.len());
-    let mut penaltyinfo = Vec::<PenaltyInfo>::with_capacity(marginal_penalties.len());
-    for (penalty_pos, s_inner) in marginal_penalties.iter().enumerate() {
+    let mut candidates = Vec::<PenaltyCandidate>::with_capacity(marginal_penalties.len());
+    for (s_inner, source, base_scale) in marginal_penalties {
         let mut s_big = Array2::<f64>::zeros((q, q));
         for level in 0..n_levels {
             let start = level * p;
             s_big
                 .slice_mut(s![start..start + p, start..start + p])
-                .assign(s_inner);
+                .assign(&s_inner);
         }
         let (s_big, factor_smooth_scale) = normalize_penalty_in_constrained_space(&s_big);
-        let mut info = marginal_penaltyinfo[penalty_pos].clone();
-        info.original_index = penalty_pos;
-        info.normalization_scale *= factor_smooth_scale;
-        info.nullspace_dim_hint = info.nullspace_dim_hint.saturating_mul(n_levels);
-        info.kronecker_factors = None;
-        penalties.push(s_big);
-        penaltyinfo.push(info);
+        candidates.push(PenaltyCandidate {
+            matrix: s_big,
+            source,
+            normalization_scale: base_scale * factor_smooth_scale,
+            kronecker_factors: None,
+            op: None,
+        });
     }
-
-    let mut nullspaces: Vec<usize> = if matches!(spec.flavour, FactorSmoothFlavour::Re) {
-        vec![q.saturating_sub(n_levels); p]
-    } else {
-        inner
-            .nullspaces
-            .iter()
-            .map(|ns| ns.saturating_mul(n_levels))
-            .collect()
-    };
 
     // `Fs` is the random-effect flavour of a smooth: the per-group curve is an
     // exchangeable Gaussian *function*, so EVERY coefficient — including the
@@ -8038,7 +8057,10 @@ pub fn build_factor_smooth(
     // per-dimension null penalties; `m=0` keeps the legacy combined double
     // penalty and adds nothing here.
     if use_per_dim_null
-        && let Some(Some(z)) = inner.null_eigenvectors.first()
+        && let Some(Some(z)) = inner
+            .active_penalties
+            .first()
+            .map(|penalty| &penalty.null_eigenvectors)
         && z.nrows() == p
     {
         for k in 0..z.ncols() {
@@ -8061,25 +8083,19 @@ pub fn build_factor_smooth(
                     .assign(&p_k);
             }
             let (s_null, null_scale) = normalize_penalty_in_constrained_space(&s_null);
-            let null_block = crate::basis::analyze_penalty_block_with_op(&s_null, None)?;
-            if null_block.rank > 0 {
-                let original_index = penalties.len();
-                penalties.push(null_block.sym_penalty);
-                nullspaces.push(null_block.nullity);
-                penaltyinfo.push(PenaltyInfo {
-                    source: PenaltySource::Primary,
-                    original_index,
-                    active: true,
-                    effective_rank: null_block.rank,
-                    dropped_reason: None,
-                    normalization_scale: null_scale,
-                    kronecker_factors: None,
-                });
-            }
+            candidates.push(PenaltyCandidate {
+                matrix: s_null,
+                source: PenaltySource::Primary,
+                normalization_scale: null_scale,
+                kronecker_factors: None,
+                op: None,
+            });
         }
     }
-    let null_eigenvectors = crate::basis::recompute_null_eigenvectors(&penalties)?;
-    let joint_null_rotation = crate::basis::compute_joint_null_rotation(&penalties)?;
+    let filtered = crate::basis::filter_penalty_candidates(candidates)?;
+    let joint_null_rotation = crate::basis::compute_joint_null_rotation(&filtered.active)?;
+    let mut dropped_penalties = inner.dropped_penalties;
+    dropped_penalties.extend(filtered.dropped);
 
     // Metadata: carry the marginal knot geometry + frozen levels so prediction
     // reconstructs an identical replicated design.
@@ -8121,20 +8137,15 @@ pub fn build_factor_smooth(
         marginal_is_cr: false,
     };
 
-    let ops = vec![None; penalties.len()];
     Ok(LocalSmoothTermBuild {
         dim: q,
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(dense)),
         // Exactly one group block is active on every row, so a common
         // marginal anchor contributes its lift once for that row.
         affine_offset: inner.affine_offset,
-        penalties,
-        ops,
-        nullspaces,
-        null_eigenvectors,
+        active_penalties: filtered.active,
         joint_null_rotation,
-        penaltyinfo,
-        pre_dropped_penaltyinfo: Vec::new(),
+        dropped_penalties,
         metadata,
         linear_constraints: None,
         box_reparam: false,
@@ -8279,7 +8290,10 @@ pub fn build_single_local_smooth_term(
             // Capture the marginal penalty's null directions BEFORE the penalty
             // vector is rebuilt below; the sum-to-zero null-space ridge replicates
             // these `z_k` into the contrast space (mgcv `bs="fs"` double-penalty).
-            let inner_null_eigenvectors = inner_built.null_eigenvectors.clone();
+            let inner_null_eigenvectors = inner_built
+                .active_penalties
+                .first()
+                .and_then(|penalty| penalty.null_eigenvectors.clone());
             let base = inner_built
                 .design
                 .try_to_dense_by_chunks("sum-to-zero factor smooth")
@@ -8320,28 +8334,9 @@ pub fn build_single_local_smooth_term(
                     }
                 }
             }
-            // Keep each emitted matrix, reported REML nullity, and metadata in
-            // one record until the legacy LocalSmoothTermBuild boundary. The
-            // former implementation mutated level-0 metadata in its original
-            // marginal slot but appended later levels, producing a different
-            // order from the marginal-major matrix emission when two marginal
-            // penalties were active (#2289).
-            let mut emissions = Vec::<(Array2<f64>, usize, PenaltyInfo)>::with_capacity(
-                inner_built.penalties.len() * levels.len(),
+            let mut candidates = Vec::<PenaltyCandidate>::with_capacity(
+                inner_built.active_penalties.len() * levels.len(),
             );
-            let active_penalty_indices = inner_built
-                .penaltyinfo
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, info)| info.active.then_some(idx))
-                .collect::<Vec<_>>();
-            if active_penalty_indices.len() != inner_built.penalties.len() {
-                crate::bail_invalid_basis!(
-                    "internal sz penalty metadata mismatch: activeinfos={}, penalties={}",
-                    active_penalty_indices.len(),
-                    inner_built.penalties.len()
-                );
-            }
             // Replicate each marginal penalty into the sum-to-zero contrast
             // space. With `L-1` free deviation blocks and the reference level
             // `d_L = -Σ_{k<L} d_k`, the marginal penalty summed over ALL `L`
@@ -8396,39 +8391,18 @@ pub fn build_single_local_smooth_term(
                     }
                     s_big
                 };
-            // One nullspace-dim entry per emitted penalty (must stay parallel to
-            // `penalties`). Each per-group wiggliness block carries the marginal's
-            // OWN nullity (a rank-`p` block touching a single level for the free
-            // blocks; the coupling block is rank-`p` over the diagonal sum), and
-            // the null ridges below record their own nullity.
-            for (penalty_pos, s_inner) in inner_built.penalties.iter().enumerate() {
-                let info_idx = active_penalty_indices[penalty_pos];
-                let base_info = inner_built.penaltyinfo[info_idx].clone();
-                let marginal_nullity = inner_built
-                    .nullspaces
-                    .get(penalty_pos)
-                    .copied()
-                    .unwrap_or(0);
+            for base_penalty in &inner_built.active_penalties {
                 // Emit `L` independent per-level blocks for this marginal penalty.
                 for which_level in 0..=l_minus_one {
-                    let raw = stz_per_group_penalty(s_inner, which_level);
+                    let raw = stz_per_group_penalty(&base_penalty.matrix, which_level);
                     let (s_big, group_scale) = normalize_penalty_in_constrained_space(&raw);
-                    let block = crate::basis::analyze_penalty_block_with_op(&s_big, None)?;
-                    if block.rank == 0 {
-                        continue;
-                    }
-                    let mut info = base_info.clone();
-                    info.original_index = emissions.len();
-                    info.normalization_scale = base_info.normalization_scale * group_scale;
-                    info.effective_rank = block.rank;
-                    info.nullspace_dim_hint = marginal_nullity;
-                    info.kronecker_factors = None;
-                    // The coupling block (which_level == l_minus_one) spans the
-                    // marginal range on the diagonal-sum direction; the free
-                    // blocks touch one level. Both leave the marginal null space
-                    // unpenalized, recorded here so the null ridges below complete
-                    // the double penalty.
-                    emissions.push((block.sym_penalty, marginal_nullity, info));
+                    candidates.push(PenaltyCandidate {
+                        matrix: s_big,
+                        source: base_penalty.info.source.clone(),
+                        normalization_scale: base_penalty.info.normalization_scale * group_scale,
+                        kronecker_factors: None,
+                        op: None,
+                    });
                 }
             }
 
@@ -8449,7 +8423,7 @@ pub fn build_single_local_smooth_term(
             // null direction `z_k` of the marginal penalty, add the rank-1
             // marginal penalty `z_k z_kᵀ` mapped into the SAME `(I + 11ᵀ)`
             // sum-to-zero contrast space, each carrying its own `λ`.
-            if let Some(Some(z)) = inner_null_eigenvectors.first()
+            if let Some(z) = inner_null_eigenvectors.as_ref()
                 && z.nrows() == p
             {
                 for k in 0..z.ncols() {
@@ -8478,55 +8452,26 @@ pub fn build_single_local_smooth_term(
                     };
                     let (s_null, null_scale) =
                         normalize_penalty_in_constrained_space(&stz_pooled_null);
-                    let null_block = crate::basis::analyze_penalty_block_with_op(&s_null, None)?;
-                    if null_block.rank > 0 {
-                        let original_index = emissions.len();
-                        emissions.push((null_block.sym_penalty, null_block.nullity, PenaltyInfo {
+                    candidates.push(PenaltyCandidate {
+                            matrix: s_null,
                             source: PenaltySource::DoublePenaltyNullspace,
-                            original_index,
-                            active: true,
-                            effective_rank: null_block.rank,
-                            dropped_reason: None,
                             normalization_scale: null_scale,
                             kronecker_factors: None,
-                        }));
-                    }
+                            op: None,
+                        });
                 }
             }
-            let mut penalties = Vec::with_capacity(emissions.len());
-            let mut nullspaces = Vec::with_capacity(emissions.len());
-            let mut penaltyinfo = Vec::with_capacity(emissions.len());
-            for (penalty, nullity, info) in emissions {
-                penalties.push(penalty);
-                nullspaces.push(nullity);
-                penaltyinfo.push(info);
-            }
-            let mut inherited_dropped = inner_built
-                .penaltyinfo
-                .iter()
-                .filter(|info| !info.active)
-                .cloned()
-                .collect::<Vec<_>>();
-            inherited_dropped.extend(std::mem::take(
-                &mut inner_built.pre_dropped_penaltyinfo,
-            ));
+            let filtered = crate::basis::filter_penalty_candidates(candidates)?;
+            let mut dropped_penalties =
+                std::mem::take(&mut inner_built.dropped_penalties);
+            dropped_penalties.extend(filtered.dropped);
             inner_built.dim = p * l_minus_one;
             inner_built.design =
                 DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(dense));
-            inner_built.penalties = penalties;
-            inner_built.ops = vec![None; inner_built.penalties.len()];
-            inner_built.nullspaces = nullspaces;
-            inner_built.penaltyinfo = penaltyinfo;
-            inner_built.pre_dropped_penaltyinfo = inherited_dropped;
-            // Invariant: `null_eigenvectors[k]` must mirror `penalties[k]`'s
-            // spectral null space. We just rebuilt `inner_built.penalties` from
-            // Kronecker-like `S_big` blocks, so the previously-plumbed
-            // `null_eigenvectors` (still parallel to the OLD per-level penalty)
-            // is stale. Recompute from the rebuilt penalties to restore the
-            inner_built.null_eigenvectors =
-                crate::basis::recompute_null_eigenvectors(&inner_built.penalties)?;
+            inner_built.active_penalties = filtered.active;
+            inner_built.dropped_penalties = dropped_penalties;
             inner_built.joint_null_rotation =
-                crate::basis::compute_joint_null_rotation(&inner_built.penalties)?;
+                crate::basis::compute_joint_null_rotation(&inner_built.active_penalties)?;
             inner_built.kronecker_factored = None;
             return Ok(inner_built);
         }
@@ -8975,11 +8920,9 @@ pub fn build_single_local_smooth_term(
     // penalty, and the κ-optimizer re-key / ψ-derivative paths route through the
     // same triplet builder so the block count stays ψ-stable (#1270).
     if let SmoothBasisSpec::Matern { .. } = &term.basis {
-        let (penalties, nullspace_dims, penaltyinfo) =
-            matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
-        built.penalties = penalties;
-        built.nullspace_dims = nullspace_dims;
-        built.penaltyinfo = penaltyinfo;
+        let filtered = matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
+        built.active_penalties = filtered.active;
+        built.dropped_penalties = filtered.dropped;
     }
 
     if built.affine_offset.is_some() && term.shape != ShapeConstraint::None {
@@ -9000,13 +8943,8 @@ pub fn build_single_local_smooth_term(
         None
     };
     let mut design_t = built.design;
-    let mut penalties_t: Vec<Array2<f64>> = built.penalties;
-    // Ops vector parallel to `penalties_t`. Survives unchanged through the
-    // identity path; nulled element-wise when `T^T S T` reparametrization
-    // is applied (operator no longer bit-equivalent to the transformed
-    // matrix); wrapped in `ScaledPenaltyOp` after Frobenius normalization.
-    let mut ops_t: Vec<Option<std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>>> =
-        built.ops;
+    let mut penalties_t = built.active_penalties;
+    let mut dropped_penalties_t = built.dropped_penalties;
     if matches!(
         spatial_identifiability_policy(term),
         Some(SpatialIdentifiability::OrthogonalToParametric)
@@ -9014,18 +8952,6 @@ pub fn build_single_local_smooth_term(
         metadata = freeze_raw_spatial_metadata(metadata, design_t.ncols());
     }
 
-    let active_penaltyinfo_t = built
-        .penaltyinfo
-        .iter()
-        .filter(|info| info.active)
-        .cloned()
-        .collect::<Vec<_>>();
-    let pre_dropped_penaltyinfo_t = built
-        .penaltyinfo
-        .iter()
-        .filter(|info| !info.active)
-        .cloned()
-        .collect::<Vec<_>>();
     let use_box_reparam =
         term.shape != ShapeConstraint::None && shape_uses_box_reparameterization(&term.basis);
     if let Some((order, sign)) = shape_order_and_sign(term.shape)
@@ -9089,47 +9015,28 @@ pub fn build_single_local_smooth_term(
         design_t = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
             coeff_op,
         )));
-        if penalties_t.len() != active_penaltyinfo_t.len() {
-            crate::bail_invalid_basis!(
-                "internal box-reparam penalty/info mismatch for term '{}': penalties={}, infos={}",
-                term.name,
-                penalties_t.len(),
-                active_penaltyinfo_t.len()
-            );
-        }
         // `β = Tγ` is an invertible change of coefficient chart. Every
         // physical quadratic functional, including the function-space
         // null-component penalty, therefore transforms by the same congruence
         // `S_γ = Tᵀ S_β T`. Rebuilding `ZZᵀ` in the γ Euclidean metric
         // would change the represented functional under this harmless chart
         // change and violate SPEC 5.
-        let mut rebuilt = Vec::with_capacity(penalties_t.len());
-        for s_local in &penalties_t {
-            let tt_s = fast_atb(&t, s_local);
-            rebuilt.push(fast_ab(&tt_s, &t));
+        for penalty in &mut penalties_t {
+            let tt_s = fast_atb(&t, &penalty.matrix);
+            penalty.matrix = fast_ab(&tt_s, &t);
+            penalty.op = None;
+            penalty.info.kronecker_factors = None;
         }
-        penalties_t = rebuilt;
-        // T^T S T (and the rebuilt γ-space ridge) invalidate op-form
-        // bit-equivalence; drop ops here.
-        ops_t = vec![None; penalties_t.len()];
-    }
-    if penalties_t.len() != active_penaltyinfo_t.len() {
-        crate::bail_invalid_basis!(
-            "internal penalty metadata mismatch for term '{}': active penalties={}, active infos={}",
-            term.name,
-            penalties_t.len(),
-            active_penaltyinfo_t.len()
-        );
-    }
-    if ops_t.len() != penalties_t.len() {
-        ops_t = vec![None; penalties_t.len()];
     }
     let penalty_candidates = penalties_t
         .into_iter()
-        .zip(active_penaltyinfo_t.into_iter())
-        .zip(ops_t.into_iter())
-        .map(
-            |((matrix, info), op_in)| -> Result<PenaltyCandidate, BasisError> {
+        .map(|penalty| -> Result<PenaltyCandidate, BasisError> {
+                let ActivePenalty {
+                    matrix,
+                    op: op_in,
+                    info,
+                    ..
+                } = penalty;
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
                 let normalization_scale = info.normalization_scale * c_new;
                 let op_scale = 1.0 / c_new;
@@ -9159,11 +9066,10 @@ pub fn build_single_local_smooth_term(
                     kronecker_factors,
                     op: scaled_op,
                 })
-            },
-        )
+            })
         .collect::<Result<Vec<_>, _>>()?;
-    let (penalties_t, nullspaces_t, penaltyinfo_t, null_eigenvectors_t, ops_t) =
-        crate::basis::filter_active_penalty_candidates_with_ops(penalty_candidates)?;
+    let filtered = crate::basis::filter_penalty_candidates(penalty_candidates)?;
+    dropped_penalties_t.extend(filtered.dropped);
     // Joint-null absorption rotation. Fresh fit specs compute Q from the final
     // per-smooth penalty set (after all in-smooth reparameterizations have
     // already been applied). Frozen specs already carry the complete realized
@@ -9186,20 +9092,16 @@ pub fn build_single_local_smooth_term(
         Some(persisted) => Some(persisted),
         None if smooth_has_frozen_identifiability(term) => None,
         None if kron_factored.is_some() => None,
-        None => crate::basis::compute_joint_null_rotation(&penalties_t)?,
+        None => crate::basis::compute_joint_null_rotation(&filtered.active)?,
     };
 
     Ok(LocalSmoothTermBuild {
         dim: p_local,
         design: design_t,
         affine_offset,
-        penalties: penalties_t,
-        ops: ops_t,
-        nullspaces: nullspaces_t,
-        null_eigenvectors: null_eigenvectors_t,
+        active_penalties: filtered.active,
         joint_null_rotation,
-        penaltyinfo: penaltyinfo_t,
-        pre_dropped_penaltyinfo: pre_dropped_penaltyinfo_t,
+        dropped_penalties: dropped_penalties_t,
         metadata,
         linear_constraints: None,
         box_reparam: use_box_reparam,
@@ -9283,8 +9185,8 @@ pub fn build_smooth_design_withworkspace_unvalidated(
 
         // Stage-2 joint-null absorption rotation. Fired *before* the
         // penalty / design / global aggregation loops below so that every
-        // subsequent reference to `built.penalties`, `built.design`, and
-        // `built.ops` sees the post-rotation values.
+        // subsequent reference to `built.active_penalties` and `built.design`
+        // sees the post-rotation values.
         //
         // The math: when the smooth's joint penalty `Σ_k S_k` has a
         // non-trivial null space, eigh selects `Q = [U_range | U_null]`
@@ -9321,15 +9223,16 @@ pub fn build_smooth_design_withworkspace_unvalidated(
                 let q = &rot.rotation;
                 built.design =
                     apply_smooth_transform_to_design(built.design.clone(), q, &term.name)?;
-                built.penalties = built
-                    .penalties
-                    .into_iter()
-                    .map(|s_local| {
-                        let qt_s = gam_linalg::faer_ndarray::fast_atb(q, &s_local);
-                        gam_linalg::faer_ndarray::fast_ab(&qt_s, q)
-                    })
-                    .collect();
-                built.ops = vec![None; built.penalties.len()];
+                for penalty in &mut built.active_penalties {
+                    let qt_s = gam_linalg::faer_ndarray::fast_atb(q, &penalty.matrix);
+                    penalty.matrix = gam_linalg::faer_ndarray::fast_ab(&qt_s, q);
+                    penalty.null_eigenvectors = penalty
+                        .null_eigenvectors
+                        .as_ref()
+                        .map(|basis| gam_linalg::faer_ndarray::fast_atb(q, basis));
+                    penalty.op = None;
+                    penalty.info.kronecker_factors = None;
+                }
                 built.kronecker_factored = None;
                 Some(rot)
             }
@@ -9337,47 +9240,20 @@ pub fn build_smooth_design_withworkspace_unvalidated(
             (None, _, _) => None,
         };
 
-        let activeinfos = built
-            .penaltyinfo
-            .iter()
-            .filter(|info| info.active)
-            .collect::<Vec<_>>();
-        if activeinfos.len() != built.penalties.len() {
-            crate::bail_invalid_basis!(
-                "internal penalty info mismatch for term '{}': activeinfos={}, penalties={}",
-                term.name,
-                activeinfos.len(),
-                built.penalties.len()
-            );
-        }
-        for (((s_local, &ns), info), op_local) in built
-            .penalties
-            .iter()
-            .zip(built.nullspaces.iter())
-            .zip(activeinfos.into_iter())
-            .zip(built.ops.iter())
-        {
+        for active_penalty in &built.active_penalties {
             let global_index = penalties_global.len();
             penalties_global.push(
-                BlockwisePenalty::new(col_start..col_end, s_local.clone())
-                    .with_op(op_local.clone()),
+                BlockwisePenalty::new(col_start..col_end, active_penalty.matrix.clone())
+                    .with_op(active_penalty.op.clone()),
             );
-            nullspace_dims_global.push(ns);
-            let mut penalty = info.clone();
-            penalty.nullspace_dim_hint = ns;
+            nullspace_dims_global.push(active_penalty.nullity);
             penaltyinfo_global.push(PenaltyBlockInfo {
                 global_index,
                 termname: Some(term.name.clone()),
-                penalty,
+                penalty: active_penalty.info.clone(),
             });
         }
-        for info in built.penaltyinfo.iter().filter(|info| !info.active) {
-            dropped_penaltyinfo_global.push(DroppedPenaltyBlockInfo {
-                termname: Some(term.name.clone()),
-                penalty: info.clone(),
-            });
-        }
-        for info in &built.pre_dropped_penaltyinfo {
+        for info in &built.dropped_penalties {
             dropped_penaltyinfo_global.push(DroppedPenaltyBlockInfo {
                 termname: Some(term.name.clone()),
                 penalty: info.clone(),
@@ -9416,9 +9292,8 @@ pub fn build_smooth_design_withworkspace_unvalidated(
             name: term.name.clone(),
             coeff_range: col_start..col_end,
             shape: term.shape,
-            penalties_local: built.penalties,
-            nullspace_dims: built.nullspaces,
-            penaltyinfo_local: built.penaltyinfo,
+            active_penalties: built.active_penalties,
+            dropped_penalties: built.dropped_penalties,
             metadata: built.metadata,
             lower_bounds_local: lb_local,
             linear_constraints_local: built.linear_constraints,

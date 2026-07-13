@@ -199,6 +199,12 @@ pub use gaussian::*;
 mod binomial;
 pub use binomial::*;
 
+mod alo_replay;
+pub use alo_replay::{
+    LocationScaleAloRowGeometry, binomial_location_scale_alo_row_geometry,
+    gaussian_location_scale_alo_row_geometry,
+};
+
 #[cfg(test)]
 mod test_support;
 

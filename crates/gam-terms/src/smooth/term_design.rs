@@ -285,13 +285,10 @@ pub fn build_term_collection_design_inner_with_policy(
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
             termname: Some(linear.name.clone()),
-            penalty: PenaltyInfo {
+            penalty: ActivePenaltyInfo {
                 source: PenaltySource::Other("LinearTermRidge".to_string()),
                 original_index: j,
-                active: true,
                 effective_rank: 1,
-                dropped_reason: None,
-                nullspace_dim_hint: 0,
                 normalization_scale: 1.0,
                 kronecker_factors: None,
             },
@@ -309,13 +306,10 @@ pub fn build_term_collection_design_inner_with_policy(
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
             termname: Some(name.clone()),
-            penalty: PenaltyInfo {
+            penalty: ActivePenaltyInfo {
                 source: PenaltySource::Other(format!("RandomEffectRidge({name})")),
                 original_index: re_idx,
-                active: true,
                 effective_rank: block_size,
-                dropped_reason: None,
-                nullspace_dim_hint: 0,
                 normalization_scale: 1.0,
                 kronecker_factors: None,
             },
@@ -354,12 +348,10 @@ pub fn build_term_collection_design_inner_with_policy(
         };
         penalties.push(bp);
         nullspace_dims.push(ns);
-        let mut penalty = localinfo.penalty.clone();
-        penalty.nullspace_dim_hint = ns;
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
             termname: localinfo.termname.clone(),
-            penalty,
+            penalty: localinfo.penalty.clone(),
         });
     }
     dropped_penaltyinfo.extend(smooth.dropped_penaltyinfo.iter().cloned());
@@ -1058,9 +1050,8 @@ fn apply_global_smooth_identifiability(
     }
 
     let mut local_designs = vec![None; smooth.terms.len()];
-    let mut local_penalties = vec![Vec::<Array2<f64>>::new(); smooth.terms.len()];
-    let mut local_nullspaces = vec![Vec::<usize>::new(); smooth.terms.len()];
-    let mut local_penaltyinfo = vec![Vec::<PenaltyInfo>::new(); smooth.terms.len()];
+    let mut local_active_penalties = vec![Vec::<ActivePenalty>::new(); smooth.terms.len()];
+    let mut local_dropped_penalties = vec![Vec::<DroppedPenaltyInfo>::new(); smooth.terms.len()];
     let mut local_metadata = vec![None; smooth.terms.len()];
     let mut local_dims = vec![0usize; smooth.terms.len()];
     let mut local_linear_constraints = vec![None; smooth.terms.len()];
@@ -1225,41 +1216,20 @@ fn apply_global_smooth_identifiability(
             }
         }
 
-        let active_penaltyinfo = term
-            .penaltyinfo_local
-            .iter()
-            .filter(|info| info.active)
-            .cloned()
-            .collect::<Vec<_>>();
-        if active_penaltyinfo.len() != term.penalties_local.len() {
-            gam_problem::bail_invalid_basis!(
-                "internal penalty metadata mismatch for term '{}': activeinfos={}, penalties={}",
-                term.name,
-                active_penaltyinfo.len(),
-                term.penalties_local.len()
-            );
-        }
-        let penalties_constrained: Vec<Array2<f64>> = term
-            .penalties_local
+        let penalty_candidates = term
+            .active_penalties
             .par_iter()
-            .map(|s_local| {
-                if let Some(gauge) = coefficient_gauge.as_ref() {
-                    gauge.restrict_penalty(s_local)
+            .map(|penalty| {
+                let matrix = if let Some(gauge) = coefficient_gauge.as_ref() {
+                    gauge.restrict_penalty(&penalty.matrix)
                 } else {
-                    s_local.clone()
-                }
-            })
-            .collect();
-        let penalty_candidates = penalties_constrained
-            .into_par_iter()
-            .zip(active_penaltyinfo.into_par_iter())
-            .map(|(matrix, info)| {
+                    penalty.matrix.clone()
+                };
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
                 PenaltyCandidate {
-                    nullspace_dim_hint: info.nullspace_dim_hint,
                     matrix,
-                    source: info.source,
-                    normalization_scale: info.normalization_scale * c_new,
+                    source: penalty.info.source.clone(),
+                    normalization_scale: penalty.info.normalization_scale * c_new,
                     kronecker_factors: None,
                     op: None,
                 }
@@ -1377,8 +1347,7 @@ fn apply_global_smooth_identifiability(
                 }
             }
         }
-        let (penalties_constrained, nullspace_constrained, penaltyinfo_constrained) =
-            filter_active_penalty_candidates(penalty_candidates)?;
+        let filtered = filter_penalty_candidates(penalty_candidates)?;
         let linear_constraints_constrained =
             if let Some(lin_local) = term.linear_constraints_local.as_ref() {
                 if let Some(gauge) = coefficient_gauge.as_ref() {
@@ -1395,9 +1364,9 @@ fn apply_global_smooth_identifiability(
 
         local_dims[idx] = design_constrained.ncols();
         local_designs[idx] = Some(design_constrained);
-        local_penalties[idx] = penalties_constrained;
-        local_nullspaces[idx] = nullspace_constrained;
-        local_penaltyinfo[idx] = penaltyinfo_constrained;
+        local_active_penalties[idx] = filtered.active;
+        local_dropped_penalties[idx] = term.dropped_penalties.clone();
+        local_dropped_penalties[idx].extend(filtered.dropped);
         local_linear_constraints[idx] = linear_constraints_constrained;
         let realized_transform = match (term.joint_null_rotation.as_ref(), z_opt.as_ref()) {
             (Some(rotation), Some(z)) => {
@@ -1450,7 +1419,7 @@ fn apply_global_smooth_identifiability(
     let mut penalties_global = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
     let mut penaltyinfo_global = Vec::<PenaltyBlockInfo>::new();
-    let mut dropped_penaltyinfo_global = smooth.dropped_penaltyinfo.clone();
+    let mut dropped_penaltyinfo_global = Vec::<DroppedPenaltyBlockInfo>::new();
     let mut coefficient_lower_bounds = Array1::<f64>::from_elem(total_p, f64::NEG_INFINITY);
     let mut any_bounds = false;
     let mut linear_constraintsrows: Vec<Array1<f64>> = Vec::new();
@@ -1461,35 +1430,20 @@ fn apply_global_smooth_identifiability(
         let p_local = local_dims[idx];
         let col_end = col_start + p_local;
 
-        let activeinfos = local_penaltyinfo[idx]
-            .iter()
-            .filter(|info| info.active)
-            .collect::<Vec<_>>();
-        if activeinfos.len() != local_penalties[idx].len() {
-            gam_problem::bail_invalid_basis!(
-                "internal penalty info mismatch for term '{}': activeinfos={}, penalties={}",
-                smooth.terms[idx].name,
-                activeinfos.len(),
-                local_penalties[idx].len()
-            );
-        }
-        for ((s_local, &ns), info) in local_penalties[idx]
-            .iter()
-            .zip(local_nullspaces[idx].iter())
-            .zip(activeinfos.into_iter())
-        {
+        for active_penalty in &local_active_penalties[idx] {
             let global_index = penalties_global.len();
-            penalties_global.push(BlockwisePenalty::new(col_start..col_end, s_local.clone()));
-            nullspace_dims_global.push(ns);
-            let mut penalty = info.clone();
-            penalty.nullspace_dim_hint = ns;
+            penalties_global.push(BlockwisePenalty::new(
+                col_start..col_end,
+                active_penalty.matrix.clone(),
+            ));
+            nullspace_dims_global.push(active_penalty.nullity);
             penaltyinfo_global.push(PenaltyBlockInfo {
                 global_index,
                 termname: Some(smooth.terms[idx].name.clone()),
-                penalty,
+                penalty: active_penalty.info.clone(),
             });
         }
-        for info in local_penaltyinfo[idx].iter().filter(|info| !info.active) {
+        for info in &local_dropped_penalties[idx] {
             dropped_penaltyinfo_global.push(DroppedPenaltyBlockInfo {
                 termname: Some(smooth.terms[idx].name.clone()),
                 penalty: info.clone(),
@@ -1500,9 +1454,8 @@ fn apply_global_smooth_identifiability(
             name: smooth.terms[idx].name.clone(),
             coeff_range: col_start..col_end,
             shape: smooth.terms[idx].shape,
-            penalties_local: local_penalties[idx].clone(),
-            nullspace_dims: local_nullspaces[idx].clone(),
-            penaltyinfo_local: local_penaltyinfo[idx].clone(),
+            active_penalties: local_active_penalties[idx].clone(),
+            dropped_penalties: local_dropped_penalties[idx].clone(),
             metadata: local_metadata[idx]
                 .clone()
                 .expect("local metadata must exist for every smooth term"),

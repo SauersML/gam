@@ -86,7 +86,10 @@ fn penalty_block_label_candidates(info: &PenaltyBlockInfo) -> Vec<String> {
     labels
 }
 
-fn penalty_block_metadata(info: &PenaltyBlockInfo) -> PenaltyBlockGammaPriorMetadata<'_> {
+fn penalty_block_metadata(
+    info: &PenaltyBlockInfo,
+    nullspace_dim: usize,
+) -> PenaltyBlockGammaPriorMetadata<'_> {
     PenaltyBlockGammaPriorMetadata {
         label: info
             .termname
@@ -96,7 +99,7 @@ fn penalty_block_metadata(info: &PenaltyBlockInfo) -> PenaltyBlockGammaPriorMeta
         termname: info.termname.as_deref(),
         source: format!("{:?}", info.penalty.source),
         effective_rank: info.penalty.effective_rank,
-        nullspace_dim_hint: info.penalty.nullspace_dim_hint,
+        nullspace_dim_hint: nullspace_dim,
     }
 }
 
@@ -143,9 +146,16 @@ pub fn realize_penalty_block_gamma_priors<F>(
 where
     F: FnMut(&PenaltyBlockGammaPriorMetadata<'_>) -> Option<(f64, f64)>,
 {
+    if design.penaltyinfo.len() != design.nullspace_dims.len() {
+        crate::bail_invalid_basis!(
+            "penalty prior metadata/nullity mismatch: metadata={}, nullities={}",
+            design.penaltyinfo.len(),
+            design.nullspace_dims.len()
+        );
+    }
     let mut priors = Vec::<gam_spec::RhoPrior>::with_capacity(design.penaltyinfo.len());
-    for info in &design.penaltyinfo {
-        let metadata = penalty_block_metadata(info);
+    for (info, &nullspace_dim) in design.penaltyinfo.iter().zip(&design.nullspace_dims) {
+        let metadata = penalty_block_metadata(info, nullspace_dim);
         if let Some((shape, rate)) = callback(&metadata) {
             validate_gamma_precision_prior(&metadata.label, shape, rate)?;
             priors.push(gam_spec::RhoPrior::GammaPrecision { shape, rate });
