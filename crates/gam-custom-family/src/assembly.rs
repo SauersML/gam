@@ -1538,6 +1538,7 @@ pub(crate) fn joint_outer_evaluate(
         outer_hessian,
         warm_start: warm,
         inner_converged: inner.converged,
+        hyper_values: Array1::zeros(0),
         inner: inner.clone(),
     })
 }
