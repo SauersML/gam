@@ -385,9 +385,9 @@ impl SaeManifoldTerm {
             AssignmentMode::OrderedBetaBernoulli { .. }
         )
         .then(|| Array1::<f64>::zeros(n * k_atoms));
-        // #932 SIMD: jets are built in aligned 4-row SIMD batches through a
-        // bounded (≤4-row) look-ahead window; unaligned / non-softmax / remainder
-        // rows fall back to the scalar per-row path (bit-identical either way).
+        // #932 complete schedule: softmax rows are built in memory-ledgered
+        // CPU/CUDA tiles through one bounded look-ahead window; non-softmax
+        // gates use their distinct dynamic row program.
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
