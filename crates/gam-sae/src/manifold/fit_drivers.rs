@@ -4561,11 +4561,7 @@ impl SaeManifoldTerm {
     /// Seed atom `atom`'s chart coordinates from the current residual: write the
     /// certified ISA circle phase when a jointly-separated plane is supplied,
     /// otherwise the one-atom Periodic/Euclidean PCA seed on the residual, then
-    /// refresh the atom's basis at the seeded coordinates. Shared verbatim by the
-    /// dense ([`Self::seed_cold_start_disjoint_charts`]) and streaming
-    /// ([`Self::seed_cold_start_disjoint_charts_streaming`]) seed drivers so both
-    /// place identical charts — only the decoder LSQ that follows differs (dense
-    /// full-height SVD vs chunked normal equations).
+    /// refresh the atom's basis at the seeded coordinates.
     fn seed_atom_chart_coords(
         &mut self,
         atom: usize,
@@ -4599,126 +4595,6 @@ impl SaeManifoldTerm {
         let coords = self.assignment.coords[atom].as_matrix();
         self.atoms[atom].refresh_basis(coords.view())?;
         Ok(())
-    }
-
-    /// CHUNKED-SEED cold start for the overcomplete (`K > P`) curved TopK lane
-    /// (#2134 walls 1+2, #1893): the streaming twin of
-    /// [`Self::seed_cold_start_disjoint_charts`].
-    ///
-    /// Places the same disjoint charts (via the shared
-    /// [`Self::seed_atom_chart_coords`]), but fits each atom's decoder from the
-    /// NORMAL EQUATIONS accumulated one row chunk of `chunk_rows` at a time
-    /// ([`super::streaming_seed::AtomDecoderNormalEq`]) instead of forming the
-    /// full-height gated design `(N × M_k)` and thin-SVD-solving it. The gated
-    /// design is materialised only one `chunk_rows`-tall block at a time and
-    /// dropped after it is accumulated, so the seed's peak footprint is the chunk
-    /// window plus the `M_k² + M_k·P` accumulators — never `O(N · M_k)`. Because
-    /// the Gram `G_k = D_kᵀ D_k` and cross `B_k = D_kᵀ R` are exact row sums, the
-    /// solve `β_k = G_k⁺ B_k` equals the dense thin-SVD seed to tolerance (proved
-    /// bit/tolerance-exact in `streaming_seed::tests` and end-to-end against this
-    /// method's dense twin in the driver parity test). The residual is deflated
-    /// chunkwise by each fitted atom, exactly as the dense path deflates it in
-    /// full.
-    ///
-    /// `chunk_rows` is the sanctioned width from the admission ledger
-    /// ([`crate::manifold::SaeTopKCurvedBudget::seed_chunk_rows`]); a `0`/`>N`
-    /// value clamps into `[1, N]`, so a caller that streams the whole batch in
-    /// one chunk is admissible (and still solves via the normal equations).
-    pub fn seed_cold_start_disjoint_charts_streaming(
-        &mut self,
-        target: ArrayView2<'_, f64>,
-        chunk_rows: usize,
-    ) -> Result<(), String> {
-        let n = self.n_obs();
-        let p = self.output_dim();
-        let k = self.k_atoms();
-        if n == 0 || k == 0 {
-            return Ok(());
-        }
-        let step = chunk_rows.clamp(1, n);
-        // Joint ISA chart separation, identical to the dense seed's front matter.
-        let joint_planes: Vec<super::isa_seed::IsaPlaneCandidate> =
-            match super::isa_seed::capture_signal_span(target, k)? {
-                Some(parts) => super::isa_seed::isa_extract_certified_planes(
-                    target,
-                    &parts,
-                    k,
-                    &super::isa_seed::IsaSeedConfig::default(),
-                ),
-                None => Vec::new(),
-            };
-        let mut next_isa_plane = joint_planes.into_iter();
-
-        let mut residual = target.to_owned();
-        for atom in 0..k {
-            // 1. Seed the chart (shared with the dense path).
-            let dim = self.atoms[atom].latent_dim;
-            let is_periodic = matches!(self.atoms[atom].basis_kind, SaeAtomBasisKind::Periodic);
-            let isa_plane = if dim > 0 && is_periodic {
-                next_isa_plane.next()
-            } else {
-                None
-            };
-            self.seed_atom_chart_coords(atom, n, residual.view(), isa_plane)?;
-            // 2. Fit the decoder from chunked normal equations: accumulate
-            //    `G_k = D_kᵀ D_k`, `B_k = D_kᵀ R` over row chunks of `step`,
-            //    materialising each gated design block only transiently.
-            let m = self.atoms[atom].basis_size();
-            let mut eq = super::streaming_seed::AtomDecoderNormalEq::zeros(m, p);
-            let mut start = 0usize;
-            while start < n {
-                let end = (start + step).min(n);
-                let design_chunk = self.gated_design_chunk(atom, start, end, m)?;
-                eq.accumulate_chunk(design_chunk.view(), residual.slice(s![start..end, ..]))?;
-                start = end;
-            }
-            let beta = eq.solve()?;
-            if beta.dim() != (m, p) {
-                return Err(format!(
-                    "SaeManifoldTerm::seed_cold_start_disjoint_charts_streaming: atom {atom} beta shape {:?} != ({m}, {p})",
-                    beta.dim()
-                ));
-            }
-            // 3. Deflate the residual chunkwise by this atom's fit (same total
-            //    deflation as the dense `residual -= D_k β_k`), then store β_k.
-            let mut start = 0usize;
-            while start < n {
-                let end = (start + step).min(n);
-                let design_chunk = self.gated_design_chunk(atom, start, end, m)?;
-                let fit_chunk = design_chunk.dot(&beta);
-                let mut resid_chunk = residual.slice_mut(s![start..end, ..]);
-                resid_chunk -= &fit_chunk;
-                start = end;
-            }
-            for col in 0..m {
-                for out in 0..p {
-                    self.atoms[atom].decoder_coefficients[[col, out]] = beta[[col, out]];
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// The gated design block `D_k[start..end] = diag(a_·k)·Φ_k` over one row
-    /// chunk (`(end - start) × M`), matching the dense seed's per-row gating
-    /// (`w · basis_values`) exactly. Materialised transiently by the streaming
-    /// seed and dropped after it is accumulated.
-    fn gated_design_chunk(
-        &self,
-        atom: usize,
-        start: usize,
-        end: usize,
-        m: usize,
-    ) -> Result<Array2<f64>, String> {
-        let mut d = Array2::<f64>::zeros((end - start, m));
-        for row in start..end {
-            let assignments = self.assignment.try_assignments_row(row)?;
-            let w = assignments[atom];
-            for col in 0..m {
-                d[[row - start, col]] = w * self.atoms[atom].basis_values[[row, col]];
-            }
-        }
-        Ok(d)
     }
 
     pub(crate) fn apply_newton_step_impl(

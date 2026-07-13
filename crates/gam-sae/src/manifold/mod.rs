@@ -236,7 +236,6 @@ mod stagewise_seed;
 mod steering;
 mod stratum_births;
 mod streaming_plan;
-mod streaming_seed;
 mod support_seed;
 mod support_outer;
 mod support_term;
@@ -295,9 +294,6 @@ mod tests_schur_seed_refusal_1782;
 
 #[cfg(test)]
 mod tests_streaming_materialize_chunk_1801;
-
-#[cfg(test)]
-mod tests_streaming_seed_parity_2134;
 
 #[cfg(test)]
 mod tests_recovery_split_780;

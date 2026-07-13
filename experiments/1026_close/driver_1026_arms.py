@@ -21,6 +21,7 @@ scored on the untouched held-out split (never train — no overfit reporting).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -158,15 +159,29 @@ def fit_pca_bar(x_tr, x_te, mean_tr, *, ranks):
     return out
 
 
-def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, max_epochs, seed, collect=None):
+def _convergence_payload(fit) -> dict:
+    certificate = fit.convergence
+    if not dataclasses.is_dataclass(certificate):
+        raise TypeError("sparse dictionary convergence certificate must be a dataclass")
+    return dataclasses.asdict(certificate)
+
+
+def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, minibatch, score_mode,
+                 max_epochs, seed, collect=None):
     import gamfit
 
     fit = gamfit.sparse_dictionary_fit(
-        x_tr, K, active=top_k, max_epochs=max_epochs)
-    tr = fit.transform(x_te)
+        x_tr, K, active=top_k, minibatch=minibatch, max_epochs=max_epochs,
+        score_mode=score_mode)
+    tr = fit.transform(x_te, score_mode=score_mode)
     recon = fit.reconstruct(tr.indices, tr.codes)
     if collect is not None:
         collect["flat_fit"] = fit
+        collect["sparse_route_stats"] = {
+            "fit": fit.score_route_stats,
+            "held_out": tr.score_route_stats,
+        }
+        collect["sparse_convergence"] = _convergence_payload(fit)
     return held_out_ev(x_te, recon, mean_tr), fit.explained_variance
 
 
@@ -181,7 +196,8 @@ def fit_curved_topk(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, max_epoc
 
 
 def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
-                    topology, max_epochs, seed, k_flat=None, collect=None):
+                    topology, sparse_minibatch, sparse_score_mode, max_epochs,
+                    seed, k_flat=None, collect=None):
     """ALL-RUST hybrid: gam sparse-dictionary linear tier at reduced actives plus
     a gam manifold-SAE curved TopK tier on the linear residual. Matched per-token
     active-scalar budget: k_lin + curved_k·(1+d) == top_k.
@@ -199,9 +215,10 @@ def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
           f"k_lin={k_lin} + curved_k={curved_k}*(1+{d}) == {top_k}", flush=True)
     t0 = time.perf_counter()
     flat = gamfit.sparse_dictionary_fit(
-        x_tr, k_flat, active=k_lin, max_epochs=max_epochs)
-    tr_tr = flat.transform(x_tr)
-    tr_te = flat.transform(x_te)
+        x_tr, k_flat, active=k_lin, minibatch=sparse_minibatch,
+        max_epochs=max_epochs, score_mode=sparse_score_mode)
+    tr_tr = flat.transform(x_tr, score_mode=sparse_score_mode)
+    tr_te = flat.transform(x_te, score_mode=sparse_score_mode)
     flat_recon_tr = flat.reconstruct(tr_tr.indices, tr_tr.codes)
     flat_recon_te = flat.reconstruct(tr_te.indices, tr_te.codes)
     ev_flat = held_out_ev(x_te, flat_recon_te, mean_tr)
@@ -222,12 +239,18 @@ def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
         collect["curved_model"] = curved
         collect["r_te"] = r_te
         collect["recon_full"] = combined
+        collect["sparse_route_stats"] = {
+            "fit": flat.score_route_stats,
+            "train": tr_tr.score_route_stats,
+            "held_out": tr_te.score_route_stats,
+        }
+        collect["sparse_convergence"] = _convergence_payload(flat)
     ev = held_out_ev(x_te, combined, mean_tr)
     return ev, ev_flat
 
 
 # --------------------------------------------------------------------------- #
-def score_bits_for_arm(arm, collect, x_te, bits_max_rows, seed):
+def score_bits_for_arm(arm, collect, x_te, bits_max_rows, seed, sparse_score_mode):
     """Build the arm's FittedFeaturizer on a test subsample and score Eq-4 bits.
 
     Returns a dict of ``bits_at_r2_*`` / ``code_bits_*`` / ``resid_bits_*`` /
@@ -250,13 +273,15 @@ def score_bits_for_arm(arm, collect, x_te, bits_max_rows, seed):
             x_bits, W_enc=collect["W_enc"], W_dec=collect["W_dec"],
             b_dec=collect["b_dec"], top_k=collect.get("top_k_flat"))
     elif arm == "gam_flat":
-        fitted = af.build_gam_flat(x_bits, fit=collect["flat_fit"])
+        fitted = af.build_gam_flat(
+            x_bits, fit=collect["flat_fit"], score_mode=sparse_score_mode)
     elif arm == "hybrid_rust":
         r_bits = np.ascontiguousarray(collect["r_te"][idx])
         recon_bits = np.ascontiguousarray(collect["recon_full"][idx])
         fitted = af.build_hybrid_rust(
             x_bits, r_bits, flat_fit=collect["flat_fit"],
-            curved_model=collect["curved_model"], recon_full=recon_bits)
+            curved_model=collect["curved_model"], recon_full=recon_bits,
+            score_mode=sparse_score_mode)
     else:
         return None
 
@@ -264,6 +289,8 @@ def score_bits_for_arm(arm, collect, x_te, bits_max_rows, seed):
     out = {f"bits_{k}": v for k, v in dl.items()}
     out["bits_scorer"] = bits_eq4.scorer_source()
     out["bits_rows"] = int(take)
+    if fitted.extras is not None and "score_route_stats" in fitted.extras:
+        out["bits_score_route_stats"] = fitted.extras["score_route_stats"]
     # gam#2233 self-certification: the Eq-4 dictionary term is
     # 0.5*dictionary_params/N*log2(N), ~95% of the score at K=32768, so the
     # crossover verdict is meaningful ONLY when the hybrid's dictionary_params do
@@ -294,6 +321,18 @@ def main() -> int:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch-size", type=int, default=4096)
     ap.add_argument("--max-epochs", type=int, default=30)
+    ap.add_argument(
+        "--sparse-minibatch",
+        type=int,
+        default=None,
+        help="required route minibatch for every sparse-dictionary fit/transform",
+    )
+    ap.add_argument(
+        "--sparse-score-mode",
+        choices=["required"],
+        default=None,
+        help="required fail-closed CUDA contract for every sparse-dictionary route",
+    )
     ap.add_argument("--d-atom", type=int, default=2)
     ap.add_argument("--atom-topology", default="circle")
     ap.add_argument("--curved-atoms", type=int, default=256)
@@ -319,6 +358,11 @@ def main() -> int:
     ap.add_argument("--tag", default="")
     ap.add_argument("--out", default="results_1026.jsonl")
     args = ap.parse_args()
+    if args.arm in {"gam_flat", "hybrid_rust"}:
+        if args.sparse_minibatch is None or args.sparse_minibatch <= 0:
+            ap.error(f"--arm {args.arm} requires a positive --sparse-minibatch")
+        if args.sparse_score_mode != "required":
+            ap.error(f"--arm {args.arm} requires --sparse-score-mode required")
 
     X = load_chunk_dir(args.chunk_dir, args.max_rows, args.seed)
     x_tr, x_te = make_split(X, args.test_frac, args.seed)
@@ -339,6 +383,8 @@ def main() -> int:
                                collect=collect)
     elif args.arm == "gam_flat":
         ev, ev_train = fit_gam_flat(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
+                                    minibatch=args.sparse_minibatch,
+                                    score_mode=args.sparse_score_mode,
                                     max_epochs=args.max_epochs, seed=args.seed,
                                     collect=collect)
         extra["ev_train"] = ev_train
@@ -350,6 +396,8 @@ def main() -> int:
         ev, ev_flat = fit_hybrid_rust(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                                       curved_K=args.curved_atoms, curved_k=args.curved_k,
                                       d=args.d_atom, topology=args.atom_topology,
+                                      sparse_minibatch=args.sparse_minibatch,
+                                      sparse_score_mode=args.sparse_score_mode,
                                       max_epochs=args.max_epochs,
                                       seed=args.seed,
                                       k_flat=args.k_flat, collect=collect)
@@ -361,7 +409,14 @@ def main() -> int:
         raise AssertionError(f"unhandled arm {args.arm!r}")
 
     if args.bits and collect is not None:
-        bits = score_bits_for_arm(args.arm, collect, x_te, args.bits_max_rows, args.seed)
+        bits = score_bits_for_arm(
+            args.arm,
+            collect,
+            x_te,
+            args.bits_max_rows,
+            args.seed,
+            args.sparse_score_mode,
+        )
         if bits is not None:
             extra.update(bits)
     if args.arm == "hybrid_rust" and args.bits:
@@ -371,9 +426,14 @@ def main() -> int:
             )
 
     wall = time.perf_counter() - t0
+    if collect is not None and "sparse_route_stats" in collect:
+        extra["sparse_route_stats"] = collect["sparse_route_stats"]
+        extra["sparse_convergence"] = collect["sparse_convergence"]
     rec = {"issue": 1026, "arm": args.arm, "tag": args.tag, "N": n, "p": p,
            "K": args.K, "k_flat": args.k_flat, "top_k": args.top_k, "d_atom": args.d_atom,
            "curved_atoms": args.curved_atoms, "curved_k": args.curved_k,
+           "sparse_minibatch": args.sparse_minibatch,
+           "sparse_score_mode": args.sparse_score_mode,
            "steps": args.steps, "seed": args.seed, "ev": ev, "wall_s": round(wall, 1),
            **extra}
     print("[#1026] RESULT " + json.dumps(rec), flush=True)
