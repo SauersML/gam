@@ -586,7 +586,7 @@ pub fn initial_survival_baseline_config_for_fit(
 pub fn survival_baseline_theta_from_config(
     cfg: &SurvivalBaselineConfig,
 ) -> Result<Option<Array1<f64>>, String> {
-    Ok(match cfg.target {
+    let theta = match cfg.target {
         SurvivalBaselineTarget::Linear => None,
         SurvivalBaselineTarget::Weibull => Some(array![
             cfg.scale
@@ -613,7 +613,20 @@ pub fn survival_baseline_theta_from_config(
                 .ok_or_else(|| "missing gompertz-makeham baseline makeham".to_string())?
                 .ln(),
         ]),
-    })
+    };
+    if let Some(theta) = theta.as_ref() {
+        if theta.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "{} baseline theta coordinates must be finite",
+                survival_baseline_targetname(cfg.target)
+            ));
+        }
+        // The inverse chart is also the target-specific domain validator. This
+        // keeps the public encoder from emitting coordinates for an invalid
+        // config (including when a caller has no data rows to evaluate).
+        survival_baseline_config_from_theta(cfg.target, theta)?;
+    }
+    Ok(theta)
 }
 
 pub fn survival_baseline_config_from_theta(
@@ -2923,9 +2936,9 @@ pub fn marginal_slope_baseline_chain_rule_hessian(
         || Array2::<f64>::zeros((dim, dim)),
         |mut acc, i, _row_weight| -> Result<Array2<f64>, String> {
             let exit_parts = marginal_slope_baseline_offset_theta_geometry(age_exit[i], cfg)?
-                    .ok_or_else(|| {
-                        "unexpected None from marginal-slope second partials at exit".to_string()
-                    })?;
+                .ok_or_else(|| {
+                    "unexpected None from marginal-slope second partials at exit".to_string()
+                })?;
             if exit_parts.first.len() != dim {
                 return Err(
                     "marginal_slope_baseline_chain_rule_hessian: theta_dim drifted".to_string(),
@@ -2934,11 +2947,12 @@ pub fn marginal_slope_baseline_chain_rule_hessian(
             let mut entry_parts = None;
             if residuals.entry[i] != 0.0 {
                 entry_parts = Some(
-                    marginal_slope_baseline_offset_theta_geometry(age_entry[i], cfg)?
-                        .ok_or_else(|| {
+                    marginal_slope_baseline_offset_theta_geometry(age_entry[i], cfg)?.ok_or_else(
+                        || {
                             "unexpected None from marginal-slope second partials at entry"
                                 .to_string()
-                        })?,
+                        },
+                    )?,
                 );
             }
             for a in 0..dim {
@@ -3307,9 +3321,11 @@ fn validate_marginal_slope_baseline_row_geometry(
             .first
             .iter()
             .any(|&(value, derivative)| !value.is_finite() || !derivative.is_finite())
-        || row.second.iter().flatten().any(|&(value, derivative)| {
-            !value.is_finite() || !derivative.is_finite()
-        })
+        || row
+            .second
+            .iter()
+            .flatten()
+            .any(|&(value, derivative)| !value.is_finite() || !derivative.is_finite())
     {
         return Err(format!(
             "survival marginal-slope baseline {channel} geometry must be finite"
@@ -3385,9 +3401,9 @@ pub fn build_survival_marginal_slope_baseline_geometry(
                     )?
                 };
                 let exit = marginal_slope_baseline_offset_theta_geometry(exit_age, cfg)?
-                .ok_or_else(|| {
-                    "nonlinear survival baseline unexpectedly has no exit geometry".to_string()
-                })?;
+                    .ok_or_else(|| {
+                        "nonlinear survival baseline unexpectedly has no exit geometry".to_string()
+                    })?;
                 validate_marginal_slope_baseline_row_geometry(&entry, dim, "entry")?;
                 validate_marginal_slope_baseline_row_geometry(&exit, dim, "exit")?;
                 Ok((entry, exit))
@@ -3491,15 +3507,13 @@ impl SurvivalMarginalSlopeFrozenOffsetChart {
                     .to_string(),
             );
         }
-        let initial_geometry = build_survival_marginal_slope_baseline_geometry(
-            age_entry,
-            age_exit,
-            initial_config,
-        )?
-        .ok_or_else(|| {
-            "survival marginal-slope frozen offset chart requires a nonlinear baseline"
-                .to_string()
-        })?;
+        let initial_geometry =
+            build_survival_marginal_slope_baseline_geometry(age_entry, age_exit, initial_config)?
+                .ok_or_else(|| {
+                String::from(
+                    "survival marginal-slope frozen offset chart requires a nonlinear baseline",
+                )
+            })?;
         Ok(Self {
             age_entry: age_entry.clone(),
             age_exit: age_exit.clone(),
@@ -4089,8 +4103,8 @@ fn finish_time_varying_survival_covariate_template(
 #[cfg(test)]
 mod tests {
     use super::{
-        SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalTimeBasisConfig,
-        baseline_chain_rule_gradient, baseline_offset_theta_partials,
+        SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalMarginalSlopeFrozenOffsetChart,
+        SurvivalTimeBasisConfig, baseline_chain_rule_gradient, baseline_offset_theta_partials,
         build_survival_marginal_slope_baseline_geometry,
         build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
         build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
@@ -4101,7 +4115,7 @@ mod tests {
         optimize_survival_baseline_config_with_gradient,
         optimize_survival_baseline_config_with_gradient_only,
         resolve_survival_marginal_slope_time_anchor_value, survival_baseline_config_from_theta,
-        survival_baseline_theta_from_config, SurvivalMarginalSlopeFrozenOffsetChart,
+        survival_baseline_theta_from_config,
     };
     use crate::probability::normal_cdf;
     use crate::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
@@ -4146,6 +4160,23 @@ mod tests {
 
     #[test]
     fn marginal_slope_frozen_offset_chart_moves_only_parametric_offsets() {
+        let invalid_empty_config = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Gompertz,
+            scale: None,
+            shape: Some(0.1),
+            rate: Some(f64::NAN),
+            makeham: None,
+        };
+        assert!(
+            build_survival_marginal_slope_baseline_geometry(
+                &Array1::zeros(0),
+                &Array1::zeros(0),
+                &invalid_empty_config,
+            )
+            .is_err(),
+            "invalid baseline config must be rejected even with no rows"
+        );
+
         let age_entry = array![0.0, 0.75, 2.0];
         let age_exit = array![1.5, 3.0, 5.5];
         let initial_config = SurvivalBaselineConfig {
@@ -4155,20 +4186,16 @@ mod tests {
             rate: Some(0.22),
             makeham: Some(0.04),
         };
-        let initial_baseline = build_survival_marginal_slope_baseline_geometry(
-            &age_entry,
-            &age_exit,
-            &initial_config,
-        )
-        .expect("initial baseline geometry")
-        .expect("nonlinear chart");
+        let initial_baseline =
+            build_survival_marginal_slope_baseline_geometry(&age_entry, &age_exit, &initial_config)
+                .expect("initial baseline geometry")
+                .expect("nonlinear chart");
         let fixed_entry = array![0.125, -0.25, 0.375];
         let fixed_exit = array![-0.45, 0.55, 0.65];
         let fixed_derivative = array![0.015, 0.025, 0.035];
         let prepared_entry = &initial_baseline.offset_entry + &fixed_entry;
         let prepared_exit = &initial_baseline.offset_exit + &fixed_exit;
-        let prepared_derivative =
-            &initial_baseline.derivative_offset_exit + &fixed_derivative;
+        let prepared_derivative = &initial_baseline.derivative_offset_exit + &fixed_derivative;
         let chart = SurvivalMarginalSlopeFrozenOffsetChart::new(
             &age_entry,
             &age_exit,
@@ -4183,9 +4210,7 @@ mod tests {
         for row in 0..age_exit.len() {
             assert!((initial.offset_entry[row] - prepared_entry[row]).abs() < 1e-14);
             assert!((initial.offset_exit[row] - prepared_exit[row]).abs() < 1e-14);
-            assert!(
-                (initial.derivative_offset_exit[row] - prepared_derivative[row]).abs() < 1e-14
-            );
+            assert!((initial.derivative_offset_exit[row] - prepared_derivative[row]).abs() < 1e-14);
         }
 
         let mut candidate_theta = chart.initial_theta().clone();
@@ -4212,9 +4237,7 @@ mod tests {
                     < 1e-14
             );
             assert!(
-                (candidate.offset_exit[row]
-                    - candidate_baseline.offset_exit[row]
-                    - frozen.1[row])
+                (candidate.offset_exit[row] - candidate_baseline.offset_exit[row] - frozen.1[row])
                     .abs()
                     < 1e-14
             );
@@ -4251,7 +4274,10 @@ mod tests {
             candidate_baseline.derivative_offset_exit_theta_second
         );
         assert_eq!(candidate_baseline.offset_entry[0], 0.0);
-        assert_eq!(candidate_baseline.offset_entry_theta_first.row(0).sum(), 0.0);
+        assert_eq!(
+            candidate_baseline.offset_entry_theta_first.row(0).sum(),
+            0.0
+        );
         assert_eq!(
             candidate_baseline
                 .offset_entry_theta_second
@@ -4285,10 +4311,8 @@ mod tests {
                         candidate.offset_exit_theta_second[[row, other_axis, axis]],
                     );
                     assert_eq!(
-                        candidate.derivative_offset_exit_theta_second
-                            [[row, axis, other_axis]],
-                        candidate.derivative_offset_exit_theta_second
-                            [[row, other_axis, axis]],
+                        candidate.derivative_offset_exit_theta_second[[row, axis, other_axis]],
+                        candidate.derivative_offset_exit_theta_second[[row, other_axis, axis]],
                     );
                 }
             }
