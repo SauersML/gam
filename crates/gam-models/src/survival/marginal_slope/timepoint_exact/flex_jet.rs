@@ -167,6 +167,44 @@ trait FlexJet: JetField + Clone {
     fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self;
 }
 
+impl FlexJet for f64 {
+    const ORDER: usize = 0;
+
+    #[inline]
+    fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
+        factors[0] * self
+    }
+}
+
+/// Lift any flex scalar through one independent second-order family direction.
+///
+/// A channel in `v`, `g`, or `h` carries respectively zero, one, or two outer
+/// derivatives in addition to its inner homogeneous order. Shifting the Euler
+/// factors by that outer order is essential: applying the unshifted factors to
+/// all three fields would silently mis-scale calibration's distinguished
+/// family derivative. Channels above the row program's certified total order
+/// four are truncated explicitly.
+impl<J: FlexJet> FlexJet for Dual2<J> {
+    const ORDER: usize = if J::ORDER >= 2 { 4 } else { J::ORDER + 2 };
+
+    #[inline]
+    fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
+        let shifted = |outer_order: usize| {
+            std::array::from_fn(|inner_order| {
+                factors
+                    .get(inner_order + outer_order)
+                    .copied()
+                    .unwrap_or(0.0)
+            })
+        };
+        Self {
+            v: self.v.scale_homogeneous_orders(shifted(0)),
+            g: self.g.scale_homogeneous_orders(shifted(1)),
+            h: self.h.scale_homogeneous_orders(shifted(2)),
+        }
+    }
+}
+
 const FLEX_OUTER_SOURCE_COUNT: usize = 6;
 const FLEX_OUTER_TERM_COUNT: usize = 7;
 
@@ -2849,33 +2887,7 @@ impl SurvivalMarginalSlopeFamily {
 // scalar-FD sanity gate (the last FD-limited seam in the #932 tower). It is an
 // ORACLE only — never used on the production sweep — so it lives beside, not
 // inside, the p-primary jet types.
-use gam_math::nested_dual::{Dual22, JetField};
-
-impl FlexJet for Dual22 {
-    // The 2+2 nesting auto-zeros `s³`/`t³`, so the highest represented order in
-    // EITHER direction is 2 — but the mixed tower reaches `∂²_s ∂²_t` (order 4).
-    // `base_moment_jets`' `e^{−Δq}` truncation stops at `(−Δq)^{ORDER}`; ORDER=4
-    // makes it exact for every channel this dual represents. The scalar-field
-    // algebra (value / add / sub / mul / neg / scale / compose_unary) is inherited
-    // directly from the shared `JetField` base impl on `Dual2<S>` — no local
-    // re-declaration, the whole point of the unified algebra base.
-    const ORDER: usize = 4;
-
-    fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
-        let channels = self.channels();
-        // `(s-order, t-order) → channels() index`, keyed to `Dual22::channels`:
-        //   [v.v, g.v, v.g, h.v, g.g, v.h, h.g, g.h, h.h]
-        //  = [(0,0),(1,0),(0,1),(2,0),(1,1),(0,2),(2,1),(1,2),(2,2)].
-        const IDX: [[usize; 3]; 3] = [[0, 2, 5], [1, 4, 7], [3, 6, 8]];
-        let mut out = [0.0f64; 9];
-        for a in 0..=2usize {
-            for b in 0..=2usize {
-                out[IDX[a][b]] = factors[a + b] * channels[IDX[a][b]];
-            }
-        }
-        Dual22::from_channels(out)
-    }
-}
+use gam_math::nested_dual::{Dual2, Dual22, JetField};
 
 #[cfg(test)]
 mod moment_engine_tests {
@@ -2886,6 +2898,47 @@ mod moment_engine_tests {
     use gam_math::jet_tower::Tower2;
     use std::hint::black_box;
     use std::time::Instant;
+
+    #[test]
+    fn dual2_flexjet_scales_runtime_channels_by_total_homogeneous_order() {
+        let factors = [2.0, 3.0, 5.0, 7.0, 11.0];
+        let original = Dual2 {
+            v: Jet2::from_parts(1.0, &[2.0, 3.0], &[4.0, 5.0, 6.0, 7.0]),
+            g: Jet2::from_parts(8.0, &[9.0, 10.0], &[11.0, 12.0, 13.0, 14.0]),
+            h: Jet2::from_parts(15.0, &[16.0, 17.0], &[18.0, 19.0, 20.0, 21.0]),
+        };
+        let scaled = original.scale_homogeneous_orders(factors);
+        let assert_part = |actual: &Jet2, expected: &Jet2, outer_order: usize| {
+            assert_eq!(actual.v, factors[outer_order] * expected.v);
+            for axis in 0..expected.g.len() {
+                assert_eq!(actual.g[axis], factors[outer_order + 1] * expected.g[axis]);
+            }
+            for axis in 0..expected.h.len() {
+                assert_eq!(actual.h[axis], factors[outer_order + 2] * expected.h[axis]);
+            }
+        };
+        assert_eq!(<Dual2<Jet2> as FlexJet>::ORDER, 4);
+        assert_part(&scaled.v, &original.v, 0);
+        assert_part(&scaled.g, &original.g, 1);
+        assert_part(&scaled.h, &original.h, 2);
+    }
+
+    #[test]
+    fn recursive_dual22_flexjet_scaling_matches_nested_total_order() {
+        let factors = [2.0, 3.0, 5.0, 7.0, 11.0];
+        let original_channels = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let scaled = Dual22::from_channels(original_channels)
+            .scale_homogeneous_orders(factors)
+            .channels();
+        // `(outer order, inner order)` in `Dual22::channels()` order.
+        let total_orders = [0usize, 1, 1, 2, 2, 2, 3, 3, 4];
+        for channel in 0..scaled.len() {
+            assert_eq!(
+                scaled[channel],
+                factors[total_orders[channel]] * original_channels[channel]
+            );
+        }
+    }
 
     /// Test-only execution policy that runs the historical order-four moment
     /// construction over a lower-order algebra. The wrapped arithmetic is
