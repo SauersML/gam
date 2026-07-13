@@ -1955,6 +1955,96 @@ pub fn filter_penalty_candidates(
     Ok(FilteredPenalties { active, dropped })
 }
 
+#[cfg(test)]
+mod atomic_penalty_record_tests {
+    use std::sync::Arc;
+
+    use ndarray::array;
+
+    use crate::analytic_penalties::PenaltyOp;
+
+    use super::*;
+
+    #[test]
+    fn dropped_candidate_cannot_shift_atomic_active_penalty_identity_2315() {
+        let primary_matrix = array![[4.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        let primary_op: Arc<dyn PenaltyOp> = Arc::new(primary_matrix.clone());
+        let secondary_matrix = array![[0.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 2.0]];
+
+        let filtered = filter_penalty_candidates(vec![
+            PenaltyCandidate {
+                matrix: Array2::zeros((3, 3)),
+                source: PenaltySource::Other("dropped-before-active".to_string()),
+                normalization_scale: 11.0,
+                kronecker_factors: None,
+                op: None,
+            },
+            PenaltyCandidate {
+                matrix: primary_matrix.clone(),
+                source: PenaltySource::Primary,
+                normalization_scale: 13.0,
+                kronecker_factors: None,
+                op: Some(Arc::clone(&primary_op)),
+            },
+            PenaltyCandidate {
+                matrix: secondary_matrix.clone(),
+                source: PenaltySource::DoublePenaltyNullspace,
+                normalization_scale: 17.0,
+                kronecker_factors: None,
+                op: None,
+            },
+        ])
+        .expect("canonical penalty filtering");
+
+        assert_eq!(filtered.dropped.len(), 1);
+        let dropped = &filtered.dropped[0];
+        assert_eq!(dropped.original_index, 0);
+        assert_eq!(
+            dropped.source,
+            PenaltySource::Other("dropped-before-active".to_string())
+        );
+        assert_eq!(dropped.reason, PenaltyDropReason::ZeroMatrix);
+        assert_eq!(dropped.normalization_scale, 11.0);
+
+        assert_eq!(filtered.active.len(), 2);
+        let primary = &filtered.active[0];
+        assert_eq!(primary.info.original_index, 1);
+        assert_eq!(primary.info.source, PenaltySource::Primary);
+        assert_eq!(primary.info.effective_rank, 1);
+        assert_eq!(primary.info.normalization_scale, 13.0);
+        assert_eq!(primary.matrix, primary_matrix);
+        assert_eq!(primary.nullity, 2);
+        assert_eq!(
+            primary
+                .null_eigenvectors
+                .as_ref()
+                .expect("rank-one primary has a null basis")
+                .ncols(),
+            primary.nullity
+        );
+        let retained_op = primary.op.as_ref().expect("primary operator retained");
+        assert!(Arc::ptr_eq(retained_op, &primary_op));
+        assert_eq!(retained_op.as_dense(), primary.matrix);
+
+        let secondary = &filtered.active[1];
+        assert_eq!(secondary.info.original_index, 2);
+        assert_eq!(secondary.info.source, PenaltySource::DoublePenaltyNullspace);
+        assert_eq!(secondary.info.effective_rank, 2);
+        assert_eq!(secondary.info.normalization_scale, 17.0);
+        assert_eq!(secondary.matrix, secondary_matrix);
+        assert_eq!(secondary.nullity, 1);
+        assert_eq!(
+            secondary
+                .null_eigenvectors
+                .as_ref()
+                .expect("rank-two secondary has a null basis")
+                .ncols(),
+            secondary.nullity
+        );
+        assert!(secondary.op.is_none());
+    }
+}
+
 /// Re-normalize already-constrained 1-D B-spline penalty candidates to unit
 /// Frobenius norm *in the constrained coordinate frame*.
 ///
@@ -3191,10 +3281,8 @@ mod function_space_null_shrinkage_tests {
             "the slope constraint removes the linear null direction but the constant direction must remain shrinkable"
         );
         assert!(built.active_penalties.iter().any(|penalty| {
-            matches!(
-                penalty.info.source,
-                PenaltySource::DoublePenaltyNullspace
-            ) && penalty.info.effective_rank == 1
+            matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace)
+                && penalty.info.effective_rank == 1
         }));
     }
 
