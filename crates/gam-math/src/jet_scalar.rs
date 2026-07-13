@@ -807,37 +807,6 @@ impl<'arena> RuntimeJetScalar<'arena> for RuntimeValue {
     }
 
     #[inline(always)]
-    fn scaled_multiply_add_affine_composed_sum<const N: usize>(
-        lefts: &[Self; N],
-        rights: &[Self; N],
-        addends: &[Self; N],
-        addend_scales: &[f64; N],
-        _input_scales: &[f64; N],
-        derivative_stacks: &[[f64; 5]; N],
-        dimension: usize,
-        &(): &'arena Self::Workspace,
-    ) -> Self {
-        assert!(
-            lefts
-                .iter()
-                .chain(rights)
-                .all(|input| input.dimension == dimension)
-        );
-        assert!(
-            addends
-                .iter()
-                .zip(addend_scales)
-                .all(|(input, &scale)| scale == 0.0 || input.dimension == dimension)
-        );
-        Self {
-            value: derivative_stacks
-                .iter()
-                .fold(0.0, |sum, stack| sum + stack[0]),
-            dimension,
-        }
-    }
-
-    #[inline(always)]
     fn dimension(&self) -> usize {
         self.dimension
     }
