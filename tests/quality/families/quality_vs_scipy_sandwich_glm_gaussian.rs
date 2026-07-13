@@ -34,7 +34,6 @@
 use csv::StringRecord;
 use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::test_support::reference::{Column, run_python};
-use gam::types::LinkFunction;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -134,9 +133,15 @@ fn gam_alo_sandwich_ci_covers_true_linear_predictor_at_nominal_rate() {
         };
 
         let yview = data.values.column(data.column_map()["y"]);
-        let alo = compute_alo_diagnostics_from_fit(&fit.fit, yview, LinkFunction::Identity)
-            .expect("gam ALO diagnostics");
-        let eta_hat = alo.pred_identity.to_vec();
+        let alo = compute_alo_diagnostics_from_fit(&fit.fit, yview).expect("gam ALO diagnostics");
+        let eta_hat = fit
+            .fit
+            .artifacts
+            .pirls
+            .as_ref()
+            .expect("Gaussian quality fixture retains converged PIRLS geometry")
+            .final_eta
+            .to_vec();
         let se = alo.se_sandwich.to_vec();
         assert_eq!(eta_hat.len(), N, "ALO eta length mismatch");
         assert_eq!(se.len(), N, "ALO se length mismatch");

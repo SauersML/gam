@@ -74,7 +74,6 @@ use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::matrix::LinearOperator;
 use gam::smooth::{TermCollectionSpec, build_term_collection_design};
 use gam::test_support::reference::{max_abs_diff, pearson, relative_l2};
-use gam::types::LinkFunction;
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::{Array1, Array2, ArrayView1};
 use std::path::Path;
@@ -243,12 +242,8 @@ fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
     // which is the predictive-honesty baseline the corrected predictor must beat.
     let (full_fit, full_spec) = fit_binomial_logit(&ds);
     let y: Vec<f64> = ds.values.column(col["DEATH_EVENT"]).to_vec();
-    let alo = compute_alo_diagnostics_from_fit(
-        &full_fit,
-        ArrayView1::from(y.as_slice()),
-        LinkFunction::Logit,
-    )
-    .expect("ALO diagnostics on binomial/logit fit");
+    let alo = compute_alo_diagnostics_from_fit(&full_fit, ArrayView1::from(y.as_slice()))
+        .expect("ALO diagnostics on binomial/logit fit");
     let alo_eta_tilde: Vec<f64> = alo.eta_tilde.to_vec();
     assert_eq!(alo_eta_tilde.len(), n, "ALO eta_tilde length mismatch");
 

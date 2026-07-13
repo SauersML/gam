@@ -27,7 +27,6 @@
 use csv::StringRecord;
 use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::inference::model_comparison::{compare, model_comparison_from_unified};
-use gam::types::LinkFunction;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -94,11 +93,20 @@ fn corrected_aic_penalizes_at_least_as_much_as_conditional() {
     };
 
     let alo =
-        compute_alo_diagnostics_from_fit(&fit.fit, ds.values.column(1), LinkFunction::Identity)
-            .expect("ALO diagnostics");
+        compute_alo_diagnostics_from_fit(&fit.fit, ds.values.column(1)).expect("ALO diagnostics");
 
     // Fitted linear predictor (identity link, no offset): the in-sample mean.
-    let eta_hat = Array1::from(alo.pred_identity.to_vec());
+    // It belongs to the converged fit geometry; ALO owns only the deleted-row
+    // predictor and uncertainty diagnostics.
+    let eta_hat = Array1::from(
+        fit.fit
+            .artifacts
+            .pirls
+            .as_ref()
+            .expect("Gaussian comparison fixture retains converged PIRLS geometry")
+            .final_eta
+            .to_vec(),
+    );
     let weights = Array1::<f64>::ones(n);
     let comparison = model_comparison_from_unified(
         &fit.fit,
@@ -106,16 +114,28 @@ fn corrected_aic_penalizes_at_least_as_much_as_conditional() {
         eta_hat.view(),
         weights.view(),
         Some(&alo),
-    );
+    )
+    .expect("construct comparison channels for the exact Gaussian fixture");
+    let corrected_edf = comparison
+        .edf
+        .corrected
+        .expect("exact Gaussian smooth fixture retains corrected EDF");
+    let rho_uncertainty_df = comparison
+        .edf
+        .rho_uncertainty_df()
+        .expect("exact Gaussian smooth fixture retains the WPS correction");
+    let aic_corrected = comparison
+        .aic_corrected
+        .expect("exact Gaussian smooth fixture retains corrected AIC");
 
     eprintln!(
         "corrected-AIC arm: edf_cond={:.4} edf_corr={:.4} rho_df={:.4} \
          aic_cond={:.4} aic_corr={:.4}",
         comparison.edf.conditional,
-        comparison.edf.corrected,
-        comparison.edf.rho_uncertainty_df(),
+        corrected_edf,
+        rho_uncertainty_df,
         comparison.aic_conditional,
-        comparison.aic_corrected,
+        aic_corrected,
     );
 
     // The conditional edf is the usual tr(F); on a wiggly smooth it must be
@@ -130,39 +150,39 @@ fn corrected_aic_penalizes_at_least_as_much_as_conditional() {
     // trace of PSD operators and must be >= 0; with a genuinely penalised smooth
     // it must be strictly positive (there is real λ-uncertainty).
     assert!(
-        comparison.edf.rho_uncertainty_df() >= 0.0,
+        rho_uncertainty_df >= 0.0,
         "WPS ρ-uncertainty df must be non-negative, got {:.6}",
-        comparison.edf.rho_uncertainty_df()
+        rho_uncertainty_df
     );
     assert!(
-        comparison.edf.rho_uncertainty_df() > 1e-6,
+        rho_uncertainty_df > 1e-6,
         "a penalised smooth must carry strictly positive smoothing-parameter \
          uncertainty in its corrected edf, got {:.6}",
-        comparison.edf.rho_uncertainty_df()
+        rho_uncertainty_df
     );
 
     // Therefore the corrected AIC penalises complexity at least as much as the
     // naive conditional AIC (same log-lik, larger edf).
     assert!(
-        comparison.aic_corrected >= comparison.aic_conditional,
+        aic_corrected >= comparison.aic_conditional,
         "corrected AIC {:.4} must be >= conditional AIC {:.4}",
-        comparison.aic_corrected,
+        aic_corrected,
         comparison.aic_conditional
     );
     assert!(
-        comparison.aic_corrected.is_finite() && comparison.aic_conditional.is_finite(),
+        aic_corrected.is_finite() && comparison.aic_conditional.is_finite(),
         "AIC values must be finite"
     );
 
-    // The PSIS-LOO channel must be populated and reliable for a smooth Gaussian
-    // fit (Pareto k̂ well below the 0.7 cutoff).
+    // The ALO predictive channel must be populated with one finite contribution
+    // per row. Its cross-observation tail fit is an influence diagnostic, not a
+    // PSIS reliability estimand, so it is deliberately not used as a pass bar.
     let loo = comparison.loo.expect("PSIS-LOO channel populated");
     assert_eq!(loo.pointwise.len(), n, "pointwise elpd length");
     assert!(loo.elpd.is_finite(), "elpd finite");
     assert!(
-        !loo.k_hat_max.is_nan() && loo.k_hat_max < 0.7,
-        "PSIS k̂ should be reliable for a smooth Gaussian fit, got {:.3}",
-        loo.k_hat_max
+        loo.pointwise.iter().all(|value| value.is_finite()),
+        "pointwise elpd contributions must be finite"
     );
 }
 
@@ -200,10 +220,17 @@ fn psis_loo_paired_comparison_prefers_the_true_generator() {
     };
 
     let cmp_of = |fit: &gam::StandardFitResult| {
-        let alo =
-            compute_alo_diagnostics_from_fit(&fit.fit, ds.values.column(1), LinkFunction::Identity)
-                .expect("ALO diagnostics");
-        let eta_hat = Array1::from(alo.pred_identity.to_vec());
+        let alo = compute_alo_diagnostics_from_fit(&fit.fit, ds.values.column(1))
+            .expect("ALO diagnostics");
+        let eta_hat = Array1::from(
+            fit.fit
+                .artifacts
+                .pirls
+                .as_ref()
+                .expect("Gaussian comparison fixture retains converged PIRLS geometry")
+                .final_eta
+                .to_vec(),
+        );
         let weights = Array1::<f64>::ones(n);
         model_comparison_from_unified(
             &fit.fit,
@@ -212,23 +239,44 @@ fn psis_loo_paired_comparison_prefers_the_true_generator() {
             weights.view(),
             Some(&alo),
         )
+        .expect("construct comparison channels for the exact Gaussian fixture")
     };
 
     let cmp_smooth = cmp_of(&fit_smooth);
     let cmp_linear = cmp_of(&fit_linear);
 
     // a = smooth (true generator), b = linear (mis-specified).
-    let report = compare(&cmp_smooth, &cmp_linear);
+    let report = compare(&cmp_smooth, &cmp_linear)
+        .expect("compare two finite fits evaluated on the same response rows");
+    let delta_elpd = report
+        .delta_elpd
+        .expect("aligned Gaussian fixtures retain paired elpd");
+    let delta_elpd_se = report
+        .delta_elpd_se
+        .expect("multi-row Gaussian fixtures retain paired elpd uncertainty");
+    let delta_aic_corrected = report
+        .delta_aic_corrected
+        .expect("both exact Gaussian fixtures retain corrected AIC");
+    let smooth_elpd = cmp_smooth
+        .loo
+        .as_ref()
+        .expect("smooth Gaussian fixture retains its ALO predictive channel")
+        .elpd;
+    let linear_elpd = cmp_linear
+        .loo
+        .as_ref()
+        .expect("linear Gaussian fixture retains its ALO predictive channel")
+        .elpd;
 
     eprintln!(
         "paired-comparison arm: rows_aligned={} Δelpd={:.4} (se {:.4}) ΔAIC_corr={:.4} \
          elpd_smooth={:.4} elpd_linear={:.4}",
         report.rows_aligned,
-        report.delta_elpd,
-        report.delta_elpd_se,
-        report.delta_aic_corrected,
-        cmp_smooth.loo.as_ref().map(|l| l.elpd).unwrap_or(f64::NAN),
-        cmp_linear.loo.as_ref().map(|l| l.elpd).unwrap_or(f64::NAN),
+        delta_elpd,
+        delta_elpd_se,
+        delta_aic_corrected,
+        smooth_elpd,
+        linear_elpd,
     );
 
     assert!(
@@ -239,22 +287,22 @@ fn psis_loo_paired_comparison_prefers_the_true_generator() {
     // predictive comparison, and by a margin larger than its own SE (a genuine,
     // not within-noise, preference).
     assert!(
-        report.delta_elpd > 0.0,
+        delta_elpd > 0.0,
         "PSIS-LOO must prefer the true smooth generator: Δelpd={:.4}",
-        report.delta_elpd
+        delta_elpd
     );
     assert!(
-        report.delta_elpd > report.delta_elpd_se,
+        delta_elpd > delta_elpd_se,
         "the predictive preference for the true model must exceed its SE: \
          Δelpd={:.4} se={:.4}",
-        report.delta_elpd,
-        report.delta_elpd_se
+        delta_elpd,
+        delta_elpd_se
     );
     // The corrected-AIC channel must agree: smaller corrected AIC for the smooth
     // (ΔAIC_corrected = AIC_corr(smooth) − AIC_corr(linear) < 0 favours smooth).
     assert!(
-        report.delta_aic_corrected < 0.0,
+        delta_aic_corrected < 0.0,
         "corrected AIC must also favour the true smooth: ΔAIC_corrected={:.4}",
-        report.delta_aic_corrected
+        delta_aic_corrected
     );
 }

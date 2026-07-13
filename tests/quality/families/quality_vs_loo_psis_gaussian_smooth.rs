@@ -36,7 +36,6 @@ use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pad_to, pearson, rmse, run_python, run_r};
-use gam::types::LinkFunction;
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -69,17 +68,23 @@ fn gam_alo_is_honest_loo_predictive_error_on_lidar() {
 
     // ALO leave-one-out linear predictor. For Gaussian-identity, eta_tilde_i is
     // the predicted MEAN for observation i when that observation is held out.
-    let alo = compute_alo_diagnostics_from_fit(
-        &fit.fit,
-        ds.values.column(logratio_idx),
-        LinkFunction::Identity,
-    )
-    .expect("gam ALO diagnostics");
+    let alo = compute_alo_diagnostics_from_fit(&fit.fit, ds.values.column(logratio_idx))
+        .expect("gam ALO diagnostics");
     let eta_tilde: Vec<f64> = alo.eta_tilde.to_vec();
     assert_eq!(eta_tilde.len(), n, "ALO eta_tilde length mismatch");
 
-    // In-sample fitted mean (the full-data fit, no point held out).
-    let mu_hat: Vec<f64> = alo.pred_identity.to_vec();
+    // In-sample fitted mean (the full-data fit, no point held out). This is a
+    // property of the converged fit, not an ALO diagnostic; read the exact
+    // predictor that supplied the ALO geometry instead of retaining a second
+    // fitted-prediction surrogate in the diagnostic payload.
+    let mu_hat: Vec<f64> = fit
+        .fit
+        .artifacts
+        .pirls
+        .as_ref()
+        .expect("Gaussian quality fixture retains converged PIRLS geometry")
+        .final_eta
+        .to_vec();
     assert_eq!(mu_hat.len(), n, "fitted-mean length mismatch");
 
     // gam's residual-variance (scale) estimate, used only to put RMSE bounds on

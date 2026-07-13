@@ -53,7 +53,6 @@ use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, max_abs_diff, pearson, relative_l2, rmse, run_r};
-use gam::types::LinkFunction;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -224,7 +223,7 @@ fn alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log() {
     let y_arr = Array1::from(y.clone());
 
     // ---- gam ALO diagnostics (the capability under test) -------------------
-    let alo = compute_alo_diagnostics_from_fit(&fit.fit, y_arr.view(), LinkFunction::Log)
+    let alo = compute_alo_diagnostics_from_fit(&fit.fit, y_arr.view())
         .expect("ALO diagnostics for Poisson/log te(x1, x2)");
     assert_eq!(alo.leverage.len(), n, "ALO leverage length mismatch");
     assert_eq!(alo.eta_tilde.len(), n, "ALO eta_tilde length mismatch");
