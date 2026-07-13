@@ -754,7 +754,8 @@ fn atlas_nerve_from_sparse_route(
             b,
         ));
     }
-    let diagram = gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates)?;
+    let diagram =
+        gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates, None)?;
     Ok(Some(AuditAtlasReport {
         chart_blocks,
         diagram,
@@ -780,6 +781,9 @@ fn atlas_nerve_dict<'py>(
     out.set_item("n_edges", diagram.n_edges)?;
     out.set_item("n_triangles", diagram.n_triangles)?;
     out.set_item("n_tetrahedra", diagram.n_tetrahedra)?;
+    out.set_item("simplex_counts", diagram.simplex_counts.clone())?;
+    out.set_item("euler_characteristic", diagram.euler_characteristic)?;
+    out.set_item("good_cover_certified", diagram.good_cover_certified)?;
     out.set_item("sampled_support_size", diagram.sampled_support_size)?;
     out.set_item("covering_side", diagram.covering_side.as_str())?;
     out.set_item("max_filtration", diagram.max_filtration)?;

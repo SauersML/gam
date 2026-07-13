@@ -3,8 +3,7 @@
 
 use super::*;
 
-use gam_math::jet_scalar::{JetScalar, OneSeed, TwoSeed};
-use gam_math::nested_dual::JetField;
+use gam_math::jet_scalar::{OneSeed, TwoSeed};
 
 impl SurvivalMarginalSlopeFamily {
     /// Build the row's third-order contracted tensor

@@ -249,10 +249,7 @@ pub struct AtlasGoodCoverCertificate {
 
 impl AtlasGoodCoverCertificate {
     #[must_use = "good-cover certificate construction errors must be handled"]
-    pub fn new(
-        chart_count: usize,
-        proofs: Vec<ConvexIntersectionProof>,
-    ) -> Result<Self, String> {
+    pub fn new(chart_count: usize, proofs: Vec<ConvexIntersectionProof>) -> Result<Self, String> {
         let mut indexed = BTreeMap::new();
         for proof in proofs {
             if proof.charts.iter().any(|&chart| chart >= chart_count) {
@@ -683,13 +680,9 @@ fn record_simplex(
         .map_err(|_| "atlas nerve simplex count overflowed i128".to_string())?;
     let previous = count - 1;
     inventory.euler_characteristic = if cardinality % 2 == 1 {
-        inventory
-            .euler_characteristic
-            .checked_add(count - previous)
+        inventory.euler_characteristic.checked_add(count - previous)
     } else {
-        inventory
-            .euler_characteristic
-            .checked_sub(count - previous)
+        inventory.euler_characteristic.checked_sub(count - previous)
     }
     .ok_or_else(|| "atlas nerve Euler characteristic overflowed i128".to_string())?;
 
@@ -759,8 +752,8 @@ fn enumerate_full_nerve(
             ));
         }
     }
-    let mut unmatched_proofs = certificate
-        .map(|certificate| certificate.proofs.keys().cloned().collect::<BTreeSet<_>>());
+    let mut unmatched_proofs =
+        certificate.map(|certificate| certificate.proofs.keys().cloned().collect::<BTreeSet<_>>());
     let mut inventory = SimplexInventory {
         counts: vec![0; charts.len()],
         vertices: Vec::with_capacity(charts.len()),
@@ -840,11 +833,8 @@ pub fn build_atlas_nerve(
     let (overlaps, sampled) = sparse_pair_overlaps(charts);
     let dtm = dtm_radii(charts, &overlaps);
 
-    let vertices: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
     let mut adjacency = vec![BTreeSet::<usize>::new(); n];
-    let mut edge_filtration = BTreeMap::<(usize, usize), f64>::new();
     let mut edge_reports = Vec::new();
-    let mut edge_simplices = Vec::new();
     let mut max_filtration = 0.0_f64;
     for (&(a, b), overlap) in &overlaps {
         let threshold = overlap.mass / overlap.positive_rows as f64;
@@ -857,8 +847,6 @@ pub fn build_atlas_nerve(
         if admitted {
             adjacency[a].insert(b);
             adjacency[b].insert(a);
-            edge_filtration.insert((a, b), filtration);
-            edge_simplices.push(vec![a, b]);
             max_filtration = max_filtration.max(filtration);
         }
         edge_reports.push(AtlasNerveEdge {
@@ -872,53 +860,28 @@ pub fn build_atlas_nerve(
         });
     }
 
-    let mut triangles = Vec::new();
-    let mut triangle_set = BTreeSet::new();
-    for a in 0..n {
-        for &b in adjacency[a].iter().filter(|&&candidate| candidate > a) {
-            for &c in adjacency[a]
-                .intersection(&adjacency[b])
-                .filter(|&&candidate| candidate > b)
-            {
-                let simplex = [a, b, c];
-                let (coactivation, threshold) = mutual_row_mass(charts, &simplex);
-                if coactivation.is_finite() && coactivation >= threshold {
-                    let tri = vec![a, b, c];
-                    triangle_set.insert(tri.clone());
-                    triangles.push(tri);
-                    let filt = edge_filtration[&(a, b)]
-                        .max(edge_filtration[&(a, c)])
-                        .max(edge_filtration[&(b, c)]);
-                    max_filtration = max_filtration.max(filt);
-                }
-            }
-        }
-    }
-
-    let mut tetrahedra = Vec::new();
-    for triangle in &triangles {
-        let [a, b, c] = [triangle[0], triangle[1], triangle[2]];
-        for &d in adjacency[a].iter().filter(|&&candidate| candidate > c) {
-            let faces = [vec![a, b, c], vec![a, b, d], vec![a, c, d], vec![b, c, d]];
-            if faces.iter().all(|face| triangle_set.contains(face)) {
-                let simplex = [a, b, c, d];
-                let (coactivation, threshold) = mutual_row_mass(charts, &simplex);
-                if coactivation.is_finite() && coactivation >= threshold {
-                    tetrahedra.push(vec![a, b, c, d]);
-                }
-            }
-        }
-    }
+    // Enumerate each clique once in canonical vertex order.  Only the boundary
+    // matrices through dimension three are retained; higher simplices are
+    // streamed into their exact counts and alternating sum, so working memory
+    // does not scale with the potentially exponential full nerve.
+    let inventory = enumerate_full_nerve(charts, &adjacency, good_cover)?;
 
     let covering_side = if sampled >= n {
         AtlasCoveringSide::AtOrAboveCoveringNumber
     } else {
         AtlasCoveringSide::BelowCoveringNumber
     };
-    let betti = compute_betti(&vertices, &edge_simplices, &triangles, &tetrahedra);
+    let betti = compute_betti(
+        &inventory.vertices,
+        &inventory.edges,
+        &inventory.triangles,
+        &inventory.tetrahedra,
+    );
     let note = format!(
-        "atlas nerve over {n} charts and {row_count} rows: sampled_support_size={sampled}, covering_side={}, Betti=({}, {}, {:?})",
+        "atlas nerve over {n} charts and {row_count} rows: sampled_support_size={sampled}, covering_side={}, good_cover_certified={}, Euler={}, Betti=({}, {}, {:?})",
         covering_side.as_str(),
+        good_cover.is_some(),
+        inventory.euler_characteristic,
         betti.b0,
         betti.b1,
         betti.b2
@@ -927,10 +890,13 @@ pub fn build_atlas_nerve(
     Ok(AtlasNerveDiagram {
         betti,
         null_calibration: None,
-        n_vertices: vertices.len(),
-        n_edges: edge_simplices.len(),
-        n_triangles: triangles.len(),
-        n_tetrahedra: tetrahedra.len(),
+        n_vertices: inventory.vertices.len(),
+        n_edges: inventory.edges.len(),
+        n_triangles: inventory.triangles.len(),
+        n_tetrahedra: inventory.tetrahedra.len(),
+        simplex_counts: inventory.counts,
+        euler_characteristic: inventory.euler_characteristic,
+        good_cover_certified: good_cover.is_some(),
         sampled_support_size: sampled,
         covering_side,
         max_filtration,
@@ -941,7 +907,10 @@ pub fn build_atlas_nerve(
 
 #[cfg(test)]
 mod tests {
-    use super::{AtlasChart, AtlasCoveringSide, AtlasTransferGate, build_atlas_nerve};
+    use super::{
+        AtlasChart, AtlasCoveringSide, AtlasGoodCoverCertificate, AtlasTransferGate,
+        ConvexIntersectionProof, build_atlas_nerve,
+    };
     use crate::chart_transfer::certify_square_transfer;
     use crate::manifold::GraphCompressionKind;
     use ndarray::{Array2, arr2};
@@ -990,12 +959,40 @@ mod tests {
         gates
     }
 
+    fn good_cover_certificate(
+        n_charts: usize,
+        maximal_intersections: &[Vec<usize>],
+    ) -> AtlasGoodCoverCertificate {
+        let mut intersections = BTreeSet::new();
+        for chart in 0..n_charts {
+            intersections.insert(vec![chart]);
+        }
+        for maximal in maximal_intersections {
+            let subset_count = 1usize << maximal.len();
+            for mask in 1..subset_count {
+                let simplex: Vec<usize> = maximal
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, &chart)| {
+                        ((mask >> position) & 1 == 1).then_some(chart)
+                    })
+                    .collect();
+                intersections.insert(simplex);
+            }
+        }
+        let proofs = intersections
+            .into_iter()
+            .map(|simplex| ConvexIntersectionProof::new(simplex.clone(), simplex[0]).unwrap())
+            .collect();
+        AtlasGoodCoverCertificate::new(n_charts, proofs).unwrap()
+    }
+
     #[test]
     fn charts_tiling_synthetic_sphere_have_h2() {
         let faces = vec![vec![0, 1, 2], vec![0, 1, 3], vec![0, 2, 3], vec![1, 2, 3]];
         let charts = charts_from_faces(4, &faces);
         let gates = all_valid_pair_gates(4);
-        let diagram = build_atlas_nerve(&charts, &gates).unwrap();
+        let diagram = build_atlas_nerve(&charts, &gates, None).unwrap();
         assert_eq!(diagram.betti.b0, 1);
         assert_eq!(diagram.betti.b1, 0);
         assert_eq!(diagram.betti.b2, Some(1));
@@ -1023,7 +1020,7 @@ mod tests {
             AtlasTransferGate::from_square_transfer(1, 2, invalid_cert, 2),
             AtlasTransferGate::from_square_transfer(2, 3, valid_cert, 2),
         ];
-        let diagram = build_atlas_nerve(&charts, &gates).unwrap();
+        let diagram = build_atlas_nerve(&charts, &gates, None).unwrap();
         assert_eq!(diagram.betti.b0, 2);
         assert_eq!(diagram.betti.b1, 0);
         let rejected = diagram
@@ -1058,7 +1055,8 @@ mod tests {
         let faces: Vec<Vec<usize>> = faces.into_iter().collect();
         let charts = charts_from_faces(side * side, &faces);
         let gates = all_valid_pair_gates(side * side);
-        let diagram = build_atlas_nerve(&charts, &gates).unwrap();
+        let certificate = good_cover_certificate(side * side, &faces);
+        let diagram = build_atlas_nerve(&charts, &gates, Some(&certificate)).unwrap();
         assert_eq!(diagram.betti.b0, 1);
         assert_eq!(diagram.betti.b1, 2);
         assert_eq!(diagram.betti.b2, Some(1));
