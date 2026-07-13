@@ -33,9 +33,9 @@ use super::family::*;
 use super::hessian_paths::*;
 use super::*;
 use crate::probability::normal_cdf;
-use gam_linalg::matrix::DesignMatrix;
-use gam_problem::{InverseLink, StandardLink};
-use ndarray::Array1;
+use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+use gam_problem::{InverseLink, ParameterBlockState, StandardLink};
+use ndarray::{Array1, Array2};
 use std::sync::{Arc, Mutex};
 
 // ------------------------------------------------------------------
@@ -512,7 +512,294 @@ fn hand_flex_grad_hess_matches_independent_fd_link_dev_932() {
 }
 
 // ==================================================================
-// GATE 2: moving-edge Leibniz cross-check. Couple a cell edge to a
+// GATE 2: one REAL StandardNormal FLEX row, with score-warp and link-
+// deviation blocks active, must carry one coherent production
+// derivative ladder V -> G -> H -> t3 -> t4.
+//
+// This deliberately contains no second likelihood, spline, calibration,
+// implicit-root, or tensor formula. Each finite difference consumes the
+// immediately lower channel from the production canonical row lowerings:
+//
+//   d(V)[d]       = G . d
+//   d(G)[d]       = H d
+//   d(H)[d]       = t3[d]
+//   d(t3[d])[d]   = t4[d,d]
+//
+// Every perturbed state rebuilds the exact cache, re-solves the row root,
+// and regenerates its StandardNormal cell moments. A duplicated synthetic
+// algebra could agree with itself; this derivative ladder cannot.
+// ==================================================================
+
+fn standard_normal_flex_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
+    let score_seed = Array1::linspace(-2.0, 2.0, 8);
+    let link_seed = Array1::linspace(-1.8, 1.8, 8);
+    let config = DeviationBlockConfig {
+        num_internal_knots: 3,
+        ..DeviationBlockConfig::default()
+    };
+    let score = build_score_warp_deviation_block_from_seed(&score_seed, &config)
+        .expect("build StandardNormal score-warp block");
+    let link = build_link_deviation_block_from_knots_design_seed_and_weights(
+        &link_seed, &link_seed, &config,
+    )
+    .expect("build StandardNormal link-deviation block");
+
+    // A one-row fitted state keeps this fourth-order lock focused while still
+    // traversing the genuine StandardNormal cell partition and moment ladder.
+    let marginal_x = Array2::ones((1, 1));
+    let logslope_x = Array2::ones((1, 1));
+    let policy = gam_runtime::resource::ResourcePolicy::default_library();
+    let family = BernoulliMarginalSlopeFamily {
+        y: Arc::new(Array1::from_vec(vec![1.0])),
+        weights: Arc::new(Array1::from_vec(vec![0.9])),
+        z: Arc::new(Array1::from_vec(vec![0.35])),
+        latent_measure: LatentMeasureKind::StandardNormal,
+        gaussian_frailty_sd: Some(0.15),
+        base_link: InverseLink::Standard(StandardLink::Probit),
+        marginal_design: DesignMatrix::Dense(DenseDesignMatrix::from(marginal_x.clone())),
+        logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(logslope_x.clone())),
+        score_warp: Some(score.runtime.clone()),
+        link_dev: Some(link.runtime.clone()),
+        policy: policy.clone(),
+        cell_moment_lru: new_cell_moment_lru_cache(&policy),
+        cell_moment_cache_stats: new_cell_moment_cache_stats(),
+        intercept_warm_starts: None,
+        auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+    };
+
+    let marginal_beta = Array1::from_vec(vec![0.18]);
+    let logslope_beta = Array1::from_vec(vec![0.32]);
+    let score_beta = Array1::from_shape_fn(score.runtime.basis_dim(), |index| {
+        0.0015 * (index as f64 + 1.0)
+    });
+    let link_beta = Array1::from_shape_fn(link.runtime.basis_dim(), |index| {
+        -0.001 * (index as f64 + 1.0)
+    });
+    let states = vec![
+        ParameterBlockState {
+            eta: marginal_x.dot(&marginal_beta),
+            beta: marginal_beta,
+        },
+        ParameterBlockState {
+            eta: logslope_x.dot(&logslope_beta),
+            beta: logslope_beta,
+        },
+        ParameterBlockState {
+            eta: Array1::zeros(1),
+            beta: score_beta,
+        },
+        ParameterBlockState {
+            eta: Array1::zeros(1),
+            beta: link_beta,
+        },
+    ];
+    (family, states)
+}
+
+struct StandardNormalFlexChannels {
+    value: f64,
+    gradient: Array1<f64>,
+    hessian: Array2<f64>,
+    third: Array2<f64>,
+    fourth: Option<Array2<f64>>,
+}
+
+fn standard_normal_flex_channels(
+    family: &BernoulliMarginalSlopeFamily,
+    states: &[ParameterBlockState],
+    cache: &super::exact_eval_cache::BernoulliMarginalSlopeExactEvalCache,
+    row: usize,
+    direction: &Array1<f64>,
+    need_fourth: bool,
+) -> StandardNormalFlexChannels {
+    assert!(
+        matches!(family.latent_measure, LatentMeasureKind::StandardNormal),
+        "canonical derivative ladder must stay on the StandardNormal branch"
+    );
+    let primary = &cache.primary;
+    assert_eq!(direction.len(), primary.total);
+    let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(cache, row);
+    let row_moments = cache
+        .row_cell_moments
+        .as_ref()
+        .and_then(|bundle| bundle.row(row, 9))
+        .expect("real StandardNormal FLEX row must materialize degree-9 production moments");
+    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+    let value = family
+        .lower_bms_flex_row_order2_with_moments(
+            row,
+            states,
+            primary,
+            row_ctx,
+            Some(row_moments),
+            cache.cell_family_forest.as_ref(),
+            true,
+            &mut scratch,
+        )
+        .expect("canonical StandardNormal V/G/H lowering");
+    let third = family
+        .row_primary_third_contracted_with_moments(row, states, cache, row_ctx, direction)
+        .expect("canonical StandardNormal t3 lowering");
+    let fourth = need_fourth.then(|| {
+        family
+            .row_primary_fourth_contracted_ordered(
+                row, states, cache, row_ctx, direction, direction,
+            )
+            .expect("canonical StandardNormal t4 lowering")
+    });
+    StandardNormalFlexChannels {
+        value,
+        gradient: scratch.grad,
+        hessian: scratch.hess,
+        third,
+        fourth,
+    }
+}
+
+fn perturb_standard_normal_flex_states(
+    states: &[ParameterBlockState],
+    primary: &PrimarySlices,
+    row: usize,
+    direction: &Array1<f64>,
+    step: f64,
+) -> Vec<ParameterBlockState> {
+    let mut perturbed = states.to_vec();
+    let marginal_delta = step * direction[primary.q];
+    perturbed[0].eta[row] += marginal_delta;
+    perturbed[0].beta[0] += marginal_delta;
+    let logslope_delta = step * direction[primary.logslope];
+    perturbed[1].eta[row] += logslope_delta;
+    perturbed[1].beta[0] += logslope_delta;
+    if let Some(range) = primary.h.as_ref() {
+        for (local, index) in range.clone().enumerate() {
+            perturbed[2].beta[local] += step * direction[index];
+        }
+    }
+    if let Some(range) = primary.w.as_ref() {
+        for (local, index) in range.clone().enumerate() {
+            perturbed[3].beta[local] += step * direction[index];
+        }
+    }
+    perturbed
+}
+
+fn derivative_ladder_relative_error(analytic: f64, finite_difference: f64) -> f64 {
+    (analytic - finite_difference).abs() / (1.0 + analytic.abs().max(finite_difference.abs()))
+}
+
+#[test]
+fn standard_normal_flex_canonical_derivative_ladder_matches_vgh_t3_t4_932() {
+    let row = 0usize;
+    let (family, states) = standard_normal_flex_fixture();
+    let cache = family
+        .build_exact_eval_cache(&states)
+        .expect("base StandardNormal FLEX exact cache");
+    let primary = cache.primary.clone();
+    let h_range = primary.h.as_ref().expect("active score-warp range");
+    let w_range = primary.w.as_ref().expect("active link-deviation range");
+    assert!(!h_range.is_empty() && !w_range.is_empty());
+
+    // One mixed direction forces q, logslope, score-warp, and link-deviation
+    // cross terms through every derivative order without materializing a dense
+    // t3/t4 tensor.
+    let mut direction = Array1::<f64>::zeros(primary.total);
+    direction[primary.q] = 0.55;
+    direction[primary.logslope] = -0.35;
+    direction[h_range.start] = 0.45;
+    direction[w_range.start] = -0.40;
+
+    let base = standard_normal_flex_channels(&family, &states, &cache, row, &direction, true);
+    let step = 2.0e-4_f64;
+    let plus_states = perturb_standard_normal_flex_states(&states, &primary, row, &direction, step);
+    let minus_states =
+        perturb_standard_normal_flex_states(&states, &primary, row, &direction, -step);
+    let plus_cache = family
+        .build_exact_eval_cache(&plus_states)
+        .expect("positive-direction StandardNormal FLEX exact cache");
+    let minus_cache = family
+        .build_exact_eval_cache(&minus_states)
+        .expect("negative-direction StandardNormal FLEX exact cache");
+    let plus =
+        standard_normal_flex_channels(&family, &plus_states, &plus_cache, row, &direction, false);
+    let minus =
+        standard_normal_flex_channels(&family, &minus_states, &minus_cache, row, &direction, false);
+
+    let max_vg = derivative_ladder_relative_error(
+        base.gradient.dot(&direction),
+        (plus.value - minus.value) / (2.0 * step),
+    );
+    let mut max_gh = 0.0_f64;
+    let mut max_h3 = 0.0_f64;
+    let mut max_34 = 0.0_f64;
+    let hessian_direction = base.hessian.dot(&direction);
+    let fourth = base.fourth.as_ref().expect("requested t4 channel");
+    for u in 0..primary.total {
+        let gradient_fd = (plus.gradient[u] - minus.gradient[u]) / (2.0 * step);
+        max_gh = max_gh.max(derivative_ladder_relative_error(
+            hessian_direction[u],
+            gradient_fd,
+        ));
+        for v in 0..primary.total {
+            let third_fd = (plus.hessian[[u, v]] - minus.hessian[[u, v]]) / (2.0 * step);
+            max_h3 = max_h3.max(derivative_ladder_relative_error(
+                base.third[[u, v]],
+                third_fd,
+            ));
+            let fourth_fd = (plus.third[[u, v]] - minus.third[[u, v]]) / (2.0 * step);
+            max_34 = max_34.max(derivative_ladder_relative_error(fourth[[u, v]], fourth_fd));
+            assert_eq!(
+                base.hessian[[u, v]].to_bits(),
+                base.hessian[[v, u]].to_bits(),
+                "canonical StandardNormal H lost exact symmetry at [{u},{v}]"
+            );
+            assert_eq!(
+                base.third[[u, v]].to_bits(),
+                base.third[[v, u]].to_bits(),
+                "canonical StandardNormal t3[d] lost exact symmetry at [{u},{v}]"
+            );
+            assert_eq!(
+                fourth[[u, v]].to_bits(),
+                fourth[[v, u]].to_bits(),
+                "canonical StandardNormal t4[d,d] lost exact symmetry at [{u},{v}]"
+            );
+        }
+    }
+
+    assert!(base.value.is_finite());
+    assert!(base.gradient.iter().all(|value| value.is_finite()));
+    assert!(base.hessian.iter().all(|value| value.is_finite()));
+    assert!(base.third.iter().all(|value| value.is_finite()));
+    assert!(fourth.iter().all(|value| value.is_finite()));
+    assert!(
+        base.third.iter().any(|value| value.abs() > 1e-10)
+            && fourth.iter().any(|value| value.abs() > 1e-10),
+        "StandardNormal t3/t4 parity lock must carry nonzero signal"
+    );
+
+    assert!(
+        max_vg <= 2e-7,
+        "V->G directional relative error {max_vg:.3e}"
+    );
+    assert!(
+        max_gh <= 2e-6,
+        "G->H directional relative error {max_gh:.3e}"
+    );
+    assert!(
+        max_h3 <= 2e-5,
+        "H->t3 directional relative error {max_h3:.3e}"
+    );
+    assert!(
+        max_34 <= 2e-4,
+        "t3->t4 directional relative error {max_34:.3e}"
+    );
+    eprintln!(
+        "#932 StandardNormal FLEX canonical ladder: V->G={max_vg:.3e} G->H={max_gh:.3e} H->t3={max_h3:.3e} t3->t4={max_34:.3e}"
+    );
+}
+
+// ==================================================================
+// GATE 3: moving-edge Leibniz cross-check. Couple a cell edge to a
 // knot crossing zE = (τ − a)/b and central-difference a moving-domain
 // quadrature; the test_support sliver jet must track the boundary flux
 // as b sweeps the crossing across the cell.
@@ -644,7 +931,7 @@ fn moving_edge_leibniz_tracks_boundary_flux_932() {
 }
 
 // ==================================================================
-// GATE 3: planted-corruption tripwire. Re-derive the Leibniz sliver
+// GATE 4: planted-corruption tripwire. Re-derive the Leibniz sliver
 // with one fold term DROPPED (the ½·g_z·δ² boundary-curvature term) and
 // confirm the moving-domain FD REJECTS it — proving the oracle's teeth.
 // ==================================================================
