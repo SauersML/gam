@@ -535,9 +535,6 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
     ridge_beta: f64,
     options: &ArrowSolveOptions,
     backend: &CpuBatchedBlockSolver,
-    gauge_deflated_directions: usize,
-    deflated_row_directions: &[Vec<Array1<f64>>],
-    deflation_row_spectra: &[Option<RowDeflationSpectrum>],
 ) -> Option<Result<ArrowNewtonStepArtifacts, ArrowSchurError>> {
     // #1017 device-engagement trace: emitted through the `log` crate at debug
     // level so a perf/triage run (`RUST_LOG=gam_solve=debug`) can see EXACTLY why
@@ -820,9 +817,6 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
                 schur_factor,
                 schur_log_det_override,
                 pcg_diagnostics: diag,
-                gauge_deflated_directions,
-                deflated_row_directions: deflated_row_directions.to_vec(),
-                deflation_row_spectra: deflation_row_spectra.to_vec(),
             }))
         }
         // A non-PD per-row / Schur condition is a real numerical signal the LM
@@ -1502,13 +1496,6 @@ pub(crate) struct ArrowNewtonStepArtifacts {
     /// the bit-identical Cholesky log-determinant.
     pub(crate) schur_log_det_override: Option<f64>,
     pub(crate) pcg_diagnostics: ArrowPcgDiagnostics,
-    pub(crate) gauge_deflated_directions: usize,
-    /// Per-row unit-norm deflated directions surfaced for the outer-gradient
-    /// deflation correction (see [`ArrowBlockFactorization::deflated_row_directions`]).
-    pub(crate) deflated_row_directions: Vec<Vec<Array1<f64>>>,
-    /// Per-row RAW spectra of spectrally-deflated blocks (see
-    /// [`ArrowBlockFactorization::deflation_row_spectra`]).
-    pub(crate) deflation_row_spectra: Vec<Option<RowDeflationSpectrum>>,
 }
 
 pub(crate) struct ArrowBlockFactorization {
@@ -2175,9 +2162,6 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             schur_factor,
             schur_log_det_override: None,
             pcg_diagnostics: ArrowPcgDiagnostics::default(),
-            gauge_deflated_directions: 0,
-            deflated_row_directions: Vec::new(),
-            deflation_row_spectra: Vec::new(),
         });
     }
     let backend = CpuBatchedBlockSolver;
@@ -2185,11 +2169,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
     // 1. BA point elimination: per-row Cholesky factors of
     // (H_tt^(i) + ridge_t · I).  `factor_blocks` reads the actual row
     // dimension from `row.htt.nrows()` so heterogeneous systems work.
-    let block_factorization = factor_blocks_for_system(sys, ridge_t, false, &backend)?;
-    let htt_factors = block_factorization.factors;
-    let gauge_deflated_directions = block_factorization.gauge_deflated_directions;
-    let deflated_row_directions = block_factorization.deflated_row_directions;
-    let deflation_row_spectra = block_factorization.deflation_row_spectra;
+    let htt_factors = factor_blocks_for_system(sys, ridge_t, false, &backend)?.factors;
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
@@ -2218,9 +2198,6 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                 ridge_beta,
                 options,
                 &backend,
-                gauge_deflated_directions,
-                &deflated_row_directions,
-                &deflation_row_spectra,
             ) {
                 return device_step;
             }
@@ -2257,9 +2234,6 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                             schur_factor: Some(schur_factor),
                             schur_log_det_override: None,
                             pcg_diagnostics,
-                            gauge_deflated_directions,
-                            deflated_row_directions,
-                            deflation_row_spectra,
                         });
                     }
                     MixedPrecisionAttempt::Fallback { reason } => {
@@ -2310,9 +2284,6 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                             schur_factor: Some(schur_factor),
                             schur_log_det_override: None,
                             pcg_diagnostics,
-                            gauge_deflated_directions,
-                            deflated_row_directions,
-                            deflation_row_spectra,
                         });
                     }
                     MixedPrecisionAttempt::Fallback { reason } => {
@@ -2418,9 +2389,6 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                                 schur_factor: None,
                                 schur_log_det_override: None,
                                 pcg_diagnostics: diag,
-                                gauge_deflated_directions,
-                                deflated_row_directions,
-                                deflation_row_spectra,
                             });
                         }
                         // Non-PD per-row block → surface the matching CPU error so
@@ -2494,9 +2462,6 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
         schur_factor,
         schur_log_det_override: None,
         pcg_diagnostics,
-        gauge_deflated_directions,
-        deflated_row_directions,
-        deflation_row_spectra,
     })
 }
 
@@ -2956,12 +2921,6 @@ pub(crate) fn solve_arrow_newton_step_cross_row(
         schur_factor: Some(precond.schur_factor),
         schur_log_det_override: None,
         pcg_diagnostics: diag,
-        gauge_deflated_directions: 0,
-        // The cross-row-penalty CG preconditioner path does not run the SAE
-        // evidence per-row spectral/gauge deflation, so no λ̃ = 1 directions are
-        // surfaced (the outer-gradient deflation correction is a no-op here).
-        deflated_row_directions: Vec::new(),
-        deflation_row_spectra: Vec::new(),
     })
 }
 
