@@ -429,35 +429,123 @@ def fit_curved_topk(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, max_epoc
     return held_out_ev(x_te, recon, mean_tr)
 
 
-def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
-                    topology, sparse_minibatch, sparse_score_mode, max_epochs,
-                    seed, collect, k_flat=None):
-    """ALL-RUST hybrid: gam sparse-dictionary linear tier at reduced actives plus
-    a gam manifold-SAE curved TopK tier on the linear residual. Matched per-token
-    active-scalar budget: k_lin + curved_k·(1+d) == top_k.
-
-    ``k_flat`` (gam#2233 theorem-faithful config): the linear tier's ATOM COUNT,
-    defaulting to ``K``. A faithful crossover test reduces it so
-    ``k_flat·P + curved_K·b·P ≤ K·P``."""
-    import gamfit
-
-    k_flat = int(k_flat) if k_flat is not None else int(K)
+def _hybrid_flat_config(*, K, top_k, curved_K, curved_k, d, k_flat,
+                        sparse_minibatch, sparse_score_mode, max_epochs):
     k_lin = top_k - curved_k * (1 + d)
     if k_lin < 1:
-        raise SystemExit(f"hybrid_rust budget infeasible: top_k={top_k} curved_k={curved_k} d={d}")
-    print(f"[hybrid_rust] k_flat={k_flat} (external ref K={K}); "
-          f"k_lin={k_lin} + curved_k={curved_k}*(1+{d}) == {top_k}", flush=True)
+        raise ValueError(
+            f"hybrid budget infeasible: top_k={top_k} curved_k={curved_k} d={d}"
+        )
+    return {
+        "K_external": int(K),
+        "K_flat": int(k_flat),
+        "active_flat": int(k_lin),
+        "top_k_external": int(top_k),
+        "curved_atoms": int(curved_K),
+        "curved_top_k": int(curved_k),
+        "curved_dim": int(d),
+        "minibatch": int(sparse_minibatch),
+        "score_mode": str(sparse_score_mode),
+        "max_epochs": int(max_epochs),
+    }
+
+
+def fit_hybrid_flat_checkpoint(
+    x_tr,
+    x_te,
+    mean_tr,
+    *,
+    flat_config,
+    pair_identity,
+    checkpoint_path,
+):
+    """Fit and persist the converged GPU flat tier for a later CPU resume."""
+    import gamfit
+
+    print(
+        f"[hybrid_flat_checkpoint] k_flat={flat_config['K_flat']} "
+        f"k_lin={flat_config['active_flat']}",
+        flush=True,
+    )
     t0 = time.perf_counter()
     flat = gamfit.sparse_dictionary_fit(
-        x_tr, k_flat, active=k_lin, minibatch=sparse_minibatch,
-        max_epochs=max_epochs, score_mode=sparse_score_mode)
-    tr_tr = flat.transform(x_tr, score_mode=sparse_score_mode)
-    tr_te = flat.transform(x_te, score_mode=sparse_score_mode)
+        x_tr,
+        flat_config["K_flat"],
+        active=flat_config["active_flat"],
+        minibatch=flat_config["minibatch"],
+        max_epochs=flat_config["max_epochs"],
+        score_mode=flat_config["score_mode"],
+    )
+    tr_tr = flat.transform(x_tr, score_mode=flat_config["score_mode"])
+    tr_te = flat.transform(x_te, score_mode=flat_config["score_mode"])
     flat_recon_tr = flat.reconstruct(tr_tr.indices, tr_tr.codes)
     flat_recon_te = flat.reconstruct(tr_te.indices, tr_te.codes)
     ev_flat = held_out_ev(x_te, flat_recon_te, mean_tr)
-    print(f"[hybrid_rust] flat tier ev={ev_flat:.4f} (k_lin={k_lin}, "
-          f"{time.perf_counter()-t0:.0f}s)", flush=True)
+    route_stats = {
+        "fit": flat.score_route_stats,
+        "train": tr_tr.score_route_stats,
+        "held_out": tr_te.score_route_stats,
+    }
+    convergence = _convergence_payload(flat)
+    arrays = {
+        "decoder": np.asarray(flat.decoder, dtype=np.float32),
+        "train_indices": np.asarray(tr_tr.indices, dtype=np.uint32),
+        "train_codes": np.asarray(tr_tr.codes, dtype=np.float32),
+        "held_out_indices": np.asarray(tr_te.indices, dtype=np.uint32),
+        "held_out_codes": np.asarray(tr_te.codes, dtype=np.float32),
+        "train_reconstruction": np.asarray(flat_recon_tr, dtype=np.float32),
+        "held_out_reconstruction": np.asarray(flat_recon_te, dtype=np.float32),
+    }
+    metadata = {
+        "pair_identity": pair_identity,
+        "flat_config": flat_config,
+        "route_stats": route_stats,
+        "convergence": convergence,
+        "explained_variance": float(flat.explained_variance),
+        "held_out_ev": float(ev_flat),
+    }
+    checkpoint_sha256 = _write_flat_checkpoint(checkpoint_path, arrays, metadata)
+    print(
+        f"[hybrid_flat_checkpoint] ev={ev_flat:.6f} sha256={checkpoint_sha256} "
+        f"elapsed={time.perf_counter()-t0:.0f}s",
+        flush=True,
+    )
+    return ev_flat, {
+        "flat_checkpoint_path": str(Path(checkpoint_path).resolve()),
+        "flat_checkpoint_sha256": checkpoint_sha256,
+        "sparse_route_stats": route_stats,
+        "sparse_convergence": convergence,
+    }
+
+
+def fit_hybrid_curved_resume(
+    x_tr,
+    x_te,
+    mean_tr,
+    *,
+    flat_config,
+    pair_identity,
+    checkpoint_path,
+    curved_K,
+    curved_k,
+    d,
+    topology,
+    max_epochs,
+    seed,
+    collect,
+):
+    """Resume the CPU curved tier from an exact converged flat checkpoint."""
+    import gamfit
+
+    arrays, metadata, checkpoint_sha256 = _read_flat_checkpoint(
+        checkpoint_path, pair_identity, flat_config
+    )
+    if arrays["train_reconstruction"].shape != x_tr.shape:
+        raise ValueError("flat checkpoint training reconstruction shape mismatch")
+    if arrays["held_out_reconstruction"].shape != x_te.shape:
+        raise ValueError("flat checkpoint held-out reconstruction shape mismatch")
+    flat_recon_tr = arrays["train_reconstruction"]
+    flat_recon_te = arrays["held_out_reconstruction"]
     r_tr = np.ascontiguousarray(x_tr - flat_recon_tr)
     r_te = np.ascontiguousarray(x_te - flat_recon_te)
     t1 = time.perf_counter()
@@ -468,23 +556,24 @@ def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
     print(f"[hybrid_rust] curved tier fit {time.perf_counter()-t1:.0f}s", flush=True)
     curved_recon_te = np.asarray(curved.reconstruct(r_te), dtype=np.float32)
     combined = flat_recon_te + curved_recon_te
-    collect["flat_fit"] = flat
+    collect["flat_decoder"] = arrays["decoder"]
+    collect["flat_held_out_indices"] = arrays["held_out_indices"]
+    collect["flat_held_out_codes"] = arrays["held_out_codes"]
     collect["curved_model"] = curved
     collect["r_te"] = r_te
     collect["recon_full"] = combined
-    collect["sparse_route_stats"] = {
-        "fit": flat.score_route_stats,
-        "train": tr_tr.score_route_stats,
-        "held_out": tr_te.score_route_stats,
-    }
-    collect["sparse_convergence"] = _convergence_payload(flat)
+    collect["sparse_route_stats"] = metadata["route_stats"]
+    collect["sparse_convergence"] = metadata["convergence"]
+    collect["curved_certificates"] = curved.certificates
+    collect["curved_termination"] = curved.termination
+    collect["flat_checkpoint_sha256"] = checkpoint_sha256
     ev = held_out_ev(x_te, combined, mean_tr)
-    return ev, ev_flat
+    return ev, float(metadata["held_out_ev"])
 
 
 # --------------------------------------------------------------------------- #
 def score_bits_for_arm(
-    arm, collect, x_te, test_row_ids, bits_max_rows, seed, sparse_score_mode
+    arm, collect, x_te, test_row_ids, bits_idx, sparse_score_mode
 ):
     """Build the arm's FittedFeaturizer on a test subsample and score Eq-4 bits.
 
@@ -497,11 +586,7 @@ def score_bits_for_arm(
     import bits_eq4
     import arm_featurizers as af
 
-    n_te = x_te.shape[0]
-    rng = np.random.default_rng(seed + 7)  # bits stream separate from fit/split
-    take = min(int(bits_max_rows), n_te)
-    idx = np.sort(rng.choice(n_te, take, replace=False))
-    x_bits = np.ascontiguousarray(x_te[idx])
+    x_bits = np.ascontiguousarray(x_te[bits_idx])
 
     if arm == "external_topk":
         fitted = af.build_external_topk(
@@ -511,21 +596,25 @@ def score_bits_for_arm(
         fitted = af.build_gam_flat(
             x_bits, fit=collect["flat_fit"], score_mode=sparse_score_mode)
     elif arm == "hybrid_rust":
-        r_bits = np.ascontiguousarray(collect["r_te"][idx])
-        recon_bits = np.ascontiguousarray(collect["recon_full"][idx])
+        r_bits = np.ascontiguousarray(collect["r_te"][bits_idx])
+        recon_bits = np.ascontiguousarray(collect["recon_full"][bits_idx])
         fitted = af.build_hybrid_rust(
-            x_bits, r_bits, flat_fit=collect["flat_fit"],
-            curved_model=collect["curved_model"], recon_full=recon_bits,
-            score_mode=sparse_score_mode)
+            r_bits,
+            flat_decoder=collect["flat_decoder"],
+            flat_indices=collect["flat_held_out_indices"][bits_idx],
+            flat_codes=collect["flat_held_out_codes"][bits_idx],
+            curved_model=collect["curved_model"],
+            recon_full=recon_bits,
+        )
     else:
         return None
 
     dl = bits_eq4.description_length(fitted, x_bits.astype(np.float64))
     out = {f"bits_{k}": v for k, v in dl.items()}
     out["bits_scorer"] = bits_eq4.scorer_source()
-    out["bits_rows"] = int(take)
-    out["bits_test_positions_sha256"] = _array_sha256(idx.astype(np.int64, copy=False))
-    out["bits_row_ids_sha256"] = _array_sha256(test_row_ids[idx])
+    out["bits_rows"] = int(bits_idx.size)
+    out["bits_test_positions_sha256"] = _array_sha256(bits_idx)
+    out["bits_row_ids_sha256"] = _array_sha256(test_row_ids[bits_idx])
     if fitted.extras is not None and "score_route_stats" in fitted.extras:
         out["bits_score_route_stats"] = fitted.extras["score_route_stats"]
     # gam#2233 self-certification: the Eq-4 dictionary term is
@@ -585,6 +674,12 @@ def main() -> int:
                          "circle). Self-certified via dict_params_faithful in the "
                          "result record.")
     ap.add_argument("--curved-k", type=int, default=2)
+    ap.add_argument(
+        "--hybrid-phase",
+        choices=["flat-checkpoint", "curved-resume"],
+        default=None,
+    )
+    ap.add_argument("--flat-checkpoint", default=None)
     ap.add_argument("--cosine-lr", action="store_true",
                     help="cosine LR decay for the external bar (stronger baseline)")
     ap.add_argument("--bits", action="store_true",
@@ -606,8 +701,19 @@ def main() -> int:
             ap.error(f"--arm {args.arm} requires a positive --sparse-minibatch")
         if args.sparse_score_mode != "required":
             ap.error(f"--arm {args.arm} requires --sparse-score-mode required")
-    if args.arm in {"external_topk", "hybrid_rust"} and not args.bits:
-        ap.error(f"--arm {args.arm} requires --bits for the #2283 paired measurement")
+    if args.arm == "hybrid_rust":
+        if args.hybrid_phase is None or args.flat_checkpoint is None:
+            ap.error("--arm hybrid_rust requires --hybrid-phase and --flat-checkpoint")
+        if args.k_flat is None or args.k_flat <= 0:
+            ap.error("--arm hybrid_rust requires a positive --k-flat")
+        if args.hybrid_phase == "flat-checkpoint" and args.bits:
+            ap.error("flat-checkpoint phase does not score bits")
+        if args.hybrid_phase == "curved-resume" and not args.bits:
+            ap.error("curved-resume phase requires --bits")
+    elif args.hybrid_phase is not None or args.flat_checkpoint is not None:
+        ap.error("--hybrid-phase and --flat-checkpoint are only valid for hybrid_rust")
+    if args.arm == "external_topk" and not args.bits:
+        ap.error("--arm external_topk requires --bits for the #2283 paired measurement")
     if args.bits_max_rows <= 0:
         ap.error("--bits-max-rows must be positive")
 
@@ -619,11 +725,25 @@ def main() -> int:
     )
     mean_tr = x_tr.mean(0)
     n, p = X.shape
+    bits_idx = _bits_selection(x_te.shape[0], args.bits_max_rows, args.seed)
+    source_provenance = _source_provenance(args.code_revision, args.wheel_sha256)
+    pair_identity = _pair_identity(
+        args,
+        n=n,
+        p=p,
+        data_manifest=data_manifest,
+        sampled_row_ids=sampled_row_ids,
+        train_row_ids=train_row_ids,
+        test_row_ids=test_row_ids,
+        bits_idx=bits_idx,
+        source_provenance=source_provenance,
+    )
     print(f"[#2283] arm={args.arm} N={n} p={p} train={x_tr.shape[0]} test={x_te.shape[0]} "
           f"K={args.K} top_k={args.top_k}", flush=True)
 
     t0 = time.perf_counter()
     extra: dict = {}
+    record_type = "result"
     # Native fit handles, convergence evidence, and score-route telemetry. Bits
     # arms add their scorer inputs to the same record.
     collect: dict = {"K_ext": int(args.K)}
@@ -643,34 +763,63 @@ def main() -> int:
                              d_atom=args.d_atom, topology=args.atom_topology,
                              max_epochs=args.max_epochs, seed=args.seed)
     elif args.arm == "hybrid_rust":
-        ev, ev_flat = fit_hybrid_rust(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
-                                      curved_K=args.curved_atoms, curved_k=args.curved_k,
-                                      d=args.d_atom, topology=args.atom_topology,
-                                      sparse_minibatch=args.sparse_minibatch,
-                                      sparse_score_mode=args.sparse_score_mode,
-                                      max_epochs=args.max_epochs,
-                                      seed=args.seed,
-                                      k_flat=args.k_flat, collect=collect)
-        extra["ev_flat_tier"] = ev_flat
+        flat_config = _hybrid_flat_config(
+            K=args.K,
+            top_k=args.top_k,
+            curved_K=args.curved_atoms,
+            curved_k=args.curved_k,
+            d=args.d_atom,
+            k_flat=args.k_flat,
+            sparse_minibatch=args.sparse_minibatch,
+            sparse_score_mode=args.sparse_score_mode,
+            max_epochs=args.max_epochs,
+        )
+        if args.hybrid_phase == "flat-checkpoint":
+            ev, checkpoint = fit_hybrid_flat_checkpoint(
+                x_tr,
+                x_te,
+                mean_tr,
+                flat_config=flat_config,
+                pair_identity=pair_identity,
+                checkpoint_path=args.flat_checkpoint,
+            )
+            extra.update(checkpoint)
+            record_type = "flat_checkpoint"
+        else:
+            ev, ev_flat = fit_hybrid_curved_resume(
+                x_tr,
+                x_te,
+                mean_tr,
+                flat_config=flat_config,
+                pair_identity=pair_identity,
+                checkpoint_path=args.flat_checkpoint,
+                curved_K=args.curved_atoms,
+                curved_k=args.curved_k,
+                d=args.d_atom,
+                topology=args.atom_topology,
+                max_epochs=args.max_epochs,
+                seed=args.seed,
+                collect=collect,
+            )
+            extra["ev_flat_tier"] = ev_flat
     elif args.arm == "pca_bar":
         extra = fit_pca_bar(x_tr, x_te, mean_tr, ranks=[16, 32, 64, 128, 512])
         ev = extra[f"pca_ev_r{args.top_k}"] if f"pca_ev_r{args.top_k}" in extra else extra["pca_ev_r32"]
     else:
         raise AssertionError(f"unhandled arm {args.arm!r}")
 
-    if args.bits:
+    if args.bits and record_type == "result":
         bits = score_bits_for_arm(
             args.arm,
             collect,
             x_te,
             test_row_ids,
-            args.bits_max_rows,
-            args.seed,
+            bits_idx,
             args.sparse_score_mode,
         )
         if bits is not None:
             extra.update(bits)
-    if args.arm == "hybrid_rust" and args.bits:
+    if args.arm == "hybrid_rust" and args.hybrid_phase == "curved-resume":
         if extra.get("bits_dict_params_faithful") is not True:
             raise RuntimeError(
                 "theorem-faithful hybrid exceeded the external dictionary-parameter budget"
@@ -680,37 +829,16 @@ def main() -> int:
     if "sparse_route_stats" in collect:
         extra["sparse_route_stats"] = collect["sparse_route_stats"]
         extra["sparse_convergence"] = collect["sparse_convergence"]
-    source_provenance = _source_provenance(args.code_revision, args.wheel_sha256)
-    data_identity = {
-        "manifest_sha256": data_manifest["sha256"],
-        "sampled_row_ids_sha256": _array_sha256(sampled_row_ids),
-        "train_row_ids_sha256": _array_sha256(train_row_ids),
-        "test_row_ids_sha256": _array_sha256(test_row_ids),
-        "bits_test_positions_sha256": extra.get("bits_test_positions_sha256"),
-        "bits_row_ids_sha256": extra.get("bits_row_ids_sha256"),
-    }
-    pair_identity = {
-        "schema": PAIR_SCHEMA,
-        "run_id": args.run_id,
-        "source": source_provenance,
-        "data": data_identity,
-        "config": {
-            "max_rows": args.max_rows,
-            "test_frac": args.test_frac,
-            "seed": args.seed,
-            "N": n,
-            "p": p,
-            "K": args.K,
-            "top_k": args.top_k,
-            "bits_max_rows": args.bits_max_rows if args.bits else None,
-            "bits_rows": extra.get("bits_rows"),
-        },
-    }
-    rec = {"issue": 2283, "arm": args.arm, "run_id": args.run_id, "N": n, "p": p,
+        extra["curved_certificates"] = collect.get("curved_certificates")
+        extra["curved_termination"] = collect.get("curved_termination")
+        extra["flat_checkpoint_sha256"] = collect.get("flat_checkpoint_sha256")
+    rec = {"issue": 2283, "record_type": record_type,
+           "arm": args.arm, "run_id": args.run_id, "N": n, "p": p,
            "K": args.K, "k_flat": args.k_flat, "top_k": args.top_k, "d_atom": args.d_atom,
            "curved_atoms": args.curved_atoms, "curved_k": args.curved_k,
            "sparse_minibatch": args.sparse_minibatch,
            "sparse_score_mode": args.sparse_score_mode,
+           "hybrid_phase": args.hybrid_phase,
            "max_rows": args.max_rows, "test_frac": args.test_frac,
            "bits_max_rows": args.bits_max_rows if args.bits else None,
            "steps": args.steps, "lr": args.lr, "batch_size": args.batch_size,
@@ -722,8 +850,7 @@ def main() -> int:
            "execution_provenance": _execution_provenance(),
            **extra}
     print("[#2283] RESULT " + json.dumps(rec), flush=True)
-    with open(args.out, "a") as f:
-        f.write(json.dumps(rec) + "\n")
+    _append_jsonl(args.out, rec)
     return 0
 
 

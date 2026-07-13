@@ -189,14 +189,18 @@ def _stack_blocks(flat, curved, recon_full) -> FittedFeaturizer:
 
 
 def build_hybrid_rust(
-    x_bits, r_bits, *, flat_fit, curved_model, recon_full, score_mode: str,
+    r_bits,
+    *,
+    flat_decoder,
+    flat_indices,
+    flat_codes,
+    curved_model,
+    recon_full,
 ) -> FittedFeaturizer:
-    """FittedFeaturizer for the all-Rust hybrid: sparse-dict flat + Rust curved."""
-    tr = flat_fit.transform(x_bits, score_mode=score_mode)
+    """FittedFeaturizer from the persisted flat routing plus Rust curved tier."""
     flat = _flat_block_from_sparse(
-        np.asarray(flat_fit.decoder), tr.indices, tr.codes)[:4]
+        np.asarray(flat_decoder), flat_indices, flat_codes)[:4]
     curved = _curved_block_rust(r_bits, model=curved_model)
     fit = _stack_blocks(flat, curved, recon_full)
     fit.name = "hybrid_rust"
-    fit.extras = {"score_route_stats": tr.score_route_stats}
     return fit
