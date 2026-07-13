@@ -82,7 +82,10 @@
 use super::*;
 use crate::bms::signed_probit_neglog_unary_stack;
 use crate::survival::marginal_slope::gpu;
-use gam_math::jet_scalar::{DynamicOrder2Accumulator, DynamicOrder2Term};
+use gam_math::jet_scalar::{
+    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicOrder2Accumulator, DynamicOrder2Term,
+    RuntimeJetScalar,
+};
 
 /// The `[f64; 5]` Faà di Bruno stack of `g(η) = logΦ(−η)` at `η`.
 ///
@@ -792,6 +795,96 @@ impl JetField for Jet3 {
 }
 
 impl FlexJet for Jet3 {
+    const ORDER: usize = 3;
+}
+
+/// Arena-backed one-seed scalar for the production directional timepoint
+/// program. It implements the same [`FlexJet`] algebra as [`Jet3`], while every
+/// derivative channel is allocated from one resettable row arena instead of a
+/// fresh `Vec` per primitive operation.
+#[derive(Clone, Copy)]
+struct ArenaJet3<'arena> {
+    arena: &'arena DynamicJetArena,
+    inner: DynamicOneSeed<'arena>,
+}
+
+impl<'arena> ArenaJet3<'arena> {
+    #[inline]
+    fn primary(
+        x: f64,
+        axis: usize,
+        p: usize,
+        direction: f64,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
+        let inner = if axis < p {
+            DynamicOneSeed::seed_direction(x, axis, direction, p, arena)
+        } else {
+            DynamicOneSeed {
+                base: DynamicOrder2::constant(x, p, arena),
+                eps: DynamicOrder2::constant(direction, p, arena),
+            }
+        };
+        Self { arena, inner }
+    }
+}
+
+impl JetField for ArenaJet3<'_> {
+    #[inline(always)]
+    fn value(&self) -> f64 {
+        self.inner.value()
+    }
+
+    #[inline(always)]
+    fn add(&self, other: &Self) -> Self {
+        Self {
+            arena: self.arena,
+            inner: self.inner.add(&other.inner),
+        }
+    }
+
+    #[inline(always)]
+    fn sub(&self, other: &Self) -> Self {
+        Self {
+            arena: self.arena,
+            inner: self.inner.sub(&other.inner),
+        }
+    }
+
+    #[inline(always)]
+    fn mul(&self, other: &Self) -> Self {
+        Self {
+            arena: self.arena,
+            inner: self.inner.mul(&other.inner),
+        }
+    }
+
+    #[inline(always)]
+    fn neg(&self) -> Self {
+        Self {
+            arena: self.arena,
+            inner: self.inner.neg(),
+        }
+    }
+
+    #[inline(always)]
+    fn scale(&self, scale: f64) -> Self {
+        Self {
+            arena: self.arena,
+            inner: self.inner.scale(scale),
+        }
+    }
+
+    #[inline(always)]
+    fn compose_unary(&self, derivatives: [f64; 5]) -> Self {
+        Self {
+            arena: self.arena,
+            inner: self.inner.compose_unary(derivatives),
+        }
+    }
+}
+
+impl FlexJet for ArenaJet3<'_> {
     const ORDER: usize = 3;
 }
 
@@ -2388,6 +2481,61 @@ impl MomentTerm for Jet3 {
     }
 }
 
+impl MomentTerm for ArenaJet3<'_> {
+    fn moment_term(&self, moment: &Self) -> Self {
+        assert!(
+            std::ptr::eq(self.arena, moment.arena),
+            "arena flex jets belong to different workspaces"
+        );
+        let coefficient_base = &self.inner.base;
+        let coefficient_eps = &self.inner.eps;
+        let moment_base = &moment.inner.base;
+        let moment_eps = &moment.inner.eps;
+        let dimension = coefficient_base.g.len();
+
+        let base = DynamicOrder2::from_channel_functions(
+            0.0,
+            dimension,
+            self.arena,
+            |axis| coefficient_base.g[axis] * moment_base.v,
+            |row, column| {
+                let index = row * dimension + column;
+                coefficient_base.h[index] * moment_base.v
+                    + 0.5
+                        * (coefficient_base.g[row] * moment_base.g[column]
+                            + coefficient_base.g[column] * moment_base.g[row])
+            },
+        );
+        let eps = DynamicOrder2::from_channel_functions(
+            coefficient_eps.v * moment_base.v,
+            dimension,
+            self.arena,
+            |axis| {
+                coefficient_eps.g[axis] * moment_base.v
+                    + 0.5
+                        * (coefficient_eps.v * moment_base.g[axis]
+                            + coefficient_base.g[axis] * moment_eps.v)
+            },
+            |row, column| {
+                let index = row * dimension + column;
+                coefficient_eps.h[index] * moment_base.v
+                    + (2.0 / 3.0)
+                        * (coefficient_eps.g[row] * moment_base.g[column]
+                            + coefficient_eps.g[column] * moment_base.g[row])
+                    + (2.0 / 3.0) * coefficient_base.h[index] * moment_eps.v
+                    + (1.0 / 3.0) * coefficient_eps.v * moment_base.h[index]
+                    + (1.0 / 3.0)
+                        * (coefficient_base.g[row] * moment_eps.g[column]
+                            + coefficient_base.g[column] * moment_eps.g[row])
+            },
+        );
+        Self {
+            arena: self.arena,
+            inner: DynamicOneSeed { base, eps },
+        }
+    }
+}
+
 impl MomentTerm for Jet4 {
     fn moment_term(&self, m: &Self) -> Self {
         // The calibration residual term lifted to the two-seed ε/δ algebra. The base
@@ -2499,6 +2647,7 @@ impl SurvivalMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
         cached: &CachedPartitionCells,
         dir: &Array1<f64>,
+        arena: &DynamicJetArena,
     ) -> Result<crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional, String>
     {
         let p = primary.total;
@@ -2507,9 +2656,11 @@ impl SurvivalMarginalSlopeFamily {
         let (obs_coeff, obs_fixed) = observed_fixed_for(self, primary, row, a, b, beta_h, beta_w)?;
         let cells = cells_from_cached(cached);
 
-        let template = Jet3::primary(0.0, usize::MAX, p, 0.0);
-        let b_jet = Jet3::primary(b, primary.g, p, dir[primary.g]);
-        let du: Vec<Jet3> = (0..p).map(|u| Jet3::primary(0.0, u, p, dir[u])).collect();
+        let template = ArenaJet3::primary(0.0, usize::MAX, p, 0.0, arena);
+        let b_jet = ArenaJet3::primary(b, primary.g, p, dir[primary.g], arena);
+        let du: Vec<ArenaJet3<'_>> = (0..p)
+            .map(|axis| ArenaJet3::primary(0.0, axis, p, dir[axis], arena))
+            .collect();
         let (eta, chi, d) = flex_timepoint_inputs_generic(
             &template,
             &b_jet,
@@ -2529,12 +2680,12 @@ impl SurvivalMarginalSlopeFamily {
 
         Ok(
             crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
-                eta_u_dir: eta.eps.g.clone(),
-                eta_uv_dir: eta.eps.h.clone(),
-                chi_u_dir: chi.eps.g.clone(),
-                chi_uv_dir: chi.eps.h.clone(),
-                d_u_dir: d.eps.g.clone(),
-                d_uv_dir: d.eps.h.clone(),
+                eta_u_dir: eta.inner.eps.g.to_vec(),
+                eta_uv_dir: eta.inner.eps.h.to_vec(),
+                chi_u_dir: chi.inner.eps.g.to_vec(),
+                chi_uv_dir: chi.inner.eps.h.to_vec(),
+                d_u_dir: d.inner.eps.g.to_vec(),
+                d_uv_dir: d.inner.eps.h.to_vec(),
             },
         )
     }
