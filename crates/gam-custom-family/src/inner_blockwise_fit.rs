@@ -7119,9 +7119,10 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
 /// [`inner_blockwise_fit`]. Computes the penalty value, the block log-dets, the
 /// (converged-only) projected KKT residual for the IFT, and the active-constraint
 /// block, then moves `states`, `s_lambdas`, and `cached_active_sets` into the
-/// returned [`BlockwiseInnerResult`]. Behavior is identical to the inline code it
-/// replaced — the `?`-propagation and the `converged`-gate on `kkt_residual` are
-/// preserved verbatim.
+/// returned [`BlockwiseInnerResult`]. Before log-determinant assembly, every
+/// unconstrained converged result with exact joint curvature is re-certified at
+/// the coefficient vector being returned; this includes modes minted by the
+/// blockwise fall-through and joint-polish paths.
 pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
