@@ -2890,12 +2890,13 @@ mod tests {
                 for r in [0.7_f64, 1.9] {
                     let max_order = 3usize;
                     let f = super::riesz_block_radial_derivatives(d, j, r, max_order);
+                    let scale = block_scale(&f);
                     let h = 1e-4;
                     let f_plus = super::riesz_block_radial_derivatives(d, j, r + h, max_order);
                     let f_minus = super::riesz_block_radial_derivatives(d, j, r - h, max_order);
                     for k in 1..=max_order {
                         let fd = (f_plus[k - 1] - f_minus[k - 1]) / (2.0 * h);
-                        assert_relative_close(f[k], fd, 1e-5);
+                        assert_fd_matches(f[k], fd, 1e-5, scale);
                     }
                 }
             }
@@ -2936,11 +2937,13 @@ mod tests {
                     let base_0 = base(0.0);
                     let base_plus = base(h);
                     let base_minus = base(-h);
+                    let scale1 = block_scale(&d1);
+                    let scale2 = block_scale(&d2);
                     for k in 0..=max_order {
                         let fd1 = (base_plus[k] - base_minus[k]) / (2.0 * h);
                         let fd2 = (base_plus[k] - 2.0 * base_0[k] + base_minus[k]) / (h * h);
-                        assert_relative_close(d1[k], fd1, 1e-5);
-                        assert_relative_close(d2[k], fd2, 1e-3);
+                        assert_fd_matches(d1[k], fd1, 1e-5, scale1);
+                        assert_fd_matches(d2[k], fd2, 1e-3, scale2);
                     }
                 }
             }
