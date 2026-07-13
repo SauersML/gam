@@ -918,6 +918,101 @@ where
     Ok(())
 }
 
+/// Derive the independent RNG seed for one globally indexed replicate.
+///
+/// SplitMix64's published integer mixer gives every `(seed, draw_index)` pair
+/// one stable stream without advancing through preceding draws. This makes a
+/// saved-model replicate stream seekable: Python/CLI consumers can request
+/// disjoint chunks, retry a chunk, or change chunk size without changing any
+/// value at a given global draw index.
+#[inline]
+fn indexed_replicate_seed(seed: u64, draw_index: u64) -> u64 {
+    let mut value =
+        seed.wrapping_add(0x9E3779B97F4A7C15_u64.wrapping_mul(draw_index.wrapping_add(1)));
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D049BB133111EB);
+    value ^ (value >> 31)
+}
+
+/// Draw a seekable range of independently seeded replicate chunks.
+///
+/// `draw_start` is the global draw index and `n_draws` is the range length.
+/// Values are a pure function of `(spec, seed, global_draw, observation)`, so
+/// separate calls over adjacent ranges concatenate bit-for-bit to a single
+/// call over their union. The sink receives global, not range-local, starts.
+pub fn sampleobservation_seeded_replicate_chunks<F>(
+    spec: &GenerativeSpec,
+    draw_start: usize,
+    n_draws: usize,
+    chunk_draws: usize,
+    seed: u64,
+    mut consume: F,
+) -> Result<(), EstimationError>
+where
+    F: for<'a> FnMut(usize, ndarray::ArrayView2<'a, f64>) -> Result<(), EstimationError>,
+{
+    use rand::SeedableRng;
+
+    if chunk_draws == 0 {
+        crate::bail_invalid_estim!("replicate chunk size must be strictly positive");
+    }
+    let draw_end = draw_start.checked_add(n_draws).ok_or_else(|| {
+        EstimationError::InvalidInput(format!(
+            "replicate draw range overflows usize: start={draw_start}, count={n_draws}"
+        ))
+    })?;
+    if n_draws == 0 {
+        return Ok(());
+    }
+    let n = spec.nobs();
+    let capacity = chunk_draws.min(n_draws);
+    let mut chunk = Array2::<f64>::zeros((capacity, n));
+    let mut start = draw_start;
+    while start < draw_end {
+        let len = (draw_end - start).min(capacity);
+        for local_draw in 0..len {
+            let global_draw = start + local_draw;
+            let global_draw_u64 = u64::try_from(global_draw).map_err(|_| {
+                EstimationError::InvalidInput(format!(
+                    "replicate draw index {global_draw} is not representable as u64"
+                ))
+            })?;
+            let mut rng =
+                rand::rngs::StdRng::seed_from_u64(indexed_replicate_seed(seed, global_draw_u64));
+            let draw = sampleobservations(spec, &mut rng)?;
+            chunk.row_mut(local_draw).assign(&draw);
+        }
+        consume(start, chunk.slice(ndarray::s![..len, ..]))?;
+        start += len;
+    }
+    Ok(())
+}
+
+/// Collect a seekable range into an allocating `n_draws × nobs` matrix.
+pub fn sampleobservation_seeded_replicates(
+    spec: &GenerativeSpec,
+    draw_start: usize,
+    n_draws: usize,
+    seed: u64,
+) -> Result<Array2<f64>, EstimationError> {
+    let mut out = Array2::<f64>::zeros((n_draws, spec.nobs()));
+    sampleobservation_seeded_replicate_chunks(
+        spec,
+        draw_start,
+        n_draws,
+        n_draws.max(1),
+        seed,
+        |global_start, chunk| {
+            let local_start = global_start - draw_start;
+            let local_end = local_start + chunk.nrows();
+            out.slice_mut(ndarray::s![local_start..local_end, ..])
+                .assign(&chunk);
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
 /// Collect multiple synthetic replicates into an `n_draws × nobs` matrix.
 ///
 /// This is intentionally the allocating convenience surface. Streaming
@@ -995,6 +1090,27 @@ mod tests {
         };
         assert_eq!(collect(1), collect(7));
         assert_eq!(collect(7), collect(256));
+    }
+
+    #[test]
+    fn seekable_seeded_ranges_concatenate_bit_exactly() {
+        let spec = GenerativeSpec {
+            mean: ndarray::array![1.5, 4.0],
+            noise: NoiseModel::Poisson,
+        };
+        let whole = sampleobservation_seeded_replicates(&spec, 0, 257, 2300).unwrap();
+        let first = sampleobservation_seeded_replicates(&spec, 0, 91, 2300).unwrap();
+        let second = sampleobservation_seeded_replicates(&spec, 91, 166, 2300).unwrap();
+        assert_eq!(whole.slice(ndarray::s![..91, ..]), first.view());
+        assert_eq!(whole.slice(ndarray::s![91.., ..]), second.view());
+
+        let mut streamed = Vec::<f64>::new();
+        sampleobservation_seeded_replicate_chunks(&spec, 0, 257, 13, 2300, |_, chunk| {
+            streamed.extend(chunk.iter().copied());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(streamed, whole.iter().copied().collect::<Vec<_>>());
     }
 
     /// The CTM inverse-transform sampler (#1613) must draw `Y = h⁻¹(Z|x)`,
