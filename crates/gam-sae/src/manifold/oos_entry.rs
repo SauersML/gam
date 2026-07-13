@@ -101,7 +101,7 @@ pub fn persisted_oos_atom_specs(
 
         let stored_harmonics = stored_n_harmonics[atom_index];
         let harmonic_topology = matches!(
-            basis_kind,
+            &basis_kind,
             SaeAtomBasisKind::Periodic
                 | SaeAtomBasisKind::Torus
                 | SaeAtomBasisKind::Cylinder

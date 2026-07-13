@@ -7,6 +7,53 @@
 
 use super::*;
 
+/// Direction-independent geometry shared by the single-direction fused Jet3
+/// route and the build-once all-axis route.
+struct FlexThirdRowGeometry {
+    row: usize,
+    p: usize,
+    qd1: f64,
+    q0: f64,
+    q1: f64,
+    q0_index: usize,
+    q1_index: usize,
+    a0: f64,
+    a1: f64,
+    g: f64,
+    o_infl: f64,
+    beta_h: Option<Array1<f64>>,
+    beta_w: Option<Array1<f64>>,
+    entry_cached: CachedPartitionCells,
+    exit_cached: CachedPartitionCells,
+}
+
+impl FlexThirdRowGeometry {
+    fn into_base(
+        self,
+        entry_base: crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+        exit_base: crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+    ) -> FlexThirdRowBase {
+        FlexThirdRowBase {
+            row: self.row,
+            p: self.p,
+            qd1: self.qd1,
+            q0: self.q0,
+            q1: self.q1,
+            q0_index: self.q0_index,
+            q1_index: self.q1_index,
+            a0: self.a0,
+            a1: self.a1,
+            g: self.g,
+            beta_h: self.beta_h,
+            beta_w: self.beta_w,
+            entry_cached: self.entry_cached,
+            exit_cached: self.exit_cached,
+            entry_base,
+            exit_base,
+        }
+    }
+}
+
 impl SurvivalMarginalSlopeFamily {
     /// Exact third-order directional contraction for the flexible survival
     /// path.  Returns D_dir H[u,v] where H is the primary-space NLL Hessian.
@@ -32,8 +79,117 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(Array2::<f64>::zeros((p, p)));
         }
 
-        let base = self.build_row_flex_third_base_with_states(row, block_states, &primary)?;
-        self.row_flex_third_contract_from_base(&base, dir)
+        let geometry = self.prepare_row_flex_third_geometry(row, block_states, &primary)?;
+        let (entry_base, entry_ext, exit_base, exit_ext) =
+            super::flex_jet::with_flex_third_jet_arena(
+                |jet_arena| -> Result<_, String> {
+                    let (entry_base, entry_ext) =
+                        self.compute_survival_timepoint_directional_jet_from_cached(
+                            geometry.row,
+                            &primary,
+                            geometry.q0,
+                            geometry.q0_index,
+                            geometry.a0,
+                            geometry.g,
+                            geometry.beta_h.as_ref(),
+                            geometry.beta_w.as_ref(),
+                            geometry.o_infl,
+                            &geometry.entry_cached,
+                            dir,
+                            jet_arena,
+                        )?;
+                    jet_arena.reset();
+                    let (exit_base, exit_ext) =
+                        self.compute_survival_timepoint_directional_jet_from_cached(
+                            geometry.row,
+                            &primary,
+                            geometry.q1,
+                            geometry.q1_index,
+                            geometry.a1,
+                            geometry.g,
+                            geometry.beta_h.as_ref(),
+                            geometry.beta_w.as_ref(),
+                            geometry.o_infl,
+                            &geometry.exit_cached,
+                            dir,
+                            jet_arena,
+                        )?;
+                    Ok((entry_base, entry_ext, exit_base, exit_ext))
+                },
+            )?;
+        if !exit_base.chi.is_finite() || exit_base.chi <= 0.0 {
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival third contracted row {row}: non-positive chi1={:.3e}",
+                    exit_base.chi,
+                ),
+            }
+            .into());
+        }
+        let base = geometry.into_base(entry_base, exit_base);
+        self.row_flex_third_contract_from_packs(&base, dir, &entry_ext, &exit_ext)
+    }
+
+    fn prepare_row_flex_third_geometry(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &FlexPrimarySlices,
+    ) -> Result<FlexThirdRowGeometry, String> {
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let q0 = q_geom.q0;
+        let q1 = q_geom.q1;
+        let qd1 = q_geom.qd1;
+        let g = block_states[2].eta[row];
+        let beta_h = self.flex_score_beta(block_states)?.cloned();
+        let beta_w = self.flex_link_beta(block_states)?.cloned();
+        let o_infl = self.influence_index_offset(row, block_states)?;
+
+        if survival_derivative_guard_violated(qd1, self.derivative_guard) {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival third contracted monotonicity violated at row {row}: qd1={qd1:.3e}"
+                ),
+            }
+            .into());
+        }
+
+        let (a0, _) = self.solve_row_survival_intercept_with_slot(
+            q0,
+            g,
+            beta_h.as_ref(),
+            beta_w.as_ref(),
+            Some((row, SurvivalInterceptSlotKind::Entry)),
+        )?;
+        let (a1, _) = self.solve_row_survival_intercept_with_slot(
+            q1,
+            g,
+            beta_h.as_ref(),
+            beta_w.as_ref(),
+            Some((row, SurvivalInterceptSlotKind::Exit)),
+        )?;
+        let entry_cached =
+            self.build_cached_partition(primary, a0, g, beta_h.as_ref(), beta_w.as_ref())?;
+        let exit_cached =
+            self.build_cached_partition(primary, a1, g, beta_h.as_ref(), beta_w.as_ref())?;
+
+        Ok(FlexThirdRowGeometry {
+            row,
+            p: primary.total,
+            qd1,
+            q0,
+            q1,
+            q0_index: primary.q0,
+            q1_index: primary.q1,
+            a0,
+            a1,
+            g,
+            o_infl,
+            beta_h,
+            beta_w,
+            entry_cached,
+            exit_cached,
+        })
     }
 
     /// Build the direction-independent per-row geometry that

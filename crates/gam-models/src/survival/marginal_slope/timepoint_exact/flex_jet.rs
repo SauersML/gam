@@ -2665,11 +2665,17 @@ impl SurvivalMarginalSlopeFamily {
         b: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
+        o_infl: f64,
         cached: &CachedPartitionCells,
         dir: &Array1<f64>,
         arena: &DynamicJetArena,
-    ) -> Result<crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional, String>
-    {
+    ) -> Result<
+        (
+            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
+        ),
+        String,
+    > {
         let p = primary.total;
         let d_check = self.evaluate_survival_denom_d(a, b, beta_h, beta_w)?;
         let z_obs = self.observed_score_projection(row);
@@ -2692,13 +2698,24 @@ impl SurvivalMarginalSlopeFamily {
             q_index,
             q,
             z_obs,
-            0.0,
+            o_infl,
             obs_coeff,
             &obs_fixed,
             &cells,
         )?;
 
-        Ok(
+        Ok((
+            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase {
+                eta: eta.inner.base.v,
+                chi: chi.inner.base.v,
+                d: d.inner.base.v,
+                eta_u: eta.inner.base.g.to_vec(),
+                eta_uv: eta.inner.base.h.to_vec(),
+                chi_u: chi.inner.base.g.to_vec(),
+                chi_uv: chi.inner.base.h.to_vec(),
+                d_u: d.inner.base.g.to_vec(),
+                d_uv: d.inner.base.h.to_vec(),
+            },
             crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
                 eta_u_dir: eta.inner.eps.g.to_vec(),
                 eta_uv_dir: eta.inner.eps.h.to_vec(),
@@ -2707,7 +2724,7 @@ impl SurvivalMarginalSlopeFamily {
                 d_u_dir: d.inner.eps.g.to_vec(),
                 d_uv_dir: d.inner.eps.h.to_vec(),
             },
-        )
+        ))
     }
 
     /// #932-2 PRODUCTION cutover (increment 2): the mixed second-directional

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,57 @@ GOLDEN = (
 
 def _model() -> ManifoldSAE:
     return ManifoldSAE.from_dict(json.loads(GOLDEN.read_text()))
+
+
+def _analytic_topology_model(
+    basis: str,
+    topology: str,
+    latent_dim: int,
+    basis_size: int,
+    n_harmonics: int,
+) -> ManifoldSAE:
+    """Replace atom zero with one exact analytic persisted topology.
+
+    The remaining two atoms keep the golden artifact's valid routing and Fisher
+    state.  Only the persisted atom schema is changed, so these tests exercise
+    the public model's frozen-state rebuild rather than any fit path.
+    """
+    payload = deepcopy(json.loads(GOLDEN.read_text()))
+    n_rows = len(payload["coords"][0])
+    p_out = len(payload["decoder_blocks"][0][0])
+    coords = [
+        [((row + 1) * (axis + 2)) / (n_rows + 7) for axis in range(latent_dim)]
+        for row in range(n_rows)
+    ]
+    decoder = [
+        [((basis_row + 1) * (column + 2)) / (basis_size + p_out) for column in range(p_out)]
+        for basis_row in range(basis_size)
+    ]
+
+    payload["basis_kinds"][0] = basis
+    payload["basis_specs"][0] = f"{basis}:persisted"
+    payload["atom_topologies"][0] = topology
+    payload["atom_topology"] = (
+        topology if all(value == topology for value in payload["atom_topologies"]) else "mixed"
+    )
+    payload["atom_dims"][0] = latent_dim
+    payload["basis_sizes"][0] = basis_size
+    payload["n_harmonics"][0] = n_harmonics
+    payload["coords"][0] = coords
+    payload["decoder_blocks"][0] = decoder
+    payload["duchon_centers"][0] = None
+
+    atom = payload["atoms"][0]
+    atom["basis"] = basis
+    atom["active_dim"] = latent_dim
+    atom["coords"] = coords
+    atom["coords_u_arc"] = None
+    atom["decoder_coefficients"] = decoder
+    atom["decoder_covariance_channel_factors"] = None
+    atom["shape_band_coords"] = None
+    atom["shape_band_mean"] = None
+    atom["shape_band_sd"] = None
+    return ManifoldSAE.from_dict(payload)
 
 
 def test_public_type_is_the_pyo3_model() -> None:
@@ -99,6 +151,106 @@ def test_target_dose_probe_is_wired_through_the_public_model() -> None:
         atol=0.0,
     )
     assert model.fisher_metric_build_count == 1
+
+
+@pytest.mark.parametrize(
+    ("basis", "topology", "latent_dim", "basis_size", "n_harmonics", "t_from", "t_to"),
+    [
+        ("euclidean", "euclidean", 2, 3, 0, [0.2, -0.3], [0.45, -0.1]),
+        ("torus", "torus", 2, 9, 1, [0.99, 0.3], [0.01, 0.55]),
+        ("cylinder", "cylinder", 2, 6, 1, [0.99, 0.25], [0.01, 0.4]),
+        ("mobius", "mobius", 2, 3, 1, [0.2, 0.4], [0.45, -0.2]),
+    ],
+)
+def test_public_steer_rebuilds_every_analytic_coordinate_action(
+    basis: str,
+    topology: str,
+    latent_dim: int,
+    basis_size: int,
+    n_harmonics: int,
+    t_from: list[float],
+    t_to: list[float],
+) -> None:
+    model = _analytic_topology_model(
+        basis, topology, latent_dim, basis_size, n_harmonics
+    )
+    source = np.asarray(t_from, dtype=np.float64)
+    target = np.asarray(t_to, dtype=np.float64)
+
+    zero = model.steer(0, 0, 1.0, source, source)
+    np.testing.assert_array_equal(zero["delta"], np.zeros(4, dtype=np.float64))
+
+    moved = model.steer(0, 0, 1.0, source, target)
+    assert np.linalg.norm(np.asarray(moved["delta"], dtype=np.float64)) > 0.0
+
+
+@pytest.mark.parametrize(
+    ("basis", "topology", "basis_size", "period", "t_from", "t_wrapped", "t_unwrapped"),
+    [
+        ("torus", "torus", 9, 1.0, [0.99, 0.3], [0.01, 0.3], [1.01, 0.3]),
+        (
+            "cylinder",
+            "cylinder",
+            6,
+            1.0,
+            [0.99, 0.25],
+            [0.01, 0.25],
+            [1.01, 0.25],
+        ),
+    ],
+)
+def test_public_steer_respects_periodic_seams_in_product_manifolds(
+    basis: str,
+    topology: str,
+    basis_size: int,
+    period: float,
+    t_from: list[float],
+    t_wrapped: list[float],
+    t_unwrapped: list[float],
+) -> None:
+    model = _analytic_topology_model(basis, topology, 2, basis_size, 1)
+    source = np.asarray(t_from, dtype=np.float64)
+    wrapped = model.steer(0, 0, 1.0, source, np.asarray(t_wrapped, dtype=np.float64))
+    unwrapped = model.steer(
+        0, 0, 1.0, source, np.asarray(t_unwrapped, dtype=np.float64)
+    )
+    assert period == 1.0
+    np.testing.assert_allclose(wrapped["delta"], unwrapped["delta"], rtol=0.0, atol=1e-12)
+
+
+def test_public_mobius_steer_identifies_deck_twins() -> None:
+    model = _analytic_topology_model("mobius", "mobius", 2, 3, 1)
+    source = np.asarray([0.2, 0.4], dtype=np.float64)
+    deck_twin = np.asarray([1.2, -0.4], dtype=np.float64)
+    plan = model.steer(0, 0, 1.0, source, deck_twin)
+    np.testing.assert_allclose(plan["delta"], np.zeros(4), rtol=0.0, atol=1e-12)
+
+
+def test_public_target_dose_rebuilds_cylinder_metadata() -> None:
+    model = _analytic_topology_model("cylinder", "cylinder", 2, 6, 1)
+    t_from = np.asarray([0.15, -0.2], dtype=np.float64)
+    t_to = np.asarray([0.18, -0.1], dtype=np.float64)
+    unit = model.steer(0, 0, 1.0, t_from, t_to)
+    target = 0.5 * float(unit["predicted_nats"])
+
+    def patched_forward_kl(amplitude: float) -> float:
+        return float(model.steer(0, 0, amplitude, t_from, t_to)["predicted_nats"])
+
+    plan = model.steer_to_target(
+        {
+            "atom_k": 0,
+            "metric_row": 0,
+            "target_nats": target,
+            "t_from": t_from,
+            "t_to": t_to,
+            "tol_rel": 1.0e-12,
+            "max_iter": 4,
+            "readout_tol_rel": 0.1,
+        },
+        patched_forward_kl,
+    )
+    assert plan["validation"] == "patched_forward"
+    assert plan["measured_nats"] == pytest.approx(target, rel=1e-12)
 
 
 def test_attach_fisher_is_atomic_and_builds_once() -> None:
