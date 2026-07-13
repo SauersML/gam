@@ -1603,11 +1603,29 @@ fn sphere_linear_block(atom: &SaeManifoldAtom) -> Option<Array2<f64>> {
 
 /// Nearest orthogonal matrix to `m` (the orthogonal polar factor `U Vᵀ` of its
 /// SVD). This is the orthogonal Procrustes solution
-/// `argmin_{QᵀQ=I} ‖Q − M‖_F`. Using the decomposition directly makes singular
-/// values, rather than iteration counts or numeric cutoffs, govern the result.
+/// `argmin_{QᵀQ=I} ‖Q − M‖_F`. The factor is accepted only when the SVD proves
+/// full numerical rank at its machine backward-error scale.
 fn nearest_orthogonal_3x3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
     let matrix = Array2::from_shape_fn((3, 3), |(row, column)| m[row][column]);
-    let (left, _, right_t) = matrix.svd(true, true).ok()?;
+    if matrix.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let (left, singular_values, right_t) = matrix.svd(true, true).ok()?;
+    let spectral_scale = singular_values.iter().copied().fold(0.0_f64, f64::max);
+    let numerical_rank_threshold =
+        f64::EPSILON * matrix.nrows().max(matrix.ncols()) as f64 * spectral_scale;
+    // `U V^T` exists even for a rank-deficient product, but its action on the
+    // nullspace is arbitrary and can change the reported orientation sign.
+    // An exact seam therefore requires a unique polar factor at machine
+    // precision; statistically uncertain alignments belong to the noisy
+    // holonomy certificate instead.
+    if spectral_scale == 0.0
+        || singular_values
+            .iter()
+            .any(|&value| value <= numerical_rank_threshold)
+    {
+        return None;
+    }
     let orthogonal = left?.dot(&right_t?);
     if orthogonal.iter().any(|value| !value.is_finite()) {
         return None;
@@ -7295,6 +7313,22 @@ mod tests {
                     p.trigger < 0.0,
                     "the distinct-circle glue must carry negative evidence, got {}",
                     p.trigger
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sphere_polar_factor_requires_identifiable_full_rank_alignment() {
+        let rank_deficient = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
+        assert!(nearest_orthogonal_3x3(rank_deficient).is_none());
+
+        let proper = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let recovered = nearest_orthogonal_3x3(proper).unwrap();
+        for row in 0..3 {
+            for column in 0..3 {
+                assert!(
+                    (recovered[row][column] - proper[row][column]).abs() <= 16.0 * f64::EPSILON
                 );
             }
         }
