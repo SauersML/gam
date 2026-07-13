@@ -1819,6 +1819,7 @@ fn with_identifiability_transform(
             periodic,
             degree,
             auto_shrink_note,
+            anchor_offset_coeffs,
         } => Ok(BasisMetadata::BSpline1D {
             knots: knots.clone(),
             periodic: *periodic,
@@ -1828,6 +1829,10 @@ fn with_identifiability_transform(
             )?,
             degree: *degree,
             auto_shrink_note: auto_shrink_note.clone(),
+            // The offset coefficients live in the raw-basis chart and are
+            // unaffected by an added constrained-chart identifiability
+            // transform; carry them through unchanged (#2297).
+            anchor_offset_coeffs: anchor_offset_coeffs.clone(),
         }),
         BasisMetadata::CubicRegression1D {
             knots,

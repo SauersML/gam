@@ -280,6 +280,8 @@ pub fn build_bspline_basis_1d(
                 periodic: Some((start, end - start, num_basis)),
                 degree: Some(spec.degree),
                 auto_shrink_note: auto_shrink_note.clone(),
+                // Periodic B-splines wrap and carry no endpoint anchor.
+                anchor_offset_coeffs: None,
             },
             kronecker_factored: None,
             ops,
@@ -387,6 +389,9 @@ pub fn build_bspline_basis_1d(
                 periodic: None,
                 degree: Some(spec.degree),
                 auto_shrink_note: auto_shrink_note.clone(),
+                // The auto-streaming path only activates for free boundary
+                // conditions (see the `is_free()` gate above), so no anchor.
+                anchor_offset_coeffs: None,
             },
             kronecker_factored: None,
             ops,
@@ -679,6 +684,14 @@ pub fn build_bspline_basis_1d(
         filter_active_penalty_candidates_with_ops(renormalize_constrained_penalty_candidates(
             transformed_candidates,
         ))?;
+    // Non-zero endpoint anchor (#2297): the constrained design above spans the
+    // zero-anchor nullspace `Z`; the anchor value is carried by the raw-basis
+    // particular solution `β_p` as an affine offset function `B_raw · β_p`. This
+    // is recomputed identically on the FrozenTransform predict rebuild (the
+    // frozen spec retains `boundary_conditions`), so `save → load → predict`
+    // replays the same offset. `None` for free / clamped / zero-anchor specs.
+    let anchor_offset_coeffs =
+        bspline_anchor_offset_coeffs(&knots, spec.degree, spec.boundary_conditions)?;
     Ok(BasisBuildResult {
         design,
         penalties,
@@ -690,6 +703,7 @@ pub fn build_bspline_basis_1d(
             periodic: None,
             degree: Some(spec.degree),
             auto_shrink_note,
+            anchor_offset_coeffs,
         },
         kronecker_factored: None,
         ops,
@@ -909,6 +923,7 @@ fn bspline_endpoint_derivative_row(
 
 fn push_bspline_boundary_rows_for_endpoint(
     rows: &mut Vec<Array1<f64>>,
+    rhs: &mut Vec<f64>,
     knots: &Array1<f64>,
     degree: usize,
     condition: BSplineEndpointBoundaryCondition,
@@ -919,15 +934,25 @@ fn push_bspline_boundary_rows_for_endpoint(
         BSplineEndpointBoundaryCondition::Free => {}
         BSplineEndpointBoundaryCondition::Clamped => {
             rows.push(bspline_endpoint_derivative_row(knots, degree, endpoint)?);
+            rhs.push(0.0);
         }
         BSplineEndpointBoundaryCondition::Anchored { value } => {
-            if !value.is_finite() || value.abs() > 1e-12 {
+            if !value.is_finite() {
                 crate::bail_invalid_basis!(
-                    "anchored B-spline boundary value must be zero for the structural Hermite pin; non-zero anchors are not supported"
+                    "anchored B-spline boundary value must be finite; got {value}"
                 );
             }
+            // The *homogeneous* constraint rows (value + derivative at the
+            // endpoint) are independent of the anchor value — a non-zero anchor
+            // shares the same nullspace transform `Z` as the zero anchor. The
+            // value only enters the RHS: `f(endpoint) = value`, with the first
+            // derivative still structurally pinned to zero (the Hermite pin).
+            // A non-zero RHS is realized by the caller as an affine offset
+            // function `B_raw · β_p` (see `bspline_anchor_offset_coeffs`).
             rows.push(bspline_endpoint_value_row(knots, degree, endpoint)?);
+            rhs.push(value);
             rows.push(bspline_endpoint_derivative_row(knots, degree, endpoint)?);
+            rhs.push(0.0);
         }
     }
     Ok(())
@@ -937,7 +962,7 @@ fn bspline_boundary_constraint_rows(
     knots: &Array1<f64>,
     degree: usize,
     boundary_conditions: BSplineBoundaryConditions,
-) -> Result<Option<Array2<f64>>, BasisError> {
+) -> Result<Option<(Array2<f64>, Array1<f64>)>, BasisError> {
     if boundary_conditions.is_free() {
         return Ok(None);
     }
@@ -946,8 +971,10 @@ fn bspline_boundary_constraint_rows(
         .checked_sub(degree + 1)
         .ok_or_else(|| BasisError::InvalidInput("invalid B-spline knot vector".to_string()))?;
     let mut rows = Vec::<Array1<f64>>::new();
+    let mut rhs_vals = Vec::<f64>::new();
     push_bspline_boundary_rows_for_endpoint(
         &mut rows,
+        &mut rhs_vals,
         knots,
         degree,
         boundary_conditions.left,
@@ -955,6 +982,7 @@ fn bspline_boundary_constraint_rows(
     )?;
     push_bspline_boundary_rows_for_endpoint(
         &mut rows,
+        &mut rhs_vals,
         knots,
         degree,
         boundary_conditions.right,
@@ -974,7 +1002,49 @@ fn bspline_boundary_constraint_rows(
         }
         c.row_mut(i).assign(&row);
     }
-    Ok(Some(c))
+    Ok(Some((c, Array1::from_vec(rhs_vals))))
+}
+
+/// Raw-basis particular solution `β_p` of the (possibly inhomogeneous) endpoint
+/// boundary constraint `C · β = rhs`, or `None` when every anchor is zero
+/// (`rhs = 0`, i.e. free/clamped/zero-anchor bases).
+///
+/// The full anchored coefficient vector decomposes as `β = β_p + Z · γ`, where
+/// `Z` spans `null(C)` — the *same* nullspace the zero-anchor case uses for its
+/// constrained design — and `γ` is the free fitted coefficient. The term's
+/// contribution to the linear predictor is therefore
+///
+/// ```text
+///   B_raw · β = B_raw · β_p  +  (B_raw · Z) · γ,
+/// ```
+///
+/// a fixed affine **offset function** `B_raw · β_p` plus the ordinary
+/// constrained design `B_raw · Z`. `β_p` is the minimum-norm solution
+/// `Cᵀ (C Cᵀ)⁻¹ rhs`, so it is orthogonal to `range(Z)` and contributes nothing
+/// the fitted `γ` could also represent. At the anchored endpoint the offset
+/// reproduces the pin exactly: value = anchor, first derivative = 0.
+pub(crate) fn bspline_anchor_offset_coeffs(
+    knots: &Array1<f64>,
+    degree: usize,
+    boundary_conditions: BSplineBoundaryConditions,
+) -> Result<Option<Array1<f64>>, BasisError> {
+    let Some((c, rhs)) = bspline_boundary_constraint_rows(knots, degree, boundary_conditions)?
+    else {
+        return Ok(None);
+    };
+    if rhs.iter().all(|v| v.abs() <= 1e-12) {
+        return Ok(None);
+    }
+    // `C Cᵀ` is the small (r × r) Gram of the endpoint rows (r ≤ 4). The value
+    // and derivative rows at each active endpoint are linearly independent for
+    // degree ≥ 1, so it is strictly positive definite; a rank drop (degenerate
+    // knot geometry) surfaces as a `strict_metric_inverse` error rather than a
+    // silently wrong offset.
+    let gram = fast_abt(&c, &c);
+    let gram_inv = strict_metric_inverse(&gram)?;
+    let alpha = gram_inv.dot(&rhs);
+    let beta_p = c.t().dot(&alpha);
+    Ok(Some(beta_p))
 }
 
 fn bspline_boundary_nullspace_transform(
@@ -982,7 +1052,8 @@ fn bspline_boundary_nullspace_transform(
     degree: usize,
     boundary_conditions: BSplineBoundaryConditions,
 ) -> Result<Option<Array2<f64>>, BasisError> {
-    let Some(c) = bspline_boundary_constraint_rows(knots, degree, boundary_conditions)? else {
+    let Some((c, _rhs)) = bspline_boundary_constraint_rows(knots, degree, boundary_conditions)?
+    else {
         return Ok(None);
     };
     let p_raw = c.ncols();
@@ -3022,6 +3093,145 @@ mod function_space_null_shrinkage_tests {
             error
                 .to_string()
                 .contains("do not support additional endpoint")
+        );
+    }
+}
+
+#[cfg(test)]
+mod anchor_offset_tests {
+    use super::*;
+
+    fn cubic_knots() -> Array1<f64> {
+        internal::generate_full_knot_vector((0.0, 1.0), 5, 3).expect("cubic knot vector")
+    }
+
+    fn endpoint(knots: &Array1<f64>, degree: usize, right: bool) -> f64 {
+        bspline_boundary_endpoint(knots, degree, right).expect("endpoint")
+    }
+
+    /// The minimum-norm particular solution reproduces the endpoint pin exactly:
+    /// value = anchor, first derivative = 0, for a one-sided left anchor.
+    #[test]
+    fn left_anchor_offset_reproduces_value_and_zero_slope() {
+        let knots = cubic_knots();
+        let degree = 3;
+        let anchor = 1.7_f64;
+        let bc = BSplineBoundaryConditions {
+            left: BSplineEndpointBoundaryCondition::Anchored { value: anchor },
+            right: BSplineEndpointBoundaryCondition::Free,
+        };
+        let beta_p = bspline_anchor_offset_coeffs(&knots, degree, bc)
+            .expect("offset solve")
+            .expect("non-zero anchor yields a particular solution");
+        let left = endpoint(&knots, degree, false);
+        let value_row = bspline_endpoint_value_row(&knots, degree, left).expect("value row");
+        let deriv_row = bspline_endpoint_derivative_row(&knots, degree, left).expect("deriv row");
+        assert!(
+            (value_row.dot(&beta_p) - anchor).abs() < 1e-10,
+            "offset value at endpoint = {} (want {anchor})",
+            value_row.dot(&beta_p)
+        );
+        assert!(
+            deriv_row.dot(&beta_p).abs() < 1e-9,
+            "offset derivative at endpoint = {} (want 0)",
+            deriv_row.dot(&beta_p)
+        );
+    }
+
+    /// A two-sided anchor pins both endpoints independently, each with zero slope.
+    #[test]
+    fn two_sided_anchor_pins_both_endpoints() {
+        let knots = cubic_knots();
+        let degree = 3;
+        let (a_left, a_right) = (2.0_f64, -0.5_f64);
+        let bc = BSplineBoundaryConditions {
+            left: BSplineEndpointBoundaryCondition::Anchored { value: a_left },
+            right: BSplineEndpointBoundaryCondition::Anchored { value: a_right },
+        };
+        let beta_p = bspline_anchor_offset_coeffs(&knots, degree, bc)
+            .expect("offset solve")
+            .expect("non-zero anchors yield a particular solution");
+        for (right, want) in [(false, a_left), (true, a_right)] {
+            let x = endpoint(&knots, degree, right);
+            let v = bspline_endpoint_value_row(&knots, degree, x).expect("value row");
+            let d = bspline_endpoint_derivative_row(&knots, degree, x).expect("deriv row");
+            assert!((v.dot(&beta_p) - want).abs() < 1e-10, "value at endpoint");
+            assert!(d.dot(&beta_p).abs() < 1e-9, "slope at endpoint");
+        }
+    }
+
+    /// The offset scales linearly with the anchor value (the constraint is
+    /// linear in the RHS), and a zero anchor yields no offset at all.
+    #[test]
+    fn offset_is_linear_in_anchor_and_zero_anchor_has_no_offset() {
+        let knots = cubic_knots();
+        let degree = 3;
+        let base = bspline_anchor_offset_coeffs(
+            &knots,
+            degree,
+            BSplineBoundaryConditions {
+                left: BSplineEndpointBoundaryCondition::Anchored { value: 1.0 },
+                right: BSplineEndpointBoundaryCondition::Free,
+            },
+        )
+        .expect("solve")
+        .expect("unit anchor");
+        let scaled = bspline_anchor_offset_coeffs(
+            &knots,
+            degree,
+            BSplineBoundaryConditions {
+                left: BSplineEndpointBoundaryCondition::Anchored { value: 3.5 },
+                right: BSplineEndpointBoundaryCondition::Free,
+            },
+        )
+        .expect("solve")
+        .expect("scaled anchor");
+        let max_dev = scaled
+            .iter()
+            .zip(base.iter())
+            .map(|(&s, &b)| (s - 3.5 * b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_dev < 1e-12, "offset must be linear in anchor: dev={max_dev}");
+
+        // A zero anchor is the ordinary homogeneous pin — no offset function.
+        assert!(
+            bspline_anchor_offset_coeffs(
+                &knots,
+                degree,
+                BSplineBoundaryConditions {
+                    left: BSplineEndpointBoundaryCondition::Anchored { value: 0.0 },
+                    right: BSplineEndpointBoundaryCondition::Clamped,
+                },
+            )
+            .expect("solve")
+            .is_none(),
+            "zero anchor + clamped endpoint must carry no affine offset"
+        );
+    }
+
+    /// The offset lives in the raw basis and is *disjoint* from the constrained
+    /// design's nullspace `Z`: `β_p` is the minimum-norm solution, hence
+    /// `Zᵀ β_p = 0`. This is what makes `β = β_p + Z γ` a clean split with no
+    /// double-counting of the anchored direction.
+    #[test]
+    fn offset_is_orthogonal_to_constrained_nullspace() {
+        let knots = cubic_knots();
+        let degree = 3;
+        let bc = BSplineBoundaryConditions {
+            left: BSplineEndpointBoundaryCondition::Anchored { value: 4.0 },
+            right: BSplineEndpointBoundaryCondition::Free,
+        };
+        let beta_p = bspline_anchor_offset_coeffs(&knots, degree, bc)
+            .expect("solve")
+            .expect("anchor");
+        let z = bspline_boundary_nullspace_transform(&knots, degree, bc)
+            .expect("nullspace transform")
+            .expect("non-trivial nullspace");
+        let projected = z.t().dot(&beta_p);
+        let max_abs = projected.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        assert!(
+            max_abs < 1e-9,
+            "min-norm offset should be orthogonal to Z, got {max_abs}"
         );
     }
 }
