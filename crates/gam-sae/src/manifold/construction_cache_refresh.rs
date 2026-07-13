@@ -75,7 +75,8 @@ pub fn refresh_isometry_caches_from_atom(
     let b = &atom.decoder_coefficients;
     let mut jac3d = ndarray::Array3::<f64>::zeros((n_obs, p, d));
     for a in 0..d {
-        let slab = jet.slice(ndarray::s![.., .., a]).dot(b);
+        let basis_axis: ndarray::ArrayView2<'_, f64> = jet.slice(ndarray::s![.., .., a]);
+        let slab = basis_axis.dot(b);
         jac3d.slice_mut(ndarray::s![.., .., a]).assign(&slab);
     }
     let jac = jac3d
@@ -104,7 +105,9 @@ pub fn refresh_isometry_caches_from_atom(
         let mut jac2_4d = ndarray::Array4::<f64>::zeros((n_obs, p, d, d));
         for a in 0..d {
             for c in 0..d {
-                let slab = hess.slice(ndarray::s![.., .., a, c]).dot(b);
+                let basis_axes: ndarray::ArrayView2<'_, f64> =
+                    hess.slice(ndarray::s![.., .., a, c]);
+                let slab = basis_axes.dot(b);
                 jac2_4d.slice_mut(ndarray::s![.., .., a, c]).assign(&slab);
             }
         }
@@ -146,7 +149,9 @@ pub fn refresh_isometry_caches_from_atom(
                 for a in 0..d {
                     for c in 0..d {
                         for e in 0..d {
-                            let slab = t3.slice(ndarray::s![.., .., a, c, e]).dot(b);
+                            let basis_axes: ndarray::ArrayView2<'_, f64> =
+                                t3.slice(ndarray::s![.., .., a, c, e]);
+                            let slab = basis_axes.dot(b);
                             jac3_5d
                                 .slice_mut(ndarray::s![.., .., a, c, e])
                                 .assign(&slab);

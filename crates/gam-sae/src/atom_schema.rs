@@ -76,20 +76,9 @@ pub fn canonical_assignment_kind(kind: &str) -> Result<&'static str, String> {
 /// Validate a basis kind that may appear in a converged native artifact.
 pub fn validate_fitted_basis_kind(name: &str) -> Result<(), String> {
     match name {
-        "periodic"
-        | "sphere"
-        | "torus"
-        | "projective_plane"
-        | "klein_bottle"
-        | "linear"
-        | "linear_block"
-        | "euclidean"
-        | "duchon"
-        | "poincare"
-        | "cylinder"
-        | "mobius"
-        | "finite_set"
-        | "spectral_graph" => Ok(()),
+        "periodic" | "sphere" | "torus" | "projective_plane" | "klein_bottle" | "linear"
+        | "linear_block" | "euclidean" | "duchon" | "poincare" | "cylinder" | "mobius"
+        | "finite_set" | "spectral_graph" => Ok(()),
         _ => Err(format!(
             "basis kind {name:?} is not canonical; expected one of ['cylinder', 'duchon', \
              'euclidean', 'finite_set', 'klein_bottle', 'linear', 'linear_block', 'mobius', \
@@ -101,18 +90,8 @@ pub fn validate_fitted_basis_kind(name: &str) -> Result<(), String> {
 /// Validate a public fit seed. Discovery-only atom kinds cannot be seeded.
 pub fn validate_seed_basis_kind(name: &str) -> Result<(), String> {
     match name {
-        "periodic"
-        | "sphere"
-        | "torus"
-        | "projective_plane"
-        | "klein_bottle"
-        | "linear"
-        | "linear_block"
-        | "euclidean"
-        | "duchon"
-        | "poincare"
-        | "mobius"
-        | "auto" => Ok(()),
+        "periodic" | "sphere" | "torus" | "projective_plane" | "klein_bottle" | "linear"
+        | "linear_block" | "euclidean" | "duchon" | "poincare" | "mobius" | "auto" => Ok(()),
         "cylinder" | "finite_set" => Err(format!(
             "basis kind {name:?} is discovery-only and cannot seed a fit"
         )),
@@ -128,17 +107,8 @@ pub fn validate_seed_basis_kind(name: &str) -> Result<(), String> {
 pub fn basis_kind_for_topology(name: &str) -> Result<String, String> {
     match name {
         "circle" => Ok("periodic".to_string()),
-        "sphere"
-        | "torus"
-        | "projective_plane"
-        | "klein_bottle"
-        | "linear"
-        | "linear_block"
-        | "euclidean"
-        | "duchon"
-        | "poincare"
-        | "mobius"
-        | "auto" => Ok(name.to_string()),
+        "sphere" | "torus" | "projective_plane" | "klein_bottle" | "linear" | "linear_block"
+        | "euclidean" | "duchon" | "poincare" | "mobius" | "auto" => Ok(name.to_string()),
         "cylinder" | "finite_set" => Err(format!(
             "topology {name:?} is discovery-only and cannot seed a fit"
         )),
@@ -185,15 +155,12 @@ pub fn coordinate_periods_for_basis(
         // The Möbius chart is represented on its double cover: angle period 2,
         // open width axis. Deck invariance lives in the basis parity.
         "mobius" if latent_dim == 2 => Ok(vec![Some(2.0), None]),
-        "periodic"
-        | "torus"
-        | "cylinder"
-        | "sphere"
-        | "projective_plane"
-        | "klein_bottle"
-        | "mobius" => Err(format!(
-            "{basis} atoms require latent dimension 2; got {latent_dim}"
+        "periodic" => Err(format!(
+            "periodic atoms require latent dimension 1; got {latent_dim}"
         )),
+        "torus" | "cylinder" | "sphere" | "projective_plane" | "klein_bottle" | "mobius" => Err(
+            format!("{basis} atoms require latent dimension 2; got {latent_dim}"),
+        ),
         _ => Ok(vec![None; latent_dim]),
     }
 }

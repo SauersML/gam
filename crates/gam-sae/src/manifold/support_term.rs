@@ -389,9 +389,7 @@ impl SaeSupportSparseTerm {
             .map(|(atom, template)| SaeAssignmentAtomSpec {
                 latent_dim: template.latent_dim(),
                 id_mode: gam_terms::latent::LatentIdMode::None,
-                manifold: template
-                    .basis_kind()
-                    .latent_manifold(template.latent_dim()),
+                manifold: template.basis_kind().latent_manifold(template.latent_dim()),
                 retraction: gam_problem::LatentRetractionRegistry::all_euclidean(),
                 latent_id: super::support_seed::splitmix64(atom as u64),
             })
@@ -801,8 +799,7 @@ impl SaeSupportSparseTerm {
         for atom_idx in 0..self.k_atoms() {
             let m = self.atoms[atom_idx].basis_size();
             let old_decoder = self.atoms[atom_idx].decoder_coefficients.clone();
-            let mut gram =
-                self.atoms[atom_idx].smooth_penalty().clone() * lambda_smooth[atom_idx];
+            let mut gram = self.atoms[atom_idx].smooth_penalty().clone() * lambda_smooth[atom_idx];
             let mut rhs = Array2::<f64>::zeros((m, self.output_dim));
             let mut rows = Vec::with_capacity(self.atom_rows[atom_idx].len());
             for &(row, slot) in &self.atom_rows[atom_idx] {
@@ -967,7 +964,7 @@ impl SaeSupportSparseTerm {
         self.validate_smoothing(lambda_smooth)?;
         self.validate_ard(ard_precisions)?;
         let residual = self.raw_residual(target)?;
-        let mut decoder_sq = 0.0;
+        let mut decoder_sq = 0.0_f64;
         let mut decoder_max = 0.0_f64;
         for atom_idx in 0..self.k_atoms() {
             let atom = &self.atoms[atom_idx];
@@ -986,7 +983,7 @@ impl SaeSupportSparseTerm {
                 decoder_max = decoder_max.max(value.abs());
             }
         }
-        let mut coordinate_sq = 0.0;
+        let mut coordinate_sq = 0.0_f64;
         let mut coordinate_max = 0.0_f64;
         for row in 0..self.n_obs() {
             for slot in 0..self.assignment.support_indices(row).len() {

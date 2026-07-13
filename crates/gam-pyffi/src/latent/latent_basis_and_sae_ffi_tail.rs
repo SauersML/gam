@@ -376,11 +376,12 @@ impl Tier0SaeCore {
                 x_new.as_array().ncols()
             )));
         }
-        Ok(Array2::from_shape_fn(
-            (x_new.as_array().nrows(), self.mean.len()),
-            |(_, col)| self.mean[col],
+        Ok(
+            Array2::from_shape_fn((x_new.as_array().nrows(), self.mean.len()), |(_, col)| {
+                self.mean[col]
+            })
+            .into_pyarray(py),
         )
-        .into_pyarray(py))
     }
 
     fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -693,11 +694,9 @@ fn sae_manifold_fit_model<'py>(
     )?;
     let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(raw.bind(py).as_any())?;
     if raw.get("model_kind").and_then(serde_json::Value::as_str) == Some("tier0_null") {
-        let mean = serde_json::from_value(
-            raw.get("training_mean")
-                .cloned()
-                .ok_or_else(|| py_value_error("Tier0SAE report is missing training_mean".to_string()))?,
-        )
+        let mean = serde_json::from_value(raw.get("training_mean").cloned().ok_or_else(|| {
+            py_value_error("Tier0SAE report is missing training_mean".to_string())
+        })?)
         .map_err(|error| py_value_error(format!("Tier0SAE training_mean: {error}")))?;
         let fitted = serde_json::from_value(
             raw.get("fitted")
@@ -705,27 +704,32 @@ fn sae_manifold_fit_model<'py>(
                 .ok_or_else(|| py_value_error("Tier0SAE report is missing fitted".to_string()))?,
         )
         .map_err(|error| py_value_error(format!("Tier0SAE fitted: {error}")))?;
-        let vanished_atoms = serde_json::from_value(
-            raw.get("vanished_atoms")
-                .cloned()
-                .ok_or_else(|| py_value_error("Tier0SAE report is missing vanished_atoms".to_string()))?,
-        )
-        .map_err(|error| py_value_error(format!("Tier0SAE vanished_atoms: {error}")))?;
+        let vanished_atoms =
+            serde_json::from_value(raw.get("vanished_atoms").cloned().ok_or_else(|| {
+                py_value_error("Tier0SAE report is missing vanished_atoms".to_string())
+            })?)
+            .map_err(|error| py_value_error(format!("Tier0SAE vanished_atoms: {error}")))?;
         let core = Tier0SaeCore {
             mean,
             fitted,
             residual_sum_squares: raw
                 .get("residual_sum_squares")
                 .and_then(serde_json::Value::as_f64)
-                .ok_or_else(|| py_value_error("Tier0SAE report has invalid residual_sum_squares".to_string()))?,
+                .ok_or_else(|| {
+                    py_value_error("Tier0SAE report has invalid residual_sum_squares".to_string())
+                })?,
             reconstruction_r2: raw
                 .get("reconstruction_r2")
                 .and_then(serde_json::Value::as_f64)
-                .ok_or_else(|| py_value_error("Tier0SAE report has invalid reconstruction_r2".to_string()))?,
+                .ok_or_else(|| {
+                    py_value_error("Tier0SAE report has invalid reconstruction_r2".to_string())
+                })?,
             metric_provenance: raw
                 .get("metric_provenance")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| py_value_error("Tier0SAE report has invalid metric_provenance".to_string()))?
+                .ok_or_else(|| {
+                    py_value_error("Tier0SAE report has invalid metric_provenance".to_string())
+                })?
                 .to_string(),
             vanished_atoms,
         };
