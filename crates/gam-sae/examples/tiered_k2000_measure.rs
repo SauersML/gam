@@ -7,7 +7,7 @@
 //! fixed point with an OPEN certificate and Tier-2 runs on its residual, so we can
 //! finally report the three #2023 acceptance numbers at scale:
 //!
-//! 1. **Open certificate contents** — `certified`, `frame_residual` vs `tolerance`,
+//! 1. **Certificate contents** — `frame_residual` vs `tolerance`,
 //!    how many of the `K` blocks stayed live (settled) vs fell dead.
 //! 2. **Held-out EV (Tier-1)** — fit the linear bulk on train, transform the held-out
 //!    split through the frozen decoder, reconstruct, and score EV against the shared
@@ -203,11 +203,13 @@ fn run() -> Result<(), String> {
         .filter(|&&u| u > 0.0)
         .count();
     println!(
-        "[k2000] CERTIFICATE certified={} frame_residual={:.3e} tolerance={:.3e} \
+        "[k2000] CERTIFICATE frame_residual={:.3e} tolerance={:.3e} \
          ev_residual={:.3e} gamma_residual={:.3e} routing_residual={:.3e} \
          reconstruction_residual={:.3e} accepted_births={} polar_failures={} \
          live_blocks={}/{} epochs_run={} wall={:.1}s",
-        cert.certified,
+        // A returned fit is certified BY CONSTRUCTION: non-convergence errors
+        // out before finalization, so `BlockSparseConvergence` no longer
+        // carries a `certified` flag — the residual fields ARE the evidence.
         cert.frame_residual,
         cert.tolerance,
         cert.ev_residual,
