@@ -155,7 +155,7 @@ mod tests;
 // library re-export) resolve unchanged. Only `pub` / `pub(crate)` items are
 // re-exported; private helpers stay encapsulated in their concern module.
 pub(crate) use constants::*;
-pub(crate) use covariate_blocks::*;
+pub use covariate_blocks::*;
 pub(crate) use dense_linalg::*;
 pub use error::*;
 pub(crate) use family::*;
@@ -167,7 +167,7 @@ pub use residual_dist::*;
 pub use row_kernel::*;
 pub use spec::*;
 pub use time_block::*;
-pub(crate) use wiggle_geometry::*;
+pub use wiggle_geometry::*;
 // `family_solver` carries the public effective-jacobian entry point
 // (`survival_location_scale_block_effective_jacobian`,
 // `SurvivalLocationScaleChannelHessian`) consumed via the

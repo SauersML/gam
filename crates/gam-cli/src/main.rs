@@ -126,8 +126,9 @@ pub(crate) use gam::families::wiggle::buildwiggle_block_input_from_knots;
 
 pub(crate) use gam::families::survival::location_scale::{
     SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
-    SurvivalLocationScaleTermSpec, TimeBlockInput, predict_survival_location_scale,
-    project_onto_linear_constraints,
+    SurvivalLocationScaleTermSpec, SurvivalLocationScaleTimeParameterization, TimeBlockInput,
+    predict_survival_location_scale, project_onto_linear_constraints,
+    replay_survival_covariate_channels,
 };
 
 pub(crate) use gam::families::survival::marginal_slope::SurvivalMarginalSlopeTermSpec;

@@ -2269,6 +2269,8 @@ mod tests {
             for (shape_index, covariance) in covariances.iter().enumerate() {
                 let mut production_workspace =
                     RigidVectorRowWorkspace::new(covariance).expect("production width workspace");
+                let value_workspace = RigidVectorValueWorkspace::new(covariance)
+                    .expect("value-only width workspace");
                 for event in [0.0, 0.35, 1.0] {
                     let production_value = row_primary_closed_form_vector_into(
                         q0,
@@ -2290,7 +2292,7 @@ mod tests {
                         qd1,
                         &slopes,
                         &scores,
-                        covariance,
+                        &value_workspace,
                         1.17,
                         event,
                         1.0e-8,
@@ -2469,6 +2471,8 @@ mod tests {
         for (shape, covariance) in covariances.iter().enumerate() {
             let mut production_workspace =
                 RigidVectorRowWorkspace::new(covariance).expect("k=14 production workspace");
+            let value_workspace =
+                RigidVectorValueWorkspace::new(covariance).expect("k=14 value-only workspace");
             for event in [0.0, 0.35, 1.0] {
                 let production_value = row_primary_closed_form_vector_into(
                     -0.31,
@@ -2485,7 +2489,16 @@ mod tests {
                 .expect("production dynamic-boundary row");
                 let production = collect_workspace_row(production_value, &production_workspace);
                 let value = survival_marginal_slope_vector_neglog(
-                    -0.31, 0.47, 1.09, &slopes, &scores, covariance, 1.17, event, 1.0e-8, 0.83,
+                    -0.31,
+                    0.47,
+                    1.09,
+                    &slopes,
+                    &scores,
+                    &value_workspace,
+                    1.17,
+                    event,
+                    1.0e-8,
+                    0.83,
                 )
                 .expect("zero-order dynamic-boundary row");
                 let dynamic = collect_row_into(DIM, |gradient, hessian| {

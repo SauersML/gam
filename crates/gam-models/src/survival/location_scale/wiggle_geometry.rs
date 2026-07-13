@@ -62,12 +62,7 @@ pub(crate) fn build_survival_location_scale_time_wiggle_basis_stack(
             ));
         }
     }
-    Ok(SurvivalLocationScaleTimeWiggleBasisStack {
-        value,
-        d1,
-        d2,
-        d3,
-    })
+    Ok(SurvivalLocationScaleTimeWiggleBasisStack { value, d1, d2, d3 })
 }
 
 /// Rebuild the exact fit-time monotone time-wiggle basis tables on saved rows.

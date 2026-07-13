@@ -356,14 +356,13 @@ pub(crate) fn fit_survival_location_scale_terms(
     // smoothing coordinate is absent, and neither time nor link wiggles exist.
     // Persist the result while the fit topology is still available; saved
     // replay must not attempt to recover it from fitted coefficient values.
-    let time_parameterization = if layout.total() == 0
-        && protected_timewiggle_cols == 0
-        && spec.linkwiggle_block.is_none()
-    {
-        SurvivalLocationScaleTimeParameterization::ReducedParametricAft
-    } else {
-        SurvivalLocationScaleTimeParameterization::MonotoneWarp
-    };
+    let time_parameterization =
+        if layout.total() == 0 && protected_timewiggle_cols == 0 && spec.linkwiggle_block.is_none()
+        {
+            SurvivalLocationScaleTimeParameterization::ReducedParametricAft
+        } else {
+            SurvivalLocationScaleTimeParameterization::MonotoneWarp
+        };
     let mut rho0 = Array1::<f64>::zeros(layout.total());
     if layout.k_time > 0 {
         if time_rho0.len() != layout.k_time {

@@ -1104,7 +1104,7 @@ pub fn survival_location_scale_alo_row_geometry(
             let mut q_entry = q_base_entry;
             let mut q_exit = q_base_exit;
             let mut derivative_multiplier = 1.0;
-            for coefficient in 0..wiggle_dimension {
+            for coefficient in 0..link_wiggle_dimension {
                 let beta = wiggle.beta[coefficient];
                 q_entry += beta * wiggle.entry_basis[coefficient];
                 q_exit += beta * wiggle.exit_basis[coefficient];
@@ -1114,14 +1114,7 @@ pub fn survival_location_scale_alo_row_geometry(
         }
         None => (q_base_entry, q_base_exit, qdot_base_exit),
     };
-    let state = survival_predictor_state(
-        h_entry,
-        h_exit,
-        hdot_exit,
-        q_entry,
-        q_exit,
-        qdot_exit,
-    );
+    let state = survival_predictor_state(h_entry, h_exit, hdot_exit, q_entry, q_exit, qdot_exit);
     let kernel = SurvivalLocationScaleFamily::exact_row_kernel_from_parts(
         input.inverse_link,
         input.derivative_guard,
@@ -1133,8 +1126,8 @@ pub fn survival_location_scale_alo_row_geometry(
     )?
     .expect("positive-weight ALO row produces an exact kernel");
 
-    let (score, hessian) = match input.link_wiggle.as_ref() {
-        None => {
+    let (score, hessian) = match (input.time_wiggle.as_ref(), input.link_wiggle.as_ref()) {
+        (None, None) => {
             let primary: [f64; SLS_ROW_K] = coordinate_values
                 .as_slice()
                 .expect("owned ALO coordinates are contiguous")
@@ -1150,27 +1143,87 @@ pub fn survival_location_scale_alo_row_geometry(
                 .expect("fixed survival location-scale Hessian shape"),
             )
         }
-        Some(wiggle) => {
+        (time_wiggle, link_wiggle) => {
             let arena = DynamicJetArena::new();
             let variables = arena.alloc_slice_fill_with(dimension, |axis| {
                 DynamicOrder2::variable(coordinate_values[axis], axis, dimension, &arena)
             });
-            let zero_third = vec![0.0; wiggle_dimension];
-            let basis = SlsWiggleRowBasis {
-                b_u0: [
-                    wiggle.entry_basis,
-                    wiggle.entry_basis_d1,
-                    wiggle.entry_basis_d2,
-                    &zero_third,
-                ],
-                b_u1: [
-                    wiggle.exit_basis,
-                    wiggle.exit_basis_d1,
-                    wiggle.exit_basis_d2,
-                    &zero_third,
-                ],
+            let (time_entry, time_exit, time_derivative) = match time_wiggle {
+                None => (
+                    variables[0].clone(),
+                    variables[1].clone(),
+                    variables[2].clone(),
+                ),
+                Some(wiggle) => {
+                    let mut entry = variables[0].clone();
+                    let mut exit = variables[1].clone();
+                    let mut derivative_multiplier =
+                        variables[0].compose_unary([1.0, 0.0, 0.0, 0.0, 0.0]);
+                    for coefficient in 0..time_wiggle_dimension {
+                        let beta = &variables[SLS_ROW_K + coefficient];
+                        entry = entry.add(&beta.mul(&variables[0].compose_unary([
+                            wiggle.entry_basis[coefficient],
+                            wiggle.entry_basis_d1[coefficient],
+                            wiggle.entry_basis_d2[coefficient],
+                            wiggle.entry_basis_d3[coefficient],
+                            0.0,
+                        ])));
+                        exit = exit.add(&beta.mul(&variables[1].compose_unary([
+                            wiggle.exit_basis[coefficient],
+                            wiggle.exit_basis_d1[coefficient],
+                            wiggle.exit_basis_d2[coefficient],
+                            wiggle.exit_basis_d3[coefficient],
+                            0.0,
+                        ])));
+                        derivative_multiplier =
+                            derivative_multiplier.add(&beta.mul(&variables[1].compose_unary([
+                                wiggle.exit_basis_d1[coefficient],
+                                wiggle.exit_basis_d2[coefficient],
+                                wiggle.exit_basis_d3[coefficient],
+                                0.0,
+                                0.0,
+                            ])));
+                    }
+                    (entry, exit, derivative_multiplier.mul(&variables[2]))
+                }
             };
-            let result = sls_row_nll_wiggle(variables, &kernel, wiggle_dimension, &basis);
+            let mut likelihood_variables = Vec::with_capacity(SLS_ROW_K + link_wiggle_dimension);
+            likelihood_variables.push(time_entry);
+            likelihood_variables.push(time_exit);
+            likelihood_variables.push(time_derivative);
+            likelihood_variables.extend(variables[3..SLS_ROW_K].iter().cloned());
+            likelihood_variables.extend(
+                variables[SLS_ROW_K + time_wiggle_dimension..]
+                    .iter()
+                    .cloned(),
+            );
+            let empty: &[f64] = &[];
+            let basis = match link_wiggle {
+                None => SlsWiggleRowBasis {
+                    b_u0: [empty, empty, empty, empty],
+                    b_u1: [empty, empty, empty, empty],
+                },
+                Some(wiggle) => SlsWiggleRowBasis {
+                    b_u0: [
+                        wiggle.entry_basis,
+                        wiggle.entry_basis_d1,
+                        wiggle.entry_basis_d2,
+                        wiggle.entry_basis_d3,
+                    ],
+                    b_u1: [
+                        wiggle.exit_basis,
+                        wiggle.exit_basis_d1,
+                        wiggle.exit_basis_d2,
+                        wiggle.exit_basis_d3,
+                    ],
+                },
+            };
+            let result = sls_row_nll_wiggle(
+                &likelihood_variables,
+                &kernel,
+                link_wiggle_dimension,
+                &basis,
+            );
             (
                 Array1::from_vec(result.g().to_vec()),
                 Array2::from_shape_vec((dimension, dimension), result.h().to_vec())
@@ -1214,6 +1267,7 @@ mod saved_alo_row_tests {
             eta_log_sigma_exit: 0.2,
             eta_log_sigma_entry: -0.1,
             eta_log_sigma_derivative_exit: -0.04,
+            time_wiggle: None,
             link_wiggle: None,
         })
         .expect("exact saved row geometry");

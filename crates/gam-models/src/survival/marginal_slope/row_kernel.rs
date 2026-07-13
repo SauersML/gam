@@ -8,7 +8,7 @@ use gam_math::jet_scalar::JetScalar;
 
 /// Bitmask of which `K=4` rigid primaries enter linearly: bit `a` set ⇒ axis `a`
 /// is linear. The higher-order sparse towers use this contract; order two is
-/// lowered directly from the [`row_program!`] SSA graph instead of using a jet.
+/// lowered directly from the canonical `row_program!` SSA graph instead of using a jet.
 pub(crate) const RIGID_LINEAR_MASK: u32 = (1 << 0) | (1 << 1) | (1 << 2);
 
 #[inline(always)]
@@ -917,7 +917,7 @@ pub(crate) fn rigid_row_order2(
 
 /// Apply the scalar domain contract shared by the ordinary row evaluator and
 /// the already-admitted GPU gather. The three witnesses come from the same
-/// [`row_program!`] declaration: directly from the generic program on CPU and
+/// `row_program!` declaration: directly from the generic program on CPU and
 /// from its dependency-sliced scalar witness schedule during GPU admission.
 pub(crate) fn validate_rigid_row_admission(
     qd1: f64,

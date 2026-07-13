@@ -1432,13 +1432,13 @@ fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
     }
 }
 
-/// #932 symbolic-order-two oracle: the production direct Rust lowering must
-/// agree with the generic `Order2<4>` evaluator on every channel and with the
-/// dependency-sliced witness evaluator on every admission witness. The random
-/// grid covers both runtime event branches, non-unit covariance, and non-unit
-/// frailty scale from the same single-sourced `row_program!` declaration.
+/// #932 unified-feature oracle: the scalar/shared 5->4 order-two pullback must
+/// agree with the generic `Order2<4>` feature-map evaluation on every channel,
+/// and its admission wrapper must agree with the dependency-sliced witness
+/// surface. The random grid covers both event branches, non-unit covariance,
+/// and non-unit frailty scale from the sole `rigid_feature_program` declaration.
 #[test]
-fn rigid_row_program_order2_matches_generic_and_witnesses_932() {
+fn rigid_feature_program_scalar_pullback_matches_generic_and_witnesses_932() {
     use gam_math::jet_scalar::{JetScalar, Order2};
 
     // Deterministic xorshift grid (no RNG dependency).
@@ -1464,37 +1464,21 @@ fn rigid_row_program_order2_matches_generic_and_witnesses_932() {
         };
 
         let dense_vars: [Order2<4>; 4] = std::array::from_fn(|a| Order2::variable(p[a], a));
-        let (dense, dense_witnesses) = rigid_row_program(
-            &dense_vars[0],
-            &dense_vars[1],
-            &dense_vars[2],
-            &dense_vars[3],
-            inputs.wi,
-            inputs.di,
-            inputs.z_sum,
-            inputs.covariance_ones,
-            inputs.probit_scale,
-        );
-        let (value, gradient, hessian, witnesses) = rigid_row_program_order2(
+        let dense = rigid_row_nll(&dense_vars, &inputs).expect("generic scalar feature map");
+        let (value, gradient, hessian) =
+            rigid_row_order2(&p, &inputs).expect("scalar feature pullback");
+        let observed_g = inputs.probit_scale * p[3];
+        let (_, _, _, semantic_witnesses) = rigid_feature_program_order2(
             p[0],
             p[1],
             p[2],
-            p[3],
+            observed_g * inputs.z_sum,
+            (p[3] * p[3]) * inputs.covariance_ones,
             inputs.wi,
             inputs.di,
-            inputs.z_sum,
-            inputs.covariance_ones,
             inputs.probit_scale,
         );
-        let sliced_witnesses = rigid_row_program_witnesses(
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            inputs.z_sum,
-            inputs.covariance_ones,
-            inputs.probit_scale,
-        );
+        let sliced_witnesses = rigid_row_admission_witnesses(&p, &inputs);
 
         let mut check = |a: f64, b: f64| {
             let rel = (a - b).abs() / (1.0 + a.abs().max(b.abs()));
@@ -1514,8 +1498,7 @@ fn rigid_row_program_order2_matches_generic_and_witnesses_932() {
             }
         }
         for witness in 0..3 {
-            check(witnesses[witness], dense_witnesses[witness]);
-            check(witnesses[witness], sliced_witnesses[witness]);
+            check(semantic_witnesses[witness], sliced_witnesses[witness]);
         }
     }
     assert!(

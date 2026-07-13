@@ -272,15 +272,6 @@ impl MemoryGovernor {
         )
     }
 
-    /// Construct a ledger with an explicit budget. Private: production code
-    /// cannot create independent budgets — every production reservation shares
-    /// [`global`](Self::global), which calls this exactly once with the
-    /// detected budget. Unit tests use it for isolated ledgers.
-    #[cfg(test)]
-    fn with_budget(budget_bytes: usize) -> Self {
-        Self::with_budget_source(budget_bytes, MemoryBudgetSource::Explicit)
-    }
-
     fn with_budget_source(budget_bytes: usize, budget_source: MemoryBudgetSource) -> Self {
         Self {
             ledger: Arc::new(GovernorLedger {
@@ -1062,6 +1053,10 @@ mod byte_lru_tests {
 mod resource_policy_tests {
     use super::*;
 
+    fn test_governor(budget_bytes: usize) -> MemoryGovernor {
+        MemoryGovernor::with_budget_source(budget_bytes, MemoryBudgetSource::Explicit)
+    }
+
     // ── rows_for_target_bytes ─────────────────────────────────────────────────
 
     #[test]
@@ -1192,7 +1187,7 @@ mod resource_policy_tests {
 
     #[test]
     fn reservations_account_and_release_on_drop() {
-        let governor = MemoryGovernor::with_budget(1_000);
+        let governor = test_governor(1_000);
         assert_eq!(governor.remaining_bytes(), 1_000);
         let first = governor.try_reserve(600, "test-first").expect("fits");
         assert_eq!(governor.reserved_bytes(), 600);
@@ -1208,7 +1203,7 @@ mod resource_policy_tests {
         // Two allocations that each fit alone must not be jointly grantable —
         // this is exactly the independent-budgets failure the ledger exists
         // to prevent.
-        let governor = MemoryGovernor::with_budget(1_000);
+        let governor = test_governor(1_000);
         let held = governor.try_reserve(600, "test-held").expect("fits alone");
         let refusal = governor
             .try_reserve(600, "test-joint")
@@ -1234,7 +1229,7 @@ mod resource_policy_tests {
 
     #[test]
     fn dense_reservation_uses_checked_footprint() {
-        let governor = MemoryGovernor::with_budget(1 << 20);
+        let governor = test_governor(1 << 20);
         let ok = governor
             .try_reserve_dense_f64(1024, 64, "test-dense")
             .expect("512 KiB fits in 1 MiB");
@@ -1245,7 +1240,7 @@ mod resource_policy_tests {
         governor
             .try_reserve_dense_f64(usize::MAX, 2, "test-overflow")
             .expect_err("overflowing footprint cannot be reserved");
-        let unlimited = MemoryGovernor::with_budget(usize::MAX);
+        let unlimited = test_governor(usize::MAX);
         assert!(matches!(
             unlimited.try_reserve_dense_f64(usize::MAX, 2, "test-overflow"),
             Err(MemoryReservationError::SizeOverflow { .. })
@@ -1254,7 +1249,7 @@ mod resource_policy_tests {
 
     #[test]
     fn concurrent_reservations_never_oversubscribe() {
-        let governor = std::sync::Arc::new(MemoryGovernor::with_budget(1_000));
+        let governor = std::sync::Arc::new(test_governor(1_000));
         let granted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
         std::thread::scope(|scope| {
@@ -1302,7 +1297,7 @@ mod resource_policy_tests {
 
     #[test]
     fn governed_value_holds_and_releases_its_charge() {
-        let governor = MemoryGovernor::with_budget(64);
+        let governor = test_governor(64);
         let governed = governor
             .try_reserve(32, "governed-value")
             .expect("reservation fits")
