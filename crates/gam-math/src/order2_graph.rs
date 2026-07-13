@@ -865,8 +865,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 } else if addend_scales[term] == 1.0 {
                     product_gradient + tape.gradients[addend * K + primary]
                 } else {
-                    product_gradient
-                        + addend_scales[term] * tape.gradients[addend * K + primary]
+                    product_gradient + addend_scales[term] * tape.gradients[addend * K + primary]
                 };
                 term_gradients[term][primary] = inner_gradient;
                 gradient[primary] += first * inner_gradient;
@@ -911,11 +910,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             Order2GraphWorkspace::push_edge(tape, left, left_first);
             Order2GraphWorkspace::push_edge(tape, right, right_first);
             if addend_scales[term] != 0.0 {
-                Order2GraphWorkspace::push_edge(
-                    tape,
-                    addend,
-                    firsts[term] * addend_scales[term],
-                );
+                Order2GraphWorkspace::push_edge(tape, addend, firsts[term] * addend_scales[term]);
             }
         }
         Order2GraphWorkspace::push_event(
@@ -1296,6 +1291,47 @@ mod tests {
         )
     }
 
+    fn fused_expression<'arena, S: RuntimeJetScalar<'arena>>(
+        vars: &[S; 6],
+        scales: &[f64; 4],
+        stacks: &[[f64; 5]; 4],
+        workspace: &'arena S::Workspace,
+    ) -> S {
+        const N: usize = 10;
+        let upstream = [
+            vars[0].product(&vars[1]),
+            vars[2].affine_compose(scales[0], scales[1], stacks[0], workspace),
+            vars[3].multiply_add(&vars[4], &vars[5]),
+        ];
+        let lefts: [S; N] = std::array::from_fn(|term| upstream[term % upstream.len()].clone());
+        let rights: [S; N] =
+            std::array::from_fn(|term| upstream[(3 * term + 1) % upstream.len()].clone());
+        let addends: [S; N] = std::array::from_fn(|term| vars[(5 * term + 2) % vars.len()].clone());
+        let addend_scales: [f64; N] = std::array::from_fn(|term| match term % 4 {
+            0 => 0.0,
+            1 => 1.0,
+            2 => -0.75,
+            _ => 0.35,
+        });
+        let input_scales: [f64; N] = std::array::from_fn(|term| match term {
+            0 => 0.0,
+            1 => -1.25,
+            _ => scales[term % scales.len()],
+        });
+        let derivative_stacks: [[f64; 5]; N] =
+            std::array::from_fn(|term| stacks[term % stacks.len()]);
+        S::scaled_multiply_add_affine_composed_sum(
+            &lefts,
+            &rights,
+            &addends,
+            &addend_scales,
+            &input_scales,
+            &derivative_stacks,
+            6,
+            workspace,
+        )
+    }
+
     #[test]
     fn compiled_graph_matches_eager_order2_randomized_full_vgh() {
         fn sample(state: &mut u64) -> f64 {
@@ -1316,6 +1352,27 @@ mod tests {
 
         let mut state = 0x932d_a660_5eed_f00d_u64;
         let mut workspace = Order2GraphWorkspace::new();
+        let mut fused_workspace = Order2GraphWorkspace::new();
+
+        fused_workspace.reset(6);
+        let empty_terms: [Order2Graph<'_, 6>; 0] = [];
+        let empty_scales: [f64; 0] = [];
+        let empty_stacks: [[f64; 5]; 0] = [];
+        let empty = Order2Graph::scaled_multiply_add_affine_composed_sum(
+            &empty_terms,
+            &empty_terms,
+            &empty_terms,
+            &empty_scales,
+            &empty_scales,
+            &empty_stacks,
+            6,
+            &fused_workspace,
+        )
+        .into_order2();
+        assert_eq!(empty.value().to_bits(), 0.0_f64.to_bits());
+        assert!(empty.g().iter().all(|&channel| channel == 0.0));
+        assert!(empty.h().iter().flatten().all(|&channel| channel == 0.0));
+
         for case in 0..256 {
             let values: [f64; 6] = std::array::from_fn(|_| sample(&mut state));
             let scales: [f64; 4] = std::array::from_fn(|_| sample(&mut state));
@@ -1333,6 +1390,7 @@ mod tests {
                 FixedRuntimeJet::from_inner(Order2::variable(values[axis], axis))
             });
             let eager = expression(&eager_vars, &coefficients, &scales, &stacks, &()).into_inner();
+            let eager_fused = fused_expression(&eager_vars, &scales, &stacks, &()).into_inner();
 
             workspace.reset(6);
             let graph_vars: [Order2Graph<'_, 6>; 6] = std::array::from_fn(|axis| {
@@ -1340,16 +1398,41 @@ mod tests {
             });
             let graph =
                 expression(&graph_vars, &coefficients, &scales, &stacks, &workspace).into_order2();
+            fused_workspace.reset(6);
+            let fused_graph_vars: [Order2Graph<'_, 6>; 6] = std::array::from_fn(|axis| {
+                Order2Graph::variable(values[axis], axis, 6, &fused_workspace)
+            });
+            let graph_fused =
+                fused_expression(&fused_graph_vars, &scales, &stacks, &fused_workspace)
+                    .into_order2();
 
             close(graph.value(), eager.value(), case, "value");
+            close(
+                graph_fused.value(),
+                eager_fused.value(),
+                case,
+                "fused value",
+            );
             for primary in 0..6 {
                 close(graph.g()[primary], eager.g()[primary], case, "gradient");
+                close(
+                    graph_fused.g()[primary],
+                    eager_fused.g()[primary],
+                    case,
+                    "fused gradient",
+                );
                 for other in 0..6 {
                     close(
                         graph.h()[primary][other],
                         eager.h()[primary][other],
                         case,
                         "Hessian",
+                    );
+                    close(
+                        graph_fused.h()[primary][other],
+                        eager_fused.h()[primary][other],
+                        case,
+                        "fused Hessian",
                     );
                 }
             }

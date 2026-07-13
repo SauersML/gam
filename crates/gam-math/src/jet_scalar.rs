@@ -1651,8 +1651,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         );
         assert!(
             addends.iter().zip(addend_scales).all(|(input, &scale)| {
-                scale == 0.0
-                    || (input.dimension() == dimension && std::ptr::eq(input.arena, arena))
+                scale == 0.0 || (input.dimension() == dimension && std::ptr::eq(input.arena, arena))
             }),
             "live dynamic fused addends must share dimension and arena"
         );
@@ -3379,8 +3378,7 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
                     } else if addend_scales[term] == 1.0 {
                         product_hessian + addends[term].0.h[primary][other]
                     } else {
-                        product_hessian
-                            + addend_scales[term] * addends[term].0.h[primary][other]
+                        product_hessian + addend_scales[term] * addends[term].0.h[primary][other]
                     };
                     channel += firsts[term] * inner_hessian
                         + seconds[term]
@@ -5516,9 +5514,9 @@ mod tests {
     }
 
     #[test]
-    fn compiled_product_and_affine_nodes_match_scalar_program_randomized() {
+    fn compiled_product_affine_and_fused_nodes_match_scalar_program_randomized() {
         const K: usize = 4;
-        const TERMS: usize = 4;
+        const TERMS: usize = 10;
 
         fn sample(state: &mut u64) -> f64 {
             *state ^= *state << 13;
@@ -5557,10 +5555,21 @@ mod tests {
             // stronger than testing only independently seeded variables.
             let fixed_inputs: [Order2<K>; TERMS] =
                 std::array::from_fn(|_| arbitrary_order2(&mut state));
-            let input_scales: [f64; TERMS] = std::array::from_fn(|_| sample(&mut state));
+            let mut input_scales: [f64; TERMS] = std::array::from_fn(|_| sample(&mut state));
+            input_scales[0] = 0.0;
+            input_scales[1] = -1.25;
+            let addend_scales: [f64; TERMS] = std::array::from_fn(|term| match term % 4 {
+                0 => 0.0,
+                1 => 1.0,
+                2 => -0.75,
+                _ => 0.35,
+            });
             let derivative_stacks: [[f64; 5]; TERMS] =
                 std::array::from_fn(|_| std::array::from_fn(|_| sample(&mut state)));
             let input_shift = sample(&mut state);
+            let fixed_lefts = std::array::from_fn(|term| fixed_inputs[term]);
+            let fixed_rights = std::array::from_fn(|term| fixed_inputs[(3 * term + 1) % TERMS]);
+            let fixed_addends = std::array::from_fn(|term| fixed_inputs[(7 * term + 2) % TERMS]);
 
             let fixed_product_direct = fixed_inputs[0].product(&fixed_inputs[1]);
             let fixed_product_scalar = fixed_inputs[0].mul(&fixed_inputs[1]);
@@ -5586,6 +5595,28 @@ mod tests {
                 JetField::scale,
                 Order2::add_constant,
                 JetField::compose_unary,
+            );
+            let fixed_fused_direct = Order2::scaled_multiply_add_affine_composed_sum(
+                &fixed_lefts,
+                &fixed_rights,
+                &fixed_addends,
+                &addend_scales,
+                &input_scales,
+                &derivative_stacks,
+            );
+            let fixed_fused_scalar = scaled_multiply_add_affine_composed_sum_default(
+                &fixed_lefts,
+                &fixed_rights,
+                &fixed_addends,
+                &addend_scales,
+                &input_scales,
+                &derivative_stacks,
+                Order2::constant,
+                JetField::add,
+                JetField::mul,
+                JetField::scale,
+                Order2::multiply_add,
+                Order2::affine_compose,
             );
 
             let arena = DynamicJetArena::new();
@@ -5632,6 +5663,35 @@ mod tests {
                 |input, constant| input.add_constant(constant, &arena),
                 RuntimeJetScalar::compose_unary,
             );
+            let dynamic_lefts = std::array::from_fn(|term| dynamic_inputs[term].clone());
+            let dynamic_rights =
+                std::array::from_fn(|term| dynamic_inputs[(3 * term + 1) % TERMS].clone());
+            let dynamic_addends =
+                std::array::from_fn(|term| dynamic_inputs[(7 * term + 2) % TERMS].clone());
+            let dynamic_fused_direct = DynamicOrder2::scaled_multiply_add_affine_composed_sum(
+                &dynamic_lefts,
+                &dynamic_rights,
+                &dynamic_addends,
+                &addend_scales,
+                &input_scales,
+                &derivative_stacks,
+                K,
+                &arena,
+            );
+            let dynamic_fused_scalar = scaled_multiply_add_affine_composed_sum_default(
+                &dynamic_lefts,
+                &dynamic_rights,
+                &dynamic_addends,
+                &addend_scales,
+                &input_scales,
+                &derivative_stacks,
+                |value| DynamicOrder2::constant(value, K, &arena),
+                RuntimeJetScalar::add,
+                RuntimeJetScalar::mul,
+                RuntimeJetScalar::scale,
+                RuntimeJetScalar::multiply_add,
+                |input, scale, shift, stack| input.affine_compose(scale, shift, stack, &arena),
+            );
 
             for (label, actual, expected) in [
                 (
@@ -5650,6 +5710,11 @@ mod tests {
                     fixed_sum_scalar.value(),
                 ),
                 (
+                    "fixed fused value",
+                    fixed_fused_direct.value(),
+                    fixed_fused_scalar.value(),
+                ),
+                (
                     "dynamic product value",
                     dynamic_product_direct.value(),
                     dynamic_product_scalar.value(),
@@ -5663,6 +5728,11 @@ mod tests {
                     "dynamic affine sum value",
                     dynamic_sum_direct.value(),
                     dynamic_sum_scalar.value(),
+                ),
+                (
+                    "dynamic fused value",
+                    dynamic_fused_direct.value(),
+                    dynamic_fused_scalar.value(),
                 ),
             ] {
                 close(actual, expected, case, label);
@@ -5685,6 +5755,11 @@ mod tests {
                         fixed_sum_scalar.g()[primary],
                     ),
                     (
+                        "fixed fused gradient",
+                        fixed_fused_direct.g()[primary],
+                        fixed_fused_scalar.g()[primary],
+                    ),
+                    (
                         "dynamic product gradient",
                         dynamic_product_direct.g()[primary],
                         dynamic_product_scalar.g()[primary],
@@ -5698,6 +5773,11 @@ mod tests {
                         "dynamic affine sum gradient",
                         dynamic_sum_direct.g()[primary],
                         dynamic_sum_scalar.g()[primary],
+                    ),
+                    (
+                        "dynamic fused gradient",
+                        dynamic_fused_direct.g()[primary],
+                        dynamic_fused_scalar.g()[primary],
                     ),
                 ] {
                     close(actual, expected, case, label);
@@ -5720,6 +5800,11 @@ mod tests {
                             fixed_sum_scalar.h()[primary][other],
                         ),
                         (
+                            "fixed fused Hessian",
+                            fixed_fused_direct.h()[primary][other],
+                            fixed_fused_scalar.h()[primary][other],
+                        ),
+                        (
                             "dynamic product Hessian",
                             dynamic_product_direct.h_at(primary, other),
                             dynamic_product_scalar.h_at(primary, other),
@@ -5734,12 +5819,52 @@ mod tests {
                             dynamic_sum_direct.h_at(primary, other),
                             dynamic_sum_scalar.h_at(primary, other),
                         ),
+                        (
+                            "dynamic fused Hessian",
+                            dynamic_fused_direct.h_at(primary, other),
+                            dynamic_fused_scalar.h_at(primary, other),
+                        ),
                     ] {
                         close(actual, expected, case, label);
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn fused_product_composition_accepts_empty_expression() {
+        const K: usize = 4;
+        let fixed_terms: [Order2<K>; 0] = [];
+        let scales: [f64; 0] = [];
+        let stacks: [[f64; 5]; 0] = [];
+        let fixed = Order2::scaled_multiply_add_affine_composed_sum(
+            &fixed_terms,
+            &fixed_terms,
+            &fixed_terms,
+            &scales,
+            &scales,
+            &stacks,
+        );
+        assert_eq!(fixed.value().to_bits(), 0.0_f64.to_bits());
+        assert!(fixed.g().iter().all(|&channel| channel == 0.0));
+        assert!(fixed.h().iter().flatten().all(|&channel| channel == 0.0));
+
+        let arena = DynamicJetArena::new();
+        let dynamic_terms: [DynamicOrder2<'_>; 0] = [];
+        let dynamic = DynamicOrder2::scaled_multiply_add_affine_composed_sum(
+            &dynamic_terms,
+            &dynamic_terms,
+            &dynamic_terms,
+            &scales,
+            &scales,
+            &stacks,
+            K,
+            &arena,
+        );
+        assert_eq!(dynamic.value().to_bits(), 0.0_f64.to_bits());
+        assert!((0..K).all(|axis| dynamic.g()[axis] == 0.0));
+        assert!((0..K).all(|row| (0..K).all(|column| dynamic.h_at(row, column) == 0.0)));
     }
 
     /// A small polynomial-plus-unary row expression written ONCE, generically

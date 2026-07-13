@@ -805,12 +805,7 @@ where
                 correction.clone(),
                 correction,
             ],
-            &[
-                linear.clone(),
-                linear.clone(),
-                linear.clone(),
-                linear,
-            ],
+            &[linear.clone(), linear.clone(), linear.clone(), linear],
             &[1.0, 1.0, 1.0, 0.0],
             &[-1.0, -1.0, 1.0, 1.0],
             &[exit_stack, entry_stack, event_stack, time_stack],
