@@ -71,5 +71,6 @@ pub use run::OuterResult;
 // that thread the termination verdict into their own payloads (gam-sae's
 // SaeOuterTermination) can name the variants.
 pub use run::OuterConvergedVia;
+pub use run::{OuterStationaryPointRejection, audit_stationary_point};
 pub(crate) use run_plan::*;
 pub(crate) use seed_screening::*;

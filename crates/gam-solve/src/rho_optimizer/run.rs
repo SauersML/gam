@@ -1038,6 +1038,55 @@ impl OuterResult {
     }
 }
 
+/// Typed refusal from [`audit_stationary_point`]. The rejected point and every
+/// analytic certificate field measured before refusal remain available to the
+/// caller; `source` records why those measurements did not certify.
+#[derive(Debug)]
+pub struct OuterStationaryPointRejection {
+    pub result: OuterResult,
+    pub source: EstimationError,
+}
+
+impl std::fmt::Display for OuterStationaryPointRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for OuterStationaryPointRejection {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Apply the shared analytic outer-optimality authority to one caller-supplied
+/// point without running an optimizer or taking a step.
+///
+/// The objective controls whether evaluating that point mutates its profiled
+/// state. Callers auditing an already-installed inner state must put their
+/// objective in a frozen evaluation mode before calling this function.
+/// `iterations == 0` in the returned result is structural: no optimization loop
+/// exists on this path.
+pub fn audit_stationary_point(
+    obj: &mut dyn OuterObjective,
+    rho: Array1<f64>,
+    context: &str,
+) -> Result<OuterResult, OuterStationaryPointRejection> {
+    let config = OuterConfig::default();
+    let selected_plan = plan(&obj.capability());
+    // There is intentionally no independent value-only probe. The analytic
+    // sample is the authority being audited, and infinity records that no
+    // optimizer-produced terminal value exists to compare against it.
+    let mut result = OuterResult::new(rho, f64::INFINITY, 0, false, selected_plan);
+    match certify_outer_optimality(obj, &config, context, &mut result) {
+        Ok(certificate) => {
+            result.criterion_certificate = Some(certificate);
+            Ok(result)
+        }
+        Err(source) => Err(OuterStationaryPointRejection { result, source }),
+    }
+}
+
 // ─── First-order optimality certificate (#934) ────────────────────────
 //
 // The objective↔gradient desync bug genus (#748, #752, #808, #901, …) has a
