@@ -1422,9 +1422,8 @@ impl Step6DeviceBatch {
 /// (`step6_tests::step6_device_emulator_source_lockstep_fingerprint_415`) can
 /// assert the `.cu` still spells the arithmetic the CPU emulator mirrors — on
 /// CPU CI, no CUDA required. Only the NVRTC compile/launch consumers below stay
-/// Linux-gated. `allow(dead_code)` because on a non-Linux, non-test lib build
-/// nothing references the string.
-#[cfg_attr(all(not(target_os = "linux"), not(test)), allow(dead_code))]
+/// Linux-gated, so non-Linux production builds do not compile unused CUDA data.
+#[cfg(any(target_os = "linux", test))]
 const SURVIVAL_FLEX_STEP6_SOURCE: &str = r#"
 extern "C" __global__ void survival_flex_step6_rows(
     const double * __restrict__ g_p_flat,
