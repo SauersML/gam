@@ -365,8 +365,8 @@ pub(crate) fn gls_wiggle_first_directional_coeffs(
     let base = &tower.base;
     let first = &tower.first;
     let d = &geom.dq_dq0;
-    let coeff_mm_base = &base.hessian_mm * &d.mapv(|value| value * value)
-        + &base.gradient_mu * &geom.d2q_dq02;
+    let coeff_mm_base =
+        &base.hessian_mm * &d.mapv(|value| value * value) + &base.gradient_mu * &geom.d2q_dq02;
     let coeff_ml_base = &base.hessian_ml * d;
     let coeff_ll_base = base.hessian_ll.clone();
     let coeff_mm_u = &first.hessian_mm * &d.mapv(|value| value * value)
