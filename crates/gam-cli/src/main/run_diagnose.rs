@@ -1,5 +1,45 @@
 use super::*;
 
+fn format_alo_coordinates(values: &Array1<f64>) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:.6}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn print_multicoordinate_alo(alo: &gam_predict::SavedModelAloDiagnostics) {
+    let diagnostics = &alo.diagnostics;
+    let mut rows = (0..diagnostics.leverage.len()).collect::<Vec<_>>();
+    rows.sort_by(|&left, &right| {
+        diagnostics.leverage[right]
+            .partial_cmp(&diagnostics.leverage[left])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["row", "leverage", "alo_coordinates", "alo_se", "cook"]);
+    for row in rows.into_iter().take(12) {
+        let standard_errors = diagnostics.alo_variance[row].mapv(|variance| variance.sqrt());
+        table.add_row(Row::from(vec![
+            Cell::new(row),
+            Cell::new(format!("{:.4}", diagnostics.leverage[row])),
+            Cell::new(format_alo_coordinates(&diagnostics.eta_tilde[row])),
+            Cell::new(format_alo_coordinates(&standard_errors)),
+            Cell::new(format!("{:.6}", diagnostics.cook_distance[row])),
+        ]));
+    }
+    cli_out!(
+        "ALO coordinates ({}): {}",
+        alo.model_class.name(),
+        alo.coordinate_names.join(", ")
+    );
+    cli_out!("ALO diagnostics (top leverage rows):");
+    cli_out!("{table}");
+}
+
 pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // `diagnose` currently has exactly one implemented diagnostic: ALO. Rather
     // than erroring with "only --alo is currently implemented for diagnose"
@@ -12,16 +52,50 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     reject_multinomial_model(&args.model, "diagnose")?;
     let model = SavedModel::load_from_path(&args.model)?;
     let parsed = parse_formula(&model.formula)?;
-    // Survival / location-scale / marginal-slope models don't have a single
-    // bare-column response, so the lookup below would fail with the cryptic
-    // "response column 'Surv(...)' not found in data" message. Reject up
-    // front with a clear message naming the model class.
+    if matches!(
+        model.predict_model_class(),
+        PredictModelClass::GaussianLocationScale
+            | PredictModelClass::BinomialLocationScale
+            | PredictModelClass::DispersionLocationScale
+    ) {
+        let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
+        require_dataset_rows("diagnose", &args.data, ds.values.nrows())?;
+        let col_map = ds.column_map();
+        let y_col = resolve_role_col(&col_map, &parsed.response, "response")?;
+        let response = ds.values.column(y_col).to_owned();
+        let prior_weights =
+            resolve_weight_column(&ds, &col_map, model.payload().weight_column.as_deref())
+                .map_err(|error| format!("failed to resolve saved diagnose weights: {error}"))?;
+        let (offset, noise_offset) = report_offset_for(&model, &ds, &col_map)?;
+        let input = build_predict_input_for_model(
+            &model,
+            ds.values.view(),
+            &col_map,
+            model.training_headers.as_ref(),
+            &offset,
+            &noise_offset,
+            model.payload().noise_offset_column.is_some(),
+        )?;
+        let alo = gam_predict::compute_saved_location_scale_alo(
+            &model,
+            &input,
+            gam_predict::SavedAloObservations {
+                response: &response,
+                prior_weights: &prior_weights,
+            },
+        )
+        .map_err(|error| format!("saved-model ALO failed: {error}"))?;
+        print_multicoordinate_alo(&alo);
+        return Ok(());
+    }
+
+    // Survival responses need risk-set/event replay, while marginal-slope and
+    // transformation models have their own row likelihood coordinates. Keep
+    // the class factual here until its exact dispatcher arm is installed.
     if model.predict_model_class() != PredictModelClass::Standard {
         return Err(format!(
-            "diagnose --alo is not yet supported for {model_class:?} models; \
-             only standard GAM fits are covered. \
-             (You can still inspect the model with `gam report <model>`.)",
-            model_class = model.predict_model_class()
+            "saved {} ALO row-likelihood replay is unavailable in this binary",
+            model.predict_model_class().name()
         ));
     }
     // A spline-scan model (a Standard fit routed through the exact O(n)
@@ -31,11 +105,8 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // cryptic missing-resolved_termspec one (#1046).
     if model.spline_scan.is_some() {
         return Err(
-            "diagnose --alo needs the dense leave-one-out leverage, which a \
-             spline-scan model does not retain (it stores only the per-knot \
-             posterior of the exact O(n) smoother). Use `gam report <model>` \
-             for its fitted quantities, or refit with double_penalty=true to \
-             obtain the dense fit ALO requires."
+            "diagnose --alo cannot replay this spline-scan model because its \
+             saved state has no coefficient-space penalized Hessian"
                 .to_string(),
         );
     }
@@ -47,10 +118,8 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // the downstream missing-resolved_termspec one.
     if model.residual_cascade.is_some() {
         return Err(
-            "diagnose --alo needs the dense leave-one-out leverage, which a \
-             residual-cascade model does not retain (it stores only the \
-             multilevel Wendland posterior of the exact O(n log n) cascade). \
-             Use `gam report <model>` for its fitted quantities."
+            "diagnose --alo cannot replay this residual-cascade model because \
+             its saved state has no coefficient-space penalized Hessian"
                 .to_string(),
         );
     }
@@ -76,8 +145,8 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // column name — the same column the fit persisted. Hard-coding `weights = 1`
     // silently dropped the case weights from every diagnostic on a
     // `--weights-column` fit: the geometry ALO path's working weights
-    // `w_i = prior_i · Fisher_i` and the refit fallback both need the true prior
-    // weights, and the recomputation below reproduces the fit's stored working
+    // `w_i = prior_i · Fisher_i` need the true prior weights, and the replay
+    // below reproduces the fit's stored working
     // weights only when seeded with them. `resolve_weight_column` returns all-ones
     // when the model carries no weight column (the unweighted default).
     let weights = resolve_weight_column(&ds, &col_map, model.weight_column.as_deref())
@@ -96,140 +165,30 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         .compose_offset(offset.view(), "diagnose saved-model design")
         .map_err(|error| error.to_string())?;
 
-    // Try geometry-based ALO from the unified result first (avoids refit).
-    let alo = if let Some((unified, geom)) = model
+    let unified = model
         .unified()
-        .and_then(|u| u.geometry.as_ref().map(|g| (u, g)))
-        // Treat a present-but-emptied geometry carrier as "geometry
-        // unavailable" and fall through to the refit branch. Batch-compacted
-        // models (see `compact_fit_result_for_batch`) used to zero these
-        // row-sized working vectors; `AloInput::from_geometry` then failed its
-        // length-N validation instead of ever reaching the refit fallback
-        // (#2030). This guard keeps diagnose working even for such saved
-        // models produced before the compaction fix.
-        .filter(|(_, geom)| !geom.working_weights.is_empty() && !geom.working_response.is_empty())
-    {
-        let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
-        // ALO's geometry constructor expects the *full* linear predictor (offset
-        // included); it re-centres internally via the separate `offset` arg to
-        // match the offset-inclusive saved working response. The refit branch
-        // below already adds `offset` here — the geometry path must too (#881).
-        let eta = &design.design.dot(&fit_saved.beta) + &effective_offset;
-        // ALO needs a dense X — materialize from row chunks when the design
-        // is an operator-backed (lazy) one. `as_dense_cow` panicked on lazy
-        // designs ("called on operator-backed design; use row chunks or
-        // matrix-vector products"), which broke `diagnose --alo` for every
-        // matern/duchon/sphere fit since those default to lazy storage.
-        let alo_design_dense = design.design.to_dense();
-        // φ must match the PIRLS-backed refit fallback: Gaussian (Identity) uses
-        // the model's estimated dispersion σ̂², not a hard-coded 1.0 (#881-class
-        // SE-scale bug). `geometry_alo_phi` reads the saved σ̂.
-        let phi = geometry_alo_phi(unified, link);
-        // Recompute the row-sized IRLS working vectors rather than reading them
-        // off `geom`. Saved models are size-compacted for n-independence
-        // (`compact_fit_result_for_batch` empties `geom.working_weights` /
-        // `geom.working_response`), so reading them off `geom` fed empty vectors
-        // to the ALO solve and every `gam diagnose` failed with
-        // "ALO diagnostics require hessian_weights length N; got 0". These
-        // vectors are *derived* — at convergence they are deterministic
-        // functions of η̂ = Xβ̂, y, and the family — so replaying the same PIRLS
-        // working-state update the fit used reproduces the fit's exact working
-        // weights/response, keeping saved models n-independent while serving the
-        // exact geometry ALO path (saved Hessian, no refit). `likelihood_scale`
-        // is threaded from the fit so any scale-carrying family (fixed-φ
-        // Gaussian, Tweedie, Gamma, Beta) reproduces bit-for-bit.
-        let recomputed =
-            geometry_alo_working_state(&family, unified, &eta, y.view(), weights.view())
-                .map_err(|e| format!("failed to recompute working state for geometry ALO: {e}"))?;
-        let input = gam::alo::AloInput::from_geometry_with_working_state(
-            geom,
-            &alo_design_dense,
-            &eta,
-            &effective_offset,
-            phi,
-            &recomputed.working_weights,
-            &recomputed.working_response,
-        );
-        gam::alo::compute_alo_from_input(&input)
-            .map_err(|e| format!("compute_alo_from_input (geometry path) failed: {e}"))?
-    } else {
-        let fit_options = FitOptions {
-            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: false,
-            skip_rho_posterior_inference: false,
-            max_iter: 80,
-            tol: 1e-6,
-            nullspace_dims: design.nullspace_dims.clone(),
-            linear_constraints: design.linear_constraints.clone(),
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
-            penalty_shrinkage_floor: Some(1e-6),
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
-            persist_warm_start_disk: false,
-        };
-        let alo_result = match alo_refit_route_for_termspec(&spec) {
-            AloRefitRoute::UnifiedTermCollection => {
-                let fitted = fit_term_collection_forspec(
-                    ds.values.view(),
-                    y.view(),
-                    weights.view(),
-                    offset.view(),
-                    &spec,
-                    family,
-                    &fit_options,
-                )
-                .map_err(|e| {
-                    format!("fit_term_collection_forspec failed during diagnose refit: {e}")
-                })?;
-                let fitted_offset = fitted
-                    .design
-                    .compose_offset(offset.view(), "diagnose refit design")
-                    .map_err(|error| error.to_string())?;
-                let eta = &fitted.design.design.dot(&fitted.fit.beta) + &fitted_offset;
-                let dense_alo_design = fitted.design.design.to_dense();
-                // φ for Gaussian (Identity) is the estimated dispersion σ̂², not
-                // 1.0 — same SE-scale bug as the geometry path. Mirrors the
-                // StandardGam sibling route, which computes φ inside
-                // compute_alo_diagnostics_from_fit.
-                let phi = geometry_alo_phi(&fitted.fit, link);
-                gam::alo::compute_alo_diagnostics_from_unified(
-                    &fitted.fit,
-                    &dense_alo_design,
-                    &eta,
-                    &fitted_offset,
-                    phi,
-                )
-                .map_err(|e| {
-                    format!(
-                        "compute_alo_diagnostics_from_unified failed during diagnose refit: {e}"
-                    )
-                })
-            }
-            AloRefitRoute::StandardGam => {
-                let fit = fit_gam(
-                    design.design.clone(),
-                    y.view(),
-                    weights.view(),
-                    effective_offset.view(),
-                    &design.penalties,
-                    family,
-                    &fit_options,
-                )
-                .map_err(|e| format!("fit_gam failed during diagnose refit: {e}"))?;
-                compute_alo_diagnostics_from_fit(&fit, y.view())
-                    .map_err(|e| format!("compute_alo_diagnostics_from_fit failed: {e}"))
-            }
-        };
-
-        alo_result?
-    };
+        .ok_or_else(|| "saved standard ALO requires a unified fit result".to_string())?;
+    let geom = unified.geometry.as_ref().ok_or_else(|| {
+        "saved standard ALO requires the exact unscaled penalized Hessian".to_string()
+    })?;
+    let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
+    let eta = &design.design.dot(&fit_saved.beta) + &effective_offset;
+    let alo_design_dense = design.design.to_dense();
+    let phi = geometry_alo_phi(unified, link);
+    let recomputed =
+        geometry_alo_working_state(&family, unified, &eta, y.view(), weights.view())
+            .map_err(|error| format!("failed to replay saved ALO working state: {error}"))?;
+    let input = gam::alo::AloInput::from_geometry_with_working_state(
+        geom,
+        &alo_design_dense,
+        &eta,
+        &effective_offset,
+        phi,
+        &recomputed.working_weights,
+        &recomputed.working_response,
+    );
+    let alo = gam::alo::compute_alo_from_input(&input)
+        .map_err(|error| format!("saved standard ALO solve failed: {error}"))?;
 
     let mut rows: Vec<(usize, f64, f64, f64)> = (0..alo.leverage.len())
         .map(|i| (i, alo.leverage[i], alo.eta_tilde[i], alo.se_sandwich[i]))
