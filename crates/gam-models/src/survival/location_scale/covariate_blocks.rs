@@ -481,40 +481,6 @@ pub(crate) fn prepare_cov_block_kind(
     }
 }
 
-/// Rebuild the exact saved threshold/log-scale likelihood channels on new
-/// rows. A resolved time basis is authoritative when present; `None` is the
-/// explicit static-block topology.
-pub fn replay_survival_covariate_block_design(
-    cov_design: &TermCollectionDesign,
-    offset: &Array1<f64>,
-    age_entry: &Array1<f64>,
-    age_exit: &Array1<f64>,
-    time_basis: Option<&SurvivalCovariateTimeBasis>,
-    block_name: &str,
-) -> Result<SurvivalCovariateReplayDesign, String> {
-    let effective_offset = match time_basis {
-        None => cov_design
-            .compose_offset(offset.view(), block_name)
-            .map_err(|error| error.to_string())?,
-        Some(_) => {
-            if cov_design.affine_offset.iter().any(|value| *value != 0.0) {
-                return Err(format!(
-                    "{block_name} time-varying replay cannot tensor a non-zero smooth anchor"
-                ));
-            }
-            offset.clone()
-        }
-    };
-    replay_survival_covariate_channels(
-        &cov_design.design,
-        &effective_offset,
-        age_entry,
-        age_exit,
-        time_basis,
-        block_name,
-    )
-}
-
 /// Matrix-level replay primitive used when subject rows have already been
 /// expanded over an explicit time grid.
 pub fn replay_survival_covariate_channels(
@@ -545,13 +511,9 @@ pub fn replay_survival_covariate_channels(
             offset: effective_offset.clone(),
         });
     };
-    let template =
-        crate::survival::construction::replay_time_varying_survival_covariate_template(
-            age_entry,
-            age_exit,
-            time_basis,
-            block_name,
-        )?;
+    let template = crate::survival::construction::replay_time_varying_survival_covariate_template(
+        age_entry, age_exit, time_basis, block_name,
+    )?;
     let SurvivalCovariateTermBlockTemplate::TimeVarying {
         time_basis_entry,
         time_basis_exit,
@@ -566,10 +528,7 @@ pub fn replay_survival_covariate_channels(
     Ok(SurvivalCovariateReplayDesign {
         design_exit: rowwise_kronecker(cov_design, &time_basis_exit),
         design_entry: Some(rowwise_kronecker(cov_design, &time_basis_entry)),
-        design_derivative_exit: Some(rowwise_kronecker(
-            cov_design,
-            &time_basis_derivative_exit,
-        )),
+        design_derivative_exit: Some(rowwise_kronecker(cov_design, &time_basis_derivative_exit)),
         offset: effective_offset.clone(),
     })
 }
