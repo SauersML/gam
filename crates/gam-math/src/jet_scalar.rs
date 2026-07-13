@@ -231,9 +231,9 @@ fn affine_composed_sum_default<T>(
 }
 
 fn scaled_multiply_add_affine_composed_sum_default<T, const N: usize>(
-    lefts: &[T; N],
-    rights: &[T; N],
-    addends: &[T; N],
+    lefts: &[&T; N],
+    rights: &[&T; N],
+    addends: &[&T; N],
     addend_scales: &[f64; N],
     input_scales: &[f64; N],
     derivative_stacks: &[[f64; 5]; N],
@@ -246,14 +246,14 @@ fn scaled_multiply_add_affine_composed_sum_default<T, const N: usize>(
 ) -> T {
     (0..N).fold(constant(0.0), |sum, term| {
         let inner = if addend_scales[term] == 0.0 {
-            mul(&lefts[term], &rights[term])
+            mul(lefts[term], rights[term])
         } else if addend_scales[term] == 1.0 {
-            multiply_add(&lefts[term], &rights[term], &addends[term])
+            multiply_add(lefts[term], rights[term], addends[term])
         } else {
             multiply_add(
-                &lefts[term],
-                &rights[term],
-                &scale(&addends[term], addend_scales[term]),
+                lefts[term],
+                rights[term],
+                &scale(addends[term], addend_scales[term]),
             )
         };
         let composed = affine_compose(&inner, input_scales[term], 0.0, derivative_stacks[term]);
@@ -379,13 +379,14 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
     /// `Σ_i f_i(input_scale_i · (left_i · right_i + addend_scale_i · addend_i))`
     /// from the certified derivative stack of each `f_i`. The expression arity
     /// is part of its type, so optimized backends need no unrelated capacity
-    /// bound and compilers can unroll the complete row expression. An exact-zero
+    /// bound and compilers can unroll the complete row expression. Operands are
+    /// borrowed so the call never copies a full derivative tower. An exact-zero
     /// addend scale (either sign of IEEE zero) removes that addend from the
     /// algebra entirely.
     fn scaled_multiply_add_affine_composed_sum<const N: usize>(
-        lefts: &[Self; N],
-        rights: &[Self; N],
-        addends: &[Self; N],
+        lefts: &[&Self; N],
+        rights: &[&Self; N],
+        addends: &[&Self; N],
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
@@ -614,9 +615,9 @@ pub trait RuntimeJetScalar<'arena>: Clone {
     /// `-0.0`) means that addend has no dimension, workspace, or
     /// derivative-channel obligations.
     fn scaled_multiply_add_affine_composed_sum<const N: usize>(
-        lefts: &[Self; N],
-        rights: &[Self; N],
-        addends: &[Self; N],
+        lefts: &[&Self; N],
+        rights: &[&Self; N],
+        addends: &[&Self; N],
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
@@ -1036,9 +1037,9 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
 
     #[inline(always)]
     fn scaled_multiply_add_affine_composed_sum<const N: usize>(
-        lefts: &[Self; N],
-        rights: &[Self; N],
-        addends: &[Self; N],
+        lefts: &[&Self; N],
+        rights: &[&Self; N],
+        addends: &[&Self; N],
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
@@ -1046,22 +1047,14 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
         &(): &'arena Self::Workspace,
     ) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
-        // SAFETY: `FixedRuntimeJet<S, K>` is transparent over `S`, so arrays of
-        // either element type have identical layout and alignment. Each cast
-        // preserves allocation, provenance, const length, shared lifetime, and
-        // creates no mutable reference.
-        let (left_inner, right_inner, addend_inner) = unsafe {
-            (
-                &*lefts.as_ptr().cast::<[S; N]>(),
-                &*rights.as_ptr().cast::<[S; N]>(),
-                &*addends.as_ptr().cast::<[S; N]>(),
-            )
-        };
+        let left_inner: [&S; N] = std::array::from_fn(|term| &lefts[term].inner);
+        let right_inner: [&S; N] = std::array::from_fn(|term| &rights[term].inner);
+        let addend_inner: [&S; N] = std::array::from_fn(|term| &addends[term].inner);
         Self {
             inner: S::scaled_multiply_add_affine_composed_sum(
-                left_inner,
-                right_inner,
-                addend_inner,
+                &left_inner,
+                &right_inner,
+                &addend_inner,
                 addend_scales,
                 input_scales,
                 derivative_stacks,
@@ -1607,9 +1600,9 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
 
     #[inline(always)]
     fn scaled_multiply_add_affine_composed_sum<const N: usize>(
-        lefts: &[Self; N],
-        rights: &[Self; N],
-        addends: &[Self; N],
+        lefts: &[&Self; N],
+        rights: &[&Self; N],
+        addends: &[&Self; N],
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
@@ -3307,9 +3300,9 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
 
     #[inline(always)]
     fn scaled_multiply_add_affine_composed_sum<const N: usize>(
-        lefts: &[Self; N],
-        rights: &[Self; N],
-        addends: &[Self; N],
+        lefts: &[&Self; N],
+        rights: &[&Self; N],
+        addends: &[&Self; N],
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
@@ -5540,9 +5533,9 @@ mod tests {
             let derivative_stacks: [[f64; 5]; TERMS] =
                 std::array::from_fn(|_| std::array::from_fn(|_| sample(&mut state)));
             let input_shift = sample(&mut state);
-            let fixed_lefts = std::array::from_fn(|term| fixed_inputs[term]);
-            let fixed_rights = std::array::from_fn(|term| fixed_inputs[(3 * term + 1) % TERMS]);
-            let fixed_addends = std::array::from_fn(|term| fixed_inputs[(7 * term + 2) % TERMS]);
+            let fixed_lefts = std::array::from_fn(|term| &fixed_inputs[term]);
+            let fixed_rights = std::array::from_fn(|term| &fixed_inputs[(3 * term + 1) % TERMS]);
+            let fixed_addends = std::array::from_fn(|term| &fixed_inputs[(7 * term + 2) % TERMS]);
 
             let fixed_product_direct = fixed_inputs[0].product(&fixed_inputs[1]);
             let fixed_product_scalar = fixed_inputs[0].mul(&fixed_inputs[1]);
@@ -5636,11 +5629,11 @@ mod tests {
                 |input, constant| input.add_constant(constant, &arena),
                 RuntimeJetScalar::compose_unary,
             );
-            let dynamic_lefts = std::array::from_fn(|term| dynamic_inputs[term].clone());
+            let dynamic_lefts = std::array::from_fn(|term| &dynamic_inputs[term]);
             let dynamic_rights =
-                std::array::from_fn(|term| dynamic_inputs[(3 * term + 1) % TERMS].clone());
+                std::array::from_fn(|term| &dynamic_inputs[(3 * term + 1) % TERMS]);
             let dynamic_addends =
-                std::array::from_fn(|term| dynamic_inputs[(7 * term + 2) % TERMS].clone());
+                std::array::from_fn(|term| &dynamic_inputs[(7 * term + 2) % TERMS]);
             let dynamic_fused_direct = DynamicOrder2::scaled_multiply_add_affine_composed_sum(
                 &dynamic_lefts,
                 &dynamic_rights,
@@ -5808,7 +5801,7 @@ mod tests {
     #[test]
     fn fused_product_composition_accepts_empty_expression() {
         const K: usize = 4;
-        let fixed_terms: [Order2<K>; 0] = [];
+        let fixed_terms: [&Order2<K>; 0] = [];
         let scales: [f64; 0] = [];
         let stacks: [[f64; 5]; 0] = [];
         let fixed = Order2::scaled_multiply_add_affine_composed_sum(
@@ -5823,7 +5816,7 @@ mod tests {
         assert!(fixed.g().iter().all(|&channel| channel == 0.0));
         assert!(fixed.h().iter().flatten().all(|&channel| channel == 0.0));
 
-        let value_terms: [RuntimeValue; 0] = [];
+        let value_terms: [&RuntimeValue; 0] = [];
         let value = RuntimeValue::scaled_multiply_add_affine_composed_sum(
             &value_terms,
             &value_terms,
@@ -5838,7 +5831,7 @@ mod tests {
         assert_eq!(value.dimension(), K);
 
         let arena = DynamicJetArena::new();
-        let dynamic_terms: [DynamicOrder2<'_>; 0] = [];
+        let dynamic_terms: [&DynamicOrder2<'_>; 0] = [];
         let dynamic = DynamicOrder2::scaled_multiply_add_affine_composed_sum(
             &dynamic_terms,
             &dynamic_terms,
@@ -5902,10 +5895,13 @@ mod tests {
         let wrapped_rights = std::array::from_fn(|term| FixedRuntimeJet::from_inner(rights[term]));
         let wrapped_addends =
             std::array::from_fn(|term| FixedRuntimeJet::from_inner(addends[term]));
+        let wrapped_left_refs = std::array::from_fn(|term| &wrapped_lefts[term]);
+        let wrapped_right_refs = std::array::from_fn(|term| &wrapped_rights[term]);
+        let wrapped_addend_refs = std::array::from_fn(|term| &wrapped_addends[term]);
         let actual = FixedRuntimeJet::<Tower4<K>, K>::scaled_multiply_add_affine_composed_sum(
-            &wrapped_lefts,
-            &wrapped_rights,
-            &wrapped_addends,
+            &wrapped_left_refs,
+            &wrapped_right_refs,
+            &wrapped_addend_refs,
             &addend_scales,
             &input_scales,
             &stacks,

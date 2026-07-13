@@ -810,9 +810,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
 
     #[inline(always)]
     fn scaled_multiply_add_affine_composed_sum<const N: usize>(
-        lefts: &[Self; N],
-        rights: &[Self; N],
-        addends: &[Self; N],
+        lefts: &[&Self; N],
+        rights: &[&Self; N],
+        addends: &[&Self; N],
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
@@ -1276,9 +1276,9 @@ mod tests {
             let right = Order2Graph::<3>::variable(-0.7, 1, 3, &workspace);
             let omitted = Order2Graph::<3>::variable(1.1, 2, 3, &workspace);
             let output = Order2Graph::scaled_multiply_add_affine_composed_sum(
-                &[left],
-                &[right],
-                &[omitted],
+                &[&left],
+                &[&right],
+                &[&omitted],
                 &[-0.0],
                 &[1.0],
                 &[[0.2, 0.0, 1.0, 0.0, 0.0]],
@@ -1296,9 +1296,9 @@ mod tests {
         let right = Order2Graph::<3>::variable(-0.7, 1, 3, &workspace);
         let live = Order2Graph::<3>::variable(1.1, 2, 3, &workspace);
         let output = Order2Graph::scaled_multiply_add_affine_composed_sum(
-            &[left],
-            &[right],
-            &[live],
+            &[&left],
+            &[&right],
+            &[&live],
             &[1.0],
             &[1.0],
             &[[0.2, 0.0, 1.0, 0.0, 0.0]],
@@ -1347,10 +1347,10 @@ mod tests {
             vars[2].affine_compose(scales[0], scales[1], stacks[0], workspace),
             vars[3].multiply_add(&vars[4], &vars[5]),
         ];
-        let lefts: [S; N] = std::array::from_fn(|term| upstream[term % upstream.len()].clone());
-        let rights: [S; N] =
-            std::array::from_fn(|term| upstream[(3 * term + 1) % upstream.len()].clone());
-        let addends: [S; N] = std::array::from_fn(|term| vars[(5 * term + 2) % vars.len()].clone());
+        let lefts: [&S; N] = std::array::from_fn(|term| &upstream[term % upstream.len()]);
+        let rights: [&S; N] =
+            std::array::from_fn(|term| &upstream[(3 * term + 1) % upstream.len()]);
+        let addends: [&S; N] = std::array::from_fn(|term| &vars[(5 * term + 2) % vars.len()]);
         let addend_scales: [f64; N] = std::array::from_fn(|term| match term % 4 {
             0 => 0.0,
             1 => 1.0,
@@ -1399,7 +1399,7 @@ mod tests {
         let mut fused_workspace = Order2GraphWorkspace::new();
 
         fused_workspace.reset(6);
-        let empty_terms: [Order2Graph<'_, 6>; 0] = [];
+        let empty_terms: [&Order2Graph<'_, 6>; 0] = [];
         let empty_scales: [f64; 0] = [];
         let empty_stacks: [[f64; 5]; 0] = [];
         let empty = Order2Graph::scaled_multiply_add_affine_composed_sum(

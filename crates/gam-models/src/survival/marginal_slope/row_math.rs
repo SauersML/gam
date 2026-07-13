@@ -793,19 +793,9 @@ where
             *derivative *= scale;
         }
         Ok(S::scaled_multiply_add_affine_composed_sum(
-            &[
-                vars[1].clone(),
-                vars[0].clone(),
-                vars[1].clone(),
-                vars[2].clone(),
-            ],
-            &[
-                correction.clone(),
-                correction.clone(),
-                correction.clone(),
-                correction,
-            ],
-            &[linear.clone(), linear.clone(), linear.clone(), linear],
+            &[&vars[1], &vars[0], &vars[1], &vars[2]],
+            &[&correction, &correction, &correction, &correction],
+            &[&linear, &linear, &linear, &linear],
             &[1.0, 1.0, 1.0, 0.0],
             &[-1.0, -1.0, 1.0, 1.0],
             &[exit_stack, entry_stack, event_stack, time_stack],
@@ -814,9 +804,9 @@ where
         ))
     } else {
         Ok(S::scaled_multiply_add_affine_composed_sum(
-            &[vars[1].clone(), vars[0].clone()],
-            &[correction.clone(), correction],
-            &[linear.clone(), linear],
+            &[&vars[1], &vars[0]],
+            &[&correction, &correction],
+            &[&linear, &linear],
             &[1.0, 1.0],
             &[-1.0, -1.0],
             &[exit_stack, entry_stack],
