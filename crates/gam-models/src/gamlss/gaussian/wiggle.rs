@@ -687,8 +687,6 @@ impl GaussianLocationScaleWiggleFamily {
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
         let xi = fast_av(xmu, &umu);
         let zeta = fast_av(x_ls, &u_ls);
-        // logb κ-scaled η_ls direction; κ' = dκ/dη_ls = κ(1−κ).
-        let szeta = &rows.kappa * &zeta;
         let phi = fast_av(&geom.basis, &uw);
         let mut q_u = &geom.dq_dq0 * &xi;
         q_u += &phi;
@@ -698,46 +696,31 @@ impl GaussianLocationScaleWiggleFamily {
         g2_u += &fast_av(&geom.basis_d2, &uw);
         let basis_u = scale_matrix_rows(&geom.basis_d1, &xi)?;
         let basis1_u = scale_matrix_rows(&geom.basis_d2, &xi)?;
-        let dw_u = -2.0 * &rows.w * &szeta;
-        let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta);
-
-        let coeff_mm_u = &(&dw_u * &geom.dq_dq0.mapv(|v| v * v))
-            + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
-            - &(&dm_u * &geom.d2q_dq02)
-            - &(&rows.m * &g2_u);
-        // OBSERVED joint Hessian directional derivatives (#1561). The μ↔ls cross
-        // is H_{μ,ls} = 2κm·dq_dq0, so its β-directional derivative differentiates
-        // κ (via zeta), m (via dm_u), and dq_dq0 (via s1_u). H_{ls,ls} =
-        // κ'(a−n)+2κ²n → d/dβ = κ''ζ(a−n) + 4κκ'ζn + (2κ²−κ')·dn (dn = δn along u).
-        // The dense sibling `gaussian_joint_psi_firstweights` d_u/c_u channels
-        // carry the same closed forms.
-        let a_coef = 2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime;
-        let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &szeta);
-        let coeff_ml_u = &(2.0 * &rows.kappa_prime * &zeta * &rows.m * &geom.dq_dq0)
-            + &(2.0 * &rows.kappa * &dm_u * &geom.dq_dq0)
-            + &(2.0 * &rows.kappa * &rows.m * &s1_u);
-        let coeff_ll_u = &(&rows.kappa_dprime * &zeta * &(&rows.obs_weight - &rows.n))
-            + &(4.0 * &rows.kappa * &rows.kappa_prime * &zeta * &rows.n)
-            + &(&a_coef * &dn_u);
-        let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
-        let c_u = -&dm_u;
-        // OBSERVED ls↔wiggle cross 2κm: value derivative l_u along u, plus the
-        // basis drift (B = B(q0) moves with the μ direction xi, δB = diag(xi)·B'
-        // = basis_u) carrying the un-differentiated coeff_lw_b = 2κm.
-        let l_u = &(2.0 * &rows.kappa_prime * &zeta * &rows.m) + &(2.0 * &rows.kappa * &dm_u);
-        let coeff_lw_b = 2.0 * &rows.kappa * &rows.m;
+        let GlsWiggleFirstDirCoeffs {
+            coeff_mm_u,
+            coeff_ml_u,
+            coeff_ll_u,
+            mean_wiggle_u,
+            gradient_mu_u,
+            scale_wiggle_u,
+            mean_wiggle_base,
+            gradient_mu_base,
+            scale_wiggle_base,
+            hessian_mm_base,
+            hessian_mm_u,
+        } = gls_wiggle_first_directional_coeffs(&rows, &geom, &q_u, &zeta, &s1_u, &g2_u);
 
         let h_mm = xt_diag_x_dense(xmu, &coeff_mm_u)?;
         let h_ml = xt_diag_y_dense(xmu, &coeff_ml_u, x_ls)?;
         let h_ll = xt_diag_x_dense(x_ls, &coeff_ll_u)?;
-        let h_mw = xt_diag_y_dense(xmu, &a_u, &geom.basis)?
-            + &xt_diag_y_dense(xmu, &(&rows.w * &geom.dq_dq0), &basis_u)?
-            + &xt_diag_y_dense(xmu, &c_u, &geom.basis_d1)?
-            + &xt_diag_y_dense(xmu, &(-&rows.m), &basis1_u)?;
-        let h_lw = xt_diag_y_dense(x_ls, &l_u, &geom.basis)?
-            + &xt_diag_y_dense(x_ls, &coeff_lw_b, &basis_u)?;
-        let a_ww = xt_diag_y_dense(&basis_u, &rows.w, &geom.basis)?;
-        let h_ww = &a_ww + &a_ww.t() + &xt_diag_x_dense(&geom.basis, &dw_u)?;
+        let h_mw = xt_diag_y_dense(xmu, &mean_wiggle_u, &geom.basis)?
+            + &xt_diag_y_dense(xmu, &mean_wiggle_base, &basis_u)?
+            + &xt_diag_y_dense(xmu, &gradient_mu_u, &geom.basis_d1)?
+            + &xt_diag_y_dense(xmu, &gradient_mu_base, &basis1_u)?;
+        let h_lw = xt_diag_y_dense(x_ls, &scale_wiggle_u, &geom.basis)?
+            + &xt_diag_y_dense(x_ls, &scale_wiggle_base, &basis_u)?;
+        let a_ww = xt_diag_y_dense(&basis_u, &hessian_mm_base, &geom.basis)?;
+        let h_ww = &a_ww + &a_ww.t() + &xt_diag_x_dense(&geom.basis, &hessian_mm_u)?;
         Ok(Some(gaussian_pack_wiggle_joint_symmetrichessian(
             &h_mm, &h_ml, &h_mw, &h_ll, &h_lw, &h_ww,
         )))
