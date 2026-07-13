@@ -1620,6 +1620,14 @@ fn gaussian_reml_fit_formula_dataset_impl(
             .map_err(|err| {
                 SharedTangentFfiError::Spec(format!("failed to build formula design matrix: {err}"))
             })?;
+    if design.affine_offset.iter().any(|value| *value != 0.0) {
+        return Err(SharedTangentFfiError::Spec(
+            "shared-tangent Gaussian REML fitting does not support non-zero smooth anchors: \
+             the vector-valued tangent response requires an explicit affine offset per tangent \
+             coordinate"
+                .to_string(),
+        ));
+    }
     let penalties: Vec<gam::families::response_geometry::SharedTangentPenalty> = design
         .penalties
         .iter()
@@ -3639,13 +3647,18 @@ fn model_debiased_functional_json(
 /// is already validated Gaussian/identity, so a continuous-response placeholder
 /// always encodes). Every required prediction column must be supplied in `x0`,
 /// mirroring `predict`'s input contract, so the plug-in equals `predict(x0)`.
+struct DebiasedQueryDesign {
+    design_row: ndarray::Array1<f64>,
+    affine_offset: f64,
+}
+
 fn debiased_query_design_full_schema(
     model: &FittedModel,
     training_headers: &[String],
     x0: &serde_json::Map<String, serde_json::Value>,
     spec: &TermCollectionSpec,
     label: &str,
-) -> Result<ndarray::Array1<f64>, String> {
+) -> Result<DebiasedQueryDesign, String> {
     // A partial `x0` cannot define m(x0); it would silently evaluate the
     // unspecified smooths at a placeholder. Reject it up front with a clear
     // message instead of the old out-of-bounds abort.
@@ -3716,7 +3729,49 @@ fn debiased_query_design_full_schema(
             qx.nrows()
         ));
     }
-    Ok(qx.row(0).to_owned())
+    let affine_offset = *q_design.affine_offset.first().ok_or_else(|| {
+        format!("debiased_functional: {label} query produced no affine offset row")
+    })?;
+    if !affine_offset.is_finite() {
+        return Err(format!(
+            "debiased_functional: {label} query produced a non-finite affine offset"
+        ));
+    }
+    Ok(DebiasedQueryDesign {
+        design_row: qx.row(0).to_owned(),
+        affine_offset,
+    })
+}
+
+fn weighted_affine_mean(
+    values: ndarray::ArrayView1<'_, f64>,
+    weights: Option<ndarray::ArrayView1<'_, f64>>,
+    label: &str,
+) -> Result<f64, String> {
+    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        return Err(format!(
+            "debiased_functional: {label} affine rows must be finite and non-empty"
+        ));
+    }
+    match weights {
+        None => Ok(values.sum() / values.len() as f64),
+        Some(weights) => {
+            if weights.len() != values.len() || weights.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "debiased_functional: {label} weights must be finite with length {}, got {}",
+                    values.len(),
+                    weights.len()
+                ));
+            }
+            let weight_sum = weights.sum();
+            if !(weight_sum.is_finite() && weight_sum > 0.0) {
+                return Err(format!(
+                    "debiased_functional: {label} weights must have positive finite sum"
+                ));
+            }
+            Ok(values.dot(&weights) / weight_sum)
+        }
+    }
 }
 
 fn model_debiased_functional_dataset_json_impl(
@@ -3854,7 +3909,10 @@ fn model_debiased_functional_dataset_json_impl(
             family.pretty_name()
         ));
     }
-    let eta = x.as_ref().dot(&beta);
+    let effective_offset = design_built
+        .compose_offset(standard.offset.view(), "debiased functional training design")
+        .map_err(|error| error.to_string())?;
+    let eta = x.as_ref().dot(&beta) + &effective_offset;
     let mut row_scores = ndarray::Array2::<f64>::zeros((n, p));
     for i in 0..n {
         let residual = eta[i] - y[i]; // ∂nll_i/∂η = η_i − y_i for Gaussian/identity
@@ -3875,7 +3933,7 @@ fn model_debiased_functional_dataset_json_impl(
         })?;
 
     // Build the functional gradient g = dθ/dβ from the spec.
-    let gradient: ndarray::Array1<f64> = match target {
+    let (gradient, functional_affine): (ndarray::Array1<f64>, f64) = match target {
         "point" | "linear" => {
             // Requires an "x0" row dict → evaluate the design at x0, built under
             // the FULL training schema so the saved spec's feature-column offsets
@@ -3887,10 +3945,12 @@ fn model_debiased_functional_dataset_json_impl(
                 })?
                 .as_object()
                 .ok_or_else(|| "debiased_functional: \"x0\" must be an object".to_string())?;
-            debiased_query_design_full_schema(&model, &training_headers, x0_obj, &spec, "x0")?
+            let query =
+                debiased_query_design_full_schema(&model, &training_headers, x0_obj, &spec, "x0")?;
+            (query.design_row, query.affine_offset)
         }
         "contrast" => {
-            let get_row = |key: &str| -> Result<ndarray::Array1<f64>, String> {
+            let get_row = |key: &str| -> Result<DebiasedQueryDesign, String> {
                 let row_obj = spec_val
                     .get(key)
                     .ok_or_else(|| {
@@ -3904,12 +3964,13 @@ fn model_debiased_functional_dataset_json_impl(
             };
             let row_a = get_row("x0")?;
             let row_b = get_row("x1")?;
-            SmoothFunctional::Contrast {
-                design_row_a: row_a.view(),
-                design_row_b: row_b.view(),
+            let gradient = SmoothFunctional::Contrast {
+                design_row_a: row_a.design_row.view(),
+                design_row_b: row_b.design_row.view(),
             }
             .gradient()
-            .map_err(|e| format!("debiased_functional: contrast gradient: {e}"))?
+            .map_err(|e| format!("debiased_functional: contrast gradient: {e}"))?;
+            (gradient, row_a.affine_offset - row_b.affine_offset)
         }
         "average_derivative" | "average_value" => {
             // Uses the full training design; optional per-row weights from spec.
@@ -3924,12 +3985,18 @@ fn model_debiased_functional_dataset_json_impl(
                 .map(ndarray::Array1::from);
             let x_ref = x.as_ref();
             if target == "average_value" {
-                SmoothFunctional::AverageValue {
+                let gradient = SmoothFunctional::AverageValue {
                     value_design: x_ref.view(),
                     weights: weights.as_ref().map(|w| w.view()),
                 }
                 .gradient()
-                .map_err(|e| format!("debiased_functional: average_value gradient: {e}"))?
+                .map_err(|e| format!("debiased_functional: average_value gradient: {e}"))?;
+                let affine = weighted_affine_mean(
+                    design_built.affine_offset.view(),
+                    weights.as_ref().map(|w| w.view()),
+                    "average_value",
+                )?;
+                (gradient, affine)
             } else {
                 // average_derivative needs rows of basis-function DERIVATIVES
                 // ∂φ_j/∂x(x_i), NOT the value design φ_j(x_i). Feeding the value
@@ -3946,20 +4013,26 @@ fn model_debiased_functional_dataset_json_impl(
                                 "debiased_functional: average_derivative design build failed: {e}"
                             )
                         })?;
-                if dx.ncols() != x.ncols() {
+                if dx.design.ncols() != x.ncols() {
                     return Err(format!(
                         "debiased_functional: average_derivative design width {} does not \
                          match fitted coefficient width {}",
-                        dx.ncols(),
+                        dx.design.ncols(),
                         x.ncols()
                     ));
                 }
-                SmoothFunctional::AverageDerivative {
-                    derivative_design: dx.view(),
+                let gradient = SmoothFunctional::AverageDerivative {
+                    derivative_design: dx.design.view(),
                     weights: weights.as_ref().map(|w| w.view()),
                 }
                 .gradient()
-                .map_err(|e| format!("debiased_functional: average_derivative gradient: {e}"))?
+                .map_err(|e| format!("debiased_functional: average_derivative gradient: {e}"))?;
+                let affine = weighted_affine_mean(
+                    dx.affine_offset.view(),
+                    weights.as_ref().map(|w| w.view()),
+                    "average_derivative",
+                )?;
+                (gradient, affine)
             }
         }
         other => {
@@ -3980,15 +4053,17 @@ fn model_debiased_functional_dataset_json_impl(
     let report = debias_with_dense_hessian(&input, h.view())
         .map_err(|e| format!("debiased_functional: Riesz engine error: {e}"))?;
 
+    let theta_plugin = report.theta_plugin + functional_affine;
+    let theta_debiased = report.theta_onestep + functional_affine;
     let half_width = 1.959_963_984_540_054 * report.se;
     let out = serde_json::json!({
         "target": target,
-        "theta_plugin": report.theta_plugin,
-        "theta_debiased": report.theta_onestep,
+        "theta_plugin": theta_plugin,
+        "theta_debiased": theta_debiased,
         "se": report.se,
         "penalty_bias": report.penalty_bias,
-        "ci_lower": report.theta_onestep - half_width,
-        "ci_upper": report.theta_onestep + half_width,
+        "ci_lower": theta_debiased - half_width,
+        "ci_upper": theta_debiased + half_width,
         "ci_level": 0.95_f64,
     });
     serde_json::to_string(&out)

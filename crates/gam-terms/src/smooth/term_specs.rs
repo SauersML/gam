@@ -2407,6 +2407,16 @@ impl TermCollectionDesign {
         if beta.iter().any(|value| !value.is_finite()) {
             crate::bail_invalid_basis!("term-collection predictor coefficients must be finite");
         }
+        if self.affine_offset.len() != self.design.nrows() {
+            crate::bail_dim_basis!(
+                "term-collection affine offset has {} rows but design has {}",
+                self.affine_offset.len(),
+                self.design.nrows()
+            );
+        }
+        if self.affine_offset.iter().any(|value| !value.is_finite()) {
+            crate::bail_invalid_basis!("term-collection affine offset must be finite");
+        }
         Ok(self.design.apply(&beta.to_owned()) + &self.affine_offset)
     }
 

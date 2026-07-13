@@ -567,7 +567,14 @@ impl TermCollectionDerivativeDesign {
                 self.design.nrows()
             );
         }
-        Ok(self.design.dot(&beta) + &self.affine_offset)
+        if beta.iter().any(|value| !value.is_finite())
+            || self.affine_offset.iter().any(|value| !value.is_finite())
+        {
+            crate::bail_invalid_basis!(
+                "term-collection derivative coefficients and affine offset must be finite"
+            );
+        }
+        Ok(self.design.dot(&beta.to_owned()) + &self.affine_offset)
     }
 }
 

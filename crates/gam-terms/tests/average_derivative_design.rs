@@ -137,9 +137,14 @@ fn analytic_average_derivative_matches_central_difference() {
     let cd_half = central(h / 2.0);
     let reference = (&cd_half * 4.0 - &cd_h) / 3.0;
 
-    assert_eq!(analytic.dim(), reference.dim(), "derivative design shape");
+    assert_eq!(
+        analytic.design.dim(),
+        reference.dim(),
+        "derivative design shape"
+    );
 
     let max_abs_err = analytic
+        .design
         .iter()
         .zip(reference.iter())
         .map(|(a, b)| (a - b).abs())

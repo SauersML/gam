@@ -271,6 +271,7 @@ fn standard_conformal_substrates(
         || fit_config.weight_column.is_some()
         || fit_config.offset_column.is_some()
         || fit_config.flexible_link
+        || design.affine_offset.iter().any(|value| *value != 0.0)
     {
         return (None, None);
     }

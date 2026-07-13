@@ -8679,8 +8679,12 @@ pub fn smooth_term_lr_inference_forspec(
                 // η at the null fit: X_null β_null + offset (per-row linear
                 // predictor; design-layout independent — Lawley reads it on the
                 // full design rows).
+                let null_offset = null
+                    .design
+                    .compose_offset(offset, "smooth likelihood-ratio null model")
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                 let mut eta = null.design.design.dot(&null.fit.beta);
-                eta += &offset;
+                eta += &null_offset;
                 (w, Some(eta))
             }
             _ => (f64::NAN, None),

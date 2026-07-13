@@ -4513,6 +4513,9 @@ fn gaussian_jackknife_plus_stats_for_standard_fit(
     if fit_config.offset_column.is_some() {
         return None;
     }
+    if design.affine_offset.iter().any(|value| *value != 0.0) {
+        return None;
+    }
     // A wiggle-augmented link breaks the Gaussian-identity closed form.
     if fit_config.flexible_link {
         return None;
@@ -4657,6 +4660,9 @@ fn exact_full_conformal_substrate_for_standard_fit(
         return None;
     }
     if fit_config.offset_column.is_some() {
+        return None;
+    }
+    if design.affine_offset.iter().any(|value| *value != 0.0) {
         return None;
     }
     if fit_config.flexible_link {

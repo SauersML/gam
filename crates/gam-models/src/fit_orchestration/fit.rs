@@ -351,7 +351,7 @@ fn tweedie_profile_loglik(request: &StandardFitRequest<'_>, p: f64) -> Option<f6
     // μ = g⁻¹(Xβ̂ + offset); the Tweedie family is fixed to the log link by
     // `resolve_family`, so g⁻¹ = exp. `design.apply` reproduces the fitted
     // linear predictor exactly (same contract the expectile/predict paths use).
-    let mut eta = fitted.design.design.apply(&fitted.fit.beta);
+    let mut eta = fitted.design.apply(fitted.fit.beta.view()).ok()?;
     if eta.len() != request.y.len() {
         return None;
     }

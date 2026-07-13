@@ -1387,7 +1387,12 @@ fn fit_expectile_laws(
         // offset folded by the design path). The design columns match the
         // combined coefficient vector exactly (the same contract `predict`
         // and the safety tests rely on).
-        let mu = result.design.design.apply(&result.fit.beta);
+        let mu = result
+            .design
+            .apply(result.fit.beta.view())
+            .map_err(|error| WorkflowError::IntegrationFailed {
+                reason: format!("expectile LAWS could not evaluate fitted design: {error}"),
+            })?;
         if mu.len() != n {
             return Err(WorkflowError::IntegrationFailed {
                 reason: format!(

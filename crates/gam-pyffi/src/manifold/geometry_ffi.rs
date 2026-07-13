@@ -9201,6 +9201,13 @@ fn standard_mean_design_dense(
     )?;
     let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    if design.affine_offset.iter().any(|value| *value != 0.0) {
+        return Err(
+            "design_matrix cannot represent a model with non-zero smooth anchors as a single \
+             coefficient matrix; use Model.predict for the complete affine predictor"
+                .to_string(),
+        );
+    }
     let dense = design
         .design
         .try_to_dense_by_chunks("design_matrix prediction design")?;
