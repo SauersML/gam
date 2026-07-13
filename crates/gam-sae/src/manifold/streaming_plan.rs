@@ -550,7 +550,7 @@ pub(crate) fn sae_topk_curved_budget_from_budget(
 /// `!resident_seed_admitted && streaming_admitted` region with an actionable
 /// error naming this function, so no admitted shape can OOM on the dense seed.
 ///
-/// Returns the full ledger on admission (resident OR streaming); a typed `Err`
+/// Returns the full ledger only when the support-sparse layout is admitted; a typed `Err`
 /// when the shape exceeds even the streaming budget — a TopK manifold request
 /// is never silently substituted with the linear sparse-code lane.
 pub fn admit_topk_curved_lane(
@@ -582,7 +582,7 @@ pub fn admit_topk_curved_lane(
         support_k,
         in_core_budget_bytes,
     );
-    if budget.resident_seed_admitted || budget.streaming_admitted {
+    if budget.streaming_admitted {
         return Ok(budget);
     }
     Err(format!(

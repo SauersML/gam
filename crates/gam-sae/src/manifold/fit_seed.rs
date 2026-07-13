@@ -129,16 +129,15 @@ pub fn admit_sae_fit_shape(
     d_max: usize,
     assignment_kind: SaeFitAssignmentKind,
     top_k: Option<usize>,
-) -> Result<(), String> {
+) -> Result<crate::front_door::SaeFitAdmission, String> {
     match assignment_kind {
         SaeFitAssignmentKind::TopK => {
             let support = top_k.ok_or_else(|| {
                 "assignment_kind 'topk' requires top_k (the fixed per-row support size)".to_string()
             })?;
             crate::front_door::admit_topk_manifold(n_obs, p_out, k_atoms, d_max.max(1), support)
-                .map(|_| ())
         }
-        _ => crate::front_door::admit_dense_certification(n_obs, p_out, k_atoms).map(|_| ()),
+        _ => crate::front_door::admit_dense_certification(n_obs, p_out, k_atoms),
     }
 }
 
@@ -159,7 +158,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
             request.basis_sizes.len()
         ));
     }
-    admit_sae_fit_shape(
+    let admission = admit_sae_fit_shape(
         n_obs,
         p_out,
         k_atoms,
@@ -167,6 +166,12 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         request.assignment_kind,
         request.top_k,
     )?;
+    if admission.lane != crate::front_door::SaeFitLane::DenseCertification {
+        return Err(
+            "build_sae_fit_seed is the dense-certification constructor; overcomplete hard-TopK requests must use the support-sparse seed entry"
+                .to_string(),
+        );
+    }
     if request.max_iter < 1 {
         return Err(format!(
             "sae_manifold_fit requires max_iter >= 1; got {}",

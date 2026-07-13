@@ -59,6 +59,11 @@ pub struct SaeFitAdmission {
     pub dense_assignment_cells: usize,
     /// Cells in the response matrix, `N*P`.
     pub response_cells: usize,
+    /// Exact support-sparse memory contract for an overcomplete hard-TopK
+    /// request. `None` for the dense-certification and sparse-linear layouts.
+    /// Keeping the ledger in the admission value prevents the public entry from
+    /// re-deciding (and potentially discarding) the lane after validation.
+    pub topk_budget: Option<crate::manifold::SaeTopKCurvedBudget>,
 }
 
 impl SaeFitAdmission {
@@ -98,6 +103,7 @@ pub fn admit_sae_fit(
         n_atoms,
         dense_assignment_cells,
         response_cells,
+        topk_budget: None,
     })
 }
 
@@ -175,17 +181,14 @@ pub(crate) fn admit_topk_manifold_with_budget(
         support_k,
         budget_bytes,
     );
-    // Both the resident sub-lane (dense seed fits in core) AND the streaming
-    // sub-lane (dense seed over budget, streamed curved shape fits) are runnable:
-    // the chunked-seed driver is wired
-    // ([`crate::manifold::SaeManifoldTerm::seed_cold_start_disjoint_charts_streaming`]
-    // + [`crate::manifold::SaeManifoldTerm::fit_topk_curved_streaming`]), so the
-    // streaming region no longer builds any dense `(N, K)` seed — it accumulates
-    // the per-atom decoder normal equations in `seed_chunk_rows()` row chunks.
-    // Only a shape past BOTH budgets refuses.
-    if ledger.resident_seed_admitted || ledger.streaming_admitted {
+    // K>P TopK has ONE representation: support-sparse. A resident dense seed is
+    // deliberately not an alternative even when it would happen to fit on this
+    // machine; accepting it would make model representation depend on available
+    // RAM and would reintroduce the N×K state this admission exists to forbid.
+    if ledger.streaming_admitted {
         return Ok(SaeFitAdmission {
             lane: SaeFitLane::CurvedStreaming,
+            topk_budget: Some(ledger),
             ..admission
         });
     }
@@ -252,6 +255,7 @@ pub fn admit_linear_dictionary(
         // cells record the shape the DEFAULT rule would have compared.
         dense_assignment_cells: n_obs.saturating_mul(n_atoms),
         response_cells: n_obs.saturating_mul(output_dim),
+        topk_budget: None,
     })
 }
 

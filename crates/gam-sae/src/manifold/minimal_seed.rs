@@ -54,7 +54,7 @@ pub fn build_sae_minimal_seed(
             request.atom_dim.len()
         ));
     }
-    admit_sae_fit_shape(
+    let admission = admit_sae_fit_shape(
         n_obs,
         p_out,
         k_atoms,
@@ -62,6 +62,12 @@ pub fn build_sae_minimal_seed(
         request.assignment_kind,
         request.top_k,
     )?;
+    if admission.lane != crate::front_door::SaeFitLane::DenseCertification {
+        return Err(
+            "build_sae_minimal_seed is the dense-certification constructor; overcomplete hard-TopK requests must use the support-sparse minimal seed entry"
+                .to_string(),
+        );
+    }
     if !request.target.iter().all(|value| value.is_finite()) {
         return Err("sae_manifold_fit_minimal: target contains non-finite values".to_string());
     }
