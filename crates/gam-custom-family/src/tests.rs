@@ -3527,10 +3527,7 @@ impl OneStepReturnedSaddleFamily {
                 1.0 + 2.0 * y * y / target_squared,
                 4.0 * displacement * y / target_squared
             ],
-            [
-                4.0 * displacement * y / target_squared,
-                shape + 3.0 * y * y
-            ],
+            [4.0 * displacement * y / target_squared, shape + 3.0 * y * y],
         ]
     }
 }
