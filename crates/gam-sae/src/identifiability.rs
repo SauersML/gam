@@ -3692,6 +3692,80 @@ mod tests {
     use super::*;
     use ndarray::{Array1, array};
 
+    fn orbit_fixture(
+        topology: AtomTopology,
+        coords: Array2<f64>,
+    ) -> (FittedAtom, AtomParameterView) {
+        let n = coords.nrows();
+        let d = coords.ncols();
+        (
+            FittedAtom {
+                name: "quotient".to_string(),
+                topology,
+                frame: Array2::zeros((2, d)),
+                ard_variances: None,
+                lowering_error: 0.0,
+                chart_canonicalized: false,
+                inner_fit: None,
+            },
+            AtomParameterView {
+                basis_values: Array2::ones((n, 1)),
+                basis_jacobian: Array3::zeros((n, 1, d)),
+                decoder: Array2::zeros((1, 2)),
+                coords,
+                activations: Array1::ones(n),
+                basis_second_jet: None,
+            },
+        )
+    }
+
+    #[test]
+    fn quotient_exact_orbits_have_the_correct_connected_gauge_dimensions() {
+        let (klein, klein_view) = orbit_fixture(
+            AtomTopology::KleinBottle,
+            Array2::from_shape_vec((2, 2), vec![0.1, 0.2, 0.4, -0.3]).unwrap(),
+        );
+        let klein_fields = exact_orbit_fields(&klein, &klein_view).unwrap();
+        assert_eq!(klein_fields.len(), 1);
+        assert!(
+            klein_fields[0]
+                .1
+                .column(0)
+                .iter()
+                .all(|value| *value == 1.0)
+        );
+        assert!(
+            klein_fields[0]
+                .1
+                .column(1)
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+
+        let (rp2, rp2_view) = orbit_fixture(
+            AtomTopology::ProjectivePlane,
+            Array2::from_shape_vec((2, 2), vec![0.2, 0.3, -0.2, 0.3 + std::f64::consts::PI])
+                .unwrap(),
+        );
+        let rp2_fields = exact_orbit_fields(&rp2, &rp2_view).unwrap();
+        assert_eq!(rp2_fields.len(), 3);
+        for (_, field, _) in rp2_fields {
+            for axis in 0..2 {
+                let deck_sign = if axis == 0 { -1.0 } else { 1.0 };
+                assert!((field[[1, axis]] - deck_sign * field[[0, axis]]).abs() <= 1.0e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn projective_orbit_certificate_refuses_the_cover_pole() {
+        let (rp2, view) = orbit_fixture(
+            AtomTopology::ProjectivePlane,
+            Array2::from_shape_vec((1, 2), vec![std::f64::consts::FRAC_PI_2, 0.0]).unwrap(),
+        );
+        assert!(exact_orbit_fields(&rp2, &view).is_err());
+    }
+
     /// #1097: the per-atom penalty-debiased functional point summaries must
     /// reproduce the exact linear functionals of the fitted decoder smooth
     /// (plug-in) and a finite debiased value, on a synthetic atom whose inner

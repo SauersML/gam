@@ -96,7 +96,8 @@ pub fn sae_build_padded_basis_stacks(
         if plan.latent_dim() > seed_shape[2] {
             return Err(format!(
                 "sae_build_padded_basis_stacks: atom {atom_idx} latent_dim {} exceeds seed_coords D_max={}",
-                plan.latent_dim(), seed_shape[2]
+                plan.latent_dim(),
+                seed_shape[2]
             ));
         }
     }
@@ -214,9 +215,7 @@ pub fn sae_build_atom_plans(
                     geometry: SaeAtomGeometryPlan::new(
                         SaeAtomBasisKind::Periodic,
                         1,
-                        SaeBasisResolution::PeriodicHarmonics {
-                            order: n_harmonics,
-                        },
+                        SaeBasisResolution::PeriodicHarmonics { order: n_harmonics },
                         SaeReferenceMetricPlan::UnitCircle,
                     )?,
                 });
@@ -551,5 +550,64 @@ mod tests {
         assert_eq!(penalty[[0, 0, 0]], 0.0);
         assert_eq!(penalty[[0, 3, 3]], 8.0);
         assert_eq!(penalty[[0, 4, 4]], 8.0);
+    }
+
+    #[test]
+    fn quotient_plans_drive_padded_stack_width_penalty_and_deck_twins() {
+        let z = Array2::<f64>::zeros((2, 1));
+        let mut seed_coords = Array3::<f64>::zeros((2, 2, 2));
+        let latitude = 0.29;
+        let longitude = -0.41;
+        seed_coords[[0, 0, 0]] = latitude;
+        seed_coords[[0, 0, 1]] = longitude;
+        seed_coords[[0, 1, 0]] = -latitude;
+        seed_coords[[0, 1, 1]] = longitude + std::f64::consts::PI;
+        let theta = 0.17;
+        let phi = 0.23;
+        seed_coords[[1, 0, 0]] = theta;
+        seed_coords[[1, 0, 1]] = phi;
+        seed_coords[[1, 1, 0]] = theta + 0.5;
+        seed_coords[[1, 1, 1]] = -phi;
+
+        let plans = sae_build_atom_plans(
+            z.view(),
+            &["projective_plane".to_string(), "klein_bottle".to_string()],
+            &[2, 2],
+            seed_coords.view(),
+            19,
+            &[Some(2), Some(2)],
+        )
+        .unwrap();
+        let (phi_stack, jet_stack, penalty_stack, basis_sizes, _) =
+            sae_build_padded_basis_stacks(&plans, seed_coords.view(), 2).unwrap();
+
+        assert_eq!(
+            plans[0].geometry,
+            SaeAtomGeometryPlan::projective_plane(2).unwrap()
+        );
+        assert_eq!(
+            plans[1].geometry,
+            SaeAtomGeometryPlan::klein_bottle(2).unwrap()
+        );
+        for atom in 0..2 {
+            let width = plans[atom].basis_size().unwrap();
+            assert_eq!(basis_sizes[atom], width);
+            assert_eq!(penalty_stack[[atom, 0, 0]], 0.0);
+            assert!((1..width).any(|column| penalty_stack[[atom, column, column]] > 0.0));
+            for column in 0..width {
+                assert!(
+                    (phi_stack[[atom, 0, column]] - phi_stack[[atom, 1, column]]).abs() <= 1.0e-12
+                );
+                let axis_signs = if atom == 0 { [-1.0, 1.0] } else { [1.0, -1.0] };
+                for axis in 0..2 {
+                    assert!(
+                        (jet_stack[[atom, 1, column, axis]]
+                            - axis_signs[axis] * jet_stack[[atom, 0, column, axis]])
+                        .abs()
+                            <= 1.0e-11
+                    );
+                }
+            }
+        }
     }
 }
