@@ -481,7 +481,10 @@ impl<'a> GaussianJointRowProgram<'a> {
     /// The concrete sparsity bits are part of the generated function's type:
     /// both score channels and all three packed Hessian channels are live.
     #[inline(always)]
-    fn row_order2(&self, row: usize) -> gam_math::jet_scalar::StaticOrder2Atom<2, 3, 3, 7> {
+    pub(crate) fn row_order2(
+        &self,
+        row: usize,
+    ) -> gam_math::jet_scalar::StaticOrder2Atom<2, 3, 3, 7> {
         gaussian_normalized_row_order2(
             0.0,
             0.0,
@@ -494,7 +497,7 @@ impl<'a> GaussianJointRowProgram<'a> {
 
     /// Symbolically lowered Hessian derivative in one predictor direction.
     #[inline(always)]
-    fn row_third_contracted(&self, row: usize, direction: &[f64; 2]) -> [[f64; 2]; 2] {
+    pub(crate) fn row_third_contracted(&self, row: usize, direction: &[f64; 2]) -> [[f64; 2]; 2] {
         gaussian_normalized_row_third_contracted(
             0.0,
             0.0,
@@ -508,7 +511,7 @@ impl<'a> GaussianJointRowProgram<'a> {
 
     /// Symbolically lowered mixed derivative of the row Hessian.
     #[inline(always)]
-    fn row_fourth_contracted(
+    pub(crate) fn row_fourth_contracted(
         &self,
         row: usize,
         direction_u: &[f64; 2],
@@ -551,6 +554,155 @@ fn add_matrix_2(left: [[f64; 2]; 2], right: [[f64; 2]; 2]) -> [[f64; 2]; 2] {
         [left[0][0] + right[0][0], left[0][1] + right[0][1]],
         [left[1][0] + right[1][0], left[1][1] + right[1][1]],
     ]
+}
+
+/// One order of generated Gaussian row geometry, stored in neutral predictor
+/// coordinates. At order zero these are `(g, H)`; in a first/second tower they
+/// are the corresponding directional derivatives of `(g, H)`.
+pub(crate) struct GaussianRowChannels {
+    pub(crate) gradient_mu: Array1<f64>,
+    pub(crate) gradient_ls: Array1<f64>,
+    pub(crate) hessian_mm: Array1<f64>,
+    pub(crate) hessian_ml: Array1<f64>,
+    pub(crate) hessian_ll: Array1<f64>,
+}
+
+impl GaussianRowChannels {
+    fn zeros(n: usize) -> Self {
+        Self {
+            gradient_mu: Array1::zeros(n),
+            gradient_ls: Array1::zeros(n),
+            hessian_mm: Array1::zeros(n),
+            hessian_ml: Array1::zeros(n),
+            hessian_ll: Array1::zeros(n),
+        }
+    }
+}
+
+pub(crate) struct GaussianRowFirstTower {
+    pub(crate) base: GaussianRowChannels,
+    pub(crate) first: GaussianRowChannels,
+}
+
+pub(crate) struct GaussianRowSecondTower {
+    pub(crate) base: GaussianRowChannels,
+    pub(crate) first_a: GaussianRowChannels,
+    pub(crate) first_b: GaussianRowChannels,
+    pub(crate) second: GaussianRowChannels,
+}
+
+fn write_base_channels(
+    channels: &mut GaussianRowChannels,
+    row: usize,
+    atom: &gam_math::jet_scalar::StaticOrder2Atom<2, 3, 3, 7>,
+) -> [[f64; 2]; 2] {
+    let gradient = atom.gradient();
+    let hessian = [
+        [atom.hessian_at(0, 0), atom.hessian_at(0, 1)],
+        [atom.hessian_at(1, 0), atom.hessian_at(1, 1)],
+    ];
+    channels.gradient_mu[row] = gradient[0];
+    channels.gradient_ls[row] = gradient[1];
+    channels.hessian_mm[row] = hessian[0][0];
+    channels.hessian_ml[row] = hessian[0][1];
+    channels.hessian_ll[row] = hessian[1][1];
+    hessian
+}
+
+fn write_directional_channels(
+    channels: &mut GaussianRowChannels,
+    row: usize,
+    gradient: [f64; 2],
+    hessian: [[f64; 2]; 2],
+) {
+    channels.gradient_mu[row] = gradient[0];
+    channels.gradient_ls[row] = gradient[1];
+    channels.hessian_mm[row] = hessian[0][0];
+    channels.hessian_ml[row] = hessian[0][1];
+    channels.hessian_ll[row] = hessian[1][1];
+}
+
+/// Generated `(g, H)` plus its first derivative along a rowwise predictor
+/// direction. The row atom is evaluated once per row.
+pub(crate) fn gaussian_row_first_tower(
+    rows: &GaussianJointRowScalars,
+    direction_mu: &Array1<f64>,
+    direction_ls: &Array1<f64>,
+) -> GaussianRowFirstTower {
+    let n = rows.obs_weight.len();
+    let program = GaussianJointRowProgram::new(rows);
+    let mut base = GaussianRowChannels::zeros(n);
+    let mut first = GaussianRowChannels::zeros(n);
+    for row in 0..n {
+        let direction = [direction_mu[row], direction_ls[row]];
+        let atom = program.row_order2(row);
+        let hessian = write_base_channels(&mut base, row, &atom);
+        write_directional_channels(
+            &mut first,
+            row,
+            matrix_vector_2(&hessian, &direction),
+            program.row_third_contracted(row, &direction),
+        );
+    }
+    GaussianRowFirstTower { base, first }
+}
+
+/// Generated `(g, H)` tower through the mixed second derivative along two
+/// rowwise directions, including a possibly nonzero mixed predictor leg.
+pub(crate) fn gaussian_row_second_tower(
+    rows: &GaussianJointRowScalars,
+    direction_a_mu: &Array1<f64>,
+    direction_a_ls: &Array1<f64>,
+    direction_b_mu: &Array1<f64>,
+    direction_b_ls: &Array1<f64>,
+    direction_ab_mu: &Array1<f64>,
+    direction_ab_ls: &Array1<f64>,
+) -> GaussianRowSecondTower {
+    let n = rows.obs_weight.len();
+    let program = GaussianJointRowProgram::new(rows);
+    let mut base = GaussianRowChannels::zeros(n);
+    let mut first_a = GaussianRowChannels::zeros(n);
+    let mut first_b = GaussianRowChannels::zeros(n);
+    let mut second = GaussianRowChannels::zeros(n);
+    for row in 0..n {
+        let direction_a = [direction_a_mu[row], direction_a_ls[row]];
+        let direction_b = [direction_b_mu[row], direction_b_ls[row]];
+        let direction_ab = [direction_ab_mu[row], direction_ab_ls[row]];
+        let atom = program.row_order2(row);
+        let hessian = write_base_channels(&mut base, row, &atom);
+        let hessian_a = program.row_third_contracted(row, &direction_a);
+        let hessian_b = program.row_third_contracted(row, &direction_b);
+        write_directional_channels(
+            &mut first_a,
+            row,
+            matrix_vector_2(&hessian, &direction_a),
+            hessian_a,
+        );
+        write_directional_channels(
+            &mut first_b,
+            row,
+            matrix_vector_2(&hessian, &direction_b),
+            hessian_b,
+        );
+        write_directional_channels(
+            &mut second,
+            row,
+            add_vector_2(
+                matrix_vector_2(&hessian_a, &direction_b),
+                matrix_vector_2(&hessian, &direction_ab),
+            ),
+            add_matrix_2(
+                program.row_fourth_contracted(row, &direction_a, &direction_b),
+                program.row_third_contracted(row, &direction_ab),
+            ),
+        );
+    }
+    GaussianRowSecondTower {
+        base,
+        first_a,
+        first_b,
+        second,
+    }
 }
 
 impl gam_math::jet_tower::RowProgram<2> for GaussianJointRowProgram<'_> {
