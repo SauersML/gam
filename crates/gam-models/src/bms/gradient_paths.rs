@@ -791,7 +791,6 @@ pub enum MarginalSlopeCovarianceShape {
 enum MarginalSlopeCovarianceStorage {
     Diagonal {
         covariance: Array1<f64>,
-        square_root: Array1<f64>,
     },
     Full {
         covariance: Array2<f64>,
@@ -799,13 +798,16 @@ enum MarginalSlopeCovarianceStorage {
         square_root_factor: Array2<f64>,
     },
     /// Low-rank factor `L` with `Σ = LLᵀ`.
-    LowRank { factor: Array2<f64> },
+    LowRank {
+        factor: Array2<f64>,
+    },
 }
 
 /// Immutable, validated covariance geometry for the physical log-slope vector.
 ///
-/// Admission is the single validation boundary. Dense covariances cache an
-/// eigensquare-root factor so subsequent quadratic forms are exact sums of
+/// Admission is the single validation boundary. Diagonal covariance entries
+/// remain the sole authority for their quadratic forms. Full covariances cache
+/// an eigensquare-root factor so subsequent quadratic forms are exact sums of
 /// squares; runtime code never repeats an eigendecomposition or applies a
 /// negative-value tolerance. The exact `1ᵀΣ1` shared-slope geometry is cached
 /// at the same boundary.
@@ -833,7 +835,6 @@ impl MarginalSlopeCovariance {
         if covariance.is_empty() {
             return Err("marginal-slope diagonal covariance is empty".to_string());
         }
-        let mut square_root = Array1::<f64>::zeros(covariance.len());
         let mut ones_quadratic_form = 0.0;
         for (axis, &value) in covariance.iter().enumerate() {
             if !(value.is_finite() && value >= 0.0) {
@@ -841,18 +842,13 @@ impl MarginalSlopeCovariance {
                     "marginal-slope diagonal covariance entry {axis} must be finite and non-negative, got {value}"
                 ));
             }
-            let root = value.sqrt();
-            square_root[axis] = root;
             ones_quadratic_form += value;
         }
         if !ones_quadratic_form.is_finite() {
             return Err("marginal-slope diagonal covariance geometry overflowed".to_string());
         }
         Ok(Self {
-            storage: MarginalSlopeCovarianceStorage::Diagonal {
-                covariance,
-                square_root,
-            },
+            storage: MarginalSlopeCovarianceStorage::Diagonal { covariance },
             ones_quadratic_form,
         })
     }
@@ -1165,12 +1161,12 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
     {
         assert_eq!(input.len(), self.dim());
         match &self.storage {
-            MarginalSlopeCovarianceStorage::Diagonal { square_root, .. } => input
+            MarginalSlopeCovarianceStorage::Diagonal { covariance } => input
                 .iter()
-                .zip(square_root)
-                .map(|(input, &root)| {
-                    let projection = root * value(input);
-                    projection * projection
+                .zip(covariance)
+                .map(|(input, &covariance)| {
+                    let input = value(input);
+                    covariance * input * input
                 })
                 .sum(),
             MarginalSlopeCovarianceStorage::Full {
@@ -2310,6 +2306,13 @@ mod covariance_admission_tests {
             + direction[1] * (dense[[1, 0]] * direction[0] + dense[[1, 1]] * direction[1]);
         let actual = covariance.quadratic_form(&direction).unwrap();
         assert!((actual - expected).abs() <= 2.0e-15);
+    }
+
+    #[test]
+    fn diagonal_covariance_entries_are_the_exact_geometry_authority_932() {
+        let covariance = MarginalSlopeCovariance::diagonal(array![3.75]).unwrap();
+        assert_eq!(covariance.ones_quadratic_form(), 3.75);
+        assert_eq!(covariance.quadratic_form(&[1.0]).unwrap(), 3.75);
     }
 
     #[test]

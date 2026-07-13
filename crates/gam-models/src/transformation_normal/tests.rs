@@ -90,6 +90,62 @@ pub(crate) fn ctn_penalty_scale_seed_uses_likelihood_to_penalty_ratio() {
 }
 
 #[test]
+pub(crate) fn prebuilt_ctn_family_uses_explicit_rho_without_reseeding() {
+    let response = array![-1.0, -0.2, 0.6, 1.3];
+    let config = toy_scop_ctn_config();
+    let (val_basis, deriv_basis, response_penalties, knots, transform) =
+        build_response_basis(&response, &config).expect("toy response basis builds");
+    let weights = Array1::ones(response.len());
+    let offset = Array1::zeros(response.len());
+    let covariate = array![[1.0], [1.0], [1.0], [1.0]];
+    let build = |source| {
+        TransformationNormalFamily::from_prebuilt_response_basis(
+            &response,
+            val_basis.clone(),
+            deriv_basis.clone(),
+            response_penalties.clone(),
+            knots.clone(),
+            config.response_degree,
+            transform.clone(),
+            &weights,
+            &offset,
+            DesignMatrix::Dense(DenseDesignMatrix::from(covariate.clone())),
+            vec![],
+            &config,
+            None,
+            source,
+        )
+    };
+
+    let derived = build(InitialLogLambdaSource::PenaltyScaleFromWeightedGram)
+        .expect("data-scaled seed family");
+    let rho_dim = derived.initial_log_lambdas.len();
+    assert!(rho_dim > 0, "fixture must carry a smoothing coordinate");
+    let explicit = Array1::from_iter((0..rho_dim).map(|index| -0.75 + 0.125 * index as f64));
+    let supplied = build(InitialLogLambdaSource::Supplied(explicit.clone()))
+        .expect("explicit-rho family");
+    assert!(beta_bits_match(&derived.initial_beta, &supplied.initial_beta));
+    assert!(beta_bits_match(
+        &supplied.block_spec().initial_log_lambdas,
+        &explicit,
+    ));
+
+    let wrong_length = match build(InitialLogLambdaSource::Supplied(Array1::zeros(rho_dim + 1))) {
+        Ok(_) => panic!("wrong-length explicit rho must fail"),
+        Err(error) => error,
+    };
+    assert!(wrong_length.contains("smoothing vector has length"));
+
+    let mut non_finite = explicit;
+    non_finite[0] = f64::NAN;
+    let non_finite = match build(InitialLogLambdaSource::Supplied(non_finite)) {
+        Ok(_) => panic!("non-finite explicit rho must fail"),
+        Err(error) => error,
+    };
+    assert!(non_finite.contains("invalid supplied transformation smoothing strength"));
+}
+
+#[test]
 pub(crate) fn tensor_psi_penalty_derivatives_follow_shape_only_scop_layout() {
     let response = array![-1.0, -0.2, 0.6, 1.3];
     let (val_basis, deriv_basis, knots, transform, p_resp) = toy_response_basis(&response);
@@ -110,6 +166,7 @@ pub(crate) fn tensor_psi_penalty_derivatives_follow_shape_only_scop_layout() {
         vec![],
         &toy_scop_ctn_config(),
         None,
+        InitialLogLambdaSource::PenaltyScaleFromWeightedGram,
     )
     .expect("toy transformation family");
 
@@ -175,6 +232,7 @@ pub(crate) fn tensor_psi_row_chunks_are_window_consistent() {
         vec![],
         &toy_scop_ctn_config(),
         None,
+        InitialLogLambdaSource::PenaltyScaleFromWeightedGram,
     )
     .expect("toy transformation family");
 
@@ -356,6 +414,7 @@ fn toy_family_and_derivatives_with_penalty_mode(
         vec![],
         &toy_scop_ctn_config(),
         None,
+        InitialLogLambdaSource::PenaltyScaleFromWeightedGram,
     )
     .expect("toy transformation family");
     let derivative_blocks =
@@ -662,6 +721,7 @@ pub(crate) fn warm_start_absorbs_offset_into_affine_seed() {
         vec![],
         &toy_scop_ctn_config(),
         Some(&warm_start),
+        InitialLogLambdaSource::PenaltyScaleFromWeightedGram,
     )
     .expect("transformation family");
 
@@ -1712,6 +1772,7 @@ pub(crate) fn ctn_coefficient_hessian_cost_switches_to_matvec_when_matrix_free_a
         vec![],
         &toy_scop_ctn_config(),
         None,
+        InitialLogLambdaSource::PenaltyScaleFromWeightedGram,
     )
     .expect("matrix-free-eligible CTN family");
     let p_resp = family.response_val_basis.ncols() as u64;
