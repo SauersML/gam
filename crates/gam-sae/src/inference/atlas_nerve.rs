@@ -396,9 +396,7 @@ impl AtlasNerveDiagram {
                 "cylinder",
                 2.0 * log_vertices,
             )),
-            (1, 0, Some(1), _) => {
-                Some((GraphCompressionKind::Sphere, "sphere", log_vertices))
-            }
+            (1, 0, Some(1), _) => Some((GraphCompressionKind::Sphere, "sphere", log_vertices)),
             _ => None,
         };
         if let Some((kind, name, named_bits)) = named {
@@ -860,20 +858,98 @@ fn enumerate_full_nerve(
     Ok(inventory)
 }
 
+fn certify_orientation_holonomy(
+    adjacency: &[BTreeSet<usize>],
+    certificate: Option<&AtlasOrientationHolonomyCertificate>,
+) -> Result<Option<AtlasOrientability>, String> {
+    let Some(certificate) = certificate else {
+        return Ok(None);
+    };
+    if certificate.chart_count != adjacency.len() {
+        return Err(format!(
+            "orientation certificate is for {} charts but the atlas has {}",
+            certificate.chart_count,
+            adjacency.len()
+        ));
+    }
+    let admitted_edges: BTreeSet<(usize, usize)> = adjacency
+        .iter()
+        .enumerate()
+        .flat_map(|(a, neighbors)| {
+            neighbors
+                .iter()
+                .copied()
+                .filter(move |&b| a < b)
+                .map(move |b| (a, b))
+        })
+        .collect();
+    let certified_edges: BTreeSet<(usize, usize)> =
+        certificate.edge_signs.keys().copied().collect();
+    if admitted_edges != certified_edges {
+        let missing: Vec<_> = admitted_edges
+            .difference(&certified_edges)
+            .copied()
+            .collect();
+        let surplus: Vec<_> = certified_edges
+            .difference(&admitted_edges)
+            .copied()
+            .collect();
+        return Err(format!(
+            "orientation certificate does not match admitted atlas edges: missing={missing:?}, surplus={surplus:?}"
+        ));
+    }
+
+    let mut orientations = vec![None; adjacency.len()];
+    for root in 0..adjacency.len() {
+        if orientations[root].is_some() {
+            continue;
+        }
+        orientations[root] = Some(1_i8);
+        let mut queue = std::collections::VecDeque::from([root]);
+        while let Some(chart) = queue.pop_front() {
+            let here = orientations[chart].expect("queued chart has an orientation");
+            for &next in &adjacency[chart] {
+                let sign = certificate.edge_signs[&gate_key(chart, next)];
+                let required = here * sign;
+                match orientations[next] {
+                    Some(existing) if existing != required => {
+                        return Ok(Some(AtlasOrientability::NonOrientable));
+                    }
+                    Some(_) => {}
+                    None => {
+                        orientations[next] = Some(required);
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(AtlasOrientability::Orientable))
+}
+
 /// Build the certificate-gated atlas nerve and read Betti numbers through H2.
 #[must_use = "atlas nerve construction errors must be handled"]
 pub fn build_atlas_nerve(
     charts: &[AtlasChart],
     transfer_gates: &[AtlasTransferGate],
     good_cover: Option<&AtlasGoodCoverCertificate>,
+    orientation: Option<&AtlasOrientationHolonomyCertificate>,
 ) -> Result<AtlasNerveDiagram, String> {
     let row_count = validate_charts(charts)?;
     let n = charts.len();
     if n == 0 {
-        if good_cover.is_some_and(|certificate| certificate.chart_count != 0) {
+        if good_cover.is_some_and(|certificate| {
+            certificate.chart_count != 0 || !certificate.proofs.is_empty()
+        }) {
             return Err(
-                "good-cover certificate for a non-empty atlas cannot certify an empty nerve"
-                    .to_string(),
+                "non-empty good-cover certificate cannot certify an empty nerve".to_string(),
+            );
+        }
+        if orientation.is_some_and(|certificate| {
+            certificate.chart_count != 0 || !certificate.edge_signs.is_empty()
+        }) {
+            return Err(
+                "non-empty orientation certificate cannot certify an empty nerve".to_string(),
             );
         }
         return Ok(AtlasNerveDiagram {
@@ -890,6 +966,7 @@ pub fn build_atlas_nerve(
             simplex_counts: Vec::new(),
             euler_characteristic: 0,
             good_cover_certified: good_cover.is_some(),
+            orientation_holonomy: orientation.map(|_| AtlasOrientability::Orientable),
             sampled_support_size: 0,
             covering_side: AtlasCoveringSide::BelowCoveringNumber,
             max_filtration: 0.0,
@@ -950,6 +1027,7 @@ pub fn build_atlas_nerve(
     // streamed into their exact counts and alternating sum, so working memory
     // does not scale with the potentially exponential full nerve.
     let inventory = enumerate_full_nerve(charts, &adjacency, good_cover)?;
+    let orientation_holonomy = certify_orientation_holonomy(&adjacency, orientation)?;
 
     let covering_side = if sampled >= n {
         AtlasCoveringSide::AtOrAboveCoveringNumber
@@ -963,7 +1041,7 @@ pub fn build_atlas_nerve(
         &inventory.tetrahedra,
     );
     let note = format!(
-        "atlas nerve over {n} charts and {row_count} rows: sampled_support_size={sampled}, covering_side={}, good_cover_certified={}, Euler={}, Betti=({}, {}, {:?})",
+        "atlas nerve over {n} charts and {row_count} rows: sampled_support_size={sampled}, covering_side={}, good_cover_certified={}, orientation_holonomy={orientation_holonomy:?}, Euler={}, Betti=({}, {}, {:?})",
         covering_side.as_str(),
         good_cover.is_some(),
         inventory.euler_characteristic,
@@ -982,6 +1060,7 @@ pub fn build_atlas_nerve(
         simplex_counts: inventory.counts,
         euler_characteristic: inventory.euler_characteristic,
         good_cover_certified: good_cover.is_some(),
+        orientation_holonomy,
         sampled_support_size: sampled,
         covering_side,
         max_filtration,
@@ -993,11 +1072,12 @@ pub fn build_atlas_nerve(
 #[cfg(test)]
 mod tests {
     use super::{
-        AtlasChart, AtlasCoveringSide, AtlasGoodCoverCertificate, AtlasTransferGate,
-        ConvexIntersectionProof, build_atlas_nerve,
+        AtlasChart, AtlasCoveringSide, AtlasGoodCoverCertificate, AtlasOrientationEdge,
+        AtlasOrientationHolonomyCertificate, AtlasTransferGate, ConvexIntersectionProof,
+        build_atlas_nerve,
     };
     use crate::chart_transfer::certify_square_transfer;
-    use crate::manifold::GraphCompressionKind;
+    use crate::manifold::{AtlasOrientability, GraphCompressionKind};
     use ndarray::{Array2, arr2};
     use std::collections::BTreeSet;
 
@@ -1070,12 +1150,38 @@ mod tests {
         AtlasGoodCoverCertificate::new(n_charts, proofs).unwrap()
     }
 
+    fn orientation_certificate(
+        n_charts: usize,
+        maximal_intersections: &[Vec<usize>],
+        reversed_edge: Option<(usize, usize)>,
+    ) -> AtlasOrientationHolonomyCertificate {
+        let reversed_edge = reversed_edge.map(|(a, b)| (a.min(b), a.max(b)));
+        let mut pairs = BTreeSet::new();
+        for intersection in maximal_intersections {
+            for left in 0..intersection.len() {
+                for right in (left + 1)..intersection.len() {
+                    let a = intersection[left].min(intersection[right]);
+                    let b = intersection[left].max(intersection[right]);
+                    pairs.insert((a, b));
+                }
+            }
+        }
+        let edges = pairs
+            .into_iter()
+            .map(|(a, b)| {
+                AtlasOrientationEdge::new(a, b, if reversed_edge == Some((a, b)) { -1 } else { 1 })
+                    .unwrap()
+            })
+            .collect();
+        AtlasOrientationHolonomyCertificate::new(n_charts, edges).unwrap()
+    }
+
     #[test]
     fn charts_tiling_synthetic_sphere_have_h2() {
         let faces = vec![vec![0, 1, 2], vec![0, 1, 3], vec![0, 2, 3], vec![1, 2, 3]];
         let charts = charts_from_faces(4, &faces);
         let gates = all_valid_pair_gates(4);
-        let diagram = build_atlas_nerve(&charts, &gates, None).unwrap();
+        let diagram = build_atlas_nerve(&charts, &gates, None, None).unwrap();
         assert_eq!(diagram.betti.b0, 1);
         assert_eq!(diagram.betti.b1, 0);
         assert_eq!(diagram.betti.b2, Some(1));
@@ -1099,7 +1205,7 @@ mod tests {
         let maximal = vec![vec![0, 1, 2, 3, 4]];
         let charts = charts_from_faces(5, &maximal);
         let gates = all_valid_pair_gates(5);
-        let diagram = build_atlas_nerve(&charts, &gates, None).unwrap();
+        let diagram = build_atlas_nerve(&charts, &gates, None, None).unwrap();
         assert_eq!(diagram.simplex_counts, vec![5, 10, 10, 5, 1]);
         assert_eq!(diagram.euler_characteristic, 1);
         assert_eq!(
@@ -1122,10 +1228,48 @@ mod tests {
             ],
         )
         .unwrap();
-        let error = build_atlas_nerve(&charts, &gates, Some(&incomplete)).unwrap_err();
+        let error = build_atlas_nerve(&charts, &gates, Some(&incomplete), None).unwrap_err();
         assert!(
             error.contains("no contractibility proof for non-empty intersection [0, 1]"),
             "unexpected certificate error: {error}"
+        );
+    }
+
+    #[test]
+    fn orientation_holonomy_separates_cylinder_from_mobius() {
+        let n = 8usize;
+        let faces: Vec<Vec<usize>> = (0..n)
+            .map(|a| {
+                let mut edge = vec![a, (a + 1) % n];
+                edge.sort_unstable();
+                edge
+            })
+            .collect();
+        let charts = charts_from_faces(n, &faces);
+        let gates = all_valid_pair_gates(n);
+        let cover = good_cover_certificate(n, &faces);
+
+        let orientable = orientation_certificate(n, &faces, None);
+        let cylinder = build_atlas_nerve(&charts, &gates, Some(&cover), Some(&orientable)).unwrap();
+        assert_eq!(
+            cylinder.orientation_holonomy,
+            Some(AtlasOrientability::Orientable)
+        );
+        assert_eq!(
+            cylinder.certified_compression().kind,
+            GraphCompressionKind::Cylinder
+        );
+
+        let half_twist = orientation_certificate(n, &faces, Some((0, 1)));
+        let mobius = build_atlas_nerve(&charts, &gates, Some(&cover), Some(&half_twist)).unwrap();
+        assert_eq!(
+            mobius.orientation_holonomy,
+            Some(AtlasOrientability::NonOrientable)
+        );
+        assert_eq!(
+            mobius.certified_compression().kind,
+            GraphCompressionKind::Graph,
+            "GF(2) Betti numbers alone cannot call a Möbius cover a cylinder"
         );
     }
 
@@ -1145,7 +1289,7 @@ mod tests {
             AtlasTransferGate::from_square_transfer(1, 2, invalid_cert, 2),
             AtlasTransferGate::from_square_transfer(2, 3, valid_cert, 2),
         ];
-        let diagram = build_atlas_nerve(&charts, &gates, None).unwrap();
+        let diagram = build_atlas_nerve(&charts, &gates, None, None).unwrap();
         assert_eq!(diagram.betti.b0, 2);
         assert_eq!(diagram.betti.b1, 0);
         let rejected = diagram
@@ -1181,7 +1325,16 @@ mod tests {
         let charts = charts_from_faces(side * side, &faces);
         let gates = all_valid_pair_gates(side * side);
         let certificate = good_cover_certificate(side * side, &faces);
-        let diagram = build_atlas_nerve(&charts, &gates, Some(&certificate)).unwrap();
+        let without_orientation =
+            build_atlas_nerve(&charts, &gates, Some(&certificate), None).unwrap();
+        assert_eq!(
+            without_orientation.certified_compression().kind,
+            GraphCompressionKind::Graph,
+            "GF(2) Betti numbers alone cannot distinguish torus from Klein bottle"
+        );
+        let orientation = orientation_certificate(side * side, &faces, None);
+        let diagram =
+            build_atlas_nerve(&charts, &gates, Some(&certificate), Some(&orientation)).unwrap();
         assert_eq!(diagram.betti.b0, 1);
         assert_eq!(diagram.betti.b1, 2);
         assert_eq!(diagram.betti.b2, Some(1));
