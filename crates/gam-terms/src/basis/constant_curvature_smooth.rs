@@ -67,9 +67,9 @@ use gam_geometry::constant_curvature::{ConstantCurvature, distance_kappa_jet};
 
 use super::{
     ActivePenalty, BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeBundle,
-    BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy, PenaltyCandidate,
-    PenaltySource, filter_penalty_candidates, normalize_penalty, select_centers_by_strategy,
-    weighted_coefficient_sum_to_zero_transform,
+    BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy, ConstructiveQuadratic,
+    PenaltyCandidate, PenaltySource, filter_penalty_candidates, normalize_penalty,
+    select_centers_by_strategy, weighted_coefficient_sum_to_zero_transform,
 };
 
 /// Realized-design identifiability policy for the constant-curvature smooth.
