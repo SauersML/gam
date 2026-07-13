@@ -308,7 +308,7 @@ fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
 /// Build the production Direct options + assert the mode the #1551 device branch
 /// keys on.
 fn direct_options() -> ArrowSolveOptions {
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     assert_eq!(
         options.mode,
         ArrowSolverMode::Direct,

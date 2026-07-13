@@ -843,6 +843,11 @@ pub(super) struct BernoulliMarginalSlopeFlexRowScratch {
     pub(super) rho: Array1<f64>,
     pub(super) tau: Array1<f64>,
     pub(super) grad: Array1<f64>,
+    /// Per-primary derivative of the row LOG-LIKELIHOOD score with respect to
+    /// the observed generated regressor z. This is the exact Murphy–Topel
+    /// channel `d(score_primary)/dz`, populated by the same flex row calculus
+    /// that fills `grad`.
+    pub(super) score_zeta: Array1<f64>,
     pub(super) hess: Array2<f64>,
     // Per-row [f64; 4] coefficient buffers used by the flex analytic path. Owned
     // by the scratch so the hot path never allocates a fresh `Vec` per row.
@@ -874,6 +879,7 @@ impl BernoulliMarginalSlopeFlexRowScratch {
             rho: Array1::zeros(primary_dim),
             tau: Array1::zeros(primary_dim),
             grad: Array1::zeros(primary_dim),
+            score_zeta: Array1::zeros(primary_dim),
             hess: Array2::zeros((primary_dim, primary_dim)),
             coeff_u: vec![[0.0; 4]; primary_dim],
             coeff_au: vec![[0.0; 4]; primary_dim],
@@ -892,6 +898,7 @@ impl BernoulliMarginalSlopeFlexRowScratch {
         self.rho.fill(0.0);
         self.tau.fill(0.0);
         self.grad.fill(0.0);
+        self.score_zeta.fill(0.0);
         if need_hessian {
             self.m_au.fill(0.0);
             self.m_uv.fill(0.0);

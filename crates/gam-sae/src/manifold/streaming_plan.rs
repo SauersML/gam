@@ -345,7 +345,8 @@ impl SaeStreamingPlan {
         // repulsion (`add_sae_decoder_repulsion`) keeps atoms apart so the
         // collapse rarely forms; this is the solve-path backstop for when it
         // still does mid-iterate.
-        options.schur_pd_floor = Some(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
+        options.newton_schur_tikhonov_rel_floor =
+            Some(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
         options
     }
 

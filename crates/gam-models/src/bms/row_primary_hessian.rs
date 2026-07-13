@@ -11,6 +11,11 @@ use super::row_kernel::*;
 use super::*;
 use gam_math::probability::normal_logcdf_derivatives;
 
+#[inline]
+fn eval_coeff4_derivative_at(coefficients: &[f64; 4], z: f64) -> f64 {
+    (3.0 * coefficients[3] * z + 2.0 * coefficients[2]) * z + coefficients[1]
+}
+
 /// Second-order scalar moment payload for a cubic coefficient jet.
 ///
 /// For `p(z) = (1,z,z²,z³)`, the first-order pullback needs
@@ -2767,6 +2772,116 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
+    /// Assemble the full-coefficient Murphy–Topel channel
+    /// `d(score_beta,i)/d z_i` for a flex BMS fit.
+    ///
+    /// The row kernel produces the exact sensitivity in its compact primary
+    /// coordinates `(q, logslope, score_warp..., link_dev...)`. This method
+    /// applies the same pullback as the joint score/Hessian assembly: q and
+    /// logslope scatter through their fitted design rows, while deviation
+    /// primaries already are coefficient coordinates and copy directly. The
+    /// returned width must exactly equal the covariance frame; a partial or
+    /// padded result is an error.
+    pub(super) fn flex_score_zeta_sensitivity(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+        expected_beta_dim: usize,
+    ) -> Result<Array2<f64>, String> {
+        if !self.effective_flex_active(block_states)? {
+            return Err(
+                "BMS Murphy-Topel flex z-sensitivity requires an active score_warp or link_dev block"
+                    .to_string(),
+            );
+        }
+        // Murphy–Topel is a full-data covariance correction. Never inherit an
+        // outer-score subsample mask from an optimization probe.
+        let mut full_options = options.clone();
+        full_options.outer_score_subsample = None;
+        full_options.auto_outer_subsample = false;
+        let cache = self.build_or_reuse_shared_exact_cache(
+            block_states,
+            &full_options,
+            false,
+        )?;
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        if slices.total != expected_beta_dim {
+            return Err(format!(
+                "BMS Murphy-Topel covariance/frame mismatch: active coefficient width {} != covariance width {expected_beta_dim}",
+                slices.total
+            ));
+        }
+        let marginal = self
+            .marginal_design
+            .try_to_dense_arc("BMS Murphy-Topel flex marginal design")?;
+        let logslope = self
+            .logslope_design
+            .try_to_dense_arc("BMS Murphy-Topel flex logslope design")?;
+        let n = self.y.len();
+        let mut out = Array2::<f64>::zeros((n, expected_beta_dim));
+        let out_slice = out
+            .as_slice_mut()
+            .ok_or_else(|| "BMS Murphy-Topel output matrix is not contiguous".to_string())?;
+        use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+        use rayon::slice::ParallelSliceMut;
+        out_slice
+            .par_chunks_mut(expected_beta_dim)
+            .enumerate()
+            .try_for_each_init(
+                || BernoulliMarginalSlopeFlexRowScratch::new(primary.total),
+                |scratch, (row, dst)| -> Result<(), String> {
+                    let row_ctx = Self::row_ctx(&cache, row);
+                    let row_moments = cache
+                        .row_cell_moments
+                        .as_ref()
+                        .and_then(|bundle| bundle.row(row, 9));
+                    self.compute_row_analytic_flex_into_with_moments(
+                        row,
+                        block_states,
+                        primary,
+                        row_ctx,
+                        row_moments,
+                        cache.cell_family_forest.as_ref(),
+                        false,
+                        scratch,
+                    )?;
+                    let row_primary = &scratch.score_zeta;
+                    let q_sensitivity = row_primary[primary.q];
+                    for (j, &xij) in marginal.row(row).iter().enumerate() {
+                        dst[slices.marginal.start + j] = q_sensitivity * xij;
+                    }
+                    let g_sensitivity = row_primary[primary.logslope];
+                    for (j, &xij) in logslope.row(row).iter().enumerate() {
+                        dst[slices.logslope.start + j] = g_sensitivity * xij;
+                    }
+                    if let (Some(beta_range), Some(primary_range)) =
+                        (slices.h.as_ref(), primary.h.as_ref())
+                    {
+                        for offset in 0..beta_range.len() {
+                            dst[beta_range.start + offset] =
+                                row_primary[primary_range.start + offset];
+                        }
+                    }
+                    if let (Some(beta_range), Some(primary_range)) =
+                        (slices.w.as_ref(), primary.w.as_ref())
+                    {
+                        for offset in 0..beta_range.len() {
+                            dst[beta_range.start + offset] =
+                                row_primary[primary_range.start + offset];
+                        }
+                    }
+                    if dst.iter().any(|value| !value.is_finite()) {
+                        return Err(format!(
+                            "BMS Murphy-Topel coefficient z-sensitivity produced a non-finite value at row {row}"
+                        ));
+                    }
+                    Ok(())
+                },
+            )?;
+        Ok(out)
+    }
+
     pub(super) fn compute_row_analytic_flex_into_with_moments(
         &self,
         row: usize,
@@ -3432,6 +3547,35 @@ impl BernoulliMarginalSlopeFamily {
         let neglog_val = -w_i * probit[0];
         let d1_m = -w_i * probit[1];
         let d2_m = -w_i * probit[2];
+
+        // #2303 Murphy–Topel generated-regressor channel for the FULL flex
+        // primary vector. Within the selected denested score/link spans every
+        // observed-index quantity is a cubic polynomial in z, so its z
+        // derivative is exact from the SAME coefficient jets used above — no
+        // finite differences and no second row-kernel definition.
+        //
+        // NLL gradient: l_u = l_eta * eta_u.
+        // LOG-LIKELIHOOD score sensitivity:
+        //   d score_u / dz
+        //     = -(l_eta_eta * eta_z * eta_u + l_eta * eta_uz).
+        // `a_u` is independent of the observed row z (the marginal-calibration
+        // root integrates over the fitted latent measure), while
+        //   eta_u  = eta_a * a_u + eta_u|a,
+        // hence
+        //   eta_uz = eta_az * a_u + d(eta_u|a)/dz.
+        let eta_z = eval_coeff4_derivative_at(&obs.coeff, z_obs);
+        let chi_z = eval_coeff4_derivative_at(&obs.dc_da, z_obs);
+        let score_zeta = &mut scratch.score_zeta;
+        for u in 0..r {
+            let rho_z = eval_coeff4_derivative_at(&g_jet.first[u], z_obs);
+            let eta_uz = chi_z * a_u[u] + rho_z;
+            score_zeta[u] = -(d2_m * eta_z * eta_u[u] + d1_m * s_y * eta_uz);
+        }
+        if score_zeta.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "BMS Murphy-Topel flex z-sensitivity produced a non-finite value at row {row}"
+            ));
+        }
 
         if need_hessian {
             let hess = &mut scratch.hess;

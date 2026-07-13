@@ -75,7 +75,7 @@ fn beta_gauge_evidence_fixture(gauge_row: [f64; 3]) -> ArrowSchurSystem {
 pub(crate) fn beta_gauge_quotient_value_inverse_and_gradient_are_orbit_invariant_2022() {
     let sys_a = beta_gauge_evidence_fixture([7.0, 2.0, -3.0]);
     let sys_b = beta_gauge_evidence_fixture([-11.0, 9.0, 8.0]);
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (_, _, cache_a) =
         solve_arrow_newton_step_with_options(&sys_a, 0.0, 0.0, &options).expect("factor A");
     let (_, _, cache_b) =
@@ -1076,11 +1076,11 @@ pub(crate) fn factor_one_row_conditions_barely_pd_block_via_ridge() {
         }
     }
 
-    // Evidence/log-det mode (`tolerate_ill_conditioning = true`) must
+    // Evidence/log-det factorization must
     // accept the same barely-PD block and return its genuine Cholesky
     // factor — the diagonal gives an exact log-determinant.
     let factor = factor_one_row(&row, 0.0, d, 0, true)
-        .expect("tolerate_ill_conditioning must accept a barely-PD-but-PD block");
+        .expect("evidence factorization must accept a barely-PD-but-PD block");
     // L Lᵀ must reproduce the original block (the factor is real, not a
     // damped surrogate).
     for i in 0..d {
@@ -1105,7 +1105,7 @@ pub(crate) fn factor_one_row_conditions_barely_pd_block_via_ridge() {
     let npd = factor_one_row(&row_npd, 0.0, d, 0, true);
     assert!(
         matches!(npd, Err(ArrowSchurError::PerRowFactorFailed { .. })),
-        "non-PD block must error even with tolerate_ill_conditioning; got {npd:?}"
+        "non-PD block must error without an explicit deflation policy; got {npd:?}"
     );
 
     // Sanity: a well-conditioned block at the same dimension still
@@ -1235,7 +1235,7 @@ pub(crate) fn evidence_row_spectral_deflates_indefinite_non_gauge_block_at_unit_
         recon[[2, 2]]
     );
 
-    // The undamped evidence factor (tolerate_ill_conditioning, ridge_t = 0,
+    // The undamped evidence factor (evidence policy, ridge_t = 0,
     // gauge passed in) now SUCCEEDS on this block via spectral deflation
     // rather than refusing — so the SAE driver gets a finite, BIAS-FREE
     // evidence cache and never falls back to a ρ-dependent ridge.
@@ -2069,7 +2069,7 @@ pub(crate) fn schur_inverse_deflated_finite_at_boundary_matches_plain_interior()
 /// correctly reports a recoverable factorization error and the
 /// LM-escalating wrapper recovers it with a finite, well-conditioned step.
 ///
-/// `with_ill_conditioning_tolerated()` accepts the RAW (undamped) blocks.
+/// The positive-definite evidence policy accepts the RAW (undamped) blocks.
 /// Its contract has two sides, pinned on two fixtures:
 ///   * row-PD but assembled-INDEFINITE H (strong coupling into near-null
 ///     t-directions) → honest refusal. Per-row PD does not imply bordered-
@@ -2151,7 +2151,7 @@ pub(crate) fn ill_conditioning_tolerated_returns_cache_with_exact_logdet() {
     // and tolerating ill-CONDITIONING must never fabricate a determinant
     // for an in-DEFINITE system — the SchurFactorFailed refusal is the
     // contract, not a defect.
-    let opts = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let opts = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let tolerate_indefinite = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &opts);
     assert!(
         matches!(
@@ -4990,15 +4990,20 @@ fn slq_reduced_schur_log_det_matches_dense_evidence() {
 
     // One-call convenience: log_det_tt is EXACT (same undamped factorization as
     // the manual sum), and log|S| approximates the dense reduced-Schur log-det.
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (log_det_tt, slq_conv) =
         matrix_free_arrow_evidence_log_det(&sys, 0.0, ridge_beta, &options, 48, 60, seed)
             .expect("matrix-free evidence log-det must succeed for the SPD fixture");
     // Reference factorization must use the SAME options-derived
-    // `tolerate_ill_conditioning` the convenience factors with (via
+    // the evidence policy the convenience factors use (via
     // `factor_blocks_for_system`), so the diagonal sum is bit-comparable.
     let htt_factors_conv = backend
-        .factor_blocks(&sys.rows, 0.0, d, options.tolerate_ill_conditioning)
+        .factor_blocks(
+            &sys.rows,
+            0.0,
+            d,
+            options.evidence_policy.factors_undamped_evidence(),
+        )
         .expect("SPD per-row blocks must factor");
     // Flat (row, axis) accumulation in the SAME order the convenience uses, so
     // the f64 associativity matches bit-for-bit.
@@ -5034,11 +5039,16 @@ fn matrix_free_arrow_evidence_surrogate_none_matches_slq_some_builds_and_reuses(
     let backend = CpuBatchedBlockSolver;
     let ridge_beta = 1e-6;
     let seed = 0x2080_5A17_C0DE_u64;
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
 
     // Dense oracle for the reduced-Schur log|S|.
     let htt_factors = backend
-        .factor_blocks(&sys.rows, 0.0, d, options.tolerate_ill_conditioning)
+        .factor_blocks(
+            &sys.rows,
+            0.0,
+            d,
+            options.evidence_policy.factors_undamped_evidence(),
+        )
         .expect("SPD per-row blocks must factor");
     let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
         .expect("dense reduced Schur must build");
@@ -5698,7 +5708,7 @@ fn reduced_schur_inverse_apply_matches_dense_solve() {
 fn matrix_free_full_arrow_apply_and_inverse_match_dense_cache() {
     let (n, d, k) = (24usize, 3usize, 48usize);
     let sys = dense_direct_system(n, d, k);
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (_, _, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
         .expect("undamped dense oracle factorization");
 

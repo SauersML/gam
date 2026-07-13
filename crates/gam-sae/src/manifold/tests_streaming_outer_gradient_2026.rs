@@ -542,7 +542,7 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
     let system = term
         .assemble_full_matrix_free_evidence_system(target.view(), &rho, None, None)
         .expect("softmax matrix-free evidence system");
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (_, _, cache) = solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
         .expect("direct factorization");
     assert!(
@@ -618,7 +618,7 @@ fn complete_matrix_free_outer_gradient_matches_dense_softmax() {
     let system = term
         .assemble_full_matrix_free_evidence_system(target.view(), &rho, None, None)
         .expect("softmax matrix-free evidence system");
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (_, _, cache) = solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
         .expect("direct factorization");
     assert!(

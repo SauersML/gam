@@ -3002,7 +3002,7 @@ pub(crate) fn objective_stall_cannot_substitute_for_kkt_envelope_2253() {
 #[test]
 pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     let (mut term0, target, rho) = small_two_atom_periodic_term();
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let cold_sys = term0
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
@@ -3178,7 +3178,7 @@ pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (_delta_t, _delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
 
@@ -3269,7 +3269,7 @@ fn matrix_free_smoothness_edf_from_probes_matches_dense_selected_inverse() {
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (_delta_t, _delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
     let lambda = rho.lambda_smooth_vec().unwrap();
@@ -3356,7 +3356,7 @@ fn matrix_free_ard_traces_from_probes_matches_dense_selected_inverse() {
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (_delta_t, _delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
 
@@ -3442,7 +3442,7 @@ fn matrix_free_ard_logdet_hessian_trace_from_probes_matches_dense() {
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (_delta_t, _delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
 
@@ -3529,7 +3529,7 @@ fn analytic_outer_gradient_with_bundle_matches_dense_assembly() {
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (_delta_t, _delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
     let loss = term.loss(target.view(), &rho).unwrap();
@@ -3643,7 +3643,7 @@ fn solve_exact_stationarity_is_self_adjoint_2080() {
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (_delta_t, _delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
     let solver = DeflatedArrowSolver::plain(&cache);
@@ -3741,7 +3741,7 @@ pub(crate) fn latent_block_inverse_diagonal_hutchinson_matches_exact_trace() {
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let (_delta_t, _delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
 
@@ -3856,7 +3856,7 @@ pub(crate) fn streaming_plan_routes_by_memory_budget_with_identical_logdet() {
     let sys = full
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
-    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
     let factor_result = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
     let full_logdet = arrow_log_det_from_cache(&factor_result.2).unwrap();
     let mut streaming = StreamingArrowSchur::from_system(&sys, streaming_plan.chunk_size);

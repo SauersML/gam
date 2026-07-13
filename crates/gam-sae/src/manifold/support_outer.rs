@@ -287,7 +287,7 @@ impl SaeSupportOuterObjective {
                 &self.ard_precisions,
             )
             .map_err(outer_error)?;
-        let options = ArrowSolveOptions::inexact_pcg().with_ill_conditioning_tolerated();
+        let options = ArrowSolveOptions::inexact_pcg().with_positive_definite_evidence();
         let (_, _, cache) = solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
             .map_err(|error| outer_error(format!("support LAML Arrow factorization: {error}")))?;
         let joint_logdet = cache

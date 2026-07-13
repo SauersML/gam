@@ -879,14 +879,7 @@ pub(crate) fn solve_dense_reduced_system(
     options: &ArrowSolveOptions,
     metric_weights: Option<&MetricWeights>,
 ) -> Result<(Array1<f64>, Option<Array2<f64>>, ArrowPcgDiagnostics), ArrowSchurError> {
-    let policy = if options.tolerate_ill_conditioning {
-        options
-            .schur_pd_floor
-            .map(|relative_floor| ReducedSchurPolicy::EvidenceUnitDeflation { relative_floor })
-            .unwrap_or(ReducedSchurPolicy::StrictNewton)
-    } else {
-        ReducedSchurPolicy::newton(options.schur_pd_floor)
-    };
+    let policy = ReducedSchurPolicy::newton(options.newton_schur_tikhonov_rel_floor);
     let DenseReducedSchurFactorization {
         factor,
         conditioned_schur: floored_schur,
@@ -926,13 +919,8 @@ pub(crate) fn solve_dense_reduced_system(
     // `ridge_beta` and re-forms a better-conditioned Schur. This guard is
     // exclusive to the dense Direct / SqrtBA path (the only caller of this
     // function); the inexact-PCG path tolerates higher κ(S) and is unaffected.
-    // Evidence/log-det-only callers (`tolerate_ill_conditioning`) skip this
-    // rejection: the factor is genuinely PD (Cholesky above succeeded), so its
-    // diagonal still yields an exact `log|S|`, and an inaccurate Δβ is harmless
-    // because the step is discarded.
-    if !options.tolerate_ill_conditioning {
-        let schur_kappa = cholesky_factor_kappa_estimate(&factor);
-        if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
+    let schur_kappa = cholesky_factor_kappa_estimate(&factor);
+    if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
             // #1026 — over-complete SAE dictionaries park surplus atoms dead
             // (β_k → 0), so the reduced Schur is PD (the Cholesky above succeeded)
             // but ILL-CONDITIONED: the dead decoder subspace carries near-zero
@@ -949,7 +937,7 @@ pub(crate) fn solve_dense_reduced_system(
             // conditioned case so the LM loop does not exhaust `ridge_β` trying to
             // (futilely) lift a fundamentally rank-deficient dead-atom subspace.
             // Without the floor (BA / non-SAE callers) the strict refusal stands.
-            if let Some(relative_floor) = options.schur_pd_floor
+            if let Some(relative_floor) = options.newton_schur_tikhonov_rel_floor
                 && let Some((floored, floored_factor)) =
                     spectral_pd_floored_schur(schur, relative_floor)
             {
@@ -984,7 +972,6 @@ pub(crate) fn solve_dense_reduced_system(
                      (H_tt)⁻¹ contamination would yield an inaccurate Δβ"
                 ),
             });
-        }
     }
     // Reduced-system solve. The f64 `factor` is always retained and returned —
     // its diagonal is the EXACT `log|S|` the evidence path reads, so the logdet
@@ -1669,7 +1656,12 @@ pub fn matrix_free_arrow_evidence_log_det(
     seed: u64,
 ) -> Result<(f64, SlqLogDet), ArrowSchurError> {
     let backend = CpuBatchedBlockSolver;
-    let factorization = factor_blocks_for_system(sys, ridge_t, options, &backend)?;
+    let factorization = factor_blocks_for_system(
+        sys,
+        ridge_t,
+        options.evidence_policy.factors_undamped_evidence(),
+        &backend,
+    )?;
     let htt_factors = factorization.factors;
     let mut log_det_tt = 0.0_f64;
     for row in 0..htt_factors.len() {
@@ -1909,7 +1901,12 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
     lane: Option<&mut SurrogateLaneState>,
 ) -> Result<(f64, f64), ArrowSchurError> {
     let backend = CpuBatchedBlockSolver;
-    let factorization = factor_blocks_for_system(sys, ridge_t, options, &backend)?;
+    let factorization = factor_blocks_for_system(
+        sys,
+        ridge_t,
+        options.evidence_policy.factors_undamped_evidence(),
+        &backend,
+    )?;
     let htt_factors = factorization.factors;
     let mut log_det_tt = 0.0_f64;
     for row in 0..htt_factors.len() {

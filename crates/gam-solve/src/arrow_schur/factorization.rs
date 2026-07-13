@@ -39,7 +39,7 @@ pub(crate) struct ArrowRowFactorResult {
 ///     (heterogeneous systems keep the per-row CPU loop), and
 ///   * a device is available and EVERY block is positive-definite at the base
 ///     ridge (a non-PD block makes the batched POTRF return `None`), and
-///   * unless `tolerate_ill_conditioning`, every resulting factor passes the
+///   * unless this is an evidence factorization, every resulting factor passes the
 ///     same diagonal-ratio κ ceiling `factor_one_row` enforces.
 ///
 /// Any of those failing returns `None`, so the caller runs the exact per-row
@@ -51,7 +51,7 @@ pub(crate) fn try_factor_blocks_batched(
     rows: &[ArrowRowBlock],
     ridge_t: f64,
     d: usize,
-    tolerate_ill_conditioning: bool,
+    evidence_factorization: bool,
 ) -> Option<ArrowFactorSlab> {
     if d == 0 || rows.is_empty() {
         return None;
@@ -104,7 +104,7 @@ pub(crate) fn try_factor_blocks_batched(
     // whole batch back to the per-row path (where its ridge lifts), matching
     // `factor_one_row` semantics exactly. Evidence/log-det-only callers
     // tolerate ill-conditioning and skip this, as on the CPU path.
-    if !tolerate_ill_conditioning {
+    if !evidence_factorization {
         for (row, factor) in rows.iter().zip(blocks.iter()) {
             let diag_scale = row_block_diag_scale(row, d);
             let kappa_est = cholesky_factor_kappa_estimate(factor);
@@ -756,7 +756,7 @@ pub(crate) fn factor_one_row(
     ridge_t: f64,
     d: usize,
     row_idx: usize,
-    tolerate_ill_conditioning: bool,
+    evidence_factorization: bool,
 ) -> Result<Array2<f64>, ArrowSchurError> {
     // Generic / non-evidence callers (CPU/GPU `factor_blocks`, the system.rs
     // assembly loops) supply no gauge directions AND do not install a row-gauge
@@ -770,7 +770,7 @@ pub(crate) fn factor_one_row(
         ridge_t,
         d,
         row_idx,
-        tolerate_ill_conditioning,
+        evidence_factorization,
         &[],
         false,
     )
@@ -782,7 +782,7 @@ pub(crate) fn factor_one_row_result(
     ridge_t: f64,
     d: usize,
     row_idx: usize,
-    tolerate_ill_conditioning: bool,
+    evidence_factorization: bool,
     row_gauges: &[Array1<f64>],
     allow_spectral_deflation: bool,
 ) -> Result<ArrowRowFactorResult, ArrowSchurError> {
@@ -853,7 +853,7 @@ pub(crate) fn factor_one_row_result(
                 // Evidence/log-det-only callers tolerate ill-conditioning: the
                 // factor is genuinely PD, so its diagonal gives an exact log|S|
                 // and an inaccurate Δβ would be discarded anyway.
-                if tolerate_ill_conditioning {
+                if evidence_factorization {
                     if ridge_t == 0.0
                         && !row_gauges.is_empty()
                         && let Some(deflated) =
@@ -934,14 +934,14 @@ pub(crate) fn factor_one_row_result(
                 ridge_eff = next;
             }
             Err(e) => {
-                // Evidence/log-det callers (`tolerate_ill_conditioning = true`)
+                // Evidence/log-det factorization
                 // consume the returned factor's diagonal as the exact
                 // log|H_tt + ridge_t·I|. Silently lifting ridge past the
                 // caller's base would shift that determinant by Σ d·log(1+δ/λ)
                 // while returning Ok, corrupting the reported evidence. A
                 // genuinely non-PD block at the base ridge must surface as
                 // an error here, not be quietly conditioned.
-                if tolerate_ill_conditioning {
+                if evidence_factorization {
                     if ridge_t == 0.0 {
                         if let Some(deflated) =
                             factor_gauge_deflated_evidence_row(row, d, row_gauges)

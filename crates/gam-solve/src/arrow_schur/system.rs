@@ -184,7 +184,7 @@ pub struct ArrowSchurSystem {
     /// These vectors live in each row's actual chart block, so compact SAE rows
     /// and dense rows share the same factorization path. Ordinary Newton solves
     /// ignore them; only undamped evidence factors with
-    /// `tolerate_ill_conditioning` set may stiffen a gauge-explained row
+    /// evidence factorization may stiffen a gauge-explained row
     /// direction.
     pub row_gauge_deflation: Option<ArrowRowGaugeDeflation>,
     /// Exact scale-gauge quotient on the reduced shared `beta` border.
@@ -1312,11 +1312,10 @@ pub struct StreamingArrowSchur {
     /// `d_i ≪ K`, this is the per-row sparse apply that replaces the `O(K)`
     /// column-probe in the streaming reduced-Schur accumulation.
     pub(crate) htbeta_transpose_matvec: Option<RowHtbetaTransposeMatvec>,
-    /// Lift the per-row κ rejection for evidence/log-det-only solves; see
-    /// [`ArrowSolveOptions::tolerate_ill_conditioning`]. Set by [`Self::solve`]
-    /// from the options; defaults to `false` so direct callers of
-    /// [`Self::accumulate_chunk`] keep the full guard.
-    pub(crate) tolerate_ill_conditioning: bool,
+    /// Whether streaming rows are being factored for undamped evidence rather
+    /// than for a Newton step. Defaults to `false` so direct chunk callers keep
+    /// the full step-accuracy guard.
+    pub(crate) evidence_factorization: bool,
     /// SAE manifold evidence-path per-row gauge deflation, copied from the
     /// source [`ArrowSchurSystem::row_gauge_deflation`] (#1273/#1377). When
     /// present, the streaming per-row factor MUST apply the SAME spectral
@@ -1370,7 +1369,7 @@ impl StreamingArrowSchur {
             row_builder,
             htbeta_matvec: None,
             htbeta_transpose_matvec: None,
-            tolerate_ill_conditioning: false,
+            evidence_factorization: false,
             row_gauge_deflation: None,
         }
     }
@@ -1453,7 +1452,7 @@ impl StreamingArrowSchur {
                 ridge_t,
                 di,
                 row_idx,
-                self.tolerate_ill_conditioning,
+                self.evidence_factorization,
                 deflation.row(row_idx),
                 // Evidence path: opt into spectral discovery of an
                 // intrinsic-dimension-flat direction even when this row's
@@ -1462,7 +1461,7 @@ impl StreamingArrowSchur {
                 true,
             )
             .map(|result| result.factor),
-            None => factor_one_row(row, ridge_t, di, row_idx, self.tolerate_ill_conditioning),
+            None => factor_one_row(row, ridge_t, di, row_idx, self.evidence_factorization),
         }
     }
 
@@ -1670,7 +1669,7 @@ impl StreamingArrowSchur {
         ridge_beta: f64,
         options: &ArrowSolveOptions,
     ) -> Result<(f64, Array2<f64>), ArrowSchurError> {
-        self.tolerate_ill_conditioning = options.tolerate_ill_conditioning;
+        self.evidence_factorization = options.evidence_policy.factors_undamped_evidence();
         self.reset_accumulator(ridge_beta)?;
         let backend = CpuBatchedBlockSolver;
         let mut log_det_tt = 0.0_f64;
@@ -1707,19 +1706,11 @@ impl StreamingArrowSchur {
         schur: &Array2<f64>,
         options: &ArrowSolveOptions,
     ) -> Result<f64, ArrowSchurError> {
-        let rhs = Array1::<f64>::zeros(schur.nrows());
-        let trust_metric_weights = None;
-        let (delta, schur_factor, diag) =
-            solve_dense_reduced_system(schur, &rhs, options, trust_metric_weights)?;
-        if delta.len() != schur.nrows() || diag.iterations != 0 {
-            return Err(ArrowSchurError::SchurFactorFailed {
-                reason: "streaming log-det reduced solve returned incoherent diagnostics"
-                    .to_string(),
-            });
-        }
-        let schur_factor = schur_factor.ok_or_else(|| ArrowSchurError::SchurFactorFailed {
-            reason: "streaming log-det requires a dense reduced Schur factor".to_string(),
-        })?;
+        let schur_factor = factor_dense_reduced_schur(
+            schur,
+            options.evidence_policy.reduced_schur_policy(),
+        )?
+        .factor;
         let mut log_det_schur = 0.0_f64;
         for axis in 0..schur_factor.nrows() {
             log_det_schur += 2.0 * schur_factor[[axis, axis]].ln();
@@ -1744,11 +1735,8 @@ impl StreamingArrowSchur {
         ridge_beta: f64,
         options: &ArrowSolveOptions,
     ) -> Result<(Array1<f64>, Array1<f64>, Option<Array2<f64>>), ArrowSchurError> {
-        // Propagate the evidence/log-det ill-conditioning tolerance to the
-        // per-row factor calls inside `accumulate_chunk` / `back_substitute`,
-        // which take their stable public signatures. Direct callers of
-        // `accumulate_chunk` keep the conservative default (`false`, full guard).
-        self.tolerate_ill_conditioning = options.tolerate_ill_conditioning;
+        // Newton streaming factors always retain the step-accuracy guard.
+        self.evidence_factorization = false;
         self.reset_accumulator(ridge_beta)?;
         for start in (0..self.n_rows).step_by(self.chunk_size) {
             let end = (start + self.chunk_size).min(self.n_rows);

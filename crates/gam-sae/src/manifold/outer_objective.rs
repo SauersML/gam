@@ -1962,7 +1962,7 @@ impl SaeManifoldOuterObjective {
             // Pivot invariant: min pivot ≥ eps · diag_scale, measured ON THE
             // GAUGE QUOTIENT (#1095). The floor uses machine epsilon (not its
             // square root) because the undamped cache is built with
-            // `with_ill_conditioning_tolerated()`, which accepts any
+            // the positive-definite evidence policy, which accepts any
             // positive-definite factor regardless of condition number.
             // Sub-sqrt(eps) pivots are legitimately produced when N < beta_dim
             // (small-N fits where the decoder Gram is rank-deficient) — this

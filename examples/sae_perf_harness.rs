@@ -699,7 +699,7 @@ fn run(shape: Shape) -> Result<(), String> {
         .solve_with_options(
             0.0,
             0.0,
-            &ArrowSolveOptions::direct().with_ill_conditioning_tolerated(),
+            &ArrowSolveOptions::direct().with_positive_definite_evidence(),
         )
         .map_err(|err| format!("inner solve failed: {err}"))?;
     print_stage(

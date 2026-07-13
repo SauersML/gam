@@ -2848,31 +2848,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
 
     let mut resolved_specs = solved.resolved_specs;
     let mut designs = solved.designs;
-    // Reduced-basis round-trip (robust cure). When the logslope design was
-    // orthogonalised to a reduced basis `G·T`, the fitted logslope coefficient
-    // `β'` lives in the reduced coordinates (width `r`). The returned
-    // `logslope_design` / `logslopespec_resolved` are the ORIGINAL full-width
-    // basis (prediction rebuilds full `G` from the resolved spec), so map the
-    // reported logslope coefficients back to the original basis `β_logslope =
-    // T·β'` (predictor-identical: `G·(T·β') = (G·T)·β'`). The marginal block,
-    // aux blocks, and the internal reduced-width flat β/geometry are untouched;
-    // only the per-block reported logslope coefficients (blocks[1] and
-    // block_states[1]) — which prediction/reporting consume against the full
-    // design — are lifted to full width.
     let mut solved_fit = solved.fit;
-    if let Some(reparam) = logslope_reduced_reparam.as_ref() {
-        let r = reparam.reduced_cols();
-        if let Some(block) = solved_fit.blocks.get_mut(1)
-            && block.beta.len() == r
-        {
-            block.beta = reparam.recover_original_logslope_beta(&block.beta)?;
-        }
-        if let Some(state) = solved_fit.block_states.get_mut(1)
-            && state.beta.len() == r
-        {
-            state.beta = reparam.recover_original_logslope_beta(&state.beta)?;
-        }
-    }
     // #905 GENERATED-REGRESSOR (Murphy–Topel) SEAM. When the conditional
     // location-scale gate fired, the slope fit above treated the calibrated
     // score `ζ = (z − m̂(C))/√v̂(C)` as KNOWN, so `solved_fit.beta_covariance()`

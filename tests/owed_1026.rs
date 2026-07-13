@@ -318,7 +318,7 @@ fn spectral_floor_preserves_healthy_subspace_under_mixed_collapse_1026() {
     sys.refresh_row_hessian_fingerprint();
 
     let mut floored = ArrowSolveOptions::direct();
-    floored.schur_pd_floor = Some(1.0e-8);
+    floored.newton_schur_tikhonov_rel_floor = Some(1.0e-8);
     let (_delta_t, delta_beta, _cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &floored)
             .expect("mixed-collapse floored solve must succeed");
@@ -349,13 +349,13 @@ fn spectral_floor_preserves_healthy_subspace_under_mixed_collapse_1026() {
 /// that dropped the floor (or never wired it on the SAE path) fails (b); a
 /// regression that floored a HEALTHY system fails (a).
 #[test]
-fn reduced_schur_pd_floor_recovers_indefinite_collapse_1026() {
+fn reduced_schur_tikhonov_recovers_indefinite_collapse_1026() {
     let sys = indefinite_collapsed_schur_system(0.01, 1.0, 1.0);
 
     // (a) Default options: strict non-PD refusal.
     let strict = ArrowSolveOptions::direct();
     assert!(
-        strict.schur_pd_floor.is_none(),
+        strict.newton_schur_tikhonov_rel_floor.is_none(),
         "default options must NOT floor the Schur (strict contract for BA / non-SAE callers)"
     );
     let strict_result = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &strict);
@@ -369,7 +369,7 @@ fn reduced_schur_pd_floor_recovers_indefinite_collapse_1026() {
 
     // (b) Floor engaged: a finite step on the conditioned (PD-floored) Schur.
     let mut floored = ArrowSolveOptions::direct();
-    floored.schur_pd_floor = Some(1.0e-8);
+    floored.newton_schur_tikhonov_rel_floor = Some(1.0e-8);
     let (delta_t, delta_beta, _cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &floored)
             .expect("spectral PD-floor must convert the non-PD refusal into a usable step");
@@ -399,13 +399,13 @@ fn reduced_schur_pd_floor_recovers_indefinite_collapse_1026() {
 /// cure cannot perturb the converged dictionary anywhere the collapse does not
 /// occur. (`h_bb` large vs the subtraction keeps S positive definite.)
 #[test]
-fn reduced_schur_pd_floor_is_noop_on_healthy_system_1026() {
+fn reduced_schur_tikhonov_is_noop_on_healthy_system_1026() {
     // h_bb = 1000 ≫ c²/h_tt = 100, so S = diag(900, 900) ≻ 0 (healthy).
     let sys = indefinite_collapsed_schur_system(0.01, 1.0, 1000.0);
 
     let strict = ArrowSolveOptions::direct();
     let mut floored = ArrowSolveOptions::direct();
-    floored.schur_pd_floor = Some(1.0e-8);
+    floored.newton_schur_tikhonov_rel_floor = Some(1.0e-8);
 
     let (dt_strict, db_strict, _c0) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &strict)
         .expect("healthy PD Schur must solve without the floor");
@@ -453,7 +453,7 @@ fn matrix_free_pcg_curvature_floor_recovers_unbounded_negative_curvature_1026() 
         pcg_strict.trust_region.radius == f64::INFINITY,
         "the SAE inner solve runs UNBOUNDED (radius = ∞); fixture must match that"
     );
-    assert!(pcg_strict.schur_pd_floor.is_none());
+    assert!(pcg_strict.newton_schur_tikhonov_rel_floor.is_none());
     // Keep it strictly the unbounded matrix-free path.
     pcg_strict.gpu_matvec = None;
     let strict_result = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &pcg_strict);
@@ -481,7 +481,7 @@ fn matrix_free_pcg_curvature_floor_recovers_unbounded_negative_curvature_1026() 
     // WITH the floor: the curvature-floor retry conditions the collapsed
     // direction and the unbounded PCG returns a finite step.
     let mut pcg_floor = ArrowSolveOptions::inexact_pcg();
-    pcg_floor.schur_pd_floor = Some(1.0e-8);
+    pcg_floor.newton_schur_tikhonov_rel_floor = Some(1.0e-8);
     pcg_floor.gpu_matvec = None;
     let (delta_t, delta_beta, _cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &pcg_floor).expect(
@@ -515,7 +515,7 @@ fn matrix_free_pcg_curvature_floor_is_noop_on_healthy_system_1026() {
     let mut pcg_strict = ArrowSolveOptions::inexact_pcg();
     pcg_strict.gpu_matvec = None;
     let mut pcg_floor = ArrowSolveOptions::inexact_pcg();
-    pcg_floor.schur_pd_floor = Some(1.0e-8);
+    pcg_floor.newton_schur_tikhonov_rel_floor = Some(1.0e-8);
     pcg_floor.gpu_matvec = None;
 
     let (dt_strict, db_strict, _c0) =

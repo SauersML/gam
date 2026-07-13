@@ -219,6 +219,34 @@ impl ArrowSolvePrecisionPolicy {
     }
 }
 
+/// Conditioning contract for the undamped evidence cache.
+///
+/// This is intentionally independent of Newton-step damping. Evidence may
+/// accept a genuinely positive but ill-conditioned operator, or may unit-pin
+/// numerical nulls so they contribute `log 1 = 0`; neither choice is permitted
+/// to alter the Newton system or its Tikhonov floor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ArrowEvidencePolicy {
+    Strict,
+    PositiveDefinite,
+    UnitDeflation { relative_floor: f64 },
+}
+
+impl ArrowEvidencePolicy {
+    pub(crate) fn factors_undamped_evidence(self) -> bool {
+        !matches!(self, Self::Strict)
+    }
+
+    pub(crate) fn reduced_schur_policy(self) -> ReducedSchurPolicy {
+        match self {
+            Self::Strict | Self::PositiveDefinite => ReducedSchurPolicy::StrictNewton,
+            Self::UnitDeflation { relative_floor } => {
+                ReducedSchurPolicy::EvidenceUnitDeflation { relative_floor }
+            }
+        }
+    }
+}
+
 /// Complete BA Schur solve options.
 ///
 /// Use [`ArrowSolveOptions::automatic`] for normal latent-coordinate fits;
@@ -242,23 +270,8 @@ pub struct ArrowSolveOptions {
     /// `crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend` when `cuda_selected()`
     /// and the system has dense per-row H_tβ slabs. `None` means CPU-only PCG.
     pub gpu_matvec: Option<GpuSchurMatvec>,
-    /// Skip the ill-conditioning *rejection* (the κ-based
-    /// [`ArrowSchurError::PerRowFactorIllConditioned`] per-row guard and the
-    /// matching reduced-Schur κ guard) while still requiring genuine positive
-    /// definiteness (a non-PD Cholesky pivot still errors).
-    ///
-    /// The κ guards exist to protect the accuracy of the Newton *step*: a
-    /// barely-PD `H_tt^(i)` or an over-conditioned reduced Schur yields an
-    /// inaccurate `Δβ`/`Δt`. Evidence-only callers
-    /// (e.g. `SaeManifoldTerm::penalized_quasi_laplace_criterion_with_cache`) do not consume the
-    /// step — they need only the factor cache for the log-determinant
-    /// (`½log|H|`, exact from `diag(L)` regardless of κ) and the selected-inverse
-    /// traces. For those callers the κ rejection is a false abort when ρ sweeps
-    /// to extreme values, so this flag lifts it and hands the
-    /// "is this step trustworthy" decision back to the caller.
-    ///
-    /// Default `false`: ordinary solves keep the full guard.
-    pub tolerate_ill_conditioning: bool,
+    /// Conditioning contract for the separately-built undamped evidence cache.
+    pub evidence_policy: ArrowEvidencePolicy,
     /// Arrow solve precision policy. Default is f64-only.
     pub solve_precision: ArrowSolvePrecisionPolicy,
     /// Optional spectral positive-definiteness floor on the *reduced Schur
@@ -290,7 +303,7 @@ pub struct ArrowSolveOptions {
     /// Only consulted by the dense Direct / SqrtBA reduced solve (the only
     /// caller of [`super::reduced_solve::solve_dense_reduced_system`]); the
     /// InexactPCG path is unaffected.
-    pub schur_pd_floor: Option<f64>,
+    pub newton_schur_tikhonov_rel_floor: Option<f64>,
     /// #1017 device-resident framed SAE frame for the LM ridge ladder.
     ///
     /// When set (by [`super::newton_step::solve_with_lm_escalation_inner`] on a
@@ -316,9 +329,12 @@ impl std::fmt::Debug for ArrowSolveOptions {
             .field("streaming_chunk_size", &self.streaming_chunk_size)
             .field("riemannian_trust_region", &self.riemannian_trust_region)
             .field("gpu_matvec", &self.gpu_matvec.is_some())
-            .field("tolerate_ill_conditioning", &self.tolerate_ill_conditioning)
+            .field("evidence_policy", &self.evidence_policy)
             .field("solve_precision", &self.solve_precision)
-            .field("schur_pd_floor", &self.schur_pd_floor)
+            .field(
+                "newton_schur_tikhonov_rel_floor",
+                &self.newton_schur_tikhonov_rel_floor,
+            )
             .field("sae_resident_frame", &self.sae_resident_frame.is_some())
             .finish()
     }
@@ -393,9 +409,9 @@ impl ArrowSolveOptions {
             streaming_chunk_size: None,
             riemannian_trust_region: false,
             gpu_matvec: None,
-            tolerate_ill_conditioning: false,
+            evidence_policy: ArrowEvidencePolicy::Strict,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
-            schur_pd_floor: None,
+            newton_schur_tikhonov_rel_floor: None,
             sae_resident_frame: None,
         }
     }
@@ -410,9 +426,9 @@ impl ArrowSolveOptions {
             streaming_chunk_size: None,
             riemannian_trust_region: false,
             gpu_matvec: None,
-            tolerate_ill_conditioning: false,
+            evidence_policy: ArrowEvidencePolicy::Strict,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
-            schur_pd_floor: None,
+            newton_schur_tikhonov_rel_floor: None,
             sae_resident_frame: None,
         }
     }
@@ -426,9 +442,9 @@ impl ArrowSolveOptions {
             streaming_chunk_size: None,
             riemannian_trust_region: false,
             gpu_matvec: None,
-            tolerate_ill_conditioning: false,
+            evidence_policy: ArrowEvidencePolicy::Strict,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
-            schur_pd_floor: None,
+            newton_schur_tikhonov_rel_floor: None,
             sae_resident_frame: None,
         }
     }
@@ -442,9 +458,9 @@ impl ArrowSolveOptions {
             streaming_chunk_size: None,
             riemannian_trust_region: false,
             gpu_matvec: None,
-            tolerate_ill_conditioning: false,
+            evidence_policy: ArrowEvidencePolicy::Strict,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
-            schur_pd_floor: None,
+            newton_schur_tikhonov_rel_floor: None,
             sae_resident_frame: None,
         }
     }
@@ -454,28 +470,24 @@ impl ArrowSolveOptions {
         self
     }
 
-    /// Lift the ill-conditioning *rejection* for evidence/log-det-only callers
-    /// while still requiring genuine PD. See [`Self::tolerate_ill_conditioning`].
-    ///
-    /// Use this when the returned `(Δt, Δβ)` Newton step is discarded and only
-    /// the factor cache is consumed (log-determinant + selected-inverse traces).
-    /// The cache stays undamped at `ridge_t = 0`, so the log-determinant is
-    /// exact regardless of κ.
-    pub fn with_ill_conditioning_tolerated(mut self) -> Self {
-        self.tolerate_ill_conditioning = true;
+    /// Build an undamped evidence cache that accepts positive-definite factors
+    /// regardless of their Newton-step condition-number gate.
+    pub fn with_positive_definite_evidence(mut self) -> Self {
+        self.evidence_policy = ArrowEvidencePolicy::PositiveDefinite;
         self
     }
 
-    /// Enable the spectral PD-floor on an indefinite reduced Schur (the SAE solve
-    /// path): floor the collapsed / dead-atom directions up to `floor·max(λ)` and
-    /// re-factor instead of hard-erroring. An overcomplete manifold-SAE fit parks
-    /// surplus atoms dead, so the reduced Schur (and the undamped evidence factor
-    /// at the optimum) can have near-zero / slightly-negative eigenvalues on the
-    /// dead subspace; flooring those lets the live subspace's exact Newton /
-    /// log-det proceed instead of aborting the whole fit on a non-PD pivot. `None`
-    /// (default) keeps the strict refusal for BA / non-SAE callers.
-    pub fn with_schur_pd_floor(mut self, floor: f64) -> Self {
-        self.schur_pd_floor = Some(floor);
+    /// Build the undamped evidence β-Schur with original-coordinate unit
+    /// deflation at `relative_floor`.
+    pub fn with_evidence_unit_deflation(mut self, relative_floor: f64) -> Self {
+        self.evidence_policy = ArrowEvidencePolicy::UnitDeflation { relative_floor };
+        self
+    }
+
+    /// Enable Newton-only spectral Tikhonov damping on collapsed reduced-Schur
+    /// directions. This never changes the evidence value or inverse.
+    pub fn with_newton_schur_tikhonov(mut self, relative_floor: f64) -> Self {
+        self.newton_schur_tikhonov_rel_floor = Some(relative_floor);
         self
     }
 
@@ -512,14 +524,14 @@ pub trait BatchedBlockSolver {
     /// Factor every per-row point block `H_tt^(i) + ridge_t I`, as in BA's
     /// point elimination stage.
     ///
-    /// `tolerate_ill_conditioning` lifts the per-row κ rejection (still
-    /// requiring genuine PD); see [`ArrowSolveOptions::tolerate_ill_conditioning`].
+    /// `evidence_factorization` lifts the Newton-step κ rejection while still
+    /// requiring genuine PD unless the system's evidence deflation handles it.
     fn factor_blocks(
         &self,
         rows: &[ArrowRowBlock],
         ridge_t: f64,
         d: usize,
-        tolerate_ill_conditioning: bool,
+        evidence_factorization: bool,
     ) -> Result<ArrowFactorSlab, ArrowSchurError>;
 
     /// Solve one factored point block against a vector RHS.
@@ -705,7 +717,7 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         rows: &[ArrowRowBlock],
         ridge_t: f64,
         d: usize,
-        tolerate_ill_conditioning: bool,
+        evidence_factorization: bool,
     ) -> Result<ArrowFactorSlab, ArrowSchurError> {
         // Multi-GPU fast path: the per-row blocks `H_tt^(i) + ridge_t·I` are
         // independent same-size SPD systems — exactly the batch
@@ -724,7 +736,7 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         // back onto the per-row path so its ridge can lift, never silently using
         // a contaminated factor.
         if let Some(batched) =
-            try_factor_blocks_batched(rows, ridge_t, d, tolerate_ill_conditioning)
+            try_factor_blocks_batched(rows, ridge_t, d, evidence_factorization)
         {
             return Ok(batched);
         }
@@ -747,7 +759,7 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
                             ridge_t,
                             d,
                             row_idx,
-                            tolerate_ill_conditioning,
+                            evidence_factorization,
                         )
                     })
                 })
@@ -760,7 +772,7 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
                     ridge_t,
                     d,
                     row_idx,
-                    tolerate_ill_conditioning,
+                    evidence_factorization,
                 )?);
             }
             out

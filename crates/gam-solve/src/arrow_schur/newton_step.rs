@@ -32,19 +32,6 @@ pub const SCHUR_SLQ_LOGDET_LANCZOS_STEPS: usize = 64;
 pub const SCHUR_SLQ_LOGDET_SEED: u64 = 0x5121_0901_4C0D_E700;
 
 #[inline]
-fn evidence_beta_gauge_active(
-    sys: &ArrowSchurSystem,
-    ridge_t: f64,
-    ridge_beta: f64,
-    options: &ArrowSolveOptions,
-) -> bool {
-    ridge_t == 0.0
-        && ridge_beta == 0.0
-        && options.tolerate_ill_conditioning
-        && sys.beta_gauge_quotient.is_some()
-}
-
-#[inline]
 fn pin_evidence_beta_schur(sys: &ArrowSchurSystem, schur: Array2<f64>) -> Array2<f64> {
     match sys.beta_gauge_quotient.as_ref() {
         Some(quotient) => quotient.pin_reduced_schur(schur.view()),
@@ -94,33 +81,28 @@ pub fn solve_arrow_newton_step_with_options(
             estimated_bytes: htbeta_estimated_bytes,
         }
     };
-    // Factor the UNDAMPED per-row blocks for the IFT predictor. When
-    // ridge_t was zero the damped and undamped factors coincide and we
-    // can alias htt_factors directly; otherwise pay a second per-row
-    // Cholesky (O(N d³), same complexity class as the Newton solve).
+    // Factor the UNDAMPED per-row blocks under the evidence policy. This is
+    // deliberately separate even at ridge zero: the Newton factors enforce
+    // step conditioning, while evidence factors may unit-deflate quotient
+    // nulls and must surface the corresponding gradient metadata.
     let htt_factors = step.htt_factors;
     let mut schur_factor = step.schur_factor;
     let mut beta_schur_deflation = None;
     let schur_log_det_override = step.schur_log_det_override;
-    // The per-row deflated directions must describe the factors the gradient's
-    // selected-inverse actually uses. For the ridge-0 evidence cache the damped
-    // and undamped factors coincide, so the step's directions apply directly;
-    // for a damped Newton cache (ridge_t > 0, never the gradient path) re-derive
-    // them from the undamped factorization alongside its deflation count.
+    // The per-row deflated directions describe exactly the independently-built
+    // evidence factors consumed by the selected inverse.
     let (
         htt_factors_undamped,
         gauge_deflated_directions,
         deflated_row_directions,
         deflation_row_spectra,
-    ) = if ridge_t == 0.0 {
-        (
-            ArrowUndampedFactors::SameAsDamped,
-            step.gauge_deflated_directions,
-            step.deflated_row_directions,
-            step.deflation_row_spectra,
-        )
-    } else {
-        let undamped = factor_blocks_for_system(sys, 0.0, options, &backend)?;
+    ) = {
+        let undamped = factor_blocks_for_system(
+            sys,
+            0.0,
+            options.evidence_policy.factors_undamped_evidence(),
+            &backend,
+        )?;
         (
             ArrowUndampedFactors::Owned(undamped.factors),
             undamped.gauge_deflated_directions,
@@ -129,8 +111,7 @@ pub fn solve_arrow_newton_step_with_options(
         )
     };
     let mut schur_factor_is_undamped = sys.k == 0;
-    let mut beta_gauge_factor_is_pinned =
-        evidence_beta_gauge_active(sys, ridge_t, ridge_beta, options);
+    let mut beta_gauge_factor_is_pinned = false;
     // A step factor is never an evidence factor, even at ridge zero: its
     // collapsed directions follow Newton/Tikhonov policy. Rebuild the dense
     // undamped Schur explicitly so value, inverse, and gradients share the
@@ -150,12 +131,7 @@ pub fn solve_arrow_newton_step_with_options(
             beta_deflation: evidence_beta_deflation,
         } = factor_dense_reduced_schur(
             &evidence_schur,
-            options
-                .schur_pd_floor
-                .map(|relative_floor| ReducedSchurPolicy::EvidenceUnitDeflation {
-                    relative_floor,
-                })
-                .unwrap_or(ReducedSchurPolicy::StrictNewton),
+            options.evidence_policy.reduced_schur_policy(),
         )?;
         drop(floored_evidence_schur);
         schur_factor = Some(evidence_schur_factor);
@@ -249,7 +225,13 @@ pub fn probe_undamped_evidence_row_factors(
         // factorization remains the authority.
         return Ok(());
     }
-    factor_blocks_for_system(sys, 0.0, options, &CpuBatchedBlockSolver).map(|_| ())
+    factor_blocks_for_system(
+        sys,
+        0.0,
+        options.evidence_policy.factors_undamped_evidence(),
+        &CpuBatchedBlockSolver,
+    )
+    .map(|_| ())
 }
 
 pub(crate) fn estimated_htbeta_bytes(n: usize, d: usize, k: usize) -> Option<usize> {
@@ -704,7 +686,7 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
             //
             //   * Small k (< SCHUR_SLQ_LOGDET_MIN_DIM): the exact dense Cholesky
             //     log-determinant, bit-identical to the CPU Direct path (including
-            //     the #1026 `schur_pd_floor` handling). Cheap and reproducible.
+            //     the #1026 Newton Tikhonov handling). Cheap and reproducible.
             //
             //   * Large k (≥ SCHUR_SLQ_LOGDET_MIN_DIM): Stochastic Lanczos
             //     Quadrature (`crate::arrow_schur::slq_logdet`) on the SPD
@@ -1554,7 +1536,7 @@ pub(crate) struct ArrowBlockFactorization {
 pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
-    options: &ArrowSolveOptions,
+    evidence_factorization: bool,
     backend: &B,
 ) -> Result<ArrowBlockFactorization, ArrowSchurError> {
     let Some(deflation) = sys.row_gauge_deflation.as_ref() else {
@@ -1563,7 +1545,7 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
                 &sys.rows,
                 ridge_t,
                 sys.d,
-                options.tolerate_ill_conditioning,
+                evidence_factorization,
             )?,
             gauge_deflated_directions: 0,
             deflated_row_directions: Vec::new(),
@@ -1598,7 +1580,7 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
                         ridge_t,
                         sys.row_dims[row_idx],
                         row_idx,
-                        options.tolerate_ill_conditioning,
+                        evidence_factorization,
                         deflation.row(row_idx),
                         true,
                     )
@@ -1613,7 +1595,7 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
                 ridge_t,
                 sys.row_dims[row_idx],
                 row_idx,
-                options.tolerate_ill_conditioning,
+                evidence_factorization,
                 deflation.row(row_idx),
                 true,
             )?);
@@ -1762,7 +1744,7 @@ pub(crate) fn try_mixed_precision_arrow_solve(
         beta_deflation: _,
     } = factor_dense_reduced_schur(
         schur,
-        ReducedSchurPolicy::newton(options.schur_pd_floor),
+        ReducedSchurPolicy::newton(options.newton_schur_tikhonov_rel_floor),
     )?;
     if floored_schur.is_some() {
         return Ok(Some(MixedPrecisionAttempt::Fallback {
@@ -1770,17 +1752,15 @@ pub(crate) fn try_mixed_precision_arrow_solve(
                 .to_string(),
         }));
     }
-    if !options.tolerate_ill_conditioning {
-        let schur_kappa = cholesky_factor_kappa_estimate(&schur_factor);
-        if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
-            return Err(ArrowSchurError::SchurFactorFailed {
-                reason: format!(
-                    "reduced Schur complement Cholesky succeeded but is ill-conditioned \
-                     (kappa_estimate={schur_kappa:e}); accumulated per-row \
-                     (H_tt)^-1 contamination would yield an inaccurate delta_beta"
-                ),
-            });
-        }
+    let schur_kappa = cholesky_factor_kappa_estimate(&schur_factor);
+    if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "reduced Schur complement Cholesky succeeded but is ill-conditioned \
+                 (kappa_estimate={schur_kappa:e}); accumulated per-row \
+                 (H_tt)^-1 contamination would yield an inaccurate delta_beta"
+            ),
+        });
     }
 
     if let Some(reason) =
@@ -2215,7 +2195,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
     // 1. BA point elimination: per-row Cholesky factors of
     // (H_tt^(i) + ridge_t · I).  `factor_blocks` reads the actual row
     // dimension from `row.htt.nrows()` so heterogeneous systems work.
-    let block_factorization = factor_blocks_for_system(sys, ridge_t, options, &backend)?;
+    let block_factorization = factor_blocks_for_system(sys, ridge_t, false, &backend)?;
     let htt_factors = block_factorization.factors;
     let gauge_deflated_directions = block_factorization.gauge_deflated_directions;
     let deflated_row_directions = block_factorization.deflated_row_directions;
@@ -2504,7 +2484,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                 trust_metric_weights,
                 // #1026 — the same opt-in floor the dense path uses, here gating
                 // the matrix-free unbounded-PCG curvature-floor retry.
-                options.schur_pd_floor,
+                options.newton_schur_tikhonov_rel_floor,
             )?;
             (delta, None, diag)
         }
@@ -2557,19 +2537,17 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
         sys: &'a ArrowSchurSystem,
         ridge_t: f64,
         ridge_beta: f64,
-        schur_pd_floor: Option<f64>,
-        tolerate_ill_conditioning: bool,
+        newton_schur_tikhonov_rel_floor: Option<f64>,
         backend: &'a B,
     ) -> Result<Self, ArrowSchurError>
     where
         B: Sync,
     {
-        let htt_factors =
-            backend.factor_blocks(&sys.rows, ridge_t, sys.d, tolerate_ill_conditioning)?;
+        let htt_factors = backend.factor_blocks(&sys.rows, ridge_t, sys.d, false)?;
         let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, backend)?;
         let schur_factor = factor_dense_reduced_schur(
             &schur,
-            ReducedSchurPolicy::newton(schur_pd_floor),
+            ReducedSchurPolicy::newton(newton_schur_tikhonov_rel_floor),
         )?
         .factor;
         Ok(Self {
@@ -2871,8 +2849,7 @@ pub(crate) fn solve_arrow_newton_step_cross_row(
         sys,
         ridge_t,
         ridge_beta,
-        options.schur_pd_floor,
-        options.tolerate_ill_conditioning,
+        options.newton_schur_tikhonov_rel_floor,
         &backend,
     )?;
 
