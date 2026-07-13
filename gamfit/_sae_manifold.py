@@ -295,9 +295,9 @@ def sae_manifold_certify_external(
 
     Unlike :func:`sae_manifold_fit`, this runs NO closed-form solve: `t_init`
     (per-atom trained on-manifold coordinates), `a_init` (trained routing
-    logits), and `decoder_blocks` (per-atom trained decoders) are installed
-    VERBATIM, and the native post-fit certificate/diagnostics pipeline runs
-    directly on that supplied state. `log_lambda_sparse` /
+    logits), and `decoder_blocks` (per-atom trained decoders) define the exact
+    installed state. Native Rust performs only the declared Tier-0 coordinate
+    change before auditing it. `log_lambda_sparse` /
     `log_lambda_smooth` / `log_ard` must be the terminal regularization state
     that produced the decoder (the same "regularization the decoder was
     trained under" contract the frozen-decoder OOS encode carries) — an

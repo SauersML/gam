@@ -1185,7 +1185,8 @@ pub fn run_sae_manifold_steer_to_target(
 /// frozen dictionary [`run_sae_manifold_oos`] / [`run_sae_manifold_steer`]
 /// rebuild from [`SaeOosAtomSpec`] + trained coordinates/logits — no
 /// coordinate or decoder solve; the caller's own (e.g. torch) training loop
-/// already produced them — installs it VERBATIM as
+/// already produced them. It maps physical target/decoder columns into the
+/// explicitly declared Tier-0 frame, installs that exact state as
 /// [`SaeCertifyRequest::base_term`], and delegates to
 /// [`run_sae_manifold_certify`] for the shared post-fit diagnostics /
 /// anytime-valid structure certificate pipeline. This is the entry a torch-lane
@@ -1246,7 +1247,8 @@ pub struct SaeCertifyExternalRequest {
 /// [`run_sae_manifold_oos`] / [`run_sae_manifold_steer`] (same
 /// [`SaeOosAtomSpec`] contract) so a torch-lane caller's decoder/coords/logits
 /// rebuild into the identical dictionary a native fit or OOS encode would, then
-/// hands the rebuilt term to [`run_sae_manifold_certify`] verbatim.
+/// hands the exact rebuilt internal-frame term to
+/// [`run_sae_manifold_certify`].
 pub fn run_sae_manifold_certify_external(
     request: SaeCertifyExternalRequest,
 ) -> Result<super::SaeExternalCertificationOutcome, SaeFitError> {

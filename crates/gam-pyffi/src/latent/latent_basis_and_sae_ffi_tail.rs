@@ -993,7 +993,7 @@ fn sae_manifold_predict_oos<'py>(
 /// own trained decoder/coords/logits using the identical per-atom marshalling
 /// contract as [`sae_manifold_predict_oos`] / `sae_steer_delta` (basis kind +
 /// latent_dim + decoder block + Duchon centers/harmonics), installs it
-/// verbatim, and calls
+/// in the caller-declared Tier-0 frame, and calls
 /// [`gam::terms::sae::manifold::run_sae_manifold_certify_external`].
 ///
 /// `initial_coords`/`initial_logits` are REQUIRED here (unlike the fit path's

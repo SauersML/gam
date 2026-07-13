@@ -6145,34 +6145,77 @@ mod empirical_flex_jet_oracle_tests {
                 }
 
                 let (
-                    fourth_repeated_ns,
-                    fourth_scheduled_ns,
+                    fourth_alternative_ns,
+                    fourth_production_ns,
                     fourth_speedup,
-                    fourth_repeated,
-                    fourth_scheduled,
+                    fourth_alternative,
+                    fourth_production,
                 ) = scheduled_abba_medians(
                     SAMPLES,
-                    || {
-                        ordered_pairs
+                    || match empirical_bms_jet_schedule(EmpiricalBmsJetChannel::FourthMany, r) {
+                        EmpiricalBmsJetSchedule::FixedWidthFromPlan => ordered_pairs
                             .iter()
                             .map(|(direction_u, direction_v)| {
-                                fixture
-                                    .family
-                                    .empirical_flex_row_fourth_contracted(
-                                        0,
-                                        &fixture.primary,
-                                        q,
-                                        slope,
-                                        beta_h,
-                                        beta_w,
-                                        &row_ctx,
-                                        direction_u,
-                                        direction_v,
-                                        &fixture.grid,
-                                    )
-                                    .expect("repeated fixed-width fourth contraction")
+                                fixture.family.empirical_flex_row_fourth_contracted(
+                                    0,
+                                    &fixture.primary,
+                                    q,
+                                    slope,
+                                    beta_h,
+                                    beta_w,
+                                    &row_ctx,
+                                    direction_u,
+                                    direction_v,
+                                    &fixture.grid,
+                                )
                             })
-                            .collect::<Vec<_>>()
+                            .collect::<Result<Vec<_>, _>>()
+                            .expect("repeated fixed-width fourth alternative"),
+                        EmpiricalBmsJetSchedule::RepeatedFixedWidth => {
+                            let plan = fixture
+                                .family
+                                .empirical_bms_row_jet_plan(
+                                    0,
+                                    &fixture.primary,
+                                    q,
+                                    slope,
+                                    beta_h,
+                                    beta_w,
+                                    row_ctx.intercept,
+                                    &fixture.grid,
+                                )
+                                .expect("fixed-plan fourth alternative");
+                            let point = BernoulliMarginalSlopeFamily::intercept_primary_point(
+                                q, slope, beta_h, beta_w,
+                            );
+                            match r {
+                                8 => BernoulliMarginalSlopeFamily::
+                                    empirical_fixed_fourth_many_from_plan::<8>(
+                                        &plan,
+                                        &point,
+                                        &ordered_pairs,
+                                    ),
+                                12 => BernoulliMarginalSlopeFamily::
+                                    empirical_fixed_fourth_many_from_plan::<12>(
+                                        &plan,
+                                        &point,
+                                        &ordered_pairs,
+                                    ),
+                                18 => BernoulliMarginalSlopeFamily::
+                                    empirical_fixed_fourth_many_from_plan::<18>(
+                                        &plan,
+                                        &point,
+                                        &ordered_pairs,
+                                    ),
+                                _ => unreachable!(
+                                    "common repeated fourth schedule has width {r}"
+                                ),
+                            }
+                            .expect("fixed-plan fourth alternative")
+                        }
+                        EmpiricalBmsJetSchedule::DynamicBatch { .. } => {
+                            unreachable!("final schedule grid contains only common widths")
+                        }
                     },
                     || {
                         fixture
@@ -6188,14 +6231,14 @@ mod empirical_flex_jet_oracle_tests {
                                 &ordered_pairs,
                                 &fixture.grid,
                             )
-                            .expect("scheduled fourth contractions")
+                            .expect("production fourth contractions")
                     },
                 );
                 for lane in 0..ordered_pairs.len() {
                     assert_matrix_close(
-                        "final scheduled fourth",
-                        &fourth_repeated[lane],
-                        &fourth_scheduled[lane],
+                        "final production fourth",
+                        &fourth_alternative[lane],
+                        &fourth_production[lane],
                     );
                 }
 
@@ -6219,7 +6262,7 @@ mod empirical_flex_jet_oracle_tests {
                     trace_speedup,
                 );
                 eprintln!(
-                    "BMS932_FINAL kind={kind} r={r} channel=t4-many repeated_abba_median_ns={fourth_repeated_ns} scheduled_abba_median_ns={fourth_scheduled_ns} abba_speedup={:.3} arena_bytes={fourth_stable}",
+                    "BMS932_FINAL kind={kind} r={r} channel=t4-many alternative_abba_median_ns={fourth_alternative_ns} production_abba_median_ns={fourth_production_ns} selection_speedup={:.3} arena_bytes={fourth_stable}",
                     fourth_speedup,
                 );
             }
