@@ -4204,6 +4204,118 @@ pub(crate) fn fixed_log_lambda_outer_finalizer_rejects_recomputed_objective_mism
 }
 
 #[test]
+pub(crate) fn fixed_log_lambda_outer_finalizer_replays_active_jeffreys_profile() {
+    #[derive(Clone)]
+    struct ActiveJeffreysQuadraticFamily;
+
+    impl CustomFamily for ActiveJeffreysQuadraticFamily {
+        fn joint_jeffreys_term_required(&self) -> bool {
+            true
+        }
+
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let beta = block_states[0].beta[0];
+            Ok(FamilyEvaluation {
+                log_likelihood: -0.25 * beta * beta,
+                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                    gradient: array![-0.5 * beta],
+                    hessian: SymmetricMatrix::Dense(array![[0.5]]),
+                }],
+            })
+        }
+
+        fn exact_newton_joint_hessian(
+            &self,
+            _: &[ParameterBlockState],
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(array![[0.5]]))
+        }
+
+        fn exact_newton_joint_hessian_directional_derivative(
+            &self,
+            _: &[ParameterBlockState],
+            _: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(array![[0.0]]))
+        }
+
+        fn has_explicit_joint_hessian(&self) -> bool {
+            true
+        }
+    }
+
+    let family = ActiveJeffreysQuadraticFamily;
+    let specs = vec![ParameterBlockSpec {
+        name: "active_jeffreys".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let rho = array![0.0];
+    let profiled = evaluate_custom_family_joint_hyper(
+        &family,
+        &specs,
+        &options,
+        &rho,
+        &[vec![]],
+        None,
+        EvalMode::ValueOnly,
+    )
+    .expect("the active-Jeffreys profile should evaluate");
+    let beta = profiled
+        .warm_start
+        .block_beta_view(0)
+        .expect("profiled mode must retain beta")
+        .to_owned();
+    let states = vec![ParameterBlockState {
+        beta: beta.clone(),
+        eta: specs[0].design.apply(&beta),
+    }];
+    let (phi, _, _) = custom_family_outer_jeffreys_hphi(
+        &family,
+        &states,
+        &specs,
+        &block_param_ranges(&specs),
+    )
+    .expect("Jeffreys profile probe")
+    .expect("absolute curvature below one must arm the Jeffreys profile");
+    assert_ne!(phi.to_bits(), 0.0_f64.to_bits());
+
+    let certified_outer = certified_test_outer(rho.clone(), profiled.objective);
+    let fit = fit_custom_family_fixed_log_lambdas_from_outer(
+        &family,
+        &specs,
+        &options,
+        Some(&profiled.warm_start),
+        &rho,
+        &certified_outer,
+    )
+    .expect("the exact active-Jeffreys profile must retain its outer certificate");
+
+    assert_eq!(fit.penalized_objective.to_bits(), profiled.objective.to_bits());
+    assert!(
+        fit.convergence_evidence()
+            .outer_certificate()
+            .is_some_and(|certificate| certificate.certifies())
+    );
+}
+
+#[test]
 pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay() {
     let family = OneStepReturnedSaddleFamily::new(0.125);
     let specs = one_step_returned_saddle_specs();
