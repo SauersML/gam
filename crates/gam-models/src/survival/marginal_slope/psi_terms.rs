@@ -32,7 +32,7 @@ impl SurvivalMarginalSlopeFamily {
             primary[0] + primary[1],
             &mut score_m.view_mut(),
         )?;
-        self.logslope_design
+        self.logslope_layout.coefficient_design()
             .axpy_row_into(row, primary[3], &mut score_g.view_mut())?;
         Ok(())
     }
@@ -76,7 +76,7 @@ impl SurvivalMarginalSlopeFamily {
                 score_m.scaled_add(primary[q], jm[q]);
             }
         }
-        self.logslope_design
+        self.logslope_layout.coefficient_design()
             .axpy_row_into(row, primary[3], &mut score_g.view_mut())?;
         Ok(())
     }

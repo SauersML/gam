@@ -1688,6 +1688,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                         coords: BlockDesignCoords|
      -> Result<Vec<ParameterBlockSpec>, String> {
         let hints = hints.borrow();
+        let block_logslope_layout = match coords {
+            BlockDesignCoords::PostCutover => post_cutover_logslope_layout.clone(),
+            BlockDesignCoords::RematerializedRaw => logslope_topology.materialize_identity(
+                logslope_design.design.clone(),
+                &common_logslope_offset,
+            )?,
+        };
+        block_logslope_layout.validate_for(spec.z.ncols())?;
         let mut cursor = 0usize;
         let rho_time = rho
             .slice(s![cursor..cursor + time_penalties_len])
@@ -1762,7 +1770,12 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let logslope_beta_hint = hints
             .logslope_beta
             .as_ref()
-            .filter(|beta| beta.len() == logslope_design.design.ncols())
+            .filter(|beta| {
+                beta.len()
+                    == block_logslope_layout
+                        .coefficient_design()
+                        .ncols()
+            })
             .cloned();
         let mut blocks = vec![
             build_time_blockspec(&time_block_ref, &design_exit, rho_time, time_beta_hint),
@@ -1774,16 +1787,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             ),
             build_logslope_blockspec(
                 logslope_design,
-                &logslope_topology,
+                &block_logslope_layout,
                 baseline_slope,
                 &spec.logslope_offset,
                 rho_logslope,
                 logslope_beta_hint,
-                Arc::from(z_primary.as_slice().ok_or_else(|| {
-                    "z_primary must be C-contiguous to build logslope block".to_string()
-                })?),
-                probit_scale,
-            ),
+                Arc::clone(&z),
+                score_covariance.clone(),
+            )?,
         ];
         // V+M-exact cutover: when the active cutover fired, the
         // `*_penalties_vm` side bindings carry per-block-width Dense

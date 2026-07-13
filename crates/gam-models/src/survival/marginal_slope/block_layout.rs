@@ -320,7 +320,7 @@ pub(crate) fn block_slices(
     }
     let time = 0..family.design_entry.ncols();
     let marginal = time.end..time.end + family.marginal_design.ncols();
-    let logslope = marginal.end..marginal.end + family.logslope_design.ncols();
+    let logslope = marginal.end..marginal.end + family.logslope_layout.coefficient_design().ncols();
     let mut cursor = logslope.end;
     let score_warp = family.score_warp.as_ref().map(|runtime| {
         let range = cursor..cursor + runtime.basis_dim() * family.score_dim();

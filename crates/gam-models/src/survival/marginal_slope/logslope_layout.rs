@@ -331,6 +331,63 @@ impl LogslopeLayout {
         Ok(())
     }
 
+    /// Fill physical log-slope values and their full-width
+    /// current-coordinate rows directly from a coefficient vector. Unlike the
+    /// likelihood's shared-channel fast path, this includes the layout-owned
+    /// offset and is therefore the authoritative source for effective-Jacobian
+    /// callbacks.
+    pub(crate) fn fill_callback_row(
+        &self,
+        row: usize,
+        beta: &Array1<f64>,
+        workspace: &mut LogslopeRowWorkspace,
+    ) -> Result<(), String> {
+        match &self.channels {
+            LogslopeChannels::PerScore { .. } => {
+                self.fill_per_score_row(row, beta, workspace)
+            }
+            LogslopeChannels::Shared { offset } => {
+                if row >= self.nrows {
+                    return Err(format!(
+                        "logslope callback row {row} is out of bounds for {} rows",
+                        self.nrows
+                    ));
+                }
+                if beta.len() != self.current_width {
+                    return Err(format!(
+                        "logslope callback beta length {} does not match current width {}",
+                        beta.len(),
+                        self.current_width,
+                    ));
+                }
+                if workspace.channel_rows.ncols() != self.current_width
+                    || workspace.values.len() != workspace.channel_rows.nrows()
+                {
+                    return Err(
+                        "shared logslope callback workspace shape does not match layout".to_string(),
+                    );
+                }
+                self.coefficient_design
+                    .row_chunk_into(
+                        row..row + 1,
+                        workspace.channel_rows.slice_mut(s![0..1, ..]),
+                    )
+                    .map_err(|error| {
+                        format!("shared logslope callback row materialization failed: {error}")
+                    })?;
+                for channel in 1..workspace.channel_rows.nrows() {
+                    for col in 0..self.current_width {
+                        workspace.channel_rows[[channel, col]] =
+                            workspace.channel_rows[[0, col]];
+                    }
+                }
+                let value = self.coefficient_design.dot_row(row, beta) + offset[row];
+                workspace.values.fill(value);
+                Ok(())
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]

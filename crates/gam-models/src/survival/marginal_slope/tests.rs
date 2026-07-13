@@ -106,15 +106,6 @@ fn unit_score_covariance() -> MarginalSlopeCovariance {
     MarginalSlopeCovariance::Diagonal(array![1.0])
 }
 
-// Mirrors the production single-z convention produced by
-// `combine_logslope_surface_designs` for `designs.len() == 1`, where the
-// emitted ranges vector is `vec![0..ncols]`. Test fixtures use empty
-// logslope designs (`n × 0`), so the single placeholder range is `0..0`.
-fn empty_logslope_surface_ranges() -> Vec<std::ops::Range<usize>> {
-    let placeholder = 0..0;
-    vec![placeholder]
-}
-
 fn base_time_block() -> TimeBlockInput {
     TimeBlockInput {
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -269,8 +260,7 @@ fn make_closed_form_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         offset_exit: Arc::new(offset_exit),
         derivative_offset_exit: Arc::new(derivative_offset_exit),
         marginal_design: DesignMatrix::from(Array2::zeros((n, 0))),
-        logslope_design: DesignMatrix::from(Array2::zeros((n, 0))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((n, 0)))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -561,8 +551,7 @@ fn test_family(
         offset_exit: Arc::new(Array1::zeros(1)),
         derivative_offset_exit: Arc::new(Array1::from_elem(1, 1e-6)),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 2))),
-        logslope_design: DesignMatrix::from(Array2::zeros((1, 3))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((1, 3)))).into(),
         score_warp,
         link_dev,
         influence_absorber: None,
@@ -961,8 +950,7 @@ fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
         offset_exit: Arc::new(array![0.4]),
         derivative_offset_exit: Arc::new(array![0.8]),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -1308,8 +1296,7 @@ fn oracle_rigid_family(
         offset_exit: Arc::new(Array1::from_shape_fn(n, |r| 0.15 - 0.03 * (r as f64))),
         derivative_offset_exit: Arc::new(Array1::from_elem(n, 0.0)),
         marginal_design: DesignMatrix::from(Array2::zeros((n, 0))),
-        logslope_design: DesignMatrix::from(Array2::zeros((n, 0))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((n, 0)))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -1556,8 +1543,7 @@ fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.6]),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -1706,8 +1692,7 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
             offset_exit: Arc::new(array![fix.q1]),
             derivative_offset_exit: Arc::new(array![fix.qd1]),
             marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
             influence_absorber: None,
@@ -1904,8 +1889,7 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         offset_exit: Arc::new(array![q1v]),
         derivative_offset_exit: Arc::new(array![qd1v]),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -2521,8 +2505,7 @@ fn flex_directional_second_derivative_fd_localizer() {
         offset_exit: Arc::new(array![q1v]),
         derivative_offset_exit: Arc::new(array![qd1v]),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -2789,8 +2772,7 @@ fn flex_bidirectional_fourth_localizer() {
         offset_exit: Arc::new(array![q1v]),
         derivative_offset_exit: Arc::new(array![qd1v]),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -3174,8 +3156,7 @@ fn flex_base_hessian_gw0_per_timepoint_matches_gradient_fd() {
         offset_exit: Arc::new(array![q1v]),
         derivative_offset_exit: Arc::new(array![qd1v]),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -3389,8 +3370,7 @@ fn flex_logslope_first_sensitivity_matches_fd() {
             offset_exit: Arc::new(array![q1v]),
             derivative_offset_exit: Arc::new(array![qd1v]),
             marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
             influence_absorber: None,
@@ -3489,8 +3469,7 @@ fn link_flex_family_supports_second_order_exact_outer_path() {
         offset_exit: Arc::new(Array1::zeros(1)),
         derivative_offset_exit: Arc::new(Array1::ones(1)),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -3533,8 +3512,7 @@ fn timewiggle_scorewarp_family_supports_second_order_exact_outer_path() {
         offset_exit: Arc::new(Array1::zeros(1)),
         derivative_offset_exit: Arc::new(Array1::ones(1)),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: None,
         influence_absorber: None,
@@ -3691,8 +3669,7 @@ fn survival_marginal_slope_coefficient_cost_uses_joint_coupled_formula() {
         offset_exit: Arc::new(Array1::zeros(n)),
         derivative_offset_exit: Arc::new(Array1::ones(n)),
         marginal_design: DesignMatrix::from(Array2::zeros((n, p_marg))),
-        logslope_design: DesignMatrix::from(Array2::zeros((n, p_log))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((n, p_log)))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -3738,8 +3715,7 @@ fn exact_outer_row_work_gate_keeps_large_timewiggle_link_models_under_linear_fle
         offset_exit: Arc::new(Array1::zeros(1)),
         derivative_offset_exit: Arc::new(Array1::ones(1)),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 20))),
-        logslope_design: DesignMatrix::from(Array2::zeros((1, 20))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((1, 20)))).into(),
         score_warp: None,
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -3783,8 +3759,7 @@ fn timewiggle_scorewarp_beta_hessian_directional_derivative_returns_finite_matri
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(array![[1.0]]),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(array![[1.0]])).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: None,
         influence_absorber: None,
@@ -3854,8 +3829,7 @@ fn timewiggle_scorewarp_beta_hessian_second_directional_derivative_returns_finit
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(array![[1.0]]),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(array![[1.0]])).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: None,
         influence_absorber: None,
@@ -3932,8 +3906,7 @@ fn link_flex_bidirectional_timepoint_returns_finite_transport() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_design: DesignMatrix::from(array![[1.0]]),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(array![[1.0]])).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -4038,8 +4011,7 @@ fn link_flex_blockwise_exact_newton_matches_joint_principal_blocks() {
         offset_exit: Arc::new(array![0.15, 0.08]),
         derivative_offset_exit: Arc::new(array![0.9, 1.1]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(logslope_design.clone()),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(logslope_design.clone())).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -4101,8 +4073,7 @@ fn link_flex_marginal_psi_terms_return_finite_joint_terms() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(array![[1.0]]),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(array![[1.0]])).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -4184,8 +4155,7 @@ fn link_flex_marginal_psi_second_order_returns_finite_joint_terms() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(logslope_design.clone()),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(logslope_design.clone())).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -4274,8 +4244,7 @@ fn link_flex_marginal_psi_hessian_directional_returns_finite_matrix() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(array![[1.0]]),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(array![[1.0]])).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -4364,8 +4333,7 @@ fn timewiggle_marginal_psi_terms_return_finite_joint_terms() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(array![[1.0]]),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(array![[1.0]])).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: None,
         influence_absorber: None,
@@ -4451,8 +4419,7 @@ fn timewiggle_blockwise_exact_newton_matches_joint_principal_blocks() {
         offset_exit: Arc::new(array![0.15, 0.08]),
         derivative_offset_exit: Arc::new(array![0.9, 1.1]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(array![[1.0], [0.5]]),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(array![[1.0], [0.5]])).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: None,
         influence_absorber: None,
@@ -4510,8 +4477,7 @@ fn flex_timewiggle_fast_gradient_matches_dense_joint_gradient() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(logslope_design.clone()),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(logslope_design.clone())).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -4604,8 +4570,7 @@ fn timewiggle_joint_hessian_matches_central_fd_of_joint_gradient() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(logslope_design.clone()),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(logslope_design.clone())).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -4806,8 +4771,7 @@ fn row_dynamic_q_geometry_into_pooled_matches_fresh_allocation_bitwise() {
         offset_exit: Arc::new(array![0.15, 0.08]),
         derivative_offset_exit: Arc::new(array![0.9, 1.1]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(logslope_design.clone()),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(logslope_design.clone())).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -4986,8 +4950,7 @@ fn flex_timewiggle_operator_to_dense_matches_evaluate_dense_joint_hessian() {
         offset_exit: Arc::new(array![0.15, 0.08]),
         derivative_offset_exit: Arc::new(array![0.9, 1.1]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(logslope_design.clone()),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(logslope_design.clone())).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -5061,8 +5024,7 @@ fn timewiggle_marginal_logslope_psi_second_order_returns_finite_joint_terms() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(logslope_design.clone()),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(logslope_design.clone())).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: None,
         influence_absorber: None,
@@ -5147,8 +5109,7 @@ fn timewiggle_marginal_psi_hessian_directional_returns_finite_matrix() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(array![[1.0]]),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(array![[1.0]])).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: None,
         influence_absorber: None,
@@ -5232,8 +5193,7 @@ fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(array![[1.0]]),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(array![[1.0]])).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5303,10 +5263,9 @@ fn censored_rows_still_reject_invalid_time_derivative() {
         marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
         )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        )),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        ))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5374,10 +5333,9 @@ fn exact_newton_evaluation_propagates_invalid_rows() {
         marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
         )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        )),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        ))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5438,10 +5396,9 @@ fn time_constraints_use_exact_derivative_guard_rows() {
         marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((2, 0)),
         )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((2, 0)),
-        )),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        ))).into(),
         time_linear_constraints: time_derivative_guard_constraints(
             &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
                 [1.0, 1.0],
@@ -5522,10 +5479,9 @@ fn time_block_constraints_synthesize_qd1_rows_when_stored_constraints_missing() 
         marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
         )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        )),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        ))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5586,10 +5542,9 @@ fn time_block_max_feasible_step_uses_synthesized_qd1_rows() {
         marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
         )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        )),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        ))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5647,10 +5602,9 @@ fn coupled_qd1_guard_limits_time_step_before_post_update_projection() {
         marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
         )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        )),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        ))).into(),
         time_linear_constraints: Some(constraints),
         score_warp: None,
         link_dev: None,
@@ -5720,10 +5674,9 @@ fn timewiggle_tail_step_is_clipped_before_it_can_flip_derivative() {
         marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
         )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        )),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        ))).into(),
         time_linear_constraints: Some(constraints),
         score_warp: None,
         link_dev: None,
@@ -5771,10 +5724,9 @@ fn time_block_post_update_rejects_infeasible_beta_instead_of_projecting() {
         marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
         )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        )),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        ))).into(),
         time_linear_constraints: append_timewiggle_tail_nonnegative_constraints(
             time_derivative_guard_constraints(
                 &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
@@ -5862,10 +5814,9 @@ fn time_block_post_update_rejects_qd1_when_no_linear_constraints() {
         marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
         )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        )),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        ))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5945,10 +5896,9 @@ fn time_block_post_update_errors_when_current_violates_qd1() {
         marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
         )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        )),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        ))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -6016,10 +5966,9 @@ fn time_block_feasible_step_stays_inside_derivative_guard() {
         marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
         )),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        )),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        ))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -6101,8 +6050,7 @@ fn mixed_blockwise_exact_newton_preserves_sparse_block_hessians() {
         offset_exit: Arc::new(array![0.0, 0.0]),
         derivative_offset_exit: Arc::new(array![0.05, 0.05]),
         marginal_design: sparse_design(&array![[1.0, 0.0], [0.0, 1.0]]),
-        logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [0.5]])),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [0.5]]))).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -6191,8 +6139,7 @@ fn survival_marginal_slope_pairwise_oracle_dumps_json() {
         offset_exit: Arc::new(array![0.15]),
         derivative_offset_exit: Arc::new(array![0.9]),
         marginal_design: DesignMatrix::from(marginal_design.clone()),
-        logslope_design: DesignMatrix::from(logslope_design.clone()),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(logslope_design.clone())).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -6632,8 +6579,7 @@ fn make_block_psi_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         offset_exit: Arc::new(offset_exit),
         derivative_offset_exit: Arc::new(derivative_offset_exit),
         marginal_design: DesignMatrix::from(marginal_design),
-        logslope_design: DesignMatrix::from(logslope_design),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(logslope_design)).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -6654,7 +6600,7 @@ fn block_psi_test_block_states(
 ) -> Vec<ParameterBlockState> {
     let n = family.n;
     let m_design = family.marginal_design.to_dense().to_owned();
-    let g_design = family.logslope_design.to_dense().to_owned();
+    let g_design = family.logslope_layout.coefficient_design().to_dense().to_owned();
     let m_eta = m_design.dot(&array![m_beta]);
     let g_eta = g_design.dot(&array![g_beta]);
     vec![
@@ -7282,8 +7228,7 @@ fn make_flex_no_wiggle_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         offset_exit: Arc::new(offset_exit),
         derivative_offset_exit: Arc::new(derivative_offset_exit),
         marginal_design: DesignMatrix::from(marginal_design),
-        logslope_design: DesignMatrix::from(logslope_design),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(logslope_design)).into(),
         score_warp: Some(score_runtime),
         link_dev: None,
         influence_absorber: None,
@@ -7302,7 +7247,7 @@ fn flex_no_wiggle_test_block_states(
 ) -> Vec<ParameterBlockState> {
     let n = family.n;
     let m_design = family.marginal_design.to_dense().to_owned();
-    let g_design = family.logslope_design.to_dense().to_owned();
+    let g_design = family.logslope_layout.coefficient_design().to_dense().to_owned();
     let m_beta = 0.15_f64;
     let g_beta = 0.25_f64;
     let m_eta = m_design.dot(&array![m_beta]);
@@ -7426,7 +7371,7 @@ fn step6_joint_beta_pullback_matches_cpu_dense_assembly_flex_no_wiggle() {
         // logslope primary g (index 3): the logslope design row.
         {
             let chunk = family
-                .logslope_design
+                .logslope_layout.coefficient_design()
                 .try_row_chunk(row..row + 1)
                 .expect("logslope row");
             let g_row = chunk.row(0);
@@ -7758,8 +7703,7 @@ fn b10_flex_family_for_parity(
         offset_exit: Arc::new(array![fixture.q1]),
         derivative_offset_exit: Arc::new(array![fixture.qd1]),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
         score_warp: Some(score_runtime.clone()),
         link_dev: Some(link_runtime.clone()),
         influence_absorber: None,
@@ -8381,8 +8325,7 @@ fn make_time_guard_family(deriv_coeff: f64, deriv_offset: f64) -> SurvivalMargin
         offset_exit: Arc::new(array![0.0]),
         derivative_offset_exit: Arc::new(array![deriv_offset]),
         marginal_design: DesignMatrix::from(Array2::zeros((1, 1))),
-        logslope_design: DesignMatrix::from(array![[1.0]]),
-        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        logslope_layout: (DesignMatrix::from(array![[1.0]])).into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -8604,8 +8547,7 @@ fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
             offset_exit: Arc::new(array![q1]),
             derivative_offset_exit: Arc::new(array![qd1]),
             marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
-            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            logslope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
             influence_absorber: None,
@@ -8793,7 +8735,7 @@ fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
     for frailty in [None, Some(0.55_f64)] {
         let mut family = oracle_rigid_family(n, &z, &weights, &event, frailty);
         family.marginal_design = DesignMatrix::from(marginal_design.clone());
-        family.logslope_design = DesignMatrix::from(logslope_design.clone());
+        family.logslope_layout.coefficient_design() = DesignMatrix::from(logslope_design.clone());
 
         let beta_time = array![0.65];
         let block_states = vec![
@@ -8910,7 +8852,7 @@ fn survival_jeffreys_contracted_trace_hessian_matches_fd_of_trace() {
 
     let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
     family.marginal_design = DesignMatrix::from(marginal_design.clone());
-    family.logslope_design = DesignMatrix::from(logslope_design.clone());
+    family.logslope_layout.coefficient_design() = DesignMatrix::from(logslope_design.clone());
 
     let total = 1 + p_m + p_g;
     let specs = vec![
@@ -9113,7 +9055,7 @@ fn survival_jeffreys_contracted_trace_hook_beats_pairwise_979() {
 
     let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
     family.marginal_design = DesignMatrix::from(marginal_design.clone());
-    family.logslope_design = DesignMatrix::from(logslope_design.clone());
+    family.logslope_layout.coefficient_design() = DesignMatrix::from(logslope_design.clone());
 
     let total = 1 + p_m + p_g;
     let specs = vec![
@@ -9254,7 +9196,7 @@ fn survival_sparse_tower4_full_t4_matches_dense_oracle_979() {
 
     let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
     family.marginal_design = DesignMatrix::from(marginal_design.clone());
-    family.logslope_design = DesignMatrix::from(logslope_design.clone());
+    family.logslope_layout.coefficient_design() = DesignMatrix::from(logslope_design.clone());
 
     let beta_time = array![0.6];
     let beta_marginal = array![0.18, -0.12];

@@ -33,7 +33,7 @@ impl SurvivalMarginalSlopeFamily {
                     primary_gradient[q_idx] * dq[coeff_idx];
             }
         }
-        self.logslope_design.axpy_row_into(
+        self.logslope_layout.coefficient_design().axpy_row_into(
             row,
             -primary_gradient[3],
             &mut joint_gradient.slice_mut(s![slices.logslope.clone()]),
@@ -68,7 +68,7 @@ impl SurvivalMarginalSlopeFamily {
                     primary_gradient[q_idx] * dq[coeff_idx];
             }
         }
-        self.logslope_design.axpy_row_into(
+        self.logslope_layout.coefficient_design().axpy_row_into(
             row,
             -primary_gradient[3],
             &mut joint_gradient.slice_mut(s![slices.logslope.clone()]),
@@ -119,7 +119,7 @@ impl SurvivalMarginalSlopeFamily {
             &q_geom.d2qd1_time_marginal,
         ];
         let logslope_chunk = self
-            .logslope_design
+            .logslope_layout.coefficient_design()
             .try_row_chunk(row..row + 1)
             .map_err(|e| format!("accumulate_dynamic_q_core_hessian logslope: {e}"))?;
         let logslope_row = logslope_chunk.row(0);
@@ -241,7 +241,7 @@ impl SurvivalMarginalSlopeFamily {
                 grad_marginal[coeff_idx] -= primary_gradient[q_idx] * dq[coeff_idx];
             }
         }
-        self.logslope_design.axpy_row_into(
+        self.logslope_layout.coefficient_design().axpy_row_into(
             row,
             -primary_gradient[3],
             &mut grad_logslope.view_mut(),
@@ -290,7 +290,7 @@ impl SurvivalMarginalSlopeFamily {
             &q_geom.d2qd1_marginal_marginal,
         ];
         let logslope_chunk = self
-            .logslope_design
+            .logslope_layout.coefficient_design()
             .try_row_chunk(row..row + 1)
             .map_err(|e| format!("accumulate_dynamic_q_core_block_hessians logslope: {e}"))?;
         let logslope_row = logslope_chunk.row(0);
@@ -448,7 +448,7 @@ impl SurvivalMarginalSlopeFamily {
             joint_hessian[[joint_idx, slices.marginal.start + coeff_idx]] += value;
         }
         let logslope_chunk = self
-            .logslope_design
+            .logslope_layout.coefficient_design()
             .try_row_chunk(row..row + 1)
             .map_err(|e| {
                 format!("accumulate_identity_primary_cross_hessian logslope try_row_chunk: {e}")
@@ -521,7 +521,7 @@ impl SurvivalMarginalSlopeFamily {
         let logslope_weight = core_hessian_column[3] * scale;
         if logslope_weight != 0.0 {
             let logslope_chunk = self
-                .logslope_design
+                .logslope_layout.coefficient_design()
                 .try_row_chunk(row..row + 1)
                 .map_err(|e| {
                     format!(

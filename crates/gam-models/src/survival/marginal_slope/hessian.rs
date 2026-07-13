@@ -188,7 +188,7 @@ impl BlockHessianAccumulator {
 
         // Logslope×logslope: single rank-1
         family
-            .logslope_design
+            .logslope_layout.coefficient_design()
             .syr_row_into(row, primary_hessian[[3, 3]], &mut self.h_gg)
             .map_err(|e| format!("add_pullback logslope syr_row_into: {e}"))?;
 
@@ -201,7 +201,7 @@ impl BlockHessianAccumulator {
                 .map_err(|e| format!("add_pullback marginal_design try_row_chunk: {e}"))?;
             let m_row = m_chunk.row(0);
             let g_chunk = family
-                .logslope_design
+                .logslope_layout.coefficient_design()
                 .try_row_chunk(row..row + 1)
                 .map_err(|e| format!("add_pullback logslope_design try_row_chunk: {e}"))?;
             let g_row = g_chunk.row(0);
@@ -221,7 +221,7 @@ impl BlockHessianAccumulator {
             primary_hessian[[2, 3]],
         ];
         let g_chunk = family
-            .logslope_design
+            .logslope_layout.coefficient_design()
             .try_row_chunk(row..row + 1)
             .map_err(|e| format!("add_pullback logslope_design try_row_chunk: {e}"))?;
         let g_row = g_chunk.row(0);
@@ -307,7 +307,7 @@ impl BlockHessianAccumulator {
                 let gh_weight = primary_hessian[[3, idx]];
                 if gh_weight != 0.0 {
                     let g_chunk = family
-                        .logslope_design
+                        .logslope_layout.coefficient_design()
                         .try_row_chunk(row..row + 1)
                         .map_err(|e| format!("add_pullback logslope_design try_row_chunk: {e}"))?;
                     let g_row = g_chunk.row(0);
@@ -361,7 +361,7 @@ impl BlockHessianAccumulator {
                 let gw_weight = primary_hessian[[3, idx]];
                 if gw_weight != 0.0 {
                     let g_chunk = family
-                        .logslope_design
+                        .logslope_layout.coefficient_design()
                         .try_row_chunk(row..row + 1)
                         .map_err(|e| format!("add_pullback logslope_design try_row_chunk: {e}"))?;
                     let g_row = g_chunk.row(0);
@@ -458,7 +458,7 @@ impl BlockHessianAccumulator {
             let gi_weight = primary_hessian[[3, infl_idx]];
             if gi_weight != 0.0 {
                 let g_chunk = family
-                    .logslope_design
+                    .logslope_layout.coefficient_design()
                     .try_row_chunk(row..row + 1)
                     .map_err(|e| format!("add_pullback logslope_design try_row_chunk: {e}"))?;
                 let g_row = g_chunk.row(0);
@@ -604,7 +604,7 @@ impl BlockHessianAccumulator {
         // Block (psi, logslope) or (logslope, psi)
         if right_primary[3] != 0.0 {
             let g_chunk = family
-                .logslope_design
+                .logslope_layout.coefficient_design()
                 .try_row_chunk(row..row + 1)
                 .map_err(|e| format!("add_rank1_psi_cross logslope_design try_row_chunk: {e}"))?;
             let g_row = g_chunk.row(0);
@@ -928,7 +928,7 @@ impl BlockHessianAccumulator {
             }
         }
         family
-            .logslope_design
+            .logslope_layout.coefficient_design()
             .syr_row_into(row, ph[[3, 3]], &mut self.h_gg)
             .map_err(|e| format!("add_pullback_with_q_geometry gg syr: {e}"))?;
         for a in 0..pt {
@@ -946,7 +946,7 @@ impl BlockHessianAccumulator {
             }
         }
         let gc = family
-            .logslope_design
+            .logslope_layout.coefficient_design()
             .try_row_chunk(row..row + 1)
             .map_err(|e| format!("add_pullback_with_q_geometry logslope try_row_chunk: {e}"))?;
         let gr = gc.row(0);
@@ -1096,7 +1096,7 @@ impl BlockHessianAccumulator {
             }
         }
         let gc = family
-            .logslope_design
+            .logslope_layout.coefficient_design()
             .try_row_chunk(row..row + 1)
             .map_err(|e| format!("add_timewiggle_psi_u_cross logslope try_row_chunk: {e}"))?;
         let gr = gc.row(0);
@@ -1404,7 +1404,7 @@ impl BlockHessianAccumulator {
             }
         }
         let gc = family
-            .logslope_design
+            .logslope_layout.coefficient_design()
             .try_row_chunk(row..row + 1)
             .map_err(|e| {
                 format!("add_rank1_psi_cross_with_q_geometry logslope try_row_chunk: {e}")

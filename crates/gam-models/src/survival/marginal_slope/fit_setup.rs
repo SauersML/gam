@@ -121,36 +121,21 @@ pub(crate) fn build_time_blockspec(
 
 pub(crate) fn build_logslope_blockspec(
     design: &TermCollectionDesign,
-    topology: &LogslopeTopology,
+    layout: &LogslopeLayout,
     baseline: f64,
     offset: &Array1<f64>,
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
-    z_scaling: Arc<[f64]>,
-    probit_scale: f64,
-) -> ParameterBlockSpec {
-    let z_vec = z_scaling.to_vec();
-    // The legacy callback has a three-primary scalar-g contract. A per-score
-    // layout has 3+K primaries and full-width channel rows after any coefficient
-    // transform; advertising the scalar callback would silently differentiate
-    // the wrong model. The exact per-score family kernels remain authoritative.
-    let jac_cb: Option<Arc<dyn crate::custom_family::BlockEffectiveJacobian>> =
-        if topology.is_per_score() {
-            None
-        } else {
-            design
-                .design
-                .try_to_dense_arc("build_logslope_blockspec")
-                .ok()
-                .map(|d| {
-                    Arc::new(LogslopeBlockJacobian::new(d, z_vec, probit_scale))
-                        as Arc<dyn crate::custom_family::BlockEffectiveJacobian>
-                })
-        };
+    z: Arc<Array2<f64>>,
+    covariance: MarginalSlopeCovariance,
+) -> Result<ParameterBlockSpec, String> {
+    let jac_cb: Option<Arc<dyn crate::custom_family::BlockEffectiveJacobian>> = Some(Arc::new(
+        LogslopeBlockJacobian::new(layout.clone(), z, covariance)?,
+    ));
 
-    ParameterBlockSpec {
+    Ok(ParameterBlockSpec {
         name: "logslope_surface".to_string(),
-        design: design.design.clone(),
+        design: layout.coefficient_design().clone(),
         offset: offset + baseline,
         penalties: design.penalties_as_penalty_matrix(),
         nullspace_dims: design.nullspace_dims.clone(),
@@ -160,7 +145,7 @@ pub(crate) fn build_logslope_blockspec(
         jacobian_callback: jac_cb,
         stacked_design: None,
         stacked_offset: None,
-    }
+    })
 }
 
 pub(crate) fn build_marginal_blockspec(

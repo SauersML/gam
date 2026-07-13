@@ -1079,7 +1079,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
             self.family.design_exit.dot_row_view(row, d_time)
                 + self.family.marginal_design.dot_row_view(row, d_marginal),
             self.family.design_derivative_exit.dot_row_view(row, d_time),
-            self.family.logslope_design.dot_row_view(row, d_logslope),
+            self.family.logslope_layout.coefficient_design().dot_row_view(row, d_logslope),
         ]
     }
 
@@ -1146,7 +1146,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         {
             let mut logslope = ndarray::ArrayViewMut1::from(&mut out[self.slices.logslope.clone()]);
             self.family
-                .logslope_design
+                .logslope_layout.coefficient_design()
                 .axpy_row_into(row, v[3], &mut logslope)
                 .expect("logslope axpy dim mismatch");
         }
@@ -1195,7 +1195,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         {
             let mut gd = ndarray::ArrayViewMut1::from(&mut diag[self.slices.logslope.clone()]);
             self.family
-                .logslope_design
+                .logslope_layout.coefficient_design()
                 .squared_axpy_row_into(row, h[3][3], &mut gd)
                 .expect("logslope squared_axpy dim mismatch");
         }
@@ -1312,7 +1312,7 @@ impl SurvivalMarginalSlopeRowKernel {
         let mut axis1 = axis(&self.family.design_exit, f_time);
         axis1 += &jf_marginal;
         let axis2 = axis(&self.family.design_derivative_exit, f_time);
-        let axis3 = axis(&self.family.logslope_design, f_logslope);
+        let axis3 = axis(&self.family.logslope_layout.coefficient_design(), f_logslope);
 
         crate::row_kernel::row_kernel_pack_jf_axes::<4>(
             n_out,
@@ -1573,7 +1573,7 @@ impl SurvivalMarginalSlopeRowKernel {
             .map_err(|e| format!("primary_trace_weight: marginal_design row chunk failed: {e}"))?;
         let xg = self
             .family
-            .logslope_design
+            .logslope_layout.coefficient_design()
             .try_row_chunk(row..row + 1)
             .map_err(|e| format!("primary_trace_weight: logslope_design row chunk failed: {e}"))?;
 

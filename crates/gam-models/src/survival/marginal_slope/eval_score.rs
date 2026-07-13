@@ -185,30 +185,6 @@ impl SurvivalMarginalSlopeFamily {
         Ok([multiplier * basis_span.evaluate(z_coord), 0.0, 0.0, 0.0])
     }
 
-    pub(crate) fn logslope_vector_for_row(
-        &self,
-        row: usize,
-        logslope_eta: &Array1<f64>,
-    ) -> Result<Vec<f64>, String> {
-        let k = self.score_dim();
-        if self.logslope_layout.is_per_score() {
-            return Err(
-                "scalar logslope eta requested for a per-score channel layout".to_string(),
-            );
-        }
-        if logslope_eta.len() != self.n {
-            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-                reason: format!(
-                    "shared survival marginal-slope logslope eta length {} does not match n={}",
-                    logslope_eta.len(),
-                    self.n
-                ),
-            }
-            .into());
-        }
-        Ok(vec![logslope_eta[row]; k])
-    }
-
     pub(crate) fn per_z_logslope_active(&self) -> bool {
         self.score_dim() > 1 && self.logslope_layout.is_per_score()
     }
