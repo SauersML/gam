@@ -22,7 +22,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     synced_states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    hyper_layout: &CustomFamilyHyperLayout,
     beta_flat: &Array1<f64>,
     rho: &[f64],
     penalty_counts: &[usize],
@@ -37,15 +37,22 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         exact_lambdas_by_block(&per_block, "psi hyper log strength").map_err(String::from)?;
 
     let mut coords = Vec::new();
-    let mut psi_global = 0usize;
 
     let build_psi_hyper_coords_start = std::time::Instant::now();
-    let total_axes: usize = derivative_blocks.iter().map(|b| b.len()).sum();
+    let total_axes = hyper_layout.len();
 
     let batched_terms: Option<Vec<ExactNewtonJointPsiTerms>> = match psi_workspace.as_ref() {
         Some(workspace) => workspace.first_order_terms_all()?,
         None => None,
     };
+    if let Some(terms) = batched_terms.as_ref()
+        && terms.len() != total_axes
+    {
+        return Err(format!(
+            "custom-family hyper workspace returned {} first-order axes for layout length {total_axes}",
+            terms.len()
+        ));
+    }
 
     // EXPLICIT ∂_ρ H_Φ context (gam#854). The joint-Jeffreys curvature `H_Φ` is
     // built from the JOINT Hessian `H_joint(β, ρ)`, so for a family whose
@@ -62,7 +69,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     // every non-Jeffreys / operator-only family is byte-unchanged.
     let jeffreys_hphi_ctx: Option<(Array2<f64>, Array2<f64>)> = if family
         .joint_jeffreys_term_required()
-        && derivative_blocks.iter().any(|block| !block.is_empty())
+        && !hyper_layout.is_empty()
     {
         match (
             build_joint_jeffreys_subspace(specs, &ranges)?,
@@ -90,47 +97,69 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     // is independent of this flag and stays folded.
     let jeffreys_info_depends_on_psi = family.joint_jeffreys_information_depends_on_psi();
 
-    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-        let (start, end) = ranges[block_idx];
-        let p_block = end - start;
+    for psi_global in 0..total_axes {
+        let axis = hyper_layout
+            .axis(psi_global)
+            .ok_or_else(|| format!("missing typed hyper axis {psi_global}"))?;
+        // 1. Get family-provided likelihood objects (joint flattened space).
+        let psi_terms = if let Some(batched) = batched_terms.as_ref() {
+            Some(batched[psi_global].clone())
+        } else if let Some(workspace) = psi_workspace.as_ref() {
+            workspace.first_order_terms(psi_global)?.or(
+                family.exact_newton_joint_psi_terms(
+                    synced_states,
+                    specs,
+                    hyper_layout,
+                    psi_global,
+                )?,
+            )
+        } else {
+            family.exact_newton_joint_psi_terms(
+                synced_states,
+                specs,
+                hyper_layout,
+                psi_global,
+            )?
+        };
+        let psi_terms = match (axis, psi_terms) {
+            (_, Some(terms)) => terms,
+            (CustomFamilyHyperAxis::DesignPenalty { .. }, None) => {
+                ExactNewtonJointPsiTerms::zeros(total)
+            }
+            (CustomFamilyHyperAxis::Family { family_axis }, None) => {
+                return Err(format!(
+                    "family-owned hyper axis {family_axis} has no exact first-order V_i/g_i/H_i terms"
+                ));
+            }
+        };
 
-        for deriv in block_derivs.iter() {
-            // 1. Get family-provided likelihood objects (joint flattened space).
-            let psi_terms = if let Some(batched) = batched_terms.as_ref() {
-                batched[psi_global].clone()
-            } else if let Some(workspace) = psi_workspace.as_ref() {
-                if let Some(terms) = workspace.first_order_terms(psi_global)? {
-                    terms
-                } else {
-                    family
-                        .exact_newton_joint_psi_terms(
-                            synced_states,
-                            specs,
-                            derivative_blocks,
-                            psi_global,
-                        )?
-                        .unwrap_or_else(|| ExactNewtonJointPsiTerms::zeros(total))
-                }
-            } else {
-                family
-                    .exact_newton_joint_psi_terms(
-                        synced_states,
-                        specs,
-                        derivative_blocks,
-                        psi_global,
-                    )?
-                    .unwrap_or_else(|| ExactNewtonJointPsiTerms::zeros(total))
-            };
+        // 2. Assemble generic penalty motion only for a typed design/penalty
+        // axis. Family axes have no fabricated block owner and therefore carry
+        // exactly zero S_i.
+        let penalty_motion = hyper_layout.design_derivative(psi_global).map(
+            |(block_idx, deriv)| {
+                let (start, end) = ranges[block_idx];
+                let p_block = end - start;
+                let s_psi_local = assemble_block_local_s_psi(
+                    deriv,
+                    &per_block_lambdas[block_idx],
+                    p_block,
+                );
+                (block_idx, start, end, s_psi_local)
+            },
+        );
 
-            // 2. Assemble S_ψ from penalty derivatives (block-local, not embedded).
-            let s_psi_local =
-                assemble_block_local_s_psi(deriv, &per_block_lambdas[block_idx], p_block);
-
-            // 3. Build HyperCoord using block-local S_ψ (avoids full p×p materialization).
-            let beta_block = beta_flat.slice(ndarray::s![start..end]);
+        // 3. Build HyperCoord using block-local S_ψ when present.
+        let mut a = psi_terms.objective_psi;
+        let mut s_psi_beta = Array1::zeros(total);
+        if let Some((_, start, end, s_psi_local)) = penalty_motion.as_ref() {
+            let beta_block = beta_flat.slice(ndarray::s![*start..*end]);
             let s_psi_beta_local = s_psi_local.dot(&beta_block);
-            let a_penalty_quadratic = 0.5 * beta_block.dot(&s_psi_beta_local);
-            let mut a = psi_terms.objective_psi + a_penalty_quadratic;
+            a += 0.5 * beta_block.dot(&s_psi_beta_local);
+            s_psi_beta
+                .slice_mut(ndarray::s![*start..*end])
+                .assign(&s_psi_beta_local);
+        }
 
             // EXPLICIT Firth VALUE ψ-derivative (gam#1607). The outer LAML cost folds
             // `−Φ(β̂)` where `Φ = ½ log|Z_Jᵀ H_info Z_J|₊` (gated), and the Jeffreys
@@ -172,12 +201,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                     )?;
                 a -= phi_psi;
             }
-            // Embed s_psi_beta into full p-vector for the score.
-            let mut s_psi_beta = Array1::zeros(total);
-            s_psi_beta
-                .slice_mut(ndarray::s![start..end])
-                .assign(&s_psi_beta_local);
-            let mut g = &psi_terms.score_psi + &s_psi_beta;
+        let mut g = &psi_terms.score_psi + &s_psi_beta;
 
             // EXPLICIT Firth Hessian β-COUPLING (gam#1607). The outer Hessian's
             // mode-response term is `−g_ψ·β̇`, with the coord score `g_ψ = ∂_β∂_ψV|_β`.
@@ -205,7 +229,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                     let psi_hdot_a = family.exact_newton_joint_psihessian_directional_derivative(
                         synced_states,
                         specs,
-                        derivative_blocks,
+                        hyper_layout,
                         psi_global,
                         &e_a,
                     )?;
@@ -222,15 +246,17 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                 }
             }
-            let ld_s = if let Some(blocks) = s_logdet_blocks {
-                blocks[block_idx].tau_gradient_component(&s_psi_local)
-            } else {
-                0.0
-            };
+        let ld_s = match (s_logdet_blocks, penalty_motion.as_ref()) {
+            (Some(blocks), Some((block_idx, _, _, s_psi_local))) => {
+                blocks[*block_idx].tau_gradient_component(s_psi_local)
+            }
+            _ => 0.0,
+        };
 
-            // Build drift: use block-local representation when possible to avoid
-            // materializing full p×p dense matrices.
-            let drift = if psi_terms.hessian_psi_operator.is_some() {
+        // Build drift: use block-local representation when possible to avoid
+        // materializing full p×p dense matrices.
+        let drift = if let Some(operator) = psi_terms.hessian_psi_operator {
+            if let Some((_, start, end, s_psi_local)) = penalty_motion {
                 // No dense Hessian contribution — penalty is block-local, operator
                 // (if present) handles the likelihood part. O(p_block²) fast path.
                 HyperCoordDrift::from_block_local_and_operator(
@@ -238,15 +264,20 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                     start,
                     end,
                     total,
-                    psi_terms.hessian_psi_operator,
+                    Some(operator),
                 )
             } else {
-                // Dense Hessian term exists (e.g., from non-implicit family).
-                // Must add block-local penalty into the dense matrix.
-                let mut dense_b = psi_terms.hessian_psi;
+                HyperCoordDrift::from_parts(None, Some(operator))
+            }
+        } else {
+            // Dense Hessian term exists (e.g., from non-implicit family).
+            // Add block-local penalty motion only for DesignPenalty axes.
+            let mut dense_b = psi_terms.hessian_psi;
+            if let Some((_, start, end, s_psi_local)) = penalty_motion {
                 dense_b
                     .slice_mut(ndarray::s![start..end, start..end])
                     .scaled_add(1.0, &s_psi_local);
+            }
                 // `dense_b` is now `∂_ρ_i H_joint|_β`. Add the explicit Jeffreys term
                 // `∂_ρ_i H_Φ|_β` (gam#854) using it as the H_joint perturbation, the
                 // family's base directional Hessian derivative `Hdot[e_a]`, and the
@@ -274,7 +305,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 family.exact_newton_joint_psihessian_directional_derivative(
                                     synced_states,
                                     specs,
-                                    derivative_blocks,
+                                    hyper_layout,
                                     psi_global,
                                     dir,
                                 )
@@ -282,23 +313,20 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                         )?;
                     dense_b += &explicit_hphi;
                 }
-                HyperCoordDrift::from_parts(Some(dense_b), psi_terms.hessian_psi_operator)
-            };
+            HyperCoordDrift::from_parts(Some(dense_b), None)
+        };
 
-            coords.push(HyperCoord {
-                a,
-                g,
-                drift,
-                ld_s,
-                b_depends_on_beta: !hessian_beta_independent,
-                is_penalty_like: false,
-                firth_g: None,
-                tk_eta_fixed: None,
-                tk_x_fixed: None,
-            });
-
-            psi_global += 1;
-        }
+        coords.push(HyperCoord {
+            a,
+            g,
+            drift,
+            ld_s,
+            b_depends_on_beta: !hessian_beta_independent,
+            is_penalty_like: false,
+            firth_g: None,
+            tk_eta_fixed: None,
+            tk_x_fixed: None,
+        });
     }
 
     log::info!(
