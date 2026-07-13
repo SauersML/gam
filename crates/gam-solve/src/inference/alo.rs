@@ -5,8 +5,11 @@ use faer::linalg::matmul::matmul;
 use faer::prelude::ReborrowMut;
 use faer::{Accum, Par};
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky};
-use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
-use gam_linalg::utils::certified_spd_factorize;
+use gam_linalg::matrix::{DesignMatrix, PsdWeightsView, SignedWeightsView};
+use gam_linalg::utils::{
+    CertifiedSpdFactor, certified_spd_factorize, symmetric_extremes,
+    validate_finite_symmetric_matrix,
+};
 use gam_math::probability::signed_log_sum_exp;
 use gam_problem::{Dispersion, LikelihoodScaleMetadata, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder, s};
@@ -603,18 +606,12 @@ fn alo_rhs_block_cols(n: usize, p: usize) -> usize {
         .min(ALO_MAX_RHS_BLOCK_COLS)
 }
 
-/// Diagonal ridge added to the local block precision when its LU pivot is
-/// below [`LU_PIVOT_SINGULAR_TOL`]. Matches the legacy `eps = 1e-6`
-/// regularisation in the prior `det_small < 1e-12` branch — bumping the
-/// determinant of `I − W A` (or `I − A W`) safely off zero without
-/// perturbing well-conditioned blocks.
-const ALO_LOCAL_BLOCK_RIDGE: f64 = 1e-6;
-
-/// Pivot magnitude below which [`lu_factor_in_place`] reports the block
-/// `I − W A` as singular and triggers the ridge-regularised refactor.
-/// Equivalent to the original `det_small < 1e-12` test on the unfactored
-/// determinant.
-const LU_PIVOT_SINGULAR_TOL: f64 = 1e-12;
+/// Backward-error multiplier for the local deletion solve. Its pivot tolerance
+/// is derived from `B * eps * ||I-WA||_inf`, making the singularity decision
+/// invariant to a uniform rescaling of the local coordinates. A singular
+/// deletion system is a real unit-leverage diagnostic and is refused rather
+/// than silently changed by adding a ridge.
+const LOCAL_DELETE_SOLVE_ROUNDOFF_FACTOR: f64 = 8.0;
 
 #[inline]
 fn percentile_index(sample_size: usize, quantile: f64) -> usize {
@@ -635,7 +632,7 @@ fn percentile_from_sorted(sorted: &[f64], quantile: f64) -> f64 {
 }
 
 #[inline]
-fn multiblock_col_offsets(block_designs: &[Array2<f64>]) -> Vec<usize> {
+fn multiblock_col_offsets(block_designs: &[DesignMatrix]) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(block_designs.len());
     let mut off = 0usize;
     for design in block_designs {
@@ -643,32 +640,6 @@ fn multiblock_col_offsets(block_designs: &[Array2<f64>]) -> Vec<usize> {
         off += design.ncols();
     }
     offsets
-}
-
-#[inline]
-fn multiblock_alo_parallel_leverage_chunk_size(
-    p_tot: usize,
-    n_blocks: usize,
-    n_obs: usize,
-    max_workers: usize,
-) -> usize {
-    if p_tot == 0 || n_blocks == 0 || n_obs == 0 {
-        return 1;
-    }
-
-    // Each parallel leverage chunk owns q_storage for all block RHS products
-    // (B * p_tot * chunk_len) plus one transposed design chunk across all
-    // blocks (p_tot * chunk_len).  Divide the global scratch budget by the
-    // maximum number of chunks Rayon can execute concurrently so total live
-    // per-chunk scratch remains bounded.
-    let workers = max_workers.max(1);
-    let per_worker_budget = (MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES / workers).max(1);
-    let elem_count_per_obs = p_tot.saturating_mul(n_blocks.saturating_add(1)).max(1);
-    let bytes_per_obs = elem_count_per_obs
-        .saturating_mul(std::mem::size_of::<f64>())
-        .max(1);
-    let budget_obs = (per_worker_budget / bytes_per_obs).max(1);
-    budget_obs.min(n_obs)
 }
 
 fn compute_alo_diagnostics_from_pirls_impl(
@@ -1511,11 +1482,12 @@ pub struct MultiBlockAloDiagnostics {
     /// Per-observation leverage tr(H_ii) where H_ii is the B×B hat-matrix block.
     pub leverage: Array1<f64>,
     /// Per-observation ALO variance diagonals: for each observation i,
-    /// Var(Δη_i) ≈ A_i (I - W_i A_i)⁻¹ W_i (I - A_i W_i)⁻¹ A_iᵀ.
+    /// Var(Δη_i) ≈ A_i (I - W_i A_i)⁻¹ C_i (I - A_i W_i)⁻¹ A_iᵀ,
+    /// where C_i is the score covariance (not assumed equal to W_i).
     /// Outer length = n_obs, inner length = n_blocks (B) containing the
     /// diagonal entries of the variance matrix.
     pub alo_variance: Vec<Array1<f64>>,
-    /// Cook-type ALO influence: D_i = Δη_iᵀ W_i Δη_i.
+    /// Cook-type ALO influence: D_i = Δη_iᵀ C_i Δη_i.
     /// Length = n_obs.
     pub cook_distance: Array1<f64>,
 }
@@ -1529,7 +1501,8 @@ pub struct MultiBlockAloDiagnostics {
 /// # Mathematical setup
 ///
 /// For observation i the per-observation Jacobian is a B × p_tot block matrix
-/// X_i whose b-th row is the i-th row of `block_designs[b]`.  The joint
+/// X_i whose b-th row is the i-th row of `coordinate_designs[b]` in that
+/// coordinate's disjoint coefficient range. The joint
 /// hat-matrix block is
 ///
 ///   H_ii = X_i H⁻¹ X_iᵀ W_i     (B × B)
@@ -1552,21 +1525,28 @@ pub struct MultiBlockAloDiagnostics {
 pub struct MultiBlockAloInput<'a> {
     /// Number of observations.
     pub n_obs: usize,
-    /// Number of predictors per observation (B).
-    pub n_blocks: usize,
-    /// B design matrices, each n_obs × p_b.  The total parameter count is
-    /// p_tot = Σ_b p_b.
-    pub block_designs: &'a [Array2<f64>],
-    /// Inverse of the penalized Hessian, H⁻¹ (p_tot × p_tot).
-    pub penalized_hessian_inv: &'a Array2<f64>,
-    /// Per-observation weight matrices W_i (B × B).  Length = n_obs.
-    pub block_weights: Vec<Array2<f64>>,
+    /// Number of local likelihood coordinates per observation (B).
+    pub n_coordinates: usize,
+    /// B possibly operator-backed design matrices, each n_obs × p_b. The
+    /// coefficient ranges are disjoint and concatenated in this order, with
+    /// p_tot = Σ_b p_b. ALO materializes only bounded row chunks.
+    pub coordinate_designs: &'a [DesignMatrix],
+    /// Exact unscaled penalized Hessian H (p_tot × p_tot). ALO factors this
+    /// matrix once and certifies blocked solves; it never materializes H⁻¹.
+    pub penalized_hessian: &'a Array2<f64>,
+    /// Per-observation observed NLL Hessians W_i (B × B). These drive the
+    /// deletion denominator and may be indefinite even when H is SPD.
+    pub observed_hessians: &'a [Array2<f64>],
+    /// Per-observation score covariance matrices C_i (B × B). These drive
+    /// variance and Cook influence, and must be positive semidefinite.
+    pub score_covariances: &'a [Array2<f64>],
     /// Per-observation score vectors s_i = ∇_{η_i} NLL_i.  Length = n_obs,
     /// each entry is B-dimensional.
-    pub scores: Vec<Array1<f64>>,
-    /// Fitted linear predictor vectors η̂_i.  Length = n_obs, each entry is
-    /// B-dimensional.
-    pub eta_hat: Vec<Array1<f64>>,
+    pub scores: &'a [Array1<f64>],
+    /// Fitted local-coordinate vectors η̂_i. Length = n_obs, each entry is
+    /// B-dimensional. These are the exact row arguments paired with the
+    /// coordinate designs; they need not be response means.
+    pub coordinate_values: &'a [Array1<f64>],
 }
 
 /// Compute multi-block ALO diagnostics: corrected η̃ and leverages.
@@ -1575,22 +1555,165 @@ pub struct MultiBlockAloInput<'a> {
 ///
 /// The dominant cost is forming X_i H⁻¹ X_iᵀ for every observation.
 /// Rather than forming the B × p_tot row-block X_i and multiplying naïvely,
-/// we precompute for each block b the matrix
+/// we solve for each coordinate b and bounded row chunk the matrix
 ///
-///   Q_b = H⁻¹ X_bᵀ      (p_tot × n)
+///   H Q_b = X_bᵀ      (p_tot × chunk)
 ///
 /// Then the (a, b) entry of the B × B matrix X_i H⁻¹ X_iᵀ is simply
 ///
 ///   (X_i H⁻¹ X_iᵀ)_{a,b} = x_{a,i}ᵀ Q_b[:,i]
 ///                           = Σ_k  X_a[i,k] · Q_b[k,i]
 ///
-/// where x_{a,i} is the i-th row of block-design a.  This turns the per-
+/// where x_{a,i} is the i-th row of coordinate-design a. This turns the per-
 /// observation work from O(B · p_tot²) into O(B² · p_tot), and the
-/// precomputation is O(B · p_tot² · n) total via a single blocked solve.
+/// solve stays bounded without forming a dense inverse or an n × p_tot panel.
 pub fn compute_multiblock_alo(
     input: &MultiBlockAloInput,
 ) -> Result<MultiBlockAloDiagnostics, EstimationError> {
     compute_multiblock_alo_inner(input).map_err(EstimationError::from)
+}
+
+fn validate_multiblock_alo_input(input: &MultiBlockAloInput<'_>) -> Result<(), AloError> {
+    let n = input.n_obs;
+    let b = input.n_coordinates;
+    if n == 0 || b == 0 {
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "multi-block ALO requires positive observation and coordinate counts; got n={n}, B={b}"
+            ),
+        });
+    }
+    if input.coordinate_designs.len() != b {
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "multi-block ALO expected {b} coordinate designs, got {}",
+                input.coordinate_designs.len()
+            ),
+        });
+    }
+    let p_tot = input.penalized_hessian.nrows();
+    if input.penalized_hessian.ncols() != p_tot || p_tot == 0 {
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "multi-block ALO penalized Hessian must be non-empty and square; got {}x{}",
+                input.penalized_hessian.nrows(),
+                input.penalized_hessian.ncols()
+            ),
+        });
+    }
+    let mut design_width = 0usize;
+    for (coordinate, design) in input.coordinate_designs.iter().enumerate() {
+        if design.nrows() != n {
+            return Err(AloError::InvalidInput {
+                reason: format!(
+                    "multi-block ALO coordinate design {coordinate} has {} rows; expected {n}",
+                    design.nrows()
+                ),
+            });
+        }
+        if design.ncols() == 0 {
+            return Err(AloError::InvalidInput {
+                reason: format!(
+                    "multi-block ALO coordinate design {coordinate} has zero coefficient columns"
+                ),
+            });
+        }
+        design_width = design_width.checked_add(design.ncols()).ok_or_else(|| {
+            AloError::InvalidInput {
+                reason: "multi-block ALO coordinate-design width overflow".to_string(),
+            }
+        })?;
+    }
+    if design_width != p_tot {
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "multi-block ALO coordinate-design widths sum to {design_width}, but the saved penalized Hessian has dimension {p_tot}"
+            ),
+        });
+    }
+    for (label, length) in [
+        ("observed_hessians", input.observed_hessians.len()),
+        ("score_covariances", input.score_covariances.len()),
+        ("scores", input.scores.len()),
+        ("coordinate_values", input.coordinate_values.len()),
+    ] {
+        if length != n {
+            return Err(AloError::InvalidInput {
+                reason: format!(
+                    "multi-block ALO requires {label} length {n}; got {length}"
+                ),
+            });
+        }
+    }
+    for row in 0..n {
+        let observed = &input.observed_hessians[row];
+        let score_covariance = &input.score_covariances[row];
+        for (label, matrix) in [
+            ("observed Hessian", observed),
+            ("score covariance", score_covariance),
+        ] {
+            if matrix.dim() != (b, b) {
+                return Err(AloError::InvalidInput {
+                    reason: format!(
+                        "multi-block ALO row {row} {label} has shape {}x{}; expected {b}x{b}",
+                        matrix.nrows(),
+                        matrix.ncols()
+                    ),
+                });
+            }
+            validate_finite_symmetric_matrix(matrix, &format!("multi-block ALO row {row} {label}"))
+                .map_err(|error| AloError::InvalidInput {
+                    reason: error.to_string(),
+                })?;
+        }
+        let covariance_scale = score_covariance
+            .iter()
+            .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+        let (minimum, maximum) = symmetric_extremes(score_covariance).ok_or_else(|| {
+            AloError::InvalidInput {
+                reason: format!(
+                    "multi-block ALO row {row} score-covariance eigendecomposition failed"
+                ),
+            }
+        })?;
+        let psd_tolerance = LOCAL_DELETE_SOLVE_ROUNDOFF_FACTOR
+            * b as f64
+            * f64::EPSILON
+            * covariance_scale.max(maximum.abs());
+        if minimum < -psd_tolerance {
+            return Err(AloError::InvalidInput {
+                reason: format!(
+                    "multi-block ALO row {row} score covariance is not positive semidefinite: minimum eigenvalue {minimum:.6e}, roundoff allowance {psd_tolerance:.6e}"
+                ),
+            });
+        }
+        for (label, vector) in [
+            ("score", &input.scores[row]),
+            ("coordinate value", &input.coordinate_values[row]),
+        ] {
+            if vector.len() != b {
+                return Err(AloError::InvalidInput {
+                    reason: format!(
+                        "multi-block ALO row {row} {label} has length {}; expected {b}",
+                        vector.len()
+                    ),
+                });
+            }
+            if let Some((coordinate, value)) = vector
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(AloError::InvalidInput {
+                    reason: format!(
+                        "multi-block ALO row {row} {label} coordinate {coordinate} is non-finite: {value}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compute_multiblock_alo_inner(
@@ -1599,32 +1722,17 @@ fn compute_multiblock_alo_inner(
     use rayon::prelude::*;
 
     let n = input.n_obs;
-    let b = input.n_blocks;
-    let p_tot = input.penalized_hessian_inv.nrows();
-
-    // --- Validate dimensions ---
-    if input.block_designs.len() != b {
-        return Err(AloError::InvalidInput {
+    let b = input.n_coordinates;
+    let p_tot = input.penalized_hessian.nrows();
+    validate_multiblock_alo_input(input)?;
+    let factor = certified_spd_factorize(input.penalized_hessian, "multi-block ALO penalized Hessian")
+        .map_err(|error| AloError::InvalidInput {
             reason: format!(
-                "MultiBlockAloInput: expected {} block designs, got {}",
-                b,
-                input.block_designs.len()
+                "multi-block ALO requires an unperturbed positive-definite saved penalized Hessian: {error}"
             ),
-        });
-    }
+        })?;
 
-    // Verify total column count matches p_tot.
-    let col_sum: usize = input.block_designs.iter().map(|d| d.ncols()).sum();
-    if col_sum != p_tot {
-        return Err(AloError::InvalidInput {
-            reason: format!(
-                "MultiBlockAloInput: total design columns ({}) != penalized_hessian_inv size ({})",
-                col_sum, p_tot
-            ),
-        });
-    }
-
-    let col_offsets = multiblock_col_offsets(input.block_designs);
+    let col_offsets = multiblock_col_offsets(input.coordinate_designs);
     let (chunk_size, max_concurrent_chunks) = multiblock_alo_parallel_plan(p_tot, b, n);
     let chunk_starts: Vec<usize> = (0..n).step_by(chunk_size).collect();
 
@@ -1644,6 +1752,7 @@ fn compute_multiblock_alo_inner(
                     let chunk_end = (chunk_start + chunk_size).min(n);
                     compute_multiblock_alo_chunk(
                         input,
+                        &factor,
                         &col_offsets,
                         chunk_start,
                         chunk_end,
@@ -1691,7 +1800,13 @@ fn multiblock_alo_parallel_plan(p_tot: usize, n_blocks: usize, n_obs: usize) -> 
     if p_tot == 0 || n_blocks == 0 || n_obs == 0 {
         return (1, 1);
     }
-    let bytes_per_obs = (p_tot * n_blocks * std::mem::size_of::<f64>()).max(1);
+    // Each live row keeps one p-vector in the materialized Jacobian chunk and
+    // one in its certified solution, for every local coordinate.
+    let bytes_per_obs = p_tot
+        .saturating_mul(n_blocks)
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<f64>())
+        .max(1);
     let workers = rayon::current_num_threads().max(1);
     let max_concurrent_chunks = (MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES / bytes_per_obs)
         .max(1)
@@ -1712,9 +1827,10 @@ struct MultiBlockAloScratch {
     perm_imaw: Vec<usize>,
     delta_eta: Vec<f64>,
     rhs_buf: Vec<f64>,
-    w_u: Vec<f64>,
+    covariance_u: Vec<f64>,
     var_diag_buf: Vec<f64>,
     w_flat: Vec<f64>,
+    covariance_flat: Vec<f64>,
     lu_scratch: Vec<f64>,
 }
 
@@ -1731,9 +1847,10 @@ impl MultiBlockAloScratch {
             perm_imaw: vec![0usize; b],
             delta_eta: vec![0.0f64; b],
             rhs_buf: vec![0.0f64; b],
-            w_u: vec![0.0f64; b],
+            covariance_u: vec![0.0f64; b],
             var_diag_buf: vec![0.0f64; b],
             w_flat: vec![0.0f64; bb_sz],
+            covariance_flat: vec![0.0f64; bb_sz],
             lu_scratch: vec![0.0f64; b],
         }
     }
@@ -1749,26 +1866,52 @@ struct MultiBlockAloChunkDiagnostics {
 
 fn compute_multiblock_alo_chunk(
     input: &MultiBlockAloInput,
+    factor: &CertifiedSpdFactor<'_>,
     col_offsets: &[usize],
     chunk_start: usize,
     chunk_end: usize,
     scratch: &mut MultiBlockAloScratch,
 ) -> Result<MultiBlockAloChunkDiagnostics, AloError> {
-    let b = input.n_blocks;
+    let b = input.n_coordinates;
+    let p_tot = input.penalized_hessian.nrows();
     let chunk_len = chunk_end - chunk_start;
 
+    let mut design_chunks = Vec::with_capacity(b);
     let mut q_blocks = Vec::with_capacity(b);
-    for blk in 0..b {
-        let x_chunk_t = input.block_designs[blk]
-            .slice(s![chunk_start..chunk_end, ..])
-            .t()
-            .to_owned();
-        let off_b = col_offsets[blk];
-        let h_slice = input
-            .penalized_hessian_inv
-            .slice(s![.., off_b..off_b + x_chunk_t.nrows()])
-            .to_owned();
-        q_blocks.push(h_slice.dot(&x_chunk_t));
+    for coordinate in 0..b {
+        let design_chunk = input.coordinate_designs[coordinate]
+            .try_row_chunk(chunk_start..chunk_end)
+            .map_err(|reason| AloError::DesignDegenerate {
+                reason: format!(
+                    "multi-block ALO could not materialize coordinate {coordinate} rows {chunk_start}..{chunk_end}: {reason}"
+                ),
+            })?;
+        if let Some(((row, column), value)) = design_chunk
+            .indexed_iter()
+            .map(|(index, &value)| (index, value))
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(AloError::DesignDegenerate {
+                reason: format!(
+                    "multi-block ALO coordinate {coordinate} design is non-finite at source row {}, column {column}: {value}",
+                    chunk_start + row
+                ),
+            });
+        }
+        let width = design_chunk.ncols();
+        let offset = col_offsets[coordinate];
+        let mut rhs = Array2::<f64>::zeros((p_tot, chunk_len));
+        rhs.slice_mut(s![offset..offset + width, ..])
+            .assign(&design_chunk.t());
+        let (solution, _) = factor.solve_matrix(&rhs).map_err(|error| {
+            AloError::LooComputationFailed {
+                reason: format!(
+                    "multi-block ALO saved-Hessian solve failed for coordinate {coordinate}, rows {chunk_start}..{chunk_end}: {error}"
+                ),
+            }
+        })?;
+        design_chunks.push(design_chunk);
+        q_blocks.push(solution);
     }
 
     let mut eta_tilde = Vec::with_capacity(chunk_len);
@@ -1778,21 +1921,24 @@ fn compute_multiblock_alo_chunk(
 
     for local_i in 0..chunk_len {
         let i = chunk_start + local_i;
-        let w_i = &input.block_weights[i];
+        let w_i = &input.observed_hessians[i];
+        let covariance_i = &input.score_covariances[i];
 
-        // Flatten W_i once per observation (row-major).
+        // Flatten the distinct observed-Hessian and score-covariance surfaces
+        // once per observation (row-major).
         for r in 0..b {
             for c in 0..b {
                 scratch.w_flat[r * b + c] = w_i[(r, c)];
+                scratch.covariance_flat[r * b + c] = covariance_i[(r, c)];
             }
         }
 
         // --- Assemble A_i = X_i H⁻¹ X_iᵀ  (B × B), row-major flat. ---
         for a in 0..b {
-            let x_a = &input.block_designs[a];
+            let x_a = &design_chunks[a];
             let p_a = x_a.ncols();
             let off_a = col_offsets[a];
-            let xa_row = x_a.row(i);
+            let xa_row = x_a.row(local_i);
             for bb in 0..b {
                 let q_bb = &q_blocks[bb];
                 let mut dot = 0.0f64;
