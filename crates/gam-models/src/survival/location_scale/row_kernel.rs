@@ -2545,9 +2545,10 @@ impl SurvivalLocationScaleFamily {
         // `jet_scalar`). The packed contractions are bit-identical to the dense
         // `row_nll_tower(row)?.{third,fourth}_contracted(...)` (the
         // `survival_ls_packed_directional_matches_dense_tower_932` oracle pins this
-        // ≤ 1e-9). Link-wiggle remains a separate carveout
-        // (`row_kernel_supported` gates on `x_link_wiggle.is_none()`), so the
-        // beta-dependent-Jacobian rows still take the hand path below.
+        // ≤ 1e-9). Link-wiggle remains a separate runtime-width lowering
+        // (`row_kernel_supported` gates on `x_link_wiggle.is_none()`):
+        // [`SurvivalLsWiggleRowKernel`] evaluates the same row NLL with dynamic
+        // packed jets because its beta-dependent Jacobian width is not const.
         self.x_link_wiggle.is_none()
     }
 
