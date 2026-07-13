@@ -3466,6 +3466,144 @@ pub(super) fn run_two_block_exact_joint_optimize(
 }
 
 #[test]
+fn staged_exact_joint_outer_reoptimizes_and_certifies_the_full_row_measure() {
+    let n = 24usize;
+    let mut data = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+        data[[i, 1]] = (i as f64 * 0.19).sin();
+    }
+
+    let matern_term = |name: &str| SmoothTermSpec {
+        name: name.to_string(),
+        basis: SmoothBasisSpec::Matern {
+            feature_cols: vec![0, 1],
+            spec: MaternBasisSpec {
+                periodic: None,
+                center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                length_scale: 1.0,
+                nu: MaternNu::FiveHalves,
+                include_intercept: false,
+                double_penalty: true,
+                identifiability: MaternIdentifiability::CenterSumToZero,
+                // An anisotropic Matérn contributes explicit spatial outer
+                // coordinates; an isotropic term's seeded range is fixed here.
+                aniso_log_scales: Some(vec![0.0, 0.0]),
+            },
+            input_scales: None,
+        },
+        shape: ShapeConstraint::None,
+        joint_null_rotation: None,
+    };
+    let meanspec = TermCollectionSpec {
+        linear_terms: Vec::new(),
+        random_effect_terms: Vec::new(),
+        smooth_terms: vec![matern_term("mean_matern")],
+    };
+    let noisespec = TermCollectionSpec {
+        linear_terms: Vec::new(),
+        random_effect_terms: Vec::new(),
+        smooth_terms: vec![matern_term("noise_matern")],
+    };
+    let kappa_options = SpatialLengthScaleOptimizationOptions {
+        enabled: true,
+        max_outer_iter: 16,
+        rel_tol: 1.0e-7,
+        pilot_subsample_threshold: 0,
+        ..SpatialLengthScaleOptimizationOptions::default()
+    };
+    let joint_setup =
+        two_block_exact_joint_hyper_setup(&meanspec, &noisespec, &kappa_options);
+    let theta_dim = joint_setup.theta0().len();
+    assert!(theta_dim > 0, "fixture must expose spatial outer coordinates");
+
+    let pilot_evals = std::cell::Cell::new(0usize);
+    let exact_evals = std::cell::Cell::new(0usize);
+    let policy = gam_model_api::families::custom_family::OuterDerivativePolicy {
+        capability: gam_problem::ExactOuterDerivativeOrder::Second,
+        predicted_hessian_work: u128::MAX,
+        predicted_gradient_work: u128::MAX,
+        // Force the staged path at tiny test n; the RowSet variant, rather
+        // than its cardinality, distinguishes the two analytic objectives.
+        subsample_capable: true,
+    };
+
+    let solved = optimize_spatial_length_scale_exact_joint(
+        data.view(),
+        &[meanspec.clone(), noisespec.clone()],
+        &[
+            spatial_length_scale_term_indices(&meanspec),
+            spatial_length_scale_term_indices(&noisespec),
+        ],
+        &kappa_options,
+        &joint_setup,
+        gam_problem::SeedRiskProfile::Gaussian,
+        true,
+        true,
+        true,
+        None,
+        policy,
+        |theta, specs, designs, provenance| {
+            assert_eq!(specs.len(), 2);
+            assert_eq!(designs.len(), 2);
+            let SpatialFitProvenance::Certified(outer) = provenance else {
+                panic!("staged spatial fit must receive certified outer provenance");
+            };
+            assert_eq!(outer.rho(), theta);
+            assert!(outer.criterion_certificate().certifies());
+            Ok(theta.clone())
+        },
+        |theta, specs, designs, eval_mode, row_set| {
+            assert_eq!(theta.len(), theta_dim);
+            assert_eq!(specs.len(), 2);
+            assert_eq!(designs.len(), 2);
+            let center = match row_set {
+                gam_problem::outer_subsample::RowSet::Subsample { .. } => {
+                    pilot_evals.set(pilot_evals.get() + 1);
+                    2.0
+                }
+                gam_problem::outer_subsample::RowSet::All => {
+                    exact_evals.set(exact_evals.get() + 1);
+                    -1.0
+                }
+            };
+            let gradient = theta.mapv(|value| value - center);
+            let cost = 0.5 * gradient.dot(&gradient);
+            let hessian = if matches!(
+                eval_mode,
+                gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
+            ) {
+                let mut dense = Array2::<f64>::zeros((theta_dim, theta_dim));
+                dense.diag_mut().fill(1.0);
+                gam_problem::HessianValue::Dense(dense)
+            } else {
+                gam_problem::HessianValue::Unavailable
+            };
+            Ok((cost, gradient, hessian))
+        },
+        |_theta, _specs, _designs| {
+            Err("fixed-point callback must stay disabled in staged regression".to_string())
+        },
+        |_beta| Ok(gam_solve::rho_optimizer::SeedOutcome::NoSlot),
+    )
+    .expect("pilot checkpoint must continue to the exact full-data optimum");
+
+    assert!(pilot_evals.get() > 0, "pilot objective was never evaluated");
+    assert!(exact_evals.get() > 0, "exact objective was never evaluated");
+    assert!(
+        solved.fit.iter().all(|value| (*value + 1.0).abs() <= 1.0e-6),
+        "returned pilot optimum instead of exact optimum: {:?}",
+        solved.fit,
+    );
+    let outer = solved
+        .certified_outer
+        .as_ref()
+        .expect("optimized spatial result must retain its certificate");
+    assert!(outer.criterion_certificate().certifies());
+    assert!(outer.final_value().abs() <= 1.0e-10);
+}
+
+#[test]
 fn exact_joint_two_block_spatial_length_scale_freezes_matern_centers() {
     let n = 40usize;
     let mut data = Array2::<f64>::zeros((n, 2));
