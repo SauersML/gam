@@ -161,6 +161,46 @@ def test_target_dose_probe_is_wired_through_the_public_model() -> None:
     assert model.fisher_metric_build_count == 1
 
 
+def test_target_dose_rejects_scalar_and_malformed_probe_results() -> None:
+    model = _model()
+    t_from = np.array([0.0], dtype=np.float64)
+    t_to = np.array([0.25], dtype=np.float64)
+    target = 0.5 * float(model.steer(0, 0, 1.0, t_from, t_to)["predicted_nats"])
+    request = {
+        "atom_k": 0,
+        "metric_row": 0,
+        "target_nats": target,
+        "t_from": t_from,
+        "t_to": t_to,
+        "tol_rel": 1.0e-12,
+        "max_iter": 4,
+        "readout_tol_rel": 0.1,
+    }
+
+    with pytest.raises(ValueError, match="must return a mapping"):
+        model.steer_to_target(request, lambda _plan: target)
+
+    def missing_measurement(plan: dict[str, object]) -> dict[str, object]:
+        return {
+            "effective_delta": list(plan["delta"]),
+            "exact_directional_nats": float(plan["predicted_nats"]),
+        }
+
+    with pytest.raises(ValueError, match="missing.*measured_nats"):
+        model.steer_to_target(request, missing_measurement)
+
+    def wrong_effective_shape(plan: dict[str, object]) -> dict[str, object]:
+        exact = float(plan["predicted_nats"])
+        return {
+            "effective_delta": [0.0],
+            "exact_directional_nats": exact,
+            "measured_nats": exact,
+        }
+
+    with pytest.raises(ValueError, match="effective_delta length"):
+        model.steer_to_target(request, wrong_effective_shape)
+
+
 @pytest.mark.parametrize(
     ("basis", "topology", "latent_dim", "basis_size", "n_harmonics", "t_from", "t_to"),
     [
