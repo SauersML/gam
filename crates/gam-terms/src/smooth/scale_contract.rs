@@ -100,6 +100,10 @@ pub enum BasisDesignScaleLaw {
     ReplicatedInner,
     /// Tensor design is the row-wise product of invariant marginal designs.
     TensorProductOfMarginals,
+    /// A random-intercept/slope block has alternating degree-zero and
+    /// degree-one columns in each factor level: intercept columns are invariant
+    /// and slope columns gain one power of the abscissa scale.
+    RandomInterceptSlopeDegreesZeroAndOne,
 }
 
 /// Transformation of active penalty matrices.
@@ -119,6 +123,9 @@ pub enum BasisPenaltyScaleLaw {
     /// Kernel/energy construction and its normalization are invariant under the
     /// complete declared parameter pullback.
     FrobeniusNormalizedInvariant,
+    /// The physical RKHS Gram is emitted without arbitrary normalization but
+    /// is itself invariant under the complete coordinate/parameter pullback.
+    InvariantPhysicalRkhsGram,
     /// Penalties are copied/congruence-transformed into wrapper blocks without
     /// introducing a coordinate scale of their own.
     ReplicatedInner,
@@ -164,6 +171,7 @@ pub enum BasisNullGeometryScaleLaw {
     IntrinsicHarmonicSubspace,
     ConstantCurvatureCenterConstraint,
     PcaScoreCongruence,
+    FullRankRandomEffect,
     ReplicatedInner,
 }
 
@@ -501,14 +509,51 @@ impl SmoothBasisSpec {
                     FactorSmoothFlavour::Sz => BasisScaleFamily::FactorSmoothSz,
                     FactorSmoothFlavour::Re => BasisScaleFamily::FactorSmoothRe,
                 };
-                BasisScaleContract::wrapper(
-                    family,
-                    BasisCoordinateScaleAction::DiscreteReplication,
-                    BasisDesignScaleLaw::ReplicatedInner,
-                    BasisDerivativeScaleLaw::DelegatedToInner,
-                    bspline_contract(&spec.marginal),
-                    Vec::new(),
-                )
+                match family {
+                    BasisScaleFamily::FactorSmoothFs | BasisScaleFamily::FactorSmoothSz => {
+                        BasisScaleContract::wrapper(
+                            family,
+                            BasisCoordinateScaleAction::DiscreteReplication,
+                            BasisDesignScaleLaw::ReplicatedInner,
+                            BasisDerivativeScaleLaw::DelegatedToInner,
+                            bspline_contract(&spec.marginal),
+                            Vec::new(),
+                        )
+                    }
+                    BasisScaleFamily::FactorSmoothRe => BasisScaleContract {
+                        family,
+                        coordinate_action: BasisCoordinateScaleAction::PositiveAffineAbscissa,
+                        design: BasisDesignScaleLaw::RandomInterceptSlopeDegreesZeroAndOne,
+                        penalty: BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
+                        derivatives: BasisDerivativeScaleLaw::InverseCoordinatePower {
+                            maximum_order: 1,
+                        },
+                        null_geometry: BasisNullGeometryScaleLaw::FullRankRandomEffect,
+                        dimensionful_parameters: vec![scale(1, DimensionfulBasisParameter::Knots)],
+                        children: vec![bspline_contract(&spec.marginal)],
+                        input_frame: InputFrameNormalization::Delegated,
+                    },
+                    BasisScaleFamily::ByVariableNumeric
+                    | BasisScaleFamily::ByVariableFactor
+                    | BasisScaleFamily::FactorSumToZero
+                    | BasisScaleFamily::OpenBSpline
+                    | BasisScaleFamily::CyclicBSpline
+                    | BasisScaleFamily::NaturalCubic
+                    | BasisScaleFamily::BySmoothNumeric
+                    | BasisScaleFamily::BySmoothFactor
+                    | BasisScaleFamily::ThinPlate
+                    | BasisScaleFamily::SphereWahba
+                    | BasisScaleFamily::SphereHarmonic
+                    | BasisScaleFamily::ConstantCurvature
+                    | BasisScaleFamily::Matern
+                    | BasisScaleFamily::MeasureJet
+                    | BasisScaleFamily::PureDuchon
+                    | BasisScaleFamily::HybridDuchon
+                    | BasisScaleFamily::Pca
+                    | BasisScaleFamily::TensorBSpline => {
+                        unreachable!("factor flavour resolved to a non-factor family")
+                    }
+                }
             }
             SmoothBasisSpec::ThinPlate { .. } => BasisScaleContract::leaf(
                 BasisScaleFamily::ThinPlate,
@@ -542,7 +587,7 @@ impl SmoothBasisSpec {
                 BasisScaleFamily::ConstantCurvature,
                 BasisCoordinateScaleAction::ConstantCurvatureChartSimilarity,
                 BasisDesignScaleLaw::Invariant,
-                BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
+                BasisPenaltyScaleLaw::InvariantPhysicalRkhsGram,
                 BasisDerivativeScaleLaw::ConstantCurvatureParameterPowers,
                 BasisNullGeometryScaleLaw::ConstantCurvatureCenterConstraint,
                 vec![
@@ -941,11 +986,17 @@ mod tests {
                     periods: vec![None, None],
                     double_penalty: false,
                     identifiability: TensorBSplineIdentifiability::None,
-                    penalty_decomposition:
-                        TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+                    penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
                 },
             },
         ]
+    }
+
+    fn zoo_basis(family: BasisScaleFamily) -> SmoothBasisSpec {
+        scale_contract_zoo()
+            .into_iter()
+            .find(|basis| basis.scale_contract().family == family)
+            .unwrap_or_else(|| panic!("scale-contract zoo is missing {family:?}"))
     }
 
     #[test]
@@ -1018,8 +1069,41 @@ mod tests {
         expected: &BasisBuildResult,
         tolerance: f64,
     ) {
-        assert_matrix_close(&actual.design.to_dense(), &expected.design.to_dense(), tolerance);
-        assert_eq!(actual.active_penalties.len(), expected.active_penalties.len());
+        assert_matrix_close(
+            &actual.design.to_dense(),
+            &expected.design.to_dense(),
+            tolerance,
+        );
+        assert_eq!(
+            actual.active_penalties.len(),
+            expected.active_penalties.len()
+        );
+        for (observed, target) in actual
+            .active_penalties
+            .iter()
+            .zip(expected.active_penalties.iter())
+        {
+            assert_eq!(observed.info.source, target.info.source);
+            assert_eq!(observed.rank, target.rank);
+            assert_eq!(observed.nullity, target.nullity);
+            assert_matrix_close(&observed.matrix, &target.matrix, tolerance);
+        }
+    }
+
+    fn assert_local_geometry_close(
+        actual: &LocalSmoothTermBuild,
+        expected: &LocalSmoothTermBuild,
+        tolerance: f64,
+    ) {
+        assert_matrix_close(
+            &actual.design.to_dense(),
+            &expected.design.to_dense(),
+            tolerance,
+        );
+        assert_eq!(
+            actual.active_penalties.len(),
+            expected.active_penalties.len()
+        );
         for (observed, target) in actual
             .active_penalties
             .iter()
@@ -1125,12 +1209,8 @@ mod tests {
         ];
         let build_tensor = |x_scale: f64, y_scale: f64| {
             let mut scaled = tensor_data.clone();
-            scaled
-                .column_mut(0)
-                .mapv_inplace(|value| value * x_scale);
-            scaled
-                .column_mut(1)
-                .mapv_inplace(|value| value * y_scale);
+            scaled.column_mut(0).mapv_inplace(|value| value * x_scale);
+            scaled.column_mut(1).mapv_inplace(|value| value * y_scale);
             let spec = TensorBSplineSpec {
                 marginalspecs: vec![open_marginal(x_scale), open_marginal(y_scale)],
                 periods: vec![None, None],
@@ -1150,6 +1230,360 @@ mod tests {
         }
     }
 
+    fn wrapper_basis(family: BasisScaleFamily, abscissa_scale: f64) -> SmoothBasisSpec {
+        let inner = || Box::new(basis(0, abscissa_scale));
+        let levels = vec![0.0_f64.to_bits(), 1.0_f64.to_bits(), 2.0_f64.to_bits()];
+        match family {
+            BasisScaleFamily::ByVariableNumeric => SmoothBasisSpec::ByVariable {
+                inner: inner(),
+                by_col: 1,
+                kind: BySmoothKind::Numeric,
+                by: ByVariableSpec::Numeric,
+            },
+            BasisScaleFamily::ByVariableFactor => SmoothBasisSpec::ByVariable {
+                inner: inner(),
+                by_col: 1,
+                kind: BySmoothKind::Level {
+                    level_bits: 1.0_f64.to_bits(),
+                },
+                by: ByVariableSpec::Level {
+                    value_bits: 1.0_f64.to_bits(),
+                    label: "one".to_string(),
+                },
+            },
+            BasisScaleFamily::FactorSumToZero => SmoothBasisSpec::FactorSumToZero {
+                inner: inner(),
+                by_col: 1,
+                levels,
+                frozen_global_orthogonality: None,
+            },
+            BasisScaleFamily::BySmoothNumeric => SmoothBasisSpec::BySmooth {
+                smooth: inner(),
+                by_kind: ByVarKind::Numeric { feature_col: 1 },
+            },
+            BasisScaleFamily::BySmoothFactor => SmoothBasisSpec::BySmooth {
+                smooth: inner(),
+                by_kind: ByVarKind::Factor {
+                    feature_col: 1,
+                    ordered: false,
+                    frozen_levels: Some(levels),
+                },
+            },
+            BasisScaleFamily::FactorSmoothFs
+            | BasisScaleFamily::FactorSmoothSz
+            | BasisScaleFamily::FactorSmoothRe => SmoothBasisSpec::FactorSmooth {
+                spec: FactorSmoothSpec {
+                    continuous_cols: vec![0],
+                    group_col: 1,
+                    marginal: open_marginal(abscissa_scale),
+                    flavour: match family {
+                        BasisScaleFamily::FactorSmoothFs => FactorSmoothFlavour::Fs {
+                            m_null_penalty_orders: vec![1],
+                        },
+                        BasisScaleFamily::FactorSmoothSz => FactorSmoothFlavour::Sz,
+                        BasisScaleFamily::FactorSmoothRe => FactorSmoothFlavour::Re,
+                        BasisScaleFamily::ByVariableNumeric
+                        | BasisScaleFamily::ByVariableFactor
+                        | BasisScaleFamily::FactorSumToZero
+                        | BasisScaleFamily::OpenBSpline
+                        | BasisScaleFamily::CyclicBSpline
+                        | BasisScaleFamily::NaturalCubic
+                        | BasisScaleFamily::BySmoothNumeric
+                        | BasisScaleFamily::BySmoothFactor
+                        | BasisScaleFamily::ThinPlate
+                        | BasisScaleFamily::SphereWahba
+                        | BasisScaleFamily::SphereHarmonic
+                        | BasisScaleFamily::ConstantCurvature
+                        | BasisScaleFamily::Matern
+                        | BasisScaleFamily::MeasureJet
+                        | BasisScaleFamily::PureDuchon
+                        | BasisScaleFamily::HybridDuchon
+                        | BasisScaleFamily::Pca
+                        | BasisScaleFamily::TensorBSpline => {
+                            unreachable!("outer factor-family match guarantees the flavour")
+                        }
+                    },
+                    group_frozen_levels: Some(levels),
+                    frozen_global_orthogonality: None,
+                },
+            },
+            BasisScaleFamily::OpenBSpline
+            | BasisScaleFamily::CyclicBSpline
+            | BasisScaleFamily::NaturalCubic
+            | BasisScaleFamily::ThinPlate
+            | BasisScaleFamily::SphereWahba
+            | BasisScaleFamily::SphereHarmonic
+            | BasisScaleFamily::ConstantCurvature
+            | BasisScaleFamily::Matern
+            | BasisScaleFamily::MeasureJet
+            | BasisScaleFamily::PureDuchon
+            | BasisScaleFamily::HybridDuchon
+            | BasisScaleFamily::Pca
+            | BasisScaleFamily::TensorBSpline => {
+                panic!("{family:?} is not a wrapper fixture")
+            }
+        }
+    }
+
+    fn build_local(data: &Array2<f64>, basis: SmoothBasisSpec) -> LocalSmoothTermBuild {
+        build_single_local_smooth_term(
+            data.view(),
+            &SmoothTermSpec {
+                name: "scale-contract-wrapper".to_string(),
+                basis,
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            },
+            &mut BasisWorkspace::new(),
+        )
+        .expect("wrapper scale fixture must build")
+    }
+
+    #[test]
+    fn every_wrapper_preserves_its_declared_inner_abscissa_pullback_2315() {
+        let data = array![
+            [0.00, 0.0],
+            [0.08, 1.0],
+            [0.17, 2.0],
+            [0.26, 0.0],
+            [0.35, 1.0],
+            [0.44, 2.0],
+            [0.56, 0.0],
+            [0.65, 1.0],
+            [0.74, 2.0],
+            [0.83, 0.0],
+            [0.92, 1.0],
+            [1.00, 2.0]
+        ];
+        let invariant_families = [
+            BasisScaleFamily::ByVariableNumeric,
+            BasisScaleFamily::ByVariableFactor,
+            BasisScaleFamily::FactorSumToZero,
+            BasisScaleFamily::BySmoothNumeric,
+            BasisScaleFamily::BySmoothFactor,
+            BasisScaleFamily::FactorSmoothFs,
+            BasisScaleFamily::FactorSmoothSz,
+        ];
+        for family in invariant_families {
+            let reference = build_local(&data, wrapper_basis(family, 1.0));
+            for factor in [1e-9_f64, 1.0, 1e9] {
+                let mut scaled = data.clone();
+                scaled.column_mut(0).mapv_inplace(|value| factor * value);
+                let actual = build_local(&scaled, wrapper_basis(family, factor));
+                assert_local_geometry_close(&actual, &reference, 2e-8);
+            }
+        }
+
+        // `bs="re"` is a random intercept+slope, so each level carries one
+        // invariant intercept column and one degree-one slope column.
+        let family = BasisScaleFamily::FactorSmoothRe;
+        let reference = build_local(&data, wrapper_basis(family, 1.0));
+        for factor in [1e-9_f64, 1.0, 1e9] {
+            let mut scaled = data.clone();
+            scaled.column_mut(0).mapv_inplace(|value| factor * value);
+            let actual = build_local(&scaled, wrapper_basis(family, factor));
+            let mut pulled_back = actual.design.to_dense();
+            for slope_col in (1..pulled_back.ncols()).step_by(2) {
+                pulled_back
+                    .column_mut(slope_col)
+                    .mapv_inplace(|value| value / factor);
+            }
+            assert_matrix_close(&pulled_back, &reference.design.to_dense(), 2e-9);
+            assert_eq!(
+                actual.active_penalties.len(),
+                reference.active_penalties.len()
+            );
+            for (observed, target) in actual
+                .active_penalties
+                .iter()
+                .zip(reference.active_penalties.iter())
+            {
+                assert_matrix_close(&observed.matrix, &target.matrix, 2e-10);
+                assert_eq!(observed.nullity, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_modulator_has_exact_degree_one_design_and_invariant_penalty_2315() {
+        let data = array![
+            [0.00, 0.4],
+            [0.08, 0.7],
+            [0.17, 1.1],
+            [0.26, 0.8],
+            [0.35, 1.4],
+            [0.44, 0.6],
+            [0.56, 1.2],
+            [0.65, 0.9],
+            [0.74, 1.5],
+            [0.83, 0.5],
+            [0.92, 1.3],
+            [1.00, 1.0]
+        ];
+        for family in [
+            BasisScaleFamily::ByVariableNumeric,
+            BasisScaleFamily::BySmoothNumeric,
+        ] {
+            let reference = build_local(&data, wrapper_basis(family, 1.0));
+            for factor in [1e-9_f64, 1.0, 1e9] {
+                let mut scaled = data.clone();
+                scaled.column_mut(1).mapv_inplace(|value| factor * value);
+                let actual = build_local(&scaled, wrapper_basis(family, 1.0));
+                let pulled_back = actual.design.to_dense().mapv(|value| value / factor);
+                assert_matrix_close(&pulled_back, &reference.design.to_dense(), 2e-10);
+                assert_eq!(
+                    actual.active_penalties.len(),
+                    reference.active_penalties.len()
+                );
+                for (observed, target) in actual
+                    .active_penalties
+                    .iter()
+                    .zip(reference.active_penalties.iter())
+                {
+                    assert_matrix_close(&observed.matrix, &target.matrix, 2e-10);
+                }
+            }
+        }
+    }
+
+    fn spherical_spec(method: SphereMethod, radians: bool) -> SphericalSplineBasisSpec {
+        SphericalSplineBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+            penalty_order: 2,
+            double_penalty: false,
+            radians,
+            method,
+            max_degree: Some(3),
+            wahba_kernel: SphereWahbaKernel::Sobolev,
+            identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        }
+    }
+
+    #[test]
+    fn sphere_constant_curvature_and_pca_obey_their_non_euclidean_gauges_2315() {
+        let degrees = array![
+            [-62.0, -150.0],
+            [-41.0, -77.0],
+            [-18.0, -12.0],
+            [4.0, 39.0],
+            [23.0, 101.0],
+            [47.0, 166.0],
+            [66.0, -115.0],
+            [11.0, -171.0]
+        ];
+        let radians = degrees.mapv(f64::to_radians);
+        for method in [SphereMethod::Wahba, SphereMethod::Harmonic] {
+            let in_degrees =
+                build_spherical_spline_basis(degrees.view(), &spherical_spec(method, false))
+                    .expect("degree-encoded sphere basis");
+            let in_radians =
+                build_spherical_spline_basis(radians.view(), &spherical_spec(method, true))
+                    .expect("radian-encoded sphere basis");
+            assert_build_geometry_close(&in_radians, &in_degrees, 2e-9);
+        }
+
+        let chart_data = array![
+            [-0.42, -0.18],
+            [-0.31, 0.22],
+            [-0.08, -0.34],
+            [0.13, 0.29],
+            [0.27, -0.11],
+            [0.38, 0.17]
+        ];
+        let centers = array![[-0.36, -0.04], [-0.12, 0.25], [0.16, -0.21], [0.34, 0.13]];
+        let kappa = -0.7_f64;
+        let length_scale = 0.55_f64;
+        let reference_spec = ConstantCurvatureBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            kappa,
+            kappa_fixed: true,
+            length_scale,
+            double_penalty: false,
+            identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
+        };
+        let reference = build_constant_curvature_basis(chart_data.view(), &reference_spec)
+            .expect("reference constant-curvature basis");
+        let (_, dk_reference, dkk_reference) = constant_curvature_kernel_kappa_jets(
+            chart_data.view(),
+            centers.view(),
+            kappa,
+            length_scale,
+        )
+        .expect("reference curvature jets");
+        for factor in [1e-9_f64, 1.0, 1e9] {
+            let scaled_data = chart_data.mapv(|value| value * factor);
+            let scaled_centers = centers.mapv(|value| value * factor);
+            let scaled_kappa = kappa / factor.powi(2);
+            let scaled_length = length_scale * factor;
+            let actual = build_constant_curvature_basis(
+                scaled_data.view(),
+                &ConstantCurvatureBasisSpec {
+                    center_strategy: CenterStrategy::UserProvided(scaled_centers.clone()),
+                    kappa: scaled_kappa,
+                    kappa_fixed: true,
+                    length_scale: scaled_length,
+                    double_penalty: false,
+                    identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
+                },
+            )
+            .expect("rescaled constant-curvature basis");
+            assert_build_geometry_close(&actual, &reference, 2e-8);
+            let (_, dk, dkk) = constant_curvature_kernel_kappa_jets(
+                scaled_data.view(),
+                scaled_centers.view(),
+                scaled_kappa,
+                scaled_length,
+            )
+            .expect("rescaled curvature jets");
+            assert_matrix_close(
+                &dk.mapv(|value| value / factor.powi(2)),
+                &dk_reference,
+                2e-8,
+            );
+            assert_matrix_close(
+                &dkk.mapv(|value| value / factor.powi(4)),
+                &dkk_reference,
+                3e-7,
+            );
+        }
+
+        let pca_data = array![
+            [-1.0, 0.3],
+            [-0.4, 1.1],
+            [0.2, -0.7],
+            [0.8, 0.5],
+            [1.3, -0.2],
+            [1.7, 0.9]
+        ];
+        let center_mean = array![0.35, 0.15];
+        let loadings = array![[0.8, -0.3], [0.6, 0.9]];
+        let reference = build_pca_smooth_basis(
+            pca_data.view(),
+            &[0, 1],
+            &loadings,
+            true,
+            1.7,
+            Some(&center_mean),
+            None,
+            32,
+        )
+        .expect("reference PCA score gauge");
+        for factor in [1e-9_f64, 1.0, 1e9] {
+            let actual = build_pca_smooth_basis(
+                pca_data.mapv(|value| factor * value).view(),
+                &[0, 1],
+                &loadings.mapv(|value| value / factor),
+                true,
+                1.7,
+                Some(&center_mean.mapv(|value| factor * value)),
+                None,
+                32,
+            )
+            .expect("rescaled PCA score gauge");
+            assert_build_geometry_close(&actual, &reference, 2e-10);
+        }
+    }
+
     #[test]
     fn euclidean_registry_frames_are_similarity_invariant_for_every_declared_family_2315() {
         let coordinates = array![
@@ -1160,13 +1594,14 @@ mod tests {
             [1.2, -0.1]
         ];
         let cases = [
-            (BasisScaleFamily::ThinPlate, scale_contract_zoo()[11].clone(), Some(0.7)),
-            (BasisScaleFamily::Matern, scale_contract_zoo()[15].clone(), Some(0.7)),
-            (BasisScaleFamily::MeasureJet, scale_contract_zoo()[16].clone(), Some(0.7)),
-            (BasisScaleFamily::PureDuchon, scale_contract_zoo()[17].clone(), None),
-            (BasisScaleFamily::HybridDuchon, scale_contract_zoo()[18].clone(), Some(0.7)),
+            (BasisScaleFamily::ThinPlate, Some(0.7)),
+            (BasisScaleFamily::Matern, Some(0.7)),
+            (BasisScaleFamily::MeasureJet, Some(0.7)),
+            (BasisScaleFamily::PureDuchon, None),
+            (BasisScaleFamily::HybridDuchon, Some(0.7)),
         ];
-        for (family, basis, length_scale) in cases {
+        for (family, length_scale) in cases {
+            let basis = zoo_basis(family);
             let contract = basis.scale_contract();
             assert_eq!(contract.family, family);
             let reference = contract
@@ -1193,11 +1628,137 @@ mod tests {
         }
     }
 
+    fn euclidean_basis(family: BasisScaleFamily, factor: f64) -> SmoothBasisSpec {
+        let centers = CenterStrategy::FarthestPoint { num_centers: 8 };
+        match family {
+            BasisScaleFamily::ThinPlate => SmoothBasisSpec::ThinPlate {
+                feature_cols: vec![0, 1],
+                spec: ThinPlateBasisSpec {
+                    center_strategy: centers,
+                    periodic: None,
+                    length_scale: 0.55 * factor,
+                    double_penalty: false,
+                    identifiability: SpatialIdentifiability::None,
+                    radial_reparam: None,
+                },
+                input_scales: None,
+            },
+            BasisScaleFamily::Matern => SmoothBasisSpec::Matern {
+                feature_cols: vec![0, 1],
+                spec: MaternBasisSpec {
+                    center_strategy: centers,
+                    periodic: None,
+                    length_scale: 0.55 * factor,
+                    nu: MaternNu::ThreeHalves,
+                    include_intercept: false,
+                    double_penalty: false,
+                    identifiability: MaternIdentifiability::None,
+                    aniso_log_scales: None,
+                },
+                input_scales: None,
+            },
+            BasisScaleFamily::MeasureJet => SmoothBasisSpec::MeasureJet {
+                feature_cols: vec![0, 1],
+                spec: MeasureJetBasisSpec {
+                    center_strategy: centers,
+                    order_s: 1.5,
+                    alpha: 1.0,
+                    tau0: 1e-3,
+                    num_scales: 3,
+                    length_scale: 0.55 * factor,
+                    double_penalty: false,
+                    learn_length_scale: false,
+                    multiscale: false,
+                    identifiability: MeasureJetIdentifiability::CenterSumToZero,
+                    frozen_quadrature: None,
+                },
+                input_scales: None,
+            },
+            BasisScaleFamily::PureDuchon | BasisScaleFamily::HybridDuchon => {
+                SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0, 1],
+                    spec: DuchonBasisSpec {
+                        center_strategy: centers,
+                        periodic: None,
+                        length_scale: (family == BasisScaleFamily::HybridDuchon)
+                            .then_some(0.55 * factor),
+                        power: if family == BasisScaleFamily::HybridDuchon {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::None,
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::all_disabled(),
+                        boundary: OneDimensionalBoundary::Open,
+                        radial_reparam: None,
+                    },
+                    input_scales: None,
+                }
+            }
+            BasisScaleFamily::ByVariableNumeric
+            | BasisScaleFamily::ByVariableFactor
+            | BasisScaleFamily::FactorSumToZero
+            | BasisScaleFamily::OpenBSpline
+            | BasisScaleFamily::CyclicBSpline
+            | BasisScaleFamily::NaturalCubic
+            | BasisScaleFamily::BySmoothNumeric
+            | BasisScaleFamily::BySmoothFactor
+            | BasisScaleFamily::FactorSmoothFs
+            | BasisScaleFamily::FactorSmoothSz
+            | BasisScaleFamily::FactorSmoothRe
+            | BasisScaleFamily::SphereWahba
+            | BasisScaleFamily::SphereHarmonic
+            | BasisScaleFamily::ConstantCurvature
+            | BasisScaleFamily::Pca
+            | BasisScaleFamily::TensorBSpline => {
+                panic!("{family:?} is not a Euclidean spatial fixture")
+            }
+        }
+    }
+
+    #[test]
+    fn every_euclidean_spatial_builder_obeys_its_registry_pullback_2315() {
+        let data = array![
+            [-0.95, -0.22],
+            [-0.82, 0.31],
+            [-0.63, -0.47],
+            [-0.48, 0.62],
+            [-0.27, -0.08],
+            [-0.11, 0.41],
+            [0.06, -0.55],
+            [0.21, 0.17],
+            [0.38, 0.73],
+            [0.54, -0.31],
+            [0.69, 0.49],
+            [0.83, -0.66],
+            [0.97, 0.04],
+            [1.08, 0.58],
+            [1.19, -0.39],
+            [1.31, 0.26]
+        ];
+        for family in [
+            BasisScaleFamily::ThinPlate,
+            BasisScaleFamily::Matern,
+            BasisScaleFamily::MeasureJet,
+            BasisScaleFamily::PureDuchon,
+            BasisScaleFamily::HybridDuchon,
+        ] {
+            let reference = build_local(&data, euclidean_basis(family, 1.0));
+            for factor in [1e-9_f64, 1.0, 1e9] {
+                let scaled = data.mapv(|value| factor * value);
+                let actual = build_local(&scaled, euclidean_basis(family, factor));
+                assert_local_geometry_close(&actual, &reference, 3e-7);
+            }
+        }
+    }
+
     #[test]
     fn malformed_frozen_scale_vectors_are_rejected_before_indexing_2315() {
-        let mut basis = scale_contract_zoo()[15].clone();
+        let mut basis = zoo_basis(BasisScaleFamily::Matern);
         let SmoothBasisSpec::Matern { input_scales, .. } = &mut basis else {
-            unreachable!("zoo index 15 is Matérn");
+            unreachable!("family lookup returned a non-Matérn basis");
         };
         for invalid in [vec![1.0], vec![1.0, 0.0], vec![1.0, f64::NAN]] {
             *input_scales = Some(invalid);

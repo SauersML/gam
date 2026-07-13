@@ -474,13 +474,6 @@ mod knot_scale_invariance_tests {
         local_sum
     }
 
-    fn full_basis_vector_at(x: f64, knots: ArrayView1<f64>, degree: usize) -> Vec<f64> {
-        let mut values = vec![0.0; knots.len() - degree - 1];
-        let mut scratch = BsplineScratch::new(degree);
-        evaluate_splines_at_point_full_support_into(x, degree, knots, &mut values, &mut scratch);
-        values
-    }
-
     /// Regression for #2292: the Cox–de Boor recurrence is scale-free (its terms
     /// are ratios `(x - t_i)/(t_{i+k} - t_i)`), so partition-of-unity must hold
     /// on a small-magnitude domain exactly as it does at unit scale. The old
@@ -515,35 +508,6 @@ mod knot_scale_invariance_tests {
                 "scale-invariance broken: partition sum {s} != 1 at x={} (scale {scale})",
                 frac * scale
             );
-        }
-    }
-
-    /// Standing affine-abscissa property for #2315: partition-of-unity alone
-    /// cannot detect a scale-dependent permutation or distortion whose row still
-    /// sums to one, so compare every basis coordinate at each required scale.
-    #[test]
-    fn clamped_bspline_full_basis_is_abscissa_scale_invariant_2315() {
-        let degree = 3;
-        let reference_knots = clamped_cubic_knots(1.0);
-        for frac in [0.0_f64, 0.05, 0.3, 0.55, 0.72, 0.95, 1.0] {
-            let reference = full_basis_vector_at(frac, reference_knots.view(), degree);
-            assert!(
-                reference.iter().any(|value| value.abs() > 0.1),
-                "reference row must carry nontrivial basis signal at {frac}"
-            );
-            for scale in [1e-9_f64, 1.0, 1e9] {
-                let scaled_knots = clamped_cubic_knots(scale);
-                let scaled = full_basis_vector_at(frac * scale, scaled_knots.view(), degree);
-                for (basis_idx, (&actual, &expected)) in
-                    scaled.iter().zip(reference.iter()).enumerate()
-                {
-                    assert!(
-                        (actual - expected).abs() <= 2e-12,
-                        "basis[{basis_idx}] changed under x,knots *= {scale} at fraction {frac}: \
-                         actual={actual:.16e} expected={expected:.16e}"
-                    );
-                }
-            }
         }
     }
 

@@ -1,6 +1,4 @@
-use super::{
-    TRANSFORMATION_MONOTONICITY_EPS, log_normal_cdf_diff_derivatives,
-};
+use super::{TRANSFORMATION_MONOTONICITY_EPS, log_normal_cdf_diff_derivatives};
 use ndarray::{Array1, Array2};
 
 /// Complete local state for one saved transformation-normal likelihood row.
@@ -92,8 +90,7 @@ pub fn transformation_normal_alo_row_geometry(
     let mut h = input.response_value_basis[0] * gamma0
         + input.additive_offset
         + input.response_floor_offset;
-    let mut h_prime = input.response_derivative_basis[0] * gamma0
-        + TRANSFORMATION_MONOTONICITY_EPS;
+    let mut h_prime = input.response_derivative_basis[0] * gamma0 + TRANSFORMATION_MONOTONICITY_EPS;
     let mut lower = input.response_lower_basis[0] * gamma0
         + input.additive_offset
         + input.response_lower_floor_offset;
@@ -120,8 +117,7 @@ pub fn transformation_normal_alo_row_geometry(
     let endpoint = log_normal_cdf_diff_derivatives(upper, lower)?;
     let weight = input.prior_weight;
     let negative_log_likelihood = weight
-        * (0.5 * h * h + 0.5 * (2.0 * std::f64::consts::PI).ln() - h_prime.ln()
-            + endpoint.log_z);
+        * (0.5 * h * h + 0.5 * (2.0 * std::f64::consts::PI).ln() - h_prime.ln() + endpoint.log_z);
 
     let mut dh = vec![0.0; dimension];
     let mut dh_prime = vec![0.0; dimension];
@@ -144,10 +140,9 @@ pub fn transformation_normal_alo_row_geometry(
     let mut nll_score = Array1::<f64>::zeros(dimension);
     let mut observed_hessian = Array2::<f64>::zeros((dimension, dimension));
     for left in 0..dimension {
-        let endpoint_first =
-            endpoint.first[0] * dupper[left] + endpoint.first[1] * dlower[left];
-        nll_score[left] = weight
-            * (h * dh[left] - dh_prime[left] * inverse_h_prime + endpoint_first);
+        let endpoint_first = endpoint.first[0] * dupper[left] + endpoint.first[1] * dlower[left];
+        nll_score[left] =
+            weight * (h * dh[left] - dh_prime[left] * inverse_h_prime + endpoint_first);
         for right in 0..dimension {
             let same_shape = left == right && left > 0;
             let d2h = if same_shape {
@@ -177,7 +172,8 @@ pub fn transformation_normal_alo_row_geometry(
                 + endpoint.second[1][0] * dlower[left] * dupper[right]
                 + endpoint.second[1][1] * dlower[left] * dlower[right];
             observed_hessian[[left, right]] = weight
-                * (dh[left] * dh[right] + h * d2h
+                * (dh[left] * dh[right]
+                    + h * d2h
                     + dh_prime[left] * dh_prime[right] * inverse_h_prime_squared
                     - d2h_prime * inverse_h_prime
                     + endpoint_second);
@@ -215,14 +211,10 @@ mod tests {
         let h_prime = TRANSFORMATION_MONOTONICITY_EPS
             + derivative[0] * gamma[0]
             + derivative[1] * gamma[1].powi(2);
-        let lower = lower_basis[0] * gamma[0]
-            + lower_basis[1] * gamma[1].powi(2)
-            + offset
-            + lower_floor;
-        let upper = upper_basis[0] * gamma[0]
-            + upper_basis[1] * gamma[1].powi(2)
-            + offset
-            + upper_floor;
+        let lower =
+            lower_basis[0] * gamma[0] + lower_basis[1] * gamma[1].powi(2) + offset + lower_floor;
+        let upper =
+            upper_basis[0] * gamma[0] + upper_basis[1] * gamma[1].powi(2) + offset + upper_floor;
         weight
             * (0.5 * h * h + 0.5 * (2.0 * std::f64::consts::PI).ln() - h_prime.ln()
                 + log_normal_cdf_diff(upper, lower).expect("finite endpoint mass"))
@@ -271,9 +263,9 @@ mod tests {
                 mp[other] += step;
                 mm[axis] -= step;
                 mm[other] -= step;
-                let hessian_fd =
-                    (scalar_nll(pp) - scalar_nll(pm) - scalar_nll(mp) + scalar_nll(mm))
-                        / (4.0 * step * step);
+                let hessian_fd = (scalar_nll(pp) - scalar_nll(pm) - scalar_nll(mp)
+                    + scalar_nll(mm))
+                    / (4.0 * step * step);
                 assert!(
                     (geometry.observed_hessian[[axis, other]] - hessian_fd).abs() <= 3.0e-6,
                     "hessian[{axis},{other}] analytic={} fd={hessian_fd}",
