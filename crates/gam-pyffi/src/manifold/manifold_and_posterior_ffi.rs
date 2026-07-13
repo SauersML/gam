@@ -5588,12 +5588,13 @@ fn build_latent_window_ffi_payload(
         let frailty = match (&request_frailty, learned_latent_sd) {
             (
                 gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-                    sigma_fixed: None,
+                    scale:
+                        gam::families::survival::lognormal_kernel::FrailtyScale::Learned { .. },
                     loading,
                 },
                 Some(sigma),
             ) => gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-                sigma_fixed: Some(sigma),
+                scale: gam::families::survival::lognormal_kernel::FrailtyScale::Fixed { sigma },
                 loading: *loading,
             },
             _ => request_frailty.clone(),
