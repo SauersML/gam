@@ -1768,7 +1768,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             if adaptive_penalty_indices.contains(&idx) {
                 return None;
             }
-            let lambda = baseline.fit.lambdas[idx];
             Some(RetainedPenaltySetup {
                 global_idx: idx,
                 global_penalty: bp.to_global(p_total),
@@ -2413,7 +2412,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         ))
     })?;
     let final_family =
-        base_family.with_adaptive_params(adaptive_params.clone(), fixed_total);
+        base_family.with_adaptive_params(adaptive_params.clone(), fixed_total.clone());
     let final_blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
         design: baseline.design.design.clone(),

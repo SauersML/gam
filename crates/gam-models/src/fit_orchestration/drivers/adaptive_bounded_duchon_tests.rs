@@ -956,6 +956,46 @@ mod adaptive_bounded_duchon_tests {
     }
 
     #[test]
+    fn spatial_adaptive_fixed_quadratic_hessian_rejects_material_asymmetry() {
+        let error = ValidatedFixedQuadraticHessian::try_from_dense(
+            array![[0.0, 0.1], [3.0, 0.0]],
+            2,
+        )
+        .expect_err("a materially asymmetric quadratic Hessian must be rejected");
+        assert!(
+            error.contains("not symmetric"),
+            "rejection must identify the violated symmetry invariant: {error}"
+        );
+    }
+
+    #[test]
+    fn spatial_adaptive_fixed_quadratic_hessian_rejects_indefinite_quadratic() {
+        let error = ValidatedFixedQuadraticHessian::try_from_dense(
+            array![[1.0, 2.0], [2.0, 1.0]],
+            2,
+        )
+        .expect_err("an indefinite quadratic Hessian must be rejected");
+        assert!(
+            error.contains("positive semidefinite"),
+            "rejection must identify the violated convexity invariant: {error}"
+        );
+    }
+
+    #[test]
+    fn spatial_adaptive_fixed_quadratic_hessian_preserves_exact_quadratic() {
+        let dense = array![[2.0, 0.25], [0.25, 1.0]];
+        let validated = ValidatedFixedQuadraticHessian::try_from_dense(dense.clone(), 2)
+            .expect("finite symmetric PSD quadratic Hessian");
+        assert_eq!(validated.as_dense(), &dense);
+
+        let (value, gradient) = validated
+            .quadratic_terms(&array![1.0, -2.0])
+            .expect("matching coefficient dimension");
+        assert_eq!(gradient, array![1.5, -1.75]);
+        assert_eq!(value, 2.5);
+    }
+
+    #[test]
     fn exact_bounded_edf_matches_trace_formula_for_simple_penalty() {
         let penalties = vec![PenaltySpec::Dense(Array2::eye(1))];
         let lambdas = array![0.25];
@@ -1756,10 +1796,10 @@ mod adaptive_bounded_duchon_tests {
             linear_constraints: baseline.design.linear_constraints.clone(),
             runtime_caches: Arc::new(runtime_caches.to_vec()),
             adaptive_params: Vec::new(),
-            fixed_quadratichessian: Arc::new(Array2::<f64>::zeros((
+            fixed_quadratic_hessian: ValidatedFixedQuadraticHessian::zero(
                 baseline.design.design.ncols(),
-                baseline.design.design.ncols(),
-            ))),
+            )
+            .expect("zero fixed quadratic Hessian"),
             hyperspecs: Arc::new(hyperspecs),
             exact_eval_cache: Arc::new(Mutex::new(None)),
         };
@@ -1877,10 +1917,8 @@ mod adaptive_bounded_duchon_tests {
                     lambda: [1e-12, log_lambda_g.exp(), 1e-12],
                     epsilon: [eps_0, eps_g, eps_c],
                 }],
-                Arc::new(Array2::<f64>::zeros((
-                    baseline.design.design.ncols(),
-                    baseline.design.design.ncols(),
-                ))),
+                ValidatedFixedQuadraticHessian::zero(baseline.design.design.ncols())
+                    .expect("zero fixed quadratic Hessian"),
             );
             evaluate_custom_family_joint_hyper(
                 &family,
