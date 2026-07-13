@@ -36,8 +36,8 @@ use crate::survival::location_scale::{
     TimeBlockInput, project_onto_linear_constraints, structural_time_coefficient_constraints,
 };
 use crate::survival::lognormal_kernel::{
-    FrailtySpec, HazardLoading, LatentSurvivalEventType, LatentSurvivalRow, LatentSurvivalRowJet,
-    log_kernel_bundle,
+    FrailtyScale, FrailtySpec, HazardLoading, LatentSurvivalEventType, LatentSurvivalRow,
+    LatentSurvivalRowJet, log_kernel_bundle,
 };
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
@@ -536,23 +536,21 @@ fn fixed_latent_hazard_frailty_typed(
     frailty: &FrailtySpec,
     context: &str,
 ) -> Result<(f64, HazardLoading), LatentSurvivalError> {
+    frailty
+        .validate()
+        .map_err(|err| LatentSurvivalError::InvalidFrailty {
+            reason: err.to_string(),
+        })?;
     match frailty {
         FrailtySpec::HazardMultiplier {
-            sigma_fixed: Some(sigma),
+            scale: FrailtyScale::Fixed { sigma },
             loading,
-        } if sigma.is_finite() && *sigma >= 0.0 => Ok((*sigma, *loading)),
+        } => Ok((*sigma, *loading)),
         FrailtySpec::HazardMultiplier {
-            sigma_fixed: Some(sigma),
+            scale: FrailtyScale::Learned { .. },
             ..
         } => Err(LatentSurvivalError::InvalidFrailty {
-            reason: format!(
-                "{context} requires a finite fixed hazard-multiplier sigma >= 0, got {sigma}"
-            ),
-        }),
-        FrailtySpec::HazardMultiplier {
-            sigma_fixed: None, ..
-        } => Err(LatentSurvivalError::InvalidFrailty {
-            reason: format!("{context} currently requires a fixed hazard-multiplier sigma"),
+            reason: format!("{context} requires a fixed hazard-multiplier sigma"),
         }),
         FrailtySpec::GaussianShift { .. } => Err(LatentSurvivalError::InvalidFrailty {
             reason: format!("{context} requires HazardMultiplier frailty, not GaussianShift"),
@@ -599,7 +597,11 @@ pub fn fit_latent_survival_terms(
     frailty: FrailtySpec,
     options: &BlockwiseFitOptions,
 ) -> Result<LatentSurvivalTermFitResult, String> {
-    let latent_sd = validate_latent_survival_inputs(data, &spec, &frailty)?;
+    let frailty_scale = validate_latent_survival_inputs(data, &spec, &frailty)?;
+    let (latent_sd, learned_initial_sigma) = match frailty_scale {
+        FrailtyScale::Fixed { sigma } => (Some(sigma), None),
+        FrailtyScale::Learned { initial_sigma } => (None, Some(initial_sigma)),
+    };
     let hazard_loading = latent_hazard_loading(&frailty, "latent-survival")?;
     let mean_design =
         build_term_collection_design(data, &spec.meanspec).map_err(|e| e.to_string())?;
@@ -662,9 +664,9 @@ pub fn fit_latent_survival_terms(
         build_time_blockspec(&time_prepared, &spec.time_block),
         build_mean_blockspec(&mean_design, mean_offset),
     ];
-    if latent_sd.is_none() {
+    if let Some(initial_sigma) = learned_initial_sigma {
         blocks.push(build_log_sigma_blockspec(
-            LEARNABLE_LATENT_SD_SEED,
+            initial_sigma,
             mean_design.design.nrows(),
         ));
     }
@@ -843,7 +845,7 @@ pub fn fit_latent_binary_terms(
 
 /// Latent-survival adapter for the shared [`LatentIntervalModel`] driver.
 ///
-/// Survival permits a learnable sigma (`sigma_fixed == None`) and carries the
+/// Survival permits [`FrailtyScale::Learned`] and carries the
 /// per-row unloaded baseline hazard at exit (which feeds the exact-event
 /// loaded/unloaded split); everything else is validated by the shared engine.
 struct LatentSurvivalModel;
@@ -860,25 +862,19 @@ impl LatentIntervalModel for LatentSurvivalModel {
     fn frailty_policy(
         frailty: &FrailtySpec,
     ) -> Result<LatentFrailtyResolution, LatentSurvivalError> {
+        frailty
+            .validate()
+            .map_err(|err| LatentSurvivalError::InvalidFrailty {
+                reason: err.to_string(),
+            })?;
         match frailty {
             FrailtySpec::HazardMultiplier {
-                sigma_fixed,
+                scale,
                 loading,
-            } => {
-                if let Some(sigma) = sigma_fixed
-                    && (!sigma.is_finite() || *sigma < 0.0)
-                {
-                    return Err(LatentSurvivalError::InvalidFrailty {
-                        reason: format!(
-                            "latent-survival requires a finite hazard-multiplier sigma >= 0, got {sigma}"
-                        ),
-                    });
-                }
-                Ok(LatentFrailtyResolution {
-                    sigma: *sigma_fixed,
-                    loading: *loading,
-                })
-            }
+            } => Ok(LatentFrailtyResolution {
+                scale: *scale,
+                loading: *loading,
+            }),
             FrailtySpec::GaussianShift { .. } => Err(LatentSurvivalError::InvalidFrailty {
                 reason: "latent-survival requires HazardMultiplier frailty, not GaussianShift"
                     .to_string(),
@@ -895,7 +891,7 @@ fn validate_latent_survival_inputs(
     data: ArrayView2<'_, f64>,
     spec: &LatentSurvivalTermSpec,
     frailty: &FrailtySpec,
-) -> Result<Option<f64>, LatentSurvivalError> {
+) -> Result<FrailtyScale, LatentSurvivalError> {
     let row = LatentIntervalRowView {
         frailty,
         age_entry: &spec.age_entry,
@@ -960,7 +956,7 @@ impl LatentIntervalModel for LatentBinaryModel {
     ) -> Result<LatentFrailtyResolution, LatentSurvivalError> {
         let (sigma, loading) = fixed_latent_hazard_frailty_typed(frailty, "latent-binary")?;
         Ok(LatentFrailtyResolution {
-            sigma: Some(sigma),
+            scale: FrailtyScale::Fixed { sigma },
             loading,
         })
     }
@@ -984,15 +980,12 @@ fn validate_latent_binary_inputs(
         derivative_guard: spec.derivative_guard,
         time_block: &spec.time_block,
     };
-    // The binary `frailty_policy` always yields `Some(sigma)` (it rejects the
-    // learnable-scale case), so the shared driver's `Option<f64>` is `Some`
-    // here; surface a structured error rather than unwrapping if that ever
-    // changes.
-    validate_latent_interval_inputs::<LatentBinaryModel>(data, &row)?.ok_or_else(|| {
-        LatentSurvivalError::InvalidFrailty {
+    match validate_latent_interval_inputs::<LatentBinaryModel>(data, &row)? {
+        FrailtyScale::Fixed { sigma } => Ok(sigma),
+        FrailtyScale::Learned { .. } => Err(LatentSurvivalError::InvalidFrailty {
             reason: "latent-binary requires a fixed latent sigma".to_string(),
-        }
-    })
+        }),
+    }
 }
 
 fn prepare_latent_time_block(
@@ -1158,14 +1151,6 @@ fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> P
         stacked_offset: None,
     }
 }
-
-/// Starting latent-frailty standard deviation when `sigma` is learnable
-/// (`sigma_fixed == None`). The log-sigma block is seeded at `log(0.5)` so the
-/// optimizer begins from a moderate, well-conditioned dispersion (σ = 0.5,
-/// neither a near-degenerate σ → 0 that flattens the frailty integral nor a
-/// large σ that makes the Gauss-Hermite quadrature heavy-tailed) and then
-/// learns the data's actual scale. Only an initial value, not a constraint.
-const LEARNABLE_LATENT_SD_SEED: f64 = 0.5;
 
 fn build_log_sigma_blockspec(initial_sigma: f64, n_obs: usize) -> ParameterBlockSpec {
     ParameterBlockSpec {
@@ -6931,7 +6916,7 @@ mod tests {
 
     fn loaded_frailty() -> FrailtySpec {
         FrailtySpec::HazardMultiplier {
-            sigma_fixed: Some(0.3),
+            scale: FrailtyScale::Fixed { sigma: 0.3 },
             loading: HazardLoading::LoadedVsUnloaded,
         }
     }
@@ -6948,16 +6933,15 @@ mod tests {
         let p_time = 2;
         let data = Array2::<f64>::zeros((n, 3));
 
-        // 1. A clean spec validates and round-trips the resolved sigma.
-        //    Survival keeps the (possibly learnable) Option; binary unwraps to
-        //    the fixed scalar.
+        // 1. A clean spec validates and round-trips the typed scale.
+        //    Binary then extracts the required fixed scalar.
         let surv_sigma = validate_latent_survival_inputs(
             data.view(),
             &valid_survival_spec(n, p_time),
             &loaded_frailty(),
         )
         .expect("valid survival spec must validate");
-        assert_eq!(surv_sigma, Some(0.3));
+        assert_eq!(surv_sigma, FrailtyScale::Fixed { sigma: 0.3 });
         let bin_sigma = validate_latent_binary_inputs(
             data.view(),
             &valid_binary_spec(n, p_time),
@@ -7055,10 +7039,10 @@ mod tests {
             "latent-binary row 2 has invalid event target 7; expected 0 or 1"
         );
 
-        // 6. Frailty policy divergence: survival accepts a learnable scale
-        //    (`sigma_fixed = None` ⇒ `Ok(None)`), binary rejects it.
+        // 6. Frailty policy divergence: survival accepts a learned scale,
+        //    binary rejects it.
         let learnable = FrailtySpec::HazardMultiplier {
-            sigma_fixed: None,
+            scale: FrailtyScale::Learned { initial_sigma: 0.5 },
             loading: HazardLoading::LoadedVsUnloaded,
         };
         let surv_learnable = validate_latent_survival_inputs(
@@ -7067,7 +7051,10 @@ mod tests {
             &learnable,
         )
         .expect("survival accepts a learnable latent scale");
-        assert_eq!(surv_learnable, None);
+        assert_eq!(
+            surv_learnable,
+            FrailtyScale::Learned { initial_sigma: 0.5 }
+        );
         let bin_learnable =
             validate_latent_binary_inputs(data.view(), &valid_binary_spec(n, p_time), &learnable)
                 .expect_err("binary requires a fixed latent scale");
