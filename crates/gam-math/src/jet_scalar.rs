@@ -4100,6 +4100,11 @@ mod tests {
         let dynamic_third = expression(&dynamic_one);
         for a in 0..K {
             for b in 0..K {
+                assert_eq!(
+                    dynamic_third.contracted_third()[a * K + b].to_bits(),
+                    dynamic_third.contracted_third()[b * K + a].to_bits(),
+                    "arena third Hessian must be exactly symmetric at ({a},{b})"
+                );
                 close(
                     dynamic_third.contracted_third()[a * K + b],
                     fixed_third[a][b],
