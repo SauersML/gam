@@ -5282,8 +5282,9 @@ impl BernoulliMarginalSlopeFamily {
     /// a batched directional contraction.
     ///
     /// Shared inner cell program of
-    /// [`Self::row_primary_third_contracted_with_moments`] and
-    /// [`Self::row_primary_third_trace_many_with_moments`]. Both consumers
+    /// [`Self::row_primary_third_contracted_with_moments`],
+    /// [`Self::row_primary_third_contracted_many_with_moments`], and
+    /// [`Self::row_primary_third_trace_many_with_moments`]. All consumers
     /// interpret the same declarative Order2/Order3 node stream; only the
     /// diagnostic labels threaded into the deviation-basis compiler differ.
     pub(crate) fn accumulate_primary_third_cell_moments(
