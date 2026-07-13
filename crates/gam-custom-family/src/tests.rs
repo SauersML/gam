@@ -4163,7 +4163,7 @@ pub(crate) fn certified_test_outer(
 }
 
 #[test]
-pub(crate) fn fixed_log_lambda_outer_finalizer_rejects_recomputed_objective_mismatch() {
+pub(crate) fn owned_mode_outer_finalizer_rejects_certified_objective_mismatch() {
     let specs = vec![ParameterBlockSpec {
         name: "certified_fixed_rho".to_string(),
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
@@ -4183,13 +4183,23 @@ pub(crate) fn fixed_log_lambda_outer_finalizer_rejects_recomputed_objective_mism
         ..BlockwiseFitOptions::default()
     };
     let selected_theta = array![0.0];
-    let certified_outer = certified_test_outer(selected_theta.clone(), 123.0);
-
-    let error = fit_custom_family_fixed_log_lambdas_from_outer(
+    let owned = evaluate_custom_family_joint_hyper_owned(
         &OneBlockIdentityFamily,
         &specs,
         &options,
+        &selected_theta,
+        &[vec![]],
         None,
+        EvalMode::ValueOnly,
+    )
+    .expect("the coefficient mode should evaluate before certificate binding");
+    let certified_outer = certified_test_outer(selected_theta.clone(), 123.0);
+
+    let error = fit_custom_family_fixed_log_lambdas_from_owned_mode(
+        &OneBlockIdentityFamily,
+        &specs,
+        &options,
+        owned.mode,
         &selected_theta,
         &certified_outer,
     )
@@ -4204,7 +4214,7 @@ pub(crate) fn fixed_log_lambda_outer_finalizer_rejects_recomputed_objective_mism
 }
 
 #[test]
-pub(crate) fn fixed_log_lambda_outer_finalizer_replays_active_jeffreys_profile() {
+pub(crate) fn owned_mode_outer_finalizer_preserves_active_jeffreys_profile_without_replay() {
     #[derive(Clone)]
     struct ActiveJeffreysQuadraticFamily;
 
@@ -4267,7 +4277,7 @@ pub(crate) fn fixed_log_lambda_outer_finalizer_replays_active_jeffreys_profile()
         ..BlockwiseFitOptions::default()
     };
     let rho = array![0.0];
-    let profiled = evaluate_custom_family_joint_hyper(
+    let profiled = evaluate_custom_family_joint_hyper_owned(
         &family,
         &specs,
         &options,
@@ -4278,6 +4288,7 @@ pub(crate) fn fixed_log_lambda_outer_finalizer_replays_active_jeffreys_profile()
     )
     .expect("the active-Jeffreys profile should evaluate");
     let beta = profiled
+        .result
         .warm_start
         .block_beta_view(0)
         .expect("profiled mode must retain beta")
@@ -4296,18 +4307,21 @@ pub(crate) fn fixed_log_lambda_outer_finalizer_replays_active_jeffreys_profile()
     .expect("absolute curvature below one must arm the Jeffreys profile");
     assert_ne!(phi.to_bits(), 0.0_f64.to_bits());
 
-    let certified_outer = certified_test_outer(rho.clone(), profiled.objective);
-    let fit = fit_custom_family_fixed_log_lambdas_from_outer(
+    let certified_outer = certified_test_outer(rho.clone(), profiled.result.objective);
+    let fit = fit_custom_family_fixed_log_lambdas_from_owned_mode(
         &family,
         &specs,
         &options,
-        Some(&profiled.warm_start),
+        profiled.mode,
         &rho,
         &certified_outer,
     )
     .expect("the exact active-Jeffreys profile must retain its outer certificate");
 
-    assert_eq!(fit.penalized_objective.to_bits(), profiled.objective.to_bits());
+    assert_eq!(
+        fit.penalized_objective.to_bits(),
+        certified_outer.final_value().to_bits()
+    );
     assert!(
         fit.convergence_evidence()
             .outer_certificate()

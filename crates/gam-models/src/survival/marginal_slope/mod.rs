@@ -140,8 +140,6 @@ mod feasibility;
 mod fit_entry;
 mod fit_setup;
 mod flex_sensitivity;
-pub mod gpu;
-pub mod gpu_prep;
 mod hessian;
 mod intercept;
 mod joint_eval;

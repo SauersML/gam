@@ -11,9 +11,8 @@
 //! gradient / Hessian (replacing the hand grad/Hessian loops in
 //! `flex_sensitivity.rs`), at [`Jet3`] yields the contracted third
 //! `D_dir H[u,v]`, and at [`Jet4`] the contracted fourth — replacing the
-//! hand probit-chain + quotient-rule assembly in
-//! `gpu::cpu_oracle_third/fourth_contraction`. The directional / bidirectional
-//! contraction "directions" fall out of the nilpotent ε / δ seeds of the timepoint
+//! former probit-chain + quotient-rule assembly. The directional /
+//! bidirectional contraction "directions" fall out of the nilpotent ε / δ seeds of the timepoint
 //! jets, exactly as the packed `Order2`/`OneSeed`/`TwoSeed` scalars do for
 //! location-scale — but here over a **runtime** primary count `p` (the flex
 //! primary count `4 + |h| + |w| + 1` is large and variable, so a `Vec`-backed
@@ -35,10 +34,9 @@
 //! through this jet single-source in production:
 //!   - `flex_sensitivity.rs` (value/grad/Hessian) → `compute_survival_timepoint_exact_jet`,
 //!   - `contracted.rs` (third/fourth) → `compute_survival_timepoint_{directional,bidirectional}_jet_from_cached`.
-//! The hand producers (`compute_survival_timepoint_{exact,directional,bidirectional}`)
-//! are DEMOTED to `#[cfg(test)]` oracle modules (`timepoint_exact::{directional,
-//! bidirectional}_oracle_tests`, `flex_oracle_structs_tests`) — kept as the
-//! cross-check, not deleted (`verify_kernel_channels` discipline).
+//! The former hand timepoint producers have been deleted; finite differences,
+//! nested duals, and generic-plan comparisons independently pin the generated
+//! channels.
 //!
 //! **HOW THE JET WAS PROVEN CORRECT.** The `Jet2`/`Jet3`/`Jet4` builders are pinned
 //! in `moment_engine_tests` against the hand path AND — decisively — against a
@@ -81,12 +79,61 @@
 
 use super::*;
 use crate::bms::signed_probit_neglog_unary_stack;
-use crate::survival::marginal_slope::gpu;
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicOrder2Accumulator, DynamicOrder2Term,
     OneSeed, Order2, RuntimeJetScalar,
 };
 use gam_math::jet_tower::Tower2;
+
+/// Canonical value/gradient/Hessian timepoint channels consumed by the
+/// contracted row expression.
+#[derive(Clone, Debug)]
+pub(crate) struct FlexTimepointBasePack {
+    pub(crate) eta: f64,
+    pub(crate) chi: f64,
+    pub(crate) d: f64,
+    pub(crate) eta_u: Vec<f64>,
+    pub(crate) eta_uv: Vec<f64>,
+    pub(crate) chi_u: Vec<f64>,
+    pub(crate) chi_uv: Vec<f64>,
+    pub(crate) d_u: Vec<f64>,
+    pub(crate) d_uv: Vec<f64>,
+}
+
+/// Single-direction extension of the canonical timepoint channels.
+#[derive(Clone, Debug)]
+pub(crate) struct FlexTimepointDirectionalPack {
+    pub(crate) eta_uv_dir: Vec<f64>,
+    pub(crate) eta_u_dir: Vec<f64>,
+    pub(crate) chi_u_dir: Vec<f64>,
+    pub(crate) chi_uv_dir: Vec<f64>,
+    pub(crate) d_u_dir: Vec<f64>,
+    pub(crate) d_uv_dir: Vec<f64>,
+}
+
+/// Mixed second-direction extension of the canonical timepoint channels.
+#[derive(Clone, Debug)]
+pub(crate) struct FlexTimepointBidirectionalPack {
+    pub(crate) eta_uv_uv: Vec<f64>,
+    pub(crate) chi_uv_uv: Vec<f64>,
+    pub(crate) d_uv_uv: Vec<f64>,
+}
+
+pub(crate) fn pack_flex_timepoint_base(
+    base: &SurvivalFlexTimepointExact,
+) -> FlexTimepointBasePack {
+    FlexTimepointBasePack {
+        eta: base.eta,
+        chi: base.chi,
+        d: base.d,
+        eta_u: base.eta_u.to_vec(),
+        eta_uv: base.eta_uv.iter().copied().collect(),
+        chi_u: base.chi_u.to_vec(),
+        chi_uv: base.chi_uv.iter().copied().collect(),
+        d_u: base.d_u.to_vec(),
+        d_uv: base.d_uv.iter().copied().collect(),
+    }
+}
 
 thread_local! {
     /// Per-worker FLEX directional workspace. The largest row tape is retained
@@ -1084,10 +1131,7 @@ trait FlexThirdOutput: FlexJet + MomentTerm {
         eta: &Self,
         chi: &Self,
         d: &Self,
-    ) -> (
-        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
-        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
-    );
+    ) -> (FlexTimepointBasePack, FlexTimepointDirectionalPack);
 }
 
 impl FlexThirdOutput for ArenaJet3<'_> {
@@ -1095,12 +1139,9 @@ impl FlexThirdOutput for ArenaJet3<'_> {
         eta: &Self,
         chi: &Self,
         d: &Self,
-    ) -> (
-        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
-        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
-    ) {
+    ) -> (FlexTimepointBasePack, FlexTimepointDirectionalPack) {
         (
-            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase {
+            FlexTimepointBasePack {
                 eta: eta.inner.base.v,
                 chi: chi.inner.base.v,
                 d: d.inner.base.v,
@@ -1111,7 +1152,7 @@ impl FlexThirdOutput for ArenaJet3<'_> {
                 d_u: d.inner.base.g.to_vec(),
                 d_uv: d.inner.base.h.to_vec(),
             },
-            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
+            FlexTimepointDirectionalPack {
                 eta_u_dir: eta.inner.eps.g.to_vec(),
                 eta_uv_dir: eta.inner.eps.h.to_vec(),
                 chi_u_dir: chi.inner.eps.g.to_vec(),
@@ -1128,14 +1169,11 @@ impl<const K: usize> FlexThirdOutput for FixedJet3<K> {
         eta: &Self,
         chi: &Self,
         d: &Self,
-    ) -> (
-        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
-        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
-    ) {
+    ) -> (FlexTimepointBasePack, FlexTimepointDirectionalPack) {
         let flatten =
             |matrix: &[[f64; K]; K]| matrix.iter().flat_map(|row| row.iter().copied()).collect();
         (
-            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase {
+            FlexTimepointBasePack {
                 eta: eta.inner.base.0.v,
                 chi: chi.inner.base.0.v,
                 d: d.inner.base.0.v,
@@ -1146,7 +1184,7 @@ impl<const K: usize> FlexThirdOutput for FixedJet3<K> {
                 d_u: d.inner.base.0.g.to_vec(),
                 d_uv: flatten(&d.inner.base.0.h),
             },
-            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
+            FlexTimepointDirectionalPack {
                 eta_u_dir: eta.inner.eps.0.g.to_vec(),
                 eta_uv_dir: flatten(&eta.inner.eps.0.h),
                 chi_u_dir: chi.inner.eps.0.g.to_vec(),
@@ -1319,24 +1357,24 @@ pub(crate) struct FlexRowJet2Channels<'a> {
 /// Entry/exit base + directional timepoint packs for the contracted-third path,
 /// bundled to keep `flex_row_nll_third_contracted` under the argument-count gate.
 pub(crate) struct FlexThirdPacks<'a> {
-    pub entry_base: &'a gpu::SurvivalFlexBlock10TimepointBase,
-    pub exit_base: &'a gpu::SurvivalFlexBlock10TimepointBase,
-    pub entry_ext: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
-    pub exit_ext: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
+    pub entry_base: &'a FlexTimepointBasePack,
+    pub exit_base: &'a FlexTimepointBasePack,
+    pub entry_ext: &'a FlexTimepointDirectionalPack,
+    pub exit_ext: &'a FlexTimepointDirectionalPack,
 }
 
 /// Entry/exit base + both directional + bidirectional timepoint packs for the
 /// contracted-fourth path, bundled to keep `flex_row_nll_fourth_contracted`
 /// under the argument-count gate.
 pub(crate) struct FlexFourthPacks<'a> {
-    pub entry_base: &'a gpu::SurvivalFlexBlock10TimepointBase,
-    pub exit_base: &'a gpu::SurvivalFlexBlock10TimepointBase,
-    pub entry_ext_u: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
-    pub exit_ext_u: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
-    pub entry_ext_v: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
-    pub exit_ext_v: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
-    pub entry_bi: &'a gpu::SurvivalFlexBlock10TimepointBiDirectional,
-    pub exit_bi: &'a gpu::SurvivalFlexBlock10TimepointBiDirectional,
+    pub entry_base: &'a FlexTimepointBasePack,
+    pub exit_base: &'a FlexTimepointBasePack,
+    pub entry_ext_u: &'a FlexTimepointDirectionalPack,
+    pub exit_ext_u: &'a FlexTimepointDirectionalPack,
+    pub entry_ext_v: &'a FlexTimepointDirectionalPack,
+    pub exit_ext_v: &'a FlexTimepointDirectionalPack,
+    pub entry_bi: &'a FlexTimepointBidirectionalPack,
+    pub exit_bi: &'a FlexTimepointBidirectionalPack,
 }
 
 impl SurvivalMarginalSlopeFamily {
@@ -2725,7 +2763,7 @@ impl SurvivalMarginalSlopeFamily {
     /// #932-2 PRODUCTION cutover (increment 2): the directional timepoint
     /// extension `D_dir(eta_u/eta_uv/chi_u/chi_uv/d_u/d_uv)` via the single-source
     /// `flex_timepoint_inputs_generic` jet builder at [`Jet3`] (one nilpotent ε
-    /// seed = the contraction direction). Returns the Block-10 directional pack
+    /// seed = the contraction direction). Returns the directional pack
     /// directly (the ε channel `.eps.g`/`.eps.h` of the `(eta, chi, d)` jets),
     /// replacing the hand `compute_survival_timepoint_directional_exact_from_cached`
     /// chain-rule assembly. Pinned term-for-term against the hand `block10_pack_dir`
@@ -2745,13 +2783,7 @@ impl SurvivalMarginalSlopeFamily {
         cached: &CachedPartitionCells,
         dir: &Array1<f64>,
         arena: &DynamicJetArena,
-    ) -> Result<
-        (
-            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
-            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
-        ),
-        String,
-    > {
+    ) -> Result<(FlexTimepointBasePack, FlexTimepointDirectionalPack), String> {
         let p = primary.total;
         let d_check = self.evaluate_survival_denom_d(a, b, beta_h, beta_w)?;
         let z_obs = self.observed_score_projection(row);
@@ -2804,7 +2836,7 @@ impl SurvivalMarginalSlopeFamily {
     /// #932-2 PRODUCTION cutover (increment 2): the mixed second-directional
     /// timepoint extension `D_{d1} D_{d2}(eta_uv/chi_uv/d_uv)` via the single-source
     /// builder at [`Jet4`] (two nilpotent seeds ε = `dir1`, δ = `dir2`). Returns the
-    /// Block-10 bidirectional pack directly (the εδ-Hessian channel `.eps_del.h`),
+    /// bidirectional pack directly (the εδ-Hessian channel `.eps_del.h`),
     /// replacing the hand `compute_survival_timepoint_bidirectional_exact_from_cached`.
     /// Pinned against the hand `block10_pack_bi` by
     /// `flex_timepoint_inputs_jet4_bidirectional_matches_hand_932` /
@@ -2822,10 +2854,7 @@ impl SurvivalMarginalSlopeFamily {
         cached: &CachedPartitionCells,
         dir1: &Array1<f64>,
         dir2: &Array1<f64>,
-    ) -> Result<
-        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBiDirectional,
-        String,
-    > {
+    ) -> Result<FlexTimepointBidirectionalPack, String> {
         let p = primary.total;
         let d_check = self.evaluate_survival_denom_d(a, b, beta_h, beta_w)?;
         let z_obs = self.observed_score_projection(row);
@@ -2854,13 +2883,11 @@ impl SurvivalMarginalSlopeFamily {
             &cells,
         )?;
 
-        Ok(
-            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBiDirectional {
-                eta_uv_uv: eta.eps_del.h.clone(),
-                chi_uv_uv: chi.eps_del.h.clone(),
-                d_uv_uv: d.eps_del.h.clone(),
-            },
-        )
+        Ok(FlexTimepointBidirectionalPack {
+            eta_uv_uv: eta.eps_del.h.clone(),
+            chi_uv_uv: chi.eps_del.h.clone(),
+            d_uv_uv: d.eps_del.h.clone(),
+        })
     }
 }
 

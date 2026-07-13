@@ -6,6 +6,9 @@
 //! path or the rigid fallback.
 
 use super::*;
+use super::flex_jet::{
+    FlexTimepointBasePack, FlexTimepointDirectionalPack, pack_flex_timepoint_base,
+};
 
 /// Direction-independent geometry shared by the single-direction fused Jet3
 /// route and the build-once all-axis route.
@@ -30,8 +33,8 @@ struct FlexThirdRowGeometry {
 impl FlexThirdRowGeometry {
     fn into_base(
         self,
-        entry_base: crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
-        exit_base: crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+        entry_base: FlexTimepointBasePack,
+        exit_base: FlexTimepointBasePack,
     ) -> FlexThirdRowBase {
         FlexThirdRowBase {
             row: self.row,
@@ -245,7 +248,10 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
 
-        Ok(geometry.into_base(block10_pack_base(&entry), block10_pack_base(&exit)))
+        Ok(geometry.into_base(
+            pack_flex_timepoint_base(&entry),
+            pack_flex_timepoint_base(&exit),
+        ))
     }
 
     /// Contract the third-order tensor of a row against a single direction,
@@ -311,8 +317,8 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         base: &FlexThirdRowBase,
         dir: &Array1<f64>,
-        entry_ext: &crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
-        exit_ext: &crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
+        entry_ext: &FlexTimepointDirectionalPack,
+        exit_ext: &FlexTimepointDirectionalPack,
     ) -> Result<Array2<f64>, String> {
         let primary = flex_primary_slices(self);
         // #932 single-source: the contracted third `Σ_c ℓ_{abc} dir_c =
@@ -558,8 +564,8 @@ impl SurvivalMarginalSlopeFamily {
                 .as_slice()
                 .ok_or_else(|| "fourth contraction: dir_v must be contiguous".to_string())?,
             super::flex_jet::FlexFourthPacks {
-                entry_base: &block10_pack_base(&entry_base),
-                exit_base: &block10_pack_base(&exit_base),
+                entry_base: &pack_flex_timepoint_base(&entry_base),
+                exit_base: &pack_flex_timepoint_base(&exit_base),
                 entry_ext_u: &entry_ext_u,
                 exit_ext_u: &exit_ext_u,
                 entry_ext_v: &entry_ext_v,

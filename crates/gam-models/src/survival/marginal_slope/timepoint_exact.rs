@@ -20,31 +20,6 @@
 
 use super::*;
 
-// #932-2 cutover: the hand directional / bidirectional timepoint producers are now
-// test-only oracles — the production contracted path (`contracted.rs`) drives the
-// single-source `flex_timepoint_inputs_generic` jet builder at `Jet3`/`Jet4`
-// (`compute_survival_timepoint_{directional,bidirectional}_jet_from_cached`). The
-// hand modules stay as the cross-check that pins the jet path (`flex_jet`'s
-// `flex_timepoint_inputs_jet{3,4}_*_matches_hand_932` gates + the `tests.rs` FD
-// witnesses), so they are gated to the test build (`*_oracle_tests`) rather than
-// deleted.
-#[cfg(test)]
-mod bidirectional_oracle_tests;
 mod contracted;
-#[cfg(test)]
-mod directional_oracle_tests;
-// #932-2 increment 3 + grad-only cutover: the hand contracted/base θ-derivative
-// producer (`compute_survival_timepoint_exact_from_cached` + its D-path builders)
-// AND the hand grad-only first-order pack are now test-only oracles — BOTH the
-// production grad-only path (`flex_jet::compute_survival_timepoint_first_order_exact`
-// at Jet1) and the value/grad/Hessian + contracted base (Jet2/Jet3/Jet4) are
-// jet-sourced from the one `flex_jet` builder. `first_full` is now test-only: its
-// sole remaining item, the shared `moving_density_boundary_flux` helper, is consumed
-// only by the `#[cfg(test)]` oracle assemblers, so the module is `cfg(test)` too
-// (in a non-test build it would be dead code under deny-warnings).
-#[cfg(test)]
-mod first_full_exact_oracle_tests;
-#[cfg(test)]
-mod first_full_tests;
 pub(crate) mod flex_jet;
 mod partition;

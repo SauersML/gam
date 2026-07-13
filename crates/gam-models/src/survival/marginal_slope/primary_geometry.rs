@@ -134,84 +134,6 @@ pub(crate) struct DenestedCellPrimaryFixedPartials {
     pub(crate) coeff_bbbu: Vec<[f64; 4]>,
 }
 
-impl DenestedCellPrimaryFixedPartials {
-    /// Reconstruct the struct from the device-flat layout emitted by
-    /// `crate::survival::marginal_slope::gpu_prep::DENESTED_CELL_PRIMARY_FIXED_PARTIALS_KERNEL_SRC`.
-    ///
-    /// Layout (per cell):
-    ///
-    /// ```text
-    ///   dc_da[4], dc_daa[4], dc_daaa[4]                       // 12 doubles
-    ///   coeff_u[r][4]                                          // 4r
-    ///   coeff_au[r][4], coeff_bu[r][4]                         // 8r
-    ///   coeff_aau[r][4], coeff_abu[r][4], coeff_bbu[r][4]      // 12r
-    ///   coeff_aaau[r][4], coeff_aabu[r][4], coeff_abbu[r][4], coeff_bbbu[r][4]
-    ///                                                          // 16r
-    /// ```
-    ///
-    /// Total length: `12 + 40 * r`.
-    pub(crate) fn from_flat_slice(flat: &[f64], r: usize) -> Result<Self, String> {
-        let expected = 12 + 40 * r;
-        if flat.len() != expected {
-            return Err(format!(
-                "DenestedCellPrimaryFixedPartials::from_flat_slice: expected {expected} doubles \
-                 (12 + 40·r with r={r}), got {}",
-                flat.len()
-            ));
-        }
-        let read4 =
-            |off: usize| -> [f64; 4] { [flat[off], flat[off + 1], flat[off + 2], flat[off + 3]] };
-        let dc_da = read4(0);
-        let dc_daa = read4(4);
-        let dc_daaa = read4(8);
-        let mut cursor = 12;
-        let read_run = |start: usize| -> Vec<[f64; 4]> {
-            let mut out = Vec::with_capacity(r);
-            for slot in 0..r {
-                let off = start + slot * 4;
-                out.push([flat[off], flat[off + 1], flat[off + 2], flat[off + 3]]);
-            }
-            out
-        };
-        let coeff_u = read_run(cursor);
-        cursor += 4 * r;
-        let coeff_au = read_run(cursor);
-        cursor += 4 * r;
-        let coeff_bu = read_run(cursor);
-        cursor += 4 * r;
-        let coeff_aau = read_run(cursor);
-        cursor += 4 * r;
-        let coeff_abu = read_run(cursor);
-        cursor += 4 * r;
-        let coeff_bbu = read_run(cursor);
-        cursor += 4 * r;
-        let coeff_aaau = read_run(cursor);
-        cursor += 4 * r;
-        let coeff_aabu = read_run(cursor);
-        cursor += 4 * r;
-        let coeff_abbu = read_run(cursor);
-        cursor += 4 * r;
-        let coeff_bbbu = read_run(cursor);
-        cursor += 4 * r;
-        assert_eq!(cursor, expected);
-        Ok(Self {
-            dc_da,
-            dc_daa,
-            dc_daaa,
-            coeff_u,
-            coeff_au,
-            coeff_bu,
-            coeff_aau,
-            coeff_abu,
-            coeff_bbu,
-            coeff_aaau,
-            coeff_aabu,
-            coeff_abbu,
-            coeff_bbbu,
-        })
-    }
-}
-
 // #932-2 cutover: `COEFF_SUPPORT_GHW`/`COEFF_SUPPORT_GW` moved to the test-masked
 // `flex_oracle_structs_tests` module — they parametrize only the now test-only hand
 // directional/bidirectional oracle (the production jet path's `observed_fixed_for`
@@ -245,8 +167,10 @@ pub(crate) struct FlexThirdRowBase {
     pub(crate) beta_w: Option<Array1<f64>>,
     pub(crate) entry_cached: CachedPartitionCells,
     pub(crate) exit_cached: CachedPartitionCells,
-    pub(crate) entry_base: crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
-    pub(crate) exit_base: crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+    pub(crate) entry_base:
+        crate::survival::marginal_slope::timepoint_exact::flex_jet::FlexTimepointBasePack,
+    pub(crate) exit_base:
+        crate::survival::marginal_slope::timepoint_exact::flex_jet::FlexTimepointBasePack,
 }
 
 pub(crate) struct CachedCellEntry {
