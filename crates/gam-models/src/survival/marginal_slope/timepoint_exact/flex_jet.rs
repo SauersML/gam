@@ -4388,7 +4388,7 @@ mod moment_engine_tests {
         let m_beta = 0.15_f64;
         let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * m_beta;
         let o_infl = 0.0_f64;
-        let solved = family
+        let a1 = family
             .solve_row_survival_intercept_with_slot(
                 q1,
                 g,
@@ -4564,9 +4564,8 @@ mod moment_engine_tests {
                 bw,
                 Some((row, SurvivalInterceptSlotKind::Exit)),
             )
-            .expect("intercept solve");
-        let a1 = solved.0;
-        let d1 = solved.1;
+            .expect("intercept solve")
+            .0;
         let cached = family
             .build_cached_partition(&primary, a1, g, bh, bw)
             .expect("cached partition");

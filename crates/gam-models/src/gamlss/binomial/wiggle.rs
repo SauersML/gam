@@ -26,6 +26,12 @@ pub(crate) struct BinomialLocationScaleWiggleRowProgram<'a> {
     basis_derivatives: Vec<Array2<f64>>,
 }
 
+#[derive(Clone, Copy)]
+enum BinomialWiggleRowOuter {
+    Observed,
+    ExpectedInformation,
+}
+
 /// Evaluate the one canonical predictor expression over an arbitrary scalar
 /// algebra.  Operation closures let both const-width `JetScalar` and
 /// runtime-width `RuntimeJetScalar` instantiate this exact body.
@@ -175,6 +181,28 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         Ok([0.0, m1, m2, m3, m4])
     }
 
+    #[inline]
+    fn outer_stack(
+        &self,
+        row: usize,
+        derivative_order: usize,
+        outer: BinomialWiggleRowOuter,
+    ) -> Result<[f64; 5], String> {
+        match outer {
+            BinomialWiggleRowOuter::Observed => self.objective_stack(row, derivative_order),
+            BinomialWiggleRowOuter::ExpectedInformation => {
+                let (information, first, second) = binomial_expected_q_information_derivatives(
+                    self.family.weights[row],
+                    self.core.mu[row],
+                    self.core.dmu_dq[row],
+                    self.core.d2mu_dq2[row],
+                    self.core.d3mu_dq3[row],
+                );
+                Ok([0.0, 0.0, information, first, second])
+            }
+        }
+    }
+
     /// Runtime-width instantiation of the canonical row program.  This is the
     /// independent full-primary path used by generic row-program verification;
     /// production structured lowerings below call the same predictor body with
@@ -246,6 +274,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         warp_stack: [f64; 5],
         terms: &[(usize, [f64; 5])],
         derivative_order: usize,
+        outer: BinomialWiggleRowOuter,
     ) -> Result<S, String> {
         use gam_math::nested_dual::JetField;
         let q = binomial_location_scale_wiggle_predictor_expression(
@@ -259,10 +288,13 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
             JetField::neg,
             JetField::compose_unary,
         );
-        Ok(q.compose_unary(self.objective_stack(row, derivative_order)?))
+        Ok(q.compose_unary(self.outer_stack(row, derivative_order, outer)?))
     }
 
-    fn order2_rows(&self) -> Result<BinomialWiggleOrder2Rows, String> {
+    fn order2_rows(
+        &self,
+        outer: BinomialWiggleRowOuter,
+    ) -> Result<BinomialWiggleOrder2Rows, String> {
         use gam_math::jet_scalar::{JetScalar, Order2};
 
         let n = self.family.y.len();
@@ -281,7 +313,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
                 std::array::from_fn(|axis| Order2::variable(values[axis], axis));
             let warp = self.linear_basis_stack(row, self.beta_w.view(), Some(self.etaw[row]));
             let h = self
-                .eval_fixed(row, &primaries, warp, &probe_terms, 2)?
+                .eval_fixed(row, &primaries, warp, &probe_terms, 2, outer)?
                 .into_channels()
                 .2;
             rows.coeff_tt[row] = h[0][0];
@@ -301,6 +333,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         d_eta_t: &Array1<f64>,
         d_eta_ls: &Array1<f64>,
         u_w: ArrayView1<'_, f64>,
+        outer: BinomialWiggleRowOuter,
     ) -> Result<BinomialWiggleFirstDirectionalRows, String> {
         use gam_math::jet_scalar::OneSeed;
 
@@ -325,7 +358,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
             terms[0] = (2, direction_stack);
             terms[1..].copy_from_slice(&probe_terms);
             let h = self
-                .eval_fixed(row, &primaries, warp, &terms, 3)?
+                .eval_fixed(row, &primaries, warp, &terms, 3, outer)?
                 .contracted_third();
             rows.coeff_tt[row] = h[0][0];
             rows.coeff_tl[row] = h[0][1];
@@ -350,6 +383,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         d_eta_t_v: &Array1<f64>,
         d_eta_ls_v: &Array1<f64>,
         v_w: ArrayView1<'_, f64>,
+        outer: BinomialWiggleRowOuter,
     ) -> Result<BinomialWiggleSecondDirectionalRows, String> {
         use gam_math::jet_scalar::TwoSeed;
 
@@ -405,7 +439,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
             terms[1] = (3, self.linear_basis_stack(row, v_w, None));
             terms[2..].copy_from_slice(&probe_terms);
             let h = self
-                .eval_fixed(row, &primaries, warp, &terms, 4)?
+                .eval_fixed(row, &primaries, warp, &terms, 4, outer)?
                 .contracted_fourth();
             rows.coeff_tt[row] = h[0][0];
             rows.coeff_tl[row] = h[0][1];
@@ -2640,7 +2674,8 @@ impl BinomialLocationScaleWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<BinomialWiggleOrder2Rows, String> {
-        BinomialLocationScaleWiggleRowProgram::new(self, block_states, 2)?.order2_rows()
+        BinomialLocationScaleWiggleRowProgram::new(self, block_states, 2)?
+            .order2_rows(BinomialWiggleRowOuter::Observed)
     }
 
     pub(crate) fn expected_wiggle_geometry_inputs<'a>(
@@ -3278,7 +3313,12 @@ impl BinomialLocationScaleWiggleFamily {
             coeff_lw_dd,
             coeff_ww_bb,
             coeff_ww_bd,
-        } = program.first_directional_rows(&d_eta_t, &d_eta_ls, uw.view())?;
+        } = program.first_directional_rows(
+            &d_eta_t,
+            &d_eta_ls,
+            uw.view(),
+            BinomialWiggleRowOuter::Observed,
+        )?;
 
         let basis: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[0].clone());
         let basis_d1: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[1].clone());
@@ -3365,6 +3405,7 @@ impl BinomialLocationScaleWiggleFamily {
             &d_eta_t_v,
             &d_eta_ls_v,
             v_w.view(),
+            BinomialWiggleRowOuter::Observed,
         )?;
 
         let basis: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[0].clone());
