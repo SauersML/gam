@@ -288,6 +288,7 @@ pub(crate) enum SmoothingCorrectionUnavailable {
 /// only for zero directions whose count is independently certified by the
 /// structural penalty map; positive curvature is never truncated and negative
 /// curvature is never salvaged as covariance.
+#[derive(Debug)]
 pub(crate) struct InvertedRhoHessian {
     pub inverse: Array2<f64>,
     pub active_rank: usize,

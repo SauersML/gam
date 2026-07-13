@@ -129,7 +129,7 @@ fn zero_prior_is_exact_exclusion_but_negative_prior_is_refused() {
 
 #[test]
 fn gamma_balanced_products_and_near_saturation_deviance_are_representable() {
-    let mu = 1.0e200;
+    let mu: f64 = 1.0e200;
     let y = f64::from_bits(mu.to_bits() + 1);
     let row = row_reweight_cpu(
         PirlsRowFamily::GammaLog,
@@ -376,7 +376,7 @@ fn device_rows_match_cpu_at_log_endpoints_tails_and_tiny_weights() {
     };
     let stream = backend.inner.ctx.default_stream();
     for family in PirlsRowFamily::ALL {
-        let eta = match family {
+        let eta: Vec<f64> = match family {
             PirlsRowFamily::PoissonLog | PirlsRowFamily::GammaLog => {
                 vec![-700.0, -2.0, 0.0, 2.0, 700.0]
             }

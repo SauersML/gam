@@ -1100,7 +1100,8 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
             )
             .expect("finite SAS eta");
             let mu = jets.jet.mu;
-            let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
+            let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu)
+                .expect("finite binomial row geometry");
             let d1 = jets.jet.d1;
             let dmu = jets.djet_depsilon.mu;
             let dd1 = jets.djet_depsilon.d1;
@@ -1126,7 +1127,8 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
                 .expect("finite SAS eta");
                 let mu = jets.jet.mu;
                 let d1 = jets.jet.d1;
-                let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
+                let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu)
+                    .expect("finite binomial row geometry");
                 aux.a1 * d1
             })
             .collect();
@@ -1160,7 +1162,8 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
-            let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
+            let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu)
+                .expect("finite binomial row geometry");
             -(aux.a2 * d1 * d1 + aux.a1 * d2)
         })
         .collect();
@@ -1366,7 +1369,8 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
             .expect("finite SAS eta");
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
-            let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
+            let aux = link_binomial_aux(i, eta[i], y[i], w[i].max(0.0), mu)
+                .expect("finite binomial row geometry");
             u[i] = aux.a1 * d1;
         }
         let mut g = -x_dense.t().dot(&u);
@@ -1391,7 +1395,8 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
         let mu = jets.jet.mu;
         let d1 = jets.jet.d1;
         let d2 = jets.jet.d2;
-        let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
+        let aux = link_binomial_aux(i, eta0[i], y[i], w[i].max(0.0), mu)
+            .expect("finite binomial row geometry");
         neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
     }
     let weighted_x = &x_dense * &neg_du_deta.insert_axis(Axis(1));
@@ -1542,7 +1547,8 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
         let mu = jets.jet.mu;
         let d1 = jets.jet.d1;
         let d2 = jets.jet.d2;
-        let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
+        let aux = link_binomial_aux(i, eta0[i], y[i], w[i].max(0.0), mu)
+            .expect("finite binomial row geometry");
         neg_du_deta[i] = -(aux.a2 * d1 * d1 + aux.a1 * d2);
     }
     let weighted_x = &x_dense * &neg_du_deta.insert_axis(Axis(1));
@@ -1570,6 +1576,7 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
 fn link_binomial_aux_stay_finite_for_saturated_sas_probabilities() {
     let saturated_cases = [
         (
+            -30.0,
             0.0,
             sas_inverse_link_jetwith_param_partials(-30.0, 0.0, 12.0)
                 .expect("finite SAS eta")
@@ -1577,6 +1584,7 @@ fn link_binomial_aux_stay_finite_for_saturated_sas_probabilities() {
                 .mu,
         ),
         (
+            30.0,
             1.0,
             sas_inverse_link_jetwith_param_partials(30.0, 0.0, 12.0)
                 .expect("finite SAS eta")
@@ -1584,8 +1592,9 @@ fn link_binomial_aux_stay_finite_for_saturated_sas_probabilities() {
                 .mu,
         ),
     ];
-    for (yi, mu) in saturated_cases {
-        let aux = link_binomial_aux(yi, 1.0, mu);
+    for (row, (eta, yi, mu)) in saturated_cases.into_iter().enumerate() {
+        let aux = link_binomial_aux(row, eta, yi, 1.0, mu)
+            .expect("saturated SAS row remains representable");
         assert!(aux.a1.is_finite(), "a1 must be finite for yi={yi} mu={mu}");
         assert!(aux.a2.is_finite(), "a2 must be finite for yi={yi} mu={mu}");
         assert!(
