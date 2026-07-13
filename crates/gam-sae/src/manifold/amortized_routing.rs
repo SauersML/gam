@@ -89,8 +89,8 @@ impl SaeManifoldTerm {
         self.atoms
             .iter()
             .map(|atom| {
-                let d = atom.latent_dim;
-                let manifold = atom.basis_kind.latent_manifold(d);
+                let d = atom.latent_dim();
+                let manifold = atom.basis_kind().latent_manifold(d);
                 let mut axes = Vec::with_capacity(d);
                 push_axes(&manifold, &mut axes);
                 if axes.len() == d {
@@ -291,7 +291,7 @@ impl SaeManifoldTerm {
                 }
                 // Reconstruct the amplitude-1 image γ_k(t̂) = Bᵀ φ(t̂).
                 let t_hat: Vec<f64> = coord_block.row(row).iter().copied().collect();
-                let coord_2d = Array2::from_shape_vec((1, atom.latent_dim), t_hat)
+                let coord_2d = Array2::from_shape_vec((1, atom.latent_dim()), t_hat)
                     .map_err(|e| format!("chart_geometry_routing_logits: coord reshape: {e}"))?;
                 let (phi, _jet) = evaluator.evaluate(coord_2d.view())?;
                 let mut gamma = vec![0.0_f64; p];

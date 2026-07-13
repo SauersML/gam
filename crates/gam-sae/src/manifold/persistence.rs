@@ -1168,7 +1168,7 @@ pub fn atom_topology_persistence(
         }
         weights[i] = support_weights[i];
     }
-    let finite_set_components = if matches!(atom.basis_kind, SaeAtomBasisKind::FiniteSet) {
+    let finite_set_components = if matches!(atom.basis_kind(), SaeAtomBasisKind::FiniteSet) {
         Some(atom.basis_size())
     } else {
         None
@@ -1176,7 +1176,7 @@ pub fn atom_topology_persistence(
     topology_persistence_verdict_impl(
         points.view(),
         Some(weights.view()),
-        &atom.basis_kind,
+        atom.basis_kind(),
         finite_set_components,
     )
 }

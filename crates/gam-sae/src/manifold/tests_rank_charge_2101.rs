@@ -147,7 +147,7 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
         term.output_dim() as f64,
         disp,
         lam[0],
-        Some(&term.atoms[0].smooth_penalty),
+        Some(term.atoms[0].smooth_penalty()),
     )
     .unwrap();
     let top_signal = spectrum
@@ -544,7 +544,7 @@ fn rank_charge_shared_primitive_parity() {
         term.output_dim() as f64,
         disp,
         lam[0],
-        Some(&term.atoms[0].smooth_penalty),
+        Some(term.atoms[0].smooth_penalty()),
     )
     .unwrap();
     eprintln!(
@@ -691,7 +691,7 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
             p_out,
             disp,
             lam[0],
-            Some(&term.atoms[0].smooth_penalty),
+            Some(term.atoms[0].smooth_penalty()),
         )
         .unwrap()
     };
@@ -703,7 +703,7 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
             p_out,
             disp,
             lam[0],
-            Some(&term.atoms[0].smooth_penalty),
+            Some(term.atoms[0].smooth_penalty()),
         )
         .unwrap()
     };

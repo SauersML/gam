@@ -52,7 +52,7 @@ pub fn refresh_isometry_caches_from_atom(
     let (_phi, jet) = evaluator.evaluate(coords)?;
 
     let n_obs = coords.nrows();
-    let d = atom.latent_dim;
+    let d = atom.latent_dim();
     let m = atom.basis_size();
     let p = atom.decoder_coefficients.ncols();
     if penalty.p_out != p {
@@ -218,7 +218,7 @@ pub fn refresh_isometry_caches_from_term(
         let mut seen = 0usize;
         let mut paired: Option<usize> = None;
         for (atom_idx, atom) in term.atoms.iter().enumerate() {
-            let matches = atom.latent_dim == p_latent_dim
+            let matches = atom.latent_dim() == p_latent_dim
                 && atom.decoder_coefficients.ncols() == p.p_out
                 && atom.basis_evaluator.is_some();
             if !matches {

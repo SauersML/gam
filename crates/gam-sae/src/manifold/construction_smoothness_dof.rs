@@ -86,7 +86,7 @@ impl SaeManifoldTerm {
             // the exact path's `M[:,col]` column construction row-for-row.
             mz.fill(0.0);
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
-                let s = &atom.smooth_penalty;
+                let s = atom.smooth_penalty();
                 let m = atom.basis_size();
                 let off = offsets[atom_idx];
                 let r = out_dim(atom_idx);
@@ -160,7 +160,7 @@ impl SaeManifoldTerm {
         };
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let s = &atom.smooth_penalty;
+            let s = atom.smooth_penalty();
             let m = atom.basis_size();
             let off = offsets[atom_idx];
             let r = out_dim(atom_idx);

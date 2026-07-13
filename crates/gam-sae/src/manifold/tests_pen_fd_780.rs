@@ -137,12 +137,12 @@ pub(crate) fn sae_fd_term(label: &str) -> (SaeManifoldTerm, Array2<f64>, SaeMani
     };
     assert_eq!(
         basis_kind.latent_manifold(1),
-        atom.basis_kind.latent_manifold(1)
+        atom.basis_kind().latent_manifold(1)
     );
     assert_eq!(phi.dim(), (n_obs, n_basis));
     assert_eq!(jet.dim(), (n_obs, n_basis, 1));
 
-    let manifold = atom.basis_kind.latent_manifold(1);
+    let manifold = atom.basis_kind().latent_manifold(1);
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         Array2::<f64>::zeros((n_obs, 1)),
         vec![coords],
@@ -342,7 +342,7 @@ pub(crate) fn sae_pen_term(
             (coords, 2, atom)
         }
     };
-    let manifold = atom.basis_kind.latent_manifold(latent_dim);
+    let manifold = atom.basis_kind().latent_manifold(latent_dim);
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         Array2::<f64>::zeros((n_obs, 1)),
         vec![coords],

@@ -759,7 +759,7 @@ pub(crate) fn factored_evidence_matches_full_b_at_small_p() {
     // Occam normalizer equals the historical ½·p·rank(S)·log λ exactly.
     let rho = SaeManifoldRho::new(0.0, 0.37, vec![array![0.0_f64]]);
     let occam = term.reml_occam_term(&rho).expect("occam");
-    let rank_s = SaeManifoldTerm::symmetric_rank(&term.atoms[0].smooth_penalty).unwrap();
+    let rank_s = SaeManifoldTerm::symmetric_rank(term.atoms[0].smooth_penalty()).unwrap();
     let expected = 0.5 * (p as f64) * (rank_s as f64) * rho.log_lambda_smooth[0];
     assert_abs_diff_eq!(occam, expected, epsilon = 1.0e-12);
 }

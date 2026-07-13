@@ -77,7 +77,7 @@ mod amortized_encoder_tests {
             );
             assert_eq!(
                 result.ncols(),
-                term.atoms[atom_idx].latent_dim,
+                term.atoms[atom_idx].latent_dim(),
                 "atom {atom_idx} encode coords must match its latent dim"
             );
         }

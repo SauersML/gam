@@ -1877,7 +1877,7 @@ impl SaeManifoldTerm {
         let atom = &self.atoms[atom_idx];
         let p = atom.decoder_coefficients.ncols();
         let mut corrected: IsometryPenalty = (**iso).clone();
-        corrected.target = PsiSlice::full(coord.len(), Some(atom.latent_dim));
+        corrected.target = PsiSlice::full(coord.len(), Some(atom.latent_dim()));
         corrected.p_out = p;
         // Single-source-of-truth gauge metric: the isometry pullback weight is
         // taken from the SAME RowMetric the reconstruction likelihood whitens
@@ -1921,7 +1921,7 @@ impl SaeManifoldTerm {
             {
                 Some(Ok(hess)) => {
                     let n_obs = coords_mat.nrows();
-                    let d = atom.latent_dim;
+                    let d = atom.latent_dim();
                     let m = atom.basis_size();
                     if hess.dim() != (n_obs, m, d, d) {
                         return Err(ArrowSchurError::SchurFactorFailed {
@@ -1961,7 +1961,8 @@ impl SaeManifoldTerm {
                              AffineCoordinateEvaluator, SphereChartEvaluator, \
                              PeriodicHarmonicEvaluator, or TorusHarmonicEvaluator for \
                              SAE-Isometry",
-                            atom.name, atom.basis_kind
+                            atom.name,
+                            atom.basis_kind()
                         ),
                     });
                 }

@@ -311,7 +311,7 @@ fn smooth_rho_derivative_matrix_2156(
             if right.atom != atom_idx {
                 continue;
             }
-            let s = &term.atoms[atom_idx].smooth_penalty;
+            let s = term.atoms[atom_idx].smooth_penalty();
             let sym_s =
                 0.5 * (s[[left.basis_col, right.basis_col]] + s[[right.basis_col, left.basis_col]]);
             let output_dot = sae_dot(&left.output, &right.output);

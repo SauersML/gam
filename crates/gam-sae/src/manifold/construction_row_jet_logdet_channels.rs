@@ -156,7 +156,7 @@ impl SaeManifoldTerm {
         let mut coord_slot: Vec<Vec<usize>> = self
             .atoms
             .iter()
-            .map(|atom| vec![SAE_FIXED_COORD_SLOT; atom.latent_dim])
+            .map(|atom| vec![SAE_FIXED_COORD_SLOT; atom.latent_dim()])
             .collect();
         for (slot, var) in vars.iter().enumerate() {
             match *var {
@@ -192,7 +192,7 @@ impl SaeManifoldTerm {
             .enumerate()
             .map(|(atom_idx, atom)| {
                 let m = atom.basis_size();
-                let d = atom.latent_dim;
+                let d = atom.latent_dim();
                 let second = &second_jets[atom_idx];
                 AtomRowBasisJet {
                     phi: (0..m)
@@ -488,12 +488,14 @@ mod tests_softmax_hand_reference {
             let mut d1: Vec<Vec<Vec<f64>>> = self
                 .atoms
                 .iter()
-                .map(|atom| vec![vec![0.0_f64; p]; atom.latent_dim])
+                .map(|atom| vec![vec![0.0_f64; p]; atom.latent_dim()])
                 .collect();
             let mut d2: Vec<Vec<Vec<Vec<f64>>>> = self
                 .atoms
                 .iter()
-                .map(|atom| vec![vec![vec![0.0_f64; p]; atom.latent_dim]; atom.latent_dim])
+                .map(|atom| {
+                    vec![vec![vec![0.0_f64; p]; atom.latent_dim()]; atom.latent_dim()]
+                })
                 .collect();
             let mut scratch = vec![0.0_f64; p];
             for k in 0..k_atoms {
@@ -501,11 +503,11 @@ mod tests_softmax_hand_reference {
                     continue;
                 }
                 self.atoms[k].fill_decoded_row(row, &mut decoded[k]);
-                for axis in 0..self.atoms[k].latent_dim {
+                for axis in 0..self.atoms[k].latent_dim() {
                     self.atoms[k].fill_decoded_derivative_row(row, axis, &mut d1[k][axis]);
                 }
-                for axis_a in 0..self.atoms[k].latent_dim {
-                    for axis_b in 0..self.atoms[k].latent_dim {
+                for axis_a in 0..self.atoms[k].latent_dim() {
+                    for axis_b in 0..self.atoms[k].latent_dim() {
                         Self::decoded_second_row(
                             &self.atoms[k],
                             &second_jets[k],

@@ -675,10 +675,10 @@ impl SaeManifoldTerm {
                     atom.output_dim()
                 ));
             }
-            if atom.latent_dim != assignment.coords[k].latent_dim() {
+            if atom.latent_dim() != assignment.coords[k].latent_dim() {
                 return Err(format!(
                     "SaeManifoldTerm::new: atom {k} latent_dim={} but assignment coord has {}",
-                    atom.latent_dim,
+                    atom.latent_dim(),
                     assignment.coords[k].latent_dim()
                 ));
             }
@@ -1222,7 +1222,7 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        let penalty = atom.smooth_penalty.clone();
+        let penalty = atom.smooth_penalty().clone();
         if penalty.dim() != (m, m) {
             return Err(format!(
                 "build_atom_inner_fit: atom {atom_idx} smooth penalty {:?} != ({m}, {m})",
@@ -1745,7 +1745,7 @@ impl SaeManifoldTerm {
                 p_out,
                 r_floor,
                 lam_k,
-                Some(&self.atoms[k].smooth_penalty),
+                Some(self.atoms[k].smooth_penalty()),
             )
             .map_err(|e| format!("rank_dof_from_grams: atom {k}: {e}"))?;
             out.push(d);
@@ -2050,7 +2050,7 @@ impl SaeManifoldTerm {
                 support_mass: support.mass(),
                 effective_n: support.fisher_n(),
                 support_ess: support.ess(),
-                untyped: matches!(atom.basis_kind, SaeAtomBasisKind::Precomputed(_)),
+                untyped: matches!(atom.basis_kind(), SaeAtomBasisKind::Precomputed(_)),
                 active_token_count,
             });
         }
@@ -2064,7 +2064,7 @@ impl SaeManifoldTerm {
         metric: &gam_problem::RowMetric,
     ) -> Result<(f64, f64), String> {
         let atom = &self.atoms[atom_idx];
-        let d = atom.latent_dim;
+        let d = atom.latent_dim();
         let p = self.output_dim();
         if d == 0 || p == 0 {
             return Ok((0.0, 0.0));
@@ -2150,11 +2150,11 @@ impl SaeManifoldTerm {
             .iter()
             .enumerate()
             .map(|(k, atom)| {
-                if matches!(atom.basis_kind, SaeAtomBasisKind::Sphere) {
+                if matches!(atom.basis_kind(), SaeAtomBasisKind::Sphere) {
                     return None;
                 }
                 let coords = self.assignment.coords[k].as_matrix().to_owned();
-                if coords.nrows() != n || coords.ncols() != atom.latent_dim {
+                if coords.nrows() != n || coords.ncols() != atom.latent_dim() {
                     return None;
                 }
                 let mut activations = Array1::<f64>::zeros(n);
@@ -2229,8 +2229,8 @@ impl SaeManifoldTerm {
         let mut atom_axis_dim: Vec<usize> = Vec::with_capacity(k);
         let mut cursor = 0usize;
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let d = atom.latent_dim;
-            let topology = match (&atom.basis_kind, d) {
+            let d = atom.latent_dim();
+            let topology = match (atom.basis_kind(), d) {
                 (SaeAtomBasisKind::Periodic, 1) | (SaeAtomBasisKind::Torus, 1) => {
                     AtomTopology::Circle
                 }
@@ -2338,7 +2338,7 @@ impl SaeManifoldTerm {
                     && (d == 1
                         || (d == 2
                             && matches!(
-                                atom.basis_kind,
+                                atom.basis_kind(),
                                 SaeAtomBasisKind::Torus
                                     | SaeAtomBasisKind::Linear
                                     | SaeAtomBasisKind::Duchon
@@ -2585,7 +2585,7 @@ impl SaeManifoldTerm {
         let d_max = self
             .atoms
             .iter()
-            .map(|atom| atom.latent_dim)
+            .map(SaeManifoldAtom::latent_dim)
             .max()
             .unwrap_or(0);
         let border_dim = if self.any_frame_active() {
@@ -3522,7 +3522,7 @@ impl SaeManifoldTerm {
                     ));
                 }
             }
-            if self.atoms[img.atom_idx].latent_dim != 1 {
+            if self.atoms[img.atom_idx].latent_dim() != 1 {
                 return Err(format!(
                     "set_hybrid_linear_images: atom {} is not d=1; only d=1 slots collapse to a straight image",
                     img.atom_idx
@@ -4058,10 +4058,10 @@ impl SaeManifoldTerm {
         let eligible: Vec<usize> = (0..self.k_atoms())
             .filter(|&atom_idx| {
                 let atom = &self.atoms[atom_idx];
-                atom.latent_dim == 1
+                atom.latent_dim() == 1
                     && atom.basis_evaluator.is_some()
                     && atom.homotopy_eta == 1.0
-                    && self.assignment.coords[atom_idx].latent_dim() == atom.latent_dim
+                    && self.assignment.coords[atom_idx].latent_dim() == atom.latent_dim()
             })
             .collect();
         // Per-atom fitted decoded image at every row (the curved candidate's
@@ -4383,7 +4383,7 @@ impl SaeManifoldTerm {
         let mut coords: Vec<Array2<f64>> = self
             .atoms
             .iter()
-            .map(|a| Array2::<f64>::zeros((n, a.latent_dim)))
+            .map(|a| Array2::<f64>::zeros((n, a.latent_dim())))
             .collect();
         let mut converged = vec![false; n];
 
@@ -4704,7 +4704,7 @@ impl SaeManifoldTerm {
         // Tentatively apply every converged joint solution, then accept/reject per row.
         let mut candidate_rows: Vec<bool> = vec![false; n];
         for atom_idx in 0..k_atoms {
-            let d = self.atoms[atom_idx].latent_dim;
+            let d = self.atoms[atom_idx].latent_dim();
             if d == 0 {
                 continue;
             }
@@ -4744,7 +4744,7 @@ impl SaeManifoldTerm {
             .collect();
         let mut reverted_any = false;
         for atom_idx in 0..k_atoms {
-            let d = self.atoms[atom_idx].latent_dim;
+            let d = self.atoms[atom_idx].latent_dim();
             if d == 0 {
                 continue;
             }
@@ -5361,7 +5361,12 @@ impl SaeManifoldTerm {
         let sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
             .atoms
             .iter()
-            .map(|atom| (atom.smooth_penalty.view(), atom.decoder_coefficients.view()))
+            .map(|atom| {
+                (
+                    atom.smooth_penalty().view(),
+                    atom.decoder_coefficients.view(),
+                )
+            })
             .collect();
         let sb_all = batched_smooth_sb(&sb_inputs, false);
         let mut acc = 0.0;
@@ -5378,7 +5383,12 @@ impl SaeManifoldTerm {
         let sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
             .atoms
             .iter()
-            .map(|atom| (atom.smooth_penalty.view(), atom.decoder_coefficients.view()))
+            .map(|atom| {
+                (
+                    atom.smooth_penalty().view(),
+                    atom.decoder_coefficients.view(),
+                )
+            })
             .collect();
         let sb_all = batched_smooth_sb(&sb_inputs, false);
         let mut per_atom = vec![0.0_f64; self.atoms.len()];

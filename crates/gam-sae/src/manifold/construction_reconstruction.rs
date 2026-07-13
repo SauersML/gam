@@ -412,7 +412,7 @@ impl SaeManifoldTerm {
             .map_err(|e| format!("reconstruction_dispersion: ARD traces: {e}"))?;
         let mut coord_edf = 0.0_f64;
         for (k, atom) in self.atoms.iter().enumerate() {
-            let d_k = atom.latent_dim;
+            let d_k = atom.latent_dim();
             if traces[k].len() != d_k {
                 return Err(format!(
                     "reconstruction_dispersion: trace shape mismatch at atom {k} \
@@ -520,7 +520,7 @@ impl SaeManifoldTerm {
                 .schur_inverse_block(block_ranges[k].clone())
                 .map_err(|e| format!("assemble_shape_uncertainty: atom {k}: {e}"))?;
             let n_rows = atom.n_obs();
-            let d = atom.latent_dim;
+            let d = atom.latent_dim();
             // Evenly-strided evaluation rows bound the band cost.
             let stride = n_rows.div_ceil(SHAPE_BAND_MAX_POINTS).max(1);
             let eval_rows: Vec<usize> = (0..n_rows).step_by(stride).collect();

@@ -365,8 +365,8 @@ fn post_move_structure_hash(term: &SaeManifoldTerm, mv: &StructureMove) -> u64 {
     // the parent's plus the move tag above.
     fp.write_usize(term.atoms.len());
     for atom in &term.atoms {
-        fp.write_str(basis_kind_tag(&atom.basis_kind));
-        fp.write_usize(atom.latent_dim);
+        fp.write_str(basis_kind_tag(atom.basis_kind()));
+        fp.write_usize(atom.latent_dim());
     }
     let digest = fp.finalize();
     let bytes = digest.as_bytes();
@@ -940,7 +940,7 @@ fn run_within_atom_carve(
     atom: usize,
 ) -> Option<Result<CarveReport, String>> {
     let a = &term.atoms[atom];
-    if a.latent_dim != 2 {
+    if a.latent_dim() != 2 {
         return None;
     }
     let evaluator = a.basis_evaluator.as_ref()?;
@@ -1292,10 +1292,10 @@ fn fit_seam_transition(term: &SaeManifoldTerm, a: usize, b: usize) -> Option<Sea
     }
     let atom_a = &term.atoms[a];
     let atom_b = &term.atoms[b];
-    if atom_a.latent_dim != 1
-        || atom_b.latent_dim != 1
-        || !matches!(atom_a.basis_kind, SaeAtomBasisKind::Periodic)
-        || !matches!(atom_b.basis_kind, SaeAtomBasisKind::Periodic)
+    if atom_a.latent_dim() != 1
+        || atom_b.latent_dim() != 1
+        || !matches!(atom_a.basis_kind(), SaeAtomBasisKind::Periodic)
+        || !matches!(atom_b.basis_kind(), SaeAtomBasisKind::Periodic)
     {
         return None;
     }
@@ -1709,10 +1709,10 @@ fn is_sphere_pair(term: &SaeManifoldTerm, a: usize, b: usize) -> bool {
     }
     let sa = &term.atoms[a];
     let sb = &term.atoms[b];
-    sa.latent_dim == 2
-        && sb.latent_dim == 2
-        && matches!(sa.basis_kind, SaeAtomBasisKind::Sphere)
-        && matches!(sb.basis_kind, SaeAtomBasisKind::Sphere)
+    sa.latent_dim() == 2
+        && sb.latent_dim() == 2
+        && matches!(sa.basis_kind(), SaeAtomBasisKind::Sphere)
+        && matches!(sb.basis_kind(), SaeAtomBasisKind::Sphere)
 }
 
 /// Fit the ambient-rotation seam transition between two sphere charts and
@@ -1895,7 +1895,7 @@ fn harvest_glue_proposals(
     let frames: Vec<Option<GrassmannFrame>> = (0..k)
         .map(|atom| {
             let at = &term.atoms[atom];
-            if at.latent_dim == 1 && matches!(at.basis_kind, SaeAtomBasisKind::Periodic) {
+            if at.latent_dim() == 1 && matches!(at.basis_kind(), SaeAtomBasisKind::Periodic) {
                 GrassmannFrame::from_decoder_row_space(at.decoder_coefficients.view())
             } else {
                 None
@@ -1979,12 +1979,13 @@ fn harvest_glue_proposals(
     // always REGISTERED (a pole seam is never single-chart-coverable).
     let mut sphere_candidates: Vec<(usize, usize)> = Vec::new();
     for a in 0..k {
-        if support_sizes[a] == 0 || !matches!(term.atoms[a].basis_kind, SaeAtomBasisKind::Sphere) {
+        if support_sizes[a] == 0 || !matches!(term.atoms[a].basis_kind(), SaeAtomBasisKind::Sphere)
+        {
             continue;
         }
         for b in (a + 1)..k {
             if support_sizes[b] == 0
-                || !matches!(term.atoms[b].basis_kind, SaeAtomBasisKind::Sphere)
+                || !matches!(term.atoms[b].basis_kind(), SaeAtomBasisKind::Sphere)
                 || term.charts_share_atlas(a, b)
             {
                 continue;
@@ -4718,7 +4719,7 @@ fn born_atom(
         template_coords.view(),
         birth_target.view(),
         weights.view(),
-        template.latent_dim,
+        template.latent_dim(),
     )?;
     // The born atom + its coordinate block. The race-won path carries the winning
     // topology's coordinate block (dimension-matched to its evaluator, manifold
@@ -5597,7 +5598,7 @@ fn linear_atom_frames(term: &SaeManifoldTerm) -> Vec<(usize, Array1<f64>, Vec<bo
     };
     let mut out = Vec::new();
     for (a, atom) in term.atoms.iter().enumerate() {
-        if !is_linear_like(&atom.basis_kind) {
+        if !is_linear_like(atom.basis_kind()) {
             continue;
         }
         let active_mask: Vec<bool> = (0..n).map(|r| assignments[[r, a]] > floor).collect();
@@ -5836,7 +5837,7 @@ fn flatten_candidates(term: &SaeManifoldTerm) -> Vec<usize> {
     };
     let mut out = Vec::new();
     for (a, atom) in term.atoms.iter().enumerate() {
-        if !matches!(atom.basis_kind, SaeAtomBasisKind::Periodic) || atom.latent_dim != 1 {
+        if !matches!(atom.basis_kind(), SaeAtomBasisKind::Periodic) || atom.latent_dim() != 1 {
             continue;
         }
         let active_idx: Vec<usize> = (0..n).filter(|&r| assignments[[r, a]] > floor).collect();
@@ -8504,8 +8505,8 @@ mod tests {
         let (born, _born_rho) = apply_structure_move_seeded(&term, &rho, &mv, &seeds).unwrap();
         let circle = born.k_atoms() - 1;
         assert_eq!(
-            born.atoms[circle].basis_kind,
-            SaeAtomBasisKind::Periodic,
+            born.atoms[circle].basis_kind(),
+            &SaeAtomBasisKind::Periodic,
             "curl births a Periodic (circle) atom"
         );
         // The born circle's own reconstruction traces the planted ring: every
@@ -8694,7 +8695,7 @@ mod tests {
             "curl ON must certify exactly one circle Birth winner"
         );
         assert_eq!(
-            on.term.atoms.last().map(|a| &a.basis_kind),
+            on.term.atoms.last().map(|a| a.basis_kind()),
             Some(&SaeAtomBasisKind::Periodic),
             "the accepted curl winner must be the recovered circle atom"
         );

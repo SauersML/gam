@@ -189,7 +189,7 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
             let mut coord_slot: Vec<Vec<usize>> = term
                 .atoms
                 .iter()
-                .map(|atom| vec![usize::MAX; atom.latent_dim])
+                .map(|atom| vec![usize::MAX; atom.latent_dim()])
                 .collect();
             for (pos, var) in vars.iter().enumerate() {
                 match *var {
@@ -207,7 +207,7 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                 .enumerate()
                 .map(|(k, atom)| {
                     let m = atom.basis_size();
-                    let d = atom.latent_dim;
+                    let d = atom.latent_dim();
                     AtomRowBasisJet {
                         phi: (0..m).map(|b| atom.basis_values[[row, b]]).collect(),
                         d_phi: (0..m)

@@ -222,10 +222,10 @@ impl SaeSupportSparseTerm {
                     template.output_dim()
                 ));
             }
-            if template.latent_dim != assignment.atom_coord_dim(atom) {
+            if template.latent_dim() != assignment.atom_coord_dim(atom) {
                 return Err(format!(
                     "SaeSupportSparseTerm::new: atom {atom} latent dim {} != assignment dim {}",
-                    template.latent_dim,
+                    template.latent_dim(),
                     assignment.atom_coord_dim(atom)
                 ));
             }
@@ -320,7 +320,7 @@ impl SaeSupportSparseTerm {
             })?;
             let mut selected = Vec::<Candidate>::with_capacity(support_k);
             for (atom_index, atom) in self.atoms.iter().enumerate() {
-                let candidate_coords = (0..atom.latent_dim)
+                let candidate_coords = (0..atom.latent_dim())
                     .map(|axis| {
                         let raw = super::support_seed::projection(
                             row_values,
@@ -328,11 +328,11 @@ impl SaeSupportSparseTerm {
                             axis + 1,
                             random_state,
                         );
-                        super::support_seed::chart_coordinate(&atom.basis_kind, axis, raw)
+                        super::support_seed::chart_coordinate(atom.basis_kind(), axis, raw)
                     })
                     .collect::<Vec<_>>();
                 let coordinate =
-                    Array2::from_shape_vec((1, atom.latent_dim), candidate_coords.clone())
+                    Array2::from_shape_vec((1, atom.latent_dim()), candidate_coords.clone())
                         .map_err(|error| {
                             format!("SaeSupportSparseTerm::reroute_fixed_decoder: {error}")
                         })?;
@@ -387,9 +387,11 @@ impl SaeSupportSparseTerm {
             .iter()
             .enumerate()
             .map(|(atom, template)| SaeAssignmentAtomSpec {
-                latent_dim: template.latent_dim,
+                latent_dim: template.latent_dim(),
                 id_mode: gam_terms::latent::LatentIdMode::None,
-                manifold: template.basis_kind.latent_manifold(template.latent_dim),
+                manifold: template
+                    .basis_kind()
+                    .latent_manifold(template.latent_dim()),
                 retraction: gam_problem::LatentRetractionRegistry::all_euclidean(),
                 latent_id: super::support_seed::splitmix64(atom as u64),
             })
@@ -536,14 +538,14 @@ impl SaeSupportSparseTerm {
             let m = self.atoms[atom].basis_size();
             let lambda = lambda_smooth[atom];
             let sb = self.atoms[atom]
-                .smooth_penalty
+                .smooth_penalty()
                 .dot(&self.atoms[atom].decoder_coefficients);
             for basis in 0..m {
                 let base = beta_offsets[atom] + basis * self.output_dim;
                 for channel in 0..self.output_dim {
                     system.gb[base + channel] += lambda * sb[[basis, channel]];
                     hbb_diag[base + channel] +=
-                        lambda * self.atoms[atom].smooth_penalty[[basis, basis]];
+                        lambda * self.atoms[atom].smooth_penalty()[[basis, basis]];
                 }
             }
         }
@@ -554,7 +556,7 @@ impl SaeSupportSparseTerm {
             penalties: self
                 .atoms
                 .iter()
-                .map(|atom| atom.smooth_penalty.clone())
+                .map(|atom| atom.smooth_penalty().clone())
                 .collect(),
             lambda_smooth: lambda_smooth.to_vec(),
             output_dim: self.output_dim,
@@ -585,7 +587,7 @@ impl SaeSupportSparseTerm {
     fn evaluate_active(&self, row: usize, slot: usize) -> Result<ActiveAtomEval, String> {
         let atom_idx = self.assignment.support_indices(row)[slot] as usize;
         let atom = &self.atoms[atom_idx];
-        let d = atom.latent_dim;
+        let d = atom.latent_dim();
         let coords =
             Array2::from_shape_vec((1, d), self.assignment.coords_for_slot(row, slot).to_vec())
                 .map_err(|error| format!("SaeSupportSparseTerm::evaluate_active: {error}"))?;
@@ -706,7 +708,7 @@ impl SaeSupportSparseTerm {
         let residual = self.raw_residual(target)?;
         let mut value = 0.5 * residual.iter().map(|entry| entry * entry).sum::<f64>();
         for (atom, &lambda) in self.atoms.iter().zip(lambda_smooth) {
-            let sb = atom.smooth_penalty.dot(&atom.decoder_coefficients);
+            let sb = atom.smooth_penalty().dot(&atom.decoder_coefficients);
             value += 0.5
                 * lambda
                 * atom
@@ -799,7 +801,8 @@ impl SaeSupportSparseTerm {
         for atom_idx in 0..self.k_atoms() {
             let m = self.atoms[atom_idx].basis_size();
             let old_decoder = self.atoms[atom_idx].decoder_coefficients.clone();
-            let mut gram = self.atoms[atom_idx].smooth_penalty.clone() * lambda_smooth[atom_idx];
+            let mut gram =
+                self.atoms[atom_idx].smooth_penalty().clone() * lambda_smooth[atom_idx];
             let mut rhs = Array2::<f64>::zeros((m, self.output_dim));
             let mut rows = Vec::with_capacity(self.atom_rows[atom_idx].len());
             for &(row, slot) in &self.atom_rows[atom_idx] {
@@ -969,7 +972,7 @@ impl SaeSupportSparseTerm {
         for atom_idx in 0..self.k_atoms() {
             let atom = &self.atoms[atom_idx];
             let mut gradient =
-                atom.smooth_penalty.dot(&atom.decoder_coefficients) * lambda_smooth[atom_idx];
+                atom.smooth_penalty().dot(&atom.decoder_coefficients) * lambda_smooth[atom_idx];
             for &(row, slot) in &self.atom_rows[atom_idx] {
                 let active = self.evaluate_active(row, slot)?;
                 for basis in 0..atom.basis_size() {

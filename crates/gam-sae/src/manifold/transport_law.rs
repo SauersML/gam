@@ -210,17 +210,17 @@ pub fn measure_atom_transport_between(
         ));
     }
     let atom_ref = &term.atoms[atom];
-    if atom_ref.latent_dim != 1 {
+    if atom_ref.latent_dim() != 1 {
         return Err(format!(
             "measure_atom_transport: the phase-shift law is defined for a 1-D circle atom; atom \
              {atom} has latent_dim {}",
-            atom_ref.latent_dim
+            atom_ref.latent_dim()
         ));
     }
-    if atom_ref.basis_kind != SaeAtomBasisKind::Periodic {
+    if atom_ref.basis_kind() != &SaeAtomBasisKind::Periodic {
         return Err(format!(
             "measure_atom_transport: atom {atom} must use the standard periodic harmonic basis, got {:?}",
-            atom_ref.basis_kind
+            atom_ref.basis_kind()
         ));
     }
     if atom_ref.homotopy_eta != 1.0 {

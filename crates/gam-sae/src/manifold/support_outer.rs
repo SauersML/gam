@@ -40,8 +40,8 @@ impl SaeSupportSmoothingLayout {
             .map(|atom| {
                 format!(
                     "{}:d{}",
-                    sae_atom_basis_kind_name(&atom.basis_kind),
-                    atom.latent_dim
+                    sae_atom_basis_kind_name(atom.basis_kind()),
+                    atom.latent_dim()
                 )
             })
             .collect::<Vec<_>>();
@@ -140,7 +140,7 @@ fn penalty_spectrum(
     let mut rank_by_group = vec![0usize; groups];
     let mut log_pdet_base_by_group = vec![0.0; groups];
     for (atom_idx, atom) in term.atoms.iter().enumerate() {
-        let symmetric = (&atom.smooth_penalty + &atom.smooth_penalty.t()) * 0.5;
+        let symmetric = (atom.smooth_penalty() + &atom.smooth_penalty().t()) * 0.5;
         let (values, _) = symmetric
             .eigh(Side::Lower)
             .map_err(|error| format!("support smooth-penalty eigendecomposition: {error}"))?;
@@ -199,7 +199,7 @@ impl SaeSupportOuterObjective {
             let lambda = lambda_smooth[atom];
             for left in 0..m {
                 for right in 0..m {
-                    let weight = lambda * self.term.atoms[atom].smooth_penalty[[left, right]];
+                    let weight = lambda * self.term.atoms[atom].smooth_penalty()[[left, right]];
                     for channel in 0..self.term.output_dim() {
                         out[offset + left * self.term.output_dim() + channel] +=
                             weight * vector[offset + right * self.term.output_dim() + channel];
@@ -214,7 +214,7 @@ impl SaeSupportOuterObjective {
         let mut out = vec![0.0; self.layout.group_keys.len()];
         for atom in 0..self.term.k_atoms() {
             let sb = self.term.atoms[atom]
-                .smooth_penalty
+                .smooth_penalty()
                 .dot(&self.term.atoms[atom].decoder_coefficients);
             let energy = self.term.atoms[atom]
                 .decoder_coefficients

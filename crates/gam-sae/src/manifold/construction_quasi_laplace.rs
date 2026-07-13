@@ -2234,7 +2234,7 @@ impl SaeManifoldTerm {
         self.assignment.validate_rho_domain(rho)?;
         let mut acc = 0.0_f64;
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
+            let rank_s = Self::symmetric_rank(atom.smooth_penalty())?;
             // Penalized decoder dimension: `r_k` coordinate channels carry the
             // `S_k` roughness penalty (full-`B` path ⇒ `r_k == p`).
             let penalized_channel_dim = atom.border_frame_rank() * rank_s;
@@ -2257,7 +2257,7 @@ impl SaeManifoldTerm {
         self.assignment.validate_rho_domain(rho)?;
         let mut out = Vec::with_capacity(self.atoms.len());
         for atom in self.atoms.iter() {
-            let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
+            let rank_s = Self::symmetric_rank(atom.smooth_penalty())?;
             let penalized_channel_dim = atom.border_frame_rank() * rank_s;
             out.push(0.5 * (penalized_channel_dim as f64));
         }
@@ -2854,7 +2854,12 @@ impl SaeManifoldTerm {
         let sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
             .atoms
             .iter()
-            .map(|atom| (atom.smooth_penalty.view(), atom.decoder_coefficients.view()))
+            .map(|atom| {
+                (
+                    atom.smooth_penalty().view(),
+                    atom.decoder_coefficients.view(),
+                )
+            })
             .collect();
         let sb_all = batched_smooth_sb(&sb_inputs, true);
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
@@ -2928,7 +2933,7 @@ impl SaeManifoldTerm {
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
         let mut m_col = Array1::<f64>::zeros(k);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let s = &atom.smooth_penalty;
+            let s = atom.smooth_penalty();
             let m = atom.basis_size();
             let off = offsets[atom_idx];
             let r = out_dim(atom_idx);
@@ -3019,7 +3024,7 @@ impl SaeManifoldTerm {
             None
         };
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let s = &atom.smooth_penalty;
+            let s = atom.smooth_penalty();
             let m = atom.basis_size();
             let off = offsets[atom_idx];
             let r = out_dim(atom_idx);
@@ -3869,8 +3874,8 @@ impl SaeManifoldTerm {
             let expected = (
                 atom.n_obs(),
                 atom.basis_size(),
-                atom.latent_dim,
-                atom.latent_dim,
+                atom.latent_dim(),
+                atom.latent_dim(),
             );
             if jet.dim() != expected {
                 return Err(format!(
@@ -4077,7 +4082,9 @@ impl SaeManifoldTerm {
                     let mut acc = 0.0_f64;
                     for nu in 0..m {
                         let s_sym =
-                            0.5 * (atom.smooth_penalty[[mu, nu]] + atom.smooth_penalty[[nu, mu]]);
+                            0.5
+                                * (atom.smooth_penalty()[[mu, nu]]
+                                    + atom.smooth_penalty()[[nu, mu]]);
                         acc += s_sym * coeffs[[nu, channel]];
                     }
                     beta[off + mu * r + channel] = lambda * acc;

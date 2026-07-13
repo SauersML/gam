@@ -3805,7 +3805,7 @@ pub(crate) fn streaming_plan_routes_by_memory_budget_with_identical_logdet() {
     let d_max = term0
         .atoms
         .iter()
-        .map(|atom| atom.latent_dim)
+        .map(SaeManifoldAtom::latent_dim)
         .max()
         .unwrap();
     let dense_plan = sae_streaming_plan_from_budget(
@@ -4242,7 +4242,7 @@ pub(crate) fn rank_revealing_reduction_collapses_unexcited_circle_harmonic_to_fu
     );
     assert_eq!(term.atoms[0].decoder_coefficients.nrows(), 3);
     assert_eq!(term.atoms[0].basis_jacobian.dim(), (6, 3, 1));
-    assert_eq!(term.atoms[0].smooth_penalty.dim(), (3, 3));
+    assert_eq!(term.atoms[0].smooth_penalty().dim(), (3, 3));
 
     // The reduced data Gram is full rank (no eigenvalue at the spectral floor).
     use gam_linalg::faer_ndarray::FaerEigh;

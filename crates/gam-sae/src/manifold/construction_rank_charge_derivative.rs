@@ -83,7 +83,7 @@ impl SaeManifoldTerm {
                 p,
                 dispersion,
                 lambda[atom_idx],
-                Some(&atom.smooth_penalty),
+                Some(atom.smooth_penalty()),
             )?;
             // #2258 — the CHARGEABLE rank, not the raw hard MP count: the
             // value path promotes a below-reconstruction-rank-edge-but-alive atom to
@@ -112,7 +112,7 @@ impl SaeManifoldTerm {
             for row in 0..m {
                 for col in 0..m {
                     penalized_gram[[row, col]] +=
-                        lambda[atom_idx] * atom.smooth_penalty[[row, col]];
+                        lambda[atom_idx] * atom.smooth_penalty()[[row, col]];
                 }
             }
             let factor = penalized_gram.cholesky(Side::Lower).map_err(|error| {
@@ -139,7 +139,10 @@ impl SaeManifoldTerm {
                 // regularizer whose differential would otherwise be omitted.
                 let inverse_gram_inverse = inverse.dot(gram).dot(&inverse);
                 gram_differential = (&inverse - &inverse_gram_inverse) * (0.5 * rank * log_n);
-                let inv_g_inv_s = inverse.dot(gram).dot(&inverse).dot(&atom.smooth_penalty);
+                let inv_g_inv_s = inverse
+                    .dot(gram)
+                    .dot(&inverse)
+                    .dot(atom.smooth_penalty());
                 let edf_log_lambda =
                     -lambda[atom_idx] * (0..m).map(|i| inv_g_inv_s[[i, i]]).sum::<f64>();
                 log_lambda_differential = 0.5 * rank * log_n * edf_log_lambda;
@@ -264,7 +267,7 @@ impl SaeManifoldTerm {
                 p,
                 dispersion,
                 lambda[atom_idx],
-                Some(&atom.smooth_penalty),
+                Some(atom.smooth_penalty()),
             )?;
             let rank = spectrum.production_chargeable_rank() as f64;
             if !(rank > 0.0) {
@@ -281,7 +284,7 @@ impl SaeManifoldTerm {
             let mut penalized_gram = gram.clone();
             for r in 0..m {
                 for c in 0..m {
-                    penalized_gram[[r, c]] += lam * atom.smooth_penalty[[r, c]];
+                    penalized_gram[[r, c]] += lam * atom.smooth_penalty()[[r, c]];
                 }
             }
             let factor = penalized_gram.cholesky(Side::Lower).map_err(|error| {
@@ -301,7 +304,7 @@ impl SaeManifoldTerm {
                 // Non-interior EDF ⇒ locally constant charge ⇒ zero curvature.
                 continue;
             }
-            let m_s = factor.solve_mat(&atom.smooth_penalty); // A⁻¹ S
+            let m_s = factor.solve_mat(atom.smooth_penalty()); // A⁻¹ S
             let mg_ms = m_g.dot(&m_s); // A⁻¹G A⁻¹S
             let t1 = (0..m).map(|i| mg_ms[[i, i]]).sum::<f64>();
             let mg_ms2 = m_g.dot(&m_s.dot(&m_s)); // A⁻¹G (A⁻¹S)²

@@ -327,7 +327,12 @@ impl SaeManifoldTerm {
         let sym_sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
             .atoms
             .iter()
-            .map(|atom| (atom.smooth_penalty.view(), atom.decoder_coefficients.view()))
+            .map(|atom| {
+                (
+                    atom.smooth_penalty().view(),
+                    atom.decoder_coefficients.view(),
+                )
+            })
             .collect();
         let sym_sb_all = batched_smooth_sb(&sym_sb_inputs, true);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
@@ -337,7 +342,8 @@ impl SaeManifoldTerm {
             let mut scaled_s = Array2::<f64>::zeros((m, m));
             for i in 0..m {
                 for j in 0..m {
-                    let s_ij = 0.5 * (atom.smooth_penalty[[i, j]] + atom.smooth_penalty[[j, i]]);
+                    let s_ij =
+                        0.5 * (atom.smooth_penalty()[[i, j]] + atom.smooth_penalty()[[j, i]]);
                     scaled_s[[i, j]] = lambda_smooth[atom_idx] * s_ij;
                 }
             }
@@ -838,7 +844,7 @@ impl SaeManifoldTerm {
                             let mut jac_compact = Array2::<f64>::zeros((q_active, p));
                             // Coordinate JVP rows for active atoms only.
                             for (j, &k) in active.iter().enumerate() {
-                                let d = self.atoms[k].latent_dim;
+                                let d = self.atoms[k].latent_dim();
                                 let a_k = assignments[k];
                                 let coord_start = starts[j];
                                 for axis in 0..d {
@@ -874,7 +880,7 @@ impl SaeManifoldTerm {
                             );
                             // Coordinate columns for all atoms.
                             for atom_idx in 0..k_atoms {
-                                let d = self.atoms[atom_idx].latent_dim;
+                                let d = self.atoms[atom_idx].latent_dim();
                                 let off = coord_offsets[atom_idx];
                                 let a_k = assignments[atom_idx];
                                 for axis in 0..d {

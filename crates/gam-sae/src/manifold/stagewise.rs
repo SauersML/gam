@@ -608,7 +608,7 @@ struct BirthSeed {
 fn template_accepts_circle_births(term: &SaeManifoldTerm) -> bool {
     term.atoms
         .first()
-        .map(|atom| atom.basis_kind == SaeAtomBasisKind::Periodic && atom.basis_size() >= 3)
+        .map(|atom| atom.basis_kind() == &SaeAtomBasisKind::Periodic && atom.basis_size() >= 3)
         .unwrap_or(false)
 }
 

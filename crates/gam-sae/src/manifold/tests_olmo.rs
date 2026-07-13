@@ -642,7 +642,7 @@ pub(crate) fn fast_encode_matches_per_row_warm_start() {
     let amps = ndarray::Array1::<f64>::ones(n);
 
     // Reference: per-row nearest_chart routing + the distilled affine predictor.
-    let mut ref_coords = ndarray::Array2::<f64>::zeros((n, atom.latent_dim));
+    let mut ref_coords = ndarray::Array2::<f64>::zeros((n, atom.latent_dim()));
     let mut ref_valid = vec![false; n];
     for row in 0..n {
         if let Some((cidx, _)) =
@@ -670,7 +670,7 @@ pub(crate) fn fast_encode_matches_per_row_warm_start() {
             "valid-mask mismatch at row {row} (routing/predictor disagreement)"
         );
         if ref_valid[row] {
-            for c in 0..atom.latent_dim {
+            for c in 0..atom.latent_dim() {
                 max_diff = max_diff.max((fast_coords[[row, c]] - ref_coords[[row, c]]).abs());
             }
         }

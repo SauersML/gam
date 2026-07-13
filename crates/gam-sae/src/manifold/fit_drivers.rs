@@ -203,7 +203,7 @@ impl SaeManifoldTerm {
             .map(|atom| SaeManifoldAtomSnapshot {
                 decoder_coefficients: atom.decoder_coefficients.clone(),
                 decoder_frame: atom.decoder_frame.clone(),
-                smooth_penalty: atom.smooth_penalty.clone(),
+                smooth_penalty: atom.smooth_penalty().clone(),
                 // Pointer-cheap handle clones; `basis_values`/`basis_jacobian`
                 // are rebuilt from these + coords on restore, avoiding the
                 // dominant `O(N·M·(1+d))` snapshot copy (see
@@ -256,7 +256,7 @@ impl SaeManifoldTerm {
                     };
                     atom.decoder_coefficients == saved.decoder_coefficients
                         && decoder_frame_matches
-                        && atom.smooth_penalty == saved.smooth_penalty
+                        && atom.smooth_penalty() == &saved.smooth_penalty
                         && atom.homotopy_eta.to_bits() == saved.homotopy_eta.to_bits()
                         && evaluator_matches
                         && second_jet_matches
@@ -306,7 +306,7 @@ impl SaeManifoldTerm {
         for (atom, snap) in self.atoms.iter_mut().zip(snapshot.atoms.iter()) {
             atom.decoder_coefficients.assign(&snap.decoder_coefficients);
             atom.decoder_frame.clone_from(&snap.decoder_frame);
-            atom.smooth_penalty.assign(&snap.smooth_penalty);
+            atom.restore_smooth_penalty_snapshot(&snap.smooth_penalty)?;
             atom.basis_evaluator.clone_from(&snap.basis_evaluator);
             atom.basis_second_jet.clone_from(&snap.basis_second_jet);
             atom.homotopy_eta = snap.homotopy_eta;
@@ -503,7 +503,7 @@ impl SaeManifoldTerm {
     ) -> Result<(), String> {
         for atom_idx in 0..self.k_atoms() {
             if !matches!(
-                self.atoms[atom_idx].basis_kind,
+                self.atoms[atom_idx].basis_kind(),
                 SaeAtomBasisKind::Linear
                     | SaeAtomBasisKind::EuclideanPatch
                     | SaeAtomBasisKind::Duchon
@@ -599,7 +599,7 @@ impl SaeManifoldTerm {
         }
         let transport = solve_basis_transport(new_phi.view(), old_phi.view())?;
         let old_decoder = self.atoms[atom_idx].decoder_coefficients.clone();
-        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
         let new_decoder = fast_ab(&transport, &old_decoder);
         let old_fit = fast_ab(&old_phi, &old_decoder);
         let new_fit = fast_ab(&new_phi, &new_decoder);
@@ -624,8 +624,9 @@ impl SaeManifoldTerm {
         let base: Arc<dyn SaeBasisEvaluator> = new_evaluator.clone();
         atom.basis_evaluator = Some(base);
         atom.basis_second_jet = Some(new_evaluator);
-        atom.smooth_penalty =
+        let transported_penalty =
             transport_smooth_penalty_for_decoder(transport.view(), old_smooth_penalty.view())?;
+        atom.install_transported_smooth_penalty(transported_penalty)?;
         Ok(())
     }
 
@@ -737,14 +738,14 @@ impl SaeManifoldTerm {
             let atom = &self.atoms[atom_idx];
             if atom.basis_evaluator.is_none()
                 || atom.homotopy_eta != 1.0
-                || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim
+                || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim()
             {
                 continue;
             }
             // Same fraction-of-period convention as the latent manifold
             // wiring (`SaeAtomBasisKind::latent_manifold`): the harmonic
             // evaluators read `t` as a fraction of one period.
-            let plan = match (&atom.basis_kind, atom.latent_dim) {
+            let plan = match (atom.basis_kind(), atom.latent_dim()) {
                 (SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus, 1) => {
                     ChartPlan::UnitSpeed(CanonicalChartTopology::Circle { period: 1.0 })
                 }
@@ -882,9 +883,9 @@ impl SaeManifoldTerm {
             });
         for atom_idx in 0..self.k_atoms() {
             let atom = &self.atoms[atom_idx];
-            if atom.latent_dim != 1
+            if atom.latent_dim() != 1
                 || atom.homotopy_eta != 1.0
-                || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim
+                || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim()
             {
                 continue;
             }
@@ -1074,17 +1075,18 @@ impl SaeManifoldTerm {
         // Commit: canonical coordinates, basis, decoder, and the congruence-
         // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as the affine
         // gauge pass).
-        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
         let flat = Array1::from_iter(new_coords.iter().copied());
         self.assignment.coords[atom_idx].set_flat(flat.view());
         let atom = &mut self.atoms[atom_idx];
         atom.basis_values = new_phi;
         atom.basis_jacobian = new_jet;
         atom.decoder_coefficients = repar.new_decoder;
-        atom.smooth_penalty = transport_smooth_penalty_for_decoder(
+        let transported_penalty = transport_smooth_penalty_for_decoder(
             repar.decoder_transport.view(),
             old_smooth_penalty.view(),
         )?;
+        atom.install_transported_smooth_penalty(transported_penalty)?;
         atom.chart_canonicalized = true;
         Ok(true)
     }
@@ -1101,11 +1103,11 @@ impl SaeManifoldTerm {
         let atom = &self.atoms[atom_idx];
         if atom.basis_evaluator.is_none()
             || atom.homotopy_eta != 1.0
-            || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim
+            || self.assignment.coords[atom_idx].latent_dim() != atom.latent_dim()
         {
             return None;
         }
-        match (&atom.basis_kind, atom.latent_dim) {
+        match (atom.basis_kind(), atom.latent_dim()) {
             (SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus, 1) => {
                 Some(CanonicalChartTopology::Circle { period: 1.0 })
             }
@@ -1215,17 +1217,18 @@ impl SaeManifoldTerm {
         // Commit: canonical coordinates, basis, decoder, and the congruence-
         // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as the affine
         // gauge pass and the d = 1 path).
-        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
         let flat = Array1::from_iter(new_coords.iter().copied());
         self.assignment.coords[atom_idx].set_flat(flat.view());
         let atom = &mut self.atoms[atom_idx];
         atom.basis_values = new_phi;
         atom.basis_jacobian = new_jet;
         atom.decoder_coefficients = repar.new_decoder;
-        atom.smooth_penalty = transport_smooth_penalty_for_decoder(
+        let transported_penalty = transport_smooth_penalty_for_decoder(
             repar.decoder_transport.view(),
             old_smooth_penalty.view(),
         )?;
+        atom.install_transported_smooth_penalty(transported_penalty)?;
         atom.chart_canonicalized = true;
         Ok(true)
     }
@@ -1301,17 +1304,18 @@ impl SaeManifoldTerm {
         // Commit: canonical coordinates, basis, decoder, and the congruence-
         // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as every other
         // canonicalization path).
-        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
         let flat = Array1::from_iter(new_coords.iter().copied());
         self.assignment.coords[atom_idx].set_flat(flat.view());
         let atom = &mut self.atoms[atom_idx];
         atom.basis_values = new_phi;
         atom.basis_jacobian = new_jet;
         atom.decoder_coefficients = repar.new_decoder;
-        atom.smooth_penalty = transport_smooth_penalty_for_decoder(
+        let transported_penalty = transport_smooth_penalty_for_decoder(
             repar.decoder_transport.view(),
             old_smooth_penalty.view(),
         )?;
+        atom.install_transported_smooth_penalty(transported_penalty)?;
         atom.chart_canonicalized = true;
         Ok(true)
     }
@@ -1387,17 +1391,18 @@ impl SaeManifoldTerm {
         // Commit: canonical coordinates, basis, decoder, and the congruence-
         // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as every other
         // canonicalization path).
-        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty.clone();
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
         let flat = Array1::from_iter(new_coords.iter().copied());
         self.assignment.coords[atom_idx].set_flat(flat.view());
         let atom = &mut self.atoms[atom_idx];
         atom.basis_values = new_phi;
         atom.basis_jacobian = new_jet;
         atom.decoder_coefficients = repar.new_decoder;
-        atom.smooth_penalty = transport_smooth_penalty_for_decoder(
+        let transported_penalty = transport_smooth_penalty_for_decoder(
             repar.decoder_transport.view(),
             old_smooth_penalty.view(),
         )?;
+        atom.install_transported_smooth_penalty(transported_penalty)?;
         atom.chart_canonicalized = true;
         Ok(true)
     }
@@ -1571,7 +1576,7 @@ impl SaeManifoldTerm {
         let joint_data_basis = joint_basis.clone();
         for atom_idx in 0..k_atoms {
             let m = basis_sizes[atom_idx];
-            let penalty = &self.atoms[atom_idx].smooth_penalty;
+            let penalty = self.atoms[atom_idx].smooth_penalty();
             if penalty.dim() != (m, m) {
                 return Err(format!(
                     "joint_decoder_beta_null_directions: atom {atom_idx} penalty shape {:?} != ({m}, {m})",
@@ -1703,7 +1708,7 @@ impl SaeManifoldTerm {
             let m = basis_sizes[atom_idx];
             let rank = frame_ranks[atom_idx];
             let off = border_offsets[atom_idx];
-            let penalty = &self.atoms[atom_idx].smooth_penalty;
+            let penalty = self.atoms[atom_idx].smooth_penalty();
             let scale = penalized_gram_scale[atom_idx];
             for basis_row in 0..m {
                 for basis_col in 0..m {
@@ -1999,7 +2004,7 @@ impl SaeManifoldTerm {
         for atom_idx in 0..self.k_atoms() {
             let d = self.assignment.coords[atom_idx].latent_dim();
             let coords = self.assignment.coords[atom_idx].as_matrix();
-            match self.atoms[atom_idx].basis_kind {
+            match self.atoms[atom_idx].basis_kind() {
                 // The Poincaré tangent patch shares the Euclidean patch's
                 // translation + scale gauge orbit on the tangent coordinate
                 // (the hyperbolic structure lives in the penalty, not the
@@ -2273,7 +2278,7 @@ impl SaeManifoldTerm {
     ) -> Result<(), String> {
         let d = self.assignment.coords[atom_idx].latent_dim();
         let mut tangent = vec![0.0_f64; self.output_dim()];
-        match self.atoms[atom_idx].basis_kind {
+        match self.atoms[atom_idx].basis_kind() {
             SaeAtomBasisKind::Linear
             | SaeAtomBasisKind::EuclideanPatch
             | SaeAtomBasisKind::Duchon
@@ -2845,7 +2850,7 @@ impl SaeManifoldTerm {
                 if a_k == 0.0 {
                     continue;
                 }
-                let d = atom.latent_dim;
+                let d = atom.latent_dim();
                 let off = coord_offsets[atom_idx];
                 for axis in 0..d {
                     atom.fill_decoded_derivative_row(row, axis, &mut full_buf);
@@ -3745,9 +3750,12 @@ impl SaeManifoldTerm {
         let residual = self.reconstruction_residual(target, rho)?;
         let basis_kinds: Vec<SaeAtomBasisKind> = atoms
             .iter()
-            .map(|&a| self.atoms[a].basis_kind.clone())
+            .map(|&a| self.atoms[a].basis_kind().clone())
             .collect();
-        let dims: Vec<usize> = atoms.iter().map(|&a| self.atoms[a].latent_dim).collect();
+        let dims: Vec<usize> = atoms
+            .iter()
+            .map(|&a| self.atoms[a].latent_dim())
+            .collect();
         // `pc_pair_offset` rotates the residual-PC assignment so a co-collapse
         // multi-start RETRY (offset = retry index) reads a disjoint principal
         // subspace from the previous attempt; the per-atom breach arm passes 0
@@ -4441,7 +4449,7 @@ impl SaeManifoldTerm {
         let (curved, flat): (Vec<usize>, Vec<usize>) =
             to_reseed.iter().copied().partition(|&atom| {
                 !matches!(
-                    self.atoms[atom].basis_kind,
+                    self.atoms[atom].basis_kind(),
                     SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Linear
                 )
             });
@@ -4543,8 +4551,11 @@ impl SaeManifoldTerm {
             //    plane (independence contrast); otherwise re-seed from the current
             //    residual's leading structure (one-atom PCA seed on the residual
             //    left by prior atoms).
-            let dim = self.atoms[atom].latent_dim;
-            let is_periodic = matches!(self.atoms[atom].basis_kind, SaeAtomBasisKind::Periodic);
+            let dim = self.atoms[atom].latent_dim();
+            let is_periodic = matches!(
+                self.atoms[atom].basis_kind(),
+                SaeAtomBasisKind::Periodic
+            );
             let isa_plane = if dim > 0 && is_periodic {
                 next_isa_plane.next()
             } else {
@@ -4625,10 +4636,10 @@ impl SaeManifoldTerm {
         let mut residual = target.to_owned();
         for atom in 0..k {
             let m = self.atoms[atom].basis_size();
-            if self.atoms[atom].smooth_penalty.dim() != (m, m) {
+            if self.atoms[atom].smooth_penalty().dim() != (m, m) {
                 return Err(format!(
                     "SaeManifoldTerm::refit_reactive_entry_decoders_at_smooth_face: atom {atom} smooth penalty shape {:?} != ({m}, {m})",
-                    self.atoms[atom].smooth_penalty.dim()
+                    self.atoms[atom].smooth_penalty().dim()
                 ));
             }
 
@@ -4661,8 +4672,8 @@ impl SaeManifoldTerm {
             for left in 0..m {
                 for right in 0..m {
                     let smooth = 0.5
-                        * (self.atoms[atom].smooth_penalty[[left, right]]
-                            + self.atoms[atom].smooth_penalty[[right, left]]);
+                        * (self.atoms[atom].smooth_penalty()[[left, right]]
+                            + self.atoms[atom].smooth_penalty()[[right, left]]);
                     normal[[left, right]] += lambda * smooth;
                 }
             }
@@ -4720,8 +4731,8 @@ impl SaeManifoldTerm {
         residual: ArrayView2<'_, f64>,
         isa_plane: Option<super::isa_seed::IsaPlaneCandidate>,
     ) -> Result<(), String> {
-        let kind = self.atoms[atom].basis_kind.clone();
-        let dim = self.atoms[atom].latent_dim;
+        let kind = self.atoms[atom].basis_kind().clone();
+        let dim = self.atoms[atom].latent_dim();
         let mut flat = Array1::<f64>::zeros(n * dim);
         if let Some(plane) = isa_plane {
             // The certified per-row phase (turns, `[0, 1)`) IS the circle chart
@@ -5166,9 +5177,9 @@ impl SaeManifoldTerm {
         // cannot change any seed value — confirming the attention-only invariant.
         let visit_order = self.enrichment_visit_order();
         for atom_idx in 0..self.k_atoms() {
-            let d = self.atoms[atom_idx].latent_dim;
+            let d = self.atoms[atom_idx].latent_dim();
             if matches!(
-                &self.atoms[atom_idx].basis_kind,
+                self.atoms[atom_idx].basis_kind(),
                 SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus
             ) && d == 1
             {
@@ -7425,13 +7436,13 @@ impl SaeManifoldTerm {
     fn synthesize_monomial_patch_evaluator(
         atom: &SaeManifoldAtom,
     ) -> Option<Arc<dyn SaeBasisEvaluator>> {
-        match atom.basis_kind {
+        match atom.basis_kind() {
             SaeAtomBasisKind::EuclideanPatch
             | SaeAtomBasisKind::Linear
             | SaeAtomBasisKind::Poincare => {}
             _ => return None,
         }
-        let latent_dim = atom.latent_dim;
+        let latent_dim = atom.latent_dim();
         let target = atom.basis_size();
         for degree in 0..=target {
             if gam_terms::basis::monomial_exponents(latent_dim, degree).len() == target {
@@ -7495,11 +7506,11 @@ impl SaeManifoldTerm {
         let mut atoms = Vec::with_capacity(k_atoms);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let coords = &chunk_coords[atom_idx];
-            if coords.nrows() != n_chunk || coords.ncols() != atom.latent_dim {
+            if coords.nrows() != n_chunk || coords.ncols() != atom.latent_dim() {
                 return Err(format!(
                     "SaeManifoldTerm::materialize_chunk: atom {atom_idx} coords shape {:?} != ({n_chunk}, {})",
                     coords.dim(),
-                    atom.latent_dim
+                    atom.latent_dim()
                 ));
             }
             // A streaming fit must re-evaluate Φ(t) at each chunk's coordinates.
@@ -7534,12 +7545,12 @@ impl SaeManifoldTerm {
                     phi.dim()
                 ));
             }
-            if jet.dim() != (n_chunk, m, atom.latent_dim) {
+            if jet.dim() != (n_chunk, m, atom.latent_dim()) {
                 return Err(format!(
                     "SaeManifoldTerm::materialize_chunk: atom '{}' evaluator returned jet {:?}, expected ({n_chunk}, {m}, {})",
                     atom.name,
                     jet.dim(),
-                    atom.latent_dim
+                    atom.latent_dim()
                 ));
             }
             // Every chunk uses the identical frozen reference-function Gram as
@@ -7547,12 +7558,12 @@ impl SaeManifoldTerm {
             // change both the quadratic and its Laplace normalizer.
             let mut chunk_atom = SaeManifoldAtom::new_with_provided_function_gram(
                 atom.name.clone(),
-                atom.basis_kind.clone(),
-                atom.latent_dim,
+                atom.basis_kind().clone(),
+                atom.latent_dim(),
                 phi,
                 jet,
                 atom.decoder_coefficients.clone(),
-                atom.smooth_penalty.clone(),
+                atom.smooth_penalty().clone(),
             )?;
             // Carry the atom's own evaluator when it has one; otherwise seed the
             // chunk with the synthesized monomial-patch evaluator (#1801) so the

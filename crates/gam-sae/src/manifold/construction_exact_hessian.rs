@@ -1270,7 +1270,7 @@ impl SaeManifoldTerm {
             };
         for a in 0..rho.log_lambda_smooth.len() {
             let atom = &self.atoms[a];
-            let s = &atom.smooth_penalty;
+            let s = atom.smooth_penalty();
             let m = atom.basis_size();
             let off = beta_offsets[a];
             let r = beta_out_dim(a);

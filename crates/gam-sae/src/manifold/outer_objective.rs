@@ -3152,7 +3152,9 @@ impl SaeManifoldOuterObjective {
             let coordinate = rho.smooth_flat_index(atom_idx);
             let lambda_k = lambda_smooth_vec[atom_idx];
             let rank_k = (self.term.atoms[atom_idx].border_frame_rank() as f64)
-                * (SaeManifoldTerm::symmetric_rank(&self.term.atoms[atom_idx].smooth_penalty)?
+                * (SaeManifoldTerm::symmetric_rank(
+                    self.term.atoms[atom_idx].smooth_penalty(),
+                )?
                     as f64);
             let quad_k = quad_per_atom[atom_idx];
             let eff_dof_k = eff_dof_per_atom[atom_idx];
@@ -3485,14 +3487,14 @@ fn reactive_smooth_curvature_scale(
 ) -> Result<Option<f64>, String> {
     let atom = &term.atoms[atom_idx];
     let m = atom.basis_values.ncols();
-    if atom.smooth_penalty.dim() != (m, m) {
+    if atom.smooth_penalty().dim() != (m, m) {
         return Err(format!(
             "reactive rho domain: atom {atom_idx} smooth penalty shape {:?} != ({m}, {m})",
-            atom.smooth_penalty.dim()
+            atom.smooth_penalty().dim()
         ));
     }
     let penalty_geometry =
-        gam_linalg::utils::rank_certified_psd_pseudoinverse(&atom.smooth_penalty, 1.0e-10)
+        gam_linalg::utils::rank_certified_psd_pseudoinverse(atom.smooth_penalty(), 1.0e-10)
             .map_err(|error| format!("reactive rho domain penalty spectrum failed: {error}"))?;
     let rank = penalty_geometry.rank();
     let penalty_pinv = penalty_geometry.into_pseudoinverse();

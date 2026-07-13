@@ -548,7 +548,7 @@ pub(crate) fn atom_curvature_bound_with_decoder(
 ) -> Result<f64, String> {
     let n = atom.n_obs();
     let m = atom.basis_size();
-    let d = atom.latent_dim;
+    let d = atom.latent_dim();
     let p = atom.output_dim();
     if second.dim() != (n, m, d, d) {
         return Err(format!(

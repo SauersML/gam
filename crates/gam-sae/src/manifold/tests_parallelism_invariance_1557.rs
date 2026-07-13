@@ -317,7 +317,8 @@ pub(crate) fn newton_trial_state_is_rayon_thread_count_invariant_2242() {
             "atom {atom_idx} basis Jacobian differs across Rayon policies"
         );
         assert_eq!(
-            serial_atom.smooth_penalty, parallel_atom.smooth_penalty,
+            serial_atom.smooth_penalty(),
+            parallel_atom.smooth_penalty(),
             "atom {atom_idx} reference roughness differs across Rayon policies"
         );
     }
