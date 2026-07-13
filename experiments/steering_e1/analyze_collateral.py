@@ -1,10 +1,11 @@
 """E2 — the collateral-damage curve (gam#2234, the headline plot).
 
-E1 (`run_e1.py`) already sweeps rotation dose `k` for BOTH intervention arms
-(on-manifold code rotation vs matched-norm flat-direction addition) and records,
-per `(base context, k, arm)`, the achieved effect (probability mass moved onto
-the intended target weekday) and the collateral (full-vocab
-`KL(base || patched)`). E2 is the read-off the #2234 thesis lives or dies on:
+E1 (`run_e1.py`) sweeps explicit target shifts and fractional doses for BOTH
+intervention arms (on-manifold code rotation vs matched-norm flat-direction
+addition) and records, per intervention, the achieved effect (FULL-SOFTMAX
+probability mass moved onto the intended next-day target token) and collateral
+`KL(patched_non_target || base_non_target)`. E2 is the read-off the #2234 thesis
+lives or dies on:
 
     "For each intervention family, sweep achieved-effect vs collateral KL. The
      on-manifold curve should sit strictly below flat steering's — curved
@@ -56,16 +57,16 @@ def load_records(path: Path) -> list[dict[str, Any]]:
 
 def arm_points(records: list[dict[str, Any]], arm: str) -> np.ndarray:
     """`(effect, collateral)` per recorded intervention for one arm. Effect =
-    probability mass moved onto the forward target weekday, using the orientation
-    fixed on the fit split; collateral = full-vocab KL(base||patched). Only
+    full-softmax probability mass moved onto the intended next-day target token;
+    collateral = target-excluded KL(patched||base). Only
     positive-effect interventions belong on an efficiency frontier."""
     pts = []
     for record in records:
-        if record["arm"] != arm or int(record["k"]) == 0:
+        if record["arm"] != arm or float(record["dose_fraction"]) == 0.0:
             continue
-        effect = float(record["target_prob_plus"]) - float(record["base_target_prob_plus"])
+        effect = float(record["target_probability_mass_moved"])
         if effect > 0.0:
-            pts.append((effect, float(record["kl_base_to_patched"])))
+            pts.append((effect, float(record["collateral_kl_model_to_base_non_target"])))
     return np.asarray(pts, dtype=np.float64).reshape(-1, 2)
 
 
@@ -137,8 +138,9 @@ def write_report(out_dir: Path, result: dict[str, Any]) -> None:
     lines = [
         "# E2 — Collateral-damage curve (gam#2234)",
         "",
-        "Achieved effect = probability mass moved onto the intended target weekday; collateral =",
-        "full-vocab `KL(base || patched)`. The frontier `g(e)` is the least collateral",
+        "Achieved effect = full-softmax probability mass moved onto the intended next-day target",
+        "token; collateral = target-excluded `KL(patched || base)`. The frontier `g(e)` is",
+        "the least collateral",
         "at which each arm buys at least effect `e` — the honest matched-EFFECT",
         "comparison (the arms reach different effects at the same dose).",
         "",

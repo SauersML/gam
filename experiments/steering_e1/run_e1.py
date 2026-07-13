@@ -3,11 +3,11 @@
 
 The gam#2234 thesis: a manifold SAE steers by moving the CODE, not the ambient
 vector — x' = x + a·(Φ(t⊕δ) − Φ(t))·B_k, where ⊕ rotates the day-of-week circle
-phase. E1 tests the headline prediction on GPT-2's calendar features: rotating
-the fitted circle coordinate by k·(2π/7) should cycle the next-token weekday
-distribution SMOOTHLY (the probability peak tracks the rotation), while a
-matched-norm flat-direction addition — the flat-SAE control — degrades into
-noise off the feature's circle.
+phase. E1 tests the headline prediction on calendar features: moving the fitted
+coordinate toward a target weekday by fractional doses up to k·(2π/7) should
+move FULL-SOFTMAX next-token mass smoothly toward that target, while a
+matched-norm flat-direction addition — the flat-SAE control — degrades off the
+feature's circle.
 
 Pipeline (all reused, provenance inline):
   1. GPT-2 calendar-activation capture + residual patching — the exact hook path
@@ -21,8 +21,11 @@ Pipeline (all reused, provenance inline):
      circle atom, d_atom=1, assignment='softmax' so the steer path is routed).
   3. Steer day-of-week phase by k·(2π/7) via model.steer(atom, t_from, t_to)
      (Rust sae_steer_delta / SaeManifoldTerm::steer_rows, landed f8d70743a).
-  4. Patch the steered residual back into GPT-2, measure restricted next-token
-     weekday probabilities + full-vocab KL(base || patched).
+  4. Patch the steered residual back into the model. Every prompt asks for the
+     day AFTER its source label, so a k-day coordinate move targets weekday
+     `(source + k + 1) mod 7`. Measure its full-softmax token probability and
+     collateral `KL(patched_non_target || base_non_target)`, conditioning both
+     distributions on every token except the intended target.
   5. Flat-SAE control: gamfit.sparse_dictionary_fit weekday latent, its decoder
      direction added at the SAME L2 norm as the on-manifold delta (fixed
      direction, no periodic structure — the thesis says it cannot cycle).
@@ -154,20 +157,63 @@ def run_patched(model: Any, tokenizer: Any, layer: Any, prompt: str, patched_act
     return out.logits[0, position, :].detach().float().cpu()
 
 
-def full_vocab_kl(clean_logits: Any, patched_logits: Any) -> float:
-    import torch
+def _logits_array(logits: Any) -> np.ndarray:
+    if hasattr(logits, "detach"):
+        logits = logits.detach().cpu().numpy()
+    values = np.asarray(logits, dtype=np.float64)
+    if values.ndim != 1 or values.size < 2 or not np.all(np.isfinite(values)):
+        raise ValueError(f"logits must be a finite 1-D vocabulary vector; got {values.shape}")
+    return values
 
-    logp = torch.log_softmax(clean_logits.to(torch.float64), dim=-1)
-    logq = torch.log_softmax(patched_logits.to(torch.float64), dim=-1)
-    p = logp.exp()
-    return float((p * (logp - logq)).sum().item())
+
+def _log_softmax(logits: Any) -> np.ndarray:
+    values = _logits_array(logits)
+    shifted = values - values.max()
+    return shifted - math.log(float(np.exp(shifted).sum()))
 
 
-def restricted_probs(logits: Any, candidate_ids: list[int]) -> np.ndarray:
-    v = logits[candidate_ids].numpy().astype(np.float64)
-    v = v - v.max()
-    e = np.exp(v)
-    return e / e.sum()
+def token_probability(logits: Any, token_id: int) -> float:
+    """Unconditional full-softmax probability of one vocabulary token."""
+    logp = _log_softmax(logits)
+    if not (0 <= token_id < logp.size):
+        raise ValueError(f"token id {token_id} out of range for vocabulary size {logp.size}")
+    return float(math.exp(float(logp[token_id])))
+
+
+def weekday_token_probabilities(logits: Any, candidate_ids: list[int]) -> np.ndarray:
+    """Full-softmax probabilities for the seven weekday tokens (never renormalized)."""
+    logp = _log_softmax(logits)
+    ids = np.asarray(candidate_ids, dtype=np.int64)
+    if ids.shape != (len(WEEKDAYS),) or np.any(ids < 0) or np.any(ids >= logp.size):
+        raise ValueError("candidate weekday token ids must be seven in-vocabulary ids")
+    return np.exp(logp[ids])
+
+
+def target_excluded_kl_model_to_base(
+    patched_logits: Any,
+    base_logits: Any,
+    target_token_id: int,
+) -> float:
+    """Collateral KL on non-target tokens: KL(patched || base), target excluded.
+
+    Each arm is conditioned on "the next token is not the intended target" before
+    computing KL, so probability mass deliberately moved onto the target is not
+    charged again as collateral damage.
+    """
+    patched = _logits_array(patched_logits)
+    base = _logits_array(base_logits)
+    if patched.shape != base.shape:
+        raise ValueError(f"patched/base vocabulary shapes differ: {patched.shape} vs {base.shape}")
+    if not (0 <= target_token_id < patched.size):
+        raise ValueError(
+            f"target token id {target_token_id} out of range for vocabulary size {patched.size}"
+        )
+    keep = np.ones(patched.size, dtype=bool)
+    keep[target_token_id] = False
+    model_log = _log_softmax(patched[keep])
+    base_log = _log_softmax(base[keep])
+    model_prob = np.exp(model_log)
+    return max(float(np.sum(model_prob * (model_log - base_log))), 0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -210,6 +256,45 @@ def collect_cloud(model, tokenizer, layer, templates):
             act, logits = run_clean(model, tokenizer, layer, prompt)
             examples.append(CleanExample(ti, di, prompt, act, logits))
     return examples
+
+
+def continuation_target_index(base_day_index: int, target_shift_days: int) -> int:
+    """Next-token weekday after replacing the source day by source+k days."""
+    if not (0 <= base_day_index < len(WEEKDAYS)):
+        raise ValueError(f"base day index must be in [0, 7); got {base_day_index}")
+    if not (1 <= target_shift_days < len(WEEKDAYS)):
+        raise ValueError(f"target shift must be an integer in [1, 6]; got {target_shift_days}")
+    return (base_day_index + target_shift_days + 1) % len(WEEKDAYS)
+
+
+def parse_target_shifts(spec: str) -> list[int]:
+    try:
+        shifts = [int(value.strip()) for value in spec.split(",") if value.strip()]
+    except ValueError as error:
+        raise ValueError("--target-shifts must be comma-separated integers") from error
+    if not shifts or len(set(shifts)) != len(shifts) or any(not 1 <= k <= 6 for k in shifts):
+        raise ValueError("--target-shifts must contain unique integers from 1 through 6")
+    return shifts
+
+
+def parse_dose_fractions(spec: str) -> list[float]:
+    try:
+        fractions = [float(value.strip()) for value in spec.split(",") if value.strip()]
+    except ValueError as error:
+        raise ValueError("--dose-fractions must be comma-separated numbers") from error
+    if (
+        not fractions
+        or any(not np.isfinite(value) or not 0.0 <= value <= 1.0 for value in fractions)
+        or any(b <= a for a, b in zip(fractions, fractions[1:]))
+        or fractions[0] != 0.0
+        or fractions[-1] != 1.0
+    ):
+        raise ValueError(
+            "--dose-fractions must be strictly increasing finite values in [0,1], including 0 and 1"
+        )
+    if not any(0.0 < value < 1.0 for value in fractions):
+        raise ValueError("--dose-fractions must include at least one fractional interior dose")
+    return fractions
 
 
 # --------------------------------------------------------------------------- #
@@ -274,8 +359,8 @@ def select_flat_direction(flat_fit, X, day_indices):
 # --------------------------------------------------------------------------- #
 def steer_records(lm_model, sae_model, tokenizer, layer, atom, chart_orientation,
                   base_examples, metric_rows, base_coords, base_amplitudes,
-                  candidate_ids, flat_dir, ks, lift=None):
-    """Run manifold + flat steering across base examples × rotation counts k.
+                  candidate_ids, flat_dir, target_shifts, dose_fractions, lift=None):
+    """Run manifold + flat steering across contexts, targets, and dose fractions.
 
     ``base_coords[i]`` is the fitted circle coordinate (length d_atom) of
     ``base_examples[i]`` on the weekday atom.
@@ -285,85 +370,123 @@ def steer_records(lm_model, sae_model, tokenizer, layer, atom, chart_orientation
         base_examples, metric_rows, base_coords, base_amplitudes
     ):
         b = base.day_index
-        base_probs = restricted_probs(base.logits, candidate_ids)
+        base_weekday_probs = weekday_token_probabilities(base.logits, candidate_ids)
         t0 = np.atleast_1d(np.asarray(t0_in, dtype=np.float64)).reshape(-1)
-        for k in ks:
-            dcoord = chart_orientation * k / 7.0
-            t_to = t0.copy()
-            t_to[0] = t0[0] + dcoord  # circle retract wraps mod period Rust-side
-            plan = sae_model.steer(int(atom), int(metric_row), float(amplitude), t0, t_to)
-            delta = np.asarray(plan["delta"], dtype=np.float64)
-            if lift is not None:
-                # Exact ambient lift through the orthonormal PCA rows.
-                delta = delta @ lift
-            import torch
+        for target_shift in target_shifts:
+            target_index = continuation_target_index(b, target_shift)
+            target_token_id = candidate_ids[target_index]
+            base_target_probability = float(base_weekday_probs[target_index])
+            for dose_fraction in dose_fractions:
+                dose_days = float(target_shift) * dose_fraction
+                dcoord = chart_orientation * dose_days / 7.0
+                t_to = t0.copy()
+                t_to[0] = t0[0] + dcoord  # periodic evaluator wraps the period-one chart
+                plan = sae_model.steer(int(atom), int(metric_row), float(amplitude), t0, t_to)
+                delta = np.asarray(plan["delta"], dtype=np.float64)
+                if lift is not None:
+                    # Exact ambient lift through the orthonormal PCA rows.
+                    delta = delta @ lift
+                import torch
 
-            # --- on-manifold arm ---
-            patched = base.activation + torch.from_numpy(delta.astype(np.float32))
-            pl = run_patched(lm_model, tokenizer, layer, base.prompt, patched)
-            man_probs = restricted_probs(pl, candidate_ids)
-            man_kl = max(full_vocab_kl(base.logits, pl), 0.0)
+                # --- on-manifold arm ---
+                patched = base.activation + torch.from_numpy(delta.astype(np.float32))
+                manifold_logits = run_patched(lm_model, tokenizer, layer, base.prompt, patched)
 
-            # --- flat control: matched-norm fixed-direction addition ---
-            flat_delta = np.linalg.norm(delta) * flat_dir
-            patched_f = base.activation + torch.from_numpy(flat_delta.astype(np.float32))
-            pl_f = run_patched(lm_model, tokenizer, layer, base.prompt, patched_f)
-            flat_probs = restricted_probs(pl_f, candidate_ids)
-            flat_kl = max(full_vocab_kl(base.logits, pl_f), 0.0)
+                # --- flat control: matched-norm fixed-direction addition ---
+                flat_delta = np.linalg.norm(delta) * flat_dir
+                patched_flat = base.activation + torch.from_numpy(flat_delta.astype(np.float32))
+                flat_logits = run_patched(lm_model, tokenizer, layer, base.prompt, patched_flat)
 
-            for arm, probs, kl in (
-                ("manifold", man_probs, man_kl),
-                ("flat", flat_probs, flat_kl),
-            ):
-                top = int(np.argmax(probs))
-                records.append({
-                    "arm": arm,
-                    "base_template": base.template_index,
-                    "base_day": WEEKDAYS[b],
-                    "base_day_index": b,
-                    "k": int(k),
-                    "delta_norm": float(np.linalg.norm(delta)),
-                    "off_manifold_norm": (
-                        float(plan["off_manifold_norm"]) if plan.get("off_manifold_norm") is not None else None),
-                    "predicted_nats": (
-                        float(plan["predicted_nats"]) if plan.get("predicted_nats") is not None else None),
-                    "realized_top_day": WEEKDAYS[top],
-                    "realized_top_index": top,
-                    "realized_shift": int((top - b) % 7),
-                    "target_prob_plus": float(probs[(b + k) % 7]),
-                    "target_prob_minus": float(probs[(b - k) % 7]),
-                    "base_target_prob_plus": float(base_probs[(b + k) % 7]),
-                    "base_target_prob_minus": float(base_probs[(b - k) % 7]),
-                    "kl_base_to_patched": kl,
-                    "weekday_probs": [float(x) for x in probs],
-                })
+                for arm, patched_logits in (
+                    ("manifold", manifold_logits),
+                    ("flat", flat_logits),
+                ):
+                    weekday_probs = weekday_token_probabilities(patched_logits, candidate_ids)
+                    top = int(np.argmax(weekday_probs))
+                    target_probability = float(weekday_probs[target_index])
+                    collateral = target_excluded_kl_model_to_base(
+                        patched_logits, base.logits, target_token_id
+                    )
+                    records.append({
+                        "arm": arm,
+                        "base_template": base.template_index,
+                        "base_day": WEEKDAYS[b],
+                        "base_day_index": b,
+                        "target_shift_days": int(target_shift),
+                        "target_day": WEEKDAYS[target_index],
+                        "target_day_index": target_index,
+                        "target_token_id": int(target_token_id),
+                        "dose_fraction": float(dose_fraction),
+                        "coordinate_delta_turns": float(dcoord),
+                        "coordinate_delta_radians": float(dcoord * TAU),
+                        "delta_norm": float(np.linalg.norm(delta)),
+                        "steer_off_manifold_norm": (
+                            float(plan["off_manifold_norm"])
+                            if arm == "manifold" and plan.get("off_manifold_norm") is not None
+                            else None
+                        ),
+                        "steer_predicted_nats": (
+                            float(plan["predicted_nats"])
+                            if arm == "manifold" and plan.get("predicted_nats") is not None
+                            else None
+                        ),
+                        "realized_top_weekday": WEEKDAYS[top],
+                        "realized_top_weekday_index": top,
+                        "target_token_probability": target_probability,
+                        "base_target_token_probability": base_target_probability,
+                        "target_probability_mass_moved": (
+                            target_probability - base_target_probability
+                        ),
+                        "collateral_kl_model_to_base_non_target": collateral,
+                        "weekday_token_probabilities": [float(x) for x in weekday_probs],
+                    })
     return records
 
 
-def summarize(records, ks):
-    """Forward cyclic accuracy fixed by the fit-split orientation and dose response."""
+def summarize(records, target_shifts, dose_fractions):
+    """Endpoint accuracy and per-target fractional dose response for each arm."""
     out: dict[str, Any] = {}
     for arm in ("manifold", "flat"):
         rs = [r for r in records if r["arm"] == arm]
         if not rs:
             continue
+        endpoint = [r for r in rs if r["dose_fraction"] == 1.0]
         acc = float(np.mean([
-            r["realized_top_index"] == (r["base_day_index"] + r["k"]) % 7 for r in rs
+            r["realized_top_weekday_index"] == r["target_day_index"] for r in endpoint
         ]))
-        tp_key = "target_prob_plus"
-        dose = {}
-        for k in ks:
-            rk = [r for r in rs if r["k"] == k]
-            dose[str(k)] = {
-                "mean_target_prob": float(np.mean([r[tp_key] for r in rk])) if rk else float("nan"),
-                "mean_kl": float(np.mean([r["kl_base_to_patched"] for r in rk])) if rk else float("nan"),
-            }
+        dose_response: dict[str, Any] = {}
+        for target_shift in target_shifts:
+            by_fraction = {}
+            for fraction in dose_fractions:
+                sample = [
+                    r for r in rs
+                    if r["target_shift_days"] == target_shift
+                    and r["dose_fraction"] == fraction
+                ]
+                by_fraction[str(fraction)] = {
+                    "mean_target_token_probability": float(np.mean([
+                        r["target_token_probability"] for r in sample
+                    ])),
+                    "mean_target_probability_mass_moved": float(np.mean([
+                        r["target_probability_mass_moved"] for r in sample
+                    ])),
+                    "mean_collateral_kl_model_to_base_non_target": float(np.mean([
+                        r["collateral_kl_model_to_base_non_target"] for r in sample
+                    ])),
+                }
+            dose_response[str(target_shift)] = by_fraction
         out[arm] = {
-            "orientation": "fit-split",
-            "cyclic_advance_accuracy": acc,
-            "mean_target_prob": float(np.mean([r[tp_key] for r in rs])),
-            "mean_kl": float(np.mean([r["kl_base_to_patched"] for r in rs])),
-            "dose_response": dose,
+            "endpoint_target_accuracy": acc,
+            "mean_endpoint_target_token_probability": float(np.mean([
+                r["target_token_probability"] for r in endpoint
+            ])),
+            "mean_endpoint_target_probability_mass_moved": float(np.mean([
+                r["target_probability_mass_moved"] for r in endpoint
+            ])),
+            "mean_endpoint_collateral_kl_model_to_base_non_target": float(np.mean([
+                r["collateral_kl_model_to_base_non_target"] for r in endpoint
+            ])),
+            "dose_response": dose_response,
         }
     return out
 
@@ -381,29 +504,39 @@ def write_outputs(out_dir: Path, meta, records, summary):
         f"- Model `{meta['model']}` block `{meta['layer_index']}`; fit EV `{meta['fit_ev']:.4f}`; "
         f"weekday atom `{meta['weekday_atom']}`.",
         "",
-        "| arm | orientation | cyclic-advance accuracy | mean target-day prob | mean collateral KL |",
-        "|---|:---:|---:|---:|---:|",
+        "| arm | endpoint target accuracy | endpoint target-token probability | "
+        "probability mass moved | target-excluded KL(model || base) |",
+        "|---|---:|---:|---:|---:|",
     ]
     for arm in ("manifold", "flat"):
         s = summary.get(arm)
         if s:
             lines.append(
-                f"| {arm} | {s['orientation']} | {s['cyclic_advance_accuracy']:.3f} | "
-                f"{s['mean_target_prob']:.4f} | {s['mean_kl']:.4f} |")
-    lines += ["", "## Dose-response (mean target-day prob / mean KL by rotation k)", ""]
-    ks = sorted({int(k) for k in summary.get("manifold", {}).get("dose_response", {})})
-    lines.append("| k | manifold target-prob | manifold KL | flat target-prob | flat KL |")
-    lines.append("|---:|---:|---:|---:|---:|")
-    for k in ks:
-        m = summary["manifold"]["dose_response"][str(k)]
-        fdr = summary.get("flat", {}).get("dose_response", {}).get(str(k), {"mean_target_prob": float("nan"), "mean_kl": float("nan")})
-        lines.append(f"| {k} | {m['mean_target_prob']:.4f} | {m['mean_kl']:.4f} | "
-                     f"{fdr['mean_target_prob']:.4f} | {fdr['mean_kl']:.4f} |")
+                f"| {arm} | {s['endpoint_target_accuracy']:.3f} | "
+                f"{s['mean_endpoint_target_token_probability']:.6f} | "
+                f"{s['mean_endpoint_target_probability_mass_moved']:.6f} | "
+                f"{s['mean_endpoint_collateral_kl_model_to_base_non_target']:.6f} |")
+    lines += ["", "## Fractional dose-response by target shift", ""]
+    lines.append("| target shift k | dose fraction | manifold mass moved | manifold collateral | "
+                 "flat mass moved | flat collateral |")
+    lines.append("|---:|---:|---:|---:|---:|---:|")
+    for target_shift, fractions in summary.get("manifold", {}).get("dose_response", {}).items():
+        for fraction, manifold_row in fractions.items():
+            flat_row = summary.get("flat", {}).get("dose_response", {}).get(
+                target_shift, {}
+            ).get(fraction, {})
+            lines.append(
+                f"| {target_shift} | {float(fraction):.3f} | "
+                f"{manifold_row['mean_target_probability_mass_moved']:.6f} | "
+                f"{manifold_row['mean_collateral_kl_model_to_base_non_target']:.6f} | "
+                f"{flat_row.get('mean_target_probability_mass_moved', float('nan')):.6f} | "
+                f"{flat_row.get('mean_collateral_kl_model_to_base_non_target', float('nan')):.6f} |"
+            )
     lines += [
         "",
-        "Prediction (gam#2234 E1): the manifold arm's target-day probability tracks the rotation k "
-        "(smooth cycling) at low collateral KL; the flat matched-norm control cannot cycle and its "
-        "target-day probability degrades as k grows off the circle.",
+        "Prediction (gam#2234 E1): full-softmax mass moves smoothly toward the correct next-day "
+        "target as dose increases, while target-excluded KL(model || base) remains below the "
+        "matched-norm flat control at matched achieved effect.",
         "",
     ]
     (out_dir / "e1_results.md").write_text("\n".join(lines) + "\n")
@@ -419,8 +552,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--k-atoms", type=int, default=1, help="manifold SAE atom count K")
     ap.add_argument("--flat-k", type=int, default=32, help="flat-SAE dictionary size (control)")
     ap.add_argument("--n-iter", type=int, default=60)
-    ap.add_argument("--max-k", type=int, default=6,
-                    help="max rotation count; each step is 1/7 of the period-one chart")
+    ap.add_argument("--target-shifts", default="1,2,3,4,5,6",
+                    help="comma-separated integer source-day shifts, each in 1..6")
+    ap.add_argument("--dose-fractions", default="0,0.25,0.5,0.75,1",
+                    help="strictly increasing target-dose fractions including 0, 1, and an interior value")
     ap.add_argument("--candidate-prefix", default=" ")
     ap.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="fp32")
     ap.add_argument("--seed", type=int, default=20260709)
@@ -432,6 +567,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    target_shifts = parse_target_shifts(args.target_shifts)
+    dose_fractions = parse_dose_fractions(args.dose_fractions)
     np.random.seed(args.seed)
     import gamfit
 
@@ -513,13 +650,15 @@ def main() -> int:
     base_coords = [base_coords_array[row] for row in range(len(base_examples))]
     base_amplitudes = [float(base_assignments[row, atom]) for row in range(len(base_examples))]
 
-    ks = list(range(1, args.max_k + 1))
-    log(f"steering {len(base_examples)} base contexts × k∈{ks} (manifold + flat)")
+    log(
+        f"steering {len(base_examples)} base contexts × targets {target_shifts} × "
+        f"dose fractions {dose_fractions} (manifold + flat)"
+    )
     records = steer_records(
         model_lm, sae_model, tok, layer, atom, chart_orientation,
         base_examples, metric_rows, base_coords, base_amplitudes,
-        candidate_ids, flat_dir, ks, lift=lift)
-    summary = summarize(records, ks)
+        candidate_ids, flat_dir, target_shifts, dose_fractions, lift=lift)
+    summary = summarize(records, target_shifts, dose_fractions)
 
     meta = {
         "model": args.model, "layer_index": args.layer_index, "k_atoms": args.k_atoms,
@@ -527,6 +666,7 @@ def main() -> int:
         "flat_latent": int(flat_lat), "weekday_atom": int(atom), "fit_ev": fit_ev,
         "chart_orientation": int(chart_orientation),
         "n_fit_rows": int(len(fit_examples)), "n_base_rows": int(len(base_examples)),
+        "target_shifts": target_shifts, "dose_fractions": dose_fractions,
         "seed": args.seed,
     }
     write_outputs(Path(args.out_dir), meta, records, summary)
@@ -540,8 +680,13 @@ def main() -> int:
     for arm in ("manifold", "flat"):
         s = summary.get(arm)
         if s:
-            print(f"E1_{arm.upper()} accuracy={s['cyclic_advance_accuracy']:.4f} "
-                  f"mean_target_prob={s['mean_target_prob']:.4f} mean_kl={s['mean_kl']:.6f}", flush=True)
+            print(
+                f"E1_{arm.upper()} endpoint_accuracy={s['endpoint_target_accuracy']:.4f} "
+                f"endpoint_target_prob={s['mean_endpoint_target_token_probability']:.6f} "
+                f"endpoint_mass_moved={s['mean_endpoint_target_probability_mass_moved']:.6f} "
+                f"endpoint_collateral={s['mean_endpoint_collateral_kl_model_to_base_non_target']:.6f}",
+                flush=True,
+            )
     return 0
 
 
