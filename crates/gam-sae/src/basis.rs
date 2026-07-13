@@ -889,6 +889,8 @@ impl SaeBasisThirdJet for SphereChartEvaluator {
 /// and it has no effect on the span, orthonormality, or reconstruction.
 #[derive(Debug, Clone)]
 struct SphHarmonicColumn {
+    /// Spherical-harmonic degree `l`.
+    degree: usize,
     /// Signed order `m ∈ [-l, l]`: `m ≥ 0` uses `cos(m·lon)`, `m < 0` uses
     /// `sin(|m|·lon)`.
     m: i64,
@@ -931,6 +933,20 @@ struct SphHarmonicColumn {
 pub struct SphericalHarmonicEvaluator {
     degree: usize,
     columns: Vec<SphHarmonicColumn>,
+}
+
+/// Spectral identity of one real spherical-harmonic column.
+///
+/// The evaluator's public column order is triangular in `(degree, order)`:
+/// degree `l` contributes orders `-l..=l`.  Carrying this identity beside the
+/// analytic evaluator lets quotient constructions restrict the cover's exact
+/// eigenspaces without re-deriving indexing conventions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SphericalHarmonicMode {
+    pub degree: usize,
+    pub order: i64,
+    /// Positive-Laplacian eigenvalue `l(l+1)` on the unit sphere.
+    pub laplace_eigenvalue: f64,
 }
 
 /// Legendre polynomials `P_0..=P_degree` as ascending-power coefficient vectors,
@@ -1009,6 +1025,7 @@ impl SphericalHarmonicEvaluator {
             for m in -(l as i64)..=(l as i64) {
                 let am = m.unsigned_abs() as usize;
                 columns.push(SphHarmonicColumn {
+                    degree: l,
                     m,
                     am,
                     norm: spherical_harmonic_norm(l, m),
@@ -1026,6 +1043,18 @@ impl SphericalHarmonicEvaluator {
 
     pub fn basis_size(&self) -> usize {
         self.columns.len()
+    }
+
+    /// Exact `(l,m)` and Laplace-eigenvalue metadata in evaluator column order.
+    pub fn spectral_modes(&self) -> Vec<SphericalHarmonicMode> {
+        self.columns
+            .iter()
+            .map(|column| SphericalHarmonicMode {
+                degree: column.degree,
+                order: column.m,
+                laplace_eigenvalue: (column.degree * (column.degree + 1)) as f64,
+            })
+            .collect()
     }
 
     /// Latitude amplitude jet `[R, R', R'', R''']` of a column via order-3 jet
@@ -1273,6 +1302,39 @@ pub fn select_spherical_harmonic_degree(
 /// (each axis contributes `2H+1` factors, so the total basis size is
 /// `(2H+1)^d`). The latent coords are angular phases in `[0, 1)` (consistent
 /// with the periodic 1-D atoms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealHarmonicComponent {
+    Constant,
+    Sine { harmonic: usize },
+    Cosine { harmonic: usize },
+}
+
+impl RealHarmonicComponent {
+    pub fn harmonic(self) -> usize {
+        match self {
+            Self::Constant => 0,
+            Self::Sine { harmonic } | Self::Cosine { harmonic } => harmonic,
+        }
+    }
+
+    /// Sign under reflection of the corresponding circle coordinate.
+    pub fn reflection_sign(self) -> i8 {
+        match self {
+            Self::Sine { .. } => -1,
+            Self::Constant | Self::Cosine { .. } => 1,
+        }
+    }
+}
+
+/// Spectral identity of one tensor-product real Fourier column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TorusHarmonicMode {
+    pub components: Vec<RealHarmonicComponent>,
+    /// Positive-Laplacian eigenvalue `sum_a k_a^2`, up to the common `(2π)^2`
+    /// chart-unit scale absorbed by the smoothing strength.
+    pub laplace_eigenvalue: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TorusHarmonicEvaluator {
     pub latent_dim: usize,
@@ -1307,6 +1369,51 @@ impl TorusHarmonicEvaluator {
                 .expect("TorusHarmonicEvaluator: basis size overflowed usize");
         }
         total
+    }
+
+    /// Real Fourier component represented by one per-axis column index.
+    pub fn axis_component(axis_column: usize) -> RealHarmonicComponent {
+        if axis_column == 0 {
+            RealHarmonicComponent::Constant
+        } else {
+            let harmonic = axis_column.div_ceil(2);
+            if axis_column % 2 == 1 {
+                RealHarmonicComponent::Sine { harmonic }
+            } else {
+                RealHarmonicComponent::Cosine { harmonic }
+            }
+        }
+    }
+
+    /// Exact tensor Fourier modes and Laplace eigenvalues in evaluator column
+    /// order (last axis fastest).
+    pub fn spectral_modes(&self) -> Vec<TorusHarmonicMode> {
+        let axis_m = self.axis_basis_size();
+        let mut index = vec![0usize; self.latent_dim];
+        let mut modes = Vec::with_capacity(self.basis_size());
+        for _ in 0..self.basis_size() {
+            let components: Vec<RealHarmonicComponent> = index
+                .iter()
+                .copied()
+                .map(Self::axis_component)
+                .collect();
+            let laplace_eigenvalue = components
+                .iter()
+                .map(|component| component.harmonic().pow(2) as f64)
+                .sum();
+            modes.push(TorusHarmonicMode {
+                components,
+                laplace_eigenvalue,
+            });
+            for axis in (0..self.latent_dim).rev() {
+                index[axis] += 1;
+                if index[axis] < axis_m {
+                    break;
+                }
+                index[axis] = 0;
+            }
+        }
+        modes
     }
 }
 
