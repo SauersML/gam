@@ -10,13 +10,13 @@ use crate::families::custom_family::joint_newton_defaults::{
     joint_hessian_has_cross_block_coupling,
 };
 use crate::families::custom_family::options::{
-    BlockwiseFitOptions, OuterDerivativePolicy, assert_derivative_blocks_match_specs,
+    BlockwiseFitOptions, OuterDerivativePolicy, assert_hyper_layout_matches_specs,
     assert_rho_matches_specs, assert_states_match_specs, assert_valid_blockspecs,
     assert_valid_options, default_coefficient_hessian_cost, default_outer_derivative_policy_costs,
     exact_outer_order_with_outer_hvp, validate_hessian_workspace_ready,
 };
 use crate::families::custom_family::psi_design::{
-    CustomFamilyBlockPsiDerivative, ExactNewtonJointHessianWorkspace,
+    CustomFamilyHyperLayout, ExactNewtonJointHessianWorkspace,
 };
 use gam_linalg::matrix::DesignMatrix;
 use gam_problem::{
@@ -50,7 +50,7 @@ pub struct ExactNewtonJointGradientEvaluation {
 /// and accumulates all K traces in a single streaming pass.
 ///
 /// All three vectors have length equal to the total number of outer
-/// hyperparameters (K = `rho.len() + Σ derivative_blocks[b].len()`), in the
+/// hyperparameters (K = `rho.len() + hyper_layout.len()`), in the
 /// same coordinate order as the unified evaluator's gradient: ρ-coords first,
 /// ψ-coords appended.
 ///
@@ -875,18 +875,14 @@ pub trait CustomFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         rho: &Array1<f64>,
         options: &BlockwiseFitOptions,
         hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
         assert_valid_blockspecs(specs, "batched outer gradient terms");
         assert_states_match_specs(block_states, specs, "batched outer gradient terms");
-        assert_derivative_blocks_match_specs(
-            derivative_blocks,
-            specs,
-            "batched outer gradient terms",
-        );
+        assert_hyper_layout_matches_specs(hyper_layout, specs, "batched outer gradient terms");
         assert_rho_matches_specs(rho, specs, "batched outer gradient terms");
         assert_valid_options(options, "batched outer gradient terms");
         validate_hessian_workspace_ready(
@@ -910,17 +906,13 @@ pub trait CustomFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         rho: &Array1<f64>,
         hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterHessianTerms>, String> {
         assert_valid_blockspecs(specs, "batched outer Hessian terms");
         assert_states_match_specs(block_states, specs, "batched outer Hessian terms");
-        assert_derivative_blocks_match_specs(
-            derivative_blocks,
-            specs,
-            "batched outer Hessian terms",
-        );
+        assert_hyper_layout_matches_specs(hyper_layout, specs, "batched outer Hessian terms");
         assert_rho_matches_specs(rho, specs, "batched outer Hessian terms");
         validate_hessian_workspace_ready(
             &hessian_workspace,
@@ -1860,7 +1852,7 @@ pub trait CustomFamily {
         &self,
         _: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        _: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _: &CustomFamilyHyperLayout,
         _: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         // Default implementation ignores this parameter.
@@ -1882,7 +1874,7 @@ pub trait CustomFamily {
         &self,
         _: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        _: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _: &CustomFamilyHyperLayout,
         _: usize,
         _: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
@@ -1905,7 +1897,7 @@ pub trait CustomFamily {
         &self,
         _: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        _: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _: &CustomFamilyHyperLayout,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         Ok(None)
     }
@@ -1924,11 +1916,11 @@ pub trait CustomFamily {
         &self,
         states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         assert_valid_options(options, "exact Newton joint psi workspace");
-        self.exact_newton_joint_psi_workspace(states, specs, derivs)
+        self.exact_newton_joint_psi_workspace(states, specs, hyper_layout)
     }
 
     /// Whether the family's exact joint ψ workspace should also be built for
@@ -1962,7 +1954,7 @@ pub trait CustomFamily {
         &self,
         _: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        _: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _: &CustomFamilyHyperLayout,
         _: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
