@@ -6,12 +6,9 @@
 //! owned by the library: the CLI, Rust callers, and the Python binding all
 //! parse and emit the same tokens, and the binding is marshalling only.
 
-use crate::basis::{klein_bottle_basis_size, projective_plane_basis_size};
-
-/// Validate harmonic metadata emitted by a native fit. Periodic, RP², and
-/// Klein atoms have exact width laws in their stored order `H`; malformed
-/// metadata is an error rather than a load-time repair. Other atom metadata
-/// passes through unchanged.
+/// Validate harmonic metadata emitted by a native fit. A periodic atom has
+/// width `M = 2H + 1` with `H >= 1`; malformed metadata is an error rather than
+/// a load-time repair. Non-periodic atom metadata passes through unchanged.
 pub fn validated_n_harmonics(
     basis_kinds: &[String],
     raw_n_harmonics: &[i64],
@@ -33,36 +30,23 @@ pub fn validated_n_harmonics(
         .enumerate()
     {
         validate_fitted_basis_kind(basis)?;
-        if matches!(basis.as_str(), "periodic" | "rp2" | "klein") {
+        if basis == "periodic" {
             if harmonics < 1 {
                 return Err(format!(
-                    "{basis} atom {atom} requires n_harmonics >= 1; got {harmonics}"
+                    "periodic atom {atom} requires n_harmonics >= 1; got {harmonics}"
                 ));
             }
-            let harmonic_order = usize::try_from(harmonics).map_err(|_| {
-                format!("{basis} atom {atom} harmonic order {harmonics} does not fit usize")
-            })?;
-            let expected_width = match basis.as_str() {
-                "periodic" => harmonic_order
-                    .checked_mul(2)
-                    .and_then(|twice| twice.checked_add(1))
-                    .ok_or_else(|| {
-                        format!("periodic atom {atom} basis width overflowed usize")
-                    })?,
-                "rp2" => projective_plane_basis_size(harmonic_order)?,
-                "klein" => klein_bottle_basis_size(harmonic_order)?,
-                other => {
-                    return Err(format!(
-                        "validated_n_harmonics: internal harmonic dispatch mismatch for {other:?}"
-                    ));
-                }
-            };
-            let stored_width = usize::try_from(width).map_err(|_| {
-                format!("{basis} atom {atom} decoder width {width} must be nonnegative")
-            })?;
-            if stored_width != expected_width {
+            let expected_width = harmonics
+                .checked_mul(2)
+                .and_then(|twice| twice.checked_add(1))
+                .ok_or_else(|| {
+                    format!(
+                        "periodic atom {atom} basis width overflows i64 for n_harmonics={harmonics}"
+                    )
+                })?;
+            if width != expected_width {
                 return Err(format!(
-                    "{basis} atom {atom} has decoder width {width}, but n_harmonics={harmonics} requires {expected_width}"
+                    "periodic atom {atom} has decoder width {width}, but n_harmonics={harmonics} requires {expected_width}"
                 ));
             }
         }
@@ -92,13 +76,12 @@ pub fn canonical_assignment_kind(kind: &str) -> Result<&'static str, String> {
 /// Validate a basis kind that may appear in a converged native artifact.
 pub fn validate_fitted_basis_kind(name: &str) -> Result<(), String> {
     match name {
-        "periodic" | "sphere" | "rp2" | "torus" | "klein" | "linear" | "linear_block"
-        | "euclidean" | "duchon" | "poincare" | "cylinder" | "mobius" | "finite_set"
-        | "spectral_graph" => Ok(()),
+        "periodic" | "sphere" | "torus" | "linear" | "linear_block" | "euclidean" | "duchon"
+        | "poincare" | "cylinder" | "mobius" | "finite_set" | "spectral_graph" => Ok(()),
         _ => Err(format!(
             "basis kind {name:?} is not canonical; expected one of ['cylinder', 'duchon', \
-             'euclidean', 'finite_set', 'klein', 'linear', 'linear_block', 'mobius', 'periodic', \
-             'poincare', 'rp2', 'spectral_graph', 'sphere', 'torus']"
+             'euclidean', 'finite_set', 'linear', 'linear_block', 'mobius', 'periodic', \
+             'poincare', 'spectral_graph', 'sphere', 'torus']"
         )),
     }
 }
@@ -106,15 +89,15 @@ pub fn validate_fitted_basis_kind(name: &str) -> Result<(), String> {
 /// Validate a public fit seed. Discovery-only atom kinds cannot be seeded.
 pub fn validate_seed_basis_kind(name: &str) -> Result<(), String> {
     match name {
-        "periodic" | "sphere" | "rp2" | "torus" | "klein" | "linear" | "linear_block"
-        | "euclidean" | "duchon" | "poincare" | "mobius" | "auto" => Ok(()),
+        "periodic" | "sphere" | "torus" | "linear" | "linear_block" | "euclidean" | "duchon"
+        | "poincare" | "mobius" | "auto" => Ok(()),
         "cylinder" | "finite_set" => Err(format!(
             "basis kind {name:?} is discovery-only and cannot seed a fit"
         )),
         _ => Err(format!(
             "basis kind {name:?} is not canonical; expected one of ['auto', 'duchon', \
-             'euclidean', 'klein', 'linear', 'linear_block', 'mobius', 'periodic', 'poincare', \
-             'rp2', 'sphere', 'torus']"
+             'euclidean', 'linear', 'linear_block', 'mobius', 'periodic', 'poincare', \
+             'sphere', 'torus']"
         )),
     }
 }
@@ -123,15 +106,14 @@ pub fn validate_seed_basis_kind(name: &str) -> Result<(), String> {
 pub fn basis_kind_for_topology(name: &str) -> Result<String, String> {
     match name {
         "circle" => Ok("periodic".to_string()),
-        "sphere" | "rp2" | "torus" | "klein" | "linear" | "linear_block" | "euclidean"
-        | "duchon" | "poincare" | "mobius" | "auto" => Ok(name.to_string()),
+        "sphere" | "torus" | "linear" | "linear_block" | "euclidean" | "duchon" | "poincare"
+        | "mobius" | "auto" => Ok(name.to_string()),
         "cylinder" | "finite_set" => Err(format!(
             "topology {name:?} is discovery-only and cannot seed a fit"
         )),
         _ => Err(format!(
             "topology {name:?} is not canonical; expected one of ['auto', 'circle', 'duchon', \
-             'euclidean', 'klein', 'linear', 'linear_block', 'mobius', 'poincare', 'rp2', \
-             'sphere', 'torus']"
+             'euclidean', 'linear', 'linear_block', 'mobius', 'poincare', 'sphere', 'torus']"
         )),
     }
 }
@@ -163,15 +145,12 @@ pub fn coordinate_periods_for_basis(
     validate_fitted_basis_kind(basis)?;
     match basis {
         "periodic" | "torus" => Ok(vec![Some(1.0); latent_dim]),
-        "klein" if latent_dim == 2 => Ok(vec![Some(1.0), Some(1.0)]),
         "cylinder" if latent_dim == 2 => Ok(vec![Some(1.0), None]),
-        "sphere" | "rp2" if latent_dim == 2 => {
-            Ok(vec![None, Some(std::f64::consts::TAU)])
-        }
+        "sphere" if latent_dim == 2 => Ok(vec![None, Some(std::f64::consts::TAU)]),
         // The Möbius chart is represented on its double cover: angle period 2,
         // open width axis. Deck invariance lives in the basis parity.
         "mobius" if latent_dim == 2 => Ok(vec![Some(2.0), None]),
-        "cylinder" | "sphere" | "rp2" | "klein" | "mobius" => Err(format!(
+        "cylinder" | "sphere" | "mobius" => Err(format!(
             "{basis} atoms require latent dimension 2; got {latent_dim}"
         )),
         _ => Ok(vec![None; latent_dim]),
