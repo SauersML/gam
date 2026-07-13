@@ -1930,13 +1930,6 @@ fn compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
             &mut criterion,
         )
     };
-    if let Some(beta) = final_beta_hint.as_ref()
-        && let Err(err) = obj.seed_inner_state(beta)
-    {
-        log::debug!(
-            "[RHO uncertainty] {context}: final inner-state restore skipped after diagnostic ({err})"
-        );
-    }
     match &diagnostic.status {
         crate::rho_uncertainty::RhoUncertaintyStatus::NoEvidenceOfHeavyTails => {
             log::info!(
