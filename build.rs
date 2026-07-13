@@ -5094,7 +5094,7 @@ fn function_declaration_without_visibility(source: &str) -> Option<&str> {
                     _ => {}
                 }
             }
-            let after_scope = scoped.get(scope_end?..) ?;
+            let after_scope = scoped.get(scope_end?..)?;
             if !after_scope.starts_with(char::is_whitespace) {
                 return None;
             }
@@ -5202,6 +5202,35 @@ fn enforce_derivative_registry_invariants() {
 
 fn enforce_derivative_policy_negative_probes() {
     enforce_derivative_registry_invariants();
+
+    for public_atom in [
+        "pub fn planted_public_row [generic, third](x) { x }",
+        "pub(crate) fn planted_crate_row [generic, fourth](x) { x }",
+        "pub(super) fn planted_super_row [generic, third, fourth](x) { x }",
+        "pub(in crate::gamlss) fn planted_scoped_row [generic, third](x) { x }",
+    ] {
+        let mask = compute_test_mask(public_atom, Path::new("crates/gam-models/src/planted.rs"));
+        let declarations = derivative_declarations(public_atom, &mask);
+        assert_eq!(
+            declarations.len(),
+            1,
+            "#932 policy self-test: a visible generated row declaration evaded discovery: {public_atom}"
+        );
+        assert!(
+            declarations[0].source.starts_with("fn ")
+                && generated_derivative_modes(&declarations[0].source).is_some()
+                && !specialization_site_is_registered(
+                    DerivativeSpecializationKind::RowAtom,
+                    "crates/gam-models/src/planted.rs",
+                    &declarations[0].source,
+                ),
+            "#932 policy self-test: a visible unregistered generated row was admitted: {public_atom}"
+        );
+    }
+    assert!(
+        function_declaration_without_visibility("publication fn planted() {}").is_none(),
+        "#932 policy self-test: a non-visibility `pub` prefix was parsed as a function"
+    );
 
     let comment_only = "// impl RowKernel<7> for CommentOnlyKernel";
     assert!(
