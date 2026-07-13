@@ -765,16 +765,8 @@ pub(crate) fn factor_one_row(
     // their outer ridge/rebuild handling. Only the SAE evidence path that
     // installs a `row_gauge_deflation` (via `factor_blocks_for_system`) opts
     // into spectral deflation.
-    factor_one_row_result(
-        row,
-        ridge_t,
-        d,
-        row_idx,
-        evidence_factorization,
-        &[],
-        false,
-    )
-    .map(|result| result.factor)
+    factor_one_row_result(row, ridge_t, d, row_idx, evidence_factorization, &[], false)
+        .map(|result| result.factor)
 }
 
 pub(crate) fn factor_one_row_result(

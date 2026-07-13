@@ -829,10 +829,7 @@ mod topk_curved_budget_tests {
             ledger.routing_workspace_bytes,
             (p + s * (2 + d)) * SAE_BYTES_PER_F64
         );
-        assert_eq!(
-            ledger.decoder_bytes,
-            k * m_hat * p * SAE_BYTES_PER_F64
-        );
+        assert_eq!(ledger.decoder_bytes, k * m_hat * p * SAE_BYTES_PER_F64);
         assert_eq!(
             ledger.border_vector_bytes,
             ledger.decoder_bytes * SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER

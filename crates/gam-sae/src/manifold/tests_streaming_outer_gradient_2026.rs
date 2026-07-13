@@ -346,9 +346,8 @@ fn production_objective_forced_streaming_value_gradient_matches_dense() {
         1.0e-6,
         1.0e-6,
     );
-    let mut streaming = SaeManifoldOuterObjective::new(
-        term, target, None, seed_rho, 40, 1.0, 1.0e-6, 1.0e-6,
-    );
+    let mut streaming =
+        SaeManifoldOuterObjective::new(term, target, None, seed_rho, 40, 1.0, 1.0e-6, 1.0e-6);
 
     // Construction binds the outer-coordinate layout to the assignment family.
     // In particular K=1 Softmax has no entropy-strength coordinate, so the
@@ -367,8 +366,8 @@ fn production_objective_forced_streaming_value_gradient_matches_dense() {
         "K=1 Softmax has no assignment-strength coordinate"
     );
 
-    let dense_eval = OuterObjective::eval(&mut dense, &rho_flat)
-        .expect("dense production value+gradient");
+    let dense_eval =
+        OuterObjective::eval(&mut dense, &rho_flat).expect("dense production value+gradient");
     let streaming_artifact = streaming
         .evaluate_outer_criterion_route(&rho, false, false)
         .expect("forced streaming production artifact");

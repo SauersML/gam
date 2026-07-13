@@ -9,9 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use gam_problem::{
-    DeclaredHessianForm, Derivative, EstimationError, HessianValue, OuterEval,
-};
+use gam_problem::{DeclaredHessianForm, Derivative, EstimationError, HessianValue, OuterEval};
 use gam_solve::rho_optimizer::{
     OuterCapability, OuterCriterionCertificate, OuterObjective, OuterProblem, SeedOutcome,
 };
@@ -200,8 +198,8 @@ impl SaeSupportOuterObjective {
                 for right in 0..m {
                     let weight = lambda * self.term.atoms[atom].smooth_penalty[[left, right]];
                     for channel in 0..self.term.output_dim() {
-                        out[offset + left * self.term.output_dim() + channel] += weight
-                            * vector[offset + right * self.term.output_dim() + channel];
+                        out[offset + left * self.term.output_dim() + channel] +=
+                            weight * vector[offset + right * self.term.output_dim() + channel];
                     }
                 }
             }
@@ -236,9 +234,7 @@ impl SaeSupportOuterObjective {
         let latent_dim = cache.delta_t_len();
         let rhs_t = Array1::<f64>::zeros(latent_dim);
         let mut traces = vec![0.0; self.layout.group_keys.len()];
-        let max_iters = beta_dim
-            .saturating_mul(2)
-            .clamp(128, 4096);
+        let max_iters = beta_dim.saturating_mul(2).clamp(128, 4096);
         for probe in 0..SUPPORT_LAML_TRACE_PROBES {
             let mut z = Array1::<f64>::zeros(beta_dim);
             for index in 0..beta_dim {
@@ -281,11 +277,7 @@ impl SaeSupportOuterObjective {
             .map_err(outer_error)?;
         let system = self
             .term
-            .assemble_arrow_schur(
-                self.target.view(),
-                &lambda_smooth,
-                &self.ard_precisions,
-            )
+            .assemble_arrow_schur(self.target.view(), &lambda_smooth, &self.ard_precisions)
             .map_err(outer_error)?;
         let options = ArrowSolveOptions::inexact_pcg().with_positive_definite_evidence();
         let (_, _, cache) = solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
@@ -325,9 +317,7 @@ impl SaeSupportOuterObjective {
         }
         let cost = 0.5
             * (joint_logdet - penalty_logdet
-                + residual_df
-                    * (1.0
-                        + (std::f64::consts::TAU * rss / residual_df).ln()));
+                + residual_df * (1.0 + (std::f64::consts::TAU * rss / residual_df).ln()));
         let traces = self.trace_by_group(&system, &cache, &lambda_smooth)?;
         let energy = self.penalty_energy_by_group(&lambda_smooth);
         let mut gradient = Array1::<f64>::zeros(self.layout.group_keys.len());
@@ -337,7 +327,9 @@ impl SaeSupportOuterObjective {
                     + residual_df * energy[group] / rss);
         }
         if !cost.is_finite() || gradient.iter().any(|value| !value.is_finite()) {
-            return Err(outer_error("support LAML produced a non-finite value or gradient"));
+            return Err(outer_error(
+                "support LAML produced a non-finite value or gradient",
+            ));
         }
         Ok(SupportOuterEvaluation {
             cost,
@@ -385,7 +377,9 @@ impl OuterObjective for SaeSupportOuterObjective {
 
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
         if beta.iter().any(|value| !value.is_finite()) {
-            return Err(outer_error("support outer seed contains a non-finite value"));
+            return Err(outer_error(
+                "support outer seed contains a non-finite value",
+            ));
         }
         Ok(SeedOutcome::NoSlot)
     }
@@ -409,7 +403,9 @@ pub fn run_sae_support_outer(
     }
     let layout = SaeSupportSmoothingLayout::from_term(&request.term);
     if layout.group_keys.is_empty() {
-        return Err(outer_error("support outer requires at least one smoothing group"));
+        return Err(outer_error(
+            "support outer requires at least one smoothing group",
+        ));
     }
     let spectrum = penalty_spectrum(&request.term, &layout).map_err(outer_error)?;
     let initial_term = request.term.clone();
@@ -448,7 +444,9 @@ pub fn run_sae_support_outer(
         })?;
     let terminal = objective.evaluate(&outer.rho)?;
     if !terminal.fixed_point.recurred {
-        return Err(outer_error("support outer terminal inner state did not recur"));
+        return Err(outer_error(
+            "support outer terminal inner state did not recur",
+        ));
     }
     Ok(SaeSupportOuterReport {
         term: objective.term,

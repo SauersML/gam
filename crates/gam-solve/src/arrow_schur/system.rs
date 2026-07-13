@@ -1706,11 +1706,9 @@ impl StreamingArrowSchur {
         schur: &Array2<f64>,
         options: &ArrowSolveOptions,
     ) -> Result<f64, ArrowSchurError> {
-        let schur_factor = factor_dense_reduced_schur(
-            schur,
-            options.evidence_policy.reduced_schur_policy(),
-        )?
-        .factor;
+        let schur_factor =
+            factor_dense_reduced_schur(schur, options.evidence_policy.reduced_schur_policy())?
+                .factor;
         let mut log_det_schur = 0.0_f64;
         for axis in 0..schur_factor.nrows() {
             log_det_schur += 2.0 * schur_factor[[axis, axis]].ln();
@@ -3216,9 +3214,7 @@ impl ArrowFactorCache {
     /// `SPECTRAL_DEFLATION_REL_FLOOR · max|λ|` (with the same hysteresis band the
     /// per-row spectral deflation uses, so a direction parked at the floor does
     /// not flicker across a ρ-walk).
-    fn deflated_schur_pseudo_inverse(
-        &self,
-    ) -> Result<DeflatedSchurPseudoInverse, ArrowSchurError> {
+    fn deflated_schur_pseudo_inverse(&self) -> Result<DeflatedSchurPseudoInverse, ArrowSchurError> {
         let Some(schur_factor) = self.schur_factor.as_ref() else {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: "schur_inverse_apply_deflated requires a dense Schur factor; \
@@ -3275,17 +3271,21 @@ impl ArrowFactorCache {
             }
         }
         let m = lower.dot(&lower.t());
-        let (evals, evecs) = m.eigh(Side::Lower).map_err(|err| {
-            ArrowSchurError::SchurFactorFailed {
-                reason: format!(
-                    "schur_inverse_apply_deflated: symmetric eigendecomposition of the \
+        let (evals, evecs) =
+            m.eigh(Side::Lower)
+                .map_err(|err| ArrowSchurError::SchurFactorFailed {
+                    reason: format!(
+                        "schur_inverse_apply_deflated: symmetric eigendecomposition of the \
                      reconstructed β-Schur operator failed: {err:?}"
-                ),
-            }
-        })?;
-        let max_abs = evals.iter().fold(0.0_f64, |acc, &v| {
-            if v.is_finite() { acc.max(v.abs()) } else { acc }
-        });
+                    ),
+                })?;
+        let max_abs =
+            evals.iter().fold(
+                0.0_f64,
+                |acc, &v| {
+                    if v.is_finite() { acc.max(v.abs()) } else { acc }
+                },
+            );
         if !(max_abs.is_finite() && max_abs > 0.0) {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: "schur_inverse_apply_deflated: reconstructed β-Schur operator has no \

@@ -613,9 +613,7 @@ fn factor_evidence_unit_deflated_schur(
     if !(max_abs.is_finite() && max_abs > 0.0) {
         return None;
     }
-    let deflate_floor = relative_floor
-        * max_abs
-        * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
+    let deflate_floor = relative_floor * max_abs * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
     let deflated: Vec<bool> = raw_evals
         .iter()
         .map(|&value| !value.is_finite() || value < deflate_floor)
@@ -653,15 +651,16 @@ fn factor_evidence_unit_deflated_schur(
         }
     }
     let factor = spectral_qr_cholesky_factor(&weighted_vt)?;
-    let beta_deflation = deflated
-        .iter()
-        .any(|&is_deflated| is_deflated)
-        .then(|| BetaSchurDeflationSpectrum {
-            evecs,
-            raw_evals,
-            cond_evals,
-            deflated: deflated.into(),
-        });
+    let beta_deflation =
+        deflated
+            .iter()
+            .any(|&is_deflated| is_deflated)
+            .then(|| BetaSchurDeflationSpectrum {
+                evecs,
+                raw_evals,
+                cond_evals,
+                deflated: deflated.into(),
+            });
     Some(DenseReducedSchurFactorization {
         factor,
         conditioned_schur: beta_deflation.as_ref().map(|_| conditioned),
@@ -826,26 +825,25 @@ pub(crate) fn factor_dense_reduced_schur(
             // reconstruction is undone back to original units below exactly like
             // the plain factor.
             match policy {
-                ReducedSchurPolicy::NewtonTikhonov { relative_floor } => match spectral_pd_floored_schur(
-                    &schur_scaled,
-                    relative_floor,
-                ) {
-                    Some((floored, floored_factor)) => (floored_factor, Some(floored)),
-                    None => {
-                        return Err(ArrowSchurError::SchurFactorFailed {
-                            reason: format!(
-                                "reduced Schur non-PD ({e}); spectral PD-floor declined \
+                ReducedSchurPolicy::NewtonTikhonov { relative_floor } => {
+                    match spectral_pd_floored_schur(&schur_scaled, relative_floor) {
+                        Some((floored, floored_factor)) => (floored_factor, Some(floored)),
+                        None => {
+                            return Err(ArrowSchurError::SchurFactorFailed {
+                                reason: format!(
+                                    "reduced Schur non-PD ({e}); spectral PD-floor declined \
                                  (no usable spectrum)"
-                            ),
-                        });
+                                ),
+                            });
+                        }
                     }
-                },
+                }
                 ReducedSchurPolicy::StrictNewton => {
                     return Err(ArrowSchurError::SchurFactorFailed { reason: e });
                 }
-                ReducedSchurPolicy::EvidenceUnitDeflation { .. } => unreachable!(
-                    "evidence unit deflation returns before Newton equilibration"
-                ),
+                ReducedSchurPolicy::EvidenceUnitDeflation { .. } => {
+                    unreachable!("evidence unit deflation returns before Newton equilibration")
+                }
             }
         }
     };
@@ -921,57 +919,53 @@ pub(crate) fn solve_dense_reduced_system(
     // function); the inexact-PCG path tolerates higher κ(S) and is unaffected.
     let schur_kappa = cholesky_factor_kappa_estimate(&factor);
     if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
-            // #1026 — over-complete SAE dictionaries park surplus atoms dead
-            // (β_k → 0), so the reduced Schur is PD (the Cholesky above succeeded)
-            // but ILL-CONDITIONED: the dead decoder subspace carries near-zero
-            // eigenvalues while the live subspace is healthy. The kappa gate's
-            // concern is an inaccurate Δβ from accumulated (H_tt)⁻¹ contamination —
-            // but on the dead subspace the correct Δβ IS ≈0 (those atoms have no
-            // signal), so the only "inaccuracy" is in directions whose true step is
-            // zero. When the spectral PD-floor is enabled (the SAE solve path),
-            // clamp exactly those collapsed directions up to `floor·max(λ)` and
-            // solve against the floored Schur: the live subspace keeps its EXACT
-            // Newton component, the dead subspace is damped to ≈0, and κ is bounded
-            // so Δβ is accurate where it matters. This is the same conditioning the
-            // non-PD branch above applies; here it also covers the PD-but-ill-
-            // conditioned case so the LM loop does not exhaust `ridge_β` trying to
-            // (futilely) lift a fundamentally rank-deficient dead-atom subspace.
-            // Without the floor (BA / non-SAE callers) the strict refusal stands.
-            if let Some(relative_floor) = options.newton_schur_tikhonov_rel_floor
-                && let Some((floored, floored_factor)) =
-                    spectral_pd_floored_schur(schur, relative_floor)
+        // #1026 — over-complete SAE dictionaries park surplus atoms dead
+        // (β_k → 0), so the reduced Schur is PD (the Cholesky above succeeded)
+        // but ILL-CONDITIONED: the dead decoder subspace carries near-zero
+        // eigenvalues while the live subspace is healthy. The kappa gate's
+        // concern is an inaccurate Δβ from accumulated (H_tt)⁻¹ contamination —
+        // but on the dead subspace the correct Δβ IS ≈0 (those atoms have no
+        // signal), so the only "inaccuracy" is in directions whose true step is
+        // zero. When the spectral PD-floor is enabled (the SAE solve path),
+        // clamp exactly those collapsed directions up to `floor·max(λ)` and
+        // solve against the floored Schur: the live subspace keeps its EXACT
+        // Newton component, the dead subspace is damped to ≈0, and κ is bounded
+        // so Δβ is accurate where it matters. This is the same conditioning the
+        // non-PD branch above applies; here it also covers the PD-but-ill-
+        // conditioned case so the LM loop does not exhaust `ridge_β` trying to
+        // (futilely) lift a fundamentally rank-deficient dead-atom subspace.
+        // Without the floor (BA / non-SAE callers) the strict refusal stands.
+        if let Some(relative_floor) = options.newton_schur_tikhonov_rel_floor
+            && let Some((floored, floored_factor)) =
+                spectral_pd_floored_schur(schur, relative_floor)
+        {
+            let direct = mixed_precision_reduced_beta(&floored, &floored_factor, rhs_beta, options)
+                .unwrap_or_else(|| cholesky_solve_vector(&floored_factor, rhs_beta));
+            if step_inside_trust_region(direct.view(), options.trust_region.radius, metric_weights)
             {
-                let direct =
-                    mixed_precision_reduced_beta(&floored, &floored_factor, rhs_beta, options)
-                        .unwrap_or_else(|| cholesky_solve_vector(&floored_factor, rhs_beta));
-                if step_inside_trust_region(
-                    direct.view(),
-                    options.trust_region.radius,
-                    metric_weights,
-                ) {
-                    return Ok((direct, Some(floored_factor), ArrowPcgDiagnostics::default()));
-                }
-                let identity = IdentityPreconditioner;
-                let (delta, diag) = steihaug_dense_system(
-                    &floored,
-                    rhs_beta,
-                    &identity,
-                    &ArrowPcgOptions {
-                        max_iterations: options.trust_region.max_iterations,
-                        relative_tolerance: options.trust_region.steihaug_relative_tolerance,
-                    },
-                    &options.trust_region,
-                    metric_weights,
-                )?;
-                return Ok((delta, Some(floored_factor), diag));
+                return Ok((direct, Some(floored_factor), ArrowPcgDiagnostics::default()));
             }
-            return Err(ArrowSchurError::SchurFactorFailed {
-                reason: format!(
-                    "reduced Schur complement Cholesky succeeded but is ill-conditioned \
+            let identity = IdentityPreconditioner;
+            let (delta, diag) = steihaug_dense_system(
+                &floored,
+                rhs_beta,
+                &identity,
+                &ArrowPcgOptions {
+                    max_iterations: options.trust_region.max_iterations,
+                    relative_tolerance: options.trust_region.steihaug_relative_tolerance,
+                },
+                &options.trust_region,
+                metric_weights,
+            )?;
+            return Ok((delta, Some(floored_factor), diag));
+        }
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "reduced Schur complement Cholesky succeeded but is ill-conditioned \
                      (kappa_estimate={schur_kappa:e}); accumulated per-row \
                      (H_tt)⁻¹ contamination would yield an inaccurate Δβ"
-                ),
-            });
+            ),
+        });
     }
     // Reduced-system solve. The f64 `factor` is always retained and returned —
     // its diagonal is the EXACT `log|S|` the evidence path reads, so the logdet
@@ -1867,9 +1861,7 @@ impl SurrogateLaneState {
 
     /// Consume the derivative representation produced by the most recent
     /// requested rational value evaluation.
-    pub fn take_logdet_derivative_bundle(
-        &mut self,
-    ) -> Option<RationalLogdetDerivativeBundle> {
+    pub fn take_logdet_derivative_bundle(&mut self) -> Option<RationalLogdetDerivativeBundle> {
         self.request_logdet_derivative_bundle = false;
         self.logdet_derivative_bundle.take()
     }
@@ -2020,12 +2012,13 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                     })?;
                 let estimate = eval.estimate;
                 let derivative_bundle = if want_logdet_derivative {
-                    Some(plan.into_directional_derivative_bundle(eval).ok_or_else(|| {
-                        ArrowSchurError::SchurFactorFailed {
-                            reason: "rational log-det derivative bundle assembly failed"
-                                .to_string(),
-                        }
-                    })?)
+                    Some(
+                        plan.into_directional_derivative_bundle(eval)
+                            .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
+                                reason: "rational log-det derivative bundle assembly failed"
+                                    .to_string(),
+                            })?,
+                    )
                 } else {
                     None
                 };

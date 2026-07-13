@@ -312,12 +312,8 @@ impl SaeManifoldTerm {
         //    once per refine round — lives inside
         //    `converge_inner_for_undamped_logdet`.
         let options = ArrowSolveOptions::direct()
-            .with_newton_schur_tikhonov(
-                gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR,
-            )
-            .with_evidence_unit_deflation(
-                gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR,
-            );
+            .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
+            .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
         let cache = self.converge_inner_for_undamped_logdet(
             target,
             rho,
@@ -382,13 +378,11 @@ impl SaeManifoldTerm {
             let mut grams = self.empty_decoder_gram_accumulator();
             self.accumulate_decoder_gram(&mut grams);
             let n_eff = self.per_atom_effective_sample_size();
-            let dispersion_lower_bound = self
-                .reconstruction_dispersion_lower_bound(&loss, Some(residual.view()))?;
-            if let Some(atoms) = self.vanished_atoms_from_signal_upper_bound(
-                &grams,
-                &n_eff,
-                dispersion_lower_bound,
-            )? {
+            let dispersion_lower_bound =
+                self.reconstruction_dispersion_lower_bound(&loss, Some(residual.view()))?;
+            if let Some(atoms) =
+                self.vanished_atoms_from_signal_upper_bound(&grams, &n_eff, dispersion_lower_bound)?
+            {
                 return Err(SaeCriterionError::VanishedAtoms(atoms));
             }
             let disp = self
@@ -2455,12 +2449,8 @@ impl SaeManifoldTerm {
         // `PerRowFactorFailed` at base ridge 0. Sharing the driver also keeps the
         // streaming and dense log-determinants bit-identical (#847).
         let options = ArrowSolveOptions::direct()
-            .with_newton_schur_tikhonov(
-                gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR,
-            )
-            .with_evidence_unit_deflation(
-                gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR,
-            );
+            .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
+            .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
         // The converged arrow-factor cache is the per-row factored Hessian
         // (matrix-free, feasible at massive K — the dense border_dim² Schur is
         // never materialised here); it is RETURNED so the EFS lane can take its
@@ -2519,8 +2509,8 @@ impl SaeManifoldTerm {
             // chunk-accumulated Grams. The β/Schur block (the ‖B‖-independent part
             // of log_det) is untouched — bit-identical dense↔streaming by design.
             let residual = self.reconstruction_residual(target, rho)?;
-            let dispersion_lower_bound = self
-                .reconstruction_dispersion_lower_bound(&loss, Some(residual.view()))?;
+            let dispersion_lower_bound =
+                self.reconstruction_dispersion_lower_bound(&loss, Some(residual.view()))?;
             if let Some(atoms) = self.vanished_atoms_from_signal_upper_bound(
                 &ri.grams,
                 &ri.n_eff,
@@ -2735,12 +2725,8 @@ impl SaeManifoldTerm {
             // storage the inner PCG already holds, not the extra O(k²) dense S.
             //
             let options = ArrowSolveOptions::direct()
-                .with_newton_schur_tikhonov(
-                    gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR,
-                )
-                .with_evidence_unit_deflation(
-                    gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR,
-                );
+                .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
+                .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
             // Assemble the WHOLE system once (a single "chunk" over all rows) so the
             // matrix-free reduced-Schur apply `v ↦ S·v` can iterate every row; the
             // per-row block storage is exactly what the inner solve already holds.
@@ -2795,12 +2781,8 @@ impl SaeManifoldTerm {
         let mut schur_acc = Array2::<f64>::zeros((border_dim, border_dim));
         let mut log_det_tt = 0.0_f64;
         let options = ArrowSolveOptions::direct()
-            .with_newton_schur_tikhonov(
-                gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR,
-            )
-            .with_evidence_unit_deflation(
-                gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR,
-            );
+            .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
+            .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
         let mut start = 0usize;
         while start < n_total {
             let end = (start + chunk_size).min(n_total);

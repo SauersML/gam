@@ -735,9 +735,7 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         // CPU loop: a barely-PD but ill-conditioned block forces the whole batch
         // back onto the per-row path so its ridge can lift, never silently using
         // a contaminated factor.
-        if let Some(batched) =
-            try_factor_blocks_batched(rows, ridge_t, d, evidence_factorization)
-        {
+        if let Some(batched) = try_factor_blocks_batched(rows, ridge_t, d, evidence_factorization) {
             return Ok(batched);
         }
         // Per-row Cholesky factorizations are INDEPENDENT (each reads only its own
@@ -754,13 +752,7 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
                 .into_par_iter()
                 .map(|row_idx| {
                     gam_problem::with_nested_parallel(|| {
-                        factor_one_row(
-                            &rows[row_idx],
-                            ridge_t,
-                            d,
-                            row_idx,
-                            evidence_factorization,
-                        )
+                        factor_one_row(&rows[row_idx], ridge_t, d, row_idx, evidence_factorization)
                     })
                 })
                 .collect::<Result<Vec<_>, ArrowSchurError>>()?

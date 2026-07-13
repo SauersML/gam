@@ -799,11 +799,6 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
                     Ok(schur) => schur,
                     Err(err) => return Some(Err(err)),
                 };
-                let schur = if evidence_beta_gauge_active(sys, ridge_t, ridge_beta, options) {
-                    pin_evidence_beta_schur(sys, schur)
-                } else {
-                    schur
-                };
                 let factor = match solve_dense_reduced_system(&schur, rhs_beta, options, None) {
                     Ok((_cpu_delta_beta, Some(factor), _diag)) => factor,
                     Ok((_, None, _)) => {
@@ -1541,12 +1536,7 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
 ) -> Result<ArrowBlockFactorization, ArrowSchurError> {
     let Some(deflation) = sys.row_gauge_deflation.as_ref() else {
         return Ok(ArrowBlockFactorization {
-            factors: backend.factor_blocks(
-                &sys.rows,
-                ridge_t,
-                sys.d,
-                evidence_factorization,
-            )?,
+            factors: backend.factor_blocks(&sys.rows, ridge_t, sys.d, evidence_factorization)?,
             gauge_deflated_directions: 0,
             deflated_row_directions: Vec::new(),
             deflation_row_spectra: Vec::new(),
@@ -2203,15 +2193,8 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
-    let beta_gauge_active = evidence_beta_gauge_active(sys, ridge_t, ridge_beta, options);
-    let rhs_beta_evidence = if beta_gauge_active {
-        sys.beta_gauge_quotient
-            .as_ref()
-            .expect("active beta gauge quotient")
-            .project_complement(rhs_beta.view())
-    } else {
-        rhs_beta.clone()
-    };
+    let beta_gauge_active = false;
+    let rhs_beta_evidence = rhs_beta.clone();
     // The Schur solve is over the reduced β vector. Latent manifold metric
     // weights live on each d-dimensional t_i block, so the induced metric for
     // this β-only Steihaug problem is Euclidean.

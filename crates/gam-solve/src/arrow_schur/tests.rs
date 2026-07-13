@@ -1968,16 +1968,22 @@ pub(crate) fn schur_inverse_deflated_finite_at_boundary_matches_plain_interior()
         }
     }
 
-    // ---- Boundary: β-Schur factor with an exactly-null third pivot, the
-    // doubly-null decoder direction at the ρ lower face. ----
+    // ---- Boundary: the evidence factor unit-pins the exactly-null third
+    // direction and carries the authoritative raw/conditioned spectrum. ----
     let kb = 3usize;
     let mut boundary = cache.clone();
     boundary.k = kb;
     boundary.schur_factor = Some(array![
         [2.0_f64, 0.0, 0.0],
-        [0.3, 1.5, 0.0],
-        [0.0, 0.0, 0.0]
+        [0.0, 1.5, 0.0],
+        [0.0, 0.0, 1.0]
     ]);
+    boundary.beta_schur_deflation = Some(BetaSchurDeflationSpectrum {
+        evecs: Array2::<f64>::eye(kb),
+        raw_evals: array![4.0_f64, 2.25, 0.0],
+        cond_evals: array![4.0_f64, 2.25, 1.0],
+        deflated: std::sync::Arc::from([false, false, true]),
+    });
     // The htbeta coupling is irrelevant to the β-Schur back-substitution under
     // test; drop it so the cloned d=2 row blocks (built for k=2) cannot be
     // consulted with a k=3 RHS.
@@ -1993,17 +1999,16 @@ pub(crate) fn schur_inverse_deflated_finite_at_boundary_matches_plain_interior()
         estimated_bytes: 0,
     };
 
-    // Plain path: the zero pivot divides to a non-finite entry.
+    // Every inverse entry point consumes the stored mask; the conditioned
+    // unit pin never reappears as a real degree of freedom.
     let mut e_null = Array1::<f64>::zeros(kb);
     e_null[2] = 1.0;
     let plain_null = boundary
         .schur_inverse_apply(e_null.view())
-        .expect("plain apply runs (and blows up numerically) at the boundary");
+        .expect("ordinary apply is deflation-aware at the boundary");
     assert!(
-        plain_null.iter().any(|v| !v.is_finite()),
-        "boundary pin: the plain back-substitution must go non-finite on the \
-         doubly-null direction — if this stops failing the fixture no longer \
-         exercises the divergence"
+        plain_null.iter().all(|v| v.abs() < 1e-12),
+        "ordinary apply must annihilate the stored β-null direction"
     );
 
     // Deflated path: finite by construction; the null direction contributes 0.
@@ -2022,13 +2027,7 @@ pub(crate) fn schur_inverse_deflated_finite_at_boundary_matches_plain_interior()
     // Kept subspace: the deflated inverse must agree with the dense inverse of
     // the leading 2×2 SPD block M = L₂L₂ᵀ (the survivors), i.e. deflation only
     // removes the null direction, never distorts the kept one.
-    let l2 = array![[2.0_f64, 0.0], [0.3, 1.5]];
-    let m2 = l2.dot(&l2.t());
-    let det = m2[[0, 0]] * m2[[1, 1]] - m2[[0, 1]] * m2[[1, 0]];
-    let m2_inv = array![
-        [m2[[1, 1]] / det, -m2[[0, 1]] / det],
-        [-m2[[1, 0]] / det, m2[[0, 0]] / det]
-    ];
+    let m2_inv = array![[0.25_f64, 0.0], [0.0, 1.0 / 2.25]];
     for col in 0..2 {
         let mut e = Array1::<f64>::zeros(kb);
         e[col] = 1.0;
@@ -6429,4 +6428,125 @@ fn factor_dense_reduced_schur_reconstructs_original_illconditioned_matrix_2015()
             x_true[i]
         );
     }
+}
+
+/// #2308 — an evidence β-null is pinned to unit stiffness in ORIGINAL β
+/// coordinates whether it is slightly negative (Cholesky refusal) or slightly
+/// positive (successful but sub-floor Cholesky). It contributes `log 1 = 0`,
+/// and the explicit mask records exactly the direction the inverse must drop.
+#[test]
+fn evidence_beta_schur_boundary_has_unit_logdet_and_authoritative_mask_2308() {
+    for collapsed in [-1.0e-12_f64, 1.0e-12_f64] {
+        let schur = array![[4.0_f64, 0.0], [0.0, collapsed]];
+        let evidence = factor_dense_reduced_schur(
+            &schur,
+            ReducedSchurPolicy::EvidenceUnitDeflation {
+                relative_floor: SPECTRAL_DEFLATION_REL_FLOOR,
+            },
+        )
+        .expect("evidence unit deflation");
+        let spectrum = evidence
+            .beta_deflation
+            .as_ref()
+            .expect("sub-floor β direction must carry metadata");
+        assert_eq!(&*spectrum.deflated, &[true, false]);
+        assert_abs_diff_eq!(spectrum.raw_evals[0], collapsed, epsilon = 1e-18);
+        assert_eq!(spectrum.cond_evals[0], 1.0);
+        assert_eq!(spectrum.cond_evals[1], 4.0);
+
+        let log_det = (0..2)
+            .map(|axis| 2.0 * evidence.factor[[axis, axis]].ln())
+            .sum::<f64>();
+        assert_abs_diff_eq!(log_det, 4.0_f64.ln(), epsilon = 2e-14);
+        let conditioned = evidence
+            .conditioned_schur
+            .as_ref()
+            .expect("boundary operator was conditioned");
+        assert_abs_diff_eq!(conditioned[[0, 0]], 4.0, epsilon = 1e-14);
+        assert_abs_diff_eq!(conditioned[[1, 1]], 1.0, epsilon = 1e-14);
+    }
+}
+
+/// #2308 — in the full-rank interior evidence performs no conditioning and the
+/// ordinary log-determinant remains `log|S|`. Newton Tikhonov remains a separate
+/// policy with its own boundary value.
+#[test]
+fn evidence_beta_schur_interior_is_raw_and_newton_boundary_is_tikhonov_2308() {
+    let interior = array![[4.0_f64, 0.0], [0.0, 2.0]];
+    let evidence = factor_dense_reduced_schur(
+        &interior,
+        ReducedSchurPolicy::EvidenceUnitDeflation {
+            relative_floor: SPECTRAL_DEFLATION_REL_FLOOR,
+        },
+    )
+    .expect("interior evidence factor");
+    assert!(evidence.beta_deflation.is_none());
+    assert!(evidence.conditioned_schur.is_none());
+    let evidence_log_det = (0..2)
+        .map(|axis| 2.0 * evidence.factor[[axis, axis]].ln())
+        .sum::<f64>();
+    assert_abs_diff_eq!(evidence_log_det, 8.0_f64.ln(), epsilon = 2e-14);
+
+    let boundary = array![[4.0_f64, 0.0], [0.0, -1.0e-12]];
+    let newton = factor_dense_reduced_schur(
+        &boundary,
+        ReducedSchurPolicy::NewtonTikhonov {
+            relative_floor: SPECTRAL_DEFLATION_REL_FLOOR,
+        },
+    )
+    .expect("Newton Tikhonov factor");
+    assert!(newton.beta_deflation.is_none());
+    let newton_conditioned = newton
+        .conditioned_schur
+        .as_ref()
+        .expect("boundary Newton operator was Tikhonov-conditioned");
+    let newton_log_det = (0..2)
+        .map(|axis| 2.0 * newton.factor[[axis, axis]].ln())
+        .sum::<f64>();
+    let expected = (newton_conditioned[[0, 0]] * newton_conditioned[[1, 1]]
+        - newton_conditioned[[0, 1]] * newton_conditioned[[1, 0]])
+    .ln();
+    assert_abs_diff_eq!(newton_log_det, expected, epsilon = 2e-12);
+    assert!((newton_log_det - 4.0_f64.ln()).abs() > 1.0);
+}
+
+/// #2308 — the public cache seam always rebuilds the same undamped evidence
+/// operator, so changing the Newton ridge history cannot change its value,
+/// mask, or inverse. This exercises the metadata propagation rather than only
+/// the reduced-factor helper.
+#[test]
+fn evidence_cache_boundary_is_invariant_to_newton_damping_history_2308() {
+    let mut sys = ArrowSchurSystem::new(0, 0, 2);
+    sys.hbb = array![[4.0_f64, 0.0], [0.0, -1.0e-12]];
+    sys.gb = Array1::<f64>::zeros(2);
+    let options = ArrowSolveOptions::direct()
+        .with_newton_schur_tikhonov(SPECTRAL_DEFLATION_REL_FLOOR)
+        .with_evidence_unit_deflation(SPECTRAL_DEFLATION_REL_FLOOR);
+
+    let (_, _, ridge_zero) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+        .expect("ridge-zero step and evidence cache");
+    let (_, _, damped_step) = solve_arrow_newton_step_with_options(&sys, 0.0, 1.0e-3, &options)
+        .expect("damped step and undamped evidence cache");
+
+    for cache in [&ridge_zero, &damped_step] {
+        assert_abs_diff_eq!(
+            cache.arrow_log_det().expect("evidence logdet"),
+            4.0_f64.ln(),
+            epsilon = 2e-14
+        );
+        let spectrum = cache
+            .beta_schur_deflation
+            .as_ref()
+            .expect("β-null metadata reached cache");
+        assert_eq!(&*spectrum.deflated, &[true, false]);
+        let null_rhs = array![0.0_f64, 1.0];
+        let solved = cache
+            .schur_inverse_apply(null_rhs.view())
+            .expect("ordinary inverse consumes evidence mask");
+        assert!(solved.iter().all(|value| value.abs() < 1e-12));
+    }
+    assert_eq!(
+        ridge_zero.arrow_log_det().unwrap().to_bits(),
+        damped_step.arrow_log_det().unwrap().to_bits()
+    );
 }
