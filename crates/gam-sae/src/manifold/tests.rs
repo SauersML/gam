@@ -419,36 +419,21 @@ pub(crate) fn circle_certificate_fixture(
 
 #[test]
 pub(crate) fn dictionary_incoherence_report_orthogonal_frames_has_zero_mu_hat() {
-    let term = circle_certificate_fixture(2.0, &[(0, 1), (2, 3)]);
+    let term = circle_certificate_fixture(4.0, &[(0, 1), (2, 3)]);
     let report = dictionary_incoherence_report(&term).unwrap();
     assert_abs_diff_eq!(report.mu_hat, 0.0, epsilon = 1.0e-12);
     assert_eq!(report.per_atom_kappa_hat.len(), 2);
-    // The report carries a verdict (no longer a "not implemented" caveat).
-    // The verdict is consistent with the threshold function evaluated on the
-    // report's own quantities — the report does not fabricate a verdict.
-    let kappa_max = report
-        .per_atom_kappa_hat
-        .iter()
-        .copied()
-        .fold(0.0_f64, f64::max);
-    let recomputed = curved_dictionary_global_optimality_verdict(
-        report.mu_hat,
-        kappa_max,
-        report.peak_activity_floor,
-        report.snr_proxy,
-        report.per_atom_kappa_hat.len(),
+    assert!(
+        report.snr_proxy > 1.0,
+        "fixture must cross the certificate SNR gate; got {}",
+        report.snr_proxy
     );
-    assert_eq!(report.global_optimality, recomputed);
-    // μ̂ = 0 (orthogonal frames) ⇒ when the preconditions hold (κ̂ < 1,
-    // SNR > 1) the certificate certifies, since the budget is positive and
-    // μ̂ cannot exceed it. κ̂ = 1/radius = 0.5 < 1 here, so the only gate is
-    // SNR; assert certification whenever SNR clears the noise floor.
-    if report.snr_proxy > 1.0 {
-        assert!(
-            report.global_optimality.is_certified(),
-            "μ̂=0, κ̂=0.5<1, SNR>1 ⇒ must certify; got {}",
+    match report.global_optimality {
+        GlobalOptimalityVerdict::CertifiedGlobal { margin } => assert!(margin > 0.0),
+        GlobalOptimalityVerdict::Uncertified { margin } => panic!(
+            "orthogonal frames with κ̂=0.25 and SNR>1 must certify; margin={margin}, note={}",
             report.note
-        );
+        ),
     }
 }
 

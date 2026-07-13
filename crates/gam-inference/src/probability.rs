@@ -839,7 +839,9 @@ mod tests {
     use gam_problem::types::{
         InverseLink, LinkComponent, MixtureLinkSpec, ResponseFamily, SasLinkSpec, StandardLink,
     };
-    use gam_solve::mixture_link::{state_from_sasspec, state_fromspec};
+    use gam_solve::mixture_link::{
+        mixture_inverse_link_jet, sas_inverse_link_jet, state_from_sasspec, state_fromspec,
+    };
     use ndarray::array;
 
     #[test]
@@ -885,36 +887,45 @@ mod tests {
         );
         let mu = try_inverse_link_array(&likelihood, eta.view()).expect("standard logit spec");
         assert_eq!(mu.len(), eta.len());
-        assert!(mu.iter().all(|p| p.is_finite() && *p > 0.0 && *p < 1.0));
+        for (&got, &eta_i) in mu.iter().zip(eta.iter()) {
+            assert_eq!(got.to_bits(), gam_linalg::utils::stable_logistic(eta_i).to_bits());
+        }
     }
 
     #[test]
     fn sas_and_mixture_stateful_inverse_link_evaluates() {
         let eta = array![0.1, -0.2, 0.3];
+        let sas_state = state_from_sasspec(SasLinkSpec {
+            initial_epsilon: 0.2,
+            initial_log_delta: -0.1,
+        })
+        .expect("sas state");
+        let sas_expected = eta.mapv(|eta_i| {
+            sas_inverse_link_jet(eta_i, sas_state.epsilon, sas_state.log_delta)
+                .expect("direct SAS jet")
+                .mu
+        });
         let sas_likelihood = LikelihoodSpec::new(
             ResponseFamily::Binomial,
-            InverseLink::Sas(
-                state_from_sasspec(SasLinkSpec {
-                    initial_epsilon: 0.2,
-                    initial_log_delta: -0.1,
-                })
-                .expect("sas state"),
-            ),
+            InverseLink::Sas(sas_state),
         );
         let sas = try_inverse_link_array(&sas_likelihood, eta.view()).expect("SAS with params");
-        assert_eq!(sas.len(), eta.len());
-        assert!(sas.iter().all(|p| p.is_finite() && *p > 0.0 && *p < 1.0));
+        for (&got, &expected) in sas.iter().zip(sas_expected.iter()) {
+            assert_eq!(got.to_bits(), expected.to_bits());
+        }
 
         let spec = MixtureLinkSpec {
             components: vec![LinkComponent::Probit, LinkComponent::CLogLog],
             initial_rho: array![0.3],
         };
         let state = state_fromspec(&spec).expect("mixture state");
+        let mix_expected = eta.mapv(|eta_i| mixture_inverse_link_jet(&state, eta_i).mu);
         let mix_likelihood =
             LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(state));
         let mix = try_inverse_link_array(&mix_likelihood, eta.view()).expect("mixture with state");
-        assert_eq!(mix.len(), eta.len());
-        assert!(mix.iter().all(|p| p.is_finite() && *p > 0.0 && *p < 1.0));
+        for (&got, &expected) in mix.iter().zip(mix_expected.iter()) {
+            assert_eq!(got.to_bits(), expected.to_bits());
+        }
     }
 
     #[test]

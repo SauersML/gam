@@ -1670,9 +1670,8 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Charter §7 hill-climb gates (Linux-only, `#[ignore]` by default —
-    // run with `cargo test -- --ignored polya_gamma_hill_climb_` on the
-    // V100. The 50×/20× ratios compare CPU vs GPU draws built in the same
+    // Charter §7 hill-climb gates (Linux-only, executed whenever the test host
+    // has a CUDA runtime). The 50×/20× ratios compare CPU vs GPU draws built in the same
     // mode; the NVRTC kernel runs at device speed regardless of host opt
     // level, so the ratio is meaningful at any host build mode.
     // ────────────────────────────────────────────────────────────────────

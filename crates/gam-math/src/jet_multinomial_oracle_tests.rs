@@ -1,15 +1,10 @@
 //! Multinomial-logit (softmax) Taylor-jet oracle (#932, FD-free exactness).
 //!
-//! Issue #932 single-sources every family's derivative tower onto ONE row-NLL
-//! expression evaluated through the generic jet algebra, instead of a
-//! hand-written gradient/Hessian/third/fourth cascade. This module wires the
-//! **multinomial logit** family — the last of the survey-flagged production
-//! families whose derivative tower is still assembled by hand
-//! (`crates/gam-models/src/multinomial_reml.rs`: `joint_loglik_and_gradient_from_probs`,
-//! `hessian_matvec_into_with_probs`, and the third/fourth "directional Fisher
-//! jet" closed forms `assemble_all_axis_directional_derivatives` /
-//! `assemble_all_axis_second_directional_derivatives`) — to the universal jet
-//! oracle.
+//! The test writes the multinomial row NLL once through generic jet algebra and
+//! compares its value, gradient, and Hessian with an independent softmax
+//! closed form. Production's higher derivatives are now generated from the
+//! canonical row program and are tested at that production seam; duplicating
+//! those formulas here would only compare a kernel with a frozen copy of itself.
 //!
 //! # Why the multinomial hand tower is exactly the softmax cumulant sequence
 //!
@@ -45,13 +40,7 @@
 //! * [`multinomial_softmax_jet_value_grad_hessian_matches_closed_form`] — the
 //!   jet value / ∇ / H against an INDEPENDENT softmax closed form, through the
 //!   same [`verify_kernel_channels`] universal oracle every other family uses.
-//! * [`multinomial_softmax_jet_third_fourth_match_production_directional_jets`] —
-//!   the jet's contracted third `∂_{a0}H` and fourth `∂_δ∂_{a0}H` against the
-//!   EXACT `Ĵ` / `Ĵ²` closed forms replicated verbatim from the production
-//!   `assemble_all_axis_*` sweeps. A dropped/sign-flipped term in either hand
-//!   closed form is loud here.
-//!
-//! Both hold at `rel_tol = 1e-11`, tighter than the issue's ~1e-10 ask.
+//! The comparison holds at `rel_tol = 1e-11`, tighter than the issue's ~1e-10 ask.
 
 use crate::jet_scalar::JetScalar;
 use crate::jet_tower::{
@@ -163,77 +152,6 @@ fn multinomial_closed_form_vgh<const M: usize>(row: &MultRow<M>) -> KernelChanne
     }
 }
 
-/// The production per-row third "directional Fisher jet" `Ĵ_{a0}` — the
-/// derivative of the Fisher block `W_{c,d} = w(δ_cd p_c − p_c p_d)` along the
-/// canonical class axis `a0` — replicated VERBATIM from
-/// `assemble_all_axis_directional_derivatives`
-/// (`crates/gam-models/src/multinomial_reml.rs`).
-fn production_jhat_third<const M: usize>(p: &[f64; M], w: f64, a0: usize) -> [[f64; M]; M] {
-    let pa0 = p[a0];
-    let mut dphat = [0.0_f64; M];
-    for c in 0..M {
-        dphat[c] = p[c] * ((if c == a0 { 1.0 } else { 0.0 }) - pa0);
-    }
-    let mut jhat = [[0.0_f64; M]; M];
-    for c in 0..M {
-        jhat[c][c] = w * (dphat[c] - 2.0 * dphat[c] * p[c]);
-        for d in (c + 1)..M {
-            let off = w * (-(dphat[c] * p[d] + p[c] * dphat[d]));
-            jhat[c][d] = off;
-            jhat[d][c] = off;
-        }
-    }
-    jhat
-}
-
-/// The production per-row fourth "second-directional Fisher jet" `Ĵ²_{a0,δ}` —
-/// the derivative of `Ĵ_{a0}` along an arbitrary first direction `δ` (in
-/// η-space) — replicated VERBATIM from
-/// `assemble_all_axis_second_directional_derivatives`
-/// (`crates/gam-models/src/multinomial_reml.rs`).
-fn production_jhat_fourth<const M: usize>(
-    p: &[f64; M],
-    w: f64,
-    a0: usize,
-    delta: &[f64; M],
-) -> [[f64; M]; M] {
-    let mut s_u = 0.0_f64;
-    for c in 0..M {
-        s_u += p[c] * delta[c];
-    }
-    let mut dp_u = [0.0_f64; M];
-    for c in 0..M {
-        dp_u[c] = p[c] * (delta[c] - s_u);
-    }
-    let pa0 = p[a0];
-    let mut dp_v_hat = [0.0_f64; M];
-    let mut ds_u_dv = 0.0_f64;
-    for c in 0..M {
-        let v = p[c] * ((if c == a0 { 1.0 } else { 0.0 }) - pa0);
-        dp_v_hat[c] = v;
-        ds_u_dv += v * delta[c];
-    }
-    let mut ddp_hat = [0.0_f64; M];
-    for c in 0..M {
-        ddp_hat[c] = dp_v_hat[c] * (delta[c] - s_u) - p[c] * ds_u_dv;
-    }
-    let mut jhat = [[0.0_f64; M]; M];
-    for a in 0..M {
-        let pa = p[a];
-        jhat[a][a] = w * (ddp_hat[a] * (1.0 - 2.0 * pa) - 2.0 * dp_u[a] * dp_v_hat[a]);
-        for b in (a + 1)..M {
-            let off = w
-                * (-(ddp_hat[a] * p[b]
-                    + dp_u[a] * dp_v_hat[b]
-                    + dp_v_hat[a] * dp_u[b]
-                    + pa * ddp_hat[b]));
-            jhat[a][b] = off;
-            jhat[b][a] = off;
-        }
-    }
-    jhat
-}
-
 /// A tiny deterministic LCG so the fixtures are pseudo-random yet fixed across
 /// runs (NO `rand`, NO date/clock seeding — per the #932 rules).
 struct Lcg(u64);
@@ -292,67 +210,4 @@ fn assert_vgh<const M: usize>(seed: u64) {
 fn multinomial_softmax_jet_value_grad_hessian_matches_closed_form() {
     assert_vgh::<2>(0x9322_2020_1109_face);
     assert_vgh::<3>(0x0bad_c0de_2020_1109);
-}
-
-fn assert_third_fourth<const M: usize>(seed: u64) {
-    let rows = make_rows::<M>(seed, 16);
-    let program = MultinomialSoftmaxRow { rows: rows.clone() };
-    // Deterministic first-direction δ in η-space for the fourth contraction.
-    let mut rng = Lcg(seed ^ 0xf0f0_f0f0_f0f0_f0f0);
-    let close = |a: f64, b: f64, label: &str| {
-        let band = REL_TOL + REL_TOL * a.abs().max(b.abs());
-        assert!(
-            (a - b).abs() <= band,
-            "{label}: jet {a:+.15e} vs production {b:+.15e} (band {band:.3e})"
-        );
-    };
-    for (row, fixture) in rows.iter().enumerate() {
-        let tower: Tower4<M> = program_full_tower(&program, row).expect("multinomial jet tower");
-        let p = softmax_active(&fixture.eta);
-        let w = fixture.w;
-        let mut delta = [0.0_f64; M];
-        for a in 0..M {
-            delta[a] = rng.uniform(-1.5, 1.5);
-        }
-        for a0 in 0..M {
-            // Third: ∂_{a0} of the Fisher block == jet third contracted along e_{a0}.
-            let mut e_a0 = [0.0_f64; M];
-            e_a0[a0] = 1.0;
-            let jet_third = tower.third_contracted(&e_a0);
-            let prod_third = production_jhat_third(&p, w, a0);
-            for c in 0..M {
-                for d in 0..M {
-                    close(
-                        jet_third[c][d],
-                        prod_third[c][d],
-                        &format!("M={M} row {row} a0 {a0} third[{c}][{d}]"),
-                    );
-                }
-            }
-            // Fourth: ∂_δ∂_{a0} of the Fisher block == jet fourth contracted (δ, e_{a0}).
-            let jet_fourth = tower.fourth_contracted(&delta, &e_a0);
-            let prod_fourth = production_jhat_fourth(&p, w, a0, &delta);
-            for c in 0..M {
-                for d in 0..M {
-                    close(
-                        jet_fourth[c][d],
-                        prod_fourth[c][d],
-                        &format!("M={M} row {row} a0 {a0} fourth[{c}][{d}]"),
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// The jet's contracted third `∂_{a0}H` and fourth `∂_δ∂_{a0}H` reproduce the
-/// EXACT production `Ĵ` / `Ĵ²` directional-Fisher-jet closed forms (replicated
-/// verbatim from the `assemble_all_axis_*` sweeps) at machine precision — for
-/// `M = 2` and `M = 3`. This pins the two hand third/fourth closed forms that the
-/// #1082 Jeffreys/Firth hot path runs against the mechanically differentiated
-/// softmax NLL: any dropped or sign-flipped term is loud.
-#[test]
-fn multinomial_softmax_jet_third_fourth_match_production_directional_jets() {
-    assert_third_fourth::<2>(0x1109_2020_9322_c0de);
-    assert_third_fourth::<3>(0xface_1109_2020_9322);
 }

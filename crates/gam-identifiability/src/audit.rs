@@ -3923,7 +3923,7 @@ mod tests {
         }
         gam_linalg::faer_ndarray::rrqr_with_permutation(m, default_rrqr_rank_alpha())
             .map(|r| r.rank)
-            .unwrap_or_else(|_| m.ncols())
+            .unwrap_or_else(|error| panic!("RRQR rank oracle failed: {error}"))
     }
 
     /// Regression for gam#1590: competing-risks (cause-specific, k=2) survival

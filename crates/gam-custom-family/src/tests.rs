@@ -2380,31 +2380,55 @@ pub(crate) fn default_custom_family_exact_hessian_hooks_assemble_diagonal_workin
 pub(crate) fn default_custom_family_exact_hessian_hooks_drive_profiled_outer_hessian() {
     let mut spec = default_diagonal_exact_hook_spec();
     spec.initial_beta = Some(Array1::zeros(2));
+    let specs = [spec];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        use_outer_hessian: true,
+        compute_covariance: false,
+        inner_max_cycles: 1,
+        ..BlockwiseFitOptions::default()
+    };
+    let penalty_derivatives = [vec![]];
+    let rho = array![0.0];
     let result = evaluate_custom_family_joint_hyper(
         &DefaultDiagonalExactHookFamily,
-        &[spec],
-        &BlockwiseFitOptions {
-            use_remlobjective: true,
-            use_outer_hessian: true,
-            compute_covariance: false,
-            inner_max_cycles: 1,
-            ..BlockwiseFitOptions::default()
-        },
-        &array![0.0],
-        &[vec![]],
+        &specs,
+        &options,
+        &rho,
+        &penalty_derivatives,
         None,
         EvalMode::ValueGradientHessian,
     )
     .expect("profiled outer Hessian should use default exact Hessian hooks");
 
     assert_eq!(result.gradient.len(), 1);
-    match result.outer_hessian {
+    let analytic = match &result.outer_hessian {
         gam_problem::HessianValue::Dense(hessian) => {
             assert_eq!(hessian.dim(), (1, 1));
-            assert!(hessian[[0, 0]].is_finite());
+            hessian[[0, 0]]
         }
         _ => panic!("outer Hessian should be analytic"),
-    }
+    };
+
+    let h = 1e-5;
+    let gradient_at = |rho_value: f64| {
+        evaluate_custom_family_joint_hyper(
+            &DefaultDiagonalExactHookFamily,
+            &specs,
+            &options,
+            &array![rho_value],
+            &penalty_derivatives,
+            None,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("profiled outer gradient")
+        .gradient[0]
+    };
+    let finite_difference = (gradient_at(h) - gradient_at(-h)) / (2.0 * h);
+    assert!(
+        (analytic - finite_difference).abs() <= 2e-3 * finite_difference.abs().max(1.0),
+        "default-hook outer Hessian: analytic={analytic}, finite_difference={finite_difference}"
+    );
 }
 
 #[test]
@@ -7454,14 +7478,21 @@ pub(crate) fn joint_newton_math_unconstrained_progress_does_not_match_certificat
         predicted_reduction: 5.0e-1,
         actual_reduction: 5.0e-1,
         trust_ratio: 1.0,
-        step_inf: 1.0e-1,
-        proposal_inf: 1.0e-1,
+        step_inf: 1.0e-12,
+        proposal_inf: 1.0e-12,
     };
-    let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
-    assert!(
-        linearized_rel < 0.5,
-        "unconstrained Newton must have linearized_rel < 0.5 (was {:.3e})",
-        linearized_rel,
+    assert_eq!(
+        constrained_stationary_certificate_decision(
+            &math,
+            1.0e-12,
+            1.0e-8,
+            1.0e-8,
+            None,
+            1.0e-12,
+            1.0e-8,
+        ),
+        ConstrainedStationaryCertificate::NotCandidate,
+        "objective and step exhaustion must not certify a Newton step whose linearized residual is genuinely falling"
     );
 }
 

@@ -3043,29 +3043,31 @@ mod tests {
     fn family_dispatch_resolves_parameterized_links_from_spec() {
         // After the LikelihoodSpec migration, the dispatch no longer needs
         // out-of-band state arguments — the parameterized link state lives on
-        // `spec.link`. Verify that supplying explicit SAS/Mixture link states
-        // through the spec produces finite jets at a representative eta.
+        // `spec.link`. Pin the dispatch against the direct stateful kernels.
         let sas_state = sas_link_state_from_raw(0.0, 0.0).expect("sas state");
+        let expected_sas =
+            sas_inverse_link_jet(0.1, sas_state.epsilon, sas_state.log_delta).expect("direct SAS");
         let sas_spec = gam_problem::LikelihoodSpec {
             response: gam_problem::ResponseFamily::Binomial,
             link: InverseLink::Sas(sas_state),
         };
         let sas_jet = inverse_link_jet_for_family(&sas_spec, 0.1).expect("sas jet");
-        assert!(sas_jet.mu.is_finite());
-        assert!(sas_jet.d1.is_finite());
+        assert_eq!(sas_jet.mu.to_bits(), expected_sas.mu.to_bits());
+        assert_eq!(sas_jet.d1.to_bits(), expected_sas.d1.to_bits());
 
         let mix_state = MixtureLinkState {
             components: vec![LinkComponent::Logit, LinkComponent::Probit],
             rho: ndarray::array![0.0],
             pi: ndarray::array![0.5, 0.5],
         };
+        let expected_mix = mixture_inverse_link_jet(&mix_state, 0.1);
         let mix_spec = gam_problem::LikelihoodSpec {
             response: gam_problem::ResponseFamily::Binomial,
             link: InverseLink::Mixture(mix_state),
         };
         let mix_jet = inverse_link_jet_for_family(&mix_spec, 0.1).expect("mix jet");
-        assert!(mix_jet.mu.is_finite());
-        assert!(mix_jet.d1.is_finite());
+        assert_eq!(mix_jet.mu.to_bits(), expected_mix.mu.to_bits());
+        assert_eq!(mix_jet.d1.to_bits(), expected_mix.d1.to_bits());
     }
 
     #[test]

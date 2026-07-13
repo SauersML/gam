@@ -2933,6 +2933,17 @@ fn issue_1191_shape_constrained_monotone_fits_through_shared_driver() {
         beta.iter().all(|b| b.is_finite()),
         "fitted coefficients must be finite (no ALO-NaN seed rejection)"
     );
+    let fitted = standard.design.design.to_dense().dot(&beta);
+    for row in 1..fitted.len() {
+        assert!(
+            fitted[row] + 1e-10 >= fitted[row - 1],
+            "monotone-increasing fit decreased between sorted rows {} and {}: {} -> {}",
+            row - 1,
+            row,
+            fitted[row - 1],
+            fitted[row]
+        );
+    }
 }
 
 /// Regression for #1767: a non-default `survival_likelihood` on a non-survival

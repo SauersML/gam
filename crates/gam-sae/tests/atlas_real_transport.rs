@@ -179,4 +179,10 @@ fn atlas_composed_bound_and_holonomy_on_real_qwen3_transport() {
     assert!(holo.net_sign == 1 || holo.net_sign == -1);
     assert!(holo.net_angle.is_finite());
     assert!(holo.angle_tolerance.is_finite() && holo.angle_tolerance >= 0.0);
+    assert!(
+        holo.is_trivial,
+        "real transport triangle violates the composition law at its defect scale: \
+         sign={}, angle={}, tolerance={}",
+        holo.net_sign, holo.net_angle, holo.angle_tolerance
+    );
 }

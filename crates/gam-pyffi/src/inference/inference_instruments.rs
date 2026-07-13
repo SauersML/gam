@@ -1871,8 +1871,12 @@ mod tests {
         let plugin_bias = (report.theta_plugin - truth).abs();
         let debiased_bias = (report.theta_onestep - truth).abs();
         assert!(
-            debiased_bias <= plugin_bias + 1e-12,
-            "orthogonal correction must not worsen bias: plugin={plugin_bias:.3e}, debiased={debiased_bias:.3e}"
+            (report.theta_onestep - report.theta_plugin).abs() > 1e-8,
+            "fixture must exercise a nonzero orthogonal correction"
+        );
+        assert!(
+            debiased_bias < plugin_bias,
+            "orthogonal correction must strictly reduce bias: plugin={plugin_bias:.3e}, debiased={debiased_bias:.3e}"
         );
 
         // The point-evaluation and contrast targets must also yield finite gradients.

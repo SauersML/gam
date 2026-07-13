@@ -9,6 +9,15 @@ fn close(got: f64, expected: f64, rel: f64) {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn backend_when_cuda_is_available() -> Option<&'static PirlsRowBackend> {
+    match PirlsRowBackend::probe() {
+        Ok(backend) => Some(backend),
+        Err(GpuError::DriverLibraryUnavailable { .. }) => None,
+        Err(error) => panic!("PIRLS-row CUDA probe failed on an available driver: {error}"),
+    }
+}
+
 #[test]
 fn exact_log_rows_retain_the_declared_endpoints_without_floors() {
     for eta in [
@@ -355,7 +364,7 @@ fn generated_sources_have_one_exact_unprojected_contract() {
 #[cfg(target_os = "linux")]
 #[test]
 fn nvrtc_compiles_every_exact_builtin_mode_when_cuda_is_present() -> Result<(), GpuError> {
-    let Ok(backend) = PirlsRowBackend::probe() else {
+    let Some(backend) = backend_when_cuda_is_available() else {
         return Ok(());
     };
     for family in PirlsRowFamily::ALL {
@@ -371,7 +380,7 @@ fn nvrtc_compiles_every_exact_builtin_mode_when_cuda_is_present() -> Result<(), 
 #[cfg(target_os = "linux")]
 #[test]
 fn device_rows_match_cpu_at_log_endpoints_tails_and_tiny_weights() {
-    let Ok(backend) = PirlsRowBackend::probe() else {
+    let Some(backend) = backend_when_cuda_is_available() else {
         return;
     };
     let stream = backend.inner.ctx.default_stream();
@@ -455,7 +464,7 @@ fn device_rows_match_cpu_at_log_endpoints_tails_and_tiny_weights() {
 #[cfg(target_os = "linux")]
 #[test]
 fn failed_device_row_writes_only_its_status() {
-    let Ok(backend) = PirlsRowBackend::probe() else {
+    let Some(backend) = backend_when_cuda_is_available() else {
         return;
     };
     let stream = backend.inner.ctx.default_stream();

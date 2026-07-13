@@ -548,7 +548,12 @@ mod dim_selection_precision_domain_tests {
         let tiny = ValidatedDimSelectionPrecisions::new(array![-700.0].view(), 1).unwrap();
         let coordinates = array![[1.0e200], [-1.0e200]];
         let energy = tiny.axis_energy(coordinates.view(), 0).unwrap();
-        assert!(energy.is_finite() && energy > 0.0);
+        let scaled_coordinate = (0.5 * tiny.physical[0]).sqrt() * 1.0e200;
+        let expected = 2.0 * scaled_coordinate * scaled_coordinate;
+        assert!(
+            (energy - expected).abs() <= 1e-12 * expected,
+            "scaled large-coordinate energy: expected {expected}, got {energy}"
+        );
     }
 }
 

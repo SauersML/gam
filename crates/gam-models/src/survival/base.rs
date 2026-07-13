@@ -5445,7 +5445,9 @@ mod tests {
         let state = model
             .update_state(&array![0.0])
             .expect("censored boundary derivative should remain feasible with zero tolerance");
-        assert!(state.deviance.is_finite());
+        assert_eq!(state.deviance, 0.0);
+        assert_eq!(state.log_likelihood, 0.0);
+        assert_eq!(state.gradient, array![0.0]);
     }
 
     #[test]
@@ -5522,7 +5524,13 @@ mod tests {
         let state = model
             .update_state(&array![-1e-8])
             .expect("tiny structural roundoff should be clamped");
-        assert!(state.deviance.is_finite());
+        let expected_deviance = -2.0 * (1.0e-12_f64).ln();
+        assert!(
+            (state.deviance - expected_deviance).abs() <= 1e-12,
+            "floored structural event deviance: expected {expected_deviance}, got {}",
+            state.deviance
+        );
+        assert_eq!(state.gradient, array![0.0]);
     }
 
     #[test]

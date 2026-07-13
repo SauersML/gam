@@ -187,6 +187,10 @@ fn massive_k_encode_is_sublinear_in_k() {
 
         let n_valid = valid.iter().filter(|&&v| v).count();
         assert_eq!(coords.nrows(), n);
+        assert_eq!(
+            n_valid, n,
+            "every planted target must route before its timing sample is admissible (K={k})"
+        );
         eprintln!(
             "[k-scaling] K={k:>6} p={p} N={n} rows/sec={rows_per_sec:>12.1} \
              routed={n_valid}/{n} ({:.1}%)",

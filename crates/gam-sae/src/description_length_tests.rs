@@ -101,9 +101,7 @@ fn manifold_fit_dl_code_rate_rises_as_distortion_tightens() {
 }
 
 #[test]
-fn manifold_fit_dl_tight_distortion_stays_finite() {
-    // A tight (but positive) distortion drives the rate large; as long as it stays
-    // above zero the reported bits are large yet finite (never +∞).
+fn manifold_fit_dl_tight_distortion_matches_reverse_water_filling_rate() {
     let codes = planted_codes(10, 4);
     let coord_variances = [1.0_f64, 0.5];
     let atom_dims = [1.0_f64, 1.0, 1.0, 1.0];
@@ -116,8 +114,14 @@ fn manifold_fit_dl_tight_distortion_stays_finite() {
         8,
         None,
     );
-    assert!(dl.bits_per_token.is_finite());
-    assert!(dl.coordinate_rate_bits.is_finite() && dl.coordinate_rate_bits > 0.0);
+    let theta = 0.5e-6_f64;
+    let expected_rate = 0.25 * ((1.0 / theta).log2() + (0.5 / theta).log2());
+    assert!(
+        (dl.coordinate_rate_bits - expected_rate).abs() <= 1e-12,
+        "tight-distortion rate: expected {expected_rate}, got {}",
+        dl.coordinate_rate_bits
+    );
+    assert_eq!(dl.l_param_bits.to_bits(), dl.coordinate_rate_bits.to_bits());
 }
 
 #[test]

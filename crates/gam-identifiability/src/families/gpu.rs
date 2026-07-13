@@ -728,6 +728,20 @@ mod tests {
     }
 
     #[test]
+    fn primary_state_cpu_oracle_is_symmetric_and_nontrivial() {
+        let (channel_blocks, h_packed, ranges) = make_fixture();
+        let (cpu_h, cpu_s) = cpu_oracle(&channel_blocks, &h_packed, &ranges);
+        assert!(cpu_h.iter().any(|value| value.abs() > 0.0));
+        assert!(cpu_s.iter().any(|value| value.abs() > 0.0));
+        for row in 0..cpu_h.nrows() {
+            for col in 0..cpu_h.ncols() {
+                assert!((cpu_h[[row, col]] - cpu_h[[col, row]]).abs() <= 1e-12);
+                assert!((cpu_s[[row, col]] - cpu_s[[col, row]]).abs() <= 1e-12);
+            }
+        }
+    }
+
+    #[test]
     fn primary_state_gram_matches_cpu_oracle_when_cuda_available() {
         let (channel_blocks, h_packed, ranges) = make_fixture();
         #[cfg(not(target_os = "linux"))]
@@ -736,17 +750,6 @@ mod tests {
                 try_primary_state_gram_cuda(&channel_blocks, &h_packed, &ranges).is_none(),
                 "non-Linux build must report no CUDA"
             );
-            // Exercise the oracle so its symmetric output matches itself,
-            // keeping the CPU reference live on non-Linux hosts.
-            let (cpu_h, cpu_s) = cpu_oracle(&channel_blocks, &h_packed, &ranges);
-            assert_eq!(cpu_h.nrows(), cpu_h.ncols());
-            assert_eq!(cpu_s.nrows(), cpu_s.ncols());
-            for row in 0..cpu_h.nrows() {
-                for col in 0..cpu_h.ncols() {
-                    assert!((cpu_h[[row, col]] - cpu_h[[col, row]]).abs() <= 1e-12);
-                    assert!((cpu_s[[row, col]] - cpu_s[[col, row]]).abs() <= 1e-12);
-                }
-            }
             return;
         }
         #[cfg(target_os = "linux")]

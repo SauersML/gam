@@ -2448,7 +2448,23 @@ mod tests {
         assert_eq!(out.samples.nrows(), cfg.n_samples * cfg.n_chains);
         assert!(out.samples.iter().all(|v| v.is_finite()));
         assert!(out.posterior_mean.iter().all(|v| v.is_finite()));
-        assert!(out.posterior_std.iter().all(|v| v.is_finite()));
+        assert!(
+            out.posterior_std
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0),
+            "every sampled coefficient must have positive posterior spread"
+        );
+        let eta = x.dot(&out.posterior_mean);
+        let posterior_nll: f64 = eta
+            .iter()
+            .zip(y.iter())
+            .map(|(&eta_i, &y_i)| gam_linalg::utils::stable_softplus(eta_i) - y_i * eta_i)
+            .sum();
+        let zero_nll = x.nrows() as f64 * std::f64::consts::LN_2;
+        assert!(
+            posterior_nll < zero_nll,
+            "posterior mean must discriminate the planted binary responses: {posterior_nll} !< {zero_nll}"
+        );
     }
 
     #[test]
@@ -3683,38 +3699,6 @@ mod tests {
     }
 
     #[test]
-    fn logit_pg_rao_blackwell_returns_finite_terms() {
-        let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
-        let y = array![1.0, 0.0, 1.0, 0.0];
-        let w = array![1.0, 1.0, 1.0, 1.0];
-        let penalty = array![[0.2, 0.0], [0.0, 0.4]];
-        let mode = array![0.0, 0.0];
-        let roots = vec![array![[0.2_f64.sqrt(), 0.0], [0.0, 0.4_f64.sqrt()]]];
-        let cfg = NutsConfig {
-            n_samples: 30,
-            nwarmup: 30,
-            n_chains: 2,
-            target_accept: 0.8,
-            seed: 789,
-        };
-
-        let rb = super::estimate_logit_pg_rao_blackwell_terms(
-            x.view(),
-            y.view(),
-            w.view(),
-            penalty.view(),
-            mode.view(),
-            &roots,
-            &cfg,
-        )
-        .expect("rao-blackwell PG should run");
-
-        assert_eq!(rb.len(), 1);
-        assert!(rb[0].is_finite());
-        assert!(rb[0] >= 0.0);
-    }
-
-    #[test]
     fn logit_pg_rao_blackwell_rejects_non_bernoulli_response() {
         let x = array![[1.0], [1.0]];
         let y = array![0.25, 1.0];
@@ -4108,6 +4092,26 @@ mod tests {
         let logp = HamiltonianTarget::logp_and_grad(&posterior, &z, &mut grad);
         assert!(logp.is_finite());
         assert!(grad.iter().all(|v| v.is_finite()));
+        let h = 1e-6;
+        for axis in 0..z.len() {
+            let mut plus = z.clone();
+            let mut minus = z.clone();
+            plus[axis] += h;
+            minus[axis] -= h;
+            let mut plus_grad = Array1::<f64>::zeros(3);
+            let mut minus_grad = Array1::<f64>::zeros(3);
+            let plus_logp =
+                HamiltonianTarget::logp_and_grad(&posterior, &plus, &mut plus_grad);
+            let minus_logp =
+                HamiltonianTarget::logp_and_grad(&posterior, &minus, &mut minus_grad);
+            let finite_difference = (plus_logp - minus_logp) / (2.0 * h);
+            assert!(
+                (grad[axis] - finite_difference).abs()
+                    <= 2e-5 * finite_difference.abs().max(1.0),
+                "structural sparse HMC gradient[{axis}]: analytic={}, finite_difference={finite_difference}",
+                grad[axis]
+            );
+        }
     }
 }
 
