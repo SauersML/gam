@@ -214,7 +214,7 @@ __global__ void row_hessian_matvec_kernel(
     // Every synchronized u-batch sweeps all v-tiles, so r=33 and arbitrary
     // wider checked shapes execute the same contraction without local arrays
     // proportional to r.
-    __shared__ double v_shared[32];
+    extern __shared__ double v_shared[];
 
     const double* h_base = h_rows + (size_t)row * (size_t)r * (size_t)r;
     double*       y_base = y_rows + (size_t)row * (size_t)r;
@@ -364,10 +364,15 @@ fn launch_matvec_linux(
         .map_err(|_| gpu_err!("row_hessian_matvec: n_rows={n} exceeds u32 range"))?;
     let r_i32 =
         i32::try_from(r).map_err(|_| gpu_err!("row_hessian_matvec: r={r} exceeds i32 range"))?;
+    let shared_mem_bytes = ROW_HV_THREADS
+        .checked_mul(u32::try_from(std::mem::size_of::<f64>()).map_err(|_| {
+            gpu_err!("row_hessian_matvec: f64 byte width exceeds CUDA shared-memory range")
+        })?)
+        .ok_or_else(|| gpu_err!("row_hessian_matvec: shared tile byte count overflow"))?;
     let cfg = LaunchConfig {
         grid_dim: (n_u32, 1, 1),
         block_dim: (ROW_HV_THREADS, 1, 1),
-        shared_mem_bytes: 0,
+        shared_mem_bytes,
     };
 
     let mut builder = stream.launch_builder(&func);
@@ -380,9 +385,9 @@ fn launch_matvec_linux(
 
     // SAFETY: every kernel argument is either an `i32` (passed by value)
     // or a device pointer to a buffer whose length was validated above
-    // (`validate()` matches the kernel's exact indexing pattern). The fixed
-    // shared-memory array is only a 32-value tile; synchronized batches cover
-    // the complete runtime width.
+    // (`validate()` matches the kernel's exact indexing pattern). Dynamic
+    // shared memory is exactly one `ROW_HV_THREADS` tile sized by the Rust
+    // launch authority; synchronized batches cover the complete runtime width.
     unsafe { builder.launch(cfg) }.gpu_ctx("row_hessian_matvec launch")?;
     stream
         .synchronize()
