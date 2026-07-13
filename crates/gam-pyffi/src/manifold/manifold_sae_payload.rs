@@ -31,7 +31,7 @@ use serde_json::Value;
 
 /// The on-disk schema tag. `from_json` rejects any other value, matching the
 /// Python `from_dict` guard.
-pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v3";
+pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v4";
 
 /// Per-atom payload (`atoms[k]`), one per `SaeManifoldAtomFit`.
 ///
@@ -151,6 +151,9 @@ pub(crate) struct ManifoldSaePayload {
     // --- D. Fisher steering ----------------------------------------------
     pub(crate) fisher_factors: Option<Vec<Vec<Vec<f64>>>>,
     pub(crate) fisher_provenance: Option<String>,
+    /// Required whenever factors are retained; never inferred from rank or a
+    /// scalar tail estimate (#2249).
+    pub(crate) fisher_factor_kind: Option<String>,
     pub(crate) metric_provenance: String,
     pub(crate) fisher_mass_residual: Option<Vec<f64>>,
     pub(crate) selected_log_lambda_sparse: Option<f64>,
@@ -217,6 +220,7 @@ impl ManifoldSaePayload {
         "hybrid_split",
         "fisher_factors",
         "fisher_provenance",
+        "fisher_factor_kind",
         "metric_provenance",
         "fisher_mass_residual",
         "selected_log_lambda_sparse",

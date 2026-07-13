@@ -949,6 +949,7 @@ def load_harvest_shard(path: str | Path) -> dict[str, Any]:
         factor_kind=factor_kind,
     )
     return {
+        "schema": _HARVEST_SCHEMA,
         "X": np.asarray(npz["X"], dtype=np.float64),
         "U": np.asarray(npz["U"], dtype=np.float64),
         "mass_residual": mass_residual,

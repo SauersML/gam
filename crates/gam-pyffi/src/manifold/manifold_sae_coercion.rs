@@ -275,6 +275,8 @@ pub(crate) struct FitConfig {
     /// The shard's provenance tag (`shard[2]`); serialized only when
     /// `fisher_factors` is present, mirroring `to_dict`.
     pub(crate) fisher_provenance: Option<String>,
+    /// Required operator status for the retained factor stack (#2249).
+    pub(crate) fisher_factor_kind: Option<String>,
     /// The caller's declared per-atom bases, used by
     /// [`preserve_linear_block_labels`]. `None`/empty leaves the fitted labels.
     pub(crate) declared_bases: Option<Vec<String>>,
@@ -597,6 +599,11 @@ pub(crate) fn build_manifold_sae_payload(
         // to_dict: `None if fisher_factors is None else str(fisher_provenance)`.
         fisher_provenance: if cfg.fisher_factors.is_some() {
             cfg.fisher_provenance.clone()
+        } else {
+            None
+        },
+        fisher_factor_kind: if cfg.fisher_factors.is_some() {
+            cfg.fisher_factor_kind.clone()
         } else {
             None
         },

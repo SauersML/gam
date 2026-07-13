@@ -114,6 +114,7 @@ pub fn cofit_linear_via_arrow(
     gamma: f32,
     config: &ArrowCofitConfig,
 ) -> Result<ArrowCofitReport, String> {
+    require_fitting_iteration("cofit_linear_via_arrow", config.max_iter)?;
     let (n, k_active) = blocks.dim();
     let b = codes.shape()[2];
     if b == 0 {
@@ -359,6 +360,7 @@ pub fn cofit_composed_via_arrow(
     gamma: f32,
     config: &ArrowCofitConfig,
 ) -> Result<ArrowCofitReport, String> {
+    require_fitting_iteration("cofit_composed_via_arrow", config.max_iter)?;
     let (n, k_active) = blocks.dim();
     let b = codes.shape()[2];
     if b == 0 {
@@ -512,6 +514,16 @@ fn require_idempotent_fixed_point(
     } else {
         Err(format!(
             "{entry}: deterministic joint-solver re-entry did not reach an idempotent fixed point within {max_iter} iterations"
+        ))
+    }
+}
+
+fn require_fitting_iteration(entry: &str, max_iter: usize) -> Result<(), String> {
+    if max_iter > 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{entry}: zero iterations is a checkpoint freeze, not an idempotent fitted fixed point"
         ))
     }
 }
@@ -735,7 +747,7 @@ mod tests {
         )
         .expect_err("an open joint-solver re-entry must not mint ArrowCofitReport");
         assert!(
-            error.contains("did not reach an idempotent fixed point"),
+            error.contains("not an idempotent fitted fixed point"),
             "unexpected non-convergence error: {error}"
         );
     }

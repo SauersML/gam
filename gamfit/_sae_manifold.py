@@ -13,6 +13,7 @@ from ._penalty_bridge import GumbelTemperatureSchedule
 
 
 ManifoldSAE = rust_module().ManifoldSAE
+_FISHER_SHARD_SCHEMA = "gamfit.FisherHarvest/v1"
 
 
 def gumbel_geometric_schedule(
@@ -111,27 +112,42 @@ def _schedule_descriptor(
 
 def _fisher_arrays(
     value: Any,
-) -> tuple[np.ndarray | None, np.ndarray | None, str | None]:
+) -> tuple[np.ndarray | None, np.ndarray | None, str | None, str | None]:
     if value is None:
-        return None, None, None
+        return None, None, None, None
     if isinstance(value, Mapping):
+        schema = value.get("schema")
+        if schema != _FISHER_SHARD_SCHEMA:
+            raise ValueError(
+                f"fisher_factors mapping must declare schema {_FISHER_SHARD_SCHEMA!r}; "
+                f"got {schema!r}"
+            )
         factors = value["U"]
         residual = value.get("mass_residual")
-        provenance = value.get("provenance", "output_fisher")
+        provenance = value["provenance"]
+        factor_kind = value["factor_kind"]
     elif hasattr(value, "U"):
         factors = value.U
         residual = getattr(value, "mass_residual", None)
-        provenance = getattr(value, "provenance", "output_fisher")
+        try:
+            provenance = value.provenance
+            factor_kind = value.factor_kind
+        except AttributeError as error:
+            raise TypeError(
+                "fisher_factors object must carry provenance and factor_kind"
+            ) from error
     else:
-        factors = value
-        residual = None
-        provenance = "output_fisher"
+        raise TypeError(
+            "fisher_factors must be a HarvestShard or a strict loaded shard mapping; "
+            "bare factor arrays have no scientific provenance or operator status"
+        )
     return (
         np.ascontiguousarray(np.asarray(factors, dtype=np.float64)),
         None
         if residual is None
         else np.ascontiguousarray(np.asarray(residual, dtype=np.float64)),
         str(provenance),
+        str(factor_kind),
     )
 
 
@@ -179,7 +195,9 @@ def sae_manifold_fit(
     are owned by the native front door.
     """
     x = _matrix(X)
-    fisher, fisher_residual, fisher_provenance = _fisher_arrays(fisher_factors)
+    fisher, fisher_residual, fisher_provenance, fisher_factor_kind = _fisher_arrays(
+        fisher_factors
+    )
     if alpha == "auto":
         alpha_value = None
         learnable_alpha = True
@@ -227,6 +245,7 @@ def sae_manifold_fit(
         fisher_factors=fisher,
         fisher_mass_residual=fisher_residual,
         fisher_provenance=fisher_provenance,
+        fisher_factor_kind=fisher_factor_kind,
         row_loss_weights=_optional_array(weights, dimensions=1),
         separation_barrier_strength_override=(
             None
@@ -291,7 +310,9 @@ def sae_manifold_certify_external(
     """
     x = _matrix(X)
     k_atoms = len(atom_basis)
-    fisher, fisher_residual, fisher_provenance = _fisher_arrays(fisher_factors)
+    fisher, fisher_residual, fisher_provenance, fisher_factor_kind = _fisher_arrays(
+        fisher_factors
+    )
     centers = duchon_centers if duchon_centers is not None else [None] * k_atoms
     harmonics = n_harmonics if n_harmonics is not None else [None] * k_atoms
     dims = _atom_dimensions(d_atom)
@@ -327,6 +348,7 @@ def sae_manifold_certify_external(
         fisher_factors=fisher,
         fisher_mass_residual=fisher_residual,
         fisher_provenance=fisher_provenance,
+        fisher_factor_kind=fisher_factor_kind,
     )
 
 
