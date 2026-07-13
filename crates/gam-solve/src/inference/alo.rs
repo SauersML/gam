@@ -1056,27 +1056,25 @@ impl<'a> AloInput<'a> {
         }
     }
 
-    /// Build an `AloInput` from a `FitGeometry`'s penalized Hessian plus
-    /// externally supplied working weights / working response.
+    /// Build an `AloInput` from an exact saved penalized Hessian plus externally
+    /// supplied working weights / working response.
     ///
     /// The row-sized IRLS working vectors are *derived* quantities: at
     /// convergence they are deterministic functions of the linear predictor
     /// `η̂ = Xβ̂`, the response `y`, and the family (`w_i = h'(η̂_i)²/(φ V(μ̂_i))·
-    /// prior_i`, `z_i = η̂_i + (y_i−μ̂_i)/h'(η̂_i)`). A size-compacted saved model
-    /// keeps the p×p `penalized_hessian` (n-independent) but drops those n-sized
-    /// vectors; a post-fit consumer such as `gam diagnose` reconstructs them from
-    /// the saved `β` by replaying the same PIRLS working-state update the fit
-    /// used, then feeds them here. This preserves the size win of dropping the
-    /// working vectors from persistence while still serving the exact geometry
-    /// ALO path (no refit, exact saved Hessian).
+    /// prior_i`, `z_i = η̂_i + (y_i−μ̂_i)/h'(η̂_i)`). A saved-model consumer
+    /// reconstructs them from the saved `β` by replaying the same PIRLS
+    /// working-state update the fit used, then feeds them here. The precision
+    /// comes from the canonical fit's exact unscaled Hessian accessor; callers
+    /// do not need a second `FitGeometry` wrapper or a covariance inversion.
     ///
     /// Same canonical (Fisher == Observed) contract as [`from_geometry`]: the
     /// supplied `working_weights` are the score-side Fisher weights and are
     /// re-viewed for the Hessian-side slot via `as_signed()`.
     ///
     /// [`from_geometry`]: AloInput::from_geometry
-    pub fn from_geometry_with_working_state(
-        geom: &'a FitGeometry,
+    pub fn from_penalized_hessian_with_working_state(
+        penalized_hessian: &'a Array2<f64>,
         design: &'a Array2<f64>,
         eta: &'a Array1<f64>,
         offset: &'a Array1<f64>,
@@ -1087,7 +1085,7 @@ impl<'a> AloInput<'a> {
         let psd_w = PsdWeightsView::from_view_unchecked(working_weights.view());
         Self {
             design,
-            penalized_hessian: &geom.penalized_hessian,
+            penalized_hessian,
             hessian_weights: psd_w.as_signed(),
             score_weights: psd_w,
             working_response,

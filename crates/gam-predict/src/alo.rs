@@ -261,10 +261,7 @@ fn compute_saved_standard_alo(
             beta.len()
         )));
     }
-    require_saved_hessian(model, class, beta.len())?;
-    let geometry = fit.geometry.as_ref().ok_or_else(|| {
-        invalid("saved standard ALO requires the exact converged working-set geometry")
-    })?;
+    let hessian = require_saved_hessian(model, class, beta.len())?;
     let eta = input.design.dot(beta) + &input.offset;
     let likelihood =
         GlmLikelihoodSpec::try_new(model.likelihood(), fit.likelihood_scale.clone())
@@ -283,8 +280,8 @@ fn compute_saved_standard_alo(
     )?;
     let phi = standard_alo_dispersion(fit.standard_deviation, likelihood.spec.link_function())?;
     let dense_design = input.design.to_dense();
-    let scalar = compute_alo_from_input(&AloInput::from_geometry_with_working_state(
-        geometry,
+    let scalar = compute_alo_from_input(&AloInput::from_penalized_hessian_with_working_state(
+        hessian,
         &dense_design,
         &eta,
         &input.offset,
