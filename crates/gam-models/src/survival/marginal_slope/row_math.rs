@@ -792,8 +792,7 @@ where
         for derivative in event_stack.iter_mut().chain(&mut time_stack) {
             *derivative *= scale;
         }
-        let zero = S::constant(0.0, dimension, workspace);
-        Ok(S::multiply_add_affine_composed_sum(
+        Ok(S::scaled_multiply_add_affine_composed_sum(
             &[
                 vars[1].clone(),
                 vars[0].clone(),
@@ -806,17 +805,24 @@ where
                 correction.clone(),
                 correction,
             ],
-            &[linear.clone(), linear.clone(), linear, zero],
+            &[
+                linear.clone(),
+                linear.clone(),
+                linear.clone(),
+                linear,
+            ],
+            &[1.0, 1.0, 1.0, 0.0],
             &[-1.0, -1.0, 1.0, 1.0],
             &[exit_stack, entry_stack, event_stack, time_stack],
             dimension,
             workspace,
         ))
     } else {
-        Ok(S::multiply_add_affine_composed_sum(
+        Ok(S::scaled_multiply_add_affine_composed_sum(
             &[vars[1].clone(), vars[0].clone()],
             &[correction.clone(), correction],
             &[linear.clone(), linear],
+            &[1.0, 1.0],
             &[-1.0, -1.0],
             &[exit_stack, entry_stack],
             dimension,

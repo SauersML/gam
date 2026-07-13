@@ -13,9 +13,7 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 
-use crate::jet_scalar::{
-    MAX_COMPOSED_PRODUCT_TERMS, Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients,
-};
+use crate::jet_scalar::{Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients};
 
 #[derive(Clone, Copy, Debug)]
 struct GraphNode {
@@ -811,42 +809,40 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
     }
 
     #[inline(always)]
-    fn multiply_add_affine_composed_sum(
-        lefts: &[Self],
-        rights: &[Self],
-        addends: &[Self],
-        input_scales: &[f64],
-        derivative_stacks: &[[f64; 5]],
+    fn scaled_multiply_add_affine_composed_sum<const N: usize>(
+        lefts: &[Self; N],
+        rights: &[Self; N],
+        addends: &[Self; N],
+        addend_scales: &[f64; N],
+        input_scales: &[f64; N],
+        derivative_stacks: &[[f64; 5]; N],
         dimension: usize,
         workspace: &'arena Self::Workspace,
     ) -> Self {
         assert_eq!(dimension, K, "compiled graph dimension mismatch");
-        let terms = lefts.len();
-        assert_eq!(rights.len(), terms);
-        assert_eq!(addends.len(), terms);
-        assert_eq!(input_scales.len(), terms);
-        assert_eq!(derivative_stacks.len(), terms);
-        assert!(
-            terms <= MAX_COMPOSED_PRODUCT_TERMS,
-            "fused product-composition term capacity exceeded"
-        );
         assert!(
             lefts
                 .iter()
                 .chain(rights)
-                .chain(addends)
                 .all(|input| std::ptr::eq(input.workspace, workspace)),
             "compiled fused product-composition inputs belong to different workspaces"
         );
+        assert!(
+            addends
+                .iter()
+                .zip(addend_scales)
+                .all(|(input, &scale)| scale == 0.0 || std::ptr::eq(input.workspace, workspace)),
+            "live compiled fused addends belong to different workspaces"
+        );
 
         let tape = workspace.tape_mut();
-        let mut term_gradients = [[0.0; K]; MAX_COMPOSED_PRODUCT_TERMS];
-        let mut firsts = [0.0; MAX_COMPOSED_PRODUCT_TERMS];
-        let mut seconds = [0.0; MAX_COMPOSED_PRODUCT_TERMS];
+        let mut term_gradients = [[0.0; K]; N];
+        let mut firsts = [0.0; N];
+        let mut seconds = [0.0; N];
         let mut value = 0.0;
         let mut gradient = [0.0; K];
         let mut support = 0_u16;
-        for term in 0..terms {
+        for term in 0..N {
             let left = lefts[term].node;
             let right = rights[term].node;
             let addend = addends[term].node;
@@ -857,12 +853,21 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             firsts[term] = first;
             seconds[term] = second;
             value += derivative_stacks[term][0];
-            support |=
-                tape.nodes[left].support | tape.nodes[right].support | tape.nodes[addend].support;
+            support |= tape.nodes[left].support | tape.nodes[right].support;
+            if addend_scales[term] != 0.0 {
+                support |= tape.nodes[addend].support;
+            }
             for primary in 0..K {
-                let inner_gradient = left_value * tape.gradients[right * K + primary]
-                    + tape.gradients[left * K + primary] * right_value
-                    + tape.gradients[addend * K + primary];
+                let product_gradient = left_value * tape.gradients[right * K + primary]
+                    + tape.gradients[left * K + primary] * right_value;
+                let inner_gradient = if addend_scales[term] == 0.0 {
+                    product_gradient
+                } else if addend_scales[term] == 1.0 {
+                    product_gradient + tape.gradients[addend * K + primary]
+                } else {
+                    product_gradient
+                        + addend_scales[term] * tape.gradients[addend * K + primary]
+                };
                 term_gradients[term][primary] = inner_gradient;
                 gradient[primary] += first * inner_gradient;
             }
@@ -879,7 +884,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let mut curvature_offset = 0;
         for_each_supported_upper_by_column(support, |primary, other| {
             let mut channel = 0.0;
-            for term in 0..terms {
+            for term in 0..N {
                 let left = lefts[term].node;
                 let right = rights[term].node;
                 let cross = tape.gradients[left * K + primary] * tape.gradients[right * K + other]
@@ -897,7 +902,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
 
         let owner = tape.node_len;
         let edge_start = tape.edge_len;
-        for term in 0..terms {
+        for term in 0..N {
             let left = lefts[term].node;
             let right = rights[term].node;
             let addend = addends[term].node;
@@ -905,7 +910,13 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             let right_first = firsts[term] * tape.nodes[left].value;
             Order2GraphWorkspace::push_edge(tape, left, left_first);
             Order2GraphWorkspace::push_edge(tape, right, right_first);
-            Order2GraphWorkspace::push_edge(tape, addend, firsts[term]);
+            if addend_scales[term] != 0.0 {
+                Order2GraphWorkspace::push_edge(
+                    tape,
+                    addend,
+                    firsts[term] * addend_scales[term],
+                );
+            }
         }
         Order2GraphWorkspace::push_event(
             tape,
