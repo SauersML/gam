@@ -692,6 +692,12 @@ pub struct AtlasCycleHolonomy {
     pub naive_edgewise_first_order_variance: Option<f64>,
     pub shared_patch_covariance_adjustment: Option<f64>,
     pub second_order_variance: Option<f64>,
+    pub naive_edgewise_second_order_variance: Option<f64>,
+    pub shared_pair_second_order_covariance_adjustment: Option<f64>,
+    /// Counterfactual second-order variance had the same patch errors been
+    /// transported through all ambient coordinates instead of each pairwise
+    /// local union. This is an audit comparator, never a decision input.
+    pub raw_ambient_second_order_variance: Option<f64>,
     pub standard_error: Option<f64>,
     pub polar_linearization_remainder_bound: Option<f64>,
     pub geometric_remainder_bound: f64,
@@ -1249,6 +1255,17 @@ mod tests {
                 AtlasHolonomyEdgeDirection::BToA,
             ]
         );
+        let cycle = &analysis.cycles()[0];
+        assert_near(cycle.first_order_variance.unwrap(), 0.0);
+        assert_near(cycle.second_order_variance.unwrap(), 0.0);
+        assert!(cycle.naive_edgewise_second_order_variance.unwrap() > 0.0);
+        assert_near(
+            cycle
+                .shared_pair_second_order_covariance_adjustment
+                .unwrap(),
+            -cycle.naive_edgewise_second_order_variance.unwrap(),
+        );
+        assert_near(cycle.raw_ambient_second_order_variance.unwrap(), 0.0);
     }
 
     #[test]
@@ -1341,6 +1358,21 @@ mod tests {
             base.orientation_flip_probability_bound(),
             padded.orientation_flip_probability_bound(),
         );
+        assert_eq!(
+            base.cycles()[0].decision.certified_value(),
+            padded.cycles()[0].decision.certified_value()
+        );
+        let projected = padded.cycles()[0].second_order_variance.unwrap();
+        let raw = padded.cycles()[0]
+            .raw_ambient_second_order_variance
+            .unwrap();
+        let projected_rank = padded.edges()[0].projected_dimension;
+        let ambient = padded.patch_summaries()[0].ambient_dimension;
+        assert_near(
+            projected / raw,
+            (projected_rank - INTRINSIC_DIMENSION) as f64 / (ambient - INTRINSIC_DIMENSION) as f64,
+        );
+        assert!(raw > projected);
     }
 
     #[test]
@@ -2037,6 +2069,9 @@ fn analyze_cycle(
             naive_edgewise_first_order_variance: None,
             shared_patch_covariance_adjustment: None,
             second_order_variance: None,
+            naive_edgewise_second_order_variance: None,
+            shared_pair_second_order_covariance_adjustment: None,
+            raw_ambient_second_order_variance: None,
             standard_error: None,
             polar_linearization_remainder_bound: None,
             geometric_remainder_bound,
@@ -2075,6 +2110,9 @@ fn analyze_cycle(
             naive_edgewise_first_order_variance: None,
             shared_patch_covariance_adjustment: None,
             second_order_variance: None,
+            naive_edgewise_second_order_variance: None,
+            shared_pair_second_order_covariance_adjustment: None,
+            raw_ambient_second_order_variance: None,
             standard_error: None,
             polar_linearization_remainder_bound: None,
             geometric_remainder_bound,
@@ -2111,7 +2149,11 @@ fn analyze_cycle(
         let step_tangent = if forward {
             canonical_tangent
         } else {
-            -canonical_tangent.t().to_owned()
+            // The reverse transition is `R^T`; differentiating it with
+            // respect to the canonical edge angle gives `(R J)^T` directly.
+            // Negating this transpose double-flips the orientation and makes
+            // the exact two-edge walk `R R^T` acquire spurious variance.
+            canonical_tangent.t().to_owned()
         };
         coefficients.push(frobenius_inner(
             transition_gradient.view(),
@@ -2122,7 +2164,9 @@ fn analyze_cycle(
     let mut patch_gradients =
         vec![Array2::<f64>::zeros((ambient, INTRINSIC_DIMENSION)); patches.len()];
     let mut naive_first_order_variance = 0.0_f64;
-    let mut second_order_variance = 0.0_f64;
+    let mut naive_edgewise_second_order_variance = 0.0_f64;
+    let mut projected_pair_coefficients = BTreeMap::<(usize, usize, usize), f64>::new();
+    let mut raw_pair_coefficients = BTreeMap::<(usize, usize), f64>::new();
     for (position, &(edge_index, _)) in cycle.steps.iter().enumerate() {
         let coefficient = coefficients[position];
         let edge = &edges[edge_index];
@@ -2146,12 +2190,22 @@ fn analyze_cycle(
                 * frobenius_squared(gradient_a.view())
                 + patches[edge.public.b].projector_variance_scale()
                     * frobenius_squared(gradient_b.view()));
-        second_order_variance += coefficient
+        naive_edgewise_second_order_variance += coefficient
             * coefficient
             * (edge.public.projected_dimension - INTRINSIC_DIMENSION) as f64
             * patches[edge.public.a].projector_variance_scale()
             * patches[edge.public.b].projector_variance_scale()
             / 2.0;
+        *projected_pair_coefficients
+            .entry((
+                edge.public.a,
+                edge.public.b,
+                edge.public.projected_dimension,
+            ))
+            .or_default() += coefficient;
+        *raw_pair_coefficients
+            .entry((edge.public.a, edge.public.b))
+            .or_default() += coefficient;
     }
     let first_order_variance: f64 = patch_gradients
         .iter()
@@ -2161,6 +2215,34 @@ fn analyze_cycle(
         })
         .sum();
     let shared_patch_covariance_adjustment = first_order_variance - naive_first_order_variance;
+    // The quadratic `delta_a^T delta_b` term is independent across distinct
+    // patch pairs, but overlap components connecting the same pair reuse the
+    // same two estimated projectors. Add their signed cycle coefficients before
+    // squaring, exactly as the first-order shared-patch terms are aggregated.
+    let second_order_variance: f64 = projected_pair_coefficients
+        .iter()
+        .map(|(&(a, b, projected_dimension), &coefficient)| {
+            coefficient
+                * coefficient
+                * (projected_dimension - INTRINSIC_DIMENSION) as f64
+                * patches[a].projector_variance_scale()
+                * patches[b].projector_variance_scale()
+                / 2.0
+        })
+        .sum();
+    let shared_pair_second_order_covariance_adjustment =
+        second_order_variance - naive_edgewise_second_order_variance;
+    let raw_ambient_second_order_variance: f64 = raw_pair_coefficients
+        .iter()
+        .map(|(&(a, b), &coefficient)| {
+            coefficient
+                * coefficient
+                * (ambient - INTRINSIC_DIMENSION) as f64
+                * patches[a].projector_variance_scale()
+                * patches[b].projector_variance_scale()
+                / 2.0
+        })
+        .sum();
     let standard_error = (first_order_variance + second_order_variance).sqrt();
     let absolute_angle = (holonomy[[1, 0]] - holonomy[[0, 1]])
         .atan2(holonomy[[0, 0]] + holonomy[[1, 1]])
@@ -2238,6 +2320,11 @@ fn analyze_cycle(
             naive_edgewise_first_order_variance: Some(naive_first_order_variance),
             shared_patch_covariance_adjustment: Some(shared_patch_covariance_adjustment),
             second_order_variance: Some(second_order_variance),
+            naive_edgewise_second_order_variance: Some(naive_edgewise_second_order_variance),
+            shared_pair_second_order_covariance_adjustment: Some(
+                shared_pair_second_order_covariance_adjustment,
+            ),
+            raw_ambient_second_order_variance: Some(raw_ambient_second_order_variance),
             standard_error: Some(standard_error),
             polar_linearization_remainder_bound: Some(polar_linearization_remainder_bound),
             geometric_remainder_bound,
@@ -2260,6 +2347,11 @@ fn analyze_cycle(
             naive_edgewise_first_order_variance: Some(naive_first_order_variance),
             shared_patch_covariance_adjustment: Some(shared_patch_covariance_adjustment),
             second_order_variance: Some(second_order_variance),
+            naive_edgewise_second_order_variance: Some(naive_edgewise_second_order_variance),
+            shared_pair_second_order_covariance_adjustment: Some(
+                shared_pair_second_order_covariance_adjustment,
+            ),
+            raw_ambient_second_order_variance: Some(raw_ambient_second_order_variance),
             standard_error: Some(standard_error),
             polar_linearization_remainder_bound: Some(polar_linearization_remainder_bound),
             geometric_remainder_bound,
@@ -2287,6 +2379,11 @@ fn analyze_cycle(
         naive_edgewise_first_order_variance: Some(naive_first_order_variance),
         shared_patch_covariance_adjustment: Some(shared_patch_covariance_adjustment),
         second_order_variance: Some(second_order_variance),
+        naive_edgewise_second_order_variance: Some(naive_edgewise_second_order_variance),
+        shared_pair_second_order_covariance_adjustment: Some(
+            shared_pair_second_order_covariance_adjustment,
+        ),
+        raw_ambient_second_order_variance: Some(raw_ambient_second_order_variance),
         standard_error: Some(standard_error),
         polar_linearization_remainder_bound: Some(polar_linearization_remainder_bound),
         geometric_remainder_bound,
