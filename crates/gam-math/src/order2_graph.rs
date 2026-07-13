@@ -5,7 +5,8 @@
 //! Hessian through every intermediate. Each node carries its value, primary
 //! gradient, and coefficients over a small basis of local curvature atoms.
 //! Scalar operations propagate those coefficients directly; the final output
-//! materializes each rank-one, cross, or quadratic atom exactly once.
+//! materializes each rank-one, diagonal, cross, or projected-quadratic atom
+//! exactly once.
 //!
 //! This is the universal second-order chain rule for a scalar DAG. Families own
 //! only their one generic row expression and certified unary derivative stacks;
@@ -25,10 +26,14 @@ enum CurvatureAtom {
         left: usize,
         right: usize,
     },
-    Quadratic {
-        operand_start: usize,
+    Diagonal {
+        term_start: usize,
         len: usize,
-        coefficient_start: usize,
+        support: u128,
+    },
+    Dense {
+        curvature_start: usize,
+        dimension: usize,
         support: u128,
     },
 }
@@ -41,9 +46,10 @@ struct GraphNode {
 
 const MAX_PRIMARY_DIMENSION: usize = 16;
 const MAX_GRAPH_NODES: usize = 32;
-const MAX_CURVATURE_ATOMS: usize = 32;
-const MAX_QUADRATIC_OPERANDS: usize = 64;
-const MAX_GRAPH_COEFFICIENTS: usize = MAX_PRIMARY_DIMENSION * MAX_PRIMARY_DIMENSION;
+const MAX_CURVATURE_ATOMS: usize = MAX_GRAPH_NODES;
+const MAX_DIAGONAL_TERMS: usize = MAX_GRAPH_NODES * MAX_GRAPH_NODES;
+const MAX_DENSE_CURVATURE_VALUES: usize =
+    MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION * MAX_PRIMARY_DIMENSION;
 const EMPTY_NODE: GraphNode = GraphNode {
     value: 0.0,
     support: 0,
@@ -55,14 +61,15 @@ struct GraphTape {
     dimension: usize,
     node_len: usize,
     atom_len: usize,
-    operand_len: usize,
-    coefficient_len: usize,
+    diagonal_len: usize,
+    dense_curvature_len: usize,
     nodes: [GraphNode; MAX_GRAPH_NODES],
     gradients: [f64; MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION],
     hessian_weights: [f64; MAX_GRAPH_NODES * MAX_CURVATURE_ATOMS],
     atoms: [CurvatureAtom; MAX_CURVATURE_ATOMS],
-    quadratic_operands: [usize; MAX_QUADRATIC_OPERANDS],
-    coefficients: [f64; MAX_GRAPH_COEFFICIENTS],
+    diagonal_inputs: [usize; MAX_DIAGONAL_TERMS],
+    diagonal_coefficients: [f64; MAX_DIAGONAL_TERMS],
+    dense_curvatures: [f64; MAX_DENSE_CURVATURE_VALUES],
 }
 
 impl GraphTape {
@@ -71,23 +78,24 @@ impl GraphTape {
             dimension: 0,
             node_len: 0,
             atom_len: 0,
-            operand_len: 0,
-            coefficient_len: 0,
+            diagonal_len: 0,
+            dense_curvature_len: 0,
             nodes: [EMPTY_NODE; MAX_GRAPH_NODES],
             gradients: [0.0; MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION],
             hessian_weights: [0.0; MAX_GRAPH_NODES * MAX_CURVATURE_ATOMS],
             atoms: [EMPTY_ATOM; MAX_CURVATURE_ATOMS],
-            quadratic_operands: [0; MAX_QUADRATIC_OPERANDS],
-            coefficients: [0.0; MAX_GRAPH_COEFFICIENTS],
+            diagonal_inputs: [0; MAX_DIAGONAL_TERMS],
+            diagonal_coefficients: [0.0; MAX_DIAGONAL_TERMS],
+            dense_curvatures: [0.0; MAX_DENSE_CURVATURE_VALUES],
         }
     }
 }
 
 /// Reusable storage for a compiled scalar DAG.
 ///
-/// Reset between rows. The boxed tape has fixed capacity, so every row after
-/// worker construction performs no tape or curvature-basis allocation and no
-/// capacity checks or growth branches.
+/// Reset between rows. The boxed tape has checked fixed capacities, so every
+/// row after worker construction performs no tape or curvature-basis allocation
+/// and no growth branches.
 #[derive(Debug)]
 pub struct Order2GraphWorkspace {
     tape: UnsafeCell<Box<GraphTape>>,
@@ -118,8 +126,8 @@ impl Order2GraphWorkspace {
         tape.dimension = dimension;
         tape.node_len = 0;
         tape.atom_len = 0;
-        tape.operand_len = 0;
-        tape.coefficient_len = 0;
+        tape.diagonal_len = 0;
+        tape.dense_curvature_len = 0;
     }
 
     /// Bytes retained by the fixed graph and curvature-basis tape.

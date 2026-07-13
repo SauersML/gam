@@ -906,32 +906,52 @@ pub(crate) fn hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d(
     d: usize,
     kappa: f64,
 ) -> Option<(f64, f64, f64)> {
-    if d % 2 != 1 || q > 2 || !(kappa > 0.0) || !kappa.is_finite() {
+    if d % 2 != 1 || q > 2 || s == 0 || !(kappa > 0.0) || !kappa.is_finite() {
         return None;
     }
-    let smoothness_order = 2 * (m + s);
-    let required = d + 2 * q;
-    if smoothness_order <= required {
+
+    // This is a *self-pair penalty* kernel.  Its q=0 spectrum is the product
+    // of the two hybrid Green's-function spectra,
+    //
+    //   |w|^{-4m} (kappa^2 + |w|^2)^{-2s},
+    //
+    // whereas `duchon_partial_fraction_coeffs(p, s, ...)` expands the
+    // single spectrum |w|^{-2p} (kappa^2 + |w|^2)^{-s}.  The partial-fraction
+    // orders therefore have to be doubled here.  Passing `(m, s)` evaluates
+    // a different kernel: for the d=3,m=s=1 collision it scales as kappa^-1,
+    // while the self-pair scales as kappa^-5.  Merely changing the derivative
+    // exponent cannot repair that value/derivative mismatch.
+    let pair_p_order = m.checked_mul(2)?;
+    let pair_s_order = s.checked_mul(2)?;
+    let spectral_decay_order = pair_p_order.checked_add(pair_s_order)?.checked_mul(2)?;
+    let required = d.checked_add(q.checked_mul(2)?)?;
+    if spectral_decay_order <= required {
         return None;
     }
 
     let length_scale = 1.0 / kappa;
-    let coeffs = super::duchon_partial_fraction_coeffs(m, s, kappa);
-    let f = super::duchon_phi_even_derivative_collision(length_scale, m, s, d, &coeffs, q).ok()?;
+    let coeffs =
+        super::duchon_partial_fraction_coeffs(pair_p_order, pair_s_order, kappa);
+    let f = super::duchon_phi_even_derivative_collision(
+        length_scale,
+        pair_p_order,
+        pair_s_order,
+        d,
+        &coeffs,
+        q,
+    )
+    .ok()?;
     if !f.is_finite() {
         return None;
     }
 
-    // In odd dimension, every half-integer Matérn Taylor block and every
-    // contributing Riesz block carries the same κ power after partial
-    // fraction assembly. The Matérn/polyharmonic Green's function of order
-    // `n = 2(m+s)` in dimension `d` scales as `g(r; κ) = κ^{d-2n} G(κr)` for a
-    // dimensionless profile `G` (convergent case `2n > d`), so its `2q`-th
-    // radial derivative at the collision `R = 0` picks up `2q` extra powers of
-    // κ from the chain rule:
-    //   f^(2q)(0; κ) = C · κ^{d - 2n + 2q} = C · κ^{d + 2q - 4(m+s)}.
-    // (The prior `d + 2q - 2(m+s)` used a single `m+s` instead of the full
-    // order `n = 2(m+s)`, mismatching the even-d path and the Fourier scaling.)
+    // Every odd-dimensional Taylor block in that doubled-order expansion
+    // carries the same power after cancellation.  Scaling w = kappa*u in the
+    // self-pair Fourier integral and taking 2q radial derivatives gives
+    //
+    //   f^(2q)(0; kappa) = C * kappa^{d + 2q - 4(m+s)}.
+    //
+    // This is exactly the exponent used by the even-d Schoenberg branch.
     let exponent = d as f64 + 2.0 * q as f64 - 4.0 * (m + s) as f64;
     let f_kappa = exponent * f / kappa;
     let f_kappa2 = exponent * (exponent - 1.0) * f / (kappa * kappa);
@@ -2759,20 +2779,19 @@ mod tests {
     }
 
     /// Regression for #2291: the odd-d hybrid self-pair κ-derivative must match
-    /// a central finite difference of the (correct) value `f(R=0; κ)`. Because
+    /// a central finite difference of the self-pair value `f(R=0; κ)`. Because
     /// the collision value is an exact power law `f = C·κ^{d+2q-4(m+s)}`, the
     /// analytic `f_κ = exponent·f/κ` and `f_κκ = exponent(exponent-1)·f/κ²` are
-    /// exact and the central FD of `f` (whose VALUE path is correct) is the
-    /// honest oracle. The prior exponent `d+2q-2(m+s)` used a single `m+s`
-    /// instead of the full Matérn order `n=2(m+s)`, so `f_κ`/`f_κκ` were wrong
-    /// by a fixed multiplicative factor while `f` stayed right — invisible to any
-    /// value-only check, but the FD below fails hard on it.
+    /// exact and the central FD of `f` is the honest oracle. The first #2291
+    /// repair corrected this exponent but left the collision value on the
+    /// single-kernel partial-fraction orders `(m,s)` instead of the self-pair
+    /// orders `(2m,2s)`. That made the analytic derivative and its own value
+    /// differ by a fixed factor (five in the lead d=3,m=s=1 case).
     #[test]
     pub(crate) fn hybrid_self_pair_odd_d_kappa_derivative_matches_value_finite_difference() {
         use super::hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d as odd_d;
-        // (d, m, s, q): d=3,m=s=1 admits only q=0 (the lead's spec); d=3,m=s=2
-        // (Matérn order n=8) admits q=0,1,2 so the FD also exercises the higher
-        // radial-derivative blocks. All odd-d convergent Duchon/Matérn cases.
+        // (d, m, s, q): the lead d=3,m=s=1 case plus q=0,1,2 from a smoother
+        // odd-dimensional self-pair, exercising every supported radial block.
         let cases = [(3usize, 1usize, 1usize, 0usize)].into_iter().chain([
             (3, 2, 2, 0),
             (3, 2, 2, 1),
