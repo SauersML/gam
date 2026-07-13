@@ -1223,57 +1223,37 @@ impl GaussianLocationScaleWiggleFamily {
         let g2_a = &geom.d3q_dq03 * &dir_a.z_primary_psi;
         let basis_a = scale_matrix_rows(&geom.basis_d1, &dir_a.z_primary_psi)?;
         let basis1_a = scale_matrix_rows(&geom.basis_d2, &dir_a.z_primary_psi)?;
-        // logb κ-chain on η_ls; e_a = ∂η_ls/∂ψ_a row-direction.
         let e_a = &dir_a.z_ls_psi;
-        let amn = &rows.obs_weight - &rows.n;
-        let dw_a = -2.0 * &rows.w * &rows.kappa * e_a;
-        let dm_a = -(&rows.w * &q_a) - &(2.0 * &rows.m * &rows.kappa * e_a);
-        let dn_a = -(2.0 * &rows.m * &q_a) - &(2.0 * &rows.n * &rows.kappa * e_a);
-        let s_mu = -&rows.m * &geom.dq_dq0;
-        let s_mu_a = -(&dm_a * &geom.dq_dq0) - &(&rows.m * &s1_a);
-        let s_ls = &rows.kappa * &amn;
-        let s_ls_a = &rows.kappa_prime * &(e_a * &amn) - &rows.kappa * &dn_a;
-        let s_w = -&rows.m;
-        let s_w_a = -&dm_a;
+        // The generated Gaussian row tower owns every likelihood derivative.
+        // This function only pulls those neutral `(q, eta_ls)` channels back
+        // through the nonlinear wiggle geometry and the design maps.
+        let GlsWiggleFirstDirCoeffs {
+            coeff_mm_base: coeff_mm,
+            coeff_ml_base: coeff_ml,
+            coeff_ll_base: coeff_ll,
+            coeff_mm_u: coeff_mm_a,
+            coeff_ml_u: coeff_ml_a,
+            coeff_ll_u: coeff_ll_a,
+            mean_wiggle_u: a_a,
+            gradient_mu_u: c_a,
+            scale_wiggle_u: l_a,
+            mean_wiggle_base: a,
+            gradient_mu_base: c,
+            gradient_ls_base: s_ls,
+            gradient_ls_u: s_ls_a,
+            scale_wiggle_base: l,
+            hessian_mm_base,
+            hessian_mm_u,
+        } = gls_wiggle_first_directional_coeffs(&rows, &geom, &q_a, e_a, &s1_a, &g2_a);
+        let s_mu = &c * &geom.dq_dq0;
+        let s_mu_a = &c_a * &geom.dq_dq0 + &c * &s1_a;
 
-        let objective_psi = (-&rows.m * &q_a + &s_ls * e_a).sum();
+        let objective_psi = (&c * &q_a + &s_ls * e_a).sum();
         let score_psi = gaussian_pack_wiggle_joint_score(
             &(xmu_map.transpose_mul(s_mu.view()) + fast_atv(xmu, &s_mu_a)),
             &(x_ls_map.transpose_mul(s_ls.view()) + fast_atv(x_ls, &s_ls_a)),
-            &(fast_atv(&basis_a, &s_w) + fast_atv(&geom.basis, &s_w_a)),
+            &(fast_atv(&basis_a, &c) + fast_atv(&geom.basis, &c_a)),
         );
-
-        // OBSERVED joint Hessian blocks under logb (#1561; Wood–Pya–Säfken 2016).
-        // μ AND the wiggle both enter the mean q = q0 + B(q0)·βw, so the whole
-        // mean side carries the observed cross-curvature 2κm against log σ. The
-        // μ-side Jacobian carries dq_dq0 (cf. s_mu = −m·dq_dq0), so the μ↔ls cross
-        // is coeff_ml = 2κm·dq_dq0; the wiggle-side Jacobian is B, so the ls↔wiggle
-        // cross is l = 2κm. coeff_ll = κ'(a−n)+2κ²n (Fisher 2κ²a overstated the
-        // σ-block information on the near-flat scale surface and over-smoothed
-        // log σ). Their ψ-derivatives differentiate κ (via e_a), m (via dm_a),
-        // dq_dq0 (via s1_a), and n (via dn_a). The SCORE (s_mu/s_ls/s_w) is the
-        // exact gradient, unchanged. At a flat/true-null σ surface n→a, m→0 so
-        // observed → Fisher and the null behavior is unchanged.
-        let coeff_mm = &rows.w * &geom.dq_dq0.mapv(|v| v * v) - &rows.m * &geom.d2q_dq02;
-        let coeff_mm_a = &(&dw_a * &geom.dq_dq0.mapv(|v| v * v))
-            + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_a)
-            - &(&dm_a * &geom.d2q_dq02)
-            - &(&rows.m * &g2_a);
-        let a_coef = 2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime;
-        let coeff_ml = 2.0 * &rows.kappa * &rows.m * &geom.dq_dq0;
-        let coeff_ml_a = &(2.0 * &rows.kappa_prime * e_a * &rows.m * &geom.dq_dq0)
-            + &(&(2.0 * &rows.kappa * &dm_a * &geom.dq_dq0)
-                + &(2.0 * &rows.kappa * &rows.m * &s1_a));
-        let coeff_ll = &rows.kappa_prime * &amn + 2.0 * &rows.kappa * &rows.kappa * &rows.n;
-        let coeff_ll_a = &(&(&rows.kappa_dprime * e_a * &amn)
-            + &(4.0 * &rows.kappa * &rows.kappa_prime * e_a * &rows.n))
-            + &(&a_coef * &dn_a);
-        let a = &rows.w * &geom.dq_dq0;
-        let a_a = &dw_a * &geom.dq_dq0 + &rows.w * &s1_a;
-        let c = -&rows.m;
-        let c_a = -&dm_a;
-        let l = 2.0 * &rows.kappa * &rows.m;
-        let l_a = &(2.0 * &rows.kappa_prime * e_a * &rows.m) + &(2.0 * &rows.kappa * &dm_a);
         let h_mm_a1 = weighted_crossprod_psi_maps(
             xmu_map,
             coeff_mm.view(),
@@ -1314,8 +1294,8 @@ impl GaussianLocationScaleWiggleFamily {
             CustomFamilyPsiLinearMapRef::Dense(&geom.basis),
         )? + &xt_diag_y_dense(x_ls, &l_a, &geom.basis)?
             + &xt_diag_y_dense(x_ls, &l, &basis_a)?;
-        let h_ww_a1 = xt_diag_y_dense(&basis_a, &rows.w, &geom.basis)?;
-        let h_ww = &h_ww_a1 + &h_ww_a1.t() + &xt_diag_x_dense(&geom.basis, &dw_a)?;
+        let h_ww_a1 = xt_diag_y_dense(&basis_a, &hessian_mm_base, &geom.basis)?;
+        let h_ww = &h_ww_a1 + &h_ww_a1.t() + &xt_diag_x_dense(&geom.basis, &hessian_mm_u)?;
 
         Ok(Some(gam_problem::ExactNewtonJointPsiTerms {
             objective_psi,
