@@ -1278,16 +1278,17 @@ fn bound_covariance_matvec_into(
 
 /// Universal second-order pullback
 /// `g_x = J^T g_y`, `H_x = J^T H_y J + sum_m g_y[m] H(y_m)`.
-/// Structural feature supports avoid multiplying the three identity rows by
-/// their known zeros. The callback owns the feature map's intrinsic Hessians,
-/// so the chain rule itself remains independent of covariance representation.
+/// Each primary enumerates only its structurally active feature rows, so the
+/// dense score block is written once in packed order rather than once per
+/// feature pair. The callback owns the feature map's intrinsic Hessians, keeping
+/// the chain rule independent of covariance representation.
 #[inline(always)]
 fn order2_feature_pullback_into<const FEATURES: usize>(
     feature_gradient: &[f64; FEATURES],
     feature_hessian: &[[f64; FEATURES]; FEATURES],
     jacobian: &[f64],
-    support_starts: &[usize; FEATURES],
-    support_ends: &[usize; FEATURES],
+    active_feature_count: impl Fn(usize) -> usize,
+    active_feature: impl Fn(usize, usize) -> usize,
     dimension: usize,
     gradient: &mut [f64],
     hessian: &mut [f64],
@@ -1296,32 +1297,31 @@ fn order2_feature_pullback_into<const FEATURES: usize>(
     debug_assert_eq!(jacobian.len(), FEATURES * dimension);
     debug_assert_eq!(gradient.len(), dimension);
     debug_assert_eq!(hessian.len(), dimension * dimension);
-    gradient.fill(0.0);
-    hessian.fill(0.0);
 
-    for feature in 0..FEATURES {
-        let weight = feature_gradient[feature];
-        let row_offset = feature * dimension;
-        for axis in support_starts[feature]..support_ends[feature] {
-            gradient[axis] += weight * jacobian[row_offset + axis];
+    for axis in 0..dimension {
+        let mut channel = 0.0;
+        for slot in 0..active_feature_count(axis) {
+            let feature = active_feature(axis, slot);
+            channel += feature_gradient[feature] * jacobian[feature * dimension + axis];
         }
+        gradient[axis] = channel;
     }
 
-    for left_feature in 0..FEATURES {
-        let left_offset = left_feature * dimension;
-        for right_feature in left_feature..FEATURES {
-            let right_offset = right_feature * dimension;
-            let weight = feature_hessian[left_feature][right_feature];
-            for left_axis in support_starts[left_feature]..support_ends[left_feature] {
-                let left = jacobian[left_offset + left_axis];
-                for right_axis in support_starts[right_feature]..support_ends[right_feature] {
-                    let channel = weight * left * jacobian[right_offset + right_axis];
-                    hessian[left_axis * dimension + right_axis] += channel;
-                    if left_feature != right_feature {
-                        hessian[right_axis * dimension + left_axis] += channel;
-                    }
+    for left_axis in 0..dimension {
+        for right_axis in left_axis..dimension {
+            let mut channel = 0.0;
+            for left_slot in 0..active_feature_count(left_axis) {
+                let left_feature = active_feature(left_axis, left_slot);
+                let left = jacobian[left_feature * dimension + left_axis];
+                for right_slot in 0..active_feature_count(right_axis) {
+                    let right_feature = active_feature(right_axis, right_slot);
+                    channel += left
+                        * feature_hessian[left_feature][right_feature]
+                        * jacobian[right_feature * dimension + right_axis];
                 }
             }
+            hessian[left_axis * dimension + right_axis] = channel;
+            hessian[right_axis * dimension + left_axis] = channel;
         }
     }
     add_weighted_feature_hessians(feature_gradient, hessian);
@@ -1511,15 +1511,19 @@ pub(crate) fn row_primary_closed_form_vector_into(
         rigid_vector_feature_program_order2(q0, q1, qd1, linear, raw_variance, w, d, probit_scale);
     validate_rigid_row_admission(qd1, &inputs, neg_eta0, neg_eta1, adjusted_derivative)?;
 
-    let support_starts = [0, 1, 2, 3, 3];
-    let support_ends = [1, 2, 3, dimension, dimension];
     let (gradient, hessian) = derivative_cells.split_at_mut(dimension);
     order2_feature_pullback_into(
         &feature_gradient,
         &feature_hessian,
         feature_jacobian,
-        &support_starts,
-        &support_ends,
+        |axis| if axis < 3 { 1 } else { 2 },
+        |axis, slot| {
+            if axis < 3 {
+                axis
+            } else {
+                FEATURE_LINEAR + slot
+            }
+        },
         dimension,
         gradient,
         hessian,
