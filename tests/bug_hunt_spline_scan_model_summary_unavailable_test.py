@@ -27,6 +27,7 @@ point returns a finite, principled value reconstructed from the scan state.
 from __future__ import annotations
 
 import importlib
+import json
 from typing import Any
 
 pytest: Any = importlib.import_module("pytest")
@@ -176,22 +177,82 @@ def test_scan_predict_point_and_interval_still_work():
     assert np.all(upper >= lower)
 
 
-def test_scan_summary_survives_save_load_roundtrip(tmp_path):
-    """A persisted-then-reloaded scan model must summarize identically — the
-    summary path reconstructs from the saved `SplineScanFit`, so it must work
-    off a round-tripped payload, not just the freshly-fitted in-memory one."""
+def test_scan_predictions_intervals_and_summary_replay_exactly_after_save_load(tmp_path):
+    """Persistence must replay the scan posterior, never reconstruct a dense fit.
+
+    The query deliberately mixes both training-domain and extrapolation rows.
+    Exact array equality is load-bearing: a dense refit can be numerically close
+    while still being a different posterior, whereas JSON round-tripping the
+    lossless ``SplineScanState`` must preserve every emitted float exactly.
+    """
     df = _dataset()
     model = _fit_scan(df, degree=5, penalty_order=3)
+    train_lo = float(df["x"].min())
+    train_hi = float(df["x"].max())
+    query = pd.DataFrame(
+        {
+            "x": [
+                train_lo - 0.25,
+                train_lo,
+                0.5 * (train_lo + train_hi),
+                train_hi,
+                train_hi + 0.25,
+            ]
+        }
+    )
+    assert query["x"].iloc[0] < train_lo
+    assert query["x"].iloc[-1] > train_hi
+
+    point_before = model.predict(query, return_type="dict")
+    bands_before = model.predict(
+        query,
+        interval=0.9,
+        observation_interval=True,
+        return_type="dict",
+    )
+    for key in ("linear_predictor", "mean"):
+        np.testing.assert_array_equal(point_before[key], bands_before[key])
+
     path = tmp_path / "scan_model.gam"
     model.save(str(path))
+    wire = json.loads(path.read_text())
+    payload = wire["payload"]
+    assert payload["spline_scan"]["feature_column"] == "x"
+    assert payload["fit_result"] is None
+    assert payload["unified"] is None
+    assert payload["resolved_termspec"] is None
+
     reloaded = gamfit.load(str(path))
+    point_after = reloaded.predict(query, return_type="dict")
+    bands_after = reloaded.predict(
+        query,
+        interval=0.9,
+        observation_interval=True,
+        return_type="dict",
+    )
+
+    assert point_after.keys() == point_before.keys()
+    for key in point_before:
+        np.testing.assert_array_equal(point_after[key], point_before[key])
+
+    expected_band_columns = {
+        "linear_predictor",
+        "mean",
+        "std_error",
+        "mean_lower",
+        "mean_upper",
+        "observation_lower",
+        "observation_upper",
+    }
+    assert bands_after.keys() == bands_before.keys()
+    assert set(bands_before) == expected_band_columns
+    for key in bands_before:
+        np.testing.assert_array_equal(bands_after[key], bands_before[key])
 
     s0 = model.summary()
     s1 = reloaded.summary()
-    assert float(s1.reml_score) == pytest.approx(float(s0.reml_score), rel=1e-9, abs=1e-9)
-    assert float(s1.edf_total) == pytest.approx(float(s0.edf_total), rel=1e-9, abs=1e-9)
+    assert s1.to_dict() == s0.to_dict()
     l0 = model.smoothing_parameters()
     l1 = reloaded.smoothing_parameters()
-    assert l1.keys() == l0.keys()
-    for key in l0:
-        assert l1[key] == pytest.approx(l0[key], rel=1e-9, abs=1e-9)
+    assert l1 == l0
+    assert reloaded.evidence == model.evidence
