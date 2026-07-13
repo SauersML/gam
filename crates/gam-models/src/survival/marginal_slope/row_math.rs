@@ -995,7 +995,7 @@ where
 }
 
 #[inline]
-fn checked_vector_workspace_layout(score_dimension: usize) -> Result<(usize, usize), String> {
+fn checked_vector_workspace_layout(score_dimension: usize) -> Result<usize, String> {
     if score_dimension == 0 {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: "survival marginal-slope vector row requires at least one score slope"
@@ -1027,7 +1027,7 @@ fn checked_vector_workspace_layout(score_dimension: usize) -> Result<(usize, usi
         }
         .to_string()
     })?;
-    Ok((dimension, derivative_cells))
+    Ok(derivative_cells)
 }
 
 /// Reusable, allocation-free production workspace bound to one validated score
@@ -1043,7 +1043,7 @@ pub(crate) struct RigidVectorRowWorkspace<'covariance> {
 impl<'covariance> RigidVectorRowWorkspace<'covariance> {
     pub(crate) fn new(covariance: &'covariance MarginalSlopeCovariance) -> Result<Self, String> {
         let score_dimension = covariance.dim();
-        let (dimension, derivative_cells) = checked_vector_workspace_layout(score_dimension)?;
+        let derivative_cells = checked_vector_workspace_layout(score_dimension)?;
         let projection_dimension = match covariance.representation() {
             MarginalSlopeCovarianceRef::LowRank(factor) => factor.ncols(),
             MarginalSlopeCovarianceRef::Diagonal(_) | MarginalSlopeCovarianceRef::Full(_) => 0,
