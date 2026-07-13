@@ -1060,12 +1060,6 @@ pub(crate) struct OuterObjectiveEvalResult {
     pub(crate) inner: BlockwiseInnerResult,
 }
 
-pub(crate) fn outer_eval_result_to_joint_hyper_result(
-    result: OuterObjectiveEvalResult,
-) -> CustomFamilyJointHyperResult {
-    outer_eval_result_into_joint_hyper_owned_result(result).result
-}
-
 pub(crate) fn outer_eval_result_into_joint_hyper_owned_result(
     result: OuterObjectiveEvalResult,
 ) -> CustomFamilyJointHyperOwnedResult {

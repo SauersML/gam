@@ -90,8 +90,9 @@ use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
 use crate::frames::GrassmannFrame;
 use crate::manifold::{
     AssignmentMode, AtlasSeamKind, GraphStructureSelection, LearnedGraphAtom, OccupancyLaw,
-    SAE_MAX_PERIODIC_HARMONICS, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
-    SaeReferenceRoughness, SphereChartTransition, UnitSpeedChartTransition,
+    SAE_MAX_PERIODIC_HARMONICS, SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisResolution,
+    SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SaeReferenceMetricPlan,
+    SphereChartTransition, UnitSpeedChartTransition,
     amplitude_concentration_certificate, classify_occupancy_interval,
 };
 use crate::migration_ledger::SaeMigrationLedger;
@@ -2791,9 +2792,8 @@ fn duplicate_atom(
 #[derive(Clone)]
 struct TopologyRaceFit {
     evaluator: Arc<dyn SaeBasisSecondJet>,
-    basis_kind: SaeAtomBasisKind,
+    geometry: SaeAtomGeometryPlan,
     manifold: LatentManifold,
-    latent_dim: usize,
     /// The `(n × d)` coordinates the winning basis was evaluated at — the born
     /// atom's coordinate block, dimension-matched to the winning evaluator.
     coords: Array2<f64>,
@@ -2812,14 +2812,35 @@ struct TopologyRaceFit {
 /// each candidate; the race then fits it to the birth target.
 struct TopologyCandidateSpec {
     kind: AutoTopologyKind,
-    basis_kind: SaeAtomBasisKind,
+    geometry: SaeAtomGeometryPlan,
     manifold: LatentManifold,
-    latent_dim: usize,
-    evaluator: Arc<dyn SaeBasisSecondJet>,
     /// The `(n, d)` coordinates this candidate evaluates its basis at. A `d = 1`
     /// candidate reads the template coordinate column; a `d = 2` candidate reads
     /// the first two columns (or pads with the single column the seed carries).
     coords: Array2<f64>,
+}
+
+impl TopologyCandidateSpec {
+    fn new(
+        kind: AutoTopologyKind,
+        geometry: SaeAtomGeometryPlan,
+        manifold: LatentManifold,
+        coords: Array2<f64>,
+    ) -> Result<Self, String> {
+        if coords.ncols() != geometry.latent_dim() {
+            return Err(format!(
+                "TopologyCandidateSpec::new: coordinate width {} != geometry latent_dim {}",
+                coords.ncols(),
+                geometry.latent_dim()
+            ));
+        }
+        Ok(Self {
+            kind,
+            geometry,
+            manifold,
+            coords,
+        })
+    }
 }
 
 /// Build the topology candidate set whose required intrinsic dimension matches
@@ -2889,27 +2910,41 @@ fn topology_candidates_for_dim(
     match d_k {
         1 => {
             let n_harmonics = (2 * d_k + 1).max(3) | 1; // odd, ≥ 3
-            specs.push(TopologyCandidateSpec {
+            let harmonic_order = (n_harmonics - 1) / 2;
+            specs.push(TopologyCandidateSpec::new(
                 kind: AutoTopologyKind::Circle,
-                basis_kind: SaeAtomBasisKind::Periodic,
-                manifold: LatentManifold::Circle { period: 1.0 },
-                latent_dim: 1,
-                evaluator: Arc::new(PeriodicHarmonicEvaluator::new(n_harmonics)?),
-                coords: coords_d(1),
-            });
-            specs.push(TopologyCandidateSpec {
-                kind: AutoTopologyKind::Euclidean,
-                basis_kind: SaeAtomBasisKind::EuclideanPatch,
-                manifold: LatentManifold::Euclidean,
-                latent_dim: 1,
-                evaluator: Arc::new(EuclideanPatchEvaluator::new(1, 3)?),
-                coords: coords_d(1),
-            });
+                SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Periodic,
+                    1,
+                    SaeBasisResolution::PeriodicHarmonics {
+                        order: harmonic_order,
+                    },
+                    SaeReferenceMetricPlan::UnitCircle,
+                )?,
+                LatentManifold::Circle { period: 1.0 },
+                coords_d(1),
+            )?);
+            specs.push(TopologyCandidateSpec::new(
+                AutoTopologyKind::Euclidean,
+                SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::EuclideanPatch,
+                    1,
+                    SaeBasisResolution::Polynomial { degree: 3 },
+                    SaeReferenceMetricPlan::EuclideanPolynomial,
+                )?,
+                LatentManifold::Euclidean,
+                coords_d(1),
+            )?);
         }
         2 => {
-            specs.push(TopologyCandidateSpec {
-                kind: AutoTopologyKind::Torus,
-                basis_kind: SaeAtomBasisKind::Torus,
+            specs.push(TopologyCandidateSpec::new(
+                AutoTopologyKind::Torus,
+                SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Torus,
+                    2,
+                    SaeBasisResolution::TorusHarmonics { per_axis_order: 2 },
+                    SaeReferenceMetricPlan::FlatRectangularTorus { tau: 0.0 },
+                )?,
                 // T² = S¹ × S¹: each axis is a unit-period circle (the
                 // fraction-of-period convention `TorusHarmonicEvaluator` shares
                 // with the periodic 1-D atom). This MUST match the production
@@ -2917,17 +2952,20 @@ fn topology_candidates_for_dim(
                 // `sae::manifold::atom`); a flat `Euclidean` manifold would leave
                 // the born atom's angles un-wrapped and the joint refit would
                 // retract on the wrong geometry.
-                manifold: LatentManifold::Product(vec![
+                LatentManifold::Product(vec![
                     LatentManifold::Circle { period: 1.0 },
                     LatentManifold::Circle { period: 1.0 },
                 ]),
-                latent_dim: 2,
-                evaluator: Arc::new(TorusHarmonicEvaluator::new(2, 2)?),
-                coords: coords_d(2),
-            });
-            specs.push(TopologyCandidateSpec {
-                kind: AutoTopologyKind::Sphere,
-                basis_kind: SaeAtomBasisKind::Sphere,
+                coords_d(2),
+            )?);
+            specs.push(TopologyCandidateSpec::new(
+                AutoTopologyKind::Sphere,
+                SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Sphere,
+                    2,
+                    SaeBasisResolution::SphereChart,
+                    SaeReferenceMetricPlan::SphereChart,
+                )?,
                 // The `SphereChartEvaluator` is a (lat, lon) intrinsic chart, so
                 // the latent manifold is the 2-D product of a bounded latitude
                 // interval and a wrapped longitude circle — NOT
@@ -2935,7 +2973,7 @@ fn topology_candidates_for_dim(
                 // unit 3-vectors the chart never produces. This matches the
                 // production seeding (`AtomTopology::Sphere` →
                 // Product[Interval(-π/2, π/2), Circle(τ)] in `sae::manifold::atom`).
-                manifold: LatentManifold::Product(vec![
+                LatentManifold::Product(vec![
                     LatentManifold::Interval {
                         lo: -std::f64::consts::FRAC_PI_2,
                         hi: std::f64::consts::FRAC_PI_2,
@@ -2944,21 +2982,30 @@ fn topology_candidates_for_dim(
                         period: std::f64::consts::TAU,
                     },
                 ]),
-                latent_dim: 2,
-                evaluator: Arc::new(SphereChartEvaluator),
-                coords: coords_d(2),
-            });
-            specs.push(TopologyCandidateSpec {
-                kind: AutoTopologyKind::Euclidean,
-                basis_kind: SaeAtomBasisKind::EuclideanPatch,
-                manifold: LatentManifold::Euclidean,
-                latent_dim: 2,
-                evaluator: Arc::new(EuclideanPatchEvaluator::new(2, 2)?),
-                coords: coords_d(2),
-            });
-            specs.push(TopologyCandidateSpec {
-                kind: AutoTopologyKind::Cylinder,
-                basis_kind: SaeAtomBasisKind::Cylinder,
+                coords_d(2),
+            )?);
+            specs.push(TopologyCandidateSpec::new(
+                AutoTopologyKind::Euclidean,
+                SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::EuclideanPatch,
+                    2,
+                    SaeBasisResolution::Polynomial { degree: 2 },
+                    SaeReferenceMetricPlan::EuclideanPolynomial,
+                )?,
+                LatentManifold::Euclidean,
+                coords_d(2),
+            )?);
+            specs.push(TopologyCandidateSpec::new(
+                AutoTopologyKind::Cylinder,
+                SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Cylinder,
+                    2,
+                    SaeBasisResolution::CylinderHarmonics {
+                        circle_order: 2,
+                        line_degree: 2,
+                    },
+                    SaeReferenceMetricPlan::CylinderProduct,
+                )?,
                 // Cylinder S¹ × ℝ: axis 0 is a unit-period circle (the
                 // fraction-of-period convention `CylinderHarmonicEvaluator` shares
                 // with the periodic / torus atoms), axis 1 is the unbounded flat
@@ -2969,28 +3016,29 @@ fn topology_candidates_for_dim(
                 // wrap the linear axis spuriously. The harmonic / degree budget
                 // mirrors the torus (2 circle harmonics) and the patch (degree 2)
                 // so the cross-topology design widths stay commensurable.
-                manifold: LatentManifold::Product(vec![
+                LatentManifold::Product(vec![
                     LatentManifold::Circle { period: 1.0 },
                     LatentManifold::Euclidean,
                 ]),
-                latent_dim: 2,
-                evaluator: Arc::new(CylinderHarmonicEvaluator::new(2, 2)?),
-                coords: coords_d(2),
-            });
+                coords_d(2),
+            )?);
         }
         _ => {
             // d_k ≥ 3: a flat Euclidean patch is the only realizable core basis
             // (the curved families top out at d = 2). The race degenerates to a
             // single candidate — still honest (the winner is reported), just not
             // a contest.
-            specs.push(TopologyCandidateSpec {
-                kind: AutoTopologyKind::Euclidean,
-                basis_kind: SaeAtomBasisKind::EuclideanPatch,
-                manifold: LatentManifold::Euclidean,
-                latent_dim: d_k,
-                evaluator: Arc::new(EuclideanPatchEvaluator::new(d_k, 2)?),
-                coords: coords_d(d_k),
-            });
+            specs.push(TopologyCandidateSpec::new(
+                AutoTopologyKind::Euclidean,
+                SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::EuclideanPatch,
+                    d_k,
+                    SaeBasisResolution::Polynomial { degree: 2 },
+                    SaeReferenceMetricPlan::EuclideanPolynomial,
+                )?,
+                LatentManifold::Euclidean,
+                coords_d(d_k),
+            )?);
         }
     }
     Ok(specs)
@@ -3035,7 +3083,11 @@ fn fit_topology_candidate(
     weights: ArrayView1<'_, f64>,
 ) -> Result<TopologyAutoFitEvidence<TopologyRaceFit>, String> {
     let n = target.nrows();
-    let (phi, jet) = spec.evaluator.evaluate(spec.coords.view())?;
+    let bundle = spec.geometry.evaluate_bundle(spec.coords.view())?;
+    let phi = bundle.basis_values;
+    let jet = bundle.basis_jacobian;
+    let penalty = bundle.reference_penalty;
+    let evaluator = bundle.evaluator;
     let m = phi.ncols();
     if phi.nrows() != n {
         return Err(format!(
@@ -3063,41 +3115,6 @@ fn fit_topology_candidate(
     }
     if !(w_sum > 0.0 && w_sum.is_finite()) {
         return Err("fit_topology_candidate: degenerate (zero-mass) birth target".into());
-    }
-
-    // The candidate basis's declared reference-function Gram, the smoothness
-    // operator the topology evidence prices. Every candidate is compared under
-    // the same fixed reference measure and second-derivative seminorm
-    // `S_ref = Σ_n Σ_{a,c} Φ''_{·,a,c}(t_n)ᵀ Φ''_{·,a,c}(t_n)`, read off its
-    // analytic second jet `Φ''[n, μ, a, c]`. A flat (line / patch) basis has a small Gram
-    // (its low-degree monomials are barely curved), a periodic / sphere basis a
-    // large one for its high harmonics: exactly the smoothness price the race must
-    // weigh against data fit. Computed identically for every candidate so the
-    // cross-topology comparison stays commensurable.
-    let second_jet = spec.evaluator.second_jet(spec.coords.view())?; // (n, m, d, d)
-    let d = spec.latent_dim;
-    let mut s_raw = Array2::<f64>::zeros((m, m));
-    for row in 0..n {
-        for a in 0..d {
-            for c in 0..d {
-                // Outer product of the (a,c) second-derivative column over basis
-                // functions, accumulated into the roughness Gram.
-                for mu in 0..m {
-                    let hmu = second_jet[[row, mu, a, c]];
-                    if hmu == 0.0 {
-                        continue;
-                    }
-                    for nu in mu..m {
-                        s_raw[[mu, nu]] += hmu * second_jet[[row, nu, a, c]];
-                    }
-                }
-            }
-        }
-    }
-    for mu in 0..m {
-        for nu in (mu + 1)..m {
-            s_raw[[nu, mu]] = s_raw[[mu, nu]];
-        }
     }
 
     // Score each candidate by its PROPER closed-form Gaussian REML evidence
@@ -3138,7 +3155,7 @@ fn fit_topology_candidate(
     let reml_fit = gaussian_reml_multi_shared_dispersion_closed_form(
         phi.view(),
         target,
-        s_raw.view(),
+        penalty.view(),
         Some(weights),
         None,
     )
@@ -3162,9 +3179,6 @@ fn fit_topology_candidate(
         effective_dim = 1.0;
     }
 
-    // The born atom carries the topology candidate's declared function-space
-    // roughness Gram unchanged. Decoder fitting never rewrites that objective.
-    let penalty = s_raw.clone();
     Ok(TopologyAutoFitEvidence {
         topology_name: spec.kind.display_name(),
         raw_reml,
@@ -3178,10 +3192,9 @@ fn fit_topology_candidate(
         effective_dim,
         n_obs: n,
         fit_handle: TopologyRaceFit {
-            evaluator: spec.evaluator.clone(),
-            basis_kind: spec.basis_kind.clone(),
+            evaluator,
+            geometry: spec.geometry.clone(),
             manifold: spec.manifold.clone(),
-            latent_dim: spec.latent_dim,
             coords: spec.coords.clone(),
             phi,
             jet,

@@ -20,10 +20,10 @@ use gam_terms::basis::{
 use gam_custom_family::{
     BlockEffectiveJacobian, BlockGeometryDirectionalDerivative, BlockWorkingSet,
     BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart,
-    ExactNewtonOuterObjective, FamilyEvaluation, FamilyLinearizationState, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
-    fit_custom_family_fixed_log_lambdas_from_outer,
+    CustomFamilyOwnedMode, ExactNewtonOuterObjective, FamilyEvaluation, FamilyLinearizationState,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    evaluate_custom_family_joint_hyper_efs_owned, evaluate_custom_family_joint_hyper_owned,
+    fit_custom_family, fit_custom_family_fixed_log_lambdas_from_owned_mode,
 };
 
 use gam_solve::estimate::{

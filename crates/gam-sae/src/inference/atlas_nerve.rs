@@ -1164,7 +1164,7 @@ mod tests {
         let projection_frame = arr2(&[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
         let tangent_coordinates = arr2(&[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]);
         let bounds = GaussianPcaPopulationBounds::new(0.1, 2.0, 1.0).unwrap();
-        let patches = (0..n_charts)
+        let patches: Vec<GaussianPcaPatch> = (0..n_charts)
             .map(|chart| {
                 GaussianPcaPatch::new(
                     chart,
@@ -1226,7 +1226,7 @@ mod tests {
         let projection_frame = arr2(&[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
         let tangent_coordinates = arr2(&[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]);
         let bounds = GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap();
-        let patches = (0..n_charts)
+        let patches: Vec<GaussianPcaPatch> = (0..n_charts)
             .map(|chart| {
                 GaussianPcaPatch::new(
                     chart,

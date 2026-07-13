@@ -4740,17 +4740,30 @@ const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
             anchors: &[
                 "impl gam_math::jet_tower::RowProgram<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
                 "impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
+                "struct SlsIndexDerivativeChannels {",
+                "fn project_index_diagonal<const CHANNELS: usize, const ORDER: usize>(",
+                "fn lower_index_derivative_channels(self) -> SlsIndexDerivativeChannels",
+                "let channels = sls_outer_plan(&kernel).lower_index_derivative_channels();",
             ],
         }],
         discovery_anchor: "impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
-        parity_pins: &[DerivativeAnchorSet {
-            path: "crates/gam-models/src/survival/location_scale/tests.rs",
-            anchors: &[
-                "fn survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels()",
-                "verify_kernel_channels(&tower, &claims, 1e-9)",
-            ],
-        }],
-        retired_identities: &[],
+        parity_pins: &[
+            DerivativeAnchorSet {
+                path: "crates/gam-models/src/survival/location_scale/tests.rs",
+                anchors: &[
+                    "fn survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels()",
+                    "verify_kernel_channels(&tower, &claims, 1e-9)",
+                ],
+            },
+            DerivativeAnchorSet {
+                path: "crates/gam-models/src/survival/location_scale/row_kernel.rs",
+                anchors: &[
+                    "fn sls_index_sparse_lowering_matches_generic_jet_all_branches_932()",
+                    "fn sls_index_sparse_lowering_matches_independent_fd_all_branches_932()",
+                ],
+            },
+        ],
+        retired_identities: &["nll_index_read_channels", "SurvivalIndexNllReadChannels"],
     },
     DerivativeSpecialization {
         family: "survival marginal-slope rigid",
@@ -5149,6 +5162,42 @@ fn enforce_derivative_policy_negative_probes() {
                 )
         }),
         "#932 policy self-test: an unregistered RowKernel was not discovered"
+    );
+
+    let registered_row_path = "crates/gam-models/src/survival/location_scale/row_kernel.rs";
+    let registered_row_source =
+        "impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {";
+    let registered_row_mask =
+        compute_test_mask(registered_row_source, Path::new(registered_row_path));
+    assert!(
+        derivative_declarations(registered_row_source, &registered_row_mask)
+            .iter()
+            .any(|declaration| {
+                is_row_kernel_declaration(&declaration.source)
+                    && specialization_site_is_registered(
+                        DerivativeSpecializationKind::RowKernel,
+                        registered_row_path,
+                        &declaration.source,
+                    )
+            }),
+        "#932 policy self-test: the exact registered survival RowKernel was not admitted"
+    );
+    let same_file_rogue_row =
+        "impl crate::row_kernel::RowKernel<SLS_ROW_K> for PlantedSameFileKernel {";
+    let same_file_rogue_row_mask =
+        compute_test_mask(same_file_rogue_row, Path::new(registered_row_path));
+    assert!(
+        derivative_declarations(same_file_rogue_row, &same_file_rogue_row_mask)
+            .iter()
+            .any(|declaration| {
+                is_row_kernel_declaration(&declaration.source)
+                    && !specialization_site_is_registered(
+                        DerivativeSpecializationKind::RowKernel,
+                        registered_row_path,
+                        &declaration.source,
+                    )
+            }),
+        "#932 policy self-test: a rogue RowKernel in the registered survival source was admitted"
     );
 
     let bounded_helper =

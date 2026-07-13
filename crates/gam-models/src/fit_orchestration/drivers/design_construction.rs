@@ -1994,6 +1994,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 
     struct SpatialAdaptiveOuterState {
         warm_cache: Option<CustomFamilyWarmStart>,
+        terminal_mode: Option<(Array1<f64>, f64, CustomFamilyOwnedMode)>,
         last_eval: Option<(
             Array1<f64>,
             f64,
@@ -2109,7 +2110,18 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             && cached_theta
                 .iter()
                 .zip(theta.iter())
-                .all(|(&a, &b)| (a - b).abs() <= 1e-12)
+                .all(|(&a, &b)| a.to_bits() == b.to_bits())
+            && st
+                .terminal_mode
+                .as_ref()
+                .is_some_and(|(mode_theta, mode_objective, _)| {
+                    mode_theta.len() == theta.len()
+                        && mode_theta
+                            .iter()
+                            .zip(theta.iter())
+                            .all(|(&a, &b)| a.to_bits() == b.to_bits())
+                        && mode_objective.to_bits() == cached_cost.to_bits()
+                })
             && (!matches!(
                 order,
                 gam_solve::rho_optimizer::OuterEvalOrder::ValueGradientHessian
@@ -2138,7 +2150,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             order,
             gam_solve::rho_optimizer::OuterEvalOrder::ValueGradientHessian
         ) && analytic_outer_hessian_available;
-        let result = evaluate_custom_family_joint_hyper(
+        let owned = evaluate_custom_family_joint_hyper_owned(
             &family_eval,
             std::slice::from_ref(&blockspec),
             &outer_opts,
@@ -2154,25 +2166,27 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         .map_err(|e| {
             EstimationError::RemlOptimizationFailed(format!("spatial adaptive eval failed: {e}"))
         })?;
-        if !result.inner_converged {
-            st.warm_cache = Some(result.warm_start.clone());
+        if !owned.result.inner_converged {
+            st.warm_cache = Some(owned.result.warm_start.clone());
             return Err(EstimationError::RemlOptimizationFailed(
                 "exact spatial adaptive inner solve did not converge".to_string(),
             ));
         }
-        if !result.objective.is_finite() || result.gradient.iter().any(|v| !v.is_finite()) {
+        if !owned.result.objective.is_finite()
+            || owned.result.gradient.iter().any(|v| !v.is_finite())
+        {
             return Err(EstimationError::RemlOptimizationFailed(
                 "exact spatial adaptive objective returned non-finite values".to_string(),
             ));
         }
         let hessian_result = if need_hessian {
-            if !result.outer_hessian.is_analytic() {
+            if !owned.result.outer_hessian.is_analytic() {
                 return Err(EstimationError::RemlOptimizationFailed(
                     "exact spatial adaptive objective did not return an exact outer Hessian"
                         .to_string(),
                 ));
             }
-            match result.outer_hessian.dim() {
+            match owned.result.outer_hessian.dim() {
                 Some(dim) if dim == theta.len() => {}
                 Some(dim) => {
                     return Err(EstimationError::RemlOptimizationFailed(format!(
@@ -2189,19 +2203,22 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             }
             st.last_eval = Some((
                 theta.to_owned(),
-                result.objective,
-                result.gradient.clone(),
-                result.outer_hessian.clone(),
-                result.warm_start.clone(),
+                owned.result.objective,
+                owned.result.gradient.clone(),
+                owned.result.outer_hessian.clone(),
+                owned.result.warm_start.clone(),
             ));
-            result.outer_hessian
+            owned.result.outer_hessian
         } else {
             HessianValue::Unavailable
         };
-        st.warm_cache = Some(result.warm_start);
+        let objective = owned.result.objective;
+        let gradient = owned.result.gradient;
+        st.warm_cache = Some(owned.result.warm_start);
+        st.terminal_mode = Some((theta.to_owned(), objective, owned.mode));
         Ok(OuterEval {
-            cost: result.objective,
-            gradient: result.gradient,
+            cost: objective,
+            gradient,
             hessian: hessian_result,
             inner_beta_hint: None,
         })
@@ -2210,6 +2227,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let mut obj = problem.build_objective_with_screening_proxy(
         SpatialAdaptiveOuterState {
             warm_cache: None,
+            terminal_mode: None,
             last_eval: None,
         },
         |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
@@ -2221,7 +2239,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             } = decode_theta(&theta)?;
             let family_eval =
                 base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
-            let result = evaluate_custom_family_joint_hyper(
+            let owned = evaluate_custom_family_joint_hyper_owned(
                 &family_eval,
                 std::slice::from_ref(&blockspec),
                 &outer_opts,
@@ -2235,14 +2253,16 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     "spatial adaptive cost eval failed: {e}"
                 ))
             })?;
-            if !result.inner_converged {
-                st.warm_cache = Some(result.warm_start);
+            if !owned.result.inner_converged {
+                st.warm_cache = Some(owned.result.warm_start);
                 return Err(EstimationError::RemlOptimizationFailed(
                     "exact spatial adaptive cost inner solve did not converge".to_string(),
                 ));
             }
-            st.warm_cache = Some(result.warm_start);
-            Ok(result.objective)
+            let objective = owned.result.objective;
+            st.warm_cache = Some(owned.result.warm_start);
+            st.terminal_mode = Some((theta, objective, owned.mode));
+            Ok(objective)
         },
         |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
             eval_outer(
@@ -2260,6 +2280,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
          order: gam_solve::rho_optimizer::OuterEvalOrder| { eval_outer(st, theta, order) },
         Some(|st: &mut SpatialAdaptiveOuterState| {
             st.warm_cache = None;
+            st.terminal_mode = None;
             st.last_eval = None;
         }),
         Some(|st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
@@ -2271,7 +2292,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             } = decode_theta(&theta)?;
             let family_eval =
                 base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
-            let result = evaluate_custom_family_joint_hyper_efs(
+            let owned = evaluate_custom_family_joint_hyper_efs_owned(
                 &family_eval,
                 std::slice::from_ref(&blockspec),
                 &outer_opts,
@@ -2284,14 +2305,16 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     "spatial adaptive EFS eval failed: {e}"
                 ))
             })?;
-            if !result.inner_converged {
-                st.warm_cache = Some(result.warm_start);
+            if !owned.result.inner_converged {
+                st.warm_cache = Some(owned.result.warm_start);
                 return Err(EstimationError::RemlOptimizationFailed(
                     "exact spatial adaptive EFS inner solve did not converge".to_string(),
                 ));
             }
-            st.warm_cache = Some(result.warm_start);
-            Ok(result.efs_eval)
+            let objective = owned.result.efs_eval.cost;
+            st.warm_cache = Some(owned.result.warm_start);
+            st.terminal_mode = Some((theta, objective, owned.mode));
+            Ok(owned.result.efs_eval)
         }),
         // Seed-screening ranking proxy (#969). The regular cost closure
         // above hard-errors on a non-converged inner solve — correct for
@@ -2313,7 +2336,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             } = decode_theta(&theta)?;
             let family_eval =
                 base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
-            let result = evaluate_custom_family_joint_hyper(
+            let owned = evaluate_custom_family_joint_hyper_owned(
                 &family_eval,
                 std::slice::from_ref(&blockspec),
                 &outer_opts,
@@ -2327,8 +2350,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     "spatial adaptive screening eval failed: {e}"
                 ))
             })?;
-            st.warm_cache = Some(result.warm_start);
-            Ok(result.objective)
+            st.warm_cache = Some(owned.result.warm_start);
+            Ok(owned.result.objective)
         },
     );
 
@@ -2342,6 +2365,30 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let outer_iterations = certified_outer.iterations();
     let outer_grad_norm = certified_outer.final_grad_norm();
     let theta_star = certified_outer.rho().clone();
+    let (mode_theta, mode_objective, terminal_mode) =
+        obj.state.terminal_mode.take().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "exact spatial adaptive optimization certified without retaining its terminal coefficient mode"
+                    .to_string(),
+            )
+        })?;
+    if mode_theta.len() != theta_star.len()
+        || mode_theta
+            .iter()
+            .zip(theta_star.iter())
+            .any(|(mode, certified)| mode.to_bits() != certified.to_bits())
+    {
+        return Err(EstimationError::InvalidInput(
+            "exact spatial adaptive terminal coefficient mode does not bitwise match the certified hyperparameter vector"
+                .to_string(),
+        ));
+    }
+    if mode_objective.to_bits() != certified_outer.final_value().to_bits() {
+        return Err(EstimationError::InvalidInput(format!(
+            "exact spatial adaptive terminal coefficient mode objective does not bitwise match the certified objective: mode={mode_objective:.17e}, certified={:.17e}",
+            certified_outer.final_value(),
+        )));
+    }
     let DecodedSpatialAdaptiveTheta {
         rho: _,
         retained_lambdas,
@@ -2383,7 +2430,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         stacked_design: None,
         stacked_offset: None,
     };
-    let final_fit = fit_custom_family_fixed_log_lambdas_from_outer(
+    let final_fit = fit_custom_family_fixed_log_lambdas_from_owned_mode(
         &certified_final_family,
         &[final_blockspec],
         &BlockwiseFitOptions {
@@ -2394,7 +2441,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             compute_covariance: true,
             ..BlockwiseFitOptions::default()
         },
-        obj.state.warm_cache.as_ref(),
+        terminal_mode,
         &theta_star,
         &certified_outer,
     )

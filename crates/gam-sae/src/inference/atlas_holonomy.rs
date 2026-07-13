@@ -3235,7 +3235,7 @@ mod tests {
             target_misround_probability,
         );
         let mut gaussian = DeterministicGaussian::new(0x2311_0004);
-        let mut wrong = 0usize;
+        let mut correctly_rounded = 0usize;
         for _ in 0..REPLICATES {
             let mut input = template.clone();
             input.contributions[0].curvature_estimate = std::f64::consts::TAU
@@ -3257,8 +3257,9 @@ mod tests {
                     [AtlasStatisticalRefusal::GaussBonnetRoundingMarginExhausted { .. }]
                 ));
             }
-            wrong += usize::from(confidence.nearest_integer_candidate != true_chi);
+            correctly_rounded += usize::from(confidence.nearest_integer_candidate == true_chi);
         }
+        let wrong = REPLICATES - correctly_rounded;
         let observed = wrong as f64 / REPLICATES as f64;
         let binomial_standard_error =
             (target_misround_probability * (1.0 - target_misround_probability) / REPLICATES as f64)

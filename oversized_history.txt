@@ -1,8 +1,0 @@
-# Persistent audit of files that once exceeded the 10k-line hard limit.
-# Auto-managed by build.rs — do NOT hand-edit. Each non-comment line is a
-# single repo-relative path currently on probation: it breached 10k lines
-# and must be brought to at most 7k lines (a real ~30% cut / cohesive
-# split, not a thin tag-along satellite) before it is auto-pruned here.
-# Concurrent branches produce additive line-level diffs that union-merge;
-# the next build re-validates and prunes redeemed entries.
-crates/gam-custom-family/src/tests.rs
