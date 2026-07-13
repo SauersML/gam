@@ -5660,7 +5660,7 @@ fn test_pure_polyharmonic_origin_jets_preserve_derivative_singularities() {
         "2D thin-plate phi_rr(0) should diverge to -inf, got {tps_phi_rr}"
     );
     let (q, _, _, _) =
-        duchon_polyharmonic_operator_block_jets(0.0, 2.0, 2).unwrap_or_else(|e| panic!("{} failed: {:?}", "thin-plate operator jet", e));
+        duchon_polyharmonic_operator_block_jets(0.0, 2, 2).unwrap_or_else(|e| panic!("{} failed: {:?}", "thin-plate operator jet", e));
     assert!(
         q.is_infinite() && q.is_sign_negative(),
         "2D thin-plate phi_r/r at collision should diverge to -inf, got {q}"

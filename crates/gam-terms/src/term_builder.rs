@@ -4820,7 +4820,7 @@ fn parse_spatial_identifiability(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis::OperatorPenaltySpec;
+    use crate::basis::{OperatorPenaltySpec, PenaltySource};
     use crate::inference::formula_dsl::parse_formula;
     use gam_data::{DataSchema, SchemaColumn};
     use ndarray::{Array1, Array2};
