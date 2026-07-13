@@ -30,7 +30,7 @@ pub(crate) struct BinomialLocationScaleWiggleRowProgram<'a> {
 /// algebra.  Operation closures let both const-width `JetScalar` and
 /// runtime-width `RuntimeJetScalar` instantiate this exact body.
 #[inline]
-fn binomial_location_scale_wiggle_predictor_expression<S>(
+fn binomial_location_scale_wiggle_predictor_expression<S: Clone>(
     primaries: &[S],
     warp_stack: Option<[f64; 5]>,
     term_count: usize,
@@ -53,13 +53,14 @@ fn binomial_location_scale_wiggle_predictor_expression<S>(
             exp_neg_eta_ls,
         ],
     );
-    let mut q = mul(&neg(&primaries[0]), &inv_sigma);
+    let q0 = mul(&neg(&primaries[0]), &inv_sigma);
+    let mut q = q0.clone();
     if let Some(stack) = warp_stack {
-        q = add(&q, &compose(&q, stack));
+        q = add(&q, &compose(&q0, stack));
     }
     for slot in 0..term_count {
         let (axis, stack) = term(slot);
-        q = add(&q, &mul(&primaries[axis], &compose(&q, stack)));
+        q = add(&q, &mul(&primaries[axis], &compose(&q0, stack)));
     }
     q
 }

@@ -475,7 +475,7 @@ pub(crate) fn gls_wiggle_second_directional_coeffs(
         + &(2.0 * &base.hessian_mm * d * s1_v)
         + &(&first_v.gradient_mu * d2)
         + &(&base.gradient_mu * g2_v);
-    let coeff_mm_uv = &(&second_uv.hessian_mm * &d.mapv(|value| value * value))
+    let coeff_mm_uv = &(&second_uv.hessian_mm * &d_squared)
         + &(2.0 * &first_u.hessian_mm * d * s1_v)
         + &(2.0 * &first_v.hessian_mm * d * s1_u)
         + &(2.0 * &base.hessian_mm * s1_u * s1_v)

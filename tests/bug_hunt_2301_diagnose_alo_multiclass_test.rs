@@ -21,12 +21,15 @@ use std::process::Command;
 
 use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
+use gam::families::survival::resolve_termspec_for_prediction;
 use gam::gam_binary;
 use gam::inference::model::FittedModel;
 use gam::predict::input::build_predict_input_for_model;
 use gam::predict::{
-    SavedAloObservations, SavedModelAloDiagnostics, SavedModelAloInput, compute_saved_model_alo,
+    PredictInput, SavedAloObservations, SavedModelAloDiagnostics, SavedModelAloInput,
+    compute_saved_model_alo,
 };
+use gam::smooth::build_term_collection_design;
 use gam::test_support::cli_harness::run_or_panic;
 use ndarray::{Array1, Array2};
 
