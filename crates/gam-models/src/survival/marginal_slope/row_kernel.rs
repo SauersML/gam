@@ -750,9 +750,7 @@ fn rigid_row_feature_jets<S: JetScalar<4>>(
 ) -> [S; RIGID_FEATURE_DIMENSION] {
     let observed_g = vars[3].scale(inputs.probit_scale);
     let linear = observed_g.scale(inputs.z_sum);
-    let variance = vars[3]
-        .mul(&vars[3])
-        .scale(inputs.covariance_ones);
+    let variance = vars[3].mul(&vars[3]).scale(inputs.covariance_ones);
     [vars[0], vars[1], vars[2], linear, variance]
 }
 
@@ -861,8 +859,7 @@ pub(crate) fn rigid_row_order2(
     jacobian[FEATURE_Q1 * DIMENSION + FEATURE_Q1] = 1.0;
     jacobian[FEATURE_QD1 * DIMENSION + FEATURE_QD1] = 1.0;
     jacobian[FEATURE_LINEAR * DIMENSION + 3] = inputs.probit_scale * inputs.z_sum;
-    jacobian[FEATURE_VARIANCE * DIMENSION + 3] =
-        2.0 * primaries[3] * inputs.covariance_ones;
+    jacobian[FEATURE_VARIANCE * DIMENSION + 3] = 2.0 * primaries[3] * inputs.covariance_ones;
 
     let mut gradient = [0.0; DIMENSION];
     let mut flat_hessian = [0.0; DIMENSION * DIMENSION];
@@ -882,8 +879,7 @@ pub(crate) fn rigid_row_order2(
         &mut gradient,
         &mut flat_hessian,
         |gradient, hessian| {
-            hessian[3 * DIMENSION + 3] +=
-                gradient[FEATURE_VARIANCE] * 2.0 * inputs.covariance_ones;
+            hessian[3 * DIMENSION + 3] += gradient[FEATURE_VARIANCE] * 2.0 * inputs.covariance_ones;
         },
     );
     let hessian = [

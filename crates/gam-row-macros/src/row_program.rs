@@ -1993,9 +1993,7 @@ mod tests {
         })
         .expect("parse row program");
         let expanded = expand(input).expect("expand row program").to_string();
-        assert!(expanded.contains(
-            "JetScalar < __ROW_PROGRAM_DERIVATIVE_DIMENSION >"
-        ));
+        assert!(expanded.contains("JetScalar < __ROW_PROGRAM_DERIVATIVE_DIMENSION >"));
         assert!(expanded.contains("RuntimeJetScalar"));
         assert!(expanded.contains("fn sample_runtime"));
         assert!(expanded.contains("fn sample_order2"));

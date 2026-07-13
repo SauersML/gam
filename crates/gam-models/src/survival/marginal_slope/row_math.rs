@@ -528,9 +528,7 @@ pub fn survival_marginal_slope_vector_neglog(
         }
         .into());
     }
-    if slopes.iter().any(|value| !value.is_finite())
-        || z.iter().any(|value| !value.is_finite())
-    {
+    if slopes.iter().any(|value| !value.is_finite()) || z.iter().any(|value| !value.is_finite()) {
         return Err(SurvivalMarginalSlopeError::InvalidInput {
             reason: "survival marginal-slope vector scores and slopes must be finite".to_string(),
         }
@@ -554,13 +552,7 @@ pub fn survival_marginal_slope_vector_neglog(
     let variance = validated_vector_variance(workspace.quadratic_value(slopes), probit_scale)?;
     let features = [q0, q1, qd1, linear, variance]
         .map(|value| RuntimeValue::constant(value, RIGID_FEATURE_DIMENSION, &()));
-    Ok(rigid_feature_runtime_nll(
-        &features,
-        &inputs,
-        RIGID_FEATURE_DIMENSION,
-        &(),
-    )?
-    .value())
+    Ok(rigid_feature_runtime_nll(&features, &inputs, RIGID_FEATURE_DIMENSION, &())?.value())
 }
 
 #[cfg(test)]
@@ -2257,8 +2249,8 @@ mod tests {
             for (shape_index, covariance) in covariances.iter().enumerate() {
                 let mut production_workspace =
                     RigidVectorRowWorkspace::new(covariance).expect("production width workspace");
-                let value_workspace = RigidVectorValueWorkspace::new(covariance)
-                    .expect("value-only width workspace");
+                let value_workspace =
+                    RigidVectorValueWorkspace::new(covariance).expect("value-only width workspace");
                 for event in [0.0, 0.35, 1.0] {
                     let production_value = row_primary_closed_form_vector_into(
                         q0,

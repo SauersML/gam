@@ -598,8 +598,9 @@ mod tests {
         );
         assert!(!SURVIVAL_ROWJET_TEMPLATE.contains("struct J2"));
         assert!(RIGID_FEATURE_PROGRAM_CUDA_VGH.contains("void rigid_feature_program"));
-        assert!(RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA
-            .contains("void rigid_feature_program_pullback4"));
+        assert!(
+            RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA.contains("void rigid_feature_program_pullback4")
+        );
         assert!(RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA.contains("rigid_feature_program("));
         assert!(!RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA.contains("neglog_phi"));
         assert!(!RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA.contains("log_normal_pdf"));
@@ -609,7 +610,7 @@ mod tests {
         assert!(!RIGID_FEATURE_PROGRAM_CUDA_VGH.contains("0.0 *"));
         assert!(source.contains("survival_rowjet_vgh"));
         assert_eq!(source.matches("void rigid_feature_program(").count(), 1);
-        assert!(!source.contains("rigid_row_program"));
+        assert!(!source.contains(concat!("rigid_row_", "program")));
         assert_eq!(source.matches("extern \"C\" __global__").count(), 1,);
         for removed in [
             "survival_rowjet_no_t4",
