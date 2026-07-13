@@ -1537,10 +1537,11 @@ mod tests {
     }
 
     /// #932 runtime-width cutover gate. The production row program derives the
-    /// complete V/G/H tower in one `DynamicOrder2` pass; this compares every
-    /// channel with the retired strongest-hand schedule for correlated full and
-    /// low-rank score covariance. The explicit score-score assertions pin the
-    /// mixed blocks that a scalar or block-diagonal check would miss.
+    /// complete V/G/H tower through the scheduled compiled graph for `k <= 8`
+    /// and the same-expression dynamic backend above it. This compares every
+    /// channel with the retired strongest-hand schedule for all covariance
+    /// forms. The explicit score-score assertions pin the mixed blocks that a
+    /// scalar or block-diagonal check would miss.
     #[test]
     fn runtime_vector_row_program_matches_strongest_hand_mixed_score_vgh_932() {
         let diagonal = MarginalSlopeCovariance::Diagonal(Array1::from_vec(vec![1.2, 0.9, 0.7]));
@@ -1736,6 +1737,8 @@ mod tests {
             let mut production_workspace = RigidVectorRowWorkspace::new();
             let mut graph_workspace = Order2GraphWorkspace::new();
             let mut dynamic_arena = DynamicJetArena::new();
+            let initial_graph_bytes = production_workspace.graph.retained_bytes();
+            let initial_dynamic_bytes = production_workspace.dynamic.allocated_bytes();
             for (shape_index, covariance) in covariances.iter().enumerate() {
                 for event in [0.0, 0.35, 1.0] {
                     let production = row_primary_closed_form_vector(
@@ -1752,6 +1755,30 @@ mod tests {
                         &mut production_workspace,
                     )
                     .expect("production vector row");
+                    if shape_index == 0 && event == 0.0 {
+                        if k <= 8 {
+                            assert!(
+                                production_workspace.graph.retained_bytes() > initial_graph_bytes,
+                                "k={k}: scheduled production graph did not record a row"
+                            );
+                            assert_eq!(
+                                production_workspace.dynamic.allocated_bytes(),
+                                initial_dynamic_bytes,
+                                "k={k}: scheduled graph width unexpectedly used the dynamic arena"
+                            );
+                        } else {
+                            assert_eq!(
+                                production_workspace.graph.retained_bytes(),
+                                initial_graph_bytes,
+                                "k={k}: dynamic boundary unexpectedly recorded a graph"
+                            );
+                            assert!(
+                                production_workspace.dynamic.allocated_bytes()
+                                    > initial_dynamic_bytes,
+                                "k={k}: production boundary did not use the dynamic arena"
+                            );
+                        }
+                    }
                     let graph = row_primary_closed_form_vector_graph::<DIM>(
                         q0,
                         q1,
