@@ -1703,7 +1703,7 @@ mod tests {
     use gam_problem::Gauge;
     use ndarray::array;
 
-    const K_SURVIVAL: usize = 4;
+    const SINGLE_SCORE_PRIMARY_WIDTH: usize = 4;
 
     fn shared_logslope_layout(design: Array2<f64>) -> LogslopeLayout {
         let n = design.nrows();
@@ -1760,7 +1760,7 @@ mod tests {
         let dqd1 = Array2::from_shape_fn((n, p), |(i, j)| 0.5 * ((i * j) as f64));
         let op = TimeBlockOperator::new(dq0.clone(), dq1.clone(), dqd1.clone(), 1);
         let full = op.evaluate_full();
-        assert_eq!(full.shape(), &[n, p, K_SURVIVAL]);
+        assert_eq!(full.shape(), &[n, p, SINGLE_SCORE_PRIMARY_WIDTH]);
         for i in 0..n {
             for j in 0..p {
                 assert_eq!(full[[i, j, 0]], dq0[[i, j]]);
@@ -1778,7 +1778,7 @@ mod tests {
         let dq = Array2::from_shape_fn((n, p), |(i, j)| (i as f64) * (j as f64 + 1.0));
         let dqd1 = Array2::from_shape_fn((n, p), |(i, j)| (j as f64) - (i as f64));
         let op = QChannelBlockOperator::new(dq.clone(), dqd1.clone(), 1);
-        let mut out = [0.0_f64; K_SURVIVAL];
+        let mut out = [0.0_f64; SINGLE_SCORE_PRIMARY_WIDTH];
         let delta = [1.0_f64, -0.5];
         op.apply_row(3, &delta, &mut out);
         let want_q = dq[[3, 0]] * 1.0 + dq[[3, 1]] * (-0.5);
@@ -1795,7 +1795,7 @@ mod tests {
         let p = 2;
         let dg = Array2::from_shape_fn((n, p), |(i, j)| (i as f64) + 0.1 * (j as f64));
         let op = LogslopeBlockOperator::new(shared_logslope_layout(dg.clone()), 1).unwrap();
-        let mut out = [0.0_f64; K_SURVIVAL];
+        let mut out = [0.0_f64; SINGLE_SCORE_PRIMARY_WIDTH];
         let delta = [2.0_f64, -1.0];
         op.apply_row(1, &delta, &mut out);
         assert_eq!(out[0], 0.0);
@@ -2081,9 +2081,10 @@ mod tests {
             log_dg[[i, 0]] = (2.0 * x[i]).cos();
             log_dg[[i, 1]] = x[i].tanh();
         }
-        let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        let mut h_full =
+            Array3::<f64>::zeros((n, SINGLE_SCORE_PRIMARY_WIDTH, SINGLE_SCORE_PRIMARY_WIDTH));
         for i in 0..n {
-            for k in 0..K_SURVIVAL {
+            for k in 0..SINGLE_SCORE_PRIMARY_WIDTH {
                 h_full[[i, k, k]] = 1.0;
             }
         }
@@ -2210,9 +2211,10 @@ mod tests {
         // so the compiler's residualisation is ordinary least-squares
         // projection — exactly what we want for verifying the
         // structural rank-deficiency attribution.
-        let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        let mut h_full =
+            Array3::<f64>::zeros((n, SINGLE_SCORE_PRIMARY_WIDTH, SINGLE_SCORE_PRIMARY_WIDTH));
         for i in 0..n {
-            for k in 0..K_SURVIVAL {
+            for k in 0..SINGLE_SCORE_PRIMARY_WIDTH {
                 h_full[[i, k, k]] = 1.0;
             }
         }
@@ -2561,9 +2563,10 @@ mod tests {
         // Pass 1: structural identity row Hessian. q0/q1/qd1/g all weighted
         // equally → marg's q1 component is visible, so marg is identifiable
         // after residualising against the time block (drops_marg = 0).
-        let mut h_ident = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        let mut h_ident =
+            Array3::<f64>::zeros((n, SINGLE_SCORE_PRIMARY_WIDTH, SINGLE_SCORE_PRIMARY_WIDTH));
         for i in 0..n {
-            for k in 0..K_SURVIVAL {
+            for k in 0..SINGLE_SCORE_PRIMARY_WIDTH {
                 h_ident[[i, k, k]] = 1.0;
             }
         }
@@ -2586,7 +2589,8 @@ mod tests {
         // Pass 2: data-adaptive row Hessian that only weighs q0 (all
         // other channel diagonals zero). Marg's q1 contribution is now
         // invisible → marg fully aliases with time on q0 → drops_marg = 1.
-        let mut h_q0_only = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        let mut h_q0_only =
+            Array3::<f64>::zeros((n, SINGLE_SCORE_PRIMARY_WIDTH, SINGLE_SCORE_PRIMARY_WIDTH));
         for i in 0..n {
             h_q0_only[[i, 0, 0]] = 1.0;
             h_q0_only[[i, 3, 3]] = 1.0;
@@ -2722,7 +2726,8 @@ mod tests {
     /// contraction reads are then `w_mm=h00`, `w_mg=h03`, `w_gg=h33`. The
     /// 2×2 (q0,g) block `[[h00,h03],[h03,h33]]` is PSD when `h00·h33 ≥ h03²`.
     fn const_row_hess_q0g(n: usize, h00: f64, h03: f64, h33: f64) -> SurvivalRowHessian {
-        let mut h = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        let mut h =
+            Array3::<f64>::zeros((n, SINGLE_SCORE_PRIMARY_WIDTH, SINGLE_SCORE_PRIMARY_WIDTH));
         for i in 0..n {
             h[[i, 0, 0]] = h00;
             h[[i, 0, 3]] = h03;
