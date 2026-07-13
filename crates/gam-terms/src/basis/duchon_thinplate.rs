@@ -1812,8 +1812,25 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
     for i in 0..kernel_cols {
         penalty_bending[[i, i]] = radial_eigvals[i];
     }
-    let penalty_ridge = build_nullspace_shrinkage_penalty(&penalty_bending)?
-        .map(|block| block.sym_penalty)
+    // Evaluate the active raw chart on its frozen knot support.  The resulting
+    // Gram is a compact domain quadrature for the represented function, so the
+    // double penalty measures the L2 size of the polynomial/null component
+    // instead of the arbitrary Euclidean size of its coefficient vector.
+    let center_kernel_rotated = if kernel_cols == 0 {
+        Array2::<f64>::zeros((k, 0))
+    } else {
+        fast_ab(&fast_ab(&omega, &z), &radial_reparam)
+    };
+    let center_poly = thin_plate_polynomial_block(knots);
+    let mut center_design = Array2::<f64>::zeros((k, total_cols));
+    center_design
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&center_kernel_rotated);
+    center_design
+        .slice_mut(s![.., kernel_cols..])
+        .assign(&center_poly);
+    let function_gram = symmetrize_penalty(&fast_ata(&center_design));
+    let penalty_ridge = function_space_nullspace_shrinkage(&penalty_bending, &function_gram)?
         .unwrap_or_else(|| Array2::<f64>::zeros((total_cols, total_cols)));
 
     Ok(ThinPlateSplineBasis {

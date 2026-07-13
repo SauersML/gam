@@ -347,22 +347,11 @@ pub fn build_thin_plate_basiswithworkspace(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // #1476-class fix: rebuild the double-penalty null-space shrinkage ridge
-        // (`DoublePenaltyNullspace`) in the CONSTRAINED chart, exactly as the
-        // 1-D B-spline path does (`rebuild_double_penalty_nullspace_in_constrained_chart`)
-        // and as the tensor path now does after its identifiability restriction.
-        //
-        // The ridge above is `Z_null Z_nullᵀ` = the projector onto the null space
-        // of the RAW (pre-identifiability) bending penalty `penalty_bending` (its
-        // all-zero polynomial block), and it was then merely congruence-restricted
-        // to `Zᵀ Z_null Z_nullᵀ Z`. The thin-plate identifiability transform `Z`
-        // DROPS the constant polynomial column and is not norm-preserving, so the
-        // restricted matrix is neither idempotent nor aligned with the null space
-        // of the *constrained* bending penalty `Zᵀ S_bend Z` — it carries shrinkage
-        // mass onto penalized (kernel) directions. Rebuild the ridge from the null
-        // space of the restricted `Primary` bending penalty so the double penalty
-        // shrinks exactly the unpenalized polynomial subspace that survives the
-        // intercept-removal constraint.
+        // Rebuild the function-metric ridge after the non-square
+        // identifiability chart. A congruence of the raw ridge carries the
+        // correct metric action on surviving null vectors; rebuilding from that
+        // action restricts it to null(S_c) without manufacturing a Euclidean
+        // coefficient projector.
         if candidates
             .iter()
             .any(|c| matches!(c.source, PenaltySource::DoublePenaltyNullspace))
@@ -371,9 +360,12 @@ pub fn build_thin_plate_basiswithworkspace(
                 .iter()
                 .find(|c| matches!(c.source, PenaltySource::Primary))
                 .map(|c| c.matrix.clone());
-            if let Some(s_c) = constrained_bend {
-                let rebuilt = crate::basis::build_nullspace_shrinkage_penalty(&s_c)?
-                    .map(|shrink| shrink.sym_penalty);
+            let constrained_ridge = candidates
+                .iter()
+                .find(|c| matches!(c.source, PenaltySource::DoublePenaltyNullspace))
+                .map(|c| c.matrix.clone());
+            if let (Some(s_c), Some(r_c)) = (constrained_bend, constrained_ridge) {
+                let rebuilt = crate::basis::rebuild_metric_consistent_ridge(&s_c, &r_c)?;
                 let p = s_c.nrows();
                 for candidate in &mut candidates {
                     if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
@@ -503,13 +495,9 @@ pub fn thin_plate_penalties_at_length_scale(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // #1476-class fix (mirror of the cold build): rebuild the
-        // `DoublePenaltyNullspace` ridge from the null space of the restricted
-        // `Primary` bending penalty rather than carrying the raw-chart projector
-        // through the (non-norm-preserving, intercept-dropping) identifiability
-        // restriction. MUST match the cold `build_thin_plate_basiswithworkspace`
-        // path exactly so a frozen-geometry length-scale re-key (#1033) produces
-        // a byte-identical ridge to the original fit.
+        // Preserve the compact function metric through the frozen non-square
+        // identifiability chart. This mirrors the cold build so the n-free
+        // length-scale re-key produces the identical ridge.
         if candidates
             .iter()
             .any(|c| matches!(c.source, PenaltySource::DoublePenaltyNullspace))
@@ -518,9 +506,12 @@ pub fn thin_plate_penalties_at_length_scale(
                 .iter()
                 .find(|c| matches!(c.source, PenaltySource::Primary))
                 .map(|c| c.matrix.clone());
-            if let Some(s_c) = constrained_bend {
-                let rebuilt = crate::basis::build_nullspace_shrinkage_penalty(&s_c)?
-                    .map(|shrink| shrink.sym_penalty);
+            let constrained_ridge = candidates
+                .iter()
+                .find(|c| matches!(c.source, PenaltySource::DoublePenaltyNullspace))
+                .map(|c| c.matrix.clone());
+            if let (Some(s_c), Some(r_c)) = (constrained_bend, constrained_ridge) {
+                let rebuilt = crate::basis::rebuild_metric_consistent_ridge(&s_c, &r_c)?;
                 let p = s_c.nrows();
                 for candidate in &mut candidates {
                     if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
@@ -3153,7 +3144,30 @@ pub(crate) fn build_thin_plate_penalty_matrices(
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&omega_constrained);
     let penalty_ridge = if double_penalty {
-        build_nullspace_shrinkage_penalty(&penalty_bending)?.map(|block| block.sym_penalty)
+        // The frozen centers are the compact quadrature support of this
+        // regression-spline representation. Evaluate the FINAL raw chart
+        // `[K_CC Z | P(C)]` there and use its Gram as the function metric. This
+        // is O(k²), independent of the training row count, and remains available
+        // to the n-free length-scale re-key.
+        let center_kernel_design = fast_ab(&omega, kernel_transform);
+        let center_mean: Vec<f64> = (0..d)
+            .map(|axis| centers.column(axis).sum() / k.max(1) as f64)
+            .collect();
+        let mut centered = centers.to_owned();
+        for axis in 0..d {
+            let mean = center_mean[axis];
+            centered.column_mut(axis).mapv_inplace(|value| value - mean);
+        }
+        let center_poly = thin_plate_polynomial_block(centered.view());
+        let mut center_design = Array2::<f64>::zeros((k, total_cols));
+        center_design
+            .slice_mut(s![.., 0..kernel_cols])
+            .assign(&center_kernel_design);
+        center_design
+            .slice_mut(s![.., kernel_cols..])
+            .assign(&center_poly);
+        let function_gram = symmetrize_penalty(&fast_ata(&center_design));
+        function_space_nullspace_shrinkage(&penalty_bending, &function_gram)?
     } else {
         None
     };
