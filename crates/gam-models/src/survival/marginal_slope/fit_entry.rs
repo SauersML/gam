@@ -2834,7 +2834,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         // blocks followed by raw flex blocks, so the gauge is extended with
         // identity over the flex widths.
         let joint_gauge = lift.extend_with_identity(&flex_widths);
-        let lift_joint_covariance = |name: &str, matrix: Array2<f64>| -> Result<Array2<f64>, String> {
+        let lift_joint_covariance = |name: &str,
+                                     matrix: Array2<f64>|
+         -> Result<Array2<f64>, String> {
             let active = joint_gauge.reduced_total();
             if matrix.dim() != (active, active) {
                 return Err(format!(

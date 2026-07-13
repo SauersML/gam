@@ -1028,8 +1028,11 @@ pub struct AloInput<'a> {
 }
 
 impl<'a> AloInput<'a> {
-    /// Build an `AloInput` from `FitGeometry` and associated vectors.
-    pub fn from_geometry(
+    /// Build an `AloInput` from `FitGeometry` and an already active-coordinate
+    /// design. Raw saved designs must first be restricted through
+    /// `geom.coefficient_gauge`; keeping this constructor crate-private makes
+    /// that frame transition explicit at the public fit boundary.
+    fn from_active_geometry(
         geom: &'a FitGeometry,
         design: &'a Array2<f64>,
         eta: &'a Array1<f64>,
@@ -1068,11 +1071,12 @@ impl<'a> AloInput<'a> {
     /// comes from the canonical fit's exact unscaled Hessian accessor; callers
     /// do not need a second `FitGeometry` wrapper or a covariance inversion.
     ///
-    /// Same canonical (Fisher == Observed) contract as [`from_geometry`]: the
+    /// Same canonical (Fisher == Observed) contract as
+    /// [`from_active_geometry`]: the
     /// supplied `working_weights` are the score-side Fisher weights and are
     /// re-viewed for the Hessian-side slot via `as_signed()`.
     ///
-    /// [`from_geometry`]: AloInput::from_geometry
+    /// [`from_active_geometry`]: AloInput::from_active_geometry
     pub fn from_penalized_hessian_with_working_state(
         penalized_hessian: &'a Array2<f64>,
         design: &'a Array2<f64>,
@@ -1359,8 +1363,8 @@ pub fn compute_alo_diagnostics_from_fit(
 
 /// Compute ALO diagnostics from a `UnifiedFitResult`.
 ///
-/// Extracts `FitGeometry` from `unified.geometry`, builds an `AloInput`
-/// via `from_geometry`, and delegates to `compute_alo_from_input`.
+/// Extracts `FitGeometry` from `unified.geometry`, pulls the raw row design
+/// into the persisted active frame, and delegates to `compute_alo_from_input`.
 /// This avoids requiring a full `UnifiedFitResult` with PIRLS artifacts.
 pub fn compute_alo_diagnostics_from_unified(
     unified: &UnifiedFitResult,
@@ -1378,7 +1382,24 @@ pub fn compute_alo_diagnostics_from_unified(
                 .to_string(),
         })
         .map_err(EstimationError::from)?;
-    let input = AloInput::from_geometry(geom, design, eta, offset, phi);
+    geom.coefficient_gauge
+        .validate()
+        .map_err(|reason| AloError::InvalidInput {
+            reason: format!("UnifiedFitResult ALO coefficient gauge is invalid: {reason}"),
+        })
+        .map_err(EstimationError::from)?;
+    if design.ncols() != geom.coefficient_gauge.raw_total() {
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "UnifiedFitResult ALO raw design has {} columns; coefficient gauge requires {}",
+                design.ncols(),
+                geom.coefficient_gauge.raw_total(),
+            ),
+        }
+        .into());
+    }
+    let active_design = geom.coefficient_gauge.restrict_design(design);
+    let input = AloInput::from_active_geometry(geom, &active_design, eta, offset, phi);
     compute_alo_from_input(&input)
 }
 

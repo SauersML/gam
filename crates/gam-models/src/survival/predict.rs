@@ -202,6 +202,28 @@ pub enum SurvivalPredictEstimand {
     Plugin,
 }
 
+/// Exact coefficient-covariance definition used for competing-risks
+/// uncertainty.
+///
+/// Selection is strict: requesting [`Self::SmoothingCorrected`] requires a
+/// saved smoothing-corrected covariance and never substitutes the conditional
+/// covariance.  The resolved value is carried on
+/// [`CompetingRisksPredictResult`] so public frontends report what they used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurvivalPredictionCovarianceMode {
+    Conditional,
+    SmoothingCorrected,
+}
+
+impl SurvivalPredictionCovarianceMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conditional => "conditional",
+            Self::SmoothingCorrected => "smoothing-corrected",
+        }
+    }
+}
+
 /// Inputs to the unified survival predict pipeline.
 pub struct SurvivalPredictRequest<'a> {
     pub model: &'a SavedModel,
@@ -242,13 +264,33 @@ pub struct SurvivalPredictResult {
     pub eta_se: Option<Array1<f64>>,
 }
 
-/// Conditional-posterior covariance projected onto the coefficients that can
-/// affect a survival prediction.  The absorbed stage-one influence block in a
+fn select_survival_prediction_covariance<'a>(
+    conditional: Option<&'a Array2<f64>>,
+    smoothing_corrected: Option<&'a Array2<f64>>,
+    mode: SurvivalPredictionCovarianceMode,
+) -> Result<&'a Array2<f64>, SurvivalPredictError> {
+    match mode {
+        SurvivalPredictionCovarianceMode::Conditional => conditional.ok_or_else(|| {
+            SurvivalPredictError::PosteriorCovariance {
+                reason: "fit result does not contain conditional covariance".to_string(),
+            }
+        }),
+        SurvivalPredictionCovarianceMode::SmoothingCorrected => {
+            smoothing_corrected.ok_or_else(|| SurvivalPredictError::PosteriorCovariance {
+                reason: "fit result does not contain smoothing-corrected covariance".to_string(),
+            })
+        }
+    }
+}
+
+/// Exact selected posterior covariance projected onto coefficients that can
+/// affect a survival prediction. The absorbed stage-one influence block in a
 /// marginal-slope fit is persisted for inference provenance but deliberately
 /// drops out of deployment, so its trailing coordinates are not quadrature
 /// dimensions.
 fn survival_prediction_posterior_factor(
     model: &SavedModel,
+    covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<(Array1<f64>, Array2<f64>), SurvivalPredictError> {
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     let inactive_tail = if require_saved_survival_likelihood_mode(model)?
@@ -269,16 +311,16 @@ fn survival_prediction_posterior_factor(
             ),
         }
     })?;
-    let covariance = fit.beta_covariance().ok_or_else(|| {
-        SurvivalPredictError::PosteriorCovariance {
-            reason: "posterior-mean survival prediction requires the saved conditional coefficient covariance; refit with the current REML path"
-                .to_string(),
-        }
-    })?;
+    let covariance = select_survival_prediction_covariance(
+        fit.beta_covariance(),
+        fit.beta_covariance_corrected(),
+        covariance_mode,
+    )?;
     if covariance.nrows() != fit.beta.len() || covariance.ncols() != fit.beta.len() {
         return Err(SurvivalPredictError::PosteriorCovariance {
             reason: format!(
-                "saved survival conditional covariance has shape {}x{}, expected {}x{} in fitted block order",
+                "saved survival {} covariance has shape {}x{}, expected {}x{} in fitted block order",
+                covariance_mode.as_str(),
                 covariance.nrows(),
                 covariance.ncols(),
                 fit.beta.len(),
@@ -606,7 +648,10 @@ fn posterior_standard_error_vectors(
 fn predict_survival_posterior_mean(
     req: SurvivalPredictRequest<'_>,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let (posterior_mean, active_covariance) = survival_prediction_posterior_factor(req.model)?;
+    let (posterior_mean, active_covariance) = survival_prediction_posterior_factor(
+        req.model,
+        SurvivalPredictionCovarianceMode::Conditional,
+    )?;
     let mut result = predict_survival(SurvivalPredictRequest {
         model: req.model,
         data: req.data,
@@ -713,20 +758,51 @@ fn predict_survival_posterior_mean(
 
 fn predict_competing_risks_with_posterior(
     req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<CompetingRisksPredictResult, SurvivalPredictError> {
     let posterior_mean_estimand = req.estimand == SurvivalPredictEstimand::PosteriorMean;
-    let (posterior_mean, active_covariance) = survival_prediction_posterior_factor(req.model)?;
-    let mut result = predict_competing_risks_survival(SurvivalPredictRequest {
-        model: req.model,
-        data: req.data,
-        col_map: req.col_map,
-        training_headers: req.training_headers,
-        primary_offset: req.primary_offset,
-        noise_offset: req.noise_offset,
-        time_grid: req.time_grid,
-        with_uncertainty: false,
-        estimand: SurvivalPredictEstimand::Plugin,
-    })?;
+    let (posterior_mean, active_covariance) =
+        survival_prediction_posterior_factor(req.model, covariance_mode)?;
+    // The public posterior-mean point is always the conditional-posterior
+    // estimand. A smoothing-corrected interval changes only its reported
+    // uncertainty, exactly as on the standard-family path. If corrected
+    // covariance becomes available for this model class, compute the
+    // conditional point once and the corrected second moments separately;
+    // never silently change the point estimand with the interval mode.
+    let separate_conditional_point = posterior_mean_estimand
+        && req.with_uncertainty
+        && covariance_mode == SurvivalPredictionCovarianceMode::SmoothingCorrected;
+    let mut result = if separate_conditional_point {
+        predict_competing_risks_with_posterior(
+            SurvivalPredictRequest {
+                model: req.model,
+                data: req.data,
+                col_map: req.col_map,
+                training_headers: req.training_headers,
+                primary_offset: req.primary_offset,
+                noise_offset: req.noise_offset,
+                time_grid: req.time_grid,
+                with_uncertainty: false,
+                estimand: SurvivalPredictEstimand::PosteriorMean,
+            },
+            SurvivalPredictionCovarianceMode::Conditional,
+        )?
+    } else {
+        predict_competing_risks_survival(
+            SurvivalPredictRequest {
+                model: req.model,
+                data: req.data,
+                col_map: req.col_map,
+                training_headers: req.training_headers,
+                primary_offset: req.primary_offset,
+                noise_offset: req.noise_offset,
+                time_grid: req.time_grid,
+                with_uncertainty: false,
+                estimand: SurvivalPredictEstimand::Plugin,
+            },
+            SurvivalPredictionCovarianceMode::Conditional,
+        )?
+    };
     let cause_count = result.cif.len();
     let (n_rows, n_times) = result.overall_survival.dim();
     let mut survival_mean = (0..cause_count)
@@ -764,17 +840,20 @@ fn predict_competing_risks_with_posterior(
 
     for_each_survival_posterior_node(&posterior_mean, &active_covariance, |node, weight| {
         let draw_model = saved_model_with_survival_coefficients(req.model, node)?;
-        let draw = predict_competing_risks_survival(SurvivalPredictRequest {
-            model: &draw_model,
-            data: req.data,
-            col_map: req.col_map,
-            training_headers: req.training_headers,
-            primary_offset: req.primary_offset,
-            noise_offset: req.noise_offset,
-            time_grid: req.time_grid,
-            with_uncertainty: false,
-            estimand: SurvivalPredictEstimand::Plugin,
-        })?;
+        let draw = predict_competing_risks_survival(
+            SurvivalPredictRequest {
+                model: &draw_model,
+                data: req.data,
+                col_map: req.col_map,
+                training_headers: req.training_headers,
+                primary_offset: req.primary_offset,
+                noise_offset: req.noise_offset,
+                time_grid: req.time_grid,
+                with_uncertainty: false,
+                estimand: SurvivalPredictEstimand::Plugin,
+            },
+            SurvivalPredictionCovarianceMode::Conditional,
+        )?;
         if draw.cif.len() != cause_count
             || draw.survival.len() != cause_count
             || draw.hazard.len() != cause_count
@@ -874,7 +953,7 @@ fn predict_competing_risks_with_posterior(
             (None, None, None, None, None, None)
         };
 
-    if posterior_mean_estimand {
+    if posterior_mean_estimand && !separate_conditional_point {
         result.hazard = hazard_mean;
         result.survival = survival_mean
             .into_iter()
@@ -894,6 +973,7 @@ fn predict_competing_risks_with_posterior(
     result.cif_se = cif_se;
     result.overall_survival_se = overall_survival_se;
     result.eta_se = eta_se;
+    result.covariance_source = req.with_uncertainty.then_some(covariance_mode);
     Ok(result)
 }
 
@@ -1275,6 +1355,9 @@ pub struct CompetingRisksPredictResult {
     /// Per-endpoint linear predictor at each row's own exit time, endpoint x row.
     pub linear_predictor: Vec<Array1<f64>>,
     pub likelihood_mode: SurvivalLikelihoodMode,
+    /// Exact covariance definition used for posterior standard errors.
+    /// `None` means no uncertainty was requested.
+    pub covariance_source: Option<SurvivalPredictionCovarianceMode>,
     /// Posterior standard deviation of each cause-specific hazard surface.
     pub hazard_se: Option<Vec<Array2<f64>>>,
     /// Posterior standard deviation of each endpoint-specific survival surface.
@@ -1712,9 +1795,10 @@ pub fn predict_survival(
 
 pub fn predict_competing_risks_survival(
     req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<CompetingRisksPredictResult, SurvivalPredictError> {
     if req.estimand == SurvivalPredictEstimand::PosteriorMean || req.with_uncertainty {
-        return predict_competing_risks_with_posterior(req);
+        return predict_competing_risks_with_posterior(req, covariance_mode);
     }
     let SurvivalPredictRequest {
         model,
@@ -2204,6 +2288,7 @@ pub fn predict_competing_risks_survival(
         overall_survival,
         linear_predictor,
         likelihood_mode: saved_likelihood_mode,
+        covariance_source: None,
         hazard_se: None,
         survival_se: None,
         cumulative_hazard_se: None,
