@@ -1,5 +1,7 @@
 use gam_sae::front_door::admit_sae_fit;
-use gam_sae::sparse_dict::{BlockSparseConfig, BlockSparseStreamState, coordinate_partition_frames};
+use gam_sae::sparse_dict::{
+    BlockSparseConfig, BlockSparseStreamState, coordinate_partition_frames,
+};
 use memmap2::Mmap;
 use ndarray::Array2;
 use serde_json::json;
@@ -755,7 +757,6 @@ fn normalize(v: &mut [f64]) {
         *value /= norm;
     }
 }
-
 
 fn read_rss() -> Rss {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();

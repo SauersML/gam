@@ -210,15 +210,14 @@ mod tests {
         );
         assert!(metric.whitens_likelihood());
 
-        let bad_tag =
-            SaeFisherRowMetricRequest::from_tag(
-                factors.view(),
-                2,
-                3,
-                Some("mystery"),
-                Some("uncertified_approximation"),
-                None,
-            );
+        let bad_tag = SaeFisherRowMetricRequest::from_tag(
+            factors.view(),
+            2,
+            3,
+            Some("mystery"),
+            Some("uncertified_approximation"),
+            None,
+        );
         assert!(bad_tag.is_err());
         assert!(
             SaeFisherRowMetricRequest::from_tag(factors.view(), 2, 3, None, None, None).is_err()

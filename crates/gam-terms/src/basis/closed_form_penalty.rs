@@ -2773,9 +2773,11 @@ mod tests {
         // (d, m, s, q): d=3,m=s=1 admits only q=0 (the lead's spec); d=3,m=s=2
         // (Matérn order n=8) admits q=0,1,2 so the FD also exercises the higher
         // radial-derivative blocks. All odd-d convergent Duchon/Matérn cases.
-        let cases = [(3usize, 1usize, 1usize, 0usize)]
-            .into_iter()
-            .chain([(3, 2, 2, 0), (3, 2, 2, 1), (3, 2, 2, 2)]);
+        let cases = [(3usize, 1usize, 1usize, 0usize)].into_iter().chain([
+            (3, 2, 2, 0),
+            (3, 2, 2, 1),
+            (3, 2, 2, 2),
+        ]);
         for (d, m, s, q) in cases {
             for kappa in [0.7_f64, 1.9] {
                 let (f, f_kappa, f_kappa2) =

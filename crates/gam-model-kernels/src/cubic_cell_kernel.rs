@@ -4737,10 +4737,22 @@ mod tests {
             ("c3", f64::INFINITY),
         ] {
             let cell = match field {
-                "c0" => DenestedCubicCell { c0: invalid, ..base },
-                "c1" => DenestedCubicCell { c1: invalid, ..base },
-                "c2" => DenestedCubicCell { c2: invalid, ..base },
-                "c3" => DenestedCubicCell { c3: invalid, ..base },
+                "c0" => DenestedCubicCell {
+                    c0: invalid,
+                    ..base
+                },
+                "c1" => DenestedCubicCell {
+                    c1: invalid,
+                    ..base
+                },
+                "c2" => DenestedCubicCell {
+                    c2: invalid,
+                    ..base
+                },
+                "c3" => DenestedCubicCell {
+                    c3: invalid,
+                    ..base
+                },
                 _ => unreachable!(),
             };
             assert!(evaluate_affine_cell_state(cell, 3).is_err());

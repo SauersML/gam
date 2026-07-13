@@ -4064,9 +4064,7 @@ pub trait LinearOperator {
             MATRIX_FREE_PCG_MAX_ITER.max(4 * p),
         )
         .ok_or_else(|| {
-            format!(
-                "matrix-free PCG broke down for explicitly requested ridge {baseridge:.3e}"
-            )
+            format!("matrix-free PCG broke down for explicitly requested ridge {baseridge:.3e}")
         })?;
         if !solution.iter().all(|value| value.is_finite()) {
             return Err("matrix-free PCG produced a non-finite solution".to_string());
@@ -4109,13 +4107,7 @@ pub trait LinearOperator {
         rhs: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
     ) -> Result<Array1<f64>, String> {
-        self.solve_systemwith_policy(
-            weights,
-            rhs,
-            penalty,
-            0.0,
-            RidgePolicy::solver_only(),
-        )
+        self.solve_systemwith_policy(weights, rhs, penalty, 0.0, RidgePolicy::solver_only())
     }
     fn solve_systemwith_policy(
         &self,
@@ -6112,13 +6104,12 @@ impl From<&DesignMatrix> for DesignBlock {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockDesignOperator, CoefficientTransformOperator, DenseDesignMatrix, DenseDesignOperator,
-        DesignBlock, DesignMatrix, EmbeddedColumnBlock, FiniteSignedWeightsView,
-        MultiChannelOperator, PsdWeightsView, ReparamOperator, ResidualisedDesignOperator,
-        ConditionedDesign, RandomEffectOperator, RowwiseKroneckerOperator, SparseDesignMatrix,
-        dense_operator_to_dense_by_chunks,
-        dense_transpose_weighted_response, fast_atv, fast_av, streaming_sparse_csc_xt_diag_x,
-        weighted_crossprod_dense_view, xt_diag_x_symmetric,
+        BlockDesignOperator, CoefficientTransformOperator, ConditionedDesign, DenseDesignMatrix,
+        DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
+        FiniteSignedWeightsView, MultiChannelOperator, PsdWeightsView, RandomEffectOperator,
+        ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator, SparseDesignMatrix,
+        dense_operator_to_dense_by_chunks, dense_transpose_weighted_response, fast_atv, fast_av,
+        streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view, xt_diag_x_symmetric,
     };
     use crate::matrix::LinearOperator;
     use crate::test_support::no_densify_design;

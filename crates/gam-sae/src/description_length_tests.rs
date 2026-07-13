@@ -836,10 +836,7 @@ fn birth_prescreen_credits_dictionary_saving_when_basis_narrower_than_span() {
          got {got}, saving-alone {saving} (a zero-clamp regression)"
     );
     // Monotonicity: an even narrower basis earns a strictly larger saving.
-    let narrower = predicted_birth_dl_bits(&BirthMdlPrescreen {
-        basis_size: 3,
-        ..p
-    });
+    let narrower = predicted_birth_dl_bits(&BirthMdlPrescreen { basis_size: 3, ..p });
     assert!(
         narrower > got,
         "a narrower basis must earn a larger dictionary saving: m=3 {narrower} <= m=5 {got}"

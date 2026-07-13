@@ -2235,16 +2235,18 @@ impl SaeManifoldOuterObjective {
     ) -> Result<(SaeManifoldLoss, ArrowFactorCache), String> {
         self.term.set_homotopy_eta(eta)?;
         self.set_isometry_homotopy_weight(eta, isometry_targets);
-        let (_cost, loss, cache) = self.term.penalized_quasi_laplace_criterion_with_cache(
-            self.target.view(),
-            rho,
-            self.registry.as_ref(),
-            self.inner_max_iter,
-            self.learning_rate,
-            self.ridge_ext_coord,
-            self.ridge_beta,
-        )
-        .map_err(|error| error.to_string())?;
+        let (_cost, loss, cache) = self
+            .term
+            .penalized_quasi_laplace_criterion_with_cache(
+                self.target.view(),
+                rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            )
+            .map_err(|error| error.to_string())?;
         self.last_loss = Some(loss.clone());
         Ok((loss, cache))
     }
@@ -2912,8 +2914,7 @@ impl SaeManifoldOuterObjective {
         // value would both duplicate the dominant pass and risk differentiating
         // a different functional.
         let direct_logdet_admitted = self.term.streaming_plan().direct_logdet_admitted();
-        let criterion =
-            self.evaluate_outer_criterion_route(&rho, direct_logdet_admitted, true);
+        let criterion = self.evaluate_outer_criterion_route(&rho, direct_logdet_admitted, true);
         let infeasible_evaluation = |reason: &str| {
             (
                 EfsEval {
@@ -3949,32 +3950,33 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // same infeasible way here so the three lanes agree; a genuinely
         // non-recoverable error still propagates.
         let direct_logdet_admitted = self.term.streaming_plan().direct_logdet_admitted();
-        let evaluation = match self
-            .evaluate_outer_criterion_route(&rho_state, direct_logdet_admitted, false)
-        {
-            Ok(evaluated) => evaluated,
-            Err(SaeCriterionError::VanishedAtoms(atoms)) => {
-                log::debug!("SAE analytic evaluation reached fixed-K structural boundary: {atoms}");
-                self.probe_telemetry.infeasible_criterion_evals += 1;
-                return Ok(OuterEval::infeasible(rho.len()));
-            }
-            // A non-PD per-row/cross-row/Schur factor has no defined Laplace
-            // evidence at this ρ. Return the objective contract's typed
-            // infeasible evaluation so the optimizer rejects/backtracks. A
-            // finite sentinel here would be a different objective. Genuine
-            // evaluation defects still hard-error below.
-            Err(SaeCriterionError::Numerical(err))
-                if Self::is_recoverable_value_probe_refusal(&err) =>
-            {
-                self.probe_telemetry.record_refusal_kind(&err);
-                log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
-                self.probe_telemetry.infeasible_criterion_evals += 1;
-                return Ok(OuterEval::infeasible(rho.len()));
-            }
-            Err(SaeCriterionError::Numerical(err)) => {
-                return Err(EstimationError::RemlOptimizationFailed(err));
-            }
-        };
+        let evaluation =
+            match self.evaluate_outer_criterion_route(&rho_state, direct_logdet_admitted, false) {
+                Ok(evaluated) => evaluated,
+                Err(SaeCriterionError::VanishedAtoms(atoms)) => {
+                    log::debug!(
+                        "SAE analytic evaluation reached fixed-K structural boundary: {atoms}"
+                    );
+                    self.probe_telemetry.infeasible_criterion_evals += 1;
+                    return Ok(OuterEval::infeasible(rho.len()));
+                }
+                // A non-PD per-row/cross-row/Schur factor has no defined Laplace
+                // evidence at this ρ. Return the objective contract's typed
+                // infeasible evaluation so the optimizer rejects/backtracks. A
+                // finite sentinel here would be a different objective. Genuine
+                // evaluation defects still hard-error below.
+                Err(SaeCriterionError::Numerical(err))
+                    if Self::is_recoverable_value_probe_refusal(&err) =>
+                {
+                    self.probe_telemetry.record_refusal_kind(&err);
+                    log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
+                    self.probe_telemetry.infeasible_criterion_evals += 1;
+                    return Ok(OuterEval::infeasible(rho.len()));
+                }
+                Err(SaeCriterionError::Numerical(err)) => {
+                    return Err(EstimationError::RemlOptimizationFailed(err));
+                }
+            };
         let cost = evaluation.cost;
         self.record_fit_data_collapse_verdict(&rho_state)
             .map_err(EstimationError::RemlOptimizationFailed)?;
@@ -5445,9 +5447,8 @@ mod linear_parity_anchor_1026_tests {
             (1.0e-2_f64).ln(),
             vec![Array1::<f64>::zeros(1)],
         );
-        let mut obj = SaeManifoldOuterObjective::new(
-            term, target, None, init_rho, 60, 0.5, 1e-4, 1e-4,
-        );
+        let mut obj =
+            SaeManifoldOuterObjective::new(term, target, None, init_rho, 60, 0.5, 1e-4, 1e-4);
         let rho_flat = obj.baseline_rho.to_flat();
         let cap = obj.capability();
         assert_eq!(

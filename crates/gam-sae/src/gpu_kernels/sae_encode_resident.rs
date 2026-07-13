@@ -1757,7 +1757,11 @@ mod tests {
             );
             // The single-chart CPU router agrees with the top-1 selection.
             if let Some((idx, _)) = crate::encode::nearest_chart(atom_atlas, xv.view(), *amp) {
-                assert_eq!(Some(&idx), cpu.first(), "nearest_chart != topk[0] at amp {amp}");
+                assert_eq!(
+                    Some(&idx),
+                    cpu.first(),
+                    "nearest_chart != topk[0] at amp {amp}"
+                );
             }
             compared += 1;
         }

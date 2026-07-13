@@ -106,16 +106,15 @@ mod tests {
                     if i == 0 { 1.0 } else { 0.0 }
                 },
             );
-        let fisher_metric_request =
-            SaeFisherRowMetricRequest::from_tag(
-                fisher_u3.view(),
-                N_CIRCLE,
-                p_out,
-                None,
-                Some("uncertified_approximation"),
-                None,
-            )
-                .expect("rank-1 output-Fisher metric request");
+        let fisher_metric_request = SaeFisherRowMetricRequest::from_tag(
+            fisher_u3.view(),
+            N_CIRCLE,
+            p_out,
+            None,
+            Some("uncertified_approximation"),
+            None,
+        )
+        .expect("rank-1 output-Fisher metric request");
 
         let registry = AnalyticPenaltyRegistry::new();
         let seed = build_sae_fit_seed(SaeFitSeedRequest {

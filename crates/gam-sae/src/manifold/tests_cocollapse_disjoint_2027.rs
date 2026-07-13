@@ -393,11 +393,7 @@ fn overcomplete_k3_planar_term(n: usize, p: usize, m: usize, duplicate: bool) ->
         // atoms 0,1 share phase 0 when duplicating (atom 2 shifted); otherwise all
         // three phases are distinct.
         let phase = if duplicate {
-            if atom == 2 {
-                1.0 / 3.0
-            } else {
-                0.0
-            }
+            if atom == 2 { 1.0 / 3.0 } else { 0.0 }
         } else {
             atom as f64 / k as f64
         };

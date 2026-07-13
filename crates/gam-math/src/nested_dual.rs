@@ -289,14 +289,7 @@ impl Dual22 {
     #[inline]
     pub fn channels(&self) -> [f64; 9] {
         [
-            self.v.v,
-            self.g.v,
-            self.v.g,
-            self.h.v,
-            self.g.g,
-            self.v.h,
-            self.h.g,
-            self.g.h,
+            self.v.v, self.g.v, self.v.g, self.h.v, self.g.g, self.v.h, self.h.g, self.g.h,
             self.h.h,
         ]
     }
@@ -400,7 +393,9 @@ mod nested_dual_tower4_oracle_tests {
                 );
             }
         }
-        eprintln!("[nested-dual #932] Dual2<Dual2> vs Tower4<2> max_rel over 4 points = {max_rel:.3e}");
+        eprintln!(
+            "[nested-dual #932] Dual2<Dual2> vs Tower4<2> max_rel over 4 points = {max_rel:.3e}"
+        );
     }
 
     /// The directional seeding (arbitrary weight vectors `d1`, `d2`) reproduces
@@ -435,8 +430,7 @@ mod nested_dual_tower4_oracle_tests {
                     c_st += tower.h[a][b] * d1[a] * d2[b];
                     for cc in 0..2 {
                         for dd in 0..2 {
-                            c_sstt +=
-                                tower.t4[a][b][cc][dd] * d1[a] * d1[b] * d2[cc] * d2[dd];
+                            c_sstt += tower.t4[a][b][cc][dd] * d1[a] * d1[b] * d2[cc] * d2[dd];
                         }
                     }
                 }
@@ -460,7 +454,9 @@ mod nested_dual_tower4_oracle_tests {
                 );
             }
         }
-        eprintln!("[nested-dual #932] directional Dual2<Dual2> vs Tower4<2> contraction max_rel = {max_rel:.3e}");
+        eprintln!(
+            "[nested-dual #932] directional Dual2<Dual2> vs Tower4<2> contraction max_rel = {max_rel:.3e}"
+        );
     }
 
     /// `from_channels` is the exact inverse of `channels` (round-trip identity),

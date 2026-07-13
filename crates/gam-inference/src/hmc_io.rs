@@ -458,8 +458,6 @@ thread_local! {
     static NUTS_RESIDUAL_SCRATCH: RefCell<Array1<f64>> = RefCell::new(Array1::zeros(0));
 }
 
-
-
 /// Resolve and certify the scale metadata consumed by an HMC target.
 ///
 /// The fitted likelihood remains the source of the covariance-scale contract,

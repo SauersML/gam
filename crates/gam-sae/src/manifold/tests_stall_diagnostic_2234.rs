@@ -72,16 +72,17 @@ fn logdet_audit_point(
     registry: Option<&AnalyticPenaltyRegistry>,
     inner_max_iter: usize,
 ) -> Result<LogdetAuditPoint, String> {
-    let (criterion_value, loss, cache) = term.penalized_quasi_laplace_criterion_with_cache(
-        target,
-        rho,
-        registry,
-        inner_max_iter,
-        0.05,
-        1.0e-6,
-        1.0e-6,
-    )
-    .map_err(|error| error.to_string())?;
+    let (criterion_value, loss, cache) = term
+        .penalized_quasi_laplace_criterion_with_cache(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            0.05,
+            1.0e-6,
+            1.0e-6,
+        )
+        .map_err(|error| error.to_string())?;
     let raw_smoothness_sum: f64 = term
         .decoder_smoothness_value_per_atom(&rho.lambda_smooth_vec().unwrap())
         .iter()

@@ -653,7 +653,11 @@ pub fn run_sae_manifold_fit(mut request: SaeFitRequest) -> Result<SaeFitOutcome,
     for mut row in request.target.rows_mut() {
         row -= &mu;
     }
-    let tier0_residual_sum_squares = request.target.iter().map(|value| value * value).sum::<f64>();
+    let tier0_residual_sum_squares = request
+        .target
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>();
     // Tier-0 INPUT STANDARDIZATION — the conditioning half of the peel. There is
     // no column equilibration anywhere else in the fit path, so a raw activation
     // target's column-norm spread (measured ~1.3e4, joint Hessian κ ≈ 1e8 on
@@ -757,9 +761,7 @@ mod structured_pass_request_tests {
 #[cfg(test)]
 mod vanished_stage_tests {
     use super::*;
-    use crate::manifold::{
-        AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
-    };
+    use crate::manifold::{AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom};
     use gam_terms::latent::LatentManifold;
     use ndarray::Array3;
 

@@ -185,16 +185,15 @@ mod tests {
                 (N_CIRCLE, P_OUT, 1),
                 |(_, i, _)| if i == 0 { 1.0 } else { 0.0 },
             );
-        let dummy_metric =
-            SaeFisherRowMetricRequest::from_tag(
-                dummy_u.view(),
-                N_CIRCLE,
-                P_OUT,
-                None,
-                Some("uncertified_approximation"),
-                None,
-            )
-                .expect("placeholder metric request");
+        let dummy_metric = SaeFisherRowMetricRequest::from_tag(
+            dummy_u.view(),
+            N_CIRCLE,
+            P_OUT,
+            None,
+            Some("uncertified_approximation"),
+            None,
+        )
+        .expect("placeholder metric request");
 
         let registry = AnalyticPenaltyRegistry::new();
         let seed = build_sae_fit_seed(SaeFitSeedRequest {
@@ -328,7 +327,9 @@ mod tests {
                 let chord: Vec<f64> = {
                     let t_mat = Array2::from_shape_vec((1, 1), vec![t_to]).unwrap();
                     let g = atom.decode_at_coords(t_mat.view()).unwrap();
-                    (0..P_OUT).map(|j| scale[j] * g[[0, j]] - z_from[j]).collect()
+                    (0..P_OUT)
+                        .map(|j| scale[j] * g[[0, j]] - z_from[j])
+                        .collect()
                 };
                 let chord_norm = chord.iter().map(|&c| c * c).sum::<f64>().sqrt();
                 if !(chord_norm > 0.0) {

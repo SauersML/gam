@@ -2412,16 +2412,13 @@ mod penalty_logdet_unify_tests {
     fn strict_pseudo_logdet_matches_canonical_penalty_value() {
         // Rank-deficient PSD penalty: 2×2 active block + a structural null dim.
         // Active eigenvalues 1.5 and 2.5 ⇒ pseudo-logdet = ln 1.5 + ln 2.5.
-        let s_rank_deficient = array![
-            [2.0, 0.5, 0.0],
-            [0.5, 2.0, 0.0],
-            [0.0, 0.0, 0.0],
-        ];
+        let s_rank_deficient = array![[2.0, 0.5, 0.0], [0.5, 2.0, 0.0], [0.0, 0.0, 0.0],];
         let expected_deficient = 1.5_f64.ln() + 2.5_f64.ln();
         let strict = strict_exact_pseudo_logdet(&s_rank_deficient, 3).expect("strict logdet");
-        let canonical = PenaltyPseudologdet::from_components(&[s_rank_deficient.clone()], &[1.0], 0.0)
-            .expect("canonical pseudo-logdet")
-            .value();
+        let canonical =
+            PenaltyPseudologdet::from_components(&[s_rank_deficient.clone()], &[1.0], 0.0)
+                .expect("canonical pseudo-logdet")
+                .value();
         assert!(
             (strict - expected_deficient).abs() < 1e-10,
             "strict pseudo-logdet {strict} != analytic {expected_deficient}"

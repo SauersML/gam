@@ -665,7 +665,9 @@ pub enum TargetDoseError {
     InvalidRequest(String),
     Steering(String),
     Probe(String),
-    FactorNeedsPatchedForward { kind: FisherDoseKind },
+    FactorNeedsPatchedForward {
+        kind: FisherDoseKind,
+    },
     UnreachableTarget {
         target_nats: f64,
         amplitude: f64,
@@ -742,9 +744,7 @@ fn record_readout_probe(
             *radius = Some((*radius).map_or(amplitude, |current| current.max(amplitude)));
         }
     } else {
-        *first_failure = Some(
-            (*first_failure).map_or(amplitude, |failed| failed.min(amplitude)),
-        );
+        *first_failure = Some((*first_failure).map_or(amplitude, |failed| failed.min(amplitude)));
         if (*radius).is_some_and(|current| current >= amplitude) {
             *radius = None;
         }
@@ -821,16 +821,8 @@ pub fn steer_to_target_nats(
                   iterations: usize,
                   readout_kl_radius: Option<f64>|
      -> Result<TargetDosePlan, TargetDoseError> {
-        let steer = steer_delta(
-            model,
-            metric,
-            atom_k,
-            metric_row,
-            amplitude,
-            t_from,
-            t_to,
-        )
-        .map_err(TargetDoseError::Steering)?;
+        let steer = steer_delta(model, metric, atom_k, metric_row, amplitude, t_from, t_to)
+            .map_err(TargetDoseError::Steering)?;
         Ok(TargetDosePlan {
             target_nats,
             seed_amplitude,

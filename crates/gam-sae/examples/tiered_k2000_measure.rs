@@ -150,7 +150,11 @@ fn ev_vs_mean(target: ArrayView2<'_, f32>, recon: ArrayView2<'_, f32>, mean: &Ar
             tss += dm * dm;
         }
     }
-    if tss <= 0.0 { f64::NAN } else { 1.0 - rss / tss }
+    if tss <= 0.0 {
+        f64::NAN
+    } else {
+        1.0 - rss / tss
+    }
 }
 
 fn run() -> Result<(), String> {

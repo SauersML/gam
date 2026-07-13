@@ -33,13 +33,13 @@ use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3};
 
 use gam_terms::latent::LatentManifold;
 
-use crate::assignment::{AssignmentMode, SaeAssignment};
-use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
-use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
 use super::block_chart::{
     BlockChartComposeConfig, BlockChartComposeResult, compose_block_coordinate_charts,
 };
 use super::coordinate::explained_variance_from_reconstruction;
+use crate::assignment::{AssignmentMode, SaeAssignment};
+use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
+use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
 
 /// Result of the arrow-Schur-routed co-fit linear tier (Stage 1).
 #[derive(Clone, Debug)]
@@ -212,8 +212,7 @@ pub fn cofit_linear_via_arrow(
 
     let recon_f64 = term.try_fitted_for_rho(&rho)?;
     let reconstructed = recon_f64.mapv(|v| v as f32);
-    let explained_variance =
-        explained_variance_from_reconstruction(target, reconstructed.view())?;
+    let explained_variance = explained_variance_from_reconstruction(target, reconstructed.view())?;
 
     Ok(ArrowCofitReport {
         reconstructed,
@@ -364,7 +363,9 @@ pub fn cofit_composed_via_arrow(
     let (n, k_active) = blocks.dim();
     let b = codes.shape()[2];
     if b == 0 {
-        return Err("cofit_composed_via_arrow: block_size (codes.shape[2]) must be >= 1".to_string());
+        return Err(
+            "cofit_composed_via_arrow: block_size (codes.shape[2]) must be >= 1".to_string(),
+        );
     }
     if decoder.nrows() == 0 || decoder.nrows() % b != 0 {
         return Err(format!(
@@ -493,8 +494,7 @@ pub fn cofit_composed_via_arrow(
 
     let recon_f64 = term.try_fitted_for_rho(&rho)?;
     let reconstructed = recon_f64.mapv(|v| v as f32);
-    let explained_variance =
-        explained_variance_from_reconstruction(target, reconstructed.view())?;
+    let explained_variance = explained_variance_from_reconstruction(target, reconstructed.view())?;
 
     Ok(ArrowCofitReport {
         reconstructed,
@@ -530,11 +530,7 @@ fn require_fitting_iteration(entry: &str, max_iter: usize) -> Result<(), String>
 
 /// The BIC-selected chart-owned block set (single blocks + both members of each
 /// selected pair), restricted to blocks that can carry an angle (`b >= 2`).
-fn accepted_curved_blocks(
-    result: &BlockChartComposeResult,
-    g: usize,
-    b: usize,
-) -> HashSet<usize> {
+fn accepted_curved_blocks(result: &BlockChartComposeResult, g: usize, b: usize) -> HashSet<usize> {
     let mut s = HashSet::new();
     if b < 2 {
         return s;
@@ -614,8 +610,8 @@ mod tests {
             b,
         )
         .expect("block reconstruction");
-        let block_ev = explained_variance_from_reconstruction(x.view(), block_recon.view())
-            .expect("block EV");
+        let block_ev =
+            explained_variance_from_reconstruction(x.view(), block_recon.view()).expect("block EV");
 
         let arrow = cofit_linear_via_arrow(
             x.view(),

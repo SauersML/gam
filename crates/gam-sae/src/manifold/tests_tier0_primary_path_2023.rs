@@ -281,7 +281,9 @@ mod tests {
     /// must read `solver=Arc`), the terminal ‖g‖, and the stop reason — the exact
     /// evidence needed to locate the residual value↔gradient seam under ARC. This
     /// is the warm micro-repro standing in for the real-GPT-2 E1 mint.
-    fn run_primary_outer_search(target: Array2<f64>) -> Result<crate::manifold::SaeFitReport, SaeFitError> {
+    fn run_primary_outer_search(
+        target: Array2<f64>,
+    ) -> Result<crate::manifold::SaeFitReport, SaeFitError> {
         let assignment_kind = SaeFitAssignmentKind::Softmax;
         let minimal = build_sae_minimal_seed(SaeMinimalSeedRequest {
             target: target.view(),
@@ -403,5 +405,4 @@ mod tests {
             }
         }
     }
-
 }

@@ -4648,8 +4648,7 @@ const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
             "impl gam_math::jet_tower::RowProgram<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
             "impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
         ],
-        discovery_anchor:
-            "impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
+        discovery_anchor: "impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
         pin_path: "crates/gam-models/src/survival/location_scale/tests.rs",
         pin_anchors: &[
             "fn survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels()",
@@ -4728,11 +4727,15 @@ fn enforce_production_derivative_specializations(root: &Path) {
         let production_path = root.join(specialization.production_path);
         match fs::read_to_string(&production_path) {
             Ok(source) => {
-                let test_mask = compute_test_mask(&source, Path::new(specialization.production_path));
+                let test_mask =
+                    compute_test_mask(&source, Path::new(specialization.production_path));
                 for anchor in specialization.production_anchors {
                     match source.find(anchor) {
                         Some(offset) => {
-                            let line = source[..offset].bytes().filter(|byte| *byte == b'\n').count();
+                            let line = source[..offset]
+                                .bytes()
+                                .filter(|byte| *byte == b'\n')
+                                .count();
                             if test_mask.get(line).copied().unwrap_or(false) {
                                 violations.push(format!(
                                     "{} production anchor is gated by cfg(test): {}",
@@ -4772,54 +4775,60 @@ fn enforce_production_derivative_specializations(root: &Path) {
         }
     }
 
-    visit_files(root, &root.join("crates/gam-models/src"), &mut |rel, content| {
-        let rel_path = rel.to_string_lossy().replace('\\', "/");
-        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
-            return;
-        }
-        let test_mask = compute_test_mask(content, rel);
-        for (line_index, line) in content.lines().enumerate() {
-            if test_mask.get(line_index).copied().unwrap_or(false) {
-                continue;
+    visit_files(
+        root,
+        &root.join("crates/gam-models/src"),
+        &mut |rel, content| {
+            let rel_path = rel.to_string_lossy().replace('\\', "/");
+            if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+                return;
             }
-            let trimmed = line.trim();
-            let row_kernel_impl = trimmed
-                .split_once(" for ")
-                .is_some_and(|(implementation, _)| {
-                    (implementation.starts_with("impl ") || implementation.starts_with("impl<"))
-                        && implementation.contains("RowKernel<")
-                });
-            if row_kernel_impl
-                && !specialization_site_is_registered(
-                    DerivativeSpecializationKind::RowKernel,
-                    &rel_path,
-                    trimmed,
-                )
-            {
-                violations.push(format!(
+            let test_mask = compute_test_mask(content, rel);
+            for (line_index, line) in content.lines().enumerate() {
+                if test_mask.get(line_index).copied().unwrap_or(false) {
+                    continue;
+                }
+                let trimmed = line.trim();
+                let row_kernel_impl =
+                    trimmed
+                        .split_once(" for ")
+                        .is_some_and(|(implementation, _)| {
+                            (implementation.starts_with("impl ")
+                                || implementation.starts_with("impl<"))
+                                && implementation.contains("RowKernel<")
+                        });
+                if row_kernel_impl
+                    && !specialization_site_is_registered(
+                        DerivativeSpecializationKind::RowKernel,
+                        &rel_path,
+                        trimmed,
+                    )
+                {
+                    violations.push(format!(
                     "unregistered production RowKernel specialization at {rel_path}:{}: {trimmed}",
                     line_index + 1
                 ));
-            }
+                }
 
-            let generated_tower = trimmed.starts_with("fn ")
-                && trimmed.contains('[')
-                && trimmed.contains("third")
-                && trimmed.contains("fourth");
-            if generated_tower
-                && !specialization_site_is_registered(
-                    DerivativeSpecializationKind::RowAtom,
-                    &rel_path,
-                    trimmed,
-                )
-            {
-                violations.push(format!(
+                let generated_tower = trimmed.starts_with("fn ")
+                    && trimmed.contains('[')
+                    && trimmed.contains("third")
+                    && trimmed.contains("fourth");
+                if generated_tower
+                    && !specialization_site_is_registered(
+                        DerivativeSpecializationKind::RowAtom,
+                        &rel_path,
+                        trimmed,
+                    )
+                {
+                    violations.push(format!(
                     "unregistered generated third/fourth row specialization at {rel_path}:{}: {trimmed}",
                     line_index + 1
                 ));
+                }
             }
-        }
-    });
+        },
+    );
 
     if violations.is_empty() {
         return;

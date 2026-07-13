@@ -110,10 +110,7 @@ fn squared_distance(z: ArrayView2<'_, f64>, a: usize, b: usize) -> f64 {
 /// shortest edge joining two distinct components (ties by `(min_row, max_row)`) is
 /// added. This restores connectivity using the true nearest cross-component pair,
 /// so a graph that is already connected is returned untouched.
-pub(crate) fn deterministic_knn_graph(
-    z: ArrayView2<'_, f64>,
-    k: usize,
-) -> Vec<Vec<(usize, f64)>> {
+pub(crate) fn deterministic_knn_graph(z: ArrayView2<'_, f64>, k: usize) -> Vec<Vec<(usize, f64)>> {
     let n = z.nrows();
     let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
     if n == 0 {
@@ -122,7 +119,8 @@ pub(crate) fn deterministic_knn_graph(
     let k = k.min(n.saturating_sub(1)).max(1);
     // Undirected edge set keyed by (min, max) so the UNION symmetrization never
     // double-inserts a mutually-chosen edge.
-    let mut edges: std::collections::BTreeMap<(usize, usize), f64> = std::collections::BTreeMap::new();
+    let mut edges: std::collections::BTreeMap<(usize, usize), f64> =
+        std::collections::BTreeMap::new();
     for i in 0..n {
         let mut dists: Vec<(f64, usize)> = Vec::with_capacity(n - 1);
         for j in 0..n {
@@ -285,10 +283,7 @@ fn dijkstra(adj: &[Vec<(usize, f64)>], source: usize) -> Vec<f64> {
 
 /// Geodesic distances from every landmark to every row: row `l` is
 /// [`dijkstra`] from landmark `landmarks[l]`. Shape `(L, n)`.
-pub(crate) fn landmark_geodesics(
-    adj: &[Vec<(usize, f64)>],
-    landmarks: &[usize],
-) -> Array2<f64> {
+pub(crate) fn landmark_geodesics(adj: &[Vec<(usize, f64)>], landmarks: &[usize]) -> Array2<f64> {
     let n = adj.len();
     let l = landmarks.len();
     let mut out = Array2::<f64>::zeros((l, n));
@@ -408,11 +403,7 @@ pub fn intrinsic_geodesic_embedding(
     }
     let floor = leading * MDS_EIGENVALUE_FLOOR_FRAC;
     let mut order: Vec<usize> = (0..evals.len()).collect();
-    order.sort_by(|&i, &j| {
-        evals[j]
-            .total_cmp(&evals[i])
-            .then_with(|| i.cmp(&j))
-    });
+    order.sort_by(|&i, &j| evals[j].total_cmp(&evals[i]).then_with(|| i.cmp(&j)));
     let axes: Vec<usize> = order
         .into_iter()
         .filter(|&c| evals[c] > floor)
@@ -653,7 +644,10 @@ mod tests {
             let seed = sae_intrinsic_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
             assert_eq!(seed.dim(), (k, n, d));
             for v in seed.iter() {
-                assert!(v.is_finite(), "{kind:?}: non-finite intrinsic seed coord {v}");
+                assert!(
+                    v.is_finite(),
+                    "{kind:?}: non-finite intrinsic seed coord {v}"
+                );
             }
         }
     }

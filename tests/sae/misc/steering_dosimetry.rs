@@ -643,9 +643,8 @@ fn target_dose_probe_exhaustion_never_returns_an_unconverged_plan() {
     let unit = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("unit");
     let unit_nats = unit.predicted_nats.expect("unit dose");
     let target = 0.5_f64;
-    let mut probe = |amplitude: f64| -> Result<f64, String> {
-        Ok(0.5 * amplitude * amplitude * unit_nats)
-    };
+    let mut probe =
+        |amplitude: f64| -> Result<f64, String> { Ok(0.5 * amplitude * amplitude * unit_nats) };
     let error = steer_to_target_nats(
         &term,
         &metric,

@@ -983,7 +983,11 @@ fn spherical_harmonic_norm(l: usize, m: i64) -> f64 {
         ratio /= k as f64;
     }
     let base = ((2 * l + 1) as f64 / (4.0 * std::f64::consts::PI) * ratio).sqrt();
-    if m == 0 { base } else { base * std::f64::consts::SQRT_2 }
+    if m == 0 {
+        base
+    } else {
+        base * std::f64::consts::SQRT_2
+    }
 }
 
 /// One-dimensional order-3 jet `[f, f', f'', f''']` product (Leibniz).
@@ -1084,7 +1088,11 @@ impl SaeBasisEvaluator for SphericalHarmonicEvaluator {
         // Base (η-invariant) block: monopole + dipole `l ≤ 1` (the base sphere
         // embedding). The quadrupole and higher harmonics `l ≥ 2` are the
         // η-dialed curvature refinement, mirroring the fixed sphere chart.
-        let curved = self.columns.iter().map(|col| col.curved).collect::<Vec<_>>();
+        let curved = self
+            .columns
+            .iter()
+            .map(|col| col.curved)
+            .collect::<Vec<_>>();
         Ok(PhiEtaSplit::from_curved_mask(curved))
     }
 
@@ -1191,8 +1199,8 @@ pub fn select_spherical_harmonic_degree(
     target: ArrayView2<'_, f64>,
     max_degree: usize,
 ) -> Result<usize, String> {
-    use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
     use faer::Side;
+    use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 
     if coords.nrows() != target.nrows() {
         return Err(format!(
@@ -1216,7 +1224,9 @@ pub fn select_spherical_harmonic_degree(
     let rhs = fast_atb(&phi, &target.to_owned());
     let decoder = gram
         .cholesky(Side::Lower)
-        .map_err(|err| format!("select_spherical_harmonic_degree: gram factorization failed: {err:?}"))?
+        .map_err(|err| {
+            format!("select_spherical_harmonic_degree: gram factorization failed: {err:?}")
+        })?
         .solve_mat(&rhs);
 
     // Per-degree mean coefficient energy over the (2l+1) orders and all outputs.
@@ -3262,8 +3272,7 @@ mod tests {
                 noisy[[row, c]] += 0.01 * (2.0 * rng() - 1.0);
             }
         }
-        let selected =
-            select_spherical_harmonic_degree(coords.view(), noisy.view(), 6).unwrap();
+        let selected = select_spherical_harmonic_degree(coords.view(), noisy.view(), 6).unwrap();
         assert_eq!(
             selected, 3,
             "spectral-noise-floor bandwidth selection must recover the planted degree 3"
@@ -3279,11 +3288,9 @@ mod tests {
     #[test]
     fn spherical_harmonic_jets_match_finite_differences() {
         let evaluator = SphericalHarmonicEvaluator::new(4).unwrap();
-        let coords = Array2::from_shape_vec(
-            (4, 2),
-            vec![0.3, 0.7, -0.9, 2.1, 1.2, -1.3, -0.1, 4.0],
-        )
-        .unwrap();
+        let coords =
+            Array2::from_shape_vec((4, 2), vec![0.3, 0.7, -0.9, 2.1, 1.2, -1.3, -0.1, 4.0])
+                .unwrap();
         let h = 1e-5;
         let m = evaluator.basis_size();
         let hess = evaluator.second_jet(coords.view()).unwrap();
@@ -3326,8 +3333,7 @@ mod tests {
                     for a in 0..2 {
                         for b in 0..2 {
                             let fd = (hp[[row, col, a, b]] - hm[[row, col, a, b]]) / (2.0 * h);
-                            max_t_err =
-                                max_t_err.max((third[[row, col, a, b, axis]] - fd).abs());
+                            max_t_err = max_t_err.max((third[[row, col, a, b, axis]] - fd).abs());
                         }
                     }
                 }

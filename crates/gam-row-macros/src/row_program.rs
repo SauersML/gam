@@ -543,9 +543,7 @@ fn collect_scalar_expression_dependencies(
             op: UnOp::Neg(_),
             expr,
             ..
-        }) => {
-            collect_scalar_expression_dependencies(expr, dependencies)
-        }
+        }) => collect_scalar_expression_dependencies(expr, dependencies),
         Expr::Binary(ExprBinary {
             left, op, right, ..
         }) if matches!(
@@ -560,7 +558,8 @@ fn collect_scalar_expression_dependencies(
                 | BinOp::Le(_)
                 | BinOp::Gt(_)
                 | BinOp::Ge(_)
-        ) => {
+        ) =>
+        {
             collect_scalar_expression_dependencies(left, dependencies)?;
             collect_scalar_expression_dependencies(right, dependencies)
         }

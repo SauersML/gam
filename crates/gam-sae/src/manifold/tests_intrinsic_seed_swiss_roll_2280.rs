@@ -19,7 +19,7 @@
 //! [`sae_intrinsic_seed_initial_coords`] and its end-to-end auto-seed path.
 
 use super::*;
-use gam_linalg::faer_ndarray::{fast_ata, fast_atb, FaerCholesky};
+use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use ndarray::{Array2, Array3};
 
 /// fable-mobius's deterministic ~2-turn swiss-roll grid in R³ (no RNG): a flat
@@ -74,13 +74,19 @@ fn heldout_tps_r2(coords: &Array2<f64>, z: &Array2<f64>) -> f64 {
     let cmean = coords.mean_axis(ndarray::Axis(0)).unwrap();
     let mut cstd = [0.0_f64; 2];
     for k in 0..2 {
-        cstd[k] = (coords.column(k).iter().map(|&v| (v - cmean[k]).powi(2)).sum::<f64>()
+        cstd[k] = (coords
+            .column(k)
+            .iter()
+            .map(|&v| (v - cmean[k]).powi(2))
+            .sum::<f64>()
             / n as f64)
             .sqrt()
             .max(1e-12);
     }
     let n_centers = 70usize;
-    let centers: Vec<usize> = (0..n_centers).map(|i| i * (n - 1) / (n_centers - 1)).collect();
+    let centers: Vec<usize> = (0..n_centers)
+        .map(|i| i * (n - 1) / (n_centers - 1))
+        .collect();
     let width = 3 + n_centers;
     let mut phi = Array2::<f64>::zeros((n, width));
     let cs = |row: usize, k: usize| (coords[[row, k]] - cmean[k]) / cstd[k];
@@ -245,5 +251,8 @@ fn swiss_roll_intrinsic_seed_is_deterministic() {
     let dims = vec![2usize];
     let a = sae_intrinsic_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
     let b = sae_intrinsic_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
-    assert_eq!(a, b, "intrinsic swiss-roll seed must be bit-identical run-to-run");
+    assert_eq!(
+        a, b,
+        "intrinsic swiss-roll seed must be bit-identical run-to-run"
+    );
 }

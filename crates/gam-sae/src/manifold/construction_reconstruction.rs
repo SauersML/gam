@@ -710,16 +710,17 @@ impl SaeManifoldTerm {
             let dispersion = (2.0 * loss.data_fit / n_scalar).max(f64::MIN_POSITIVE);
             return Ok(self.unavailable_shape_uncertainty(dispersion));
         }
-        let (_cost, loss, cache) = self.penalized_quasi_laplace_criterion_with_cache(
-            target,
-            rho,
-            registry,
-            inner_max_iter,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-        )
-        .map_err(|error| error.to_string())?;
+        let (_cost, loss, cache) = self
+            .penalized_quasi_laplace_criterion_with_cache(
+                target,
+                rho,
+                registry,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            )
+            .map_err(|error| error.to_string())?;
         let residual = self.reconstruction_residual(target, rho)?;
         let dispersion =
             self.reconstruction_dispersion(&loss, &cache, rho, Some(residual.view()))?;

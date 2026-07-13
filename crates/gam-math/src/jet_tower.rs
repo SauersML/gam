@@ -2214,14 +2214,7 @@ mod tests {
             p: &[S; 2],
         ) -> Result<S, String> {
             let r = S::constant(self.y[row]).sub(&p[0]);
-            Ok(p[1].add(
-                &p[1]
-                    .scale(-2.0)
-                    .exp()
-                    .mul(&r)
-                    .mul(&r)
-                    .scale(0.5),
-            ))
+            Ok(p[1].add(&p[1].scale(-2.0).exp().mul(&r).mul(&r).scale(0.5)))
         }
     }
 
@@ -2347,16 +2340,11 @@ mod tests {
                 .get(row)
                 .ok_or_else(|| format!("gnarly: tau row {row} out of range"))?;
             let a = p[0].mul(&p[1]).exp();
-            let b = p[2]
-                .mul(&p[2])
-                .add(&S::constant(1.0))
-                .sqrt();
+            let b = p[2].mul(&p[2]).add(&S::constant(1.0)).sqrt();
             let c = a.add(&b).add(&S::constant(tau)).ln();
             let d = p[1].scale(0.5).add(&S::constant(2.0)).powf(1.7);
             let delta = p[0].sub(&p[2]);
-            Ok(c
-                .mul(&d.recip())
-                .add(&delta.mul(&delta).scale(0.25)))
+            Ok(c.mul(&d.recip()).add(&delta.mul(&delta).scale(0.25)))
         }
     }
 

@@ -327,7 +327,11 @@ pub(crate) fn evaluate_spline_local_values(
         let mut saved = 0.0;
         for r in 0..d {
             let den = right[r + 1] + left[d - r];
-            let temp = if !knot_span_is_degenerate(den) { n[r] / den } else { 0.0 };
+            let temp = if !knot_span_is_degenerate(den) {
+                n[r] / den
+            } else {
+                0.0
+            };
             n[r] = saved + right[r + 1] * temp;
             saved = left[d - r] * temp;
         }
@@ -484,7 +488,10 @@ mod knot_scale_invariance_tests {
         let ref_knots = clamped_cubic_knots(1.0);
         for &frac in &[0.05, 0.3, 0.55, 0.72, 0.95] {
             let s = partition_sum_at(frac, ref_knots.view(), degree);
-            assert!((s - 1.0).abs() < 1e-12, "unit-scale partition sum {s} != 1 at {frac}");
+            assert!(
+                (s - 1.0).abs() < 1e-12,
+                "unit-scale partition sum {s} != 1 at {frac}"
+            );
         }
 
         // Tiny-scale domain (magnitude 1e-12): the smallest distinct knot span
@@ -516,13 +523,8 @@ mod knot_scale_invariance_tests {
         let mut d2 = vec![0.0; num_basis];
         let mut d2_tiny = vec![0.0; num_basis];
         evaluate_bspline_derivative_scalar(0.37, knots.view(), degree, &mut d1).unwrap();
-        evaluate_bspline_derivative_scalar(
-            0.37 * scale,
-            tiny_knots.view(),
-            degree,
-            &mut d1_tiny,
-        )
-        .unwrap();
+        evaluate_bspline_derivative_scalar(0.37 * scale, tiny_knots.view(), degree, &mut d1_tiny)
+            .unwrap();
         evaluate_bsplinesecond_derivative_scalar(0.37, knots.view(), degree, &mut d2).unwrap();
         evaluate_bsplinesecond_derivative_scalar(
             0.37 * scale,
@@ -559,15 +561,7 @@ mod knot_scale_invariance_tests {
         let degree = 2;
         for &scale in &[1.0, 1e-12] {
             // t[3] == t[0] == 0 -> basis function 0 has zero support.
-            let knots = Array1::from(vec![
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                scale,
-                scale,
-                scale,
-            ]);
+            let knots = Array1::from(vec![0.0, 0.0, 0.0, 0.0, scale, scale, scale]);
             let err = validate_knot_spans_nondegenerate(knots.view(), degree)
                 .expect_err("zero-support basis must be rejected at scale {scale}");
             assert!(

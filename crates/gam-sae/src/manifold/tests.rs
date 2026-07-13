@@ -1332,13 +1332,9 @@ pub(crate) fn compact_mixed_dimensional_manifold_expands_euclidean_axes_2295() {
     .unwrap();
     let term = SaeManifoldTerm::new(vec![circle_atom, plane_atom], assignment).unwrap();
     let assignments = vec![array![1.0_f64, 1.0], array![1.0, 1.0]];
-    let layout = SaeRowLayout::from_topk_gates(
-        &assignments,
-        2,
-        vec![1, 2],
-        term.assignment.coord_offsets(),
-    )
-    .unwrap();
+    let layout =
+        SaeRowLayout::from_topk_gates(&assignments, 2, vec![1, 2], term.assignment.coord_offsets())
+            .unwrap();
 
     let (manifold, point) = term.compact_row_ext_manifold_and_point(0, &layout);
     assert_eq!(point.len(), 3);
@@ -1356,11 +1352,7 @@ pub(crate) fn compact_mixed_dimensional_manifold_expands_euclidean_axes_2295() {
     );
     assert_eq!(
         manifold
-            .project_vector_to_gradient_tangent(
-                point.view(),
-                gradient.view(),
-                velocity.view(),
-            )
+            .project_vector_to_gradient_tangent(point.view(), gradient.view(), velocity.view(),)
             .len(),
         3
     );
@@ -3675,9 +3667,7 @@ fn solve_exact_stationarity_is_self_adjoint_2080() {
     assert!(n_params >= 2, "fixture must expose ≥2 outer coordinates");
     // Two production IFT right-hand sides (the sparse coordinate and the smooth
     // coordinate), so the test exercises A⁺ on genuine, distinct arrow vectors.
-    let u = term
-        .outer_rho_gradient_ift_rhs(&rho, 0, &cache)
-        .unwrap();
+    let u = term.outer_rho_gradient_ift_rhs(&rho, 0, &cache).unwrap();
     let v = term
         .outer_rho_gradient_ift_rhs(&rho, n_params - 1, &cache)
         .unwrap();
@@ -3688,10 +3678,28 @@ fn solve_exact_stationarity_is_self_adjoint_2080() {
         .solve_exact_stationarity(&rho, target.view(), &cache, &solver, &v)
         .unwrap();
     // ⟨A⁺u, v⟩ vs ⟨u, A⁺v⟩ (pub arrow-vector fields; no type import needed).
-    let lhs = a_u.t.iter().zip(v.t.iter()).map(|(a, b)| a * b).sum::<f64>()
-        + a_u.beta.iter().zip(v.beta.iter()).map(|(a, b)| a * b).sum::<f64>();
-    let rhs = u.t.iter().zip(a_v.t.iter()).map(|(a, b)| a * b).sum::<f64>()
-        + u.beta.iter().zip(a_v.beta.iter()).map(|(a, b)| a * b).sum::<f64>();
+    let lhs = a_u
+        .t
+        .iter()
+        .zip(v.t.iter())
+        .map(|(a, b)| a * b)
+        .sum::<f64>()
+        + a_u
+            .beta
+            .iter()
+            .zip(v.beta.iter())
+            .map(|(a, b)| a * b)
+            .sum::<f64>();
+    let rhs =
+        u.t.iter()
+            .zip(a_v.t.iter())
+            .map(|(a, b)| a * b)
+            .sum::<f64>()
+            + u.beta
+                .iter()
+                .zip(a_v.beta.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f64>();
     let scale = lhs.abs().max(rhs.abs()).max(1.0);
     assert!(
         (lhs - rhs).abs() <= 1.0e-6 * scale,

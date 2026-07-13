@@ -203,12 +203,7 @@ impl MultiDirJet {
             let mut buf = cell.borrow_mut();
             buf.clear();
             buf.resize(4 * count, 0.0);
-            compose_unary_coefficients_into(
-                &self.coeffs,
-                derivs,
-                buf.as_mut_slice(),
-                &mut out,
-            );
+            compose_unary_coefficients_into(&self.coeffs, derivs, buf.as_mut_slice(), &mut out);
         });
         Self { coeffs: out }
     }
@@ -231,12 +226,7 @@ pub fn compose_unary_four_slot_coefficients(
 ) -> [f64; 16] {
     let mut scratch = [0.0f64; 64];
     let mut out = [0.0f64; 16];
-    compose_unary_coefficients_into(
-        &coefficients,
-        derivs,
-        &mut scratch,
-        &mut out,
-    );
+    compose_unary_coefficients_into(&coefficients, derivs, &mut scratch, &mut out);
     out
 }
 

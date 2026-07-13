@@ -531,9 +531,7 @@ impl RowMetric {
                         .to_string(),
                 );
             }
-            FisherFactorKind::CertifiedPsdLowerBound
-                if self.truncation_mass_residual.is_none() =>
-            {
+            FisherFactorKind::CertifiedPsdLowerBound if self.truncation_mass_residual.is_none() => {
                 return Err(
                     "RowMetric::with_fisher_factor_kind CertifiedPsdLowerBound requires an exact omitted-trace record"
                         .to_string(),

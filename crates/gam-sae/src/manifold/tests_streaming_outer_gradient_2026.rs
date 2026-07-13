@@ -331,11 +331,7 @@ fn wide_border_routes_to_streaming_with_complete_analytic_gradient_certificate()
 #[test]
 fn production_objective_forced_streaming_value_gradient_matches_dense() {
     let target = planted_circle_embedded(32, 4, 0.02);
-    let mut term = planted_circle_seed_term(
-        target.view(),
-        PlantedCircleAssignmentMode::Softmax,
-    )
-    .0;
+    let mut term = planted_circle_seed_term(target.view(), PlantedCircleAssignmentMode::Softmax).0;
     term.atoms[0].basis_second_jet = Some(Arc::new(
         PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator"),
     ));
@@ -350,19 +346,11 @@ fn production_objective_forced_streaming_value_gradient_matches_dense() {
         1.0e-6,
         1.0e-6,
     );
-    let mut streaming = SaeManifoldOuterObjective::new(
-        term,
-        target,
-        None,
-        rho.clone(),
-        40,
-        1.0,
-        1.0e-6,
-        1.0e-6,
-    );
+    let mut streaming =
+        SaeManifoldOuterObjective::new(term, target, None, rho.clone(), 40, 1.0, 1.0e-6, 1.0e-6);
 
-    let dense_eval = OuterObjective::eval(&mut dense, &rho.to_flat())
-        .expect("dense production value+gradient");
+    let dense_eval =
+        OuterObjective::eval(&mut dense, &rho.to_flat()).expect("dense production value+gradient");
     let streaming_artifact = streaming
         .evaluate_outer_criterion_route(&rho, false, false)
         .expect("forced streaming production artifact");

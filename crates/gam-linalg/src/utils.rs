@@ -145,7 +145,6 @@ pub fn inf_norm<I: IntoIterator<Item = f64>>(values: I) -> f64 {
     values.into_iter().fold(0.0_f64, |acc, x| acc.max(x.abs()))
 }
 
-
 /// A posteriori certificate for an unperturbed symmetric linear solve.
 ///
 /// The reported backward error is the max-entry norm bound
@@ -613,12 +612,12 @@ fn certified_symmetric_matrix_solve(
             });
         }
     }
-    let factor = StableSolver::new()
-        .factorize(matrix)
-        .map_err(|error| CertifiedSymmetricSolveError::Factorization {
+    let factor = StableSolver::new().factorize(matrix).map_err(|error| {
+        CertifiedSymmetricSolveError::Factorization {
             label: label.to_string(),
             reason: error.to_string(),
-        })?;
+        }
+    })?;
     let mut solution = rhs.clone();
     let mut solution_view = array2_to_matmut(&mut solution);
     factor.solve_in_place(solution_view.as_mut());
@@ -730,7 +729,6 @@ impl StableSolver {
         let view = FaerArrayView::new(matrix);
         factorize_symmetricwith_fallback(view.as_ref(), Side::Lower)
     }
-
 }
 
 pub fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
@@ -1912,6 +1910,9 @@ mod condition_number_tests {
         m[[0, 0]] = 1.0e-14;
         m[[1, 1]] = 4.0;
         let cond = symmetric_spectrum_condition_number(&m);
-        assert!(cond > 1.0e14, "expected unfloored ratio ~4e14, got {cond:e}");
+        assert!(
+            cond > 1.0e14,
+            "expected unfloored ratio ~4e14, got {cond:e}"
+        );
     }
 }

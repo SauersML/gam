@@ -3696,9 +3696,9 @@ impl SaeManifoldTerm {
         // eigenvalues, i.e. the residual's per-direction energies (squared singular
         // values). p×p keeps the cost off `n` for the wide-output regime.
         let gram = fast_atb(&residual, &residual);
-        let (_u, energies, _vt) = gram.svd(false, false).map_err(|e| {
-            format!("residual_has_uncovered_signal: residual-Gram SVD failed: {e}")
-        })?;
+        let (_u, energies, _vt) = gram
+            .svd(false, false)
+            .map_err(|e| format!("residual_has_uncovered_signal: residual-Gram SVD failed: {e}"))?;
         let energies: Vec<f64> = energies
             .iter()
             .copied()
@@ -8246,7 +8246,9 @@ mod projection_policy_tests {
     fn leading_direction_above_noise_floor_separates_signal_from_noise_2132() {
         // Pure noise: comparable per-direction energies, no spike ⇒ the leading
         // direction does NOT clear the lower-quartile·log2 floor.
-        let noise: Vec<f64> = (0..20).map(|i| 1.0 + 0.15 * ((i % 5) as f64 - 2.0)).collect();
+        let noise: Vec<f64> = (0..20)
+            .map(|i| 1.0 + 0.15 * ((i % 5) as f64 - 2.0))
+            .collect();
         assert!(
             !leading_direction_above_noise_floor(&noise),
             "a flat (pure-noise) residual spectrum must read as NO uncovered signal"

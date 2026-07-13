@@ -184,8 +184,7 @@ pub fn fit_tiered(
     let seed_policy = config
         .tier1_seed
         .resolve(r0_f32.nrows(), r0_f32.ncols(), &config.tier1);
-    let tier1 =
-        fit_block_sparse_dictionary_with_seed(r0_f32.view(), &config.tier1, seed_policy)?;
+    let tier1 = fit_block_sparse_dictionary_with_seed(r0_f32.view(), &config.tier1, seed_policy)?;
 
     let mut ledger = SaeMigrationLedger::new();
 

@@ -369,15 +369,8 @@ pub(crate) fn has_clamped_bspline_boundaries(knotview: ArrayView1<f64>, degree: 
     }
     let left = knotview[0];
     let right = knotview[knotview.len() - 1];
-    let left_clamped = knotview
-        .iter()
-        .take(clamp_count)
-        .all(|&k| k == left);
-    let right_clamped = knotview
-        .iter()
-        .rev()
-        .take(clamp_count)
-        .all(|&k| k == right);
+    let left_clamped = knotview.iter().take(clamp_count).all(|&k| k == left);
+    let right_clamped = knotview.iter().rev().take(clamp_count).all(|&k| k == right);
     left_clamped && right_clamped
 }
 
