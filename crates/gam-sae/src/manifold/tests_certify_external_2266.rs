@@ -1,25 +1,23 @@
-//! #2266 — evaluation-only certification entry for externally-trained
-//! (torch-lane) SAE-manifold state.
+//! #2263/#2266 — zero-optimization stationarity audit for externally-trained
+//! SAE-manifold state.
 //!
 //! [`crate::manifold::tests_tier0_primary_path_2023`] drives the full typed
 //! seed → fit pipeline through [`run_sae_manifold_fit`]. This module proves
-//! the sibling path: a caller that already has a fitted decoder / coordinates
-//! / gate logits (e.g. produced by a torch-lane trainer, not this crate's
-//! closed-form solve) can hand that state to [`run_sae_manifold_certify`]
-//! and get the SAME post-fit diagnostics/certificates WITHOUT this crate
-//! ever running an outer ρ search or an inner solve on it. The seed built by
-//! `build_sae_fit_seed` stands in for the externally-trained state here —
-//! `run_sae_manifold_certify` is never handed to `run_sae_manifold_fit`, so
-//! the certified term is exactly the SEED, not a converged fit.
+//! the sibling path: arbitrary arrays are evaluated but cannot become a fit;
+//! only an exact state independently certified by the native inner-KKT and
+//! outer-criterion authorities reaches the post-fit report.
 
 #[cfg(test)]
 mod tests {
     use crate::inference::steering::steer_delta;
     use crate::manifold::{
-        SaeCertifyRequest, SaeFisherRowMetricRequest, SaeFitAssignmentKind, SaeFitConfig,
-        SaeFitSeedReport, SaeFitSeedRequest, SaeMinimalSeedReport, SaeMinimalSeedRequest,
-        SaeOuterVerdict, build_sae_fit_seed, build_sae_minimal_seed, run_sae_manifold_certify,
+        SaeCertifyRequest, SaeExternalCertificationOutcome, SaeFisherRowMetricRequest,
+        SaeFitAssignmentKind, SaeFitConfig, SaeFitSeedReport, SaeFitSeedRequest,
+        SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, SaeMinimalSeedReport,
+        SaeMinimalSeedRequest, SaeOuterVerdict, build_sae_fit_seed, build_sae_minimal_seed,
+        run_sae_manifold_certify,
     };
+    use gam_solve::rho_optimizer::{OuterProblem, OuterResult};
     use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
     use ndarray::{Array2, Array3};
 
@@ -51,14 +49,13 @@ mod tests {
         })
     }
 
-    /// Build a K=1 periodic-atom seed term via the minimal-seed pipeline
-    /// (mirrors `tests_tier0_primary_path_2023::run_primary`'s seed
-    /// construction) and hand it STRAIGHT to `run_sae_manifold_certify` — no
-    /// call to `run_sae_manifold_fit` anywhere in this path, so the certified
-    /// term is exactly the seed, standing in for an externally-trained state
-    /// this crate never optimized.
-    #[test]
-    fn certify_external_seed_without_running_the_solve() {
+    fn seeded_external_fixture() -> (
+        Array2<f64>,
+        SaeManifoldTerm,
+        SaeManifoldRho,
+        bool,
+        &'static str,
+    ) {
         let target = circle_target();
         let assignment_kind = SaeFitAssignmentKind::Softmax;
         let minimal = build_sae_minimal_seed(SaeMinimalSeedRequest {
@@ -158,84 +155,126 @@ mod tests {
             isometry_pin_active,
             metric_provenance,
         } = seed;
-        let k_atoms_seeded = base_term.k_atoms();
-
-        let report = run_sae_manifold_certify(SaeCertifyRequest {
+        (
+            target,
             base_term,
-            target: target.clone(),
-            registry,
             initial_rho,
-            max_iter: 4,
+            isometry_pin_active,
+            metric_provenance,
+        )
+    }
+
+    fn certify_request(
+        target: Array2<f64>,
+        base_term: SaeManifoldTerm,
+        initial_rho: SaeManifoldRho,
+        isometry_pin_active: bool,
+        metric_provenance: &'static str,
+    ) -> SaeCertifyRequest {
+        SaeCertifyRequest {
+            base_term,
+            target,
+            registry: AnalyticPenaltyRegistry::new(),
+            initial_rho,
+            max_iter: 40,
             learning_rate: 1.0,
             ridge_ext_coord: 1.0e-6,
             ridge_beta: 1.0e-6,
             alpha: 1.0,
             isometry_pin_active,
             metric_provenance,
-            // Keep the test deterministic and cheap: the structure-search
-            // path around a certified external state is exercised by the
-            // production fit entry's own coverage; this test's contract is
-            // the certify entry's postlude on the state AS PROVIDED.
             run_structure_search: false,
             cancel: None,
-        })
-        .expect("certify entry runs without invoking the closed-form solve");
+        }
+    }
 
-        // #2266 — no outer search and no inner solve ran on this path.
-        assert_eq!(
+    #[test]
+    fn raw_external_seed_is_a_typed_nonfit() {
+        let (target, term, rho, pin, provenance) = seeded_external_fixture();
+        let outcome = run_sae_manifold_certify(certify_request(
+            target,
+            term,
+            rho,
+            pin,
+            provenance,
+        ))
+        .expect("stationarity audit itself must evaluate");
+        let SaeExternalCertificationOutcome::NonStationary(report) = outcome else {
+            panic!("an unoptimized seed must never mint SaeFitReport");
+        };
+        assert!(!report.inner.certifies());
+        assert_eq!(report.optimization_iterations, 0);
+        assert!(report.reason.contains("inner KKT stationarity"));
+    }
+
+    fn native_converged_state() -> (Array2<f64>, SaeManifoldTerm, SaeManifoldRho, bool, &'static str) {
+        let (target, term, rho, pin, provenance) = seeded_external_fixture();
+        let rho_flat = rho.to_flat();
+        let registry = AnalyticPenaltyRegistry::new();
+        let mut objective = SaeManifoldOuterObjective::new(
+            term,
+            target.clone(),
+            Some(registry),
+            rho,
+            40,
+            1.0,
+            1.0e-6,
+            1.0e-6,
+        );
+        let result: OuterResult = OuterProblem::new(rho_flat.len())
+            .with_initial_rho(rho_flat)
+            .run(&mut objective, "#2263 native replay fixture")
+            .expect("native outer search must run");
+        assert!(result.converged, "native fixture must be genuinely converged");
+        objective
+            .certify_outer_result(&result)
+            .expect("native result must carry the shared stationarity certificate");
+        objective.remove_checkpoint();
+        let fitted = objective.into_fitted().expect("certified native fit");
+        (target, fitted.term, fitted.rho, pin, provenance)
+    }
+
+    #[test]
+    fn converged_native_replay_passes_zero_optimization_audit_and_perturbation_fails() {
+        let (target, term, rho, pin, provenance) = native_converged_state();
+        let mut perturbed = term.clone();
+        let mut beta = perturbed.flatten_beta();
+        beta[0] += 0.25;
+        perturbed
+            .set_flat_beta(beta.view())
+            .expect("perturb installed decoder");
+        let perturbed_outcome = run_sae_manifold_certify(certify_request(
+            target.clone(),
+            perturbed,
+            rho.clone(),
+            pin,
+            provenance,
+        ))
+        .expect("perturbed state must be evaluated");
+        assert!(matches!(
+            perturbed_outcome,
+            SaeExternalCertificationOutcome::NonStationary(_)
+        ));
+
+        let outcome = run_sae_manifold_certify(certify_request(
+            target.clone(),
+            term,
+            rho,
+            pin,
+            provenance,
+        ))
+        .expect("converged replay audit");
+        let SaeExternalCertificationOutcome::Certified(report) = outcome else {
+            panic!("a natively converged exact replay must pass the zero-step audit");
+        };
+        assert!(matches!(
             report.outer_termination.verdict,
-            SaeOuterVerdict::External,
-            "the certify entry must report the External verdict, never a Search/FixedRho \
-             certificate for state it never optimized"
-        );
-        assert_eq!(
-            report.outer_termination.evals, 0,
-            "no outer/inner evaluation ran on the certify path"
-        );
+            SaeOuterVerdict::Audited(_)
+        ));
+        assert_eq!(report.outer_termination.evals, 0);
+        assert_eq!(report.fitted.dim(), target.dim());
+        assert!(report.penalized_quasi_laplace_criterion.is_finite());
 
-        assert!(
-            report.reconstruction_r2.is_finite(),
-            "reconstruction R² must be finite"
-        );
-        assert!(
-            !report.structure_certificate_json.is_empty(),
-            "the anytime-valid structure certificate must serialize even when the \
-             structure search did not run (a trivially-certifying empty ledger)"
-        );
-        assert_eq!(
-            report.fitted.dim(),
-            target.dim(),
-            "the certified reconstruction must match the target's (N, p) shape"
-        );
-        assert_eq!(
-            report.assignments.nrows(),
-            target.nrows(),
-            "assignments must carry one row per observation"
-        );
-        assert_eq!(
-            report.term.k_atoms(),
-            k_atoms_seeded,
-            "with structure search disabled, the certified atom count is exactly the seed's"
-        );
-        assert!(
-            report.loss.total().is_finite(),
-            "the loss evaluated at the installed state must be finite"
-        );
-        assert!(
-            report.penalized_quasi_laplace_criterion.is_finite(),
-            "the penalized objective evaluated at the installed state must be finite"
-        );
-
-        // #2266 — validity_radius (and predicted_nats) is NOT a report field:
-        // it is a per-steer-call quantity `steer_delta` computes from the
-        // TERM + a behavioral RowMetric, exactly the same for a
-        // certify-external term as for a natively-fitted one. Prove the
-        // certified term is fully steer_delta-capable: the installed
-        // output-Fisher metric must have survived the certify entry's
-        // postlude untouched (no metric replacement anywhere in
-        // `run_sae_manifold_certify`'s certificate/diagnostics rebuild), and a
-        // small on-manifold move must report a finite, positive
-        // validity_radius exactly as it would off a native fit.
         let metric = report
             .term
             .row_metric()
@@ -254,9 +293,6 @@ mod tests {
             radius.is_finite() && radius > 0.0,
             "validity_radius must be a finite positive latent step length; got {radius}"
         );
-        assert!(
-            plan.predicted_nats.is_some(),
-            "predicted_nats must likewise be available under a behavioral metric"
-        );
+        assert!(plan.predicted_nats.is_some());
     }
 }
