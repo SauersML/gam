@@ -20,7 +20,7 @@
 
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,
-    OneDimensionalBoundary, build_bspline_basis_1d,
+    OneDimensionalBoundary, PenaltySource, build_bspline_basis_1d,
 };
 use ndarray::Array1;
 
@@ -85,9 +85,10 @@ fn single_penalty_bspline_penalties_are_frobenius_normalized() {
     for (label, spec) in cases {
         let built = build_bspline_basis_1d(x.view(), &spec)
             .unwrap_or_else(|e| panic!("{label}: basis build failed: {e:?}"));
-        assert!(
-            !built.penalties.is_empty(),
-            "{label}: expected at least one active penalty"
+        assert_eq!(
+            built.active_penalties.len(),
+            1,
+            "{label}: expected exactly one active penalty"
         );
         // The single active wiggliness block must be Frobenius-normalized so its
         // λ shares the unit-Frobenius scale used by cr / duchon / tensor. The
@@ -97,7 +98,12 @@ fn single_penalty_bspline_penalties_are_frobenius_normalized() {
         // scores) to unit Frobenius — so the certified norm must be bit-exactly
         // 1, not merely O(1). An un-normalized difference penalty would land at
         // O(10–10³); the pre-#1401 raw-only normalization left it at ≈0.9997.
-        let n = frob(&built.penalties[0]);
+        let penalty = &built.active_penalties[0];
+        assert!(
+            matches!(penalty.info.source, PenaltySource::Primary),
+            "{label}: sole active penalty must be the primary wiggliness block"
+        );
+        let n = frob(&penalty.matrix);
         assert!(
             (n - 1.0).abs() < 1e-10,
             "{label}: penalty is NOT Frobenius-normalized: ‖S‖_F = {n:.12e} (expected 1.0). \

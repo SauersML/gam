@@ -122,12 +122,12 @@ fn matern_basis_and_penalty_are_all_finite() {
     assert_all_finite(dense.view(), "matern design matrix");
 
     assert!(
-        !built.penalties.is_empty(),
+        !built.active_penalties.is_empty(),
         "INVARIANT VIOLATED [matern emits at least one penalty]: a penalized smooth with no \
          penalty block silently drops its smoothing constraint."
     );
-    for (k, pen) in built.penalties.iter().enumerate() {
-        assert_all_finite(pen.view(), &format!("matern penalty block #{k}"));
+    for (k, active) in built.active_penalties.iter().enumerate() {
+        assert_all_finite(active.matrix.view(), &format!("matern penalty block #{k}"));
     }
 }
 

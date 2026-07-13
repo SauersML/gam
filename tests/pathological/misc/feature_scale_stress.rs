@@ -9,7 +9,7 @@
 
 use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary,
+    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary, PenaltySource,
     PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d,
     build_periodic_bspline_basis_1d, build_spherical_spline_basis,
     cyclic_bspline_derivative_penalty_matrix, fit_periodic_bspline_curve,
@@ -247,7 +247,12 @@ fn sphere_harmonic_basis_scales_and_keeps_diag_penalty_at_100k() {
         );
         assert_eq!(built.design.ncols(), l * (l + 2));
         // Penalty is diagonal, monotone in degree.
-        let p = &built.penalties[0];
+        let p = &built
+            .active_penalties
+            .iter()
+            .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+            .expect("harmonic sphere must retain its primary roughness penalty")
+            .matrix;
         for i in 0..p.nrows() {
             for j in 0..p.ncols() {
                 if i != j {

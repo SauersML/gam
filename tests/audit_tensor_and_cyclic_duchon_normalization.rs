@@ -20,8 +20,9 @@
 
 use gam::basis::{
     BasisWorkspace, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
-    DuchonOperatorPenaltySpec, OneDimensionalBoundary, SpatialIdentifiability, SphereMethod,
-    SphericalSplineBasisSpec, build_duchon_basiswithworkspace, build_spherical_spline_basis,
+    DuchonOperatorPenaltySpec, OneDimensionalBoundary, PenaltySource, SpatialIdentifiability,
+    SphereMethod, SphericalSplineBasisSpec, build_duchon_basiswithworkspace,
+    build_spherical_spline_basis,
 };
 use ndarray::Array2;
 
@@ -57,11 +58,16 @@ fn cyclic_duchon_penalty_is_frobenius_normalized() {
     let built = build_duchon_basiswithworkspace(x.view(), &spec, &mut workspace)
         .expect("cyclic Duchon basis build");
     assert_eq!(
-        built.penalties.len(),
+        built.active_penalties.len(),
         1,
         "cyclic Duchon ships exactly one (roughness) penalty block"
     );
-    let n = frob(&built.penalties[0]);
+    let penalty = &built.active_penalties[0];
+    assert!(
+        matches!(penalty.info.source, PenaltySource::Primary),
+        "cyclic Duchon's sole active penalty must be its primary roughness block"
+    );
+    let n = frob(&penalty.matrix);
     assert!(
         (n - 1.0).abs() < 1e-9,
         "cyclic Duchon penalty is NOT Frobenius-normalized: ‖S‖_F = {n:.6e} (expected 1.0). \
@@ -96,11 +102,16 @@ fn harmonic_sphere_penalty_is_intentionally_not_frobenius_normalized() {
     };
     let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere harmonic basis");
     assert_eq!(
-        built.penalties.len(),
+        built.active_penalties.len(),
         1,
         "harmonic sphere ships one penalty"
     );
-    let n = frob(&built.penalties[0]);
+    let penalty = &built.active_penalties[0];
+    assert!(
+        matches!(penalty.info.source, PenaltySource::Primary),
+        "harmonic sphere's sole active penalty must be its physical roughness block"
+    );
+    let n = frob(&penalty.matrix);
     // The largest physical eigenvalue at L=3, m=2 is [3*4]^2 = 144, so ‖S‖_F is
     // on the order of 100+. The point is that it is intentionally NOT ~1: the
     // orthonormal-S² basis makes these the physical roughness eigenvalues, which
