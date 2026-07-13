@@ -1933,7 +1933,7 @@ fn inner_fit_from_certified_outer(
     family: &BernoulliMarginalSlopeFamily,
     blocks: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-    warm_start: Option<&CustomFamilyWarmStart>,
+    mode: crate::custom_family::CustomFamilyOwnedMode,
     theta: &Array1<f64>,
     outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
 ) -> Result<UnifiedFitResult, String> {
@@ -1943,13 +1943,8 @@ fn inner_fit_from_certified_outer(
     );
     options.use_outer_hessian = false;
     options.outer_tol = options.outer_tol.max(2.0e-5);
-    fit_custom_family_fixed_log_lambdas_from_outer(
-        family,
-        blocks,
-        &options,
-        warm_start,
-        theta,
-        outer,
+    fit_custom_family_fixed_log_lambdas_from_owned_mode(
+        family, blocks, &options, mode, theta, outer,
     )
     .map_err(|error| error.to_string())
 }
@@ -2787,15 +2782,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 SpatialFitProvenance::NoOuterOptimization => {
                     inner_fit(&family, &blocks, options)?
                 }
-                SpatialFitProvenance::Certified(outer) => {
-                    let warm_start = exact_warm_start.borrow();
+                SpatialFitProvenance::Certified { outer, mode } => {
                     inner_fit_from_certified_outer(
-                        &family,
-                        &blocks,
-                        options,
-                        warm_start.as_ref(),
-                        theta,
-                        outer,
+                        &family, &blocks, options, mode, theta, outer,
                     )?
                 }
             };
@@ -2896,7 +2885,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 &tolerance_options,
                 row_set,
             );
-            let eval = evaluate_custom_family_joint_hyper_shared(
+            let owned = evaluate_custom_family_joint_hyper_owned_shared(
                 &family,
                 &blocks,
                 &eval_options,
@@ -2906,29 +2895,34 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 effective_mode,
             )?;
             if let Some(err) = bernoulli_marginal_slope_runaway_error(
-                &eval.warm_start,
+                &owned.result.warm_start,
                 &designs[0],
                 &specs[0],
-                eval.inner_converged,
+                owned.result.inner_converged,
                 "exact outer evaluation",
             ) {
                 runaway_error.replace(Some(err.clone()));
                 return Err(err);
             }
-            exact_warm_start.replace(Some(eval.warm_start.clone()));
-            if !eval.inner_converged {
+            exact_warm_start.replace(Some(owned.result.warm_start.clone()));
+            if !owned.result.inner_converged {
                 return Err(
                     "exact bernoulli marginal-slope inner solve did not converge".to_string(),
                 );
             }
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
                 && analytic_joint_hessian_available
-                && !eval.outer_hessian.is_analytic()
+                && !owned.result.outer_hessian.is_analytic()
             {
                 return Err("exact bernoulli marginal-slope joint [rho, psi] objective did not return an outer Hessian"
                             .to_string());
             }
-            Ok((eval.objective, eval.gradient, eval.outer_hessian))
+            Ok(ExactJointEvaluation {
+                objective: owned.result.objective,
+                gradient: owned.result.gradient,
+                hessian: owned.result.outer_hessian,
+                mode: owned.mode,
+            })
         },
         |theta,
          specs: &[TermCollectionSpec],
@@ -2962,7 +2956,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 &tolerance_options,
                 row_set,
             );
-            let eval = evaluate_custom_family_joint_hyper_efs_shared(
+            let owned = evaluate_custom_family_joint_hyper_efs_owned_shared(
                 &family,
                 &blocks,
                 &eval_options,
@@ -2971,22 +2965,25 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 exact_warm_start.borrow().as_ref(),
             )?;
             if let Some(err) = bernoulli_marginal_slope_runaway_error(
-                &eval.warm_start,
+                &owned.result.warm_start,
                 &designs[0],
                 &specs[0],
-                eval.inner_converged,
+                owned.result.inner_converged,
                 "EFS outer evaluation",
             ) {
                 runaway_error.replace(Some(err.clone()));
                 return Err(err);
             }
-            exact_warm_start.replace(Some(eval.warm_start.clone()));
-            if !eval.inner_converged {
+            exact_warm_start.replace(Some(owned.result.warm_start.clone()));
+            if !owned.result.inner_converged {
                 return Err(
                     "exact bernoulli marginal-slope EFS inner solve did not converge".to_string(),
                 );
             }
-            Ok(eval.efs_eval)
+            Ok(ExactJointEfsEvaluation {
+                evaluation: owned.result.efs_eval,
+                mode: owned.mode,
+            })
         },
         crate::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
     )?;

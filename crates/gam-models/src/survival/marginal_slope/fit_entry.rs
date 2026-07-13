@@ -2345,15 +2345,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 SpatialFitProvenance::NoOuterOptimization => {
                     inner_fit(&family, &blocks, options)?
                 }
-                SpatialFitProvenance::Certified(outer) => {
-                    let warm_start = exact_warm_start.borrow();
+                SpatialFitProvenance::Certified { outer, mode } => {
                     inner_fit_from_certified_outer(
-                        &family,
-                        &blocks,
-                        options,
-                        warm_start.as_ref(),
-                        theta,
-                        outer,
+                        &family, &blocks, options, mode, theta, outer,
                     )?
                 }
             };
@@ -2463,7 +2457,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 eval_id,
                 scope: crate::custom_family::EvalScope::OuterDerivative,
             });
-            let eval = evaluate_custom_family_joint_hyper_shared(
+            let owned = evaluate_custom_family_joint_hyper_owned_shared(
                 &family,
                 &blocks,
                 &outer_options,
@@ -2472,28 +2466,33 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 exact_warm_start.borrow().as_ref(),
                 effective_mode,
             )?;
-            exact_warm_start.replace(Some(eval.warm_start.clone()));
-            if !eval.inner_converged {
+            exact_warm_start.replace(Some(owned.result.warm_start.clone()));
+            if !owned.result.inner_converged {
                 return Err(
                     "exact survival marginal-slope inner solve did not converge".to_string()
                 );
             }
             log::info!(
                 "[survival-marginal-slope/outer-eval] end objective={:.6e} mode={:?} elapsed={:.3}s",
-                eval.objective,
+                owned.result.objective,
                 eval_mode,
                 eval_started.elapsed().as_secs_f64(),
             );
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
                 && analytic_joint_hessian_available
-                && !eval.outer_hessian.is_analytic()
+                && !owned.result.outer_hessian.is_analytic()
             {
                 return Err(
                     "exact survival marginal-slope joint objective did not return an outer Hessian"
-                        .to_string(),
+                    .to_string(),
                 );
             }
-            Ok((eval.objective, eval.gradient, eval.outer_hessian))
+            Ok(ExactJointEvaluation {
+                objective: owned.result.objective,
+                gradient: owned.result.gradient,
+                hessian: owned.result.outer_hessian,
+                mode: owned.mode,
+            })
         },
         |theta,
          specs: &[TermCollectionSpec],
@@ -2551,7 +2550,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 eval_id,
                 scope: crate::custom_family::EvalScope::OuterDerivative,
             });
-            let eval = evaluate_custom_family_joint_hyper_efs_shared(
+            let owned = evaluate_custom_family_joint_hyper_efs_owned_shared(
                 &family,
                 &blocks,
                 &outer_options,
@@ -2559,8 +2558,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
             )?;
-            exact_warm_start.replace(Some(eval.warm_start.clone()));
-            if !eval.inner_converged {
+            exact_warm_start.replace(Some(owned.result.warm_start.clone()));
+            if !owned.result.inner_converged {
                 return Err(
                     "exact survival marginal-slope EFS inner solve did not converge".to_string(),
                 );
@@ -2569,7 +2568,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 "[survival-marginal-slope/outer-efs] end elapsed={:.3}s",
                 eval_started.elapsed().as_secs_f64(),
             );
-            Ok(eval.efs_eval)
+            Ok(ExactJointEfsEvaluation {
+                evaluation: owned.result.efs_eval,
+                mode: owned.mode,
+            })
         },
         crate::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
     );

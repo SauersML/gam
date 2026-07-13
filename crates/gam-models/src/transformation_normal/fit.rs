@@ -1,83 +1,4 @@
 use super::*;
-use std::rc::Rc;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TransformationExactOwnedModeKey {
-    theta_bits: Vec<u64>,
-    geometry_key: Vec<u64>,
-}
-
-impl TransformationExactOwnedModeKey {
-    fn new(theta: &Array1<f64>, geometry_key: &[u64]) -> Self {
-        Self {
-            theta_bits: theta.iter().map(|value| value.to_bits()).collect(),
-            geometry_key: geometry_key.to_vec(),
-        }
-    }
-}
-
-/// One-shot ownership handoff from the terminal exact outer evaluation to fit
-/// assembly. A certified CTN fit must consume the coefficient mode that
-/// produced the terminal full-data objective and derivatives; re-entering the
-/// nonconvex squared-SCOP solver here can select another basin and repeats the
-/// dominant inner/profile/Hessian work.
-struct TransformationExactOwnedModeSlot<T> {
-    owned: Option<(TransformationExactOwnedModeKey, T)>,
-}
-
-impl<T> Default for TransformationExactOwnedModeSlot<T> {
-    fn default() -> Self {
-        Self { owned: None }
-    }
-}
-
-impl<T> TransformationExactOwnedModeSlot<T> {
-    fn invalidate(&mut self) {
-        self.owned = None;
-    }
-
-    fn publish(
-        &mut self,
-        theta: &Array1<f64>,
-        geometry_key: &[u64],
-        row_set: &gam_problem::outer_subsample::RowSet,
-        eval_mode: gam_problem::EvalMode,
-        owned: T,
-    ) {
-        self.invalidate();
-        if !matches!(row_set, gam_problem::outer_subsample::RowSet::All)
-            || matches!(eval_mode, gam_problem::EvalMode::ValueOnly)
-        {
-            return;
-        }
-        self.owned = Some((
-            TransformationExactOwnedModeKey::new(theta, geometry_key),
-            owned,
-        ));
-    }
-
-    fn take_exact(
-        &mut self,
-        theta: &Array1<f64>,
-        geometry_key: &[u64],
-    ) -> Result<T, String> {
-        let expected = TransformationExactOwnedModeKey::new(theta, geometry_key);
-        let (actual, owned) = self.owned.take().ok_or_else(|| {
-            "certified transformation outer result did not retain its terminal full-data coefficient mode"
-                .to_string()
-        })?;
-        if actual != expected {
-            return Err(format!(
-                "certified transformation terminal coefficient mode identity mismatch: expected theta_bits={:?} geometry_key={:?}, retained theta_bits={:?} geometry_key={:?}",
-                expected.theta_bits,
-                expected.geometry_key,
-                actual.theta_bits,
-                actual.geometry_key,
-            ));
-        }
-        Ok(owned)
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct TransformationExactGeometryCache {
@@ -590,10 +511,6 @@ pub fn fit_transformation_normal(
     // rather than the generic `coefficient_*_cost × K` default.
     let outer_derivative_policy =
         probe_family.outer_derivative_policy(&probe_blocks, joint_setup.log_kappa_dim(), &options);
-    let terminal_mode_slot = Rc::new(RefCell::new(TransformationExactOwnedModeSlot::default()));
-    let fit_terminal_mode_slot = Rc::clone(&terminal_mode_slot);
-    let exact_terminal_mode_slot = Rc::clone(&terminal_mode_slot);
-
     let solved = optimize_spatial_length_scale_exact_joint(
         covariate_data,
         &block_specs_slice,
@@ -653,10 +570,7 @@ pub fn fit_transformation_normal(
                         selection,
                     )
                 }
-                SpatialFitProvenance::Certified(outer) => {
-                    let selection = fit_terminal_mode_slot
-                        .borrow_mut()
-                        .take_exact(theta, &geometry.key)?;
+                SpatialFitProvenance::Certified { outer, mode: selection } => {
                     log::info!(
                         "[transformation-normal] consuming certified terminal coefficient mode candidate={} objective={:.16e} without profile replay",
                         selection.selected_candidate,
@@ -714,10 +628,6 @@ pub fn fit_transformation_normal(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set| {
-            // Any subsequent exact evaluation revokes the prior carrier. Only
-            // the latest derivative-bearing full-data evaluation may be handed
-            // to certified fit assembly.
-            exact_terminal_mode_slot.borrow_mut().invalidate();
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             ensure_exact_geometry(&specs[0], &designs[0], &rho)?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
@@ -780,21 +690,19 @@ pub fn fit_transformation_normal(
             exact_mode_branch
                 .borrow_mut()
                 .record_value(eval_mode, selection.result.warm_start.clone());
-            exact_terminal_mode_slot.borrow_mut().publish(
-                theta,
-                &geometry.key,
-                row_set,
-                eval_mode,
-                selection,
-            );
 
-            Ok((objective, gradient, outer_hessian))
+            Ok(ExactJointEvaluation {
+                objective,
+                gradient,
+                hessian: outer_hessian,
+                mode: selection,
+            })
         },
         |_theta,
          _specs: &[TermCollectionSpec],
          _designs: &[TermCollectionDesign],
          _row_set| {
-            Err::<gam_problem::EfsEval, String>("transformation-normal EFS callback invoked even though fixed-point optimization is disabled for beta-dependent exact curvature".to_string())
+            Err::<ExactJointEfsEvaluation<crate::custom_family::CustomFamilyJointHyperModeSelection>, String>("transformation-normal EFS callback invoked even though fixed-point optimization is disabled for beta-dependent exact curvature".to_string())
         },
         |_beta: &Array1<f64>| Ok(gam_solve::rho_optimizer::SeedOutcome::NoSlot),
     )?;
@@ -805,138 +713,4 @@ pub fn fit_transformation_normal(
     fit.fit = calibrated_fit;
     fit.score_calibration = score_calibration;
     Ok(fit)
-}
-
-#[cfg(test)]
-mod owned_mode_slot_tests {
-    use super::*;
-    use std::cell::Cell;
-
-    #[derive(Default)]
-    struct WorkCounts {
-        family_evaluations: Cell<usize>,
-        profile_replays: Cell<usize>,
-        hessian_builds: Cell<usize>,
-    }
-
-    struct OwnedProbe {
-        work: Rc<WorkCounts>,
-    }
-
-    #[test]
-    fn certified_terminal_mode_is_moved_once_without_reprofile_work() {
-        let theta = ndarray::array![1.0, -2.0, 0.25];
-        let geometry_key = vec![7, 11, 13];
-        let work = Rc::new(WorkCounts::default());
-        work.family_evaluations.set(1);
-        work.hessian_builds.set(1);
-        let mut slot = TransformationExactOwnedModeSlot::default();
-        slot.publish(
-            &theta,
-            &geometry_key,
-            &gam_problem::outer_subsample::RowSet::All,
-            gam_problem::EvalMode::ValueGradientHessian,
-            OwnedProbe {
-                work: Rc::clone(&work),
-            },
-        );
-        let before = (
-            work.family_evaluations.get(),
-            work.profile_replays.get(),
-            work.hessian_builds.get(),
-        );
-
-        let owned = slot
-            .take_exact(&theta, &geometry_key)
-            .expect("exact terminal mode must be consumed");
-        assert!(Rc::ptr_eq(&owned.work, &work));
-        assert_eq!(
-            before,
-            (
-                work.family_evaluations.get(),
-                work.profile_replays.get(),
-                work.hessian_builds.get(),
-            ),
-            "moving the terminal carrier must perform no family evaluation, profile replay, or Hessian build",
-        );
-        assert!(
-            slot.take_exact(&theta, &geometry_key).is_err(),
-            "the terminal coefficient mode is a one-shot ownership handoff",
-        );
-    }
-
-    #[test]
-    fn certified_terminal_mode_rejects_stale_theta_geometry_and_row_measure() {
-        let theta = ndarray::array![1.0, -2.0, 0.25];
-        let geometry_key = vec![7, 11, 13];
-        let mut slot = TransformationExactOwnedModeSlot::default();
-        let payload = || OwnedProbe {
-            work: Rc::new(WorkCounts::default()),
-        };
-
-        slot.publish(
-            &theta,
-            &geometry_key,
-            &gam_problem::outer_subsample::RowSet::All,
-            gam_problem::EvalMode::ValueAndGradient,
-            payload(),
-        );
-        assert!(
-            slot.take_exact(&ndarray::array![1.0, -2.0, 0.5], &geometry_key)
-                .is_err(),
-            "a stale full-theta carrier must be refused",
-        );
-
-        slot.publish(
-            &theta,
-            &geometry_key,
-            &gam_problem::outer_subsample::RowSet::All,
-            gam_problem::EvalMode::ValueAndGradient,
-            payload(),
-        );
-        assert!(
-            slot.take_exact(&theta, &[7, 11, 17]).is_err(),
-            "a carrier from another realized geometry must be refused",
-        );
-
-        slot.publish(
-            &theta,
-            &geometry_key,
-            &gam_problem::outer_subsample::RowSet::All,
-            gam_problem::EvalMode::ValueGradientHessian,
-            payload(),
-        );
-        slot.publish(
-            &theta,
-            &geometry_key,
-            &gam_problem::outer_subsample::RowSet::Subsample {
-                rows: Arc::new(vec![
-                    gam_problem::outer_subsample::WeightedOuterRow {
-                        index: 0,
-                        weight: 2.0,
-                        stratum: 0,
-                    },
-                ]),
-                n_full: 2,
-            },
-            gam_problem::EvalMode::ValueGradientHessian,
-            payload(),
-        );
-        assert!(
-            slot.take_exact(&theta, &geometry_key).is_err(),
-            "a later subsample evaluation must revoke the full-data carrier",
-        );
-
-        slot.publish(
-            &theta,
-            &geometry_key,
-            &gam_problem::outer_subsample::RowSet::All,
-            gam_problem::EvalMode::ValueOnly,
-            payload(),
-        );
-        assert!(
-            slot.take_exact(&theta, &geometry_key).is_err(),
-            "value-only evidence cannot own a certified terminal mode",
-        );
-    }
 }

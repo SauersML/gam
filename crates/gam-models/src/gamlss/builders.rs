@@ -2155,9 +2155,8 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         //   intended behaviour when `length_scale=…` is
                         //   set on every spatial term.
                         if joint_setup.log_kappa_dim() > 0 && kappa_options.enabled {
-                            let warm_start = hyper_warm_start_cell.borrow().clone();
-                            let certified_outer = match provenance {
-                                SpatialFitProvenance::Certified(outer) => outer,
+                            let (certified_outer, mode) = match provenance {
+                                SpatialFitProvenance::Certified { outer, mode } => (outer, mode),
                                 SpatialFitProvenance::NoOuterOptimization => {
                                     return Err(
                                         "active GAMLSS spatial optimization returned no certified outer provenance"
@@ -2170,11 +2169,11 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                                     options,
                                     &crate::row_kernel::RowSet::All,
                                 );
-                            fit_custom_family_fixed_log_lambdas_from_outer(
+                            fit_custom_family_fixed_log_lambdas_from_owned_mode(
                                 &family,
                                 &blocks,
                                 &exact_options,
-                                warm_start.as_ref(),
+                                mode,
                                 theta,
                                 certified_outer,
                             )?
@@ -2250,7 +2249,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     // stays `None` and the call is equivalent to the prior path.
                     let eval_options =
                         crate::outer_subsample::exact_outer_options_for_row_set(options, row_set);
-                    let eval = evaluate_custom_family_joint_hyper(
+                    let owned = evaluate_custom_family_joint_hyper_owned(
                         &family,
                         &blocks,
                         &eval_options,
@@ -2259,21 +2258,26 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         warm_start.as_ref(),
                         eval_mode,
                     )?;
-                    *hyper_warm_start_cell.borrow_mut() = Some(eval.warm_start.clone());
-                    if !eval.inner_converged {
+                    *hyper_warm_start_cell.borrow_mut() = Some(owned.result.warm_start.clone());
+                    if !owned.result.inner_converged {
                         return Err(
                             "exact two-block spatial inner solve did not converge".to_string(),
                         );
                     }
                     if matches!(eval_mode, EvalMode::ValueGradientHessian)
-                        && !eval.outer_hessian.is_analytic()
+                        && !owned.result.outer_hessian.is_analytic()
                     {
                         return Err(
                             "exact two-block spatial objective requires a full joint [rho, psi] hessian"
-                                .to_string(),
+                            .to_string(),
                         );
                     }
-                    Ok((eval.objective, eval.gradient, eval.outer_hessian))
+                    Ok(ExactJointEvaluation {
+                        objective: owned.result.objective,
+                        gradient: owned.result.gradient,
+                        hessian: owned.result.outer_hessian,
+                        mode: owned.mode,
+                    })
                 },
                 |theta,
                  specs: &[TermCollectionSpec],
@@ -2314,7 +2318,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     let warm_start = hyper_warm_start_cell.borrow().clone();
                     let eval_options =
                         crate::outer_subsample::exact_outer_options_for_row_set(options, row_set);
-                    let eval = evaluate_custom_family_joint_hyper_efs(
+                    let owned = evaluate_custom_family_joint_hyper_efs_owned(
                         &family,
                         &blocks,
                         &eval_options,
@@ -2322,13 +2326,16 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &psiderivative_blocks,
                         warm_start.as_ref(),
                     )?;
-                    *hyper_warm_start_cell.borrow_mut() = Some(eval.warm_start.clone());
-                    if !eval.inner_converged {
+                    *hyper_warm_start_cell.borrow_mut() = Some(owned.result.warm_start.clone());
+                    if !owned.result.inner_converged {
                         return Err(
                             "exact two-block spatial EFS inner solve did not converge".to_string(),
                         );
                     }
-                    Ok(eval.efs_eval)
+                    Ok(ExactJointEfsEvaluation {
+                        evaluation: owned.result.efs_eval,
+                        mode: owned.mode,
+                    })
                 },
                 |_beta: &Array1<f64>| Ok(gam_solve::rho_optimizer::SeedOutcome::NoSlot),
             )

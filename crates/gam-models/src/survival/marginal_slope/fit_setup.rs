@@ -190,7 +190,7 @@ pub(crate) fn inner_fit_from_certified_outer(
     family: &SurvivalMarginalSlopeFamily,
     blocks: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-    warm_start: Option<&CustomFamilyWarmStart>,
+    mode: crate::custom_family::CustomFamilyOwnedMode,
     theta: &Array1<f64>,
     outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
 ) -> Result<UnifiedFitResult, String> {
@@ -198,13 +198,8 @@ pub(crate) fn inner_fit_from_certified_outer(
         options,
         &crate::row_kernel::RowSet::All,
     );
-    fit_custom_family_fixed_log_lambdas_from_outer(
-        family,
-        blocks,
-        &options,
-        warm_start,
-        theta,
-        outer,
+    fit_custom_family_fixed_log_lambdas_from_owned_mode(
+        family, blocks, &options, mode, theta, outer,
     )
     .map_err(|error| error.to_string())
 }

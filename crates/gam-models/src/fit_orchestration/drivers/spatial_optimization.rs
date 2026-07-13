@@ -6675,6 +6675,15 @@ where
         fn install_terminal_mode(&mut self, theta: &Array1<f64>, objective: f64, mode: M) {
             self.terminal_mode = Some((theta.clone(), objective, mode));
         }
+
+        fn terminal_mode_matches(&self, theta: &Array1<f64>, objective: f64) -> bool {
+            self.terminal_mode
+                .as_ref()
+                .is_some_and(|(mode_theta, mode_objective, _)| {
+                    theta_values_match(mode_theta, theta)
+                        && mode_objective.to_bits() == objective.to_bits()
+                })
+        }
     }
 
     let mut state = NBlockExactJointState {
@@ -6882,7 +6891,9 @@ where
                           theta: &Array1<f64>,
                           order: OuterEvalOrder|
          -> Result<OuterEval, EstimationError> {
-            if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta) {
+            if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta)
+                && ctx.terminal_mode_matches(theta, cost)
+            {
                 let cached_satisfies_order = match order {
                     OuterEvalOrder::Value => true,
                     OuterEvalOrder::ValueAndGradient => grad.len() == theta.len(),
@@ -7010,7 +7021,9 @@ where
         let obj = problem.build_objective_with_eval_order(
             &mut state,
             |ctx: &mut &mut NBlockExactJointState<'_, Mode>, theta: &Array1<f64>| {
-                if let Some(cost) = ctx.cache.memoized_cost(theta) {
+                if let Some(cost) = ctx.cache.memoized_cost(theta)
+                    && ctx.terminal_mode_matches(theta, cost)
+                {
                     return Ok(cost);
                 }
                 if let Err(err) = ctx.ensure_theta(theta) {
@@ -7115,6 +7128,14 @@ where
                     );
                     let ExactJointEfsEvaluation { evaluation, mode } =
                         eval_result.map_err(EstimationError::RemlOptimizationFailed)?;
+                    // An EFS solve can select a different coefficient mode at
+                    // the same theta.  Revoke any derivative memo assembled
+                    // from the previous mode before installing this carrier;
+                    // a later analytic certification must then re-evaluate and
+                    // replace both the derivative payload and the owned mode
+                    // atomically.
+                    ctx.cache.invalidate_objective_memo();
+                    ctx.cache.store_cost_only(theta, evaluation.cost);
                     ctx.install_terminal_mode(theta, evaluation.cost, mode);
                     Ok(evaluation)
                 },

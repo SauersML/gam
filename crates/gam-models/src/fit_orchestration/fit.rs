@@ -8,35 +8,165 @@ pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> b
     }
 }
 
-/// Map a converged outer-optimizer result to its recovered inverse-link state,
-/// or surface a convergence/recovery failure as a `WorkflowError`. Used by the
-/// survival location-scale inverse-link profiling path to turn the optimized
-/// `rho` into the concrete `InverseLink` before the final fixed-link refit.
-pub(crate) fn recover_converged_survival_inverse_link<R>(
-    result: gam_solve::rho_optimizer::OuterResult,
+struct ProfiledOuterPayload<T> {
+    theta: Array1<f64>,
+    objective: f64,
+    gradient: Array1<f64>,
+    value: T,
+}
+
+/// Consume only the exact terminal payload reinstalled by the shared outer
+/// runner. The sealed carrier owns the independently re-measured certificate;
+/// bitwise identity across all analytic channels prevents a stale trial, an
+/// independent refit, or caller-written convergence metadata from crossing
+/// this fit-minting boundary.
+fn consume_certified_profiled_outer_payload<T>(
+    selected: Option<ProfiledOuterPayload<T>>,
+    outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
     context: &str,
-    recover: R,
-) -> Result<InverseLink, String>
-where
-    R: FnOnce(&Array1<f64>) -> Option<InverseLink>,
-{
-    if !result.converged {
-        return Err(WorkflowError::IntegrationFailed {
-            reason: format!(
-                "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-                result.iterations,
-                result.final_value,
-                result.final_grad_norm_report(),
-            ),
-        }
-        .into());
+) -> Result<ProfiledOuterPayload<T>, String> {
+    let selected = selected
+        .ok_or_else(|| format!("{context} retained no optimizer-installed terminal profile"))?;
+    if selected.theta.len() != outer.rho().len()
+        || selected
+            .theta
+            .iter()
+            .zip(outer.rho().iter())
+            .any(|(selected, certified)| selected.to_bits() != certified.to_bits())
+    {
+        return Err(format!(
+            "{context} terminal profile hyperparameters do not bitwise match the certified optimum"
+        ));
     }
-    recover(&result.rho).ok_or_else(|| {
-        format!(
-            "{context} produced an invalid inverse-link state at rho={:?}",
-            result.rho.to_vec()
+    if selected.objective.to_bits() != outer.final_value().to_bits() {
+        return Err(format!(
+            "{context} terminal profile objective does not bitwise match the certified optimum: selected={:.17e}, certified={:.17e}",
+            selected.objective,
+            outer.final_value(),
+        ));
+    }
+    let certified_gradient = outer.final_gradient().ok_or_else(|| {
+        format!("{context} certified result retained no analytic terminal gradient")
+    })?;
+    if selected.gradient.len() != certified_gradient.len()
+        || selected
+            .gradient
+            .iter()
+            .zip(certified_gradient.iter())
+            .any(|(selected, certified)| selected.to_bits() != certified.to_bits())
+    {
+        return Err(format!(
+            "{context} terminal profile gradient does not bitwise match the certified optimum"
+        ));
+    }
+    Ok(selected)
+}
+
+#[cfg(test)]
+mod profiled_outer_payload_tests {
+    use super::*;
+    use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
+    use gam_solve::rho_optimizer::OuterProblem;
+
+    fn certified_quadratic() -> gam_solve::rho_optimizer::CertifiedOuterResult {
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
+            .with_tolerance(1.0e-8)
+            .with_max_iter(40)
+            .with_initial_rho(Array1::from_vec(vec![0.5]))
+            .with_seed_config(gam_problem::SeedConfig {
+                max_seeds: 1,
+                seed_budget: 1,
+                ..Default::default()
+            });
+        let mut objective = problem.build_objective(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(0.5 * (theta[0] - 0.25).powi(2)),
+            |_: &mut (), theta: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: 0.5 * (theta[0] - 0.25).powi(2),
+                    gradient: Array1::from_vec(vec![theta[0] - 0.25]),
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<
+                fn(
+                    &mut (),
+                    &Array1<f64>,
+                ) -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
+            >,
+        );
+        problem
+            .run_certified(&mut objective, "profiled-payload unit")
+            .expect("quadratic outer problem must certify")
+    }
+
+    fn matching_payload(
+        outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
+    ) -> ProfiledOuterPayload<&'static str> {
+        ProfiledOuterPayload {
+            theta: outer.rho().clone(),
+            objective: outer.final_value(),
+            gradient: outer
+                .final_gradient()
+                .expect("analytic fixture must retain its terminal gradient")
+                .clone(),
+            value: "terminal profile",
+        }
+    }
+
+    #[test]
+    fn selected_profile_requires_theta_objective_and_gradient_identity() {
+        let outer = certified_quadratic();
+
+        let mut wrong_theta = matching_payload(&outer);
+        wrong_theta.theta[0] += 1.0;
+        assert!(
+            consume_certified_profiled_outer_payload(
+                Some(wrong_theta),
+                &outer,
+                "theta substitution",
+            )
+            .expect_err("theta substitution must be rejected")
+            .contains("hyperparameters")
+        );
+
+        let mut wrong_objective = matching_payload(&outer);
+        wrong_objective.objective = f64::from_bits(wrong_objective.objective.to_bits() + 1);
+        assert!(
+            consume_certified_profiled_outer_payload(
+                Some(wrong_objective),
+                &outer,
+                "objective substitution",
+            )
+            .expect_err("objective substitution must be rejected")
+            .contains("objective")
+        );
+
+        let mut wrong_gradient = matching_payload(&outer);
+        wrong_gradient.gradient[0] += 1.0;
+        assert!(
+            consume_certified_profiled_outer_payload(
+                Some(wrong_gradient),
+                &outer,
+                "gradient substitution",
+            )
+            .expect_err("gradient substitution must be rejected")
+            .contains("gradient")
+        );
+
+        let selected = consume_certified_profiled_outer_payload(
+            Some(matching_payload(&outer)),
+            &outer,
+            "valid terminal profile",
         )
-    })
+        .expect("the exact runner-installed terminal payload must be consumable");
+        assert_eq!(selected.value, "terminal profile");
+        assert!(outer.criterion_certificate().certifies());
+    }
 }
 /// Lower floor applied before taking `ln(λ)` when mapping a smoothing parameter
 /// into the log-λ optimization coordinate. `λ` is non-negative by construction;
@@ -61,6 +191,7 @@ struct SurvivalLocationScaleProfile {
     inverse_link: InverseLink,
     wiggle_knots: Option<Array1<f64>>,
     wiggle_degree: Option<usize>,
+    inverse_link_outer: Option<gam_solve::rho_optimizer::CertifiedOuterResult>,
 }
 
 fn survival_pirls_status_is_certified(status: gam_solve::pirls::PirlsStatus) -> bool {
@@ -143,6 +274,7 @@ impl SurvivalLocationScaleProfile {
             inverse_link: self.inverse_link,
             wiggle_knots: self.wiggle_knots,
             wiggle_degree: self.wiggle_degree,
+            inverse_link_outer: self.inverse_link_outer,
         }
     }
 }
@@ -2881,6 +3013,7 @@ pub(crate) fn fit_survival_location_scale_model(
             inverse_link,
             wiggle_knots,
             wiggle_degree,
+            inverse_link_outer: None,
         })
     }
 

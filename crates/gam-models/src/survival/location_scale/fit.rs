@@ -119,13 +119,18 @@ pub(crate) fn fit_reduced_parametric_aft(
 /// runs, because the location-scale finalizer empties `UnifiedFitResult::block_states`
 /// (see `survival_fit_from_parts` — `block_states: Vec::new()`), and the family's
 /// `offset_channel_geometry` method needs the raw, populated per-block state.
+enum SurvivalLocationScaleFitAuthority<'a> {
+    Direct,
+    Certified {
+        theta: &'a Array1<f64>,
+        outer: &'a gam_solve::rho_optimizer::CertifiedOuterResult,
+        mode: crate::custom_family::CustomFamilyOwnedMode,
+    },
+}
+
 fn fit_survival_location_scale_with_geometry_authority(
     spec: SurvivalLocationScaleSpec,
-    certified_outer: Option<(
-        &Array1<f64>,
-        &gam_solve::rho_optimizer::CertifiedOuterResult,
-        Option<&CustomFamilyWarmStart>,
-    )>,
+    authority: SurvivalLocationScaleFitAuthority<'_>,
 ) -> Result<(UnifiedFitResult, SurvivalLocationScaleConvergedGeometry), String> {
     let prepared = prepare_survival_location_scale_model(&spec)?;
     let options = survival_blockwise_fit_options(&spec);
@@ -140,7 +145,10 @@ fn fit_survival_location_scale_with_geometry_authority(
     // genuinely flexible or penalized survival LS fit keeps the full coupled
     // path below.
     let fit = if prepared.is_reduced_parametric_aft() {
-        if certified_outer.is_some() {
+        if matches!(
+            &authority,
+            SurvivalLocationScaleFitAuthority::Certified { .. }
+        ) {
             return Err(SurvivalLocationScaleError::InternalInvariant {
                 reason: "a reduced unpenalized AFT fit cannot carry an optimized smoothing certificate"
                     .to_string(),
@@ -148,21 +156,26 @@ fn fit_survival_location_scale_with_geometry_authority(
             .into());
         }
         fit_reduced_parametric_aft(&prepared, &options)?
-    } else if let Some((theta, outer, warm_start)) = certified_outer {
-        let exact_options = crate::outer_subsample::exact_outer_options_for_row_set(
-            &options,
-            &crate::row_kernel::RowSet::All,
-        );
-        fit_custom_family_fixed_log_lambdas_from_outer(
-            &prepared.family,
-            &prepared.blockspecs,
-            &exact_options,
-            warm_start,
-            theta,
-            outer,
-        )?
     } else {
-        fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?
+        match authority {
+            SurvivalLocationScaleFitAuthority::Direct => {
+                fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?
+            }
+            SurvivalLocationScaleFitAuthority::Certified { theta, outer, mode } => {
+                let exact_options = crate::outer_subsample::exact_outer_options_for_row_set(
+                    &options,
+                    &crate::row_kernel::RowSet::All,
+                );
+                fit_custom_family_fixed_log_lambdas_from_owned_mode(
+                    &prepared.family,
+                    &prepared.blockspecs,
+                    &exact_options,
+                    mode,
+                    theta,
+                    outer,
+                )?
+            }
+        }
     };
     // `finalize_survival_location_scale_fit` indexes the populated block
     // states directly, so an empty result from the inner fit violates this
@@ -189,18 +202,21 @@ fn fit_survival_location_scale_with_geometry_authority(
 pub(crate) fn fit_survival_location_scale_with_geometry(
     spec: SurvivalLocationScaleSpec,
 ) -> Result<(UnifiedFitResult, SurvivalLocationScaleConvergedGeometry), String> {
-    fit_survival_location_scale_with_geometry_authority(spec, None)
+    fit_survival_location_scale_with_geometry_authority(
+        spec,
+        SurvivalLocationScaleFitAuthority::Direct,
+    )
 }
 
 fn fit_survival_location_scale_with_geometry_from_outer(
     spec: SurvivalLocationScaleSpec,
     theta: &Array1<f64>,
     outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
-    warm_start: Option<&CustomFamilyWarmStart>,
+    mode: crate::custom_family::CustomFamilyOwnedMode,
 ) -> Result<(UnifiedFitResult, SurvivalLocationScaleConvergedGeometry), String> {
     fit_survival_location_scale_with_geometry_authority(
         spec,
-        Some((theta, outer, warm_start)),
+        SurvivalLocationScaleFitAuthority::Certified { theta, outer, mode },
     )
 }
 
@@ -781,13 +797,9 @@ pub(crate) fn fit_survival_location_scale_terms(
                 SpatialFitProvenance::NoOuterOptimization => {
                     fit_survival_location_scale_with_geometry(assembled)?
                 }
-                SpatialFitProvenance::Certified(outer) => {
-                    let warm_start = exact_warm_start.borrow();
+                SpatialFitProvenance::Certified { outer, mode } => {
                     fit_survival_location_scale_with_geometry_from_outer(
-                        assembled,
-                        theta,
-                        outer,
-                        warm_start.as_ref(),
+                        assembled, theta, outer, mode,
                     )?
                 }
             };
@@ -860,7 +872,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 &survival_blockwise_fit_options(&assembled),
                 row_set,
             );
-            let eval = evaluate_custom_family_joint_hyper(
+            let owned = evaluate_custom_family_joint_hyper_owned(
                 &prepared.family,
                 &prepared.blockspecs,
                 &eval_options,
@@ -870,13 +882,18 @@ pub(crate) fn fit_survival_location_scale_terms(
                 effective_mode,
             )
             .map_err(|e| e.to_string())?;
-            exact_warm_start.replace(Some(eval.warm_start.clone()));
-            if !eval.inner_converged {
+            exact_warm_start.replace(Some(owned.result.warm_start.clone()));
+            if !owned.result.inner_converged {
                 return Err(
                     "survival location-scale exact joint inner solve did not converge".to_string(),
                 );
             }
-            Ok((eval.objective, eval.gradient, eval.outer_hessian))
+            Ok(ExactJointEvaluation {
+                objective: owned.result.objective,
+                gradient: owned.result.gradient,
+                hessian: owned.result.outer_hessian,
+                mode: owned.mode,
+            })
         },
         |theta,
          specs: &[TermCollectionSpec],
@@ -928,7 +945,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 &survival_blockwise_fit_options(&assembled),
                 row_set,
             );
-            let eval = evaluate_custom_family_joint_hyper_efs(
+            let owned = evaluate_custom_family_joint_hyper_efs_owned(
                 &prepared.family,
                 &prepared.blockspecs,
                 &eval_options,
@@ -937,14 +954,17 @@ pub(crate) fn fit_survival_location_scale_terms(
                 exact_warm_start.borrow().as_ref(),
             )
             .map_err(|e| e.to_string())?;
-            exact_warm_start.replace(Some(eval.warm_start.clone()));
-            if !eval.inner_converged {
+            exact_warm_start.replace(Some(owned.result.warm_start.clone()));
+            if !owned.result.inner_converged {
                 return Err(
                     "survival location-scale exact joint EFS inner solve did not converge"
                         .to_string(),
                 );
             }
-            Ok(eval.efs_eval)
+            Ok(ExactJointEfsEvaluation {
+                evaluation: owned.result.efs_eval,
+                mode: owned.mode,
+            })
         },
         crate::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
     )?;
