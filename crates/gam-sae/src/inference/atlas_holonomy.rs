@@ -249,9 +249,10 @@ impl GaussianPatchRowSplit {
 /// Why the pilot projection may replace the ambient space in a certificate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PilotProjectionProvenance {
-    /// The retained frame spans the entire ambient space. Capture is therefore
-    /// exact by algebra and spends no probability budget.
-    ExactFullAmbientCapture,
+    /// A fixed retained frame with a deterministic proof that it contains the
+    /// population tangent exactly. Full ambient retention is one such proof.
+    /// This branch spends no probability budget and admits no leakage field.
+    ExactAnalyticCapture,
     /// A frame fitted on the independent pilot rows, without a population
     /// capture theorem. It remains useful computationally but cannot sign a
     /// topology claim about the original ambient tangent.
@@ -260,7 +261,7 @@ pub enum PilotProjectionProvenance {
 
 impl PilotProjectionProvenance {
     fn is_certified(self) -> bool {
-        matches!(self, Self::ExactFullAmbientCapture)
+        matches!(self, Self::ExactAnalyticCapture)
     }
 }
 
@@ -737,15 +738,6 @@ impl GaussianPcaPatch {
                 }
             }
         }
-        if matches!(
-            pilot_projection,
-            PilotProjectionProvenance::ExactFullAmbientCapture
-        ) && retained != ambient
-        {
-            return Err(format!(
-                "Gaussian PCA patch {chart} claims exact full-ambient capture with retained dimension {retained} below ambient dimension {ambient}"
-            ));
-        }
         Ok(Self {
             chart,
             row_split,
@@ -886,7 +878,7 @@ impl GaussianPcaPatch {
         }
         .validate()?;
         let pilot_projection = if retained_dimension == ambient {
-            PilotProjectionProvenance::ExactFullAmbientCapture
+            PilotProjectionProvenance::ExactAnalyticCapture
         } else {
             PilotProjectionProvenance::IndependentPilotEstimate
         };
@@ -1569,7 +1561,7 @@ pub struct GaussianPcaHolonomyAnalysis {
     error_model: GaussianPcaErrorModel,
     edges: Vec<ProjectedAtlasEdgeGeometry>,
     orientation: AtlasStatisticalDecision<AtlasOrientability>,
-    orientation_flip_probability_bound: f64,
+    orientation_flip_probability_bound: Option<f64>,
     sample_prescription: Vec<AtlasPatchSamplePrescription>,
     cycles: Vec<AtlasCycleHolonomy>,
     gauss_bonnet: Option<GaussBonnetConfidence>,
@@ -1607,7 +1599,7 @@ impl GaussianPcaHolonomyAnalysis {
     }
 
     #[must_use]
-    pub fn orientation_flip_probability_bound(&self) -> f64 {
+    pub fn orientation_flip_probability_bound(&self) -> Option<f64> {
         self.orientation_flip_probability_bound
     }
 
@@ -1748,10 +1740,7 @@ mod tests {
                 inference_rows,
             )
             .unwrap(),
-            PilotProjectionProvenance::CertifiedFixed {
-                tangent_leakage_bound: 0.0,
-                error_probability_bound: 0.0,
-            },
+            PilotProjectionProvenance::ExactAnalyticCapture,
             GaussianPatchCentering::MeanEstimatedOnInferenceRows,
             projection_frame(plane_angle, padded_ambient),
             tangent_gauge(gauge_angle, reflected),
@@ -1779,11 +1768,27 @@ mod tests {
             .unwrap()
     }
 
+    fn certified_edge(
+        a: usize,
+        b: usize,
+        overlap: usize,
+        geometric_remainder_bound: f64,
+    ) -> ProjectedAtlasEdgeSpec {
+        ProjectedAtlasEdgeSpec::new(
+            a,
+            b,
+            overlap,
+            PopulationCrossGramProvenance::CertifiedSmallestSingularValue { lower_bound: 0.5 },
+            geometric_remainder_bound,
+        )
+        .unwrap()
+    }
+
     fn triangle_edges() -> Vec<ProjectedAtlasEdgeSpec> {
         vec![
-            ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap(),
-            ProjectedAtlasEdgeSpec::new(1, 2, 0, 0.0).unwrap(),
-            ProjectedAtlasEdgeSpec::new(2, 0, 0, 0.0).unwrap(),
+            certified_edge(0, 1, 0, 0.0),
+            certified_edge(1, 2, 0, 0.0),
+            certified_edge(2, 0, 0, 0.0),
         ]
     }
 
@@ -1911,10 +1916,7 @@ mod tests {
                 inference_rows,
             )
             .unwrap(),
-            PilotProjectionProvenance::CertifiedFixed {
-                tangent_leakage_bound: 0.0,
-                error_probability_bound: 0.0,
-            },
+            PilotProjectionProvenance::ExactAnalyticCapture,
             GaussianPatchCentering::MeanEstimatedOnInferenceRows,
             identity_projection(ambient),
             tangent,
@@ -1944,7 +1946,16 @@ mod tests {
             AtlasHolonomyEdgeId::new(2, 4, 9).unwrap()
         );
         assert!(AtlasSignedEdge::new(0, 1, 0, 0).is_err());
-        assert!(ProjectedAtlasEdgeSpec::new(0, 1, 0, f64::NAN).is_err());
+        assert!(
+            ProjectedAtlasEdgeSpec::new(
+                0,
+                1,
+                0,
+                PopulationCrossGramProvenance::EstimatedOnly,
+                f64::NAN,
+            )
+            .is_err()
+        );
         assert!(
             ExactAnalyticHolonomyCertificate::new(
                 2,
@@ -2014,8 +2025,8 @@ mod tests {
                 patch(1, 0.0, 0.0, false, 1_000_000, 0),
             ],
             vec![
-                ProjectedAtlasEdgeSpec::new(0, 1, 7, 0.0).unwrap(),
-                ProjectedAtlasEdgeSpec::new(0, 1, 3, 0.0).unwrap(),
+                certified_edge(0, 1, 7, 0.0),
+                certified_edge(0, 1, 3, 0.0),
             ],
             AtlasFamilywiseLevel::new(0.05).unwrap(),
             None,
@@ -2050,12 +2061,12 @@ mod tests {
         assert_near(cycle.first_order_variance.unwrap(), 0.0);
         assert_near(cycle.bilinear_quadratic_variance.unwrap(), 0.0);
         assert!(matches!(
-            cycle.limit_law,
-            Some(AtlasCycleLimitLaw::DegenerateQuadraticGaussian { .. })
+            cycle.asymptotic_regime,
+            Some(AtlasCycleAsymptoticRegime::FirstOrderDegenerate { .. })
         ));
         assert!(matches!(
             cycle.decision.refusals(),
-            [AtlasStatisticalRefusal::DegenerateQuadraticGaussianLimit { .. }]
+            [AtlasStatisticalRefusal::DegenerateFirstOrderLimitUnresolved { .. }]
         ));
     }
 
@@ -2067,8 +2078,8 @@ mod tests {
                 patch(1, std::f64::consts::FRAC_PI_2, 0.0, false, 1_000_000, 0),
             ],
             vec![
-                ProjectedAtlasEdgeSpec::new(0, 1, 7, 0.0).unwrap(),
-                ProjectedAtlasEdgeSpec::new(0, 1, 3, 0.0).unwrap(),
+                certified_edge(0, 1, 7, 0.0),
+                certified_edge(0, 1, 3, 0.0),
             ],
             AtlasFamilywiseLevel::new(0.05).unwrap(),
             None,
@@ -2264,12 +2275,12 @@ mod tests {
                 projected_patch_from_tangent(0, inference_rows, true_a.clone()),
                 projected_patch_from_tangent(1, inference_rows, true_b.clone()),
             ],
-            vec![ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap()],
+            vec![certified_edge(0, 1, 0, 0.0)],
             AtlasFamilywiseLevel::new(0.05).unwrap(),
             None,
         );
         assert!(analysis.orientation().certified_value().is_some());
-        let bound = analysis.orientation_flip_probability_bound();
+        let bound = analysis.orientation_flip_probability_bound().unwrap();
         let perturbation_sd = analysis.patch_summaries()[0]
             .projector_variance_scale()
             .sqrt();
@@ -2285,6 +2296,42 @@ mod tests {
             observed <= bound + 1.0 / REPLICATES as f64,
             "observed flip rate {observed:.6e} exceeded finite-sample bound {bound:.6e}"
         );
+    }
+
+    #[test]
+    fn observed_cross_gram_margin_cannot_set_its_own_flip_bound() {
+        let patches = vec![
+            patch(0, 0.0, 0.0, false, 1_000_000, 0),
+            patch(1, 0.2, 0.0, false, 1_000_000, 0),
+        ];
+        let error_model = GaussianPcaErrorModel::independent(
+            &patches,
+            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
+        )
+        .unwrap();
+        let analysis = GaussianPcaHolonomyAnalysis::certify(
+            patches,
+            vec![
+                ProjectedAtlasEdgeSpec::new(
+                    0,
+                    1,
+                    0,
+                    PopulationCrossGramProvenance::EstimatedOnly,
+                    0.0,
+                )
+                .unwrap(),
+            ],
+            error_model,
+            AtlasFamilywiseLevel::new(0.05).unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(analysis.orientation_flip_probability_bound(), None);
+        assert!(matches!(
+            analysis.orientation().refusals(),
+            [AtlasStatisticalRefusal::PopulationCrossGramMarginUncertified { .. }]
+        ));
     }
 
     #[test]
@@ -2307,8 +2354,8 @@ mod tests {
             padded.cycles()[0].first_order_variance.unwrap(),
         );
         assert_near(
-            base.orientation_flip_probability_bound(),
-            padded.orientation_flip_probability_bound(),
+            base.orientation_flip_probability_bound().unwrap(),
+            padded.orientation_flip_probability_bound().unwrap(),
         );
         assert_eq!(
             base.cycles()[0].decision.certified_value(),
@@ -2328,7 +2375,7 @@ mod tests {
                     patch(0, 0.0, 0.0, false, rows, 0),
                     patch(1, 0.2, 0.0, false, rows, 0),
                 ],
-                vec![ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap()],
+                vec![certified_edge(0, 1, 0, 0.0)],
                 AtlasFamilywiseLevel::new(0.05).unwrap(),
                 None,
             )
@@ -2336,7 +2383,8 @@ mod tests {
         let small = build(16);
         let large = build(1_000_000);
         assert!(
-            large.orientation_flip_probability_bound() < small.orientation_flip_probability_bound()
+            large.orientation_flip_probability_bound().unwrap()
+                < small.orientation_flip_probability_bound().unwrap()
         );
         assert_eq!(
             small.sample_prescription()[0].required_rows,
@@ -2357,7 +2405,7 @@ mod tests {
                 patch(0, 0.0, 0.0, false, 1_000_000, 0),
                 patch(1, 0.2, 0.0, false, 1_000_000, 0),
             ],
-            vec![ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap()],
+            vec![certified_edge(0, 1, 0, 0.0)],
             level,
             None,
         );
@@ -2368,8 +2416,8 @@ mod tests {
                 patch(2, -0.2, 0.0, false, 1_000_000, 0),
             ],
             vec![
-                ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap(),
-                ProjectedAtlasEdgeSpec::new(0, 2, 0, 0.0).unwrap(),
+                certified_edge(0, 1, 0, 0.0),
+                certified_edge(0, 2, 0, 0.0),
             ],
             level,
             None,
@@ -2394,12 +2442,15 @@ mod tests {
         let frame_budget = single_center.aligned_frame_error_budget;
         assert_near(
             2.0 * frame_budget + frame_budget * frame_budget,
-            edge.orientation_margin.min(edge.principal_angle_cosines[1]),
+            edge.population_cross_gram
+                .certified_lower_bound()
+                .unwrap(),
         );
     }
 
     fn cancellation_gauss_bonnet(remainder: f64) -> GaussBonnetInput {
         GaussBonnetInput::new(
+            GaussBonnetCovarianceAuthority::CertifiedGaussianLinearization,
             vec![GaussBonnetNoiseSource::new(7, arr2(&[[1.0]])).unwrap()],
             vec![
                 GaussBonnetContribution::new(
@@ -2421,27 +2472,68 @@ mod tests {
         .unwrap()
     }
 
+    fn nondegenerate_gauss_bonnet(
+        remainder: f64,
+        authority: GaussBonnetCovarianceAuthority,
+    ) -> GaussBonnetInput {
+        GaussBonnetInput::new(
+            authority,
+            vec![GaussBonnetNoiseSource::new(7, arr2(&[[1.0]])).unwrap()],
+            vec![
+                GaussBonnetContribution::new(
+                    std::f64::consts::TAU,
+                    remainder,
+                    0.0,
+                    vec![GaussBonnetSourceGradient::new(7, array![1.0]).unwrap()],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn gauss_bonnet_uses_shared_source_covariance_before_integer_rounding() {
+    fn gauss_bonnet_cancellation_is_aggregated_and_refuses_a_degenerate_normal_law() {
         let confidence = gauss_bonnet_confidence(&cancellation_gauss_bonnet(0.0), 0.05).unwrap();
         assert_eq!(confidence.first_order_variance, 0.0);
         assert_eq!(confidence.naive_contribution_variance, 2.0);
         assert_eq!(confidence.shared_source_covariance_adjustment, -2.0);
-        assert_eq!(
-            confidence.decision.certified_value().copied(),
-            Some(AtlasEulerCharacteristic(1))
-        );
+        assert_eq!(confidence.standard_error, None);
+        assert_eq!(confidence.misround_probability_bound, None);
+        assert!(matches!(
+            confidence.decision.refusals(),
+            [AtlasStatisticalRefusal::GaussBonnetFirstOrderLimitDegenerate { .. }]
+        ));
     }
 
     #[test]
     fn gauss_bonnet_refuses_when_remainder_consumes_rounding_cell() {
-        let confidence =
-            gauss_bonnet_confidence(&cancellation_gauss_bonnet(std::f64::consts::PI), 0.05)
-                .unwrap();
+        let confidence = gauss_bonnet_confidence(
+            &nondegenerate_gauss_bonnet(
+                std::f64::consts::PI,
+                GaussBonnetCovarianceAuthority::CertifiedGaussianLinearization,
+            ),
+            0.05,
+        )
+        .unwrap();
         assert!(confidence.decision.certified_value().is_none());
         assert!(matches!(
             confidence.decision.refusals(),
             [AtlasStatisticalRefusal::GaussBonnetRoundingMarginExhausted { .. }]
+        ));
+    }
+
+    #[test]
+    fn gauss_bonnet_plugin_covariance_cannot_mint_a_frequentist_certificate() {
+        let confidence = gauss_bonnet_confidence(
+            &nondegenerate_gauss_bonnet(0.0, GaussBonnetCovarianceAuthority::AsymptoticPlugIn),
+            0.05,
+        )
+        .unwrap();
+        assert_eq!(confidence.misround_probability_bound, None);
+        assert!(matches!(
+            confidence.decision.refusals(),
+            [AtlasStatisticalRefusal::GaussBonnetGaussianLinearizationIsPlugin]
         ));
     }
 
@@ -2455,6 +2547,7 @@ mod tests {
         let standard_error = std::f64::consts::PI / critical;
         let true_chi = AtlasEulerCharacteristic(2);
         let template = GaussBonnetInput::new(
+            GaussBonnetCovarianceAuthority::CertifiedGaussianLinearization,
             vec![
                 GaussBonnetNoiseSource::new(0, arr2(&[[standard_error * standard_error]])).unwrap(),
             ],
@@ -2479,9 +2572,9 @@ mod tests {
             let confidence = gauss_bonnet_confidence(&input, requested_alpha).unwrap();
             assert_eq!(
                 confidence.decision.error_probability_bound(),
-                Some(confidence.misround_probability_bound)
+                confidence.misround_probability_bound
             );
-            assert!(confidence.misround_probability_bound <= requested_alpha);
+            assert!(confidence.misround_probability_bound.unwrap() <= requested_alpha);
             wrong += usize::from(confidence.decision.certified_value().copied() != Some(true_chi));
         }
         let observed = wrong as f64 / REPLICATES as f64;
@@ -2864,8 +2957,9 @@ fn patch_tail(
 /// Largest common aligned-frame error at the two endpoints which cannot reach
 /// the singular-cross-Gram boundary. If both endpoint errors are at most `h`,
 /// the cross-Gram perturbation is at most `2h + h²`. Solving
-/// `2h + h² = m`, with `m = |det(U_b^T U_a)| <= sigma_min(U_b^T U_a)`, uses the
-/// complete determinant margin rather than a hand-chosen fraction of it.
+/// `2h + h² = m` uses a deterministic lower bound `m` on the population
+/// cross-Gram's smallest singular value. An observed random margin cannot set
+/// its own unconditional error threshold.
 fn orientation_endpoint_frame_budget(edge: &EdgeWork) -> Option<f64> {
     let population_margin = edge
         .public
@@ -3151,7 +3245,7 @@ fn analyze_cycle(
         cycle_index,
         steps: cycle_steps.clone(),
         absolute_angle: None,
-        limit_law: None,
+        asymptotic_regime: None,
         first_order_variance: None,
         naive_edgewise_first_order_variance: None,
         covariance_aggregation_adjustment: None,
@@ -3296,13 +3390,13 @@ fn analyze_cycle(
         .max(f64::MIN_POSITIVE);
     let variance_backward_error = f64::EPSILON * dimension.max(1) as f64 * variance_scale;
     let degenerate = first_order_variance <= variance_backward_error;
-    let limit_law = if degenerate {
-        AtlasCycleLimitLaw::DegenerateQuadraticGaussian {
-            bias: quadratic_bias,
-            variance: quadratic_variance,
+    let asymptotic_regime = if degenerate {
+        AtlasCycleAsymptoticRegime::FirstOrderDegenerate {
+            bilinear_quadratic_bias_diagnostic: quadratic_bias,
+            bilinear_quadratic_variance_diagnostic: quadratic_variance,
         }
     } else {
-        AtlasCycleLimitLaw::FirstOrderGaussian {
+        AtlasCycleAsymptoticRegime::FirstOrderGaussian {
             variance: first_order_variance,
             authority: error_model.authority,
         }
@@ -3332,6 +3426,21 @@ fn analyze_cycle(
             });
         }
     }
+    for &(edge_index, _) in &cycle.steps {
+        let edge = &edges[edge_index];
+        if edge
+            .public
+            .population_cross_gram
+            .certified_lower_bound()
+            .is_none()
+        {
+            reasons.push(
+                AtlasStatisticalRefusal::PopulationCrossGramMarginUncertified {
+                    edge: edge.public.identity(),
+                },
+            );
+        }
+    }
     if matches!(
         error_model.authority,
         GaussianPcaCovarianceAuthority::AsymptoticPlugIn
@@ -3339,10 +3448,10 @@ fn analyze_cycle(
         reasons.push(AtlasStatisticalRefusal::GaussianLinearizationIsPlugin { cycle_index });
     }
     if degenerate {
-        reasons.push(AtlasStatisticalRefusal::DegenerateQuadraticGaussianLimit {
+        reasons.push(AtlasStatisticalRefusal::DegenerateFirstOrderLimitUnresolved {
             cycle_index,
-            quadratic_bias,
-            quadratic_variance,
+            bilinear_quadratic_bias_diagnostic: quadratic_bias,
+            bilinear_quadratic_variance_diagnostic: quadratic_variance,
         });
     }
 
@@ -3365,6 +3474,13 @@ fn analyze_cycle(
         ) else {
             continue;
         };
+        let Some(population_margin) = edge
+            .public
+            .population_cross_gram
+            .certified_lower_bound()
+        else {
+            continue;
+        };
         for (chart, tail) in [(edge.public.a, tail_a), (edge.public.b, tail_b)] {
             let bounds = patches[chart]
                 .spectrum_provenance
@@ -3382,23 +3498,22 @@ fn analyze_cycle(
         let cross_error = tail_a.aligned_frame_error
             + tail_b.aligned_frame_error
             + tail_a.aligned_frame_error * tail_b.aligned_frame_error;
-        if cross_error >= edge.smallest_singular_value {
+        if cross_error >= population_margin {
             reasons.push(AtlasStatisticalRefusal::PolarLinearizationUnresolved {
                 cycle_index,
                 edge: edge.public.identity(),
                 cross_gram_error_bound: cross_error,
-                smallest_singular_value: edge.smallest_singular_value,
+                population_smallest_singular_value_lower_bound: population_margin,
             });
             continue;
         }
-        let polar_difference =
-            2.0 * cross_error / (2.0 * edge.smallest_singular_value - cross_error);
+        let polar_difference = 2.0 * cross_error / (2.0 * population_margin - cross_error);
         if polar_difference >= 2.0 {
             reasons.push(AtlasStatisticalRefusal::PolarLinearizationUnresolved {
                 cycle_index,
                 edge: edge.public.identity(),
                 cross_gram_error_bound: cross_error,
-                smallest_singular_value: edge.smallest_singular_value,
+                population_smallest_singular_value_lower_bound: population_margin,
             });
             continue;
         }
@@ -3417,7 +3532,7 @@ fn analyze_cycle(
         cycle_index,
         steps: cycle_steps.clone(),
         absolute_angle: Some(absolute_angle),
-        limit_law: Some(limit_law),
+        asymptotic_regime: Some(asymptotic_regime),
         first_order_variance: Some(first_order_variance),
         naive_edgewise_first_order_variance: Some(naive_first_order_variance),
         covariance_aggregation_adjustment: Some(covariance_aggregation_adjustment),
@@ -3513,7 +3628,8 @@ fn gauss_bonnet_confidence(
     if first_order_variance < 0.0 {
         first_order_variance = 0.0;
     }
-    let standard_error = first_order_variance.sqrt();
+    let degenerate = first_order_variance <= variance_backward_error;
+    let standard_error = (!degenerate).then(|| first_order_variance.sqrt());
     let integer_f64 = (total_curvature_estimate / std::f64::consts::TAU).round();
     if !(integer_f64.is_finite()
         && integer_f64 >= i64::MIN as f64
@@ -3534,11 +3650,29 @@ fn gauss_bonnet_confidence(
     // radius would turn a frequentist error rate into a data-dependent number
     // and could not be advertised as the misround probability.
     let stochastic_rounding_margin = std::f64::consts::PI - total_remainder;
-    let (misround_probability_bound, decision) = if observed_rounding_margin <= 0.0
-        || stochastic_rounding_margin <= 0.0
-    {
+    let mut authority_refusals = Vec::new();
+    if matches!(
+        input.covariance_authority,
+        GaussBonnetCovarianceAuthority::AsymptoticPlugIn
+    ) {
+        authority_refusals
+            .push(AtlasStatisticalRefusal::GaussBonnetGaussianLinearizationIsPlugin);
+    }
+    if degenerate {
+        authority_refusals.push(AtlasStatisticalRefusal::GaussBonnetFirstOrderLimitDegenerate {
+            first_order_variance,
+        });
+    }
+    let (misround_probability_bound, decision) = if !authority_refusals.is_empty() {
         (
-            1.0,
+            None,
+            AtlasStatisticalDecision::Refused {
+                reasons: authority_refusals,
+            },
+        )
+    } else if observed_rounding_margin <= 0.0 || stochastic_rounding_margin <= 0.0 {
+        (
+            Some(1.0),
             AtlasStatisticalDecision::Refused {
                 reasons: vec![
                     AtlasStatisticalRefusal::GaussBonnetRoundingMarginExhausted {
@@ -3549,16 +3683,20 @@ fn gauss_bonnet_confidence(
             },
         )
     } else {
-        let probability = if standard_error == 0.0 {
-            0.0
-        } else {
-            let normal = Normal::new(0.0, 1.0)
-                .map_err(|error| format!("standard-normal construction failed: {error}"))?;
-            (2.0 * (1.0 - normal.cdf(stochastic_rounding_margin / standard_error))).clamp(0.0, 1.0)
-        };
+        let normal = Normal::new(0.0, 1.0)
+            .map_err(|error| format!("standard-normal construction failed: {error}"))?;
+        let probability = (2.0
+            * (1.0
+                - normal.cdf(
+                    stochastic_rounding_margin
+                        / standard_error.ok_or_else(|| {
+                            "nondegenerate Gauss-Bonnet law lost its standard error".to_string()
+                        })?,
+                )))
+        .clamp(0.0, 1.0);
         if probability <= allocated_alpha {
             (
-                probability,
+                Some(probability),
                 AtlasStatisticalDecision::Certified {
                     value: nearest_integer_candidate,
                     error_probability_bound: probability,
@@ -3566,7 +3704,7 @@ fn gauss_bonnet_confidence(
             )
         } else {
             (
-                probability,
+                Some(probability),
                 AtlasStatisticalDecision::Refused {
                     reasons: vec![AtlasStatisticalRefusal::GaussBonnetErrorBoundExceedsLevel {
                         misround_probability_bound: probability,

@@ -733,14 +733,18 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         &self,
         rows: &crate::row_kernel::RowSet,
         row_hessians: &[[[f64; 2]; 2]],
-    ) -> Option<Array2<f64>> {
+    ) -> Option<Result<Array2<f64>, String>> {
         // Only the full-data unit-weight measure is BLAS-3 accelerated; a
         // Horvitz-Thompson subsample keeps the generic per-row HT path.
         if !matches!(rows, crate::row_kernel::RowSet::All) {
             return None;
         }
         if row_hessians.len() != self.family.y.len() {
-            return None;
+            return Some(Err(format!(
+                "BMS rigid hessian_dense_override row-Hessian length mismatch: got {}, expected {}",
+                row_hessians.len(),
+                self.family.y.len()
+            )));
         }
         // The chunked `Xᵀ diag(w) X` build slices contiguous design rows via
         // `try_row_chunk`, which every dense-backed design (materialised OR
@@ -765,25 +769,18 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             });
             return None;
         }
-        // When a CUDA device is present, route the WHOLE `Xᵀ diag(w) X` joint
-        // Hessian through one device dispatch (the embarrassingly-parallel
-        // whole-n GEMM the device wants) rather than per-chunk launches. The
-        // GPU-presence probe is checked first so CPU boxes never pay the three
-        // length-n contracted-weight allocations: `rigid_joint_hessian_on_gpu`
-        // would return `None` there anyway, so the build below is the CPU path.
-        if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
-            let w_mm: Array1<f64> = row_hessians.iter().map(|h| h[0][0]).collect();
-            let w_mg: Array1<f64> = row_hessians.iter().map(|h| h[0][1]).collect();
-            let w_gg: Array1<f64> = row_hessians.iter().map(|h| h[1][1]).collect();
-            if let Some(joint) = rigid_joint_hessian_on_gpu(
-                &self.family.marginal_design,
-                &self.family.logslope_design,
-                &w_mm,
-                &w_mg,
-                &w_gg,
-            ) {
-                return Some(joint);
-            }
+        // Route an eligible whole-design joint Gram through one CUDA dispatch.
+        // `Ok(None)` means CUDA was declined before execution (non-materialized
+        // design, no runtime, or below policy); after admission, a missing
+        // device result is an error and cannot select the CPU algorithm.
+        match rigid_joint_hessian_on_gpu(
+            &self.family.marginal_design,
+            &self.family.logslope_design,
+            row_hessians,
+        ) {
+            Ok(Some(joint)) => return Some(Ok(joint)),
+            Ok(None) => {}
+            Err(error) => return Some(Err(error)),
         }
         Some(self.hessian_dense_blas3(row_hessians))
     }
@@ -880,42 +877,78 @@ fn blas3_gram_chunk_rows(n: usize) -> usize {
 }
 
 /// Whole-design GPU dispatch for the rigid `Xᵀ diag(w) X` joint Hessian.
-/// Routes the full-n contracted weights `(w_mm, w_mg, w_gg)` and the two
-/// dense design views through [`gam_gpu::linalg_dispatch::try_fast_joint_hessian_2x2`],
-/// the same auto-dispatch entry the manifold / Arrow-Schur paths use. The
-/// auto-dispatch gates on `GpuRuntime::global()` and the dense-reduction flop
-/// floor, returning `None` whenever the workload is below gate or the backend
-/// fails — the caller then runs the deterministic CPU chunked-BLAS3 fallback.
-/// Returns `None` whenever either design is operator-backed / residualised
-/// (no `as_dense_ref`): the device path needs a contiguous host matrix to
-/// stage, and densifying an operator design here would defeat the memory
-/// contract the chunked `try_row_chunk` path exists to honour.
+///
+/// `Ok(None)` is reserved for structural or policy decisions made before CUDA
+/// execution: either design is not materialized dense, no runtime exists, or
+/// the workload is below the device floor. Once `route_through_gpu` admits the
+/// operation, a missing result from the current optional `gam-gpu` API is a
+/// contextual `Err`; it never selects the CPU algorithm.
 #[inline]
 fn rigid_joint_hessian_on_gpu(
     marginal_design: &gam_linalg::matrix::DesignMatrix,
     logslope_design: &gam_linalg::matrix::DesignMatrix,
-    w_mm: &Array1<f64>,
-    w_mg: &Array1<f64>,
-    w_gg: &Array1<f64>,
-) -> Option<Array2<f64>> {
-    let x_full = marginal_design.as_dense_ref()?;
-    let g_full = logslope_design.as_dense_ref()?;
-    gam_gpu::linalg_dispatch::try_fast_joint_hessian_2x2(
-        x_full.view(),
-        g_full.view(),
-        w_mm.view(),
-        w_mg.view(),
-        w_gg.view(),
-    )
+    row_hessians: &[[[f64; 2]; 2]],
+) -> Result<Option<Array2<f64>>, String> {
+    let Some(x_full) = marginal_design.as_dense_ref() else {
+        return Ok(None);
+    };
+    let Some(g_full) = logslope_design.as_dense_ref() else {
+        return Ok(None);
+    };
+    let rows = x_full.nrows();
+    let logslope_rows = g_full.nrows();
+    if rows != logslope_rows || rows != row_hessians.len() {
+        return Err(format!(
+            "BMS rigid joint-Hessian dimensions disagree: marginal_rows={rows}, \
+             logslope_rows={logslope_rows}, row_hessians={}",
+            row_hessians.len()
+        ));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let marginal_cols = x_full.ncols();
+        let logslope_cols = g_full.ncols();
+        let operation = gam_gpu::linalg_dispatch::DispatchOp::JointHessian2x2 {
+            n: rows,
+            pa: marginal_cols,
+            pb: logslope_cols,
+        };
+        if gam_gpu::linalg_dispatch::route_through_gpu(operation).is_none() {
+            return Ok(None);
+        }
+
+        let w_mm: Array1<f64> = row_hessians.iter().map(|h| h[0][0]).collect();
+        let w_mg: Array1<f64> = row_hessians.iter().map(|h| h[0][1]).collect();
+        let w_gg: Array1<f64> = row_hessians.iter().map(|h| h[1][1]).collect();
+        require_selected_cuda_gram_result(
+            "rigid joint Hessian",
+            rows,
+            marginal_cols,
+            logslope_cols,
+            gam_gpu::linalg_dispatch::try_fast_joint_hessian_2x2(
+                x_full.view(),
+                g_full.view(),
+                w_mm.view(),
+                w_mg.view(),
+                w_gg.view(),
+            ),
+        )
+        .map(Some)
+    }
 }
 
 impl BernoulliRigidRowKernel {
     /// Chunked BLAS-3 implementation backing
     /// [`RowKernel::hessian_dense_override`]. `row_hessians[row]` is the cached
     /// primary `2×2` row Hessian; `RowSet::All` (unit weights) is guaranteed by
-    /// the caller, and the caller resolved both designs to dense contiguous
-    /// views, so the build is infallible.
-    fn hessian_dense_blas3(&self, row_hessians: &[[[f64; 2]; 2]]) -> Array2<f64> {
+    /// the caller. Materialization and any selected CUDA Gram execution report
+    /// errors through the row-kernel dense-Hessian contract.
+    fn hessian_dense_blas3(&self, row_hessians: &[[[f64; 2]; 2]]) -> Result<Array2<f64>, String> {
         let slices = &self.slices;
         let n = self.family.y.len();
 
@@ -933,10 +966,10 @@ impl BernoulliRigidRowKernel {
         // whether the designs expose a pre-materialised `as_dense_ref`. The gate
         // in `hessian_dense_override` excludes sparse designs, so `try_row_chunk`
         // here never densifies a sparse block. A failed chunk materialisation at
-        // the converged β snapshot is a hard numerical-contract violation — the
-        // design row buffer is fixed and finite for the whole fit — so it
-        // surfaces by panic, mirroring every other kernel-level contract here.
-        let chunk_body = |(start, end): (usize, usize)| -> BernoulliBlockHessianAccumulator {
+        // the converged β snapshot is a hard numerical-contract error because
+        // the design row buffer is fixed for the whole fit.
+        type GramChunkResult = Result<BernoulliBlockHessianAccumulator, String>;
+        let chunk_body = |(start, end): (usize, usize)| -> GramChunkResult {
             // Pin the per-chunk faer Gram GEMMs to `Par::Seq` for the duration of
             // this chunk body. The outer `chunks.into_par_iter()` already fans the
             // row-blocks (sized by `blas3_gram_chunk_rows` to fill the pool)
@@ -964,13 +997,13 @@ impl BernoulliRigidRowKernel {
                             .family
                             .marginal_design
                             .try_row_chunk(start..end)
-                            .map(Into::into)
-                            .unwrap_or_else(|e| {
-                                std::panic::panic_any(format!(
+                            .map_err(|e| {
+                                format!(
                                     "bernoulli rigid hessian_dense_blas3 marginal_design \
                                      try_row_chunk({start}..{end}): {e}"
-                                ))
-                            }),
+                                )
+                            })?
+                            .into(),
                     };
                 let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
                     match self.family.logslope_design.as_dense_ref() {
@@ -979,13 +1012,13 @@ impl BernoulliRigidRowKernel {
                             .family
                             .logslope_design
                             .try_row_chunk(start..end)
-                            .map(Into::into)
-                            .unwrap_or_else(|e| {
-                                std::panic::panic_any(format!(
+                            .map_err(|e| {
+                                format!(
                                     "bernoulli rigid hessian_dense_blas3 logslope_design \
                                      try_row_chunk({start}..{end}): {e}"
-                                ))
-                            }),
+                                )
+                            })?
+                            .into(),
                     };
                 for row in start..end {
                     let local = row - start;
@@ -994,8 +1027,8 @@ impl BernoulliRigidRowKernel {
                     w_mg[local] = h[0][1];
                     w_gg[local] = h[1][1];
                 }
-                acc.add_weighted_design_grams_from_chunks(&x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg);
-                acc
+                acc.add_weighted_design_grams_from_chunks(&x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg)?;
+                Ok(acc)
             })
         };
 
@@ -1004,26 +1037,26 @@ impl BernoulliRigidRowKernel {
         if run_serial {
             let mut acc = BernoulliBlockHessianAccumulator::new(slices);
             for chunk in chunks {
-                acc.add(&chunk_body(chunk));
+                acc.add(&chunk_body(chunk)?);
             }
-            return acc.to_dense(slices);
+            return Ok(acc.to_dense(slices));
         }
-        let acc = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+        let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
             chunks.len(),
-            |range| {
+            |range| -> Result<BernoulliBlockHessianAccumulator, String> {
                 let mut acc = BernoulliBlockHessianAccumulator::new(slices);
                 for chunk in &chunks[range] {
-                    acc.add(&chunk_body(*chunk));
+                    acc.add(&chunk_body(*chunk)?);
                 }
-                acc
+                Ok(acc)
             },
-            |mut left, right| {
+            |mut left, right| -> Result<BernoulliBlockHessianAccumulator, String> {
                 left.add(&right);
-                left
+                Ok(left)
             },
-        )
+        )?
         .unwrap_or_else(|| BernoulliBlockHessianAccumulator::new(slices));
-        acc.to_dense(slices)
+        Ok(acc.to_dense(slices))
     }
 
     /// Chunked BLAS-3 implementation backing
@@ -1105,15 +1138,15 @@ impl BernoulliRigidRowKernel {
                     }
                     acc.add_weighted_design_grams_from_chunks(
                         &x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg,
-                    );
+                    )?;
                     Ok(acc)
                 })
             };
 
         // Parallel over chunks: each chunk body is an independent BLAS-3 GEMM
         // pair over `CHUNK_ROWS` rows reading the already-built shared third
-        // tensor, so the fold has no nested cache contention. Fall back to a
-        // serial chunk loop when already inside a Rayon worker (the outer
+        // tensor, so the fold has no nested cache contention. Use a serial
+        // chunk loop when already inside a Rayon worker (the outer
         // joint-Newton / ψ-sweep par_iter holds the pool) so a nested
         // `into_par_iter` does not starve the pool — the same guard the batched
         // builder uses.
@@ -1312,7 +1345,7 @@ impl BernoulliRigidRowKernel {
                         }
                         acc.add_weighted_design_grams_from_chunks(
                             &x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg,
-                        );
+                        )?;
                         Ok(acc)
                     };
                 // Serial chunk fold within an axis: the axis fan-out already
@@ -1470,7 +1503,7 @@ impl BernoulliRigidRowKernel {
                         }
                         acc.add_weighted_design_grams_from_chunks(
                             &x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg,
-                        );
+                        )?;
                         Ok(acc)
                     };
                 // Serial in-order chunk reduce matches the

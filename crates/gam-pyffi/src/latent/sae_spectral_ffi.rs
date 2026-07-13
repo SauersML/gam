@@ -688,7 +688,7 @@ fn cross_fitted_holonomy_from_ambient(
     use gam::terms::sae::inference::atlas_holonomy::{
         AtlasFamilywiseLevel, AtlasHolonomyCertificate, GaussianPatchRowSplit,
         GaussianPcaCovarianceAuthority, GaussianPcaErrorModel, GaussianPcaPatch,
-        ProjectedAtlasEdgeSpec,
+        PopulationCrossGramProvenance, ProjectedAtlasEdgeSpec,
     };
     if data.ncols() < 3 {
         return Err(format!(
@@ -740,7 +740,15 @@ fn cross_fitted_holonomy_from_ambient(
     let edge_specs = admitted_edges
         .iter()
         .copied()
-        .map(|edge| ProjectedAtlasEdgeSpec::new(edge.a(), edge.b(), edge.overlap(), 0.0))
+        .map(|edge| {
+            ProjectedAtlasEdgeSpec::new(
+                edge.a(),
+                edge.b(),
+                edge.overlap(),
+                PopulationCrossGramProvenance::EstimatedOnly,
+                0.0,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     AtlasHolonomyCertificate::gaussian_pca(
         patches,

@@ -1148,7 +1148,7 @@ fn try_gpu_xt_diag_x<S: ndarray::Data<Elem = f64>>(
     chunk: &ndarray::ArrayBase<S, ndarray::Ix2>,
     weights: ArrayView1<'_, f64>,
 ) -> Result<Option<Array2<f64>>, String> {
-    let (rows, _cols) = chunk.dim();
+    let rows = chunk.nrows();
     if rows != weights.len() {
         return Err(format!(
             "BMS Xᵀ diag(w) X dimension mismatch: rows={rows}, weights={}",
@@ -1181,7 +1181,7 @@ fn try_gpu_xt_diag_y<SX: ndarray::Data<Elem = f64>, SY: ndarray::Data<Elem = f64
     }
     let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
         return Ok(None);
-    }
+    };
     if !runtime.policy().xtwy_target_is_gpu(rows, p_x, q, true) {
         return Ok(None);
     }
@@ -1277,19 +1277,72 @@ pub(super) fn add_weighted_chunk_gram<S: ndarray::Data<Elem = f64>>(
 mod selected_cuda_gram_tests {
     use super::*;
 
+    fn assert_call_sites_propagate_result(source: &str, call: &str, expected: usize) {
+        let sites = source.match_indices(call).collect::<Vec<_>>();
+        assert_eq!(
+            sites.len(),
+            expected,
+            "unexpected number of `{call}` call sites"
+        );
+        for (offset, _) in sites {
+            let statement = source[offset..]
+                .split_once(';')
+                .map(|(statement, _)| statement)
+                .expect("Gram call statement must end with a semicolon");
+            assert!(
+                statement.trim_end().ends_with('?'),
+                "Gram call does not propagate its Result: {statement}"
+            );
+        }
+    }
+
     #[test]
     fn admitted_cuda_gram_without_a_result_is_fail_closed_932() {
-        let error = require_selected_cuda_gram_result::<Array2<f64>>(
-            "sentinel Gram",
-            17,
-            5,
-            3,
-            None,
-        )
-        .expect_err("an admitted CUDA Gram may not select a CPU algorithm after failure");
+        let error =
+            require_selected_cuda_gram_result::<Array2<f64>>("sentinel Gram", 17, 5, 3, None)
+                .expect_err("an admitted CUDA Gram may not select a CPU algorithm after failure");
 
         assert!(error.contains("BMS selected CUDA sentinel Gram execution failed"));
         assert!(error.contains("rows=17, lhs_cols=5, rhs_cols=3"));
         assert!(error.contains("gam-gpu BLAS returned no result"));
+    }
+
+    #[test]
+    fn every_bms_gram_caller_propagates_selected_cuda_errors_932() {
+        let hessian_source = include_str!("hessian_paths.rs");
+        let row_kernel_source = include_str!("row_kernel.rs");
+        let axis_source = include_str!("axis_direction_search.rs");
+
+        assert!(!hessian_source.contains(concat!("and_then(|w| ", "try_gpu_xt_diag")));
+        assert!(!hessian_source.contains(concat!("if let Some(gpu_gram) = ", "try_gpu_xt_diag_x")));
+        let rigid_start = row_kernel_source
+            .find("fn rigid_joint_hessian_on_gpu(")
+            .expect("rigid joint-Hessian CUDA boundary must exist");
+        let rigid_end = row_kernel_source[rigid_start..]
+            .find("\n}\n\nimpl BernoulliRigidRowKernel")
+            .map(|offset| rigid_start + offset)
+            .expect("rigid joint-Hessian CUDA boundary must be structurally bounded");
+        let rigid_source = &row_kernel_source[rigid_start..rigid_end];
+        let policy_gate = rigid_source
+            .find("route_through_gpu(operation).is_none()")
+            .expect("rigid joint Hessian must distinguish pre-execution policy decline");
+        let fail_closed = rigid_source
+            .find("require_selected_cuda_gram_result(")
+            .expect("rigid joint Hessian must reject a missing selected CUDA result");
+        assert!(policy_gate < fail_closed);
+        assert!(rigid_source.contains("return Ok(None);"));
+        assert!(rigid_source.contains("try_fast_joint_hessian_2x2("));
+
+        assert_call_sites_propagate_result(
+            row_kernel_source,
+            "add_weighted_design_grams_from_chunks(",
+            4,
+        );
+        assert_call_sites_propagate_result(
+            axis_source,
+            "add_weighted_design_grams_from_chunks(",
+            2,
+        );
+        assert_call_sites_propagate_result(axis_source, "add_weighted_chunk_gram(", 6);
     }
 }

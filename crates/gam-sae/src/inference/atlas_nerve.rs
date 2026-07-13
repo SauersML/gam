@@ -1042,10 +1042,12 @@ mod tests {
     use crate::inference::atlas_holonomy::{
         AtlasFamilywiseLevel, AtlasHolonomyCertificate, AtlasHolonomyEdgeId, AtlasSignedEdge,
         AtlasStatisticalDecision, ExactAnalyticHolonomyCertificate, GaussBonnetContribution,
-        GaussBonnetInput, GaussBonnetNoiseSource, GaussBonnetSourceGradient,
+        GaussBonnetCovarianceAuthority, GaussBonnetInput, GaussBonnetNoiseSource,
+        GaussBonnetSourceGradient,
         GaussianPatchCentering, GaussianPatchRowSplit, GaussianPcaCovarianceAuthority,
         GaussianPcaErrorModel, GaussianPcaPatch, GaussianPcaPopulationBounds,
-        GaussianPcaSpectrumProvenance, PilotProjectionProvenance, ProjectedAtlasEdgeSpec,
+        GaussianPcaSpectrumProvenance, PilotProjectionProvenance,
+        PopulationCrossGramProvenance, ProjectedAtlasEdgeSpec,
     };
     use crate::manifold::{AtlasOrientability, GraphCompressionKind};
     use ndarray::{Array2, arr2, array};
@@ -1165,10 +1167,7 @@ mod tests {
                     chart,
                     GaussianPatchRowSplit::from_disjoint_ranges(chart * 16, 2, chart * 16 + 8, 2)
                         .unwrap(),
-                    PilotProjectionProvenance::CertifiedFixed {
-                        tangent_leakage_bound: 0.0,
-                        error_probability_bound: 0.0,
-                    },
+                    PilotProjectionProvenance::ExactAnalyticCapture,
                     GaussianPatchCentering::MeanEstimatedOnInferenceRows,
                     projection_frame.clone(),
                     tangent_coordinates.clone(),
@@ -1192,7 +1191,18 @@ mod tests {
         }
         let edge_specs = pairs
             .into_iter()
-            .map(|(a, b)| ProjectedAtlasEdgeSpec::new(a, b, 0, 0.0).unwrap())
+            .map(|(a, b)| {
+                ProjectedAtlasEdgeSpec::new(
+                    a,
+                    b,
+                    0,
+                    PopulationCrossGramProvenance::CertifiedSmallestSingularValue {
+                        lower_bound: 1.0,
+                    },
+                    0.0,
+                )
+                .unwrap()
+            })
             .collect();
         let error_model = GaussianPcaErrorModel::independent(
             &patches,
@@ -1228,10 +1238,7 @@ mod tests {
                         1_000_000,
                     )
                     .unwrap(),
-                    PilotProjectionProvenance::CertifiedFixed {
-                        tangent_leakage_bound: 0.0,
-                        error_probability_bound: 0.0,
-                    },
+                    PilotProjectionProvenance::ExactAnalyticCapture,
                     GaussianPatchCentering::MeanEstimatedOnInferenceRows,
                     projection_frame.clone(),
                     tangent_coordinates.clone(),
@@ -1255,10 +1262,22 @@ mod tests {
         }
         let edge_specs = pairs
             .into_iter()
-            .map(|(a, b)| ProjectedAtlasEdgeSpec::new(a, b, 0, 0.0).unwrap())
+            .map(|(a, b)| {
+                ProjectedAtlasEdgeSpec::new(
+                    a,
+                    b,
+                    0,
+                    PopulationCrossGramProvenance::CertifiedSmallestSingularValue {
+                        lower_bound: 1.0,
+                    },
+                    0.0,
+                )
+                .unwrap()
+            })
             .collect();
         let gauss_bonnet = GaussBonnetInput::new(
-            vec![GaussBonnetNoiseSource::new(0, arr2(&[[0.0]])).unwrap()],
+            GaussBonnetCovarianceAuthority::CertifiedGaussianLinearization,
+            vec![GaussBonnetNoiseSource::new(0, arr2(&[[1.0e-12]])).unwrap()],
             vec![
                 GaussBonnetContribution::new(
                     std::f64::consts::TAU * euler_characteristic as f64,
