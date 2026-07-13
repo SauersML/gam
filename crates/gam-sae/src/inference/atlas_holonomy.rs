@@ -2489,6 +2489,44 @@ mod tests {
     }
 
     #[test]
+    fn degenerate_first_order_cycle_refuses_instead_of_declaring_trivial_holonomy() {
+        // Two coincident parallel overlaps between the same charts cancel in the
+        // cycle, so the first-order (l) term degenerates to zero: the holonomy
+        // statistic is then a weighted chi-squared, not a Normal, and the
+        // universal z-test is invalid. The cycle must therefore emit a typed
+        // refusal, and a degenerate law must NEVER be resolved into a certified
+        // NotRejected verdict sold as "holonomy trivial".
+        let analysis = certified_analysis(
+            vec![
+                patch(0, 0.0, 0.0, false, 1_000_000, 0),
+                patch(1, 0.0, 0.0, false, 1_000_000, 0),
+            ],
+            vec![certified_edge(0, 1, 7, 0.0), certified_edge(0, 1, 3, 0.0)],
+            AtlasFamilywiseLevel::new(0.05).unwrap(),
+            None,
+        );
+        assert_eq!(analysis.cycles().len(), 1);
+        let cycle = &analysis.cycles()[0];
+        assert!(matches!(
+            cycle.asymptotic_regime,
+            Some(AtlasCycleAsymptoticRegime::FirstOrderDegenerate { .. })
+        ));
+        // No conclusion of any kind can be read off the degenerate law: the
+        // decision is a refusal, never Certified(NotRejected) or any other value.
+        assert!(
+            cycle.decision.certified_value().is_none(),
+            "a degenerate first-order limit must not certify NotRejected as trivial holonomy"
+        );
+        assert!(cycle.decision.refusals().iter().any(|reason| matches!(
+            reason,
+            AtlasStatisticalRefusal::DegenerateFirstOrderLimitUnresolved { .. }
+        )));
+        // The Gaussian standard error is withheld precisely because the Normal
+        // law does not hold, so the z-test is never reached.
+        assert!(cycle.standard_error.is_none());
+    }
+
+    #[test]
     fn singular_parallel_overlap_refusals_name_each_edge_identity() {
         let analysis = certified_analysis(
             vec![
