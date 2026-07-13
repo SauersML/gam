@@ -575,6 +575,33 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
     }
 }
 
+/// Lift a fixed-width primary jet through an independent second-order
+/// direction. Primary variables live in the inner scalar; constructing one
+/// must not seed the outer direction, which is reserved for a family or
+/// hyperparameter derivative selected by the caller.
+impl<S, const K: usize> JetScalar<K> for crate::nested_dual::Dual2<S>
+where
+    S: JetScalar<K>,
+{
+    #[inline]
+    fn constant(c: f64) -> Self {
+        Self {
+            v: S::constant(c),
+            g: S::constant(0.0),
+            h: S::constant(0.0),
+        }
+    }
+
+    #[inline]
+    fn variable(x: f64, axis: usize) -> Self {
+        Self {
+            v: S::variable(x, axis),
+            g: S::constant(0.0),
+            h: S::constant(0.0),
+        }
+    }
+}
+
 /// A Taylor-jet scalar whose primary dimension is selected at runtime.
 ///
 /// This is the dimensioned counterpart of [`JetScalar`].  Its algebra is the
@@ -7318,8 +7345,129 @@ mod batch_tests {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{JetScalar, Order1, Order2, filtered_implicit_solve_scalar};
-    use crate::nested_dual::JetField;
+    use super::{JetScalar, OneSeed, Order1, Order2, filtered_implicit_solve_scalar};
+    use crate::nested_dual::{Dual2, JetField};
+
+    // A deliberately mixed beta/family program. Its family derivatives below
+    // are analytic scalar programs, so these checks have no finite-difference
+    // truncation or step-size oracle.
+    fn family_program<const K: usize, S: JetScalar<K>>(x: &S, y: &S, theta: &S) -> S {
+        let xy = x.mul(y);
+        let exponential = theta.mul(&xy).exp();
+        let theta_squared_x_squared = theta.mul(theta).mul(&x.mul(x)).scale(0.375);
+        let theta_y_cubed = theta.mul(&y.mul(y).mul(y)).scale(-0.2);
+        exponential
+            .add(&theta_squared_x_squared)
+            .add(&theta_y_cubed)
+    }
+
+    fn analytic_family_first<const K: usize, S: JetScalar<K>>(
+        x: &S,
+        y: &S,
+        theta: &S,
+    ) -> S {
+        let xy = x.mul(y);
+        let exponential = theta.mul(&xy).exp();
+        xy.mul(&exponential)
+            .add(&theta.mul(&x.mul(x)).scale(0.75))
+            .add(&y.mul(y).mul(y).scale(-0.2))
+    }
+
+    fn analytic_family_second<const K: usize, S: JetScalar<K>>(
+        x: &S,
+        y: &S,
+        theta: &S,
+    ) -> S {
+        let xy = x.mul(y);
+        let exponential = theta.mul(&xy).exp();
+        xy.mul(&xy)
+            .mul(&exponential)
+            .add(&x.mul(x).scale(0.75))
+    }
+
+    fn assert_channel_close(actual: f64, expected: f64, channel: &str) {
+        let tolerance = 256.0 * f64::EPSILON * (1.0 + actual.abs().max(expected.abs()));
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{channel}: actual={actual:.17e}, expected={expected:.17e}, tolerance={tolerance:.3e}"
+        );
+    }
+
+    fn assert_order2_channels<const K: usize>(
+        actual: &Order2<K>,
+        expected: &Order2<K>,
+        prefix: &str,
+    ) {
+        assert_channel_close(actual.value(), expected.value(), &format!("{prefix}.value"));
+        for a in 0..K {
+            assert_channel_close(actual.g()[a], expected.g()[a], &format!("{prefix}.g[{a}]"));
+            for b in 0..K {
+                assert_channel_close(
+                    actual.h()[a][b],
+                    expected.h()[a][b],
+                    &format!("{prefix}.h[{a}][{b}]"),
+                );
+            }
+        }
+    }
+
+    /// The outer first/second channels carry the family derivative while each
+    /// inner `Order2` independently carries beta value/gradient/Hessian.
+    #[test]
+    fn dual2_order2_extracts_exact_family_value_gradient_hessian_channels() {
+        const K: usize = 2;
+        let x0 = 0.7;
+        let y0 = -0.45;
+        let theta0 = 0.6;
+        let x = <Dual2<Order2<K>> as JetScalar<K>>::variable(x0, 0);
+        let y = <Dual2<Order2<K>> as JetScalar<K>>::variable(y0, 1);
+        let theta = Dual2 {
+            v: Order2::constant(theta0),
+            g: Order2::constant(1.0),
+            h: Order2::constant(0.0),
+        };
+
+        let actual = family_program(&x, &y, &theta);
+        let reference_x = Order2::variable(x0, 0);
+        let reference_y = Order2::variable(y0, 1);
+        let reference_theta = Order2::constant(theta0);
+        let expected_first =
+            analytic_family_first(&reference_x, &reference_y, &reference_theta);
+        let expected_second =
+            analytic_family_second(&reference_x, &reference_y, &reference_theta);
+
+        assert_order2_channels(&actual.g, &expected_first, "family_first");
+        assert_order2_channels(&actual.h, &expected_second, "family_second");
+    }
+
+    /// `g.eps.h[a][b]` is the directional beta drift of the family-Hessian
+    /// channel, obtained by exact nested AD rather than differencing Hessians.
+    #[test]
+    fn dual2_oneseed_extracts_exact_family_hessian_drift() {
+        const K: usize = 2;
+        let x0 = 0.7;
+        let y0 = -0.45;
+        let theta0 = 0.6;
+        let direction = [0.3, -0.8];
+
+        let mut x = <Dual2<OneSeed<K>> as JetScalar<K>>::variable(x0, 0);
+        let mut y = <Dual2<OneSeed<K>> as JetScalar<K>>::variable(y0, 1);
+        x.v.eps = Order2::constant(direction[0]);
+        y.v.eps = Order2::constant(direction[1]);
+        let theta = Dual2 {
+            v: OneSeed::constant(theta0),
+            g: OneSeed::constant(1.0),
+            h: OneSeed::constant(0.0),
+        };
+
+        let actual = family_program(&x, &y, &theta);
+        let reference_x = OneSeed::seed_direction(x0, 0, direction[0]);
+        let reference_y = OneSeed::seed_direction(y0, 1, direction[1]);
+        let reference_theta = OneSeed::constant(theta0);
+        let expected = analytic_family_first(&reference_x, &reference_y, &reference_theta);
+
+        assert_order2_channels(&actual.g.eps, &expected.eps, "family_first_drift");
+    }
 
     // ── Order2 direct property tests ─────────────────────────────────────────
 
