@@ -298,9 +298,13 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// A100 NVRTC kernel that evaluates the transcendental per-row jet for all
     /// `n` rows in parallel — it returns the three parallel `n`-length vectors
     /// here; otherwise the default `None` keeps the per-row `row_kernel(row)`
-    /// loop. The batched result MUST be bit-close (≤1e-9) to the per-row path
-    /// (it runs the SAME unified jet on device), so the cache is identical; the
-    /// fast path is a pure accelerator with a CPU fallback inside it.
+    /// loop. `None` is exclusively an up-front policy/availability decline,
+    /// before accelerator execution starts. Once an override selects the
+    /// accelerator it must return `Some(Err(_))` on probe, compilation, launch,
+    /// transfer, or validation failure; the dispatcher must not substitute the
+    /// per-row CPU algorithm after that selection. The batched result MUST be
+    /// bit-close (≤1e-9) to the per-row path because it runs the same unified
+    /// row program on device.
     fn batched_value_grad_hess_all(
         &self,
     ) -> Option<Result<(Vec<f64>, Vec<[f64; K]>, Vec<[[f64; K]; K]>), String>> {

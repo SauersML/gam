@@ -7,9 +7,10 @@
 //! (the `coeff_au` / `coeff_bu` / `g_au_fixed` / `g_bu_fixed` + implicit-
 //! function-theorem `a_u`/`a_uv` chains).
 //!
-//! The discipline here is deliberately blunt and external: drive the PRODUCTION
-//! hand path to get its analytic value/gradient/Hessian, then central-difference
-//! the hand path's OWN returned value `ℓ(θ) = −w·logΦ(s_y·η(z; a(θ), θ))` w.r.t.
+//! The discipline here is deliberately blunt and external: drive the production
+//! compiled lowering of the canonical BMS FLEX program to get its analytic
+//! value/gradient/Hessian, then central-difference that lowering's OWN returned
+//! value `ℓ(θ) = −w·logΦ(s_y·η(z; a(θ), θ))` w.r.t.
 //! every primary `θ = [q, logslope, β…]`, re-solving the calibrated intercept
 //! `a(θ)` at every stencil point (the value is intercept-Jacobian-independent, so
 //! the re-solve shares no derivative-chain code with the analytic path). A
@@ -240,7 +241,7 @@ fn vnll(fx: &VFixture, p: &[f64]) -> f64 {
 }
 
 // ------------------------------------------------------------------
-// Production hand-path drivers.
+// Production canonical-lowering drivers.
 // ------------------------------------------------------------------
 
 fn beta_vec(fx: &VFixture, p: &[f64]) -> Array1<f64> {
@@ -260,8 +261,8 @@ fn beta_vec(fx: &VFixture, p: &[f64]) -> Array1<f64> {
 /// ~1e-5 into the Richardson Hessian). The returned NLL reads only `a` (not
 /// the calibration Jacobian `m_a`), so feeding a placeholder `m_a` here is
 /// exact for the value channel — the derivative chain under test is reached
-/// only through the separate analytic call in `hand_grad_hess`.
-fn hand_value(fx: &VFixture, p: &[f64]) -> f64 {
+/// only through the separate analytic call in `production_grad_hess`.
+fn production_value(fx: &VFixture, p: &[f64]) -> f64 {
     let q = p[fx.primary.q];
     let b = p[fx.primary.logslope];
     let beta = beta_vec(fx, p);
@@ -295,11 +296,11 @@ fn hand_value(fx: &VFixture, p: &[f64]) -> f64 {
             false,
             &mut scratch,
         )
-        .expect("hand path value")
+        .expect("production canonical-lowering value")
 }
 
-/// Hand-path analytic (value, gradient, Hessian) at θ.
-fn hand_grad_hess(fx: &VFixture, p: &[f64]) -> (f64, Vec<f64>, Vec<f64>) {
+/// Production compiled-lowering analytic (value, gradient, Hessian) at θ.
+fn production_grad_hess(fx: &VFixture, p: &[f64]) -> (f64, Vec<f64>, Vec<f64>) {
     let r = fx.primary.total;
     let q = p[fx.primary.q];
     let b = p[fx.primary.logslope];
@@ -335,7 +336,7 @@ fn hand_grad_hess(fx: &VFixture, p: &[f64]) -> (f64, Vec<f64>, Vec<f64>) {
             true,
             &mut scratch,
         )
-        .expect("hand path grad/hess");
+        .expect("production canonical-lowering grad/hess");
     let grad = scratch.grad.iter().copied().collect::<Vec<_>>();
     let mut hess = vec![0.0; r * r];
     for u in 0..r {
@@ -369,7 +370,7 @@ fn fd_grad(fx: &VFixture, p0: &[f64], i: usize, h: f64) -> f64 {
         let mut pm = p0.to_vec();
         pp[i] += step;
         pm[i] -= step;
-        (hand_value(fx, &pp) - hand_value(fx, &pm)) / (2.0 * step)
+        (production_value(fx, &pp) - production_value(fx, &pm)) / (2.0 * step)
     };
     let g_h = central(h);
     let g_h2 = central(0.5 * h);
@@ -385,8 +386,8 @@ fn fd_hess(fx: &VFixture, p0: &[f64], i: usize, j: usize, h: f64) -> f64 {
             let mut pm = p0.to_vec();
             pp[i] += step;
             pm[i] -= step;
-            let f0 = hand_value(fx, p0);
-            (hand_value(fx, &pp) - 2.0 * f0 + hand_value(fx, &pm)) / (step * step)
+            let f0 = production_value(fx, p0);
+            (production_value(fx, &pp) - 2.0 * f0 + production_value(fx, &pm)) / (step * step)
         } else {
             let mut tpp = p0.to_vec();
             let mut tpm = p0.to_vec();
@@ -400,8 +401,8 @@ fn fd_hess(fx: &VFixture, p0: &[f64], i: usize, j: usize, h: f64) -> f64 {
             tmp[j] += step;
             tmm[i] -= step;
             tmm[j] -= step;
-            (hand_value(fx, &tpp) - hand_value(fx, &tpm) - hand_value(fx, &tmp)
-                + hand_value(fx, &tmm))
+            (production_value(fx, &tpp) - production_value(fx, &tpm) - production_value(fx, &tmp)
+                + production_value(fx, &tmm))
                 / (4.0 * step * step)
         }
     };
@@ -411,10 +412,10 @@ fn fd_hess(fx: &VFixture, p0: &[f64], i: usize, j: usize, h: f64) -> f64 {
 }
 
 // ==================================================================
-// GATE 1: hand-path analytic grad/Hessian vs independent FD of the
-// hand-path value, both deviation branches, death (y = 1).
+// GATE 1: production compiled-lowering grad/Hessian vs independent FD of its
+// value, both deviation branches, death (y = 1).
 // ==================================================================
-fn run_hand_gate(is_score_warp: bool) {
+fn run_production_gate(is_score_warp: bool) {
     let fx = vfixture(is_score_warp);
     let r = fx.primary.total;
     let label = if is_score_warp {
@@ -437,12 +438,12 @@ fn run_hand_gate(is_score_warp: bool) {
         p0[i] = fx.beta_dev[k];
     }
 
-    // (a) independent value cross-check: hand path value == my scalar NLL.
-    let v_hand = hand_value(&fx, &p0);
+    // (a) independent value cross-check: production lowering == scalar NLL.
+    let v_production = production_value(&fx, &p0);
     let v_ind = vnll(&fx, &p0);
     assert!(
-        (v_hand - v_ind).abs() <= 1e-9 * v_ind.abs().max(1.0),
-        "{label} hand value {v_hand:+.12e} != independent scalar {v_ind:+.12e}"
+        (v_production - v_ind).abs() <= 1e-9 * v_ind.abs().max(1.0),
+        "{label} production value {v_production:+.12e} != independent scalar {v_ind:+.12e}"
     );
 
     // (b) independent intercept cross-check vs production root.
@@ -466,7 +467,7 @@ fn run_hand_gate(is_score_warp: bool) {
     );
 
     // (c) analytic grad/Hessian vs 4th-order Richardson FD of the value.
-    let (v_gh, grad, hess) = hand_grad_hess(&fx, &p0);
+    let (v_gh, grad, hess) = production_grad_hess(&fx, &p0);
     // The analytic path (production root) and the FD path (ulp-tight
     // independent root) must agree on the value at the base point.
     assert!(
@@ -502,13 +503,13 @@ fn run_hand_gate(is_score_warp: bool) {
 }
 
 #[test]
-fn hand_flex_grad_hess_matches_independent_fd_score_warp_932() {
-    run_hand_gate(true);
+fn production_flex_grad_hess_matches_independent_fd_score_warp_932() {
+    run_production_gate(true);
 }
 
 #[test]
-fn hand_flex_grad_hess_matches_independent_fd_link_dev_932() {
-    run_hand_gate(false);
+fn production_flex_grad_hess_matches_independent_fd_link_dev_932() {
+    run_production_gate(false);
 }
 
 // ==================================================================

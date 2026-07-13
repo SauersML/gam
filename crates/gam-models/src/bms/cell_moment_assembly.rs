@@ -5139,13 +5139,15 @@ mod empirical_flex_jet_oracle_tests {
         }
     }
 
-    /// #932 P3 GATE (direct hand-vs-jet certificate): the single-source
-    /// runtime-jet flex row NLL ([`canonical_flex_row_program_order2`]) reproduces the
-    /// production HAND path `lower_bms_flex_row_order2_from_parts` — value,
-    /// dense `r`-gradient, AND full `r×r` Hessian — to ≤1e-9 on the
-    /// empirical-grid branch (the branch the empirical fixture routes the hand
-    /// path through). This pins the jet against the EXACT function the cutover
-    /// will replace, exercising the entire shared assembly the hand path runs:
+    /// #932 P3 GATE (runtime-vs-compiled certificate): the independent runtime-
+    /// scalar evaluation ([`canonical_flex_row_program_order2`]) reproduces the
+    /// production compiled Order2 lowering
+    /// `lower_bms_flex_row_order2_from_parts` — value, dense `r`-gradient, AND
+    /// full `r×r` Hessian — to ≤1e-9 on the empirical-grid branch. Both routes
+    /// interpret the canonical [`BmsFlexRowProgram`] calibration/finalizer
+    /// schedules through different scalar/storage backends, so this test pins
+    /// the deployed lowering rather than a retired parallel hand calculus. It
+    /// exercises the entire shared assembly:
     /// the calibration moments `f_u/f_au/f_uv/f_aa`, the implicit-function-theorem
     /// intercept lift `a(θ)` (`a_u`/`a_uv`), the observed-index chain
     /// `η_u = χ·a_u + ρ` / `η_uv = χ·a_uv + η_aa·a_u·a_v + τ_u·a_v + a_u·τ_v + r_uv`,
@@ -5153,7 +5155,7 @@ mod empirical_flex_jet_oracle_tests {
     /// with score-warp OR link-wiggle active, deaths (y=1) at the observed row.
     /// A dropped IFT / Leibniz / Faà di Bruno term in either path blows the bound.
     #[test]
-    fn canonical_flex_row_program_order2_matches_hand_path_932() {
+    fn canonical_flex_row_program_order2_matches_production_lowering_932() {
         for is_score_warp in [true, false] {
             let fx = make_fixture(is_score_warp);
             let r = fx.primary.total;
@@ -5234,29 +5236,29 @@ mod empirical_flex_jet_oracle_tests {
                     true,
                     &mut scratch,
                 )
-                .expect("hand flex path");
+                .expect("canonical production flex lowering");
 
             let jet = canonical_flex_row_program_order2(&fx, &p0);
 
             assert!(
                 (neglog - jet.value).abs() <= 1e-9 * jet.value.abs().max(1.0),
-                "{label} value: hand {neglog:+.12e} != jet {:+.12e}",
+                "{label} value: production {neglog:+.12e} != runtime {:+.12e}",
                 jet.value,
             );
             for u in 0..r {
                 assert!(
                     (scratch.grad[u] - jet.gradient[u]).abs()
                         <= 1e-9 * jet.gradient[u].abs().max(1.0),
-                    "{label} grad[{u}]: hand {:+.12e} != jet {:+.12e}",
+                    "{label} grad[{u}]: production {:+.12e} != runtime {:+.12e}",
                     scratch.grad[u],
                     jet.gradient[u],
                 );
                 for v in 0..r {
-                    let h_hand = scratch.hess[[u, v]];
+                    let h_production = scratch.hess[[u, v]];
                     let h_jet = jet.hessian[u * r + v];
                     assert!(
-                        (h_hand - h_jet).abs() <= 1e-9 * h_jet.abs().max(1.0),
-                        "{label} hess[{u},{v}]: hand {h_hand:+.12e} != jet {h_jet:+.12e}"
+                        (h_production - h_jet).abs() <= 1e-9 * h_jet.abs().max(1.0),
+                        "{label} hess[{u},{v}]: production {h_production:+.12e} != runtime {h_jet:+.12e}"
                     );
                 }
             }
@@ -5271,10 +5273,10 @@ mod empirical_flex_jet_oracle_tests {
     /// four nodes leave several denested cells EMPTY and at least one holding a
     /// single node (the degenerate-moment paths where a compiled accumulator
     /// typically diverges from a loop) — over score-warp AND link-deviation,
-    /// `b>0` AND `b<0`. The fixture routes the `GlobalEmpirical` branch, i.e. the
-    /// production path the cutover replaces; `jet2` is a fully independent
-    /// per-node reference (proven vs the hand path by
-    /// `canonical_flex_row_program_order2_matches_hand_path_932`).
+    /// `b>0` AND `b<0`. The fixture routes the production `GlobalEmpirical`
+    /// compiled-moment branch; `jet2` is a fully independent per-node reference
+    /// (proven against the production compiled lowering by
+    /// `canonical_flex_row_program_order2_matches_production_lowering_932`).
     #[test]
     fn flex_factored_matches_jet2_degenerate_grids_932() {
         let sparse = crate::bms::EmpiricalZGrid::new(

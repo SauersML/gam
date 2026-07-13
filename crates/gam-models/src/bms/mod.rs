@@ -2188,8 +2188,9 @@ pub(crate) mod cell_moment_assembly;
 #[cfg(test)]
 mod test_support;
 // #932 INDEPENDENT adversarial verifier (bms-flex-verify): a high-order
-// finite-difference oracle on the production hand path
-// `lower_bms_flex_row_order2_from_parts` + a moving-edge Leibniz
+// finite-difference oracle on the production compiled lowering
+// `lower_bms_flex_row_order2_from_parts` of the canonical BMS FLEX program,
+// plus a moving-edge Leibniz
 // cross-check + a planted-corruption tripwire. Bare `#[cfg(test)] mod` with the
 // allowed `*_tests` name so the build.rs ban-scanner exempts it; owned solely by
 // the verifier (never edits the implementer's row_primary_hessian /
