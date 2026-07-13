@@ -266,11 +266,11 @@ impl Drop for RowPrimaryEvalPin {
 ///   the fused gradient+dense-H path via
 ///   [`BernoulliMarginalSlopeFamily::cached_row_primary_hessian`] and
 ///   [`BernoulliMarginalSlopeFamily::cached_row_primary_eval`].
-/// - `Device` (Linux/CUDA only): row Hessian + designs live on the GPU.
-///   HVP / diagonal / dense-block consumers route through the device-aware
-///   GPU entry points. Widths above the direct dense kernel's shared-memory
-///   bound materialize through bounded multi-RHS device HVPs; device failures
-///   propagate instead of changing algorithms.
+/// - `Device` (Linux/CUDA only): row value, gradient, Hessian, and designs live
+///   on the GPU. Log-likelihood / score / HVP / diagonal / dense consumers route
+///   through device entry points. Widths above the direct dense kernel's
+///   shared-memory bound materialize through bounded multi-RHS device HVPs;
+///   device failures propagate instead of changing algorithms.
 pub enum RowPrimaryEvalCache {
     Empty,
     Host(RowPrimaryEvalPin),
@@ -281,8 +281,9 @@ pub enum RowPrimaryEvalCache {
     /// build scratch stays one tile wide and the inner operator never falls
     /// back to recomputing row Hessians per probe.
     Tiled(RowPrimaryEvalTiles),
-    /// Device-resident row Hessian + designs. HVP / diagonal / dense-block
-    /// consumers route through the device-aware GPU entry points.
+    /// Device-resident row value + gradient + Hessian + designs. Every
+    /// downstream joint-value/score/Hessian consumer routes through the
+    /// device-aware entry points.
     #[cfg(target_os = "linux")]
     Device(crate::bms::gpu::row::DeviceResidentRowHess),
 }
@@ -331,6 +332,21 @@ impl RowPrimaryEvalCache {
             Self::Device(hess) => Some(hess),
             _ => None,
         }
+    }
+
+    /// Reject a host row-calculus entry point after the device cache has been
+    /// selected. Device selection is an algorithm commitment, so a caller
+    /// must consume the resident value/gradient/Hessian channels instead of
+    /// silently recomputing the canonical row program on CPU.
+    #[inline]
+    pub(crate) fn reject_device_cpu_recompute(&self, operation: &str) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::Device(_)) {
+            return Err(format!(
+                "BMS {operation}: device-resident row evaluation selected; CPU row recomputation is forbidden"
+            ));
+        }
+        Ok(())
     }
 }
 

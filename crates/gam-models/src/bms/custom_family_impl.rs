@@ -1535,6 +1535,8 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
             cache,
             matvec_calls: AtomicUsize::new(0),
             fused_gradient_dense: OnceLock::new(),
+            #[cfg(target_os = "linux")]
+            device_joint_gradient: OnceLock::new(),
             options,
         })
     }
@@ -1544,6 +1546,22 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     ) -> Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String> {
         self.fused_gradient_dense
             .get_or_init(|| {
+                #[cfg(target_os = "linux")]
+                if let Some(gradient) = self.selected_device_joint_gradient()? {
+                    let hessian = self
+                        .selected_device_dense_hessian("fused_gradient_dense")?
+                        .ok_or_else(|| {
+                            "BMS fused_gradient_dense: selected device cache disappeared"
+                                .to_string()
+                        })?;
+                    return Ok(Arc::new(ExactNewtonJointFusedDenseEvaluation {
+                        gradient: ExactNewtonJointGradientEvaluation {
+                            log_likelihood: gradient.log_likelihood,
+                            gradient: gradient.gradient.clone(),
+                        },
+                        hessian,
+                    }));
+                }
                 self.family
                     .exact_newton_joint_fused_gradient_dense_from_cache(
                         &self.block_states,
@@ -1552,6 +1570,41 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
                     .map(Arc::new)
             })
             .clone()
+    }
+
+    /// Pull back and reduce the canonical device-resident row value/gradient
+    /// buffers exactly once. A selected CUDA path is fail-closed: launch,
+    /// reduction, download, and shape errors are cached and propagated.
+    #[cfg(target_os = "linux")]
+    fn selected_device_joint_gradient(
+        &self,
+    ) -> Result<Option<Arc<ExactNewtonJointGradientEvaluation>>, String> {
+        let Some(_device_state) = self.cache.row_primary_hessians.device() else {
+            return Ok(None);
+        };
+        let expected = self.cache.slices.total;
+        self.device_joint_gradient
+            .get_or_init(|| {
+                let reduced = self
+                    .family
+                    .selected_device_joint_gradient_from_cache(
+                        &self.cache,
+                        "joint_gradient_evaluation",
+                    )?
+                    .ok_or_else(|| {
+                        "BMS joint_gradient_evaluation: selected device cache disappeared"
+                            .to_string()
+                    })?;
+                if reduced.gradient.len() != expected {
+                    return Err(format!(
+                        "BMS joint_gradient_evaluation: device gradient len={} != p_total={expected}",
+                        reduced.gradient.len()
+                    ));
+                }
+                Ok(Arc::new(reduced))
+            })
+            .clone()
+            .map(Some)
     }
 
     /// Materialize the joint Hessian from an already-selected device cache.
@@ -1563,18 +1616,11 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         &self,
         operation: &str,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some(device_state) = self.cache.row_primary_hessians.device() else {
+        let Some(_device_state) = self.cache.row_primary_hessians.device() else {
             return Ok(None);
         };
-        let p_total = self.cache.slices.total;
-        let flat = crate::bms::gpu::flex::require_selected_gpu_result(
-            operation,
-            crate::bms::gpu::row::launch_bms_flex_row_dense(device_state),
-        )?;
-        let dense = Array2::from_shape_vec((p_total, p_total), flat).map_err(|error| {
-            format!("BMS {operation}: {p_total}x{p_total} reshape failed: {error}")
-        })?;
-        Ok(Some(dense))
+        self.family
+            .selected_device_dense_hessian_from_cache(&self.cache, operation)
     }
 
     /// Matrix-free inner-Newton/CG route for BMS flex large-n.
@@ -1639,8 +1685,10 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         // implementation selects direct dense vs bounded multi-RHS H*I by
         // width and propagates every failure.
         #[cfg(target_os = "linux")]
-        if let Some(dense) = self.selected_device_dense_hessian("hessian_dense")? {
-            return Ok(Some(dense));
+        if self.cache.row_primary_hessians.device().is_some() {
+            return self
+                .fused_gradient_dense()
+                .map(|fused| Some(fused.hessian.clone()));
         }
         if log_exact_work(self.family.y.len()) {
             log::info!(
@@ -1682,14 +1730,20 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         // Device-resident state stays on the selected CUDA algorithm. Wide
         // matrices use multi-RHS H*I rather than crossing to CPU.
         #[cfg(target_os = "linux")]
-        if let Some(dense) = self.selected_device_dense_hessian("hessian_dense_forced")? {
-            return Ok(Some(dense));
+        if self.cache.row_primary_hessians.device().is_some() {
+            return self
+                .fused_gradient_dense()
+                .map(|fused| Some(fused.hessian.clone()));
         }
         self.fused_gradient_dense()
             .map(|fused| Some(fused.hessian.clone()))
     }
 
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
+        #[cfg(target_os = "linux")]
+        if let Some(gradient) = self.selected_device_joint_gradient()? {
+            return Ok(Some(gradient.log_likelihood));
+        }
         self.family
             .log_likelihood_from_exact_cache(&self.block_states, &self.cache)
             .map(Some)
@@ -1698,6 +1752,13 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
     fn joint_gradient_evaluation(
         &self,
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        #[cfg(target_os = "linux")]
+        if let Some(gradient) = self.selected_device_joint_gradient()? {
+            return Ok(Some(ExactNewtonJointGradientEvaluation {
+                log_likelihood: gradient.log_likelihood,
+                gradient: gradient.gradient.clone(),
+            }));
+        }
         if self.cache.slices.total < 512 && !self.matrix_free_inner_route() {
             // The only current consumer of workspace-side joint gradients is
             // the exact joint-Newton path. For bounded dense systems it will

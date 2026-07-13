@@ -1182,10 +1182,10 @@ pub(crate) const BMS_FLEX_ROW_HVP_MAX_RHS: usize = 8;
 /// [`launch_bms_flex_row_kernel_device_resident`] and consumed by
 /// [`launch_bms_flex_row_hvp`] / [`launch_bms_flex_row_diagonal`].
 ///
-/// Owns the row-Hessian + design slices on-device so the host can issue
-/// many HVPs against the same β snapshot without round-tripping
-/// 626 MB through host RAM. Drop releases the device memory back to
-/// the CUDA runtime.
+/// Owns the canonical row value, gradient, Hessian, and design slices on-device
+/// so every downstream value/score/Hessian consumer shares one row evaluation
+/// without round-tripping the large cache through host RAM. Drop releases the
+/// device memory back to the CUDA runtime.
 /// Per-row Hessian storage layout on the device. The build path is free to
 /// emit either, and the Hv / diag kernels read whichever the storage says.
 ///
@@ -1247,8 +1247,8 @@ pub(crate) fn num_hvp_chunks(n: usize) -> usize {
     n.div_ceil(HVP_ROWS_PER_CTA as usize)
 }
 
-/// NVRTC source: HVP-partial kernel + HVP-reduce kernel + diag-partial +
-/// diag-reduce. All kernels mirror the CPU oracle in this file.
+/// NVRTC source: deterministic joint-gradient, HVP, diagonal, and dense
+/// partial+reduce kernels. All kernels mirror CPU oracles in this file.
 #[cfg(target_os = "linux")]
 pub(crate) const HVP_KERNEL_SOURCE: &str = r#"
 // CPU parity reference: cpu_oracle_bms_flex_row_hvp / cpu_oracle_bms_flex_row_diagonal

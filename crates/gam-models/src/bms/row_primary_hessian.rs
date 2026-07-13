@@ -2232,9 +2232,8 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Returns the cached row-primary (neglog, grad_row) for host-resident
     /// caches. Returns `None` when the cache is absent, device-resident, or
-    /// the row is out of range. Device-resident caches recompute the row
-    /// kernel on the rare CPU-fused-gradient fallback path; the GPU
-    /// dense-block kernel handles the hot path for them directly.
+    /// the row is out of range. Device consumers use their resident aggregate
+    /// kernel and never enter this host-row accessor.
     #[inline]
     pub(super) fn cached_row_primary_eval<'a>(
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
@@ -7047,6 +7046,15 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
     ) -> Result<Array2<f64>, String> {
+        #[cfg(target_os = "linux")]
+        if let Some(hessian) =
+            self.selected_device_dense_hessian_from_cache(cache, "exact dense Hessian")?
+        {
+            return Ok(hessian);
+        }
+        cache
+            .row_primary_hessians
+            .reject_device_cpu_recompute("exact dense Hessian")?;
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
@@ -7247,6 +7255,31 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
     ) -> Result<ExactNewtonJointFusedDenseEvaluation, String> {
+        #[cfg(target_os = "linux")]
+        if cache.row_primary_hessians.device().is_some() {
+            let gradient = self
+                .selected_device_joint_gradient_from_cache(
+                    cache,
+                    "fused exact gradient+dense Hessian",
+                )?
+                .ok_or_else(|| {
+                    "BMS fused exact gradient+dense Hessian: selected device cache disappeared"
+                        .to_string()
+                })?;
+            let hessian = self
+                .selected_device_dense_hessian_from_cache(
+                    cache,
+                    "fused exact gradient+dense Hessian",
+                )?
+                .ok_or_else(|| {
+                    "BMS fused exact gradient+dense Hessian: selected device cache disappeared"
+                        .to_string()
+                })?;
+            return Ok(ExactNewtonJointFusedDenseEvaluation { gradient, hessian });
+        }
+        cache
+            .row_primary_hessians
+            .reject_device_cpu_recompute("fused exact gradient+dense Hessian")?;
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();
@@ -7356,8 +7389,9 @@ impl BernoulliMarginalSlopeFamily {
                                 Self::cached_row_primary_hessian(cache, row);
                             cached_hessian = cached_hess;
                         } else {
-                            // Cache miss (device-resident or no cache): run the
-                            // row kernel once for neglog + grad + (maybe) hess.
+                            // Host cache miss: run the row kernel once for
+                            // neglog + grad + (maybe) hess. Device caches are
+                            // rejected at the function boundary above.
                             cached_grad_row_storage = None;
                             let row_ctx = Self::row_ctx(cache, row);
                             let cached_hess =
@@ -7554,6 +7588,15 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
     ) -> Result<f64, String> {
+        #[cfg(target_os = "linux")]
+        if let Some(gradient) =
+            self.selected_device_joint_gradient_from_cache(cache, "exact log likelihood")?
+        {
+            return Ok(gradient.log_likelihood);
+        }
+        cache
+            .row_primary_hessians
+            .reject_device_cpu_recompute("exact log likelihood")?;
         if !self.effective_flex_active(block_states)? {
             return self
                 .log_likelihood_only_with_options(block_states, &BlockwiseFitOptions::default());

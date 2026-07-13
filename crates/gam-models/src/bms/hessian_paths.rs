@@ -242,7 +242,7 @@ impl BernoulliBlockHessianAccumulator {
         ) {
             let x = x_full.slice(s![rows.clone(), ..]);
             let g = g_full.slice(s![rows, ..]);
-            self.add_weighted_design_grams_from_chunks(&x, &g, w_mm, w_mg, w_gg);
+            self.add_weighted_design_grams_from_chunks(&x, &g, w_mm, w_mg, w_gg)?;
             return Ok(());
         }
         let x = family
@@ -253,7 +253,7 @@ impl BernoulliBlockHessianAccumulator {
             .logslope_design
             .try_row_chunk(rows)
             .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
-        self.add_weighted_design_grams_from_chunks(&x, &g, w_mm, w_mg, w_gg);
+        self.add_weighted_design_grams_from_chunks(&x, &g, w_mm, w_mg, w_gg)?;
         Ok(())
     }
 
@@ -267,28 +267,29 @@ impl BernoulliBlockHessianAccumulator {
         w_mm: &Array1<f64>,
         w_mg: &Array1<f64>,
         w_gg: &Array1<f64>,
-    ) {
+    ) -> Result<(), String> {
         // Biobank-scale lever: the marginal (`h_mm`) and logslope (`h_gg`)
         // weighted Gram blocks are the dominant `Xᵀ diag(w) X` reductions over
         // n ≈ 356k rows. Route each to the CUDA f64 GEMM when a device is
-        // present and the chunk clears the device flop floor; the CPU
-        // chunked-BLAS3 path is the f64 fallback (no device, below threshold,
-        // transient decline). Bit-faithful within the manifold-path GPU/CPU
-        // f64 parity.
-        match w_mm.as_slice().and_then(|w| try_gpu_xt_diag_x(x, w)) {
+        // present and the chunk clears the device flop floor. CPU execution is
+        // chosen only before CUDA admission (no runtime or below threshold);
+        // after admission, a missing device result is an error. Both algorithms
+        // use the same fp64 reduction over the same rows.
+        match try_gpu_xt_diag_x(x, w_mm.view())? {
             Some(gpu_mm) => self.h_mm += &gpu_mm,
             None => self.h_mm += &gam_linalg::faer_ndarray::fast_xt_diag_x(x, w_mm),
         }
         if w_mg.iter().any(|value| *value != 0.0) {
-            match w_mg.as_slice().and_then(|w| try_gpu_xt_diag_y(x, w, g)) {
+            match try_gpu_xt_diag_y(x, w_mg.view(), g)? {
                 Some(gpu_mg) => self.h_mg += &gpu_mg,
                 None => self.h_mg += &gam_linalg::faer_ndarray::fast_xt_diag_y(x, w_mg, g),
             }
         }
-        match w_gg.as_slice().and_then(|w| try_gpu_xt_diag_x(g, w)) {
+        match try_gpu_xt_diag_x(g, w_gg.view())? {
             Some(gpu_gg) => self.h_gg += &gpu_gg,
             None => self.h_gg += &gam_linalg::faer_ndarray::fast_xt_diag_x(g, w_gg),
         }
+        Ok(())
     }
 
     /// Batch the exact h/w pullback terms for one row chunk.

@@ -7,11 +7,70 @@ use super::*;
 use crate::gpu_kernels::row_hessian_ops;
 
 impl BernoulliMarginalSlopeFamily {
+    /// Cache-boundary adapter for the canonical device row value/gradient
+    /// aggregate. Every direct-family and workspace consumer goes through this
+    /// authority; a selected device launch can never cross to host calculus.
+    #[cfg(target_os = "linux")]
+    pub(super) fn selected_device_joint_gradient_from_cache(
+        &self,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        operation: &str,
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        let Some(device_state) = cache.row_primary_hessians.device() else {
+            return Ok(None);
+        };
+        let reduced = crate::bms::gpu::flex::require_selected_gpu_result(
+            operation,
+            crate::bms::gpu::row::launch_bms_flex_row_joint_gradient(device_state),
+        )?;
+        let expected = cache.slices.total;
+        if reduced.gradient.len() != expected {
+            return Err(format!(
+                "BMS {operation}: device gradient len={} != p_total={expected}",
+                reduced.gradient.len()
+            ));
+        }
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood: reduced.log_likelihood,
+            gradient: Array1::from_vec(reduced.gradient),
+        }))
+    }
+
+    /// Cache-boundary adapter for device joint-Hessian materialization.
+    #[cfg(target_os = "linux")]
+    pub(super) fn selected_device_dense_hessian_from_cache(
+        &self,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        operation: &str,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some(device_state) = cache.row_primary_hessians.device() else {
+            return Ok(None);
+        };
+        let p_total = cache.slices.total;
+        let flat = crate::bms::gpu::flex::require_selected_gpu_result(
+            operation,
+            crate::bms::gpu::row::launch_bms_flex_row_dense(device_state),
+        )?;
+        let dense = Array2::from_shape_vec((p_total, p_total), flat).map_err(|error| {
+            format!("BMS {operation}: {p_total}x{p_total} reshape failed: {error}")
+        })?;
+        Ok(Some(dense))
+    }
+
     pub(super) fn exact_newton_joint_gradient_evaluation_from_cache(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
     ) -> Result<ExactNewtonJointGradientEvaluation, String> {
+        #[cfg(target_os = "linux")]
+        if let Some(gradient) =
+            self.selected_device_joint_gradient_from_cache(cache, "exact joint gradient")?
+        {
+            return Ok(gradient);
+        }
+        cache
+            .row_primary_hessians
+            .reject_device_cpu_recompute("exact joint gradient")?;
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();

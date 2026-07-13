@@ -1506,6 +1506,9 @@ pub(super) struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     pub(super) matvec_calls: AtomicUsize,
     pub(super) fused_gradient_dense:
         OnceLock<Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String>>,
+    #[cfg(target_os = "linux")]
+    pub(super) device_joint_gradient:
+        OnceLock<Result<Arc<ExactNewtonJointGradientEvaluation>, String>>,
     /// Outer-only joint-Hessian directional-derivative options. The
     /// `outer_score_subsample` field is the row mask threaded through the
     /// `_with_options` directional-derivative helpers so the cached joint

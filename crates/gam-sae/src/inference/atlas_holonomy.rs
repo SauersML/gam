@@ -3222,7 +3222,16 @@ fn analyze_cycle(
         .atan2(holonomy[[0, 0]] + holonomy[[1, 1]])
         .abs();
 
-    for patch in patches {
+    let incident_charts: BTreeSet<_> = cycle
+        .steps
+        .iter()
+        .flat_map(|&(edge_index, _)| {
+            let edge = &edges[edge_index].public;
+            [edge.a, edge.b]
+        })
+        .collect();
+    for chart in incident_charts {
+        let patch = &patches[chart];
         if !patch.pilot_projection.is_certified() {
             reasons
                 .push(AtlasStatisticalRefusal::PilotProjectionUncertified { chart: patch.chart });
