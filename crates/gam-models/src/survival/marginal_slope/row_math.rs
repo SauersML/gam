@@ -995,9 +995,7 @@ where
 }
 
 #[inline]
-fn checked_vector_workspace_layout(
-    score_dimension: usize,
-) -> Result<(usize, usize, usize), String> {
+fn checked_vector_workspace_layout(score_dimension: usize) -> Result<(usize, usize), String> {
     if score_dimension == 0 {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: "survival marginal-slope vector row requires at least one score slope"
@@ -1029,15 +1027,7 @@ fn checked_vector_workspace_layout(
         }
         .to_string()
     })?;
-    let jacobian_cells = RIGID_FEATURE_DIMENSION
-        .checked_mul(dimension)
-        .ok_or_else(|| SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "survival marginal-slope primary width {dimension} overflows its feature Jacobian storage"
-            ),
-        }
-        .to_string())?;
-    Ok((dimension, jacobian_cells, derivative_cells))
+    Ok((dimension, derivative_cells))
 }
 
 /// Reusable, allocation-free production workspace bound to one validated score
@@ -1047,28 +1037,21 @@ pub(crate) struct RigidVectorRowWorkspace<'covariance> {
     covariance: &'covariance MarginalSlopeCovariance,
     sigma_g: Box<[f64]>,
     low_rank_projection: Box<[f64]>,
-    feature_jacobian: Box<[f64]>,
     derivative_cells: Box<[f64]>,
 }
 
 impl<'covariance> RigidVectorRowWorkspace<'covariance> {
     pub(crate) fn new(covariance: &'covariance MarginalSlopeCovariance) -> Result<Self, String> {
         let score_dimension = covariance.dim();
-        let (dimension, jacobian_cells, derivative_cells) =
-            checked_vector_workspace_layout(score_dimension)?;
+        let (dimension, derivative_cells) = checked_vector_workspace_layout(score_dimension)?;
         let projection_dimension = match covariance.representation() {
             MarginalSlopeCovarianceRef::LowRank(factor) => factor.ncols(),
             MarginalSlopeCovarianceRef::Diagonal(_) | MarginalSlopeCovarianceRef::Full(_) => 0,
         };
-        let mut feature_jacobian = vec![0.0; jacobian_cells].into_boxed_slice();
-        feature_jacobian[FEATURE_Q0 * dimension + FEATURE_Q0] = 1.0;
-        feature_jacobian[FEATURE_Q1 * dimension + FEATURE_Q1] = 1.0;
-        feature_jacobian[FEATURE_QD1 * dimension + FEATURE_QD1] = 1.0;
         Ok(Self {
             covariance,
             sigma_g: vec![0.0; score_dimension].into_boxed_slice(),
             low_rank_projection: vec![0.0; projection_dimension].into_boxed_slice(),
-            feature_jacobian,
             derivative_cells: vec![0.0; derivative_cells].into_boxed_slice(),
         })
     }
@@ -1178,49 +1161,122 @@ pub(crate) fn order2_feature_pullback_into<const FEATURES: usize>(
 }
 
 #[inline(always)]
-fn add_weighted_variance_hessian(
-    covariance: &MarginalSlopeCovariance,
-    feature_gradient: &[f64; RIGID_FEATURE_DIMENSION],
+fn write_rigid_vector_score_hessian_block(
+    feature_hessian: &[[f64; RIGID_FEATURE_DIMENSION]; RIGID_FEATURE_DIMENSION],
+    z: &[f64],
+    sigma_g: &[f64],
+    probit_scale: f64,
+    variance_curvature_scale: f64,
     dimension: usize,
     hessian: &mut [f64],
+    covariance_coefficient: impl Fn(usize, usize) -> f64,
 ) {
-    let scale = 2.0 * feature_gradient[FEATURE_VARIANCE];
+    for left_score in 0..z.len() {
+        let left_linear = probit_scale * z[left_score];
+        let left_variance = 2.0 * sigma_g[left_score];
+        let to_linear = feature_hessian[FEATURE_LINEAR][FEATURE_LINEAR] * left_linear
+            + feature_hessian[FEATURE_VARIANCE][FEATURE_LINEAR] * left_variance;
+        let to_variance = feature_hessian[FEATURE_LINEAR][FEATURE_VARIANCE] * left_linear
+            + feature_hessian[FEATURE_VARIANCE][FEATURE_VARIANCE] * left_variance;
+        let left_primary = 3 + left_score;
+        for right_score in left_score..z.len() {
+            let right_linear = probit_scale * z[right_score];
+            let right_variance = 2.0 * sigma_g[right_score];
+            let channel = to_linear * right_linear
+                + to_variance * right_variance
+                + variance_curvature_scale * covariance_coefficient(left_score, right_score);
+            let right_primary = 3 + right_score;
+            hessian[left_primary * dimension + right_primary] = channel;
+            hessian[right_primary * dimension + left_primary] = channel;
+        }
+    }
+}
+
+/// Exact sparse pullback of the canonical feature program through
+/// `(q0,q1,qd1,g) -> (q0,q1,qd1,s*z'g,g'Sigma*g)`. The likelihood remains
+/// entirely owned by `rigid_feature_program_order2`; this function lowers only
+/// the declared feature-map structure. Each score pair is visited once, and
+/// `2*dL/dV*Sigma` is fused into that visit rather than materializing a dense
+/// feature Jacobian or a second score-Hessian pass.
+#[inline(always)]
+fn rigid_vector_feature_pullback_into(
+    feature_gradient: &[f64; RIGID_FEATURE_DIMENSION],
+    feature_hessian: &[[f64; RIGID_FEATURE_DIMENSION]; RIGID_FEATURE_DIMENSION],
+    z: &[f64],
+    sigma_g: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    probit_scale: f64,
+    dimension: usize,
+    gradient: &mut [f64],
+    hessian: &mut [f64],
+) {
+    for identity in 0..3 {
+        gradient[identity] = feature_gradient[identity];
+        for other_identity in 0..3 {
+            hessian[identity * dimension + other_identity] =
+                feature_hessian[identity][other_identity];
+        }
+    }
+
+    for score in 0..z.len() {
+        let primary = 3 + score;
+        let linear = probit_scale * z[score];
+        let variance = 2.0 * sigma_g[score];
+        gradient[primary] = feature_gradient[FEATURE_LINEAR] * linear
+            + feature_gradient[FEATURE_VARIANCE] * variance;
+        for identity in 0..3 {
+            let channel = feature_hessian[identity][FEATURE_LINEAR] * linear
+                + feature_hessian[identity][FEATURE_VARIANCE] * variance;
+            hessian[identity * dimension + primary] = channel;
+            hessian[primary * dimension + identity] = channel;
+        }
+    }
+
+    let variance_curvature_scale = 2.0 * feature_gradient[FEATURE_VARIANCE];
     match covariance.representation() {
         MarginalSlopeCovarianceRef::Diagonal(diagonal) => {
-            for axis in 0..diagonal.len() {
-                let primary = 3 + axis;
-                hessian[primary * dimension + primary] += scale * diagonal[axis];
-            }
+            write_rigid_vector_score_hessian_block(
+                feature_hessian,
+                z,
+                sigma_g,
+                probit_scale,
+                variance_curvature_scale,
+                dimension,
+                hessian,
+                |row, column| {
+                    if row == column { diagonal[row] } else { 0.0 }
+                },
+            );
         }
         MarginalSlopeCovarianceRef::Full(matrix) => {
-            for row in 0..matrix.nrows() {
-                let primary_row = 3 + row;
-                for column in row..matrix.ncols() {
-                    let primary_column = 3 + column;
-                    let channel = scale * matrix[[row, column]];
-                    hessian[primary_row * dimension + primary_column] += channel;
-                    if row != column {
-                        hessian[primary_column * dimension + primary_row] += channel;
-                    }
-                }
-            }
+            write_rigid_vector_score_hessian_block(
+                feature_hessian,
+                z,
+                sigma_g,
+                probit_scale,
+                variance_curvature_scale,
+                dimension,
+                hessian,
+                |row, column| matrix[[row, column]],
+            );
         }
         MarginalSlopeCovarianceRef::LowRank(factor) => {
-            for row in 0..factor.nrows() {
-                let primary_row = 3 + row;
-                for column in row..factor.nrows() {
-                    let primary_column = 3 + column;
+            write_rigid_vector_score_hessian_block(
+                feature_hessian,
+                z,
+                sigma_g,
+                probit_scale,
+                variance_curvature_scale,
+                dimension,
+                hessian,
+                |row, column| {
                     let mut coefficient = 0.0;
                     for rank in 0..factor.ncols() {
                         coefficient += factor[[row, rank]] * factor[[column, rank]];
                     }
-                    let channel = scale * coefficient;
-                    hessian[primary_row * dimension + primary_column] += channel;
-                    if row != column {
-                        hessian[primary_column * dimension + primary_row] += channel;
-                    }
-                }
-            }
+                    coefficient
+                },
+            );
         }
     }
 }
@@ -1277,7 +1333,6 @@ pub(crate) fn row_primary_closed_form_vector_into(
         covariance,
         sigma_g,
         low_rank_projection,
-        feature_jacobian,
         derivative_cells,
     } = workspace;
     let covariance = *covariance;
@@ -1285,8 +1340,6 @@ pub(crate) fn row_primary_closed_form_vector_into(
     let mut linear_dot = 0.0;
     for axis in 0..k {
         linear_dot += slopes[axis] * z[axis];
-        feature_jacobian[FEATURE_LINEAR * dimension + 3 + axis] = probit_scale * z[axis];
-        feature_jacobian[FEATURE_VARIANCE * dimension + 3 + axis] = 2.0 * sigma_g[axis];
     }
     let raw_variance =
         validated_vector_variance(covariance.quadratic_form_unchecked(slopes), probit_scale)?;
@@ -1305,24 +1358,16 @@ pub(crate) fn row_primary_closed_form_vector_into(
     validate_rigid_row_admission(qd1, &inputs, neg_eta0, neg_eta1, adjusted_derivative)?;
 
     let (gradient, hessian) = derivative_cells.split_at_mut(dimension);
-    order2_feature_pullback_into(
+    rigid_vector_feature_pullback_into(
         &feature_gradient,
         &feature_hessian,
-        feature_jacobian,
-        |axis| if axis < 3 { 1 } else { 2 },
-        |axis, slot| {
-            if axis < 3 {
-                axis
-            } else {
-                FEATURE_LINEAR + slot
-            }
-        },
+        z,
+        sigma_g,
+        covariance,
+        probit_scale,
         dimension,
         gradient,
         hessian,
-        |gradient, hessian| {
-            add_weighted_variance_hessian(covariance, gradient, dimension, hessian);
-        },
     );
     Ok(value)
 }
