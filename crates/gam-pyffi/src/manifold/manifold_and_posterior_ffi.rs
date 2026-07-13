@@ -5314,15 +5314,12 @@ fn build_survival_location_scale_ffi_payload(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
-    weights: &Array1<f64>,
     ls_result: gam::families::fit_orchestration::SurvivalLocationScaleFitResult,
 ) -> Result<FittedModelPayload, String> {
     use gam::families::survival::construction::{
         build_survival_time_basis, parse_survival_baseline_config, parse_survival_likelihood_mode,
         parse_survival_time_basis_config, resolve_survival_time_anchor_value,
     };
-    use ndarray::{Array2, s};
-
     // Re-derive survival metadata from the formula and FitConfig so we can
     // reproduce the saved model layout that the CLI persists.
     let parsed = gam::inference::formula_dsl::parse_formula(&formula)

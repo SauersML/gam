@@ -28,9 +28,7 @@ pub(crate) use gam::families::bms::BernoulliMarginalSlopeFitResult;
 
 pub(crate) use gam::families::inverse_link::{apply_inverse_link_spec_vec, apply_inverse_link_vec};
 
-pub(crate) use gam::families::scale_design::{
-    build_scale_deviation_transform, infer_non_intercept_start,
-};
+pub(crate) use gam::families::scale_design::build_scale_deviation_transform;
 
 pub(crate) use gam::families::survival::construction::{
     SavedSurvivalTimeBasis, survival_likelihood_modename,

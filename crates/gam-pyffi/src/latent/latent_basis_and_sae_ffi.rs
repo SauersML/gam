@@ -2917,7 +2917,7 @@ fn sae_streaming_plan(
         plan.estimated_matrix_free_peak_bytes,
     )?;
     out.set_item("in_core_budget_bytes", plan.in_core_budget_bytes)?;
-    out.set_item("host_available_bytes", plan.host_available_bytes)?;
+    out.set_item("process_available_bytes", plan.process_available_bytes)?;
     out.set_item("direct_admitted", plan.direct_admitted)?;
     out.set_item("matrix_free_admitted", plan.matrix_free_admitted)?;
     out.set_item(
@@ -2958,7 +2958,7 @@ fn sae_streaming_plan_to_pydict<'py>(
         plan.estimated_matrix_free_peak_bytes,
     )?;
     out.set_item("in_core_budget_bytes", plan.in_core_budget_bytes)?;
-    out.set_item("host_available_bytes", plan.host_available_bytes)?;
+    out.set_item("process_available_bytes", plan.process_available_bytes)?;
     out.set_item("direct_admitted", plan.direct_admitted)?;
     out.set_item("matrix_free_admitted", plan.matrix_free_admitted)?;
     out.set_item(

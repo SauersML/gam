@@ -85,6 +85,9 @@
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
+#[cfg(target_os = "linux")]
+use std::fmt::Write as _;
+
 use gam_gpu::gpu_error::GpuError;
 
 #[cfg(target_os = "linux")]
@@ -92,6 +95,11 @@ use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+
+#[cfg(target_os = "linux")]
+use super::super::flex_row_program::{
+    BmsFlexCalibrationOrder2Node, BmsFlexRowOrder2FinalizerNode, BmsFlexRowProgram,
+};
 
 /// Hard ceiling on `r` (= 2 + p_h + p_w). Matches the shared-memory budget
 /// argument in the module docstring: with `MAX_R = 32` the per-block shared
@@ -364,23 +372,20 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
     }
 }
 
-/// NVRTC kernel source body. One CUDA block per row; 32 threads per block
-/// parallise the per-cell sums into shared-memory scratch; thread 0 of the
-/// block finishes the IFT + observed-point + Mills + Hessian write-out.
+/// Non-semantic CUDA scaffolding for the generated row kernel. One CUDA block
+/// per row; 32 threads per block parallelise the per-cell sums into
+/// shared-memory scratch. The calibration and finalizer markers are replaced
+/// by interpreting [`BmsFlexRowProgram`]'s typed node streams.
 ///
 /// Shared probit numerics (`erfcx_nonnegative`, `log_ndtr`,
 /// `log_ndtr_and_mills`) are provided by
 /// `numerics_device::PROBIT_NUMERICS_CU`, which is prepended before
 /// passing to `cudarc::nvrtc::compile_ptx`.
 ///
-/// **CPU parity reference**: the body mirrors
-/// `lower_bms_flex_row_order2_from_parts` in
-/// `src/families/bernoulli_marginal_slope.rs`.
 #[cfg(target_os = "linux")]
-pub(crate) const ROW_KERNEL_BODY: &str = r#"
+const CUDA_ROW_KERNEL_TEMPLATE: &str = r#"
 // One block per row. blockDim.x = 32; threadIdx.x parallises per-cell sums.
-// CPU parity reference: src/families/bernoulli_marginal_slope.rs
-//                      ::lower_bms_flex_row_order2_from_parts.
+// Semantic calibration/finalization visits are generated from BmsFlexRowProgram.
 
 #define INV_TWO_PI     0.15915494309189535
 
@@ -539,57 +544,11 @@ extern "C" __global__ void bms_flex_row_kernel(
              + (R[2]*S[3] + R[3]*S[2])*T[5]                                                \
              + (R[3]*S[3])*T[6])
 
-        // F_a += D(A_c) ; F_aa += H(A_c, A_c, AA_c) = D(AA_c) − Q(A_c, A_c).
+        // The typed calibration schedule below consumes these primitive
+        // coefficient views through D_OF/Q_OF.
         const double *A_c  = cell_a  + (size_t)c * 4;
         const double *AA_c = cell_aa + (size_t)c * 4;
-        local_Fa  += D_OF(A_c);
-        local_Faa += D_OF(AA_c) - Q_OF(A_c, A_c);
-
-        // For each u > 0: F_u += D(R_{c,u}) ; F_au += H(A_c, R_{c,u}, AR_{c,u})
-        //                                   = D(AR_{c,u}) − Q(A_c, R_{c,u}).
-        for (int u = 1; u < r; ++u) {
-            const double *R_u = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
-            const double *AR_u = cell_ar + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
-            double d_R   = D_OF(R_u);
-            double d_AR  = D_OF(AR_u);
-            double q_AR  = Q_OF(A_c, R_u);
-            atomic_add_f64(&F_u[u], d_R);
-            atomic_add_f64(&F_au[u], d_AR - q_AR);
-        }
-
-        // F_uv: only b·b, b·h_j, b·w_ℓ have a material `S_{c,uv}`; every other
-        // (u, v) pair just contributes −Q(R_u, R_v).
-        // CPU parity: `SparsePrimaryCoeffJetView::pair_from_b_family` with
-        // `COEFF_SUPPORT_BHW` — every cross pair outside the b-row is zero.
-        for (int u = 1; u < r; ++u) {
-            const double *R_u = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
-            for (int v = u; v < r; ++v) {
-                const double *R_v = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(v - 1)) * 4;
-                double q_uv = Q_OF(R_u, R_v);
-                double d_s  = 0.0;
-                // S_{bb}: u == v == 1 (b coordinate).
-                if (u == 1 && v == 1) {
-                    const double *S_bb = cell_sbb + (size_t)c * 4;
-                    d_s = D_OF(S_bb);
-                }
-                // S_{b·h_j}: u == 1, v in score-warp block, or symmetric.
-                else if (u == 1 && v >= 2 && v < 2 + p_h) {
-                    int j = v - 2;
-                    const double *S_bh = cell_sbh + ((size_t)c * (size_t)p_h + (size_t)j) * 4;
-                    d_s = D_OF(S_bh);
-                }
-                // S_{b·w_ℓ}: u == 1, v in link-wiggle block, or symmetric.
-                else if (u == 1 && v >= 2 + p_h && v < r) {
-                    int l = v - (2 + p_h);
-                    const double *S_bw = cell_sbw + ((size_t)c * (size_t)p_w + (size_t)l) * 4;
-                    d_s = D_OF(S_bw);
-                }
-                // Symmetric mirror: u in (h or w) block, v == 1 cannot happen
-                // because we iterate v >= u; skip.
-                double val = d_s - q_uv;
-                atomic_add_f64(&F_uv[u * r + v], val);
-            }
-        }
+        /*__BMS_FLEX_CALIBRATION_ORDER2__*/
 
         #undef D_OF
         #undef Q_OF
@@ -638,58 +597,14 @@ extern "C" __global__ void bms_flex_row_kernel(
     }
     double inv_Fa = 1.0 / F_a;
 
-    // IFT, first order.
-    //   a_u = -F_u · inv_Fa     (q-override: a_q = mu_1 · inv_Fa).
+    // Storage consumed by the generated dependency-ordered finalizer.
     double a_u[32];
-    a_u[0] = mu_1 * inv_Fa;
-    for (int u = 1; u < r; ++u) {
-        a_u[u] = -F_u[u] * inv_Fa;
-    }
-
-    // IFT, second order.
-    //   a_uv = -(F_uv + F_au · a_v + F_av · a_u + F_aa · a_u · a_v) · inv_Fa.
-    // The q-row contributions (u==0 or v==0) collapse to a_uv = mu_2 · inv_Fa
-    // when both are 0 and to (F_au_v) · inv_Fa-style mixed shape otherwise.
-    // We compute it uniformly using the populated F_uv / F_au with the
-    // q-overrides above.
     double a_uv[32 * 32];
-    for (int u = 0; u < r; ++u) {
-        for (int v = u; v < r; ++v) {
-            double term = F_uv[u * r + v]
-                        + F_au[v] * a_u[u]
-                        + F_au[u] * a_u[v]
-                        + F_aa * a_u[u] * a_u[v];
-            double val = -term * inv_Fa;
-            a_uv[u * r + v] = val;
-            a_uv[v * r + u] = val;
-        }
-    }
-
-    // Observed predictor jets at z_obs.
-    //   bar_e_u  = chi · a_u + rho_u.
-    //   bar_e_uv = chi · a_uv + xi · a_u · a_v + tau_u · a_v + a_u · tau_v + r_uv.
     double chi = row_chi[row];
     double xi  = row_xi[row];
     const double *rho = row_rho + (size_t)row * r;
     const double *tau = row_tau + (size_t)row * r;
     const double *ruv = row_ruv + (size_t)row * r * r;
-
-    for (int u = 0; u < r; ++u) {
-        bar_e_u[u] = chi * a_u[u] + rho[u];
-    }
-    for (int u = 0; u < r; ++u) {
-        for (int v = u; v < r; ++v) {
-            double val = chi * a_uv[u * r + v]
-                       + xi  * a_u[u] * a_u[v]
-                       + tau[u] * a_u[v]
-                       + a_u[u] * tau[v]
-                       + ruv[u * r + v];
-            bar_e_uv[u * r + v] = val;
-            if (u != v) {
-                bar_e_uv[v * r + u] = val;
-            }
-        }
-    }
 
     // Probit Mills.
     double y    = row_y[row];
@@ -710,20 +625,211 @@ extern "C" __global__ void bms_flex_row_kernel(
     double B_i =  w * probit_curvature;
 
     out_neglog[row] = -w * log_cdf;
-    for (int u = 0; u < r; ++u) {
-        out_grad[row * r + u] = A_i * bar_e_u[u];
-    }
-    for (int u = 0; u < r; ++u) {
-        for (int v = u; v < r; ++v) {
-            double val = B_i * bar_e_u[u] * bar_e_u[v] + A_i * bar_e_uv[u * r + v];
-            out_hess[row * r * r + u * r + v] = val;
-            if (u != v) {
-                out_hess[row * r * r + v * r + u] = val;
-            }
-        }
-    }
+    /*__BMS_FLEX_ORDER2_FINALIZER__*/
 }
 "#;
+
+#[cfg(target_os = "linux")]
+fn build_generated_row_kernel_source() -> String {
+    const CALIBRATION_MARKER: &str = "        /*__BMS_FLEX_CALIBRATION_ORDER2__*/";
+    const FINALIZER_MARKER: &str = "    /*__BMS_FLEX_ORDER2_FINALIZER__*/";
+
+    let (prefix, remainder) = CUDA_ROW_KERNEL_TEMPLATE
+        .split_once(CALIBRATION_MARKER)
+        .expect("CUDA row template must contain the calibration marker");
+    let (between, suffix) = remainder
+        .split_once(FINALIZER_MARKER)
+        .expect("CUDA row template must contain the finalizer marker");
+    let mut source = String::with_capacity(CUDA_ROW_KERNEL_TEMPLATE.len() + 240_000);
+    source.push_str(prefix);
+
+    BmsFlexRowProgram::try_for_each_calibration_order2_contiguous(
+        1..MAX_R,
+        true,
+        |node| -> std::fmt::Result {
+            match node {
+                BmsFlexCalibrationOrder2Node::InterceptFirst => {
+                    writeln!(source, "        local_Fa += D_OF(A_c);")?;
+                }
+                BmsFlexCalibrationOrder2Node::InterceptSecond => {
+                    writeln!(
+                        source,
+                        "        local_Faa += D_OF(AA_c) - Q_OF(A_c, A_c);"
+                    )?;
+                }
+                BmsFlexCalibrationOrder2Node::PrimaryFirst { primary } => {
+                    writeln!(source, "        if (r > {primary}) {{")?;
+                    writeln!(
+                        source,
+                        "            const double *R = cell_r + ((size_t)c * (size_t)(r - 1) + {offset}) * 4;",
+                        offset = primary - 1,
+                    )?;
+                    writeln!(source, "            atomic_add_f64(&F_u[{primary}], D_OF(R));")?;
+                    writeln!(source, "        }}")?;
+                }
+                BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary } => {
+                    writeln!(source, "        if (r > {primary}) {{")?;
+                    writeln!(
+                        source,
+                        "            const double *R = cell_r + ((size_t)c * (size_t)(r - 1) + {offset}) * 4;",
+                        offset = primary - 1,
+                    )?;
+                    writeln!(
+                        source,
+                        "            const double *AR = cell_ar + ((size_t)c * (size_t)(r - 1) + {offset}) * 4;",
+                        offset = primary - 1,
+                    )?;
+                    writeln!(
+                        source,
+                        "            atomic_add_f64(&F_au[{primary}], D_OF(AR) - Q_OF(A_c, R));"
+                    )?;
+                    writeln!(source, "        }}")?;
+                }
+                BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left, right } => {
+                    writeln!(source, "        if (r > {right}) {{")?;
+                    writeln!(
+                        source,
+                        "            const double *R_left = cell_r + ((size_t)c * (size_t)(r - 1) + {offset}) * 4;",
+                        offset = left - 1,
+                    )?;
+                    writeln!(
+                        source,
+                        "            const double *R_right = cell_r + ((size_t)c * (size_t)(r - 1) + {offset}) * 4;",
+                        offset = right - 1,
+                    )?;
+                    writeln!(source, "            double explicit_second = 0.0;")?;
+                    if left == 1 && right == 1 {
+                        writeln!(
+                            source,
+                            "            explicit_second = D_OF(cell_sbb + (size_t)c * 4);"
+                        )?;
+                    } else if left == 1 {
+                        writeln!(source, "            if ({right} < 2 + p_h) {{")?;
+                        writeln!(
+                            source,
+                            "                const double *S = cell_sbh + ((size_t)c * (size_t)p_h + {right} - 2) * 4;"
+                        )?;
+                        writeln!(source, "                explicit_second = D_OF(S);")?;
+                        writeln!(source, "            }} else {{")?;
+                        writeln!(
+                            source,
+                            "                const double *S = cell_sbw + ((size_t)c * (size_t)p_w + {right} - (2 + p_h)) * 4;"
+                        )?;
+                        writeln!(source, "                explicit_second = D_OF(S);")?;
+                        writeln!(source, "            }}")?;
+                    }
+                    writeln!(
+                        source,
+                        "            atomic_add_f64(&F_uv[{left} * r + {right}], explicit_second - Q_OF(R_left, R_right));"
+                    )?;
+                    writeln!(source, "        }}")?;
+                }
+            }
+            Ok(())
+        },
+    )
+    .expect("writing generated CUDA calibration source into String cannot fail");
+
+    source.push_str(between);
+    BmsFlexRowProgram::try_for_each_order2_finalizer(
+        MAX_R,
+        true,
+        |node| -> std::fmt::Result {
+            match node {
+                BmsFlexRowOrder2FinalizerNode::ImplicitFirst { primary } => {
+                    writeln!(source, "    if (r > {primary}) {{")?;
+                    writeln!(
+                        source,
+                        "        a_u[{primary}] = -F_u[{primary}] * inv_Fa;"
+                    )?;
+                    writeln!(source, "    }}")?;
+                }
+                BmsFlexRowOrder2FinalizerNode::ImplicitFirstComplete => {
+                    writeln!(source, "    // Canonical implicit-first stage complete.")?;
+                }
+                BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left, right } => {
+                    writeln!(source, "    if (r > {right}) {{")?;
+                    writeln!(
+                        source,
+                        "        double term = F_uv[{left} * r + {right}] + F_au[{right}] * a_u[{left}] + F_au[{left}] * a_u[{right}] + F_aa * a_u[{left}] * a_u[{right}];"
+                    )?;
+                    writeln!(source, "        double value = -term * inv_Fa;")?;
+                    writeln!(source, "        a_uv[{left} * r + {right}] = value;")?;
+                    if left != right {
+                        writeln!(source, "        a_uv[{right} * r + {left}] = value;")?;
+                    }
+                    writeln!(source, "    }}")?;
+                }
+                BmsFlexRowOrder2FinalizerNode::ObservedFirst { primary } => {
+                    writeln!(source, "    if (r > {primary}) {{")?;
+                    writeln!(
+                        source,
+                        "        bar_e_u[{primary}] = chi * a_u[{primary}] + rho[{primary}];"
+                    )?;
+                    writeln!(source, "    }}")?;
+                }
+                BmsFlexRowOrder2FinalizerNode::ObservedScoreSensitivity { primary } => {
+                    if primary == 0 {
+                        writeln!(
+                            source,
+                            "    // Score-sensitivity nodes have no Stage-2 device output channel."
+                        )?;
+                    }
+                }
+                BmsFlexRowOrder2FinalizerNode::ObservedSecond { left, right } => {
+                    writeln!(source, "    if (r > {right}) {{")?;
+                    writeln!(
+                        source,
+                        "        double observed_second = chi * a_uv[{left} * r + {right}] + xi * a_u[{left}] * a_u[{right}] + tau[{left}] * a_u[{right}] + a_u[{left}] * tau[{right}] + ruv[{left} * r + {right}];"
+                    )?;
+                    writeln!(
+                        source,
+                        "        bar_e_uv[{left} * r + {right}] = observed_second;"
+                    )?;
+                    if left != right {
+                        writeln!(
+                            source,
+                            "        bar_e_uv[{right} * r + {left}] = observed_second;"
+                        )?;
+                    }
+                    writeln!(
+                        source,
+                        "        double hessian_value = B_i * bar_e_u[{left}] * bar_e_u[{right}] + A_i * observed_second;"
+                    )?;
+                    writeln!(
+                        source,
+                        "        out_hess[row * r * r + {left} * r + {right}] = hessian_value;"
+                    )?;
+                    if left != right {
+                        writeln!(
+                            source,
+                            "        out_hess[row * r * r + {right} * r + {left}] = hessian_value;"
+                        )?;
+                    }
+                    writeln!(source, "    }}")?;
+                }
+                BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary } => {
+                    writeln!(source, "    if (r > {primary}) {{")?;
+                    writeln!(
+                        source,
+                        "        out_grad[row * r + {primary}] = A_i * bar_e_u[{primary}];"
+                    )?;
+                    writeln!(source, "    }}")?;
+                }
+            }
+            Ok(())
+        },
+    )
+    .expect("writing generated CUDA finalizer source into String cannot fail");
+    source.push_str(suffix);
+    source
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn generated_row_kernel_source() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE.get_or_init(build_generated_row_kernel_source)
+}
 
 // Force `s_f` to be considered used at the Rust level even though Stage 2 of
 // the kernel doesn't consume it on-device (the host has already baked the
@@ -751,7 +857,7 @@ impl RowKernelBackend {
                 gam_gpu::backend_probe::probe_backend_with_compile("bms_flex_row", |parts| {
                     let row_kernel_source = [
                         gam_gpu::numerics_device::PROBIT_NUMERICS_CU,
-                        ROW_KERNEL_BODY,
+                        generated_row_kernel_source(),
                     ]
                     .concat();
                     // #1551: route through the project's single arch-aware NVRTC
@@ -2914,287 +3020,23 @@ pub fn launch_bms_flex_row_dense_block(
         })
 }
 
-// Block 9 / V100-build unblock (2026-05-27): every test below either
-// constructs `BmsFlexBlockLayout` / `BmsFlexPrimaryLayout` (Linux-only
-// types) or drives a CUDA-dependent fixture, so gate the whole module
-// `#[cfg(all(test, target_os = "linux"))]`. On macOS the structs are
-// absent and these tests do not compile — the build.rs ban scanner
-// explicitly rejects `#[cfg(any(..., test))]` on the struct definitions
-// themselves as a dead-code escape hatch.
-// #415 parity lock: the CPU host oracle for the BMS-FLEX row kernel lives in a
-// non-linux-gated `#[cfg(test)]` module so it can be exercised on the macOS dev
-// box + CPU CI (the sibling `mod tests` is linux-gated because it also builds
-// CUDA-only fixture types). `cpu_oracle_outputs` itself is platform-independent.
+// Host numerical primitives and the production CPU↔generated-CUDA parity lock.
 #[cfg(test)]
-mod oracle_parity_tests {
+mod row_kernel_tests {
     use super::*;
 
-    // ── CPU oracle that mirrors ROW_KERNEL_BODY bit-for-bit ──────────────────
-    //
-    // `cpu_oracle_outputs` implements the same algebra as
-    // `bms_flex_row_kernel` in ROW_KERNEL_BODY: per-cell `T_n` / `D` / `Q`
-    // contractions, q-row override, IFT to `a_u` / `a_uv`, observed-point
-    // assembly to `bar_e_u` / `bar_e_uv`, probit Mills, and the final
-    // `out_grad` / `out_hess` writes. It takes the same
-    // `BmsFlexRowKernelInputs` struct so a CUDA-equipped host can run both
-    // paths off one bundle and check element-wise parity.
-    //
-    // Used by the GPU↔CPU parity test below; the test skips on non-Linux
-    // hosts via cfg, but the oracle itself is platform-independent so the
-    // macOS lib build can still type-check it.
-
-    pub(crate) const ORACLE_INV_TWO_PI: f64 = 1.0 / std::f64::consts::TAU;
-
-    pub(crate) fn oracle_log_ndtr_and_mills(x: f64) -> (f64, f64) {
+    pub(crate) fn host_log_ndtr_and_mills(x: f64) -> (f64, f64) {
         gam_gpu::numerics_host::log_ndtr_and_mills(x)
     }
 
-    pub(crate) fn oracle_log_ndtr_mills_curvature(x: f64) -> (f64, f64, f64) {
+    pub(crate) fn host_log_ndtr_mills_curvature(x: f64) -> (f64, f64, f64) {
         gam_gpu::numerics_host::log_ndtr_mills_curvature(x)
     }
 
-    /// Same outputs the device kernel writes: `(neglog, grad, hess)` per row.
-    /// `grad` is row-major `n × r`, `hess` is row-major `n × r × r`.
-    /// Mirrors `bms_flex_row_kernel` line-for-line so kernel + oracle diverge
-    /// only if one side breaks parity.
-    pub(crate) fn cpu_oracle_outputs(
-        inputs: &BmsFlexRowKernelInputs<'_>,
-    ) -> BmsFlexRowKernelOutputs {
-        let n = inputs.n_rows;
-        let r = inputs.r;
-        let p_h = inputs.p_h;
-        let p_w = inputs.p_w;
-        let mut neglog = vec![0.0_f64; n];
-        let mut grad = vec![0.0_f64; n * r];
-        let mut hess = vec![0.0_f64; n * r * r];
-        let cell_moments_host = match &inputs.cell_moments {
-            CellMomentsSource::Host(slice) => *slice,
-            #[cfg(target_os = "linux")]
-            CellMomentsSource::Device(_) => panic!(
-                // SAFETY: this CPU oracle is a host-only sanity checker invoked
-                // exclusively from `#[cfg(test)] mod tests`. The kernel-launch
-                // path uses `CellMomentsSource::Device(...)`; the oracle must
-                // never see that variant. Reaching this arm means a test
-                // mis-wired its fixture — surface it loudly at the call site.
-                "cpu_oracle_outputs: cell_moments is device-resident; oracle \
-                 is a host-only sanity checker"
-            ),
-        };
 
-        for row in 0..n {
-            // ── per-cell sweep: accumulate F_u, F_au, F_uv, F_a, F_aa.
-            let mut f_u = vec![0.0_f64; r];
-            let mut f_au = vec![0.0_f64; r];
-            let mut f_uv = vec![0.0_f64; r * r];
-            let mut f_a = 0.0_f64;
-            let mut f_aa = 0.0_f64;
-
-            let cell_lo = inputs.cell_offsets[row] as usize;
-            let cell_hi = inputs.cell_offsets[row + 1] as usize;
-            for c in cell_lo..cell_hi {
-                let c_arr = [
-                    inputs.cell_c0[c],
-                    inputs.cell_c1[c],
-                    inputs.cell_c2[c],
-                    inputs.cell_c3[c],
-                ];
-                let m = &cell_moments_host[c * MOMENT_STRIDE..(c + 1) * MOMENT_STRIDE];
-
-                // T_n = κ · Σ_e C_e · m_{e+n}, n = 0..6.
-                let mut t = [0.0_f64; 7];
-                for (n_idx, t_slot) in t.iter_mut().enumerate() {
-                    let mut acc = 0.0_f64;
-                    for (e, c_e) in c_arr.iter().enumerate() {
-                        acc = c_e.mul_add(m[e + n_idx], acc);
-                    }
-                    *t_slot = acc * ORACLE_INV_TWO_PI;
-                }
-
-                let d_of = |r_arr: &[f64]| -> f64 {
-                    ORACLE_INV_TWO_PI
-                        * (r_arr[0] * m[0] + r_arr[1] * m[1] + r_arr[2] * m[2] + r_arr[3] * m[3])
-                };
-                let q_of = |r_arr: &[f64], s_arr: &[f64]| -> f64 {
-                    (r_arr[0] * s_arr[0]) * t[0]
-                        + (r_arr[0] * s_arr[1] + r_arr[1] * s_arr[0]) * t[1]
-                        + (r_arr[0] * s_arr[2] + r_arr[1] * s_arr[1] + r_arr[2] * s_arr[0]) * t[2]
-                        + (r_arr[0] * s_arr[3]
-                            + r_arr[1] * s_arr[2]
-                            + r_arr[2] * s_arr[1]
-                            + r_arr[3] * s_arr[0])
-                            * t[3]
-                        + (r_arr[1] * s_arr[3] + r_arr[2] * s_arr[2] + r_arr[3] * s_arr[1]) * t[4]
-                        + (r_arr[2] * s_arr[3] + r_arr[3] * s_arr[2]) * t[5]
-                        + (r_arr[3] * s_arr[3]) * t[6]
-                };
-
-                let a_c = &inputs.cell_a[c * 4..(c + 1) * 4];
-                let aa_c = &inputs.cell_aa[c * 4..(c + 1) * 4];
-                f_a += d_of(a_c);
-                f_aa += d_of(aa_c) - q_of(a_c, a_c);
-
-                for u in 1..r {
-                    let r_u_off = (c * (r - 1) + (u - 1)) * 4;
-                    let r_u = &inputs.cell_r[r_u_off..r_u_off + 4];
-                    let ar_u = &inputs.cell_ar[r_u_off..r_u_off + 4];
-                    f_u[u] += d_of(r_u);
-                    f_au[u] += d_of(ar_u) - q_of(a_c, r_u);
-                }
-
-                for u in 1..r {
-                    let r_u_off = (c * (r - 1) + (u - 1)) * 4;
-                    let r_u = &inputs.cell_r[r_u_off..r_u_off + 4];
-                    for v in u..r {
-                        let r_v_off = (c * (r - 1) + (v - 1)) * 4;
-                        let r_v = &inputs.cell_r[r_v_off..r_v_off + 4];
-                        let q_uv = q_of(r_u, r_v);
-                        let d_s = if u == 1 && v == 1 {
-                            let s_bb = &inputs.cell_sbb[c * 4..(c + 1) * 4];
-                            d_of(s_bb)
-                        } else if u == 1 && v >= 2 && v < 2 + p_h {
-                            let j = v - 2;
-                            let off = (c * p_h + j) * 4;
-                            let s_bh = &inputs.cell_sbh[off..off + 4];
-                            d_of(s_bh)
-                        } else if u == 1 && v >= 2 + p_h && v < r {
-                            let l = v - (2 + p_h);
-                            let off = (c * p_w + l) * 4;
-                            let s_bw = &inputs.cell_sbw[off..off + 4];
-                            d_of(s_bw)
-                        } else {
-                            0.0
-                        };
-                        f_uv[u * r + v] += d_s - q_uv;
-                    }
-                }
-            }
-
-            // q-row overrides (mirror kernel lines 691–700).
-            let mu_1 = inputs.mu_1[row];
-            let mu_2 = inputs.mu_2[row];
-            f_u[0] = -mu_1;
-            f_au[0] = 0.0;
-            for v in 0..r {
-                f_uv[v] = 0.0;
-                f_uv[v * r] = 0.0;
-            }
-            f_uv[0] = -mu_2;
-
-            // Degenerate F_a ⇒ NaN-fill (mirror kernel lines 703–706).
-            if !f_a.is_finite() || f_a <= 0.0 {
-                neglog[row] = f64::NAN;
-                for slot in grad[row * r..(row + 1) * r].iter_mut() {
-                    *slot = f64::NAN;
-                }
-                for slot in hess[row * r * r..(row + 1) * r * r].iter_mut() {
-                    *slot = f64::NAN;
-                }
-                continue;
-            }
-            let inv_fa = 1.0 / f_a;
-
-            // IFT first/second order.
-            let mut a_u = vec![0.0_f64; r];
-            a_u[0] = mu_1 * inv_fa;
-            for u in 1..r {
-                a_u[u] = -f_u[u] * inv_fa;
-            }
-            let mut a_uv = vec![0.0_f64; r * r];
-            for u in 0..r {
-                for v in u..r {
-                    let term = f_uv[u * r + v]
-                        + f_au[v] * a_u[u]
-                        + f_au[u] * a_u[v]
-                        + f_aa * a_u[u] * a_u[v];
-                    let val = -term * inv_fa;
-                    a_uv[u * r + v] = val;
-                    a_uv[v * r + u] = val;
-                }
-            }
-
-            // Observed predictor jets.
-            let chi = inputs.chi_obs[row];
-            let xi = inputs.xi_obs[row];
-            let rho = &inputs.rho_u[row * r..(row + 1) * r];
-            let tau = &inputs.tau_u[row * r..(row + 1) * r];
-            let ruv = &inputs.r_uv[row * r * r..(row + 1) * r * r];
-            let mut bar_e_u = vec![0.0_f64; r];
-            for u in 0..r {
-                bar_e_u[u] = chi * a_u[u] + rho[u];
-            }
-            let mut bar_e_uv = vec![0.0_f64; r * r];
-            for u in 0..r {
-                for v in u..r {
-                    let val = chi * a_uv[u * r + v]
-                        + xi * a_u[u] * a_u[v]
-                        + tau[u] * a_u[v]
-                        + a_u[u] * tau[v]
-                        + ruv[u * r + v];
-                    bar_e_uv[u * r + v] = val;
-                    if u != v {
-                        bar_e_uv[v * r + u] = val;
-                    }
-                }
-            }
-
-            // Probit Mills + final writes.
-            let y = inputs.y[row];
-            let w = inputs.w[row];
-            let s = 2.0 * y - 1.0;
-            // #415 parity: the observed predictor VALUE is packed directly
-            // (`inputs.e_obs`), matching the CPU family's `signed_margin =
-            // s_y * eta_val`. `bar_e_u[0]` is the u=0 first-derivative jet and
-            // is used only for the gradient/Hessian, never as the Mills margin.
-            let e_obs = inputs.e_obs[row];
-            let m_arg = s * e_obs;
-            let (log_cdf, lambda, probit_curvature) = oracle_log_ndtr_mills_curvature(m_arg);
-            let a_i = -w * s * lambda;
-            let b_i = w * probit_curvature;
-            neglog[row] = -w * log_cdf;
-            for u in 0..r {
-                grad[row * r + u] = a_i * bar_e_u[u];
-            }
-            for u in 0..r {
-                for v in u..r {
-                    let val = b_i * bar_e_u[u] * bar_e_u[v] + a_i * bar_e_uv[u * r + v];
-                    hess[row * r * r + u * r + v] = val;
-                    if u != v {
-                        hess[row * r * r + v * r + u] = val;
-                    }
-                }
-            }
-        }
-
-        BmsFlexRowKernelOutputs { neglog, grad, hess }
-    }
-
-    // #415 parity lock. This test lives HERE (a descendant of `bms::gpu::row`)
-    // rather than in `bms::row_primary_hessian` because the host oracle
-    // `cpu_oracle_outputs` must live in a PRIVATE `#[cfg(test)]` mod (the
-    // build.rs ban-scanner forbids `#[cfg(test)]` on a non-private mod), so a
-    // sibling module cannot reach it. Nested here, the test sees the private
-    // oracle directly while the packer/CPU-family methods it drives are
-    // `pub(in crate::bms)` and stay reachable. The nested module carries no
-    // `#[cfg(test)]` attribute of its own (it inherits the parent's), so it is
-    // ban-scanner-clean.
+    // #415 parity lock: one fitted StandardNormal FLEX family supplies both
+    // the production CPU lowering and the generated CUDA launch.
     mod parity_415 {
-        //! #415 parity lock: the GPU-host oracle `cpu_oracle_outputs` (which
-        //! GATES the device row kernel via
-        //! `bms_flex_row_kernel_matches_cpu_oracle_when_cuda_available`) must
-        //! reproduce the CPU family reference
-        //! `lower_bms_flex_row_order2_from_parts` element-for-element, from
-        //! ONE fitted `(family, block_states, cache)`.
-        //!
-        //! Before this test the only ties between the two were (1) an FD lock on
-        //! the outer scalar Mills layer and (2) a string-contains comment guard —
-        //! neither pins the cell-contraction algebra (`F_a`, `F_aa`, `F_au`,
-        //! `F_uv` → value/grad/Hessian). This closes that gap: the SAME fitted
-        //! state is packed into `BmsFlexRowKernelInputs` and run through
-        //! `cpu_oracle_outputs` for all rows, and independently run through the
-        //! CPU family per row; every row value, full gradient, and full r×r
-        //! Hessian must agree to ~1e-10.
-
-        use super::cpu_oracle_outputs;
         use crate::bms::family::*;
         use crate::bms::hessian_paths::*;
         use crate::bms::{DeviationBlockConfig, LatentMeasureKind, exact_kernel};

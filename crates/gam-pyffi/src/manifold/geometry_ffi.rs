@@ -7141,7 +7141,6 @@ fn fit_dataset_impl(
             )?
         }
         FitRequest::SurvivalLocationScale(ls_request) => {
-            let weights = ls_request.spec.weights.clone();
             let fit_result = fit_model(FitRequest::SurvivalLocationScale(ls_request))?;
             let ls_result = match fit_result {
                 FitResult::SurvivalLocationScale(result) => result,
@@ -7152,13 +7151,7 @@ fn fit_dataset_impl(
                     });
                 }
             };
-            build_survival_location_scale_ffi_payload(
-                formula,
-                &dataset,
-                &fit_config,
-                &weights,
-                ls_result,
-            )?
+            build_survival_location_scale_ffi_payload(formula, &dataset, &fit_config, ls_result)?
         }
         FitRequest::SurvivalTransformation(rp_request) => {
             let fit_result = fit_model(FitRequest::SurvivalTransformation(rp_request))?;
