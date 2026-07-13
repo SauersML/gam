@@ -105,8 +105,9 @@ use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3
 use std::sync::Arc;
 
 pub(crate) use gam_solve::arrow_schur::{
-    ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem,
-    ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, DeviceSaePcgData,
+    ArrowBetaGaugeQuotient, ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError,
+    ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode, BetaPenaltyOp, CompositePenaltyOp,
+    DensePenaltyOp, DeviceSaePcgData,
     DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp,
     IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
     SparseRankOnePenaltyOp, StreamingArrowSchur, matrix_free_arrow_inverse_apply,
@@ -340,6 +341,9 @@ mod tests_tier0_shared_mean_2023;
 
 #[cfg(test)]
 mod tests_tier0_primary_path_2023;
+
+#[cfg(test)]
+mod tests_2228_inner_gauge_probe;
 
 #[cfg(test)]
 mod tests_certify_external_2266;
