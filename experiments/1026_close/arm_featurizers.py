@@ -15,11 +15,10 @@ The three wired arms (gam#2233 task 3): ``external_topk``, ``gam_flat``, and
 
 Memory note (K up to 32768): the scorer only ever reads the gate through
 ``gate > 1e-10`` and indexes ``atom_contribution(g)[take]`` with ``take`` a small
-row subset. We therefore (a) pass a single nonnegative magnitude gate — the code
-SPECTRUM is a per-row-sign-invariant SVD, so the |code| magnitude reproduces the
-exact singular values while the arm's own signed ``recon`` carries the residual —
-and (b) return a lazy row-indexable contribution proxy so no full (N, P) atom
-array is ever materialized.
+row subset. We therefore (a) keep one dense nonnegative magnitude gate solely for
+firing selection and (b) recover each selected atom's SIGNED sparse code lazily
+from ``indices`` / ``codes`` when materialising its contribution. This avoids a
+second dense ``N x K`` matrix without changing the centered code spectrum.
 """
 from __future__ import annotations
 
@@ -57,12 +56,16 @@ class _RowLazyContribution:
         return self._fn(np.asarray(idx))
 
 
-def _dense_mag_gate(indices: np.ndarray, codes: np.ndarray, k: int) -> np.ndarray:
+def _dense_magnitude_gate(indices: np.ndarray, codes: np.ndarray, k: int) -> np.ndarray:
     """Scatter sparse (indices, codes) into a dense nonnegative (N, K) gate."""
     n = indices.shape[0]
     gate = np.zeros((n, k), dtype=np.float32)
-    rows = np.arange(n)[:, None]
-    gate[rows, indices.astype(np.int64)] = np.abs(codes).astype(np.float32)
+    rows = np.broadcast_to(np.arange(n, dtype=np.int64)[:, None], indices.shape)
+    np.maximum.at(
+        gate,
+        (rows, indices.astype(np.int64, copy=False)),
+        np.abs(codes).astype(np.float32, copy=False),
+    )
     return gate
 
 
@@ -70,20 +73,33 @@ def _dense_mag_gate(indices: np.ndarray, codes: np.ndarray, k: int) -> np.ndarra
 # Flat blocks (external TopK torch bar, gam sparse-dictionary lane)            #
 # --------------------------------------------------------------------------- #
 def _flat_block_from_sparse(
-    x_bits: np.ndarray, decoder: np.ndarray, indices: np.ndarray, codes: np.ndarray,
-    recon: np.ndarray,
+    decoder: np.ndarray,
+    indices: np.ndarray,
+    codes: np.ndarray,
 ):
     """Common flat-block scoring surface from a sparse (indices, codes) routing.
 
     Returns (gate (N,K), atom_contribution(g)->lazy, code_dims (K,), dict_params).
     """
     k = decoder.shape[0]
-    gate = _dense_mag_gate(indices, codes, k)
+    sparse_indices = np.ascontiguousarray(indices, dtype=np.int64)
+    sparse_codes = np.ascontiguousarray(codes, dtype=np.float32)
+    if sparse_indices.shape != sparse_codes.shape:
+        raise ValueError(
+            f"sparse indices {sparse_indices.shape} and codes {sparse_codes.shape} must match"
+        )
+    gate = _dense_magnitude_gate(sparse_indices, sparse_codes, k)
 
     def atom_contribution(g: int):
-        col = gate[:, g]  # nonnegative magnitude; SVD spectrum is sign-invariant
         dec_g = decoder[g]
-        return _RowLazyContribution(lambda take, col=col, dec_g=dec_g: np.outer(col[take], dec_g))
+
+        def selected_rows(take, g=g, dec_g=dec_g):
+            row_indices = sparse_indices[take]
+            row_codes = sparse_codes[take]
+            signed_code = np.where(row_indices == g, row_codes, 0.0).sum(axis=1)
+            return np.outer(signed_code, dec_g)
+
+        return _RowLazyContribution(selected_rows)
 
     return gate, atom_contribution, np.ones(k, dtype=int), int(decoder.size)
 
@@ -97,7 +113,7 @@ def build_external_topk(x_bits, *, W_enc, W_dec, b_dec, top_k) -> FittedFeaturiz
     rows = np.arange(pre.shape[0])[:, None]
     topv = np.maximum(pre[rows, topi], 0.0)  # ReLU (Gao TopK)
     gate, contrib, code_dims, dparams = _flat_block_from_sparse(
-        x_bits, W_dec, topi, topv, recon=None)
+        W_dec, topi, topv)
     recon = np.einsum("nk,nkp->np", topv, W_dec[topi]) + b_dec[None, :]
     return FittedFeaturizer(
         name="external_topk", gate=gate, atom_contribution=contrib,
@@ -110,7 +126,7 @@ def build_gam_flat(x_bits, *, fit) -> FittedFeaturizer:
     tr = fit.transform(x_bits)
     recon = fit.reconstruct(tr.indices, tr.codes)
     gate, contrib, code_dims, dparams = _flat_block_from_sparse(
-        x_bits, np.asarray(fit.decoder), tr.indices, tr.codes, recon=recon)
+        np.asarray(fit.decoder), tr.indices, tr.codes)
     return FittedFeaturizer(
         name="gam_flat", gate=gate, atom_contribution=contrib,
         code_dims=code_dims, dictionary_params=dparams,
@@ -177,7 +193,7 @@ def build_hybrid_rust(
     """FittedFeaturizer for the all-Rust hybrid: sparse-dict flat + Rust curved."""
     tr = flat_fit.transform(x_bits)
     flat = _flat_block_from_sparse(
-        x_bits, np.asarray(flat_fit.decoder), tr.indices, tr.codes, recon=None)[:4]
+        np.asarray(flat_fit.decoder), tr.indices, tr.codes)[:4]
     curved = _curved_block_rust(r_bits, model=curved_model)
     fit = _stack_blocks(flat, curved, recon_full)
     fit.name = "hybrid_rust"
