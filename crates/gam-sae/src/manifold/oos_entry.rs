@@ -15,7 +15,7 @@ use ndarray::{Array1, Array2, Array3, ArrayView2, s};
 
 use crate::hybrid_split::AtomLinearImage;
 use crate::inference::steering::{
-    PatchedForwardKl, SteerPlan, TargetDoseConfig, TargetDosePlan, TargetDoseRequest, steer_delta,
+    AppliedDoseProbe, SteerPlan, TargetDoseConfig, TargetDosePlan, TargetDoseRequest, steer_delta,
     steer_to_target_nats,
 };
 
@@ -1125,12 +1125,13 @@ pub struct SaeSteerToTargetRequest {
 }
 
 /// Solve for the amplitude that realizes `target_nats` on atom `atom_k`'s chord.
-/// The optional `probe` (a patched-forward KL callback, `a → KL`) drives the
-/// bracketed closed-loop correction and the readout-KL radius; with `probe = None`
-/// the returned [`TargetDosePlan`] is the unvalidated closed-form seed.
+/// The optional plan-aware probe drives the bracketed closed-loop correction and
+/// records exact directional local-Fisher and patched-forward measurements for
+/// the same effective delta; with `probe = None` the returned [`TargetDosePlan`]
+/// is the exact-factor-only closed-form seed.
 pub fn run_sae_manifold_steer_to_target(
     request: SaeSteerToTargetRequest,
-    probe: Option<&mut PatchedForwardKl<'_>>,
+    probe: Option<&mut AppliedDoseProbe<'_>>,
 ) -> Result<TargetDosePlan, String> {
     let SaeSteerToTargetRequest {
         atoms,

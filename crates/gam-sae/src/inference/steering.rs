@@ -585,11 +585,28 @@ pub fn predicted_response(
     Ok(project_onto_tangent_span(&tangents, delta))
 }
 
-/// A patched-forward KL probe the target-dose loop plugs into: given an applied
-/// amplitude `a`, return the measured `KL(p_base ‖ p_patched)` in nats for the
-/// chord `a·(g(t_to) − g(t_from))`. The GPU re-measurement supplies a real
-/// model-in-the-loop forward here; the closed-form seed needs none.
-pub type PatchedForwardKl<'a> = dyn FnMut(f64) -> Result<f64, String> + 'a;
+/// One model-in-the-loop observation of the exact [`SteerPlan`] supplied to an
+/// [`AppliedDoseProbe`]. The effective delta is the vector the downstream model
+/// actually received after its device/dtype conversion; it may differ from the
+/// f64 requested delta through quantization. `exact_directional_nats` is the
+/// full local-Fisher quadratic of that effective delta. `measured_nats` is the
+/// patched-forward `KL(p_base ‖ p_patched)` for the same effective delta.
+///
+/// Keeping all three values atomic prevents a caller from pricing one vector
+/// and measuring another, and keeps the resident [`RowMetric`] dose an explicit
+/// diagnostic rather than silently promoting an approximate operator (#2249).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppliedDoseObservation {
+    pub effective_delta: Array1<f64>,
+    pub exact_directional_nats: f64,
+    pub measured_nats: f64,
+}
+
+/// Plan-aware external-model dose probe. The callback must execute the supplied
+/// plan; a scalar-amplitude callback cannot prove which activation delta it
+/// actually applied and is deliberately not part of the contract.
+pub type AppliedDoseProbe<'a> =
+    dyn FnMut(&SteerPlan) -> Result<AppliedDoseObservation, String> + 'a;
 
 /// Tuning for the closed-loop correction in [`steer_to_target_nats`].
 #[derive(Clone, Copy, Debug)]
@@ -646,9 +663,10 @@ pub struct TargetDosePlan {
     /// Exact applied move at the solved amplitude, including `delta`, predicted
     /// dose, metric provenance, chart radius, and off-manifold audit.
     pub steer: SteerPlan,
-    /// Probe-measured patched-forward KL at [`SteerPlan::amplitude`], when a callback
-    /// was supplied; `None` for the pure closed-form seed.
-    pub measured_nats: Option<f64>,
+    /// Exact directional local-Fisher dose, effective applied delta, and measured
+    /// patched-forward KL at [`SteerPlan::amplitude`]. `None` for the pure
+    /// closed-form seed. This never changes the resident metric or its status.
+    pub applied_probe: Option<AppliedDoseObservation>,
     /// Number of patched-forward probes consumed (0 without a callback).
     pub iterations: usize,
     /// **READOUT-KL radius**: the largest probed amplitude whose measured KL still
@@ -717,17 +735,40 @@ impl std::fmt::Display for TargetDoseError {
 
 impl std::error::Error for TargetDoseError {}
 
-/// One patched-forward probe with a finiteness/non-negativity guard on the
-/// returned KL. A free fn (not a closure) so the `&mut PatchedForwardKl<'_>`
-/// reborrow across the correction loop is unambiguous.
-fn probe_kl(probe: &mut PatchedForwardKl<'_>, a: f64) -> Result<f64, TargetDoseError> {
-    let kl = probe(a).map_err(TargetDoseError::Probe)?;
-    if !(kl.is_finite() && kl >= 0.0) {
+/// Execute and validate one model-in-the-loop observation. Validation lives in
+/// the Rust authority so every binding fails closed on malformed model data.
+fn probe_applied_dose(
+    probe: &mut AppliedDoseProbe<'_>,
+    plan: &SteerPlan,
+) -> Result<AppliedDoseObservation, TargetDoseError> {
+    let observation = probe(plan).map_err(TargetDoseError::Probe)?;
+    if observation.effective_delta.len() != plan.delta.len() {
         return Err(TargetDoseError::Probe(format!(
-            "steer_to_target_nats: probe returned a non-finite/negative KL {kl} at amplitude {a}"
+            "steer_to_target_nats: probe effective_delta length {} does not match plan delta length {}",
+            observation.effective_delta.len(),
+            plan.delta.len()
         )));
     }
-    Ok(kl)
+    if !observation.effective_delta.iter().all(|value| value.is_finite()) {
+        return Err(TargetDoseError::Probe(
+            "steer_to_target_nats: probe effective_delta must be finite".to_string(),
+        ));
+    }
+    if !(observation.exact_directional_nats.is_finite()
+        && observation.exact_directional_nats >= 0.0)
+    {
+        return Err(TargetDoseError::Probe(format!(
+            "steer_to_target_nats: probe exact_directional_nats must be finite and non-negative; got {}",
+            observation.exact_directional_nats
+        )));
+    }
+    if !(observation.measured_nats.is_finite() && observation.measured_nats >= 0.0) {
+        return Err(TargetDoseError::Probe(format!(
+            "steer_to_target_nats: probe measured_nats must be finite and non-negative; got {}",
+            observation.measured_nats
+        )));
+    }
+    Ok(observation)
 }
 
 fn record_readout_probe(
@@ -769,7 +810,7 @@ pub fn steer_to_target_nats(
     model: &SaeManifoldTerm,
     metric: &RowMetric,
     request: TargetDoseRequest<'_>,
-    probe: Option<&mut PatchedForwardKl<'_>>,
+    probe: Option<&mut AppliedDoseProbe<'_>>,
 ) -> Result<TargetDosePlan, TargetDoseError> {
     let TargetDoseRequest {
         atom_k,
@@ -824,20 +865,20 @@ pub fn steer_to_target_nats(
              imply an unrepresentable amplitude {seed_amplitude}"
         )));
     }
-    let quad = |a: f64| a * a * unit_nats;
-
-    let finish = |amplitude: f64,
-                  measured_nats: Option<f64>,
+    let plan_at = |amplitude: f64| {
+        steer_delta(model, metric, atom_k, metric_row, amplitude, t_from, t_to)
+            .map_err(TargetDoseError::Steering)
+    };
+    let finish = |steer: SteerPlan,
+                  applied_probe: Option<AppliedDoseObservation>,
                   iterations: usize,
                   readout_kl_radius: Option<f64>|
      -> Result<TargetDosePlan, TargetDoseError> {
-        let steer = steer_delta(model, metric, atom_k, metric_row, amplitude, t_from, t_to)
-            .map_err(TargetDoseError::Steering)?;
         Ok(TargetDosePlan {
             target_nats,
             seed_amplitude,
             steer,
-            measured_nats,
+            applied_probe,
             iterations,
             readout_kl_radius,
         })
@@ -846,9 +887,8 @@ pub fn steer_to_target_nats(
     let probe = match probe {
         Some(probe) => probe,
         // No model in the loop: return the unvalidated closed-form seed.
-        None => return finish(seed_amplitude, None, 0, None),
+        None => return finish(plan_at(seed_amplitude)?, None, 0, None),
     };
-    let can_establish_readout_radius = unit.predicted_nats_kind == FisherDoseKind::ExactFull;
 
     // Track a contiguous probed prefix of quadratic agreement. Once an amplitude
     // fails the contract, no later probe at or beyond it can enlarge the radius.
@@ -862,20 +902,20 @@ pub fn steer_to_target_nats(
     let mut lo_a = 0.0_f64;
     let mut lo_kl = 0.0_f64;
     let mut hi_a = seed_amplitude;
-    let mut hi_kl = probe_kl(probe, hi_a)?;
+    let mut hi_plan = plan_at(hi_a)?;
+    let mut hi_probe = probe_applied_dose(probe, &hi_plan)?;
+    let mut hi_kl = hi_probe.measured_nats;
     probes += 1;
-    if can_establish_readout_radius {
-        record_readout_probe(
-            hi_a,
-            hi_kl,
-            quad(hi_a),
-            config.readout_tol_rel,
-            &mut first_readout_failure,
-            &mut readout_kl_radius,
-        );
-    }
+    record_readout_probe(
+        hi_a,
+        hi_kl,
+        hi_probe.exact_directional_nats,
+        config.readout_tol_rel,
+        &mut first_readout_failure,
+        &mut readout_kl_radius,
+    );
     if (hi_kl - target_nats).abs() / target_nats <= config.tol_rel {
-        return finish(hi_a, Some(hi_kl), probes, readout_kl_radius);
+        return finish(hi_plan, Some(hi_probe), probes, readout_kl_radius);
     }
     while hi_kl < target_nats {
         if probes >= config.max_iter {
@@ -893,18 +933,18 @@ pub fn steer_to_target_nats(
                  beyond the finite f64 range after amplitude {hi_a} realized {hi_kl} nats"
             )));
         }
-        let next_kl = probe_kl(probe, next_a)?;
+        let next_plan = plan_at(next_a)?;
+        let next_probe = probe_applied_dose(probe, &next_plan)?;
+        let next_kl = next_probe.measured_nats;
         probes += 1;
-        if can_establish_readout_radius {
-            record_readout_probe(
-                next_a,
-                next_kl,
-                quad(next_a),
-                config.readout_tol_rel,
-                &mut first_readout_failure,
-                &mut readout_kl_radius,
-            );
-        }
+        record_readout_probe(
+            next_a,
+            next_kl,
+            next_probe.exact_directional_nats,
+            config.readout_tol_rel,
+            &mut first_readout_failure,
+            &mut readout_kl_radius,
+        );
         if next_kl <= hi_kl {
             return Err(TargetDoseError::UnreachableTarget {
                 target_nats,
@@ -916,8 +956,10 @@ pub fn steer_to_target_nats(
         lo_kl = hi_kl;
         hi_a = next_a;
         hi_kl = next_kl;
+        hi_plan = next_plan;
+        hi_probe = next_probe;
         if (hi_kl - target_nats).abs() / target_nats <= config.tol_rel {
-            return finish(hi_a, Some(hi_kl), probes, readout_kl_radius);
+            return finish(hi_plan, Some(hi_probe), probes, readout_kl_radius);
         }
     }
 
@@ -931,20 +973,25 @@ pub fn steer_to_target_nats(
         } else {
             0.5 * (lo_a + hi_a)
         };
-        let measured = probe_kl(probe, candidate)?;
+        let candidate_plan = plan_at(candidate)?;
+        let candidate_probe = probe_applied_dose(probe, &candidate_plan)?;
+        let measured = candidate_probe.measured_nats;
         probes += 1;
-        if can_establish_readout_radius {
-            record_readout_probe(
-                candidate,
-                measured,
-                quad(candidate),
-                config.readout_tol_rel,
-                &mut first_readout_failure,
-                &mut readout_kl_radius,
-            );
-        }
+        record_readout_probe(
+            candidate,
+            measured,
+            candidate_probe.exact_directional_nats,
+            config.readout_tol_rel,
+            &mut first_readout_failure,
+            &mut readout_kl_radius,
+        );
         if (measured - target_nats).abs() / target_nats <= config.tol_rel {
-            return finish(candidate, Some(measured), probes, readout_kl_radius);
+            return finish(
+                candidate_plan,
+                Some(candidate_probe),
+                probes,
+                readout_kl_radius,
+            );
         }
         if measured < target_nats {
             lo_a = candidate;
