@@ -6791,7 +6791,12 @@ mod tests {
     fn factor_by_penalties_carry_full_expanded_null_geometry_2293() {
         let ds = factor_dataset_l3();
         let col_map = ds.column_map();
-        let parsed = parse_formula("y ~ s(x, by=g, k=8)").expect("parse by smooth");
+        // Leave the marginal null space unshrunk so every level-specific term
+        // must carry a non-trivial joint-null chart. The production default is
+        // double-penalized, whose primary and null-space ridge have a full-rank
+        // joint sum and therefore correctly produce no joint-null rotation.
+        let parsed = parse_formula("y ~ s(x, by=g, k=8, double_penalty=false)")
+            .expect("parse by smooth");
         let mut notes = Vec::new();
         let terms = build_termspec(
             &parsed.terms,
@@ -6801,41 +6806,58 @@ mod tests {
             &ResourcePolicy::default_library(),
         )
         .expect("build by smooth spec");
-        let term = terms.smooth_terms.first().expect("by smooth term");
-        let mut workspace = crate::basis::BasisWorkspace::new();
-        let built =
-            crate::smooth::build_single_local_smooth_term(ds.values.view(), term, &mut workspace)
-                .expect("build expanded by-factor smooth");
+        assert_eq!(terms.smooth_terms.len(), 3, "one smooth per factor level");
 
-        let active_info = built
-            .penaltyinfo
-            .iter()
-            .filter(|info| info.active)
-            .collect::<Vec<_>>();
-        assert_eq!(active_info.len(), built.penalties.len());
-        for (idx, ((penalty, &nullity), null_basis)) in built
-            .penalties
-            .iter()
-            .zip(built.nullspaces.iter())
-            .zip(built.null_eigenvectors.iter())
-            .enumerate()
-        {
-            let analysis = crate::basis::analyze_penalty_block(penalty).expect("PSD block");
-            assert_eq!(analysis.rank + nullity, built.dim, "penalty {idx}");
-            assert_eq!(analysis.nullity, nullity, "penalty {idx}");
-            assert_eq!(active_info[idx].effective_rank, analysis.rank);
-            assert_eq!(active_info[idx].nullspace_dim_hint, nullity);
-            let basis = null_basis.as_ref().expect("nontrivial expanded null basis");
-            assert_eq!(basis.nrows(), built.dim);
-            assert_eq!(basis.ncols(), nullity);
+        // Formula construction represents an unordered factor-by smooth as one
+        // explicit level-gated term per factor level. Validate the complete
+        // realized expansion, rather than inspecting only its first level or
+        // assuming the legacy monolithic BySmooth::Factor representation.
+        for term in &terms.smooth_terms {
+            assert!(matches!(
+                &term.basis,
+                SmoothBasisSpec::ByVariable {
+                    by: ByVariableSpec::Level { .. },
+                    ..
+                }
+            ));
+            let mut workspace = crate::basis::BasisWorkspace::new();
+            let built = crate::smooth::build_single_local_smooth_term(
+                ds.values.view(),
+                term,
+                &mut workspace,
+            )
+            .expect("build level-gated factor-by smooth");
+
+            let active_info = built
+                .penaltyinfo
+                .iter()
+                .filter(|info| info.active)
+                .collect::<Vec<_>>();
+            assert_eq!(active_info.len(), built.penalties.len());
+            for (idx, ((penalty, &nullity), null_basis)) in built
+                .penalties
+                .iter()
+                .zip(built.nullspaces.iter())
+                .zip(built.null_eigenvectors.iter())
+                .enumerate()
+            {
+                let analysis = crate::basis::analyze_penalty_block(penalty).expect("PSD block");
+                assert_eq!(analysis.rank + nullity, built.dim, "penalty {idx}");
+                assert_eq!(analysis.nullity, nullity, "penalty {idx}");
+                assert_eq!(active_info[idx].effective_rank, analysis.rank);
+                assert_eq!(active_info[idx].nullspace_dim_hint, nullity);
+                let basis = null_basis.as_ref().expect("nontrivial factor-level null basis");
+                assert_eq!(basis.nrows(), built.dim);
+                assert_eq!(basis.ncols(), nullity);
+            }
+            let joint = built
+                .joint_null_rotation
+                .as_ref()
+                .expect("factor-level joint null geometry");
+            assert!(joint.joint_nullity > 0);
+            assert_eq!(joint.rotation.nrows(), built.dim);
+            assert_eq!(joint.rotation.ncols(), built.dim);
         }
-        let joint = built
-            .joint_null_rotation
-            .as_ref()
-            .expect("by-factor joint null geometry");
-        assert!(joint.joint_nullity > 0);
-        assert_eq!(joint.rotation.nrows(), built.dim);
-        assert_eq!(joint.rotation.ncols(), built.dim);
     }
 
     #[test]
