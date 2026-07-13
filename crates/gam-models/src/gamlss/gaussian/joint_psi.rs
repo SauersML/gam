@@ -622,6 +622,18 @@ fn write_directional_channels(
     channels.hessian_ll[row] = hessian[1][1];
 }
 
+/// Generated Gaussian row gradient and Hessian with no directional scratch.
+pub(crate) fn gaussian_row_channels(rows: &GaussianJointRowScalars) -> GaussianRowChannels {
+    let n = rows.obs_weight.len();
+    let program = GaussianJointRowProgram::new(rows);
+    let mut base = GaussianRowChannels::zeros(n);
+    for row in 0..n {
+        let atom = program.row_order2(row);
+        write_base_channels(&mut base, row, &atom);
+    }
+    base
+}
+
 /// Generated `(g, H)` plus its first derivative along a rowwise predictor
 /// direction. The row atom is evaluated once per row.
 pub(crate) fn gaussian_row_first_tower(
