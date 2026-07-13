@@ -533,7 +533,7 @@ pub fn fit_transformation_normal(
         |theta,
          specs: &[TermCollectionSpec],
          designs: &[TermCollectionDesign],
-         provenance| {
+         provenance: SpatialFitProvenance<'_, CustomFamilyJointHyperModeSelection>| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             ensure_exact_geometry(&specs[0], &designs[0], &rho)?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
