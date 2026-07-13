@@ -932,6 +932,121 @@ pub fn jeffreys_subspace_from_penalty(
     })
 }
 
+/// One authoritative reduced-information artifact for a joint Jeffreys term.
+///
+/// Preparing the plan performs the only `Z_J^T H Z_J` construction and spectral
+/// decomposition for an evaluation.  In particular, callers can inspect
+/// [`Self::is_active`] before asking a family for any beta-directional
+/// derivatives.  This ordering is load-bearing: an inactive conditioning gate
+/// makes the whole term exactly zero, so constructing `{Hdot[e_a]}` first would
+/// spend the dominant `O(n p^3)` row sweep on an artifact that cannot be read.
+#[derive(Clone)]
+pub struct JointJeffreysPlan {
+    z_j: Array2<f64>,
+    reduced_information: Array2<f64>,
+    evals: Array1<f64>,
+    evecs: Array2<f64>,
+    lambda_min: f64,
+    lambda_max: f64,
+    gate_weight: f64,
+    floor: f64,
+    floor_in_relative_regime: bool,
+    idx_min: usize,
+    idx_max: usize,
+}
+
+impl JointJeffreysPlan {
+    /// Build the exact reduced-information spectrum and conditioning gate once.
+    pub fn prepare(
+        h_joint: ArrayView2<'_, f64>,
+        z_j: ArrayView2<'_, f64>,
+    ) -> Result<Self, String> {
+        let p = h_joint.nrows();
+        if h_joint.ncols() != p {
+            return Err(format!(
+                "joint_jeffreys_term: H must be square, got {}x{}",
+                h_joint.nrows(),
+                h_joint.ncols()
+            ));
+        }
+        if z_j.nrows() != p {
+            return Err(format!(
+                "joint_jeffreys_term: Z_J has {} rows, expected {} to match H",
+                z_j.nrows(),
+                p
+            ));
+        }
+        let m = z_j.ncols();
+        if m == 0 {
+            return Ok(Self {
+                z_j: z_j.to_owned(),
+                reduced_information: Array2::zeros((0, 0)),
+                evals: Array1::zeros(0),
+                evecs: Array2::zeros((0, 0)),
+                lambda_min: f64::INFINITY,
+                lambda_max: 0.0,
+                gate_weight: 0.0,
+                floor: REDUCED_INFO_ABSOLUTE_FLOOR,
+                floor_in_relative_regime: false,
+                idx_min: 0,
+                idx_max: 0,
+            });
+        }
+
+        // H_id = Z_J^T H Z_J (m x m reduced information on the Jeffreys span).
+        let hz = h_joint.dot(&z_j);
+        let h_id = z_j.t().dot(&hz);
+        let mut h_id_sym = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                h_id_sym[[i, j]] = 0.5 * (h_id[[i, j]] + h_id[[j, i]]);
+            }
+        }
+        let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
+            format!("joint_jeffreys_term: reduced-information eigendecomposition failed: {e}")
+        })?;
+        let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
+        let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let gate_weight = conditioning_gate_weight(lambda_min, lambda_max);
+        let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max)
+            .max(REDUCED_INFO_ABSOLUTE_FLOOR);
+        let floor_in_relative_regime = lambda_max > 0.0
+            && REDUCED_INFO_RELATIVE_FLOOR * lambda_max >= REDUCED_INFO_ABSOLUTE_FLOOR;
+        let mut idx_min = 0usize;
+        let mut idx_max = 0usize;
+        for i in 1..m {
+            if evals[i] < evals[idx_min] {
+                idx_min = i;
+            }
+            if evals[i] > evals[idx_max] {
+                idx_max = i;
+            }
+        }
+        Ok(Self {
+            z_j: z_j.to_owned(),
+            reduced_information: h_id_sym,
+            evals,
+            evecs,
+            lambda_min,
+            lambda_max,
+            gate_weight,
+            floor,
+            floor_in_relative_regime,
+            idx_min,
+            idx_max,
+        })
+    }
+
+    /// Whether the exact conditioning gate permits a nonzero Jeffreys term.
+    pub fn is_active(&self) -> bool {
+        !self.reduced_information.is_empty() && self.gate_weight != 0.0
+    }
+
+    fn coefficient_dim(&self) -> usize {
+        self.z_j.nrows()
+    }
+}
+
 /// Tier-B Jeffreys term on the joint under-identified span, computed directly
 /// from the coupled joint Hessian `H` (NOT from a single-eta
 /// `FirthDenseOperator`). This is the path BMS / survival-marginal-slope /
@@ -964,35 +1079,68 @@ where
     DirFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
 {
     let p = h_joint.nrows();
-    if h_joint.ncols() != p {
-        return Err(format!(
-            "joint_jeffreys_term: H must be square, got {}x{}",
-            h_joint.nrows(),
-            h_joint.ncols()
-        ));
-    }
-    if z_j.nrows() != p {
-        return Err(format!(
-            "joint_jeffreys_term: Z_J has {} rows, expected {} to match H",
-            z_j.nrows(),
-            p
-        ));
-    }
-    let m = z_j.ncols();
-    if m == 0 {
+    joint_jeffreys_term_batched(h_joint, z_j, || {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
+            .into_par_iter()
+            .map(|k| {
+                let mut axis = Array1::<f64>::zeros(p);
+                axis[k] = 1.0;
+                gam_problem::with_nested_parallel(|| hessian_dir(&axis))
+            })
+            .collect();
+        let mut hdots = Vec::with_capacity(p);
+        for hdot in results {
+            match hdot? {
+                Some(hdot) => hdots.push(hdot),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(hdots))
+    })
+}
+
+/// Batched joint-Jeffreys evaluation with a lazy all-axes derivative provider.
+///
+/// `hessian_axes` is invoked exactly once when the prepared conditioning gate is
+/// active and never when it is inactive.  The same [`JointJeffreysPlan`] supplies
+/// the value, gradient, and curvature, so the optimization cannot accidentally
+/// gate one information matrix and differentiate another.
+pub fn joint_jeffreys_term_batched<AxesFn>(
+    h_joint: ArrayView2<'_, f64>,
+    z_j: ArrayView2<'_, f64>,
+    hessian_axes: AxesFn,
+) -> Result<(f64, Array1<f64>, Array2<f64>), String>
+where
+    AxesFn: FnOnce() -> Result<Option<Vec<Array2<f64>>>, String>,
+{
+    let plan = JointJeffreysPlan::prepare(h_joint, z_j)?;
+    joint_jeffreys_term_from_plan(plan, hessian_axes)
+}
+
+fn joint_jeffreys_term_from_plan<AxesFn>(
+    plan: JointJeffreysPlan,
+    hessian_axes: AxesFn,
+) -> Result<(f64, Array1<f64>, Array2<f64>), String>
+where
+    AxesFn: FnOnce() -> Result<Option<Vec<Array2<f64>>>, String>,
+{
+    let p = plan.coefficient_dim();
+    if !plan.is_active() {
         return Ok((0.0, Array1::zeros(p), Array2::zeros((p, p))));
     }
-    // H_id = Z_J^T H Z_J  (m x m reduced information on the Jeffreys span).
-    let hz = h_joint.dot(&z_j);
-    let h_id = z_j.t().dot(&hz);
-    // Symmetrize defensively (observed-information round-off can break exact
-    // symmetry).
-    let mut h_id_sym = Array2::<f64>::zeros((m, m));
-    for i in 0..m {
-        for j in 0..m {
-            h_id_sym[[i, j]] = 0.5 * (h_id[[i, j]] + h_id[[j, i]]);
-        }
-    }
+    let m = plan.reduced_information.nrows();
+    let z_j = plan.z_j;
+    let evals = plan.evals;
+    let evecs = plan.evecs;
+    let lambda_min = plan.lambda_min;
+    let lambda_max = plan.lambda_max;
+    let gate_weight = plan.gate_weight;
+    let floor = plan.floor;
+    let floor_in_relative_regime = plan.floor_in_relative_regime;
+    let idx_min_gate = plan.idx_min;
+    let idx_max_gate = plan.idx_max;
+
     // FULL-SPAN ROBUSTNESS. With the Jeffreys span equal to the FULL identifiable
     // coefficient space, `H_id` is the (reduced) observed information over every
     // direction. For non-canonical links (e.g. probit) the observed information
@@ -1006,10 +1154,6 @@ where
     // the value, gradient and curvature are the exact Jeffreys quantities there;
     // a genuinely separating direction has near-zero curvature, where the floor
     // simply keeps `Φ` finite while the `H_Φ` curvature below grows to bound it.
-    let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
-        format!("joint_jeffreys_term: reduced-information eigendecomposition failed: {e}")
-    })?;
-    let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
     // CONDITIONING GATE ("no cost on easy fits"). The eigendecomposition we just
     // computed gives the full reduced spectrum; the worst-conditioned direction
     // is `λ_min`. We skip the term (zero value, gradient and curvature) only when
@@ -1023,11 +1167,6 @@ where
     // direction at small `n` that the scale-free relative ratio alone would miss
     // — we fall through to the floored log-det term below, the `O(1)`-bounding
     // curvature this machinery exists to supply.
-    let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-    let gate_weight = conditioning_gate_weight(lambda_min, lambda_max);
-    if gate_weight == 0.0 {
-        return Ok((0.0, Array1::zeros(p), Array2::zeros((p, p))));
-    }
     // Conditioning-gate mode motion (gam#1821). `Φ = G·U` with `G =
     // conditioning_gate_weight(λ_min(β), λ_max(β))`. Because `λ_min, λ_max` move
     // with β through the inner mode, the β-gradient of `Φ` is
@@ -1044,22 +1183,8 @@ where
     // and the floor-response fix already applied to the eigenvalue drift.
     let (gate_grad_min, gate_grad_max) = conditioning_gate_weight_grad(lambda_min, lambda_max);
     let gate_motion_active = gate_grad_min != 0.0 || gate_grad_max != 0.0;
-    let (idx_min_gate, idx_max_gate) = {
-        let mut lo = 0usize;
-        let mut hi = 0usize;
-        for i in 1..m {
-            if evals[i] < evals[lo] {
-                lo = i;
-            }
-            if evals[i] > evals[hi] {
-                hi = i;
-            }
-        }
-        (lo, hi)
-    };
     // Absolute floor relative to the dominant identified curvature: negligible on
     // identified directions (O(n)), positive on separating ones.
-    let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
     // FLOOR β-DEPENDENCE (root cause of gam#826 / the below-floor value↔gradient
     // mismatch). The regularization floor is `max(REL·λ_max, ABS)`; in the active
     // RELATIVE regime it scales with `λ_max(β)`, which is itself a function of β.
@@ -1081,19 +1206,11 @@ where
     // dominant eigenvalue; a tied `λ_max` is a measure-zero kink the smooth-gate
     // band keeps away from (and the floor-response term is itself O(λ/floor)-tiny
     // there), so no special-casing is warranted.
-    let floor_in_relative_regime =
-        lambda_max > 0.0 && REDUCED_INFO_RELATIVE_FLOOR * lambda_max >= REDUCED_INFO_ABSOLUTE_FLOOR;
     // Index of the dominant eigenvalue `λ_max` (the one the relative floor
     // tracks), needed for `∂λ_max/∂β_k = v_maxᵀ D_k v_max = (Ṽ_k)_mm`. Only
     // consulted in the relative regime.
     let lambda_max_idx: Option<usize> = if floor_in_relative_regime {
-        let mut idx_max = 0usize;
-        for i in 1..m {
-            if evals[i] > evals[idx_max] {
-                idx_max = i;
-            }
-        }
-        Some(idx_max)
+        Some(idx_max_gate)
     } else {
         None
     };
@@ -1137,47 +1254,25 @@ where
     // does not expose the exact derivative and the whole term degenerates to
     // `(gate_weight·phi, 0, 0)` (matching the serial first-None behaviour); any
     // `Err` propagates.
-    let hdots: Vec<Array2<f64>> = {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
-            .into_par_iter()
-            .map(|k| {
-                let mut axis = Array1::<f64>::zeros(p);
-                axis[k] = 1.0;
-                // Mark this whole directional pass as a nested data-parallel
-                // region so every faer GEMM it issues pins to `Par::Seq` instead
-                // of re-fanning the global Rayon pool against this p-way axis
-                // fan-out (the rayon×BLAS oversubscription guard from the
-                // nested-BLAS fix). Bit-identical: faer partitions matmul output,
-                // never the contracted axis.
-                gam_problem::with_nested_parallel(|| hessian_dir(&axis))
-            })
-            .collect();
-        // Resolve in index order so the first anomaly (Err, then None, then a
-        // shape mismatch) wins exactly as the original serial loop did.
-        let mut hdots = Vec::with_capacity(p);
-        for hdot in results {
-            let hdot = match hdot? {
-                Some(hdot) => hdot,
-                None => {
-                    // Family does not expose an exact directional derivative; the
-                    // Jeffreys gradient/curvature degenerate to zero (objective
-                    // still well-defined). This keeps the term safe rather than
-                    // wrong.
-                    return Ok((phi, Array1::zeros(p), Array2::zeros((p, p))));
-                }
-            };
-            if hdot.nrows() != p || hdot.ncols() != p {
-                return Err(format!(
-                    "joint_jeffreys_term: Hdot shape {}x{} != {p}x{p}",
-                    hdot.nrows(),
-                    hdot.ncols()
-                ));
-            }
-            hdots.push(hdot);
-        }
-        hdots
+    let hdots = match hessian_axes()? {
+        Some(hdots) => hdots,
+        None => return Ok((phi, Array1::zeros(p), Array2::zeros((p, p)))),
     };
+    if hdots.len() != p {
+        return Err(format!(
+            "joint_jeffreys_term: got {} canonical Hdot matrices, expected {p}",
+            hdots.len()
+        ));
+    }
+    for hdot in &hdots {
+        if hdot.nrows() != p || hdot.ncols() != p {
+            return Err(format!(
+                "joint_jeffreys_term: Hdot shape {}x{} != {p}x{p}",
+                hdot.nrows(),
+                hdot.ncols()
+            ));
+        }
+    }
     let mut reduced_drift: HashMap<usize, Arc<Array2<f64>>> = HashMap::with_capacity(p);
     let mut floor_drift: HashMap<usize, f64> = HashMap::new();
     // Per-axis conditioning-gate mode motion `∂G/∂β_k` (see the gate block above).
@@ -2352,6 +2447,30 @@ where
 mod tests {
     use super::*;
     use ndarray::array;
+
+    #[test]
+    fn inactive_reduced_gate_performs_zero_all_axis_builds() {
+        use std::cell::Cell;
+
+        // The ambient H has a weak middle axis, but Z_J excludes it.  The exact
+        // reduced information is diag(32, 64), which clears both gate ramps.
+        // This also pins that laziness is decided from Z_J^T H Z_J, never from
+        // an accidental full-span/Z_J=I assumption.
+        let h = array![[32.0, 0.0, 0.0], [0.0, 1e-12, 0.0], [0.0, 0.0, 64.0]];
+        let z = array![[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]];
+        let all_axis_builds = Cell::new(0usize);
+
+        let (phi, grad, hphi) = joint_jeffreys_term_batched(h.view(), z.view(), || {
+            all_axis_builds.set(all_axis_builds.get() + 1);
+            Ok(Some(vec![Array2::zeros((3, 3)); 3]))
+        })
+        .expect("inactive reduced Jeffreys plan");
+
+        assert_eq!(all_axis_builds.get(), 0);
+        assert_eq!(phi, 0.0);
+        assert_eq!(grad, Array1::zeros(3));
+        assert_eq!(hphi, Array2::zeros((3, 3)));
+    }
 
     /// Test-only analytic oracle: the per-direction mode-response drift
     /// `D_β H_Φ[δ]` of the Tier-B Jeffreys curvature surrogate. Production now
