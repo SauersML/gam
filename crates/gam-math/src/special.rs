@@ -196,6 +196,39 @@ pub fn bessel_i0_centered_terms_from_log_abs(log_abs_eta: f64) -> (f64, f64, f64
     (-0.5 * (std::f64::consts::TAU.ln() + log_abs_eta), 1.0, -0.5)
 }
 
+/// Second log-scale derivative of the centered Bessel primitive:
+/// `d²/d(log η)²[log I0(η) − η]`, the derivative of the third term returned by
+/// [`bessel_i0_centered_terms_from_log_abs`] (`η d/dη[log I0(η) − η]`).
+///
+/// Writing `s = log η`, `r = I1(η)/I0(η)`, and `c(s) = log I0(η) − η`, the first
+/// log-derivative is `c'(s) = η(r − 1)` (the returned `.2`). Differentiating
+/// again and using the modified-Bessel ratio ODE `r'(η) = 1 − r/η − r²` gives the
+/// closed form
+///
+/// `c''(s) = η(r − 1) + η² r'(η) = −η + η²(1 − r²)`,
+///
+/// which stays finite through the same overflow-free `log|η|` gateway as the
+/// value/first-derivative terms. Beyond the float range the leading term of the
+/// asymptotic series has `c'(s) → −½` (a constant), so `c''(s) → 0`; likewise
+/// `η → 0` gives `c''(s) → 0`. This is the exact second derivative the periodic
+/// (von-Mises) ARD log-precision normalizer needs for the outer-REML Hessian
+/// (its log-partition is `n[−η + log I0(η)]`, whose `∂²/∂(log α)²` is
+/// `−n · c''(log η)` up to the affine `log η = log α + const` shift).
+pub fn bessel_i0_centered_second_log_derivative_from_log_abs(log_abs_eta: f64) -> f64 {
+    if log_abs_eta.is_nan() {
+        return f64::NAN;
+    }
+    if log_abs_eta == f64::NEG_INFINITY {
+        return 0.0;
+    }
+    if log_abs_eta > f64::MAX.ln() {
+        return 0.0;
+    }
+    let eta = log_abs_eta.exp();
+    let (_centered, ratio, _scaled_derivative) = bessel_i0_centered_terms(eta);
+    -eta + eta * eta * (1.0 - ratio * ratio)
+}
+
 /// Overflow-free `(log I0(eta) - |eta|, I1(|eta|) / I0(|eta|))`.
 ///
 /// Centering the logarithm by its leading `|eta|` term is essential whenever a
