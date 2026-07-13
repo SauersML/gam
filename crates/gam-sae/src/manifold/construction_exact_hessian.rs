@@ -1331,6 +1331,72 @@ impl SaeManifoldTerm {
             }
         }
 
+        // Sparse (assignment log-strength): C_sparse = the softmax Gershgorin PSD
+        // majorizer `w_row · D`, `D = diag(Σ_j|H_kj|)` at `scale = λ_sparse·s/τ²`,
+        // written into H_tt's logit slots by the assembly — the SAME operator
+        // `assignment_log_strength_hessian_trace` traces. `|scale·H_kj| = scale·|H_kj|`
+        // for `scale > 0`, so `D` is degree-one in `λ_sparse = e^ρ` exactly like the
+        // smoothing and ARD operators, and `∂C_sparse/∂ρ_sparse = C_sparse`. Its
+        // `sign(H_kj)` kink lives in the LOGITS, which a ρ perturbation never moves,
+        // so the active branch is invariant at the fixed stratum. The `H_bd⁻¹` leg
+        // then reproduces the gradient's `coordinate_block_assignment_...` subtraction
+        // with no extra math, and the cross terms against smooth/ARD fall out of the
+        // same uniform formula.
+        if let Some(sparse_flat) = rho.sparse_flat_index() {
+            let k_atoms = self.k_atoms();
+            match self.assignment.mode {
+                AssignmentMode::Softmax {
+                    temperature,
+                    sparsity,
+                } if k_atoms > 1 => {
+                    if self.last_row_layout.is_some() {
+                        return Err(
+                            "logdet_daleckii_krein_hessian: the compact top-k softmax row \
+                             layout is not covered by the sparse log-strength operator; \
+                             refusing to assemble a Hessian with an unmodelled sparse row"
+                                .to_string(),
+                        );
+                    }
+                    let inv_tau = 1.0 / temperature;
+                    let scale = rho.lambda_sparse()? * sparsity * inv_tau * inv_tau;
+                    let penalty =
+                        gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                            k_atoms,
+                            temperature,
+                        );
+                    let assignment_dim = self.assignment.assignment_coord_dim();
+                    let c = c_by_flat
+                        .entry(sparse_flat)
+                        .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+                    for row in 0..self.n_obs() {
+                        let w_row = row_w.map_or(1.0, |w| w[row]);
+                        let base = cache.row_offsets[row];
+                        let q = cache.row_dims[row];
+                        let logit_dim = assignment_dim.min(q);
+                        let row_logits: Vec<f64> = (0..k_atoms)
+                            .map(|atom| self.assignment.logits[[row, atom]])
+                            .collect();
+                        let d = penalty.psd_majorizer_abs_row_sums(&row_logits, scale);
+                        for atom in 0..logit_dim {
+                            c[[base + atom, base + atom]] += w_row * d[atom];
+                        }
+                    }
+                }
+                // K ≤ 1 softmax has no free logit: the gradient's sparse logdet trace
+                // is identically zero, so a zero row here is the CORRECT curvature.
+                AssignmentMode::Softmax { .. } => {}
+                _ => {
+                    return Err(
+                        "logdet_daleckii_krein_hessian: rho carries a sparse log-strength \
+                         coordinate under a non-softmax assignment prior, whose ∂H/∂ρ_sparse \
+                         majorizer operator this channel does not yet model; refusing to \
+                         assemble a Hessian with a silently-zero sparse row"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         // Precompute G·Cᵢ, H_bd⁻¹·Cᵢ, and their traces for each flat coordinate.
         let flats: Vec<usize> = c_by_flat.keys().copied().collect();
         let mut gc: Vec<Array2<f64>> = Vec::with_capacity(flats.len());

@@ -229,7 +229,10 @@ mod amortized_encoder_tests {
             .logdet_daleckii_krein_hessian(&rho, &cache)
             .expect("logdet Daleckii-Krein Hessian block assembles");
 
-        // The smooth + ARD coordinates this channel covers (sparse/block excluded).
+        // The smooth + ARD + sparse coordinates this channel covers. The sparse
+        // (softmax log-strength) coordinate MUST be included: it is live on this
+        // softmax fixture, and a channel that left it silently zero would hand ARC a
+        // Hessian with a null row while the gradient there is nonzero.
         let mut coord_indices: Vec<usize> = Vec::new();
         for a in 0..rho.log_lambda_smooth.len() {
             coord_indices.push(rho.smooth_flat_index(a));
@@ -242,6 +245,15 @@ mod amortized_encoder_tests {
                 }
             }
         }
+        let sparse_index = rho
+            .sparse_flat_index()
+            .expect("the softmax fixture must carry a live sparse log-strength coordinate");
+        coord_indices.push(sparse_index);
+        assert!(
+            analytic[[sparse_index, sparse_index]].abs() > 1.0e-6,
+            "sparse log-strength logdet curvature must be non-trivial: {}",
+            analytic[[sparse_index, sparse_index]]
+        );
 
         // Non-vacuity: a smoothing AND an ARD diagonal must carry real curvature,
         // else the gate would pass on an all-zero block.
@@ -315,6 +327,15 @@ mod amortized_encoder_tests {
                 for axis in 0..r.log_ard[kk].len() {
                     v[r.ard_flat_index(kk, axis)] += ard_joint[kk][axis] - ard_coord[kk][axis];
                 }
+            }
+            if let Some(si) = r.sparse_flat_index() {
+                let joint = t
+                    .assignment_log_strength_hessian_trace(&r, &cache, &solver)
+                    .expect("sparse joint logdet trace");
+                let coord = t
+                    .coordinate_block_assignment_log_strength_hessian_trace(&r, &cache)
+                    .expect("sparse coordinate-block logdet trace");
+                v[si] = joint - coord;
             }
             v
         };
