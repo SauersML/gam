@@ -13,3 +13,4 @@
 pub(crate) mod manifold_pyclasses;
 pub(crate) mod manifold_sae_coercion;
 pub(crate) mod manifold_sae_payload;
+pub(crate) mod support_sparse_sae_ffi;
