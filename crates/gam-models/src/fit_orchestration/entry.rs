@@ -751,6 +751,15 @@ fn gaussian_response_is_constant(request: &StandardFitRequest<'_>) -> bool {
     if !request.family.is_gaussian_identity() || request.y.is_empty() {
         return false;
     }
+    // An inhomogeneous anchor adds a data-dependent affine channel only when
+    // the term collection is realized. The shortcut predicate intentionally
+    // does not build that design, so it cannot prove `y - user_offset -
+    // anchor_offset` is constant. Keep such models on the ordinary exact fit
+    // path; treating the user offset alone as complete would mint a false
+    // zero-residual fit.
+    if gam_terms::smooth::term_collection_has_nonzero_anchor(&request.spec) {
+        return false;
+    }
     // The intercept-only shortcut is exact — residual ≡ 0 — precisely when the
     // OFFSET-ADJUSTED response `y − offset` is constant: then `η = offset +
     // intercept = y` at every row. Testing the raw `y` alone would (a) miss an

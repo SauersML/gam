@@ -3561,6 +3561,10 @@ fn run_exact_joint_spatial_optimization(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<(Array1<f64>, f64, SpatialLengthScaleOptimizationTiming), EstimationError> {
     let label = kind.label();
+    let effective_offset = baseline_design
+        .compose_offset(offset, "spatial joint fit")
+        .map_err(EstimationError::BasisError)?;
+    let offset = effective_offset.view();
     // Use bounds and design metadata for validation.
     assert!(
         lower.len() == theta0.len() && upper.len() == theta0.len(),

@@ -33,7 +33,7 @@ use gam_runtime::resource::MatrixMaterializationError;
 
 use faer::sparse::{SparseColMat, Triplet};
 
-use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis, s};
 
 use serde::{Deserialize, Serialize};
 

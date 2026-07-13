@@ -1622,10 +1622,19 @@ impl LocationScaleFamilyBuilder for DispersionGlmLocationScaleTermBuilder {
         );
         layout.validate_theta_len(theta.len(), "dispersion location-scale")?;
 
+        let mean_offset = mean_design
+            .compose_offset(self.mean_offset.view(), "dispersion location-scale mean")
+            .map_err(|error| error.to_string())?;
+        let noise_offset = noise_design
+            .compose_offset(
+                self.noise_offset.view(),
+                "dispersion location-scale log-precision",
+            )
+            .map_err(|error| error.to_string())?;
         let mut meanspec = build_location_scale_block(
             "mu",
             mean_design.design.clone(),
-            self.mean_offset.clone(),
+            mean_offset,
             mean_design.penalties_as_penalty_matrix(),
             mean_design.nullspace_dims.clone(),
             layout.mean_from(theta),
@@ -1643,7 +1652,7 @@ impl LocationScaleFamilyBuilder for DispersionGlmLocationScaleTermBuilder {
         let mut dispspec = build_location_scale_block(
             "log_precision",
             noise_design.design.clone(),
-            self.noise_offset.clone(),
+            noise_offset,
             disp_penalties,
             disp_nullspace,
             layout.noise_from(theta),

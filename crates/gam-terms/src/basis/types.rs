@@ -312,6 +312,17 @@ impl BSplineBoundaryConditions {
         );
         left != right
     }
+
+    /// Whether either endpoint carries an inhomogeneous value constraint.
+    pub fn has_nonzero_anchor(&self) -> bool {
+        let nonzero = |condition: BSplineEndpointBoundaryCondition| {
+            matches!(
+                condition,
+                BSplineEndpointBoundaryCondition::Anchored { value } if value != 0.0
+            )
+        };
+        nonzero(self.left) || nonzero(self.right)
+    }
 }
 
 /// Per-smooth identifiability policy for 1D B-spline bases.

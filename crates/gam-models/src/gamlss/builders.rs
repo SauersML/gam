@@ -449,10 +449,16 @@ pub(crate) fn build_gaussian_mean_and_scale_blocks(
     noise_beta_hint: Option<Array1<f64>>,
     context: &str,
 ) -> Result<(ParameterBlockSpec, ParameterBlockSpec), String> {
+    let mean_offset = mean_design
+        .compose_offset(mean_offset.view(), &format!("{context}: mu"))
+        .map_err(|error| error.to_string())?;
+    let noise_offset = noise_design
+        .compose_offset(noise_offset.view(), &format!("{context}: log_sigma"))
+        .map_err(|error| error.to_string())?;
     let mut meanspec = build_location_scale_block(
         "mu",
         mean_design.design.clone(),
-        mean_offset.clone(),
+        mean_offset,
         mean_design.penalties_as_penalty_matrix(),
         mean_design.nullspace_dims.clone(),
         mean_log_lambdas,
@@ -473,7 +479,7 @@ pub(crate) fn build_gaussian_mean_and_scale_blocks(
     let mut noisespec = build_location_scale_block(
         "log_sigma",
         prepared_noise_design,
-        noise_offset.clone(),
+        noise_offset,
         noise_design.penalties_as_penalty_matrix(),
         noise_design.nullspace_dims.clone(),
         noise_log_lambdas,
@@ -521,6 +527,12 @@ pub(crate) fn build_binomial_threshold_and_scale_blocks(
     noise_beta_hint: Option<Array1<f64>>,
     context: &str,
 ) -> Result<(ParameterBlockSpec, ParameterBlockSpec), String> {
+    let mean_offset = mean_design
+        .compose_offset(mean_offset.view(), &format!("{context}: threshold"))
+        .map_err(|error| error.to_string())?;
+    let noise_offset = noise_design
+        .compose_offset(noise_offset.view(), &format!("{context}: log_sigma"))
+        .map_err(|error| error.to_string())?;
     let identifiednoise_design =
         identified_binomial_log_sigma_design(mean_design, noise_design, weights)?;
     let p_noise = identifiednoise_design.ncols();
@@ -530,7 +542,7 @@ pub(crate) fn build_binomial_threshold_and_scale_blocks(
     let mut thresholdspec = build_location_scale_block(
         "threshold",
         mean_design.design.clone(),
-        mean_offset.clone(),
+        mean_offset,
         mean_design.penalties_as_penalty_matrix(),
         vec![],
         mean_log_lambdas,
@@ -542,7 +554,7 @@ pub(crate) fn build_binomial_threshold_and_scale_blocks(
     let mut log_sigmaspec = build_location_scale_block(
         "log_sigma",
         identifiednoise_design,
-        noise_offset.clone(),
+        noise_offset,
         log_sigma_penalty_matrices,
         vec![],
         noise_log_lambdas,
@@ -2785,7 +2797,9 @@ pub(crate) fn select_binomial_mean_link_wiggle_basis_from_pilot(
     wiggle_cfg: &WiggleBlockConfig,
     wiggle_penalty_orders: &[usize],
 ) -> Result<SelectedWiggleBasis, String> {
-    let q_seed = pilot_design.design.dot(&pilot_fit.beta);
+    let q_seed = pilot_design
+        .apply(pilot_fit.beta.view())
+        .map_err(|error| error.to_string())?;
     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
 }
 
@@ -2834,7 +2848,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 wiggle_degree,
                 eta_block: ParameterBlockInput {
                     design: pilot_design.design.clone(),
-                    offset: Array1::zeros(y.len()),
+                    offset: pilot_design.affine_offset.clone(),
                     penalties: pilot_design
                         .penalties
                         .iter()
@@ -2900,7 +2914,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             wiggle_degree,
             eta_block: ParameterBlockInput {
                 design: baseline_design.design.clone(),
-                offset: Array1::zeros(y.len()),
+                offset: baseline_design.affine_offset.clone(),
                 penalties: baseline_design
                     .penalties
                     .iter()
@@ -3022,7 +3036,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             ParameterBlockSpec {
                 name: "eta".to_string(),
                 design: design.design.clone(),
-                offset: Array1::zeros(y_cloned.len()),
+                offset: design.affine_offset.clone(),
                 penalties: design.penalties_as_penalty_matrix(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
@@ -3311,7 +3325,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             wiggle_degree,
             eta_block: ParameterBlockInput {
                 design: design.design.clone(),
-                offset: Array1::zeros(y.len()),
+                offset: design.affine_offset.clone(),
                 penalties: design
                     .penalties
                     .iter()

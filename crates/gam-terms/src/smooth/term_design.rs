@@ -444,6 +444,41 @@ pub fn term_collection_has_one_sided_anchored_bspline(spec: &TermCollectionSpec)
         .any(|term| smooth_basis_has_one_sided_anchored_bspline(&term.basis))
 }
 
+/// Whether any smooth term realizes an inhomogeneous endpoint anchor and thus
+/// contributes a fixed affine row offset.
+pub fn term_collection_has_nonzero_anchor(spec: &TermCollectionSpec) -> bool {
+    spec.smooth_terms
+        .iter()
+        .any(|term| smooth_basis_has_nonzero_anchor(&term.basis))
+}
+
+fn smooth_basis_has_nonzero_anchor(basis: &SmoothBasisSpec) -> bool {
+    match basis {
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            smooth_basis_has_nonzero_anchor(inner)
+        }
+        SmoothBasisSpec::BSpline1D { spec, .. } => {
+            spec.boundary_conditions.has_nonzero_anchor()
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_basis_has_nonzero_anchor(smooth),
+        SmoothBasisSpec::TensorBSpline { spec, .. } => spec
+            .marginalspecs
+            .iter()
+            .any(|marginal| marginal.boundary_conditions.has_nonzero_anchor()),
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            spec.marginal.boundary_conditions.has_nonzero_anchor()
+        }
+        SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::Sphere { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Duchon { .. }
+        | SmoothBasisSpec::Pca { .. } => false,
+    }
+}
+
 fn smooth_basis_has_one_sided_anchored_bspline(basis: &SmoothBasisSpec) -> bool {
     match basis {
         SmoothBasisSpec::ByVariable { inner, .. }

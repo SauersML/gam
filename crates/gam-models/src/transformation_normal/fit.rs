@@ -222,6 +222,9 @@ pub fn fit_transformation_normal(
         // ------------------------------------------------------------------
         let cov_design = boot_design;
         let cov_spec_resolved = boot_spec;
+        let effective_offset = cov_design
+            .compose_offset(offset.view(), "transformation-normal fit")
+            .map_err(|error| error.to_string())?;
 
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
             response,
@@ -232,7 +235,7 @@ pub fn fit_transformation_normal(
             effective_config.response_degree,
             resp_transform,
             weights,
-            offset,
+            &effective_offset,
             cov_design.design.clone(),
             cov_design
                 .penalties
@@ -308,6 +311,9 @@ pub fn fit_transformation_normal(
     // refuses with a `joint hyper rho dimension mismatch`.
     let probe_design = build_term_collection_design(covariate_data, &boot_spec)
         .map_err(|e| format!("failed to rebuild frozen probe covariate design: {e}"))?;
+    let probe_offset = probe_design
+        .compose_offset(offset.view(), "transformation-normal spatial probe")
+        .map_err(|error| error.to_string())?;
 
     // Build an initial family + blocks for capability probing.
     let probe_family = TransformationNormalFamily::from_prebuilt_response_basis(
@@ -319,7 +325,7 @@ pub fn fit_transformation_normal(
         effective_config.response_degree,
         resp_transform.clone(),
         weights,
-        offset,
+        &probe_offset,
         probe_design.design.clone(),
         probe_design
             .penalties
@@ -404,6 +410,9 @@ pub fn fit_transformation_normal(
     // Helper: build family from prebuilt response basis + covariate design.
     let make_family =
         |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
+            let effective_offset = cov_design
+                .compose_offset(offset.view(), "transformation-normal spatial fit")
+                .map_err(|error| error.to_string())?;
             TransformationNormalFamily::from_prebuilt_response_basis(
                 response,
                 rv.clone(),
@@ -413,7 +422,7 @@ pub fn fit_transformation_normal(
                 rdeg,
                 rt.clone(),
                 weights,
-                offset,
+                &effective_offset,
                 cov_design.design.clone(),
                 cov_design
                     .penalties

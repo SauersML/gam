@@ -13,8 +13,21 @@ use super::{
     CoefficientBlockSelector, CoefficientGroupSpec, CustomFamilyError, ParameterBlockSpec,
     PenaltyMatrix, RealizedCoefficientGroup, RealizedCoefficientGroupSpecs, validate_blockspecs,
 };
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// One physical penalty emission in its final block-local order. Keeping the
+/// matrix, nullity mode, initial precision, label, and prior in one record makes
+/// it impossible for a group penalty to be inserted into a block while its
+/// metadata is appended to a differently ordered side vector.
+#[derive(Clone)]
+struct RealizedPenaltyEmission {
+    penalty: PenaltyMatrix,
+    nullspace_dim: Option<usize>,
+    initial_log_lambda: f64,
+    label: String,
+    prior: gam_problem::RhoPrior,
+}
 
 pub(crate) fn coefficient_group_block_index(
     specs: &[ParameterBlockSpec],
@@ -197,25 +210,47 @@ pub fn realize_coefficient_groups_for_custom_family(
         })
         .collect::<Vec<_>>();
 
-    let mut realized_specs = specs.to_vec();
-    let mut penalty_labels = Vec::<String>::new();
-    let mut outer_labels = Vec::<String>::new();
     let base_count = specs.iter().map(|spec| spec.penalties.len()).sum::<usize>();
-    let mut priors = expand_custom_group_base_prior(&base_prior, base_count, "coefficient groups")?;
+    let base_priors =
+        expand_custom_group_base_prior(&base_prior, base_count, "coefficient groups")?;
     let mut base_prior_idx = 0usize;
-
+    let mut infer_nullity_by_block = Vec::with_capacity(specs.len());
+    let mut emissions_by_block = Vec::<Vec<RealizedPenaltyEmission>>::with_capacity(specs.len());
     for (block_idx, spec) in specs.iter().enumerate() {
+        if !spec.nullspace_dims.is_empty() && spec.nullspace_dims.len() != spec.penalties.len() {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "coefficient-group block '{}' has {} penalties but {} structural nullities; nullity metadata must be either complete or absent",
+                    spec.name,
+                    spec.penalties.len(),
+                    spec.nullspace_dims.len()
+                ),
+            }
+            .into());
+        }
+        let infer_nullity = !spec.penalties.is_empty() && spec.nullspace_dims.is_empty();
+        infer_nullity_by_block.push(infer_nullity);
+        let mut emissions = Vec::with_capacity(spec.penalties.len());
         for penalty_idx in 0..spec.penalties.len() {
-            let label = format!("__block_{block_idx}_penalty_{penalty_idx}");
-            penalty_labels.push(label.clone());
-            outer_labels.push(label);
+            let penalty = spec.penalties[penalty_idx].clone();
+            let label = penalty
+                .precision_label()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("__block_{block_idx}_penalty_{penalty_idx}"));
+            emissions.push(RealizedPenaltyEmission {
+                penalty,
+                nullspace_dim: (!infer_nullity).then(|| spec.nullspace_dims[penalty_idx]),
+                initial_log_lambda: spec.initial_log_lambdas[penalty_idx],
+                label,
+                prior: base_priors[base_prior_idx].clone(),
+            });
             base_prior_idx += 1;
         }
+        emissions_by_block.push(emissions);
     }
     assert_eq!(base_prior_idx, base_count);
 
     for group in &realized_groups {
-        outer_labels.push(group.label.clone());
         let group_prior = match group.prior.as_ref() {
             Some(prior) => prior.to_rho_prior(),
             None => match &base_prior {
@@ -228,7 +263,6 @@ pub fn realize_coefficient_groups_for_custom_family(
                 prior => prior.clone(),
             },
         };
-        priors.push(group_prior);
 
         // Hierarchical Gamma precision update.
         //
@@ -261,29 +295,95 @@ pub fn realize_coefficient_groups_for_custom_family(
                 by_block.entry(block_idx).or_default().push(column);
             }
             for (block_idx, columns) in by_block {
-                let p = realized_specs[block_idx].design.ncols();
+                let p = specs[block_idx].design.ncols();
                 let mut matrix = Array2::<f64>::zeros((p, p));
                 for column in &columns {
                     matrix[[*column, *column]] = 1.0;
                 }
-                realized_specs[block_idx]
-                    .penalties
-                    .push(PenaltyMatrix::Dense(matrix).with_precision_label(group.label.clone()));
-                realized_specs[block_idx]
-                    .nullspace_dims
-                    .push(p.saturating_sub(columns.len()));
-                let mut rho =
-                    Array1::<f64>::zeros(realized_specs[block_idx].initial_log_lambdas.len() + 1);
-                if !realized_specs[block_idx].initial_log_lambdas.is_empty() {
-                    let old_len = realized_specs[block_idx].initial_log_lambdas.len();
-                    rho.slice_mut(s![..old_len])
-                        .assign(&realized_specs[block_idx].initial_log_lambdas);
-                }
-                let last = rho.len() - 1;
-                rho[last] = group.initial_log_precision;
-                realized_specs[block_idx].initial_log_lambdas = rho;
-                penalty_labels.push(group.label.clone());
+                emissions_by_block[block_idx].push(RealizedPenaltyEmission {
+                    penalty: PenaltyMatrix::Dense(matrix).with_precision_label(group.label.clone()),
+                    // `ParameterBlockSpec` currently represents inferred nullities
+                    // with one block-wide empty vector. Preserve that mode for the
+                    // whole block instead of creating a dangerous partial vector by
+                    // appending only the new group's known nullity.
+                    nullspace_dim: (!infer_nullity_by_block[block_idx])
+                        .then_some(p.saturating_sub(columns.len())),
+                    initial_log_lambda: group.initial_log_precision,
+                    label: group.label.clone(),
+                    prior: group_prior.clone(),
+                });
             }
+        }
+    }
+
+    let mut realized_specs = specs.to_vec();
+    for ((spec, emissions), &infer_nullity) in realized_specs
+        .iter_mut()
+        .zip(emissions_by_block.iter())
+        .zip(infer_nullity_by_block.iter())
+    {
+        spec.penalties = emissions
+            .iter()
+            .map(|emission| emission.penalty.clone())
+            .collect();
+        spec.initial_log_lambdas =
+            Array1::from_iter(emissions.iter().map(|emission| emission.initial_log_lambda));
+        spec.nullspace_dims = if infer_nullity {
+            Vec::new()
+        } else {
+            emissions
+                .iter()
+                .map(|emission| {
+                    emission
+                        .nullspace_dim
+                        .expect("structural-nullity blocks emit complete metadata")
+                })
+                .collect()
+        };
+    }
+
+    // Derive both physical and outer metadata from the exact same final
+    // block-flattened emission walk consumed by `penalty_label_layout_with_joint`.
+    // The first physical occurrence of a label owns its outer coordinate; tied
+    // group pieces reuse it and must agree on prior and initial precision.
+    let mut penalty_labels = Vec::<String>::new();
+    let mut outer_labels = Vec::<String>::new();
+    let mut priors = Vec::<gam_problem::RhoPrior>::new();
+    let mut outer_initial_log_lambdas = Vec::<f64>::new();
+    let mut outer_by_label = BTreeMap::<String, usize>::new();
+    for emissions in &emissions_by_block {
+        for emission in emissions {
+            penalty_labels.push(emission.label.clone());
+            if emission.penalty.fixed_log_lambda().is_some() {
+                continue;
+            }
+            if let Some(&outer_idx) = outer_by_label.get(&emission.label) {
+                if priors[outer_idx] != emission.prior {
+                    return Err(CustomFamilyError::ConstraintViolation {
+                        reason: format!(
+                            "precision label '{}' carries inconsistent rho priors across physical penalty pieces",
+                            emission.label
+                        ),
+                    }
+                    .into());
+                }
+                let first = outer_initial_log_lambdas[outer_idx];
+                if (first - emission.initial_log_lambda).abs() > 1e-10 {
+                    return Err(CustomFamilyError::ConstraintViolation {
+                        reason: format!(
+                            "precision label '{}' has inconsistent initial log-precisions: {first} and {}",
+                            emission.label, emission.initial_log_lambda
+                        ),
+                    }
+                    .into());
+                }
+                continue;
+            }
+            let outer_idx = outer_labels.len();
+            outer_by_label.insert(emission.label.clone(), outer_idx);
+            outer_labels.push(emission.label.clone());
+            priors.push(emission.prior.clone());
+            outer_initial_log_lambdas.push(emission.initial_log_lambda);
         }
     }
 
@@ -306,4 +406,107 @@ pub fn realize_coefficient_groups_for_custom_family(
         outer_labels,
         independent_prior_factor_labels,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gam_spec::CoefficientGroupPrior;
+
+    fn one_penalty_block(
+        name: &str,
+        initial_log_lambda: f64,
+        nullspace_dims: Vec<usize>,
+    ) -> ParameterBlockSpec {
+        ParameterBlockSpec {
+            name: name.to_string(),
+            design: crate::DesignMatrix::from(Array2::<f64>::eye(2)),
+            offset: Array1::zeros(2),
+            penalties: vec![PenaltyMatrix::Dense(Array2::<f64>::eye(2))],
+            nullspace_dims,
+            initial_log_lambdas: Array1::from_vec(vec![initial_log_lambda]),
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        }
+    }
+
+    #[test]
+    fn multi_block_group_priors_follow_realized_penalty_order_2315() {
+        let specs = vec![
+            // Empty means infer every nullity in this block. Appending the group
+            // must keep it empty rather than manufacturing a partial vector.
+            one_penalty_block("early", -1.0, Vec::new()),
+            one_penalty_block("late", -2.0, vec![0]),
+        ];
+        let mut group =
+            CoefficientGroupSpec::new("early_group", vec![crate::coefficient_label("early", 0)])
+                .with_prior(CoefficientGroupPrior::NormalLogPrecision {
+                    mean: 30.0,
+                    sd: 3.0,
+                });
+        group.initial_log_precision = Some(7.0);
+        let base_prior = gam_problem::RhoPrior::Independent(vec![
+            gam_problem::RhoPrior::Normal {
+                mean: 10.0,
+                sd: 1.0,
+            },
+            gam_problem::RhoPrior::Normal {
+                mean: 20.0,
+                sd: 2.0,
+            },
+        ]);
+
+        let realized = realize_coefficient_groups_for_custom_family(
+            &specs,
+            std::slice::from_ref(&group),
+            base_prior,
+        )
+        .expect("two-block coefficient-group layout must realize");
+
+        let expected_labels = vec![
+            "__block_0_penalty_0".to_string(),
+            "early_group".to_string(),
+            "__block_1_penalty_0".to_string(),
+        ];
+        assert_eq!(realized.penalty_labels, expected_labels);
+        assert_eq!(realized.outer_labels, expected_labels);
+        assert_eq!(realized.specs[0].penalties.len(), 2);
+        assert_eq!(realized.specs[0].nullspace_dims, Vec::<usize>::new());
+        assert_eq!(
+            realized.specs[0].initial_log_lambdas.as_slice(),
+            Some(&[-1.0, 7.0][..])
+        );
+        assert_eq!(realized.specs[1].penalties.len(), 1);
+        assert_eq!(realized.specs[1].nullspace_dims, vec![0]);
+
+        let gam_problem::RhoPrior::Independent(priors) = &realized.rho_prior else {
+            panic!("realized coefficient-group prior must be coordinate-wise")
+        };
+        assert_eq!(
+            priors,
+            &vec![
+                gam_problem::RhoPrior::Normal {
+                    mean: 10.0,
+                    sd: 1.0,
+                },
+                gam_problem::RhoPrior::Normal {
+                    mean: 30.0,
+                    sd: 3.0,
+                },
+                gam_problem::RhoPrior::Normal {
+                    mean: 20.0,
+                    sd: 2.0,
+                },
+            ]
+        );
+
+        let layout =
+            crate::penalty_label_layout_with_joint(&realized.specs, vec![2, 1], Vec::new())
+                .expect("realized specs must reproduce the exported outer layout");
+        assert_eq!(layout.initial_rho.as_slice(), Some(&[-1.0, 7.0, -2.0][..]));
+        assert_eq!(layout.physical_to_outer, vec![Some(0), Some(1), Some(2)]);
+    }
 }
