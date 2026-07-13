@@ -270,13 +270,22 @@ pub(crate) fn survival_nonrigid_pilot_eta(
         grad_eta1[i] = -k1 + event_w * eta1[i];
         hess_eta1[i] = k2 + event_w;
         if !hess_eta1[i].is_finite() || hess_eta1[i] < 0.0 {
-            // Defensive: any non-PSD row would corrupt the joint Gram. Clamp
-            // to a tiny positive so the IRLS step degenerates to a small
-            // proximal update rather than producing NaN.
-            hess_eta1[i] = hess_eta1[i].max(0.0);
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival non-rigid pilot row {i} produced invalid eta1 curvature {}",
+                    hess_eta1[i],
+                ),
+            }
+            .into());
         }
         if !grad_eta1[i].is_finite() {
-            grad_eta1[i] = 0.0;
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival non-rigid pilot row {i} produced non-finite eta1 gradient {}",
+                    grad_eta1[i],
+                ),
+            }
+            .into());
         }
     }
     // Normal equations: (Xᵀ W X + λI) β = -Xᵀ g, where W = diag(hess_eta1)
