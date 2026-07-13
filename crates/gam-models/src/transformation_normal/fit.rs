@@ -610,9 +610,8 @@ pub fn fit_transformation_normal(
                 ) {
                     Ok(candidate) => candidate,
                     Err(error) => {
-                        let rejection = format!(
-                            "mode_candidate={candidate_idx} evaluator error: {error}"
-                        );
+                        let rejection =
+                            format!("mode_candidate={candidate_idx} evaluator error: {error}");
                         log::warn!(
                             "[transformation-normal] rejected exact coefficient-mode candidate: {rejection}"
                         );
@@ -621,9 +620,8 @@ pub fn fit_transformation_normal(
                     }
                 };
                 if !candidate.inner_converged {
-                    let rejection = format!(
-                        "mode_candidate={candidate_idx} inner solve did not converge"
-                    );
+                    let rejection =
+                        format!("mode_candidate={candidate_idx} inner solve did not converge");
                     log::warn!(
                         "[transformation-normal] rejected exact coefficient-mode candidate: {rejection}"
                     );
@@ -633,9 +631,8 @@ pub fn fit_transformation_normal(
                 if !candidate.objective.is_finite()
                     || candidate.gradient.iter().any(|value| !value.is_finite())
                 {
-                    let rejection = format!(
-                        "mode_candidate={candidate_idx} returned a non-finite criterion"
-                    );
+                    let rejection =
+                        format!("mode_candidate={candidate_idx} returned a non-finite criterion");
                     log::warn!(
                         "[transformation-normal] rejected exact coefficient-mode candidate: {rejection}"
                     );
