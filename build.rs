@@ -4617,110 +4617,221 @@ enum DerivativeSpecializationKind {
 struct DerivativeSpecialization {
     family: &'static str,
     kind: DerivativeSpecializationKind,
-    production_path: &'static str,
-    production_anchors: &'static [&'static str],
+    production_sources: &'static [DerivativeAnchorSet],
     discovery_anchor: &'static str,
-    pin_path: &'static str,
-    pin_anchors: &'static [&'static str],
+    parity_pins: &'static [DerivativeAnchorSet],
+    retired_identities: &'static [&'static str],
+}
+
+struct DerivativeAnchorSet {
+    path: &'static str,
+    anchors: &'static [&'static str],
 }
 
 const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
     DerivativeSpecialization {
         family: "BMS rigid Bernoulli",
         kind: DerivativeSpecializationKind::RowKernel,
-        production_path: "crates/gam-models/src/bms/row_kernel.rs",
-        production_anchors: &[
-            "impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidRowKernel",
-            "impl RowKernel<2> for BernoulliRigidRowKernel",
-        ],
+        production_sources: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/bms/row_kernel.rs",
+            anchors: &[
+                "impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidRowKernel",
+                "impl RowKernel<2> for BernoulliRigidRowKernel",
+            ],
+        }],
         discovery_anchor: "impl RowKernel<2> for BernoulliRigidRowKernel",
-        pin_path: "crates/gam-models/src/bms/gradient_paths.rs",
-        pin_anchors: &[
-            "fn rigid_bernoulli_row_kernel_agrees_with_jet_tower_program_all_channels()",
-            "verify_kernel_channels(&tower, &claims, 1e-9)",
+        parity_pins: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/bms/gradient_paths.rs",
+            anchors: &[
+                "fn rigid_bernoulli_row_kernel_agrees_with_jet_tower_program_all_channels()",
+                "verify_kernel_channels(&tower, &claims, 1e-9)",
+            ],
+        }],
+        retired_identities: &[],
+    },
+    DerivativeSpecialization {
+        family: "BMS FLEX Bernoulli",
+        kind: DerivativeSpecializationKind::Bespoke,
+        production_sources: &[
+            DerivativeAnchorSet {
+                path: "crates/gam-models/src/bms/flex_row_program.rs",
+                anchors: &[
+                    "pub(super) struct BmsFlexRowProgram",
+                    "pub(super) fn evaluate<'arena, S: RuntimeJetScalar<'arena>>(",
+                    "let intercept = filtered_implicit_solve_runtime_scalar(",
+                    "Ok(signed.compose_unary(self.observed_neglog_stack))",
+                    "pub(super) fn try_for_each_calibration_order2<E>(",
+                    "pub(super) fn try_for_each_calibration_order3_contiguous<E>(",
+                    "pub(super) fn try_for_each_calibration_order4_contiguous<E>(",
+                    "pub(super) fn try_for_each_order2_finalizer<E>(",
+                    "pub(super) fn try_for_each_order3_finalizer<E>(",
+                    "pub(super) fn try_for_each_order4_finalizer<E>(",
+                ],
+            },
+            DerivativeAnchorSet {
+                path: "crates/gam-models/src/bms/cell_moment_assembly.rs",
+                anchors: &[
+                    "pub(super) fn empirical_flex_row_third_contracted_many(",
+                    "let jet = plan.evaluate(vars, 3, &workspace)?;",
+                    "pub(super) fn empirical_dynamic_fourth_batch_from_plan(",
+                    "let jet = plan.evaluate(vars, 4, &workspace)?;",
+                ],
+            },
+            DerivativeAnchorSet {
+                path: "crates/gam-models/src/bms/row_primary_hessian.rs",
+                anchors: &[
+                    "pub(super) fn lower_bms_flex_row_order2(",
+                    "pub(super) fn lower_bms_flex_row_order2_with_moments(",
+                    "pub(super) fn lower_bms_flex_row_order2_from_parts(",
+                    "BmsFlexRowProgram::try_for_each_calibration_order2(",
+                    "BmsFlexRowProgram::try_for_each_calibration_order3_contiguous(",
+                    "BmsFlexRowProgram::try_for_each_calibration_order4_contiguous(",
+                    "BmsFlexRowProgram::try_for_each_order2_finalizer(",
+                    "BmsFlexRowProgram::try_for_each_order3_finalizer(",
+                    "BmsFlexRowProgram::try_for_each_order4_finalizer(",
+                ],
+            },
+            DerivativeAnchorSet {
+                path: "crates/gam-models/src/bms/gpu/row.rs",
+                anchors: &[
+                    "fn build_generated_row_kernel_source() -> String",
+                    "BmsFlexRowProgram::try_for_each_calibration_order2_phase(",
+                    "BmsFlexRowProgram::try_for_each_order2_finalizer_phase(",
+                    "SOURCE.get_or_init(build_generated_row_kernel_source)",
+                ],
+            },
+        ],
+        discovery_anchor: "pub(super) struct BmsFlexRowProgram",
+        parity_pins: &[
+            DerivativeAnchorSet {
+                path: "crates/gam-models/src/bms/flex_verify_932_tests.rs",
+                anchors: &[
+                    "fn standard_normal_flex_canonical_derivative_ladder_matches_vgh_t3_t4_932()",
+                    ".lower_bms_flex_row_order2_with_moments(",
+                    ".row_primary_third_contracted_with_moments(",
+                    ".row_primary_fourth_contracted_ordered(",
+                ],
+            },
+            DerivativeAnchorSet {
+                path: "crates/gam-models/src/bms/gpu/row.rs",
+                anchors: &[
+                    "fn generated_cuda_row_kernel_matches_canonical_cpu_lowering_415()",
+                    "fn generated_source_interprets_compact_canonical_phase_streams()",
+                ],
+            },
+        ],
+        retired_identities: &[
+            "compute_row_analytic_flex_into",
+            "compute_row_analytic_flex_into_with_moments",
+            "compute_row_analytic_flex_from_parts_into",
         ],
     },
     DerivativeSpecialization {
         family: "survival location-scale",
         kind: DerivativeSpecializationKind::RowKernel,
-        production_path: "crates/gam-models/src/survival/location_scale/row_kernel.rs",
-        production_anchors: &[
-            "impl gam_math::jet_tower::RowProgram<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
-            "impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
-        ],
+        production_sources: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/survival/location_scale/row_kernel.rs",
+            anchors: &[
+                "impl gam_math::jet_tower::RowProgram<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
+                "impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
+            ],
+        }],
         discovery_anchor: "impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
-        pin_path: "crates/gam-models/src/survival/location_scale/tests.rs",
-        pin_anchors: &[
-            "fn survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels()",
-            "verify_kernel_channels(&tower, &claims, 1e-9)",
-        ],
+        parity_pins: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/survival/location_scale/tests.rs",
+            anchors: &[
+                "fn survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels()",
+                "verify_kernel_channels(&tower, &claims, 1e-9)",
+            ],
+        }],
+        retired_identities: &[],
     },
     DerivativeSpecialization {
         family: "survival marginal-slope rigid",
         kind: DerivativeSpecializationKind::RowKernel,
-        production_path: "crates/gam-models/src/survival/marginal_slope/row_kernel.rs",
-        production_anchors: &[
-            "impl gam_math::jet_tower::RowProgram<4> for SurvivalMarginalSlopeRowKernel",
-            "impl RowKernel<4> for SurvivalMarginalSlopeRowKernel",
-        ],
+        production_sources: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/survival/marginal_slope/row_kernel.rs",
+            anchors: &[
+                "impl gam_math::jet_tower::RowProgram<4> for SurvivalMarginalSlopeRowKernel",
+                "impl RowKernel<4> for SurvivalMarginalSlopeRowKernel",
+            ],
+        }],
         discovery_anchor: "impl RowKernel<4> for SurvivalMarginalSlopeRowKernel",
-        pin_path: "crates/gam-models/src/survival/marginal_slope/tests.rs",
-        pin_anchors: &[
-            "fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels()",
-            "verify_kernel_channels(&tower, &claims, 1e-9)",
-        ],
+        parity_pins: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/survival/marginal_slope/tests.rs",
+            anchors: &[
+                "fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels()",
+                "verify_kernel_channels(&tower, &claims, 1e-9)",
+            ],
+        }],
+        retired_identities: &[],
     },
     DerivativeSpecialization {
         family: "multinomial Fisher",
         kind: DerivativeSpecializationKind::Bespoke,
-        production_path: "crates/gam-models/src/multinomial_reml.rs",
-        production_anchors: &[
-            "pub struct MultinomialLogitRowProgram<'row>",
-            "impl<const M: usize> gam_math::jet_tower::RowProgram<M> for MultinomialLogitRowProgram<'_>",
-            "fn eval_expression<S: JetField>",
-            "fn negative_log_likelihood_from_normalization",
-            "pub(crate) fn value_gradient_hessian_into",
-            "fn softmax_fisher_perturbation<S: FisherPerturbation>",
-        ],
+        production_sources: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/multinomial_reml.rs",
+            anchors: &[
+                "pub struct MultinomialLogitRowProgram<'row>",
+                "impl<const M: usize> gam_math::jet_tower::RowProgram<M> for MultinomialLogitRowProgram<'_>",
+                "fn eval_expression<S: JetField>",
+                "fn negative_log_likelihood_from_normalization",
+                "pub(crate) fn value_gradient_hessian_into",
+                "fn softmax_fisher_perturbation<S: FisherPerturbation>",
+            ],
+        }],
         discovery_anchor: "fn softmax_fisher_perturbation<S: FisherPerturbation>",
-        pin_path: "crates/gam-models/src/multinomial_reml.rs",
-        pin_anchors: &[
-            "fn multinomial_live_tower_matches_jet_and_fd()",
-            "fn multinomial_extreme_tails_share_one_stable_row_program_932()",
-        ],
+        parity_pins: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/multinomial_reml.rs",
+            anchors: &[
+                "fn multinomial_live_tower_matches_jet_and_fd()",
+                "fn multinomial_extreme_tails_share_one_stable_row_program_932()",
+            ],
+        }],
+        retired_identities: &[],
     },
     DerivativeSpecialization {
         family: "Gaussian location-scale",
         kind: DerivativeSpecializationKind::RowAtom,
-        production_path: "crates/gam-models/src/gamlss/gaussian/joint_psi.rs",
-        production_anchors: &[
-            "fn gaussian_normalized_row [generic, order2, third, fourth]",
-            "pub struct GaussianJointRowProgram<'a>",
-            "impl gam_math::jet_tower::RowProgram<2> for GaussianJointRowProgram<'_>",
-        ],
+        production_sources: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/gamlss/gaussian/joint_psi.rs",
+            anchors: &[
+                "fn gaussian_normalized_row [generic, order2, third, fourth]",
+                "pub struct GaussianJointRowProgram<'a>",
+                "impl gam_math::jet_tower::RowProgram<2> for GaussianJointRowProgram<'_>",
+            ],
+        }],
         discovery_anchor: "fn gaussian_normalized_row [generic, order2, third, fourth]",
-        pin_path: "crates/gam-models/src/gamlss/gaussian/joint_psi.rs",
-        pin_anchors: &[
-            "fn first_directional_weights_match_jet_third()",
-            "fn second_directional_weights_match_jet_fourth()",
-            "crate::gamlss::GaussianJointRowProgram::new(&rows)",
-        ],
+        parity_pins: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/gamlss/gaussian/joint_psi.rs",
+            anchors: &[
+                "fn first_directional_weights_match_jet_third()",
+                "fn second_directional_weights_match_jet_fourth()",
+                "crate::gamlss::GaussianJointRowProgram::new(&rows)",
+            ],
+        }],
+        retired_identities: &[],
     },
     DerivativeSpecialization {
         family: "cause-specific survival",
         kind: DerivativeSpecializationKind::RowAtom,
-        production_path: "crates/gam-models/src/survival/base.rs",
-        production_anchors: &[
-            "fn cause_specific_row [generic, order2, third, fourth]",
-            "pub struct CauseSpecificRowProgram",
-            "impl gam_math::jet_tower::RowProgram<3> for CauseSpecificRowProgram",
-        ],
+        production_sources: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/survival/base.rs",
+            anchors: &[
+                "fn cause_specific_row [generic, order2, third, fourth]",
+                "pub struct CauseSpecificRowProgram",
+                "impl gam_math::jet_tower::RowProgram<3> for CauseSpecificRowProgram",
+            ],
+        }],
         discovery_anchor: "fn cause_specific_row [generic, order2, third, fourth]",
-        pin_path: "crates/gam-models/src/survival/base.rs",
-        pin_anchors: &[
-            "fn cause_specific_live_tower_matches_jet_and_fd()",
-            "crate::survival::CauseSpecificRowProgram::new(",
-        ],
+        parity_pins: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/survival/base.rs",
+            anchors: &[
+                "fn cause_specific_live_tower_matches_jet_and_fd()",
+                "crate::survival::CauseSpecificRowProgram::new(",
+            ],
+        }],
+        retired_identities: &[],
     },
 ];
 
@@ -4739,6 +4850,18 @@ fn code_anchor_line_indices(source: &str, anchor: &str) -> Vec<usize> {
         .into_iter()
         .enumerate()
         .filter_map(|(line_index, line)| line.contains(anchor).then_some(line_index))
+        .collect()
+}
+
+fn code_identifier_line_indices(source: &str, identifier: &str) -> Vec<usize> {
+    strip_file_lines(source)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(line_index, line)| {
+            line.split(|character: char| character != '_' && !character.is_ascii_alphanumeric())
+                .any(|token| token == identifier)
+                .then_some(line_index)
+        })
         .collect()
 }
 
@@ -4884,57 +5007,75 @@ fn enforce_derivative_policy_negative_probes() {
         unregistered_generated, 2,
         "#932 policy self-test: separate generated-third/fourth declarations were not both discovered"
     );
+
+    let retired = "fn planted_retired_identity() {}";
+    assert_eq!(
+        code_identifier_line_indices(retired, "planted_retired_identity"),
+        vec![0],
+        "#932 policy self-test: a retired derivative identity was not discovered"
+    );
+    assert!(
+        code_identifier_line_indices(
+            "// planted_retired_identity\nfn planted_retired_identity_suffix() {}",
+            "planted_retired_identity",
+        )
+        .is_empty(),
+        "#932 policy self-test: retired-identity matching ignored token boundaries or comments"
+    );
 }
 
 fn enforce_production_derivative_specializations(root: &Path) {
     enforce_derivative_policy_negative_probes();
     let mut violations = Vec::new();
     for specialization in PRODUCTION_DERIVATIVE_SPECIALIZATIONS {
-        let production_path = root.join(specialization.production_path);
-        match fs::read_to_string(&production_path) {
-            Ok(source) => {
-                let test_mask =
-                    compute_test_mask(&source, Path::new(specialization.production_path));
-                for anchor in specialization.production_anchors {
-                    let anchor_lines = code_anchor_line_indices(&source, anchor);
-                    if anchor_lines.is_empty() {
-                        violations.push(format!(
-                            "{} production anchor is missing: {}",
-                            specialization.family, anchor
-                        ));
-                    } else if anchor_lines
-                        .iter()
-                        .all(|line| test_mask.get(*line).copied().unwrap_or(false))
-                    {
-                        violations.push(format!(
-                            "{} production anchor is gated by cfg(test): {}",
-                            specialization.family, anchor
-                        ));
+        for production in specialization.production_sources {
+            let production_path = root.join(production.path);
+            match fs::read_to_string(&production_path) {
+                Ok(source) => {
+                    let test_mask = compute_test_mask(&source, Path::new(production.path));
+                    for anchor in production.anchors {
+                        let anchor_lines = code_anchor_line_indices(&source, anchor);
+                        if anchor_lines.is_empty() {
+                            violations.push(format!(
+                                "{} production anchor is missing from {}: {}",
+                                specialization.family, production.path, anchor
+                            ));
+                        } else if anchor_lines
+                            .iter()
+                            .all(|line| test_mask.get(*line).copied().unwrap_or(false))
+                        {
+                            violations.push(format!(
+                                "{} production anchor is gated by cfg(test) in {}: {}",
+                                specialization.family, production.path, anchor
+                            ));
+                        }
                     }
                 }
+                Err(error) => violations.push(format!(
+                    "{} production source {} cannot be read: {error}",
+                    specialization.family, production.path
+                )),
             }
-            Err(error) => violations.push(format!(
-                "{} production source {} cannot be read: {error}",
-                specialization.family, specialization.production_path
-            )),
         }
 
-        let pin_path = root.join(specialization.pin_path);
-        match fs::read_to_string(&pin_path) {
-            Ok(source) => {
-                for anchor in specialization.pin_anchors {
-                    if code_anchor_line_indices(&source, anchor).is_empty() {
-                        violations.push(format!(
-                            "{} registered parity pin is missing anchor: {}",
-                            specialization.family, anchor
-                        ));
+        for pin in specialization.parity_pins {
+            let pin_path = root.join(pin.path);
+            match fs::read_to_string(&pin_path) {
+                Ok(source) => {
+                    for anchor in pin.anchors {
+                        if code_anchor_line_indices(&source, anchor).is_empty() {
+                            violations.push(format!(
+                                "{} registered parity pin is missing from {}: {}",
+                                specialization.family, pin.path, anchor
+                            ));
+                        }
                     }
                 }
+                Err(error) => violations.push(format!(
+                    "{} pin source {} cannot be read: {error}",
+                    specialization.family, pin.path
+                )),
             }
-            Err(error) => violations.push(format!(
-                "{} pin source {} cannot be read: {error}",
-                specialization.family, specialization.pin_path
-            )),
         }
     }
 
@@ -4945,6 +5086,18 @@ fn enforce_production_derivative_specializations(root: &Path) {
             let rel_path = rel.to_string_lossy().replace('\\', "/");
             if rel.extension().and_then(OsStr::to_str) != Some("rs") {
                 return;
+            }
+            for specialization in PRODUCTION_DERIVATIVE_SPECIALIZATIONS {
+                for identifier in specialization.retired_identities {
+                    for line_index in code_identifier_line_indices(content, identifier) {
+                        violations.push(format!(
+                            "{} retired derivative identity reappeared at {rel_path}:{}: {}",
+                            specialization.family,
+                            line_index + 1,
+                            identifier
+                        ));
+                    }
+                }
             }
             let test_mask = compute_test_mask(content, rel);
             for declaration in derivative_declarations(content, &test_mask) {
@@ -5001,7 +5154,10 @@ fn specialization_site_is_registered(
         .iter()
         .any(|specialization| {
             specialization.kind == kind
-                && specialization.production_path == path
+                && specialization
+                    .production_sources
+                    .iter()
+                    .any(|source| source.path == path)
                 && normalized_source
                     .contains(&normalized_rust_fragment(specialization.discovery_anchor))
         })
