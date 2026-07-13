@@ -87,6 +87,26 @@ use gam_math::jet_scalar::{
     RuntimeJetScalar,
 };
 
+thread_local! {
+    /// Per-worker FLEX directional workspace. The largest row tape is retained
+    /// across contractions, so warmed production calls do not revisit the
+    /// global allocator for runtime-sized derivative channels.
+    static FLEX_THIRD_JET_ARENA: std::cell::RefCell<DynamicJetArena> =
+        std::cell::RefCell::new(DynamicJetArena::new());
+}
+
+pub(super) fn with_flex_third_jet_arena<R>(
+    evaluate: impl FnOnce(&mut DynamicJetArena) -> R,
+) -> R {
+    FLEX_THIRD_JET_ARENA.with(|workspace| {
+        let mut arena = workspace.borrow_mut();
+        arena.reset();
+        let result = evaluate(&mut arena);
+        arena.reset();
+        result
+    })
+}
+
 /// The `[f64; 5]` Faà di Bruno stack of `g(η) = logΦ(−η)` at `η`.
 ///
 /// With `N(m) = −logΦ(m)` and `(k1,k2,k3,k4) = N′…N⁗(m)` at `m = −η`
