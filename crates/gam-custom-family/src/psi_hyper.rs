@@ -367,12 +367,10 @@ pub fn build_jeffreys_hphi_ctx<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     synced_states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    hyper_layout: &CustomFamilyHyperLayout,
     total: usize,
 ) -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
-    if family.joint_jeffreys_term_required()
-        && derivative_blocks.iter().any(|block| !block.is_empty())
-    {
+    if family.joint_jeffreys_term_required() && !hyper_layout.is_empty() {
         let ranges = block_param_ranges(specs);
         Ok(
             match (
