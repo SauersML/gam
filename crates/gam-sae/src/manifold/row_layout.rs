@@ -142,3 +142,35 @@ impl SaeRowLayout {
         }
     }
 }
+
+#[cfg(test)]
+mod support_state_tests {
+    use super::*;
+    use crate::assignment_state::{SaeAssignmentAtomSpec, SaeAssignmentState};
+
+    #[test]
+    fn direct_layout_preserves_heterogeneous_active_offsets() {
+        let state = SaeAssignmentState::from_topk_support_heterogeneous(
+            2,
+            4,
+            2,
+            vec![
+                SaeAssignmentAtomSpec::euclidean(1),
+                SaeAssignmentAtomSpec::euclidean(3),
+                SaeAssignmentAtomSpec::euclidean(2),
+                SaeAssignmentAtomSpec::euclidean(1),
+            ],
+            vec![vec![2, 0], vec![3, 1]],
+            vec![vec![1.0; 2]; 2],
+            vec![vec![0.0; 3], vec![0.0; 4]],
+        )
+        .expect("state builds");
+        let layout = SaeRowLayout::from_assignment_state(&state).expect("layout builds");
+        assert_eq!(layout.active_atoms, vec![vec![0, 2], vec![1, 3]]);
+        assert_eq!(layout.coord_starts, vec![vec![0, 1], vec![0, 3]]);
+        assert_eq!(layout.coord_dims, vec![1, 3, 2, 1]);
+        assert_eq!(layout.coord_offsets_full, vec![0, 1, 4, 6]);
+        assert_eq!(layout.row_q_active(0), 3);
+        assert_eq!(layout.row_q_active(1), 4);
+    }
+}

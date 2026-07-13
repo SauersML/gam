@@ -764,4 +764,87 @@ mod tests {
         assert!(!state.is_full_support());
         assert!(state.materialize_dense().is_err());
     }
+
+    #[test]
+    fn heterogeneous_support_is_canonical_duplicate_free_and_unpadded() {
+        let specs = vec![
+            SaeAssignmentAtomSpec {
+                latent_dim: 1,
+                id_mode: LatentIdMode::None,
+                manifold: LatentManifold::Circle { period: 1.0 },
+                retraction: LatentRetractionRegistry::all_euclidean(),
+                latent_id: 11,
+            },
+            SaeAssignmentAtomSpec::euclidean(3),
+            SaeAssignmentAtomSpec {
+                latent_dim: 2,
+                id_mode: LatentIdMode::None,
+                manifold: LatentManifold::Product(vec![
+                    LatentManifold::Circle { period: 1.0 },
+                    LatentManifold::Interval { lo: -1.0, hi: 1.0 },
+                ]),
+                retraction: LatentRetractionRegistry::all_euclidean(),
+                latent_id: 12,
+            },
+        ];
+        // Input order [2,0] is deliberately non-canonical. Coordinate blocks
+        // are [atom2: two values, atom0: one value] in that input order.
+        let state = SaeAssignmentState::from_topk_support_heterogeneous(
+            1,
+            3,
+            2,
+            specs.clone(),
+            vec![vec![2, 0]],
+            vec![vec![0.2, 0.8]],
+            vec![vec![0.25, -0.5, 0.75]],
+        )
+        .expect("heterogeneous state builds");
+        assert_eq!(state.support_indices(0), &[0, 2]);
+        assert_eq!(state.gate_params(0), &[0.8, 0.2]);
+        assert_eq!(state.coords_for_slot(0, 0), &[0.75]);
+        assert_eq!(state.coords_for_slot(0, 1), &[0.25, -0.5]);
+        assert_eq!(state.coord_cells(), 3, "sum of active d_k, no d_max padding");
+        assert_eq!(state.atom_coord_dim(0), 1);
+        assert_eq!(state.atom_coord_dim(1), 3);
+        assert_eq!(state.atom_coord_dim(2), 2);
+        assert_eq!(
+            state.atom_manifold(0),
+            &LatentManifold::Circle { period: 1.0 }
+        );
+
+        let duplicate = SaeAssignmentState::from_topk_support_heterogeneous(
+            1,
+            3,
+            2,
+            specs,
+            vec![vec![1, 1]],
+            vec![vec![1.0, 1.0]],
+            vec![vec![0.0; 6]],
+        )
+        .expect_err("duplicate support must fail");
+        assert!(duplicate.contains("duplicate atom"));
+    }
+
+    #[test]
+    fn ten_thousand_atoms_do_not_change_resident_row_state() {
+        let n = 7usize;
+        let k = 10_000usize;
+        let s = 3usize;
+        let state = SaeAssignmentState::from_topk_support(
+            n,
+            k,
+            s,
+            1,
+            (0..n)
+                .map(|row| vec![row as u32, (row + 100) as u32, (row + 999) as u32])
+                .collect(),
+            vec![vec![1.0; s]; n],
+            vec![vec![0.0; s]; n],
+        )
+        .expect("K=1e4 support state builds");
+        assert_eq!(state.active_state_cells(), n * s * 3);
+        assert_eq!(state.gate_cells(), n * s);
+        assert_ne!(state.gate_cells(), n * k);
+        assert!(state.materialize_dense().is_err());
+    }
 }

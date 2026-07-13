@@ -215,4 +215,102 @@ impl SaeManifoldTerm {
             },
         })
     }
+
+    /// PATH C channel — exact fixed-stratum second derivative of the rank-charge
+    /// `direct_rho` channel (the `log λ_smooth` derivative of
+    /// `C = Σ_k ½ rank_k · basis_edf_k · log N_eff,k`).
+    ///
+    /// At a frozen inner state the chargeable rank and `N_eff` are locally
+    /// constant, so with the per-atom `A = G + λ S` (`G` = decoder Gram, `S` =
+    /// reference smooth penalty), `basis_edf = tr(A⁻¹G)` and the gradient's
+    /// direct channel is `direct_rho_k = ½ rank · log N · d(edf)/d log λ` with
+    /// `d(edf)/d log λ = −λ tr(A⁻¹G A⁻¹S)`. Differentiating once more (using
+    /// `dA⁻¹/dλ = −A⁻¹ S A⁻¹`) gives
+    /// `d²(edf)/d(log λ)² = d(edf)/d log λ + 2 λ² tr((A⁻¹S)² A⁻¹G)`, hence the
+    /// diagonal smooth entry
+    /// `H_kk = direct_rho_k + rank · log N · λ² · tr(A⁻¹G (A⁻¹S)²)`.
+    /// Atoms are independent (diagonal block); a non-interior-EDF atom's charge
+    /// is on a locally constant branch, so both its gradient and this Hessian
+    /// entry are zero — matching the value/gradient branch exactly. Mirrors the
+    /// setup of [`Self::production_rank_charge_derivative`] so the two
+    /// differentiate one object.
+    pub(crate) fn rank_charge_direct_rho_hessian(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+    ) -> Result<Array2<f64>, String> {
+        self.assignment.validate_rho_domain(rho)?;
+        let n_params = rho.to_flat().len();
+        let mut hessian = Array2::<f64>::zeros((n_params, n_params));
+        let residual = self.reconstruction_residual(target, rho)?;
+        let dispersion =
+            self.reconstruction_dispersion(loss, cache, rho, Some(residual.view()))?;
+        let mut grams = self.empty_decoder_gram_accumulator();
+        self.accumulate_decoder_gram(&mut grams);
+        let n_eff = self.per_atom_effective_sample_size();
+        let lambda = rho.lambda_smooth_vec()?;
+        let p = self.output_dim() as f64;
+        for atom_idx in 0..self.k_atoms() {
+            let atom = &self.atoms[atom_idx];
+            let gram = &grams[atom_idx];
+            let m = atom.basis_size();
+            let n_atom = n_eff[atom_idx];
+            let spectrum = super::wbic_audit::recon_spectrum(
+                gram,
+                &atom.decoder_coefficients,
+                n_atom,
+                p,
+                dispersion,
+                lambda[atom_idx],
+                Some(&atom.smooth_penalty),
+            )?;
+            let rank = spectrum.production_chargeable_rank() as f64;
+            if !(rank > 0.0) {
+                return Err(format!(
+                    "rank_charge_direct_rho_hessian: atom {atom_idx} is on the rank-zero \
+                     Laplace-invalid branch (vanished decoder)"
+                ));
+            }
+            let log_n = n_atom.max(1.0).ln();
+            if m == 0 || log_n == 0.0 {
+                continue;
+            }
+            let lam = lambda[atom_idx];
+            let mut penalized_gram = gram.clone();
+            for r in 0..m {
+                for c in 0..m {
+                    penalized_gram[[r, c]] += lam * atom.smooth_penalty[[r, c]];
+                }
+            }
+            let factor = penalized_gram.cholesky(Side::Lower).map_err(|error| {
+                format!(
+                    "rank_charge_direct_rho_hessian: atom {atom_idx} penalized Gram \
+                     factorization failed: {error}"
+                )
+            })?;
+            let m_g = factor.solve_mat(gram); // A⁻¹ G
+            let raw_edf = (0..m).map(|i| m_g[[i, i]]).sum::<f64>();
+            let edf = super::construction::certified_basis_edf(
+                raw_edf,
+                m,
+                "rank_charge_direct_rho_hessian",
+            )?;
+            if !(edf > 0.0 && edf < m as f64) {
+                // Non-interior EDF ⇒ locally constant charge ⇒ zero curvature.
+                continue;
+            }
+            let m_s = factor.solve_mat(&atom.smooth_penalty); // A⁻¹ S
+            let mg_ms = m_g.dot(&m_s); // A⁻¹G A⁻¹S
+            let t1 = (0..m).map(|i| mg_ms[[i, i]]).sum::<f64>();
+            let mg_ms2 = m_g.dot(&m_s.dot(&m_s)); // A⁻¹G (A⁻¹S)²
+            let t_extra = (0..m).map(|i| mg_ms2[[i, i]]).sum::<f64>();
+            let direct = 0.5 * rank * log_n * (-lam * t1);
+            let h_kk = direct + rank * log_n * lam * lam * t_extra;
+            let idx = rho.smooth_flat_index(atom_idx);
+            hessian[[idx, idx]] += h_kk;
+        }
+        Ok(hessian)
+    }
 }
