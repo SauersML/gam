@@ -6,7 +6,7 @@ use super::*;
 
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOrder2, FixedRuntimeJet, JetScalar, Order2, RuntimeJetScalar,
-    SymmetricQuadraticCoefficients,
+    RuntimeValue,
 };
 use gam_math::order2_graph::{Order2Graph, Order2GraphWorkspace};
 
@@ -452,42 +452,25 @@ pub fn survival_marginal_slope_vector_neglog(
     derivative_guard: f64,
     probit_scale: f64,
 ) -> Result<f64, String> {
-    if survival_derivative_guard_violated(qd1, derivative_guard) {
-        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-            reason: format!(
-                "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
-            ),
-        }
-        .into());
+    let dimension = 3 + slopes.len();
+    let mut vars = Vec::with_capacity(dimension);
+    for (axis, value) in [q0, q1, qd1]
+        .into_iter()
+        .chain(slopes.iter().copied())
+        .enumerate()
+    {
+        vars.push(RuntimeValue::variable(value, axis, dimension, &()));
     }
-    let c = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale)?;
-    let eta0 = survival_marginal_slope_vector_eta(q0, z, slopes, covariance, probit_scale)?;
-    let eta1 = survival_marginal_slope_vector_eta(q1, z, slopes, covariance, probit_scale)?;
-    let ad1 = qd1 * c;
-    if !(ad1.is_finite() && ad1 > 0.0) {
-        return Err(SurvivalMarginalSlopeError::NumericalFailure {
-            reason: format!(
-                "survival marginal-slope transformed derivative must be positive, got {ad1}"
-            ),
-        }
-        .into());
-    }
-
-    let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
-    let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
-    let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
-    // Same survival row density as the scalar closed-form path, with only
-    // eta and d eta/dt changed by the vector marginal-preserving map:
-    //
-    //   ell = w[(1-d)(-log Phi(-eta1)) + log Phi(-eta0)
-    //           - d log phi(eta1) - d log(qd1 c)].
-    //
-    // There is no extra baseline -log phi(q1) or -log qd1 factor; adding
-    // either would make K=1 diverge from `row_primary_closed_form`.
-    Ok(weight
-        * ((1.0 - event) * (-logcdf_neg_eta1) + logcdf_neg_eta0
-            - event * log_phi_eta1
-            - event * ad1.ln()))
+    let inputs = RigidRowInputs {
+        row: 0,
+        wi: weight,
+        di: event,
+        z_sum: 0.0,
+        covariance_ones: 0.0,
+        probit_scale,
+        qd1_lower: derivative_guard,
+    };
+    Ok(rigid_vector_row_nll(&vars, z, covariance, &inputs, &())?.value())
 }
 
 #[cfg(test)]
@@ -702,115 +685,6 @@ mod vector_hand_oracle_tests {
 /// and Hessian channel then flows through the same stable probit/log-density
 /// leaf stacks as [`rigid_row_nll`]. There is no separately maintained chain
 /// rule for score cross-blocks.
-enum VectorSupport {
-    Zero,
-    Singleton { axis: usize, value: f64 },
-    Multiple,
-}
-
-#[inline(always)]
-fn vector_support(input: &[f64]) -> VectorSupport {
-    let mut singleton = None;
-    for (axis, &value) in input.iter().enumerate() {
-        if value == 0.0 {
-            continue;
-        }
-        if singleton.is_some() {
-            return VectorSupport::Multiple;
-        }
-        singleton = Some((axis, value));
-    }
-    match singleton {
-        None => VectorSupport::Zero,
-        Some((axis, value)) => VectorSupport::Singleton { axis, value },
-    }
-}
-
-impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
-    fn dimension(&self) -> usize {
-        self.dim()
-    }
-
-    fn multiply(&self, input: &[f64], output: &mut [f64]) {
-        assert_eq!(input.len(), self.dim());
-        assert_eq!(output.len(), self.dim());
-        match self {
-            Self::Diagonal(diagonal) => {
-                for axis in 0..input.len() {
-                    output[axis] = diagonal[axis] * input[axis];
-                }
-            }
-            Self::Full(matrix) => {
-                match vector_support(input) {
-                    VectorSupport::Zero => {
-                        output.fill(0.0);
-                        return;
-                    }
-                    VectorSupport::Singleton { axis, value } => {
-                        for row in 0..input.len() {
-                            output[row] = matrix[[row, axis]] * value;
-                        }
-                        return;
-                    }
-                    VectorSupport::Multiple => {}
-                }
-                for row in 0..input.len() {
-                    let mut value = 0.0;
-                    for column in 0..input.len() {
-                        value += matrix[[row, column]] * input[column];
-                    }
-                    output[row] = value;
-                }
-            }
-            Self::LowRank(factor) => {
-                output.fill(0.0);
-                match vector_support(input) {
-                    VectorSupport::Zero => return,
-                    VectorSupport::Singleton { axis, value } => {
-                        for rank in 0..factor.ncols() {
-                            let projection = factor[[axis, rank]] * value;
-                            for row in 0..input.len() {
-                                output[row] += factor[[row, rank]] * projection;
-                            }
-                        }
-                        return;
-                    }
-                    VectorSupport::Multiple => {}
-                }
-                for rank in 0..factor.ncols() {
-                    let mut projection = 0.0;
-                    for row in 0..input.len() {
-                        projection += factor[[row, rank]] * input[row];
-                    }
-                    for row in 0..input.len() {
-                        output[row] += factor[[row, rank]] * projection;
-                    }
-                }
-            }
-        }
-    }
-
-    fn coefficient(&self, row: usize, column: usize) -> f64 {
-        match self {
-            Self::Diagonal(diagonal) => {
-                if row == column {
-                    diagonal[row]
-                } else {
-                    0.0
-                }
-            }
-            Self::Full(matrix) => matrix[[row, column]],
-            Self::LowRank(factor) => {
-                let mut value = 0.0;
-                for rank in 0..factor.ncols() {
-                    value += factor[[row, rank]] * factor[[column, rank]];
-                }
-                value
-            }
-        }
-    }
-}
-
 fn rigid_vector_row_nll<'arena, S>(
     vars: &[S],
     z: &[f64],
@@ -1826,6 +1700,19 @@ mod tests {
                         &mut production_workspace,
                     )
                     .expect("production vector row");
+                    let value = survival_marginal_slope_vector_neglog(
+                        q0,
+                        q1,
+                        qd1,
+                        &slopes,
+                        &scores,
+                        covariance,
+                        1.17,
+                        event,
+                        1.0e-8,
+                        probit_scale,
+                    )
+                    .expect("zero-order canonical vector row");
                     if shape_index == 0 && event == 0.0 {
                         if k <= 8 {
                             assert_eq!(
@@ -1905,6 +1792,13 @@ mod tests {
                             probit_scale,
                         )
                         .expect("strongest-hand vector row");
+
+                    close(
+                        "zero-order",
+                        &format!("shape={shape_index} event={event} value"),
+                        value,
+                        hand.0,
+                    );
 
                     for (backend, actual) in [
                         ("production", &production),
@@ -2019,6 +1913,10 @@ mod tests {
                     &mut production_workspace,
                 )
                 .expect("production dynamic-boundary row");
+                let value = survival_marginal_slope_vector_neglog(
+                    -0.31, 0.47, 1.09, &slopes, &scores, covariance, 1.17, event, 1.0e-8, 0.83,
+                )
+                .expect("zero-order dynamic-boundary row");
                 let dynamic = row_primary_closed_form_vector_dynamic(
                     -0.31,
                     0.47,
@@ -2039,6 +1937,7 @@ mod tests {
                 .expect("strongest-hand dynamic-boundary row");
 
                 close(shape, event, "production value", production.0, hand.0);
+                close(shape, event, "zero-order value", value, hand.0);
                 close(shape, event, "dynamic value", dynamic.0, hand.0);
                 for primary in 0..DIM {
                     close(

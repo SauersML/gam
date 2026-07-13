@@ -96,10 +96,7 @@ pub trait SymmetricQuadraticCoefficients {
             let row_value = value(&inputs[row]);
             out += self.coefficient(row, row) * row_value * row_value;
             for column in row + 1..inputs.len() {
-                out += 2.0
-                    * self.coefficient(row, column)
-                    * row_value
-                    * value(&inputs[column]);
+                out += 2.0 * self.coefficient(row, column) * row_value * value(&inputs[column]);
             }
         }
         out
@@ -604,7 +601,10 @@ impl<'arena> RuntimeJetScalar<'arena> for RuntimeValue {
 
     #[inline(always)]
     fn variable(x: f64, axis: usize, dimension: usize, &(): &'arena Self::Workspace) -> Self {
-        assert!(axis < dimension, "runtime value variable axis out of bounds");
+        assert!(
+            axis < dimension,
+            "runtime value variable axis out of bounds"
+        );
         Self {
             value: x,
             dimension,
@@ -4974,8 +4974,7 @@ mod tests {
         let value_quadratic =
             RuntimeValue::symmetric_quadratic_form(&value_inputs, &coefficients, K, &());
         let value_linear = RuntimeValue::linear_combination(&value_inputs, &weights, K, &());
-        let value_composed =
-            RuntimeValue::composed_sum(&value_inputs, &derivative_stacks, K, &());
+        let value_composed = RuntimeValue::composed_sum(&value_inputs, &derivative_stacks, K, &());
 
         let arena = DynamicJetArena::new();
         let dynamic_vars: [DynamicOrder2<'_>; K] =

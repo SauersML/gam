@@ -887,11 +887,8 @@ impl MarginalSlopeCovariance {
         if vector.iter().any(|value| !value.is_finite()) {
             return Err("marginal-slope covariance vector contains non-finite values".to_string());
         }
-        let value = <Self as SymmetricQuadraticCoefficients>::quadratic_value(
-            self,
-            vector,
-            |value| *value,
-        );
+        let value =
+            <Self as SymmetricQuadraticCoefficients>::quadratic_value(self, vector, |value| *value);
         if value.is_finite() && value >= COVARIANCE_QUADRATIC_FORM_PSD_TOL {
             Ok(value.max(0.0))
         } else {
