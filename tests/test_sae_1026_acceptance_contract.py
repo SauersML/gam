@@ -86,7 +86,7 @@ def test_2267_route_selection_switches_at_realized_pca_width():
         "certificate_type": "ManifoldSAE.certificates+termination",
         "assignment": "topk",
         "active_support": 3,
-        "support_contract": "exact_nonzero_assignments_per_row",
+        "support_contract": "exact_selected_support_values_per_row",
         "precision": "float64",
     }
     assert linear == {
@@ -126,9 +126,13 @@ def test_2267_overcomplete_curved_worker_passes_exact_topk(monkeypatch):
 
         def converged_latents(self, x):
             x = np.asarray(x, dtype=float)
-            assignments = np.zeros((x.shape[0], 3), dtype=float)
-            assignments[:, :2] = 0.5
-            return {"fitted": x.copy(), "assignments": assignments}
+            indices = np.tile(np.array([[0, 1]], dtype=np.uint32), (x.shape[0], 1))
+            values = np.full((x.shape[0], 2), 0.5, dtype=float)
+            return {
+                "fitted": x.copy(),
+                "support_indices": indices,
+                "support_values": values,
+            }
 
     def fake_fit(*args, **kwargs):
         calls.append((args, kwargs))

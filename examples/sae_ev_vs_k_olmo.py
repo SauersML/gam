@@ -189,7 +189,7 @@ def _arm_route(k: int, p: int, arm: str, active_support: int) -> dict:
             "certificate_type": "ManifoldSAE.certificates+termination",
             "assignment": "topk",
             "active_support": int(active_support),
-            "support_contract": "exact_nonzero_assignments_per_row",
+            "support_contract": "exact_selected_support_values_per_row",
             "precision": "float64",
         }
     return {
@@ -294,6 +294,8 @@ def _manifold_fit_worker(
         raise RuntimeError(f"unsupported manifold assignment route {assignment!r}")
 
     fit_started = time.perf_counter()
+    if assignment != "topk":
+        fit_options["separation_barrier_strength"] = separation_barrier_strength
     m = sae_manifold_fit(
         z_tr,
         K=k,
@@ -301,7 +303,6 @@ def _manifold_fit_worker(
         atom_topology=topology,  # "circle" (curved) or "linear" (true rank-1 affine lane)
         n_iter=manifold_iterations,
         random_state=seed,
-        separation_barrier_strength=separation_barrier_strength,
         # This is a fixed-K EV-vs-K sweep: fit exactly `k` atoms and stop. Keep
         # both optional pipeline stages explicit so this example cannot silently
         # turn back into topology search plus repeated full outer refits (#2267).
@@ -311,11 +312,11 @@ def _manifold_fit_worker(
     )
     fit_seconds = time.perf_counter() - fit_started
 
-    chosen_k = getattr(m, "chosen_k", None)
-    if chosen_k != k:
+    fitted_width = getattr(m, "requested_k", getattr(m, "chosen_k", None))
+    if fitted_width != k:
         raise RuntimeError(
-            f"{arm} manifold route returned {type(m).__name__} with chosen_k={chosen_k!r}; "
-            f"fixed-K benchmark requires a ManifoldSAE with chosen_k={k}"
+            f"{arm} manifold route returned {type(m).__name__} with dictionary width={fitted_width!r}; "
+            f"fixed-K benchmark requires a ManifoldSAE requested at K={k}"
         )
 
     reconstruct_started = time.perf_counter()
@@ -340,15 +341,17 @@ def _manifold_fit_worker(
     support = None
     if assignment == "topk":
         support = {
-            "train": _exact_dense_support_summary(
-                train_latents["assignments"],
+            "train": _exact_sparse_support_summary(
+                train_latents["support_indices"],
+                train_latents["support_values"],
                 rows=z_tr.shape[0],
                 k=k,
                 active_support=active_support,
                 label=f"{arm} train",
             ),
-            "held_out": _exact_dense_support_summary(
-                test_latents["assignments"],
+            "held_out": _exact_sparse_support_summary(
+                test_latents["support_indices"],
+                test_latents["support_values"],
                 rows=z_te.shape[0],
                 k=k,
                 active_support=active_support,

@@ -221,7 +221,7 @@ fn public_fit_penalties(
 
     let mut descriptors = Vec::new();
     let mut names = Vec::new();
-    if matches!(coord_sparsity.as_str(), "scad" | "mcp") {
+    if sparsity_weight > 0.0 && matches!(coord_sparsity.as_str(), "scad" | "mcp") {
         descriptors.push(serde_json::json!({
             "kind": "scad_mcp",
             "target": "t",
@@ -416,11 +416,11 @@ impl Tier0SaeCore {
     atom_basis=None,
     assignment_kind="softmax",
     gumbel_schedule=None,
-    isometry_weight=1.0,
+    isometry_weight=0.0,
     native_ard_enabled=true,
     decoder_feature_sparsity_groups=None,
     max_iter=50,
-    sparsity_strength=1.0,
+    sparsity_strength=0.0,
     coord_sparsity="scad",
     scad_mcp_gamma=None,
     smoothness=1.0,
@@ -429,9 +429,9 @@ impl Tier0SaeCore {
     learning_rate=None,
     random_state=0,
     block_orthogonality_weight=0.0,
-    nuclear_norm_weight=1.0,
+    nuclear_norm_weight=0.0,
     nuclear_norm_max_rank=None,
-    decoder_incoherence_weight=1.0,
+    decoder_incoherence_weight=0.0,
     top_k=None,
     initial_coords=None,
     initial_logits=None,
@@ -584,6 +584,78 @@ fn sae_manifold_fit_model<'py>(
     .map_err(py_value_error)?;
     if native_ard_enabled {
         penalties.push("ARDPenalty".to_string());
+    }
+
+    // Crossing K>P under hard TopK changes representation before the dense
+    // minimal seed is even named. The support driver owns admission, seeding,
+    // direct active-row fitting, LAML selection, and the sparse model payload;
+    // there is no dense retry or translation adapter on this branch.
+    if assignment == "topk" && k_atoms > p_out {
+        let support_k = top_k.ok_or_else(|| {
+            py_value_error("overcomplete assignment='topk' requires top_k".to_string())
+        })?;
+        if max_iter == 0 {
+            return Err(py_value_error(
+                "support-sparse ManifoldSAE requires max_iter >= 1".to_string(),
+            ));
+        }
+        if initial_logits.is_some() || initial_coords.is_some() {
+            return Err(py_value_error(
+                "support-sparse ManifoldSAE accepts only canonical sparse warm state; dense a_init/t_init tensors are invalid"
+                    .to_string(),
+            ));
+        }
+        if analytic_penalties.is_some() {
+            return Err(py_value_error(format!(
+                "support-sparse ManifoldSAE does not accept dense-coordinate or coefficient penalties; requested {penalties:?}. Its smoothing term is the LAML-selected final-function seminorm"
+            )));
+        }
+        if !native_ard_enabled {
+            return Err(py_value_error(
+                "support-sparse ManifoldSAE requires its coordinate ARD prior".to_string(),
+            ));
+        }
+        if learnable_alpha || gumbel_schedule.is_some() || threshold_gate_threshold != 0.0 {
+            return Err(py_value_error(
+                "support-sparse hard TopK has read-only binary gates: learnable alpha, Gumbel schedules, and threshold-gate thresholds are not model coordinates"
+                    .to_string(),
+            ));
+        }
+        if fisher_factors.is_some()
+            || fisher_mass_residual.is_some()
+            || fisher_provenance.is_some()
+            || fisher_factor_kind.is_some()
+            || row_loss_weights.is_some()
+        {
+            return Err(py_value_error(
+                "support-sparse ManifoldSAE currently requires the Euclidean row measure with uniform row weights; metric shards must not be silently discarded"
+                    .to_string(),
+            ));
+        }
+        if separation_barrier_strength_override.is_some()
+            || promote_from_residual
+            || run_structure_search
+            || structured_residual_passes != 0
+        {
+            return Err(py_value_error(
+                "support-sparse ManifoldSAE is the unbundled fixed-support fit; separation barriers, promotion, structure search, and structured-refit passes are separate stages"
+                    .to_string(),
+            ));
+        }
+        return crate::manifold::support_sparse_sae_ffi::fit_support_sparse_manifold_sae(
+            py,
+            crate::manifold::support_sparse_sae_ffi::SupportSparseFitRequest {
+                target: z_view,
+                atom_basis,
+                atom_dim,
+                support_k,
+                initial_smoothness: smoothness,
+                max_iter,
+                trust_radius: resolved_learning_rate,
+                tolerance: 1.0e-6,
+                random_state,
+            },
+        );
     }
 
     let raw = sae_manifold_fit_minimal(

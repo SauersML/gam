@@ -65,7 +65,9 @@ fn add_mean(mut fitted: Array2<f64>, mean: &[f64]) -> Array2<f64> {
 }
 
 fn centered(target: ArrayView2<'_, f64>, mean: &[f64]) -> Array2<f64> {
-    Array2::from_shape_fn(target.dim(), |(row, column)| target[[row, column]] - mean[column])
+    Array2::from_shape_fn(target.dim(), |(row, column)| {
+        target[[row, column]] - mean[column]
+    })
 }
 
 fn support_indices(term: &SaeSupportSparseTerm) -> Result<Array2<u32>, String> {
@@ -79,16 +81,10 @@ fn support_indices(term: &SaeSupportSparseTerm) -> Result<Array2<u32>, String> {
 }
 
 fn support_values(term: &SaeSupportSparseTerm) -> Array2<f64> {
-    Array2::ones((
-        term.n_obs(),
-        term.assignment.support_indices(0).len(),
-    ))
+    Array2::ones((term.n_obs(), term.assignment.support_indices(0).len()))
 }
 
-fn coords_rows<'py>(
-    py: Python<'py>,
-    term: &SaeSupportSparseTerm,
-) -> PyResult<Bound<'py, PyList>> {
+fn coords_rows<'py>(py: Python<'py>, term: &SaeSupportSparseTerm) -> PyResult<Bound<'py, PyList>> {
     let rows = PyList::empty(py);
     for row in 0..term.n_obs() {
         rows.append(Array1::from(term.assignment.coords_row(row).to_vec()).into_pyarray(py))?;
@@ -116,11 +112,15 @@ fn fixed_point_json(report: &SaeSupportFixedPointReport) -> serde_json::Value {
 }
 
 impl SupportSparseManifoldSaeCore {
-    fn infer(&self, target: ArrayView2<'_, f64>) -> Result<(SaeSupportSparseTerm, Array2<f64>, serde_json::Value), String> {
+    fn infer(
+        &self,
+        target: ArrayView2<'_, f64>,
+    ) -> Result<(SaeSupportSparseTerm, Array2<f64>, serde_json::Value), String> {
         if target.ncols() != self.training_mean.len() || target.nrows() == 0 {
             return Err(format!(
                 "ManifoldSAE.converged_latents requires positive rows and P={}; got {:?}",
-                self.training_mean.len(), target.dim()
+                self.training_mean.len(),
+                target.dim()
             ));
         }
         if target.iter().any(|value| !value.is_finite()) {
@@ -162,7 +162,9 @@ impl SupportSparseManifoldSaeCore {
         out.set_item("fitted", fitted.into_pyarray(py))?;
         out.set_item(
             "support_indices",
-            support_indices(term).map_err(py_value_error)?.into_pyarray(py),
+            support_indices(term)
+                .map_err(py_value_error)?
+                .into_pyarray(py),
         )?;
         out.set_item("support_values", support_values(term).into_pyarray(py))?;
         out.set_item("coords", coords_rows(py, term)?)?;
@@ -246,7 +248,10 @@ impl SupportSparseManifoldSaeCore {
                 .map_err(py_value_error)?
                 .into_pyarray(py),
         )?;
-        out.set_item("support_values", support_values(&self.term).into_pyarray(py))?;
+        out.set_item(
+            "support_values",
+            support_values(&self.term).into_pyarray(py),
+        )?;
         out.set_item("coords", coords_rows(py, &self.term)?)?;
         let decoders = PyList::empty(py);
         for atom in &self.term.atoms {
@@ -256,8 +261,14 @@ impl SupportSparseManifoldSaeCore {
         out.set_item("log_lambda_smooth", self.log_lambda_smooth.clone())?;
         out.set_item("ard_precisions", self.ard_precisions.clone())?;
         out.set_item("criterion", self.criterion)?;
-        out.set_item("certificates", json_value_to_py(py, self.certificates.clone())?)?;
-        out.set_item("termination", json_value_to_py(py, self.termination.clone())?)?;
+        out.set_item(
+            "certificates",
+            json_value_to_py(py, self.certificates.clone())?,
+        )?;
+        out.set_item(
+            "termination",
+            json_value_to_py(py, self.termination.clone())?,
+        )?;
         Ok(out.unbind().into_any())
     }
 
@@ -273,17 +284,29 @@ impl SupportSparseManifoldSaeCore {
     }
 
     #[getter]
-    fn chosen_k(&self) -> usize { self.term.k_atoms() }
+    fn chosen_k(&self) -> usize {
+        self.term.k_atoms()
+    }
     #[getter]
-    fn requested_k(&self) -> usize { self.requested_k }
+    fn requested_k(&self) -> usize {
+        self.requested_k
+    }
     #[getter]
-    fn assignment(&self) -> &'static str { "topk" }
+    fn assignment(&self) -> &'static str {
+        "topk"
+    }
     #[getter]
-    fn top_k(&self) -> usize { self.support_k }
+    fn top_k(&self) -> usize {
+        self.support_k
+    }
     #[getter]
-    fn atom_topologies(&self) -> Vec<String> { self.atom_topologies.clone() }
+    fn atom_topologies(&self) -> Vec<String> {
+        self.atom_topologies.clone()
+    }
     #[getter]
-    fn hybrid_split(&self, py: Python<'_>) -> PyObject { py.None() }
+    fn hybrid_split(&self, py: Python<'_>) -> PyObject {
+        py.None()
+    }
     #[getter]
     fn certificates(&self, py: Python<'_>) -> PyResult<PyObject> {
         json_value_to_py(py, self.certificates.clone())
@@ -301,12 +324,18 @@ impl SupportSparseManifoldSaeCore {
         Array1::from(self.training_mean.clone()).into_pyarray(py)
     }
     #[getter]
-    fn reconstruction_r2(&self) -> f64 { self.reconstruction_r2 }
+    fn reconstruction_r2(&self) -> f64 {
+        self.reconstruction_r2
+    }
     #[getter]
-    fn penalized_quasi_laplace_criterion(&self) -> f64 { self.criterion }
+    fn penalized_quasi_laplace_criterion(&self) -> f64 {
+        self.criterion
+    }
     #[getter]
     fn support_indices<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<u32>>> {
-        Ok(support_indices(&self.term).map_err(py_value_error)?.into_pyarray(py))
+        Ok(support_indices(&self.term)
+            .map_err(py_value_error)?
+            .into_pyarray(py))
     }
     #[getter]
     fn support_values<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
@@ -328,18 +357,11 @@ pub(crate) fn fit_support_sparse_manifold_sae(
 ) -> PyResult<PyObject> {
     let (n_obs, output_dim) = request.target.dim();
     let requested_k = request.atom_basis.len();
-    let effective_dims =
-        sae_support_effective_atom_dims(&request.atom_basis, &request.atom_dim)
-            .map_err(py_value_error)?;
+    let effective_dims = sae_support_effective_atom_dims(&request.atom_basis, &request.atom_dim)
+        .map_err(py_value_error)?;
     let d_max = effective_dims.iter().copied().max().unwrap_or(1);
-    let admission = admit_topk_manifold(
-        n_obs,
-        output_dim,
-        requested_k,
-        d_max,
-        request.support_k,
-    )
-    .map_err(py_value_error)?;
+    let admission = admit_topk_manifold(n_obs, output_dim, requested_k, d_max, request.support_k)
+        .map_err(py_value_error)?;
     if admission.lane != SaeFitLane::CurvedStreaming {
         return Err(py_value_error(format!(
             "support-sparse fit requires CurvedStreaming admission; got {:?}",
@@ -401,12 +423,12 @@ pub(crate) fn fit_support_sparse_manifold_sae(
         .zip(fitted.iter())
         .map(|(truth, fit)| (truth - fit).powi(2))
         .sum::<f64>();
-    let total_ss = request
-        .target
-        .rows()
-        .into_iter()
-        .flat_map(|row| row.iter().enumerate().map(|(column, value)| (value - training_mean[column]).powi(2)))
-        .sum::<f64>();
+    let mut total_ss = 0.0;
+    for row in request.target.rows() {
+        for (column, value) in row.iter().enumerate() {
+            total_ss += (value - training_mean[column]).powi(2);
+        }
+    }
     let reconstruction_r2 = if total_ss > 0.0 {
         1.0 - residual_ss / total_ss
     } else {
@@ -426,8 +448,8 @@ pub(crate) fn fit_support_sparse_manifold_sae(
         "outer_iterations": outer.outer_iterations,
         "recurred": outer.fixed_point.recurred,
     });
-    let atom_topologies = gam::terms::sae::atom_schema::topologies_for_bases(&atom_basis)
-        .map_err(py_value_error)?;
+    let atom_topologies =
+        gam::terms::sae::atom_schema::topologies_for_bases(&atom_basis).map_err(py_value_error)?;
     let log_lambda_smooth = outer.lambda_smooth.iter().map(|value| value.ln()).collect();
     let model = SupportSparseManifoldSaeCore {
         term: outer.term,
