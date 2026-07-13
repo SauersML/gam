@@ -12,17 +12,19 @@
 
 use crate::chart_transfer::TransferCertificate;
 use crate::inference::layer_transport::FittedTransport;
-use crate::manifold::{BettiSignature, GraphCompressionKind, GraphCompressionReport};
+use crate::manifold::{
+    AtlasOrientability, BettiSignature, GraphCompressionKind, GraphCompressionReport,
+};
 use crate::null_battery::ClaimNullCalibration;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
-/// Which side of the chart-covering sample count the diagram sits on.
+/// Which side of the chart-count sampling diagnostic the diagram sits on.
 ///
-/// Nerve invariance is a covering theorem: once the sampled support resolves at
-/// least the chart cover, refining samples should not change the cover nerve.
-/// Below that count, a diagram is still a measurement, but it is marked as
-/// under-resolved.
+/// This says only whether the observed support count is at least the number of
+/// charts.  It is useful for spotting an obviously under-sampled atlas, but is
+/// neither a contractibility test nor a Nerve-theorem premise.  Only an
+/// [`AtlasGoodCoverCertificate`] establishes the good-cover precondition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AtlasCoveringSide {
     BelowCoveringNumber,
@@ -247,6 +249,71 @@ pub struct AtlasGoodCoverCertificate {
     proofs: BTreeMap<Vec<usize>, ConvexIntersectionProof>,
 }
 
+/// Orientation sign of one certified chart transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AtlasOrientationEdge {
+    a: usize,
+    b: usize,
+    sign: i8,
+}
+
+impl AtlasOrientationEdge {
+    #[must_use = "orientation-edge construction errors must be handled"]
+    pub fn new(a: usize, b: usize, sign: i8) -> Result<Self, String> {
+        if a == b {
+            return Err("an orientation transition cannot be a self-edge".to_string());
+        }
+        if !matches!(sign, -1 | 1) {
+            return Err(format!(
+                "an orientation transition sign must be +1 or -1, got {sign}"
+            ));
+        }
+        Ok(Self {
+            a: a.min(b),
+            b: a.max(b),
+            sign,
+        })
+    }
+}
+
+/// Exact signed transition cocycle for the admitted atlas overlaps.
+///
+/// The certificate must contain exactly the nerve's admitted edges.  The nerve
+/// then propagates local orientations through this cocycle: a contradiction is
+/// a negative-holonomy cycle, while a consistent assignment is the explicit
+/// trivial-orientation proof needed to distinguish cylinder from Möbius and
+/// torus from Klein bottle over GF(2).
+#[derive(Clone, Debug)]
+pub struct AtlasOrientationHolonomyCertificate {
+    chart_count: usize,
+    edge_signs: BTreeMap<(usize, usize), i8>,
+}
+
+impl AtlasOrientationHolonomyCertificate {
+    #[must_use = "orientation certificate construction errors must be handled"]
+    pub fn new(chart_count: usize, edges: Vec<AtlasOrientationEdge>) -> Result<Self, String> {
+        let mut edge_signs = BTreeMap::new();
+        for edge in edges {
+            if edge.b >= chart_count {
+                return Err(format!(
+                    "orientation edge ({}, {}) is outside the {chart_count}-chart atlas",
+                    edge.a, edge.b
+                ));
+            }
+            if edge_signs.insert((edge.a, edge.b), edge.sign).is_some() {
+                return Err(format!(
+                    "duplicate orientation proof for atlas edge ({}, {})",
+                    edge.a, edge.b
+                ));
+            }
+        }
+        Ok(Self {
+            chart_count,
+            edge_signs,
+        })
+    }
+}
+
 impl AtlasGoodCoverCertificate {
     #[must_use = "good-cover certificate construction errors must be handled"]
     pub fn new(chart_count: usize, proofs: Vec<ConvexIntersectionProof>) -> Result<Self, String> {
@@ -289,6 +356,9 @@ pub struct AtlasNerveDiagram {
     /// Whether every non-empty intersection was matched to an explicit
     /// contractibility proof.
     pub good_cover_certified: bool,
+    /// Orientability read from an explicit signed transition cocycle. `None`
+    /// means no orientation proof was supplied, never "assume orientable".
+    pub orientation_holonomy: Option<AtlasOrientability>,
     pub sampled_support_size: usize,
     pub covering_side: AtlasCoveringSide,
     pub max_filtration: f64,
@@ -312,14 +382,23 @@ impl AtlasNerveDiagram {
             return GraphCompressionReport::unnamed(generic);
         }
         let log_vertices = (self.n_vertices.max(2) as f64).log2();
-        let named = match (self.betti.b0, self.betti.b1, self.betti.b2) {
-            (1, 2, Some(1)) => Some((GraphCompressionKind::Torus, "torus", 2.0 * log_vertices)),
-            (1, 1, Some(0)) => Some((
+        let named = match (
+            self.betti.b0,
+            self.betti.b1,
+            self.betti.b2,
+            self.orientation_holonomy,
+        ) {
+            (1, 2, Some(1), Some(AtlasOrientability::Orientable)) => {
+                Some((GraphCompressionKind::Torus, "torus", 2.0 * log_vertices))
+            }
+            (1, 1, Some(0), Some(AtlasOrientability::Orientable)) => Some((
                 GraphCompressionKind::Cylinder,
                 "cylinder",
                 2.0 * log_vertices,
             )),
-            (1, 0, Some(1)) => Some((GraphCompressionKind::Sphere, "sphere", log_vertices)),
+            (1, 0, Some(1), _) => {
+                Some((GraphCompressionKind::Sphere, "sphere", log_vertices))
+            }
             _ => None,
         };
         if let Some((kind, name, named_bits)) = named {
@@ -791,6 +870,12 @@ pub fn build_atlas_nerve(
     let row_count = validate_charts(charts)?;
     let n = charts.len();
     if n == 0 {
+        if good_cover.is_some_and(|certificate| certificate.chart_count != 0) {
+            return Err(
+                "good-cover certificate for a non-empty atlas cannot certify an empty nerve"
+                    .to_string(),
+            );
+        }
         return Ok(AtlasNerveDiagram {
             betti: BettiSignature {
                 b0: 0,
@@ -973,9 +1058,7 @@ mod tests {
                 let simplex: Vec<usize> = maximal
                     .iter()
                     .enumerate()
-                    .filter_map(|(position, &chart)| {
-                        ((mask >> position) & 1 == 1).then_some(chart)
-                    })
+                    .filter_map(|(position, &chart)| ((mask >> position) & 1 == 1).then_some(chart))
                     .collect();
                 intersections.insert(simplex);
             }
@@ -998,9 +1081,51 @@ mod tests {
         assert_eq!(diagram.betti.b2, Some(1));
         assert_eq!(diagram.n_triangles, 4);
         assert_eq!(diagram.n_tetrahedra, 0);
+        assert_eq!(diagram.euler_characteristic, 2);
+        assert!(!diagram.good_cover_certified);
+        assert_eq!(
+            diagram.certified_compression().kind,
+            GraphCompressionKind::Graph,
+            "sample coverage and the right Betti signature are not a good-cover proof"
+        );
         assert_eq!(
             diagram.covering_side,
             AtlasCoveringSide::AtOrAboveCoveringNumber
+        );
+    }
+
+    #[test]
+    fn full_nerve_euler_includes_five_way_overlap() {
+        let maximal = vec![vec![0, 1, 2, 3, 4]];
+        let charts = charts_from_faces(5, &maximal);
+        let gates = all_valid_pair_gates(5);
+        let diagram = build_atlas_nerve(&charts, &gates, None).unwrap();
+        assert_eq!(diagram.simplex_counts, vec![5, 10, 10, 5, 1]);
+        assert_eq!(diagram.euler_characteristic, 1);
+        assert_eq!(
+            diagram.n_vertices as i128 - diagram.n_edges as i128 + diagram.n_triangles as i128,
+            5,
+            "the old V-E+F truncation is deliberately wrong on this overlap"
+        );
+    }
+
+    #[test]
+    fn good_cover_certificate_must_match_every_nonempty_intersection() {
+        let faces = vec![vec![0, 1]];
+        let charts = charts_from_faces(2, &faces);
+        let gates = all_valid_pair_gates(2);
+        let incomplete = AtlasGoodCoverCertificate::new(
+            2,
+            vec![
+                ConvexIntersectionProof::new(vec![0], 0).unwrap(),
+                ConvexIntersectionProof::new(vec![1], 1).unwrap(),
+            ],
+        )
+        .unwrap();
+        let error = build_atlas_nerve(&charts, &gates, Some(&incomplete)).unwrap_err();
+        assert!(
+            error.contains("no contractibility proof for non-empty intersection [0, 1]"),
+            "unexpected certificate error: {error}"
         );
     }
 

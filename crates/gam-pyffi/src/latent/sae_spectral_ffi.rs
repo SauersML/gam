@@ -1119,7 +1119,17 @@ fn sparse_atlas_nerve_richness_statistic(
     let report =
         atlas_nerve_from_sparse_route(route, activation_threshold as f32, Some(chart_blocks))?
             .ok_or_else(|| "atlas null statistic requires at least two block charts".to_string())?;
-    Ok((report.diagram.n_edges + report.diagram.n_triangles + report.diagram.n_tetrahedra) as f64)
+    let richness = report
+        .diagram
+        .simplex_counts
+        .iter()
+        .skip(1)
+        .map(|&count| count as f64)
+        .sum::<f64>();
+    if !richness.is_finite() {
+        return Err("atlas nerve richness overflowed finite reporting range".to_string());
+    }
+    Ok(richness)
 }
 
 #[derive(Clone, Copy, Default)]
