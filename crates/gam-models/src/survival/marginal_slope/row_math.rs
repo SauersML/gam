@@ -355,6 +355,13 @@ pub(crate) fn survival_nonrigid_pilot_eta(
         .cholesky(faer::Side::Lower)
         .map_err(|e| format!("survival_nonrigid_pilot_eta: Cholesky failed: {e:?}"))?;
     let beta_step = factor.solvevec(&rhs);
+    if beta_step.iter().any(|value| !value.is_finite()) {
+        return Err(SurvivalMarginalSlopeError::NumericalFailure {
+            reason: "survival non-rigid pilot Newton solve produced a non-finite coefficient"
+                .to_string(),
+        }
+        .into());
+    }
     // Apply the Newton update: pilot q_exit ← q_exit + chain_q · β_loc,
     // pilot slope ← slope + chain_g · β_g — but the chain factors were
     // already folded into `x_chain` above so the row delta along η₁ is
@@ -394,27 +401,25 @@ pub(crate) fn survival_nonrigid_pilot_eta(
         let q_new = q_exit[i] + q_delta[i];
         let g_new = slope[i] + g_delta[i];
         let proposed = rigid_observed_eta(q_new, g_new, z_primary[i], probit_scale);
+        if !proposed.is_finite() {
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival non-rigid pilot row {i} produced a non-finite updated eta1"
+                ),
+            }
+            .into());
+        }
         let delta = proposed - eta1[i];
         let capped = if delta.abs() > step_cap {
             eta1[i] + step_cap.copysign(delta)
         } else {
             proposed
         };
-        pilot_eta[i] = if capped.is_finite() { capped } else { eta1[i] };
+        pilot_eta[i] = capped;
     }
-    // Logslope-surface warm start (#808): the `G`-block portion of the joint
-    // Newton step, used to seed the logslope block's `initial_beta` off the
-    // `g = 0` seed where the block is W-null. Sanitise to finite values; the
-    // per-row logslope value `baseline_slope + logslope_offset + G·β_g` is the
-    // operating point the inner refines from, so a non-finite coefficient
-    // (degenerate one-step solve) falls back to the zero warm start rather than
-    // poisoning the seed.
-    let beta_logslope = if beta_g.iter().all(|v| v.is_finite()) {
-        beta_g
-    } else {
-        Array1::<f64>::zeros(p_g)
-    };
-    Ok((pilot_eta, beta_logslope))
+    // Logslope-surface warm start (#808): the finite `G`-block portion of the
+    // joint Newton step seeds the logslope block off the W-null `g = 0` point.
+    Ok((pilot_eta, beta_g))
 }
 
 pub fn survival_marginal_slope_vector_scale(
