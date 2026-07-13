@@ -1550,21 +1550,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 None,
                 recompile_ctx,
             ),
-            Err(reason) => {
-                log::warn!("[smgs phase-4b active] skipped: {reason}");
-                (
-                    spec.time_block.design_entry.clone(),
-                    spec.time_block.design_exit.clone(),
-                    spec.time_block.design_derivative_exit.clone(),
-                    marginal_design.clone(),
-                    logslope_design.clone(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            }
+            Err(reason) => return Err(format!("[smgs phase-4b active] {reason}")),
         }
     };
     let offset_entry = Arc::new(spec.time_block.offset_entry.clone());

@@ -1257,6 +1257,41 @@ pub fn apply_compiled_map_to_designs(
             map.compiled_block_ranges.len(),
         ));
     }
+
+    // The current survival runtime represents time, marginal, and logslope as
+    // three semantically distinct coefficient blocks.  It can therefore apply
+    // an independent coefficient-side transform inside each block, but it
+    // cannot represent a compiled column that simultaneously changes an
+    // earlier block's primary channels.  A general compiler map is block-upper
+    // triangular: its strict-upper `-R` slabs make (for example) a logslope
+    // coordinate also move the raw time/marginal coefficients.  Slicing only
+    // the diagonal `V_b` slabs would silently drop that primary-state motion;
+    // the corresponding exact penalty `Tᵀ S T` would also couple blocks.
+    //
+    // Until the family owns a joint compiled-primary layout and joint
+    // penalties, accept exactly block-diagonal maps only.  This is an exact
+    // structural gate, deliberately without a numerical tolerance: an
+    // unrepresented nonzero coefficient is a model change, however small.
+    for (raw_block_idx, raw_range) in map.raw_block_ranges.iter().enumerate() {
+        for (compiled_block_idx, compiled_range) in map.compiled_block_ranges.iter().enumerate() {
+            if raw_block_idx == compiled_block_idx {
+                continue;
+            }
+            for raw_row in raw_range.clone() {
+                for compiled_col in compiled_range.clone() {
+                    let value = map.raw_from_compiled[[raw_row, compiled_col]];
+                    if value != 0.0 {
+                        return Err(format!(
+                            "apply_compiled_map_to_designs: unsupported cross-block lift at \
+                             raw block {raw_block_idx}, compiled block {compiled_block_idx}, \
+                             T[{raw_row},{compiled_col}]={value}; survival's split-block runtime \
+                             requires an exactly block-diagonal CompiledMap"
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let time_raw = map.raw_block_ranges[0].clone();
     let marg_raw = map.raw_block_ranges[1].clone();
     let log_raw = map.raw_block_ranges[2].clone();
@@ -1730,18 +1765,13 @@ mod tests {
         assert!(validate_partition(std::slice::from_ref(&full_cover), 5, "test").is_ok());
     }
 
-    /// Regression for #368: the phase-4b compiled-map penalty pullback must
-    /// emit a PER-BLOCK-WIDTH penalty for every block (sized to that block's
-    /// COMPILED design width), even when a block drops columns and the
-    /// triangular T carries nonzero off-diagonal cross-block residualisation
-    /// `R_{a→b}`. The original bug pulled penalties back through the full
-    /// joint T (`Tᵀ S T`), producing joint-compiled-width penalties (e.g.
-    /// 7×7) that did not fit a single per-block `ParameterBlockSpec.penalties`
-    /// slot (e.g. time block compiled width 3), making `validate_blockspecs`
-    /// fail and `assert_valid_blockspecs` panic across the FFI boundary on
-    /// ordinary survival data.
+    /// A nonzero cross-block residual cannot be represented by the split-block
+    /// survival runtime: the likelihood needs the omitted `-A R` primary-state
+    /// motion and the exact penalty `Tᵀ S T` couples coefficient blocks.  The
+    /// old test falsely blessed this map by checking only output widths and the
+    /// diagonal `Vᵀ S V` slabs.  The construction boundary must reject it.
     #[test]
-    fn compiled_map_penalty_pullback_is_per_block_width_with_nonzero_residual() {
+    fn compiled_map_with_nonzero_cross_block_residual_is_rejected() {
         use gam_identifiability::families::compiler::CompiledMap;
         use gam_terms::smooth::BlockwisePenalty;
 
@@ -1812,7 +1842,7 @@ mod tests {
         let marg_pens = vec![BlockwisePenalty::new(0..3, s_marg.clone())];
         let log_pens = vec![BlockwisePenalty::new(0..2, s_log.clone())];
 
-        let out = apply_compiled_map_to_designs(
+        let error = apply_compiled_map_to_designs(
             &map,
             raw_time_entry,
             raw_time_exit,
@@ -1823,58 +1853,8 @@ mod tests {
             &marg_pens,
             &log_pens,
         )
-        .expect("apply_compiled_map_to_designs must succeed");
-
-        // Designs carry per-block compiled widths.
-        assert_eq!(out.time_design_entry.ncols(), 3);
-        assert_eq!(out.marginal_design.ncols(), 2);
-        assert_eq!(out.logslope_design.ncols(), 2);
-
-        // Core invariant the bug violated: every penalty is sized to ITS
-        // OWN block's compiled width, NOT the joint compiled width (7).
-        for s in &out.time_penalties {
-            assert_eq!(
-                s.as_dense_cow().dim(),
-                (3, 3),
-                "time penalty must be per-block 3×3, not joint-width"
-            );
-        }
-        for s in &out.marginal_penalties {
-            assert_eq!(
-                s.as_dense_cow().dim(),
-                (2, 2),
-                "marginal penalty must match reduced compiled width 2, not joint 7"
-            );
-        }
-        for s in &out.logslope_penalties {
-            assert_eq!(s.as_dense_cow().dim(), (2, 2));
-        }
-
-        // For the time block (block 0, no anchor ⇒ R=None), the per-block
-        // pullback is EXACT: θ_timeᵀ P_time θ_time == γ_timeᵀ S_time γ_time
-        // with γ_time = V_time · θ_time. Verify the quadratic-form identity.
-        let p_time_dense = out.time_penalties[0].as_dense_cow().into_owned();
-        let theta_time = Array1::<f64>::from_shape_fn(3, |k| 0.4 + 0.7 * (k as f64));
-        let gamma_time = v_time.dot(&theta_time);
-        let lhs = theta_time.dot(&p_time_dense.dot(&theta_time));
-        let rhs = gamma_time.dot(&s_time.dot(&gamma_time));
-        assert!(
-            (lhs - rhs).abs() < 1e-10,
-            "time-block per-block pullback must be exact: lhs={lhs}, rhs={rhs}"
-        );
-
-        // The marginal pullback must equal V_margᵀ S_marg V_marg exactly
-        // (block-local; the cross-block R_marg lives in the design, not here).
-        let p_marg_dense = out.marginal_penalties[0].as_dense_cow().into_owned();
-        let want_marg = v_marg.t().dot(&s_marg.dot(&v_marg));
-        for i in 0..2 {
-            for j in 0..2 {
-                assert!(
-                    (p_marg_dense[[i, j]] - want_marg[[i, j]]).abs() < 1e-12,
-                    "marginal penalty must be V_margᵀ S_marg V_marg at ({i},{j})"
-                );
-            }
-        }
+        .expect_err("a triangular map cannot be represented by split blocks");
+        assert!(error.contains("unsupported cross-block lift"), "{error}");
     }
 
     /// Top-level Phase-4b API test for the SMGS parametric path:
