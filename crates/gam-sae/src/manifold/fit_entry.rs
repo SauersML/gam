@@ -52,6 +52,15 @@ use super::{
 /// Hard cap on evidence-certified #2021 whitened-residual refit passes.
 pub const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
 
+fn validate_structured_residual_passes(passes: usize) -> Result<(), SaeFitError> {
+    if passes > STRUCTURED_RESIDUAL_PASSES_MAX {
+        return Err(SaeFitError::InvalidRequest(format!(
+            "structured_residual_passes={passes} exceeds the hard maximum {STRUCTURED_RESIDUAL_PASSES_MAX}"
+        )));
+    }
+    Ok(())
+}
+
 /// Absolute precision floor on the RELATIVE post-dictionary residual energy
 /// `‖Z − Ẑ‖²_F / ‖Z‖²_F` below which the structured-residual pass is skipped and
 /// the fit degrades to the already-certified pass-0 iid model.
@@ -263,6 +272,7 @@ impl std::fmt::Display for SaeFitStage {
 /// flattened into a message or converted into a fit.
 #[derive(Debug)]
 pub enum SaeFitError {
+    InvalidRequest(String),
     Fit(String),
     OuterRun {
         stage: SaeFitStage,
@@ -283,7 +293,7 @@ impl From<String> for SaeFitError {
 impl std::fmt::Display for SaeFitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Fit(message) => f.write_str(message),
+            Self::InvalidRequest(message) | Self::Fit(message) => f.write_str(message),
             Self::OuterRun { stage, source } => {
                 write!(f, "SAE manifold {stage} outer search failed: {source}")
             }
@@ -313,7 +323,7 @@ impl std::error::Error for SaeFitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::OuterRun { source, .. } => Some(source),
-            Self::Fit(_) | Self::OuterDidNotConverge { .. } => None,
+            Self::InvalidRequest(_) | Self::Fit(_) | Self::OuterDidNotConverge { .. } => None,
         }
     }
 }
@@ -405,6 +415,7 @@ pub struct SaeFitRequest {
 /// * `cancel`, when present, is polled by every inner objective; the caller sets
 ///   it on interrupt so the abandoned worker's next outer eval bails.
 pub fn run_sae_manifold_fit(mut request: SaeFitRequest) -> Result<SaeFitReport, SaeFitError> {
+    validate_structured_residual_passes(request.structured_residual_passes)?;
     // #2023 Increment 5 — Tier-0 shared-mean peel as the ONE entry's NATIVE
     // preprocessing (the "seed policy" tier of the tiered schedule, folded into the
     // single fit rather than a separate surface). The shared column mean μ is the
@@ -512,6 +523,21 @@ pub fn run_sae_manifold_fit(mut request: SaeFitRequest) -> Result<SaeFitReport, 
     // untouched.
     lift_tier0_rows(&mut report.fitted, &mu, sigma.as_ref());
     Ok(report)
+}
+
+#[cfg(test)]
+mod structured_pass_request_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_structured_pass_count_above_hard_cap_is_rejected_2267() {
+        assert!(validate_structured_residual_passes(0).is_ok());
+        assert!(validate_structured_residual_passes(STRUCTURED_RESIDUAL_PASSES_MAX).is_ok());
+        assert!(matches!(
+            validate_structured_residual_passes(STRUCTURED_RESIDUAL_PASSES_MAX + 1),
+            Err(SaeFitError::InvalidRequest(_))
+        ));
+    }
 }
 
 /// Lift an `N×p` reconstruction produced against the standardized de-meaned

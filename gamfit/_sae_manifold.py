@@ -93,6 +93,12 @@ def _atom_bases(value: Any) -> list[str] | None:
     return [str(basis) for basis in value]
 
 
+def _structured_residual_pass_count(value: Any) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise TypeError("structured_residual_passes must be an integer")
+    return int(value)
+
+
 def _schedule_descriptor(
     schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None,
 ) -> dict[str, Any] | None:
@@ -229,7 +235,9 @@ def sae_manifold_fit(
         ),
         promote_from_residual=bool(promote_from_residual),
         run_structure_search=bool(run_structure_search),
-        structured_residual_passes=int(structured_residual_passes),
+        structured_residual_passes=_structured_residual_pass_count(
+            structured_residual_passes
+        ),
     )
 
 

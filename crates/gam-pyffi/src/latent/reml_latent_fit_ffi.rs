@@ -9,7 +9,7 @@ fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFit
 
     let message = err.to_string();
     match err {
-        SaeFitError::Fit(_) => py_value_error(message),
+        SaeFitError::InvalidRequest(_) | SaeFitError::Fit(_) => py_value_error(message),
         SaeFitError::OuterRun { stage, source } => {
             let exc = estimation_error_to_pyerr(source);
             let bound = exc.value(py);

@@ -1,6 +1,7 @@
 import inspect
 
 import numpy as np
+import pytest
 
 from gamfit import _sae_manifold
 
@@ -35,3 +36,18 @@ def test_external_certificate_defaults_to_evaluation_only():
         _sae_manifold.sae_manifold_certify_external
     ).parameters["run_structure_search"]
     assert parameter.default is False
+
+
+def test_structured_pass_count_does_not_truncate_non_integer(monkeypatch):
+    class NativeStub:
+        def sae_manifold_fit_model(self, *args, **kwargs):
+            raise AssertionError("invalid request must be rejected before native dispatch")
+
+    monkeypatch.setattr(_sae_manifold, "rust_module", lambda: NativeStub())
+    with pytest.raises(TypeError, match="must be an integer"):
+        _sae_manifold.sae_manifold_fit(
+            np.asarray([[0.0], [1.0]]),
+            K=1,
+            d_atom=1,
+            structured_residual_passes=1.5,
+        )
