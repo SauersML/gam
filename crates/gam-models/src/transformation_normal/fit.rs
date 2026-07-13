@@ -441,7 +441,8 @@ pub fn fit_transformation_normal(
 
     let ensure_exact_geometry = |spec: &TermCollectionSpec,
                                  design: &TermCollectionDesign,
-                                 rho: &Array1<f64>|
+                                 rho: &Array1<f64>,
+                                 hyper_values: &Array1<f64>|
      -> Result<(), String> {
         let effective_spec = freeze_term_collection_from_design(spec, design)
             .map_err(|e| format!("failed to freeze transformation geometry key: {e}"))?;
@@ -452,11 +453,24 @@ pub fn fit_transformation_normal(
             .map(|cached| cached.key != key)
             .unwrap_or(true);
         if !needs_rebuild {
-            return exact_geometry_cache
-                .borrow_mut()
+            let mut cache = exact_geometry_cache.borrow_mut();
+            let cached = cache
                 .as_mut()
-                .ok_or_else(|| "missing transformation exact geometry cache".to_string())?
-                .update_block_log_lambdas(rho);
+                .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
+            if cached.hyper_layout.values().len() != hyper_values.len()
+                || cached
+                    .hyper_layout
+                    .values()
+                    .iter()
+                    .zip(hyper_values)
+                    .any(|(cached, current)| cached.to_bits() != current.to_bits())
+            {
+                return Err(
+                    "transformation exact geometry key reused across distinct hypercoordinate values"
+                        .to_string(),
+                );
+            }
+            return cached.update_block_log_lambdas(rho);
         }
 
         let geom_start = std::time::Instant::now();
@@ -485,6 +499,7 @@ pub fn fit_transformation_normal(
             hyper_layout: Arc::new(CustomFamilyHyperLayout::new(
                 vec![tensor_derivs],
                 Vec::new(),
+                hyper_values.clone(),
             )?),
         }));
         Ok(())
@@ -538,7 +553,8 @@ pub fn fit_transformation_normal(
          designs: &[TermCollectionDesign],
          provenance: SpatialFitProvenance<'_, CustomFamilyJointHyperModeSelection>| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            ensure_exact_geometry(&specs[0], &designs[0], &rho)?;
+            let hyper_values = theta.slice(s![joint_setup.rho_dim()..]).to_owned();
+            ensure_exact_geometry(&specs[0], &designs[0], &rho, &hyper_values)?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref
                 .as_mut()
@@ -632,7 +648,8 @@ pub fn fit_transformation_normal(
          eval_mode,
          row_set| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            ensure_exact_geometry(&specs[0], &designs[0], &rho)?;
+            let hyper_values = theta.slice(s![joint_setup.rho_dim()..]).to_owned();
+            ensure_exact_geometry(&specs[0], &designs[0], &rho, &hyper_values)?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref
                 .as_mut()
