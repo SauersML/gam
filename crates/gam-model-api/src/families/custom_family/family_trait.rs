@@ -180,6 +180,28 @@ pub trait CustomFamily {
     /// Evaluate log-likelihood and per-block working quantities at current block predictors.
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String>;
 
+    /// Build family-owned current-state scalars for a post-fit
+    /// identifiability audit.
+    ///
+    /// Dynamic Jacobian callbacks must not reconstruct cross-block primary
+    /// geometry from one block's coefficient slice. A family that returns
+    /// `Some` here supplies the exact per-row state shared by all callbacks;
+    /// the fit engine then re-audits the converged raw-coordinate model with
+    /// those scalars. Static families return `None` and skip that audit.
+    fn current_identifiability_family_scalars(
+        &self,
+        _: &[ParameterBlockState],
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, String> {
+        Ok(None)
+    }
+
+    /// Scale stored on the converged identifiability linearization state.
+    /// Families returning dynamic scalars override this when their callbacks
+    /// use a non-unit probit/frailty scale.
+    fn identifiability_probit_frailty_scale(&self) -> f64 {
+        1.0
+    }
+
     /// Compute only the log-likelihood without building working sets.
     ///
     /// This is used in backtracking line searches where only the objective value

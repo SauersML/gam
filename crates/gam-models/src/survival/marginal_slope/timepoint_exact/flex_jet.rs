@@ -2732,220 +2732,6 @@ impl SurvivalMarginalSlopeFamily {
 // directional/bidirectional path (`row_flex_{third,fourth}_contract_from_base`)
 // drives `flex_timepoint_inputs_generic` at `Jet3`/`Jet4`.
 
-impl MomentTerm for Jet3 {
-    fn moment_term(&self, m: &Self) -> Self {
-        // The calibration residual term lifted to the one-seed ε algebra. The base
-        // channel is the order-≤2 [`Jet2`] `moment_term`; the ε channel carries the
-        // order-3 `j/(j+m)` Leibniz weights (verified against the symbolic operator):
-        //   ε.v   = cE.v·M_v
-        //   ε.g   = cE.g·M_v + ½·(cE.v·M_g + cB.g·mE.v)
-        //   ε.h   = cE.h·M_v + ⅔·(cE.g⊗M_g + cB.h·mE.v) + ⅓·(cE.v·mE.h-cross + cB.g⊗mE.g)
-        // where cB/cE = self.base/eps, mB/mE = m.base/eps (and ⊗ the symmetric cross).
-        let base = self.base.moment_term(&m.base);
-        let eps = jet2_moment_eps(&self.base, &self.eps, &m.base, &m.eps);
-        Jet3 { base, eps }
-    }
-}
-
-impl MomentTerm for ArenaJet3<'_> {
-    fn moment_term(&self, moment: &Self) -> Self {
-        assert!(
-            std::ptr::eq(self.arena, moment.arena),
-            "arena flex jets belong to different workspaces"
-        );
-        let coefficient_base = &self.inner.base;
-        let coefficient_eps = &self.inner.eps;
-        let moment_base = &moment.inner.base;
-        let moment_eps = &moment.inner.eps;
-        let dimension = coefficient_base.g.len();
-
-        let base = DynamicOrder2::from_channel_functions(
-            0.0,
-            dimension,
-            self.arena,
-            |axis| coefficient_base.g[axis] * moment_base.v,
-            |row, column| {
-                let index = row * dimension + column;
-                coefficient_base.h[index] * moment_base.v
-                    + 0.5
-                        * (coefficient_base.g[row] * moment_base.g[column]
-                            + coefficient_base.g[column] * moment_base.g[row])
-            },
-        );
-        let eps = DynamicOrder2::from_channel_functions(
-            coefficient_eps.v * moment_base.v,
-            dimension,
-            self.arena,
-            |axis| {
-                coefficient_eps.g[axis] * moment_base.v
-                    + 0.5
-                        * (coefficient_eps.v * moment_base.g[axis]
-                            + coefficient_base.g[axis] * moment_eps.v)
-            },
-            |row, column| {
-                let index = row * dimension + column;
-                coefficient_eps.h[index] * moment_base.v
-                    + (2.0 / 3.0)
-                        * (coefficient_eps.g[row] * moment_base.g[column]
-                            + coefficient_eps.g[column] * moment_base.g[row])
-                    + (2.0 / 3.0) * coefficient_base.h[index] * moment_eps.v
-                    + (1.0 / 3.0) * coefficient_eps.v * moment_base.h[index]
-                    + (1.0 / 3.0)
-                        * (coefficient_base.g[row] * moment_eps.g[column]
-                            + coefficient_base.g[column] * moment_eps.g[row])
-            },
-        );
-        Self {
-            arena: self.arena,
-            inner: DynamicOneSeed { base, eps },
-        }
-    }
-}
-
-impl<const K: usize> MomentTerm for FixedJet3<K> {
-    fn moment_term(&self, moment: &Self) -> Self {
-        let coefficient_base = &self.inner.base.0;
-        let coefficient_eps = &self.inner.eps.0;
-        let moment_base = &moment.inner.base.0;
-        let moment_eps = &moment.inner.eps.0;
-
-        let mut base = Tower2::<K>::zero();
-        for axis in 0..K {
-            base.g[axis] = coefficient_base.g[axis] * moment_base.v;
-        }
-        for row in 0..K {
-            for column in row..K {
-                let channel = coefficient_base.h[row][column] * moment_base.v
-                    + 0.5
-                        * (coefficient_base.g[row] * moment_base.g[column]
-                            + coefficient_base.g[column] * moment_base.g[row]);
-                base.h[row][column] = channel;
-                base.h[column][row] = channel;
-            }
-        }
-
-        let mut eps = Tower2::<K>::zero();
-        eps.v = coefficient_eps.v * moment_base.v;
-        for axis in 0..K {
-            eps.g[axis] = coefficient_eps.g[axis] * moment_base.v
-                + 0.5
-                    * (coefficient_eps.v * moment_base.g[axis]
-                        + coefficient_base.g[axis] * moment_eps.v);
-        }
-        for row in 0..K {
-            for column in row..K {
-                let channel = coefficient_eps.h[row][column] * moment_base.v
-                    + (2.0 / 3.0)
-                        * (coefficient_eps.g[row] * moment_base.g[column]
-                            + coefficient_eps.g[column] * moment_base.g[row])
-                    + (2.0 / 3.0) * coefficient_base.h[row][column] * moment_eps.v
-                    + (1.0 / 3.0) * coefficient_eps.v * moment_base.h[row][column]
-                    + (1.0 / 3.0)
-                        * (coefficient_base.g[row] * moment_eps.g[column]
-                            + coefficient_base.g[column] * moment_eps.g[row]);
-                eps.h[row][column] = channel;
-                eps.h[column][row] = channel;
-            }
-        }
-
-        Self {
-            inner: OneSeed {
-                base: Order2(base),
-                eps: Order2(eps),
-            },
-        }
-    }
-}
-
-impl MomentTerm for Jet4 {
-    fn moment_term(&self, m: &Self) -> Self {
-        // The calibration residual term lifted to the two-seed ε/δ algebra. The base
-        // is the order-≤2 [`Jet2`] `moment_term`; ε/δ are the order-3 ε-channel
-        // [`jet2_moment_eps`]; the εδ channel carries the order-4 `j/(j+m)` Leibniz
-        // weights (every channel verified term-for-term against the symbolic operator).
-        let base = self.base.moment_term(&m.base);
-        let eps = jet2_moment_eps(&self.base, &self.eps, &m.base, &m.eps);
-        let del = jet2_moment_eps(&self.base, &self.del, &m.base, &m.del);
-        let eps_del = jet2_moment_eps_del(self, m);
-        Jet4 {
-            base,
-            eps,
-            del,
-            eps_del,
-        }
-    }
-}
-
-/// The εδ channel of the contracted calibration residual term for [`Jet4`] — the
-/// order-4 `j/(j+m)`-weighted product (every term verified against the symbolic
-/// operator). `c`/`m` are the full coefficient / moment Jet4s.
-fn jet2_moment_eps_del(c: &Jet4, m: &Jet4) -> Jet2 {
-    let (cb, ca, cd, cad) = (&c.base, &c.eps, &c.del, &c.eps_del);
-    let (mb, ma, md, mad) = (&m.base, &m.eps, &m.del, &m.eps_del);
-    let p = cb.p();
-    // εδ.v {a,b}:  c(a)M(b)·½ + c(a,b)M()·1 + c(b)M(a)·½
-    let v = 0.5 * ca.v * md.v + cad.v * mb.v + 0.5 * cd.v * ma.v;
-    // εδ.g {s,a,b}: c(a)M(b,s)·⅓ + c(a,b)M(s)·⅔ + c(a,b,s)M()·1 + c(a,s)M(b)·⅔
-    //            + c(b)M(a,s)·⅓ + c(b,s)M(a)·⅔ + c(s)M(a,b)·⅓
-    let mut g = vec![0.0; p];
-    for i in 0..p {
-        g[i] = (1.0 / 3.0) * ca.v * md.g[i]
-            + (2.0 / 3.0) * cad.v * mb.g[i]
-            + cad.g[i] * mb.v
-            + (2.0 / 3.0) * ca.g[i] * md.v
-            + (1.0 / 3.0) * cd.v * ma.g[i]
-            + (2.0 / 3.0) * cd.g[i] * ma.v
-            + (1.0 / 3.0) * cb.g[i] * mad.v;
-    }
-    // εδ.h {s,s,a,b}:  c(a)M(b,s,s)·¼ + c(a,b)M(s,s)·½ + c(a,b,s)M(s)·(3/2 over the
-    //   symmetric s-pair) + c(a,b,s,s)M()·1 + c(a,s)M(b,s)·1 + c(a,s,s)M(b)·¾
-    //   + c(b)M(a,s,s)·¼ + c(b,s)M(a,s)·1 + c(b,s,s)M(a)·¾
-    //   + c(s)M(a,b,s)·½ + c(s,s)M(a,b)·½
-    // The single-index forms (c(a,s)M(b,s), etc.) symmetrize to (i,j)+(j,i) below.
-    let mut h = vec![0.0; p * p];
-    for i in 0..p {
-        for j in 0..p {
-            let k = i * p + j;
-            h[k] = 0.25 * ca.v * md.h[k]
-                + 0.5 * cad.v * mb.h[k]
-                + 0.75 * (cad.g[i] * mb.g[j] + cad.g[j] * mb.g[i])
-                + cad.h[k] * mb.v
-                + 0.5 * (ca.g[i] * md.g[j] + ca.g[j] * md.g[i])
-                + 0.75 * ca.h[k] * md.v
-                + 0.25 * cd.v * ma.h[k]
-                + 0.5 * (cd.g[i] * ma.g[j] + cd.g[j] * ma.g[i])
-                + 0.75 * cd.h[k] * ma.v
-                + 0.25 * (cb.g[i] * mad.g[j] + cb.g[j] * mad.g[i])
-                + 0.5 * cb.h[k] * mad.v;
-        }
-    }
-    Jet2 { v, g, h }
-}
-
-/// The ε channel of the contracted calibration residual term (the order-3
-/// `j/(j+m)`-weighted product), shared by [`Jet3`] and [`Jet4`]. `cb`/`ce` are the
-/// coefficient jet's base / ε Jet2 parts, `mb`/`me` the moment jet's. Returns the
-/// ε-channel Jet2 (`v`/`g`/`h`).
-fn jet2_moment_eps(cb: &Jet2, ce: &Jet2, mb: &Jet2, me: &Jet2) -> Jet2 {
-    let p = cb.p();
-    let v = ce.v * mb.v;
-    let mut g = vec![0.0; p];
-    for i in 0..p {
-        g[i] = ce.g[i] * mb.v + 0.5 * (ce.v * mb.g[i] + cb.g[i] * me.v);
-    }
-    let mut h = vec![0.0; p * p];
-    for i in 0..p {
-        for j in 0..p {
-            h[i * p + j] = ce.h[i * p + j] * mb.v
-                + (2.0 / 3.0) * (ce.g[i] * mb.g[j] + ce.g[j] * mb.g[i])
-                + (2.0 / 3.0) * cb.h[i * p + j] * me.v
-                + (1.0 / 3.0) * ce.v * mb.h[i * p + j]
-                + (1.0 / 3.0) * (cb.g[i] * me.g[j] + cb.g[j] * me.g[i]);
-        }
-    }
-    Jet2 { v, g, h }
-}
-
 impl SurvivalMarginalSlopeFamily {
     /// #932-2 PRODUCTION cutover (increment 2): the directional timepoint
     /// extension `D_dir(eta_u/eta_uv/chi_u/chi_uv/d_u/d_uv)` via the single-source
@@ -3115,46 +2901,17 @@ impl FlexJet for Dual22 {
     // directly from the shared `JetField` base impl on `Dual2<S>` — no local
     // re-declaration, the whole point of the unified algebra base.
     const ORDER: usize = 4;
-}
 
-impl MomentTerm for Dual22 {
-    fn moment_term(&self, m: &Self) -> Self {
-        // The layout-independent Leibniz-weighted moving-boundary residual term
-        // (same math as the `Jet2` impl, re-expressed in the two-direction
-        // `(s, t)` channel layout). `self` = c_k (coefficient jet, value
-        // stripped), `m` = M_k (moment jet). For a target channel of order
-        // `α = (a in s, b in t)`, sum over every split that puts `(j, l)` of the
-        // derivatives on `c` (the rest on `M`), excluding the pure-`M` split
-        // `(0, 0)` (c's value is carried by the scalar seed, not here). Each
-        // split's weight is `|β| / |α| = (j + l) / (a + b)`, times the
-        // multinomial multiplicity `C(a, j)·C(b, l)` for choosing which
-        // same-direction derivatives land on `c`.
-        let c = self.channels();
-        let mm = m.channels();
+    fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
+        let channels = self.channels();
         // `(s-order, t-order) → channels() index`, keyed to `Dual22::channels`:
         //   [v.v, g.v, v.g, h.v, g.g, v.h, h.g, g.h, h.h]
         //  = [(0,0),(1,0),(0,1),(2,0),(1,1),(0,2),(2,1),(1,2),(2,2)].
         const IDX: [[usize; 3]; 3] = [[0, 2, 5], [1, 4, 7], [3, 6, 8]];
-        // Binomial C(n, k) for n, k ∈ {0, 1, 2}.
-        const BINOM: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 2.0, 1.0]];
         let mut out = [0.0f64; 9];
         for a in 0..=2usize {
             for b in 0..=2usize {
-                let total = a + b;
-                if total == 0 {
-                    continue; // value channel: stripped.
-                }
-                let mut acc = 0.0;
-                for j in 0..=a {
-                    for l in 0..=b {
-                        if j + l == 0 {
-                            continue; // pure-M split dropped.
-                        }
-                        let w = BINOM[a][j] * BINOM[b][l] * ((j + l) as f64) / (total as f64);
-                        acc += w * c[IDX[j][l]] * mm[IDX[a - j][b - l]];
-                    }
-                }
-                out[IDX[a][b]] = acc;
+                out[IDX[a][b]] = factors[a + b] * channels[IDX[a][b]];
             }
         }
         Dual22::from_channels(out)
@@ -3217,6 +2974,10 @@ mod moment_engine_tests {
 
     impl<J: FlexJet> FlexJet for ForcedOrder4<J> {
         const ORDER: usize = 4;
+
+        fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
+            Self(self.0.scale_homogeneous_orders(factors))
+        }
     }
 
     // #932-2 cutover: the hand IFT intercept-Hessian lift (`lift_flex_intercept_hessian`
