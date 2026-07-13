@@ -1529,7 +1529,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     })
     .with_exact_polish(CustomOuterState::begin_exact_polish);
 
-    let outer_result = problem.run(&mut obj, "custom family");
+    let outer_result = problem.run_certified(&mut obj, "custom family");
 
     let last_error_detail = obj
         .state
@@ -1543,58 +1543,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         })
         .unwrap_or_default();
 
-    // SPEC 20: a fit object only ever comes from a certified-converged outer
-    // optimization. A non-converged outer result is a typed nonconvergence
-    // error carrying its evidence (plan, iterations, gradient norm, and rho
-    // checkpoint). A keyed coefficient warm start is persisted when the family
-    // supplies the response fingerprint required for safe reuse. Work survives
-    // through checkpoint/resume, never by minting a degraded fit. A
-    // Laplace/Gaussian approximation centered at a
-    // non-mode is not posterior inference, so there is no sampling rung to
-    // "escalate" to here: sampling is only ever legitimate about a certified
-    // mode, and a certified mode has no nonconvergence to recover from.
-    let (rho_star, outer_grad_norm, outer_iters, outer_certificate) = match outer_result {
-        Ok(outer_result)
-            if outer_result.converged
-                && outer_result
-                    .criterion_certificate
-                    .as_ref()
-                    .is_some_and(|certificate| certificate.certifies()) =>
-        {
-            (
-                outer_result.rho,
-                outer_result.final_grad_norm,
-                outer_result.iterations,
-                outer_result.criterion_certificate,
-            )
-        }
-        Ok(outer_result) => {
-            if let Some(warm) = obj.state.warm_cache.as_ref() {
-                store_persistent_custom_family_warm_start(
-                    persistent_warm_start_key.as_deref(),
-                    specs,
-                    warm,
-                );
-            }
-            let certificate = outer_result
-                .criterion_certificate
-                .as_ref()
-                .map_or_else(|| "missing".to_string(), |value| value.summary());
-            return Err(CustomFamilyError::Optimization {
-                context: "fit_custom_family outer smoothing",
-                reason: format!(
-                    "outer smoothing optimization did not certify convergence \
-                     (plan={}, iterations={}, |grad|={}, certificate={}, \
-                     rho_checkpoint={:?}); no fit was assembled.{}",
-                    outer_result.plan_used,
-                    outer_result.iterations,
-                    outer_result.final_grad_norm_report(),
-                    certificate,
-                    outer_result.rho.as_slice().unwrap_or(&[]),
-                    last_error_detail
-                ),
-            });
-        }
+    // SPEC 20: only the optimizer-owned certified carrier is fit authority.
+    // Raw `OuterResult` status/certificate fields are intentionally
+    // insufficient here; `run_certified` is the sole constructor that seals
+    // the terminal analytic evidence after final-state installation.
+    let certified_outer = match outer_result {
+        Ok(outer) => outer,
         Err(e) => {
             let rho_checkpoint = obj
                 .state
@@ -1612,7 +1566,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             return Err(CustomFamilyError::Optimization {
                 context: "fit_custom_family outer smoothing",
                 reason: format!(
-                    "outer smoothing optimization failed after exhausting strategy fallbacks: \
+                    "outer smoothing optimization failed certified-fit validation after exhausting strategy fallbacks: \
                      {e}; rho_checkpoint={rho_checkpoint:?}; no fit was assembled.\
                      {last_error_detail}"
                 ),
@@ -1621,41 +1575,96 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     };
     screening_cap.store(0, Ordering::Relaxed);
 
-    let per_block = split_labeled_log_lambdas(&rho_star, &label_layout)?;
-    // Seed the final β̂ refit at ρ* from the outer optimizer's warm cache.
-    //
-    // When the cache's ρ bit-matches ρ* the seed is passed whole: the inner
-    // solve's same-ρ fast path reuses the cached converged mode (logdets,
-    // penalty, active constraints) directly.
-    //
-    // When it does NOT match (the last accepted outer eval sat at a nearby
-    // trial ρ, not ρ*), the ρ-specific `cached_inner` is invalid and MUST NOT
-    // be reused — but the converged block β at that nearby ρ is still the best
-    // available continuation seed for the final refit's coupled joint Newton.
-    // Previously the whole seed was dropped to `None` here, forcing the refit
-    // to COLD-START from the family-default β. On a stiff two-block
-    // location-scale basin that cold start can diverge even though the outer
-    // search already certified ρ*: with a `bs='tp', k>=20` scale smooth the
-    // refit drove the *mean* block to |β|~10 and aborted with a KKT
-    // cert-refusal (`phantom_multiplier_with_well_conditioned_H`), while
-    // k=25 — a different, more forgiving basin — converged. Keeping the β
-    // continuation (and active sets) seeds the refit at the outer optimum so
-    // the coupled Newton opens next to its solution instead of cold (#1561).
-    // The inner solve already re-gates cache-mode reuse on its own
-    // `warm_start_matches_block_log_lambdas` check, so stripping `cached_inner`
-    // here is the belt-and-suspenders guarantee that a mismatched-ρ seed
-    // contributes ONLY its β/active-set continuation, never a stale mode.
-    let final_seed = obj.state.warm_cache.clone().map(|mut seed| {
-        if !warm_start_matches_block_log_lambdas(&seed, &per_block) {
-            seed.cached_inner = None;
+    // Consume the exact derivative-bearing evaluator state installed by the
+    // runner's final full-fidelity synchronization. Objective, gradient,
+    // smoothing coordinate, and coefficient mode form one sealed identity.
+    // Warm starts are deliberately excluded: they are seeds, not evidence
+    // about which nonconvex coefficient basin produced the certificate.
+    let terminal = obj.state.terminal_mode.take().ok_or_else(|| {
+        CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal mode ownership",
+            reason: "outer optimization certified without retaining a derivative-bearing terminal coefficient mode; no fit was assembled"
+                .to_string(),
         }
-        seed
-    });
+    })?;
+    let certified_gradient = certified_outer.final_gradient().ok_or_else(|| {
+        CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal gradient ownership",
+            reason: "certified outer result retained no exact analytic terminal gradient; no fit was assembled"
+                .to_string(),
+        }
+    })?;
+    if terminal.theta.len() != certified_outer.rho().len()
+        || terminal
+            .theta
+            .iter()
+            .zip(certified_outer.rho().iter())
+            .any(|(terminal, certified)| terminal.to_bits() != certified.to_bits())
+    {
+        return Err(CustomFamilyError::InvalidInput {
+            context: "fit_custom_family terminal theta identity",
+            reason: "terminal coefficient mode does not bitwise match the certified outer hyperparameter vector"
+                .to_string(),
+        });
+    }
+    if terminal.objective.to_bits() != certified_outer.final_value().to_bits() {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal objective identity",
+            reason: format!(
+                "terminal coefficient-mode objective does not bitwise match the certified outer objective: terminal={:.17e}, certified={:.17e}",
+                terminal.objective,
+                certified_outer.final_value(),
+            ),
+        });
+    }
+    if terminal.gradient.len() != certified_gradient.len()
+        || terminal
+            .gradient
+            .iter()
+            .zip(certified_gradient.iter())
+            .any(|(terminal, certified)| terminal.to_bits() != certified.to_bits())
+    {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal gradient identity",
+            reason: "terminal coefficient-mode gradient does not bitwise match the optimizer-owned analytic certificate gradient"
+                .to_string(),
+        });
+    }
+    if terminal.mode.objective.to_bits() != terminal.objective.to_bits()
+        || terminal.mode.rho.len() != terminal.theta.len()
+        || terminal
+            .mode
+            .rho
+            .iter()
+            .zip(terminal.theta.iter())
+            .any(|(mode, terminal)| mode.to_bits() != terminal.to_bits())
+    {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal carrier identity",
+            reason: "terminal outer payload and its owned coefficient mode have different objective or hyperparameter bits"
+                .to_string(),
+        });
+    }
+
+    let rho_star = certified_outer.rho().clone();
+    let CustomFamilyOwnedMode {
+        objective: penalized_objective,
+        rho: mode_rho,
+        inner,
+    } = terminal.mode;
+    if !inner.converged {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal mode ownership",
+            reason: "the certified terminal coefficient mode was not converged; no fit was assembled"
+                .to_string(),
+        });
+    }
+    let per_block = split_labeled_log_lambdas(&rho_star, &label_layout)?;
     let mut final_options = options.clone();
     final_options.outer_inner_max_iterations = None;
-    // gam#1587: the final β̂ refit must apply the same full-width joint penalty
-    // at the converged ρ* as every outer eval did, or the reported coefficients
-    // (and predictions) would be the UNPENALIZED-by-the-centered-metric mode.
+    // Reconstruct only the deterministic penalty geometry needed by covariance
+    // and EDF assembly. The coefficient mode itself already came from this
+    // exact rho-specific bundle and is never solved or evaluated again.
     if !label_layout.joint_specs.is_empty() {
         let total_compiled: usize = specs.iter().map(|s| s.design.ncols()).sum();
         let joint_log_lambdas = label_layout.joint_log_lambdas(&rho_star);
@@ -1667,70 +1676,57 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .map_err(CustomFamilyError::from)?;
         final_options.joint_penalties = Some(std::sync::Arc::new(bundle));
     }
-    let mut inner = inner_blockwise_fit(
-        family,
-        specs,
-        &per_block,
-        &final_options,
-        final_seed.as_ref(),
-    )
-    .map_err(|error| CustomFamilyError::Optimization {
-        context: "fit_custom_family final inner refit",
-        reason: format!(
-            "{error}; rho_checkpoint={:?}; no fit was assembled.{}",
-            rho_star.as_slice().unwrap_or(&[]),
-            last_error_detail
-        ),
-    })?;
-    if !inner.converged {
-        // Preserve the refit's rho/coefficients in the response-keyed cache
-        // when this family supports persistent warm starts, then reject the
-        // non-mode. The rho checkpoint is carried in the typed error regardless.
-        store_persistent_custom_family_warm_start(
-            persistent_warm_start_key.as_deref(),
-            specs,
-            &constrained_warm_start_from_inner(&rho_star, &inner),
-        );
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family final inner refit",
-            reason: format!(
-                "outer smoothing optimization final inner refit did not converge after {} cycles; \
-                 rho_checkpoint={:?}; no fit was assembled.{}",
-                inner.cycles,
-                rho_star.as_slice().unwrap_or(&[]),
-                last_error_detail
-            ),
-        });
-    }
-    let final_warm_start = constrained_warm_start_from_inner(&rho_star, &inner);
+
+    let final_warm_start = constrained_warm_start_from_inner(&mode_rho, &inner);
     store_persistent_custom_family_warm_start(
         persistent_warm_start_key.as_deref(),
         specs,
         &final_warm_start,
     );
-    refresh_all_block_etas(family, specs, &mut inner.block_states).map_err(|e| {
-        format!(
-            "outer smoothing optimization failed during final eta refresh: \
-             {e}.{last_error_detail}"
-        )
-    })?;
     audit_converged_identifiability(
         family,
         raw_specs,
         &canonical,
         &inner.block_states,
-        outer_iters,
+        certified_outer.iterations(),
     )?;
-    // gam#1587: pass `final_options` (carrying the joint penalty bundle) so the
-    // posterior precision `H = H_lik + S_λ` includes the full-width centered
-    // penalty, matching the inner-converged mode.
+
+    // The inner evaluator retains the exact returned-beta likelihood/Jeffreys
+    // Hessian workspace. Require it and materialize from that owned state: a
+    // family callback here would be a second evaluation and could silently
+    // change a stateful augmentation or coefficient basin.
+    let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+    let workspace = inner.joint_workspace.as_ref().ok_or_else(|| {
+        CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal curvature ownership",
+            reason: "the certified terminal mode did not retain its returned-beta Hessian workspace"
+                .to_string(),
+        }
+    })?;
+    let hessian_source = exact_newton_joint_hessian_source_from_workspace(
+        workspace,
+        total_p,
+        MaterializationIntent::LogdetFactorization,
+        "custom-family certified terminal Hessian",
+    )?
+    .ok_or_else(|| CustomFamilyError::Optimization {
+        context: "fit_custom_family terminal curvature ownership",
+        reason: "the certified terminal mode workspace did not expose its exact returned-beta Hessian"
+            .to_string(),
+    })?;
+    let hessian = materialize_joint_hessian_source(
+        &hessian_source,
+        total_p,
+        "custom-family certified terminal Hessian materialization",
+    )?;
+
     let covariance_conditional = compute_joint_covariance_required(
         family,
         specs,
         &inner.block_states,
         &per_block,
         &final_options,
-        None,
+        Some(&hessian),
     )
     .map_err(|error| CustomFamilyError::Optimization {
         context: "fit_custom_family final covariance factorization",
@@ -1740,30 +1736,16 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         ),
     })?;
 
-    // gam#1587/#561: pass `final_options` (carrying the joint penalty bundle at
-    // the selected ρ*) so the exported geometry's penalized Hessian — and the
-    // trace EDF derived from it — includes the full-width centered penalty,
-    // matching the covariance path above and the inner-converged mode.
     let geometry = compute_joint_geometry(
         family,
         specs,
         &inner.block_states,
         &per_block,
         &final_options,
-        None,
+        Some(&hessian),
     )
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family joint geometry",
-        reason,
-    })?;
-    let penalized_objective = inner_penalized_objective(
-        &inner,
-        include_exact_newton_logdet_h(family, options),
-        include_exact_newton_logdet_s(family, options),
-        "custom-family fit final outer refit",
-    )
-    .map_err(|reason| CustomFamilyError::Optimization {
-        context: "fit_custom_family penalized objective",
         reason,
     })?;
     // Cross-fit FitArtifact capture (Phase 0/1) for the converged smoothing
@@ -1801,9 +1783,9 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             canonical: Some(&canonical),
             result_specs: raw_specs,
             penalized_objective,
-            outer_iterations: outer_iters,
-            outer_gradient_norm: outer_grad_norm,
-            criterion_certificate: outer_certificate,
+            outer_iterations: certified_outer.iterations(),
+            outer_gradient_norm: certified_outer.final_grad_norm(),
+            criterion_certificate: Some(certified_outer.criterion_certificate().clone()),
             outer_converged: true,
             joint_log_lambdas,
         },

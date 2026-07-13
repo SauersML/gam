@@ -3088,7 +3088,6 @@ fn fit_topology_candidate(
     let jet = bundle.basis_jacobian;
     let penalty = bundle.reference_penalty;
     let evaluator = bundle.evaluator;
-    let m = phi.ncols();
     if phi.nrows() != n {
         return Err(format!(
             "fit_topology_candidate: basis rows {} != target rows {n}",
@@ -5700,7 +5699,7 @@ fn curl_candidates(
         cfg.coalesce_max_overlap,
     );
     if signed.len() < 2 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // A per-atom → frame index map so a signed direction can gather its members'

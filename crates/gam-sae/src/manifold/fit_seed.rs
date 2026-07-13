@@ -8,7 +8,7 @@
 
 use gam_problem::RowMetric;
 use gam_terms::analytic_penalties::{AnalyticPenaltyKind, AnalyticPenaltyRegistry};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
+use ndarray::{Array1, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
 
 use super::*;
 
@@ -406,6 +406,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::Array2;
 
     #[test]
     fn assignment_kind_is_strict_and_typed() {
