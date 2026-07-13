@@ -1,7 +1,7 @@
 use super::*;
 use ::opt::FixedPointObjective;
 use ndarray::array;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ─── #934 first-order optimality certificate ──────────────────────
@@ -511,6 +511,193 @@ fn curvature_widening_still_rejects_genuine_nonstationarity() {
         outcome.is_err(),
         "a genuinely non-stationary point must not be certified by the curvature bound",
     );
+}
+
+fn terminal_fidelity_feedback(cap_value: usize) -> InnerProgressFeedback {
+    InnerProgressFeedback {
+        cap: Arc::new(AtomicUsize::new(cap_value)),
+        accepted_iter: Arc::new(AtomicUsize::new(0)),
+        last_iters: Arc::new(AtomicUsize::new(cap_value)),
+        last_converged: Arc::new(AtomicBool::new(false)),
+        ift_residual: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
+        accept_rho: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
+    }
+}
+
+/// Standard REML regression for #2309.  The search cache contains a
+/// cap-produced sample whose moderate gradient is paired with artificial stiff
+/// curvature; the old certificate reused it and widened its bound enough to
+/// certify.  Terminal certification must clear that cache, evaluate at cap=0,
+/// and reject the genuinely non-stationary full-fidelity gradient.
+#[test]
+fn standard_reml_certificate_uses_fresh_uncapped_inner_state_2309() {
+    struct StandardState {
+        feedback: InnerProgressFeedback,
+        coarse_cache_present: bool,
+        reset_count: usize,
+        evaluated_caps: Vec<usize>,
+    }
+
+    let feedback = terminal_fidelity_feedback(3);
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_tolerance(1.0e-6)
+        .with_outer_inner_cap(feedback.clone());
+    let config = problem.config();
+    let state = StandardState {
+        feedback,
+        coarse_cache_present: true,
+        reset_count: 0,
+        evaluated_caps: Vec::new(),
+    };
+    let mut obj = problem.build_objective(
+        state,
+        |_: &mut StandardState, _: &Array1<f64>| Ok(10.0),
+        |state: &mut StandardState, _: &Array1<f64>| {
+            let cap = state.feedback.cap.load(Ordering::Relaxed);
+            state.evaluated_caps.push(cap);
+            if state.coarse_cache_present {
+                return Ok(OuterEval {
+                    cost: 10.0,
+                    gradient: array![0.5],
+                    hessian: HessianValue::Dense(array![[1.25e8]]),
+                    inner_beta_hint: None,
+                });
+            }
+            state.feedback.last_iters.store(12, Ordering::Relaxed);
+            state
+                .feedback
+                .last_converged
+                .store(cap == 0, Ordering::Relaxed);
+            Ok(OuterEval {
+                cost: 10.0,
+                gradient: array![37.0],
+                hessian: HessianValue::Dense(array![[1.0]]),
+                inner_beta_hint: None,
+            })
+        },
+        Some(|state: &mut StandardState| {
+            state.reset_count += 1;
+            state.coarse_cache_present = false;
+            state.feedback.last_iters.store(0, Ordering::Relaxed);
+            state
+                .feedback
+                .last_converged
+                .store(false, Ordering::Relaxed);
+        }),
+        None::<fn(&mut StandardState, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let mut result = OuterResult::new(
+        array![0.0],
+        10.0,
+        1,
+        true,
+        OuterPlan {
+            solver: Solver::Arc,
+            hessian_source: HessianSource::Analytic,
+        },
+    );
+
+    assert!(
+        certify_outer_optimality(&mut obj, &config, "standard REML #2309", &mut result).is_err(),
+        "the full-fidelity gradient has real descent and must not inherit the coarse widened bound",
+    );
+    assert_eq!(obj.state.reset_count, 1);
+    assert_eq!(obj.state.evaluated_caps, vec![0]);
+    assert_eq!(obj.state.feedback.cap.load(Ordering::Relaxed), 3);
+    assert_eq!(result.final_gradient.as_ref(), Some(&array![37.0]));
+}
+
+/// Mixture/SAS regression for the augmented `[rho | link]` layout.  It proves
+/// that terminal reset happens before the final link state is evaluated and
+/// that a coarse rho-only artifact cannot donate its curvature-scaled bound to
+/// the fresh link-coordinate gradient.
+#[test]
+fn mixture_reml_certificate_recomputes_augmented_theta_at_full_fidelity_2309() {
+    struct MixtureState {
+        feedback: InnerProgressFeedback,
+        coarse_rho_cache_present: bool,
+        reset_count: usize,
+        evaluated_caps: Vec<usize>,
+        last_theta: Option<Array1<f64>>,
+    }
+
+    let feedback = terminal_fidelity_feedback(3);
+    let problem = OuterProblem::new(2)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_psi_dim(1)
+        .with_tolerance(1.0e-6)
+        .with_outer_inner_cap(feedback.clone());
+    let config = problem.config();
+    let state = MixtureState {
+        feedback,
+        coarse_rho_cache_present: true,
+        reset_count: 0,
+        evaluated_caps: Vec::new(),
+        last_theta: None,
+    };
+    let mut obj = problem.build_objective(
+        state,
+        |_: &mut MixtureState, _: &Array1<f64>| Ok(10.0),
+        |state: &mut MixtureState, theta: &Array1<f64>| {
+            let cap = state.feedback.cap.load(Ordering::Relaxed);
+            state.evaluated_caps.push(cap);
+            state.last_theta = Some(theta.clone());
+            if state.coarse_rho_cache_present {
+                return Ok(OuterEval {
+                    cost: 10.0,
+                    gradient: array![0.0, 0.5],
+                    hessian: HessianValue::Dense(array![[1.0, 0.0], [0.0, 1.25e8]]),
+                    inner_beta_hint: None,
+                });
+            }
+            state.feedback.last_iters.store(14, Ordering::Relaxed);
+            state
+                .feedback
+                .last_converged
+                .store(cap == 0, Ordering::Relaxed);
+            Ok(OuterEval {
+                cost: 10.0,
+                gradient: array![0.0, 37.0],
+                hessian: HessianValue::Dense(array![[1.0, 0.0], [0.0, 1.0]]),
+                inner_beta_hint: None,
+            })
+        },
+        Some(|state: &mut MixtureState| {
+            state.reset_count += 1;
+            state.coarse_rho_cache_present = false;
+            state.last_theta = None;
+            state.feedback.last_iters.store(0, Ordering::Relaxed);
+            state
+                .feedback
+                .last_converged
+                .store(false, Ordering::Relaxed);
+        }),
+        None::<fn(&mut MixtureState, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let theta_hat = array![0.2, -0.8];
+    let mut result = OuterResult::new(
+        theta_hat.clone(),
+        10.0,
+        1,
+        true,
+        OuterPlan {
+            solver: Solver::Arc,
+            hessian_source: HessianSource::Analytic,
+        },
+    );
+
+    assert!(
+        certify_outer_optimality(&mut obj, &config, "mixture REML #2309", &mut result).is_err(),
+        "the full-fidelity link gradient has real descent and must not inherit the coarse widened bound",
+    );
+    assert_eq!(obj.state.reset_count, 1);
+    assert_eq!(obj.state.evaluated_caps, vec![0]);
+    assert_eq!(obj.state.last_theta.as_ref(), Some(&theta_hat));
+    assert_eq!(obj.state.feedback.cap.load(Ordering::Relaxed), 3);
+    assert_eq!(result.final_gradient.as_ref(), Some(&array![0.0, 37.0]));
 }
 
 fn audit_gradient_only_roundoff_residual_2269(
