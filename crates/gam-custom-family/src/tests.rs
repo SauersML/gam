@@ -1762,13 +1762,15 @@ pub(crate) fn fused_trial_workspace_error_is_not_scalarized() {
         outcome: FusedTrialWorkspaceOutcome::LogLikelihoodError,
     };
     assert_eq!(
-        joint_line_search_log_likelihood_with_workspace(
+        fused_first_attempt_log_likelihood(
             &family,
             &BlockwiseFitOptions::default(),
             &[],
             &[],
+            0,
+            true,
         )
-        .expect_err("workspace evaluation errors must propagate"),
+        .expect_err("the trust-attempt gate must propagate workspace evaluation errors"),
         "fused-trial-log-likelihood-error",
     );
 }
