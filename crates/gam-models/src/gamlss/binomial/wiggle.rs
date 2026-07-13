@@ -2678,99 +2678,17 @@ impl BinomialLocationScaleWiggleFamily {
             .order2_rows(BinomialWiggleRowOuter::Observed)
     }
 
-    pub(crate) fn expected_wiggle_geometry_inputs<'a>(
-        &'a self,
-        block_states: &'a [ParameterBlockState],
-        specs: Option<&'a [ParameterBlockSpec]>,
-    ) -> Result<Option<ExpectedWiggleGeometryInputs<'a>>, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleWiggleFamily",
-            3,
-            block_states.len(),
-        )?;
-        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(specs)? else {
-            return Ok(None);
-        };
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch {
-                reason:
-                    "BinomialLocationScaleWiggleFamily expected-information input size mismatch"
-                        .to_string(),
-            }
-            .into());
-        }
-        Ok(Some(ExpectedWiggleGeometryInputs {
-            x_t,
-            x_ls,
-            eta_t,
-            eta_ls,
-            etaw,
-        }))
-    }
-
     pub(crate) fn expected_wiggle_information_with_specs(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some(inputs) = self.expected_wiggle_geometry_inputs(block_states, Some(specs))? else {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
-        let ExpectedWiggleGeometryInputs {
-            x_t,
-            x_ls,
-            eta_t,
-            eta_ls,
-            etaw,
-        } = inputs;
-        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
-        let core = binomial_location_scale_core(
-            &self.y,
-            &self.weights,
-            eta_t,
-            eta_ls,
-            Some(etaw),
-            &self.link_kind,
-        )?;
-        let b0 = self.wiggle_design(core.q0.view())?;
-        let d0 = self.wiggle_basiswith_options(core.q0.view(), BasisOptions::first_derivative())?;
-        let m = d0.dot(betaw) + 1.0;
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let pw = b0.ncols();
-        let total = pt + pls + pw;
-        let mut out = Array2::<f64>::zeros((total, total));
-        let mut b = Array1::<f64>::zeros(total);
-        for i in 0..self.y.len() {
-            let q = core.q0[i] + etaw[i];
-            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q).map_err(|e| {
-                format!("BinomialLocationScaleWiggle expected information link jet failed: {e}")
-            })?;
-            let (f, _, _) = binomial_expected_q_information_derivatives(
-                self.weights[i],
-                jet.mu,
-                jet.d1,
-                jet.d2,
-                jet.d3,
-            );
-            if f == 0.0 {
-                continue;
-            }
-            let q0 = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
-            b.fill(0.0);
-            b.slice_mut(s![0..pt])
-                .scaled_add(m[i] * q0.q_t, &x_t.row(i));
-            b.slice_mut(s![pt..pt + pls])
-                .scaled_add(m[i] * q0.q_ls, &x_ls.row(i));
-            b.slice_mut(s![pt + pls..]).assign(&b0.row(i));
-            scaled_outer_add(out.view_mut(), f, b.view(), b.view());
-        }
-        mirror_upper_to_lower(&mut out);
-        Ok(Some(out))
+        let program = BinomialLocationScaleWiggleRowProgram::new(self, block_states, 2)?;
+        let rows = program.order2_rows(BinomialWiggleRowOuter::ExpectedInformation)?;
+        Ok(Some(rows.assemble_dense(x_t.as_ref(), x_ls.as_ref())?))
     }
 
     pub(crate) fn expected_wiggle_information_directional_with_specs(
@@ -2779,84 +2697,26 @@ impl BinomialLocationScaleWiggleFamily {
         specs: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some(inputs) = self.expected_wiggle_geometry_inputs(block_states, Some(specs))? else {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
-        let ExpectedWiggleGeometryInputs {
-            x_t,
-            x_ls,
-            eta_t,
-            eta_ls,
-            etaw,
-        } = inputs;
-        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
-        let core = binomial_location_scale_core(
-            &self.y,
-            &self.weights,
-            eta_t,
-            eta_ls,
-            Some(etaw),
-            &self.link_kind,
-        )?;
-        let b0 = self.wiggle_design(core.q0.view())?;
-        let d0 = self.wiggle_basiswith_options(core.q0.view(), BasisOptions::first_derivative())?;
-        let dd0 =
-            self.wiggle_basiswith_options(core.q0.view(), BasisOptions::second_derivative())?;
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let pw = b0.ncols();
-        let layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
-        let (u_t, u_ls, uw) = layout.split_three(d_beta_flat, "expected wiggle d_beta")?;
+        let program = BinomialLocationScaleWiggleRowProgram::new(self, block_states, 3)?;
+        let layout =
+            GamlssBetaLayout::withwiggle(x_t.ncols(), x_ls.ncols(), program.beta_w.len());
+        let (u_t, u_ls, u_w) = layout.split_three(d_beta_flat, "expected wiggle d_beta")?;
         let d_eta_t = fast_av(&x_t, &u_t);
         let d_eta_ls = fast_av(&x_ls, &u_ls);
-        let m = d0.dot(betaw) + 1.0;
-        let g2 = dd0.dot(betaw);
-        let total = layout.total();
-        let mut out = Array2::<f64>::zeros((total, total));
-        let mut b = Array1::<f64>::zeros(total);
-        let mut bu = Array1::<f64>::zeros(total);
-        for i in 0..self.y.len() {
-            let q = core.q0[i] + etaw[i];
-            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q).map_err(|e| {
-                format!("BinomialLocationScaleWiggle expected dI link jet failed: {e}")
-            })?;
-            let (f, f1, _) = binomial_expected_q_information_derivatives(
-                self.weights[i],
-                jet.mu,
-                jet.d1,
-                jet.d2,
-                jet.d3,
-            );
-            if f == 0.0 && f1 == 0.0 {
-                continue;
-            }
-            let q0 = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
-            let dq0_u = q0.q_t * d_eta_t[i] + q0.q_ls * d_eta_ls[i];
-            let dq0_t_u = q0.q_tl * d_eta_ls[i];
-            let dq0_ls_u = q0.q_tl * d_eta_t[i] + q0.q_ll * d_eta_ls[i];
-            let bu_w = b0.row(i).dot(&uw);
-            let b1u = d0.row(i).dot(&uw);
-            let dm_u = g2[i] * dq0_u + b1u;
-            let alpha_u = m[i] * dq0_u + bu_w;
-            let q_t = m[i] * q0.q_t;
-            let q_ls = m[i] * q0.q_ls;
-            let dq_t_u = dm_u * q0.q_t + m[i] * dq0_t_u;
-            let dq_ls_u = dm_u * q0.q_ls + m[i] * dq0_ls_u;
-            b.fill(0.0);
-            bu.fill(0.0);
-            b.slice_mut(s![0..pt]).scaled_add(q_t, &x_t.row(i));
-            b.slice_mut(s![pt..pt + pls]).scaled_add(q_ls, &x_ls.row(i));
-            b.slice_mut(s![pt + pls..]).assign(&b0.row(i));
-            bu.slice_mut(s![0..pt]).scaled_add(dq_t_u, &x_t.row(i));
-            bu.slice_mut(s![pt..pt + pls])
-                .scaled_add(dq_ls_u, &x_ls.row(i));
-            bu.slice_mut(s![pt + pls..]).scaled_add(dq0_u, &d0.row(i));
-            scaled_outer_add(out.view_mut(), f1 * alpha_u, b.view(), b.view());
-            scaled_outer_add(out.view_mut(), f, bu.view(), b.view());
-            scaled_outer_add(out.view_mut(), f, b.view(), bu.view());
-        }
-        mirror_upper_to_lower(&mut out);
-        Ok(Some(out))
+        let rows = program.first_directional_rows(
+            &d_eta_t,
+            &d_eta_ls,
+            u_w.view(),
+            BinomialWiggleRowOuter::ExpectedInformation,
+        )?;
+        Ok(Some(rows.assemble_dense(
+            x_t.as_ref(),
+            x_ls.as_ref(),
+            &program.basis_derivatives,
+        )?))
     }
 
     pub(crate) fn expected_wiggle_information_second_directional_with_specs(
@@ -2864,144 +2724,36 @@ impl BinomialLocationScaleWiggleFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
         d_beta_u_flat: &Array1<f64>,
-        d_betav_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some(inputs) = self.expected_wiggle_geometry_inputs(block_states, Some(specs))? else {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
-        let ExpectedWiggleGeometryInputs {
-            x_t,
-            x_ls,
-            eta_t,
-            eta_ls,
-            etaw,
-        } = inputs;
-        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
-        let core = binomial_location_scale_core(
-            &self.y,
-            &self.weights,
-            eta_t,
-            eta_ls,
-            Some(etaw),
-            &self.link_kind,
-        )?;
-        let b0 = self.wiggle_design(core.q0.view())?;
-        let d0 = self.wiggle_basiswith_options(core.q0.view(), BasisOptions::first_derivative())?;
-        let dd0 =
-            self.wiggle_basiswith_options(core.q0.view(), BasisOptions::second_derivative())?;
-        let d3q = self.wiggle_d3q_dq03(core.q0.view(), betaw.view())?;
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let pw = b0.ncols();
-        let layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
-        let (u_t, u_ls, uw) = layout.split_three(d_beta_u_flat, "expected wiggle d_beta_u")?;
-        let (v_t, v_ls, vw) = layout.split_three(d_betav_flat, "expected wiggle d_beta_v")?;
+        let program = BinomialLocationScaleWiggleRowProgram::new(self, block_states, 4)?;
+        let layout =
+            GamlssBetaLayout::withwiggle(x_t.ncols(), x_ls.ncols(), program.beta_w.len());
+        let (u_t, u_ls, u_w) =
+            layout.split_three(d_beta_u_flat, "expected wiggle d_beta_u")?;
+        let (v_t, v_ls, v_w) =
+            layout.split_three(d_beta_v_flat, "expected wiggle d_beta_v")?;
         let d_eta_t_u = fast_av(&x_t, &u_t);
         let d_eta_ls_u = fast_av(&x_ls, &u_ls);
         let d_eta_t_v = fast_av(&x_t, &v_t);
         let d_eta_ls_v = fast_av(&x_ls, &v_ls);
-        let m = d0.dot(betaw) + 1.0;
-        let g2 = dd0.dot(betaw);
-        let total = layout.total();
-        let mut out = Array2::<f64>::zeros((total, total));
-        let mut b = Array1::<f64>::zeros(total);
-        let mut bu = Array1::<f64>::zeros(total);
-        let mut bv = Array1::<f64>::zeros(total);
-        let mut buv = Array1::<f64>::zeros(total);
-        for i in 0..self.y.len() {
-            let q = core.q0[i] + etaw[i];
-            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q).map_err(|e| {
-                format!("BinomialLocationScaleWiggle expected d2I link jet failed: {e}")
-            })?;
-            let (f, f1, f2) = binomial_expected_q_information_derivatives(
-                self.weights[i],
-                jet.mu,
-                jet.d1,
-                jet.d2,
-                jet.d3,
-            );
-            if f == 0.0 && f1 == 0.0 && f2 == 0.0 {
-                continue;
-            }
-            let q0 = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
-            let dq0_u = q0.q_t * d_eta_t_u[i] + q0.q_ls * d_eta_ls_u[i];
-            let dq0_v = q0.q_t * d_eta_t_v[i] + q0.q_ls * d_eta_ls_v[i];
-            let d2q0_uv = q0.q_tl * (d_eta_t_u[i] * d_eta_ls_v[i] + d_eta_t_v[i] * d_eta_ls_u[i])
-                + q0.q_ll * d_eta_ls_u[i] * d_eta_ls_v[i];
-            let dq0_t_u = q0.q_tl * d_eta_ls_u[i];
-            let dq0_t_v = q0.q_tl * d_eta_ls_v[i];
-            let dq0_ls_u = q0.q_tl * d_eta_t_u[i] + q0.q_ll * d_eta_ls_u[i];
-            let dq0_ls_v = q0.q_tl * d_eta_t_v[i] + q0.q_ll * d_eta_ls_v[i];
-            let d2q0_t_uv = q0.q_tl_ls * d_eta_ls_u[i] * d_eta_ls_v[i];
-            let d2q0_ls_uv = q0.q_tl_ls
-                * (d_eta_ls_u[i] * d_eta_t_v[i] + d_eta_ls_v[i] * d_eta_t_u[i])
-                + q0.q_ll_ls * d_eta_ls_u[i] * d_eta_ls_v[i];
-
-            let br = b0.row(i);
-            let dr = d0.row(i);
-            let ddr = dd0.row(i);
-            let b_u = br.dot(&uw);
-            let b_v = br.dot(&vw);
-            let b1_u = dr.dot(&uw);
-            let b1_v = dr.dot(&vw);
-            let b2_u = ddr.dot(&uw);
-            let b2_v = ddr.dot(&vw);
-            let dm_u = g2[i] * dq0_u + b1_u;
-            let dm_v = g2[i] * dq0_v + b1_v;
-            let d2m_uv = d3q[i] * dq0_u * dq0_v + g2[i] * d2q0_uv + b2_v * dq0_u + b2_u * dq0_v;
-            let alpha_u = m[i] * dq0_u + b_u;
-            let alpha_v = m[i] * dq0_v + b_v;
-            let alpha_uv = m[i] * d2q0_uv + g2[i] * dq0_u * dq0_v + b1_u * dq0_v + b1_v * dq0_u;
-
-            let q_t = m[i] * q0.q_t;
-            let q_ls = m[i] * q0.q_ls;
-            let dq_t_u = dm_u * q0.q_t + m[i] * dq0_t_u;
-            let dq_t_v = dm_v * q0.q_t + m[i] * dq0_t_v;
-            let dq_ls_u = dm_u * q0.q_ls + m[i] * dq0_ls_u;
-            let dq_ls_v = dm_v * q0.q_ls + m[i] * dq0_ls_v;
-            let d2q_t_uv = d2m_uv * q0.q_t + dm_u * dq0_t_v + dm_v * dq0_t_u + m[i] * d2q0_t_uv;
-            let d2q_ls_uv =
-                d2m_uv * q0.q_ls + dm_u * dq0_ls_v + dm_v * dq0_ls_u + m[i] * d2q0_ls_uv;
-
-            b.fill(0.0);
-            bu.fill(0.0);
-            bv.fill(0.0);
-            buv.fill(0.0);
-            b.slice_mut(s![0..pt]).scaled_add(q_t, &x_t.row(i));
-            b.slice_mut(s![pt..pt + pls]).scaled_add(q_ls, &x_ls.row(i));
-            b.slice_mut(s![pt + pls..]).assign(&br);
-            bu.slice_mut(s![0..pt]).scaled_add(dq_t_u, &x_t.row(i));
-            bu.slice_mut(s![pt..pt + pls])
-                .scaled_add(dq_ls_u, &x_ls.row(i));
-            bu.slice_mut(s![pt + pls..]).scaled_add(dq0_u, &dr);
-            bv.slice_mut(s![0..pt]).scaled_add(dq_t_v, &x_t.row(i));
-            bv.slice_mut(s![pt..pt + pls])
-                .scaled_add(dq_ls_v, &x_ls.row(i));
-            bv.slice_mut(s![pt + pls..]).scaled_add(dq0_v, &dr);
-            buv.slice_mut(s![0..pt]).scaled_add(d2q_t_uv, &x_t.row(i));
-            buv.slice_mut(s![pt..pt + pls])
-                .scaled_add(d2q_ls_uv, &x_ls.row(i));
-            buv.slice_mut(s![pt + pls..])
-                .scaled_add(dq0_u * dq0_v, &ddr);
-            buv.slice_mut(s![pt + pls..]).scaled_add(d2q0_uv, &dr);
-
-            scaled_outer_add(
-                out.view_mut(),
-                f2 * alpha_u * alpha_v + f1 * alpha_uv,
-                b.view(),
-                b.view(),
-            );
-            scaled_outer_add(out.view_mut(), f1 * alpha_u, bv.view(), b.view());
-            scaled_outer_add(out.view_mut(), f1 * alpha_u, b.view(), bv.view());
-            scaled_outer_add(out.view_mut(), f1 * alpha_v, bu.view(), b.view());
-            scaled_outer_add(out.view_mut(), f1 * alpha_v, b.view(), bu.view());
-            scaled_outer_add(out.view_mut(), f, buv.view(), b.view());
-            scaled_outer_add(out.view_mut(), f, b.view(), buv.view());
-            scaled_outer_add(out.view_mut(), f, bu.view(), bv.view());
-            scaled_outer_add(out.view_mut(), f, bv.view(), bu.view());
-        }
-        mirror_upper_to_lower(&mut out);
-        Ok(Some(out))
+        let rows = program.second_directional_rows(
+            &d_eta_t_u,
+            &d_eta_ls_u,
+            u_w.view(),
+            &d_eta_t_v,
+            &d_eta_ls_v,
+            v_w.view(),
+            BinomialWiggleRowOuter::ExpectedInformation,
+        )?;
+        Ok(Some(rows.assemble_dense(
+            x_t.as_ref(),
+            x_ls.as_ref(),
+            &program.basis_derivatives,
+        )?))
     }
 }
 
@@ -3029,14 +2781,6 @@ pub(crate) struct BinomialWiggleOrder2Rows {
     pub(crate) coeff_ww: Array1<f64>,
     pub(crate) b0: Array2<f64>,
     pub(crate) d0: Array2<f64>,
-}
-
-pub(crate) struct ExpectedWiggleGeometryInputs<'a> {
-    pub(crate) x_t: Cow<'a, Array2<f64>>,
-    pub(crate) x_ls: Cow<'a, Array2<f64>>,
-    pub(crate) eta_t: &'a Array1<f64>,
-    pub(crate) eta_ls: &'a Array1<f64>,
-    pub(crate) etaw: &'a Array1<f64>,
 }
 
 impl BinomialWiggleOrder2Rows {

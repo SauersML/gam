@@ -159,8 +159,8 @@ pub(crate) fn with_flex_third_jet_arena<R>(evaluate: impl FnOnce(&mut DynamicJet
 /// (`signed_probit_neglog_derivatives_up_to_fourth`), the chain rule on
 /// `g(η) = −N(−η)` gives `g′ = k1`, `g″ = −k2`, `g‴ = k3`, `g⁗ = −k4`. This is
 /// the entry/exit survival stack; composing the timepoint η-jet with it
-/// reproduces the hand `entry_u1 = −entry_k1`, `entry_u2 = entry_k2`, … mapping
-/// (`flex_sensitivity.rs`, `gpu::cpu_oracle_*`).
+/// supplies the canonical entry/exit survival derivatives consumed by every
+/// generated flex-row lowering.
 #[inline]
 fn surv_stack(eta: f64) -> Result<[f64; 5], String> {
     let signed_margin = -eta;
@@ -1472,7 +1472,7 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     /// Single-source flex contracted third `D_dir H[u,v]` from the entry/exit
-    /// base + directional packs. Replaces `gpu::cpu_oracle_third_contraction`.
+    /// base + directional packs through the canonical flex-row plan.
     pub(crate) fn flex_row_nll_third_contracted(
         &self,
         row: usize,
@@ -1537,7 +1537,7 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Single-source flex contracted fourth `Σ_{cd} ℓ_{abcd} u_c v_d` from the
     /// entry/exit base + both directional packs + bidirectional packs. Replaces
-    /// `gpu::cpu_oracle_fourth_contraction`.
+    /// the same canonical flex-row plan at fourth order.
     pub(crate) fn flex_row_nll_fourth_contracted(
         &self,
         row: usize,
@@ -2610,13 +2610,8 @@ fn observed_fixed_for(
 impl SurvivalMarginalSlopeFamily {
     /// #932-2 PRODUCTION cutover: the exact timepoint `(eta, chi, d)` value /
     /// gradient / Hessian via the single-source `flex_timepoint_inputs_generic`
-    /// jet builder at [`Jet2`], replacing the hand
-    /// `compute_survival_timepoint_exact` probit-chain / quotient-rule / IFT
-    /// assembly. The `Jet2` base channel of the generic builder is pinned
-    /// term-for-term against the hand exact pack by the oracle gates in
-    /// `moment_engine_tests` (`flex_timepoint_inputs_jet3_directional_matches_
-    /// hand_932` asserts `eta.base/chi.base/dnorm.base == compute_survival_
-    /// timepoint_exact_from_cached`).
+    /// jet builder at [`Jet2`]. Independent finite differences pin its value,
+    /// gradient, and Hessian channels in `moment_engine_tests`.
     pub(crate) fn compute_survival_timepoint_exact_jet(
         &self,
         row: usize,
@@ -2764,11 +2759,9 @@ impl SurvivalMarginalSlopeFamily {
     /// extension `D_dir(eta_u/eta_uv/chi_u/chi_uv/d_u/d_uv)` via the single-source
     /// `flex_timepoint_inputs_generic` jet builder at [`Jet3`] (one nilpotent ε
     /// seed = the contraction direction). Returns the directional pack
-    /// directly (the ε channel `.eps.g`/`.eps.h` of the `(eta, chi, d)` jets),
-    /// replacing the hand `compute_survival_timepoint_directional_exact_from_cached`
-    /// chain-rule assembly. Pinned term-for-term against the hand `block10_pack_dir`
-    /// by `flex_timepoint_inputs_jet3_directional_matches_hand_932` /
-    /// `_ghw_jet3_jet4_match_hand_932`.
+    /// directly (the ε channel `.eps.g`/`.eps.h` of the `(eta, chi, d)` jets).
+    /// The row-level contracted tensor is pinned by independent rigid-tower and
+    /// finite-difference witnesses.
     pub(crate) fn compute_survival_timepoint_directional_jet_from_cached(
         &self,
         row: usize,
@@ -2836,11 +2829,9 @@ impl SurvivalMarginalSlopeFamily {
     /// #932-2 PRODUCTION cutover (increment 2): the mixed second-directional
     /// timepoint extension `D_{d1} D_{d2}(eta_uv/chi_uv/d_uv)` via the single-source
     /// builder at [`Jet4`] (two nilpotent seeds ε = `dir1`, δ = `dir2`). Returns the
-    /// bidirectional pack directly (the εδ-Hessian channel `.eps_del.h`),
-    /// replacing the hand `compute_survival_timepoint_bidirectional_exact_from_cached`.
-    /// Pinned against the hand `block10_pack_bi` by
-    /// `flex_timepoint_inputs_jet4_bidirectional_matches_hand_932` /
-    /// `_ghw_jet3_jet4_match_hand_932`.
+    /// bidirectional pack directly (the εδ-Hessian channel `.eps_del.h`).
+    /// Nested-dual and scalar finite-difference gates independently pin this
+    /// fourth-order channel.
     pub(crate) fn compute_survival_timepoint_bidirectional_jet_from_cached(
         &self,
         row: usize,
@@ -4102,24 +4093,7 @@ mod moment_engine_tests {
             );
         }
     }
-    // ── §3c: real-family Jet3/Jet4 directional gates vs the hand directional/
-    // bidirectional packs ───────────────────────────────────────────────────────
-    //
-    // The generic `flex_timepoint_inputs_generic<J>` instantiated at `Jet3` (one
-    // directional seed `dir`) must produce, in its `eps` channel, the exact
-    // `block10_pack_dir` content the hand `compute_survival_timepoint_directional_
-    // exact_from_cached` assembles by explicit chain rule:
-    //   (Jet3 eta).eps.g[u]   == eta_u_dir[u]    = D_dir(eta_u[u])
-    //   (Jet3 eta).eps.h[u,v] == eta_uv_dir[u,v] = D_dir(eta_uv[u,v])
-    // and likewise chi/d. At `Jet4` (two seeds u,v) the `eps_del` channel is the
-    // mixed second-directional `D_du D_dv` = `block10_pack_bi`. These gates build a
-    // REAL g-only survival family (no score-warp/link-dev, so every g order lives in
-    // the observed `(a,b)` pack — no channel jets), drive both paths off the SAME
-    // cached partition, and pin term-for-term. The h/w channel orders ARE covered:
-    // `flex_timepoint_inputs_ghw_jet3_jet4_match_hand_932` runs the SAME generic
-    // builder on a family with active score-warp AND link-dev primaries (their
-    // `(a,b)`-Taylor enters via the observed multivariate pack `observed_fixed_for`).
-
+    // ── §3c: real-family finite-difference and nested-dual gates ──────────────
     /// A minimal g-only survival marginal-slope family for the §3c directional gates:
     /// scalar score covariance, raw `z`, a 1-col marginal + 1-col logslope design, no
     /// score-warp/link-dev/wiggle/absorber. Deterministic synthetic data.
@@ -4494,7 +4468,7 @@ mod moment_engine_tests {
         }
     }
 
-    // ── §3c h/w channels: g+h+w directional/bidirectional gate ──────────────────
+    // ── §3c h/w channels: g+h+w scalar-FD gate ────────────────────────────────
     //
     // With score-warp(`h`) AND link-dev(`w`) active, the OBSERVED eta/chi carry the
     // `h`/`w` primaries, and their bidirectional derivatives involve the
@@ -4751,87 +4725,6 @@ mod moment_engine_tests {
             (o_eta, o_chi, o_d)
         };
 
-        let cmp_vec = |label: &str, jet: &Vec<f64>, hand: &[f64]| {
-            for u in 0..p {
-                assert!(
-                    (jet[u] - hand[u]).abs() <= 1e-6 * (1.0 + hand[u].abs()),
-                    "{label}[{u}] jet {} != hand {}",
-                    jet[u],
-                    hand[u]
-                );
-            }
-        };
-        let cmp_mat = |label: &str, jet: &Vec<f64>, hand: &Array2<f64>| {
-            for u in 0..p {
-                for v in 0..p {
-                    assert!(
-                        (jet[u * p + v] - hand[[u, v]]).abs() <= 1e-6 * (1.0 + hand[[u, v]].abs()),
-                        "{label}[{u},{v}] jet {} != hand {}",
-                        jet[u * p + v],
-                        hand[[u, v]]
-                    );
-                }
-            }
-        };
-
-        // ── Jet3 directional ──
-        let dir =
-            Array1::from_iter((0..p).map(|c| 0.1 + 0.05 * (c as f64) - 0.02 * ((c % 3) as f64)));
-        let hand_dir = family
-            .compute_survival_timepoint_directional_exact_from_cached(
-                row, &primary, q1, primary.q1, a1, g, bh, bw, &cached, &dir, true,
-            )
-            .expect("hand directional");
-        let base = family
-            .compute_survival_timepoint_exact_from_cached(
-                row, &primary, q1, primary.q1, a1, g, d1, bh, bw, o_infl, true, &cached,
-            )
-            .expect("hand base");
-
-        let template3 = Jet3::primary(0.0, usize::MAX, p, 0.0);
-        let b_jet3 = Jet3::primary(g, primary.g, p, dir[primary.g]);
-        let du3: Vec<Jet3> = (0..p).map(|u| Jet3::primary(0.0, u, p, dir[u])).collect();
-        let (eta3, chi3, d3) = flex_timepoint_inputs_generic(
-            &template3,
-            &b_jet3,
-            &du3,
-            a1,
-            d_check,
-            primary.g,
-            primary.infl,
-            primary.q1,
-            q1,
-            z_obs,
-            o_infl,
-            obs_coeff,
-            &obs_fixed,
-            &cells,
-        )
-        .expect("generic jet3");
-
-        // Base channel vs hand base (validates the h/w eta/chi Hessian too).
-        cmp_vec("eta_u", &eta3.base.g, base.eta_u.as_slice().unwrap());
-        cmp_mat("eta_uv", &eta3.base.h, &base.eta_uv);
-        cmp_vec("chi_u", &chi3.base.g, base.chi_u.as_slice().unwrap());
-        cmp_mat("chi_uv", &chi3.base.h, &base.chi_uv);
-        cmp_vec("d_u", &d3.base.g, base.d_u.as_slice().unwrap());
-        cmp_mat("d_uv", &d3.base.h, &base.d_uv);
-        // Directional channel vs hand directional.
-        cmp_vec(
-            "eta_u_dir",
-            &eta3.eps.g,
-            hand_dir.eta_u_dir.as_slice().unwrap(),
-        );
-        cmp_mat("eta_uv_dir", &eta3.eps.h, &hand_dir.eta_uv_dir);
-        cmp_vec(
-            "chi_u_dir",
-            &chi3.eps.g,
-            hand_dir.chi_u_dir.as_slice().unwrap(),
-        );
-        cmp_mat("chi_uv_dir", &chi3.eps.h, &hand_dir.chi_uv_dir);
-        cmp_vec("d_u_dir", &d3.eps.g, hand_dir.d_u_dir.as_slice().unwrap());
-        cmp_mat("d_uv_dir", &d3.eps.h, &hand_dir.d_uv_dir);
-
         // ── Jet4 bidirectional ──
         let dir1 =
             Array1::from_iter((0..p).map(|c| 0.12 + 0.04 * (c as f64) - 0.01 * ((c % 2) as f64)));
@@ -5008,341 +4901,6 @@ mod compiled_order2_oracle_tests {
                     close(g_out.h[k], f_hessian[k], &format!("hess[{k}]"));
                 }
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod hand_vs_jet_bench_tests {
-    //! #932 SPEED AUDIT: shipped value/grad/Hessian (the compiled
-    //! [`FlexOuterPlan`] order-two lowering on production ndarray views) vs the
-    //! ORIGINAL HAND probit-chain +
-    //! quotient-rule assembly it replaced (recovered verbatim from the pre-cutover
-    //! commit `b17785d2a~1`, `flex_sensitivity.rs`). Measures ns/row at
-    //! p∈{6,12,24}, asserts ≤1e-12 channel agreement, and quantifies the
-    //! transcendental fraction (the 2×logΦ + 2×neglog-deriv calls both paths share).
-    use super::*;
-    // Test-only oracle imports live INSIDE the test module — `#[cfg(test)]`
-    // on file-level use statements is scanner-banned (conditional imports).
-    use crate::bms::signed_probit_neglog_derivatives_up_to_fourth;
-    use crate::inference::probability::signed_probit_logcdf_and_mills_ratio;
-    use ndarray::{Array1, Array2};
-    use std::hint::black_box;
-    use std::time::Instant;
-
-    fn xorshift(state: &mut u64) -> f64 {
-        let mut x = *state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        *state = x;
-        let u = (x >> 11) as f64 / ((1u64 << 53) as f64);
-        2.0 * u - 1.0
-    }
-
-    /// The ORIGINAL HAND value/grad/Hessian assembly (verbatim from
-    /// `b17785d2a~1` `flex_sensitivity.rs`): sparse single-pass grad loop +
-    /// upper-triangle Hessian loop reading the timepoint `*_u`/`*_uv` ndarrays
-    /// directly (NO contiguous copy). Pays its own 2×logΦ + 2×neglog-deriv calls.
-    fn hand_vgh(row: &Row, p: usize) -> (f64, Array1<f64>, Array2<f64>) {
-        let Row {
-            eta0,
-            eta0_u,
-            eta0_uv,
-            eta1,
-            eta1_u,
-            eta1_uv,
-            chi1,
-            chi1_u,
-            chi1_uv,
-            d1,
-            d1_u,
-            d1_uv,
-            q1,
-            qd1,
-            wi,
-            di,
-            q1_idx,
-            qd1_idx,
-        } = row;
-        let (eta0, eta1, chi1, d1, q1, qd1, wi, di) =
-            (*eta0, *eta1, *chi1, *d1, *q1, *qd1, *wi, *di);
-        let (q1_idx, qd1_idx) = (*q1_idx, *qd1_idx);
-        let (log_surv0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
-        let (log_surv1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
-        let (entry_k1, entry_k2, _, _) =
-            signed_probit_neglog_derivatives_up_to_fourth(-eta0, -wi).unwrap();
-        let (exit_k1, exit_k2, _, _) =
-            signed_probit_neglog_derivatives_up_to_fourth(-eta1, wi * (1.0 - di)).unwrap();
-
-        let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
-        let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
-        let row_nll = wi
-            * (log_surv0
-                - (1.0 - di) * log_surv1
-                - di * log_phi_eta1
-                - di * chi1.ln()
-                - di * log_phi_q1
-                + di * d1.ln()
-                - di * qd1.ln());
-
-        let mut grad = Array1::<f64>::zeros(p);
-        let mut hess = Array2::<f64>::zeros((p, p));
-        let entry_u1 = -entry_k1;
-        let entry_u2 = entry_k2;
-        let exit_surv_u1 = -exit_k1;
-        let exit_surv_u2 = exit_k2;
-
-        for u in 0..p {
-            grad[u] += entry_u1 * eta0_u[u];
-            grad[u] += exit_surv_u1 * eta1_u[u];
-            grad[u] += wi * di * eta1 * eta1_u[u];
-            grad[u] -= wi * di * chi1_u[u] / chi1;
-            if u == q1_idx {
-                grad[u] += wi * di * q1;
-            }
-            grad[u] += wi * di * d1_u[u] / d1;
-            if u == qd1_idx {
-                grad[u] -= wi * di / qd1;
-            }
-        }
-
-        for u in 0..p {
-            for v in u..p {
-                let mut value = 0.0;
-                value += entry_u2 * eta0_u[u] * eta0_u[v] + entry_u1 * eta0_uv[[u, v]];
-                value += exit_surv_u2 * eta1_u[u] * eta1_u[v] + exit_surv_u1 * eta1_uv[[u, v]];
-                value += wi * di * (eta1_u[u] * eta1_u[v] + eta1 * eta1_uv[[u, v]]);
-                value -=
-                    wi * di * (chi1_uv[[u, v]] / chi1 - (chi1_u[u] * chi1_u[v]) / (chi1 * chi1));
-                if u == q1_idx && v == q1_idx {
-                    value += wi * di;
-                }
-                value += wi * di * (d1_uv[[u, v]] / d1 - (d1_u[u] * d1_u[v]) / (d1 * d1));
-                if u == qd1_idx && v == qd1_idx {
-                    value += wi * di / (qd1 * qd1);
-                }
-                hess[[u, v]] = value;
-                hess[[v, u]] = value;
-            }
-        }
-        (row_nll, grad, hess)
-    }
-
-    /// The shipped path: survival stacks plus direct-view compiled lowering of
-    /// the exact [`FlexOuterPlan`] used by the `want_hess` branch of
-    /// `flex_row_nll_value_grad_hess`).
-    fn jet_vgh(row: &Row, p: usize) -> (f64, Array1<f64>, Array2<f64>) {
-        let Row {
-            eta0,
-            eta0_u,
-            eta0_uv,
-            eta1,
-            eta1_u,
-            eta1_uv,
-            chi1,
-            chi1_u,
-            chi1_uv,
-            d1,
-            d1_u,
-            d1_uv,
-            q1,
-            qd1,
-            wi,
-            di,
-            q1_idx,
-            qd1_idx,
-        } = row;
-        let (eta0, eta1, chi1, d1, q1, qd1, wi, di) =
-            (*eta0, *eta1, *chi1, *d1, *q1, *qd1, *wi, *di);
-        let (q1_idx, qd1_idx) = (*q1_idx, *qd1_idx);
-        let surv0 = surv_stack(eta0).unwrap();
-        let surv1 = surv_stack(eta1).unwrap();
-        let plan = FlexOuterPlan::new(chi1, d1, qd1, surv0, surv1, wi, di);
-        let (row_value, row_gradient, row_hessian) = lower_flex_outer_plan_order2(
-            &plan,
-            FlexOrder2Inputs {
-                eta0: FlexOrder2View {
-                    value: eta0,
-                    gradient: eta0_u.view(),
-                    hessian: eta0_uv.view(),
-                },
-                eta1: FlexOrder2View {
-                    value: eta1,
-                    gradient: eta1_u.view(),
-                    hessian: eta1_uv.view(),
-                },
-                q1: (q1, q1_idx),
-                chi1: FlexOrder2View {
-                    value: chi1,
-                    gradient: chi1_u.view(),
-                    hessian: chi1_uv.view(),
-                },
-                d1: FlexOrder2View {
-                    value: d1,
-                    gradient: d1_u.view(),
-                    hessian: d1_uv.view(),
-                },
-                qd1: (qd1, qd1_idx),
-            },
-            p,
-        );
-        let value = row_value + wi * di * std::f64::consts::TAU.ln();
-        let grad = Array1::from(row_gradient);
-        let hess = Array2::from_shape_vec((p, p), row_hessian).unwrap();
-        (value, grad, hess)
-    }
-
-    /// One synthetic flex row: timepoint value/grad/Hessian tensors for the four
-    /// jet sources (`eta0`, `eta1`, `chi1`, `d1`) plus the scalar `q1`/`qd1`
-    /// values, their primary slots, and the row weight/event. Bundled into a
-    /// struct so the hand/jet kernels take one borrow instead of 19 positional
-    /// arguments.
-    struct Row {
-        eta0: f64,
-        eta0_u: Array1<f64>,
-        eta0_uv: Array2<f64>,
-        eta1: f64,
-        eta1_u: Array1<f64>,
-        eta1_uv: Array2<f64>,
-        chi1: f64,
-        chi1_u: Array1<f64>,
-        chi1_uv: Array2<f64>,
-        d1: f64,
-        d1_u: Array1<f64>,
-        d1_uv: Array2<f64>,
-        q1: f64,
-        qd1: f64,
-        wi: f64,
-        di: f64,
-        q1_idx: usize,
-        qd1_idx: usize,
-    }
-
-    fn make_row(p: usize, st: &mut u64) -> Row {
-        // Moderate η so logΦ / Mills are well-conditioned; χ,D strictly positive.
-        let eta0 = 0.4 * xorshift(st);
-        let eta1 = 0.4 * xorshift(st);
-        let chi1 = 1.5 + 0.4 * xorshift(st);
-        let d1 = 1.5 + 0.4 * xorshift(st);
-        let q1 = 0.8 + 0.3 * xorshift(st);
-        let qd1 = 1.2 + 0.3 * xorshift(st);
-        let wi = 0.7 + (xorshift(st) + 1.0).abs();
-        let di = if xorshift(st) > -0.3 { 1.0 } else { 0.0 };
-        let mk_g = |st: &mut u64| Array1::from_iter((0..p).map(|_| 0.5 * xorshift(st)));
-        let mk_h = |st: &mut u64| {
-            let mut h = Array2::<f64>::zeros((p, p));
-            for i in 0..p {
-                for j in i..p {
-                    let x = 0.3 * xorshift(st);
-                    h[[i, j]] = x;
-                    h[[j, i]] = x;
-                }
-            }
-            h
-        };
-        let e0g = mk_g(st);
-        let e0h = mk_h(st);
-        let e1g = mk_g(st);
-        let e1h = mk_h(st);
-        let cg = mk_g(st);
-        let chh = mk_h(st);
-        let dg = mk_g(st);
-        let dh = mk_h(st);
-        Row {
-            eta0,
-            eta0_u: e0g,
-            eta0_uv: e0h,
-            eta1,
-            eta1_u: e1g,
-            eta1_uv: e1h,
-            chi1,
-            chi1_u: cg,
-            chi1_uv: chh,
-            d1,
-            d1_u: dg,
-            d1_uv: dh,
-            q1,
-            qd1,
-            wi,
-            di,
-            q1_idx: p - 2,
-            qd1_idx: p - 1,
-        }
-    }
-
-    #[test]
-    fn hand_vs_jet_vgh_bitident_and_timing() {
-        for &p in &[6usize, 12, 24] {
-            let mut st = 0xA1B2_C3D4_E5F6_0718u64 ^ (p as u64).wrapping_mul(0x9E3779B97F4A7C15);
-            let mut max_diff = 0.0f64;
-            let mut rows: Vec<Row> = Vec::new();
-            for _ in 0..256 {
-                let r = make_row(p, &mut st);
-                let (h_v, h_g, h_h) = hand_vgh(&r, p);
-                let (j_v, j_g, j_h) = jet_vgh(&r, p);
-                max_diff = max_diff.max((h_v - j_v).abs());
-                for u in 0..p {
-                    max_diff = max_diff.max((h_g[u] - j_g[u]).abs());
-                    for v in 0..p {
-                        max_diff = max_diff.max((h_h[[u, v]] - j_h[[u, v]]).abs());
-                    }
-                }
-                rows.push(r);
-            }
-            assert!(
-                max_diff <= 1e-12,
-                "hand vs jet channel mismatch p={p}: max_diff={max_diff:.3e}"
-            );
-
-            let iters = 200_000usize / p;
-            let n = rows.len();
-            for r in &rows {
-                let (_, g, h) = hand_vgh(r, p);
-                black_box((g, h));
-                let (_, g, h) = jet_vgh(r, p);
-                black_box((g, h));
-            }
-
-            let t0 = Instant::now();
-            for k in 0..iters {
-                let r = &rows[k % n];
-                let out = hand_vgh(black_box(r), p);
-                black_box(out);
-            }
-            let hand_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
-
-            let t1 = Instant::now();
-            for k in 0..iters {
-                let r = &rows[k % n];
-                let out = jet_vgh(black_box(r), p);
-                black_box(out);
-            }
-            let jet_ns = t1.elapsed().as_nanos() as f64 / iters as f64;
-
-            let r = &rows[0];
-            let t2 = Instant::now();
-            for _ in 0..iters {
-                let (a, _) = signed_probit_logcdf_and_mills_ratio(black_box(-r.eta0));
-                let (b, _) = signed_probit_logcdf_and_mills_ratio(black_box(-r.eta1));
-                let c = signed_probit_neglog_derivatives_up_to_fourth(black_box(-r.eta0), -r.wi)
-                    .unwrap();
-                let d = signed_probit_neglog_derivatives_up_to_fourth(
-                    black_box(-r.eta1),
-                    r.wi * (1.0 - r.di),
-                )
-                .unwrap();
-                black_box((a, b, c, d));
-            }
-            let trans_ns = t2.elapsed().as_nanos() as f64 / iters as f64;
-
-            eprintln!(
-                "VGH-BENCH p={p:2}: hand={hand_ns:7.1} ns/row  jet={jet_ns:7.1} ns/row  \
-                 ratio_jet/hand={:.2}x  transcendental={trans_ns:6.1} ns ({:.0}% of hand)  \
-                 max_diff={max_diff:.1e}",
-                jet_ns / hand_ns,
-                100.0 * trans_ns / hand_ns,
-            );
         }
     }
 }
