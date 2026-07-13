@@ -553,15 +553,15 @@ fn residual_span_frame_is_the_production_hook_low_rank_and_spans_truth() {
         ..Default::default()
     };
     let iso_rows: Vec<usize> = (0..64).collect();
-    let got = residual_span_frame(iso.view(), &iso_rows, &tight).expect("runs");
+    let got = residual_span_frame(iso.view(), &iso_rows, &tight)
+        .expect("runs")
+        .expect("rank_max below ambient width must return a strict low-rank frame");
     // rank_max=4 < p=8 so a frame is still returned, but it must be a strict
     // low-rank projection (r <= 4), never the full width.
-    if let Some(f) = got {
-        assert!(
-            f.rank() <= 4 && f.rank() < 8,
-            "seam frame must stay strictly low-rank"
-        );
-    }
+    assert!(
+        got.rank() <= 4 && got.rank() < 8,
+        "seam frame must stay strictly low-rank"
+    );
 }
 
 #[test]

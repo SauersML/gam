@@ -5972,18 +5972,18 @@ fn heart_failure_structural_time_small() {
     }
     // Solve via direct inversion (2x2).
     let det = lhs[[0, 0]] * lhs[[1, 1]] - lhs[[0, 1]] * lhs[[1, 0]];
-    let delta = if det.abs() > 1e-30 {
-        let inv00 = lhs[[1, 1]] / det;
-        let inv01 = -lhs[[0, 1]] / det;
-        let inv10 = -lhs[[1, 0]] / det;
-        let inv11 = lhs[[0, 0]] / det;
-        array![
-            inv00 * grad[0] + inv01 * grad[1],
-            inv10 * grad[0] + inv11 * grad[1]
-        ]
-    } else {
-        Array1::zeros(p)
-    };
+    assert!(
+        det.abs() > 1e-30,
+        "heart-failure Newton fixture must have an invertible ridged Hessian; det={det}"
+    );
+    let inv00 = lhs[[1, 1]] / det;
+    let inv01 = -lhs[[0, 1]] / det;
+    let inv10 = -lhs[[1, 0]] / det;
+    let inv11 = lhs[[0, 0]] / det;
+    let delta = array![
+        inv00 * grad[0] + inv01 * grad[1],
+        inv10 * grad[0] + inv11 * grad[1]
+    ];
     assert!(
         delta.iter().all(|v| v.is_finite()),
         "Newton delta has non-finite entries: {:?}",

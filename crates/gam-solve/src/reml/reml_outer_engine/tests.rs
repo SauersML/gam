@@ -3416,7 +3416,7 @@ pub(crate) fn efs_log_step_from_grad_recovers_canonical_form() {
 
     // Asymptotic clamp on the lower side: ratio → 0⁺ ⇒ floor at -MAX.
     let s = efs_log_step_from_grad(1.0, 0.5 - 1e-30).expect("near-singular");
-    assert!((s - (-EFS_MAX_STEP)).abs() < 1e-12 || s == 0.5 * (-EFS_MAX_STEP) || s.is_finite());
+    assert!((s + EFS_MAX_STEP).abs() < 1e-12);
     assert!(s <= 0.0);
 
     // Pathological: q_eff ≤ 0, non-finite inputs.

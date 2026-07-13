@@ -2639,9 +2639,20 @@ mod tests {
         // Actually 1 - w*a = 1 - 1.0 = 0.0, so det < 1e-12 => regularised with eps=1e-6
         // (I - W A + eps) = 1e-6, so v = s / 1e-6 = 4e5
         // delta_eta = A * v = 0.5 * 4e5 = 2e5
-        // This is the regularised case; just check it doesn't panic and returns finite values.
-        assert!(result.eta_tilde[0][0].is_finite());
-        assert!(result.cook_distance[0].is_finite());
-        assert!(result.alo_variance[0][0].is_finite());
+        let expected_delta = 0.5 * s_val / ALO_LOCAL_BLOCK_RIDGE;
+        let expected_eta = 1.0 + expected_delta;
+        let expected_cook = w_val * expected_delta * expected_delta;
+        let expected_variance =
+            0.5 * 0.5 * w_val / (ALO_LOCAL_BLOCK_RIDGE * ALO_LOCAL_BLOCK_RIDGE);
+        for (got, expected, label) in [
+            (result.eta_tilde[0][0], expected_eta, "eta_tilde"),
+            (result.cook_distance[0], expected_cook, "cook_distance"),
+            (result.alo_variance[0][0], expected_variance, "alo_variance"),
+        ] {
+            assert!(
+                (got - expected).abs() <= 1e-12 * expected.abs().max(1.0),
+                "{label}: expected {expected}, got {got}"
+            );
+        }
     }
 }
