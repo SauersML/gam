@@ -5042,7 +5042,7 @@ fn normalized_rust_fragment(source: &str) -> String {
 
 #[derive(Debug, PartialEq, Eq)]
 struct RustCodeToken {
-    source: String,
+    lexeme: String,
     line_index: usize,
 }
 
@@ -5080,7 +5080,7 @@ fn rust_code_tokens(source: &str) -> Vec<RustCodeToken> {
                 start
                     + COMPOUND_PUNCTUATION
                         .iter()
-                        .find_map(|punctuation| {
+                        .find_map(|&punctuation| {
                             rest.starts_with(punctuation).then_some(punctuation.len())
                         })
                         .unwrap_or_else(|| {
@@ -5091,7 +5091,7 @@ fn rust_code_tokens(source: &str) -> Vec<RustCodeToken> {
                         })
             };
             tokens.push(RustCodeToken {
-                source: line[start..end].to_string(),
+                lexeme: line[start..end].to_string(),
                 line_index,
             });
             start = end;
@@ -5102,6 +5102,10 @@ fn rust_code_tokens(source: &str) -> Vec<RustCodeToken> {
 
 fn code_anchor_line_indices(source: &str, anchor: &str) -> Vec<usize> {
     let source_tokens = rust_code_tokens(source);
+    code_anchor_line_indices_in_tokens(&source_tokens, anchor)
+}
+
+fn code_anchor_line_indices_in_tokens(source_tokens: &[RustCodeToken], anchor: &str) -> Vec<usize> {
     let anchor_tokens = rust_code_tokens(anchor);
     if anchor_tokens.is_empty() {
         return Vec::new();
@@ -5112,7 +5116,7 @@ fn code_anchor_line_indices(source: &str, anchor: &str) -> Vec<usize> {
         if window
             .iter()
             .zip(&anchor_tokens)
-            .all(|(source, anchor)| source.source == anchor.source)
+            .all(|(source, anchor)| source.lexeme == anchor.lexeme)
         {
             let line_index = window[0].line_index;
             if lines.last() != Some(&line_index) {
@@ -5599,8 +5603,10 @@ fn enforce_production_derivative_specializations(root: &Path) {
             match fs::read_to_string(&production_path) {
                 Ok(source) => {
                     let test_mask = compute_test_mask(&source, Path::new(production.path));
+                    let source_tokens = rust_code_tokens(&source);
                     for anchor in production.anchors {
-                        let anchor_lines = code_anchor_line_indices(&source, anchor);
+                        let anchor_lines =
+                            code_anchor_line_indices_in_tokens(&source_tokens, anchor);
                         if anchor_lines.is_empty() {
                             violations.push(format!(
                                 "{} production anchor is missing from {}: {}",
@@ -5628,8 +5634,9 @@ fn enforce_production_derivative_specializations(root: &Path) {
             let pin_path = root.join(pin.path);
             match fs::read_to_string(&pin_path) {
                 Ok(source) => {
+                    let source_tokens = rust_code_tokens(&source);
                     for anchor in pin.anchors {
-                        if code_anchor_line_indices(&source, anchor).is_empty() {
+                        if code_anchor_line_indices_in_tokens(&source_tokens, anchor).is_empty() {
                             violations.push(format!(
                                 "{} registered parity pin is missing from {}: {}",
                                 specialization.family, pin.path, anchor

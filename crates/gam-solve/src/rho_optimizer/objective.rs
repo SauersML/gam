@@ -381,6 +381,17 @@ pub trait OuterObjective {
         Ok(None)
     }
 
+    /// Optional analytic evaluation order that must own the final installed
+    /// objective state, independently of the solver plan that found `rho`.
+    ///
+    /// The default follows the solver (`EFS` finalizes through `eval_efs`,
+    /// BFGS through first order, ARC through second order). Stateful profiled
+    /// objectives may override this when only one evaluator produces the
+    /// ownership payload consumed by fit assembly.
+    fn terminal_eval_order(&self) -> Option<OuterEvalOrder> {
+        None
+    }
+
     /// Re-install the selected outer result into the mutable objective before
     /// callers consume objective-owned fitted state. Optimizers may evaluate
     /// rejected trial points after the best point was found; without this final
@@ -395,14 +406,14 @@ pub trait OuterObjective {
             "[OUTER] finalize: re-installing best rho into the objective (solver {:?})",
             plan.solver
         );
-        match plan.solver {
-            Solver::Efs | Solver::HybridEfs => self.eval_efs(rho).map(|_| ()),
-            Solver::Bfgs => self
-                .eval_with_order(rho, OuterEvalOrder::ValueAndGradient)
-                .map(|_| ()),
-            Solver::Arc => self
-                .eval_with_order(rho, OuterEvalOrder::ValueGradientHessian)
-                .map(|_| ()),
+        let order = self.terminal_eval_order().or(match plan.solver {
+            Solver::Efs | Solver::HybridEfs => None,
+            Solver::Bfgs => Some(OuterEvalOrder::ValueAndGradient),
+            Solver::Arc => Some(OuterEvalOrder::ValueGradientHessian),
+        });
+        match order {
+            Some(order) => self.eval_with_order(rho, order).map(|_| ()),
+            None => self.eval_efs(rho).map(|_| ()),
         }
     }
 }
@@ -768,6 +779,10 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         self.inner.allow_continuation_prewarm()
     }
 
+    fn terminal_eval_order(&self) -> Option<OuterEvalOrder> {
+        self.inner.terminal_eval_order()
+    }
+
     fn reactive_domain_scalar_contract(
         &self,
     ) -> Result<Option<crate::continuation_path::ContinuationScalarContract>, EstimationError> {
@@ -845,6 +860,9 @@ pub struct ClosureObjective<
     /// Optional inner-state seeding closure. Objectives with PIRLS / Newton
     /// inner state install cached β here before the first outer eval.
     pub(crate) seed_fn: Option<Fseed>,
+    /// Analytic evaluator that must install the terminal owned state even when
+    /// the selected optimization plan itself used EFS.
+    pub(crate) terminal_eval_order: Option<OuterEvalOrder>,
     /// Whether a seed hook should also opt the objective into generic
     /// continuation pre-warm. High-dimensional REML keeps the seed hook for
     /// cache/warm-start replay but declines the expensive rho-anneal pre-pass.
@@ -941,6 +959,10 @@ where
         self.continuation_prewarm && self.seed_fn.is_some()
     }
 
+    fn terminal_eval_order(&self) -> Option<OuterEvalOrder> {
+        self.terminal_eval_order
+    }
+
     fn reset(&mut self) {
         if let Some(f) = self.reset_fn.as_mut() {
             f(&mut self.state);
@@ -960,6 +982,13 @@ impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs,
         Fpolish: FnMut(&mut S) -> bool + 'static,
     {
         self.exact_polish_fn = Some(Box::new(transition));
+        self
+    }
+
+    /// Force final state installation through one analytic evaluator order.
+    /// Search-time solver selection remains unchanged.
+    pub fn with_terminal_eval_order(mut self, order: OuterEvalOrder) -> Self {
+        self.terminal_eval_order = Some(order);
         self
     }
 }
@@ -1001,6 +1030,7 @@ where
             exact_polish_fn: self.exact_polish_fn,
             screening_proxy_fn: self.screening_proxy_fn,
             seed_fn: Some(seed_fn),
+            terminal_eval_order: self.terminal_eval_order,
             continuation_prewarm: self.continuation_prewarm,
         }
     }
@@ -1261,6 +1291,10 @@ impl<'a> CanonicalizedObjective<'a> {
 impl<'a> OuterObjective for CanonicalizedObjective<'a> {
     fn capability(&self) -> OuterCapability {
         self.inner.capability()
+    }
+
+    fn terminal_eval_order(&self) -> Option<OuterEvalOrder> {
+        self.inner.terminal_eval_order()
     }
 
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {

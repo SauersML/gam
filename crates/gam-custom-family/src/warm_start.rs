@@ -977,16 +977,28 @@ impl CustomOuterState {
         self.terminal_mode = None;
     }
 
+    /// Begin one derivative-bearing outer evaluation transaction.
+    ///
+    /// Clearing happens before any fallible work. Only
+    /// [`Self::install_terminal_mode`] commits a replacement, so every error or
+    /// infeasible return leaves the state empty rather than exposing an older
+    /// coefficient basin as terminal evidence.
+    pub(crate) fn begin_terminal_evaluation(&mut self) {
+        self.terminal_mode = None;
+    }
+
     pub(crate) fn install_terminal_mode(
         &mut self,
         theta: &Array1<f64>,
         objective: f64,
+        fit_objective: f64,
         gradient: &Array1<f64>,
         mode: CustomFamilyOwnedMode,
     ) {
         self.terminal_mode = Some(CustomFamilyTerminalMode {
             theta: theta.clone(),
             objective,
+            fit_objective,
             gradient: gradient.clone(),
             mode,
         });
@@ -1028,7 +1040,11 @@ impl CustomOuterState {
 /// exact evaluator state before fit assembly consumes it.
 pub(crate) struct CustomFamilyTerminalMode {
     pub(crate) theta: Array1<f64>,
+    /// Certified outer objective, including the labeled rho prior.
     pub(crate) objective: f64,
+    /// Same-evaluation profile objective reported on the public fit, excluding
+    /// the rho prior by API contract.
+    pub(crate) fit_objective: f64,
     pub(crate) gradient: Array1<f64>,
     pub(crate) mode: CustomFamilyOwnedMode,
 }

@@ -1214,6 +1214,7 @@ mod tests {
                     &Array1<f64>,
                 ) -> Result<crate::rho_optimizer::SeedOutcome, EstimationError>,
             >,
+            terminal_eval_order: None,
             continuation_prewarm: true,
         };
 
@@ -1284,6 +1285,7 @@ mod tests {
                     &Array1<f64>,
                 ) -> Result<crate::rho_optimizer::SeedOutcome, EstimationError>,
             >,
+            terminal_eval_order: None,
             continuation_prewarm: true,
         };
 

@@ -574,6 +574,7 @@ impl OuterProblem {
             exact_polish_fn: None,
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
+            terminal_eval_order: None,
             continuation_prewarm: self.continuation_prewarm,
         }
     }
@@ -612,6 +613,7 @@ impl OuterProblem {
             exact_polish_fn: None,
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
+            terminal_eval_order: None,
             continuation_prewarm: self.continuation_prewarm,
         }
     }
@@ -652,6 +654,7 @@ impl OuterProblem {
             exact_polish_fn: None,
             screening_proxy_fn: Some(screening_proxy_fn),
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
+            terminal_eval_order: None,
             continuation_prewarm: self.continuation_prewarm,
         }
     }

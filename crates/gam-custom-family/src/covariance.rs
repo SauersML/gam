@@ -1367,11 +1367,15 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
                     hessian.ncols(),
                 ));
             }
-            let working_len = states.first().map(|state| state.eta.len()).unwrap_or(0);
             (
                 hessian.clone(),
-                Array1::zeros(working_len),
-                Array1::zeros(working_len),
+                // An owned returned-beta Hessian is exact coefficient-space
+                // curvature, not an IRLS pseudo-observation measure. Empty
+                // vectors truthfully encode that no working-data evidence was
+                // retained; row-length zero weights would fabricate an ALO
+                // system with a different likelihood geometry.
+                Array1::zeros(0),
+                Array1::zeros(0),
             )
         } else {
             let eval = family.evaluate(states).ok();
@@ -1400,8 +1404,7 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
                     // downstream IRLS covariance path is unused for these
                     // families (they report dispersion = 1). Match the joint
                     // multi-block branch's zero-length convention.
-                    let working_len = states.first().map(|state| state.eta.len()).unwrap_or(0);
-                    (h, Array1::zeros(working_len), Array1::zeros(working_len))
+                    (h, Array1::zeros(0), Array1::zeros(0))
                 }
                 _ => return Ok(None),
             }
@@ -1510,7 +1513,6 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
     {
         bundle.add_to_matrix(&mut h);
     }
-    let working_len = states.first().map(|state| state.eta.len()).unwrap_or(0);
     Ok(Some(FitGeometry {
         coefficient_gauge: gam_problem::gauge::Gauge::identity(
             &specs
@@ -1519,8 +1521,11 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
                 .collect::<Vec<_>>(),
         ),
         penalized_hessian: h.into(),
-        working_weights: Array1::zeros(working_len),
-        working_response: Array1::zeros(working_len),
+        // Joint exact-Newton curvature carries no per-row IRLS pseudo-data.
+        // Empty is the explicit unavailable representation; n zeros would be
+        // a fabricated likelihood measure.
+        working_weights: Array1::zeros(0),
+        working_response: Array1::zeros(0),
     }))
 }
 

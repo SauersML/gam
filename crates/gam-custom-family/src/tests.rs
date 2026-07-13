@@ -4622,35 +4622,98 @@ pub(crate) fn owned_mode_finalizer_preserves_prior_and_active_jeffreys_without_r
     let evaluations_before_finalization = family.evaluations.load(Ordering::Relaxed);
 
     let objective = profiled.objective;
-    let mode = CustomFamilyOwnedMode {
-        objective,
-        rho: rho.clone(),
-        inner: profiled.inner,
-    };
-    let certified_outer = certified_test_outer(rho.clone(), objective);
-    let fit = fit_custom_family_fixed_log_lambdas_from_owned_mode(
-        &family,
-        &specs,
-        &options,
-        mode,
-        &rho,
-        &certified_outer,
+    let fit_objective = inner_penalized_objective(
+        &profiled.inner,
+        include_exact_newton_logdet_h(&family, &options),
+        include_exact_newton_logdet_s(&family, &options),
+        "prior-bearing terminal test mode",
     )
-    .expect("the exact active-Jeffreys profile must retain its outer certificate");
+    .expect("owned-inner fit objective");
+    assert_eq!(fit_objective.to_bits(), flat.objective.to_bits());
+    let terminal = CustomFamilyTerminalMode {
+        theta: rho.clone(),
+        objective,
+        fit_objective,
+        gradient: profiled.gradient,
+        mode: CustomFamilyOwnedMode {
+            objective,
+            rho: rho.clone(),
+            inner: profiled.inner,
+        },
+    };
+    let certified_outer = certified_test_outer(rho, objective);
+    let (_mode, bound_fit_objective) = bind_certified_custom_family_terminal_mode(
+        terminal,
+        &certified_outer,
+        &prior,
+    )
+    .expect("the prior-bearing terminal identity must bind without replay");
 
     assert_eq!(
-        fit.penalized_objective.to_bits(),
-        certified_outer.final_value().to_bits()
+        bound_fit_objective.to_bits(),
+        flat.objective.to_bits(),
+        "the public fit objective must exclude the labeled rho prior",
+    );
+    assert_eq!(
+        certified_outer.final_value().to_bits(),
+        objective.to_bits(),
+        "the optimizer certificate must retain the prior-bearing outer objective",
     );
     assert_eq!(
         family.evaluations.load(Ordering::Relaxed),
         evaluations_before_finalization,
-        "owned-mode finalization must not call the family evaluator again",
+        "terminal identity binding must not call the family evaluator again",
     );
+}
+
+#[test]
+pub(crate) fn failed_terminal_probe_clears_stale_owned_mode() {
+    let specs = vec![ParameterBlockSpec {
+        name: "failed_terminal_probe".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let theta = array![0.0];
+    let evaluated = evaluate_custom_family_joint_hyper_owned(
+        &OneBlockIdentityFamily,
+        &specs,
+        &BlockwiseFitOptions {
+            use_remlobjective: false,
+            compute_covariance: false,
+            ..BlockwiseFitOptions::default()
+        },
+        &theta,
+        &[vec![]],
+        None,
+        EvalMode::ValueOnly,
+    )
+    .expect("stale terminal mode fixture");
+    let objective = evaluated.result.objective;
+    let mode = CustomFamilyOwnedMode {
+        objective,
+        rho: theta.clone(),
+        inner: evaluated.mode.inner,
+    };
+    let mut state = CustomOuterState::new(None);
+    state.install_terminal_mode(&theta, objective, objective, &array![0.0], mode);
+    assert!(state.terminal_mode.is_some());
+
+    // This is the transaction boundary used immediately before every
+    // derivative-bearing outer probe. A subsequent Err/infeasible return does
+    // not reinstall anything, so the previous successful basin cannot leak
+    // into certified assembly.
+    state.begin_terminal_evaluation();
     assert!(
-        fit.convergence_evidence()
-            .outer_certificate()
-            .is_some_and(|certificate| certificate.certifies())
+        state.terminal_mode.is_none(),
+        "a failed derivative probe must leave no stale terminal mode",
     );
 }
 

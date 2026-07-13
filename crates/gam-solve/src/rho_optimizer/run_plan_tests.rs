@@ -1497,10 +1497,72 @@ fn closure_objective_delegates() {
         exact_polish_fn: None,
         screening_proxy_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
+        terminal_eval_order: None,
         continuation_prewarm: true,
     };
     assert_eq!(obj.capability().n_params, 1);
     assert_eq!(obj.eval_cost(&Array1::zeros(1)).unwrap(), 1.0);
+}
+
+#[test]
+fn closure_terminal_order_overrides_efs_finalization() {
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable);
+    let mut obj = problem
+        .build_objective_with_eval_order(
+            (Vec::<OuterEvalOrder>::new(), 0usize),
+            |_, _: &Array1<f64>| Ok(0.0),
+            |_, _: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: 0.0,
+                    gradient: array![0.0],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: None,
+                })
+            },
+            |state: &mut (Vec<OuterEvalOrder>, usize),
+             _: &Array1<f64>,
+             order: OuterEvalOrder| {
+                state.0.push(order);
+                Ok(OuterEval {
+                    cost: 0.0,
+                    gradient: array![0.0],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut (Vec<OuterEvalOrder>, usize))>,
+            Some(
+                |state: &mut (Vec<OuterEvalOrder>, usize), _: &Array1<f64>| {
+                    state.1 += 1;
+                    Ok(EfsEval {
+                        cost: 0.0,
+                        steps: vec![0.0],
+                        beta: None,
+                        psi_gradient: None,
+                        psi_indices: None,
+                        inner_hessian_scale: None,
+                        logdet_enclosure_gap: None,
+                        consecutive_restored_incumbents: None,
+                    })
+                },
+            ),
+        )
+        .with_terminal_eval_order(OuterEvalOrder::ValueAndGradient);
+    let efs_plan = OuterPlan {
+        solver: Solver::Efs,
+        hessian_source: HessianSource::None,
+    };
+
+    obj.finalize_outer_result(&array![0.0], &efs_plan)
+        .expect("terminal analytic installation");
+
+    assert_eq!(obj.state.0, vec![OuterEvalOrder::ValueAndGradient]);
+    assert_eq!(
+        obj.state.1, 0,
+        "the EFS search evaluator must not overwrite analytic terminal ownership",
+    );
 }
 
 #[test]
@@ -1535,6 +1597,7 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
         exact_polish_fn: None,
         screening_proxy_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
+        terminal_eval_order: None,
         continuation_prewarm: true,
     }
     .with_seed_inner_state(|state: &mut Vec<f64>, beta: &Array1<f64>| {
@@ -1603,6 +1666,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         exact_polish_fn: None,
         screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
+        terminal_eval_order: None,
         continuation_prewarm: true,
     };
     let mut bridge = OuterFixedPointBridge {
@@ -1682,6 +1746,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         exact_polish_fn: None,
         screening_proxy_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
+        terminal_eval_order: None,
         continuation_prewarm: true,
     };
     let mut bridge = OuterFixedPointBridge {
