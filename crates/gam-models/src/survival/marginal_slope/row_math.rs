@@ -865,7 +865,7 @@ where
             *derivative *= scale;
         }
         Ok(S::affine_composed_sum(
-            &[eta1, eta0, eta1, adjusted_derivative],
+            &[eta1.clone(), eta0, eta1, adjusted_derivative],
             &[-1.0, -1.0, 1.0, 1.0],
             &[exit_stack, entry_stack, event_stack, time_stack],
             dimension,
