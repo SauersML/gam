@@ -1265,16 +1265,15 @@ pub(crate) fn run_outer_with_plan(
                             }
                         }
                         Err(ArcError::ObjectiveFailed { message })
-                            if message == COST_STALL_CONVERGED_SENTINEL =>
+                            if message == ARC_INFEASIBLE_STALL_SENTINEL =>
                         {
-                            // The bridge's cost-stall guard halted ARC because
-                            // the REML score stopped decreasing (#1089/#1237).
-                            // Rebuild the outer result from the published best
-                            // iterate; the converged flag rides on the guard's
-                            // bound-projected stationarity test (`exit.converged`)
-                            // exactly as the BFGS branch does. A non-converged
-                            // cost-stall flows into the same best-so-far
-                            // non-convergence reporting as MaxIterations.
+                            // ARC received a consecutive run of non-finite
+                            // probes, so there was no current Hessian with which
+                            // to certify the stored best. Rebuild a checkpoint
+                            // from that best, but never report bridge-level
+                            // convergence: only ARC's synchronized projected-
+                            // gradient + reduced-Hessian gate can own a finite
+                            // second-order convergence verdict (#979).
                             let exit = cost_stall_exit.lock().ok().and_then(|mut slot| slot.take());
                             match exit {
                                 Some(exit) => {
@@ -1283,7 +1282,7 @@ pub(crate) fn run_outer_with_plan(
                                         exit.value,
                                         exit.iterations,
                                         Some(exit.grad_norm),
-                                        exit.converged,
+                                        false,
                                         *the_plan,
                                     );
                                     // #2241 — carry the guard's measured probe-
@@ -1291,22 +1290,16 @@ pub(crate) fn run_outer_with_plan(
                                     // certificate honors the same flat band the
                                     // guard certified in the loop.
                                     result.flat_noise_grad_bound = exit.noise_grad_bound;
-                                    // Preserve HOW ARC stopped even when the
-                                    // guard already certified the stalled score
-                                    // surface. The mandatory final analytic
-                                    // certificate uses this provenance to apply
-                                    // the same derived score-relative flat-valley
-                                    // bound as the guard. Dropping the marker on
-                                    // `exit.converged=true` made the final pass
-                                    // silently revert to the much tighter raw
-                                    // solver bound and reject the identical
-                                    // point (#1689: |g|=.042 on |V|≈982).
+                                    // Preserve HOW ARC stopped so the mandatory
+                                    // final analytic certificate can report the
+                                    // checkpoint provenance without confusing it
+                                    // with an optimizer convergence result.
                                     result.operator_stop_reason =
                                         Some(OperatorTrustRegionStopReason::CostStallFlatValley);
                                     Ok(result)
                                 }
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
-                                    "ARC cost-stall sentinel fired without a published best \
+                                    "ARC infeasible-stall sentinel fired without a published best \
                                      iterate ({context})"
                                 ))),
                             }

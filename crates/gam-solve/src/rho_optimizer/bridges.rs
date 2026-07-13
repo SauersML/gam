@@ -151,6 +151,14 @@ pub(crate) const PROBE_REFUSAL_FATAL_SENTINEL: &str = "OUTER_PROBE_REFUSAL_FATAL
 /// stationary optimum, and is reported `converged = false`.
 pub(crate) const COST_STALL_CONVERGED_SENTINEL: &str = "OUTER_COST_STALL_CONVERGED";
 
+/// Sentinel used only when ARC has no finite current sample to hand to its
+/// second-order convergence gate. A consecutive run of infeasible probes may
+/// stop the trajectory at its best feasible checkpoint, but it can never
+/// certify that checkpoint as converged: the bridge does not have a synchronized
+/// Hessian there. The runner therefore always maps this sentinel to a
+/// non-converged result.
+pub(crate) const ARC_INFEASIBLE_STALL_SENTINEL: &str = "OUTER_ARC_INFEASIBLE_STALL";
+
 /// Verdict produced by folding one accepted outer iterate into
 /// [`CostStallGuard::observe`].
 pub(crate) enum CostStallVerdict {
@@ -859,6 +867,34 @@ impl CostStallGuard {
                 // for a running best-so-far snapshot (#2241).
                 noise_grad_bound: None,
             });
+        }
+    }
+
+    /// A finite analytic second-order sample must reach ARC's synchronized
+    /// projected-gradient + reduced-Hessian convergence gate. The generic
+    /// cost-stall guard may still track the best feasible iterate, but it cannot
+    /// halt the finite path from a first-order verdict. Reset only the finite
+    /// stall window and revoke the provisional published convergence label;
+    /// retain the best/recent evidence for budget-exhaustion recovery.
+    fn defer_finite_second_order_stall(&mut self) {
+        self.no_improve_streak = 0;
+        if let Ok(mut slot) = self.exit.lock()
+            && let Some(exit) = slot.as_mut()
+        {
+            exit.converged = false;
+            exit.noise_grad_bound = None;
+        }
+    }
+
+    /// An infeasible ARC probe carries no Hessian. Even when the generic guard's
+    /// projected-gradient band classifies the stored best as stationary, the
+    /// early-stop result is only a checkpoint until the mandatory outer
+    /// certificate re-evaluates it with exact curvature.
+    fn revoke_published_convergence(&mut self) {
+        if let Ok(mut slot) = self.exit.lock()
+            && let Some(exit) = slot.as_mut()
+        {
+            exit.converged = false;
         }
     }
 }
@@ -1706,8 +1742,9 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
 }
 
 impl OuterSecondOrderBridge<'_> {
-    /// Fold one ARC oracle eval `(ρ, cost, grad)` into the cost-stall guard,
-    /// returning the `Fatal` cost-stall sentinel when the guard halts the loop.
+    /// Fold one finite ARC oracle eval `(ρ, cost, grad)` into the cost-stall
+    /// guard without allowing that first-order guard to halt the second-order
+    /// solver.
     ///
     /// Cost-stall halt (#1089/#1237). `opt::Arc` evaluates the (value, gradient,
     /// Hessian) triple at every trial point — accepted or rejected — through
@@ -1722,14 +1759,12 @@ impl OuterSecondOrderBridge<'_> {
     /// direction with a persistent out-of-bounds ∂V/∂ρ is KKT-stationary even
     /// though its raw gradient never vanishes. A trial that beats the best cost
     /// resets the streak, so genuine descent never trips the halt.
-    fn observe_cost_stall(
-        &mut self,
-        x: &Array1<f64>,
-        eval: &OuterEval,
-    ) -> Option<ObjectiveEvalError> {
+    fn observe_cost_stall(&mut self, x: &Array1<f64>, eval: &OuterEval) {
         let bounds = self.cost_stall_bounds.clone();
         let separation_bound_stationary = {
-            let guard = self.cost_stall.as_ref()?;
+            let Some(guard) = self.cost_stall.as_ref() else {
+                return;
+            };
             lower_bound_outward_active_count(
                 x,
                 &eval.gradient,
@@ -1742,7 +1777,9 @@ impl OuterSecondOrderBridge<'_> {
         // solve at the λ→0 ridge reports a half-fit cost the guard must not adopt
         // as best-so-far. `None` (no feedback) defaults to `true`.
         let inner_converged = inner_solve_converged(self.outer_inner_cap.as_ref());
-        let guard = self.cost_stall.as_mut()?;
+        let Some(guard) = self.cost_stall.as_mut() else {
+            return;
+        };
         let projected_g_norm = projected_gradient_norm(x, &eval.gradient, bounds.as_ref());
         let verdict = if separation_bound_stationary {
             // #1426: certify the constrained-stationary fast-path with the REAL
@@ -1761,7 +1798,7 @@ impl OuterSecondOrderBridge<'_> {
             guard.observe(x, eval.cost, projected_g_norm, inner_converged)
         };
         match verdict {
-            CostStallVerdict::Continue => None,
+            CostStallVerdict::Continue => {}
             CostStallVerdict::StuckKeepDescending {
                 residual_grad_norm,
                 escape_threshold,
@@ -1788,40 +1825,36 @@ impl OuterSecondOrderBridge<'_> {
                     STUCK_STALL_MAX_ESCAPES,
                     guard.best_value,
                 );
-                None
             }
             CostStallVerdict::Converged => {
                 log::info!(
-                    "[OUTER] ARC cost-stall convergence: REML objective improved < {:.3e} \
-                     (relative) over {} consecutive outer steps AND the projected gradient \
-                     cleared the outer tolerance (|g|={:.3e} <= {:.3e}); accepting best-so-far \
-                     as a stationary optimum (value={:.6e}).",
+                    "[OUTER] ARC finite cost stall deferred to exact second-order convergence: \
+                     REML objective improved < {:.3e} (relative) over {} consecutive outer \
+                     steps and the stored best projected gradient is small (|g|={:.3e} <= \
+                     {:.3e}), but only ARC owns the synchronized reduced-Hessian certificate \
+                     (value={:.6e}).",
                     guard.rel_tol,
                     guard.window,
                     guard.best_grad_norm,
                     guard.grad_threshold,
                     guard.best_value,
                 );
-                Some(ObjectiveEvalError::Fatal {
-                    message: COST_STALL_CONVERGED_SENTINEL.to_string(),
-                })
+                guard.defer_finite_second_order_stall();
             }
             CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
                 log::warn!(
-                    "[OUTER] ARC cost-stall FLAT-VALLEY STALL: REML objective improved < {:.3e} \
-                     (relative) over {} consecutive outer steps but the projected gradient is \
-                     still ABOVE the outer tolerance (|g|={:.3e} > {:.3e}); halting on a \
-                     weakly-identified ρ valley floor and reporting NON-CONVERGED (residual \
-                     outer non-stationarity, value={:.6e}).",
+                    "[OUTER] ARC finite cost stall deferred: REML objective improved < {:.3e} \
+                     (relative) over {} consecutive outer steps but the stored best projected \
+                     gradient remains above tolerance (|g|={:.3e} > {:.3e}). Returning the \
+                     current finite gradient + Hessian to ARC instead of halting at a stale \
+                     best point (value={:.6e}).",
                     guard.rel_tol,
                     guard.window,
                     residual_grad_norm,
                     guard.grad_threshold,
                     guard.best_value,
                 );
-                Some(ObjectiveEvalError::Fatal {
-                    message: COST_STALL_CONVERGED_SENTINEL.to_string(),
-                })
+                guard.defer_finite_second_order_stall();
             }
         }
     }
@@ -1856,18 +1889,19 @@ impl OuterSecondOrderBridge<'_> {
                 None
             }
             CostStallVerdict::Converged => {
-                log::info!(
-                    "[OUTER] ARC cost-stall convergence (infeasible run): {} consecutive \
-                     infeasible λ→0 trials after the best feasible iterate, whose projected \
-                     gradient cleared the outer tolerance (|g|={:.3e} <= {:.3e}); accepting \
-                     best feasible as a stationary optimum (value={:.6e}).",
+                log::warn!(
+                    "[OUTER] ARC infeasible-probe stall: {} consecutive infeasible λ→0 trials \
+                     after the best feasible iterate. Its stored projected gradient is small \
+                     (|g|={:.3e} <= {:.3e}), but no synchronized Hessian is available here; \
+                     halting only as a NON-CONVERGED checkpoint (value={:.6e}).",
                     guard.window,
                     guard.best_grad_norm,
                     guard.grad_threshold,
                     guard.best_value,
                 );
+                guard.revoke_published_convergence();
                 Some(ObjectiveEvalError::Fatal {
-                    message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+                    message: ARC_INFEASIBLE_STALL_SENTINEL.to_string(),
                 })
             }
             CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
@@ -1881,8 +1915,9 @@ impl OuterSecondOrderBridge<'_> {
                     guard.grad_threshold,
                     guard.best_value,
                 );
+                guard.revoke_published_convergence();
                 Some(ObjectiveEvalError::Fatal {
-                    message: COST_STALL_CONVERGED_SENTINEL.to_string(),
+                    message: ARC_INFEASIBLE_STALL_SENTINEL.to_string(),
                 })
             }
         }
@@ -1986,13 +2021,11 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                 .collect::<Vec<_>>()
                 .join(","),
         );
-        // Cost-stall halt BEFORE the (possibly expensive) Hessian build: ARC's
-        // per-iterate oracle reaches here, so this is where the near-separable
-        // multinomial cycling is caught and certified (#1237). See
-        // `observe_cost_stall`.
-        if let Some(err) = self.observe_cost_stall(x, &eval) {
-            return Err(err);
-        }
+        // Observe finite cost progress, but never let this first-order guard
+        // halt a second-order route. ARC must receive this exact sample so its
+        // projected-gradient + reduced-Hessian gate can either certify a mode
+        // or exploit negative curvature (#979).
+        self.observe_cost_stall(x, &eval);
         let hessian = build_bridge_hessian_for_source(
             self.hessian_source,
             eval.hessian,

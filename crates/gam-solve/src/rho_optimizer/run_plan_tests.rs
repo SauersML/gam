@@ -1971,7 +1971,7 @@ fn analytic_route_unavailable_hessian_is_fatal() {
 /// its raw gradient never vanishes. This drives the ARC bridge directly (no
 /// 380s end-to-end fit) and asserts the stall is reached and certified.
 #[test]
-fn arc_bridge_cost_stall_certifies_at_bound_separation() {
+fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
     // A flat objective at the lower bound `rho = -10` whose raw gradient is a
     // constant `g = +1`: its descent step `-g = -1` points further DOWN, out of
     // the feasible box, so under the corrected KKT projection (#1074, a14b71220)
@@ -2030,36 +2030,78 @@ fn arc_bridge_cost_stall_certifies_at_bound_separation() {
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
     };
     // Hammer eval_hessian at the lower bound — the ARC per-iterate oracle path.
-    // The guard tolerates the first `COST_STALL_WINDOW` no-improve steps, then
-    // halts with the sentinel.
-    let mut sentinel_fired = false;
+    // Every finite sample, including the one that fills the stall window, must
+    // retain its Hessian so ARC owns the convergence verdict.
     for _ in 0..(COST_STALL_WINDOW + 2) {
-        match SecondOrderObjective::eval_hessian(&mut bridge, &lo) {
-            Ok(_) => {}
-            Err(ObjectiveEvalError::Fatal { message }) => {
-                assert_eq!(
-                    message, COST_STALL_CONVERGED_SENTINEL,
-                    "ARC cost-stall must halt via the shared convergence sentinel"
-                );
-                sentinel_fired = true;
-                break;
-            }
-            Err(other) => panic!("unexpected ARC bridge error: {other:?}"),
-        }
+        let sample = SecondOrderObjective::eval_hessian(&mut bridge, &lo)
+            .expect("finite ARC stall sample must reach the second-order solver");
+        assert_eq!(sample.hessian, Some(array![[1.0]]));
     }
-    assert!(
-        sentinel_fired,
-        "ARC bridge must halt the cost-stall valley within {} evals (separation never settles otherwise)",
-        COST_STALL_WINDOW + 2
-    );
     let published = exit.lock().unwrap().take().expect("best iterate published");
     assert!(
-        published.converged,
-        "an at-bound stall with a ZERO projected KKT residual must certify CONVERGED \
-         (raw |g|=1 is the out-of-bounds separation gradient, not non-stationarity)"
+        !published.converged,
+        "the bridge may retain a recovery checkpoint but cannot certify finite \
+         second-order convergence before ARC checks reduced curvature"
     );
     assert_eq!(published.rho, lo, "best iterate is the bound-pinned ρ");
     assert_eq!(published.value, 1.0);
+}
+
+/// #979: a finite cost/gradient stall at an interior strict saddle must never
+/// intercept the analytic Hessian. ARC needs the negative eigenvalue to take its
+/// cubic hard-case step; a first-order bridge sentinel would strand the search at
+/// the same indefinite point later rejected by final certification.
+#[test]
+fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
+    let point = array![0.0];
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Either);
+    let mut obj = problem.build_objective_with_eval_order(
+        (),
+        |_: &mut (), _: &Array1<f64>| Ok(1.0),
+        |_: &mut (), _: &Array1<f64>| {
+            Err(EstimationError::InvalidInput(
+                "legacy eager eval should not run".to_string(),
+            ))
+        },
+        |_: &mut (), _: &Array1<f64>, order: OuterEvalOrder| {
+            Ok(OuterEval {
+                cost: 1.0,
+                gradient: array![0.0],
+                hessian: match order {
+                    OuterEvalOrder::ValueGradientHessian => HessianValue::Dense(array![[-1.0]]),
+                    _ => HessianValue::Unavailable,
+                },
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
+    let mut bridge = OuterSecondOrderBridge {
+        obj: &mut obj,
+        layout: OuterThetaLayout::new(1, 0),
+        hessian_source: HessianSource::Analytic,
+        materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
+        eval_count: 0,
+        outer_inner_cap: None,
+        g_norm_initial: None,
+        last_g_norm: None,
+        last_value_grad_rho: None,
+        cost_stall: Some(guard),
+        cost_stall_bounds: Some((array![-10.0], array![10.0])),
+    };
+
+    for _ in 0..5 {
+        let sample = SecondOrderObjective::eval_hessian(&mut bridge, &point)
+            .expect("strict-saddle Hessian must reach ARC after the stall window fills");
+        assert_eq!(sample.hessian, Some(array![[-1.0]]));
+    }
+    let published = exit.lock().unwrap().take().expect("best checkpoint published");
+    assert!(!published.converged);
 }
 
 /// Near-separable multinomial timeout (#1082/#1237), FEASIBLE bound-pinned arm.
@@ -2074,7 +2116,7 @@ fn arc_bridge_cost_stall_certifies_at_bound_separation() {
 /// no-improvement, so the window fills and ARC halts at the best feasible
 /// iterate. This drives the ARC bridge directly and asserts the halt.
 #[test]
-fn arc_bridge_cost_stall_halts_on_kkt_stationary_bound_descent() {
+fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
     let lo = array![-10.0];
     let hi = array![10.0];
     // Strictly-decreasing cost so the cost-improvement test alone would NEVER
@@ -2129,31 +2171,15 @@ fn arc_bridge_cost_stall_halts_on_kkt_stationary_bound_descent() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
     };
-    let mut sentinel_fired = false;
     for _ in 0..(COST_STALL_WINDOW + 2) {
-        match SecondOrderObjective::eval_hessian(&mut bridge, &lo) {
-            Ok(_) => {}
-            Err(ObjectiveEvalError::Fatal { message }) => {
-                assert_eq!(
-                    message, COST_STALL_CONVERGED_SENTINEL,
-                    "KKT-stationary-at-bound halt must use the shared convergence sentinel"
-                );
-                sentinel_fired = true;
-                break;
-            }
-            Err(other) => panic!("unexpected ARC bridge error: {other:?}"),
-        }
+        let sample = SecondOrderObjective::eval_hessian(&mut bridge, &lo)
+            .expect("finite bound sample must reach ARC with curvature");
+        assert_eq!(sample.hessian, Some(array![[1.0]]));
     }
-    assert!(
-        sentinel_fired,
-        "ARC bridge must halt the bound-pinned descent within {} evals even though the raw \
-         cost is still strictly decreasing (the projected KKT residual is zero)",
-        COST_STALL_WINDOW + 2
-    );
     let published = exit.lock().unwrap().take().expect("best iterate published");
     assert!(
-        published.converged,
-        "a KKT-stationary at-bound stall (projected |g|=0 ≤ 1e-3) must certify CONVERGED"
+        !published.converged,
+        "ARC, not the finite bridge stall, must certify a PSD bound optimum"
     );
     assert_eq!(published.rho, lo, "best iterate is the bound-pinned ρ");
 }
@@ -2237,8 +2263,8 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
             Ok(_) => panic!("an infeasible (cost=∞) trial must not return a finite sample"),
             Err(ObjectiveEvalError::Fatal { message }) => {
                 assert_eq!(
-                    message, COST_STALL_CONVERGED_SENTINEL,
-                    "infeasible-run halt must use the shared convergence sentinel"
+                    message, ARC_INFEASIBLE_STALL_SENTINEL,
+                    "infeasible-run halt must use the non-converged ARC checkpoint sentinel"
                 );
                 sentinel_fired = true;
                 break;
@@ -2255,8 +2281,9 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
     );
     let published = exit.lock().unwrap().take().expect("best iterate published");
     assert!(
-        published.converged,
-        "halt back to the feasible iterate (projected |g|≈1e-9 ≤ 1e-3) must certify CONVERGED"
+        !published.converged,
+        "an infeasible current probe has no synchronized Hessian, so its stored \
+         best can only be a non-converged checkpoint"
     );
     assert_eq!(
         published.rho, feasible_rho,
