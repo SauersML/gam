@@ -1862,6 +1862,7 @@ pub fn build_measure_jet_basis(
     let sigma_coord = measure_jet_input_noise_scale(data, centers.view())?;
     Ok(BasisBuildResult {
         design,
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,

@@ -608,6 +608,7 @@ fn build_duchon_basis_uncached(
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,

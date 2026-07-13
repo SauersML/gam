@@ -271,6 +271,7 @@ pub fn build_bspline_basis_1d(
             ))?;
         return Ok(BasisBuildResult {
             design,
+            affine_offset: None,
             penalties,
             nullspace_dims,
             penaltyinfo,
@@ -380,6 +381,7 @@ pub fn build_bspline_basis_1d(
             ))?;
         return Ok(BasisBuildResult {
             design,
+            affine_offset: None,
             penalties,
             nullspace_dims,
             penaltyinfo,
@@ -536,6 +538,32 @@ pub fn build_bspline_basis_1d(
             }
         }
     };
+    let anchor_offset_coeffs =
+        bspline_anchor_offset_coeffs(&knots, spec.degree, spec.boundary_conditions)?;
+    let affine_offset = match anchor_offset_coeffs.as_ref() {
+        Some(beta_p) => {
+            let raw_design = design_dense_opt.as_ref().ok_or_else(|| {
+                BasisError::InvalidInput(
+                    "anchored B-spline affine offset requires the dense raw basis".to_string(),
+                )
+            })?;
+            if raw_design.ncols() != beta_p.len() {
+                crate::bail_dim_basis!(
+                    "anchored B-spline affine offset coefficient length {} does not match raw basis width {}",
+                    beta_p.len(),
+                    raw_design.ncols()
+                );
+            }
+            let offset = raw_design.dot(beta_p);
+            if offset.iter().any(|value| !value.is_finite()) {
+                crate::bail_invalid_basis!(
+                    "anchored B-spline affine offset produced a non-finite row value"
+                );
+            }
+            Some(offset)
+        }
+        None => None,
+    };
     let s_bend_raw =
         bspline_derivative_penalty_matrix(knots.view(), spec.degree, spec.penalty_order)?;
     let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
@@ -690,10 +718,9 @@ pub fn build_bspline_basis_1d(
     // is recomputed identically on the FrozenTransform predict rebuild (the
     // frozen spec retains `boundary_conditions`), so `save → load → predict`
     // replays the same offset. `None` for free / clamped / zero-anchor specs.
-    let anchor_offset_coeffs =
-        bspline_anchor_offset_coeffs(&knots, spec.degree, spec.boundary_conditions)?;
     Ok(BasisBuildResult {
         design,
+        affine_offset,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -833,6 +860,7 @@ pub fn build_cubic_regression_basis_1d(
 
     Ok(BasisBuildResult {
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design_c)),
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -1032,7 +1060,7 @@ pub(crate) fn bspline_anchor_offset_coeffs(
     else {
         return Ok(None);
     };
-    if rhs.iter().all(|v| v.abs() <= 1e-12) {
+    if rhs.iter().all(|value| *value == 0.0) {
         return Ok(None);
     }
     // `C Cᵀ` is the small (r × r) Gram of the endpoint rows (r ≤ 4). The value

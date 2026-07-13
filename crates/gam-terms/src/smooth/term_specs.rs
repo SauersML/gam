@@ -6113,6 +6113,7 @@ pub fn build_tensor_bspline_basis(
 
     Ok(BasisBuildResult {
         design,
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -7138,6 +7139,7 @@ pub fn build_pca_smooth_basis(
             }])?;
         return Ok(BasisBuildResult {
             design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(op))),
+            affine_offset: None,
             penalties,
             nullspace_dims,
             penaltyinfo,
@@ -7191,6 +7193,7 @@ pub fn build_pca_smooth_basis(
         }])?;
     Ok(BasisBuildResult {
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design)),
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,

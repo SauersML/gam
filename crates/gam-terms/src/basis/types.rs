@@ -1464,6 +1464,16 @@ pub enum BasisMetadata {
 #[derive(Clone)]
 pub struct BasisBuildResult {
     pub design: DesignMatrix,
+    /// Fixed row-wise contribution carried by an affine basis chart.
+    ///
+    /// Ordinary bases are linear in their fitted coefficients and leave this
+    /// as `None`. An inhomogeneous boundary condition, such as a non-zero
+    /// B-spline endpoint anchor, realizes the basis as
+    /// `offset(x) + design(x) * beta`; the known `offset(x)` belongs here, not
+    /// in a fake coefficient column. Term-collection assembly sums these
+    /// channels and routes the result through the model's ordinary likelihood
+    /// offset at fit and prediction time.
+    pub affine_offset: Option<Array1<f64>>,
     pub penalties: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
     pub penaltyinfo: Vec<PenaltyInfo>,
@@ -1552,6 +1562,10 @@ impl std::fmt::Debug for BasisBuildResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BasisBuildResult")
             .field("design", &self.design)
+            .field(
+                "affine_offset_len",
+                &self.affine_offset.as_ref().map(|offset| offset.len()),
+            )
             .field("penalties", &self.penalties)
             .field("nullspace_dims", &self.nullspace_dims)
             .field("penaltyinfo", &self.penaltyinfo)

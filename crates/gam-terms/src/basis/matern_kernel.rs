@@ -395,6 +395,7 @@ pub fn build_thin_plate_basiswithworkspace(
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,

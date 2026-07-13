@@ -764,6 +764,7 @@ pub fn build_constant_curvature_basis(
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,

@@ -1791,11 +1791,36 @@ pub(crate) fn push_deviation_aux_blockspecs(
     score_warp_beta_hint: Option<Array1<f64>>,
     link_dev_beta_hint: Option<Array1<f64>>,
 ) -> Result<(), String> {
+    fn take_rho_slice(
+        rho: &Array1<f64>,
+        cursor: &mut usize,
+        count: usize,
+        block_name: &str,
+    ) -> Result<Array1<f64>, String> {
+        let start = *cursor;
+        let end = start.checked_add(count).ok_or_else(|| {
+            format!(
+                "{block_name} penalty-rho range overflow: start={start}, count={count}"
+            )
+        })?;
+        if end > rho.len() {
+            return Err(format!(
+                "{block_name} penalty-rho range {start}..{end} exceeds rho length {}",
+                rho.len()
+            ));
+        }
+        let slice = rho.slice(s![start..end]).to_owned();
+        *cursor = end;
+        Ok(slice)
+    }
+
     if let Some(prepared) = score_warp_prepared {
-        let rho_h = rho
-            .slice(s![*cursor..*cursor + prepared.block.penalties.len()])
-            .to_owned();
-        *cursor += prepared.block.penalties.len();
+        let rho_h = take_rho_slice(
+            rho,
+            cursor,
+            prepared.block.penalties.len(),
+            "score_warp_dev",
+        )?;
         blocks.push(build_deviation_aux_blockspec(
             "score_warp_dev",
             prepared,
@@ -1804,9 +1829,12 @@ pub(crate) fn push_deviation_aux_blockspecs(
         )?);
     }
     if let Some(prepared) = link_dev_prepared {
-        let rho_w = rho
-            .slice(s![*cursor..*cursor + prepared.block.penalties.len()])
-            .to_owned();
+        let rho_w = take_rho_slice(
+            rho,
+            cursor,
+            prepared.block.penalties.len(),
+            "link_dev",
+        )?;
         blocks.push(build_deviation_aux_blockspec(
             "link_dev",
             prepared,
@@ -1815,6 +1843,73 @@ pub(crate) fn push_deviation_aux_blockspecs(
         )?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod deviation_penalty_layout_tests {
+    use super::*;
+
+    fn prepared_with_penalty_orders(orders: Vec<usize>) -> DeviationPrepared {
+        let seed = Array1::linspace(-1.0, 1.0, 48);
+        let config = DeviationBlockConfig {
+            degree: 3,
+            num_internal_knots: 6,
+            penalty_order: *orders.first().expect("test requires a penalty order"),
+            penalty_orders: orders,
+            double_penalty: false,
+            monotonicity_eps: 0.0,
+        };
+        build_score_warp_deviation_block_from_seed(&seed, &config)
+            .expect("test deviation block must build")
+    }
+
+    #[test]
+    fn composed_score_link_influence_rho_layout_advances_by_emitted_counts_2315() {
+        // Deliberately use unequal component counts and disjoint sentinels. A
+        // length-only assertion cannot detect the old bug: link_dev received the
+        // right-looking slice, but failing to advance the cursor made the following
+        // influence absorber silently reuse link_dev's first rho coordinate.
+        let score_warp = prepared_with_penalty_orders(vec![1, 2]);
+        let link_dev = prepared_with_penalty_orders(vec![1, 2, 3]);
+        assert_eq!(score_warp.block.penalties.len(), 2);
+        assert_eq!(link_dev.block.penalties.len(), 3);
+
+        // Coordinate zero stands for an already-consumed core penalty. The final
+        // coordinate is the influence absorber's trailing ridge.
+        let rho = Array1::from_vec(vec![-101.0, 11.0, 12.0, 21.0, 22.0, 23.0, 31.0]);
+        let mut cursor = 1usize;
+        let mut blocks = Vec::new();
+        push_deviation_aux_blockspecs(
+            &mut blocks,
+            &rho,
+            &mut cursor,
+            Some(&score_warp),
+            Some(&link_dev),
+            None,
+            None,
+        )
+        .expect("composed deviation layout must be realized");
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].name, "score_warp_dev");
+        assert_eq!(blocks[0].initial_log_lambdas.as_slice(), Some(&[11.0, 12.0][..]));
+        assert_eq!(blocks[1].name, "link_dev");
+        assert_eq!(
+            blocks[1].initial_log_lambdas.as_slice(),
+            Some(&[21.0, 22.0, 23.0][..])
+        );
+        assert_eq!(
+            cursor, 6,
+            "the next consumer must start after every emitted deviation penalty"
+        );
+
+        let influence_rho = rho.slice(s![cursor..cursor + 1]).to_owned();
+        assert_eq!(influence_rho.as_slice(), Some(&[31.0][..]));
+        assert_ne!(
+            influence_rho[0], blocks[1].initial_log_lambdas[0],
+            "the influence absorber must not reuse link_dev's first rho coordinate"
+        );
+    }
 }
 
 fn inner_fit(

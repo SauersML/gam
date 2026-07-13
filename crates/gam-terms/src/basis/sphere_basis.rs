@@ -129,6 +129,7 @@ pub fn build_spherical_spline_basis(
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -710,6 +711,7 @@ pub(crate) fn build_spherical_harmonic_basis(
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design)),
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -1001,6 +1003,7 @@ pub(crate) fn build_matern_basis_seeded(
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,

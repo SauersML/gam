@@ -917,6 +917,7 @@ pub(crate) fn build_periodic_duchon_basis_1d(
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -1141,6 +1142,7 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
         design,
+        affine_offset: None,
         penalties,
         nullspace_dims,
         penaltyinfo,
