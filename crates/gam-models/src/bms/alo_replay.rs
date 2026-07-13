@@ -481,6 +481,7 @@ pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_linalg::matrix::DenseDesignMatrix;
     use gam_math::probability::{normal_cdf, normal_pdf};
     use gam_problem::StandardLink;
 
@@ -566,6 +567,172 @@ mod tests {
         assert!(
             (geometry.observed_hessian[0][0] - score_meat).abs() > 1e-3,
             "observed Hessian and empirical score meat must remain distinct"
+        );
+    }
+
+    fn independent_empirical_score_warp_nll(point: [f64; 3]) -> f64 {
+        let [marginal_eta, slope, score_beta] = point;
+        let nodes = [-0.8_f64, 0.9_f64];
+        let grid_weights = [0.35_f64, 0.65_f64];
+        let target = normal_cdf(marginal_eta);
+        let calibration = |intercept: f64| {
+            nodes
+                .iter()
+                .zip(grid_weights.iter())
+                .map(|(&z, &weight)| weight * normal_cdf(intercept + slope * (z + score_beta * z)))
+                .sum::<f64>()
+                - target
+        };
+        let mut lower = -40.0_f64;
+        let mut upper = 40.0_f64;
+        assert!(calibration(lower) < 0.0 && calibration(upper) > 0.0);
+        for _iteration in 0..180 {
+            let midpoint = 0.5 * (lower + upper);
+            if calibration(midpoint) < 0.0 {
+                lower = midpoint;
+            } else {
+                upper = midpoint;
+            }
+        }
+        let intercept = 0.5 * (lower + upper);
+        let observed_z = 0.25_f64;
+        let observed_eta = intercept + slope * (observed_z + score_beta * observed_z);
+        -1.3 * normal_cdf(observed_eta).ln()
+    }
+
+    #[test]
+    fn empirical_flex_saved_alo_matches_independent_resolved_likelihood_oracle() {
+        let marginal_eta = 0.2_f64;
+        let slope = -0.35_f64;
+        let score_beta = 0.12_f64;
+        let score_runtime = SavedCompiledFlexBlock {
+            kernel: crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
+            breakpoints: vec![-2.0, 2.0],
+            basis_dim: 1,
+            // One frozen local cubic representing h(z)=z on the entire
+            // empirical/observed support.  The independent oracle above uses
+            // the global expression directly and never calls this runtime.
+            span_c0: vec![vec![-2.0]],
+            span_c1: vec![vec![1.0]],
+            span_c2: vec![vec![0.0]],
+            span_c3: vec![vec![0.0]],
+            anchor_correction: None,
+            anchor_components: Vec::new(),
+        };
+        let marginal_design = DesignMatrix::Dense(DenseDesignMatrix::from(Array2::ones((1, 1))));
+        let logslope_design = DesignMatrix::Dense(DenseDesignMatrix::from(Array2::ones((1, 1))));
+        let marginal_beta = Array1::from_vec(vec![marginal_eta]);
+        let logslope_beta = Array1::from_vec(vec![slope]);
+        let score_warp_beta = Array1::from_vec(vec![score_beta]);
+        let marginal_rows = Array1::from_vec(vec![marginal_eta]);
+        let slope_rows = Array1::from_vec(vec![slope]);
+        let latent_z = Array1::from_vec(vec![0.25]);
+        let response = Array1::from_vec(vec![1.0]);
+        let prior_weights = Array1::from_vec(vec![1.3]);
+        let replay =
+            replay_saved_bernoulli_marginal_slope_alo(BernoulliMarginalSlopeSavedAloReplayInput {
+                base_link: &InverseLink::Standard(StandardLink::Probit),
+                marginal_design: &marginal_design,
+                logslope_design: &logslope_design,
+                marginal_beta: &marginal_beta,
+                logslope_beta: &logslope_beta,
+                score_warp_beta: Some(&score_warp_beta),
+                link_deviation_beta: None,
+                marginal_eta: &marginal_rows,
+                slope: &slope_rows,
+                latent_z: &latent_z,
+                response: &response,
+                prior_weights: &prior_weights,
+                latent_measure: LatentMeasureKind::GlobalEmpirical {
+                    grid: super::super::EmpiricalZGrid::new(
+                        vec![-0.8, 0.9],
+                        vec![0.35, 0.65],
+                        "saved ALO empirical-flex oracle",
+                    )
+                    .expect("valid empirical grid"),
+                },
+                gaussian_frailty_sd: None,
+                score_warp_runtime: Some(&score_runtime),
+                link_deviation_runtime: None,
+                score_warp_anchor_rows: None,
+                link_deviation_anchor_rows: None,
+            })
+            .expect("saved empirical-flex row must replay");
+        assert_eq!(replay.score_warp_dimension, 1);
+        assert_eq!(replay.link_deviation_dimension, 0);
+        let row = &replay.rows[0];
+        assert_eq!(
+            row.coordinate_values.to_vec(),
+            vec![marginal_eta, slope, score_beta]
+        );
+
+        let point = [marginal_eta, slope, score_beta];
+        let gradient_step = 2.0e-5_f64;
+        for axis in 0..3 {
+            let mut plus = point;
+            let mut minus = point;
+            plus[axis] += gradient_step;
+            minus[axis] -= gradient_step;
+            let expected = (independent_empirical_score_warp_nll(plus)
+                - independent_empirical_score_warp_nll(minus))
+                / (2.0 * gradient_step);
+            assert_close(
+                &format!("empirical-flex score[{axis}]"),
+                row.nll_score[axis],
+                expected,
+                3.0e-7,
+            );
+        }
+
+        let hessian_step = 3.0e-4_f64;
+        let center = independent_empirical_score_warp_nll(point);
+        for first in 0..3 {
+            for second in first..3 {
+                let expected = if first == second {
+                    let mut plus = point;
+                    let mut minus = point;
+                    plus[first] += hessian_step;
+                    minus[first] -= hessian_step;
+                    (independent_empirical_score_warp_nll(plus) - 2.0 * center
+                        + independent_empirical_score_warp_nll(minus))
+                        / hessian_step.powi(2)
+                } else {
+                    let mut plus_plus = point;
+                    let mut plus_minus = point;
+                    let mut minus_plus = point;
+                    let mut minus_minus = point;
+                    plus_plus[first] += hessian_step;
+                    plus_plus[second] += hessian_step;
+                    plus_minus[first] += hessian_step;
+                    plus_minus[second] -= hessian_step;
+                    minus_plus[first] -= hessian_step;
+                    minus_plus[second] += hessian_step;
+                    minus_minus[first] -= hessian_step;
+                    minus_minus[second] -= hessian_step;
+                    (independent_empirical_score_warp_nll(plus_plus)
+                        - independent_empirical_score_warp_nll(plus_minus)
+                        - independent_empirical_score_warp_nll(minus_plus)
+                        + independent_empirical_score_warp_nll(minus_minus))
+                        / (4.0 * hessian_step.powi(2))
+                };
+                assert_close(
+                    &format!("empirical-flex Hessian[{first},{second}]"),
+                    row.observed_hessian[[first, second]],
+                    expected,
+                    4.0e-5,
+                );
+                assert_close(
+                    &format!("empirical-flex symmetry[{second},{first}]"),
+                    row.observed_hessian[[second, first]],
+                    expected,
+                    4.0e-5,
+                );
+            }
+        }
+        let score_meat = row.nll_score[0] * row.nll_score[0];
+        assert!(
+            (row.observed_hessian[[0, 0]] - score_meat).abs() > 1.0e-3,
+            "observed Hessian W and empirical score meat C must remain separate"
         );
     }
 }
