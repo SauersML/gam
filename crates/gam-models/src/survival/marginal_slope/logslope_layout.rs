@@ -256,13 +256,10 @@ impl LogslopeLayout {
         })
     }
 
-    /// Evaluate every physical log-slope channel at one coefficient vector.
-    ///
-    /// The returned matrix is `(n_rows × score_dim)`. This is the sole
-    /// construction-time source for the primary state consumed by the
-    /// identifiability row Hessian: offsets, raw channel partitioning, and the
-    /// raw-to-current coefficient transform are therefore identical to the
-    /// likelihood path.
+    /// Evaluate every physical log-slope channel at one current-coordinate
+    /// coefficient vector. This is the sole batch evaluator for pilot,
+    /// identifiability, and converged-state geometry; it delegates each row to
+    /// the same callback kernel used by the likelihood.
     pub(crate) fn physical_values(
         &self,
         score_dim: usize,
