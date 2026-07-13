@@ -22,12 +22,12 @@
 //! `sample_standard` (`src/inference/sample.rs`) now refreshes the spec's family
 //! `theta` from the fit's jointly-estimated `theta_hat`
 //! (`fit.likelihood_scale.negbin_theta()`) before dispatch — the exact slot the
-//! NUTS arm consumes. Its in-source comment states the refresh "mirrors how the
-//! replicate path reads `theta_hat` via the canonical `family_noise_parameter`
-//! helper (`negbin_theta().or(seed)`)". That canonical helper —
-//! [`gam::inference::generative::family_noise_parameter`] — is the single,
-//! PUBLIC, production dispersion picker shared by `gam generate` and
-//! `sample_replicates`; the NB arm is literally `scale.negbin_theta().or(Some(theta))`.
+//! NUTS arm consumes. The canonical
+//! [`gam::inference::generative::family_noise_parameter`] helper is the single,
+//! public production dispersion picker shared by `gam generate` and
+//! `sample_replicates`. It accepts only family-consistent fitted scale metadata:
+//! estimated NB uses `EstimatedNegBinTheta`, fixed NB uses `FixedNegBinTheta`,
+//! and missing metadata is an error rather than permission to reuse a seed.
 //!
 //! ## What this test asserts — against the REAL production function
 //!
@@ -37,9 +37,9 @@
 //! production refresh were reverted), this test drives the SAME production
 //! dispersion-selection logic through the public `family_noise_parameter`: the NB
 //! variance parameter the sampler/generator consumes is sourced from the fit's
-//! estimated `theta_hat` (NOT the seed), honours a user-fixed `theta`, and falls
-//! back to the seed only for an unfitted model. A revert that drops the
-//! `negbin_theta()` consult (drawing at the seed `1.0`) fails this test.
+//! estimated `theta_hat` (NOT the seed), honours a user-fixed `theta`, and
+//! refuses an unfitted model with unresolved scale metadata. A revert that
+//! draws at the seed `1.0` fails this test.
 
 use gam::inference::generative::family_noise_parameter;
 use gam::types::{LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
@@ -58,8 +58,7 @@ const WRONG_RESIDUAL_SCALE: f64 = 99.0;
 /// #1463 PRIMARY: the estimated-theta fit path. The NB dispersion the sampler
 /// consumes must be the fitted `theta_hat`, NOT the construction seed `1.0` and
 /// NOT the residual-scale fallback. This exercises the production
-/// `family_noise_parameter` NB arm (`scale.negbin_theta().or(Some(theta))`) that
-/// `sample_standard`'s refresh mirrors.
+/// `family_noise_parameter` NB arm that `sample_standard`'s refresh mirrors.
 #[test]
 fn nb_dispersion_is_fitted_theta_hat_not_seed_1463() {
     let scale = LikelihoodScaleMetadata::EstimatedNegBinTheta {
@@ -74,6 +73,7 @@ fn nb_dispersion_is_fitted_theta_hat_not_seed_1463() {
 
     let spec = LikelihoodSpec::negative_binomial_log(SEED_THETA);
     let theta = family_noise_parameter(scale, WRONG_RESIDUAL_SCALE, &spec)
+        .expect("fitted NB scale metadata must be valid")
         .expect("NB family must carry a dispersion parameter");
 
     assert_eq!(
@@ -106,6 +106,7 @@ fn nb_dispersion_honors_user_fixed_theta_1463() {
     // metadata is what the picker consults.
     let spec = LikelihoodSpec::negative_binomial_log_fixed(SEED_THETA);
     let theta = family_noise_parameter(scale, WRONG_RESIDUAL_SCALE, &spec)
+        .expect("fixed NB scale metadata must be valid")
         .expect("fixed NB family must carry a dispersion parameter");
     assert_eq!(
         theta, USER_FIXED_THETA,
@@ -113,21 +114,20 @@ fn nb_dispersion_honors_user_fixed_theta_1463() {
     );
 }
 
-/// #1463 fallback: an UNFITTED NB model (no scale metadata) must fall back to the
-/// spec seed `theta` — the `.or(Some(theta))` tail of the production picker. This
-/// pins that the fix did not over-rotate into always-ignoring the seed.
+/// #1463: an unfitted NB model has no authoritative dispersion. Construction
+/// seeds initialize fitting; they are not valid generative parameters.
 #[test]
-fn nb_dispersion_falls_back_to_seed_when_unfitted_1463() {
+fn nb_dispersion_refuses_unfitted_scale_metadata_1463() {
     let seeded = LikelihoodSpec::negative_binomial_log(2.5);
-    let theta = family_noise_parameter(
+    let error = family_noise_parameter(
         LikelihoodScaleMetadata::Unspecified,
         WRONG_RESIDUAL_SCALE,
         &seeded,
     )
-    .expect("unfitted NB still resolves to its seed");
-    assert_eq!(
-        theta, 2.5,
-        "an unfitted NB model must fall back to the spec seed theta, not the residual scale"
+    .expect_err("unfitted NB must not generate from its construction seed");
+    assert!(
+        error.to_string().contains("unresolved"),
+        "unfitted NB must report unresolved dispersion metadata: {error}"
     );
 }
 
@@ -146,7 +146,9 @@ fn dispersion_picker_is_not_negbin_for_other_families_1463() {
         response: ResponseFamily::Gaussian,
         link: gam::types::InverseLink::Standard(gam::types::StandardLink::Identity),
     };
-    let sigma = family_noise_parameter(scale, 1.75, &gaussian).expect("Gaussian generative sigma");
+    let sigma = family_noise_parameter(scale, 1.75, &gaussian)
+        .expect("profiled Gaussian scale metadata must be valid")
+        .expect("Gaussian family must carry a generative sigma");
     assert_eq!(
         sigma, 1.75,
         "Gaussian generative noise is the residual scale, not an NB theta"

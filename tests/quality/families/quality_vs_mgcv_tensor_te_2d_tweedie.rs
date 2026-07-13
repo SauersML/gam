@@ -166,12 +166,13 @@ fn gam_tensor_te_2d_tweedie_matches_mgcv() {
     let mgcv_eta_err = rmse(mgcv_eta, &eta_true);
     let gam_mu_err = rmse(&gam_mu, &mu_true);
     let gam_edf = fit.fit.edf_total().unwrap_or(f64::NAN);
+    let gam_phi = fit
+        .fit
+        .dispersion_phi()
+        .expect("fitted Tweedie model must carry valid dispersion");
     eprintln!(
         "[diag] gam tweedie: outer_converged=certified outer_iterations={} grad_norm={:?} reml_score={:.6} gam_phi={:.6}",
-        fit.fit.outer_iterations,
-        fit.fit.outer_gradient_norm,
-        fit.fit.reml_score,
-        fit.fit.dispersion_phi(),
+        fit.fit.outer_iterations, fit.fit.outer_gradient_norm, fit.fit.reml_score, gam_phi,
     );
     eprintln!("[diag] gam tweedie lambdas={:?}", fit.fit.lambdas.to_vec());
     eprintln!(

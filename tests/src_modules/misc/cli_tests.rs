@@ -2978,11 +2978,13 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             penalty_block_trace: vec![],
             edf_total: 1.5,
             smoothing_correction: None,
+            smoothing_correction_method: None,
             penalized_hessian: hessian.clone().into(),
             working_weights: working_weights.clone(),
             working_response: working_response.clone(),
             reparam_qs: Some(Array2::eye(2)),
-            dispersion: gam::estimate::Dispersion::Known(1.0),
+            dispersion: gam::estimate::Dispersion::known(1.0)
+                .expect("unit known dispersion is valid"),
             beta_covariance: None,
             beta_standard_errors: None,
             beta_covariance_corrected: None,
@@ -6185,7 +6187,8 @@ fn saved_baseline_timewiggle_reconstruction_keeps_requested_order_one_penalty() 
         seed[eta_entry.len() + i] = eta_exit[i];
     }
     let (primary_order, extra_orders) =
-        gam::families::wiggle::split_wiggle_penalty_orders(2, &saved_cfg.penalty_orders);
+        gam::families::wiggle::split_wiggle_penalty_orders(2, &saved_cfg.penalty_orders)
+            .expect("saved positive penalty orders are valid");
     let mut block = gam::families::wiggle::buildwiggle_block_input_from_knots(
         seed.view(),
         &wiggle_knots,
@@ -6199,8 +6202,13 @@ fn saved_baseline_timewiggle_reconstruction_keeps_requested_order_one_penalty() 
             "rebuild saved baseline-timewiggle block", e
         )
     });
-    gam::families::wiggle::append_selected_wiggle_penalty_orders(&mut block, &extra_orders)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "append saved extra penalties", e));
+    gam::families::wiggle::append_selected_wiggle_function_penalties(
+        &mut block,
+        &wiggle_knots,
+        saved_cfg.degree,
+        &extra_orders,
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "append saved extra penalties", e));
 
     assert_eq!(wiggle_cfg.penalty_orders, vec![1, 2, 3]);
     assert_eq!(saved_cfg.penalty_orders, vec![1, 2, 3]);

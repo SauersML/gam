@@ -52,7 +52,6 @@
 //! mechanism: gam runs NUTS (1 chain, 10k draws — this convex Gaussian target
 //! converges in a few leapfrogs), scipy draws i.i.d. from the exact Gaussian.
 
-use gam::estimate::Dispersion;
 use gam::hmc::{
     FamilyNutsInputs, GlmFlatInputs, NutsConfig, explicit_fit_hessian_for_whitening,
     run_nuts_sampling_flattened_family,
@@ -113,9 +112,7 @@ fn gam_nuts_posterior_matches_scipy_exact_conjugate_gaussian() {
         .fit
         .dispersion()
         .expect("Gaussian fit reports an estimated dispersion");
-    let phi = match dispersion {
-        Dispersion::Estimated(v) | Dispersion::Known(v) => v,
-    };
+    let phi = dispersion.phi();
     assert!(
         phi.is_finite() && phi > 0.0,
         "fitted dispersion must be positive, got {phi}"
@@ -152,7 +149,7 @@ fn gam_nuts_posterior_matches_scipy_exact_conjugate_gaussian() {
             penalty_matrix: penalty.view(),
             mode: fit.fit.beta.view(),
             hessian: hessian.view(),
-            gamma_shape: None,
+            likelihood_scale: fit.fit.likelihood_scale,
             dispersion,
             firth_bias_reduction: false,
             offset: None,

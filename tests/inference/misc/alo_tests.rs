@@ -208,7 +208,7 @@ fn alo_uses_exact_dense_stabilized_hessian_export_from_penalized_pirls() {
     weighted_x *= &sqrtw.view().insert_axis(Axis(1));
     let mut expected = weighted_x.t().dot(&weighted_x);
     expected += &fit.reparam_result.s_transformed;
-    let ridge = fit.ridge_passport.laplacehessianridge().max(0.0);
+    let ridge = fit.ridge_passport.delta();
     for d in 0..p {
         expected[[d, d]] += ridge;
     }
@@ -223,7 +223,7 @@ fn alo_uses_exact_dense_stabilized_hessian_export_from_penalized_pirls() {
         "exported ALO Hessian must be the exact penalized PIRLS Hessian; max_abs_diff={max_abs_diff:.3e}"
     );
 
-    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Probit)
+    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view())
         .expect("ALO should accept exact dense Hessian exported from penalized PIRLS");
     assert_eq!(alo.leverage.len(), n);
     assert!(alo.leverage.iter().all(|v| v.is_finite()));
@@ -246,12 +246,10 @@ fn case_deletion_from_pirls_leverage_matches_alo_dialect() {
     let w = Array1::<f64>::ones(n);
     let fit = fit_identity_penalized(&x, &y, &w, LinkFunction::Probit, 0.35);
 
-    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Probit)
-        .expect("ALO diagnostics");
-    let influence =
-        gam::alo::compute_case_deletion_from_pirls(&fit, y.view(), LinkFunction::Probit)
-            .expect("case-deletion diagnostics must not error on a converged fit")
-            .expect("no leverage-one row in this well-conditioned fit");
+    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view()).expect("ALO diagnostics");
+    let influence = gam::alo::compute_case_deletion_from_pirls(&fit)
+        .expect("case-deletion diagnostics must not error on a converged fit")
+        .expect("no leverage-one row in this well-conditioned fit");
 
     assert_eq!(influence.leverage.len(), n);
     assert_eq!(influence.dfbeta.nrows(), n);
@@ -298,10 +296,7 @@ fn alo_solve_setup_rejects_non_square_dense_hessian_instead_of_workaround() {
         working_response: &working_response,
         eta: &eta,
         offset: &offset,
-        link: LinkFunction::Logit,
         phi: 1.0,
-        penalty_root: None,
-        ridge: 0.0,
         score_curvature: None,
     };
 
@@ -326,7 +321,7 @@ fn alo_se_calculation_correct() {
         w[i] = 0.2;
     }
     let fit = fit_unpenalized(&x, &y, &w, LinkFunction::Logit);
-    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Logit).unwrap();
+    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view()).unwrap();
 
     let x_dense = fit.x_transformed.to_dense();
     let sqrtw = fit.finalweights.mapv(f64::sqrt);
@@ -364,7 +359,7 @@ fn alo_hat_diag_sane_and_bounded() {
     let (x, y, _) = generate_synthetic_binary_data(n, p, 42);
     let w = Array1::<f64>::ones(n);
     let fit = fit_unpenalized(&x, &y, &w, LinkFunction::Logit);
-    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Logit).unwrap();
+    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view()).unwrap();
     let leverage = alo.leverage;
 
     for &a in &leverage {
@@ -396,8 +391,7 @@ fn alo_hat_diag_sane_and_bounded() {
     let mut wzero = w.clone();
     wzero[10] = 0.0;
     let fitzero = fit_unpenalized(&x, &y, &wzero, LinkFunction::Logit);
-    let alozero =
-        compute_alo_diagnostics_from_pirls(&fitzero, y.view(), LinkFunction::Logit).unwrap();
+    let alozero = compute_alo_diagnostics_from_pirls(&fitzero, y.view()).unwrap();
     assert!(alozero.leverage[10].abs() < 1e-12);
 }
 
@@ -422,7 +416,7 @@ fn alo_matches_exact_frozen_curvature_loo_small_n_binomial() {
     let w = Array1::<f64>::ones(n);
     let fit = fit_unpenalized(&x, &y, &w, LinkFunction::Logit);
     let x_dense = fit.x_transformed.to_dense();
-    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Logit).unwrap();
+    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view()).unwrap();
 
     let w_full = fit.finalweights.clone();
     let sqrtw = w_full.mapv(f64::sqrt);
@@ -522,7 +516,7 @@ fn alo_matches_true_loo_small_n_binomial_refit() {
     let (x, y, _) = generate_synthetic_binary_data(n, p, 42);
     let w = Array1::<f64>::ones(n);
     let fit = fit_unpenalized(&x, &y, &w, LinkFunction::Logit);
-    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Logit).unwrap();
+    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view()).unwrap();
 
     let x_dense = fit.x_transformed.to_dense();
     let sqrtw = fit.finalweights.mapv(f64::sqrt);
@@ -673,7 +667,7 @@ fn alo_error_is_driven_by_saturated_points() {
 
     let w = Array1::<f64>::ones(n);
     let fit = fit_unpenalized(&x, &y, &w, LinkFunction::Logit);
-    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view(), LinkFunction::Logit).unwrap();
+    let alo = compute_alo_diagnostics_from_pirls(&fit, y.view()).unwrap();
 
     let mut loo_pred = Array1::<f64>::zeros(n);
     let mut loo_se = Array1::<f64>::zeros(n);
