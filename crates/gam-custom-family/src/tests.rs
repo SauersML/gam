@@ -4143,8 +4143,38 @@ pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay
         .collect();
     let evaluations_before_finalization = family.evaluations.load(Ordering::Relaxed);
 
+    let mut raw_outer = gam_solve::rho_optimizer::OuterResult::new(
+        Array1::zeros(0),
+        f64::from_bits(selected_objective_bits),
+        7,
+        true,
+        gam_solve::rho_optimizer::OuterPlan {
+            solver: gam_solve::rho_optimizer::Solver::Arc,
+            hessian_source: gam_solve::rho_optimizer::HessianSource::Analytic,
+        },
+    );
+    raw_outer.final_grad_norm = Some(0.0);
+    raw_outer.criterion_certificate = Some(
+        gam_solve::rho_optimizer::OuterCriterionCertificate {
+            stationarity: gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
+                grad_norm: 0.0,
+                projected_grad_norm: 0.0,
+                bound: 1.0e-8,
+            },
+            hessian_psd: Some(true),
+            lambdas_railed: Vec::new(),
+        },
+    );
+    let certified_outer = gam_solve::rho_optimizer::CertifiedOuterResult::try_from(raw_outer)
+        .expect("the test outer optimum should carry a valid analytic certificate");
+
     let fit = fit_custom_family_fixed_log_lambdas_from_mode_selection(
-        &family, &specs, &options, selection, 0, None, true,
+        &family,
+        &specs,
+        &options,
+        selection,
+        &Array1::zeros(0),
+        &certified_outer,
     )
     .expect("the exact selected mode should finalize without another inner solve");
 
@@ -4154,6 +4184,13 @@ pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay
         "finalization must consume the selected mode and cached Hessian without replaying the family",
     );
     assert_eq!(fit.penalized_objective.to_bits(), selected_objective_bits);
+    assert_eq!(fit.outer_iterations, 7);
+    assert_eq!(fit.outer_gradient_norm, Some(0.0));
+    assert!(
+        fit.convergence_evidence()
+            .outer_certificate()
+            .is_some_and(|certificate| certificate.certifies()),
+    );
     assert!(fit.covariance_conditional.is_some());
     assert!(fit.geometry.is_some());
     assert_eq!(fit.block_states.len(), selected_beta_bits.len());
