@@ -249,7 +249,7 @@ pub(crate) fn compute_drift_deriv_traces(
     beta_j: &Array1<f64>,
     fixed_drift_deriv: Option<&SharedFixedDriftDerivFn>,
     subspace: Option<&PenaltySubspaceTrace>,
-) -> f64 {
+) -> Result<f64, String> {
     let trace_via = |result: DriftDerivResult| -> f64 {
         if let Some(kernel) = subspace {
             match result {
@@ -265,20 +265,18 @@ pub(crate) fn compute_drift_deriv_traces(
     };
     let mut trace = 0.0;
     // M_i[β_j] = D_β B_i[β_j]
-    if b_i_depends
-        && let (Some(ei), Some(drift_fn)) = (ext_i, fixed_drift_deriv)
-        && let Some(result) = drift_fn(ei, beta_j)
-    {
-        trace += trace_via(result);
+    if b_i_depends && let (Some(ei), Some(drift_fn)) = (ext_i, fixed_drift_deriv) {
+        if let Some(result) = drift_fn(ei, beta_j)? {
+            trace += trace_via(result);
+        }
     }
     // M_j[β_i] = D_β B_j[β_i]
-    if b_j_depends
-        && let (Some(ej), Some(drift_fn)) = (ext_j, fixed_drift_deriv)
-        && let Some(result) = drift_fn(ej, beta_i)
-    {
-        trace += trace_via(result);
+    if b_j_depends && let (Some(ej), Some(drift_fn)) = (ext_j, fixed_drift_deriv) {
+        if let Some(result) = drift_fn(ej, beta_i)? {
+            trace += trace_via(result);
+        }
     }
-    trace
+    Ok(trace)
 }
 
 /// Compute the base trace of the fixed-β second Hessian drift: tr(G_ε ∂²H/∂θ_i∂θ_j|_β).
