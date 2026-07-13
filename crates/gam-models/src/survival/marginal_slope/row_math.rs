@@ -885,6 +885,55 @@ pub(crate) fn row_primary_closed_form_vector(
     Ok((row.v, gradient, hessian))
 }
 
+#[cfg(test)]
+fn row_primary_closed_form_vector_fixed<const DIM: usize>(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    slopes: &[f64],
+    z: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    use gam_math::jet_scalar::{FixedRuntimeJet, JetScalar, Order2};
+    use gam_math::nested_dual::JetField;
+
+    if DIM != 3 + slopes.len() {
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "fixed runtime-vector row dimension mismatch: DIM={DIM}, slopes={}",
+                slopes.len()
+            ),
+        }
+        .into());
+    }
+    let values: [f64; DIM] = std::array::from_fn(|axis| match axis {
+        0 => q0,
+        1 => q1,
+        2 => qd1,
+        _ => slopes[axis - 3],
+    });
+    let vars: [FixedRuntimeJet<Order2<DIM>, DIM>; DIM] = std::array::from_fn(|axis| {
+        FixedRuntimeJet::from_inner(Order2::variable(values[axis], axis))
+    });
+    let inputs = RigidRowInputs {
+        row: 0,
+        wi: w,
+        di: d,
+        z_sum: 0.0,
+        covariance_ones: 0.0,
+        probit_scale,
+        qd1_lower: derivative_guard,
+    };
+    let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, &())?.into_inner();
+    let gradient = Array1::from_vec(row.g().to_vec());
+    let hessian = Array2::from_shape_fn((DIM, DIM), |(a, b)| row.h()[a][b]);
+    Ok((row.value(), gradient, hessian))
+}
+
 pub(crate) fn standardize_latent_z_matrix_with_policy(
     z: &Array2<f64>,
     weights: &Array1<f64>,
@@ -1281,6 +1330,19 @@ mod tests {
                 &mut arena,
             )
             .expect("runtime vector row program");
+            let fixed = row_primary_closed_form_vector_fixed::<6>(
+                q0,
+                q1,
+                qd1,
+                &slopes,
+                &scores,
+                covariance,
+                1.3,
+                event,
+                1.0e-8,
+                probit_scale,
+            )
+            .expect("fixed vector row program");
             let hand = vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
                 q0,
                 q1,
@@ -1296,16 +1358,27 @@ mod tests {
             .expect("strongest-hand vector row");
 
             close(&format!("case {case} value"), runtime.0, hand.0);
+            close(&format!("case {case} fixed value"), fixed.0, hand.0);
             for axis_a in 0..runtime.1.len() {
                 close(
                     &format!("case {case} gradient[{axis_a}]"),
                     runtime.1[axis_a],
                     hand.1[axis_a],
                 );
+                close(
+                    &format!("case {case} fixed gradient[{axis_a}]"),
+                    fixed.1[axis_a],
+                    hand.1[axis_a],
+                );
                 for axis_b in 0..runtime.1.len() {
                     close(
                         &format!("case {case} Hessian[{axis_a},{axis_b}]"),
                         runtime.2[[axis_a, axis_b]],
+                        hand.2[[axis_a, axis_b]],
+                    );
+                    close(
+                        &format!("case {case} fixed Hessian[{axis_a},{axis_b}]"),
+                        fixed.2[[axis_a, axis_b]],
                         hand.2[[axis_a, axis_b]],
                     );
                 }
@@ -1394,6 +1467,21 @@ mod tests {
             );
 
             let runtime_ns = best_ns(20_000, || evaluate_runtime(&mut arena));
+            let fixed_ns = best_ns(20_000, || {
+                row_primary_closed_form_vector_fixed::<6>(
+                    q0,
+                    q1,
+                    qd1,
+                    &slopes,
+                    &scores,
+                    covariance,
+                    1.3,
+                    event,
+                    1.0e-8,
+                    probit_scale,
+                )
+                .expect("fixed vector row program")
+            });
             let hand_ns = best_ns(20_000, || {
                 vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
                     q0,
@@ -1411,10 +1499,11 @@ mod tests {
             });
             eprintln!(
                 "G932_VECTOR_ORDER2_RELEASE covariance={label} k=3 event={event:.0} \
-                 runtime_ns={runtime_ns:.3} hand_ns={hand_ns:.3} \
-                 hand_over_runtime={:.6} first_warm_bytes={first_warm_bytes} \
+                 runtime_ns={runtime_ns:.3} fixed_ns={fixed_ns:.3} hand_ns={hand_ns:.3} \
+                 hand_over_runtime={:.6} hand_over_fixed={:.6} first_warm_bytes={first_warm_bytes} \
                  stable_warm_bytes={stable_warm_bytes}",
                 hand_ns / runtime_ns,
+                hand_ns / fixed_ns,
             );
         }
     }
