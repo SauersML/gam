@@ -4073,7 +4073,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // differenced value path.
         self.current_rho = rho_state;
         self.last_loss = Some(evaluation.loss);
-        if self.termination.record(cost) {
+        if !self.audit_installed_state && self.termination.record(cost) {
             self.bank_checkpoint(rho);
         }
         Ok(OuterEval {

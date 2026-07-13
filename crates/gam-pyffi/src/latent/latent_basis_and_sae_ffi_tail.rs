@@ -1002,10 +1002,11 @@ fn sae_manifold_predict_oos<'py>(
 /// `log_ard` are the trained terminal regularization state the certificate is
 /// evaluated under — the same "must supply the regularization that produced
 /// the decoder" contract `sae_manifold_predict_oos` already carries.
-/// `outer_termination.verdict` on the returned payload reports `External`
-/// (see the library entry's doc) rather than a native stationarity
-/// certificate, and `penalized_quasi_laplace_criterion` is the penalized
-/// objective evaluated AT the supplied state, not a certified minimum.
+/// The native entry first audits the supplied state without taking an optimizer
+/// step. A nonstationary state returns a typed evaluation-only diagnostic with
+/// no fit payload or structure evidence. A passing state alone reaches the
+/// ordinary fit-report marshaller, with termination verdict
+/// `audited_stationary` and zero optimization iterations.
 #[pyfunction(signature = (
     z,
     atom_basis,
@@ -1215,8 +1216,38 @@ fn sae_manifold_certify_external<'py>(
         run_structure_search,
     };
 
-    let report = gam::terms::sae::manifold::run_sae_manifold_certify_external(request)
+    let outcome = gam::terms::sae::manifold::run_sae_manifold_certify_external(request)
         .map_err(|err| sae_fit_error_to_pyerr(py, err))?;
+    let report = match outcome {
+        gam::terms::sae::manifold::SaeExternalCertificationOutcome::Certified(report) => report,
+        gam::terms::sae::manifold::SaeExternalCertificationOutcome::NonStationary(report) => {
+            let out = PyDict::new(py);
+            out.set_item("status", "nonstationary")?;
+            out.set_item("is_fit", false)?;
+            out.set_item("optimization_iterations", report.optimization_iterations)?;
+            out.set_item("reason", report.reason)?;
+            let inner = PyDict::new(py);
+            inner.set_item("raw_gradient_norm", report.inner.raw_gradient_norm)?;
+            inner.set_item(
+                "quotient_gradient_norm",
+                report.inner.quotient_gradient_norm,
+            )?;
+            inner.set_item("stationarity_bound", report.inner.stationarity_bound)?;
+            inner.set_item("certifies", report.inner.certifies())?;
+            out.set_item("inner_kkt", inner)?;
+            let outer = PyDict::new(py);
+            outer.set_item("raw_gradient_norm", report.outer_raw_gradient_norm)?;
+            outer.set_item(
+                "projected_gradient_norm",
+                report.outer_projected_gradient_norm,
+            )?;
+            outer.set_item("stationarity_bound", report.outer_stationarity_bound)?;
+            out.set_item("outer_stationarity", outer)?;
+            out.set_item("structure_search", py.None())?;
+            out.set_item("structure_certificate", py.None())?;
+            return Ok(out.unbind());
+        }
+    };
 
     // #2266/#2263 — the reported dict shape below is a deliberate duplicate of
     // `sae_manifold_fit_inner`'s postlude (same `SaeFitReport` fields, same
@@ -1344,6 +1375,8 @@ fn sae_manifold_certify_external<'py>(
     }
 
     let out = PyDict::new(py);
+    out.set_item("status", "certified")?;
+    out.set_item("is_fit", true)?;
     out.set_item("atoms", atoms_py)?;
     out.set_item("assignments_z", assignments.into_pyarray(py))?;
     out.set_item("logits", term.assignment.logits.clone().into_pyarray(py))?;

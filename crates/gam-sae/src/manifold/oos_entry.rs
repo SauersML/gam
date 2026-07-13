@@ -22,7 +22,7 @@ use crate::inference::steering::{
 use super::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
     MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeBasisSecondJet, SaeCertifyRequest, SaeFitError, SaeFitReport,
+    SaeBasisEvaluator, SaeBasisSecondJet, SaeCertifyRequest, SaeFitError,
     SaeManifoldAtom, SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm, SaeStreamingPlan,
     SphereChartEvaluator, TorusHarmonicEvaluator, run_sae_manifold_certify,
     sae_pca_seed_initial_coords,
@@ -1240,7 +1240,7 @@ pub struct SaeCertifyExternalRequest {
 /// hands the rebuilt term to [`run_sae_manifold_certify`] verbatim.
 pub fn run_sae_manifold_certify_external(
     request: SaeCertifyExternalRequest,
-) -> Result<SaeFitReport, SaeFitError> {
+) -> Result<super::SaeExternalCertificationOutcome, SaeFitError> {
     let SaeCertifyExternalRequest {
         target,
         atoms: atom_specs,

@@ -34,7 +34,7 @@ use gam_math::probability::beta_quantile;
 use gam_problem::topology_certificates::CertificateLedger;
 use gam_problem::{EstimationError, MetricProvenance};
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
-use gam_solve::rho_optimizer::{OuterProblem, OuterResult};
+use gam_solve::rho_optimizer::{OuterProblem, OuterResult, audit_stationary_point};
 use gam_solve::seeding::SeedConfig;
 use gam_solve::structure_search::{MoveBudget, StructureMove};
 use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
@@ -46,7 +46,7 @@ use crate::tiered::Tier0Mean;
 use super::{
     AmortizedEncoderConsistency, AssignmentMode, CoordinateFidelityCertificate,
     SaeManifoldFitDiagnostics, SaeManifoldLoss, SaeManifoldOuterObjective, SaeManifoldRho,
-    SaeManifoldTerm, SaeOuterTermination, SaeOuterVerdict, SaeShapeUncertainty,
+    SaeManifoldTerm, SaeOuterTermination, SaeShapeUncertainty,
     SaeTrustDiagnostics, TopologyPersistenceCertificate, VanishedAtoms,
 };
 
@@ -231,6 +231,90 @@ pub struct SaeFitReport {
     pub structure_certificate_json: String,
     /// The reported `log_alpha` (ordered Beta--Bernoulli concentration or the caller's α fallback).
     pub reported_log_alpha: f64,
+}
+
+/// Exact inner-KKT measurements at one caller-installed external state. No
+/// optimizer is invoked to form these values; they are read directly from the
+/// analytic joint system assembled at the supplied `(term, rho)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SaeInstalledInnerKktAudit {
+    pub raw_gradient_norm: f64,
+    pub quotient_gradient_norm: f64,
+    pub stationarity_bound: f64,
+}
+
+impl SaeInstalledInnerKktAudit {
+    pub fn certifies(&self) -> bool {
+        SaeManifoldTerm::quasi_laplace_kkt_stationary(
+            self.raw_gradient_norm,
+            self.quotient_gradient_norm,
+            self.stationarity_bound,
+        )
+    }
+}
+
+/// Typed diagnostic for an externally supplied state that was evaluated but
+/// refused as a fit. It intentionally carries no term, fitted payload, shape
+/// uncertainty, certificate ledger, or structure evidence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SaeExternalEvaluationReport {
+    pub inner: SaeInstalledInnerKktAudit,
+    pub outer_raw_gradient_norm: Option<f64>,
+    pub outer_projected_gradient_norm: Option<f64>,
+    pub outer_stationarity_bound: Option<f64>,
+    pub optimization_iterations: usize,
+    pub reason: String,
+}
+
+/// External state certification either mints the ordinary converged-fit report
+/// or returns a non-fit diagnostic. The rejected variant cannot be confused
+/// with [`SaeFitOutcome`] and cannot reach inference/structure marshalling.
+pub enum SaeExternalCertificationOutcome {
+    Certified(SaeFitReport),
+    NonStationary(SaeExternalEvaluationReport),
+}
+
+fn installed_inner_kkt_audit(
+    term: &mut SaeManifoldTerm,
+    target: ndarray::ArrayView2<'_, f64>,
+    rho: &SaeManifoldRho,
+    registry: &AnalyticPenaltyRegistry,
+) -> Result<SaeInstalledInnerKktAudit, SaeFitError> {
+    let system = term
+        .assemble_arrow_schur(target, rho, Some(registry))
+        .map_err(SaeFitError::Fit)?;
+    let raw_gradient_norm_sq = SaeManifoldTerm::system_grad_norm_sq(&system);
+    let raw_gradient_norm = raw_gradient_norm_sq.sqrt();
+    let lambda_smooth = rho.lambda_smooth_vec().map_err(SaeFitError::Fit)?;
+    let quotient_gradient_norm = term.quotient_gradient_norm_from_system(
+        &system,
+        raw_gradient_norm_sq,
+        &lambda_smooth,
+    );
+    Ok(SaeInstalledInnerKktAudit {
+        raw_gradient_norm,
+        quotient_gradient_norm,
+        stationarity_bound: super::SAE_MANIFOLD_INNER_GRAD_REL_TOL * term.inner_iterate_scale(),
+    })
+}
+
+fn external_nonstationary_report(
+    inner: SaeInstalledInnerKktAudit,
+    outer: Option<&OuterResult>,
+    reason: String,
+) -> SaeExternalCertificationOutcome {
+    let stationarity = outer
+        .and_then(|result| result.criterion_certificate.as_ref())
+        .map(|certificate| &certificate.stationarity);
+    SaeExternalCertificationOutcome::NonStationary(SaeExternalEvaluationReport {
+        inner,
+        outer_raw_gradient_norm: stationarity.map(|certificate| certificate.raw_norm()),
+        outer_projected_gradient_norm: stationarity
+            .map(|certificate| certificate.projected_norm()),
+        outer_stationarity_bound: stationarity.map(|certificate| certificate.bound()),
+        optimization_iterations: outer.map_or(0, |result| result.iterations),
+        reason,
+    })
 }
 
 /// Exact intercept-only result when the committed fixed-`K` terminal state has
@@ -1494,27 +1578,21 @@ pub struct SaeCertifyRequest {
     pub cancel: Option<Arc<AtomicBool>>,
 }
 
-/// Evaluation-only certification entry (#2266). Installs an
-/// externally-trained (torch-lane) SAE-manifold state VERBATIM — no outer ρ
-/// search, no inner solve, no #2021 structured-residual alternation, no
-/// residual-promotion — and then runs exactly the post-fit
-/// diagnostics/certificate pipeline [`run_sae_manifold_fit`] runs after ITS
-/// own solve (shape-uncertainty bands, trust/fit reports, coordinate
-/// fidelity, the optional #977/#997 structure search, and the anytime-valid
-/// structure certificate). This is how a fit produced outside the closed-form
-/// engine gets the same certificates as a native fit, without pretending a
-/// first-order stationarity certificate exists for state this entry never
-/// optimized: `outer_termination.verdict` reports
-/// [`SaeOuterVerdict::External`], and `penalized_quasi_laplace_criterion` is
-/// documented as the penalized objective evaluated AT the provided state, not
-/// a certified stationary criterion.
+/// Zero-optimization certification entry (#2263). Installs an externally
+/// trained SAE-manifold state verbatim, measures its exact inner KKT residual,
+/// then applies the shared analytic outer-criterion certificate at the supplied
+/// rho. A failed audit returns [`SaeExternalEvaluationReport`], never a fit.
+/// Only a state that independently passes both authorities enters the native
+/// post-fit diagnostics and optional structure-evidence pipeline.
 ///
 /// KEEP IN SYNC WITH `run_sae_manifold_fit_on_target`'s postlude (#2266): the
 /// shared post-fit pipeline is duplicated here rather than extracted into a
 /// common helper, because the source function is under concurrent edit
 /// elsewhere in this workspace and an extraction risked colliding with that
 /// churn. A change to one postlude must be mirrored in the other.
-pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitReport, SaeFitError> {
+pub fn run_sae_manifold_certify(
+    request: SaeCertifyRequest,
+) -> Result<SaeExternalCertificationOutcome, SaeFitError> {
     let SaeCertifyRequest {
         base_term,
         target: z,
@@ -1535,26 +1613,63 @@ pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitRepo
     // Bind the flat assignment-strength layout tag to the term's assignment
     // family; this changes no numeric value, so `rho` is otherwise installed
     // verbatim from the caller.
-    let mut rho = initial_rho.for_assignment(term.assignment.mode);
+    let rho = initial_rho.for_assignment(term.assignment.mode);
     term.assignment
         .validate_rho_domain(&rho)
         .map_err(SaeFitError::Fit)?;
 
-    // No outer search / inner solve ran, so there is no just-converged joint
-    // Hessian factor to read off an outer objective (contrast
-    // `run_sae_manifold_fit_on_target`'s `objective.decoder_shape_uncertainty()`
-    // before `into_fitted`). Form the joint shape bands directly off the
-    // CURRENT term + rho — the same rebuild `run_sae_manifold_fit_on_target`
-    // uses when a post-search structural change stales its pre-search bands.
-    let mut shape_uncertainty = term.recompute_joint_shape_uncertainty(
-        z.view(),
-        &rho,
-        Some(&registry),
-        max_iter,
+    let inner_audit = installed_inner_kkt_audit(&mut term, z.view(), &rho, &registry)?;
+    if !inner_audit.certifies() {
+        return Ok(external_nonstationary_report(
+            inner_audit.clone(),
+            None,
+            format!(
+                "installed external state failed inner KKT stationarity: raw={:.6e}, quotient={:.6e}, bound={:.6e}",
+                inner_audit.raw_gradient_norm,
+                inner_audit.quotient_gradient_norm,
+                inner_audit.stationarity_bound,
+            ),
+        ));
+    }
+
+    // Construct the ordinary native outer objective in frozen installed-state
+    // mode. The audit evaluates the exact supplied point once; it runs neither
+    // an inner update nor an outer optimization loop.
+    let rho_flat = rho.to_flat();
+    let mut objective = SaeManifoldOuterObjective::new(
+        term,
+        z.clone(),
+        Some(registry.clone()),
+        rho,
+        0,
         learning_rate,
         ridge_ext_coord,
         ridge_beta,
-    )?;
+    )
+    .for_installed_state_audit();
+    let outer_result = match audit_stationary_point(
+        &mut objective,
+        rho_flat,
+        "SAE external installed-state audit",
+    ) {
+        Ok(result) => result,
+        Err(rejection) => {
+            return Ok(external_nonstationary_report(
+                inner_audit,
+                Some(&rejection.result),
+                rejection.source.to_string(),
+            ));
+        }
+    };
+    objective
+        .certify_installed_state_audit(&outer_result)
+        .map_err(SaeFitError::Fit)?;
+    let mut shape_uncertainty = objective.decoder_shape_uncertainty()?;
+    let fitted_result = objective.into_fitted().map_err(SaeFitError::Fit)?;
+    let mut term = fitted_result.term;
+    let mut rho = fitted_result.rho;
+    let penalized_quasi_laplace_criterion = fitted_result.penalized_quasi_laplace_criterion;
+    let outer_termination = fitted_result.termination;
 
     {
         let assignments = term.assignment.assignments();
@@ -1777,20 +1892,9 @@ pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitRepo
         .map_err(|error| error.to_string())?;
     let structure_certificate_json =
         serde_json::to_string(&structure_certificate).map_err(|e| e.to_string())?;
-
-    // #2266 — no outer search and no inner solve ran; the returned scalars are
-    // evaluated AT the installed state, not certified as a stationary optimum.
     let loss = term.loss(z.view(), &rho)?;
-    let penalized_quasi_laplace_criterion =
-        term.penalized_objective_total(z.view(), &rho, Some(&registry), 1.0)?;
-    let outer_termination = SaeOuterTermination {
-        verdict: SaeOuterVerdict::External,
-        evals: 0,
-        evals_since_improvement: 0,
-        wall: std::time::Duration::ZERO,
-    };
 
-    Ok(SaeFitReport {
+    Ok(SaeExternalCertificationOutcome::Certified(SaeFitReport {
         term,
         rho,
         loss,
@@ -1810,7 +1914,7 @@ pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitRepo
         structure_search_json,
         structure_certificate_json,
         reported_log_alpha,
-    })
+    }))
 }
 
 #[cfg(test)]
