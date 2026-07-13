@@ -2331,32 +2331,46 @@ fn sample_table(
 // PyPairedCifOptions) were never defined in the main crate; the orphaned
 // implementations and their helpers were deleted below.
 
+fn dense_affine_design_to_python(
+    py: Python<'_>,
+    affine: DenseAffineDesign,
+) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("offset", affine.offset.into_pyarray(py))?;
+    out.set_item("matrix", affine.matrix.into_pyarray(py))?;
+    out.set_item("coefficients", affine.coefficients.into_pyarray(py))?;
+    out.set_item("coefficient_frame", affine.coefficient_frame)?;
+    out.set_item("coefficient_start", affine.coefficient_start)?;
+    out.set_item("coefficient_stop", affine.coefficient_stop)?;
+    Ok(out.unbind())
+}
+
 #[pyfunction]
-fn design_matrix_table_dense(
+fn affine_design_table(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
-) -> PyResult<Py<PyArray2<f64>>> {
+) -> PyResult<Py<PyDict>> {
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
-    let out = detach_py_result(py, "design_matrix_table_dense", move || {
-        design_matrix_encoded_table_impl(&model_bytes, dataset)
+    let affine = detach_py_result(py, "affine_design_table", move || {
+        affine_design_encoded_table_impl(&model_bytes, dataset)
     })?;
-    Ok(out.into_pyarray(py).unbind())
+    dense_affine_design_to_python(py, affine)
 }
 
 #[pyfunction]
-fn design_matrix_array<'py>(
+fn affine_design_array<'py>(
     py: Python<'py>,
     model_bytes: Vec<u8>,
     x: PyReadonlyArray2<'py, f64>,
-) -> PyResult<Py<PyArray2<f64>>> {
+) -> PyResult<Py<PyDict>> {
     let x_values = x.as_array().to_owned();
-    let out = detach_py_result(py, "design_matrix_array", move || {
-        design_matrix_array_impl(&model_bytes, x_values.view())
+    let affine = detach_py_result(py, "affine_design_array", move || {
+        affine_design_array_impl(&model_bytes, x_values.view())
     })?;
-    Ok(out.into_pyarray(py).unbind())
+    dense_affine_design_to_python(py, affine)
 }
 
 #[pyfunction(signature = (t, knots, degree = 3, periodic = false))]

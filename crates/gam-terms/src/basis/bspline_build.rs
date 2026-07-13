@@ -2562,7 +2562,7 @@ pub(crate) fn function_space_subspace_shrinkage_derivatives(
 /// ridge `G Z (ZᵀGZ)⁻¹ ZᵀG` penalizes `∫ (null component of f)²` instead — a
 /// property of the function alone, covariant under any basis change
 /// (`S → MᵀSM`, `G → MᵀGM` maps the ridge to exactly `MᵀRM`).
-pub(crate) fn function_space_nullspace_shrinkage(
+pub fn function_space_nullspace_shrinkage(
     penalty: &Array2<f64>,
     gram: &Array2<f64>,
 ) -> Result<Option<Array2<f64>>, BasisError> {

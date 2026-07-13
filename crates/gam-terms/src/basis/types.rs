@@ -890,17 +890,6 @@ pub struct MaternBasisSpec {
     /// When None, isotropic distance r = ‖x - c‖ is used.
     #[serde(default)]
     pub aniso_log_scales: Option<Vec<f64>>,
-    /// Frozen double-penalty nullspace-shrinkage decision (gam#787/#860).
-    ///
-    /// `None` (the default, and the cold-build value) = decide whether to emit
-    /// the `DoublePenaltyNullspace` candidate via the κ-dependent spectral test in
-    /// `build_nullspace_shrinkage_penalty`. `Some(b)` = force the decision (set by
-    /// the freeze step from the bootstrap-κ build, mirrored from
-    /// `MaternIdentifiability::FrozenTransform`) so the learned-penalty count stays
-    /// invariant as the κ-optimizer rebuilds the design at each trial length-scale.
-    /// Only consulted when `double_penalty` is true.
-    #[serde(default)]
-    pub nullspace_shrinkage_survived: Option<bool>,
 }
 
 /// Per-smooth identifiability policy for Matérn kernel coefficients.
@@ -920,27 +909,7 @@ pub enum MaternIdentifiability {
     /// Use this when explicit linear terms should own global trends.
     CenterLinearOrthogonal,
     /// Freeze a fit-time transform `Z` so prediction cannot drift.
-    ///
-    /// `nullspace_shrinkage_survived` freezes the double-penalty
-    /// nullspace-shrinkage decision alongside the transform (gam#787/#860). The
-    /// matern double-penalty path emits a `DoublePenaltyNullspace` candidate iff
-    /// `build_nullspace_shrinkage_penalty(&projected_kernel)` finds a near-zero
-    /// eigenvalue — but that spectral test is κ-DEPENDENT (its tolerance scales
-    /// with `λ_max`), so a near-zero eigenvalue can cross the threshold as the
-    /// κ-optimizer rebuilds the design at each trial length-scale. That flips the
-    /// learned-penalty count 6↔7 across the rebuild and the rebuilt design's ρ
-    /// dimension then disagrees with the frozen joint setup ("joint hyper rho
-    /// dimension mismatch" → every κ seed fails startup validation). Freezing the
-    /// bootstrap-κ decision here (`Some(true)` = always emit the shrinkage
-    /// candidate, `Some(false)` = never) keeps the penalty count INVARIANT across
-    /// the κ rebuild so κ actually optimizes. `None` = decide via the spectral
-    /// test (the non-frozen / cold-build behavior; also the serde back-compat
-    /// default for transforms frozen before this field existed).
-    FrozenTransform {
-        transform: Array2<f64>,
-        #[serde(default)]
-        nullspace_shrinkage_survived: Option<bool>,
-    },
+    FrozenTransform { transform: Array2<f64> },
 }
 
 /// Duchon null-space polynomial degree.
@@ -1399,13 +1368,6 @@ pub enum BasisMetadata {
         /// Per-axis anisotropy log-scales η_a for geometric anisotropy.
         /// When Some, distance is r = √(Σ_a exp(2η_a) · (x_a - c_a)²).
         aniso_log_scales: Option<Vec<f64>>,
-        /// Realized double-penalty nullspace-shrinkage decision at this build
-        /// (gam#787/#860). The freeze step pins this into
-        /// `MaternIdentifiability::FrozenTransform::nullspace_shrinkage_survived`
-        /// so the κ-optimizer's per-trial rebuilds keep the learned-penalty count
-        /// invariant (otherwise the κ-dependent spectral test flips it 6↔7 → "joint
-        /// hyper rho dimension mismatch").
-        nullspace_shrinkage_survived: bool,
     },
     Duchon {
         centers: Array2<f64>,

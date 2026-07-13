@@ -4740,8 +4740,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(sample_table, module)?)?;
-    module.add_function(wrap_pyfunction!(design_matrix_table_dense, module)?)?;
-    module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;
+    module.add_function(wrap_pyfunction!(affine_design_table, module)?)?;
+    module.add_function(wrap_pyfunction!(affine_design_array, module)?)?;
     module.add_function(wrap_pyfunction!(
         build_difference_smooth_request_json,
         module
@@ -8894,22 +8894,81 @@ fn resolve_nuts_config(model: &FittedModel, options: PySampleOptions) -> NutsCon
     }
 }
 
-fn design_matrix_encoded_table_impl(
-    model_bytes: &[u8],
-    source: EncodedDataset,
-) -> Result<Array2<f64>, String> {
-    let model = load_model_impl(model_bytes)?;
-    let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
-    design_matrix_dense(&model, dataset)
+struct DenseAffineDesign {
+    offset: Array1<f64>,
+    matrix: Array2<f64>,
+    coefficients: Array1<f64>,
+    coefficient_frame: &'static str,
+    coefficient_start: usize,
+    coefficient_stop: usize,
 }
 
-fn design_matrix_array_impl(
+fn affine_design_for_dataset(
+    model: &FittedModel,
+    dataset: EncodedDataset,
+) -> Result<DenseAffineDesign, String> {
+    // A scan-routed model intentionally owns no finite B-spline coefficient
+    // frame.  Its exact state-space predictor therefore has no affine design to
+    // expose; keep the refusal structural and actionable (#1046).
+    if let Some(scan) = scan_introspection(model)? {
+        return Err(format!(
+            "{} is fit by the exact O(n) state-space spline scan, which does not \
+             have a finite coefficient-frame design; design_matrix() is unavailable. \
+             Refit with double_penalty=true if you need an explicit affine design.",
+            scan_smooth_label(&scan)
+        ));
+    }
+    if model.predict_model_class() != PredictModelClass::Standard {
+        return Err(format!(
+            "design_matrix supports standard GAM models; got '{}'. For other \
+             classes use Model.predict, whose saved predictor can contain \
+             multiple coupled parameter surfaces.",
+            prediction_model_class_label(model)
+        ));
+    }
+
+    let col_map = dataset.column_map();
+    let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
+    let offset_noise = Array1::zeros(dataset.values.nrows());
+    let input = build_predict_input_for_model(
+        model,
+        dataset.values.view(),
+        &col_map,
+        model.training_headers.as_ref(),
+        &offset,
+        &offset_noise,
+        false,
+    )?;
+    let affine = gam_predict::fitted_standard_affine_design(model, &input)?;
+    let matrix = affine
+        .matrix
+        .try_to_dense_by_chunks("public affine prediction design")?;
+    Ok(DenseAffineDesign {
+        offset: affine.offset,
+        matrix,
+        coefficients: affine.coefficients,
+        coefficient_frame: affine.coefficient_frame.name(),
+        coefficient_start: affine.coefficient_range.start,
+        coefficient_stop: affine.coefficient_range.end,
+    })
+}
+
+fn affine_design_encoded_table_impl(
+    model_bytes: &[u8],
+    source: EncodedDataset,
+) -> Result<DenseAffineDesign, String> {
+    let model = load_model_impl(model_bytes)?;
+    let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
+    affine_design_for_dataset(&model, dataset)
+}
+
+fn affine_design_array_impl(
     model_bytes: &[u8],
     x: ArrayView2<'_, f64>,
-) -> Result<Array2<f64>, String> {
+) -> Result<DenseAffineDesign, String> {
     let model = load_model_impl(model_bytes)?;
     let dataset = dataset_from_x_array_with_model_schema(&model, x)?;
-    design_matrix_dense(&model, dataset)
+    affine_design_for_dataset(&model, dataset)
 }
 
 /// Population variance (divide by `n`, matching numpy `np.var`'s default).
@@ -8949,8 +9008,9 @@ fn model_partial_dependence_encoded_impl(
     term: &str,
     source: EncodedDataset,
 ) -> Result<(Vec<f64>, Vec<f64>), String> {
-    let x = design_matrix_encoded_table_impl(model_bytes, source)?;
     let model = load_model_impl(model_bytes)?;
+    let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
+    let x = standard_mean_design_dense(&model, dataset)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     let beta = &fit.beta;
     let cov = fit
@@ -9010,8 +9070,9 @@ fn model_variance_share_encoded_impl(
     source: EncodedDataset,
     term: Option<String>,
 ) -> Result<Vec<(String, f64)>, String> {
-    let x = design_matrix_encoded_table_impl(model_bytes, source)?;
     let model = load_model_impl(model_bytes)?;
+    let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
+    let x = standard_mean_design_dense(&model, dataset)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     let beta = &fit.beta;
     let blocks = term_blocks_for_model_impl(model_bytes)?;
@@ -9090,7 +9151,13 @@ fn model_variance_share(
     })
 }
 
-fn design_matrix_dense(
+/// Internal full mean-block design used by term diagnostics.
+///
+/// This is deliberately distinct from the public affine predictor design.  A
+/// link-wiggle's final fitted predictor uses the mean block as its row offset
+/// and a LinkWiggle-frame matrix, so returning this internal matrix from the
+/// public API was the architectural root cause of #2299.
+fn standard_mean_design_dense(
     model: &FittedModel,
     dataset: EncodedDataset,
 ) -> Result<Array2<f64>, String> {
@@ -9115,11 +9182,11 @@ fn design_matrix_dense(
             prediction_model_class_label(model)
         ));
     }
-    if model.has_link_wiggle() {
+    if model.saved_link_wiggle()?.is_some() {
         return Err(
-            "design_matrix does not yet support link-wiggle models because the \
-             linear predictor is q0 + B(q0)·theta, not a single X·beta product. \
-             Use Model.predict for these models."
+            "term-design diagnostics do not define an additive mean-block \
+             decomposition for link-wiggle models; use design_matrix() for the \
+             exact fitted affine predictor or Model.predict for response-scale output."
                 .to_string(),
         );
     }

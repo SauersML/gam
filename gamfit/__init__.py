@@ -320,6 +320,7 @@ from ._exceptions import (
     UnsupportedLinkError,
 )
 from ._model import (
+    AffineDesign,
     CompetingRisksCIF,
     CompetingRisksPrediction,
     Model,

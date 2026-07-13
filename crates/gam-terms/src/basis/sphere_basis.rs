@@ -821,21 +821,6 @@ pub(crate) fn build_matern_basis_seeded(
             z.clone()
         }
     });
-    // Frozen double-penalty nullspace-shrinkage decision carried by a
-    // FrozenTransform identifiability (gam#787/#860). `None` for cold/non-frozen
-    // builds → decide via the κ-dependent spectral test; `Some(b)` (set at the
-    // bootstrap-κ freeze) forces the decision so the learned-penalty count is
-    // invariant across the κ optimizer's per-trial design rebuilds.
-    let frozen_nullspace_shrinkage_survived = match &spec.identifiability {
-        MaternIdentifiability::FrozenTransform {
-            nullspace_shrinkage_survived,
-            ..
-        } => *nullspace_shrinkage_survived,
-        _ => None,
-    };
-    // Realized decision, recorded into metadata so the freeze step can pin it.
-    // Each candidate-emission arm below overwrites this with its actual outcome.
-    let mut realized_nullspace_shrinkage_survived = false;
     let design_cols =
         z_opt.as_ref().map_or(centers.nrows(), Array2::ncols) + usize::from(spec.include_intercept);
     let dense_bytes = dense_design_bytes(data.nrows(), design_cols);
@@ -877,14 +862,11 @@ pub(crate) fn build_matern_basis_seeded(
                 spec.include_intercept,
                 full_transform.as_ref(),
             )?;
-            let (candidates, survived) = matern_double_penalty_candidates_with_decision(
+            matern_double_penalty_candidates(
                 &primary,
                 &function_gram,
                 spec.include_intercept,
-                frozen_nullspace_shrinkage_survived,
-            )?;
-            realized_nullspace_shrinkage_survived = survived;
-            candidates
+            )?
         } else {
             build_matern_operator_penalty_candidates(
                 centers.view(),
@@ -968,14 +950,11 @@ pub(crate) fn build_matern_basis_seeded(
                 spec.include_intercept,
                 full_transform.as_ref(),
             )?;
-            let (candidates, survived) = matern_double_penalty_candidates_with_decision(
+            matern_double_penalty_candidates(
                 &primary,
                 &function_gram,
                 spec.include_intercept,
-                frozen_nullspace_shrinkage_survived,
-            )?;
-            realized_nullspace_shrinkage_survived = survived;
-            candidates
+            )?
         } else {
             build_matern_operator_penalty_candidates(
                 centers.view(),
@@ -1005,13 +984,7 @@ pub(crate) fn build_matern_basis_seeded(
             DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(m.basis.clone()))
         };
         let candidates = if spec.double_penalty {
-            let (candidates, survived) = build_matern_double_penalty_candidates(
-                &m,
-                full_transform.as_ref(),
-                frozen_nullspace_shrinkage_survived,
-            )?;
-            realized_nullspace_shrinkage_survived = survived;
-            candidates
+            build_matern_double_penalty_candidates(&m, full_transform.as_ref())?
         } else {
             build_matern_operator_penalty_candidates(
                 centers.view(),
@@ -1040,7 +1013,6 @@ pub(crate) fn build_matern_basis_seeded(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: aniso,
-            nullspace_shrinkage_survived: realized_nullspace_shrinkage_survived,
         },
         kronecker_factored: None,
         ops,

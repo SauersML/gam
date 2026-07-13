@@ -510,19 +510,58 @@ pub(crate) fn install_time_nullspace_shrinkage_penalty(
         }
     }
 
-    let Some(shrinkage) = gam_terms::basis::build_nullspace_shrinkage_penalty(&aggregate)
+    if time_block.design_entry.ncols() != p {
+        return Err(format!(
+            "survival-marginal-slope time_block entry design has {} columns, expected {p}",
+            time_block.design_entry.ncols(),
+        ));
+    }
+    // Use the average endpoint function measure, not Euclidean coefficient
+    // length. Entry and exit evaluations are the two value channels through
+    // which this time function enters the survival likelihood; averaging their
+    // Grams makes the metric invariant to whole-sample replication while
+    // treating both endpoints symmetrically. Under any coefficient chart
+    // change M, `G -> M' G M`, so the resulting null ridge transforms by the
+    // same congruence instead of changing the represented penalty.
+    let entry_mass = time_block.design_entry.nrows();
+    let exit_mass = time_block.design_exit.nrows();
+    let total_mass = entry_mass.saturating_add(exit_mass);
+    if total_mass == 0 {
+        return Err(
+            "survival-marginal-slope time_block cannot define a function metric from zero endpoint rows"
+                .to_string(),
+        );
+    }
+    let entry_gram = time_block
+        .design_entry
+        .diag_xtw_x(&Array1::ones(entry_mass))
+        .map_err(|err| {
+            format!("survival-marginal-slope time_block entry function Gram: {err}")
+        })?;
+    let exit_gram = time_block
+        .design_exit
+        .diag_xtw_x(&Array1::ones(exit_mass))
+        .map_err(|err| {
+            format!("survival-marginal-slope time_block exit function Gram: {err}")
+        })?;
+    let function_gram = (entry_gram + exit_gram).mapv(|value| value / total_mass as f64);
+
+    let Some(shrinkage) = gam_terms::basis::function_space_nullspace_shrinkage(
+        &aggregate,
+        &function_gram,
+    )
         .map_err(|err| format!("survival-marginal-slope time_block nullspace shrinkage: {err}"))?
     else {
         return Ok(false);
     };
-    if shrinkage.sym_penalty.nrows() != p || shrinkage.sym_penalty.ncols() != p {
+    if shrinkage.nrows() != p || shrinkage.ncols() != p {
         return Err(format!(
             "survival-marginal-slope time_block nullspace shrinkage penalty must be {p}x{p}, got {}x{}",
-            shrinkage.sym_penalty.nrows(),
-            shrinkage.sym_penalty.ncols(),
+            shrinkage.nrows(),
+            shrinkage.ncols(),
         ));
     }
-    time_block.penalties.push(shrinkage.sym_penalty);
+    time_block.penalties.push(shrinkage);
     time_block.nullspace_dims.push(0);
     log::info!(
         "[survival-marginal-slope] added time_block nullspace shrinkage penalty (p={p}, penalties={})",

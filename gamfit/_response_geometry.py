@@ -322,8 +322,12 @@ class SharedGaussianRemlTangentFit:
         return int(self.coefficients.shape[1])
 
     def predict_tangent(self, data: Any) -> Any:
-        x = self.template_model.design_matrix(data)
-        return x @ self.coefficients
+        affine = self.template_model.design_matrix(data)
+        if affine.coefficient_frame != "full":
+            raise RuntimeError(
+                "response-geometry tangent prediction requires a full-frame affine design"
+            )
+        return affine.offset[:, None] + affine.matrix @ self.coefficients
 
     def summary(self) -> dict[str, Any]:
         # ``lambdas`` / ``edf`` are shared per-smooth (length M, common to every

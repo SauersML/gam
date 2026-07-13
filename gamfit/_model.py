@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence, cast
+
+import numpy as np
+from numpy.typing import NDArray
 
 from ._binding import rust_module
 from ._diagnostics import Diagnostics
@@ -32,6 +36,46 @@ from ._survival import (
     term_blocks_for_model,
 )
 from ._tables import normalize_table, response_column_name, restore_output_table
+
+
+AffineCoefficientFrame = Literal["full", "link_wiggle"]
+
+
+@dataclass(frozen=True, slots=True)
+class AffineDesign:
+    """Exact fitted affine predictor returned by :meth:`Model.design_matrix`.
+
+    ``offset + matrix @ coefficients`` reproduces the fitted linear predictor.
+    ``coefficient_frame`` names the coordinate system containing those exact
+    coefficients; ``coefficient_slice`` is the represented half-open slice in
+    that frame.  A link-wiggle frame can be a saved standard-basis lift of the
+    fit's identifiable reduced coordinates, so it must not be reinterpreted as
+    a slice of the joint posterior sample vector.
+    """
+
+    offset: NDArray[np.float64]
+    matrix: NDArray[np.float64]
+    coefficients: NDArray[np.float64]
+    coefficient_frame: AffineCoefficientFrame
+    coefficient_start: int
+    coefficient_stop: int
+
+    @property
+    def coefficient_slice(self) -> slice:
+        """Half-open slice represented inside :attr:`coefficient_frame`."""
+        return slice(self.coefficient_start, self.coefficient_stop)
+
+
+def _affine_design_from_payload(payload: Any) -> AffineDesign:
+    """Shape the Rust-owned affine payload without duplicating model math."""
+    return AffineDesign(
+        offset=payload["offset"],
+        matrix=payload["matrix"],
+        coefficients=payload["coefficients"],
+        coefficient_frame=cast(AffineCoefficientFrame, payload["coefficient_frame"]),
+        coefficient_start=int(payload["coefficient_start"]),
+        coefficient_stop=int(payload["coefficient_stop"]),
+    )
 
 
 class Model:
@@ -708,18 +752,36 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
 
-    def design_matrix(self, data: Any) -> Any:
-        """Materialised design matrix for ``data`` against the saved model."""
-        headers, rows, _ = normalize_table(data)
-        return rust_module().design_matrix_table_dense(self._model_bytes, headers, rows)
+    def design_matrix(self, data: Any) -> AffineDesign:
+        """Return the exact fitted affine predictor design for ``data``.
 
-    def design_matrix_array(self, X: Any) -> Any:
-        """Materialised design matrix for a numeric feature matrix."""
+        The result always has one typed shape.  For an ordinary standard GAM,
+        ``offset`` is the model's row offset, ``matrix`` is the full saved-model
+        design, and the coefficient frame is ``"full"``.  For a link-wiggle
+        fit, ``offset`` is the fitted base predictor and ``matrix`` is the saved
+        warp basis evaluated at its exact fitted index (including the frozen
+        #2141 index shift); its frame is ``"link_wiggle"``.
+
+        In both cases, ``offset + matrix @ coefficients`` reproduces the fitted
+        linear predictor.  Scan-routed and coupled multi-surface models have no
+        finite single-frame affine representation and are rejected explicitly.
+        """
+        headers, rows, _ = normalize_table(data)
+        try:
+            payload = rust_module().affine_design_table(self._model_bytes, headers, rows)
+            return _affine_design_from_payload(payload)
+        except Exception as exc:
+            raise map_exception(exc) from exc
+
+    def design_matrix_array(self, X: Any) -> AffineDesign:
+        """Exact fitted affine predictor design for a numeric feature matrix."""
         try:
             rust = rust_module()
-            return rust.design_matrix_array(
-                self._model_bytes,
-                rust.numeric_matrix_f64(X, "X"),
+            return _affine_design_from_payload(
+                rust.affine_design_array(
+                    self._model_bytes,
+                    rust.numeric_matrix_f64(X, "X"),
+                )
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -1512,6 +1574,7 @@ class MultinomialModel:
 
 
 __all__ = [
+    "AffineDesign",
     "CompetingRisksCIF",
     "CompetingRisksPrediction",
     "Model",

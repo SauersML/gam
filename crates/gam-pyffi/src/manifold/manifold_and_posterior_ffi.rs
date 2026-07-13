@@ -760,7 +760,7 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
         request,
         |headers, rows| {
             let dataset = dataset_with_model_schema(&model, headers, rows)?;
-            design_matrix_dense(&model, dataset)
+            standard_mean_design_dense(&model, dataset)
         },
     )?;
     serde_json::to_string(&rows)

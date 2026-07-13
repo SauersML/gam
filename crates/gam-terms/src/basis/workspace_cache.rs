@@ -399,12 +399,11 @@ pub(crate) fn matern_center_function_gram(
     Ok(symmetrize_penalty(&fast_ata(&center_design)))
 }
 
-pub(crate) fn matern_double_penalty_candidates_with_decision(
+pub(crate) fn matern_double_penalty_candidates(
     primary: &Array2<f64>,
     function_gram: &Array2<f64>,
     include_intercept: bool,
-    frozen: Option<bool>,
-) -> Result<(Vec<PenaltyCandidate>, bool), BasisError> {
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
     // gam#1379 — guard the Primary projected kernel Gram itself. It is `Zᵀ K Z`
     // with a finite Matérn kernel `K`, so it is finite in exact arithmetic; if a
     // degenerate trial geometry made it non-finite we cannot ship it as a
@@ -432,15 +431,7 @@ pub(crate) fn matern_double_penalty_candidates_with_decision(
     // eigenvalues near a floating-point tolerance remain range directions; they
     // must be conditioned/reduced, never reclassified into a κ-dependent null
     // projector. This makes penalty topology structural and κ-invariant.
-    let survived = include_intercept;
-    if let Some(expected) = frozen
-        && expected != survived
-    {
-        crate::bail_invalid_basis!(
-            "frozen Matérn nullspace topology ({expected}) disagrees with structural intercept topology ({survived})"
-        );
-    }
-    if survived {
+    if include_intercept {
         let p = primary.nrows();
         let mut intercept_frame = Array2::<f64>::zeros((p, 1));
         intercept_frame[[p - 1, 0]] = 1.0;
@@ -451,24 +442,18 @@ pub(crate) fn matern_double_penalty_candidates_with_decision(
             PenaltySource::DoublePenaltyNullspace,
         ));
     }
-    Ok((candidates, survived))
+    Ok(candidates)
 }
 
 pub(crate) fn build_matern_double_penalty_candidates(
     spline: &MaternSplineBasis,
     full_transform: Option<&Array2<f64>>,
-    frozen_nullspace_shrinkage_survived: Option<bool>,
-) -> Result<(Vec<PenaltyCandidate>, bool), BasisError> {
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let primary = project_penalty_matrix(&spline.penalty_kernel, full_transform);
     let include_intercept = spline.num_polynomial_basis == 1;
     let function_gram =
         matern_center_function_gram(&spline.penalty_kernel, include_intercept, full_transform)?;
-    matern_double_penalty_candidates_with_decision(
-        &primary,
-        &function_gram,
-        include_intercept,
-        frozen_nullspace_shrinkage_survived,
-    )
+    matern_double_penalty_candidates(&primary, &function_gram, include_intercept)
 }
 
 /// Creates a Matérn spline basis from data and centers.
