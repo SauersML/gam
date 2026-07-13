@@ -1,6 +1,6 @@
 use gam::basis::{
-    CenterStrategy, SphericalSplineBasisSpec, build_spherical_spline_basis,
-    spherical_wahba_kernel_matrix,
+    ActivePenalty, BasisBuildResult, CenterStrategy, PenaltySource, SphericalSplineBasisSpec,
+    build_spherical_spline_basis, spherical_wahba_kernel_matrix,
 };
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula};
@@ -9,6 +9,14 @@ use gam::terms::basis::BasisMetadata;
 use gam::terms::smooth::SmoothBasisSpec;
 use gam::terms::term_builder::build_termspec;
 use ndarray::{array, s};
+
+fn primary_penalty(built: &BasisBuildResult) -> &ActivePenalty {
+    built
+        .active_penalties
+        .iter()
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+        .expect("basis must retain its primary penalty")
+}
 
 #[test]
 fn wahba_kernel_is_longitude_periodic_and_symmetric() {
@@ -58,8 +66,14 @@ fn spherical_basis_builds_raw_wahba_design_and_penalties() {
     let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere basis");
     assert_eq!(built.design.nrows(), data.nrows());
     assert_eq!(built.design.ncols(), data.nrows());
-    assert_eq!(built.penalties.len(), 2);
-    assert_eq!(built.penalties[0].nrows(), data.nrows());
+    assert_eq!(built.active_penalties.len(), 2);
+    assert_eq!(primary_penalty(&built).matrix.nrows(), data.nrows());
+    let nullspace_shrinkage = built
+        .active_penalties
+        .iter()
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace))
+        .expect("double_penalty=true must retain its null-space shrinkage penalty");
+    assert_eq!(nullspace_shrinkage.matrix.nrows(), data.nrows());
 
     match built.metadata {
         BasisMetadata::Sphere {
@@ -296,8 +310,8 @@ fn spherical_harmonic_basis_builds_with_correct_width_and_diagonal_penalty() {
     let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere harmonic basis");
     // dim = L(L+2) = 3*5 = 15
     assert_eq!(built.design.ncols(), 15);
-    assert_eq!(built.penalties.len(), 1);
-    let p = built.penalties[0].clone();
+    assert_eq!(built.active_penalties.len(), 1);
+    let p = &primary_penalty(&built).matrix;
     // diagonal
     for i in 0..p.nrows() {
         for j in 0..p.ncols() {
@@ -328,15 +342,11 @@ fn spherical_harmonic_penalty_order_changes_penalty_shape() {
         wahba_kernel: Default::default(),
         identifiability: Default::default(),
     };
-    let p1 = build_spherical_spline_basis(data.view(), &spec)
-        .expect("m=1 harmonic basis")
-        .penalties[0]
-        .clone();
+    let built_m1 = build_spherical_spline_basis(data.view(), &spec).expect("m=1 harmonic basis");
+    let p1 = &primary_penalty(&built_m1).matrix;
     spec.penalty_order = 4;
-    let p4 = build_spherical_spline_basis(data.view(), &spec)
-        .expect("m=4 harmonic basis")
-        .penalties[0]
-        .clone();
+    let built_m4 = build_spherical_spline_basis(data.view(), &spec).expect("m=4 harmonic basis");
+    let p4 = &primary_penalty(&built_m4).matrix;
 
     let low_degree_ratio_m1 = p1[(3, 3)] / p1[(0, 0)];
     let low_degree_ratio_m4 = p4[(3, 3)] / p4[(0, 0)];

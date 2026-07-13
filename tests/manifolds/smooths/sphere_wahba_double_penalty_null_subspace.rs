@@ -9,12 +9,12 @@
 //! i.e. > 3 centers at SPHERE_UNPENALIZED_LOW_DEGREE=1). It therefore shrank the
 //! wrong subspace and left the genuinely-unpenalized harmonics free.
 //!
-//! Contract pinned on the realized `penalties`/`penaltyinfo`: the double-penalty
-//! ridge must ANNIHILATE the primary penalty (complementary subspaces in the
-//! same chart), `‖ridge·primary‖/(‖ridge‖‖primary‖) ≈ 0`. The as-built
-//! kernel-block ridge left ≈ 0.41 of that product; the fixed null-space ridge
-//! leaves ~0. A ≥4-center fixture puts the build in the `low_degree_cols > 0`
-//! regime so the wrong-subspace path is exercised.
+//! Contract pinned on the realized atomic active-penalty records: the
+//! double-penalty ridge must ANNIHILATE the primary penalty (complementary
+//! subspaces in the same chart), `‖ridge·primary‖/(‖ridge‖‖primary‖) ≈ 0`. The
+//! as-built kernel-block ridge left ≈ 0.41 of that product; the fixed
+//! null-space ridge leaves ~0. A ≥4-center fixture puts the build in the
+//! `low_degree_cols > 0` regime so the wrong-subspace path is exercised.
 
 use faer::Side;
 use gam::basis::{
@@ -54,28 +54,26 @@ fn wahba_sphere_double_penalty_ridge_shrinks_primary_null_space() {
     let built = build_spherical_spline_basis(data.view(), &spec).expect("Wahba sphere basis");
 
     let primary = built
-        .penalties
+        .active_penalties
         .iter()
-        .zip(built.penaltyinfo.iter())
-        .find(|(_, i)| matches!(i.source, PenaltySource::Primary))
-        .map(|(s, _)| s.clone())
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+        .map(|penalty| &penalty.matrix)
         .expect("a Primary RKHS penalty");
     let ridge = built
-        .penalties
+        .active_penalties
         .iter()
-        .zip(built.penaltyinfo.iter())
-        .find(|(_, i)| matches!(i.source, PenaltySource::DoublePenaltyNullspace))
-        .map(|(s, _)| s.clone())
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace))
+        .map(|penalty| &penalty.matrix)
         .expect("a DoublePenaltyNullspace ridge (double_penalty=true)");
 
-    let pn = frob(&primary);
-    let rn = frob(&ridge);
+    let pn = frob(primary);
+    let rn = frob(ridge);
     assert!(pn > 0.0 && rn > 0.0, "degenerate primary/ridge");
 
     // Complementary-subspace contract: the ridge range is the primary's null
     // space (the low-degree harmonics), so ridge·primary ≈ 0. The old kernel-block
     // ridge leaves ≈ 0.41 here.
-    let rel = frob(&ridge.dot(&primary)) / (rn * pn);
+    let rel = frob(&ridge.dot(primary)) / (rn * pn);
     assert!(
         rel < 1e-8,
         "Wahba sphere double-penalty ridge does not annihilate the primary RKHS \
