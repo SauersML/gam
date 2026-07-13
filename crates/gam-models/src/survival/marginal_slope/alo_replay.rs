@@ -341,6 +341,7 @@ pub fn replay_saved_survival_marginal_slope_alo(
         z: Arc::new(z_matrix),
         score_covariance,
         gaussian_frailty_sd: input.gaussian_frailty_sd,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: input.derivative_guard,
         design_entry: input.design_entry.clone(),
         design_exit: input.design_exit.clone(),

@@ -246,6 +246,7 @@ fn make_closed_form_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         z: Arc::new(z.insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         // Empty time/marginal/logslope designs: `n_rows × 0` so the
         // closed-form q geometry is driven entirely by offsets.
@@ -585,6 +586,7 @@ fn test_family(
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -620,6 +622,7 @@ fn validate_spec_rejects_coordinate_cone_without_guard_offset() {
         marginal_offset: Array1::zeros(2),
         frailty: FrailtySpec::None,
         derivative_guard: 1e-4,
+        baseline_hyper: SurvivalMarginalSlopeBaselineHyperSpec::Linear,
         time_block: TimeBlockInput {
             design_entry: DesignMatrix::from(Array2::zeros((2, 1))),
             design_exit: DesignMatrix::from(Array2::zeros((2, 1))),
@@ -649,7 +652,7 @@ fn validate_spec_rejects_coordinate_cone_without_guard_offset() {
 }
 
 #[test]
-fn validate_spec_rejects_learnable_gaussian_shift_sigma() {
+fn validate_spec_accepts_learned_gaussian_shift_sigma() {
     let spec = SurvivalMarginalSlopeTermSpec {
         age_entry: array![0.0, 0.0],
         age_exit: array![1.0, 1.0],
@@ -663,6 +666,7 @@ fn validate_spec_rejects_learnable_gaussian_shift_sigma() {
             scale: FrailtyScale::Learned { initial_sigma: 0.5 },
         },
         derivative_guard: 1e-4,
+        baseline_hyper: SurvivalMarginalSlopeBaselineHyperSpec::Linear,
         time_block: base_time_block(),
         timewiggle_block: None,
         logslopespec: empty_termspec(),
@@ -674,8 +678,7 @@ fn validate_spec_rejects_learnable_gaussian_shift_sigma() {
         latent_z_policy: LatentZPolicy::default(),
     };
 
-    let err = validate_spec(&spec).expect_err("learnable GaussianShift sigma should be rejected");
-    assert!(err.contains("learnable GaussianShift sigma is not implemented"));
+    validate_spec(&spec).expect("learned GaussianShift scale is an explicit family coordinate");
 }
 
 #[test]
@@ -986,6 +989,7 @@ fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
         z: Arc::new(array![0.25].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -1562,6 +1566,7 @@ fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
         z: Arc::new(array![-0.35].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -1707,6 +1712,7 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
             z: Arc::new(array![fix.z].insert_axis(Axis(1))),
             score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
+            family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
             design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -1904,6 +1910,7 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         z: Arc::new(array![z_row].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -2346,6 +2353,7 @@ fn link_flex_family_supports_second_order_exact_outer_path() {
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -2389,6 +2397,7 @@ fn timewiggle_scorewarp_family_supports_second_order_exact_outer_path() {
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 5))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 5))),
@@ -2543,6 +2552,7 @@ fn survival_marginal_slope_coefficient_cost_uses_joint_coupled_formula() {
         z: Arc::new(Array1::zeros(n).insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((n, p_time))),
         design_exit: DesignMatrix::from(Array2::zeros((n, p_time))),
@@ -2589,6 +2599,7 @@ fn exact_outer_row_work_gate_keeps_large_timewiggle_link_models_under_linear_fle
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 12))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 12))),
@@ -2633,6 +2644,7 @@ fn timewiggle_scorewarp_beta_hessian_directional_derivative_returns_finite_matri
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
         design_exit: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -2703,6 +2715,7 @@ fn timewiggle_scorewarp_beta_hessian_second_directional_derivative_returns_finit
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
         design_exit: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -2782,6 +2795,7 @@ fn link_flex_blockwise_exact_newton_matches_joint_principal_blocks() {
         z: Arc::new(array![0.15, -0.25].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((2, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((2, 1))),
@@ -2844,6 +2858,7 @@ fn link_flex_marginal_psi_terms_return_finite_joint_terms() {
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -2926,6 +2941,7 @@ fn link_flex_marginal_psi_second_order_returns_finite_joint_terms() {
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -3015,6 +3031,7 @@ fn link_flex_marginal_psi_hessian_directional_returns_finite_matrix() {
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -3104,6 +3121,7 @@ fn timewiggle_marginal_psi_terms_return_finite_joint_terms() {
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
         design_exit: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -3181,6 +3199,7 @@ fn timewiggle_blockwise_exact_newton_matches_joint_principal_blocks() {
         z: Arc::new(array![0.15, -0.25].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(array![
             [0.0, 0.0, 0.0, 0.0, 0.0],
@@ -3248,6 +3267,7 @@ fn flex_timewiggle_fast_gradient_matches_dense_joint_gradient() {
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
         design_exit: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -3341,6 +3361,7 @@ fn timewiggle_joint_hessian_matches_central_fd_of_joint_gradient() {
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(array![[0.4, -0.1, 0.2, 0.0, 0.0]]),
         design_exit: DesignMatrix::from(array![[0.6, 0.3, -0.15, 0.0, 0.0]]),
@@ -3533,6 +3554,7 @@ fn row_dynamic_q_geometry_into_pooled_matches_fresh_allocation_bitwise() {
         z: Arc::new(array![0.15, -0.25].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(array![
             [0.0, 0.0, 0.0, 0.0, 0.0],
@@ -3712,6 +3734,7 @@ fn flex_timewiggle_operator_to_dense_matches_evaluate_dense_joint_hessian() {
         z: Arc::new(array![0.15, -0.25].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(array![
             [0.0, 0.0, 0.0, 0.0, 0.0],
@@ -3795,6 +3818,7 @@ fn timewiggle_marginal_logslope_psi_second_order_returns_finite_joint_terms() {
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
         design_exit: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -3880,6 +3904,7 @@ fn timewiggle_marginal_psi_hessian_directional_returns_finite_matrix() {
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
         design_exit: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -3964,6 +3989,7 @@ fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: Some(sigma),
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -4026,6 +4052,7 @@ fn censored_rows_still_reject_invalid_time_derivative() {
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-4,
         design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 1)),
@@ -4097,6 +4124,7 @@ fn exact_newton_evaluation_propagates_invalid_rows() {
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-4,
         design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
             0.0
@@ -4161,6 +4189,7 @@ fn time_constraints_use_exact_derivative_guard_rows() {
         z: Arc::new(array![0.0, 0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-4,
         design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((2, 2)),
@@ -4245,6 +4274,7 @@ fn time_block_constraints_synthesize_qd1_rows_when_stored_constraints_missing() 
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
             0.0, 0.0
@@ -4309,6 +4339,7 @@ fn time_block_max_feasible_step_uses_synthesized_qd1_rows() {
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
             0.0, 0.0
@@ -4370,6 +4401,7 @@ fn coupled_qd1_guard_limits_time_step_before_post_update_projection() {
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1.0,
         design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
             0.0, 0.0
@@ -4443,6 +4475,7 @@ fn timewiggle_tail_step_is_clipped_before_it_can_flip_derivative() {
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
             0.0, 0.0
@@ -4494,6 +4527,7 @@ fn time_block_post_update_rejects_infeasible_beta_instead_of_projecting() {
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
             1.0, 0.0
@@ -4583,6 +4617,7 @@ fn time_block_post_update_rejects_qd1_when_no_linear_constraints() {
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
             0.0
@@ -4668,6 +4703,7 @@ fn time_block_post_update_errors_when_current_violates_qd1() {
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
             0.0
@@ -4739,6 +4775,7 @@ fn time_block_feasible_step_stays_inside_derivative_guard() {
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-4,
         design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
             0.0, 0.0
@@ -4832,6 +4869,7 @@ fn mixed_blockwise_exact_newton_preserves_sparse_block_hessians() {
         z: Arc::new(array![0.1, -0.2].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [0.6]])),
         design_exit: DesignMatrix::Dense(DenseDesignMatrix::from(array![[0.9], [0.5]])),
@@ -5170,6 +5208,7 @@ fn make_block_psi_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         z: Arc::new(z.insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((n, 0))),
         design_exit: DesignMatrix::from(Array2::zeros((n, 0))),
@@ -5823,6 +5862,7 @@ fn make_flex_no_wiggle_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         z: Arc::new(z.insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((n, 0))),
         design_exit: DesignMatrix::from(Array2::zeros((n, 0))),
@@ -6120,6 +6160,7 @@ fn flex_contraction_fixture_family(
         z: Arc::new(array![fixture.z].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -6351,6 +6392,7 @@ fn make_time_guard_family(deriv_coeff: f64, deriv_offset: f64) -> SurvivalMargin
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-6,
         design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
         design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -6573,6 +6615,7 @@ fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
             z: Arc::new(array![zr].insert_axis(Axis(1))),
             score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
+            family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
             design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
