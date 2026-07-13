@@ -475,6 +475,82 @@ impl<'a> GaussianJointRowProgram<'a> {
         }
         Ok(())
     }
+
+    /// Symbolically lowered value/gradient/Hessian for one certified row.
+    ///
+    /// The concrete sparsity bits are part of the generated function's type:
+    /// both score channels and all three packed Hessian channels are live.
+    #[inline(always)]
+    fn row_order2(&self, row: usize) -> gam_math::jet_scalar::StaticOrder2Atom<2, 3, 3, 7> {
+        gaussian_normalized_row_order2(
+            0.0,
+            0.0,
+            self.rows.obs_weight[row],
+            self.rows.standardized_residual[row],
+            self.rows.inv_sigma[row],
+            self.rows.kappa[row],
+        )
+    }
+
+    /// Symbolically lowered Hessian derivative in one predictor direction.
+    #[inline(always)]
+    fn row_third_contracted(&self, row: usize, direction: &[f64; 2]) -> [[f64; 2]; 2] {
+        gaussian_normalized_row_third_contracted(
+            0.0,
+            0.0,
+            self.rows.obs_weight[row],
+            self.rows.standardized_residual[row],
+            self.rows.inv_sigma[row],
+            self.rows.kappa[row],
+            direction,
+        )
+    }
+
+    /// Symbolically lowered mixed derivative of the row Hessian.
+    #[inline(always)]
+    fn row_fourth_contracted(
+        &self,
+        row: usize,
+        direction_u: &[f64; 2],
+        direction_v: &[f64; 2],
+    ) -> [[f64; 2]; 2] {
+        gaussian_normalized_row_fourth_contracted(
+            0.0,
+            0.0,
+            self.rows.obs_weight[row],
+            self.rows.standardized_residual[row],
+            self.rows.inv_sigma[row],
+            self.rows.kappa[row],
+            direction_u,
+            direction_v,
+        )
+    }
+}
+
+#[inline(always)]
+fn matrix_vector_2(matrix: &[[f64; 2]; 2], vector: &[f64; 2]) -> [f64; 2] {
+    [
+        matrix[0][0] * vector[0] + matrix[0][1] * vector[1],
+        matrix[1][0] * vector[0] + matrix[1][1] * vector[1],
+    ]
+}
+
+#[inline(always)]
+fn dot_2(left: &[f64; 2], right: &[f64; 2]) -> f64 {
+    left[0] * right[0] + left[1] * right[1]
+}
+
+#[inline(always)]
+fn add_vector_2(left: [f64; 2], right: [f64; 2]) -> [f64; 2] {
+    [left[0] + right[0], left[1] + right[1]]
+}
+
+#[inline(always)]
+fn add_matrix_2(left: [[f64; 2]; 2], right: [[f64; 2]; 2]) -> [[f64; 2]; 2] {
+    [
+        [left[0][0] + right[0][0], left[0][1] + right[0][1]],
+        [left[1][0] + right[1][0], left[1][1] + right[1][1]],
+    ]
 }
 
 impl gam_math::jet_tower::RowProgram<2> for GaussianJointRowProgram<'_> {
@@ -733,20 +809,13 @@ pub(crate) fn gaussian_joint_first_directionalweights(
     dotmu: &Array1<f64>,
     dot_eta: &Array1<f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    let nobs = scalars.w.len();
+    let nobs = scalars.obs_weight.len();
+    let program = GaussianJointRowProgram::new(scalars);
     let mut w_u = Array1::<f64>::zeros(nobs);
     let mut c_u = Array1::<f64>::zeros(nobs);
     let mut d_u = Array1::<f64>::zeros(nobs);
     for i in 0..nobs {
-        let matrix = gaussian_normalized_row_third_contracted(
-            0.0,
-            0.0,
-            scalars.obs_weight[i],
-            scalars.standardized_residual[i],
-            scalars.inv_sigma[i],
-            scalars.kappa[i],
-            &[dotmu[i], dot_eta[i]],
-        );
+        let matrix = program.row_third_contracted(i, &[dotmu[i], dot_eta[i]]);
         w_u[i] = matrix[0][0];
         c_u[i] = matrix[0][1];
         d_u[i] = matrix[1][1];
@@ -763,18 +832,14 @@ pub(crate) fn gaussian_jointsecond_directionalweights(
     dotmuv: &Array1<f64>,
     dot_etav: &Array1<f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    let nobs = scalars.w.len();
+    let nobs = scalars.obs_weight.len();
+    let program = GaussianJointRowProgram::new(scalars);
     let mut w_uv = Array1::<f64>::zeros(nobs);
     let mut c_uv = Array1::<f64>::zeros(nobs);
     let mut d_uv = Array1::<f64>::zeros(nobs);
     for i in 0..nobs {
-        let matrix = gaussian_normalized_row_fourth_contracted(
-            0.0,
-            0.0,
-            scalars.obs_weight[i],
-            scalars.standardized_residual[i],
-            scalars.inv_sigma[i],
-            scalars.kappa[i],
+        let matrix = program.row_fourth_contracted(
+            i,
             &[dotmu_u[i], dot_eta_u[i]],
             &[dotmuv[i], dot_etav[i]],
         );
@@ -790,7 +855,8 @@ pub(crate) fn gaussian_joint_psi_firstweights(
     mu_a: &Array1<f64>,
     eta_a: &Array1<f64>,
 ) -> GaussianJointPsiFirstWeights {
-    let nobs = scalars.w.len();
+    let nobs = scalars.obs_weight.len();
+    let program = GaussianJointRowProgram::new(scalars);
     let mut objective_psirow = Array1::<f64>::uninit(nobs);
     let mut scoremu = Array1::<f64>::uninit(nobs);
     let mut score_ls = Array1::<f64>::uninit(nobs);
@@ -803,52 +869,26 @@ pub(crate) fn gaussian_joint_psi_firstweights(
     let mut dhmu_ls = Array1::<f64>::uninit(nobs);
     let mut dh_ls_ls = Array1::<f64>::uninit(nobs);
     for i in 0..nobs {
-        let mi = scalars.m[i];
-        let ni = scalars.n[i];
-        let ki = scalars.kappa[i];
-        let kpi = scalars.kappa_prime[i];
-        let kdpi = scalars.kappa_dprime[i];
-        let ai = scalars.obs_weight[i];
-        let ma = mu_a[i];
-        let ea = eta_a[i];
-        // κ-scaled log-sigma direction.
-        let sea = ki * ea;
-        let smu = -mi;
-        let sls = ki * (ai - ni);
-        let wi = scalars.w[i];
-        scoremu[i].write(smu);
-        score_ls[i].write(sls);
-        dscoremu[i].write(wi * ma + 2.0 * mi * sea);
-        // + κ'·(a−n)·η̇ chain-rule term (∂[κ(a−n)]/∂η = κ'(a−n) + 2κ²n).
-        dscore_ls[i].write(ki * (2.0 * mi * ma + 2.0 * ni * sea) + kpi * (ai - ni) * ea);
-        hmumu[i].write(wi);
-        // OBSERVED joint penalized Hessian (Wood–Pya–Säfken 2016 LAML object;
-        // #1561 cutover from the block-Fisher #684/#566 approximation). The
-        // outer LAML criterion `−½log|H+S|` and its ρ-gradient require the
-        // observed curvature at β̂ — the Fisher object (cross ≡ 0, σσ = 2κ²a)
-        // overstated σ-block information on the near-flat scale surface and
-        // over-smoothed log σ. Observed cross block H_{μ,ls} = 2κm; this is the
-        // SAME single-source coefficient as `gaussian_locscale_observed_joint_row_coeffs`
-        // and the dense `exact_newton_joint_hessian_from_designs`. At a flat/true
-        // null σ surface n→a, m→0, so observed → Fisher and the null behavior is
-        // unchanged. The score channels stay the exact observed gradient.
-        hmu_ls[i].write(2.0 * ki * mi);
-        // Observed (log σ, log σ) curvature H_{ls,ls} = κ'(a−n) + 2κ²n.
-        h_ls_ls[i].write(kpi * (ai - ni) + 2.0 * ki * ki * ni);
-        dhmumu[i].write(-2.0 * wi * sea);
-        // Directional derivative of the observed cross block 2κm along (μ̇=ma,
-        // η̇=ea): d(2κm)[ξ] = −2κw·ma + (2κ'−4κ²)m·ea (same as the dense
-        // `gaussian_joint_first_directionalweights` c_u channel).
-        dhmu_ls[i].write(ki * (-2.0 * wi * ma - 4.0 * mi * sea) + 2.0 * mi * kpi * ea);
-        // Directional derivative of the observed h_ls_ls along (μ̇=ma, η̇=ea):
-        //   ∂h/∂η_μ = −2m(2κ²−κ'),  ∂h/∂η_ls = κ''(a−n) + (6κκ'−4κ³)n
-        // (same as the dense `gaussian_joint_first_directionalweights` d_u).
-        let a_coef = 2.0 * ki * ki - kpi;
-        dh_ls_ls[i].write(
-            -2.0 * mi * a_coef * ma
-                + (kdpi * (ai - ni) + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * ea,
-        );
-        objective_psirow[i].write(smu * ma + sls * ea);
+        let direction = [mu_a[i], eta_a[i]];
+        let atom = program.row_order2(i);
+        let score = atom.gradient();
+        let hessian = [
+            [atom.hessian_at(0, 0), atom.hessian_at(0, 1)],
+            [atom.hessian_at(1, 0), atom.hessian_at(1, 1)],
+        ];
+        let score_direction = matrix_vector_2(&hessian, &direction);
+        let hessian_direction = program.row_third_contracted(i, &direction);
+        objective_psirow[i].write(dot_2(&score, &direction));
+        scoremu[i].write(score[0]);
+        score_ls[i].write(score[1]);
+        dscoremu[i].write(score_direction[0]);
+        dscore_ls[i].write(score_direction[1]);
+        hmumu[i].write(hessian[0][0]);
+        hmu_ls[i].write(hessian[0][1]);
+        h_ls_ls[i].write(hessian[1][1]);
+        dhmumu[i].write(hessian_direction[0][0]);
+        dhmu_ls[i].write(hessian_direction[0][1]);
+        dh_ls_ls[i].write(hessian_direction[1][1]);
     }
     // SAFETY: every `MaybeUninit` slot in each field array was written
     // exactly once inside the `for i in 0..nobs` loop above.
@@ -878,7 +918,8 @@ pub(crate) fn gaussian_joint_psisecondweights(
     mu_ab: &Array1<f64>,
     eta_ab: &Array1<f64>,
 ) -> GaussianJointPsiSecondWeights {
-    let nobs = scalars.w.len();
+    let nobs = scalars.obs_weight.len();
+    let program = GaussianJointRowProgram::new(scalars);
     let mut objective_psi_psirow = Array1::<f64>::uninit(nobs);
     let mut d2scoremu = Array1::<f64>::uninit(nobs);
     let mut d2score_ls = Array1::<f64>::uninit(nobs);
@@ -886,80 +927,32 @@ pub(crate) fn gaussian_joint_psisecondweights(
     let mut d2hmu_ls = Array1::<f64>::uninit(nobs);
     let mut d2h_ls_ls = Array1::<f64>::uninit(nobs);
     for i in 0..nobs {
-        let wi = scalars.w[i];
-        let mi = scalars.m[i];
-        let ni = scalars.n[i];
-        let ki = scalars.kappa[i];
-        let kpi = scalars.kappa_prime[i];
-        let kdpi = scalars.kappa_dprime[i];
-        let ai = scalars.obs_weight[i];
-        let amn = ai - ni;
-        let ma = mu_a[i];
-        let mb = mu_b[i];
-        let mab = mu_ab[i];
-        let ea = eta_a[i];
-        let eb = eta_b[i];
-        let eab = eta_ab[i];
-        // κ-scaled log-sigma directions.
-        let sea = ki * ea;
-        let seb = ki * eb;
-        let seab = ki * eab;
-        let cross = ma * seb + mb * sea;
-        // Bare-η symmetric form (no κ): needed for κ' chain-rule terms.
-        let cross_eta = ma * eb + mb * ea;
-        let sea_seb = sea * seb;
-        let ea_eb = ea * eb;
-        let ma_mb = ma * mb;
-        // + κ'·(a−n)·ea·eb: dκ/dη chain-rule contribution from σ = b + e^η.
+        let direction_a = [mu_a[i], eta_a[i]];
+        let direction_b = [mu_b[i], eta_b[i]];
+        let direction_ab = [mu_ab[i], eta_ab[i]];
+        let atom = program.row_order2(i);
+        let score = atom.gradient();
+        let hessian = [
+            [atom.hessian_at(0, 0), atom.hessian_at(0, 1)],
+            [atom.hessian_at(1, 0), atom.hessian_at(1, 1)],
+        ];
+        let hessian_a = program.row_third_contracted(i, &direction_a);
+        let hessian_ab = program.row_third_contracted(i, &direction_ab);
+        let hessian_a_b = program.row_fourth_contracted(i, &direction_a, &direction_b);
+        let score_second = add_vector_2(
+            matrix_vector_2(&hessian_a, &direction_b),
+            matrix_vector_2(&hessian, &direction_ab),
+        );
+        let hessian_second = add_matrix_2(hessian_a_b, hessian_ab);
         objective_psi_psirow[i].write(
-            wi * ma_mb + 2.0 * mi * cross + 2.0 * ni * sea_seb - mi * mab
-                + ki * amn * eab
-                + kpi * amn * ea_eb,
+            dot_2(&direction_a, &matrix_vector_2(&hessian, &direction_b))
+                + dot_2(&score, &direction_ab),
         );
-        // + 2·m·κ'·ea·eb: ∂²(−m)/∂η² = −4mκ² + 2mκ'.
-        d2scoremu[i].write(
-            wi * mab - 2.0 * wi * cross - 4.0 * mi * sea_seb
-                + 2.0 * mi * seab
-                + 2.0 * mi * kpi * ea_eb,
-        );
-        // + 2·κ'·m·sym(μ_a η_b) + (κ''(a−n)+6κκ'n)·ea·eb + κ'(a−n)·eab.
-        d2score_ls[i].write(
-            ki * (-2.0 * wi * ma_mb - 4.0 * mi * cross - 4.0 * ni * sea_seb
-                + 2.0 * mi * mab
-                + 2.0 * ni * seab)
-                + 2.0 * mi * kpi * cross_eta
-                + (kdpi * amn + 6.0 * ki * kpi * ni) * ea_eb
-                + kpi * amn * eab,
-        );
-        // − 2·κ'·w·ea·eb: ∂²w/∂η² = 4wκ² − 2wκ'.
-        d2hmumu[i].write(4.0 * wi * sea_seb - 2.0 * wi * seab - 2.0 * wi * kpi * ea_eb);
-        // Second ψ-directional derivative of the OBSERVED cross block 2κm
-        // (#1561). Bilinear part = the dense `gaussian_jointsecond_directionalweights`
-        // c_uv form; the direction-curvature part = ∇(2κm)·(μ_ab, η_ab) with
-        // ∂(2κm)/∂η_μ = −2κw, ∂(2κm)/∂η_ls = (2κ'−4κ²)m.
-        d2hmu_ls[i].write(
-            ki * (4.0 * wi * cross + 8.0 * mi * sea_seb) - 2.0 * wi * kpi * cross_eta
-                + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * ea_eb
-                - 2.0 * ki * wi * mab
-                + (2.0 * kpi - 4.0 * ki * ki) * mi * eab,
-        );
-        // Second ψ-directional derivative of the OBSERVED h_ls_ls = κ'(a−n)+2κ²n
-        // (#1561). Bilinear part = the dense `gaussian_jointsecond_directionalweights`
-        // d_uv form (A = 2κ²−κ', E = 6κκ'−4κ³−κ'', κ''' = κ''(1−2κ)−2κ'²); the
-        // direction-curvature part = ∇h_ls_ls·(μ_ab, η_ab) with
-        // ∂h/∂η_μ = −2mA, ∂h/∂η_ls = κ''(a−n) + (6κκ'−4κ³)n.
-        let a_coef = 2.0 * ki * ki - kpi;
-        let e_coef = 6.0 * ki * kpi - 4.0 * ki * ki * ki - kdpi;
-        let ktp = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
-        d2h_ls_ls[i].write(
-            2.0 * wi * a_coef * ma_mb
-                + mi * (8.0 * ki * ki * ki - 12.0 * ki * kpi + 2.0 * kdpi) * cross_eta
-                + (ktp * ai - 2.0 * ki * ni * e_coef
-                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi - 12.0 * ki * ki * kpi - ktp))
-                    * ea_eb
-                - 2.0 * mi * a_coef * mab
-                + (kdpi * amn + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * eab,
-        );
+        d2scoremu[i].write(score_second[0]);
+        d2score_ls[i].write(score_second[1]);
+        d2hmumu[i].write(hessian_second[0][0]);
+        d2hmu_ls[i].write(hessian_second[0][1]);
+        d2h_ls_ls[i].write(hessian_second[1][1]);
     }
     // SAFETY: every `MaybeUninit` slot in each field array was written
     // exactly once inside the `for i in 0..nobs` loop above.
@@ -977,11 +970,6 @@ pub(crate) fn gaussian_joint_psisecondweights(
 
 pub(crate) fn gaussian_joint_psi_mixed_driftweights(
     scalars: &GaussianJointRowScalars,
-    // Both channels are needed now that the curvature is OBSERVED (#1561): the
-    // cross block H_{μ,ls}=2κm and the observed h_ls_ls both depend on the
-    // μ-channel drift (`dot_mu`), the ψ μ-direction (`mu_a`), and the mixed
-    // μ direction-curvature (`dot_mu_a`). `u = (dot_mu, dot_eta)` is the drift
-    // direction, `a = (mu_a, eta_a)` the ψ direction.
     dot_mu: &Array1<f64>,
     dot_eta: &Array1<f64>,
     mu_a: &Array1<f64>,
@@ -989,7 +977,8 @@ pub(crate) fn gaussian_joint_psi_mixed_driftweights(
     dot_mu_a: &Array1<f64>,
     dot_eta_a: &Array1<f64>,
 ) -> GaussianJointPsiMixedDriftWeights {
-    let nobs = scalars.w.len();
+    let nobs = scalars.obs_weight.len();
+    let program = GaussianJointRowProgram::new(scalars);
     let mut dhmumu_u = Array1::<f64>::uninit(nobs);
     let mut dhmu_ls_u = Array1::<f64>::uninit(nobs);
     let mut dh_ls_ls_u = Array1::<f64>::uninit(nobs);
@@ -997,63 +986,20 @@ pub(crate) fn gaussian_joint_psi_mixed_driftweights(
     let mut d2hmu_ls = Array1::<f64>::uninit(nobs);
     let mut d2h_ls_ls = Array1::<f64>::uninit(nobs);
     for i in 0..nobs {
-        let wi = scalars.w[i];
-        let mi = scalars.m[i];
-        let ni = scalars.n[i];
-        let ki = scalars.kappa[i];
-        let kpi = scalars.kappa_prime[i];
-        let kdpi = scalars.kappa_dprime[i];
-        let ai = scalars.obs_weight[i];
-        let dmu = dot_mu[i];
-        let de = dot_eta[i];
-        let ma = mu_a[i];
-        let ea = eta_a[i];
-        let dma = dot_mu_a[i];
-        let dea = dot_eta_a[i];
-        // κ-scaled log-sigma directions.
-        let sde = ki * de;
-        let sea = ki * ea;
-        let sdea = ki * dea;
-        let de_ea = de * ea;
-        // A = 2κ²−κ', E = 6κκ'−4κ³−κ'', κ''' = κ''(1−2κ)−2κ'² (logb-link).
-        let a_coef = 2.0 * ki * ki - kpi;
-        let e_coef = 6.0 * ki * kpi - 4.0 * ki * ki * ki - kdpi;
-        let ktp = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
-        // First directional derivative of Hessian blocks along the drift u.
-        dhmumu_u[i].write(-2.0 * wi * sde);
-        // OBSERVED cross block drift d_u(2κm) = −2κw·dot_mu + (2κ'−4κ²)m·dot_eta
-        // (#1561; same closed form as the dense c_u channel).
-        dhmu_ls_u[i].write(ki * (-2.0 * wi * dmu - 4.0 * mi * sde) + 2.0 * mi * kpi * de);
-        // OBSERVED h_ls_ls drift d_u(κ'(a−n)+2κ²n) = −2m·A·dot_mu
-        // + (κ''(a−n)+(6κκ'−4κ³)n)·dot_eta (#1561; dense d_u channel).
-        dh_ls_ls_u[i].write(
-            -2.0 * mi * a_coef * dmu
-                + (kdpi * (ai - ni) + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * de,
+        let drift = [dot_mu[i], dot_eta[i]];
+        let psi = [mu_a[i], eta_a[i]];
+        let mixed_direction = [dot_mu_a[i], dot_eta_a[i]];
+        let hessian_drift = program.row_third_contracted(i, &drift);
+        let hessian_mixed = add_matrix_2(
+            program.row_fourth_contracted(i, &drift, &psi),
+            program.row_third_contracted(i, &mixed_direction),
         );
-        // − 2·κ'·w·de·ea: ∂²w/∂η² = 4wκ² − 2wκ'.
-        d2hmumu[i].write(4.0 * wi * sde * sea - 2.0 * wi * sdea - 2.0 * wi * kpi * de_ea);
-        // OBSERVED cross block mixed second drift D_u D_a(2κm): bilinear in
-        // u=(dmu,de), a=(ma,ea) plus the direction-curvature ∇(2κm)·(dma,dea)
-        // with ∂(2κm)/∂η_μ=−2κw, ∂(2κm)/∂η_ls=(2κ'−4κ²)m (#1561).
-        d2hmu_ls[i].write(
-            ki * (4.0 * wi * (dmu * sea + ma * sde) + 8.0 * mi * sde * sea)
-                - 2.0 * wi * kpi * (dmu * ea + ma * de)
-                + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * de_ea
-                - 2.0 * ki * wi * dma
-                + (2.0 * kpi - 4.0 * ki * ki) * mi * dea,
-        );
-        // OBSERVED h_ls_ls mixed second drift D_u D_a(κ'(a−n)+2κ²n): bilinear in
-        // u=(dmu,de), a=(ma,ea) plus the direction-curvature ∇h_ls_ls·(dma,dea)
-        // with ∂h/∂η_μ=−2mA, ∂h/∂η_ls=κ''(a−n)+(6κκ'−4κ³)n (#1561).
-        d2h_ls_ls[i].write(
-            2.0 * wi * a_coef * (dmu * ma)
-                + mi * (8.0 * ki * ki * ki - 12.0 * ki * kpi + 2.0 * kdpi) * (dmu * ea + ma * de)
-                + (ktp * ai - 2.0 * ki * ni * e_coef
-                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi - 12.0 * ki * ki * kpi - ktp))
-                    * de_ea
-                - 2.0 * mi * a_coef * dma
-                + (kdpi * (ai - ni) + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * dea,
-        );
+        dhmumu_u[i].write(hessian_drift[0][0]);
+        dhmu_ls_u[i].write(hessian_drift[0][1]);
+        dh_ls_ls_u[i].write(hessian_drift[1][1]);
+        d2hmumu[i].write(hessian_mixed[0][0]);
+        d2hmu_ls[i].write(hessian_mixed[0][1]);
+        d2h_ls_ls[i].write(hessian_mixed[1][1]);
     }
     // SAFETY: every `MaybeUninit` slot in each field array was written
     // exactly once inside the `for i in 0..nobs` loop above.
@@ -1094,18 +1040,12 @@ pub(crate) fn gaussian_locscale_observed_joint_row_coeffs(
     rows: &GaussianJointRowScalars,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     let n = rows.obs_weight.len();
+    let program = GaussianJointRowProgram::new(rows);
     let mut mm = Array1::<f64>::zeros(n);
     let mut ml = Array1::<f64>::zeros(n);
     let mut ll = Array1::<f64>::zeros(n);
     for row in 0..n {
-        let atom = gaussian_normalized_row_order2(
-            0.0,
-            0.0,
-            rows.obs_weight[row],
-            rows.standardized_residual[row],
-            rows.inv_sigma[row],
-            rows.kappa[row],
-        );
+        let atom = program.row_order2(row);
         mm[row] = atom.hessian_at(0, 0);
         ml[row] = atom.hessian_at(0, 1);
         ll[row] = atom.hessian_at(1, 1);
