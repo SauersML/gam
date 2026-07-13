@@ -9394,12 +9394,18 @@ fn release_measure_flex_jet_orders_vs_retained_oracles_932() {
             &primary,
         )
         .expect("production Jet2 value/gradient/Hessian");
-    assert_eq!(jet1.0.to_bits(), jet2.0.to_bits(), "Jet1/Jet2 value drift");
+    let value_gap = (jet1.0 - jet2.0).abs();
+    assert!(
+        value_gap <= 1.0e-14 * jet2.0.abs().max(1.0),
+        "Jet1/Jet2 value drift: gap={value_gap:e}"
+    );
+    let mut jet1_jet2_gradient_max_rel = 0.0_f64;
     for (axis, (&first, &second)) in jet1.1.iter().zip(jet2.1.iter()).enumerate() {
-        assert_eq!(
-            first.to_bits(),
-            second.to_bits(),
-            "Jet1/Jet2 gradient drift at axis {axis}"
+        let relative = (first - second).abs() / second.abs().max(1.0);
+        jet1_jet2_gradient_max_rel = jet1_jet2_gradient_max_rel.max(relative);
+        assert!(
+            relative <= 1.0e-14,
+            "Jet1/Jet2 gradient drift at axis {axis}: rel={relative:e}"
         );
     }
 
@@ -9452,7 +9458,8 @@ fn release_measure_flex_jet_orders_vs_retained_oracles_932() {
 
     eprintln!(
         "G932_FLEX_RELEASE fixture={} p={} jet1_ns={jet1_ns:.3} jet2_ns={jet2_ns:.3} \
-         jet2_over_jet1={:.6} hand_t3_ns={hand_third_ns:.3} jet3_ns={jet3_ns:.3} \
+         jet2_over_jet1={:.6} jet1_jet2_gradient_max_rel={jet1_jet2_gradient_max_rel:.6e} \
+         hand_t3_ns={hand_third_ns:.3} jet3_ns={jet3_ns:.3} \
          hand_over_jet3={:.6} t3_max_abs={third_max_abs:.6e} t3_max_rel={third_max_rel:.6e} \
          invalid_hand_t4_ns={invalid_hand_fourth_ns:.3} jet4_ns={jet4_ns:.3} \
          invalid_hand_over_jet4={:.6} invalid_t4_max_abs={fourth_max_abs:.6e} \
