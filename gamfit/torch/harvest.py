@@ -11,9 +11,9 @@ harvests, for each token, the exact low-rank input shard that gam's
   scaled so that ``U_n U_nᵀ`` reconstructs the rank-r truncation of ``G_n``
   (column ``k`` is ``√λ_k · v_k``). This is exactly the factor convention
   ``RowMetric::output_fisher`` expects: it forms ``W_n = U_n U_nᵀ`` directly;
-* ``mass_residual`` — ``trace(G_n) − Σ_{k≤r} λ_k``, the output-Fisher mass that
-  falls *off* the captured top-r subspace. This is what makes the rank-r cut
-  honest downstream: it bounds the whitening error the truncation incurs.
+* ``mass_residual`` — an optional estimate of
+  ``trace(G_n) − Σ_{k≤r} λ_k``. It is a scalar diagnostic, never an operator
+  certificate and never evidence that a randomized factor is a PSD lower bound.
 
 Everything is matrix-free. The Jacobian ``J_n`` (``C × p``) and the pullback
 ``G_n`` (``p × p``) are **never materialized**. The only primitive used is the
@@ -179,12 +179,22 @@ class HarvestShard:
         if X.ndim != 2:
             raise ValueError(f"X must be (n, p); got shape {X.shape}")
         n, p = X.shape
+        if isinstance(self.rank, (bool, np.bool_)) or not isinstance(
+            self.rank, (int, np.integer)
+        ):
+            raise TypeError("rank must be an integer")
+        if self.rank < 1:
+            raise ValueError(f"rank must be >= 1; got {self.rank}")
         if U.shape != (n, p, self.rank):
             raise ValueError(
                 f"U must be (n, p, r) = ({n}, {p}, {self.rank}); got shape {U.shape}"
             )
         if mr is not None and mr.shape != (n,):
             raise ValueError(f"mass_residual must be (n,) = ({n},); got shape {mr.shape}")
+        if not np.all(np.isfinite(X)) or not np.all(np.isfinite(U)):
+            raise ValueError("X and U must contain only finite values")
+        if mr is not None and (not np.all(np.isfinite(mr)) or np.any(mr < 0.0)):
+            raise ValueError("mass_residual must contain finite non-negative values")
         if self.factor_kind not in _FISHER_FACTOR_KINDS:
             raise ValueError(
                 f"factor_kind must be one of {sorted(_FISHER_FACTOR_KINDS)}; "
@@ -643,10 +653,9 @@ def harvest_behavioral_fisher_probes(
     The columns of ``U_n = [v₁/√s … v_s/√s] ∈ ℝ^{p × s}`` are consumed verbatim
     by ``RowMetric::behavioral_fisher``: it forms ``M_n = U_n U_nᵀ ≈ G_n`` and
     prices the reconstruction residual as ``½ eᵀ M_n e`` (nats), the generalized
-    least-squares data-fit. Unlike the eigenfactor form there is no rank-r
-    truncation — every direction is retained stochastically — so ``mass_residual``
-    is identically ``0`` (the sketch is a full-rank unbiased estimator, not a
-    truncation), carried only to satisfy the shared shard layout.
+    least-squares data-fit. This is a stochastic operator approximation, not a
+    truncation with a certified tail, so it carries
+    ``factor_kind="uncertified_approximation"`` and no ``mass_residual``.
 
     Parameters
     ----------
