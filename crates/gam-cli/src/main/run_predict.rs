@@ -310,9 +310,10 @@ pub(crate) fn run_predict_unified(
     }
 
     cli_out!(
-        "wrote predictions: {} (rows={})",
+        "wrote predictions: {} (rows={}){}",
         args.out.display(),
-        mean.len()
+        mean.len(),
+        covariance_provenance_note(args, nonlinear || args.uncertainty)
     );
     Ok(())
 }
@@ -1050,9 +1051,10 @@ pub(crate) fn run_predict_saved_latent_window_impl(
         mean_hi.as_ref().map(|a| a.view()),
     )?;
     cli_out!(
-        "wrote predictions: {} (rows={})",
+        "wrote predictions: {} (rows={}){}",
         args.out.display(),
-        mean.len()
+        mean.len(),
+        covariance_provenance_note(args, need_covariance)
     );
     Ok(())
 }
@@ -1436,9 +1438,10 @@ pub(crate) fn run_predict_survival(
             )?;
         }
         cli_out!(
-            "wrote predictions: {} (rows={})",
+            "wrote predictions: {} (rows={}){}",
             args.out.display(),
-            mean.len()
+            mean.len(),
+            covariance_provenance_note(args, include_survival_location_scale_intervals)
         );
         return Ok(());
     }
@@ -1559,9 +1562,13 @@ pub(crate) fn run_predict_survival(
             mean_hi.as_ref().map(|values| values.view()),
         )?;
         cli_out!(
-            "wrote predictions: {} (rows={})",
+            "wrote predictions: {} (rows={}){}",
             args.out.display(),
-            mean.len()
+            mean.len(),
+            covariance_provenance_note(
+                args,
+                args.mode == PredictModeArg::PosteriorMean || args.uncertainty
+            )
         );
         return Ok(());
     }
@@ -1701,9 +1708,13 @@ pub(crate) fn run_predict_survival(
         mean_hi.as_ref().map(|a| a.view()),
     )?;
     cli_out!(
-        "wrote predictions: {} (rows={})",
+        "wrote predictions: {} (rows={}){}",
         args.out.display(),
-        mean.len()
+        mean.len(),
+        covariance_provenance_note(
+            args,
+            args.mode == PredictModeArg::PosteriorMean || args.uncertainty
+        )
     );
     Ok(())
 }
