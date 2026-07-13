@@ -524,7 +524,9 @@ impl DynamicOrder2<'_> {
     /// whose channel law is not ordinary scalar multiplication. Each channel is
     /// written directly into the row arena, so downstream runtime-jet programs
     /// can keep their specialized algebra without materializing temporary
-    /// `Vec`s or exposing the arena pointer stored by [`DynamicOrder2`].
+    /// `Vec`s or exposing the arena pointer stored by [`DynamicOrder2`]. The
+    /// Hessian function is evaluated on the upper triangle and mirrored because
+    /// a scalar Hessian is symmetric.
     #[inline]
     #[must_use]
     pub fn from_channel_functions<'arena>(
@@ -535,9 +537,14 @@ impl DynamicOrder2<'_> {
         mut hessian: impl FnMut(usize, usize) -> f64,
     ) -> DynamicOrder2<'arena> {
         let g = arena.alloc_slice_fill_with(dimension, |axis| gradient(axis));
-        let h = arena.alloc_slice_fill_with(dimension * dimension, |index| {
-            hessian(index / dimension, index % dimension)
-        });
+        let h = arena.zeros(dimension * dimension);
+        for row in 0..dimension {
+            for column in row..dimension {
+                let channel = hessian(row, column);
+                h[row * dimension + column] = channel;
+                h[column * dimension + row] = channel;
+            }
+        }
         DynamicOrder2 {
             arena,
             v: value,
