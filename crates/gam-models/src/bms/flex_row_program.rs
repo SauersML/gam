@@ -56,6 +56,32 @@ pub(super) enum BmsFlexCalibrationOrder3Node {
     },
 }
 
+/// Declarative mixed directional derivative of the Order2 calibration
+/// schedule. Each `pair` indexes one backend-owned `(left, right)` direction
+/// pair; the program owns every scalar, primary, and primary-pair visit within
+/// it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BmsFlexCalibrationOrder4Node {
+    DirectionPairStart {
+        pair: usize,
+    },
+    InterceptMixedThird {
+        pair: usize,
+    },
+    InterceptMixedFourth {
+        pair: usize,
+    },
+    InterceptPrimaryMixedFourth {
+        pair: usize,
+        primary: usize,
+    },
+    PrimaryPairMixedFourth {
+        pair: usize,
+        left: usize,
+        right: usize,
+    },
+}
+
 /// Borrowed scalar coordinates of the canonical BMS FLEX row program.
 ///
 /// This is the zero-allocation input to optimized lowerings. The dense generic
@@ -294,6 +320,36 @@ impl BmsFlexRowProgram {
         Ok(())
     }
 
+    /// Interpret the canonical mixed directional derivative of the Order2
+    /// schedule for `direction_pair_count` backend-owned direction pairs.
+    pub(super) fn try_for_each_calibration_order4<E>(
+        active_primaries: &[usize],
+        direction_pair_count: usize,
+        mut visit: impl FnMut(BmsFlexCalibrationOrder4Node) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for pair in 0..direction_pair_count {
+            visit(BmsFlexCalibrationOrder4Node::DirectionPairStart { pair })?;
+            visit(BmsFlexCalibrationOrder4Node::InterceptMixedThird { pair })?;
+            visit(BmsFlexCalibrationOrder4Node::InterceptMixedFourth { pair })?;
+            for &primary in active_primaries {
+                visit(BmsFlexCalibrationOrder4Node::InterceptPrimaryMixedFourth {
+                    pair,
+                    primary,
+                })?;
+            }
+            for (position, &left) in active_primaries.iter().enumerate() {
+                for &right in &active_primaries[position..] {
+                    visit(BmsFlexCalibrationOrder4Node::PrimaryPairMixedFourth {
+                        pair,
+                        left,
+                        right,
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn from_parts(
         point: BmsFlexProgramPoint<'_>,
         calibration: Vec<BmsFlexCalibrationProgramNode>,
@@ -466,5 +522,47 @@ mod tests {
                 *direction == 1
             }
         }));
+
+        let mut order4 = Vec::new();
+        BmsFlexRowProgram::try_for_each_calibration_order4(
+            &active,
+            1,
+            |node| -> Result<(), std::convert::Infallible> {
+                order4.push(node);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            order4,
+            vec![
+                BmsFlexCalibrationOrder4Node::DirectionPairStart { pair: 0 },
+                BmsFlexCalibrationOrder4Node::InterceptMixedThird { pair: 0 },
+                BmsFlexCalibrationOrder4Node::InterceptMixedFourth { pair: 0 },
+                BmsFlexCalibrationOrder4Node::InterceptPrimaryMixedFourth {
+                    pair: 0,
+                    primary: 1,
+                },
+                BmsFlexCalibrationOrder4Node::InterceptPrimaryMixedFourth {
+                    pair: 0,
+                    primary: 4,
+                },
+                BmsFlexCalibrationOrder4Node::PrimaryPairMixedFourth {
+                    pair: 0,
+                    left: 1,
+                    right: 1,
+                },
+                BmsFlexCalibrationOrder4Node::PrimaryPairMixedFourth {
+                    pair: 0,
+                    left: 1,
+                    right: 4,
+                },
+                BmsFlexCalibrationOrder4Node::PrimaryPairMixedFourth {
+                    pair: 0,
+                    left: 4,
+                    right: 4,
+                },
+            ]
+        );
     }
 }

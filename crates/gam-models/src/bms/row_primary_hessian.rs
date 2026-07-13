@@ -6,8 +6,8 @@ use super::cell_moment_assembly::{
 use super::exact_eval_cache::*;
 use super::family::*;
 use super::flex_row_program::{
-    BmsFlexCalibrationOrder2Node, BmsFlexCalibrationOrder3Node, BmsFlexProgramPoint,
-    BmsFlexRowProgram,
+    BmsFlexCalibrationOrder2Node, BmsFlexCalibrationOrder3Node,
+    BmsFlexCalibrationOrder4Node, BmsFlexProgramPoint, BmsFlexRowProgram,
 };
 use super::gradient_paths::*;
 use super::hessian_paths::*;
@@ -5476,7 +5476,6 @@ impl BernoulliMarginalSlopeFamily {
                 },
             )?;
 
-            let mut current_direction = usize::MAX;
             let mut coeff_dir = [0.0; 4];
             let mut coeff_a_dir = [0.0; 4];
             let mut coeff_aa_dir = [0.0; 4];
@@ -5488,7 +5487,6 @@ impl BernoulliMarginalSlopeFamily {
                 |node| -> Result<(), String> {
                     match node {
                         BmsFlexCalibrationOrder3Node::DirectionStart { direction } => {
-                            current_direction = direction;
                             let dir = &row_dirs[direction];
                             coeff_dir = coeff_jet.directional_family(
                                 coeff_jet.first,
@@ -5521,7 +5519,6 @@ impl BernoulliMarginalSlopeFamily {
                             }
                         }
                         BmsFlexCalibrationOrder3Node::InterceptDirectionalSecond { direction } => {
-                            debug_assert_eq!(direction, current_direction);
                             f_a_dir[direction] += exact::cell_second_derivative_from_moments(
                                 cell,
                                 &dc_da,
@@ -5531,7 +5528,6 @@ impl BernoulliMarginalSlopeFamily {
                             )?;
                         }
                         BmsFlexCalibrationOrder3Node::InterceptDirectionalThird { direction } => {
-                            debug_assert_eq!(direction, current_direction);
                             f_aa_dir[direction] += exact::cell_third_derivative_from_moments(
                                 cell,
                                 &dc_da,
@@ -5548,7 +5544,6 @@ impl BernoulliMarginalSlopeFamily {
                             direction,
                             primary,
                         } => {
-                            debug_assert_eq!(direction, current_direction);
                             f_au_dir[direction * r + primary] +=
                                 exact::cell_third_derivative_from_moments(
                                     cell,
@@ -5567,7 +5562,6 @@ impl BernoulliMarginalSlopeFamily {
                             left,
                             right,
                         } => {
-                            debug_assert_eq!(direction, current_direction);
                             let dir = &row_dirs[direction];
                             let second_coeff = coeff_jet.pair_from_b_family(
                                 coeff_jet.b_first,
@@ -6049,20 +6043,17 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_au = Array1::<f64>::zeros(r);
         let mut f_uv = Array2::<f64>::zeros((r, r));
 
-        let mut f_a_u = 0.0;
-        let mut f_aa_u = 0.0;
-        let mut f_au_u = Array1::<f64>::zeros(r);
-        let mut f_uv_u = Array2::<f64>::zeros((r, r));
-
-        let mut f_a_v = 0.0;
-        let mut f_aa_v = 0.0;
-        let mut f_au_v = Array1::<f64>::zeros(r);
-        let mut f_uv_v = Array2::<f64>::zeros((r, r));
-
-        let mut f_a_uv = 0.0;
-        let mut f_aa_uv = 0.0;
-        let mut f_au_uv = Array1::<f64>::zeros(r);
-        let mut f_uv_uv = Array2::<f64>::zeros((r, r));
+        let directions = [dir_u, dir_v];
+        let direction_pairs = [(0usize, 1usize)];
+        let active_primaries = (1..r).collect::<Vec<_>>();
+        let mut f_a_dir = [0.0; 2];
+        let mut f_aa_dir = [0.0; 2];
+        let mut f_au_dir = vec![0.0; 2 * r];
+        let mut f_uv_dir = vec![0.0; 2 * r * r];
+        let mut f_a_mixed = [0.0];
+        let mut f_aa_mixed = [0.0];
+        let mut f_au_mixed = vec![0.0; r];
+        let mut f_uv_mixed = vec![0.0; r * r];
 
         let owned_cells;
         let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
@@ -6205,307 +6196,369 @@ impl BernoulliMarginalSlopeFamily {
                 &dc_da,
                 &dc_da,
                 &dc_daa,
-                &state.moments,
-            )?;
-
-            for u in 1..r {
-                f_u[u] +=
-                    exact::cell_first_derivative_from_moments(&coeff_jet.first[u], &state.moments)?;
-                f_au[u] += exact::cell_second_derivative_from_moments(
-                    cell,
-                    &dc_da,
-                    &coeff_jet.first[u],
-                    &coeff_jet.a_first[u],
-                    &state.moments,
-                )?;
-            }
-            let coeff_dir_u =
-                coeff_jet.directional_family(coeff_jet.first, dir_u, COEFF_SUPPORT_BHW);
-            let coeff_dir_v =
-                coeff_jet.directional_family(coeff_jet.first, dir_v, COEFF_SUPPORT_BHW);
-            let coeff_a_dir_u =
-                coeff_jet.directional_family(coeff_jet.a_first, dir_u, COEFF_SUPPORT_BW);
-            let coeff_a_dir_v =
-                coeff_jet.directional_family(coeff_jet.a_first, dir_v, COEFF_SUPPORT_BW);
-            let coeff_aa_dir_u =
-                coeff_jet.directional_family(coeff_jet.aa_first, dir_u, COEFF_SUPPORT_BW);
-            let coeff_aa_dir_v =
-                coeff_jet.directional_family(coeff_jet.aa_first, dir_v, COEFF_SUPPORT_BW);
-
-            f_a_u += exact::cell_second_derivative_from_moments(
-                cell,
-                &dc_da,
-                &coeff_dir_u,
-                &coeff_a_dir_u,
-                &state.moments,
-            )?;
-            f_a_v += exact::cell_second_derivative_from_moments(
-                cell,
-                &dc_da,
-                &coeff_dir_v,
-                &coeff_a_dir_v,
-                &state.moments,
-            )?;
-            f_aa_u += exact::cell_third_derivative_from_moments(
-                cell,
-                &dc_da,
-                &dc_da,
-                &coeff_dir_u,
-                &dc_daa,
-                &coeff_a_dir_u,
-                &coeff_a_dir_u,
-                &coeff_aa_dir_u,
-                &state.moments,
-            )?;
-            f_aa_v += exact::cell_third_derivative_from_moments(
-                cell,
-                &dc_da,
-                &dc_da,
-                &coeff_dir_v,
-                &dc_daa,
-                &coeff_a_dir_v,
-                &coeff_a_dir_v,
-                &coeff_aa_dir_v,
-                &state.moments,
-            )?;
-
-            let coeff_dir_uv = coeff_jet.mixed_directional_from_b_family(
-                coeff_jet.b_first,
-                dir_u,
-                dir_v,
-                COEFF_SUPPORT_BHW,
-            );
-            let coeff_a_dir_uv = coeff_jet.mixed_directional_from_b_family(
-                coeff_jet.ab_first,
-                dir_u,
-                dir_v,
-                COEFF_SUPPORT_BW,
-            );
-            let coeff_aa_dir_uv = coeff_jet.mixed_directional_from_b_family(
-                coeff_jet.aab_first,
-                dir_u,
-                dir_v,
-                COEFF_SUPPORT_W,
-            );
-
-            f_a_uv += exact::cell_third_derivative_from_moments(
-                cell,
-                &dc_da,
-                &coeff_dir_u,
-                &coeff_dir_v,
-                &coeff_a_dir_u,
-                &coeff_a_dir_v,
-                &coeff_dir_uv,
-                &coeff_a_dir_uv,
-                &state.moments,
-            )?;
-            f_aa_uv += exact::cell_fourth_derivative_from_moments(
-                cell,
-                &dc_da,
-                &dc_da,
-                &coeff_dir_u,
-                &coeff_dir_v,
-                &dc_daa,
-                &coeff_a_dir_u,
-                &coeff_a_dir_v,
-                &coeff_a_dir_u,
-                &coeff_a_dir_v,
-                &coeff_dir_uv,
-                &coeff_aa_dir_u,
-                &coeff_aa_dir_v,
-                &coeff_a_dir_uv,
-                &coeff_a_dir_uv,
-                &coeff_aa_dir_uv,
-                &state.moments,
-            )?;
-
-            let mut coeff_u_dir_u = vec![[0.0; 4]; r];
-            let mut coeff_u_dir_v = vec![[0.0; 4]; r];
-            let mut coeff_u_dir_uv = vec![[0.0; 4]; r];
-            let mut coeff_au_dir_u = vec![[0.0; 4]; r];
-            let mut coeff_au_dir_v = vec![[0.0; 4]; r];
-            let mut coeff_au_dir_uv = vec![[0.0; 4]; r];
-            for u in 1..r {
-                coeff_u_dir_u[u] = coeff_jet.param_directional_from_b_family(
-                    coeff_jet.b_first,
-                    u,
-                    dir_u,
-                    COEFF_SUPPORT_BHW,
-                );
-                coeff_u_dir_v[u] = coeff_jet.param_directional_from_b_family(
-                    coeff_jet.b_first,
-                    u,
-                    dir_v,
-                    COEFF_SUPPORT_BHW,
-                );
-                coeff_u_dir_uv[u] = coeff_jet.param_mixed_from_bb_family(
-                    coeff_jet.bb_first,
-                    u,
-                    dir_u,
-                    dir_v,
-                    COEFF_SUPPORT_BW,
-                );
-                coeff_au_dir_u[u] = coeff_jet.param_directional_from_b_family(
-                    coeff_jet.ab_first,
-                    u,
-                    dir_u,
-                    COEFF_SUPPORT_BW,
-                );
-                coeff_au_dir_v[u] = coeff_jet.param_directional_from_b_family(
-                    coeff_jet.ab_first,
-                    u,
-                    dir_v,
-                    COEFF_SUPPORT_BW,
-                );
-                coeff_au_dir_uv[u] = coeff_jet.param_mixed_from_bb_family(
-                    coeff_jet.abb_first,
-                    u,
-                    dir_u,
-                    dir_v,
-                    COEFF_SUPPORT_W,
-                );
-            }
-
-            for u in 1..r {
-                f_au_u[u] += exact::cell_third_derivative_from_moments(
-                    cell,
-                    &dc_da,
-                    &coeff_u[u],
-                    &coeff_dir_u,
-                    &coeff_au[u],
-                    &coeff_a_dir_u,
-                    &coeff_u_dir_u[u],
-                    &coeff_au_dir_u[u],
-                    &state.moments,
-                )?;
-                f_au_v[u] += exact::cell_third_derivative_from_moments(
-                    cell,
-                    &dc_da,
-                    &coeff_u[u],
-                    &coeff_dir_v,
-                    &coeff_au[u],
-                    &coeff_a_dir_v,
-                    &coeff_u_dir_v[u],
-                    &coeff_au_dir_v[u],
-                    &state.moments,
-                )?;
-                f_au_uv[u] += exact::cell_fourth_derivative_from_moments(
-                    cell,
-                    &dc_da,
-                    &coeff_u[u],
-                    &coeff_dir_u,
-                    &coeff_dir_v,
-                    &coeff_au[u],
-                    &coeff_a_dir_u,
-                    &coeff_a_dir_v,
-                    &coeff_u_dir_u[u],
-                    &coeff_u_dir_v[u],
-                    &coeff_dir_uv,
-                    &coeff_au_dir_u[u],
-                    &coeff_au_dir_v[u],
-                    &coeff_a_dir_uv,
-                    &coeff_u_dir_uv[u],
-                    &coeff_au_dir_uv[u],
-                    &state.moments,
-                )?;
-            }
-
-            for u in 1..r {
-                for v in u..r {
-                    let second_coeff =
-                        coeff_jet.pair_from_b_family(coeff_jet.b_first, u, v, COEFF_SUPPORT_BHW);
-                    let base_val = exact::cell_second_derivative_from_moments(
-                        cell,
-                        &coeff_jet.first[u],
-                        &coeff_jet.first[v],
-                        &second_coeff,
-                        &state.moments,
-                    )?;
-                    f_uv[[u, v]] += base_val;
-                    if u != v {
-                        f_uv[[v, u]] += base_val;
+            BmsFlexRowProgram::try_for_each_calibration_order2(
+                &active_primaries,
+                true,
+                |node| -> Result<(), String> {
+                    match node {
+                        BmsFlexCalibrationOrder2Node::InterceptFirst => {
+                            f_a +=
+                                exact::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+                        }
+                        BmsFlexCalibrationOrder2Node::InterceptSecond => {
+                            f_aa += exact::cell_second_derivative_from_moments(
+                                cell,
+                                &dc_da,
+                                &dc_da,
+                                &dc_daa,
+                                &state.moments,
+                            )?;
+                        }
+                        BmsFlexCalibrationOrder2Node::PrimaryFirst { primary } => {
+                            f_u[primary] += exact::cell_first_derivative_from_moments(
+                                &coeff_jet.first[primary],
+                                &state.moments,
+                            )?;
+                        }
+                        BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary } => {
+                            f_au[primary] += exact::cell_second_derivative_from_moments(
+                                cell,
+                                &dc_da,
+                                &coeff_jet.first[primary],
+                                &coeff_jet.a_first[primary],
+                                &state.moments,
+                            )?;
+                        }
+                        BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left, right } => {
+                            let second_coeff = coeff_jet.pair_from_b_family(
+                                coeff_jet.b_first,
+                                left,
+                                right,
+                                COEFF_SUPPORT_BHW,
+                            );
+                            let value = exact::cell_second_derivative_from_moments(
+                                cell,
+                                &coeff_jet.first[left],
+                                &coeff_jet.first[right],
+                                &second_coeff,
+                                &state.moments,
+                            )?;
+                            f_uv[[left, right]] += value;
+                            if left != right {
+                                f_uv[[right, left]] += value;
+                            }
+                        }
                     }
+                    Ok(())
+                },
+            )?;
 
-                    let third_u = coeff_jet.pair_directional_from_bb_family(
-                        coeff_jet.bb_first,
-                        u,
-                        v,
-                        dir_u,
-                        COEFF_SUPPORT_BW,
-                    );
-                    let third_v = coeff_jet.pair_directional_from_bb_family(
-                        coeff_jet.bb_first,
-                        u,
-                        v,
-                        dir_v,
-                        COEFF_SUPPORT_BW,
-                    );
-                    let fourth_uv = coeff_jet.pair_mixed_from_bbb_family(
-                        coeff_jet.bbb_first,
-                        u,
-                        v,
-                        dir_u,
-                        dir_v,
-                        COEFF_SUPPORT_W,
-                    );
-
-                    let dir_u_val = exact::cell_third_derivative_from_moments(
-                        cell,
-                        &coeff_jet.first[u],
-                        &coeff_jet.first[v],
-                        &coeff_dir_u,
-                        &second_coeff,
-                        &coeff_u_dir_u[u],
-                        &coeff_u_dir_u[v],
-                        &third_u,
-                        &state.moments,
-                    )?;
-                    let dir_v_val = exact::cell_third_derivative_from_moments(
-                        cell,
-                        &coeff_jet.first[u],
-                        &coeff_jet.first[v],
-                        &coeff_dir_v,
-                        &second_coeff,
-                        &coeff_u_dir_v[u],
-                        &coeff_u_dir_v[v],
-                        &third_v,
-                        &state.moments,
-                    )?;
-                    let mix_val = exact::cell_fourth_derivative_from_moments(
-                        cell,
-                        &coeff_jet.first[u],
-                        &coeff_jet.first[v],
-                        &coeff_dir_u,
-                        &coeff_dir_v,
-                        &second_coeff,
-                        &coeff_u_dir_u[u],
-                        &coeff_u_dir_v[u],
-                        &coeff_u_dir_u[v],
-                        &coeff_u_dir_v[v],
-                        &coeff_dir_uv,
-                        &third_u,
-                        &third_v,
-                        &coeff_u_dir_uv[u],
-                        &coeff_u_dir_uv[v],
-                        &fourth_uv,
-                        &state.moments,
-                    )?;
-                    f_uv_u[[u, v]] += dir_u_val;
-                    f_uv_v[[u, v]] += dir_v_val;
-                    f_uv_uv[[u, v]] += mix_val;
-                    if u != v {
-                        f_uv_u[[v, u]] += dir_u_val;
-                        f_uv_v[[v, u]] += dir_v_val;
-                        f_uv_uv[[v, u]] += mix_val;
+            let mut coeff_dirs = [[0.0; 4]; 2];
+            let mut coeff_a_dirs = [[0.0; 4]; 2];
+            let mut coeff_aa_dirs = [[0.0; 4]; 2];
+            let mut coeff_u_dirs = vec![[0.0; 4]; 2 * r];
+            let mut coeff_au_dirs = vec![[0.0; 4]; 2 * r];
+            BmsFlexRowProgram::try_for_each_calibration_order3(
+                &active_primaries,
+                directions.len(),
+                |node| -> Result<(), String> {
+                    match node {
+                        BmsFlexCalibrationOrder3Node::DirectionStart { direction } => {
+                            let dir = directions[direction];
+                            coeff_dirs[direction] = coeff_jet.directional_family(
+                                coeff_jet.first,
+                                dir,
+                                COEFF_SUPPORT_BHW,
+                            );
+                            coeff_a_dirs[direction] = coeff_jet.directional_family(
+                                coeff_jet.a_first,
+                                dir,
+                                COEFF_SUPPORT_BW,
+                            );
+                            coeff_aa_dirs[direction] = coeff_jet.directional_family(
+                                coeff_jet.aa_first,
+                                dir,
+                                COEFF_SUPPORT_BW,
+                            );
+                            let base = direction * r;
+                            for &primary in &active_primaries {
+                                coeff_u_dirs[base + primary] =
+                                    coeff_jet.param_directional_from_b_family(
+                                        coeff_jet.b_first,
+                                        primary,
+                                        dir,
+                                        COEFF_SUPPORT_BHW,
+                                    );
+                                coeff_au_dirs[base + primary] =
+                                    coeff_jet.param_directional_from_b_family(
+                                        coeff_jet.ab_first,
+                                        primary,
+                                        dir,
+                                        COEFF_SUPPORT_BW,
+                                    );
+                            }
+                        }
+                        BmsFlexCalibrationOrder3Node::InterceptDirectionalSecond { direction } => {
+                            f_a_dir[direction] += exact::cell_second_derivative_from_moments(
+                                cell,
+                                &dc_da,
+                                &coeff_dirs[direction],
+                                &coeff_a_dirs[direction],
+                                &state.moments,
+                            )?;
+                        }
+                        BmsFlexCalibrationOrder3Node::InterceptDirectionalThird { direction } => {
+                            f_aa_dir[direction] += exact::cell_third_derivative_from_moments(
+                                cell,
+                                &dc_da,
+                                &dc_da,
+                                &coeff_dirs[direction],
+                                &dc_daa,
+                                &coeff_a_dirs[direction],
+                                &coeff_a_dirs[direction],
+                                &coeff_aa_dirs[direction],
+                                &state.moments,
+                            )?;
+                        }
+                        BmsFlexCalibrationOrder3Node::InterceptPrimaryDirectionalThird {
+                            direction,
+                            primary,
+                        } => {
+                            let base = direction * r;
+                            f_au_dir[base + primary] +=
+                                exact::cell_third_derivative_from_moments(
+                                    cell,
+                                    &dc_da,
+                                    &coeff_jet.first[primary],
+                                    &coeff_dirs[direction],
+                                    &coeff_jet.a_first[primary],
+                                    &coeff_a_dirs[direction],
+                                    &coeff_u_dirs[base + primary],
+                                    &coeff_au_dirs[base + primary],
+                                    &state.moments,
+                                )?;
+                        }
+                        BmsFlexCalibrationOrder3Node::PrimaryPairDirectionalThird {
+                            direction,
+                            left,
+                            right,
+                        } => {
+                            let second_coeff = coeff_jet.pair_from_b_family(
+                                coeff_jet.b_first,
+                                left,
+                                right,
+                                COEFF_SUPPORT_BHW,
+                            );
+                            let third_coeff = coeff_jet.pair_directional_from_bb_family(
+                                coeff_jet.bb_first,
+                                left,
+                                right,
+                                directions[direction],
+                                COEFF_SUPPORT_BW,
+                            );
+                            let vector_base = direction * r;
+                            let value = exact::cell_third_derivative_from_moments(
+                                cell,
+                                &coeff_jet.first[left],
+                                &coeff_jet.first[right],
+                                &coeff_dirs[direction],
+                                &second_coeff,
+                                &coeff_u_dirs[vector_base + left],
+                                &coeff_u_dirs[vector_base + right],
+                                &third_coeff,
+                                &state.moments,
+                            )?;
+                            let matrix_base = direction * r * r;
+                            f_uv_dir[matrix_base + left * r + right] += value;
+                            if left != right {
+                                f_uv_dir[matrix_base + right * r + left] += value;
+                            }
+                        }
                     }
-                }
-            }
-        }
+                    Ok(())
+                },
+            )?;
 
-        f_u[0] = -marginal.mu1;
-        f_uv[[0, 0]] = -marginal.mu2;
-        f_uv_u[[0, 0]] = -dir_u[0] * marginal.mu3;
-        f_uv_v[[0, 0]] = -dir_v[0] * marginal.mu3;
+            let mut coeff_dir_mixed = [0.0; 4];
+            let mut coeff_a_dir_mixed = [0.0; 4];
+            let mut coeff_aa_dir_mixed = [0.0; 4];
+            let mut coeff_u_mixed = vec![[0.0; 4]; r];
+            let mut coeff_au_mixed = vec![[0.0; 4]; r];
+            BmsFlexRowProgram::try_for_each_calibration_order4(
+                &active_primaries,
+                direction_pairs.len(),
+                |node| -> Result<(), String> {
+                    match node {
+                        BmsFlexCalibrationOrder4Node::DirectionPairStart { pair } => {
+                            let (left_direction, right_direction) = direction_pairs[pair];
+                            let left_dir = directions[left_direction];
+                            let right_dir = directions[right_direction];
+                            coeff_dir_mixed = coeff_jet.mixed_directional_from_b_family(
+                                coeff_jet.b_first,
+                                left_dir,
+                                right_dir,
+                                COEFF_SUPPORT_BHW,
+                            );
+                            coeff_a_dir_mixed = coeff_jet.mixed_directional_from_b_family(
+                                coeff_jet.ab_first,
+                                left_dir,
+                                right_dir,
+                                COEFF_SUPPORT_BW,
+                            );
+                            coeff_aa_dir_mixed = coeff_jet.mixed_directional_from_b_family(
+                                coeff_jet.aab_first,
+                                left_dir,
+                                right_dir,
+                                COEFF_SUPPORT_W,
+                            );
+                            for &primary in &active_primaries {
+                                coeff_u_mixed[primary] = coeff_jet.param_mixed_from_bb_family(
+                                    coeff_jet.bb_first,
+                                    primary,
+                                    left_dir,
+                                    right_dir,
+                                    COEFF_SUPPORT_BW,
+                                );
+                                coeff_au_mixed[primary] = coeff_jet.param_mixed_from_bb_family(
+                                    coeff_jet.abb_first,
+                                    primary,
+                                    left_dir,
+                                    right_dir,
+                                    COEFF_SUPPORT_W,
+                                );
+                            }
+                        }
+                        BmsFlexCalibrationOrder4Node::InterceptMixedThird { pair } => {
+                            let (left_direction, right_direction) = direction_pairs[pair];
+                            f_a_mixed[pair] += exact::cell_third_derivative_from_moments(
+                                cell,
+                                &dc_da,
+                                &coeff_dirs[left_direction],
+                                &coeff_dirs[right_direction],
+                                &coeff_a_dirs[left_direction],
+                                &coeff_a_dirs[right_direction],
+                                &coeff_dir_mixed,
+                                &coeff_a_dir_mixed,
+                                &state.moments,
+                            )?;
+                        }
+                        BmsFlexCalibrationOrder4Node::InterceptMixedFourth { pair } => {
+                            let (left_direction, right_direction) = direction_pairs[pair];
+                            f_aa_mixed[pair] += exact::cell_fourth_derivative_from_moments(
+                                cell,
+                                &dc_da,
+                                &dc_da,
+                                &coeff_dirs[left_direction],
+                                &coeff_dirs[right_direction],
+                                &dc_daa,
+                                &coeff_a_dirs[left_direction],
+                                &coeff_a_dirs[right_direction],
+                                &coeff_a_dirs[left_direction],
+                                &coeff_a_dirs[right_direction],
+                                &coeff_dir_mixed,
+                                &coeff_aa_dirs[left_direction],
+                                &coeff_aa_dirs[right_direction],
+                                &coeff_a_dir_mixed,
+                                &coeff_a_dir_mixed,
+                                &coeff_aa_dir_mixed,
+                                &state.moments,
+                            )?;
+                        }
+                        BmsFlexCalibrationOrder4Node::InterceptPrimaryMixedFourth {
+                            pair,
+                            primary,
+                        } => {
+                            let (left_direction, right_direction) = direction_pairs[pair];
+                            let left_base = left_direction * r;
+                            let right_base = right_direction * r;
+                            f_au_mixed[pair * r + primary] +=
+                                exact::cell_fourth_derivative_from_moments(
+                                    cell,
+                                    &dc_da,
+                                    &coeff_jet.first[primary],
+                                    &coeff_dirs[left_direction],
+                                    &coeff_dirs[right_direction],
+                                    &coeff_jet.a_first[primary],
+                                    &coeff_a_dirs[left_direction],
+                                    &coeff_a_dirs[right_direction],
+                                    &coeff_u_dirs[left_base + primary],
+                                    &coeff_u_dirs[right_base + primary],
+                                    &coeff_dir_mixed,
+                                    &coeff_au_dirs[left_base + primary],
+                                    &coeff_au_dirs[right_base + primary],
+                                    &coeff_a_dir_mixed,
+                                    &coeff_u_mixed[primary],
+                                    &coeff_au_mixed[primary],
+                                    &state.moments,
+                                )?;
+                        }
+                        BmsFlexCalibrationOrder4Node::PrimaryPairMixedFourth {
+                            pair,
+                            left,
+                            right,
+                        } => {
+                            let (left_direction, right_direction) = direction_pairs[pair];
+                            let left_dir = directions[left_direction];
+                            let right_dir = directions[right_direction];
+                            let second_coeff = coeff_jet.pair_from_b_family(
+                                coeff_jet.b_first,
+                                left,
+                                right,
+                                COEFF_SUPPORT_BHW,
+                            );
+                            let third_left = coeff_jet.pair_directional_from_bb_family(
+                                coeff_jet.bb_first,
+                                left,
+                                right,
+                                left_dir,
+                                COEFF_SUPPORT_BW,
+                            );
+                            let third_right = coeff_jet.pair_directional_from_bb_family(
+                                coeff_jet.bb_first,
+                                left,
+                                right,
+                                right_dir,
+                                COEFF_SUPPORT_BW,
+                            );
+                            let fourth_mixed = coeff_jet.pair_mixed_from_bbb_family(
+                                coeff_jet.bbb_first,
+                                left,
+                                right,
+                                left_dir,
+                                right_dir,
+                                COEFF_SUPPORT_W,
+                            );
+                            let left_base = left_direction * r;
+                            let right_base = right_direction * r;
+                            let value = exact::cell_fourth_derivative_from_moments(
+                                cell,
+                                &coeff_jet.first[left],
+                                &coeff_jet.first[right],
+                                &coeff_dirs[left_direction],
+                                &coeff_dirs[right_direction],
+                                &second_coeff,
+                                &coeff_u_dirs[left_base + left],
+                                &coeff_u_dirs[right_base + left],
+                                &coeff_u_dirs[left_base + right],
+                                &coeff_u_dirs[right_base + right],
+                                &coeff_dir_mixed,
+                                &third_left,
+                                &third_right,
+                                &coeff_u_mixed[left],
+                                &coeff_u_mixed[right],
+                                &fourth_mixed,
+                                &state.moments,
+                            )?;
+                            let matrix_base = pair * r * r;
+                            f_uv_mixed[matrix_base + left * r + right] += value;
+                            if left != right {
+                                f_uv_mixed[matrix_base + right * r + left] += value;
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
         f_uv_uv[[0, 0]] = -dir_u[0] * dir_v[0] * marginal.mu4;
 
         let inv_f_a = 1.0 / f_a;
