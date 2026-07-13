@@ -70,7 +70,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     };
     let (baseline_initial_theta, baseline_lower_theta, baseline_upper_theta) =
         match &spec.baseline_hyper {
-            SurvivalMarginalSlopeBaselineHyperSpec::Linear => {
+            SurvivalMarginalSlopeBaselineHyperSpec::Linear { .. } => {
                 (Vec::new(), Vec::new(), Vec::new())
             }
             SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear { chart } => {
@@ -1679,7 +1679,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 ));
             }
             let baseline_geometry = match &spec.baseline_hyper {
-                SurvivalMarginalSlopeBaselineHyperSpec::Linear => None,
+                SurvivalMarginalSlopeBaselineHyperSpec::Linear { .. } => None,
                 SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear { chart } => {
                     let baseline_theta = theta
                         .slice(s![family_coordinate_start..baseline_end])
@@ -2872,11 +2872,28 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             FlexActivation::On,
             BlockDesignCoords::RematerializedRaw,
         )?;
-        let selected_baseline = final_family
-            .family_hyper
-            .baseline_geometry
-            .as_ref()
-            .map(|geometry| geometry.baseline_config.clone());
+        let selected_baseline = match (
+            &spec.baseline_hyper,
+            final_family.family_hyper.baseline_geometry.as_ref(),
+        ) {
+            (SurvivalMarginalSlopeBaselineHyperSpec::Linear { config }, None) => config.clone(),
+            (
+                SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear { .. },
+                Some(geometry),
+            ) => geometry.baseline_config.clone(),
+            (SurvivalMarginalSlopeBaselineHyperSpec::Linear { .. }, Some(_)) => {
+                return Err(
+                    "fixed linear survival marginal-slope baseline unexpectedly realized family coordinates"
+                        .to_string(),
+                );
+            }
+            (SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear { .. }, None) => {
+                return Err(
+                    "learned nonlinear survival marginal-slope baseline lost its certified geometry"
+                        .to_string(),
+                );
+            }
+        };
         let (residuals, curvatures) =
             final_family.offset_channel_geometry(&solved.fit.block_states)?;
         (residuals, curvatures, selected_baseline)

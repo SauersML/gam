@@ -107,15 +107,15 @@ pub(crate) use gam::families::survival::survival_event_code_from_value;
 
 pub(crate) use gam::families::survival::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
-    SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
+    SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, SurvivalTimeBuildOutput,
+    add_survival_time_derivative_guard_offset,
     baseline_chain_rule_gradient, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_derivative_design,
     build_time_varying_survival_covariate_template, center_survival_time_designs_at_anchor,
     evaluate_survival_time_basis_row, initial_survival_baseline_config_for_fit,
     location_scale_uses_probit_survival_baseline, marginal_slope_baseline_chain_rule_gradient,
-    marginal_slope_baseline_chain_rule_hessian, normalize_survival_time_pair,
-    optimize_survival_baseline_config_with_gradient,
-    optimize_survival_baseline_config_with_gradient_only, parse_survival_distribution,
+    normalize_survival_time_pair, optimize_survival_baseline_config_with_gradient_only,
+    parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config,
     require_structural_survival_time_basis, resolve_survival_marginal_slope_time_anchor_value,
     resolve_survival_time_anchor_value, resolve_survival_transformation_time_anchor_value,
@@ -132,7 +132,9 @@ pub(crate) use gam::families::survival::location_scale::{
     replay_survival_covariate_channels,
 };
 
-pub(crate) use gam::families::survival::marginal_slope::SurvivalMarginalSlopeTermSpec;
+pub(crate) use gam::families::survival::marginal_slope::{
+    SurvivalMarginalSlopeBaselineHyperSpec, SurvivalMarginalSlopeTermSpec,
+};
 
 pub(crate) use gam::families::survival::predict::{
     apply_inverse_link_state_to_fit_result, build_saved_survival_marginal_slope_predictor,

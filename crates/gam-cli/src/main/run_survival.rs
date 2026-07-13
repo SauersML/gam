@@ -904,8 +904,8 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             );
         }
 
-        let frailty = fit_frailty_spec_from_survival_args(&args, "survival marginal-slope")?
-            .resolve_fixed_gaussian_shift("survival marginal-slope")?;
+        let frailty = fit_frailty_spec_from_survival_args(&args, "survival marginal-slope")?;
+        frailty.validate_for_marginal_slope()?;
         let kappa_options = {
             let mut opts = SpatialLengthScaleOptimizationOptions::default();
             opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
@@ -913,6 +913,40 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         };
         let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
         options.compute_covariance = true;
+        // Freeze the complete time stack once. Nonlinear baseline coordinates
+        // may move only the three offset channels inside this chart; designs,
+        // knots, penalties, and the structural feasibility cone stay fixed for
+        // the entire joint LAML solve.
+        let prepared = prepare_survival_time_stack(
+            &age_entry,
+            &age_exit,
+            &baseline_cfg,
+            SurvivalLikelihoodMode::MarginalSlope,
+            None,
+            time_anchor,
+            exact_derivative_guard,
+            &time_build,
+            effective_timewiggle.as_ref(),
+            None,
+        )?;
+        let baseline_hyper = match baseline_cfg.target {
+            SurvivalBaselineTarget::Linear => SurvivalMarginalSlopeBaselineHyperSpec::Linear {
+                config: survival_marginal_slope_offset_baseline_config(
+                    &age_exit,
+                    &baseline_cfg,
+                ),
+            },
+            _ => SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear {
+                chart: SurvivalMarginalSlopeFrozenOffsetChart::new(
+                    &age_entry,
+                    &age_exit,
+                    &baseline_cfg,
+                    &prepared.eta_offset_entry,
+                    &prepared.eta_offset_exit,
+                    &prepared.derivative_offset_exit,
+                )?,
+            },
+        };
         let buildspec = |prepared: &PreparedSurvivalTimeStack| {
             SurvivalMarginalSlopeTermSpec {
             age_entry: age_entry.clone(),
@@ -925,6 +959,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             marginal_offset: threshold_offset.clone(),
             frailty: frailty.clone(),
             derivative_guard: exact_derivative_guard,
+            baseline_hyper: baseline_hyper.clone(),
             time_block: TimeBlockInput {
                 design_entry: prepared.time_design_entry.clone(),
                 design_exit: prepared.time_design_exit.clone(),
@@ -965,86 +1000,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             score_influence_jacobian: None,
         }
         };
-        if baseline_cfg.target != SurvivalBaselineTarget::Linear {
-            baseline_cfg = optimize_survival_baseline_config_with_gradient(
-                &baseline_cfg,
-                "survival marginal-slope baseline",
-                |candidate| {
-                    let prepared = prepare_survival_time_stack(
-                        &age_entry,
-                        &age_exit,
-                        candidate,
-                        SurvivalLikelihoodMode::MarginalSlope,
-                        None,
-                        time_anchor,
-                        exact_derivative_guard,
-                        &time_build,
-                        effective_timewiggle.as_ref(),
-                        None,
-                    )?;
-                    // Disable kappa optimization during baseline search so each
-                    // candidate evaluation is cheap (inner solve only, no spatial
-                    // length-scale outer loop).
-                    let mut baseline_kappa = SpatialLengthScaleOptimizationOptions::default();
-                    baseline_kappa.enabled = false;
-                    let mut baseline_options = options.clone();
-                    baseline_options.compute_covariance = false;
-                    let fit = match fit_model(FitRequest::SurvivalMarginalSlope(
-                        SurvivalMarginalSlopeFitRequest {
-                            data: ds.values.view(),
-                            spec: buildspec(&prepared),
-                            options: baseline_options,
-                            kappa_options: baseline_kappa,
-                        },
-                    )) {
-                        Ok(FitResult::SurvivalMarginalSlope(result)) => result,
-                        Ok(_) => {
-                            return Err(
-                                "internal survival marginal-slope workflow returned the wrong result variant"
-                                    .to_string(),
-                            );
-                        }
-                        Err(e) => {
-                            return Err(format!("survival marginal-slope fit failed: {e}"));
-                        }
-                    };
-                    let gradient = marginal_slope_baseline_chain_rule_gradient(
-                        age_entry.view(),
-                        age_exit.view(),
-                        candidate,
-                        &fit.baseline_offset_residuals,
-                    )?
-                    .ok_or_else(|| {
-                        "survival marginal-slope baseline unexpectedly has no theta gradient"
-                            .to_string()
-                    })?;
-                    let hessian = marginal_slope_baseline_chain_rule_hessian(
-                        age_entry.view(),
-                        age_exit.view(),
-                        candidate,
-                        &fit.baseline_offset_residuals,
-                        &fit.baseline_offset_curvatures,
-                    )?
-                    .ok_or_else(|| {
-                        "survival marginal-slope baseline unexpectedly has no theta Hessian"
-                            .to_string()
-                    })?;
-                    Ok((fit.fit.reml_score, gradient, hessian))
-                },
-            )?;
-        }
-        let prepared = prepare_survival_time_stack(
-            &age_entry,
-            &age_exit,
-            &baseline_cfg,
-            SurvivalLikelihoodMode::MarginalSlope,
-            None,
-            time_anchor,
-            exact_derivative_guard,
-            &time_build,
-            effective_timewiggle.as_ref(),
-            None,
-        )?;
         let phase_start = std::time::Instant::now();
         log::info!(
             "[PHASE] survival-margslope fit start n={}",
@@ -1087,11 +1042,16 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             let save_frailty = match (&frailty, fit.gaussian_frailty_sd) {
                 (
                     gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
-                        sigma_fixed: None,
+                        scale:
+                            gam::families::survival::lognormal_kernel::FrailtyScale::Learned {
+                                ..
+                            },
                     },
                     Some(learned),
                 ) => gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
-                    sigma_fixed: Some(learned),
+                    scale: gam::families::survival::lognormal_kernel::FrailtyScale::Fixed {
+                        sigma: learned,
+                    },
                 },
                 _ => frailty,
             };
@@ -1142,8 +1102,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 }
                 None => None,
             };
-            let saved_offset_baseline =
-                survival_marginal_slope_offset_baseline_config(&age_exit, &baseline_cfg);
+            let saved_offset_baseline = fit.baseline_config.clone();
             let payload = assemble_survival_marginal_slope_payload(
                 SurvivalMarginalSlopeInputs {
                     formula,

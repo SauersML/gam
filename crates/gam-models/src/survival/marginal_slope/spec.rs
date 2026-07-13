@@ -11,7 +11,12 @@ use super::*;
 /// optimized jointly with smoothing, spatial, and learned-frailty axes.
 #[derive(Clone, Debug)]
 pub enum SurvivalMarginalSlopeBaselineHyperSpec {
-    Linear,
+    Linear {
+        /// Exact fixed baseline represented by the prepared offset channels.
+        /// It contributes zero optimizer axes but is carried through the fit
+        /// result without reconstruction or fallback.
+        config: crate::survival::construction::SurvivalBaselineConfig,
+    },
     Nonlinear {
         chart: crate::survival::construction::SurvivalMarginalSlopeFrozenOffsetChart,
     },
@@ -20,7 +25,7 @@ pub enum SurvivalMarginalSlopeBaselineHyperSpec {
 impl SurvivalMarginalSlopeBaselineHyperSpec {
     pub(crate) fn initial_theta(&self) -> Option<&Array1<f64>> {
         match self {
-            Self::Linear => None,
+            Self::Linear { .. } => None,
             Self::Nonlinear { chart } => Some(chart.initial_theta()),
         }
     }
@@ -126,7 +131,7 @@ pub struct SurvivalMarginalSlopeFitResult {
     pub gaussian_frailty_sd: Option<f64>,
     /// Certified nonlinear baseline selected by the joint LAML solve. Linear
     /// baselines have no family-owned coordinates and therefore return `None`.
-    pub baseline_config: Option<crate::survival::construction::SurvivalBaselineConfig>,
+    pub baseline_config: crate::survival::construction::SurvivalBaselineConfig,
     pub logslope_design: TermCollectionDesign,
     pub baseline_slope: f64,
     pub baseline_offset_residuals: OffsetChannelResiduals,
