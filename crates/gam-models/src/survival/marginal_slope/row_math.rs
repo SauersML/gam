@@ -2120,8 +2120,8 @@ mod tests {
     }
 
     /// Temporary #932 release sweep for every width promoted to the packed
-    /// fixed schedule. This prevents the k=3 fixture from hiding a larger-width
-    /// stack or code-size cliff before the dispatch policy is made permanent.
+    /// fixed schedule. This compares every canonical backend directly so the
+    /// production cutoff cannot hide a larger-width stack-probe cost.
     #[test]
     fn release_measure_packed_widths_k1_to_k8_vs_strongest_hand_932() {
         use std::hint::black_box;
@@ -2176,41 +2176,87 @@ mod tests {
                 ];
 
                 for &(label, covariance) in &cases {
-                    let mut workspace = RigidVectorRowWorkspace::new();
-                    let evaluate_production = |workspace: &mut RigidVectorRowWorkspace| {
-                        row_primary_closed_form_vector(
-                            -0.28, 0.53, 1.18, &slopes, &scores, covariance, 1.21, 1.0, 1.0e-8,
-                            0.87, workspace,
-                        )
-                        .expect("packed production width")
-                    };
-                    black_box(evaluate_production(&mut workspace));
+                    for event in [0.0, 1.0] {
+                        let mut workspace = RigidVectorRowWorkspace::new();
+                        let mut graph_workspace = Order2GraphWorkspace::new();
+                        let mut dynamic_arena = DynamicJetArena::new();
+                        let evaluate_production = |workspace: &mut RigidVectorRowWorkspace| {
+                            row_primary_closed_form_vector(
+                                -0.28, 0.53, 1.18, &slopes, &scores, covariance, 1.21, event,
+                                1.0e-8, 0.87, workspace,
+                            )
+                            .expect("packed production width")
+                        };
+                        black_box(evaluate_production(&mut workspace));
 
-                    let production_ns = best_ns(5_000, || evaluate_production(&mut workspace));
-                    let fixed_ns = best_ns(5_000, || {
-                        row_primary_closed_form_vector_fixed::<$dim>(
-                            -0.28, 0.53, 1.18, &slopes, &scores, covariance, 1.21, 1.0, 1.0e-8,
-                            0.87,
-                        )
-                        .expect("direct fixed width")
-                    });
-                    let hand_ns = best_ns(5_000, || {
-                        vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
-                            -0.28, 0.53, 1.18, &slopes, &scores, covariance, 1.21, 1.0, 1.0e-8,
-                            0.87,
-                        )
-                        .expect("strongest-hand width")
-                    });
-                    eprintln!(
-                        "G932_PACKED_WIDTH_RELEASE covariance={label} k={} dim={} \
-                         production_ns={production_ns:.3} fixed_ns={fixed_ns:.3} \
-                         hand_ns={hand_ns:.3} hand_over_production={:.6} \
-                         hand_over_fixed={:.6}",
-                        $k,
-                        $dim,
-                        hand_ns / production_ns,
-                        hand_ns / fixed_ns,
-                    );
+                        let production_ns =
+                            best_ns(5_000, || evaluate_production(&mut workspace));
+                        let fixed_ns = best_ns(5_000, || {
+                            row_primary_closed_form_vector_fixed::<$dim>(
+                                -0.28, 0.53, 1.18, &slopes, &scores, covariance, 1.21, event,
+                                1.0e-8, 0.87,
+                            )
+                            .expect("direct fixed width")
+                        });
+                        let graph_ns = best_ns(5_000, || {
+                            row_primary_closed_form_vector_graph::<$dim>(
+                                -0.28,
+                                0.53,
+                                1.18,
+                                &slopes,
+                                &scores,
+                                covariance,
+                                1.21,
+                                event,
+                                1.0e-8,
+                                0.87,
+                                &mut graph_workspace,
+                            )
+                            .expect("direct graph width")
+                        });
+                        let dynamic_ns = best_ns(5_000, || {
+                            row_primary_closed_form_vector_dynamic(
+                                -0.28,
+                                0.53,
+                                1.18,
+                                &slopes,
+                                &scores,
+                                covariance,
+                                1.21,
+                                event,
+                                1.0e-8,
+                                0.87,
+                                &mut dynamic_arena,
+                            )
+                            .expect("direct dynamic width")
+                        });
+                        let hand_ns = best_ns(5_000, || {
+                            vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
+                                -0.28,
+                                0.53,
+                                1.18,
+                                &slopes,
+                                &scores,
+                                covariance,
+                                1.21,
+                                event,
+                                1.0e-8,
+                                0.87,
+                            )
+                            .expect("strongest-hand width")
+                        });
+                        let fastest_canonical_ns = fixed_ns.min(graph_ns).min(dynamic_ns);
+                        eprintln!(
+                            "G932_PACKED_WIDTH_RELEASE covariance={label} event={event:.0} \
+                             k={} dim={} production_ns={production_ns:.3} fixed_ns={fixed_ns:.3} \
+                             graph_ns={graph_ns:.3} dynamic_ns={dynamic_ns:.3} hand_ns={hand_ns:.3} \
+                             production_over_fastest_canonical={:.6} hand_over_production={:.6}",
+                            $k,
+                            $dim,
+                            production_ns / fastest_canonical_ns,
+                            hand_ns / production_ns,
+                        );
+                    }
                 }
             }};
         }
