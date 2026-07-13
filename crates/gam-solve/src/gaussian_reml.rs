@@ -3447,14 +3447,38 @@ fn add_up(lhs: f64, rhs: f64) -> f64 {
     round_up(lhs + rhs)
 }
 
-fn mul_nonnegative_down(lhs: f64, rhs: f64) -> f64 {
-    debug_assert!(lhs >= 0.0 && rhs >= 0.0);
-    round_down(lhs * rhs).max(0.0)
+/// Outward product of a non-negative scalar and a non-negative interval.
+/// Invalid signs/order are not a recoverable numerical perturbation: callers
+/// must refuse certification rather than silently clamp the interval.
+fn nonnegative_product_interval(lhs: f64, rhs: Interval) -> Option<Interval> {
+    if !(lhs.is_finite()
+        && lhs >= 0.0
+        && rhs.lo.is_finite()
+        && rhs.hi.is_finite()
+        && rhs.lo >= 0.0
+        && rhs.hi >= rhs.lo)
+    {
+        return None;
+    }
+    Some(Interval {
+        lo: round_down(lhs * rhs.lo).max(0.0),
+        hi: round_up(lhs * rhs.hi),
+    })
 }
 
-fn mul_nonnegative_up(lhs: f64, rhs: f64) -> f64 {
-    debug_assert!(lhs >= 0.0 && rhs >= 0.0);
-    round_up(lhs * rhs)
+/// Outward square of a non-negative interval.
+fn nonnegative_square_interval(bounds: Interval) -> Option<Interval> {
+    if !(bounds.lo.is_finite()
+        && bounds.hi.is_finite()
+        && bounds.lo >= 0.0
+        && bounds.hi >= bounds.lo)
+    {
+        return None;
+    }
+    Some(Interval {
+        lo: round_down(bounds.lo * bounds.lo).max(0.0),
+        hi: round_up(bounds.hi * bounds.hi),
+    })
 }
 
 /// Enclose accumulated nearest-rounded arithmetic under the standard
@@ -3633,10 +3657,28 @@ fn reml_deriv_enclosure_profile(
                 delta.ln()
             };
             let kr = kernel_ranges(a + log_delta, b + log_delta);
-            num_lo = add_down(num_lo, mul_nonnegative_down(c2, kr.w_lo));
-            num_hi = add_up(num_hi, mul_nonnegative_up(c2, kr.w_hi));
-            sv_lo = add_down(sv_lo, mul_nonnegative_down(c2, kr.v_lo));
-            sv_hi = add_up(sv_hi, mul_nonnegative_up(c2, kr.v_hi));
+            let Some(w_product) = nonnegative_product_interval(
+                c2,
+                Interval {
+                    lo: kr.w_lo,
+                    hi: kr.w_hi,
+                },
+            ) else {
+                return (Interval::entire(), Interval::entire());
+            };
+            let Some(v_product) = nonnegative_product_interval(
+                c2,
+                Interval {
+                    lo: kr.v_lo,
+                    hi: kr.v_hi,
+                },
+            ) else {
+                return (Interval::entire(), Interval::entire());
+            };
+            num_lo = add_down(num_lo, w_product.lo);
+            num_hi = add_up(num_hi, w_product.hi);
+            sv_lo = add_down(sv_lo, v_product.lo);
+            sv_hi = add_up(sv_hi, v_product.hi);
             dph_lo = add_down(dph_lo, round_down(c2 * kr.k_lo));
             dph_hi = add_up(dph_hi, round_up(c2 * kr.k_hi));
         }
@@ -3669,12 +3711,13 @@ fn reml_deriv_enclosure_profile(
         // (dp′/dp)² with dp′ ≥ 0, dp > 0.
         let bl = round_down(num_lo / dp_hi).max(0.0);
         let bh = round_up(num_hi / dp_lo);
-        let sq_lo = mul_nonnegative_down(bl, bl);
-        let sq_hi = mul_nonnegative_up(bh, bh);
+        let Some(squared_ratio) = nonnegative_square_interval(Interval { lo: bl, hi: bh }) else {
+            return (Interval::entire(), Interval::entire());
+        };
 
         // term_j = dp″/dp − (dp′/dp)².
-        vpp_disp_lo = add_down(vpp_disp_lo, round_down(adp_lo - sq_hi));
-        vpp_disp_hi = add_up(vpp_disp_hi, round_up(adp_hi - sq_lo));
+        vpp_disp_lo = add_down(vpp_disp_lo, round_down(adp_lo - squared_ratio.hi));
+        vpp_disp_hi = add_up(vpp_disp_hi, round_up(adp_hi - squared_ratio.lo));
     }
 
     let vp_lo = add_down(g1_lo, round_down(half_nu * g2_lo));
