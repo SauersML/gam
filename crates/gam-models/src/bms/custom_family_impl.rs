@@ -770,7 +770,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 &kern,
                 &cache,
                 &crate::row_kernel::RowSet::All,
-            )));
+            )?));
         }
 
         // Build the dense joint Hessian by accumulating per-row primary
