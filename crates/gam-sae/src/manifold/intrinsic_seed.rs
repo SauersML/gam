@@ -320,15 +320,24 @@ pub fn intrinsic_geodesic_embedding(
             ));
         }
     }
-    if n < 3 {
-        // Too few rows for a geodesic graph to differ from the ambient metric.
-        // Fall back to a mean-centered raw-coordinate embedding (leading columns),
-        // which for n ≤ 2 is already the exact MDS solution.
-        for row in 0..n {
-            for col in 0..d.min(z.ncols()) {
-                out[[row, col]] = z[[row, col]];
-            }
+    if n == 1 {
+        return Ok(out);
+    }
+    if n == 2 {
+        // Two points have a unique centered one-dimensional MDS realization up
+        // to sign: place them at ± half their full ambient distance. Copying a
+        // leading raw feature (the old path) discarded separation carried by
+        // any other ambient column and was neither centered nor isometric.
+        let dist2 = squared_distance(z, 0, 1);
+        if !dist2.is_finite() {
+            return Err(
+                "intrinsic_seed: pairwise distance overflowed; rescale Z before seeding"
+                    .to_string(),
+            );
         }
+        let half_distance = 0.5 * dist2.sqrt();
+        out[[0, 0]] = -half_distance;
+        out[[1, 0]] = half_distance;
         return Ok(out);
     }
     let k = intrinsic_seed_knn(n, d).min(n - 1);
@@ -625,6 +634,15 @@ mod tests {
             "MDS on a complete-graph (exact-Euclidean) configuration must reproduce \
              its pairwise distances to rounding (max relative error {max_rel:.3e})"
         );
+    }
+
+    #[test]
+    fn two_row_embedding_preserves_full_ambient_distance() {
+        let z = Array2::from_shape_vec((2, 3), vec![4.0, -2.0, 1.0, 4.0, 4.0, 9.0]).unwrap();
+        let embed = intrinsic_geodesic_embedding(z.view(), 1).unwrap();
+        assert_eq!(embed[[0, 0]], -5.0);
+        assert_eq!(embed[[1, 0]], 5.0);
+        assert_eq!(embed[[0, 0]] + embed[[1, 0]], 0.0);
     }
 
     /// Determinism doctrine: the embedding is bit-identical run-to-run.
