@@ -1,5 +1,33 @@
 use super::*;
 
+/// Derive the survival location-scale outer-evaluation options from the exact
+/// row measure selected by the spatial optimizer.
+///
+/// `row_set` is the sole authority for this evaluation.  In particular, an
+/// inherited automatic/staged pilot must not survive into a full-data replay:
+/// that would let the inner mode, objective gradient, and Hessian describe
+/// different Horvitz--Thompson measures.  `All` therefore clears every stale
+/// mask just as deliberately as `Subsample` installs the selected weighted
+/// rows.
+pub(crate) fn survival_location_scale_exact_outer_options(
+    options: &BlockwiseFitOptions,
+    row_set: &crate::row_kernel::RowSet,
+) -> BlockwiseFitOptions {
+    let mut effective = options.clone();
+    effective.auto_outer_subsample = false;
+    effective.outer_score_subsample = match row_set {
+        crate::row_kernel::RowSet::All => None,
+        crate::row_kernel::RowSet::Subsample { rows, n_full } => Some(Arc::new(
+            crate::outer_subsample::OuterScoreSubsample::from_weighted_rows(
+                rows.as_ref().clone(),
+                *n_full,
+                0,
+            ),
+        )),
+    };
+    effective
+}
+
 /// Run the direct parametric-AFT MLE for a fully reduced constant-scale model
 /// and assemble the same [`UnifiedFitResult`] the coupled path would produce.
 ///
@@ -799,19 +827,10 @@ pub(crate) fn fit_survival_location_scale_terms(
                 }
                 other => other,
             };
-            let mut eval_options = survival_blockwise_fit_options(&assembled);
-            match row_set {
-                crate::row_kernel::RowSet::All => {}
-                crate::row_kernel::RowSet::Subsample { rows, n_full } => {
-                    eval_options.outer_score_subsample = Some(Arc::new(
-                        crate::outer_subsample::OuterScoreSubsample::from_weighted_rows(
-                            (**rows).clone(),
-                            *n_full,
-                            *n_full as u64,
-                        ),
-                    ));
-                }
-            }
+            let eval_options = survival_location_scale_exact_outer_options(
+                &survival_blockwise_fit_options(&assembled),
+                row_set,
+            );
             let eval = evaluate_custom_family_joint_hyper(
                 &prepared.family,
                 &prepared.blockspecs,
