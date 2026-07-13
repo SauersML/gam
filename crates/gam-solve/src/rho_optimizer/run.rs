@@ -2477,7 +2477,7 @@ pub(crate) fn outer_bounds_template(config: &OuterConfig, n: usize) -> (Array1<f
 /// box. The resulting box is stored back on `config`, making it the one source
 /// consumed by seed projection, continuation entry, every solver, and terminal
 /// projected-stationarity certification.
-fn install_objective_domain(
+pub(super) fn install_objective_domain(
     config: &mut OuterConfig,
     n_params: usize,
     objective_lower: Option<Array1<f64>>,

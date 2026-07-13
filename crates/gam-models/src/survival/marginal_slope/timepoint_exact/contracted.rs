@@ -207,100 +207,48 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         primary: &FlexPrimarySlices,
     ) -> Result<FlexThirdRowBase, String> {
-        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-        let q0 = q_geom.q0;
-        let q1 = q_geom.q1;
-        let qd1 = q_geom.qd1;
-        let g = block_states[2].eta[row];
-        let beta_h = self.flex_score_beta(block_states)?;
-        let beta_w = self.flex_link_beta(block_states)?;
-        let o_infl = self.influence_index_offset(row, block_states)?;
-
-        if survival_derivative_guard_violated(qd1, self.derivative_guard) {
-            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                reason: format!(
-                    "survival third contracted monotonicity violated at row {row}: qd1={qd1:.3e}"
-                ),
-            }
-            .into());
-        }
-
-        // The intercept solve's density check `d0`/`d1` is recomputed inside the jet
-        // base builder (`evaluate_survival_denom_d`); only the intercepts are needed.
-        let (a0, _) = self.solve_row_survival_intercept_with_slot(
-            q0,
-            g,
-            beta_h,
-            beta_w,
-            Some((row, SurvivalInterceptSlotKind::Entry)),
-        )?;
-        let (a1, _) = self.solve_row_survival_intercept_with_slot(
-            q1,
-            g,
-            beta_h,
-            beta_w,
-            Some((row, SurvivalInterceptSlotKind::Exit)),
-        )?;
-
-        let entry_cached = self.build_cached_partition(primary, a0, g, beta_h, beta_w)?;
-        let exit_cached = self.build_cached_partition(primary, a1, g, beta_h, beta_w)?;
+        let geometry = self.prepare_row_flex_third_geometry(row, block_states, primary)?;
 
         // #932-2 increment 3: the contracted BASE timepoint (value/grad/Hessian seed of
         // the Jet3/Jet4 contraction) now comes from the single-source jet builder, not
         // the hand `compute_survival_timepoint_exact_from_cached`.
         let entry = self.compute_survival_timepoint_exact_jet_from_cached(
-            row,
+            geometry.row,
             primary,
-            q0,
-            primary.q0,
-            a0,
-            g,
-            beta_h,
-            beta_w,
-            o_infl,
-            &entry_cached,
+            geometry.q0,
+            geometry.q0_index,
+            geometry.a0,
+            geometry.g,
+            geometry.beta_h.as_ref(),
+            geometry.beta_w.as_ref(),
+            geometry.o_infl,
+            &geometry.entry_cached,
         )?;
         let exit = self.compute_survival_timepoint_exact_jet_from_cached(
-            row,
+            geometry.row,
             primary,
-            q1,
-            primary.q1,
-            a1,
-            g,
-            beta_h,
-            beta_w,
-            o_infl,
-            &exit_cached,
+            geometry.q1,
+            geometry.q1_index,
+            geometry.a1,
+            geometry.g,
+            geometry.beta_h.as_ref(),
+            geometry.beta_w.as_ref(),
+            geometry.o_infl,
+            &geometry.exit_cached,
         )?;
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {
             return Err(SurvivalMarginalSlopeError::NumericalFailure {
                 reason: format!(
-                    "survival third contracted row {row}: non-positive chi1={:.3e}",
+                    "survival third contracted row {}: non-positive chi1={:.3e}",
+                    geometry.row,
                     exit.chi,
                 ),
             }
             .into());
         }
 
-        Ok(FlexThirdRowBase {
-            row,
-            p: primary.total,
-            qd1,
-            q0,
-            q1,
-            q0_index: primary.q0,
-            q1_index: primary.q1,
-            a0,
-            a1,
-            g,
-            beta_h: beta_h.cloned(),
-            beta_w: beta_w.cloned(),
-            entry_cached,
-            exit_cached,
-            entry_base: block10_pack_base(&entry),
-            exit_base: block10_pack_base(&exit),
-        })
+        Ok(geometry.into_base(block10_pack_base(&entry), block10_pack_base(&exit)))
     }
 
     /// Contract the third-order tensor of a row against a single direction,
@@ -327,7 +275,7 @@ impl SurvivalMarginalSlopeFamily {
         // `compute_survival_timepoint_directional_exact_from_cached` + `block10_pack_dir`.
         let (entry_ext, exit_ext) = super::flex_jet::with_flex_third_jet_arena(
             |jet_arena| -> Result<_, String> {
-                let entry_ext = self.compute_survival_timepoint_directional_jet_from_cached(
+                let (_, entry_ext) = self.compute_survival_timepoint_directional_jet_from_cached(
                     base.row,
                     &primary,
                     base.q0,
@@ -336,12 +284,13 @@ impl SurvivalMarginalSlopeFamily {
                     base.g,
                     beta_h,
                     beta_w,
+                    0.0,
                     &base.entry_cached,
                     dir,
                     jet_arena,
                 )?;
                 jet_arena.reset();
-                let exit_ext = self.compute_survival_timepoint_directional_jet_from_cached(
+                let (_, exit_ext) = self.compute_survival_timepoint_directional_jet_from_cached(
                     base.row,
                     &primary,
                     base.q1,
@@ -350,6 +299,7 @@ impl SurvivalMarginalSlopeFamily {
                     base.g,
                     beta_h,
                     beta_w,
+                    0.0,
                     &base.exit_cached,
                     dir,
                     jet_arena,
@@ -358,6 +308,17 @@ impl SurvivalMarginalSlopeFamily {
             },
         )?;
 
+        self.row_flex_third_contract_from_packs(base, dir, &entry_ext, &exit_ext)
+    }
+
+    fn row_flex_third_contract_from_packs(
+        &self,
+        base: &FlexThirdRowBase,
+        dir: &Array1<f64>,
+        entry_ext: &crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
+        exit_ext: &crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
+    ) -> Result<Array2<f64>, String> {
+        let primary = flex_primary_slices(self);
         // #932 single-source: the contracted third `Σ_c ℓ_{abc} dir_c =
         // (D_dir H)[a][b]` is the ε-Hessian channel of the ONE generic flex
         // row-NLL expression (`flex_row_nll`) instantiated at the one-seed jet
@@ -374,8 +335,8 @@ impl SurvivalMarginalSlopeFamily {
             super::flex_jet::FlexThirdPacks {
                 entry_base: &base.entry_base,
                 exit_base: &base.exit_base,
-                entry_ext: &entry_ext,
-                exit_ext: &exit_ext,
+                entry_ext,
+                exit_ext,
             },
         )
     }

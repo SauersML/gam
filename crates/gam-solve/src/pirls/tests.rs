@@ -5,7 +5,7 @@
 // `pirls::tests` module) because the scanner forbids `#[cfg(test)]` on bare
 // src items and cross-module consumption rules out a private test_support
 // submodule in `deviance.rs`.
-use super::{LN_2PI, log_gamma_stirling_correction, tweedie_exact_series_loglik_from_eta};
+use super::{LN_2PI, tweedie_exact_series_loglik_from_eta};
 use gam_spec::is_valid_tweedie_power;
 
 #[inline]
@@ -87,11 +87,10 @@ fn tweedie_series_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
 fn tweedie_exact_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
     tweedie_series_loglik(yi, mui, w, p, phi)
 }
-//!
-//! The nested `#[cfg(test)] mod`s below address the rest of the solver through
-//! `super::`, which now resolves to this module; the re-imports here forward the
-//! sibling concern modules and the shared item surface so those paths keep
-//! pointing at the same definitions they did when this file was inlined.
+// The nested test modules below address the rest of the solver through
+// `super::`, which resolves to this module; the re-imports here forward the
+// sibling concern modules and the shared item surface so those paths keep
+// pointing at the same definitions they did when this file was inlined.
 
 pub(crate) use super::*;
 

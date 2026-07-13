@@ -2210,7 +2210,6 @@ mod tests {
         percentile_from_sorted, percentile_index, spd_quadratic_after_certified_solve,
     };
     use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
-    use gam_problem::LinkFunction;
 
     // Reference variance forms (`phi * quad`) used only as the expected value in
     // the ALO variance tests. Production computes these through the overflow-safe

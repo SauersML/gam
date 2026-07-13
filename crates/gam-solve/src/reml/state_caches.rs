@@ -1920,7 +1920,7 @@ mod exact_deviance_state_cache_tests {
     #[test]
     fn observed_quadratic_scales_before_squaring_and_preserves_sign() {
         let x = Array2::<f64>::zeros((2, 1));
-        let weights_obs = array![1.0e-320, -1.0e-320];
+        let weights_obs = array![1.0e-320_f64, -1.0e-320_f64];
         let weights_obs_log_abs = weights_obs.mapv(|weight| weight.abs().ln());
         let target = Gam784BlockTarget {
             x_transformed: &x,

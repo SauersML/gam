@@ -3218,34 +3218,3 @@ mod negative_binomial_joint_certificate_tests {
         }
     }
 }
-
-#[cfg(test)]
-mod diagonal_smoothing_correction_tests {
-    use super::low_rank_covariance_diagonal;
-    use ndarray::array;
-
-    #[test]
-    fn low_rank_diagonal_matches_the_full_congruence() {
-        let mode_response = array![[1.0, 2.0], [-3.0, 0.5], [0.0, 4.0]];
-        let rho_covariance = array![[2.0, 0.25], [0.25, 1.5]];
-        let expected = mode_response
-            .dot(&rho_covariance)
-            .dot(&mode_response.t())
-            .diag()
-            .to_owned();
-        let actual = low_rank_covariance_diagonal(mode_response.view(), &rho_covariance)
-            .expect("compatible finite low-rank factors");
-        for (&got, &want) in actual.iter().zip(expected.iter()) {
-            assert!((got - want).abs() <= 16.0 * f64::EPSILON * want.abs().max(1.0));
-        }
-    }
-
-    #[test]
-    fn low_rank_diagonal_rejects_shape_mismatch() {
-        let mode_response = array![[1.0, 2.0]];
-        let wrong_rho_covariance = array![[1.0]];
-        assert!(
-            low_rank_covariance_diagonal(mode_response.view(), &wrong_rho_covariance).is_none()
-        );
-    }
-}

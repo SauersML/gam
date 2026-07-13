@@ -5000,6 +5000,8 @@ pub fn cloglog_ghq_derivatives_adaptive(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use gam_problem::LikelihoodScaleMetadata;
+    use gam_spec::LikelihoodSpec;
 
     /// Pins `log_half_erfc_stable` (both the `u > 0` erfcx branch and the
     /// `u <= 0` `normal_logcdf` branch) against an external high-precision
