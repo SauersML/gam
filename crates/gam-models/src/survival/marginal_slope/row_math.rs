@@ -1030,13 +1030,41 @@ fn checked_vector_workspace_layout(score_dimension: usize) -> Result<usize, Stri
     Ok(derivative_cells)
 }
 
+#[inline]
+fn checked_upper_triangle_cells(dimension: usize) -> Result<usize, String> {
+    let successor = dimension.checked_add(1).ok_or_else(|| {
+        SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope score width {dimension} overflows its packed covariance storage"
+            ),
+        }
+        .to_string()
+    })?;
+    let cells = if dimension % 2 == 0 {
+        (dimension / 2).checked_mul(successor)
+    } else {
+        dimension.checked_mul(successor / 2)
+    };
+    cells.ok_or_else(|| {
+        SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope score width {dimension} overflows its packed covariance storage"
+            ),
+        }
+        .to_string()
+    })
+}
+
 /// Reusable, allocation-free production workspace bound to one validated score
 /// covariance. The row kernel performs one covariance matvec and one packed
 /// coefficient traversal; validation and representation binding happen here.
 pub(crate) struct RigidVectorRowWorkspace<'covariance> {
     covariance: &'covariance MarginalSlopeCovariance,
+    score_dimension: usize,
     sigma_g: Box<[f64]>,
+    linear_direction: Box<[f64]>,
     low_rank_projection: Box<[f64]>,
+    low_rank_covariance_upper: Box<[f64]>,
     derivative_cells: Box<[f64]>,
 }
 
@@ -1044,20 +1072,40 @@ impl<'covariance> RigidVectorRowWorkspace<'covariance> {
     pub(crate) fn new(covariance: &'covariance MarginalSlopeCovariance) -> Result<Self, String> {
         let score_dimension = covariance.dim();
         let derivative_cells = checked_vector_workspace_layout(score_dimension)?;
-        let projection_dimension = match covariance.representation() {
-            MarginalSlopeCovarianceRef::LowRank(factor) => factor.ncols(),
-            MarginalSlopeCovarianceRef::Diagonal(_) | MarginalSlopeCovarianceRef::Full(_) => 0,
+        let (projection_dimension, low_rank_covariance_upper) = match covariance.representation() {
+            MarginalSlopeCovarianceRef::LowRank(factor) => {
+                let mut covariance_upper =
+                    vec![0.0; checked_upper_triangle_cells(score_dimension)?];
+                let mut slot = 0;
+                for left in 0..score_dimension {
+                    for right in left..score_dimension {
+                        let mut coefficient = 0.0;
+                        for rank in 0..factor.ncols() {
+                            coefficient += factor[[left, rank]] * factor[[right, rank]];
+                        }
+                        covariance_upper[slot] = coefficient;
+                        slot += 1;
+                    }
+                }
+                (factor.ncols(), covariance_upper.into_boxed_slice())
+            }
+            MarginalSlopeCovarianceRef::Diagonal(_) | MarginalSlopeCovarianceRef::Full(_) => {
+                (0, Vec::new().into_boxed_slice())
+            }
         };
         Ok(Self {
             covariance,
+            score_dimension,
             sigma_g: vec![0.0; score_dimension].into_boxed_slice(),
+            linear_direction: vec![0.0; score_dimension].into_boxed_slice(),
             low_rank_projection: vec![0.0; projection_dimension].into_boxed_slice(),
+            low_rank_covariance_upper,
             derivative_cells: vec![0.0; derivative_cells].into_boxed_slice(),
         })
     }
 
     pub(crate) fn derivatives(&self) -> (ArrayView1<'_, f64>, ArrayView2<'_, f64>) {
-        let dimension = 3 + self.covariance.dim();
+        let dimension = 3 + self.score_dimension;
         let (gradient, hessian) = self.derivative_cells.split_at(dimension);
         (
             ArrayView1::from(gradient),
@@ -1068,20 +1116,24 @@ impl<'covariance> RigidVectorRowWorkspace<'covariance> {
 }
 
 #[inline(always)]
-fn bound_covariance_matvec_into(
+fn bound_covariance_matvec_and_quadratic_into(
     covariance: &MarginalSlopeCovariance,
     vector: &[f64],
     output: &mut [f64],
     low_rank_projection: &mut [f64],
-) {
+) -> f64 {
     // `RigidVectorRowWorkspace::new` sizes both buffers from this covariance,
     // and `row_primary_closed_form_vector_into` rejects a row whose slope or
     // score width differs before reaching this hot kernel.
     match covariance.representation() {
         MarginalSlopeCovarianceRef::Diagonal(diagonal) => {
+            let mut quadratic = 0.0;
             for axis in 0..vector.len() {
-                output[axis] = diagonal[axis] * vector[axis];
+                let projected = diagonal[axis] * vector[axis];
+                output[axis] = projected;
+                quadratic += projected * vector[axis];
             }
+            quadratic
         }
         MarginalSlopeCovarianceRef::Full(matrix) => {
             for row in 0..vector.len() {
@@ -1091,13 +1143,23 @@ fn bound_covariance_matvec_into(
                 }
                 output[row] = value;
             }
+            // Full covariance quadratic forms are authoritatively evaluated as
+            // sums of squares through the admitted eigen-square-root factor.
+            // `vector' * output` is mathematically equal but has different
+            // rounding and can manufacture a tiny negative value at the PSD
+            // boundary, so this representation deliberately retains that
+            // independent traversal.
+            covariance.quadratic_form_unchecked(vector)
         }
         MarginalSlopeCovarianceRef::LowRank(factor) => {
-            low_rank_projection.fill(0.0);
+            let mut quadratic = 0.0;
             for rank in 0..factor.ncols() {
+                let mut projection = 0.0;
                 for axis in 0..vector.len() {
-                    low_rank_projection[rank] += factor[[axis, rank]] * vector[axis];
+                    projection += factor[[axis, rank]] * vector[axis];
                 }
+                low_rank_projection[rank] = projection;
+                quadratic += projection * projection;
             }
             output.fill(0.0);
             for axis in 0..vector.len() {
@@ -1105,6 +1167,7 @@ fn bound_covariance_matvec_into(
                     output[axis] += factor[[axis, rank]] * low_rank_projection[rank];
                 }
             }
+            quadratic
         }
     }
 }
@@ -1163,31 +1226,35 @@ pub(crate) fn order2_feature_pullback_into<const FEATURES: usize>(
 #[inline(always)]
 fn write_rigid_vector_score_hessian_block(
     feature_hessian: &[[f64; RIGID_FEATURE_DIMENSION]; RIGID_FEATURE_DIMENSION],
-    z: &[f64],
-    sigma_g: &[f64],
-    probit_scale: f64,
+    linear_direction: &[f64],
+    variance_direction: &[f64],
     variance_curvature_scale: f64,
     dimension: usize,
     hessian: &mut [f64],
-    covariance_coefficient: impl Fn(usize, usize) -> f64,
+    covariance_coefficient: impl Fn(usize, usize, usize) -> f64,
 ) {
-    for left_score in 0..z.len() {
-        let left_linear = probit_scale * z[left_score];
-        let left_variance = 2.0 * sigma_g[left_score];
+    let mut covariance_slot = 0;
+    for left_score in 0..linear_direction.len() {
+        let left_linear = linear_direction[left_score];
+        let left_variance = variance_direction[left_score];
         let to_linear = feature_hessian[FEATURE_LINEAR][FEATURE_LINEAR] * left_linear
             + feature_hessian[FEATURE_VARIANCE][FEATURE_LINEAR] * left_variance;
         let to_variance = feature_hessian[FEATURE_LINEAR][FEATURE_VARIANCE] * left_linear
             + feature_hessian[FEATURE_VARIANCE][FEATURE_VARIANCE] * left_variance;
         let left_primary = 3 + left_score;
-        for right_score in left_score..z.len() {
-            let right_linear = probit_scale * z[right_score];
-            let right_variance = 2.0 * sigma_g[right_score];
+        for right_score in left_score..linear_direction.len() {
+            let right_linear = linear_direction[right_score];
+            let right_variance = variance_direction[right_score];
             let channel = to_linear * right_linear
                 + to_variance * right_variance
-                + variance_curvature_scale * covariance_coefficient(left_score, right_score);
+                + variance_curvature_scale
+                    * covariance_coefficient(covariance_slot, left_score, right_score);
+            covariance_slot += 1;
             let right_primary = 3 + right_score;
             hessian[left_primary * dimension + right_primary] = channel;
-            hessian[right_primary * dimension + left_primary] = channel;
+            if left_score != right_score {
+                hessian[right_primary * dimension + left_primary] = channel;
+            }
         }
     }
 }
@@ -1202,10 +1269,10 @@ fn write_rigid_vector_score_hessian_block(
 fn rigid_vector_feature_pullback_into(
     feature_gradient: &[f64; RIGID_FEATURE_DIMENSION],
     feature_hessian: &[[f64; RIGID_FEATURE_DIMENSION]; RIGID_FEATURE_DIMENSION],
-    z: &[f64],
-    sigma_g: &[f64],
+    linear_direction: &[f64],
+    variance_direction: &[f64],
     covariance: &MarginalSlopeCovariance,
-    probit_scale: f64,
+    low_rank_covariance_upper: &[f64],
     dimension: usize,
     gradient: &mut [f64],
     hessian: &mut [f64],
@@ -1218,10 +1285,10 @@ fn rigid_vector_feature_pullback_into(
         }
     }
 
-    for score in 0..z.len() {
+    for score in 0..linear_direction.len() {
         let primary = 3 + score;
-        let linear = probit_scale * z[score];
-        let variance = 2.0 * sigma_g[score];
+        let linear = linear_direction[score];
+        let variance = variance_direction[score];
         gradient[primary] = feature_gradient[FEATURE_LINEAR] * linear
             + feature_gradient[FEATURE_VARIANCE] * variance;
         for identity in 0..3 {
@@ -1237,13 +1304,12 @@ fn rigid_vector_feature_pullback_into(
         MarginalSlopeCovarianceRef::Diagonal(diagonal) => {
             write_rigid_vector_score_hessian_block(
                 feature_hessian,
-                z,
-                sigma_g,
-                probit_scale,
+                linear_direction,
+                variance_direction,
                 variance_curvature_scale,
                 dimension,
                 hessian,
-                |row, column| {
+                |_, row, column| {
                     if row == column { diagonal[row] } else { 0.0 }
                 },
             );
@@ -1251,31 +1317,23 @@ fn rigid_vector_feature_pullback_into(
         MarginalSlopeCovarianceRef::Full(matrix) => {
             write_rigid_vector_score_hessian_block(
                 feature_hessian,
-                z,
-                sigma_g,
-                probit_scale,
+                linear_direction,
+                variance_direction,
                 variance_curvature_scale,
                 dimension,
                 hessian,
-                |row, column| matrix[[row, column]],
+                |_, row, column| matrix[[row, column]],
             );
         }
-        MarginalSlopeCovarianceRef::LowRank(factor) => {
+        MarginalSlopeCovarianceRef::LowRank(_) => {
             write_rigid_vector_score_hessian_block(
                 feature_hessian,
-                z,
-                sigma_g,
-                probit_scale,
+                linear_direction,
+                variance_direction,
                 variance_curvature_scale,
                 dimension,
                 hessian,
-                |row, column| {
-                    let mut coefficient = 0.0;
-                    for rank in 0..factor.ncols() {
-                        coefficient += factor[[row, rank]] * factor[[column, rank]];
-                    }
-                    coefficient
-                },
+                |slot, _, _| low_rank_covariance_upper[slot],
             );
         }
     }
@@ -1294,7 +1352,7 @@ pub(crate) fn row_primary_closed_form_vector_into(
     workspace: &mut RigidVectorRowWorkspace<'_>,
 ) -> Result<f64, String> {
     let k = slopes.len();
-    let configured_dimension = workspace.covariance.dim();
+    let configured_score_dimension = workspace.score_dimension;
     if z.len() != k {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
@@ -1305,10 +1363,10 @@ pub(crate) fn row_primary_closed_form_vector_into(
         }
         .into());
     }
-    if configured_dimension != k {
+    if configured_score_dimension != k {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
-                "survival marginal-slope vector workspace width mismatch: configured={configured_dimension}, row={k}"
+                "survival marginal-slope vector workspace width mismatch: configured={configured_score_dimension}, row={k}"
             ),
         }
         .into());
@@ -1331,18 +1389,27 @@ pub(crate) fn row_primary_closed_form_vector_into(
     let dimension = 3 + k;
     let RigidVectorRowWorkspace {
         covariance,
+        score_dimension: _,
         sigma_g,
+        linear_direction,
         low_rank_projection,
+        low_rank_covariance_upper,
         derivative_cells,
     } = workspace;
     let covariance = *covariance;
-    bound_covariance_matvec_into(covariance, slopes, sigma_g, low_rank_projection);
+    let raw_quadratic = bound_covariance_matvec_and_quadratic_into(
+        covariance,
+        slopes,
+        sigma_g,
+        low_rank_projection,
+    );
     let mut linear_dot = 0.0;
     for axis in 0..k {
         linear_dot += slopes[axis] * z[axis];
+        linear_direction[axis] = probit_scale * z[axis];
+        sigma_g[axis] *= 2.0;
     }
-    let raw_variance =
-        validated_vector_variance(covariance.quadratic_form_unchecked(slopes), probit_scale)?;
+    let raw_variance = validated_vector_variance(raw_quadratic, probit_scale)?;
     let linear = probit_scale * linear_dot;
     let inputs = RigidRowInputs {
         row: 0,
@@ -1361,10 +1428,10 @@ pub(crate) fn row_primary_closed_form_vector_into(
     rigid_vector_feature_pullback_into(
         &feature_gradient,
         &feature_hessian,
-        z,
+        linear_direction,
         sigma_g,
         covariance,
-        probit_scale,
+        low_rank_covariance_upper,
         dimension,
         gradient,
         hessian,
@@ -2541,6 +2608,81 @@ mod tests {
     }
 
     #[test]
+    fn fused_bound_covariance_matvec_preserves_representation_bits_932() {
+        let diagonal =
+            MarginalSlopeCovariance::diagonal(Array1::from_vec(vec![1.2, 0.9, 1.4])).unwrap();
+        let full = MarginalSlopeCovariance::full(
+            Array2::from_shape_vec(
+                (3, 3),
+                vec![1.2, 0.15, -0.05, 0.15, 0.9, 0.08, -0.05, 0.08, 1.4],
+            )
+            .expect("3x3 full covariance"),
+        )
+        .unwrap();
+        let low_rank = MarginalSlopeCovariance::low_rank(
+            Array2::from_shape_vec((3, 2), vec![0.8, -0.1, 0.25, 0.7, -0.45, 0.35])
+                .expect("3x2 low-rank factor"),
+        )
+        .unwrap();
+        let slopes = [0.37, -0.91, 1.23];
+
+        for covariance in [&diagonal, &full, &low_rank] {
+            let projection_dimension = match covariance.representation() {
+                MarginalSlopeCovarianceRef::LowRank(factor) => factor.ncols(),
+                MarginalSlopeCovarianceRef::Diagonal(_) | MarginalSlopeCovarianceRef::Full(_) => 0,
+            };
+            let mut projected = vec![0.0; slopes.len()];
+            let mut projection = vec![0.0; projection_dimension];
+            let actual_quadratic = bound_covariance_matvec_and_quadratic_into(
+                covariance,
+                &slopes,
+                &mut projected,
+                &mut projection,
+            );
+            let expected_quadratic = covariance.quadratic_form_unchecked(&slopes);
+            assert_eq!(
+                actual_quadratic.to_bits(),
+                expected_quadratic.to_bits(),
+                "fused quadratic changed {:?} representation rounding",
+                covariance.shape(),
+            );
+
+            let mut expected_projected = vec![0.0; slopes.len()];
+            covariance.multiply(&slopes, &mut expected_projected);
+            for axis in 0..slopes.len() {
+                assert_eq!(
+                    projected[axis].to_bits(),
+                    expected_projected[axis].to_bits(),
+                    "fused matvec changed {:?} representation rounding at axis {axis}",
+                    covariance.shape(),
+                );
+            }
+
+            let workspace =
+                RigidVectorRowWorkspace::new(covariance).expect("validated vector workspace");
+            match covariance.representation() {
+                MarginalSlopeCovarianceRef::LowRank(_) => {
+                    let mut slot = 0;
+                    for left in 0..slopes.len() {
+                        for right in left..slopes.len() {
+                            assert_eq!(
+                                workspace.low_rank_covariance_upper[slot].to_bits(),
+                                covariance.coefficient(left, right).to_bits(),
+                                "cached low-rank covariance changed coefficient ({left},{right}) rounding",
+                            );
+                            slot += 1;
+                        }
+                    }
+                    assert_eq!(slot, workspace.low_rank_covariance_upper.len());
+                }
+                MarginalSlopeCovarianceRef::Diagonal(_) | MarginalSlopeCovarianceRef::Full(_) => {
+                    assert!(workspace.low_rank_covariance_upper.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn vector_workspace_is_compact_and_rejects_cross_width_reuse_932() {
         assert!(
             std::mem::size_of::<RigidVectorRowWorkspace<'static>>() <= 128,
@@ -2548,6 +2690,8 @@ mod tests {
         );
         assert!(checked_vector_workspace_layout(0).is_err());
         assert!(checked_vector_workspace_layout(usize::MAX).is_err());
+        assert_eq!(checked_upper_triangle_cells(3).unwrap(), 6);
+        assert!(checked_upper_triangle_cells(usize::MAX).is_err());
 
         assert!(MarginalSlopeCovariance::diagonal(Array1::zeros(0)).is_err());
         let covariance = MarginalSlopeCovariance::diagonal(Array1::ones(3)).unwrap();
