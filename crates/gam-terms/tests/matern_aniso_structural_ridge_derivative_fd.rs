@@ -68,7 +68,10 @@ fn realized_penalties_at_psi(
     trial.aniso_log_scales = Some(eta);
     build_matern_basiswithworkspace(data.view(), &trial, &mut BasisWorkspace::default())
         .expect("realized anisotropic Matérn value build")
-        .penalties
+        .active_penalties
+        .iter()
+        .map(|penalty| penalty.matrix.clone())
+        .collect()
 }
 
 fn max_abs(matrix: &Array2<f64>) -> f64 {
@@ -103,12 +106,12 @@ fn matern_aniso_nonorthogonal_structural_ridge_jet_matches_central_finite_differ
     let (data, spec, psi) = fixture();
     let base = build_matern_basiswithworkspace(data.view(), &spec, &mut BasisWorkspace::default())
         .expect("base anisotropic Matérn value build");
-    let ridge = &base
+    let ridge_index = base
         .active_penalties
         .iter()
-        .find(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace))
-        .expect("explicit intercept must emit an active structural ridge")
-        .matrix;
+        .position(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace))
+        .expect("explicit intercept must emit an active structural ridge");
+    let ridge = &base.active_penalties[ridge_index].matrix;
     let intercept_column = ridge.ncols() - 1;
     let kernel_intercept_overlap = (0..intercept_column)
         .map(|column| ridge[[column, intercept_column]].abs())
