@@ -55,37 +55,58 @@ pub(crate) fn report_offset_for(
     )
 }
 
-/// Dispersion φ to feed the geometry-based ALO path for a saved model.
+/// Build the exact affine row input consumed by saved-model ALO.
 ///
-/// The PIRLS-backed ALO path (`compute_alo_diagnostics_from_pirls`) keys φ on
-/// the link: Identity (Gaussian) gets the estimated dispersion `RSS/(n−edf)`,
-/// every other link gets 1.0. The saved-model geometry path was instead
-/// hard-coding φ = 1.0, so for any Gaussian fit `diagnose --alo` / `report`
-/// reported `se_bayes` / `se_sandwich` wrong by exactly `√φ̂` relative to the
-/// refit fallback path — the two ALO routes disagreed on the SE scale for the
-/// same model. The model already stores its converged dispersion as the
-/// residual standard deviation `σ̂` (`UnifiedFitResult::standard_deviation`,
-/// set to `√(weighted_rss / (n−edf))` for Gaussian), so φ̂ = σ̂² reproduces the
-/// PIRLS formula exactly and keeps the geometry and refit SE columns identical.
-pub(crate) fn geometry_alo_phi(unified: &UnifiedFitResult, link: LinkFunction) -> f64 {
-    match link {
-        LinkFunction::Identity => {
-            let sigma = unified.standard_deviation;
-            if sigma.is_finite() && sigma > 0.0 {
-                sigma * sigma
-            } else {
-                1.0
-            }
-        }
-        LinkFunction::Log
-        | LinkFunction::Logit
-        | LinkFunction::Probit
-        | LinkFunction::CLogLog
-        | LinkFunction::LogLog
-        | LinkFunction::Cauchit
-        | LinkFunction::Sas
-        | LinkFunction::BetaLogistic => 1.0,
+/// Transformation-normal prediction normally carries a response-scale
+/// quadrature result in `PredictInput`; case deletion instead needs the
+/// persisted covariate design that parameterises every local gamma coordinate.
+/// Keeping that distinction here gives `diagnose` and `report` one assembly
+/// authority while the likelihood replay itself remains in `gam-predict`.
+pub(crate) fn build_saved_alo_predict_input(
+    model: &SavedModel,
+    data: ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    offset: &Array1<f64>,
+    noise_offset: &Array1<f64>,
+    noise_offset_supplied: bool,
+) -> Result<PredictInput, String> {
+    if model.predict_model_class() != PredictModelClass::TransformationNormal {
+        return build_predict_input_for_model(
+            model,
+            data,
+            col_map,
+            training_headers,
+            offset,
+            noise_offset,
+            noise_offset_supplied,
+        );
     }
+    if noise_offset_supplied {
+        return Err(
+            "saved transformation-normal ALO does not have a secondary offset coordinate"
+                .to_string(),
+        );
+    }
+    let spec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )?;
+    let design = build_term_collection_design(data, &spec)
+        .map_err(|error| format!("failed to build saved transformation-normal ALO design: {error}"))?;
+    let effective_offset = design
+        .compose_offset(offset.view(), "saved transformation-normal ALO design")
+        .map_err(|error| error.to_string())?;
+    Ok(PredictInput {
+        design: design.design,
+        offset: effective_offset,
+        design_noise: None,
+        offset_noise: None,
+        auxiliary_scalar: None,
+        auxiliary_matrix: None,
+    })
 }
 
 pub(crate) fn resolve_predict_offsets(

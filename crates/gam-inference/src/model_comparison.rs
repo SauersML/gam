@@ -26,7 +26,6 @@
 //! Both channels are *corroboration*: they ride alongside the evidence headline
 //! a race already produces, never replacing it.
 
-use crate::alo::AloDiagnostics;
 use gam_problem::types::{GlmLikelihoodSpec, LikelihoodSpec};
 use gam_solve::estimate::{EstimationError, UnifiedFitResult};
 use gam_solve::psis::pareto_smooth_weights;
@@ -465,12 +464,14 @@ pub fn compare(
 }
 
 /// Assemble the comparison payload for a fitted GLM/GAM from the fit result plus
-/// optional ALO diagnostics.
+/// optional ALO leave-one-out predictor coordinates.
 ///
 /// Corrected AIC is populated only with retained, method-certified correction
-/// provenance. The ALO elpd channel is populated when `alo` is supplied and the
-/// fit carries an engine-level family; both predictors are scored directly in
-/// eta coordinates.
+/// provenance. The ALO elpd channel is populated when `alo_eta_tilde` is
+/// supplied and the fit carries an engine-level family; both predictors are
+/// scored directly in eta coordinates. Taking the sole coordinate consumed by
+/// this calculation keeps model comparison independent of any particular ALO
+/// result schema (scalar or multi-coordinate).
 ///
 /// `eta_hat` is the *fitted* linear predictor (including offset) and `y` the
 /// response, both length `n`.
@@ -479,7 +480,7 @@ pub fn model_comparison_from_unified(
     y: ArrayView1<'_, f64>,
     eta_hat: ArrayView1<'_, f64>,
     prior_weights: ArrayView1<'_, f64>,
-    alo: Option<&AloDiagnostics>,
+    alo_eta_tilde: Option<ArrayView1<'_, f64>>,
 ) -> Result<ModelComparison, EstimationError> {
     let phi = fit.dispersion_phi()?;
     let edf_conditional = fit.edf_total().ok_or_else(|| {
@@ -543,13 +544,13 @@ pub fn model_comparison_from_unified(
         .corrected
         .map(|corrected| -2.0 * log_lik + 2.0 * (corrected + scale_dof));
 
-    let loo = match (alo, fit.likelihood_family.as_ref()) {
-        (Some(alo), Some(spec)) => {
+    let loo = match (alo_eta_tilde, fit.likelihood_family.as_ref()) {
+        (Some(eta_tilde), Some(spec)) => {
             let scale = reporting_scale(spec, &fit.likelihood_scale, phi);
             Some(alo_elpd_from_family(
                 y,
                 eta_hat,
-                alo.eta_tilde.view(),
+                eta_tilde,
                 prior_weights,
                 spec,
                 scale,

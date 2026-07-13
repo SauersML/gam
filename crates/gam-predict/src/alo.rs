@@ -19,8 +19,10 @@ use gam_models::transformation_normal::{
 };
 use gam_problem::{EstimationError, ResponseFamily};
 use gam_solve::inference::alo::{
-    MultiBlockAloDiagnostics, MultiBlockAloInput, compute_multiblock_alo,
+    AloInput, MultiBlockAloDiagnostics, MultiBlockAloInput, compute_alo_from_input,
+    compute_multiblock_alo,
 };
+use gam_spec::{GlmLikelihoodSpec, LinkFunction};
 use gam_terms::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
 };
@@ -179,6 +181,140 @@ fn require_saved_hessian<'a>(
         )));
     }
     Ok(hessian)
+}
+
+fn standard_alo_dispersion(
+    standard_deviation: f64,
+    link: LinkFunction,
+) -> Result<f64, EstimationError> {
+    if link != LinkFunction::Identity {
+        return Ok(1.0);
+    }
+    if !standard_deviation.is_finite() || standard_deviation <= 0.0 {
+        return Err(invalid(format!(
+            "saved standard identity-link ALO requires a positive finite fitted residual standard deviation, got {standard_deviation}"
+        )));
+    }
+    Ok(standard_deviation * standard_deviation)
+}
+
+fn compute_saved_standard_alo(
+    model: &FittedModel,
+    input: &PredictInput,
+    observations: &SavedAloObservations<'_>,
+) -> Result<SavedModelAloDiagnostics, EstimationError> {
+    let class = PredictModelClass::Standard;
+    let n = observations.response.len();
+    if n == 0
+        || observations.prior_weights.len() != n
+        || input.design.nrows() != n
+        || input.offset.len() != n
+    {
+        return Err(invalid(format!(
+            "saved standard ALO row mismatch: response={n}, weights={}, design={}, offset={}",
+            observations.prior_weights.len(),
+            input.design.nrows(),
+            input.offset.len(),
+        )));
+    }
+    if input.design_noise.is_some()
+        || input.offset_noise.is_some()
+        || input.auxiliary_scalar.is_some()
+        || input.auxiliary_matrix.is_some()
+    {
+        return Err(invalid(
+            "saved standard ALO received non-standard secondary or auxiliary coordinates",
+        ));
+    }
+    if let Some((row, weight)) = observations
+        .prior_weights
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, weight)| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err(invalid(format!(
+            "saved standard ALO prior weight[{row}] must be finite and non-negative, got {weight}"
+        )));
+    }
+
+    let fit = model.payload().fit_result.as_ref().ok_or_else(|| {
+        invalid("saved standard ALO requires a canonical fitted coefficient state")
+    })?;
+    if fit.blocks.len() != 1 {
+        return Err(invalid(format!(
+            "saved standard ALO requires exactly one affine coefficient block; got {}",
+            fit.blocks.len()
+        )));
+    }
+    let beta = &fit.blocks[0].beta;
+    if input.design.ncols() != beta.len() {
+        return Err(invalid(format!(
+            "saved standard ALO design has {} columns; fitted affine block has {} coefficients",
+            input.design.ncols(),
+            beta.len()
+        )));
+    }
+    require_saved_hessian(model, class, beta.len())?;
+    let geometry = fit.geometry.as_ref().ok_or_else(|| {
+        invalid("saved standard ALO requires the exact converged working-set geometry")
+    })?;
+    let eta = input.design.dot(beta) + &input.offset;
+    let likelihood = GlmLikelihoodSpec::try_new(
+        model.likelihood(),
+        fit.likelihood_scale.clone(),
+    )
+    .map_err(|error| invalid(format!("saved standard ALO likelihood scale: {error}")))?;
+    let mut mean = Array1::<f64>::zeros(n);
+    let mut working_weights = Array1::<f64>::zeros(n);
+    let mut working_response = Array1::<f64>::zeros(n);
+    gam_solve::pirls::update_glmvectors_by_family(
+        observations.response.view(),
+        &eta,
+        &likelihood,
+        observations.prior_weights.view(),
+        &mut mean,
+        &mut working_weights,
+        &mut working_response,
+    )?;
+    let phi = standard_alo_dispersion(fit.standard_deviation, likelihood.spec.link_function())?;
+    let dense_design = input.design.to_dense();
+    let scalar = compute_alo_from_input(&AloInput::from_geometry_with_working_state(
+        geometry,
+        &dense_design,
+        &eta,
+        &input.offset,
+        phi,
+        &working_weights,
+        &working_response,
+    ))?;
+
+    let eta_tilde = scalar
+        .eta_tilde
+        .iter()
+        .copied()
+        .map(|value| Array1::from_vec(vec![value]))
+        .collect::<Vec<_>>();
+    let alo_variance = scalar
+        .se_sandwich
+        .iter()
+        .copied()
+        .map(|standard_error| Array1::from_vec(vec![standard_error * standard_error]))
+        .collect::<Vec<_>>();
+    let cook_distance = Array1::from_shape_fn(n, |row| {
+        let deletion = scalar.eta_tilde[row] - eta[row];
+        phi * working_weights[row] * deletion * deletion
+    });
+    Ok(SavedModelAloDiagnostics {
+        model_class: class,
+        coordinate_names: vec!["eta".to_string()],
+        diagnostics: MultiBlockAloDiagnostics {
+            eta_tilde,
+            leverage: scalar.leverage,
+            alo_variance,
+            cook_distance,
+        },
+    })
 }
 
 fn compute_saved_multicoordinate_core(
@@ -521,7 +657,7 @@ fn compute_dispersion_location_scale_alo(
 /// This path never refits and never substitutes another model. The saved
 /// penalized Hessian, row likelihood and coefficient topology must all be
 /// present and dimensionally aligned or the request fails factually.
-pub fn compute_saved_location_scale_alo(
+fn compute_saved_location_scale_alo(
     model: &FittedModel,
     input: &PredictInput,
     observations: SavedAloObservations<'_>,
@@ -544,7 +680,7 @@ pub fn compute_saved_location_scale_alo(
 }
 
 /// Replay exact saved-H ALO for a rigid Bernoulli marginal-slope fit.
-pub fn compute_saved_bernoulli_marginal_slope_alo(
+fn compute_saved_bernoulli_marginal_slope_alo(
     model: &FittedModel,
     input: &PredictInput,
     observations: SavedAloObservations<'_>,
@@ -639,7 +775,7 @@ pub fn compute_saved_bernoulli_marginal_slope_alo(
 }
 
 /// Replay exact saved-H ALO for a finite-support transformation-normal fit.
-pub fn compute_saved_transformation_normal_alo(
+fn compute_saved_transformation_normal_alo(
     model: &FittedModel,
     covariate_design: &DesignMatrix,
     additive_offset: &Array1<f64>,
@@ -887,4 +1023,38 @@ pub fn compute_saved_transformation_normal_alo(
         scores,
         coordinate_values,
     )
+}
+
+/// Replay exact ALO from one saved-model authority for every fitted class.
+///
+/// The dispatcher never refits, substitutes a simpler model, or reconstructs
+/// a penalized Hessian from covariance. `input` must contain the affine row
+/// designs consumed by the fitted likelihood. For transformation-normal fits,
+/// that means the persisted covariate design rather than the response-scale
+/// prediction quadrature carrier.
+pub fn compute_saved_model_alo(
+    model: &FittedModel,
+    input: &PredictInput,
+    observations: SavedAloObservations<'_>,
+) -> Result<SavedModelAloDiagnostics, EstimationError> {
+    match model.predict_model_class() {
+        PredictModelClass::Standard => compute_saved_standard_alo(model, input, &observations),
+        PredictModelClass::GaussianLocationScale
+        | PredictModelClass::BinomialLocationScale
+        | PredictModelClass::DispersionLocationScale => {
+            compute_saved_location_scale_alo(model, input, observations)
+        }
+        PredictModelClass::BernoulliMarginalSlope => {
+            compute_saved_bernoulli_marginal_slope_alo(model, input, observations)
+        }
+        PredictModelClass::TransformationNormal => compute_saved_transformation_normal_alo(
+            model,
+            &input.design,
+            &input.offset,
+            observations,
+        ),
+        PredictModelClass::Survival => Err(invalid(
+            "saved survival ALO requires typed event/time row replay; no survival mode may be substituted",
+        )),
+    }
 }
