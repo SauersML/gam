@@ -3136,6 +3136,28 @@ impl ArrowFactorCache {
         Ok(self.apply_deflated_pseudo_inverse(&deflated, rhs))
     }
 
+    /// Precompute the deflated spectral pseudo-inverse ONCE and return a
+    /// reusable applier — the many-RHS form of
+    /// [`Self::schur_inverse_apply_deflated`]. The EDF trace contracts
+    /// `(H⁻¹)_ββ` against one `λS⊗I` column per basis coefficient (`Σ_k M_k·r_k`
+    /// columns total); recomputing the `O(K³)` eigendecomposition per column
+    /// would multiply that cost by the border width for no reason. Each apply
+    /// through the returned closure is `O(K²)` (two dense mat-vecs through the
+    /// eigenbasis), identical in complexity to the plain
+    /// [`Self::schur_inverse_apply`] back-substitution it replaces.
+    ///
+    /// Same deflation semantics, contract, and errors as
+    /// [`Self::schur_inverse_apply_deflated`]; the closure itself is
+    /// infallible (rhs length is the caller's loop invariant — a wrong length
+    /// panics in the underlying gemv shape check rather than dividing by a
+    /// null pivot).
+    pub fn schur_deflated_applier(
+        &self,
+    ) -> Result<impl Fn(ArrayView1<'_, f64>) -> Array1<f64> + '_, ArrowSchurError> {
+        let deflated = self.deflated_schur_pseudo_inverse()?;
+        Ok(move |rhs: ArrayView1<'_, f64>| self.apply_deflated_pseudo_inverse(&deflated, rhs))
+    }
+
     /// Deflation-aware dense principal sub-block of `(H⁻¹)_ββ` — the drop-in for
     /// [`Self::schur_inverse_block`] used by the per-atom EDF trace. Identical
     /// contract, but each column is solved through the spectral pseudo-inverse

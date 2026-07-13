@@ -2895,6 +2895,18 @@ impl SaeManifoldTerm {
                 )
                 .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason });
         }
+        // #2253/#2228 λ→0 boundary: the plain per-column back-substitution
+        // divides by the doubly-null (data-null ∧ penalty-null) β-Schur pivots
+        // at the ρ lower face and returns `Inf`/`NaN` — the EDF value is the
+        // ONLY outer-gradient piece that contracts `(H⁻¹)_ββ`, so it is the
+        // piece that diverges while the criterion value stays finite. Route
+        // every column through the deflated spectral pseudo-inverse instead:
+        // the eigendecomposition happens ONCE (`schur_deflated_applier`), a
+        // doubly-null direction contributes exactly 0 dof (it is
+        // unidentifiable, not a real degree of freedom), and in the interior
+        // no direction deflates so the trace matches the plain path to
+        // round-off.
+        let apply = cache.schur_deflated_applier()?;
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
         let mut m_col = Array1::<f64>::zeros(k);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
@@ -2912,7 +2924,7 @@ impl SaeManifoldTerm {
                         let s_nu_mu = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
                         m_col[off + nu * r + oc] = lambda * s_nu_mu;
                     }
-                    let z = cache.schur_inverse_apply(m_col.view())?;
+                    let z = apply(m_col.view());
                     trace += z[col];
                 }
             }
