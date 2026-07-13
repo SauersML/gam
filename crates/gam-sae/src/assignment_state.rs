@@ -421,6 +421,43 @@ impl SaeAssignmentState {
         Ok(())
     }
 
+    /// Replace one compact coordinate row and project every heterogeneous atom
+    /// block onto its declared manifold. This is the exact snapshot-restore
+    /// operation required by support-sparse line searches: applying a negated
+    /// step is not an inverse retraction at interval boundaries or on curved
+    /// manifolds, so rollback must restore the accepted point itself.
+    pub fn set_row_coords(&mut self, row: usize, values: &[f64]) -> Result<(), String> {
+        if row >= self.n_obs {
+            return Err(format!(
+                "SaeAssignmentState::set_row_coords: row {row} out of range N={}",
+                self.n_obs
+            ));
+        }
+        if values.len() != self.coords[row].len() {
+            return Err(format!(
+                "SaeAssignmentState::set_row_coords: row {row} value width {} != compact coordinate width {}",
+                values.len(),
+                self.coords[row].len()
+            ));
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "SaeAssignmentState::set_row_coords: row {row} contains a non-finite coordinate"
+            ));
+        }
+        let mut cursor = 0usize;
+        for &atom in &self.indices[row] {
+            let meta = &self.atom_coord_meta[atom as usize];
+            let end = cursor + meta.latent_dim;
+            let candidate = Array1::from_vec(values[cursor..end].to_vec());
+            let projected = meta.manifold.project_point(candidate.view());
+            self.coords[row][cursor..end]
+                .copy_from_slice(projected.as_slice().expect("projection is contiguous"));
+            cursor = end;
+        }
+        Ok(())
+    }
+
     /// Whether every row's support is the full `[0, K)` in ascending order (the
     /// dense-materialization precondition).
     pub fn is_full_support(&self) -> bool {
