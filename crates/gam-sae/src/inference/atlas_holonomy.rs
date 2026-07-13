@@ -55,6 +55,20 @@ impl AtlasFamilywiseLevel {
 /// Why a statistical atlas claim was not allowed to promote.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AtlasStatisticalRefusal {
+    PilotProjectionUncertified {
+        chart: usize,
+    },
+    PopulationSpectrumUncertified {
+        chart: usize,
+    },
+    GaussianLinearizationIsPlugin {
+        cycle_index: usize,
+    },
+    DegenerateQuadraticGaussianLimit {
+        cycle_index: usize,
+        quadratic_bias: f64,
+        quadratic_variance: f64,
+    },
     SingularProjectedCrossGram {
         edge: AtlasHolonomyEdgeId,
         smallest_singular_value: f64,
@@ -92,6 +106,101 @@ pub enum AtlasStatisticalRefusal {
         misround_probability_bound: f64,
         allocated_alpha: f64,
     },
+}
+
+/// Exact row identity for the independent pilot/inference split of one patch.
+///
+/// Counts alone cannot establish cross-fitting: the concrete row sets are
+/// retained so the constructor can prove that a patch never fits its pilot
+/// projection on a row later used for inference, and the joint covariance
+/// model can prove whether inference errors from different patches are
+/// independent or require an explicit cross block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GaussianPatchRowSplit {
+    pilot_rows: Vec<usize>,
+    inference_rows: Vec<usize>,
+}
+
+impl GaussianPatchRowSplit {
+    #[must_use = "Gaussian patch row-split validation errors must be handled"]
+    pub fn new(mut pilot_rows: Vec<usize>, mut inference_rows: Vec<usize>) -> Result<Self, String> {
+        pilot_rows.sort_unstable();
+        inference_rows.sort_unstable();
+        if pilot_rows.is_empty() || inference_rows.is_empty() {
+            return Err("Gaussian PCA pilot and inference row sets must both be non-empty".to_string());
+        }
+        if pilot_rows.windows(2).any(|rows| rows[0] == rows[1])
+            || inference_rows.windows(2).any(|rows| rows[0] == rows[1])
+        {
+            return Err("Gaussian PCA pilot and inference row sets must not contain duplicates".to_string());
+        }
+        if pilot_rows
+            .iter()
+            .any(|row| inference_rows.binary_search(row).is_ok())
+        {
+            return Err("Gaussian PCA pilot and inference row sets must be disjoint".to_string());
+        }
+        Ok(Self {
+            pilot_rows,
+            inference_rows,
+        })
+    }
+
+    #[must_use]
+    pub fn pilot_rows(&self) -> &[usize] {
+        &self.pilot_rows
+    }
+
+    #[must_use]
+    pub fn inference_rows(&self) -> &[usize] {
+        &self.inference_rows
+    }
+}
+
+/// Why the pilot projection may replace the ambient space in a certificate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PilotProjectionProvenance {
+    /// A fixed analytic frame with a stated population-tangent leakage bound.
+    CertifiedFixed {
+        tangent_leakage_bound: f64,
+        error_probability_bound: f64,
+    },
+    /// A frame fitted on the independent pilot rows, without a population
+    /// capture theorem. It remains useful computationally but cannot sign a
+    /// topology claim about the original ambient tangent.
+    IndependentPilotEstimate,
+}
+
+impl PilotProjectionProvenance {
+    fn validate(self) -> Result<Self, String> {
+        if let Self::CertifiedFixed {
+            tangent_leakage_bound,
+            error_probability_bound,
+        } = self
+        {
+            if !(tangent_leakage_bound.is_finite()
+                && tangent_leakage_bound >= 0.0
+                && tangent_leakage_bound < 1.0)
+            {
+                return Err(format!(
+                    "pilot tangent-leakage bound must be finite in [0, 1), got {tangent_leakage_bound}"
+                ));
+            }
+            if !(error_probability_bound.is_finite()
+                && error_probability_bound >= 0.0
+                && error_probability_bound < 1.0)
+            {
+                return Err(format!(
+                    "pilot projection error probability must be finite in [0, 1), got {error_probability_bound}"
+                ));
+            }
+        }
+        Ok(self)
+    }
+
+    fn is_certified(self) -> bool {
+        matches!(self, Self::CertifiedFixed { .. })
+    }
 }
 
 /// An authoritative statistical decision.  A refused decision carries the
@@ -380,6 +489,63 @@ impl GaussianPcaPopulationBounds {
     }
 }
 
+/// Statistical authority for the spectrum used by one projected PCA patch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GaussianPcaSpectrumProvenance {
+    /// Population bounds supplied by an independent analytic or concentration
+    /// argument. Only this branch can drive the finite-sample orientation tail.
+    CertifiedPopulation(GaussianPcaPopulationBounds),
+    /// Spectrum estimated from the inference covariance. This drives plug-in
+    /// power diagnostics but is never silently promoted to a probability bound.
+    PlugInEstimate {
+        noise_variance: f64,
+        signal_variance: f64,
+        eigengap: f64,
+    },
+}
+
+impl GaussianPcaSpectrumProvenance {
+    fn validate(self) -> Result<Self, String> {
+        match self {
+            Self::CertifiedPopulation(bounds) => {
+                GaussianPcaPopulationBounds::new(
+                    bounds.noise_variance_upper,
+                    bounds.signal_variance_upper,
+                    bounds.eigengap_lower,
+                )?;
+            }
+            Self::PlugInEstimate {
+                noise_variance,
+                signal_variance,
+                eigengap,
+            } => {
+                if !(noise_variance.is_finite() && noise_variance >= 0.0) {
+                    return Err(format!(
+                        "plug-in PCA noise variance must be finite and nonnegative, got {noise_variance}"
+                    ));
+                }
+                if !(signal_variance.is_finite()
+                    && signal_variance > 0.0
+                    && eigengap.is_finite()
+                    && eigengap > 0.0)
+                {
+                    return Err(format!(
+                        "plug-in PCA signal variance and eigengap must be finite and positive, got signal={signal_variance}, gap={eigengap}"
+                    ));
+                }
+            }
+        }
+        Ok(self)
+    }
+
+    fn certified_bounds(self) -> Option<GaussianPcaPopulationBounds> {
+        match self {
+            Self::CertifiedPopulation(bounds) => Some(bounds),
+            Self::PlugInEstimate { .. } => None,
+        }
+    }
+}
+
 /// How the inference-split patch mean was handled.  This determines the exact
 /// covariance degrees of freedom rather than pretending that `n` and `n - 1`
 /// are interchangeable.
@@ -416,8 +582,8 @@ impl GaussianPatchCentering {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GaussianPcaPatch {
     chart: usize,
-    projection_fit_rows: usize,
-    inference_rows: usize,
+    row_split: GaussianPatchRowSplit,
+    pilot_projection: PilotProjectionProvenance,
     centering: GaussianPatchCentering,
     /// Exact Wishart degrees of freedom implied by `inference_rows` and
     /// `centering`, validated once at construction and carried into every
@@ -427,28 +593,26 @@ pub struct GaussianPcaPatch {
     tangent_coordinates: Array2<f64>,
     noise_variance_estimate: f64,
     signal_variance_estimate: f64,
-    population_bounds: GaussianPcaPopulationBounds,
+    spectrum_provenance: GaussianPcaSpectrumProvenance,
 }
 
 impl GaussianPcaPatch {
     #[must_use = "Gaussian PCA patch validation errors must be handled"]
     pub fn new(
         chart: usize,
-        projection_fit_rows: usize,
-        inference_rows: usize,
+        row_split: GaussianPatchRowSplit,
+        pilot_projection: PilotProjectionProvenance,
         centering: GaussianPatchCentering,
         projection_frame: Array2<f64>,
         tangent_coordinates: Array2<f64>,
         noise_variance_estimate: f64,
         signal_variance_estimate: f64,
-        population_bounds: GaussianPcaPopulationBounds,
+        spectrum_provenance: GaussianPcaSpectrumProvenance,
     ) -> Result<Self, String> {
         let (ambient, retained) = projection_frame.dim();
-        if projection_fit_rows == 0 {
-            return Err(format!(
-                "Gaussian PCA patch {chart} projection split must contain at least one row"
-            ));
-        }
+        let pilot_projection = pilot_projection.validate()?;
+        let spectrum_provenance = spectrum_provenance.validate()?;
+        let inference_rows = row_split.inference_rows.len();
         let covariance_dof = centering
             .covariance_degrees_of_freedom(inference_rows)
             .filter(|&value| value > 0)
@@ -515,15 +679,15 @@ impl GaussianPcaPatch {
         }
         Ok(Self {
             chart,
-            projection_fit_rows,
-            inference_rows,
+            row_split,
+            pilot_projection,
             centering,
             covariance_degrees_of_freedom: covariance_dof,
             projection_frame,
             tangent_coordinates,
             noise_variance_estimate,
             signal_variance_estimate,
-            population_bounds,
+            spectrum_provenance,
         })
     }
 
@@ -556,15 +720,16 @@ impl GaussianPcaPatch {
     fn audit_summary(&self) -> GaussianPcaPatchSummary {
         GaussianPcaPatchSummary {
             chart: self.chart,
-            projection_fit_rows: self.projection_fit_rows,
-            inference_rows: self.inference_rows,
+            projection_fit_rows: self.row_split.pilot_rows.len(),
+            inference_rows: self.row_split.inference_rows.len(),
             centering: self.centering,
             covariance_degrees_of_freedom: self.covariance_degrees_of_freedom,
             ambient_dimension: self.ambient_dimension(),
             retained_dimension: self.retained_dimension(),
             noise_variance_estimate: self.noise_variance_estimate,
             signal_variance_estimate: self.signal_variance_estimate,
-            population_bounds: self.population_bounds,
+            pilot_projection: self.pilot_projection,
+            spectrum_provenance: self.spectrum_provenance,
         }
     }
 }
@@ -587,7 +752,8 @@ pub struct GaussianPcaPatchSummary {
     pub retained_dimension: usize,
     pub noise_variance_estimate: f64,
     pub signal_variance_estimate: f64,
-    pub population_bounds: GaussianPcaPopulationBounds,
+    pub pilot_projection: PilotProjectionProvenance,
+    pub spectrum_provenance: GaussianPcaSpectrumProvenance,
 }
 
 impl GaussianPcaPatchSummary {
@@ -596,6 +762,204 @@ impl GaussianPcaPatchSummary {
         let noise = self.noise_variance_estimate;
         let signal = self.signal_variance_estimate;
         noise * (signal + noise) / (signal * signal * self.covariance_degrees_of_freedom as f64)
+    }
+}
+
+/// Whether the joint horizontal-error covariance is an exact Gaussian law or
+/// an asymptotic plug-in approximation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GaussianPcaCovarianceAuthority {
+    CertifiedGaussianLinearization,
+    AsymptoticPlugIn,
+}
+
+/// Provenance of the off-diagonal patch covariance blocks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CrossPatchCovarianceProvenance {
+    /// Every patch's inference rows are pairwise disjoint, so its cross blocks
+    /// are structurally zero. The constructor verifies this from row identity.
+    DisjointInferenceRows,
+    /// Shared inference rows are permitted and every cross block is carried by
+    /// the supplied joint covariance rather than silently treated as zero.
+    ExplicitJointCovariance,
+}
+
+/// Joint covariance of the horizontal tangent-frame errors in each patch's
+/// retained pilot coordinates.
+///
+/// Patch `j` contributes `r_j * d` row-major coordinates for an error matrix
+/// `E_j` with `Delta_j = W_j E_j`. Keeping the operator in these small
+/// coordinates makes cross-patch covariance exact without allocating an
+/// ambient `(P d V)^2` matrix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GaussianPcaErrorModel {
+    authority: GaussianPcaCovarianceAuthority,
+    cross_patch_provenance: CrossPatchCovarianceProvenance,
+    offsets: Vec<usize>,
+    covariance: Array2<f64>,
+}
+
+impl GaussianPcaErrorModel {
+    fn coordinate_offsets(patches: &[GaussianPcaPatch]) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(patches.len() + 1);
+        offsets.push(0);
+        for patch in patches {
+            offsets.push(
+                offsets.last().copied().unwrap_or(0)
+                    + patch.retained_dimension() * INTRINSIC_DIMENSION,
+            );
+        }
+        offsets
+    }
+
+    /// Construct the exact block-diagonal operator implied by pairwise-disjoint
+    /// inference rows and the isotropic-spike patch law.
+    #[must_use = "Gaussian PCA error-model validation errors must be handled"]
+    pub fn independent(
+        patches: &[GaussianPcaPatch],
+        authority: GaussianPcaCovarianceAuthority,
+    ) -> Result<Self, String> {
+        for left in 0..patches.len() {
+            for right in (left + 1)..patches.len() {
+                if patches[left]
+                    .row_split
+                    .inference_rows
+                    .iter()
+                    .any(|row| patches[right].row_split.inference_rows.binary_search(row).is_ok())
+                {
+                    return Err(format!(
+                        "Gaussian PCA patches {} and {} share inference rows; an explicit joint covariance is required",
+                        patches[left].chart, patches[right].chart
+                    ));
+                }
+            }
+        }
+        let offsets = Self::coordinate_offsets(patches);
+        let dimension = offsets.last().copied().unwrap_or(0);
+        let mut covariance = Array2::<f64>::zeros((dimension, dimension));
+        for (patch_index, patch) in patches.iter().enumerate() {
+            let retained = patch.retained_dimension();
+            let normal = identity_square(retained)
+                - patch
+                    .tangent_coordinates
+                    .dot(&patch.tangent_coordinates.t());
+            let scale = patch.projector_variance_scale();
+            let offset = offsets[patch_index];
+            for row_left in 0..retained {
+                for row_right in 0..retained {
+                    for tangent in 0..INTRINSIC_DIMENSION {
+                        let left = offset + row_left * INTRINSIC_DIMENSION + tangent;
+                        let right = offset + row_right * INTRINSIC_DIMENSION + tangent;
+                        covariance[[left, right]] = scale * normal[[row_left, row_right]];
+                    }
+                }
+            }
+        }
+        Self::new(
+            patches,
+            authority,
+            CrossPatchCovarianceProvenance::DisjointInferenceRows,
+            covariance,
+        )
+    }
+
+    /// Construct a caller-supplied joint operator, including every shared-row
+    /// cross block.
+    #[must_use = "Gaussian PCA error-model validation errors must be handled"]
+    pub fn new(
+        patches: &[GaussianPcaPatch],
+        authority: GaussianPcaCovarianceAuthority,
+        cross_patch_provenance: CrossPatchCovarianceProvenance,
+        covariance: Array2<f64>,
+    ) -> Result<Self, String> {
+        let offsets = Self::coordinate_offsets(patches);
+        let dimension = offsets.last().copied().unwrap_or(0);
+        if covariance.dim() != (dimension, dimension) {
+            return Err(format!(
+                "joint Gaussian PCA covariance has shape {:?}, expected ({dimension}, {dimension})",
+                covariance.dim()
+            ));
+        }
+        if covariance.iter().any(|value| !value.is_finite()) {
+            return Err("joint Gaussian PCA covariance must be finite".to_string());
+        }
+        let scale = covariance
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        let backward_error = f64::EPSILON * dimension.max(1) as f64 * scale;
+        let mut symmetric = covariance;
+        for row in 0..dimension {
+            for column in row..dimension {
+                if (symmetric[[row, column]] - symmetric[[column, row]]).abs() > backward_error {
+                    return Err(format!(
+                        "joint Gaussian PCA covariance is not symmetric at ({row}, {column})"
+                    ));
+                }
+                let value = (symmetric[[row, column]] + symmetric[[column, row]]) / 2.0;
+                symmetric[[row, column]] = value;
+                symmetric[[column, row]] = value;
+            }
+        }
+        if dimension > 0 {
+            let (eigenvalues, _) = symmetric.eigh(faer::Side::Lower).map_err(|error| {
+                format!("joint Gaussian PCA covariance eigendecomposition failed: {error}")
+            })?;
+            if eigenvalues.iter().any(|&value| value < -backward_error) {
+                return Err("joint Gaussian PCA covariance must be positive semidefinite".to_string());
+            }
+        }
+        if matches!(
+            cross_patch_provenance,
+            CrossPatchCovarianceProvenance::DisjointInferenceRows
+        ) {
+            for left_patch in 0..patches.len() {
+                for right_patch in (left_patch + 1)..patches.len() {
+                    if patches[left_patch]
+                        .row_split
+                        .inference_rows
+                        .iter()
+                        .any(|row| {
+                            patches[right_patch]
+                                .row_split
+                                .inference_rows
+                                .binary_search(row)
+                                .is_ok()
+                        })
+                    {
+                        return Err(format!(
+                            "disjoint covariance provenance contradicts shared inference rows in patches {left_patch} and {right_patch}"
+                        ));
+                    }
+                    for row in offsets[left_patch]..offsets[left_patch + 1] {
+                        for column in offsets[right_patch]..offsets[right_patch + 1] {
+                            if symmetric[[row, column]].abs() > backward_error {
+                                return Err(format!(
+                                    "disjoint covariance provenance has a nonzero cross block for patches {left_patch} and {right_patch}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            authority,
+            cross_patch_provenance,
+            offsets,
+            covariance: symmetric,
+        })
+    }
+
+    #[must_use]
+    pub fn authority(&self) -> GaussianPcaCovarianceAuthority {
+        self.authority
+    }
+
+    #[must_use]
+    pub fn cross_patch_provenance(&self) -> &CrossPatchCovarianceProvenance {
+        &self.cross_patch_provenance
     }
 }
 
@@ -680,6 +1044,24 @@ pub enum AtlasCycleConclusion {
     NotRejected,
 }
 
+/// Limiting law identified for one cycle before any hypothesis decision.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AtlasCycleLimitLaw {
+    /// The nonzero first derivative contracts an authoritative joint Gaussian
+    /// error law. The nonlinear contribution is handled by a separate
+    /// high-probability remainder, never folded into a z standard error.
+    FirstOrderGaussian {
+        variance: f64,
+        authority: GaussianPcaCovarianceAuthority,
+    },
+    /// The first derivative cancels at numerical backward-error scale. The
+    /// leading term is quadratic Gaussian chaos and a z-test is forbidden.
+    DegenerateQuadraticGaussian {
+        bias: f64,
+        variance: f64,
+    },
+}
+
 /// One fundamental-cycle readout with every uncertainty term exposed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtlasCycleHolonomy {
@@ -688,16 +1070,12 @@ pub struct AtlasCycleHolonomy {
     /// overlap component, so parallel transitions remain distinguishable.
     steps: Vec<AtlasHolonomyCycleStep>,
     pub absolute_angle: Option<f64>,
+    pub limit_law: Option<AtlasCycleLimitLaw>,
     pub first_order_variance: Option<f64>,
     pub naive_edgewise_first_order_variance: Option<f64>,
-    pub shared_patch_covariance_adjustment: Option<f64>,
-    pub second_order_variance: Option<f64>,
-    pub naive_edgewise_second_order_variance: Option<f64>,
-    pub shared_pair_second_order_covariance_adjustment: Option<f64>,
-    /// Counterfactual second-order variance had the same patch errors been
-    /// transported through all ambient coordinates instead of each pairwise
-    /// local union. This is an audit comparator, never a decision input.
-    pub raw_ambient_second_order_variance: Option<f64>,
+    pub covariance_aggregation_adjustment: Option<f64>,
+    pub bilinear_quadratic_bias: Option<f64>,
+    pub bilinear_quadratic_variance: Option<f64>,
     pub standard_error: Option<f64>,
     pub polar_linearization_remainder_bound: Option<f64>,
     pub geometric_remainder_bound: f64,
@@ -933,6 +1311,7 @@ pub struct GaussianPcaHolonomyAnalysis {
     familywise_level: AtlasFamilywiseLevel,
     chart_count: usize,
     patch_summaries: Vec<GaussianPcaPatchSummary>,
+    error_model: GaussianPcaErrorModel,
     edges: Vec<ProjectedAtlasEdgeGeometry>,
     orientation: AtlasStatisticalDecision<AtlasOrientability>,
     orientation_flip_probability_bound: f64,
@@ -955,6 +1334,11 @@ impl GaussianPcaHolonomyAnalysis {
     #[must_use]
     pub fn patch_summaries(&self) -> &[GaussianPcaPatchSummary] {
         &self.patch_summaries
+    }
+
+    #[must_use]
+    pub fn error_model(&self) -> &GaussianPcaErrorModel {
+        &self.error_model
     }
 
     #[must_use]
@@ -1808,6 +2192,7 @@ struct EdgeWork {
     angle_gradient: Option<Array2<f64>>,
     patch_gradient_a: Option<Array2<f64>>,
     patch_gradient_b: Option<Array2<f64>>,
+    projection_cross_gram_ba: Array2<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -1859,6 +2244,14 @@ fn identity_2() -> Array2<f64> {
     identity
 }
 
+fn identity_square(dimension: usize) -> Array2<f64> {
+    let mut identity = Array2::<f64>::zeros((dimension, dimension));
+    for diagonal in 0..dimension {
+        identity[[diagonal, diagonal]] = 1.0;
+    }
+    identity
+}
+
 fn rotation_generator() -> Array2<f64> {
     let mut generator = Array2::<f64>::zeros((INTRINSIC_DIMENSION, INTRINSIC_DIMENSION));
     generator[[0, 1]] = -1.0;
@@ -1874,8 +2267,12 @@ fn frobenius_squared(matrix: ArrayView2<'_, f64>) -> f64 {
     matrix.iter().map(|value| value * value).sum()
 }
 
-fn project_normal(tangent: ArrayView2<'_, f64>, value: &Array2<f64>) -> Array2<f64> {
-    value - &tangent.dot(&tangent.t().dot(value))
+fn project_patch_normal(patch: &GaussianPcaPatch, value: &Array2<f64>) -> Array2<f64> {
+    let local = patch.projection_frame.t().dot(value);
+    &local
+        - &patch
+            .tangent_coordinates
+            .dot(&patch.tangent_coordinates.t().dot(&local))
 }
 
 fn build_projected_edge(
@@ -1884,6 +2281,10 @@ fn build_projected_edge(
 ) -> Result<EdgeWork, String> {
     let patch_a = &patches[spec.a];
     let patch_b = &patches[spec.b];
+    let projection_cross_gram_ba = patch_b
+        .projection_frame
+        .t()
+        .dot(&patch_a.projection_frame);
     let ambient = patch_a.ambient_dimension();
     let retained_a = patch_a.retained_dimension();
     let retained_b = patch_b.retained_dimension();
@@ -1978,6 +2379,7 @@ fn build_projected_edge(
             angle_gradient: None,
             patch_gradient_a: None,
             patch_gradient_b: None,
+            projection_cross_gram_ba,
         });
     }
     let transition = left.dot(&right_t);
@@ -1992,8 +2394,8 @@ fn build_projected_edge(
     // component before cycle aggregation, leaving a projector derivative.
     let raw_a = tangent_b.dot(&angle_gradient);
     let raw_b = tangent_a.dot(&angle_gradient.t());
-    let patch_gradient_a = project_normal(tangent_a.view(), &raw_a);
-    let patch_gradient_b = project_normal(tangent_b.view(), &raw_b);
+    let patch_gradient_a = project_patch_normal(patch_a, &raw_a);
+    let patch_gradient_b = project_patch_normal(patch_b, &raw_b);
     let mut public_transition = [[0.0; INTRINSIC_DIMENSION]; INTRINSIC_DIMENSION];
     for i in 0..INTRINSIC_DIMENSION {
         for j in 0..INTRINSIC_DIMENSION {
@@ -2018,6 +2420,7 @@ fn build_projected_edge(
         angle_gradient: Some(angle_gradient),
         patch_gradient_a: Some(patch_gradient_a),
         patch_gradient_b: Some(patch_gradient_b),
+        projection_cross_gram_ba,
     })
 }
 
@@ -2139,17 +2542,18 @@ fn patch_tail(
     patch: &GaussianPcaPatch,
     projected_dimension: usize,
     tail_parameter: f64,
-) -> PatchTail {
+) -> Option<PatchTail> {
+    let bounds = patch.spectrum_provenance.certified_bounds()?;
     let degrees_of_freedom = patch.covariance_degrees_of_freedom() as f64;
     let u = ((projected_dimension as f64).sqrt() + (2.0 * tail_parameter).sqrt())
         / degrees_of_freedom.sqrt();
-    let covariance_error = patch.population_bounds.spectral_radius_upper() * (2.0 * u + u * u);
-    let projector_error = 2.0 * covariance_error / patch.population_bounds.eigengap_lower;
-    PatchTail {
+    let covariance_error = bounds.spectral_radius_upper() * (2.0 * u + u * u);
+    let projector_error = 2.0 * covariance_error / bounds.eigengap_lower;
+    Some(PatchTail {
         covariance_error,
         projector_error,
         aligned_frame_error: aligned_frame_error(projector_error),
-    }
+    })
 }
 
 /// Largest common aligned-frame error at the two endpoints which cannot reach
@@ -2167,9 +2571,12 @@ fn orientation_endpoint_frame_budget(edge: &EdgeWork) -> f64 {
 }
 
 fn covariance_budget_ratio(patch: &GaussianPcaPatch, frame_budget: f64) -> f64 {
+    let Some(bounds) = patch.spectrum_provenance.certified_bounds() else {
+        return 0.0;
+    };
     let projector_budget = projector_error_for_aligned_frame_error(frame_budget);
-    let covariance_budget = patch.population_bounds.eigengap_lower * projector_budget / 2.0;
-    covariance_budget / patch.population_bounds.spectral_radius_upper()
+    let covariance_budget = bounds.eigengap_lower * projector_budget / 2.0;
+    covariance_budget / bounds.spectral_radius_upper()
 }
 
 fn required_covariance_degrees_of_freedom(
@@ -2218,6 +2625,18 @@ fn orientation_tail_and_prescription(
     Vec<AtlasPatchSamplePrescription>,
 ) {
     let mut reasons = Vec::new();
+    for patch in patches {
+        if !patch.pilot_projection.is_certified() {
+            reasons.push(AtlasStatisticalRefusal::PilotProjectionUncertified {
+                chart: patch.chart,
+            });
+        }
+        if patch.spectrum_provenance.certified_bounds().is_none() {
+            reasons.push(AtlasStatisticalRefusal::PopulationSpectrumUncertified {
+                chart: patch.chart,
+            });
+        }
+    }
     for edge in edges {
         if edge.public.estimated_sign.is_none() {
             reasons.push(AtlasStatisticalRefusal::SingularProjectedCrossGram {
@@ -2248,6 +2667,9 @@ fn orientation_tail_and_prescription(
         let frame_budget = orientation_endpoint_frame_budget(edge);
         for chart in [edge.public.a, edge.public.b] {
             let patch = &patches[chart];
+            if patch.spectrum_provenance.certified_bounds().is_none() {
+                continue;
+            }
             let projected_dimension = edge.public.projected_dimension;
             let required_dof = required_covariance_degrees_of_freedom(
                 patch,
@@ -2278,7 +2700,7 @@ fn orientation_tail_and_prescription(
             .unwrap_or(usize::MAX);
         prescriptions.push(AtlasPatchSamplePrescription {
             chart,
-            current_rows: patch.inference_rows,
+            current_rows: patch.row_split.inference_rows.len(),
             required_rows,
             current_covariance_degrees_of_freedom: patch.covariance_degrees_of_freedom(),
             required_covariance_degrees_of_freedom: required_dof,
