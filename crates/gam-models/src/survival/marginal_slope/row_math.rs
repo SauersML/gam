@@ -1257,9 +1257,9 @@ pub(crate) fn order2_feature_pullback_into<const FEATURES: usize>(
     hessian: &mut [f64],
     add_weighted_feature_hessians: impl FnOnce(&[f64; FEATURES], &mut [f64]),
 ) {
-    // The sole caller slices all three buffers from the checked workspace
-    // layout produced by `checked_vector_workspace_layout`; these lengths are
-    // construction invariants rather than conditional debug behavior.
+    // Both production callers provide exact slices: four primary channels for
+    // the scalar/shared feature-map pullback, and the checked workspace layout
+    // for the general vector pullback.
 
     for axis in 0..dimension {
         let mut channel = 0.0;

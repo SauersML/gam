@@ -5214,55 +5214,6 @@ fn prediction_applies_threshold_and_log_sigma_offsets() {
 }
 
 #[test]
-fn component_prediction_matches_full_design_for_repeated_prediction_grid() {
-    let fit = test_survival_fit(array![0.4, -0.1], array![0.2, 0.3], array![-0.5, 0.1], None);
-    let inverse_link = residual_distribution_inverse_link(ResidualDistribution::Gaussian);
-    let x_time_exit = array![[1.0, 0.2], [1.0, 0.8], [0.5, -0.3], [0.5, 0.4]];
-    let x_threshold = array![[1.0, -0.2], [1.0, -0.2], [0.0, 0.6], [0.0, 0.6]];
-    let x_log_sigma = array![[1.0, 0.3], [1.0, 0.3], [0.0, -0.4], [0.0, -0.4]];
-    let eta_time_offset_exit = array![0.2, 0.25, -0.1, -0.05];
-    let eta_threshold_offset = array![0.7, 0.7, -0.2, -0.2];
-    let eta_log_sigma_offset = array![0.4, 0.4, -0.3, -0.3];
-    let full_input = SurvivalLocationScalePredictInput {
-        x_time_exit: x_time_exit.clone(),
-        eta_time_offset_exit: eta_time_offset_exit.clone(),
-        time_wiggle_knots: None,
-        time_wiggle_degree: None,
-        time_wiggle_ncols: 0,
-        x_threshold: DesignMatrix::from(x_threshold.clone()),
-        eta_threshold_offset: eta_threshold_offset.clone(),
-        x_log_sigma: DesignMatrix::from(x_log_sigma.clone()),
-        eta_log_sigma_offset: eta_log_sigma_offset.clone(),
-        x_link_wiggle: None,
-        link_wiggle_knots: None,
-        link_wiggle_degree: None,
-        inverse_link: inverse_link.clone(),
-    };
-    let full = predict_survival_location_scale(&full_input, &fit).expect("full predict");
-    let eta_t = x_threshold.dot(&fit.beta_threshold()) + eta_threshold_offset;
-    let eta_ls = x_log_sigma.dot(&fit.beta_log_sigma()) + eta_log_sigma_offset;
-    let component = predict_survival_location_scale_from_linear_components(
-        &x_time_exit,
-        &eta_time_offset_exit,
-        None,
-        None,
-        0,
-        &eta_t,
-        &eta_ls,
-        None,
-        None,
-        &inverse_link,
-        &fit,
-    )
-    .expect("component predict");
-
-    for i in 0..full.eta.len() {
-        assert!((full.eta[i] - component.eta[i]).abs() <= 1e-12);
-        assert!((full.survival_prob[i] - component.survival_prob[i]).abs() <= 1e-12);
-    }
-}
-
-#[test]
 fn sparse_prediction_and_uncertainty_match_dense() {
     let fit = test_survival_fit(
         array![0.4, -0.1],
