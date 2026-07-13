@@ -162,6 +162,51 @@ def test_joint_competing_risks_survival_is_reachable_from_fit() -> None:
     assert np.all((pred.cif >= 0.0) & (pred.cif <= 1.0))
     assert np.all((pred.overall_survival >= 0.0) & (pred.overall_survival <= 1.0))
 
+    interval_pred = model.predict(
+        prediction_rows()[["entry", "exit", "event", "age"]], interval=0.9
+    )
+    assert isinstance(interval_pred, gamfit.CompetingRisksPrediction)
+    assert interval_pred.interval_level == 0.9
+    np.testing.assert_allclose(interval_pred.cif, pred.cif)
+    np.testing.assert_allclose(interval_pred.overall_survival, pred.overall_survival)
+
+    cause_surface_fields = (
+        "hazard",
+        "survival",
+        "cumulative_hazard",
+        "cif",
+    )
+    for field in cause_surface_fields:
+        point = np.asarray(getattr(interval_pred, field), dtype=float)
+        se = np.asarray(getattr(interval_pred, f"{field}_se"), dtype=float)
+        lower = np.asarray(getattr(interval_pred, f"{field}_lower"), dtype=float)
+        upper = np.asarray(getattr(interval_pred, f"{field}_upper"), dtype=float)
+        assert point.shape == se.shape == lower.shape == upper.shape
+        assert point.shape == (2 * 3, interval_pred.times.size)
+        assert np.all(np.isfinite(se))
+        assert np.all(se >= 0.0)
+        assert np.all(lower <= point)
+        assert np.all(point <= upper)
+
+    overall = np.asarray(interval_pred.overall_survival, dtype=float)
+    overall_se = np.asarray(interval_pred.overall_survival_se, dtype=float)
+    overall_lower = np.asarray(interval_pred.overall_survival_lower, dtype=float)
+    overall_upper = np.asarray(interval_pred.overall_survival_upper, dtype=float)
+    assert overall.shape == overall_se.shape == overall_lower.shape == overall_upper.shape
+    assert np.all(overall_se >= 0.0)
+    assert np.all(overall_lower <= overall)
+    assert np.all(overall <= overall_upper)
+
+    eta = np.asarray(interval_pred.linear_predictor, dtype=float)
+    eta_se = np.asarray(interval_pred.eta_se, dtype=float)
+    eta_lower = np.asarray(interval_pred.eta_lower, dtype=float)
+    eta_upper = np.asarray(interval_pred.eta_upper, dtype=float)
+    assert eta.shape == eta_se.shape == eta_lower.shape == eta_upper.shape == (2 * 3,)
+    assert np.all(eta_se >= 0.0)
+    assert np.all(eta_lower <= eta)
+    assert np.all(eta <= eta_upper)
+    assert np.any(np.asarray(interval_pred.cif_se, dtype=float) > 0.0)
+
 
 def test_survival_location_scale_regressor_prediction_does_not_saturate() -> None:
     model = gamfit.fit(

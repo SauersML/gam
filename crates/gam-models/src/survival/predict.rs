@@ -4154,6 +4154,69 @@ mod tests {
     use crate::probability::{normal_cdf, normal_pdf};
 
     #[test]
+    fn posterior_quadrature_second_moment_honors_cross_coordinate_covariance() {
+        let posterior_mean = ndarray::array![0.4, -0.2];
+        let covariance = ndarray::array![[0.9, 0.35], [0.35, 0.6]];
+        let mut functional_mean = 0.0_f64;
+        let mut functional_second = 0.0_f64;
+        let mut recovered_cross_covariance = 0.0_f64;
+
+        for_each_survival_posterior_node(&posterior_mean, &covariance, |node, weight| {
+            let functional = node[0] + 2.0 * node[1];
+            functional_mean += weight * functional;
+            functional_second += weight * functional * functional;
+            recovered_cross_covariance +=
+                weight * (node[0] - posterior_mean[0]) * (node[1] - posterior_mean[1]);
+            Ok(())
+        })
+        .expect("joint posterior quadrature");
+
+        let expected_mean = posterior_mean[0] + 2.0 * posterior_mean[1];
+        let expected_variance = covariance[[0, 0]]
+            + 4.0 * covariance[[1, 1]]
+            + 4.0 * covariance[[0, 1]];
+        assert!((functional_mean - expected_mean).abs() <= 1e-12);
+        assert!((recovered_cross_covariance - covariance[[0, 1]]).abs() <= 1e-12);
+
+        let mean_surface = Array2::from_elem((1, 1), functional_mean);
+        let second_surface = Array2::from_elem((1, 1), functional_second);
+        let standard_error = posterior_standard_error_matrix(
+            &mean_surface,
+            &second_surface,
+            "joint-covariance witness",
+        )
+        .expect("posterior standard error");
+        assert!((standard_error[[0, 0]].powi(2) - expected_variance).abs() <= 1e-11);
+    }
+
+    #[test]
+    fn posterior_quadrature_zero_covariance_has_zero_standard_error() {
+        let posterior_mean = ndarray::array![0.25, -0.75];
+        let covariance = Array2::<f64>::zeros((2, 2));
+        let mut functional_mean = 0.0_f64;
+        let mut functional_second = 0.0_f64;
+        let mut node_count = 0usize;
+
+        for_each_survival_posterior_node(&posterior_mean, &covariance, |node, weight| {
+            let functional = node[0].exp() + node[1].sin();
+            functional_mean += weight * functional;
+            functional_second += weight * functional * functional;
+            node_count += 1;
+            Ok(())
+        })
+        .expect("rank-zero posterior quadrature");
+
+        assert_eq!(node_count, 1, "rank-zero covariance has one exact node");
+        let standard_error = posterior_standard_error_matrix(
+            &Array2::from_elem((1, 1), functional_mean),
+            &Array2::from_elem((1, 1), functional_second),
+            "rank-zero witness",
+        )
+        .expect("rank-zero posterior standard error");
+        assert_eq!(standard_error[[0, 0]], 0.0);
+    }
+
+    #[test]
     fn probit_survival_hazard_uses_density_over_survival() {
         let eta = 2.0;
         let eta_t = 0.3;

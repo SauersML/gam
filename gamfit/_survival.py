@@ -71,14 +71,33 @@ class CompetingRisksPrediction:
 
     model_class: str
     likelihood_mode: str
+    interval_level: float | None
     endpoint_names: tuple[str, ...]
     times: Any
     hazard: Any
+    hazard_se: Any | None
+    hazard_lower: Any | None
+    hazard_upper: Any | None
     survival: Any
+    survival_se: Any | None
+    survival_lower: Any | None
+    survival_upper: Any | None
     cumulative_hazard: Any
+    cumulative_hazard_se: Any | None
+    cumulative_hazard_lower: Any | None
+    cumulative_hazard_upper: Any | None
     cif: Any
+    cif_se: Any | None
+    cif_lower: Any | None
+    cif_upper: Any | None
     overall_survival: Any
+    overall_survival_se: Any | None
+    overall_survival_lower: Any | None
+    overall_survival_upper: Any | None
     linear_predictor: Any
+    eta_se: Any | None
+    eta_lower: Any | None
+    eta_upper: Any | None
     columns: dict[str, list[float]]
 
 
@@ -711,14 +730,33 @@ def competing_risks_prediction_from_ffi_payload(
     return CompetingRisksPrediction(
         model_class=parsed["model_class"],
         likelihood_mode=parsed["likelihood_mode"],
+        interval_level=parsed["interval_level"],
         endpoint_names=tuple(parsed["endpoint_names"]),
         times=parsed["times"],
         hazard=parsed["hazard"],
+        hazard_se=parsed["hazard_se"],
+        hazard_lower=parsed["hazard_lower"],
+        hazard_upper=parsed["hazard_upper"],
         survival=parsed["survival"],
+        survival_se=parsed["survival_se"],
+        survival_lower=parsed["survival_lower"],
+        survival_upper=parsed["survival_upper"],
         cumulative_hazard=parsed["cumulative_hazard"],
+        cumulative_hazard_se=parsed["cumulative_hazard_se"],
+        cumulative_hazard_lower=parsed["cumulative_hazard_lower"],
+        cumulative_hazard_upper=parsed["cumulative_hazard_upper"],
         cif=parsed["cif"],
+        cif_se=parsed["cif_se"],
+        cif_lower=parsed["cif_lower"],
+        cif_upper=parsed["cif_upper"],
         overall_survival=parsed["overall_survival"],
+        overall_survival_se=parsed["overall_survival_se"],
+        overall_survival_lower=parsed["overall_survival_lower"],
+        overall_survival_upper=parsed["overall_survival_upper"],
         linear_predictor=parsed["linear_predictor"],
+        eta_se=parsed["eta_se"],
+        eta_lower=parsed["eta_lower"],
+        eta_upper=parsed["eta_upper"],
         columns=parsed["columns"],
     )
 

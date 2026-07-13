@@ -5620,7 +5620,7 @@ fn predict_table_survival(
         .is_some_and(|cause_count| cause_count > 1)
     {
         let result = predict_competing_risks_survival_result(model, dataset, options)?;
-        return serialize_competing_risks_prediction_payload(result);
+        return serialize_competing_risks_prediction_payload(result, options.interval);
     }
     let result = predict_survival_result(model, dataset, options)?;
     serialize_survival_prediction_payload(model, result)
@@ -5804,9 +5804,237 @@ fn serialize_survival_prediction_payload(
         .map_err(|err| format!("failed to serialize survival prediction payload: {err}"))
 }
 
+fn competing_risks_surface_bounds(
+    point: &[Array2<f64>],
+    standard_error: &[Array2<f64>],
+    z: f64,
+    lower_limit: f64,
+    upper_limit: f64,
+    label: &str,
+) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), String> {
+    if point.len() != standard_error.len() {
+        return Err(format!(
+            "competing-risks {label} interval cause count mismatch: point={}, standard_error={}",
+            point.len(),
+            standard_error.len(),
+        ));
+    }
+    let mut lower = Vec::with_capacity(point.len());
+    let mut upper = Vec::with_capacity(point.len());
+    for (cause, (point_surface, se_surface)) in point.iter().zip(standard_error).enumerate() {
+        if point_surface.dim() != se_surface.dim() {
+            return Err(format!(
+                "competing-risks {label} interval shape mismatch for cause {}: point={:?}, standard_error={:?}",
+                cause + 1,
+                point_surface.dim(),
+                se_surface.dim(),
+            ));
+        }
+        let mut lower_surface = Array2::<f64>::zeros(point_surface.raw_dim());
+        let mut upper_surface = Array2::<f64>::zeros(point_surface.raw_dim());
+        for ((row, column), &point_value) in point_surface.indexed_iter() {
+            let se = se_surface[[row, column]];
+            if !(point_value.is_finite() && se.is_finite() && se >= 0.0) {
+                return Err(format!(
+                    "competing-risks {label} interval requires finite point and non-negative finite SE for cause {}, row {row}, time column {column}; got point={point_value}, se={se}",
+                    cause + 1,
+                ));
+            }
+            lower_surface[[row, column]] = (point_value - z * se).max(lower_limit);
+            upper_surface[[row, column]] = (point_value + z * se).min(upper_limit);
+        }
+        lower.push(lower_surface);
+        upper.push(upper_surface);
+    }
+    Ok((lower, upper))
+}
+
+fn competing_risks_matrix_bounds(
+    point: &Array2<f64>,
+    standard_error: &Array2<f64>,
+    z: f64,
+    lower_limit: f64,
+    upper_limit: f64,
+    label: &str,
+) -> Result<(Array2<f64>, Array2<f64>), String> {
+    let (mut lower, mut upper) = competing_risks_surface_bounds(
+        std::slice::from_ref(point),
+        std::slice::from_ref(standard_error),
+        z,
+        lower_limit,
+        upper_limit,
+        label,
+    )?;
+    Ok((lower.remove(0), upper.remove(0)))
+}
+
+fn competing_risks_vector_bounds(
+    point: &[Array1<f64>],
+    standard_error: &[Array1<f64>],
+    z: f64,
+    label: &str,
+) -> Result<(Vec<Array1<f64>>, Vec<Array1<f64>>), String> {
+    if point.len() != standard_error.len() {
+        return Err(format!(
+            "competing-risks {label} interval cause count mismatch: point={}, standard_error={}",
+            point.len(),
+            standard_error.len(),
+        ));
+    }
+    let mut lower = Vec::with_capacity(point.len());
+    let mut upper = Vec::with_capacity(point.len());
+    for (cause, (point_vector, se_vector)) in point.iter().zip(standard_error).enumerate() {
+        if point_vector.len() != se_vector.len() {
+            return Err(format!(
+                "competing-risks {label} interval length mismatch for cause {}: point={}, standard_error={}",
+                cause + 1,
+                point_vector.len(),
+                se_vector.len(),
+            ));
+        }
+        let mut lower_vector = Array1::<f64>::zeros(point_vector.len());
+        let mut upper_vector = Array1::<f64>::zeros(point_vector.len());
+        for row in 0..point_vector.len() {
+            let point_value = point_vector[row];
+            let se = se_vector[row];
+            if !(point_value.is_finite() && se.is_finite() && se >= 0.0) {
+                return Err(format!(
+                    "competing-risks {label} interval requires finite point and non-negative finite SE for cause {}, row {row}; got point={point_value}, se={se}",
+                    cause + 1,
+                ));
+            }
+            lower_vector[row] = point_value - z * se;
+            upper_vector[row] = point_value + z * se;
+        }
+        lower.push(lower_vector);
+        upper.push(upper_vector);
+    }
+    Ok((lower, upper))
+}
+
+fn vectors_to_nested(vectors: &[Array1<f64>]) -> Vec<Vec<f64>> {
+    vectors.iter().map(|vector| vector.to_vec()).collect()
+}
+
 fn serialize_competing_risks_prediction_payload(
     result: gam::families::survival::predict::CompetingRisksPredictResult,
+    interval_level: Option<f64>,
 ) -> Result<String, String> {
+    let (
+        hazard_lower,
+        hazard_upper,
+        survival_lower,
+        survival_upper,
+        cumulative_hazard_lower,
+        cumulative_hazard_upper,
+        cif_lower,
+        cif_upper,
+        overall_survival_lower,
+        overall_survival_upper,
+        eta_lower,
+        eta_upper,
+    ) = if let Some(level) = interval_level {
+        let z = gam::inference::probability::standard_normal_quantile(0.5 + 0.5 * level);
+        if !z.is_finite() || z <= 0.0 {
+            return Err(format!(
+                "competing-risks prediction interval produced invalid normal quantile for level {level}: {z}"
+            ));
+        }
+        let hazard_se = result.hazard_se.as_ref().ok_or_else(|| {
+            "competing-risks interval requested but posterior hazard SE is missing".to_string()
+        })?;
+        let survival_se = result.survival_se.as_ref().ok_or_else(|| {
+            "competing-risks interval requested but posterior survival SE is missing".to_string()
+        })?;
+        let cumulative_hazard_se = result.cumulative_hazard_se.as_ref().ok_or_else(|| {
+            "competing-risks interval requested but posterior cumulative-hazard SE is missing"
+                .to_string()
+        })?;
+        let cif_se = result.cif_se.as_ref().ok_or_else(|| {
+            "competing-risks interval requested but posterior CIF SE is missing".to_string()
+        })?;
+        let overall_survival_se = result.overall_survival_se.as_ref().ok_or_else(|| {
+            "competing-risks interval requested but posterior overall-survival SE is missing"
+                .to_string()
+        })?;
+        let eta_se = result.eta_se.as_ref().ok_or_else(|| {
+            "competing-risks interval requested but posterior eta SE is missing".to_string()
+        })?;
+        let (hazard_lower, hazard_upper) = competing_risks_surface_bounds(
+            &result.hazard,
+            hazard_se,
+            z,
+            0.0,
+            f64::INFINITY,
+            "hazard",
+        )?;
+        let (survival_lower, survival_upper) = competing_risks_surface_bounds(
+            &result.survival,
+            survival_se,
+            z,
+            0.0,
+            1.0,
+            "survival",
+        )?;
+        let (cumulative_hazard_lower, cumulative_hazard_upper) =
+            competing_risks_surface_bounds(
+                &result.cumulative_hazard,
+                cumulative_hazard_se,
+                z,
+                0.0,
+                f64::INFINITY,
+                "cumulative hazard",
+            )?;
+        let (cif_lower, cif_upper) = competing_risks_surface_bounds(
+            &result.cif,
+            cif_se,
+            z,
+            0.0,
+            1.0,
+            "cumulative incidence",
+        )?;
+        let (overall_survival_lower, overall_survival_upper) =
+            competing_risks_matrix_bounds(
+                &result.overall_survival,
+                overall_survival_se,
+                z,
+                0.0,
+                1.0,
+                "overall survival",
+            )?;
+        let (eta_lower, eta_upper) =
+            competing_risks_vector_bounds(&result.linear_predictor, eta_se, z, "eta")?;
+        (
+            Some(hazard_lower),
+            Some(hazard_upper),
+            Some(survival_lower),
+            Some(survival_upper),
+            Some(cumulative_hazard_lower),
+            Some(cumulative_hazard_upper),
+            Some(cif_lower),
+            Some(cif_upper),
+            Some(overall_survival_lower),
+            Some(overall_survival_upper),
+            Some(eta_lower),
+            Some(eta_upper),
+        )
+    } else {
+        if result.hazard_se.is_some()
+            || result.survival_se.is_some()
+            || result.cumulative_hazard_se.is_some()
+            || result.cif_se.is_some()
+            || result.overall_survival_se.is_some()
+            || result.eta_se.is_some()
+        {
+            return Err(
+                "competing-risks posterior SEs were produced without an interval level"
+                    .to_string(),
+            );
+        }
+        (
+            None, None, None, None, None, None, None, None, None, None, None, None,
+        )
+    };
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
     for (endpoint_idx, name) in result.endpoint_names.iter().enumerate() {
         let suffix = name.replace('-', "_");
@@ -5821,6 +6049,52 @@ fn serialize_competing_risks_prediction_payload(
                 .map(|i| result.cif[endpoint_idx][[i, t_last]])
                 .collect(),
         );
+        if let (
+            Some(eta_se),
+            Some(eta_lower),
+            Some(eta_upper),
+            Some(cif_se),
+            Some(cif_lower),
+            Some(cif_upper),
+        ) = (
+            result.eta_se.as_ref(),
+            eta_lower.as_ref(),
+            eta_upper.as_ref(),
+            result.cif_se.as_ref(),
+            cif_lower.as_ref(),
+            cif_upper.as_ref(),
+        ) {
+            columns.insert(
+                format!("eta_{suffix}_std_error"),
+                eta_se[endpoint_idx].to_vec(),
+            );
+            columns.insert(
+                format!("eta_{suffix}_lower"),
+                eta_lower[endpoint_idx].to_vec(),
+            );
+            columns.insert(
+                format!("eta_{suffix}_upper"),
+                eta_upper[endpoint_idx].to_vec(),
+            );
+            columns.insert(
+                format!("failure_prob_{suffix}_std_error"),
+                (0..cif_se[endpoint_idx].nrows())
+                    .map(|i| cif_se[endpoint_idx][[i, t_last]])
+                    .collect(),
+            );
+            columns.insert(
+                format!("failure_prob_{suffix}_lower"),
+                (0..cif_lower[endpoint_idx].nrows())
+                    .map(|i| cif_lower[endpoint_idx][[i, t_last]])
+                    .collect(),
+            );
+            columns.insert(
+                format!("failure_prob_{suffix}_upper"),
+                (0..cif_upper[endpoint_idx].nrows())
+                    .map(|i| cif_upper[endpoint_idx][[i, t_last]])
+                    .collect(),
+            );
+        }
     }
     let t_last = result.overall_survival.ncols().saturating_sub(1);
     columns.insert(
@@ -5829,6 +6103,24 @@ fn serialize_competing_risks_prediction_payload(
             .map(|i| result.overall_survival[[i, t_last]])
             .collect(),
     );
+    if let (Some(se), Some(lower), Some(upper)) = (
+        result.overall_survival_se.as_ref(),
+        overall_survival_lower.as_ref(),
+        overall_survival_upper.as_ref(),
+    ) {
+        columns.insert(
+            "overall_survival_std_error".to_string(),
+            (0..se.nrows()).map(|i| se[[i, t_last]]).collect(),
+        );
+        columns.insert(
+            "overall_survival_lower".to_string(),
+            (0..lower.nrows()).map(|i| lower[[i, t_last]]).collect(),
+        );
+        columns.insert(
+            "overall_survival_upper".to_string(),
+            (0..upper.nrows()).map(|i| upper[[i, t_last]]).collect(),
+        );
+    }
     let likelihood_mode_str = match result.likelihood_mode {
         gam::families::survival::construction::SurvivalLikelihoodMode::MarginalSlope => {
             "marginal-slope"
@@ -5851,16 +6143,45 @@ fn serialize_competing_risks_prediction_payload(
         "likelihood_mode": likelihood_mode_str,
         "endpoint_names": result.endpoint_names,
         "times": result.times,
+        "interval_level": interval_level,
         "hazard": matrices_to_nested(&result.hazard),
+        "hazard_se": result.hazard_se.as_ref().map(|value| matrices_to_nested(value)),
+        "hazard_lower": hazard_lower.as_ref().map(|value| matrices_to_nested(value)),
+        "hazard_upper": hazard_upper.as_ref().map(|value| matrices_to_nested(value)),
         "survival": matrices_to_nested(&result.survival),
+        "survival_se": result.survival_se.as_ref().map(|value| matrices_to_nested(value)),
+        "survival_lower": survival_lower.as_ref().map(|value| matrices_to_nested(value)),
+        "survival_upper": survival_upper.as_ref().map(|value| matrices_to_nested(value)),
         "cumulative_hazard": matrices_to_nested(&result.cumulative_hazard),
+        "cumulative_hazard_se": result
+            .cumulative_hazard_se
+            .as_ref()
+            .map(|value| matrices_to_nested(value)),
+        "cumulative_hazard_lower": cumulative_hazard_lower
+            .as_ref()
+            .map(|value| matrices_to_nested(value)),
+        "cumulative_hazard_upper": cumulative_hazard_upper
+            .as_ref()
+            .map(|value| matrices_to_nested(value)),
         "cif": matrices_to_nested(&result.cif),
+        "cif_se": result.cif_se.as_ref().map(|value| matrices_to_nested(value)),
+        "cif_lower": cif_lower.as_ref().map(|value| matrices_to_nested(value)),
+        "cif_upper": cif_upper.as_ref().map(|value| matrices_to_nested(value)),
         "overall_survival": matrix_to_nested(&result.overall_survival),
+        "overall_survival_se": result
+            .overall_survival_se
+            .as_ref()
+            .map(matrix_to_nested),
+        "overall_survival_lower": overall_survival_lower.as_ref().map(matrix_to_nested),
+        "overall_survival_upper": overall_survival_upper.as_ref().map(matrix_to_nested),
         "linear_predictor": result
             .linear_predictor
             .iter()
             .map(|eta| eta.to_vec())
             .collect::<Vec<_>>(),
+        "eta_se": result.eta_se.as_ref().map(|value| vectors_to_nested(value)),
+        "eta_lower": eta_lower.as_ref().map(|value| vectors_to_nested(value)),
+        "eta_upper": eta_upper.as_ref().map(|value| vectors_to_nested(value)),
         "columns": columns,
     });
     serde_json::to_string(&payload)

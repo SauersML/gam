@@ -1302,6 +1302,13 @@ fn competing_risks_prediction_payload_from_json(py: Python<'_>, raw: &str) -> Py
             .and_then(serde_json::Value::as_str)
             .unwrap_or(""),
     )?;
+    match object
+        .get("interval_level")
+        .and_then(serde_json::Value::as_f64)
+    {
+        Some(level) => out.set_item("interval_level", level)?,
+        None => out.set_item("interval_level", py.None())?,
+    }
     out.set_item(
         "endpoint_names",
         competing_risks_string_list(object.get("endpoint_names"), "endpoint_names")?,
@@ -1312,19 +1319,74 @@ fn competing_risks_prediction_payload_from_json(py: Python<'_>, raw: &str) -> Py
             .into_pyarray(py),
     )?;
     set_optional_competing_risks_matrix(py, &out, "hazard", object.get("hazard"))?;
+    set_optional_competing_risks_matrix(py, &out, "hazard_se", object.get("hazard_se"))?;
+    set_optional_competing_risks_matrix(py, &out, "hazard_lower", object.get("hazard_lower"))?;
+    set_optional_competing_risks_matrix(py, &out, "hazard_upper", object.get("hazard_upper"))?;
     set_optional_competing_risks_matrix(py, &out, "survival", object.get("survival"))?;
+    set_optional_competing_risks_matrix(py, &out, "survival_se", object.get("survival_se"))?;
+    set_optional_competing_risks_matrix(
+        py,
+        &out,
+        "survival_lower",
+        object.get("survival_lower"),
+    )?;
+    set_optional_competing_risks_matrix(
+        py,
+        &out,
+        "survival_upper",
+        object.get("survival_upper"),
+    )?;
     set_optional_competing_risks_matrix(
         py,
         &out,
         "cumulative_hazard",
         object.get("cumulative_hazard"),
     )?;
+    set_optional_competing_risks_matrix(
+        py,
+        &out,
+        "cumulative_hazard_se",
+        object.get("cumulative_hazard_se"),
+    )?;
+    set_optional_competing_risks_matrix(
+        py,
+        &out,
+        "cumulative_hazard_lower",
+        object.get("cumulative_hazard_lower"),
+    )?;
+    set_optional_competing_risks_matrix(
+        py,
+        &out,
+        "cumulative_hazard_upper",
+        object.get("cumulative_hazard_upper"),
+    )?;
     set_optional_competing_risks_matrix(py, &out, "cif", object.get("cif"))?;
+    set_optional_competing_risks_matrix(py, &out, "cif_se", object.get("cif_se"))?;
+    set_optional_competing_risks_matrix(py, &out, "cif_lower", object.get("cif_lower"))?;
+    set_optional_competing_risks_matrix(py, &out, "cif_upper", object.get("cif_upper"))?;
     set_optional_competing_risks_matrix(
         py,
         &out,
         "overall_survival",
         object.get("overall_survival"),
+    )?;
+    set_optional_competing_risks_matrix(
+        py,
+        &out,
+        "overall_survival_se",
+        object.get("overall_survival_se"),
+    )?;
+    set_optional_competing_risks_matrix(
+        py,
+        &out,
+        "overall_survival_lower",
+        object.get("overall_survival_lower"),
+    )?;
+    set_optional_competing_risks_matrix(
+        py,
+        &out,
+        "overall_survival_upper",
+        object.get("overall_survival_upper"),
     )?;
     set_optional_competing_risks_vector(
         py,
@@ -1332,6 +1394,9 @@ fn competing_risks_prediction_payload_from_json(py: Python<'_>, raw: &str) -> Py
         "linear_predictor",
         object.get("linear_predictor"),
     )?;
+    set_optional_competing_risks_vector(py, &out, "eta_se", object.get("eta_se"))?;
+    set_optional_competing_risks_vector(py, &out, "eta_lower", object.get("eta_lower"))?;
+    set_optional_competing_risks_vector(py, &out, "eta_upper", object.get("eta_upper"))?;
 
     let columns = PyDict::new(py);
     for (name, values) in competing_risks_columns(object.get("columns"))? {
