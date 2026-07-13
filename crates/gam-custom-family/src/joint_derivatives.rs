@@ -651,7 +651,8 @@ impl ExtCoordBundle {
         });
         let drift_fn = self.drift_fn.map(|callback| {
             Box::new(move |ext_idx: usize, direction: &Array1<f64>| {
-                callback(ext_idx, direction).map(|result| scale_drift_deriv_result(result, scale))
+                callback(ext_idx, direction)
+                    .map(|result| result.map(|result| scale_drift_deriv_result(result, scale)))
             }) as FixedDriftDerivFn
         });
         // The contracted ψψ hook is a (scaled) linear functional of the same
