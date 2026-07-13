@@ -4128,9 +4128,14 @@ pub(crate) fn load_joint_gradient_evaluation<F: CustomFamily + Clone + Send + Sy
 ) -> Result<JointGradientLoad, String> {
     let workspace = match preferred_workspace {
         Some(workspace) => Some(workspace),
-        None if prefer_workspace && family.inner_joint_workspace_gradient_available(specs) => {
-            family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
-        }
+        None if prefer_workspace => Some(
+            family
+                .exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
+                .ok_or_else(|| {
+                    "joint Newton requested an exact Hessian workspace, but the family returned none"
+                        .to_string()
+                })?,
+        ),
         None => None,
     };
     if let Some(workspace_ref) = workspace.as_ref()

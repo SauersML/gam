@@ -177,12 +177,16 @@ impl GaussianPatchRowSplit {
         pilot_rows.sort_unstable();
         inference_rows.sort_unstable();
         if pilot_rows.is_empty() || inference_rows.is_empty() {
-            return Err("Gaussian PCA pilot and inference row sets must both be non-empty".to_string());
+            return Err(
+                "Gaussian PCA pilot and inference row sets must both be non-empty".to_string(),
+            );
         }
         if pilot_rows.windows(2).any(|rows| rows[0] == rows[1])
             || inference_rows.windows(2).any(|rows| rows[0] == rows[1])
         {
-            return Err("Gaussian PCA pilot and inference row sets must not contain duplicates".to_string());
+            return Err(
+                "Gaussian PCA pilot and inference row sets must not contain duplicates".to_string(),
+            );
         }
         if pilot_rows
             .iter()
@@ -853,7 +857,7 @@ impl GaussianPcaPatch {
                 data.nrows()
             ));
         }
-        let pilot_covariance = selected_covariance(data, &pilot_rows, None)?;
+        let pilot_covariance = selected_covariance(data.view(), &pilot_rows, None)?;
         let (_, pilot_vectors) = pilot_covariance
             .eigh(faer::Side::Lower)
             .map_err(|error| format!("cross-fitted patch {chart} pilot PCA failed: {error}"))?;
@@ -865,7 +869,7 @@ impl GaussianPcaPatch {
                 .assign(&pilot_vectors.column(source));
         }
         let inference_covariance =
-            selected_covariance(data, &inference_rows, Some(&projection_frame))?;
+            selected_covariance(data.view(), &inference_rows, Some(&projection_frame))?;
         let (inference_values, inference_vectors) = inference_covariance
             .eigh(faer::Side::Lower)
             .map_err(|error| format!("cross-fitted patch {chart} inference PCA failed: {error}"))?;
@@ -944,9 +948,11 @@ fn selected_covariance(
             }
         }
     }
-    let degrees_of_freedom = rows.len().checked_sub(1).ok_or_else(|| {
-        "sample covariance requires at least two rows".to_string()
-    })? as f64;
+    let degrees_of_freedom = rows
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "sample covariance requires at least two rows".to_string())?
+        as f64;
     for left in 0..dimension {
         for right in 0..=left {
             let value = covariance[[left, right]] / degrees_of_freedom;
@@ -1129,7 +1135,9 @@ impl GaussianPcaErrorModel {
                 format!("joint Gaussian PCA covariance eigendecomposition failed: {error}")
             })?;
             if eigenvalues.iter().any(|&value| value < -backward_error) {
-                return Err("joint Gaussian PCA covariance must be positive semidefinite".to_string());
+                return Err(
+                    "joint Gaussian PCA covariance must be positive semidefinite".to_string(),
+                );
             }
         }
         if matches!(
@@ -1271,10 +1279,7 @@ pub enum AtlasCycleLimitLaw {
     },
     /// The first derivative cancels at numerical backward-error scale. The
     /// leading term is quadratic Gaussian chaos and a z-test is forbidden.
-    DegenerateQuadraticGaussian {
-        bias: f64,
-        variance: f64,
-    },
+    DegenerateQuadraticGaussian { bias: f64, variance: f64 },
 }
 
 /// One fundamental-cycle readout with every uncertainty term exposed.
@@ -1735,14 +1740,8 @@ mod tests {
             GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
         )
         .unwrap();
-        GaussianPcaHolonomyAnalysis::certify(
-            patches,
-            edges,
-            error_model,
-            level,
-            gauss_bonnet,
-        )
-        .unwrap()
+        GaussianPcaHolonomyAnalysis::certify(patches, edges, error_model, level, gauss_bonnet)
+            .unwrap()
     }
 
     fn triangle_edges() -> Vec<ProjectedAtlasEdgeSpec> {
@@ -2526,10 +2525,7 @@ fn build_projected_edge(
 ) -> Result<EdgeWork, String> {
     let patch_a = &patches[spec.a];
     let patch_b = &patches[spec.b];
-    let projection_cross_gram_ba = patch_b
-        .projection_frame
-        .t()
-        .dot(&patch_a.projection_frame);
+    let projection_cross_gram_ba = patch_b.projection_frame.t().dot(&patch_a.projection_frame);
     let ambient = patch_a.ambient_dimension();
     let retained_a = patch_a.retained_dimension();
     let retained_b = patch_b.retained_dimension();
@@ -2872,9 +2868,8 @@ fn orientation_tail_and_prescription(
     let mut reasons = Vec::new();
     for patch in patches {
         if !patch.pilot_projection.is_certified() {
-            reasons.push(AtlasStatisticalRefusal::PilotProjectionUncertified {
-                chart: patch.chart,
-            });
+            reasons
+                .push(AtlasStatisticalRefusal::PilotProjectionUncertified { chart: patch.chart });
         }
         if patch.spectrum_provenance.certified_bounds().is_none() {
             reasons.push(AtlasStatisticalRefusal::PopulationSpectrumUncertified {
@@ -3023,18 +3018,16 @@ fn write_patch_gradient(
     let offset = model.offsets[patch];
     for row in 0..gradient.nrows() {
         for column in 0..INTRINSIC_DIMENSION {
-            target[offset + row * INTRINSIC_DIMENSION + column] +=
-                scale * gradient[[row, column]];
+            target[offset + row * INTRINSIC_DIMENSION + column] += scale * gradient[[row, column]];
         }
     }
 }
 
-fn quadratic_gaussian_moments(
-    quadratic: &Array2<f64>,
-    covariance: &Array2<f64>,
-) -> (f64, f64) {
+fn quadratic_gaussian_moments(quadratic: &Array2<f64>, covariance: &Array2<f64>) -> (f64, f64) {
     let product = quadratic.dot(covariance);
-    let bias: f64 = (0..product.nrows()).map(|index| product[[index, index]]).sum();
+    let bias: f64 = (0..product.nrows())
+        .map(|index| product[[index, index]])
+        .sum();
     let trace_square: f64 = (0..product.nrows())
         .flat_map(|row| (0..product.ncols()).map(move |column| (row, column)))
         .map(|(row, column)| product[[row, column]] * product[[column, row]])
@@ -3133,9 +3126,10 @@ fn analyze_cycle(
             .t()
             .dot(&holonomy_gradient)
             .dot(&before[position].t());
-        let canonical = edges[edge_index].transition.as_ref().ok_or_else(|| {
-            format!("cycle {cycle_index} lost edge {}", edge_index)
-        })?;
+        let canonical = edges[edge_index]
+            .transition
+            .as_ref()
+            .ok_or_else(|| format!("cycle {cycle_index} lost edge {}", edge_index))?;
         let canonical_tangent = canonical.dot(&generator);
         let step_tangent = if forward {
             canonical_tangent
@@ -3177,8 +3171,7 @@ fn analyze_cycle(
             &mut edge_gradient,
         );
         aggregate_gradient += &edge_gradient;
-        naive_first_order_variance +=
-            covariance_quadratic(&error_model.covariance, &edge_gradient);
+        naive_first_order_variance += covariance_quadratic(&error_model.covariance, &edge_gradient);
 
         let angle_gradient = edge.angle_gradient.as_ref().ok_or_else(|| {
             format!("cycle {cycle_index} lost angle gradient for edge {edge_index}")
@@ -3190,16 +3183,11 @@ fn analyze_cycle(
                 let frame_inner = edge.projection_cross_gram_ba[[coordinate_b, coordinate_a]];
                 for tangent_b in 0..INTRINSIC_DIMENSION {
                     for tangent_a in 0..INTRINSIC_DIMENSION {
-                        let a_index = offset_a
-                            + coordinate_a * INTRINSIC_DIMENSION
-                            + tangent_a;
-                        let b_index = offset_b
-                            + coordinate_b * INTRINSIC_DIMENSION
-                            + tangent_b;
-                        let value = coefficient
-                            * angle_gradient[[tangent_b, tangent_a]]
-                            * frame_inner
-                            / 2.0;
+                        let a_index = offset_a + coordinate_a * INTRINSIC_DIMENSION + tangent_a;
+                        let b_index = offset_b + coordinate_b * INTRINSIC_DIMENSION + tangent_b;
+                        let value =
+                            coefficient * angle_gradient[[tangent_b, tangent_a]] * frame_inner
+                                / 2.0;
                         quadratic[[a_index, b_index]] += value;
                         quadratic[[b_index, a_index]] += value;
                     }
@@ -3209,8 +3197,7 @@ fn analyze_cycle(
     }
     let first_order_variance =
         covariance_quadratic(&error_model.covariance, &aggregate_gradient).max(0.0);
-    let covariance_aggregation_adjustment =
-        first_order_variance - naive_first_order_variance;
+    let covariance_aggregation_adjustment = first_order_variance - naive_first_order_variance;
     let (quadratic_bias, quadratic_variance) =
         quadratic_gaussian_moments(&quadratic, &error_model.covariance);
     let variance_scale = first_order_variance
@@ -3237,9 +3224,8 @@ fn analyze_cycle(
 
     for patch in patches {
         if !patch.pilot_projection.is_certified() {
-            reasons.push(AtlasStatisticalRefusal::PilotProjectionUncertified {
-                chart: patch.chart,
-            });
+            reasons
+                .push(AtlasStatisticalRefusal::PilotProjectionUncertified { chart: patch.chart });
         }
         if patch.spectrum_provenance.certified_bounds().is_none() {
             reasons.push(AtlasStatisticalRefusal::PopulationSpectrumUncertified {
@@ -3262,9 +3248,7 @@ fn analyze_cycle(
     }
 
     let endpoint_event_count = 2 * cycle.steps.len();
-    let tail_parameter = (2.0 * endpoint_event_count as f64
-        / subspace_tail_probability_bound)
-        .ln();
+    let tail_parameter = (2.0 * endpoint_event_count as f64 / subspace_tail_probability_bound).ln();
     let mut polar_linearization_remainder_bound = 0.0_f64;
     for (position, &(edge_index, _)) in cycle.steps.iter().enumerate() {
         let edge = &edges[edge_index];
@@ -3287,9 +3271,7 @@ fn analyze_cycle(
                 .spectrum_provenance
                 .certified_bounds()
                 .ok_or_else(|| format!("cycle {cycle_index} lost certified patch bounds"))?;
-            if tail.covariance_error >= bounds.eigengap_lower / 2.0
-                || tail.projector_error >= 1.0
-            {
+            if tail.covariance_error >= bounds.eigengap_lower / 2.0 || tail.projector_error >= 1.0 {
                 reasons.push(AtlasStatisticalRefusal::PatchTailCrossesEigengap {
                     edge: edge.public.identity(),
                     chart,
@@ -3327,8 +3309,7 @@ fn analyze_cycle(
             .as_ref()
             .map(|gradient| frobenius_squared(gradient.view()).sqrt())
             .unwrap_or(0.0);
-        let linear_change_bound =
-            gradient_norm * (INTRINSIC_DIMENSION as f64).sqrt() * cross_error;
+        let linear_change_bound = gradient_norm * (INTRINSIC_DIMENSION as f64).sqrt() * cross_error;
         polar_linearization_remainder_bound +=
             coefficients[position].abs() * (total_angle_change + linear_change_bound);
     }
@@ -3354,9 +3335,8 @@ fn analyze_cycle(
         return Ok(analyzed(AtlasStatisticalDecision::Refused { reasons }));
     }
     let rejection_boundary = cycle_rejection_boundary(
-        standard_error.ok_or_else(|| {
-            format!("cycle {cycle_index} degenerate Gaussian law reached z-test")
-        })?,
+        standard_error
+            .ok_or_else(|| format!("cycle {cycle_index} degenerate Gaussian law reached z-test"))?,
         polar_linearization_remainder_bound,
         geometric_remainder_bound,
         gaussian_error_budget,

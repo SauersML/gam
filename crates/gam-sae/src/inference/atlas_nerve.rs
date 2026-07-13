@@ -1043,8 +1043,9 @@ mod tests {
         AtlasFamilywiseLevel, AtlasHolonomyCertificate, AtlasHolonomyEdgeId, AtlasSignedEdge,
         AtlasStatisticalDecision, ExactAnalyticHolonomyCertificate, GaussBonnetContribution,
         GaussBonnetInput, GaussBonnetNoiseSource, GaussBonnetSourceGradient,
-        GaussianPatchCentering, GaussianPcaPatch, GaussianPcaPopulationBounds,
-        ProjectedAtlasEdgeSpec,
+        GaussianPatchCentering, GaussianPatchRowSplit, GaussianPcaCovarianceAuthority,
+        GaussianPcaErrorModel, GaussianPcaPatch, GaussianPcaPopulationBounds,
+        GaussianPcaSpectrumProvenance, PilotProjectionProvenance, ProjectedAtlasEdgeSpec,
     };
     use crate::manifold::{AtlasOrientability, GraphCompressionKind};
     use ndarray::{Array2, arr2, array};
@@ -1162,14 +1163,18 @@ mod tests {
             .map(|chart| {
                 GaussianPcaPatch::new(
                     chart,
-                    2,
-                    2,
+                    GaussianPatchRowSplit::from_disjoint_ranges(chart * 16, 2, chart * 16 + 8, 2)
+                        .unwrap(),
+                    PilotProjectionProvenance::CertifiedFixed {
+                        tangent_leakage_bound: 0.0,
+                        error_probability_bound: 0.0,
+                    },
                     GaussianPatchCentering::MeanEstimatedOnInferenceRows,
                     projection_frame.clone(),
                     tangent_coordinates.clone(),
                     0.1,
                     1.0,
-                    bounds,
+                    GaussianPcaSpectrumProvenance::CertifiedPopulation(bounds),
                 )
                 .unwrap()
             })
@@ -1189,9 +1194,15 @@ mod tests {
             .into_iter()
             .map(|(a, b)| ProjectedAtlasEdgeSpec::new(a, b, 0, 0.0).unwrap())
             .collect();
+        let error_model = GaussianPcaErrorModel::independent(
+            &patches,
+            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
+        )
+        .unwrap();
         AtlasHolonomyCertificate::gaussian_pca(
             patches,
             edge_specs,
+            error_model,
             AtlasFamilywiseLevel::new(0.05).unwrap(),
             None,
         )
@@ -1210,14 +1221,23 @@ mod tests {
             .map(|chart| {
                 GaussianPcaPatch::new(
                     chart,
-                    1_000_000,
-                    1_000_000,
+                    GaussianPatchRowSplit::from_disjoint_ranges(
+                        chart * 4_000_000,
+                        1_000_000,
+                        chart * 4_000_000 + 1_000_000,
+                        1_000_000,
+                    )
+                    .unwrap(),
+                    PilotProjectionProvenance::CertifiedFixed {
+                        tangent_leakage_bound: 0.0,
+                        error_probability_bound: 0.0,
+                    },
                     GaussianPatchCentering::MeanEstimatedOnInferenceRows,
                     projection_frame.clone(),
                     tangent_coordinates.clone(),
                     0.01,
                     1.0,
-                    bounds,
+                    GaussianPcaSpectrumProvenance::CertifiedPopulation(bounds),
                 )
                 .unwrap()
             })
@@ -1250,9 +1270,15 @@ mod tests {
             ],
         )
         .unwrap();
+        let error_model = GaussianPcaErrorModel::independent(
+            &patches,
+            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
+        )
+        .unwrap();
         AtlasHolonomyCertificate::gaussian_pca(
             patches,
             edge_specs,
+            error_model,
             AtlasFamilywiseLevel::new(0.01).unwrap(),
             Some(gauss_bonnet),
         )

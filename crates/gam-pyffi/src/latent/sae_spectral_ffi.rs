@@ -421,6 +421,7 @@ struct AuditTopologyRecord {
 struct AuditAtlasReport {
     chart_blocks: Vec<usize>,
     diagram: gam::terms::sae::inference::atlas_nerve::AtlasNerveDiagram,
+    holonomy_unavailable_reason: Option<String>,
 }
 
 fn betti_signature_dict<'py>(
@@ -672,10 +673,90 @@ fn chart_transfer_gate_sparse(
     }
 }
 
+/// Build the fitted Gaussian-PCA holonomy analysis on a deterministic global
+/// cross-fit. Even rows fit every live chart's pilot frame; odd rows are
+/// assigned to exactly one live chart for inference. Consequently no pilot row
+/// is reused for inference and patch inference sets are pairwise disjoint.
+/// Spectrum values remain typed plug-in estimates, so the core reports an
+/// analyzed refusal rather than manufacturing a finite-sample certificate.
+fn cross_fitted_holonomy_from_ambient(
+    charts: &[gam::terms::sae::inference::atlas_nerve::AtlasChart],
+    admitted_edges: &[gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyEdgeId],
+    data: ndarray::ArrayView2<'_, f64>,
+    familywise_alpha: f64,
+) -> Result<gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyCertificate, String> {
+    use gam::terms::sae::inference::atlas_holonomy::{
+        AtlasFamilywiseLevel, AtlasHolonomyCertificate, GaussianPatchRowSplit,
+        GaussianPcaCovarianceAuthority, GaussianPcaErrorModel, GaussianPcaPatch,
+        ProjectedAtlasEdgeSpec,
+    };
+    if data.ncols() < 3 {
+        return Err(format!(
+            "cross-fitted atlas holonomy needs at least three ambient coordinates, got {}",
+            data.ncols()
+        ));
+    }
+    let mut live_by_row = vec![Vec::<usize>::new(); data.nrows()];
+    for (chart, patch) in charts.iter().enumerate() {
+        for &row in patch.support_rows() {
+            if row >= data.nrows() {
+                return Err(format!(
+                    "atlas chart {chart} support row {row} exceeds ambient data height {}",
+                    data.nrows()
+                ));
+            }
+            live_by_row[row].push(chart);
+        }
+    }
+    let mut pilot_rows = vec![Vec::<usize>::new(); charts.len()];
+    let mut inference_rows = vec![Vec::<usize>::new(); charts.len()];
+    for (row, live) in live_by_row.iter().enumerate() {
+        if row % 2 == 0 {
+            for &chart in live {
+                pilot_rows[chart].push(row);
+            }
+        } else if !live.is_empty() {
+            let owner = live[(row / 2) % live.len()];
+            inference_rows[owner].push(row);
+        }
+    }
+    let mut patches = Vec::with_capacity(charts.len());
+    for chart in 0..charts.len() {
+        let split = GaussianPatchRowSplit::new(
+            std::mem::take(&mut pilot_rows[chart]),
+            std::mem::take(&mut inference_rows[chart]),
+        )?;
+        patches.push(GaussianPcaPatch::fit_cross_fitted_plugin(
+            chart,
+            split,
+            data.view(),
+            data.ncols(),
+        )?);
+    }
+    let error_model = GaussianPcaErrorModel::independent(
+        &patches,
+        GaussianPcaCovarianceAuthority::AsymptoticPlugIn,
+    )?;
+    let edge_specs = admitted_edges
+        .iter()
+        .copied()
+        .map(|edge| ProjectedAtlasEdgeSpec::new(edge.a(), edge.b(), edge.overlap(), 0.0))
+        .collect::<Result<Vec<_>, _>>()?;
+    AtlasHolonomyCertificate::gaussian_pca(
+        patches,
+        edge_specs,
+        error_model,
+        AtlasFamilywiseLevel::new(familywise_alpha)?,
+        None,
+    )
+}
+
 fn atlas_nerve_from_sparse_route(
     route: &AuditSparseRoute,
     activation_threshold: f32,
     requested_blocks: Option<&[usize]>,
+    ambient_data: Option<ndarray::ArrayView2<'_, f64>>,
+    familywise_alpha: Option<f64>,
 ) -> Result<Option<AuditAtlasReport>, String> {
     if route.block_size == 1 {
         return Ok(None);
@@ -749,11 +830,57 @@ fn atlas_nerve_from_sparse_route(
             gates.push(gate);
         }
     }
-    let diagram =
+    let preliminary =
         gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates, None, None)?;
+    let admitted_edges: Vec<_> = preliminary
+        .edges
+        .iter()
+        .filter(|edge| edge.admitted)
+        .map(|edge| {
+            gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyEdgeId::new(
+                edge.a,
+                edge.b,
+                edge.overlap,
+            )
+        })
+        .collect::<Result<_, _>>()?;
+    let (holonomy_certificate, holonomy_unavailable_reason) = match (
+        ambient_data,
+        familywise_alpha,
+    ) {
+        (Some(data), Some(alpha)) => {
+            match cross_fitted_holonomy_from_ambient(&charts, &admitted_edges, data, alpha) {
+                Ok(certificate) => (Some(certificate), None),
+                Err(reason) => (None, Some(reason)),
+            }
+        }
+        (None, None) => (
+            None,
+            Some(
+                "ambient observations and a familywise level were not supplied for cross-fitted holonomy"
+                    .to_string(),
+            ),
+        ),
+        _ => {
+            return Err(
+                "cross-fitted atlas holonomy requires ambient observations and familywise alpha together"
+                    .to_string(),
+            );
+        }
+    };
+    let diagram = match holonomy_certificate {
+        Some(certificate) => gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(
+            &charts,
+            &gates,
+            None,
+            Some(certificate),
+        )?,
+        None => preliminary,
+    };
     Ok(Some(AuditAtlasReport {
         chart_blocks,
         diagram,
+        holonomy_unavailable_reason,
     }))
 }
 
@@ -788,9 +915,24 @@ fn atlas_nerve_dict<'py>(
     out.set_item("good_cover_certified", diagram.good_cover_certified)?;
     match diagram.holonomy_certificate.as_ref() {
         Some(certificate) => {
-            out.set_item("holonomy_status", "analyzed")?;
+            let certified = certificate.certified_orientability().is_some();
+            out.set_item(
+                "holonomy_status",
+                if certified {
+                    "analyzed_certified"
+                } else {
+                    "analyzed_refused"
+                },
+            )?;
             out.set_item("holonomy_provenance", certificate.provenance_label())?;
-            out.set_item("holonomy_missing_inputs", py.None())?;
+            if certified {
+                out.set_item("holonomy_missing_inputs", py.None())?;
+            } else {
+                out.set_item(
+                    "holonomy_missing_inputs",
+                    "certified population spectral bounds and a finite-sample Gaussian linearization law",
+                )?;
+            }
         }
         None => {
             // Sparse block routing supplies fitted pairwise transfers, but not
@@ -801,7 +943,10 @@ fn atlas_nerve_dict<'py>(
             out.set_item("holonomy_provenance", py.None())?;
             out.set_item(
                 "holonomy_missing_inputs",
-                "independent PCA fit/inference splits, population spectral bounds, and shared-source Gauss-Bonnet covariance",
+                report
+                    .holonomy_unavailable_reason
+                    .as_deref()
+                    .unwrap_or("cross-fitted holonomy inputs were unavailable"),
             )?;
         }
     }
@@ -877,7 +1022,7 @@ fn atlas_nerve_diagram<'py>(
     )
     .map_err(PyValueError::new_err)?;
     let report = detach_py_result(py, "atlas_nerve_diagram", move || {
-        atlas_nerve_from_sparse_route(&route, activation_threshold, blocks.as_deref())
+        atlas_nerve_from_sparse_route(&route, activation_threshold, blocks.as_deref(), None, None)
     })?;
     let reason = if block_size == 1 {
         "scalar block_size == 1 exposes no atlas nerve"
@@ -1166,9 +1311,14 @@ fn sparse_atlas_nerve_richness_statistic(
     chart_blocks: &[usize],
     activation_threshold: f64,
 ) -> Result<f64, String> {
-    let report =
-        atlas_nerve_from_sparse_route(route, activation_threshold as f32, Some(chart_blocks))?
-            .ok_or_else(|| "atlas null statistic requires at least two block charts".to_string())?;
+    let report = atlas_nerve_from_sparse_route(
+        route,
+        activation_threshold as f32,
+        Some(chart_blocks),
+        None,
+        None,
+    )?
+    .ok_or_else(|| "atlas null statistic requires at least two block charts".to_string())?;
     let richness = report
         .diagram
         .simplex_counts
@@ -1761,10 +1911,13 @@ fn audit_sae<'py>(
 
         let topology_records =
             topology_records_from_codes(&coordinate_reports, block_size, activation_threshold);
+        let atlas_data = data_values.mapv(f64::from);
         let atlas_nerve = atlas_nerve_from_sparse_route(
             &route,
             activation_threshold,
             coordinate_blocks.as_deref(),
+            Some(atlas_data.view()),
+            Some(delta),
         )?;
         let absorption = absorption_audit(&route, activation_threshold, max_absorption_pairs);
 
@@ -1905,7 +2058,7 @@ mod sae_spectral_ffi_tests {
             "atlas test route",
         )
         .unwrap();
-        let report = atlas_nerve_from_sparse_route(&route, 0.0, None)
+        let report = atlas_nerve_from_sparse_route(&route, 0.0, None, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(report.diagram.edges.len(), 1);
@@ -1981,7 +2134,7 @@ mod sae_spectral_ffi_tests {
             "atlas uncertified route",
         )
         .unwrap();
-        let report = atlas_nerve_from_sparse_route(&route, 0.0, None)
+        let report = atlas_nerve_from_sparse_route(&route, 0.0, None, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(report.diagram.edges.len(), 1);

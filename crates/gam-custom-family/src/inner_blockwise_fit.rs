@@ -486,31 +486,47 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             cached_joint_workspace.is_some(),
         );
     }
-    // Validate exact-Newton block Hessians at the family-evaluation
-    // boundary. A non-finite entry is a contract violation against the
-    // family's analytic second derivative; refuse to iterate before
-    // any factorization rather than letting it slip through to a
-    // downstream logdet check that may be gated off by the outer
-    // optimizer's flags.
+    // Validate the one authoritative curvature source at the inner-solve
+    // boundary. Workspace families must use that exact source here and in
+    // cycle 0; asking `family.evaluate` for block Hessians would assemble the
+    // same CTN rowwise-Kronecker Gram a second time at the same beta. Families
+    // without a workspace retain the generic block-Hessian guard.
     let validate_started = std::time::Instant::now();
-    // Gradient-override families (e.g. Gaussian/Binomial location-scale, whose
-    // `exact_newton_joint_gradient_evaluation` serves the exact joint score)
-    // return `cached_eval = None` from `load_joint_gradient_evaluation`, which
-    // would otherwise SKIP this guard entirely (#2108 / #1820). Materialize the
-    // family evaluation once here and keep it in `cached_eval` so the
-    // finite-block-Hessian guard still runs at the inner-solve boundary and the
-    // blockwise fall-through reuses the same eval instead of recomputing it.
-    if cached_eval.is_none() {
-        cached_eval = Some(family.evaluate(&states)?);
-    }
-    if let Some(eval) = cached_eval.as_ref() {
-        validate_block_hessians_finite(eval)?;
-    }
+    let mut cached_joint_hessian_source = if joint_workspace_requested {
+        let workspace = cached_joint_workspace.as_ref().ok_or_else(|| {
+            "joint Newton requested an exact Hessian workspace, but gradient loading retained none"
+                .to_string()
+        })?;
+        Some(
+            exact_newton_joint_hessian_source_from_workspace(
+                workspace,
+                total_joint_p,
+                MaterializationIntent::InnerSolve,
+                "joint Newton inner prevalidation Hessian source",
+            )?
+            .ok_or_else(|| {
+                "joint Newton exact Hessian workspace supplied no inner-solve curvature source"
+                    .to_string()
+            })?,
+        )
+    } else {
+        // Gradient-override families (e.g. Gaussian/Binomial location-scale,
+        // whose `exact_newton_joint_gradient_evaluation` serves the exact joint
+        // score) return no cached evaluation. Materialize it once so the
+        // non-workspace block-Hessian guard cannot be skipped (#2108 / #1820).
+        if cached_eval.is_none() {
+            cached_eval = Some(family.evaluate(&states)?);
+        }
+        if let Some(eval) = cached_eval.as_ref() {
+            validate_block_hessians_finite(eval)?;
+        }
+        None
+    };
     if prelude_log {
         log::info!(
             "[STAGE] PIRLS/inner step=validate_block_hessians_finite elapsed={:.3}s checked={}",
             validate_started.elapsed().as_secs_f64(),
-            cached_eval.is_some(),
+            cached_eval.is_some() || cached_joint_hessian_source.is_some(),
         );
     }
     let penalty_started = std::time::Instant::now();
@@ -1077,10 +1093,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let joint_hessian_source = if joint_workspace_requested {
                 let cached_hit = cached_joint_workspace.is_some();
                 let workspace = match cached_joint_workspace.take() {
-                    Some(workspace) => Some(workspace),
-                    None => family.exact_newton_joint_hessian_workspace_with_options(
-                        &states, specs, options,
-                    )?,
+                    Some(workspace) => workspace,
+                    None => family
+                        .exact_newton_joint_hessian_workspace_with_options(
+                            &states, specs, options,
+                        )?
+                        .ok_or_else(|| {
+                            "joint Newton requested an exact Hessian workspace, but the family returned none"
+                                .to_string()
+                        })?,
                 };
                 if cycle_log && cycle == 0 {
                     log::info!(
@@ -1091,19 +1112,22 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         total_p,
                     );
                 }
-                hessian_workspace_for_cycle = workspace.clone();
-                workspace
-                    .as_ref()
-                    .map(|workspace| {
+                hessian_workspace_for_cycle = Some(Arc::clone(&workspace));
+                Some(match cached_joint_hessian_source.take() {
+                    Some(source) => source,
+                    None => {
                         exact_newton_joint_hessian_source_from_workspace(
-                            workspace,
+                            &workspace,
                             total_p,
                             MaterializationIntent::InnerSolve,
                             "joint Newton inner exact-newton operator mismatch",
-                        )
-                    })
-                    .transpose()?
-                    .flatten()
+                        )?
+                        .ok_or_else(|| {
+                            "joint Newton exact Hessian workspace supplied no inner-solve curvature source"
+                                .to_string()
+                        })?
+                    }
+                })
             } else {
                 None
             };
