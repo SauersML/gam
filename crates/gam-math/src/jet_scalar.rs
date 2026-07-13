@@ -3428,8 +3428,9 @@ impl<L: Lane, const K: usize> OneSeedLane<L, K> {
 
     /// Exact order-≤2-per-part Faà di Bruno composition `f ∘ self`, given the
     /// per-lane outer-derivative stack `d = [f, f′, f″, f‴, f⁗]`. Term-for-term
-    /// identical to [`OneSeed::compose_unary`]: the base reads `d[0..=2]` and the
-    /// ε-coefficient is `f′(base)` (reads `d[1..=3]`) times `eps`.
+    /// identical to the fused [`OneSeed::compose_unary`] channels: the base reads
+    /// `d[0..=2]`, while the ε-coefficient directly evaluates
+    /// `f′(base)·eps` from `d[1..=3]` without an intermediate jet.
     #[inline]
     pub fn compose_unary(&self, d: [L; 5]) -> Self {
         let base = self.base.compose_unary([d[0], d[1], d[2]]);
@@ -4575,6 +4576,124 @@ mod tests {
             for b in 0..2 {
                 close(third[a][b], truth[a][b], &format!("third[{a}][{b}]"));
             }
+        }
+    }
+
+    /// The fused fixed-width OneSeed product/composition preserves every
+    /// channel of the defining unfused nilpotent algebra. Random symmetric
+    /// Order2 inputs exercise dense non-seed intermediates, while exact
+    /// mirrored symmetry is checked as an independent production invariant.
+    #[test]
+    fn fused_one_seed_channels_match_unfused_definition_932() {
+        const K: usize = 8;
+
+        fn random_scalar(state: &mut u64) -> f64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            ((*state >> 11) as f64 / ((1_u64 << 53) as f64)) * 2.0 - 1.0
+        }
+
+        fn random_order2<const N: usize>(state: &mut u64) -> Order2<N> {
+            let mut tower = crate::jet_tower::Tower2::<N>::zero();
+            tower.v = random_scalar(state);
+            for axis in 0..N {
+                tower.g[axis] = random_scalar(state);
+            }
+            for row in 0..N {
+                for column in row..N {
+                    let channel = random_scalar(state);
+                    tower.h[row][column] = channel;
+                    tower.h[column][row] = channel;
+                }
+            }
+            Order2(tower)
+        }
+
+        fn assert_channels_close<const N: usize>(
+            label: &str,
+            actual: &OneSeed<N>,
+            expected: &OneSeed<N>,
+        ) {
+            for (part_label, actual_part, expected_part) in [
+                ("base", &actual.base.0, &expected.base.0),
+                ("eps", &actual.eps.0, &expected.eps.0),
+            ] {
+                let check = |channel: &str, got: f64, want: f64| {
+                    let tolerance = 2.0e-14 * got.abs().max(want.abs()).max(1.0);
+                    assert!(
+                        (got - want).abs() <= tolerance,
+                        "{label} {part_label} {channel}: got={got:+.17e} want={want:+.17e}"
+                    );
+                };
+                check("value", actual_part.v, expected_part.v);
+                for row in 0..N {
+                    check(
+                        &format!("gradient[{row}]"),
+                        actual_part.g[row],
+                        expected_part.g[row],
+                    );
+                    for column in 0..N {
+                        check(
+                            &format!("hessian[{row},{column}]"),
+                            actual_part.h[row][column],
+                            expected_part.h[row][column],
+                        );
+                        assert_eq!(
+                            actual_part.h[row][column].to_bits(),
+                            actual_part.h[column][row].to_bits(),
+                            "{label} {part_label} Hessian symmetry at [{row},{column}]"
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut state = 0x9320_1eed_5eed_cafe_u64;
+        for sample in 0..256 {
+            let left = OneSeed {
+                base: random_order2::<K>(&mut state),
+                eps: random_order2::<K>(&mut state),
+            };
+            let right = OneSeed {
+                base: random_order2::<K>(&mut state),
+                eps: random_order2::<K>(&mut state),
+            };
+
+            let fused_product = left.mul(&right);
+            let unfused_product = OneSeed {
+                base: left.base.mul(&right.base),
+                eps: left
+                    .base
+                    .mul(&right.eps)
+                    .add(&left.eps.mul(&right.base)),
+            };
+            assert_channels_close(
+                &format!("sample {sample} product"),
+                &fused_product,
+                &unfused_product,
+            );
+
+            let derivatives: [f64; 5] = std::array::from_fn(|_| random_scalar(&mut state));
+            let fused_composition = left.compose_unary(derivatives);
+            let unfused_composition = OneSeed {
+                base: left.base.compose_unary(derivatives),
+                eps: left
+                    .base
+                    .compose_unary([
+                        derivatives[1],
+                        derivatives[2],
+                        derivatives[3],
+                        derivatives[4],
+                        derivatives[4],
+                    ])
+                    .mul(&left.eps),
+            };
+            assert_channels_close(
+                &format!("sample {sample} composition"),
+                &fused_composition,
+                &unfused_composition,
+            );
         }
     }
 
