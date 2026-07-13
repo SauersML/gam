@@ -597,8 +597,9 @@ pub fn fit_transformation_normal(
             let competing_modes = warm_starts.len() > 1;
             let mut selected_eval = None;
             let mut selected_source = "anchor";
+            let mut rejected_modes = Vec::new();
             for (candidate_idx, warm_start) in warm_starts.iter().enumerate() {
-                let candidate = evaluate_custom_family_joint_hyper(
+                let candidate = match evaluate_custom_family_joint_hyper(
                     &geometry.family,
                     &geometry.blocks,
                     &options,
@@ -606,21 +607,40 @@ pub fn fit_transformation_normal(
                     &geometry.derivative_blocks,
                     warm_start.as_ref(),
                     eval_mode,
-                )
-                .map_err(|e| {
-                    format!("transformation exact_fn mode candidate {candidate_idx}: {e}")
-                })?;
+                ) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        let rejection = format!(
+                            "mode_candidate={candidate_idx} evaluator error: {error}"
+                        );
+                        log::warn!(
+                            "[transformation-normal] rejected exact coefficient-mode candidate: {rejection}"
+                        );
+                        rejected_modes.push(rejection);
+                        continue;
+                    }
+                };
                 if !candidate.inner_converged {
-                    return Err(format!(
-                        "transformation exact joint inner solve did not converge for eval_mode={eval_mode:?}, mode_candidate={candidate_idx}"
-                    ));
+                    let rejection = format!(
+                        "mode_candidate={candidate_idx} inner solve did not converge"
+                    );
+                    log::warn!(
+                        "[transformation-normal] rejected exact coefficient-mode candidate: {rejection}"
+                    );
+                    rejected_modes.push(rejection);
+                    continue;
                 }
                 if !candidate.objective.is_finite()
                     || candidate.gradient.iter().any(|value| !value.is_finite())
                 {
-                    return Err(format!(
-                        "transformation exact joint returned non-finite criterion for eval_mode={eval_mode:?}, mode_candidate={candidate_idx}"
-                    ));
+                    let rejection = format!(
+                        "mode_candidate={candidate_idx} returned a non-finite criterion"
+                    );
+                    log::warn!(
+                        "[transformation-normal] rejected exact coefficient-mode candidate: {rejection}"
+                    );
+                    rejected_modes.push(rejection);
+                    continue;
                 }
                 let source = if candidate_idx == 0 {
                     "cold"
@@ -644,7 +664,10 @@ pub fn fit_transformation_normal(
                 }
             }
             let eval = selected_eval.ok_or_else(|| {
-                "transformation exact joint produced no coefficient-mode candidate".to_string()
+                format!(
+                    "transformation exact joint produced no converged finite coefficient mode for eval_mode={eval_mode:?}: {}",
+                    rejected_modes.join("; ")
+                )
             })?;
             if competing_modes {
                 log::info!(

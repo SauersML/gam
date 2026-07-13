@@ -337,6 +337,99 @@ row_atom! {
     }
 }
 
+/// Frozen local coordinates for exact saved-model ALO replay of one
+/// cause-specific transformation/Weibull survival row.
+pub struct CauseSpecificSurvivalAloRowInput {
+    pub eta_exit: f64,
+    pub eta_entry: f64,
+    pub derivative_exit: f64,
+    pub prior_weight: f64,
+    pub entry_active: bool,
+    pub event: bool,
+}
+
+/// Negative-log-likelihood geometry in local coordinates
+/// `[eta_exit, eta_entry, derivative_exit]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CauseSpecificSurvivalAloRowGeometry {
+    pub negative_log_likelihood: f64,
+    pub nll_score: [f64; 3],
+    pub observed_hessian: [[f64; 3]; 3],
+}
+
+/// Evaluate the exact order-two row atom shared with survival fitting.
+///
+/// Inactive entry/event channels are canonicalised before evaluation so their
+/// score and curvature are exactly zero and cannot form `0 * overflow` or
+/// `0 * log(nonpositive)` intermediates.
+pub fn cause_specific_survival_alo_row_geometry(
+    input: CauseSpecificSurvivalAloRowInput,
+) -> Result<CauseSpecificSurvivalAloRowGeometry, String> {
+    if !input.prior_weight.is_finite() || input.prior_weight < 0.0 {
+        return Err(format!(
+            "cause-specific saved ALO prior weight must be finite and non-negative, got {}",
+            input.prior_weight
+        ));
+    }
+    if !input.eta_exit.is_finite() {
+        return Err(format!(
+            "cause-specific saved ALO exit index must be finite, got {}",
+            input.eta_exit
+        ));
+    }
+    let eta_entry = if input.entry_active {
+        if !input.eta_entry.is_finite() {
+            return Err(format!(
+                "cause-specific saved ALO active entry index must be finite, got {}",
+                input.eta_entry
+            ));
+        }
+        input.eta_entry
+    } else {
+        0.0
+    };
+    let derivative_exit = if input.event {
+        if !input.derivative_exit.is_finite() || input.derivative_exit <= 0.0 {
+            return Err(format!(
+                "cause-specific saved ALO event derivative must be positive and finite, got {}",
+                input.derivative_exit
+            ));
+        }
+        input.derivative_exit
+    } else {
+        1.0
+    };
+    let atom = cause_specific_row_order2(
+        input.eta_exit,
+        eta_entry,
+        derivative_exit,
+        input.prior_weight,
+        f64::from(input.entry_active),
+        f64::from(input.event),
+    );
+    let gradient = atom.gradient();
+    let observed_hessian = std::array::from_fn(|row| {
+        std::array::from_fn(|column| atom.hessian_at(row, column))
+    });
+    if !atom.value().is_finite()
+        || gradient.iter().any(|value| !value.is_finite())
+        || observed_hessian
+            .iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+    {
+        return Err(format!(
+            "cause-specific saved ALO row geometry is non-finite: nll={}, score={gradient:?}, hessian={observed_hessian:?}",
+            atom.value(),
+        ));
+    }
+    Ok(CauseSpecificSurvivalAloRowGeometry {
+        negative_log_likelihood: atom.value(),
+        nll_score: gradient,
+        observed_hessian,
+    })
+}
+
 #[derive(Clone, Copy)]
 struct CauseSpecificAtomInput {
     primary: [f64; 3],
@@ -3293,6 +3386,57 @@ impl PirlsWorkingModel for WorkingModelSurvival {
 mod tests {
     use super::*;
     use ndarray::{Array1, Array2, Array3, array, s};
+
+    #[test]
+    fn saved_cause_specific_alo_matches_independent_closed_form() {
+        let eta_exit = 0.4_f64;
+        let eta_entry = -0.3_f64;
+        let derivative_exit = 1.7_f64;
+        let weight = 2.2_f64;
+        let geometry = cause_specific_survival_alo_row_geometry(
+            CauseSpecificSurvivalAloRowInput {
+                eta_exit,
+                eta_entry,
+                derivative_exit,
+                prior_weight: weight,
+                entry_active: true,
+                event: true,
+            },
+        )
+        .expect("valid cause-specific row");
+        let expected_nll = weight
+            * (eta_exit.exp()
+                - eta_entry.exp()
+                - eta_exit
+                - derivative_exit.ln());
+        let expected_score = [
+            weight * (eta_exit.exp() - 1.0),
+            -weight * eta_entry.exp(),
+            -weight / derivative_exit,
+        ];
+        let expected_hessian = [
+            [weight * eta_exit.exp(), 0.0, 0.0],
+            [0.0, -weight * eta_entry.exp(), 0.0],
+            [0.0, 0.0, weight / derivative_exit.powi(2)],
+        ];
+        assert!((geometry.negative_log_likelihood - expected_nll).abs() <= 2.0e-14);
+        for row in 0..3 {
+            assert!((geometry.nll_score[row] - expected_score[row]).abs() <= 2.0e-14);
+            for column in 0..3 {
+                assert!(
+                    (geometry.observed_hessian[row][column]
+                        - expected_hessian[row][column])
+                        .abs()
+                        <= 2.0e-14
+                );
+            }
+        }
+        let score_meat = geometry.nll_score[0] * geometry.nll_score[0];
+        assert!(
+            (geometry.observed_hessian[0][0] - score_meat).abs() > 1.0e-2,
+            "survival observed W and empirical score meat C must remain separate"
+        );
+    }
 
     /// #932 production single-source parity for the cause-specific Royston-Parmar
     /// derivative tower. The earlier cutover added only a gam-math oracle that
