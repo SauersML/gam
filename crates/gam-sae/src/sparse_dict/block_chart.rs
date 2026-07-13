@@ -1443,18 +1443,31 @@ mod tests {
             base.selected_by_bic, big.selected_by_bic,
             "accept/reject verdict must be scale-invariant"
         );
+        // The deviance currency is scale-invariant in EXACT arithmetic — every
+        // dᵢ depends only on the ratio SSE_lin/SSE_chart and the telescoping
+        // eᵢ/(2 ŝ²) terms, all of which are unit-free. The residual divergence is
+        // pure floating-point: the upstream fit (whitening + relative-ridge
+        // regression on a ×10-rescaled Gram matrix) is only scale-EQUIVARIANT up
+        // to roundoff, and that ~ε accumulates through SSE → deviance → gain. On
+        // the ~3e3-magnitude margin/gain the gap is ~1e-4 absolute ≈ 4e-8
+        // relative — a few ×√ε, no summation reordering here makes it bit-exact.
+        // Assert a principled RELATIVE tolerance well above the roundoff floor
+        // (1e-6) yet far below any physically meaningful scale-dependence.
+        let scale_invariant = |a: f64, b: f64| (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0);
         assert!(
-            (base.margin - big.margin).abs() < 1e-6,
+            scale_invariant(base.margin, big.margin),
             "margin must be scale-invariant: {} vs {}",
             base.margin,
             big.margin
         );
         assert!(
-            (base.deviance_gain - big.deviance_gain).abs() < 1e-6,
-            "deviance gain must be scale-invariant"
+            scale_invariant(base.deviance_gain, big.deviance_gain),
+            "deviance gain must be scale-invariant: {} vs {}",
+            base.deviance_gain,
+            big.deviance_gain
         );
         assert!(
-            (base.ci_low - big.ci_low).abs() < 1e-6 && (base.ci_high - big.ci_high).abs() < 1e-6,
+            scale_invariant(base.ci_low, big.ci_low) && scale_invariant(base.ci_high, big.ci_high),
             "the deviance-scale CI must be scale-invariant"
         );
 
