@@ -111,7 +111,7 @@ fn measure_jet_build_scale_smoke_200k_rows() {
         "realized scale band must be non-empty"
     );
     assert_eq!(
-        built.penalties.len(),
+        built.active_penalties.len(),
         eps_band.len() + 1,
         "per-level candidate count must be band length ({}) + 1 ridge",
         eps_band.len()

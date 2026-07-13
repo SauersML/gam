@@ -49,7 +49,7 @@ use gam::basis::{
     build_constant_curvature_basis, constant_curvature_effective_length,
     constant_curvature_kernel_kappa_jets, constant_curvature_kernel_matrix,
 };
-use gam::terms::basis::BasisMetadata;
+use gam::terms::basis::{BasisMetadata, PenaltySource};
 use ndarray::{Array2, array};
 
 const LENGTH_SCALE: f64 = 1.5;
@@ -201,9 +201,18 @@ fn primary_penalty_is_raw_kernel_gram_no_ridge_1404() {
     };
     let built = build_constant_curvature_basis(pts.view(), &spec).expect("build");
     assert_eq!(
-        built.penalties.len(),
+        built.active_penalties.len(),
         1,
         "single RKHS penalty (no ridge) when double_penalty = false"
+    );
+    let primary = built
+        .active_penalties
+        .iter()
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+        .expect("constant-curvature basis must retain its primary RKHS penalty");
+    assert_eq!(
+        primary.info.normalization_scale, 1.0,
+        "constant-curvature RKHS penalty must retain its raw physical scale"
     );
 
     let BasisMetadata::ConstantCurvature {
@@ -219,7 +228,7 @@ fn primary_penalty_is_raw_kernel_gram_no_ridge_1404() {
     let raw = constant_curvature_kernel_matrix(pts.view(), pts.view(), kappa, ell_eff)
         .expect("raw kernel");
     let gram = z.t().dot(&raw).dot(z);
-    let s_built = &built.penalties[0];
+    let s_built = &primary.matrix;
 
     // RAW operator (normalization_scale = 1): the penalty is the constrained
     // Gram itself, up to symmetrization — the proportionality constant is 1, not

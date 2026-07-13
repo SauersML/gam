@@ -18,7 +18,7 @@
 //! profiled REML criterion over a κ grid — never another tool's output.
 
 use gam::terms::basis::{
-    CenterStrategy, ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability,
+    CenterStrategy, ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, PenaltySource,
     build_constant_curvature_basis, constant_curvature_kernel_matrix,
     realized_constant_curvature_length_scale,
 };
@@ -151,11 +151,16 @@ fn argmin_kappa(data: &Array2<f64>, ell_ref: f64, kappa_true: f64) -> f64 {
         let built = build_constant_curvature_basis(data.view(), &spec).unwrap();
         let b = built.design.to_dense();
         assert_eq!(
-            built.penalties.len(),
+            built.active_penalties.len(),
             1,
             "with double_penalty=false the curv smooth must expose exactly one (RKHS Gram) penalty"
         );
-        let v = profiled_reml(&b, &y, &built.penalties[0]);
+        let primary = built
+            .active_penalties
+            .iter()
+            .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+            .expect("constant-curvature basis must retain its primary RKHS penalty");
+        let v = profiled_reml(&b, &y, &primary.matrix);
         if v < best_v {
             best_v = v;
             best_k = kappa;

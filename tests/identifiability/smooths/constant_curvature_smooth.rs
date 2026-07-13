@@ -25,7 +25,7 @@ use gam::basis::{
 use gam::inference::formula_dsl::parse_formula;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::terms::basis::BasisMetadata;
+use gam::terms::basis::{BasisMetadata, PenaltySource};
 use gam::terms::smooth::SmoothBasisSpec;
 use gam::terms::term_builder::build_termspec;
 use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
@@ -154,7 +154,14 @@ fn basis_is_continuous_through_kappa_zero() {
             identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
         };
         let built = build_constant_curvature_basis(pts.view(), &spec).expect("build");
-        (built.design.to_dense(), built.penalties[0].clone())
+        let penalty = built
+            .active_penalties
+            .iter()
+            .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+            .expect("constant-curvature basis must retain its primary RKHS penalty")
+            .matrix
+            .clone();
+        (built.design.to_dense(), penalty)
     };
     let (x0, s0) = build(0.0);
     let (xp, sp) = build(1e-6);
@@ -254,7 +261,11 @@ fn penalty_is_constrained_kernel_gram() {
     let built = build_constant_curvature_basis(pts.view(), &spec).expect("build");
     assert_eq!(built.design.nrows(), pts.nrows());
     assert_eq!(built.design.ncols(), pts.nrows() - 1);
-    assert_eq!(built.penalties.len(), 2, "primary + ridge double penalty");
+    assert_eq!(
+        built.active_penalties.len(),
+        2,
+        "primary + ridge double penalty"
+    );
     let BasisMetadata::ConstantCurvature {
         centers,
         kappa: meta_kappa,
@@ -296,7 +307,12 @@ fn penalty_is_constrained_kernel_gram() {
     }
     // Primary penalty ∝ zᵀKz (Frobenius-normalized in the build).
     let gram = z.t().dot(&raw).dot(z);
-    let s_built = &built.penalties[0];
+    let s_built = &built
+        .active_penalties
+        .iter()
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+        .expect("constant-curvature basis must retain its primary RKHS penalty")
+        .matrix;
     let scale = {
         let mut num = 0.0_f64;
         let mut den = 0.0_f64;
