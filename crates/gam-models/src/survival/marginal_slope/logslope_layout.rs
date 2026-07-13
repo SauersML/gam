@@ -256,6 +256,89 @@ impl LogslopeLayout {
         })
     }
 
+    /// Evaluate every physical log-slope channel at one coefficient vector.
+    ///
+    /// The returned matrix is `(n_rows × score_dim)`. This is the sole
+    /// construction-time source for the primary state consumed by the
+    /// identifiability row Hessian: offsets, raw channel partitioning, and the
+    /// raw-to-current coefficient transform are therefore identical to the
+    /// likelihood path.
+    pub(crate) fn physical_values(
+        &self,
+        score_dim: usize,
+        beta: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        self.validate_for(score_dim)?;
+        if beta.len() != self.current_width {
+            return Err(format!(
+                "logslope physical-value beta length {} does not match current width {}",
+                beta.len(),
+                self.current_width,
+            ));
+        }
+        let mut values = Array2::<f64>::zeros((self.nrows, score_dim));
+        let mut workspace = self.row_workspace(score_dim)?;
+        for row in 0..self.nrows {
+            self.fill_callback_row(row, beta.view(), &mut workspace)?;
+            for channel in 0..score_dim {
+                values[[row, channel]] = workspace.values[channel];
+            }
+        }
+        Ok(values)
+    }
+
+    /// Stream the physical-channel coefficient Jacobian for a row range.
+    ///
+    /// `out` is row-major in the primary channel: row
+    /// `local_row * score_dim + channel` contains the full current-coordinate
+    /// row `∂g_channel/∂β`. Offsets do not enter these rows. A caller can select
+    /// a contiguous coefficient sub-range without materialising the complete
+    /// `(n × p × K)` tensor.
+    pub(crate) fn fill_primary_jacobian_rows(
+        &self,
+        score_dim: usize,
+        rows: std::ops::Range<usize>,
+        columns: std::ops::Range<usize>,
+        out: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        self.validate_for(score_dim)?;
+        if rows.end < rows.start || rows.end > self.nrows {
+            return Err(format!(
+                "logslope primary-Jacobian row range {:?} is outside 0..{}",
+                rows, self.nrows,
+            ));
+        }
+        if columns.end < columns.start || columns.end > self.current_width {
+            return Err(format!(
+                "logslope primary-Jacobian column range {:?} is outside 0..{}",
+                columns, self.current_width,
+            ));
+        }
+        let chunk = rows.len();
+        if out.dim() != (chunk * score_dim, columns.len()) {
+            return Err(format!(
+                "logslope primary-Jacobian output is {}x{}, expected {}x{}",
+                out.nrows(),
+                out.ncols(),
+                chunk * score_dim,
+                columns.len(),
+            ));
+        }
+        let zero_beta = Array1::<f64>::zeros(self.current_width);
+        let mut workspace = self.row_workspace(score_dim)?;
+        for row in rows.clone() {
+            self.fill_callback_row(row, zero_beta.view(), &mut workspace)?;
+            let local_row = row - rows.start;
+            for channel in 0..score_dim {
+                for (local_col, current_col) in columns.clone().enumerate() {
+                    out[[local_row * score_dim + channel, local_col]] =
+                        workspace.channel_rows[[channel, current_col]];
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn fill_shared_values(
         &self,
         value: f64,
@@ -530,6 +613,38 @@ mod tests {
             array![[2.0, 0.0, 0.0], [0.0, 3.0, 5.0]]
         );
         assert_eq!(workspace.values(), &[34.5, 172.5]);
+    }
+
+    #[test]
+    fn physical_values_and_streamed_primary_rows_share_one_layout_truth_932() {
+        let topology = LogslopeTopology::per_score(vec![0..1, 1..3], 3).unwrap();
+        let transform = array![[1.0, 0.5], [0.0, 2.0], [3.0, -1.0]];
+        let layout = topology
+            .materialize(
+                DesignMatrix::from(array![[2.0, 3.0, 5.0], [7.0, 11.0, 13.0]]),
+                transform,
+                &array![0.25, -0.5],
+            )
+            .unwrap();
+        let beta = array![0.4, -0.2];
+
+        let values = layout.physical_values(2, beta.view()).unwrap();
+        let mut rows = Array2::<f64>::zeros((4, 2));
+        layout
+            .fill_primary_jacobian_rows(2, 0..2, 0..2, &mut rows)
+            .unwrap();
+
+        for row in 0..2 {
+            let offset = [0.25, -0.5][row];
+            for channel in 0..2 {
+                let streamed = rows.row(row * 2 + channel);
+                assert!((values[[row, channel]] - (streamed.dot(&beta) + offset)).abs() <= 1e-12);
+            }
+        }
+        assert_eq!(rows.row(0), array![2.0, 1.0]);
+        assert_eq!(rows.row(1), array![15.0, 1.0]);
+        assert_eq!(rows.row(2), array![7.0, 3.5]);
+        assert_eq!(rows.row(3), array![39.0, 9.0]);
     }
 
     #[test]
