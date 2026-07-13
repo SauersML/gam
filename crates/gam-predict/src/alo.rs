@@ -2,7 +2,8 @@ use std::ops::Range;
 
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam_models::gamlss::{
-    DispersionFamilyKind, binomial_location_scale_alo_row_geometry, dispersion_alo_row_geometry,
+    BinomialLocationScaleAloRowInput, DispersionFamilyKind, GaussianLocationScaleAloRowInput,
+    binomial_location_scale_alo_row_geometry, dispersion_alo_row_geometry,
     gaussian_location_scale_alo_row_geometry,
 };
 use gam_models::inference::model::{
@@ -260,24 +261,25 @@ fn compute_gaussian_location_scale_alo(
     let mut scores = Vec::with_capacity(n);
     let mut coordinate_values = Vec::with_capacity(n);
     for row in 0..n {
-        let geometry = gaussian_location_scale_alo_row_geometry(
+        let basis_row = basis.row(row);
+        let basis_d1_row = basis_d1.row(row);
+        let basis_d2_row = basis_d2.row(row);
+        let geometry = gaussian_location_scale_alo_row_geometry(GaussianLocationScaleAloRowInput {
             row,
-            observations.response[row],
-            base_mean[row],
-            eta_scale[row],
-            observations.prior_weights[row],
+            y: observations.response[row],
+            base_mean: base_mean[row],
+            eta_log_sigma: eta_scale[row],
+            prior_weight: observations.prior_weights[row],
             response_scale,
-            basis.row(row).as_slice().expect("basis row contiguous"),
-            basis_d1
-                .row(row)
+            wiggle_basis: basis_row.as_slice().expect("basis row contiguous"),
+            wiggle_basis_d1: basis_d1_row
                 .as_slice()
                 .expect("basis derivative row contiguous"),
-            basis_d2
-                .row(row)
+            wiggle_basis_d2: basis_d2_row
                 .as_slice()
                 .expect("basis second derivative row contiguous"),
             wiggle_beta,
-        )
+        })
         .map_err(|reason| invalid(format!("saved Gaussian ALO row {row}: {reason}")))?;
         observed_hessians.push(geometry.observed_hessian);
         scores.push(geometry.nll_score);
@@ -378,23 +380,24 @@ fn compute_binomial_location_scale_alo(
     let mut scores = Vec::with_capacity(n);
     let mut coordinate_values = Vec::with_capacity(n);
     for row in 0..n {
-        let geometry = binomial_location_scale_alo_row_geometry(
-            observations.response[row],
-            threshold_eta[row],
-            eta_scale[row],
-            observations.prior_weights[row],
-            &inverse_link,
-            basis.row(row).as_slice().expect("basis row contiguous"),
-            basis_d1
-                .row(row)
+        let basis_row = basis.row(row);
+        let basis_d1_row = basis_d1.row(row);
+        let basis_d2_row = basis_d2.row(row);
+        let geometry = binomial_location_scale_alo_row_geometry(BinomialLocationScaleAloRowInput {
+            y: observations.response[row],
+            threshold_eta: threshold_eta[row],
+            eta_log_sigma: eta_scale[row],
+            prior_weight: observations.prior_weights[row],
+            inverse_link: &inverse_link,
+            wiggle_basis: basis_row.as_slice().expect("basis row contiguous"),
+            wiggle_basis_d1: basis_d1_row
                 .as_slice()
                 .expect("basis derivative row contiguous"),
-            basis_d2
-                .row(row)
+            wiggle_basis_d2: basis_d2_row
                 .as_slice()
                 .expect("basis second derivative row contiguous"),
             wiggle_beta,
-        )
+        })
         .map_err(|reason| invalid(format!("saved binomial ALO row {row}: {reason}")))?;
         observed_hessians.push(geometry.observed_hessian);
         scores.push(geometry.nll_score);

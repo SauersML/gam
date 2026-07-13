@@ -103,18 +103,12 @@ fn matern_aniso_nonorthogonal_structural_ridge_jet_matches_central_finite_differ
     let (data, spec, psi) = fixture();
     let base = build_matern_basiswithworkspace(data.view(), &spec, &mut BasisWorkspace::default())
         .expect("base anisotropic Matérn value build");
-    let ridge_index = base
+    let ridge = &base
         .active_penalties
         .iter()
-        .position(|penalty| {
-            matches!(
-                penalty.info.source,
-                PenaltySource::DoublePenaltyNullspace
-            )
-        })
-        .expect("explicit intercept must emit an active structural ridge");
-
-    let ridge = &base.active_penalties[ridge_index].matrix;
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace))
+        .expect("explicit intercept must emit an active structural ridge")
+        .matrix;
     let intercept_column = ridge.ncols() - 1;
     let kernel_intercept_overlap = (0..intercept_column)
         .map(|column| ridge[[column, intercept_column]].abs())

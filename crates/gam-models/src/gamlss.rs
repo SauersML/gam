@@ -201,6 +201,7 @@ pub use binomial::*;
 
 mod alo_replay;
 pub use alo_replay::{
+    BinomialLocationScaleAloRowInput, GaussianLocationScaleAloRowInput,
     LocationScaleAloRowGeometry, binomial_location_scale_alo_row_geometry,
     gaussian_location_scale_alo_row_geometry,
 };

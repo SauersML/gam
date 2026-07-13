@@ -14,6 +14,33 @@ pub struct LocationScaleAloRowGeometry {
     pub observed_hessian: Array2<f64>,
 }
 
+/// Complete saved-row state for exact Gaussian location-scale ALO replay.
+pub struct GaussianLocationScaleAloRowInput<'a> {
+    pub row: usize,
+    pub y: f64,
+    pub base_mean: f64,
+    pub eta_log_sigma: f64,
+    pub prior_weight: f64,
+    pub response_scale: f64,
+    pub wiggle_basis: &'a [f64],
+    pub wiggle_basis_d1: &'a [f64],
+    pub wiggle_basis_d2: &'a [f64],
+    pub wiggle_beta: &'a [f64],
+}
+
+/// Complete saved-row state for exact binomial location-scale ALO replay.
+pub struct BinomialLocationScaleAloRowInput<'a> {
+    pub y: f64,
+    pub threshold_eta: f64,
+    pub eta_log_sigma: f64,
+    pub prior_weight: f64,
+    pub inverse_link: &'a InverseLink,
+    pub wiggle_basis: &'a [f64],
+    pub wiggle_basis_d1: &'a [f64],
+    pub wiggle_basis_d2: &'a [f64],
+    pub wiggle_beta: &'a [f64],
+}
+
 fn validate_saved_wiggle_row(
     context: &str,
     basis: &[f64],
@@ -63,19 +90,21 @@ fn dot_slices(left: &[f64], right: &[f64]) -> f64 {
 /// and then transformed analytically to raw coordinates. This preserves the
 /// fitter's extreme-value semantics while pairing the result with the raw
 /// precision persisted after response rescaling.
-#[allow(clippy::too_many_arguments)]
 pub fn gaussian_location_scale_alo_row_geometry(
-    row: usize,
-    y: f64,
-    base_mean: f64,
-    eta_log_sigma: f64,
-    prior_weight: f64,
-    response_scale: f64,
-    wiggle_basis: &[f64],
-    wiggle_basis_d1: &[f64],
-    wiggle_basis_d2: &[f64],
-    wiggle_beta: &[f64],
+    input: GaussianLocationScaleAloRowInput<'_>,
 ) -> Result<LocationScaleAloRowGeometry, String> {
+    let GaussianLocationScaleAloRowInput {
+        row,
+        y,
+        base_mean,
+        eta_log_sigma,
+        prior_weight,
+        response_scale,
+        wiggle_basis,
+        wiggle_basis_d1,
+        wiggle_basis_d2,
+        wiggle_beta,
+    } = input;
     validate_saved_wiggle_row(
         "Gaussian location-scale ALO",
         wiggle_basis,
@@ -145,18 +174,20 @@ pub fn gaussian_location_scale_alo_row_geometry(
 /// The q-space NLL derivatives are the same family-aware derivatives used by
 /// fitting. The surrounding chain rule retains the exact second derivatives of
 /// `q0 = -eta_t exp(-eta_s)` and optional `B(q0) beta_w`.
-#[allow(clippy::too_many_arguments)]
 pub fn binomial_location_scale_alo_row_geometry(
-    y: f64,
-    threshold_eta: f64,
-    eta_log_sigma: f64,
-    prior_weight: f64,
-    inverse_link: &InverseLink,
-    wiggle_basis: &[f64],
-    wiggle_basis_d1: &[f64],
-    wiggle_basis_d2: &[f64],
-    wiggle_beta: &[f64],
+    input: BinomialLocationScaleAloRowInput<'_>,
 ) -> Result<LocationScaleAloRowGeometry, String> {
+    let BinomialLocationScaleAloRowInput {
+        y,
+        threshold_eta,
+        eta_log_sigma,
+        prior_weight,
+        inverse_link,
+        wiggle_basis,
+        wiggle_basis_d1,
+        wiggle_basis_d2,
+        wiggle_beta,
+    } = input;
     validate_saved_wiggle_row(
         "binomial location-scale ALO",
         wiggle_basis,
@@ -260,18 +291,18 @@ mod tests {
         let eta_sigma = 0.3;
         let weight = 1.4;
         let response_scale = 5.0;
-        let geometry = gaussian_location_scale_alo_row_geometry(
-            0,
+        let geometry = gaussian_location_scale_alo_row_geometry(GaussianLocationScaleAloRowInput {
+            row: 0,
             y,
-            mean,
-            eta_sigma,
-            weight,
+            base_mean: mean,
+            eta_log_sigma: eta_sigma,
+            prior_weight: weight,
             response_scale,
-            &[],
-            &[],
-            &[],
-            &[],
-        )
+            wiggle_basis: &[],
+            wiggle_basis_d1: &[],
+            wiggle_basis_d2: &[],
+            wiggle_beta: &[],
+        })
         .expect("Gaussian saved row must replay");
 
         let sigma =
@@ -317,17 +348,17 @@ mod tests {
         let basis_d1 = [-0.15];
         let basis_d2 = [0.07];
         let beta = [0.25];
-        let geometry = binomial_location_scale_alo_row_geometry(
+        let geometry = binomial_location_scale_alo_row_geometry(BinomialLocationScaleAloRowInput {
             y,
-            threshold,
-            log_sigma,
-            weight,
-            &InverseLink::Standard(StandardLink::Logit),
-            &basis,
-            &basis_d1,
-            &basis_d2,
-            &beta,
-        )
+            threshold_eta: threshold,
+            eta_log_sigma: log_sigma,
+            prior_weight: weight,
+            inverse_link: &InverseLink::Standard(StandardLink::Logit),
+            wiggle_basis: &basis,
+            wiggle_basis_d1: &basis_d1,
+            wiggle_basis_d2: &basis_d2,
+            wiggle_beta: &beta,
+        })
         .expect("binomial saved row must replay");
 
         let q0 = -threshold * (-log_sigma).exp();
