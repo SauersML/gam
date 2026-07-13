@@ -1758,9 +1758,9 @@ fn scan_for_banned_substrings(
 /// the test/example/bench scope as the legitimate use site for those
 /// primitives; the mask is the place that decision is enforced.
 ///
-/// Brace tracking uses `strip_strings_and_comments` per line to ignore
-/// braces inside string literals and `//` comments. Block comments and
-/// raw strings are out of scope (same limitation as the other scanners).
+/// Brace tracking uses the stateful file stripper to ignore braces inside
+/// strings and comments, including multi-line raw strings and nested block
+/// comments.
 fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
     let lines: Vec<&str> = content.lines().collect();
     let n = lines.len();
@@ -3248,25 +3248,30 @@ fn strip_strings_and_comments(line: &str) -> String {
 
 /// Walk every line of `content`, carrying string-open state across line
 /// boundaries. Returns one stripped line per source line. This is the
-/// correct path for any scanner whose keyword/substring could appear
-/// inside a multi-line string literal (Rust permits real newlines inside
-/// `"..."`, and `\<newline>` continuations are common in long error
-/// messages). Raw strings (`r"..."`, `r#"..."#`) and block comments
-/// (`/* ... */`) are still out of scope — the helper handles plain
-/// double-quoted strings only, which covers the dominant false-positive
-/// case (multi-line `format!`/`panic!`/`write!` message text).
+/// correct path for any scanner whose keyword/subsequence could appear in
+/// a multi-line string or nested block comment. Rust raw strings and nested
+/// block comments are tracked across lines so scanners never mistake their
+/// contents for live code.
 fn strip_file_lines(content: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut in_str = false;
     let mut quote: u8 = 0;
     let mut raw_hashes: u8 = 0;
+    let mut block_comment_depth = 0usize;
     for line in content.lines() {
-        let (stripped, after_in_str, after_quote, after_hashes) =
-            strip_strings_and_comments_stateful_raw(line, in_str, quote, raw_hashes);
+        let (stripped, after_in_str, after_quote, after_hashes, after_block_comment_depth) =
+            strip_strings_and_comments_stateful_raw(
+                line,
+                in_str,
+                quote,
+                raw_hashes,
+                block_comment_depth,
+            );
         out.push(stripped);
         in_str = after_in_str;
         quote = after_quote;
         raw_hashes = after_hashes;
+        block_comment_depth = after_block_comment_depth;
     }
     out
 }
@@ -3279,26 +3284,28 @@ fn strip_strings_and_comments_stateful(
     in_str_in: bool,
     quote_in: u8,
 ) -> (String, bool, u8) {
-    let result = strip_strings_and_comments_stateful_raw(line, in_str_in, quote_in, 0);
+    let result = strip_strings_and_comments_stateful_raw(line, in_str_in, quote_in, 0, 0);
     (result.0, result.1, result.2)
 }
 
-/// Raw-string-aware variant. Tracks Rust raw strings `r#"..."#` so the
-/// embedded `"` characters do not toggle the regular-string state machine
-/// and leak code outside the literal into the stripped output. `hashes_in`
-/// is the active hash count for an open raw string (0 when not in one).
+/// Raw-string- and block-comment-aware variant. Tracks Rust raw strings
+/// `r#"..."#` and nested `/* ... */` comments so neither can leak apparent
+/// code into scanner input. `hashes_in` is the active hash count for an open
+/// raw string (0 when not in one).
 fn strip_strings_and_comments_stateful_raw(
     line: &str,
     in_str_in: bool,
     quote_in: u8,
     hashes_in: u8,
-) -> (String, bool, u8, u8) {
+    block_comment_depth_in: usize,
+) -> (String, bool, u8, u8, usize) {
     let bytes = line.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
     let mut in_str = in_str_in;
     let mut str_quote: u8 = quote_in;
     let mut raw_hashes: u8 = hashes_in;
+    let mut block_comment_depth = block_comment_depth_in;
     // Raw-string mode is signaled by `raw_hashes > 0` *or* by `in_str` with
     // `str_quote == b'"'` and a sentinel; here we use `raw_hashes` separately
     // for the hash count and treat any `raw_hashes != 0` together with
@@ -3309,6 +3316,21 @@ fn strip_strings_and_comments_stateful_raw(
     // with `raw_hashes` holding N (including 0).
     while i < bytes.len() {
         let c = bytes[i];
+        if block_comment_depth > 0 {
+            if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                block_comment_depth += 1;
+                out.extend_from_slice(b"  ");
+                i += 2;
+            } else if c == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                block_comment_depth -= 1;
+                out.extend_from_slice(b"  ");
+                i += 2;
+            } else {
+                out.push(b' ');
+                i += 1;
+            }
+            continue;
+        }
         if in_str && str_quote == b'r' {
             // Inside a raw string. Close only on `"` followed by exactly
             // `raw_hashes` `#` bytes (greedy match is fine — Rust's tokenizer
@@ -3356,8 +3378,16 @@ fn strip_strings_and_comments_stateful_raw(
             i += 1;
             continue;
         }
-        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            break;
+        if c == b'/' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'/' {
+                break;
+            }
+            if bytes[i + 1] == b'*' {
+                block_comment_depth = 1;
+                out.extend_from_slice(b"  ");
+                i += 2;
+                continue;
+            }
         }
         // Raw string opener: `r"..."`, `r#"..."#`, `br"..."`, `br#"..."#`.
         // Detect both `r` and `br` prefixes followed by zero or more `#` and
@@ -3438,7 +3468,7 @@ fn strip_strings_and_comments_stateful_raw(
         i += 1;
     }
     let s = String::from_utf8(out).unwrap_or_else(|_| line.to_string());
-    (s, in_str, str_quote, raw_hashes)
+    (s, in_str, str_quote, raw_hashes, block_comment_depth)
 }
 
 /// True if `line` contains `kw` as a whole word (boundaries on both sides
@@ -3826,9 +3856,8 @@ fn scan_for_banned_allow(
 
 /// Scan for any `let _...` binding (bare `_`, `_name`, `mut _`, `mut _name`,
 /// or tuple pattern `let (_, _) = ...;` where every binding is underscore-named).
-/// Skips lines whose `let` is inside a `//`-line-comment or a string literal.
-/// Multi-line raw strings and `/* ... */` blocks are out of scope: the scanner
-/// is a line-level heuristic, not a full parser. Build.rs is exempt.
+/// Skips lines whose `let` is inside a string or comment, including multi-line
+/// raw strings and nested `/* ... */` blocks. Build.rs is exempt.
 fn scan_for_let_underscore(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
     visit_files(root, dir, &mut |rel, content| {
         let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -5011,12 +5040,87 @@ fn normalized_rust_fragment(source: &str) -> String {
     source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RustCodeToken {
+    source: String,
+    line_index: usize,
+}
+
+fn rust_code_tokens(source: &str) -> Vec<RustCodeToken> {
+    const COMPOUND_PUNCTUATION: &[&str] = &[
+        "<<=", ">>=", "..=", "...", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=",
+        "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<", ">>", "..",
+    ];
+
+    let mut tokens = Vec::new();
+    for (line_index, line) in strip_file_lines(source).into_iter().enumerate() {
+        let bytes = line.as_bytes();
+        let mut start = 0usize;
+        while start < bytes.len() {
+            if bytes[start].is_ascii_whitespace() {
+                start += 1;
+                continue;
+            }
+
+            let end = if bytes[start].is_ascii_alphanumeric()
+                || bytes[start] == b'_'
+                || !bytes[start].is_ascii()
+            {
+                let mut end = start + 1;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'_'
+                        || !bytes[end].is_ascii())
+                {
+                    end += 1;
+                }
+                end
+            } else {
+                let rest = &line[start..];
+                start
+                    + COMPOUND_PUNCTUATION
+                        .iter()
+                        .find_map(|punctuation| {
+                            rest.starts_with(punctuation).then_some(punctuation.len())
+                        })
+                        .unwrap_or_else(|| {
+                            rest.chars()
+                                .next()
+                                .expect("non-empty token tail")
+                                .len_utf8()
+                        })
+            };
+            tokens.push(RustCodeToken {
+                source: line[start..end].to_string(),
+                line_index,
+            });
+            start = end;
+        }
+    }
+    tokens
+}
+
 fn code_anchor_line_indices(source: &str, anchor: &str) -> Vec<usize> {
-    strip_file_lines(source)
-        .into_iter()
-        .enumerate()
-        .filter_map(|(line_index, line)| line.contains(anchor).then_some(line_index))
-        .collect()
+    let source_tokens = rust_code_tokens(source);
+    let anchor_tokens = rust_code_tokens(anchor);
+    if anchor_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    for window in source_tokens.windows(anchor_tokens.len()) {
+        if window
+            .iter()
+            .zip(&anchor_tokens)
+            .all(|(source, anchor)| source.source == anchor.source)
+        {
+            let line_index = window[0].line_index;
+            if lines.last() != Some(&line_index) {
+                lines.push(line_index);
+            }
+        }
+    }
+    lines
 }
 
 fn code_identifier_line_indices(source: &str, identifier: &str) -> Vec<usize> {
@@ -5238,6 +5342,55 @@ fn enforce_derivative_policy_negative_probes() {
         code_anchor_line_indices(comment_only, "impl RowKernel<7> for CommentOnlyKernel")
             .is_empty(),
         "#932 policy self-test: a comment-only anchor was treated as production code"
+    );
+
+    let gaussian_order2_anchor = "fn row_order2(&self, row: usize) -> \
+                                  gam_math::jet_scalar::StaticOrder2Atom<2, 3, 3, 7>";
+    let multiline_gaussian_order2 = "impl GaussianJointRowProgram<'_> {\n\
+        pub(crate) fn row_order2(\n\
+            &self,\n\
+            row: usize,\n\
+        ) -> gam_math::jet_scalar::StaticOrder2Atom<2, 3, 3, 7> {\n\
+            unreachable!()\n\
+        }\n\
+    }";
+    assert_eq!(
+        code_anchor_line_indices(multiline_gaussian_order2, gaussian_order2_anchor),
+        vec![1],
+        "#932 policy self-test: rustfmt line wrapping changed a production anchor's identity"
+    );
+
+    let cfg_test_gaussian_order2 = format!("#[cfg(test)]\n{multiline_gaussian_order2}");
+    let cfg_test_mask = compute_test_mask(
+        &cfg_test_gaussian_order2,
+        Path::new("crates/gam-models/src/planted.rs"),
+    );
+    let cfg_test_anchor_lines =
+        code_anchor_line_indices(&cfg_test_gaussian_order2, gaussian_order2_anchor);
+    assert!(
+        !cfg_test_anchor_lines.is_empty()
+            && cfg_test_anchor_lines
+                .iter()
+                .all(|line| cfg_test_mask.get(*line).copied().unwrap_or(false)),
+        "#932 policy self-test: multiline anchor matching escaped cfg(test) ownership"
+    );
+
+    let gaussian_order2_near_matches = "fn row_order2_suffix(\n\
+        &self, row: usize\n\
+    ) -> gam_math::jet_scalar::StaticOrder2Atom<2, 3, 3, 7> { unreachable!() }\n\
+    fn row_order2(\n\
+        &self, row: usize\n\
+    ) -> gam_math::jet_scalar::StaticOrder2Atom<2, 3, 3, 70> { unreachable!() }";
+    assert!(
+        code_anchor_line_indices(gaussian_order2_near_matches, gaussian_order2_anchor).is_empty(),
+        "#932 policy self-test: anchor matching admitted an identifier or constant suffix"
+    );
+
+    let commented_gaussian_order2 =
+        format!("// {gaussian_order2_anchor}\n/* outer /* nested */ {gaussian_order2_anchor} */");
+    assert!(
+        code_anchor_line_indices(&commented_gaussian_order2, gaussian_order2_anchor).is_empty(),
+        "#932 policy self-test: anchor matching admitted line or block comments"
     );
 
     let row_kernel = "impl RowKernel<7> for PlantedKernel {}";

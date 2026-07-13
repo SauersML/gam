@@ -4214,7 +4214,60 @@ pub(crate) fn owned_mode_outer_finalizer_rejects_certified_objective_mismatch() 
 }
 
 #[test]
-pub(crate) fn owned_mode_outer_finalizer_preserves_active_jeffreys_profile_without_replay() {
+pub(crate) fn terminal_mode_binding_rejects_gradient_substitution() {
+    let specs = vec![ParameterBlockSpec {
+        name: "terminal_gradient_identity".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let theta = array![0.0];
+    let owned = evaluate_custom_family_joint_hyper_owned(
+        &OneBlockIdentityFamily,
+        &specs,
+        &options,
+        &theta,
+        &[vec![]],
+        None,
+        EvalMode::ValueOnly,
+    )
+    .expect("terminal coefficient mode fixture");
+    let objective = owned.result.objective;
+    let certified_outer = certified_test_outer(theta.clone(), objective);
+    let substituted = CustomFamilyTerminalMode {
+        theta,
+        objective,
+        // The certified fixture owns an exact zero terminal gradient. Keeping
+        // theta/objective/mode identical while substituting only this vector
+        // must still fail closed.
+        gradient: array![1.0],
+        mode: owned.mode,
+    };
+
+    let error = match bind_certified_custom_family_terminal_mode(substituted, &certified_outer) {
+        Ok(_) => panic!("a different terminal gradient cannot inherit the outer certificate"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("gradient does not bitwise match"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+pub(crate) fn owned_mode_finalizer_preserves_prior_and_active_jeffreys_without_replay() {
     #[derive(Clone)]
     struct ActiveJeffreysQuadraticFamily {
         evaluations: Arc<AtomicUsize>,
@@ -4282,20 +4335,43 @@ pub(crate) fn owned_mode_outer_finalizer_preserves_active_jeffreys_profile_witho
         ..BlockwiseFitOptions::default()
     };
     let rho = array![0.0];
-    let profiled = evaluate_custom_family_joint_hyper_owned(
+    let penalty_counts = validate_blockspecs(&specs).expect("valid test block");
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("valid labeled layout");
+    let flat = outerobjectivegradienthessian_labeled(
         &family,
         &specs,
         &options,
+        &layout,
         &rho,
-        &[vec![]],
         None,
+        &gam_problem::RhoPrior::Flat,
         EvalMode::ValueOnly,
     )
-    .expect("the active-Jeffreys profile should evaluate");
+    .expect("the flat active-Jeffreys profile should evaluate");
+    let prior = gam_problem::RhoPrior::Normal { mean: 1.0, sd: 2.0 };
+    let profiled = outerobjectivegradienthessian_labeled(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &rho,
+        Some(&flat.warm_start),
+        &prior,
+        EvalMode::ValueOnly,
+    )
+    .expect("the prior-bearing active-Jeffreys profile should evaluate");
+    let (prior_cost, _, _) = rho_prior_cost_gradient_hessian(&prior, &rho)
+        .expect("normal rho prior should evaluate");
+    assert_eq!(
+        profiled.objective.to_bits(),
+        (flat.objective + prior_cost).to_bits(),
+        "the owned objective must include the active labeled rho prior exactly once",
+    );
     let beta = profiled
-        .result
         .warm_start
-        .block_beta_view(0)
+        .block_beta
+        .first()
         .expect("profiled mode must retain beta")
         .to_owned();
     let states = vec![ParameterBlockState {
@@ -4313,12 +4389,18 @@ pub(crate) fn owned_mode_outer_finalizer_preserves_active_jeffreys_profile_witho
     assert_ne!(phi.to_bits(), 0.0_f64.to_bits());
     let evaluations_before_finalization = family.evaluations.load(Ordering::Relaxed);
 
-    let certified_outer = certified_test_outer(rho.clone(), profiled.result.objective);
+    let objective = profiled.objective;
+    let mode = CustomFamilyOwnedMode {
+        objective,
+        rho: rho.clone(),
+        inner: profiled.inner,
+    };
+    let certified_outer = certified_test_outer(rho.clone(), objective);
     let fit = fit_custom_family_fixed_log_lambdas_from_owned_mode(
         &family,
         &specs,
         &options,
-        profiled.mode,
+        mode,
         &rho,
         &certified_outer,
     )

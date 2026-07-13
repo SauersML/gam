@@ -629,6 +629,77 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
     Ok(upper)
 }
 
+/// Bind one evaluator-owned coefficient mode to the optimizer-owned terminal
+/// certificate and consume the carrier on success.
+///
+/// Every comparison is bitwise. Numerically close state is not interchangeable
+/// provenance for a nonconvex profiled objective, and there is deliberately no
+/// warm-start/re-evaluation fallback when any part of the identity differs.
+pub(crate) fn bind_certified_custom_family_terminal_mode(
+    terminal: CustomFamilyTerminalMode,
+    certified_outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
+) -> Result<CustomFamilyOwnedMode, CustomFamilyError> {
+    let certified_gradient = certified_outer.final_gradient().ok_or_else(|| {
+        CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal gradient ownership",
+            reason: "certified outer result retained no exact analytic terminal gradient; no fit was assembled"
+                .to_string(),
+        }
+    })?;
+    if terminal.theta.len() != certified_outer.rho().len()
+        || terminal
+            .theta
+            .iter()
+            .zip(certified_outer.rho().iter())
+            .any(|(terminal, certified)| terminal.to_bits() != certified.to_bits())
+    {
+        return Err(CustomFamilyError::InvalidInput {
+            context: "fit_custom_family terminal theta identity",
+            reason: "terminal coefficient mode does not bitwise match the certified outer hyperparameter vector"
+                .to_string(),
+        });
+    }
+    if terminal.objective.to_bits() != certified_outer.final_value().to_bits() {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal objective identity",
+            reason: format!(
+                "terminal coefficient-mode objective does not bitwise match the certified outer objective: terminal={:.17e}, certified={:.17e}",
+                terminal.objective,
+                certified_outer.final_value(),
+            ),
+        });
+    }
+    if terminal.gradient.len() != certified_gradient.len()
+        || terminal
+            .gradient
+            .iter()
+            .zip(certified_gradient.iter())
+            .any(|(terminal, certified)| terminal.to_bits() != certified.to_bits())
+    {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal gradient identity",
+            reason: "terminal coefficient-mode gradient does not bitwise match the optimizer-owned analytic certificate gradient"
+                .to_string(),
+        });
+    }
+    if terminal.mode.objective.to_bits() != terminal.objective.to_bits()
+        || terminal.mode.rho.len() != terminal.theta.len()
+        || terminal
+            .mode
+            .rho
+            .iter()
+            .zip(terminal.theta.iter())
+            .any(|(mode, terminal)| mode.to_bits() != terminal.to_bits())
+    {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal carrier identity",
+            reason: "terminal outer payload and its owned coefficient mode have different objective or hyperparameter bits"
+                .to_string(),
+        });
+    }
+    Ok(terminal.mode)
+}
+
 pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -1587,71 +1658,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 .to_string(),
         }
     })?;
-    let certified_gradient = certified_outer.final_gradient().ok_or_else(|| {
-        CustomFamilyError::Optimization {
-            context: "fit_custom_family terminal gradient ownership",
-            reason: "certified outer result retained no exact analytic terminal gradient; no fit was assembled"
-                .to_string(),
-        }
-    })?;
-    if terminal.theta.len() != certified_outer.rho().len()
-        || terminal
-            .theta
-            .iter()
-            .zip(certified_outer.rho().iter())
-            .any(|(terminal, certified)| terminal.to_bits() != certified.to_bits())
-    {
-        return Err(CustomFamilyError::InvalidInput {
-            context: "fit_custom_family terminal theta identity",
-            reason: "terminal coefficient mode does not bitwise match the certified outer hyperparameter vector"
-                .to_string(),
-        });
-    }
-    if terminal.objective.to_bits() != certified_outer.final_value().to_bits() {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family terminal objective identity",
-            reason: format!(
-                "terminal coefficient-mode objective does not bitwise match the certified outer objective: terminal={:.17e}, certified={:.17e}",
-                terminal.objective,
-                certified_outer.final_value(),
-            ),
-        });
-    }
-    if terminal.gradient.len() != certified_gradient.len()
-        || terminal
-            .gradient
-            .iter()
-            .zip(certified_gradient.iter())
-            .any(|(terminal, certified)| terminal.to_bits() != certified.to_bits())
-    {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family terminal gradient identity",
-            reason: "terminal coefficient-mode gradient does not bitwise match the optimizer-owned analytic certificate gradient"
-                .to_string(),
-        });
-    }
-    if terminal.mode.objective.to_bits() != terminal.objective.to_bits()
-        || terminal.mode.rho.len() != terminal.theta.len()
-        || terminal
-            .mode
-            .rho
-            .iter()
-            .zip(terminal.theta.iter())
-            .any(|(mode, terminal)| mode.to_bits() != terminal.to_bits())
-    {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family terminal carrier identity",
-            reason: "terminal outer payload and its owned coefficient mode have different objective or hyperparameter bits"
-                .to_string(),
-        });
-    }
-
     let rho_star = certified_outer.rho().clone();
+    let mode = bind_certified_custom_family_terminal_mode(terminal, &certified_outer)?;
     let CustomFamilyOwnedMode {
         objective: penalized_objective,
         rho: mode_rho,
         inner,
-    } = terminal.mode;
+    } = mode;
     if !inner.converged {
         return Err(CustomFamilyError::Optimization {
             context: "fit_custom_family terminal mode ownership",
