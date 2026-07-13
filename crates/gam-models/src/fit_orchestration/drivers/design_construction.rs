@@ -2404,7 +2404,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         zero_quadratic.clone(),
     );
     let fixed_total = ValidatedFixedQuadraticHessian::try_from_dense(
-        fixed_total.clone(),
+        fixed_total,
         baseline.design.design.ncols(),
     )
     .map_err(|error| {
@@ -2543,8 +2543,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             0.0,
         )
     };
-    let stable_penalty_term =
-        2.0 * final_eval.adaptive_penalty_value + beta.dot(&fixed_total.dot(&beta));
+    let stable_penalty_term = 2.0 * final_eval.adaptive_penalty_value
+        + beta.dot(&fixed_total.as_dense().dot(&beta));
     let standard_deviation = if family.is_gaussian_identity() {
         let denom = (y.len() as f64 - edf_total).max(1.0);
         (deviance / denom).sqrt()

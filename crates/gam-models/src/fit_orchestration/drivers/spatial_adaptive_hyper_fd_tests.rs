@@ -102,10 +102,10 @@ fn build_spatial_adaptive_joint_hyper_scaffold(
         linear_constraints: baseline.design.linear_constraints.clone(),
         runtime_caches: Arc::new(runtime_caches.to_vec()),
         adaptive_params: Vec::new(),
-        fixed_quadratichessian: Arc::new(Array2::<f64>::zeros((
+        fixed_quadratic_hessian: ValidatedFixedQuadraticHessian::zero(
             baseline.design.design.ncols(),
-            baseline.design.design.ncols(),
-        ))),
+        )
+        .expect("zero fixed quadratic Hessian"),
         hyperspecs: Arc::new(hyperspecs),
         exact_eval_cache: Arc::new(Mutex::new(None)),
     };
@@ -211,10 +211,8 @@ fn exact_spatial_adaptive_joint_hypergradient_matches_finite_difference() {
                 lambda: [theta[0].exp(), theta[1].exp(), theta[2].exp()],
                 epsilon: [theta[3].exp(), theta[4].exp(), theta[5].exp()],
             }],
-            Arc::new(Array2::<f64>::zeros((
-                baseline.design.design.ncols(),
-                baseline.design.design.ncols(),
-            ))),
+            ValidatedFixedQuadraticHessian::zero(baseline.design.design.ncols())
+                .expect("zero fixed quadratic Hessian"),
         );
         evaluate_custom_family_joint_hyper(
             &family,
@@ -380,7 +378,8 @@ fn adaptive_hyper_derivative_dispatch_matches_reference() {
             lambda: [0.7, 1.3, 0.4],
             epsilon: [eps_0, eps_g, eps_c],
         }],
-        fixed_quadratichessian: Arc::new(Array2::<f64>::zeros((p, p))),
+        fixed_quadratic_hessian: ValidatedFixedQuadraticHessian::zero(p)
+            .expect("zero fixed quadratic Hessian"),
         hyperspecs: Arc::new(hyperspecs),
         exact_eval_cache: Arc::new(Mutex::new(None)),
     };
