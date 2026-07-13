@@ -1810,35 +1810,39 @@ fn fit_custom_family_fixed_log_lambdas_with_provenance<
     warm_start: Option<&CustomFamilyWarmStart>,
     provenance: FixedLogLambdaProvenance<'_>,
 ) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
-    let (outer_iterations, outer_gradient_norm, criterion_certificate, certified_theta) =
-        match provenance {
-            FixedLogLambdaProvenance::UserFixed => (0, None, None, None),
-            FixedLogLambdaProvenance::CertifiedOuter {
-                selected_theta,
-                outer,
-            } => {
-                if selected_theta.len() != outer.rho().len()
-                    || selected_theta
-                        .iter()
-                        .zip(outer.rho().iter())
-                        .any(|(selected, certified)| {
-                            selected.to_bits() != certified.to_bits()
-                        })
-                {
-                    return Err(CustomFamilyError::InvalidInput {
-                        context: "fit_custom_family_fixed_log_lambdas outer identity",
-                        reason: "the supplied full hyperparameter vector does not bitwise match the certified outer optimum"
-                            .to_string(),
-                    });
-                }
-                (
-                    outer.iterations(),
-                    outer.final_grad_norm(),
-                    Some(outer.criterion_certificate().clone()),
-                    Some(outer.rho()),
-                )
+    let (
+        outer_iterations,
+        outer_gradient_norm,
+        criterion_certificate,
+        certified_theta,
+        certified_objective,
+    ) = match provenance {
+        FixedLogLambdaProvenance::UserFixed => (0, None, None, None, None),
+        FixedLogLambdaProvenance::CertifiedOuter {
+            selected_theta,
+            outer,
+        } => {
+            if selected_theta.len() != outer.rho().len()
+                || selected_theta
+                    .iter()
+                    .zip(outer.rho().iter())
+                    .any(|(selected, certified)| selected.to_bits() != certified.to_bits())
+            {
+                return Err(CustomFamilyError::InvalidInput {
+                    context: "fit_custom_family_fixed_log_lambdas outer identity",
+                    reason: "the supplied full hyperparameter vector does not bitwise match the certified outer optimum"
+                        .to_string(),
+                });
             }
-        };
+            (
+                outer.iterations(),
+                outer.final_grad_norm(),
+                Some(outer.criterion_certificate().clone()),
+                Some(outer.rho()),
+                Some(outer.final_value()),
+            )
+        }
+    };
     let canonical = gam_identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
     let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
     let penalty_counts = validate_blockspecs(specs)?;
@@ -1877,6 +1881,26 @@ fn fit_custom_family_fixed_log_lambdas_with_provenance<
             ),
         });
     }
+    let penalized_objective = inner_penalized_objective(
+        &inner,
+        include_exact_newton_logdet_h(family, options),
+        include_exact_newton_logdet_s(family, options),
+        "custom-family fixed-log-lambda fit",
+    )
+    .map_err(|reason| CustomFamilyError::Optimization {
+        context: "fit_custom_family_fixed_log_lambdas penalized objective",
+        reason,
+    })?;
+    if let Some(certified_objective) = certified_objective
+        && penalized_objective.to_bits() != certified_objective.to_bits()
+    {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas objective identity",
+            reason: format!(
+                "the recomputed coefficient mode does not belong to the certified outer optimum: recomputed={penalized_objective:.17e}, certified={certified_objective:.17e}; no fit was assembled"
+            ),
+        });
+    }
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     audit_converged_identifiability(
         family,
@@ -1910,16 +1934,6 @@ fn fit_custom_family_fixed_log_lambdas_with_provenance<
     )
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family_fixed_log_lambdas joint geometry",
-        reason,
-    })?;
-    let penalized_objective = inner_penalized_objective(
-        &inner,
-        include_exact_newton_logdet_h(family, options),
-        include_exact_newton_logdet_s(family, options),
-        "custom-family fixed-log-lambda fit",
-    )
-    .map_err(|reason| CustomFamilyError::Optimization {
-        context: "fit_custom_family_fixed_log_lambdas penalized objective",
         reason,
     })?;
     assemble_custom_family_fit_result(
