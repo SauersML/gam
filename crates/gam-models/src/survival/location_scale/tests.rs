@@ -461,6 +461,45 @@ fn survival_fit_parts_with_outer_evidence(
     }
 }
 
+fn certified_survival_fit_quadratic() -> gam_solve::rho_optimizer::CertifiedOuterResult {
+    use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
+    use gam_solve::rho_optimizer::OuterProblem;
+
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_tolerance(1.0e-8)
+        .with_max_iter(40)
+        .with_initial_rho(array![0.5])
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let mut objective = problem.build_objective(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(0.5 * (theta[0] - 0.25).powi(2)),
+        |_: &mut (), theta: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: 0.5 * (theta[0] - 0.25).powi(2),
+                gradient: array![theta[0] - 0.25],
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<
+            fn(
+                &mut (),
+                &Array1<f64>,
+            ) -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
+        >,
+    );
+    problem
+        .run_certified(&mut objective, "survival fit finalization certificate fixture")
+        .expect("a real convex outer solve must issue the preservation proof")
+}
+
 #[test]
 fn survival_fit_finalization_rejects_dropped_outer_certificate() {
     let error = survival_fit_from_parts(survival_fit_parts_with_outer_evidence(2, None))
@@ -473,23 +512,21 @@ fn survival_fit_finalization_rejects_dropped_outer_certificate() {
 
 #[test]
 fn survival_fit_finalization_preserves_outer_certificate() {
-    let certificate = gam_solve::rho_optimizer::OuterCriterionCertificate {
-        stationarity: gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
-            grad_norm: 0.0,
-            projected_grad_norm: 0.0,
-            bound: 1.0e-8,
-        },
-        hessian_psd: Some(true),
-        lambdas_railed: Vec::new(),
-    };
+    let certified_outer = certified_survival_fit_quadratic();
+    let outer_iterations = certified_outer.iterations();
+    assert!(
+        outer_iterations > 0,
+        "certificate fixture must exercise nontrivial outer-work preservation"
+    );
+    let certificate = certified_outer.criterion_certificate().clone();
     let expected = certificate.summary();
     let fit = survival_fit_from_parts(survival_fit_parts_with_outer_evidence(
-        2,
+        outer_iterations,
         Some(certificate),
     ))
     .expect("a carried certifying outer proof must survive finalization");
 
-    assert_eq!(fit.outer_iterations, 2);
+    assert_eq!(fit.outer_iterations, outer_iterations);
     assert_eq!(
         fit.convergence_evidence()
             .outer_certificate()
