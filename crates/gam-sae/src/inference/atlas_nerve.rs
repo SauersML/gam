@@ -862,13 +862,7 @@ pub fn build_atlas_nerve(
                 "non-empty good-cover certificate cannot certify an empty nerve".to_string(),
             );
         }
-        if orientation.is_some_and(|certificate| {
-            certificate.chart_count != 0 || !certificate.edge_signs.is_empty()
-        }) {
-            return Err(
-                "non-empty orientation certificate cannot certify an empty nerve".to_string(),
-            );
-        }
+        validate_holonomy_certificate(0, &BTreeSet::new(), holonomy_certificate.as_ref())?;
         return Ok(AtlasNerveDiagram {
             betti: BettiSignature {
                 b0: 0,
@@ -883,7 +877,7 @@ pub fn build_atlas_nerve(
             simplex_counts: Vec::new(),
             euler_characteristic: 0,
             good_cover_certified: good_cover.is_some(),
-            orientation_holonomy: orientation.map(|_| AtlasOrientability::Orientable),
+            holonomy_certificate,
             sampled_support_size: 0,
             covering_side: AtlasCoveringSide::BelowCoveringNumber,
             max_filtration: 0.0,
@@ -931,6 +925,7 @@ pub fn build_atlas_nerve(
         edge_reports.push(AtlasNerveEdge {
             a,
             b,
+            overlap: 0,
             coactivation_mass: overlap.mass,
             coactivation_threshold: threshold,
             transfer_valid,
@@ -944,7 +939,19 @@ pub fn build_atlas_nerve(
     // streamed into their exact counts and alternating sum, so working memory
     // does not scale with the potentially exponential full nerve.
     let inventory = enumerate_full_nerve(charts, &adjacency, good_cover)?;
-    let orientation_holonomy = certify_orientation_holonomy(&adjacency, orientation)?;
+    let admitted_edge_inventory: BTreeSet<AtlasHolonomyEdgeId> = edge_reports
+        .iter()
+        .filter(|edge| edge.admitted)
+        .map(|edge| AtlasHolonomyEdgeId::new(edge.a, edge.b, edge.overlap))
+        .collect::<Result<_, _>>()?;
+    validate_holonomy_certificate(
+        n,
+        &admitted_edge_inventory,
+        holonomy_certificate.as_ref(),
+    )?;
+    let certified_orientability = holonomy_certificate
+        .as_ref()
+        .and_then(AtlasHolonomyCertificate::certified_orientability);
 
     let covering_side = if sampled >= n {
         AtlasCoveringSide::AtOrAboveCoveringNumber
@@ -958,7 +965,7 @@ pub fn build_atlas_nerve(
         &inventory.tetrahedra,
     );
     let note = format!(
-        "atlas nerve over {n} charts and {row_count} rows: sampled_support_size={sampled}, covering_side={}, good_cover_certified={}, orientation_holonomy={orientation_holonomy:?}, Euler={}, Betti=({}, {}, {:?})",
+        "atlas nerve over {n} charts and {row_count} rows: sampled_support_size={sampled}, covering_side={}, good_cover_certified={}, certified_orientability={certified_orientability:?}, Euler={}, Betti=({}, {}, {:?})",
         covering_side.as_str(),
         good_cover.is_some(),
         inventory.euler_characteristic,
@@ -977,7 +984,7 @@ pub fn build_atlas_nerve(
         simplex_counts: inventory.counts,
         euler_characteristic: inventory.euler_characteristic,
         good_cover_certified: good_cover.is_some(),
-        orientation_holonomy,
+        holonomy_certificate,
         sampled_support_size: sampled,
         covering_side,
         max_filtration,
@@ -989,11 +996,13 @@ pub fn build_atlas_nerve(
 #[cfg(test)]
 mod tests {
     use super::{
-        AtlasChart, AtlasCoveringSide, AtlasGoodCoverCertificate, AtlasOrientationEdge,
-        AtlasOrientationHolonomyCertificate, AtlasTransferGate, ConvexIntersectionProof,
-        build_atlas_nerve,
+        AtlasChart, AtlasCoveringSide, AtlasGoodCoverCertificate, AtlasTransferGate,
+        ConvexIntersectionProof, build_atlas_nerve,
     };
     use crate::chart_transfer::certify_square_transfer;
+    use crate::inference::atlas_holonomy::{
+        AtlasHolonomyCertificate, AtlasSignedEdge, ExactAnalyticHolonomyCertificate,
+    };
     use crate::manifold::{AtlasOrientability, GraphCompressionKind};
     use ndarray::{Array2, arr2};
     use std::collections::BTreeSet;
@@ -1071,7 +1080,7 @@ mod tests {
         n_charts: usize,
         maximal_intersections: &[Vec<usize>],
         reversed_edge: Option<(usize, usize)>,
-    ) -> AtlasOrientationHolonomyCertificate {
+    ) -> AtlasHolonomyCertificate {
         let reversed_edge = reversed_edge.map(|(a, b)| (a.min(b), a.max(b)));
         let mut pairs = BTreeSet::new();
         for intersection in maximal_intersections {
@@ -1086,11 +1095,22 @@ mod tests {
         let edges = pairs
             .into_iter()
             .map(|(a, b)| {
-                AtlasOrientationEdge::new(a, b, if reversed_edge == Some((a, b)) { -1 } else { 1 })
-                    .unwrap()
+                AtlasSignedEdge::new(
+                    a,
+                    b,
+                    0,
+                    if reversed_edge == Some((a, b)) {
+                        -1
+                    } else {
+                        1
+                    },
+                )
+                .unwrap()
             })
             .collect();
-        AtlasOrientationHolonomyCertificate::new(n_charts, edges).unwrap()
+        AtlasHolonomyCertificate::ExactAnalytic(
+            ExactAnalyticHolonomyCertificate::new(n_charts, edges).unwrap(),
+        )
     }
 
     #[test]
@@ -1167,9 +1187,9 @@ mod tests {
         let cover = good_cover_certificate(n, &faces);
 
         let orientable = orientation_certificate(n, &faces, None);
-        let cylinder = build_atlas_nerve(&charts, &gates, Some(&cover), Some(&orientable)).unwrap();
+        let cylinder = build_atlas_nerve(&charts, &gates, Some(&cover), Some(orientable)).unwrap();
         assert_eq!(
-            cylinder.orientation_holonomy,
+            cylinder.certified_orientability(),
             Some(AtlasOrientability::Orientable)
         );
         assert_eq!(
@@ -1178,9 +1198,9 @@ mod tests {
         );
 
         let half_twist = orientation_certificate(n, &faces, Some((0, 1)));
-        let mobius = build_atlas_nerve(&charts, &gates, Some(&cover), Some(&half_twist)).unwrap();
+        let mobius = build_atlas_nerve(&charts, &gates, Some(&cover), Some(half_twist)).unwrap();
         assert_eq!(
-            mobius.orientation_holonomy,
+            mobius.certified_orientability(),
             Some(AtlasOrientability::NonOrientable)
         );
         assert_eq!(
@@ -1251,7 +1271,7 @@ mod tests {
         );
         let orientation = orientation_certificate(side * side, &faces, None);
         let diagram =
-            build_atlas_nerve(&charts, &gates, Some(&certificate), Some(&orientation)).unwrap();
+            build_atlas_nerve(&charts, &gates, Some(&certificate), Some(orientation)).unwrap();
         assert_eq!(diagram.betti.b0, 1);
         assert_eq!(diagram.betti.b1, 2);
         assert_eq!(diagram.betti.b2, Some(1));

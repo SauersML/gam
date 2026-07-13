@@ -56,8 +56,7 @@ impl AtlasFamilywiseLevel {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AtlasStatisticalRefusal {
     SingularProjectedCrossGram {
-        a: usize,
-        b: usize,
+        edge: AtlasHolonomyEdgeId,
         smallest_singular_value: f64,
         numerical_rank_threshold: f64,
     },
@@ -75,8 +74,7 @@ pub enum AtlasStatisticalRefusal {
     },
     PolarLinearizationUnresolved {
         cycle_index: usize,
-        a: usize,
-        b: usize,
+        edge: AtlasHolonomyEdgeId,
         cross_gram_error_bound: f64,
         smallest_singular_value: f64,
     },
@@ -146,9 +144,9 @@ impl<T> AtlasStatisticalDecision<T> {
 /// geometry, statistical, nerve, and persistence layers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AtlasHolonomyEdgeId {
-    pub a: usize,
-    pub b: usize,
-    pub overlap: usize,
+    a: usize,
+    b: usize,
+    overlap: usize,
 }
 
 impl AtlasHolonomyEdgeId {
@@ -163,18 +161,86 @@ impl AtlasHolonomyEdgeId {
             overlap,
         })
     }
+
+    #[must_use]
+    pub fn a(self) -> usize {
+        self.a
+    }
+
+    #[must_use]
+    pub fn b(self) -> usize {
+        self.b
+    }
+
+    #[must_use]
+    pub fn overlap(self) -> usize {
+        self.overlap
+    }
+}
+
+/// Direction in which a canonical overlap edge is traversed by a cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtlasHolonomyEdgeDirection {
+    AToB,
+    BToA,
+}
+
+/// One validated, directed step of a holonomy cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AtlasHolonomyCycleStep {
+    edge: AtlasHolonomyEdgeId,
+    direction: AtlasHolonomyEdgeDirection,
+}
+
+impl AtlasHolonomyCycleStep {
+    fn from_traversal(edge: AtlasHolonomyEdgeId, forward: bool) -> Self {
+        Self {
+            edge,
+            direction: if forward {
+                AtlasHolonomyEdgeDirection::AToB
+            } else {
+                AtlasHolonomyEdgeDirection::BToA
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn edge(self) -> AtlasHolonomyEdgeId {
+        self.edge
+    }
+
+    #[must_use]
+    pub fn direction(self) -> AtlasHolonomyEdgeDirection {
+        self.direction
+    }
+
+    #[must_use]
+    pub fn from(self) -> usize {
+        match self.direction {
+            AtlasHolonomyEdgeDirection::AToB => self.edge.a,
+            AtlasHolonomyEdgeDirection::BToA => self.edge.b,
+        }
+    }
+
+    #[must_use]
+    pub fn to(self) -> usize {
+        match self.direction {
+            AtlasHolonomyEdgeDirection::AToB => self.edge.b,
+            AtlasHolonomyEdgeDirection::BToA => self.edge.a,
+        }
+    }
 }
 
 /// One canonical undirected transition sign.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AtlasSignedEdge {
-    pub a: usize,
-    pub b: usize,
+    a: usize,
+    b: usize,
     /// Identity of a connected overlap component between the same chart pair.
     /// Parallel components are distinct cocycle edges and can themselves close
     /// a two-edge fundamental cycle.
-    pub overlap: usize,
-    pub sign: i8,
+    overlap: usize,
+    sign: i8,
 }
 
 impl AtlasSignedEdge {
@@ -201,6 +267,11 @@ impl AtlasSignedEdge {
             b: self.b,
             overlap: self.overlap,
         }
+    }
+
+    #[must_use]
+    pub fn sign(self) -> i8 {
+        self.sign
     }
 }
 
@@ -343,19 +414,19 @@ impl GaussianPatchCentering {
 /// hidden `q`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GaussianPcaPatch {
-    pub chart: usize,
-    pub projection_fit_rows: usize,
-    pub inference_rows: usize,
-    pub centering: GaussianPatchCentering,
+    chart: usize,
+    projection_fit_rows: usize,
+    inference_rows: usize,
+    centering: GaussianPatchCentering,
     /// Exact Wishart degrees of freedom implied by `inference_rows` and
     /// `centering`, validated once at construction and carried into every
     /// variance, tail, and occupancy prescription.
-    pub covariance_degrees_of_freedom: usize,
-    pub projection_frame: Array2<f64>,
-    pub tangent_coordinates: Array2<f64>,
-    pub noise_variance_estimate: f64,
-    pub signal_variance_estimate: f64,
-    pub population_bounds: GaussianPcaPopulationBounds,
+    covariance_degrees_of_freedom: usize,
+    projection_frame: Array2<f64>,
+    tangent_coordinates: Array2<f64>,
+    noise_variance_estimate: f64,
+    signal_variance_estimate: f64,
+    population_bounds: GaussianPcaPopulationBounds,
 }
 
 impl GaussianPcaPatch {
@@ -535,13 +606,13 @@ impl GaussianPcaPatchSummary {
 /// One edge requested from the Gaussian-PCA atlas.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProjectedAtlasEdgeSpec {
-    pub a: usize,
-    pub b: usize,
-    pub overlap: usize,
+    a: usize,
+    b: usize,
+    overlap: usize,
     /// Deterministic continuum/discretization error for this edge, in radians.
     /// This is supplied by the geometry builder; it is never inferred from a
     /// grid or hidden angular threshold.
-    pub geometric_remainder_bound: f64,
+    geometric_remainder_bound: f64,
 }
 
 impl ProjectedAtlasEdgeSpec {
@@ -626,12 +697,9 @@ pub enum AtlasCycleConclusion {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtlasCycleHolonomy {
     pub cycle_index: usize,
-    /// Closed chart walk, so the first chart is repeated at the end.
-    pub charts: Vec<usize>,
-    /// Canonical overlap-component identity for each step in `charts` order.
-    /// This has length `charts.len() - 1`; the chart walk supplies direction,
-    /// while this inventory distinguishes parallel transitions.
-    pub edges: Vec<AtlasHolonomyEdgeId>,
+    /// Ordered, directed transitions.  Edge identity includes the connected
+    /// overlap component, so parallel transitions remain distinguishable.
+    steps: Vec<AtlasHolonomyCycleStep>,
     pub absolute_angle: Option<f64>,
     pub first_order_variance: Option<f64>,
     pub naive_edgewise_first_order_variance: Option<f64>,
@@ -643,6 +711,25 @@ pub struct AtlasCycleHolonomy {
     pub gaussian_error_budget: f64,
     pub subspace_tail_probability_bound: f64,
     pub decision: AtlasStatisticalDecision<AtlasCycleConclusion>,
+}
+
+impl AtlasCycleHolonomy {
+    #[must_use]
+    pub fn steps(&self) -> &[AtlasHolonomyCycleStep] {
+        &self.steps
+    }
+
+    /// Derive the closed chart walk from the single authoritative step list.
+    #[must_use]
+    pub fn closed_chart_walk(&self) -> Vec<usize> {
+        let Some(first) = self.steps.first().copied() else {
+            return Vec::new();
+        };
+        let mut charts = Vec::with_capacity(self.steps.len() + 1);
+        charts.push(first.from());
+        charts.extend(self.steps.iter().copied().map(AtlasHolonomyCycleStep::to));
+        charts
+    }
 }
 
 /// A covariance source shared by one or more Gauss--Bonnet angle terms.
@@ -832,15 +919,62 @@ pub struct GaussBonnetConfidence {
 /// Complete noisy-PCA analysis, including refused decisions.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GaussianPcaHolonomyAnalysis {
-    pub familywise_level: AtlasFamilywiseLevel,
-    pub chart_count: usize,
-    pub patch_summaries: Vec<GaussianPcaPatchSummary>,
-    pub edges: Vec<ProjectedAtlasEdgeGeometry>,
-    pub orientation: AtlasStatisticalDecision<AtlasOrientability>,
-    pub orientation_flip_probability_bound: f64,
-    pub sample_prescription: Vec<AtlasPatchSamplePrescription>,
-    pub cycles: Vec<AtlasCycleHolonomy>,
-    pub gauss_bonnet: Option<GaussBonnetConfidence>,
+    familywise_level: AtlasFamilywiseLevel,
+    chart_count: usize,
+    patch_summaries: Vec<GaussianPcaPatchSummary>,
+    edges: Vec<ProjectedAtlasEdgeGeometry>,
+    orientation: AtlasStatisticalDecision<AtlasOrientability>,
+    orientation_flip_probability_bound: f64,
+    sample_prescription: Vec<AtlasPatchSamplePrescription>,
+    cycles: Vec<AtlasCycleHolonomy>,
+    gauss_bonnet: Option<GaussBonnetConfidence>,
+}
+
+impl GaussianPcaHolonomyAnalysis {
+    #[must_use]
+    pub fn familywise_level(&self) -> AtlasFamilywiseLevel {
+        self.familywise_level
+    }
+
+    #[must_use]
+    pub fn chart_count(&self) -> usize {
+        self.chart_count
+    }
+
+    #[must_use]
+    pub fn patch_summaries(&self) -> &[GaussianPcaPatchSummary] {
+        &self.patch_summaries
+    }
+
+    #[must_use]
+    pub fn edges(&self) -> &[ProjectedAtlasEdgeGeometry] {
+        &self.edges
+    }
+
+    #[must_use]
+    pub fn orientation(&self) -> &AtlasStatisticalDecision<AtlasOrientability> {
+        &self.orientation
+    }
+
+    #[must_use]
+    pub fn orientation_flip_probability_bound(&self) -> f64 {
+        self.orientation_flip_probability_bound
+    }
+
+    #[must_use]
+    pub fn sample_prescription(&self) -> &[AtlasPatchSamplePrescription] {
+        &self.sample_prescription
+    }
+
+    #[must_use]
+    pub fn cycles(&self) -> &[AtlasCycleHolonomy] {
+        &self.cycles
+    }
+
+    #[must_use]
+    pub fn gauss_bonnet(&self) -> Option<&GaussBonnetConfidence> {
+        self.gauss_bonnet.as_ref()
+    }
 }
 
 /// Closed provenance sum for every production atlas holonomy result.
@@ -861,10 +995,10 @@ impl AtlasHolonomyCertificate {
 
     /// Complete canonical edge inventory, including overlap component.
     ///
-    /// Unlike [`Self::certified_edges`], this remains available when a noisy
-    /// orientation decision is refused.  Consumers can therefore validate
-    /// that a refusal belongs to exactly the atlas they are reporting without
-    /// converting the refusal into a promotable signed cocycle.
+    /// This remains available when a noisy orientation decision is refused.
+    /// Consumers can therefore validate that a refusal belongs to exactly the
+    /// atlas they are reporting without converting the refusal into a
+    /// promotable signed cocycle.
     #[must_use]
     pub fn edge_inventory(&self) -> Vec<AtlasHolonomyEdgeId> {
         match self {
@@ -879,30 +1013,6 @@ impl AtlasHolonomyCertificate {
                 .iter()
                 .map(ProjectedAtlasEdgeGeometry::identity)
                 .collect(),
-        }
-    }
-
-    /// Certified edge signs.  A noisy analysis whose flip bound was refused
-    /// intentionally exposes no promotable cocycle.
-    #[must_use]
-    pub fn certified_edges(&self) -> Option<Vec<AtlasSignedEdge>> {
-        match self {
-            Self::ExactAnalytic(certificate) => Some(certificate.edges().to_vec()),
-            Self::GaussianPcaPlugin(analysis) => {
-                analysis.orientation.certified_value()?;
-                analysis
-                    .edges
-                    .iter()
-                    .map(|edge| {
-                        Some(AtlasSignedEdge {
-                            a: edge.a,
-                            b: edge.b,
-                            overlap: edge.overlap,
-                            sign: edge.estimated_sign?,
-                        })
-                    })
-                    .collect()
-            }
         }
     }
 
@@ -1085,12 +1195,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(analysis.cycles.len(), 1);
-        assert_eq!(analysis.cycles[0].charts, vec![0, 1, 0]);
+        assert_eq!(analysis.cycles[0].closed_chart_walk(), vec![0, 1, 0]);
         assert_eq!(
-            analysis.cycles[0].edges,
+            analysis.cycles[0]
+                .steps()
+                .iter()
+                .copied()
+                .map(AtlasHolonomyCycleStep::edge)
+                .collect::<Vec<_>>(),
             vec![
                 AtlasHolonomyEdgeId::new(0, 1, 3).unwrap(),
                 AtlasHolonomyEdgeId::new(0, 1, 7).unwrap(),
+            ]
+        );
+        assert_eq!(
+            analysis.cycles[0]
+                .steps()
+                .iter()
+                .copied()
+                .map(AtlasHolonomyCycleStep::direction)
+                .collect::<Vec<_>>(),
+            vec![
+                AtlasHolonomyEdgeDirection::AToB,
+                AtlasHolonomyEdgeDirection::BToA,
             ]
         );
     }
@@ -1318,10 +1445,6 @@ fn frobenius_squared(matrix: ArrayView2<'_, f64>) -> f64 {
     matrix.iter().map(|value| value * value).sum()
 }
 
-fn canonical_edge_key(a: usize, b: usize) -> (usize, usize) {
-    (a.min(b), a.max(b))
-}
-
 fn project_normal(tangent: ArrayView2<'_, f64>, value: &Array2<f64>) -> Array2<f64> {
     value - &tangent.dot(&tangent.t().dot(value))
 }
@@ -1480,6 +1603,7 @@ fn fundamental_cycles(
         neighbors.sort_unstable();
     }
     let mut parent = vec![None::<usize>; chart_count];
+    let mut parent_edge = vec![None::<usize>; chart_count];
     let mut reached = vec![false; chart_count];
     let mut tree_edges = BTreeSet::<usize>::new();
     for root in 0..chart_count {
@@ -1493,16 +1617,13 @@ fn fundamental_cycles(
                 if !reached[next] {
                     reached[next] = true;
                     parent[next] = Some(chart);
+                    parent_edge[next] = Some(edge_index);
                     tree_edges.insert(edge_index);
                     queue.push_back(next);
                 }
             }
         }
     }
-    let tree_edge_lookup: BTreeMap<(usize, usize), usize> = tree_edges
-        .iter()
-        .map(|&index| ((edges[index].a, edges[index].b), index))
-        .collect();
     let mut cycles = Vec::new();
     for (chord_index, chord) in edges.iter().enumerate() {
         if tree_edges.contains(&chord_index) {
@@ -1543,9 +1664,18 @@ fn fundamental_cycles(
         let mut steps = Vec::with_capacity(walk.len() - 1);
         let tree_step_count = walk.len().saturating_sub(2);
         for endpoints in walk.windows(2).take(tree_step_count) {
-            let key = canonical_edge_key(endpoints[0], endpoints[1]);
-            let edge_index = *tree_edge_lookup.get(&key).ok_or_else(|| {
-                format!("fundamental-cycle tree edge {key:?} is absent")
+            let child = if parent[endpoints[0]] == Some(endpoints[1]) {
+                endpoints[0]
+            } else if parent[endpoints[1]] == Some(endpoints[0]) {
+                endpoints[1]
+            } else {
+                return Err(format!(
+                    "fundamental-cycle charts ({}, {}) are not joined by a spanning-tree edge",
+                    endpoints[0], endpoints[1]
+                ));
+            };
+            let edge_index = parent_edge[child].ok_or_else(|| {
+                format!("fundamental-cycle chart {child} has no spanning-tree edge identity")
             })?;
             let forward = endpoints[0] == edges[edge_index].a;
             steps.push((edge_index, forward));
@@ -1609,8 +1739,7 @@ fn orientation_tail_and_prescription(
     for edge in edges {
         if edge.public.estimated_sign.is_none() {
             reasons.push(AtlasStatisticalRefusal::SingularProjectedCrossGram {
-                a: edge.public.a,
-                b: edge.public.b,
+                edge: edge.public.identity(),
                 smallest_singular_value: edge.smallest_singular_value,
                 numerical_rank_threshold: edge.numerical_rank_threshold,
             });
@@ -1738,10 +1867,12 @@ fn analyze_cycle(
 ) -> Result<AtlasCycleHolonomy, String> {
     let gaussian_error_budget = allocated_alpha / 2.0;
     let subspace_tail_probability_bound = allocated_alpha - gaussian_error_budget;
-    let cycle_edges: Vec<AtlasHolonomyEdgeId> = cycle
+    let cycle_steps: Vec<AtlasHolonomyCycleStep> = cycle
         .steps
         .iter()
-        .map(|&(edge, _)| edges[edge].public.identity())
+        .map(|&(edge, forward)| {
+            AtlasHolonomyCycleStep::from_traversal(edges[edge].public.identity(), forward)
+        })
         .collect();
     let geometric_remainder_bound: f64 = cycle
         .steps
@@ -1753,8 +1884,7 @@ fn analyze_cycle(
         let edge = &edges[edge_index];
         if edge.transition.is_none() {
             reasons.push(AtlasStatisticalRefusal::SingularProjectedCrossGram {
-                a: edge.public.a,
-                b: edge.public.b,
+                edge: edge.public.identity(),
                 smallest_singular_value: edge.smallest_singular_value,
                 numerical_rank_threshold: edge.numerical_rank_threshold,
             });
@@ -1763,8 +1893,7 @@ fn analyze_cycle(
     if !reasons.is_empty() {
         return Ok(AtlasCycleHolonomy {
             cycle_index,
-            charts: cycle.charts.clone(),
-            edges: cycle_edges,
+            steps: cycle_steps,
             absolute_angle: None,
             first_order_variance: None,
             naive_edgewise_first_order_variance: None,
@@ -1800,8 +1929,7 @@ fn analyze_cycle(
     if determinant_2(holonomy.view()) < 0.0 {
         return Ok(AtlasCycleHolonomy {
             cycle_index,
-            charts: cycle.charts.clone(),
-            edges: cycle_edges,
+            steps: cycle_steps,
             absolute_angle: None,
             first_order_variance: None,
             naive_edgewise_first_order_variance: None,
@@ -1940,8 +2068,7 @@ fn analyze_cycle(
         if cross_error >= edge.smallest_singular_value {
             reasons.push(AtlasStatisticalRefusal::PolarLinearizationUnresolved {
                 cycle_index,
-                a: edge.public.a,
-                b: edge.public.b,
+                edge: edge.public.identity(),
                 cross_gram_error_bound: cross_error,
                 smallest_singular_value: edge.smallest_singular_value,
             });
@@ -1952,8 +2079,7 @@ fn analyze_cycle(
         if polar_difference >= 2.0 {
             reasons.push(AtlasStatisticalRefusal::PolarLinearizationUnresolved {
                 cycle_index,
-                a: edge.public.a,
-                b: edge.public.b,
+                edge: edge.public.identity(),
                 cross_gram_error_bound: cross_error,
                 smallest_singular_value: edge.smallest_singular_value,
             });
@@ -1973,8 +2099,7 @@ fn analyze_cycle(
     if !reasons.is_empty() {
         return Ok(AtlasCycleHolonomy {
             cycle_index,
-            charts: cycle.charts.clone(),
-            edges: cycle_edges,
+            steps: cycle_steps,
             absolute_angle: Some(absolute_angle),
             first_order_variance: Some(first_order_variance),
             naive_edgewise_first_order_variance: Some(naive_first_order_variance),
@@ -1999,8 +2124,7 @@ fn analyze_cycle(
     if std::f64::consts::PI - absolute_angle <= rejection_boundary {
         return Ok(AtlasCycleHolonomy {
             cycle_index,
-            charts: cycle.charts.clone(),
-            edges: cycle_edges,
+            steps: cycle_steps,
             absolute_angle: Some(absolute_angle),
             first_order_variance: Some(first_order_variance),
             naive_edgewise_first_order_variance: Some(naive_first_order_variance),
@@ -2029,8 +2153,7 @@ fn analyze_cycle(
     };
     Ok(AtlasCycleHolonomy {
         cycle_index,
-        charts: cycle.charts.clone(),
-        edges: cycle_edges,
+        steps: cycle_steps,
         absolute_angle: Some(absolute_angle),
         first_order_variance: Some(first_order_variance),
         naive_edgewise_first_order_variance: Some(naive_first_order_variance),
