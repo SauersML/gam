@@ -1,4 +1,5 @@
-use super::{bernoulli_marginal_link_map, rigid_standard_normal_row_kernel};
+use super::family::bernoulli_marginal_link_map;
+use super::gradient_paths::rigid_standard_normal_row_kernel;
 use gam_problem::InverseLink;
 
 /// Complete saved-row state for exact rigid Bernoulli marginal-slope ALO replay.

@@ -347,29 +347,6 @@ impl SavedFitSummary {
 
 use gam::estimate::{ensure_finite_scalar, validate_all_finite};
 
-pub(crate) fn termspec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
-    spec.linear_terms.iter().any(|term| {
-        matches!(
-            term.coefficient_geometry,
-            LinearCoefficientGeometry::Bounded { .. }
-        )
-    })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AloRefitRoute {
-    StandardGam,
-    UnifiedTermCollection,
-}
-
-pub(crate) fn alo_refit_route_for_termspec(spec: &TermCollectionSpec) -> AloRefitRoute {
-    if termspec_has_bounded_terms(spec) {
-        AloRefitRoute::UnifiedTermCollection
-    } else {
-        AloRefitRoute::StandardGam
-    }
-}
-
 pub(crate) fn compact_saved_multiblock_fit_result(
     blocks: Vec<gam::estimate::FittedBlock>,
     lambdas: Array1<f64>,

@@ -730,7 +730,10 @@ fn cli_firth_validation_accepts_binomial_cloglog() {
 fn cli_firth_validation_accepts_bounded_binomial_logit_terms() {
     let spec = bounded_cli_termspec();
     assert!(
-        super::termspec_has_bounded_terms(&spec),
+        spec.linear_terms.iter().any(|term| matches!(
+            term.coefficient_geometry,
+            LinearCoefficientGeometry::Bounded { .. }
+        )),
         "fixture must exercise bounded coefficient geometry"
     );
 
@@ -749,19 +752,6 @@ fn cli_firth_validation_accepts_bounded_binomial_logit_terms() {
             "--firth is a likelihood policy, not a bounded-term policy", e
         )
     });
-}
-
-#[test]
-fn cli_diagnose_alo_routes_bounded_terms_through_unified_refit() {
-    let bounded = bounded_cli_termspec();
-    assert_eq!(
-        super::alo_refit_route_for_termspec(&bounded),
-        super::AloRefitRoute::UnifiedTermCollection
-    );
-    assert_eq!(
-        super::alo_refit_route_for_termspec(&empty_termspec()),
-        super::AloRefitRoute::StandardGam
-    );
 }
 
 #[test]
