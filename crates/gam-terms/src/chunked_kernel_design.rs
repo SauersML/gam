@@ -467,9 +467,8 @@ mod chunked_kernel_operator_tests {
         .unwrap();
         let dense = op.to_dense();
         let weights = array![2.0, -3.0, 0.25];
-        let expected = dense
-            .t()
-            .dot(&(dense * weights.view().insert_axis(ndarray::Axis(1))));
+        let weighted_dense = dense.clone() * weights.view().insert_axis(ndarray::Axis(1));
+        let expected = dense.t().dot(&weighted_dense);
         let got = op.diag_xtw_x(&weights).unwrap();
         assert!((&got - &expected).iter().all(|value| value.abs() < 1e-12));
 
