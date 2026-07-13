@@ -2792,6 +2792,19 @@ mod tests {
     #[test]
     pub(crate) fn hybrid_self_pair_odd_d_kappa_derivative_matches_value_finite_difference() {
         use super::hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d as odd_d;
+        // Independent normalization oracle for the reported d=3,m=s=1 case.
+        // At kappa=1 the doubled-order partial fraction is
+        //   1/[rho^4(1+rho^2)^2],
+        // whose two Matérn collision constants sum to
+        //   2*(-1/(4*pi)) + 1/(8*pi) = -3/(8*pi).
+        // The erroneous single-kernel expansion returned +1/(4*pi).
+        let lead_value = odd_d(0, 1, 1, 3, 1.0).expect("valid lead self-pair").0;
+        assert_relative_close(
+            lead_value,
+            -3.0 / (8.0 * std::f64::consts::PI),
+            1e-12,
+        );
+
         // (d, m, s, q): the lead d=3,m=s=1 case plus q=0,1,2 from a smoother
         // odd-dimensional self-pair, exercising every supported radial block.
         let cases = [(3usize, 1usize, 1usize, 0usize)].into_iter().chain([
