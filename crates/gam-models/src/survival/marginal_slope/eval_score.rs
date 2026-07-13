@@ -191,64 +191,57 @@ impl SurvivalMarginalSlopeFamily {
         logslope_eta: &Array1<f64>,
     ) -> Result<Vec<f64>, String> {
         let k = self.score_dim();
-        if self.logslope_surface_ranges.len() == k && k > 1 && logslope_eta.len() == self.n {
+        if self.logslope_layout.is_per_score() {
             return Err(
-                    "survival marginal-slope internal logslope vector requested scalar eta for a per-z surface layout"
-                        .to_string(),
-                );
+                "scalar logslope eta requested for a per-score channel layout".to_string(),
+            );
         }
-        if logslope_eta.len() == self.n {
-            return Ok(vec![logslope_eta[row]; k]);
+        if logslope_eta.len() != self.n {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "shared survival marginal-slope logslope eta length {} does not match n={}",
+                    logslope_eta.len(),
+                    self.n
+                ),
+            }
+            .into());
         }
-        if logslope_eta.len() == self.n * k {
-            let start = row * k;
-            return Ok(logslope_eta.slice(s![start..start + k]).to_vec());
-        }
-        Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "survival marginal-slope logslope eta length {} is incompatible with n={} and score dim K={k}",
-                logslope_eta.len(),
-                self.n
-            ),
-        }
-        .into())
+        Ok(vec![logslope_eta[row]; k])
     }
 
     pub(crate) fn per_z_logslope_active(&self) -> bool {
-        self.score_dim() > 1 && self.logslope_surface_ranges.len() == self.score_dim()
+        self.score_dim() > 1 && self.logslope_layout.is_per_score()
     }
 
-    pub(crate) fn logslope_surface_values_for_row(
+    pub(crate) fn logslope_row_workspace(&self) -> Result<LogslopeRowWorkspace, String> {
+        self.logslope_layout.row_workspace(self.score_dim())
+    }
+
+    pub(crate) fn fill_logslope_values_for_row(
         &self,
         row: usize,
-        beta_logslope: &Array1<f64>,
-    ) -> Result<Vec<f64>, String> {
-        let k = self.score_dim();
-        if !self.per_z_logslope_active() {
-            return self.logslope_vector_for_row(row, beta_logslope);
-        }
-        let g_row = self
-            .logslope_design
-            .try_row_chunk(row..row + 1)
-            .map_err(|e| format!("logslope_surface_values_for_row logslope row chunk: {e}"))?;
-        let row_view = g_row.row(0);
-        let mut out = Vec::with_capacity(k);
-        for range in &self.logslope_surface_ranges {
-            out.push(
-                row_view
-                    .slice(s![range.clone()])
-                    .dot(&beta_logslope.slice(s![range.clone()])),
+        block_states: &[ParameterBlockState],
+        workspace: &mut LogslopeRowWorkspace,
+    ) -> Result<(), String> {
+        if self.per_z_logslope_active() {
+            return self.logslope_layout.fill_per_score_row(
+                row,
+                &block_states[2].beta,
+                workspace,
             );
         }
-        Ok(out)
-    }
-
-    pub(crate) fn logslope_surface_row(&self, row: usize) -> Result<Array1<f64>, String> {
-        let chunk = self
-            .logslope_design
-            .try_row_chunk(row..row + 1)
-            .map_err(|e| format!("logslope_surface_row logslope row chunk: {e}"))?;
-        Ok(chunk.row(0).to_owned())
+        if block_states[2].eta.len() != self.n {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "shared survival marginal-slope logslope eta length {} does not match n={}",
+                    block_states[2].eta.len(),
+                    self.n,
+                ),
+            }
+            .into());
+        }
+        self.logslope_layout
+            .fill_shared_values(block_states[2].eta[row], workspace)
     }
 
     pub(crate) fn shared_logslope_covariance_scale(&self) -> Result<f64, String> {

@@ -1113,14 +1113,275 @@ impl SaeManifoldTerm {
         Ok(hessian)
     }
 
+    /// PATH C channel 4 — exact fixed-stratum second derivative of the outer
+    /// gradient's log-determinant Daleckii–Krein trace channel (`logdet_trace`).
+    ///
+    /// The gradient's `logdet_trace` component is, per outer coordinate `i`,
+    /// `logdet_trace_i = ½·[tr(G Cᵢ) − tr(H_bd⁻¹ Cᵢ)]`, where `Cᵢ = ∂H/∂ρ_i` is
+    /// the penalty curvature the coordinate scales, `G = H⁻¹` is the FULL joint
+    /// arrow inverse (the `ard_joint` / smoothness-EDF selected inverse), and
+    /// `H_bd⁻¹` is the block-diagonal per-row `H_tt` inverse the rank-charge
+    /// coordinate block subtracts (`ard_coordinate` trace). The smoothing channel
+    /// touches only `H_ββ`, so its `H_bd⁻¹` leg is identically zero; the periodic
+    /// ARD channel touches only the row-local `t`-slots, so both legs contribute.
+    ///
+    /// Every operator `Cᵢ` is degree-one in `exp(ρ_i)` at a frozen inner state —
+    /// `λ_k·S_k ⊗ I` on the β-block for smoothing; `w_row·max(α cos κt, 0)` on the
+    /// active `t`-rows for periodic ARD (`w_row·α` for a Euclidean axis). The
+    /// `max(·,0)` majorizer active set is invariant under a ρ perturbation because
+    /// ρ scales only `α`, never the frozen coordinate `t`. Hence
+    /// `∂Cᵢ/∂ρ_j = δ_{ij} Cᵢ` and, with the Daleckii–Krein differential
+    /// `∂G/∂ρ_j = −G C_j G` for each inverse `G`,
+    /// `block[i,j] = ½·δ_{ij}·(tr(G Cᵢ) − tr(H_bd⁻¹ Cᵢ))
+    ///              − ½·(tr(G C_j G Cᵢ) − tr(H_bd⁻¹ C_j H_bd⁻¹ Cᵢ))`.
+    /// The diagonal `δ` term is exactly the coordinate's own `logdet_trace_i`
+    /// value (the "self-term equals the operator" identity). A smoothing `C_j`
+    /// vanishes on `H_bd⁻¹` (t-only) and an ARD `C_i` couples to a smoothing `C_j`
+    /// only through the FULL inverse's `t`–β block, matching the gradient's
+    /// construction.
+    ///
+    /// Small-dense materialization: build `G` dense by solving the arrow system
+    /// against each unit arrow basis vector (`DeflatedArrowSolver::plain`), and
+    /// `H_bd⁻¹` from the per-row undamped Cholesky factors — the same two inverses
+    /// the gradient's `ard_joint` / `ard_coordinate` legs use, so value, gradient,
+    /// and this Hessian share one (deflation-free interior) selected inverse.
+    /// Shared-ARD axes accumulate their per-atom operators into one flat
+    /// coordinate, matching the gradient's chain-rule `+=`.
+    pub(crate) fn logdet_daleckii_krein_hessian(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+    ) -> Result<Array2<f64>, String> {
+        self.assignment.validate_rho_domain(rho)?;
+        let n_params = rho.to_flat().len();
+        let total_t = cache.delta_t_len();
+        let k = cache.k;
+        let dim = total_t + k;
+        let solver = DeflatedArrowSolver::plain(cache);
+
+        // Full joint inverse G = H⁻¹ (dim×dim), materialized column by column by
+        // solving the arrow system against each unit arrow basis vector.
+        let mut g = Array2::<f64>::zeros((dim, dim));
+        let mut rhs_t = Array1::<f64>::zeros(total_t);
+        let rhs_beta_zero = Array1::<f64>::zeros(k);
+        for col in 0..total_t {
+            rhs_t[col] = 1.0;
+            let sol = solver.solve(rhs_t.view(), rhs_beta_zero.view())?;
+            rhs_t[col] = 0.0;
+            for r in 0..total_t {
+                g[[r, col]] = sol.t[r];
+            }
+            for r in 0..k {
+                g[[total_t + r, col]] = sol.beta[r];
+            }
+        }
+        let rhs_t_zero = Array1::<f64>::zeros(total_t);
+        let mut rhs_beta = Array1::<f64>::zeros(k);
+        for col in 0..k {
+            rhs_beta[col] = 1.0;
+            let sol = solver.solve(rhs_t_zero.view(), rhs_beta.view())?;
+            rhs_beta[col] = 0.0;
+            for r in 0..total_t {
+                g[[r, total_t + col]] = sol.t[r];
+            }
+            for r in 0..k {
+                g[[total_t + r, total_t + col]] = sol.beta[r];
+            }
+        }
+        // H⁻¹ is self-adjoint; symmetrize away solver round-off asymmetry.
+        for a in 0..dim {
+            for b in (a + 1)..dim {
+                let avg = 0.5 * (g[[a, b]] + g[[b, a]]);
+                g[[a, b]] = avg;
+                g[[b, a]] = avg;
+            }
+        }
+
+        // Block-diagonal row-local t-inverse H_bd⁻¹ (dim×dim; β block zero) — the
+        // inverse the rank-charge coordinate-block trace subtracts, built from the
+        // same per-row undamped Cholesky factors `coordinate_block_ard_...` uses.
+        let mut h_bd = Array2::<f64>::zeros((dim, dim));
+        for row in 0..self.n_obs() {
+            let q = cache.row_dims[row];
+            let base = cache.row_offsets[row];
+            let factor = cache.undamped_factor(row);
+            let mut unit = Array1::<f64>::zeros(q);
+            for col in 0..q {
+                unit.fill(0.0);
+                unit[col] = 1.0;
+                let solved = cholesky_solve_vector(factor, unit.view());
+                for r in 0..q {
+                    h_bd[[base + r, base + col]] = solved[r];
+                }
+            }
+        }
+
+        // ∂H/∂ρ operators Cᵢ for the smoothing (β-block) and ARD (t-diagonal)
+        // coordinates, keyed by flat outer index (shared-ARD axes accumulate).
+        let mut c_by_flat: std::collections::BTreeMap<usize, Array2<f64>> =
+            std::collections::BTreeMap::new();
+
+        // Smoothing: Cₐ = (λ_a·½(Sₐ+Sₐᵀ)) ⊗ I on atom a's β-block, the exact
+        // operator `decoder_smoothness_effective_dof_with_solver_per_atom` traces.
+        let lambda_smooth = rho.lambda_smooth_vec()?;
+        let p = self.output_dim();
+        let frames_active = self.frames_active();
+        let (beta_offsets, beta_out_dim): (Vec<usize>, Box<dyn Fn(usize) -> usize>) =
+            if frames_active {
+                let ranks: Vec<usize> =
+                    self.atoms.iter().map(|a| a.border_frame_rank()).collect();
+                (
+                    self.factored_beta_offsets(),
+                    Box::new(move |kk: usize| ranks[kk]),
+                )
+            } else {
+                (self.beta_offsets(), Box::new(move |_kk: usize| p))
+            };
+        for a in 0..rho.log_lambda_smooth.len() {
+            let atom = &self.atoms[a];
+            let s = &atom.smooth_penalty;
+            let m = atom.basis_size();
+            let off = beta_offsets[a];
+            let r = beta_out_dim(a);
+            let lambda = lambda_smooth[a];
+            let flat = rho.smooth_flat_index(a);
+            let c = c_by_flat
+                .entry(flat)
+                .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+            for mu in 0..m {
+                for nu in 0..m {
+                    let s_sym = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
+                    let val = lambda * s_sym;
+                    if val == 0.0 {
+                        continue;
+                    }
+                    for oc in 0..r {
+                        c[[total_t + off + nu * r + oc, total_t + off + mu * r + oc]] += val;
+                    }
+                }
+            }
+        }
+
+        // ARD: C_{k,axis} = w_row·max(α cos κt, 0) (periodic) / w_row·α (Euclidean)
+        // on the row-local t-slot for (atom k, axis) — the exact PSD-majorizer
+        // curvature `ard_log_precision_hessian_trace` differentiates. The slot
+        // layout mirrors that trace (compact top-k vs dense per-atom offsets).
+        let ard_precisions = self.validated_ard_precisions(rho)?;
+        let row_w = self.row_loss_weights.as_deref();
+        let coord_offsets = self.assignment.coord_offsets();
+        let periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(LatentCoordValues::effective_axis_periods)
+            .collect();
+        for row in 0..self.n_obs() {
+            let w_row = row_w.map_or(1.0, |w| w[row]);
+            let base = cache.row_offsets[row];
+            match self.last_row_layout {
+                Some(ref layout) => {
+                    for (pos, &kk) in layout.active_atoms[row].iter().enumerate() {
+                        if rho.log_ard[kk].is_empty() {
+                            continue;
+                        }
+                        let start = layout.coord_starts[row][pos];
+                        let coord = &self.assignment.coords[kk];
+                        for axis in 0..coord.latent_dim() {
+                            let alpha = ard_precisions[kk][axis];
+                            let t = coord.row(row)[axis];
+                            let hess = w_row
+                                * ArdAxisPrior::eval(alpha, t, periods[kk][axis])
+                                    .psd_majorizer_hess();
+                            if hess == 0.0 {
+                                continue;
+                            }
+                            let flat = rho.ard_flat_index(kk, axis);
+                            let c = c_by_flat
+                                .entry(flat)
+                                .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+                            let g_idx = base + start + axis;
+                            c[[g_idx, g_idx]] += hess;
+                        }
+                    }
+                }
+                None => {
+                    for kk in 0..self.k_atoms() {
+                        if rho.log_ard[kk].is_empty() {
+                            continue;
+                        }
+                        let coord = &self.assignment.coords[kk];
+                        for axis in 0..coord.latent_dim() {
+                            let alpha = ard_precisions[kk][axis];
+                            let t = coord.row(row)[axis];
+                            let hess = w_row
+                                * ArdAxisPrior::eval(alpha, t, periods[kk][axis])
+                                    .psd_majorizer_hess();
+                            if hess == 0.0 {
+                                continue;
+                            }
+                            let flat = rho.ard_flat_index(kk, axis);
+                            let c = c_by_flat
+                                .entry(flat)
+                                .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+                            let g_idx = base + coord_offsets[kk] + axis;
+                            c[[g_idx, g_idx]] += hess;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Precompute G·Cᵢ, H_bd⁻¹·Cᵢ, and their traces for each flat coordinate.
+        let flats: Vec<usize> = c_by_flat.keys().copied().collect();
+        let mut gc: Vec<Array2<f64>> = Vec::with_capacity(flats.len());
+        let mut hc: Vec<Array2<f64>> = Vec::with_capacity(flats.len());
+        let mut tr_g: Vec<f64> = Vec::with_capacity(flats.len());
+        let mut tr_h: Vec<f64> = Vec::with_capacity(flats.len());
+        for &flat in &flats {
+            let c = &c_by_flat[&flat];
+            let gci = g.dot(c);
+            let hci = h_bd.dot(c);
+            tr_g.push((0..dim).map(|d| gci[[d, d]]).sum());
+            tr_h.push((0..dim).map(|d| hci[[d, d]]).sum());
+            gc.push(gci);
+            hc.push(hci);
+        }
+
+        // block[i,j] = ½·δ_{ij}·(tr(G Cᵢ) − tr(H_bd⁻¹ Cᵢ))
+        //            − ½·(tr(G Cᵢ G C_j) − tr(H_bd⁻¹ Cᵢ H_bd⁻¹ C_j)).
+        let mut hessian = Array2::<f64>::zeros((n_params, n_params));
+        for (ii, &fi) in flats.iter().enumerate() {
+            for (jj, &fj) in flats.iter().enumerate() {
+                let (gi, gj) = (&gc[ii], &gc[jj]);
+                let (hi, hj) = (&hc[ii], &hc[jj]);
+                let mut cross_g = 0.0_f64;
+                let mut cross_h = 0.0_f64;
+                for a in 0..dim {
+                    for b in 0..dim {
+                        cross_g += gi[[a, b]] * gj[[b, a]];
+                        cross_h += hi[[a, b]] * hj[[b, a]];
+                    }
+                }
+                let diag = if ii == jj {
+                    0.5 * (tr_g[ii] - tr_h[ii])
+                } else {
+                    0.0
+                };
+                hessian[[fi, fj]] += diag - 0.5 * (cross_g - cross_h);
+            }
+        }
+        Ok(hessian)
+    }
+
     /// PATH C (#2253) — assemble the exact fixed-stratum dense outer Hessian for
     /// the small-dense ARC route from its analytic channels, and the production
     /// consumer of the per-channel methods as they land.
     ///
-    /// UNDER CONSTRUCTION: only the solver-free explicit channel
-    /// ([`Self::outer_explicit_smoothness_ard_hessian`]) is implemented; the
-    /// rank-charge `direct_rho`, deflated log-determinant Daleckii–Krein trace,
-    /// and third-order forward-sensitivity channels are still pending. Until every
+    /// UNDER CONSTRUCTION: the solver-free explicit channel
+    /// ([`Self::outer_explicit_smoothness_ard_hessian`]), the rank-charge
+    /// `direct_rho` channel, and the deflated log-determinant Daleckii–Krein trace
+    /// ([`Self::logdet_daleckii_krein_hessian`]) are implemented; only the
+    /// third-order forward-sensitivity channel is still pending. Until every
     /// channel is assembled the curvature is incomplete, so this REFUSES rather
     /// than hand back a partial Hessian — the objective keeps
     /// `DeclaredHessianForm::Unavailable` and its `eval` returns
@@ -1137,13 +1398,14 @@ impl SaeManifoldTerm {
     ) -> Result<Array2<f64>, String> {
         let mut hessian = self.outer_explicit_smoothness_ard_hessian(rho, loss.smoothness)?;
         hessian += &self.rank_charge_direct_rho_hessian(target, rho, loss, cache)?;
-        // Landed: explicit smoothness/ARD + rank-charge direct channels. Pending:
-        // the deflated log-determinant Daleckii–Krein trace and the third-order
-        // forward-sensitivity channel. Refuse partial curvature until both land.
+        hessian += &self.logdet_daleckii_krein_hessian(rho, cache)?;
+        // Landed: explicit smoothness/ARD + rank-charge direct + deflated
+        // log-determinant Daleckii–Krein trace channels. Pending: the third-order
+        // forward-sensitivity channel. Refuse partial curvature until it lands.
         Err(format!(
             "PATH C exact fixed-stratum outer Hessian is incomplete: the {}×{} explicit \
-             smoothness/ARD + rank-charge blocks are landed, but the deflated \
-             log-determinant and third-order channels are still pending; refusing to \
+             smoothness/ARD + rank-charge + log-determinant blocks are landed, but the \
+             third-order forward-sensitivity channel is still pending; refusing to \
              advertise partial curvature",
             hessian.nrows(),
             hessian.ncols()

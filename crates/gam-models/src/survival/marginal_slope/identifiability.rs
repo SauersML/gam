@@ -590,7 +590,7 @@ pub struct SurvivalParametricCompiled {
     pub drops_by_block: (usize, usize, usize),
 }
 
-fn wrap_design_with_transform(
+pub(crate) fn wrap_design_with_transform(
     raw: DesignMatrix,
     v: &Array2<f64>,
     context: &str,
@@ -1409,6 +1409,7 @@ pub fn apply_compiled_map_to_designs(
         time_design_derivative_exit: time_deriv_out,
         marginal_design: marg_out,
         logslope_design: log_out,
+        logslope_current_from_raw: v_log,
         time_penalties,
         marginal_penalties,
         logslope_penalties,
@@ -1592,6 +1593,10 @@ pub struct CompiledSurvivalDesignsVMExact {
     pub time_design_derivative_exit: DesignMatrix,
     pub marginal_design: DesignMatrix,
     pub logslope_design: DesignMatrix,
+    /// Exact block-local map from raw log-slope coefficients to the current
+    /// compiled coordinates. Physical per-score channels use this same map to
+    /// emit full-width current-coordinate Jacobian rows.
+    pub logslope_current_from_raw: Array2<f64>,
     /// Per-block penalties, each pulled back through that block's OWN
     /// diagonal reparameterisation `V_b` as `V_bᵀ S_b V_b`. The result
     /// is a per-block-width `PenaltyMatrix::Dense`

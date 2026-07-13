@@ -145,6 +145,7 @@ mod intercept;
 mod joint_eval;
 mod joint_workspace;
 mod kkt_refusal;
+mod logslope_layout;
 mod newton_operators;
 #[cfg(test)]
 mod poly_arith_tests;
@@ -167,6 +168,7 @@ pub(crate) use hessian::*;
 pub(crate) use joint_eval::*;
 pub(crate) use joint_workspace::*;
 pub(crate) use kkt_refusal::*;
+pub(crate) use logslope_layout::*;
 pub(crate) use primary_geometry::*;
 pub(crate) use row_kernel::*;
 pub use row_math::*;

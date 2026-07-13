@@ -121,6 +121,7 @@ pub(crate) fn build_time_blockspec(
 
 pub(crate) fn build_logslope_blockspec(
     design: &TermCollectionDesign,
+    topology: &LogslopeTopology,
     baseline: f64,
     offset: &Array1<f64>,
     rho: Array1<f64>,
@@ -129,14 +130,23 @@ pub(crate) fn build_logslope_blockspec(
     probit_scale: f64,
 ) -> ParameterBlockSpec {
     let z_vec = z_scaling.to_vec();
-    let jac_cb: Option<Arc<dyn crate::custom_family::BlockEffectiveJacobian>> = design
-        .design
-        .try_to_dense_arc("build_logslope_blockspec")
-        .ok()
-        .map(|d| {
-            Arc::new(LogslopeBlockJacobian::new(d, z_vec, probit_scale))
-                as Arc<dyn crate::custom_family::BlockEffectiveJacobian>
-        });
+    // The legacy callback has a three-primary scalar-g contract. A per-score
+    // layout has 3+K primaries and full-width channel rows after any coefficient
+    // transform; advertising the scalar callback would silently differentiate
+    // the wrong model. The exact per-score family kernels remain authoritative.
+    let jac_cb: Option<Arc<dyn crate::custom_family::BlockEffectiveJacobian>> =
+        if topology.is_per_score() {
+            None
+        } else {
+            design
+                .design
+                .try_to_dense_arc("build_logslope_blockspec")
+                .ok()
+                .map(|d| {
+                    Arc::new(LogslopeBlockJacobian::new(d, z_vec, probit_scale))
+                        as Arc<dyn crate::custom_family::BlockEffectiveJacobian>
+                })
+        };
 
     ParameterBlockSpec {
         name: "logslope_surface".to_string(),
@@ -641,14 +651,7 @@ pub(crate) fn shift_penalty(mut penalty: BlockwisePenalty, offset: usize) -> Blo
 pub(crate) fn combine_logslope_surface_designs(
     mut designs: Vec<TermCollectionDesign>,
     specs: &[TermCollectionSpec],
-) -> Result<
-    (
-        TermCollectionDesign,
-        TermCollectionSpec,
-        Vec<std::ops::Range<usize>>,
-    ),
-    String,
-> {
+) -> Result<(TermCollectionDesign, TermCollectionSpec, LogslopeTopology), String> {
     if designs.is_empty() {
         return Err(
             "survival marginal-slope requires at least one logslope surface design".to_string(),
@@ -656,12 +659,11 @@ pub(crate) fn combine_logslope_surface_designs(
     }
     if designs.len() == 1 {
         let design = designs.remove(0);
-        let range = 0..design.design.ncols();
         let spec = specs
             .first()
             .cloned()
             .ok_or_else(|| "missing logslope surface spec".to_string())?;
-        return Ok((design, spec, vec![range]));
+        return Ok((design, spec, LogslopeTopology::shared()));
     }
     if designs.iter().any(|design| {
         design.linear_constraints.is_some() || design.coefficient_lower_bounds.is_some()
@@ -750,7 +752,8 @@ pub(crate) fn combine_logslope_surface_designs(
     combined.linear_ranges = linear_ranges;
     combined.random_effect_ranges = random_effect_ranges;
     combined.random_effect_levels = random_effect_levels;
-    Ok((combined, concatenate_term_specs(specs), ranges))
+    let topology = LogslopeTopology::per_score(ranges, combined.design.ncols())?;
+    Ok((combined, concatenate_term_specs(specs), topology))
 }
 
 /// Compute a baseline slope from the actual survival marginal-slope likelihood,

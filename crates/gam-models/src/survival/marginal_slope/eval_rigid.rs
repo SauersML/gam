@@ -27,18 +27,15 @@ impl SurvivalMarginalSlopeFamily {
         q_geom: SurvivalMarginalSlopeDynamicRowValues,
         block_states: &[ParameterBlockState],
         probit_scale: f64,
+        logslope_workspace: &mut LogslopeRowWorkspace,
     ) -> Result<f64, String> {
-        let slopes = if self.per_z_logslope_active() {
-            self.logslope_surface_values_for_row(row, &block_states[2].beta)?
-        } else {
-            self.logslope_vector_for_row(row, &block_states[2].eta)?
-        };
+        self.fill_logslope_values_for_row(row, block_states, logslope_workspace)?;
         let z = self.z.row(row).to_vec();
         survival_marginal_slope_vector_neglog(
             q_geom.q0,
             q_geom.q1,
             q_geom.qd1,
-            &slopes,
+            logslope_workspace.values(),
             &z,
             &self.score_covariance,
             self.weights[row],

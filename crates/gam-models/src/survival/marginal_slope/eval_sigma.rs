@@ -46,6 +46,7 @@ impl SurvivalMarginalSlopeFamily {
             row_iter.len(),
             |range| -> Result<f64, String> {
                 let mut ll = 0.0;
+                let mut logslope_workspace = self.logslope_row_workspace()?;
                 for idx in range {
                     let weighted = row_iter[idx];
                     let i = weighted.index;
@@ -57,6 +58,7 @@ impl SurvivalMarginalSlopeFamily {
                                 q_geom,
                                 block_states,
                                 probit_scale,
+                                &mut logslope_workspace,
                             )?;
                         continue;
                     }

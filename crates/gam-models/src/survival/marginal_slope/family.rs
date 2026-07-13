@@ -32,9 +32,10 @@ pub(crate) struct SurvivalMarginalSlopeFamily {
     pub(crate) derivative_offset_exit: Arc<Array1<f64>>,
     /// Baseline covariate block: contributes additively to q0 and q1, but not qd1.
     pub(crate) marginal_design: DesignMatrix,
-    /// Log-slope block: standard single design.
-    pub(crate) logslope_design: DesignMatrix,
-    pub(crate) logslope_surface_ranges: Vec<std::ops::Range<usize>>,
+    /// The log-slope coefficient design, its physical channels in current
+    /// coordinates, and their baseline + smooth offsets. This is the sole
+    /// source of truth for both scalar and per-score log-slope geometry.
+    pub(crate) logslope_layout: LogslopeLayout,
     pub(crate) score_warp: Option<DeviationRuntime>,
     pub(crate) link_dev: Option<DeviationRuntime>,
     /// Absorbed Stage-1 influence columns `Z̃_infl` at the training rows

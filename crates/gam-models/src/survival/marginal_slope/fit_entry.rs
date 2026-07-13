@@ -127,7 +127,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         .map_err(|e| format!("failed to rebuild frozen probe SMGS joint designs: {e}"))?;
     let marginal_design = joint_designs.remove(0);
     let marginalspec_boot = joint_specs.remove(0);
-    let (logslope_design, logslopespec_boot, logslope_surface_ranges) =
+    let (logslope_design, logslopespec_boot, logslope_topology) =
         combine_logslope_surface_designs(joint_designs, &joint_specs)?;
     spec.marginal_offset = marginal_design
         .compose_offset(
@@ -141,6 +141,24 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             "survival marginal-slope logslope block",
         )
         .map_err(|error| error.to_string())?;
+    let raw_logslope_design_for_layout = logslope_design.design.clone();
+    let common_logslope_offset = &spec.logslope_offset + baseline_slope;
+    let raw_logslope_layout = logslope_topology.materialize_identity(
+        raw_logslope_design_for_layout.clone(),
+        &common_logslope_offset,
+    )?;
+    if logslope_topology.is_per_score()
+        && logslope_topology.score_count() != spec.z.ncols()
+    {
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope has {} per-score logslope channels but latent score dimension K={}",
+                logslope_topology.score_count(),
+                spec.z.ncols(),
+            ),
+        }
+        .into());
+    }
 
     // Phase-4b parametric identifiability pre-flight (observability-only).
     //
@@ -826,6 +844,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         gam_linalg::matrix::DesignMatrix,
         gam_terms::smooth::TermCollectionDesign,
         gam_terms::smooth::TermCollectionDesign,
+        LogslopeLayout,
         Option<gam_solve::gauge::Gauge>,
         Option<Vec<crate::custom_family::PenaltyMatrix>>,
         Option<Vec<crate::custom_family::PenaltyMatrix>>,
@@ -838,6 +857,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         design_derivative_exit,
         marginal_design,
         logslope_design,
+        post_cutover_logslope_layout,
         smgs_lift_v,
         time_penalties_vm,
         marginal_penalties_vm,
@@ -854,6 +874,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             spec.time_block.design_derivative_exit.clone(),
             marginal_design.clone(),
             logslope_design.clone(),
+            raw_logslope_layout.clone(),
             None,
             None,
             None,
@@ -1524,13 +1545,19 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 let mut marg_out = marginal_design.clone();
                 marg_out.design = applied.marginal_design;
                 let mut log_out = logslope_design.clone();
-                log_out.design = applied.logslope_design;
+                let compiled_logslope_layout = logslope_topology.materialize(
+                    raw_logslope_design_for_layout.clone(),
+                    applied.logslope_current_from_raw.clone(),
+                    &common_logslope_offset,
+                )?;
+                log_out.design = compiled_logslope_layout.coefficient_design().clone();
                 (
                     applied.time_design_entry,
                     applied.time_design_exit,
                     applied.time_design_derivative_exit,
                     marg_out,
                     log_out,
+                    compiled_logslope_layout,
                     Some(lift),
                     Some(applied.time_penalties),
                     Some(applied.marginal_penalties),
@@ -1544,6 +1571,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 spec.time_block.design_derivative_exit.clone(),
                 marginal_design.clone(),
                 logslope_design.clone(),
+                raw_logslope_layout.clone(),
                 None,
                 None,
                 None,
@@ -1601,8 +1629,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign,
                        sigma: Option<f64>,
-                       flex: FlexActivation|
-     -> SurvivalMarginalSlopeFamily {
+                       flex: FlexActivation,
+                       coords: BlockDesignCoords|
+     -> Result<SurvivalMarginalSlopeFamily, String> {
         let (score_warp_active, link_dev_active) = match flex {
             FlexActivation::OffForRigidPilot => (None, None),
             FlexActivation::On => (score_warp_runtime.clone(), link_dev_runtime.clone()),
@@ -1615,7 +1644,15 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             FlexActivation::OffForRigidPilot => None,
             FlexActivation::On => influence_absorber_residualized.clone(),
         };
-        SurvivalMarginalSlopeFamily {
+        let logslope_layout = match coords {
+            BlockDesignCoords::PostCutover => post_cutover_logslope_layout.clone(),
+            BlockDesignCoords::RematerializedRaw => logslope_topology.materialize_identity(
+                logslope_design.design.clone(),
+                &common_logslope_offset,
+            )?,
+        };
+        logslope_layout.validate_for(spec.z.ncols())?;
+        Ok(SurvivalMarginalSlopeFamily {
             n,
             event: Arc::clone(&event),
             weights: Arc::clone(&weights),
@@ -1630,8 +1667,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             offset_exit: Arc::clone(&offset_exit),
             derivative_offset_exit: Arc::clone(&derivative_offset_exit),
             marginal_design: marginal_design.design.clone(),
-            logslope_design: logslope_design.design.clone(),
-            logslope_surface_ranges: logslope_surface_ranges.clone(),
+            logslope_layout,
             score_warp: score_warp_active,
             link_dev: link_dev_active,
             influence_absorber: influence_absorber_active,
@@ -1642,7 +1678,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
             auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-        }
+        })
     };
 
     let build_blocks = |rho: &Array1<f64>,
@@ -1738,6 +1774,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             ),
             build_logslope_blockspec(
                 logslope_design,
+                &logslope_topology,
                 baseline_slope,
                 &spec.logslope_offset,
                 rho_logslope,
@@ -2003,7 +2040,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             &logslope_design,
             initial_sigma,
             FlexActivation::OffForRigidPilot,
-        );
+            BlockDesignCoords::PostCutover,
+        )?;
         let mut pilot_options = options.clone();
         // The pilot is only a warm start. Avoid production covariance assembly
         // and cap inner cycles so a bad seed cannot silently consume minutes
@@ -2146,7 +2184,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         &logslope_design,
         initial_sigma,
         FlexActivation::On,
-    );
+        BlockDesignCoords::PostCutover,
+    )?;
     let (joint_gradient, joint_hessian) =
         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
@@ -2295,7 +2334,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             )?;
             let sigma = sigma_from_theta(theta);
             sigma_hint.replace(sigma);
-            let family = make_family(&designs[0], &designs[1], sigma, FlexActivation::On);
+            let family = make_family(
+                &designs[0],
+                &designs[1],
+                sigma,
+                FlexActivation::On,
+                BlockDesignCoords::RematerializedRaw,
+            )?;
             let fit = inner_fit(&family, &blocks, options)?;
             let mut hints_mut = hints.borrow_mut();
             if let Some(block) = fit.block_states.first() {
@@ -2378,7 +2423,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 }
                 other => other,
             };
-            let family = make_family(&designs[0], &designs[1], sigma, FlexActivation::On);
+            let family = make_family(
+                &designs[0],
+                &designs[1],
+                sigma,
+                FlexActivation::On,
+                BlockDesignCoords::RematerializedRaw,
+            )?;
             let derivative_blocks = if matches!(effective_mode, EvalMode::ValueOnly) {
                 Arc::new(vec![Vec::new(); blocks.len()])
             } else {
@@ -2457,7 +2508,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             }
             let sigma = sigma_from_theta(theta);
             sigma_hint.replace(sigma);
-            let family = make_family(&designs[0], &designs[1], sigma, FlexActivation::On);
+            let family = make_family(
+                &designs[0],
+                &designs[1],
+                sigma,
+                FlexActivation::On,
+                BlockDesignCoords::RematerializedRaw,
+            )?;
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval_id = outer_eval_counter.get();
             outer_eval_counter.set(eval_id.wrapping_add(1));
@@ -2707,7 +2764,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             &solved.designs[1],
             *sigma_hint.borrow(),
             FlexActivation::On,
-        );
+            BlockDesignCoords::RematerializedRaw,
+        )?;
         final_family.offset_channel_geometry(&solved.fit.block_states)?
     };
 
