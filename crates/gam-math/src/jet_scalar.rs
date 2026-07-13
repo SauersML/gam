@@ -830,7 +830,9 @@ impl<'arena> RuntimeJetScalar<'arena> for RuntimeValue {
                 .all(|(input, &scale)| scale == 0.0 || input.dimension == dimension)
         );
         Self {
-            value: derivative_stacks.iter().map(|stack| stack[0]).sum(),
+            value: derivative_stacks
+                .iter()
+                .fold(0.0, |sum, stack| sum + stack[0]),
             dimension,
         }
     }
