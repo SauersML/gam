@@ -1383,6 +1383,7 @@ fn steer_delta_from_arrays(
     fisher_factors: Option<ndarray::ArrayView3<'_, f64>>,
     fisher_mass_residual: Option<ndarray::ArrayView1<'_, f64>>,
     fisher_provenance: Option<&str>,
+    fisher_factor_kind: Option<&str>,
 ) -> PyResult<gam::inference::steering::SteerPlan> {
     let fisher_metric = match fisher_factors {
         Some(u3) => {
@@ -1391,6 +1392,7 @@ fn steer_delta_from_arrays(
                 n_obs,
                 p_out,
                 fisher_provenance,
+                fisher_factor_kind,
                 fisher_mass_residual,
             )
             .map_err(py_value_error)?;
@@ -1775,6 +1777,7 @@ fn steer_plan_to_pydict(
     fisher_factors = None,
     fisher_mass_residual = None,
     fisher_provenance = None,
+    fisher_factor_kind = None,
 ))]
 fn sae_steer_delta<'py>(
     py: Python<'py>,
@@ -1801,6 +1804,7 @@ fn sae_steer_delta<'py>(
     fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
     fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
     fisher_provenance: Option<String>,
+    fisher_factor_kind: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
         decoder_blocks.iter().map(|b| b.as_array()).collect();
@@ -1836,6 +1840,7 @@ fn sae_steer_delta<'py>(
         fisher_view,
         fisher_mass_view,
         fisher_provenance.as_deref(),
+        fisher_factor_kind.as_deref(),
     )?;
     steer_plan_to_pydict(py, plan)
 }
