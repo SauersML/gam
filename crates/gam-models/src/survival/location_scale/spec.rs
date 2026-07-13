@@ -528,12 +528,31 @@ pub fn survival_fit_from_parts(
     if let Some(geom) = geometry.as_ref() {
         geom.validate_numeric_finiteness()
             .map_err(|e| e.to_string())?;
-        let (rows, cols) = geom.penalized_hessian.dim();
-        if rows != total_p || cols != total_p {
+        let mut saved_block_widths = vec![
+            beta_time.len(),
+            beta_threshold.len(),
+            beta_log_sigma.len(),
+        ];
+        if let Some(beta) = beta_link_wiggle.as_ref() {
+            saved_block_widths.push(beta.len());
+        }
+        if geom.coefficient_gauge.raw_widths() != saved_block_widths {
             return Err(SurvivalLocationScaleError::InvalidConfiguration {
                 reason: format!(
-                    "survival_fit.geometry.penalized_hessian must be {}x{}, got {}x{}",
-                    total_p, total_p, rows, cols
+                    "survival_fit.geometry coefficient-gauge raw block widths {:?} do not match saved coefficient widths {:?}",
+                    geom.coefficient_gauge.raw_widths(),
+                    saved_block_widths,
+                ),
+            }
+            .into());
+        }
+        let active_p = geom.coefficient_gauge.reduced_total();
+        let (rows, cols) = geom.penalized_hessian.dim();
+        if rows != active_p || cols != active_p {
+            return Err(SurvivalLocationScaleError::InvalidConfiguration {
+                reason: format!(
+                    "survival_fit.geometry active-coordinate penalized_hessian must be {}x{}, got {}x{}",
+                    active_p, active_p, rows, cols
                 ),
             }
             .into());
