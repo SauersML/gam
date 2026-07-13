@@ -2552,6 +2552,21 @@ pub fn arrow_factor_max_pivot(cache: &ArrowFactorCache) -> Option<f64> {
     max_pivot
 }
 
+/// Spectral pseudo-inverse of the cached β-Schur operator `M = L Lᵀ`, deflated
+/// across the numerically-null curvature directions using the solver's
+/// canonical rank floor ([`SPECTRAL_DEFLATION_REL_FLOOR`]).
+///
+/// `evecs` are the orthonormal eigenvectors of `M` (columns), `inv_evals[i]`
+/// is `1/λᵢ` for a kept direction and exactly `0.0` for a deflated one, so
+/// `M⁺ = evecs · diag(inv_evals) · evecsᵀ` is the Moore–Penrose pseudo-inverse
+/// restricted to the kept subspace. Away from the ρ lower face every eigenvalue
+/// sits far above the floor, no direction deflates, and `M⁺` equals `M⁻¹` to
+/// round-off — so the deflated selected inverse reduces to the plain one.
+struct DeflatedSchurPseudoInverse {
+    evecs: Array2<f64>,
+    inv_evals: Array1<f64>,
+}
+
 impl ArrowFactorCache {
     pub fn n_rows(&self) -> usize {
         self.htt_factors.len()
@@ -3068,6 +3083,191 @@ impl ArrowFactorCache {
             }
         }
         Ok(out)
+    }
+
+    /// Deflation-aware selected inverse of the cached β-Schur complement — a
+    /// drop-in for [`Self::schur_inverse_apply`] that pseudo-inverts across the
+    /// numerically-null curvature directions instead of dividing by them.
+    ///
+    /// # Why this exists (the λ→0 EDF divergence)
+    ///
+    /// The REML EDF/log-det-trace term contracts `(H⁻¹)_ββ` against `λS`. At the
+    /// ρ lower face a decoder direction can be null in BOTH the data
+    /// (`J_ββ ≈ 0`) AND the penalty (`s ≈ 0`), making `S_β = J + λS` singular
+    /// along it. The plain [`Self::schur_inverse_apply`] then divides by a
+    /// ~zero pivot and returns `Inf`/`NaN` (the value stays finite — only this
+    /// `H⁻¹`-contraction blows up). This method instead forms the spectral
+    /// pseudo-inverse `M⁺` of the SAME operator `M = L Lᵀ` the plain path
+    /// inverts, dropping every eigen-direction at or below the solver's
+    /// canonical rank floor `SPECTRAL_DEFLATION_REL_FLOOR · max|λ|` (the exact
+    /// threshold [`factor_spectral_deflated_criterion_row`] and the per-row
+    /// gauge deflation already use — NOT a new epsilon and NOT a λ-smoothing
+    /// floor). A doubly-null direction (`j ≈ 0 ∧ s ≈ 0`) deflates to `0` (it is
+    /// unidentifiable, not a real DOF); a penalty-only direction survives. The
+    /// result is finite by construction.
+    ///
+    /// # Interior equivalence
+    ///
+    /// Away from the boundary every eigenvalue of `M` sits orders of magnitude
+    /// above the floor, so NO direction deflates and `M⁺ = M⁻¹` to round-off —
+    /// this returns the plain selected inverse with no silent bias. Only the
+    /// λ→0 face deflates. The exact-Newton path keeps calling the plain
+    /// [`Self::schur_inverse_apply`] and is byte-for-byte unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Same dense-Schur / undamped-factor / `rhs.len() != K` contract as
+    /// [`Self::schur_inverse_apply`], plus a failed symmetric eigendecomposition
+    /// of the reconstructed `M`.
+    pub fn schur_inverse_apply_deflated(
+        &self,
+        rhs: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, ArrowSchurError> {
+        if rhs.len() != self.k {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "schur_inverse_apply_deflated: rhs length {} != K {}",
+                    rhs.len(),
+                    self.k
+                ),
+            });
+        }
+        let deflated = self.deflated_schur_pseudo_inverse()?;
+        Ok(self.apply_deflated_pseudo_inverse(&deflated, rhs))
+    }
+
+    /// Deflation-aware dense principal sub-block of `(H⁻¹)_ββ` — the drop-in for
+    /// [`Self::schur_inverse_block`] used by the per-atom EDF trace. Identical
+    /// contract, but each column is solved through the spectral pseudo-inverse
+    /// (see [`Self::schur_inverse_apply_deflated`]) so a boundary atom with a
+    /// doubly-null decoder direction yields a finite block instead of `NaN`.
+    ///
+    /// The eigendecomposition of `M = L Lᵀ` is computed ONCE and reused across
+    /// all `W = block.len()` columns.
+    pub fn schur_inverse_block_deflated(
+        &self,
+        block: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, ArrowSchurError> {
+        if block.end > self.k {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "schur_inverse_block_deflated: block end {} exceeds K {}",
+                    block.end, self.k
+                ),
+            });
+        }
+        let deflated = self.deflated_schur_pseudo_inverse()?;
+        let w = block.len();
+        let mut out = Array2::<f64>::zeros((w, w));
+        let mut e_j = Array1::<f64>::zeros(self.k);
+        for (jc, j) in block.clone().enumerate() {
+            e_j.fill(0.0);
+            e_j[j] = 1.0;
+            let col = self.apply_deflated_pseudo_inverse(&deflated, e_j.view());
+            for (ic, i) in block.clone().enumerate() {
+                out[[ic, jc]] = col[i];
+            }
+        }
+        // (H⁻¹)_ββ is symmetric; symmetrize to clear round-off asymmetry.
+        for ic in 0..w {
+            for jc in (ic + 1)..w {
+                let avg = 0.5 * (out[[ic, jc]] + out[[jc, ic]]);
+                out[[ic, jc]] = avg;
+                out[[jc, ic]] = avg;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reconstruct the SPD operator `M = L Lᵀ` this cache inverts (the plain
+    /// [`Self::schur_inverse_apply`] solves `M x = rhs`; when a β-gauge quotient
+    /// is installed `M = P S P + Q Qᵀ`), symmetric-eigendecompose it, and deflate
+    /// every eigen-direction at or below the canonical rank floor
+    /// `SPECTRAL_DEFLATION_REL_FLOOR · max|λ|` (with the same hysteresis band the
+    /// per-row spectral deflation uses, so a direction parked at the floor does
+    /// not flicker across a ρ-walk).
+    fn deflated_schur_pseudo_inverse(
+        &self,
+    ) -> Result<DeflatedSchurPseudoInverse, ArrowSchurError> {
+        let Some(schur_factor) = self.schur_factor.as_ref() else {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "schur_inverse_apply_deflated requires a dense Schur factor; \
+                         the InexactPCG mode does not form one"
+                    .to_string(),
+            });
+        };
+        if !self.schur_factor_is_undamped {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "schur_inverse_apply_deflated refuses a Schur factor that was not built \
+                         from the undamped evidence row factors"
+                    .to_string(),
+            });
+        }
+        let k = self.k;
+        // Reconstruct `M = L Lᵀ` from the LOWER triangle only (the strict-upper
+        // entries of the stored factor are not part of the Cholesky factor and
+        // must not enter the product).
+        let mut lower = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            for j in 0..=i {
+                lower[[i, j]] = schur_factor[[i, j]];
+            }
+        }
+        let m = lower.dot(&lower.t());
+        let (evals, evecs) = m.eigh(Side::Lower).map_err(|err| {
+            ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "schur_inverse_apply_deflated: symmetric eigendecomposition of the \
+                     reconstructed β-Schur operator failed: {err:?}"
+                ),
+            }
+        })?;
+        let max_abs = evals.iter().fold(0.0_f64, |acc, &v| {
+            if v.is_finite() { acc.max(v.abs()) } else { acc }
+        });
+        if !(max_abs.is_finite() && max_abs > 0.0) {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "schur_inverse_apply_deflated: reconstructed β-Schur operator has no \
+                         finite positive spectrum"
+                    .to_string(),
+            });
+        }
+        // Canonical rank floor, with the SAME hysteresis band the per-row
+        // spectral deflation applies — this is a rank-deflation (deciding which
+        // curvature directions are numerically null), not a λ-smoothing floor.
+        let floor = SPECTRAL_DEFLATION_REL_FLOOR * max_abs;
+        let deflate_floor = floor * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
+        let inv_evals = evals.mapv(|lambda| {
+            if lambda.is_finite() && lambda > deflate_floor {
+                1.0 / lambda
+            } else {
+                0.0
+            }
+        });
+        Ok(DeflatedSchurPseudoInverse { evecs, inv_evals })
+    }
+
+    /// Apply a precomputed [`DeflatedSchurPseudoInverse`] to one RHS, mirroring
+    /// the β-gauge-quotient complement projection of the plain
+    /// [`Self::schur_inverse_apply`]: `P M⁺ P rhs` when a quotient is installed,
+    /// `M⁺ rhs` otherwise.
+    fn apply_deflated_pseudo_inverse(
+        &self,
+        deflated: &DeflatedSchurPseudoInverse,
+        rhs: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let rhs_owned = match self.beta_gauge_quotient.as_ref() {
+            Some(quotient) => quotient.project_complement(rhs),
+            None => rhs.to_owned(),
+        };
+        // M⁺ r = Q · diag(1/λ̃) · Qᵀ r.
+        let coeffs = deflated.evecs.t().dot(&rhs_owned);
+        let scaled = &coeffs * &deflated.inv_evals;
+        let solved = deflated.evecs.dot(&scaled);
+        match self.beta_gauge_quotient.as_ref() {
+            Some(quotient) => quotient.project_complement(solved.view()),
+            None => solved,
+        }
     }
 }
 
