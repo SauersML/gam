@@ -155,9 +155,13 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
     /// structural direct-dense build (`scop_gradient_and_negative_hessian`).
     /// The right representation depends entirely on what the consumer does:
     ///
-    /// - `InnerSolve` only applies `H · v`, so stream the HVP — building the
-    ///   dense matrix would be `O(p²)` memory and a `Θ(n·p²)` build paid up
-    ///   front for a solve that may take far fewer than `p` matvecs.
+    /// - `InnerSolve` uses the dense spectral trust-region solver whenever the
+    ///   workspace's bounded dense cache is enabled. The operator diagonal and
+    ///   first HVP both populate that exact same cache, so returning `Operator`
+    ///   would hide an already-materialized Hessian behind an SPD-PCG contract.
+    ///   That loses the negative-curvature certificate and hard-case step needed
+    ///   by SCOP's nonconvex squared shape chart while saving no row work. Wider
+    ///   systems, for which the cache is disabled, remain streamed.
     /// - `LogdetFactorization` factorizes `H + S_λ` and therefore needs a dense
     ///   matrix regardless. Returning `Operator` here only makes the dispatch
     ///   wrap the HVP and forces the logdet consumer to immediately re-densify
@@ -170,6 +174,9 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
         intent: MaterializationIntent,
     ) -> JointHessianSourcePreference {
         match intent {
+            MaterializationIntent::InnerSolve if self.dense_hessian_cache_enabled() => {
+                JointHessianSourcePreference::Dense
+            }
             MaterializationIntent::LogdetFactorization => JointHessianSourcePreference::Dense,
             MaterializationIntent::InnerSolve
             | MaterializationIntent::OuterEvaluation

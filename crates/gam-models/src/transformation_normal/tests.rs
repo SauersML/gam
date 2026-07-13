@@ -1571,6 +1571,11 @@ pub(crate) fn ctn_joint_hessian_workspace_matvec_into_primes_dense_cache() {
     )
     .expect("workspace build");
     assert!(workspace.dense_hessian_cache_enabled());
+    assert_eq!(
+        workspace.hessian_source_preference_for_intent(MaterializationIntent::InnerSolve),
+        JointHessianSourcePreference::Dense,
+        "a CTN Hessian that will be cached densely must expose that matrix to the inner spectral mode solver"
+    );
     assert!(workspace.dense_hessian_cache.get().is_none());
 
     let dense = family
