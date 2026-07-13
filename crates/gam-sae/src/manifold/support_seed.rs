@@ -143,6 +143,40 @@ fn effective_atom(
     ))
 }
 
+fn resolve_support_atoms(
+    atom_basis: &[String],
+    atom_dim: &[usize],
+) -> Result<(Vec<SaeAtomBasisKind>, Vec<usize>, Vec<SaeAssignmentAtomSpec>), String> {
+    if atom_basis.len() != atom_dim.len() {
+        return Err(format!(
+            "support-sparse atom metadata lengths differ: basis={}, dims={}",
+            atom_basis.len(),
+            atom_dim.len()
+        ));
+    }
+    let mut atom_kinds = Vec::with_capacity(atom_basis.len());
+    let mut effective_atom_dim = Vec::with_capacity(atom_basis.len());
+    let mut atom_specs = Vec::with_capacity(atom_basis.len());
+    for atom in 0..atom_basis.len() {
+        let kind = sae_atom_basis_kind_from_str(&atom_basis[atom]);
+        let (latent_dim, spec) = effective_atom(atom_dim[atom], &kind, atom)?;
+        atom_kinds.push(kind);
+        effective_atom_dim.push(latent_dim);
+        atom_specs.push(spec);
+    }
+    Ok((atom_kinds, effective_atom_dim, atom_specs))
+}
+
+/// Resolve public atom dimensions to the actual heterogeneous chart widths
+/// charged by support-sparse admission. In particular, a periodic atom's
+/// public dimension selects harmonic resolution while its live chart is 1-D.
+pub fn sae_support_effective_atom_dims(
+    atom_basis: &[String],
+    atom_dim: &[usize],
+) -> Result<Vec<usize>, String> {
+    resolve_support_atoms(atom_basis, atom_dim).map(|(_, dimensions, _)| dimensions)
+}
+
 fn chart_coordinate(kind: &SaeAtomBasisKind, axis: usize, raw: f64) -> f64 {
     match kind {
         SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => {
@@ -202,16 +236,8 @@ pub fn build_sae_support_seed(
         ));
     }
 
-    let mut atom_kinds = Vec::with_capacity(k_atoms);
-    let mut effective_atom_dim = Vec::with_capacity(k_atoms);
-    let mut atom_specs = Vec::with_capacity(k_atoms);
-    for atom in 0..k_atoms {
-        let kind = sae_atom_basis_kind_from_str(&request.atom_basis[atom]);
-        let (latent_dim, spec) = effective_atom(request.atom_dim[atom], &kind, atom)?;
-        atom_kinds.push(kind);
-        effective_atom_dim.push(latent_dim);
-        atom_specs.push(spec);
-    }
+    let (atom_kinds, effective_atom_dim, atom_specs) =
+        resolve_support_atoms(request.atom_basis, request.atom_dim)?;
     let d_max = effective_atom_dim.iter().copied().max().unwrap_or(1);
     if d_max != budget.d_max {
         return Err(format!(
