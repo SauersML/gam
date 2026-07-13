@@ -669,6 +669,46 @@ mod tests {
     }
 
     #[test]
+    fn frailty_resolvers_preserve_fixed_vs_learned_scale_mode() {
+        assert_eq!(
+            resolve_cli_frailty_spec(
+                Some(CliFrailtyKind::GaussianShift),
+                Some(0.3),
+                None,
+                "test",
+            )
+            .unwrap(),
+            FrailtySpec::GaussianShift {
+                scale: FrailtyScale::Fixed { sigma: 0.3 },
+            }
+        );
+        assert_eq!(
+            resolve_cli_frailty_spec(
+                Some(CliFrailtyKind::GaussianShift),
+                None,
+                None,
+                "test",
+            )
+            .unwrap(),
+            FrailtySpec::GaussianShift {
+                scale: DEFAULT_LEARNED_FRAILTY_SCALE,
+            }
+        );
+        assert_eq!(
+            parse_json_frailty_spec(
+                Some("hazard-multiplier".to_string()),
+                None,
+                Some("full".to_string()),
+            )
+            .unwrap(),
+            FrailtySpec::HazardMultiplier {
+                scale: DEFAULT_LEARNED_FRAILTY_SCALE,
+                loading: HazardLoading::Full,
+            }
+        );
+    }
+
+    #[test]
     fn rich_request_document_resolves_every_frontend_parity_field() {
         let request = FitRequestDocument::new(
             "y ~ duchon(z)",
