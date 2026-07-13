@@ -1043,12 +1043,8 @@ impl<const K: usize> FlexThirdOutput for FixedJet3<K> {
         crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
         crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
     ) {
-        let flatten = |matrix: &[[f64; K]; K]| {
-            matrix
-                .iter()
-                .flat_map(|row| row.iter().copied())
-                .collect()
-        };
+        let flatten =
+            |matrix: &[[f64; K]; K]| matrix.iter().flat_map(|row| row.iter().copied()).collect();
         (
             crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase {
                 eta: eta.inner.base.0.v,
@@ -5229,6 +5225,31 @@ mod moment_engine_tests {
         cmp_mat("chi_uv_dir", &chi.eps.h, &hand.chi_uv_dir);
         cmp_vec("d_u_dir", &dnorm.eps.g, hand.d_u_dir.as_slice().unwrap());
         cmp_mat("d_uv_dir", &dnorm.eps.h, &hand.d_uv_dir);
+
+        // The dynamic p=4 production schedule retains one bounded tape per
+        // worker. Repeating an identical-width row must not grow that warmed
+        // high-water mark.
+        let run_dynamic_row = || {
+            with_flex_third_jet_arena(|arena| {
+                family
+                    .compute_survival_timepoint_directional_jet_from_cached(
+                        row, &primary, q1, primary.q1, a1, g, None, None, o_infl, &cached, &dir,
+                        arena,
+                    )
+                    .expect("dynamic FLEX third row")
+            })
+        };
+        let retained_bytes = || with_flex_third_jet_arena(|arena| arena.allocated_bytes());
+        run_dynamic_row();
+        let first = retained_bytes();
+        assert!(first > 0, "FLEX third arena did not retain its warm tape");
+        run_dynamic_row();
+        let second = retained_bytes();
+        assert_eq!(
+            second, first,
+            "same-width FLEX third row grew its warmed arena: {first} -> {second} bytes"
+        );
+        eprintln!("G932_FLEX_THIRD_ARENA retained_bytes={second}");
     }
 
     /// #932 grad-only cutover: the production grad-only timepoint
