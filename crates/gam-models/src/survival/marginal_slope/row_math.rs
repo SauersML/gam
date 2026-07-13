@@ -2220,6 +2220,112 @@ mod tests {
         }
     }
 
+    /// Temporary #932 release sweep for every width promoted to the packed
+    /// fixed schedule. This prevents the k=3 fixture from hiding a larger-width
+    /// stack or code-size cliff before the dispatch policy is made permanent.
+    #[test]
+    fn release_measure_packed_widths_k1_to_k8_vs_strongest_hand_932() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn best_ns<T, F: FnMut() -> T>(iterations: usize, mut evaluate: F) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    black_box(evaluate());
+                }
+                best = best.min(start.elapsed().as_nanos() as f64 / iterations as f64);
+            }
+            best
+        }
+
+        macro_rules! measure_width {
+            ($k:literal, $dim:literal) => {{
+                let slopes: Vec<f64> = (0..$k)
+                    .map(|axis| {
+                        let magnitude = 0.27 + 0.08 * axis as f64;
+                        if axis % 2 == 0 { magnitude } else { -magnitude }
+                    })
+                    .collect();
+                let scores: Vec<f64> = (0..$k)
+                    .map(|axis| -1.25 + 2.5 * (axis + 1) as f64 / ($k + 1) as f64)
+                    .collect();
+                let diagonal =
+                    MarginalSlopeCovariance::Diagonal(Array1::from_shape_fn($k, |axis| {
+                        0.8 + 0.07 * axis as f64
+                    }));
+                let full =
+                    MarginalSlopeCovariance::Full(Array2::from_shape_fn(($k, $k), |(row, col)| {
+                        if row == col {
+                            1.0 + 0.05 * row as f64
+                        } else {
+                            0.02 / (1.0 + row.abs_diff(col) as f64)
+                        }
+                    }));
+                let low_rank = MarginalSlopeCovariance::LowRank(Array2::from_shape_fn(
+                    ($k, $k.min(3)),
+                    |(row, column)| {
+                        let sign = if (row + column) % 2 == 0 { 1.0 } else { -1.0 };
+                        sign * (0.17 + 0.025 * row as f64 + 0.04 * column as f64)
+                    },
+                ));
+                let cases = [
+                    ("diagonal", &diagonal),
+                    ("full", &full),
+                    ("low_rank", &low_rank),
+                ];
+
+                for &(label, covariance) in &cases {
+                    let mut workspace = RigidVectorRowWorkspace::new();
+                    let evaluate_production = |workspace: &mut RigidVectorRowWorkspace| {
+                        row_primary_closed_form_vector(
+                            -0.28, 0.53, 1.18, &slopes, &scores, covariance, 1.21, 1.0, 1.0e-8,
+                            0.87, workspace,
+                        )
+                        .expect("packed production width")
+                    };
+                    black_box(evaluate_production(&mut workspace));
+
+                    let production_ns = best_ns(5_000, || evaluate_production(&mut workspace));
+                    let fixed_ns = best_ns(5_000, || {
+                        row_primary_closed_form_vector_fixed::<$dim>(
+                            -0.28, 0.53, 1.18, &slopes, &scores, covariance, 1.21, 1.0, 1.0e-8,
+                            0.87,
+                        )
+                        .expect("direct fixed width")
+                    });
+                    let hand_ns = best_ns(5_000, || {
+                        vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
+                            -0.28, 0.53, 1.18, &slopes, &scores, covariance, 1.21, 1.0, 1.0e-8,
+                            0.87,
+                        )
+                        .expect("strongest-hand width")
+                    });
+                    eprintln!(
+                        "G932_PACKED_WIDTH_RELEASE covariance={label} k={} dim={} \
+                         production_ns={production_ns:.3} fixed_ns={fixed_ns:.3} \
+                         hand_ns={hand_ns:.3} hand_over_production={:.6} \
+                         hand_over_fixed={:.6}",
+                        $k,
+                        $dim,
+                        hand_ns / production_ns,
+                        hand_ns / fixed_ns,
+                    );
+                }
+            }};
+        }
+
+        measure_width!(1, 4);
+        measure_width!(2, 5);
+        measure_width!(3, 6);
+        measure_width!(4, 7);
+        measure_width!(5, 8);
+        measure_width!(6, 9);
+        measure_width!(7, 10);
+        measure_width!(8, 11);
+    }
+
     /// #932 cutover gate: every live K=1 scalar caller now uses the packed
     /// lowering of `rigid_row_nll`. Pin every returned channel against the
     /// retired strongest hand schedule over both event branches, ordinary
