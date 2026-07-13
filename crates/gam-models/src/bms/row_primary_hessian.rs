@@ -4102,112 +4102,6 @@ impl BernoulliMarginalSlopeFamily {
         let g_a = eval_coeff4_at(&obs.dc_da, z_obs);
         let g_aa = eval_coeff4_at(&obs.dc_daa, z_obs);
         let g_aaa = eval_coeff4_at(&obs.dc_daaa, z_obs);
-        let mut g_u = Array1::<f64>::zeros(r);
-        let mut g_au = Array1::<f64>::zeros(r);
-        let mut g_aau = Array1::<f64>::zeros(r);
-        let mut g_uv = Array2::<f64>::zeros((r, r));
-        let mut g_auv = Array2::<f64>::zeros((r, r));
-        for u in 1..r {
-            g_u[u] = eval_coeff4_at(&g_jet.first[u], z_obs);
-            g_au[u] = eval_coeff4_at(&g_jet.a_first[u], z_obs);
-            g_aau[u] = eval_coeff4_at(&g_jet.aa_first[u], z_obs);
-        }
-        for u in 1..r {
-            for v in u..r {
-                let second_coeff = g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_BHW);
-                let val = eval_coeff4_at(&second_coeff, z_obs);
-                g_uv[[u, v]] = val;
-                g_uv[[v, u]] = val;
-
-                let third_coeff = g_jet.pair_from_b_family(g_jet.ab_first, u, v, COEFF_SUPPORT_BW);
-                let third_val = eval_coeff4_at(&third_coeff, z_obs);
-                g_auv[[u, v]] = third_val;
-                g_auv[[v, u]] = third_val;
-            }
-        }
-
-        let mut g_u_dir_fixed = vec![[0.0; 4]; r];
-        let mut g_au_dir_fixed = vec![[0.0; 4]; r];
-        let g_dir_fixed = g_jet.directional_family(g_jet.first, dir, COEFF_SUPPORT_BHW);
-        let g_a_dir_fixed = g_jet.directional_family(g_jet.a_first, dir, COEFF_SUPPORT_BW);
-        let g_aa_dir_fixed = g_jet.directional_family(g_jet.aa_first, dir, COEFF_SUPPORT_BW);
-        let g_dir = eval_coeff4_at(&g_dir_fixed, z_obs);
-        let g_a_dir = eval_coeff4_at(&g_a_dir_fixed, z_obs);
-        let g_aa_dir = eval_coeff4_at(&g_aa_dir_fixed, z_obs);
-
-        for u in 1..r {
-            g_u_dir_fixed[u] =
-                g_jet.param_directional_from_b_family(g_jet.b_first, u, dir, COEFF_SUPPORT_BHW);
-            g_au_dir_fixed[u] =
-                g_jet.param_directional_from_b_family(g_jet.ab_first, u, dir, COEFF_SUPPORT_BW);
-        }
-
-        let mut g_u_dir = Array1::<f64>::zeros(r);
-        let mut g_uv_dir = Array2::<f64>::zeros((r, r));
-        for u in 1..r {
-            g_u_dir[u] = eval_coeff4_at(&g_u_dir_fixed[u], z_obs);
-        }
-        for u in 1..r {
-            for v in u..r {
-                let third_coeff = g_jet.pair_directional_from_bb_family(
-                    g_jet.bb_first,
-                    u,
-                    v,
-                    dir,
-                    COEFF_SUPPORT_BW,
-                );
-                let val = eval_coeff4_at(&third_coeff, z_obs);
-                g_uv_dir[[u, v]] = val;
-                g_uv_dir[[v, u]] = val;
-            }
-        }
-
-        let eta_u = g_a * &a_u + &g_u;
-        let mut eta_uv = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let val = g_a * a_uv[[u, v]]
-                    + g_aa * a_u[u] * a_u[v]
-                    + g_au[u] * a_u[v]
-                    + g_au[v] * a_u[u]
-                    + g_uv[[u, v]];
-                eta_uv[[u, v]] = val;
-                eta_uv[[v, u]] = val;
-            }
-        }
-        let eta_dir = g_a * a_dir + g_dir;
-        let eta_u_dir = eta_uv.dot(dir);
-        let dg_a_dir = g_aa * a_dir + g_a_dir;
-        let dg_aa_dir = g_aaa * a_dir + g_aa_dir;
-        let mut dg_au_dir = Array1::<f64>::zeros(r);
-        let mut dg_uv_dir = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            dg_au_dir[u] = g_aau[u] * a_dir + eval_coeff4_at(&g_au_dir_fixed[u], z_obs);
-        }
-        for u in 0..r {
-            for v in u..r {
-                let val = g_auv[[u, v]] * a_dir + g_uv_dir[[u, v]];
-                dg_uv_dir[[u, v]] = val;
-                dg_uv_dir[[v, u]] = val;
-            }
-        }
-
-        let mut eta_uv_dir = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let val = dg_a_dir * a_uv[[u, v]]
-                    + g_a * a_uv_dir[[u, v]]
-                    + dg_aa_dir * a_u[u] * a_u[v]
-                    + g_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v])
-                    + dg_au_dir[u] * a_u[v]
-                    + g_au[u] * a_u_dir[v]
-                    + dg_au_dir[v] * a_u[u]
-                    + g_au[v] * a_u_dir[u]
-                    + dg_uv_dir[[u, v]];
-                eta_uv_dir[[u, v]] = val;
-                eta_uv_dir[[v, u]] = val;
-            }
-        }
 
         let y_i = self.y[row];
         let w_i = self.weights[row];
@@ -4217,18 +4111,162 @@ impl BernoulliMarginalSlopeFamily {
         let u1 = s_y * k1;
         let u3 = s_y * k3;
 
+        let mut a_u = Array1::<f64>::zeros(r);
+        let mut a_uv = Array2::<f64>::zeros((r, r));
+        let mut a_dir = 0.0;
+        let mut a_u_dir = Array1::<f64>::zeros(r);
+        let mut a_uv_dir = Array2::<f64>::zeros((r, r));
+        let mut g_u = Array1::<f64>::zeros(r);
+        let mut g_au = Array1::<f64>::zeros(r);
+        let mut g_aau = Array1::<f64>::zeros(r);
+        let mut g_uv = Array2::<f64>::zeros((r, r));
+        let mut g_auv = Array2::<f64>::zeros((r, r));
+        let mut eta_u = Array1::<f64>::zeros(r);
+        let mut eta_uv = Array2::<f64>::zeros((r, r));
+        let mut eta_dir = 0.0;
+        let mut eta_u_dir = Array1::<f64>::zeros(r);
+        let mut dg_a_dir = 0.0;
+        let mut dg_aa_dir = 0.0;
+        let mut dg_au_dir = Array1::<f64>::zeros(r);
+        let mut eta_uv_dir = Array2::<f64>::zeros((r, r));
         let mut out = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let val = u3 * eta_u[u] * eta_u[v] * eta_dir
-                    + k2 * (eta_uv[[u, v]] * eta_dir
-                        + eta_u[u] * eta_u_dir[v]
-                        + eta_u[v] * eta_u_dir[u])
-                    + u1 * eta_uv_dir[[u, v]];
-                out[[u, v]] = val;
-                out[[v, u]] = val;
+
+        BmsFlexRowProgram::try_for_each_order3_finalizer(r, 1, |node| -> Result<(), String> {
+            match node {
+                BmsFlexRowOrder3FinalizerNode::Order2(
+                    BmsFlexRowOrder2FinalizerNode::ImplicitFirst { primary },
+                ) => {
+                    a_u[primary] = -f_u[primary] * inv_f_a;
+                }
+                BmsFlexRowOrder3FinalizerNode::Order2(
+                    BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left, right },
+                ) => {
+                    let value = -(f_uv[[left, right]]
+                        + f_au[left] * a_u[right]
+                        + f_au[right] * a_u[left]
+                        + f_aa * a_u[left] * a_u[right])
+                        * inv_f_a;
+                    a_uv[[left, right]] = value;
+                    a_uv[[right, left]] = value;
+                }
+                BmsFlexRowOrder3FinalizerNode::Order2(
+                    BmsFlexRowOrder2FinalizerNode::ObservedFirst { primary },
+                ) => {
+                    if primary > 0 {
+                        g_u[primary] = eval_coeff4_at(&g_jet.first[primary], z_obs);
+                        g_au[primary] = eval_coeff4_at(&g_jet.a_first[primary], z_obs);
+                        g_aau[primary] = eval_coeff4_at(&g_jet.aa_first[primary], z_obs);
+                    }
+                    eta_u[primary] = g_a * a_u[primary] + g_u[primary];
+                }
+                BmsFlexRowOrder3FinalizerNode::Order2(
+                    BmsFlexRowOrder2FinalizerNode::ObservedSecond { left, right },
+                ) => {
+                    if left > 0 {
+                        let second_coeff =
+                            g_jet.pair_from_b_family(g_jet.b_first, left, right, COEFF_SUPPORT_BHW);
+                        g_uv[[left, right]] = eval_coeff4_at(&second_coeff, z_obs);
+                        g_uv[[right, left]] = g_uv[[left, right]];
+                        let third_coeff =
+                            g_jet.pair_from_b_family(g_jet.ab_first, left, right, COEFF_SUPPORT_BW);
+                        g_auv[[left, right]] = eval_coeff4_at(&third_coeff, z_obs);
+                        g_auv[[right, left]] = g_auv[[left, right]];
+                    }
+                    let value = g_a * a_uv[[left, right]]
+                        + g_aa * a_u[left] * a_u[right]
+                        + g_au[left] * a_u[right]
+                        + g_au[right] * a_u[left]
+                        + g_uv[[left, right]];
+                    eta_uv[[left, right]] = value;
+                    eta_uv[[right, left]] = value;
+                }
+                BmsFlexRowOrder3FinalizerNode::Order2(
+                    BmsFlexRowOrder2FinalizerNode::ImplicitFirstComplete
+                    | BmsFlexRowOrder2FinalizerNode::ObservedScoreSensitivity { .. }
+                    | BmsFlexRowOrder2FinalizerNode::NegLogFirst { .. },
+                ) => {
+                    // The row context already owns the converged intercept;
+                    // score-z sensitivity and first-order output mutation
+                    // are not dependencies of a third contraction.
+                }
+                BmsFlexRowOrder3FinalizerNode::DirectionStart { .. } => {
+                    f_uv_dir[[0, 0]] = -dir[0] * marginal.mu3;
+                    a_dir = a_u.dot(dir);
+                    a_u_dir.assign(&a_uv.dot(dir));
+                    let g_dir_fixed = g_jet.directional_family(g_jet.first, dir, COEFF_SUPPORT_BHW);
+                    let g_a_dir_fixed =
+                        g_jet.directional_family(g_jet.a_first, dir, COEFF_SUPPORT_BW);
+                    let g_aa_dir_fixed =
+                        g_jet.directional_family(g_jet.aa_first, dir, COEFF_SUPPORT_BW);
+                    eta_dir = g_a * a_dir + eval_coeff4_at(&g_dir_fixed, z_obs);
+                    eta_u_dir.assign(&eta_uv.dot(dir));
+                    dg_a_dir = g_aa * a_dir + eval_coeff4_at(&g_a_dir_fixed, z_obs);
+                    dg_aa_dir = g_aaa * a_dir + eval_coeff4_at(&g_aa_dir_fixed, z_obs);
+                }
+                BmsFlexRowOrder3FinalizerNode::ImplicitDirectionalSecond {
+                    left, right, ..
+                } => {
+                    let numerator = f_uv_dir[[left, right]]
+                        + f_au_dir[left] * a_u[right]
+                        + f_au[left] * a_u_dir[right]
+                        + f_au_dir[right] * a_u[left]
+                        + f_au[right] * a_u_dir[left]
+                        + f_aa_dir * a_u[left] * a_u[right]
+                        + f_aa * (a_u_dir[left] * a_u[right] + a_u[left] * a_u_dir[right]);
+                    let value = -(numerator + f_a_dir * a_uv[[left, right]]) * inv_f_a;
+                    a_uv_dir[[left, right]] = value;
+                    a_uv_dir[[right, left]] = value;
+                }
+                BmsFlexRowOrder3FinalizerNode::ObservedDirectionalFirst { primary, .. } => {
+                    let coefficient = g_jet.param_directional_from_b_family(
+                        g_jet.ab_first,
+                        primary,
+                        dir,
+                        COEFF_SUPPORT_BW,
+                    );
+                    dg_au_dir[primary] =
+                        g_aau[primary] * a_dir + eval_coeff4_at(&coefficient, z_obs);
+                }
+                BmsFlexRowOrder3FinalizerNode::ObservedDirectionalSecond {
+                    left, right, ..
+                } => {
+                    let fixed = if left == 0 {
+                        0.0
+                    } else {
+                        let coefficient = g_jet.pair_directional_from_bb_family(
+                            g_jet.bb_first,
+                            left,
+                            right,
+                            dir,
+                            COEFF_SUPPORT_BW,
+                        );
+                        eval_coeff4_at(&coefficient, z_obs)
+                    };
+                    let dg_uv_dir = g_auv[[left, right]] * a_dir + fixed;
+                    let value = dg_a_dir * a_uv[[left, right]]
+                        + g_a * a_uv_dir[[left, right]]
+                        + dg_aa_dir * a_u[left] * a_u[right]
+                        + g_aa * (a_u_dir[left] * a_u[right] + a_u[left] * a_u_dir[right])
+                        + dg_au_dir[left] * a_u[right]
+                        + g_au[left] * a_u_dir[right]
+                        + dg_au_dir[right] * a_u[left]
+                        + g_au[right] * a_u_dir[left]
+                        + dg_uv_dir;
+                    eta_uv_dir[[left, right]] = value;
+                    eta_uv_dir[[right, left]] = value;
+                }
+                BmsFlexRowOrder3FinalizerNode::NegLogThird { left, right, .. } => {
+                    let value = u3 * eta_u[left] * eta_u[right] * eta_dir
+                        + k2 * (eta_uv[[left, right]] * eta_dir
+                            + eta_u[left] * eta_u_dir[right]
+                            + eta_u[right] * eta_u_dir[left])
+                        + u1 * eta_uv_dir[[left, right]];
+                    out[[left, right]] = value;
+                    out[[right, left]] = value;
+                }
             }
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
 

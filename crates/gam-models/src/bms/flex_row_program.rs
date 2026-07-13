@@ -124,25 +124,12 @@ pub(super) enum BmsFlexRowOrder2FinalizerPhase {
 
 /// Dependency-ordered directional derivative of the Order2 row finalizer.
 ///
-/// Backends supply the scalar formulas for each visit. This stream owns the
-/// base primary/pair traversal, then each direction's implicit, observed, and
-/// negative-log-likelihood stages in dependency order.
+/// Backends supply the scalar formulas for each visit. The base is the exact
+/// Order2 stream, followed by each direction's implicit, observed, and
+/// negative-log-likelihood extensions in dependency order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BmsFlexRowOrder3FinalizerNode {
-    ImplicitFirst {
-        primary: usize,
-    },
-    ImplicitSecond {
-        left: usize,
-        right: usize,
-    },
-    ObservedFirst {
-        primary: usize,
-    },
-    ObservedSecond {
-        left: usize,
-        right: usize,
-    },
+    Order2(BmsFlexRowOrder2FinalizerNode),
     DirectionStart {
         direction: usize,
     },
@@ -171,25 +158,12 @@ pub(super) enum BmsFlexRowOrder3FinalizerNode {
 /// finalizer stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BmsFlexRowOrder3FinalizerPhase {
-    ImplicitFirst,
-    ImplicitSecond,
-    ObservedFirst,
-    ObservedSecond,
-    DirectionStart {
-        direction: usize,
-    },
-    ImplicitDirectionalSecond {
-        direction: usize,
-    },
-    ObservedDirectionalFirst {
-        direction: usize,
-    },
-    ObservedDirectionalSecond {
-        direction: usize,
-    },
-    NegLogThird {
-        direction: usize,
-    },
+    Order2(BmsFlexRowOrder2FinalizerPhase),
+    DirectionStart { direction: usize },
+    ImplicitDirectionalSecond { direction: usize },
+    ObservedDirectionalFirst { direction: usize },
+    ObservedDirectionalSecond { direction: usize },
+    NegLogThird { direction: usize },
 }
 
 /// Borrowed scalar coordinates of the canonical BMS FLEX row program.
@@ -560,47 +534,55 @@ impl BmsFlexRowProgram {
         mut visit: impl FnMut(BmsFlexRowOrder2FinalizerNode) -> Result<(), E>,
     ) -> Result<(), E> {
         Self::try_for_each_order2_finalizer_phase(need_hessian, |phase| {
-            match phase {
-                BmsFlexRowOrder2FinalizerPhase::ImplicitFirst => {
-                    for primary in 0..primary_count {
-                        visit(BmsFlexRowOrder2FinalizerNode::ImplicitFirst { primary })?;
-                    }
+            Self::try_expand_order2_finalizer_phase(primary_count, phase, &mut visit)
+        })
+    }
+
+    fn try_expand_order2_finalizer_phase<E>(
+        primary_count: usize,
+        phase: BmsFlexRowOrder2FinalizerPhase,
+        visit: &mut impl FnMut(BmsFlexRowOrder2FinalizerNode) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match phase {
+            BmsFlexRowOrder2FinalizerPhase::ImplicitFirst => {
+                for primary in 0..primary_count {
+                    visit(BmsFlexRowOrder2FinalizerNode::ImplicitFirst { primary })?;
                 }
-                BmsFlexRowOrder2FinalizerPhase::ImplicitFirstComplete => {
-                    visit(BmsFlexRowOrder2FinalizerNode::ImplicitFirstComplete)?;
-                }
-                BmsFlexRowOrder2FinalizerPhase::ImplicitSecond => {
-                    for left in 0..primary_count {
-                        for right in left..primary_count {
-                            visit(BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left, right })?;
-                        }
-                    }
-                }
-                BmsFlexRowOrder2FinalizerPhase::ObservedFirst => {
-                    for primary in 0..primary_count {
-                        visit(BmsFlexRowOrder2FinalizerNode::ObservedFirst { primary })?;
-                    }
-                }
-                BmsFlexRowOrder2FinalizerPhase::ObservedScoreSensitivity => {
-                    for primary in 0..primary_count {
-                        visit(BmsFlexRowOrder2FinalizerNode::ObservedScoreSensitivity { primary })?;
-                    }
-                }
-                BmsFlexRowOrder2FinalizerPhase::ObservedSecond => {
-                    for left in 0..primary_count {
-                        for right in left..primary_count {
-                            visit(BmsFlexRowOrder2FinalizerNode::ObservedSecond { left, right })?;
-                        }
-                    }
-                }
-                BmsFlexRowOrder2FinalizerPhase::NegLogFirst => {
-                    for primary in 0..primary_count {
-                        visit(BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary })?;
+            }
+            BmsFlexRowOrder2FinalizerPhase::ImplicitFirstComplete => {
+                visit(BmsFlexRowOrder2FinalizerNode::ImplicitFirstComplete)?;
+            }
+            BmsFlexRowOrder2FinalizerPhase::ImplicitSecond => {
+                for left in 0..primary_count {
+                    for right in left..primary_count {
+                        visit(BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left, right })?;
                     }
                 }
             }
-            Ok(())
-        })
+            BmsFlexRowOrder2FinalizerPhase::ObservedFirst => {
+                for primary in 0..primary_count {
+                    visit(BmsFlexRowOrder2FinalizerNode::ObservedFirst { primary })?;
+                }
+            }
+            BmsFlexRowOrder2FinalizerPhase::ObservedScoreSensitivity => {
+                for primary in 0..primary_count {
+                    visit(BmsFlexRowOrder2FinalizerNode::ObservedScoreSensitivity { primary })?;
+                }
+            }
+            BmsFlexRowOrder2FinalizerPhase::ObservedSecond => {
+                for left in 0..primary_count {
+                    for right in left..primary_count {
+                        visit(BmsFlexRowOrder2FinalizerNode::ObservedSecond { left, right })?;
+                    }
+                }
+            }
+            BmsFlexRowOrder2FinalizerPhase::NegLogFirst => {
+                for primary in 0..primary_count {
+                    visit(BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Visit the canonical dependency phases without selecting an index
@@ -640,29 +622,12 @@ impl BmsFlexRowProgram {
         visit: &mut impl FnMut(BmsFlexRowOrder3FinalizerNode) -> Result<(), E>,
     ) -> Result<(), E> {
         match phase {
-            BmsFlexRowOrder3FinalizerPhase::ImplicitFirst => {
-                for primary in 0..primary_count {
-                    visit(BmsFlexRowOrder3FinalizerNode::ImplicitFirst { primary })?;
-                }
-            }
-            BmsFlexRowOrder3FinalizerPhase::ImplicitSecond => {
-                for left in 0..primary_count {
-                    for right in left..primary_count {
-                        visit(BmsFlexRowOrder3FinalizerNode::ImplicitSecond { left, right })?;
-                    }
-                }
-            }
-            BmsFlexRowOrder3FinalizerPhase::ObservedFirst => {
-                for primary in 0..primary_count {
-                    visit(BmsFlexRowOrder3FinalizerNode::ObservedFirst { primary })?;
-                }
-            }
-            BmsFlexRowOrder3FinalizerPhase::ObservedSecond => {
-                for left in 0..primary_count {
-                    for right in left..primary_count {
-                        visit(BmsFlexRowOrder3FinalizerNode::ObservedSecond { left, right })?;
-                    }
-                }
+            BmsFlexRowOrder3FinalizerPhase::Order2(order2_phase) => {
+                Self::try_expand_order2_finalizer_phase(
+                    primary_count,
+                    order2_phase,
+                    &mut |node| visit(BmsFlexRowOrder3FinalizerNode::Order2(node)),
+                )?;
             }
             BmsFlexRowOrder3FinalizerPhase::DirectionStart { direction } => {
                 visit(BmsFlexRowOrder3FinalizerNode::DirectionStart { direction })?;
@@ -718,26 +683,15 @@ impl BmsFlexRowProgram {
         direction_count: usize,
         mut visit: impl FnMut(BmsFlexRowOrder3FinalizerPhase) -> Result<(), E>,
     ) -> Result<(), E> {
-        visit(BmsFlexRowOrder3FinalizerPhase::ImplicitFirst)?;
-        visit(BmsFlexRowOrder3FinalizerPhase::ImplicitSecond)?;
-        visit(BmsFlexRowOrder3FinalizerPhase::ObservedFirst)?;
-        visit(BmsFlexRowOrder3FinalizerPhase::ObservedSecond)?;
+        Self::try_for_each_order2_finalizer_phase(true, |phase| {
+            visit(BmsFlexRowOrder3FinalizerPhase::Order2(phase))
+        })?;
         for direction in 0..direction_count {
-            visit(BmsFlexRowOrder3FinalizerPhase::DirectionStart {
-                direction,
-            })?;
-            visit(
-                BmsFlexRowOrder3FinalizerPhase::ImplicitDirectionalSecond { direction },
-            )?;
-            visit(BmsFlexRowOrder3FinalizerPhase::ObservedDirectionalFirst {
-                direction,
-            })?;
-            visit(
-                BmsFlexRowOrder3FinalizerPhase::ObservedDirectionalSecond { direction },
-            )?;
-            visit(BmsFlexRowOrder3FinalizerPhase::NegLogThird {
-                direction,
-            })?;
+            visit(BmsFlexRowOrder3FinalizerPhase::DirectionStart { direction })?;
+            visit(BmsFlexRowOrder3FinalizerPhase::ImplicitDirectionalSecond { direction })?;
+            visit(BmsFlexRowOrder3FinalizerPhase::ObservedDirectionalFirst { direction })?;
+            visit(BmsFlexRowOrder3FinalizerPhase::ObservedDirectionalSecond { direction })?;
+            visit(BmsFlexRowOrder3FinalizerPhase::NegLogThird { direction })?;
         }
         Ok(())
     }
@@ -1030,5 +984,101 @@ mod tests {
                 BmsFlexRowOrder2FinalizerPhase::NegLogFirst,
             ]
         );
+
+        let mut order3_finalizer = Vec::new();
+        BmsFlexRowProgram::try_for_each_order3_finalizer(
+            2,
+            1,
+            |node| -> Result<(), std::convert::Infallible> {
+                order3_finalizer.push(node);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut expected_order3_finalizer = finalizer
+            .iter()
+            .copied()
+            .map(BmsFlexRowOrder3FinalizerNode::Order2)
+            .collect::<Vec<_>>();
+        expected_order3_finalizer.extend([
+            BmsFlexRowOrder3FinalizerNode::DirectionStart { direction: 0 },
+            BmsFlexRowOrder3FinalizerNode::ImplicitDirectionalSecond {
+                direction: 0,
+                left: 0,
+                right: 0,
+            },
+            BmsFlexRowOrder3FinalizerNode::ImplicitDirectionalSecond {
+                direction: 0,
+                left: 0,
+                right: 1,
+            },
+            BmsFlexRowOrder3FinalizerNode::ImplicitDirectionalSecond {
+                direction: 0,
+                left: 1,
+                right: 1,
+            },
+            BmsFlexRowOrder3FinalizerNode::ObservedDirectionalFirst {
+                direction: 0,
+                primary: 0,
+            },
+            BmsFlexRowOrder3FinalizerNode::ObservedDirectionalFirst {
+                direction: 0,
+                primary: 1,
+            },
+            BmsFlexRowOrder3FinalizerNode::ObservedDirectionalSecond {
+                direction: 0,
+                left: 0,
+                right: 0,
+            },
+            BmsFlexRowOrder3FinalizerNode::ObservedDirectionalSecond {
+                direction: 0,
+                left: 0,
+                right: 1,
+            },
+            BmsFlexRowOrder3FinalizerNode::ObservedDirectionalSecond {
+                direction: 0,
+                left: 1,
+                right: 1,
+            },
+            BmsFlexRowOrder3FinalizerNode::NegLogThird {
+                direction: 0,
+                left: 0,
+                right: 0,
+            },
+            BmsFlexRowOrder3FinalizerNode::NegLogThird {
+                direction: 0,
+                left: 0,
+                right: 1,
+            },
+            BmsFlexRowOrder3FinalizerNode::NegLogThird {
+                direction: 0,
+                left: 1,
+                right: 1,
+            },
+        ]);
+        assert_eq!(order3_finalizer, expected_order3_finalizer);
+
+        let mut order3_finalizer_phases = Vec::new();
+        BmsFlexRowProgram::try_for_each_order3_finalizer_phase(
+            1,
+            |phase| -> Result<(), std::convert::Infallible> {
+                order3_finalizer_phases.push(phase);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut expected_order3_phases = finalizer_phases
+            .iter()
+            .copied()
+            .map(BmsFlexRowOrder3FinalizerPhase::Order2)
+            .collect::<Vec<_>>();
+        expected_order3_phases.extend([
+            BmsFlexRowOrder3FinalizerPhase::DirectionStart { direction: 0 },
+            BmsFlexRowOrder3FinalizerPhase::ImplicitDirectionalSecond { direction: 0 },
+            BmsFlexRowOrder3FinalizerPhase::ObservedDirectionalFirst { direction: 0 },
+            BmsFlexRowOrder3FinalizerPhase::ObservedDirectionalSecond { direction: 0 },
+            BmsFlexRowOrder3FinalizerPhase::NegLogThird { direction: 0 },
+        ]);
+        assert_eq!(order3_finalizer_phases, expected_order3_phases);
     }
 }
