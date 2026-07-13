@@ -15,9 +15,9 @@ use gam_math::jet_scalar::{DynamicJetArena, DynamicOrder2, RuntimeJetScalar};
 // with η₀ = q₀c + s_f g z, η₁ = q₁c + s_f g z, a'₁ = qd₁·c,
 // c = √(1 + (s_f g)²), s_f = 1/√(1+σ²).
 //
-// The K=1 value/gradient/Hessian is lowered from `rigid_row_nll` at the packed
-// `SparseOrder2` scalar. It remains stack-only while sharing one mathematical
-// expression with the higher-order and CUDA schedules.
+// The K=1 value/gradient/Hessian is lowered symbolically from the same
+// `row_program!` SSA graph as `rigid_row_nll` and CUDA. It remains stack-only
+// without constructing a forward jet or duplicating the mathematical program.
 
 #[inline]
 pub(crate) fn rigid_observed_logslope(g: f64, probit_scale: f64) -> f64 {
@@ -499,13 +499,13 @@ mod vector_hand_oracle {
         (-inv, inv2, -2.0 * inv2 * inv, 6.0 * inv2 * inv2)
     }
 
-fn marginal_slope_covariance_matvec(
-    covariance: &MarginalSlopeCovariance,
-    vector: &[f64],
-) -> Result<Vec<f64>, String> {
-    covariance.validate("survival marginal-slope covariance matvec")?;
-    if vector.len() != covariance.dim() {
-        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+    fn marginal_slope_covariance_matvec(
+        covariance: &MarginalSlopeCovariance,
+        vector: &[f64],
+    ) -> Result<Vec<f64>, String> {
+        covariance.validate("survival marginal-slope covariance matvec")?;
+        if vector.len() != covariance.dim() {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
                 "survival marginal-slope covariance matvec dimension mismatch: vector={}, covariance={}",
                 vector.len(),
@@ -513,55 +513,55 @@ fn marginal_slope_covariance_matvec(
             ),
         }
         .into());
-    }
-    Ok(match covariance {
-        MarginalSlopeCovariance::Diagonal(diag) => vector
-            .iter()
-            .zip(diag.iter())
-            .map(|(&v, &sigma)| sigma * v)
-            .collect(),
-        MarginalSlopeCovariance::Full(cov) => {
-            let mut out = vec![0.0; cov.nrows()];
-            for i in 0..cov.nrows() {
-                for j in 0..cov.ncols() {
-                    out[i] += cov[[i, j]] * vector[j];
-                }
-            }
-            out
         }
-        MarginalSlopeCovariance::LowRank(factor) => {
-            let mut projected = vec![0.0; factor.ncols()];
-            for r in 0..factor.ncols() {
-                for k in 0..factor.nrows() {
-                    projected[r] += factor[[k, r]] * vector[k];
+        Ok(match covariance {
+            MarginalSlopeCovariance::Diagonal(diag) => vector
+                .iter()
+                .zip(diag.iter())
+                .map(|(&v, &sigma)| sigma * v)
+                .collect(),
+            MarginalSlopeCovariance::Full(cov) => {
+                let mut out = vec![0.0; cov.nrows()];
+                for i in 0..cov.nrows() {
+                    for j in 0..cov.ncols() {
+                        out[i] += cov[[i, j]] * vector[j];
+                    }
                 }
+                out
             }
-            let mut out = vec![0.0; factor.nrows()];
-            for k in 0..factor.nrows() {
+            MarginalSlopeCovariance::LowRank(factor) => {
+                let mut projected = vec![0.0; factor.ncols()];
                 for r in 0..factor.ncols() {
-                    out[k] += factor[[k, r]] * projected[r];
+                    for k in 0..factor.nrows() {
+                        projected[r] += factor[[k, r]] * vector[k];
+                    }
                 }
+                let mut out = vec![0.0; factor.nrows()];
+                for k in 0..factor.nrows() {
+                    for r in 0..factor.ncols() {
+                        out[k] += factor[[k, r]] * projected[r];
+                    }
+                }
+                out
             }
-            out
-        }
-    })
-}
+        })
+    }
 
-pub(super) fn row_primary_closed_form_vector_hand_reference(
-    q0: f64,
-    q1: f64,
-    qd1: f64,
-    slopes: &[f64],
-    z: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    w: f64,
-    d: f64,
-    derivative_guard: f64,
-    probit_scale: f64,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-    let k = slopes.len();
-    if z.len() != k || covariance.dim() != k {
-        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+    pub(super) fn row_primary_closed_form_vector_hand_reference(
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        slopes: &[f64],
+        z: &[f64],
+        covariance: &MarginalSlopeCovariance,
+        w: f64,
+        d: f64,
+        derivative_guard: f64,
+        probit_scale: f64,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let k = slopes.len();
+        if z.len() != k || covariance.dim() != k {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
                 "survival marginal-slope vector row dimension mismatch: slopes={}, z={}, covariance={}",
                 k,
@@ -570,123 +570,124 @@ pub(super) fn row_primary_closed_form_vector_hand_reference(
             ),
         }
         .into());
-    }
-    let c = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale)?;
-    let sigma_g = marginal_slope_covariance_matvec(covariance, slopes)?;
-    let s2 = probit_scale * probit_scale;
-    let mut c1 = vec![0.0; k];
-    for a in 0..k {
-        c1[a] = s2 * sigma_g[a] / c;
-    }
-    let mut c2 = Array2::<f64>::zeros((k, k));
-    for a in 0..k {
-        for b in 0..k {
-            let sigma_ab = match covariance {
-                MarginalSlopeCovariance::Diagonal(diag) => {
-                    if a == b {
-                        diag[a]
-                    } else {
-                        0.0
-                    }
-                }
-                MarginalSlopeCovariance::Full(cov) => cov[[a, b]],
-                MarginalSlopeCovariance::LowRank(factor) => {
-                    let mut value = 0.0;
-                    for r in 0..factor.ncols() {
-                        value += factor[[a, r]] * factor[[b, r]];
-                    }
-                    value
-                }
-            };
-            c2[[a, b]] = s2 * sigma_ab / c - (s2 * sigma_g[a]) * (s2 * sigma_g[b]) / (c * c * c);
         }
-    }
+        let c = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale)?;
+        let sigma_g = marginal_slope_covariance_matvec(covariance, slopes)?;
+        let s2 = probit_scale * probit_scale;
+        let mut c1 = vec![0.0; k];
+        for a in 0..k {
+            c1[a] = s2 * sigma_g[a] / c;
+        }
+        let mut c2 = Array2::<f64>::zeros((k, k));
+        for a in 0..k {
+            for b in 0..k {
+                let sigma_ab = match covariance {
+                    MarginalSlopeCovariance::Diagonal(diag) => {
+                        if a == b {
+                            diag[a]
+                        } else {
+                            0.0
+                        }
+                    }
+                    MarginalSlopeCovariance::Full(cov) => cov[[a, b]],
+                    MarginalSlopeCovariance::LowRank(factor) => {
+                        let mut value = 0.0;
+                        for r in 0..factor.ncols() {
+                            value += factor[[a, r]] * factor[[b, r]];
+                        }
+                        value
+                    }
+                };
+                c2[[a, b]] =
+                    s2 * sigma_ab / c - (s2 * sigma_g[a]) * (s2 * sigma_g[b]) / (c * c * c);
+            }
+        }
 
-    let linear = probit_scale
-        * slopes
-            .iter()
-            .zip(z.iter())
-            .map(|(&g, &zi)| g * zi)
-            .sum::<f64>();
-    let eta0 = q0 * c + linear;
-    let eta1 = q1 * c + linear;
-    let ad1 = qd1 * c;
-    if survival_derivative_guard_violated(qd1, derivative_guard) {
-        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+        let linear = probit_scale
+            * slopes
+                .iter()
+                .zip(z.iter())
+                .map(|(&g, &zi)| g * zi)
+                .sum::<f64>();
+        let eta0 = q0 * c + linear;
+        let eta1 = q1 * c + linear;
+        let ad1 = qd1 * c;
+        if survival_derivative_guard_violated(qd1, derivative_guard) {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
             reason: format!(
                 "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
             ),
         }
         .into());
-    }
-    if !(ad1.is_finite() && ad1 > 0.0) {
-        return Err(SurvivalMarginalSlopeError::NumericalFailure {
-            reason: format!(
-                "survival marginal-slope transformed derivative must be positive, got {ad1}"
-            ),
         }
-        .into());
-    }
-
-    let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
-    let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
-    let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
-    let nll =
-        w * ((1.0 - d) * (-logcdf_neg_eta1) + logcdf_neg_eta0 - d * log_phi_eta1 - d * ad1.ln());
-
-    let (e0_k1, e0_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta0, -w)?;
-    let (e1_k1, e1_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta1, w * (1.0 - d))?;
-    let phi_u1 = w * d * eta1;
-    let phi_u2 = w * d;
-    let (nl_u1, nl_u2, _, _) = neglog_derivatives(ad1);
-    let td_u1 = w * d * nl_u1;
-    let td_u2 = w * d * nl_u2;
-    let u1_eta0 = -e0_k1;
-    let u1_eta1 = -e1_k1 + phi_u1;
-    let u1_ad1 = td_u1;
-    let u2_eta0 = e0_k2;
-    let u2_eta1 = e1_k2 + phi_u2;
-    let u2_ad1 = td_u2;
-
-    let dim = 3 + k;
-    let mut grad = Array1::<f64>::zeros(dim);
-    let mut hess = Array2::<f64>::zeros((dim, dim));
-    grad[0] = u1_eta0 * c;
-    grad[1] = u1_eta1 * c;
-    grad[2] = u1_ad1 * c;
-    hess[[0, 0]] = u2_eta0 * c * c;
-    hess[[1, 1]] = u2_eta1 * c * c;
-    hess[[2, 2]] = u2_ad1 * c * c;
-    for a in 0..k {
-        let idx = 3 + a;
-        let dlin = probit_scale * z[a];
-        let deta0 = q0 * c1[a] + dlin;
-        let deta1 = q1 * c1[a] + dlin;
-        let dad1 = qd1 * c1[a];
-        grad[idx] = u1_eta0 * deta0 + u1_eta1 * deta1 + u1_ad1 * dad1;
-        hess[[0, idx]] = u2_eta0 * c * deta0 + u1_eta0 * c1[a];
-        hess[[idx, 0]] = hess[[0, idx]];
-        hess[[1, idx]] = u2_eta1 * c * deta1 + u1_eta1 * c1[a];
-        hess[[idx, 1]] = hess[[1, idx]];
-        hess[[2, idx]] = u2_ad1 * c * dad1 + u1_ad1 * c1[a];
-        hess[[idx, 2]] = hess[[2, idx]];
-        for b in 0..k {
-            let jdx = 3 + b;
-            let dlin_b = probit_scale * z[b];
-            let deta0_b = q0 * c1[b] + dlin_b;
-            let deta1_b = q1 * c1[b] + dlin_b;
-            let dad1_b = qd1 * c1[b];
-            hess[[idx, jdx]] = u2_eta0 * deta0 * deta0_b
-                + u1_eta0 * q0 * c2[[a, b]]
-                + u2_eta1 * deta1 * deta1_b
-                + u1_eta1 * q1 * c2[[a, b]]
-                + u2_ad1 * dad1 * dad1_b
-                + u1_ad1 * qd1 * c2[[a, b]];
+        if !(ad1.is_finite() && ad1 > 0.0) {
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope transformed derivative must be positive, got {ad1}"
+                ),
+            }
+            .into());
         }
-    }
-    Ok((nll, grad, hess))
-}
 
+        let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
+        let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
+        let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
+        let nll = w
+            * ((1.0 - d) * (-logcdf_neg_eta1) + logcdf_neg_eta0 - d * log_phi_eta1 - d * ad1.ln());
+
+        let (e0_k1, e0_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta0, -w)?;
+        let (e1_k1, e1_k2, _, _) =
+            signed_probit_neglog_derivatives_up_to_fourth(-eta1, w * (1.0 - d))?;
+        let phi_u1 = w * d * eta1;
+        let phi_u2 = w * d;
+        let (nl_u1, nl_u2, _, _) = neglog_derivatives(ad1);
+        let td_u1 = w * d * nl_u1;
+        let td_u2 = w * d * nl_u2;
+        let u1_eta0 = -e0_k1;
+        let u1_eta1 = -e1_k1 + phi_u1;
+        let u1_ad1 = td_u1;
+        let u2_eta0 = e0_k2;
+        let u2_eta1 = e1_k2 + phi_u2;
+        let u2_ad1 = td_u2;
+
+        let dim = 3 + k;
+        let mut grad = Array1::<f64>::zeros(dim);
+        let mut hess = Array2::<f64>::zeros((dim, dim));
+        grad[0] = u1_eta0 * c;
+        grad[1] = u1_eta1 * c;
+        grad[2] = u1_ad1 * c;
+        hess[[0, 0]] = u2_eta0 * c * c;
+        hess[[1, 1]] = u2_eta1 * c * c;
+        hess[[2, 2]] = u2_ad1 * c * c;
+        for a in 0..k {
+            let idx = 3 + a;
+            let dlin = probit_scale * z[a];
+            let deta0 = q0 * c1[a] + dlin;
+            let deta1 = q1 * c1[a] + dlin;
+            let dad1 = qd1 * c1[a];
+            grad[idx] = u1_eta0 * deta0 + u1_eta1 * deta1 + u1_ad1 * dad1;
+            hess[[0, idx]] = u2_eta0 * c * deta0 + u1_eta0 * c1[a];
+            hess[[idx, 0]] = hess[[0, idx]];
+            hess[[1, idx]] = u2_eta1 * c * deta1 + u1_eta1 * c1[a];
+            hess[[idx, 1]] = hess[[1, idx]];
+            hess[[2, idx]] = u2_ad1 * c * dad1 + u1_ad1 * c1[a];
+            hess[[idx, 2]] = hess[[2, idx]];
+            for b in 0..k {
+                let jdx = 3 + b;
+                let dlin_b = probit_scale * z[b];
+                let deta0_b = q0 * c1[b] + dlin_b;
+                let deta1_b = q1 * c1[b] + dlin_b;
+                let dad1_b = qd1 * c1[b];
+                hess[[idx, jdx]] = u2_eta0 * deta0 * deta0_b
+                    + u1_eta0 * q0 * c2[[a, b]]
+                    + u2_eta1 * deta1 * deta1_b
+                    + u1_eta1 * q1 * c2[[a, b]]
+                    + u2_ad1 * dad1 * dad1_b
+                    + u1_ad1 * qd1 * c2[[a, b]];
+            }
+        }
+        Ok((nll, grad, hess))
+    }
 }
 
 /// Runtime-width rigid row program for independent score slopes.
@@ -745,9 +746,8 @@ where
         .into());
     }
 
-    let observed_slopes = arena.alloc_slice_fill_with(k, |axis| {
-        vars[3 + axis].scale(inputs.probit_scale)
-    });
+    let observed_slopes =
+        arena.alloc_slice_fill_with(k, |axis| vars[3 + axis].scale(inputs.probit_scale));
     let mut linear = S::constant(0.0, dimension, arena);
     for axis in 0..k {
         linear = linear.add(&observed_slopes[axis].scale(z[axis]));
@@ -779,8 +779,7 @@ where
             for column in 0..factor.ncols() {
                 let mut projection = S::constant(0.0, dimension, arena);
                 for row in 0..k {
-                    projection =
-                        projection.add(&observed_slopes[row].scale(factor[[row, column]]));
+                    projection = projection.add(&observed_slopes[row].scale(factor[[row, column]]));
                 }
                 variance = variance.add(&projection.mul(&projection));
             }
@@ -804,9 +803,8 @@ where
     }
 
     let one_plus_variance = variance.add(&S::constant(1.0, dimension, arena));
-    let correction = one_plus_variance.compose_unary(unary_derivatives_sqrt(
-        one_plus_variance.value(),
-    ));
+    let correction =
+        one_plus_variance.compose_unary(unary_derivatives_sqrt(one_plus_variance.value()));
     let eta0 = vars[0].mul(&correction).add(&linear);
     let eta1 = vars[1].mul(&correction).add(&linear);
     let adjusted_derivative = vars[2].mul(&correction);
@@ -838,9 +836,7 @@ where
             .compose_unary(unary_derivatives_log(adjusted_derivative.value()))
             .scale((-inputs.wi) * inputs.di);
     }
-    Ok(exit
-        .add(&entry)
-        .add(&event_density.add(&time_derivative)))
+    Ok(exit.add(&entry).add(&event_density.add(&time_derivative)))
 }
 
 pub(crate) fn row_primary_closed_form_vector(
@@ -944,10 +940,8 @@ pub(crate) fn c_derivatives(g: f64, probit_scale: f64) -> (f64, f64, f64, f64, f
 ///
 /// Every live K=1 caller (pilot initialization, sigma evaluation,
 /// identifiability compilation, KKT refusal, and the `RowKernel`) therefore
-/// executes the same scalar expression. [`SparseOrder2`] changes only the
-/// generated execution schedule: the three index-affine primaries carry a
-/// compile-time sparsity certificate, while all leaf curvature and cross terms
-/// still come from the one row program.
+/// executes the same direct scalar schedule, including its leaf curvature and
+/// cross terms.
 #[inline]
 pub(crate) fn row_primary_closed_form(
     q0: f64,
@@ -960,12 +954,6 @@ pub(crate) fn row_primary_closed_form(
     derivative_guard: f64,
     probit_scale: f64,
 ) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
-    use gam_math::jet_scalar::JetScalar;
-    use gam_math::nested_dual::JetField;
-
-    let primaries = [q0, q1, qd1, g];
-    let vars: [SparseOrder2<RIGID_LINEAR_MASK>; N_PRIMARY] =
-        std::array::from_fn(|axis| SparseOrder2::variable(primaries[axis], axis));
     let inputs = RigidRowInputs {
         row: 0,
         wi: w,
@@ -975,8 +963,7 @@ pub(crate) fn row_primary_closed_form(
         probit_scale,
         qd1_lower: derivative_guard,
     };
-    let row = rigid_row_nll(&vars, &inputs)?;
-    Ok((row.value(), row.g(), row.h()))
+    rigid_row_order2(&[q0, q1, qd1, g], &inputs)
 }
 
 #[cfg(test)]
@@ -1042,8 +1029,7 @@ mod test_support {
         let phi_u1 = w * d * eta1;
         let phi_u2 = w * d;
         // Time derivative: -d·log(ad1).
-        let (nl_u1, nl_u2, _, _) =
-            super::vector_hand_oracle::neglog_derivatives(ad1);
+        let (nl_u1, nl_u2, _, _) = super::vector_hand_oracle::neglog_derivatives(ad1);
         let td_u1 = w * d * nl_u1;
         let td_u2 = w * d * nl_u2;
 
@@ -1282,9 +1268,7 @@ mod tests {
             );
         };
 
-        for (case, &(covariance, event, q0, q1, qd1, probit_scale))
-            in cases.iter().enumerate()
-        {
+        for (case, &(covariance, event, q0, q1, qd1, probit_scale)) in cases.iter().enumerate() {
             let runtime = row_primary_closed_form_vector(
                 q0,
                 q1,

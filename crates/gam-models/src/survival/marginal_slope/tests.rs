@@ -1201,9 +1201,7 @@ impl gam_math::jet_tower::RowProgram<4> for SurvivalMarginalSlopeRigidNllProgram
         // c(g) = sqrt(1 + (s_f g)^2)  — K=1 covariance_ones = 1, exactly the
         // shared MultiDirJet `one_plus_b2 -> sqrt` composition.
         let observed_g = g.scale(s_f);
-        let one_plus_b2 = observed_g
-            .mul(&observed_g)
-            .add(&S::constant(1.0));
+        let one_plus_b2 = observed_g.mul(&observed_g).add(&S::constant(1.0));
         let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.value()));
 
         let eta0 = q0.mul(&c).add(&observed_g.scale(z));
@@ -1413,15 +1411,13 @@ fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
     }
 }
 
-/// #932 static-sparsity oracle: the `SparseOrder2<RIGID_LINEAR_MASK>` scalar the
-/// production `row_kernel` (v,g,H) path instantiates must be BIT-IDENTICAL to the
-/// dense `Order2<4>` on the SAME single-sourced `rigid_row_nll` expression, over
-/// a random grid of primaries and inputs (mixed event/censored, frailty probit
-/// scale != 1). The sparse scalar elides only the provably-zero linear×linear
-/// self-Hessian reads, so every read channel (value/gradient/full Hessian) must
-/// agree exactly — proving the perf optimization is loss-free.
+/// #932 symbolic-order-two oracle: the production direct Rust lowering must
+/// agree with the generic `Order2<4>` evaluator on every channel and with the
+/// dependency-sliced witness evaluator on every admission witness. The random
+/// grid covers both runtime event branches, non-unit covariance, and non-unit
+/// frailty scale from the same single-sourced `row_program!` declaration.
 #[test]
-fn rigid_row_kernel_sparse_matches_dense_932() {
+fn rigid_row_program_order2_matches_generic_and_witnesses_932() {
     use gam_math::jet_scalar::{JetScalar, Order2};
 
     // Deterministic xorshift grid (no RNG dependency).
@@ -1447,11 +1443,37 @@ fn rigid_row_kernel_sparse_matches_dense_932() {
         };
 
         let dense_vars: [Order2<4>; 4] = std::array::from_fn(|a| Order2::variable(p[a], a));
-        let dense = rigid_row_nll(&dense_vars, &inputs).expect("dense rigid row nll");
-
-        let sparse_vars: [SparseOrder2<RIGID_LINEAR_MASK>; 4] =
-            std::array::from_fn(|a| SparseOrder2::variable(p[a], a));
-        let sparse = rigid_row_nll(&sparse_vars, &inputs).expect("sparse rigid row nll");
+        let (dense, dense_witnesses) = rigid_row_program(
+            &dense_vars[0],
+            &dense_vars[1],
+            &dense_vars[2],
+            &dense_vars[3],
+            inputs.wi,
+            inputs.di,
+            inputs.z_sum,
+            inputs.covariance_ones,
+            inputs.probit_scale,
+        );
+        let (value, gradient, hessian, witnesses) = rigid_row_program_order2(
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            inputs.wi,
+            inputs.di,
+            inputs.z_sum,
+            inputs.covariance_ones,
+            inputs.probit_scale,
+        );
+        let sliced_witnesses = rigid_row_program_witnesses(
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            inputs.z_sum,
+            inputs.covariance_ones,
+            inputs.probit_scale,
+        );
 
         let mut check = |a: f64, b: f64| {
             let rel = (a - b).abs() / (1.0 + a.abs().max(b.abs()));
@@ -1460,47 +1482,25 @@ fn rigid_row_kernel_sparse_matches_dense_932() {
             }
             assert!(
                 (a - b).abs() <= 1e-12 + 1e-12 * a.abs().max(b.abs()),
-                "sparse vs dense channel disagreement: {a:+.16e} vs {b:+.16e}"
+                "generated vs generic channel disagreement: {a:+.16e} vs {b:+.16e}"
             );
         };
-        check(sparse.value(), dense.value());
+        check(value, dense.value());
         for a in 0..4 {
-            check(sparse.g()[a], dense.g()[a]);
+            check(gradient[a], dense.g()[a]);
             for b in 0..4 {
-                check(sparse.h()[a][b], dense.h()[a][b]);
+                check(hessian[a][b], dense.h()[a][b]);
             }
+        }
+        for witness in 0..3 {
+            check(witnesses[witness], dense_witnesses[witness]);
+            check(witnesses[witness], sliced_witnesses[witness]);
         }
     }
     assert!(
         max_rel <= 1e-12,
-        "sparse vs dense max relative error {max_rel:.3e} exceeds 1e-12"
+        "generated vs generic max relative error {max_rel:.3e} exceeds 1e-12"
     );
-}
-
-/// #932 static-sparsity SAFETY: declaring a genuinely NONLINEAR axis (`g`, axis
-/// 3) as linear violates the index-affine contract and must panic at the
-/// debug-checked elision site rather than silently dropping the linear×linear
-/// curvature it would skip — so a future mis-declaration cannot ship a wrong
-/// Hessian.
-#[test]
-#[should_panic(expected = "static-sparsity contract violated")]
-fn rigid_row_kernel_sparse_wrong_mask_panics_932() {
-    use gam_math::jet_scalar::JetScalar;
-    // Mask claims ALL four axes linear, including the nonlinear g (axis 3).
-    const WRONG: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
-    let p = [0.3_f64, 0.9, 1.4, 0.25];
-    let inputs = RigidRowInputs {
-        row: 0,
-        wi: 1.0,
-        di: 1.0,
-        z_sum: 0.2,
-        covariance_ones: 1.0,
-        probit_scale: 0.85,
-        qd1_lower: -1.0,
-    };
-    let vars: [SparseOrder2<WRONG>; 4] = std::array::from_fn(|a| SparseOrder2::variable(p[a], a));
-    rigid_row_nll(&vars, &inputs)
-        .expect("rigid_row_nll must panic on the wrong static-sparsity mask before it can return");
 }
 
 #[test]
@@ -9073,7 +9073,8 @@ fn survival_jeffreys_contracted_trace_hook_beats_pairwise_979() {
         0.2 + 0.05 * ((r + j) as f64).cos() + 0.011 * (j as f64) - 0.003 * (r as f64) / (n as f64)
     });
     let logslope_design = Array2::from_shape_fn((n, p_g), |(r, j)| {
-        0.1 + 0.07 * ((r + 2 * j) as f64).sin() - 0.009 * (j as f64) + 0.004 * (r as f64) / (n as f64)
+        0.1 + 0.07 * ((r + 2 * j) as f64).sin() - 0.009 * (j as f64)
+            + 0.004 * (r as f64) / (n as f64)
     });
 
     let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
@@ -9196,7 +9197,10 @@ fn survival_jeffreys_contracted_trace_hook_beats_pairwise_979() {
 /// or fails.
 #[test]
 fn survival_sparse_tower4_full_t4_matches_dense_oracle_979() {
-    use super::row_kernel::{RIGID_LINEAR_MASK, SparseTower4, rigid_row_inputs, rigid_row_kernel_primaries, rigid_row_nll};
+    use super::row_kernel::{
+        RIGID_LINEAR_MASK, SparseTower4, rigid_row_inputs, rigid_row_kernel_primaries,
+        rigid_row_nll,
+    };
     use gam_math::jet_scalar::JetScalar;
     use gam_math::jet_tower::program_full_tower;
 
@@ -9327,13 +9331,13 @@ fn release_measure_flex_jet_orders_vs_retained_oracles_932() {
 
     fn matrix_gap(production: &Array2<f64>, retained: &[f64]) -> (f64, f64) {
         assert_eq!(production.len(), retained.len());
-        production
-            .iter()
-            .zip(retained)
-            .fold((0.0_f64, 0.0_f64), |(max_abs, max_rel), (&got, &want)| {
+        production.iter().zip(retained).fold(
+            (0.0_f64, 0.0_f64),
+            |(max_abs, max_rel), (&got, &want)| {
                 let abs = (got - want).abs();
                 (max_abs.max(abs), max_rel.max(abs / want.abs().max(1.0)))
-            })
+            },
+        )
     }
 
     let fixture = B10_PARITY_FIXTURES[0];

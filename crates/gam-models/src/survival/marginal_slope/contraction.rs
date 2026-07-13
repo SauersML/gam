@@ -81,11 +81,10 @@ impl SurvivalMarginalSlopeFamily {
         Ok(rigid_row_nll(&vars, &inputs)?.contracted_fourth())
     }
 
-    /// Compute per-row primary gradient and Hessian from the single-source rigid
-    /// row NLL at the packed `Order2<4>` scalar (no dense `Tower4<4>`). The hot
-    /// inner computation uses stack arrays only; conversion to Array1/Array2
-    /// happens once at the boundary for API compatibility with outer-derivative
-    /// paths.
+    /// Compute per-row primary gradient and Hessian from the direct symbolic
+    /// lowering of the single-source rigid row program. The hot inner
+    /// computation uses stack arrays only; conversion to Array1/Array2 happens
+    /// once at the boundary for API compatibility with outer-derivative paths.
     pub(crate) fn compute_row_primary_gradient_hessian_uncached(
         &self,
         row: usize,
@@ -98,14 +97,7 @@ impl SurvivalMarginalSlopeFamily {
             "survival marginal-slope rigid row helper kernel",
         )?;
         let p = rigid_row_kernel_primaries(self, block_states, row)?;
-        // Static-sparsity (v,g,H): q0/q1/qd1 linear ⇒ linear×linear self-Hessian
-        // elided (see `SparseOrder2`). Bit-identical to the dense `Order2<4>`.
-        let vars: [SparseOrder2<RIGID_LINEAR_MASK>; 4] =
-            std::array::from_fn(|a| SparseOrder2::variable(p[a], a));
-        let out = rigid_row_nll(&vars, &inputs)?;
-        let nll = out.value();
-        let grad_arr = out.g();
-        let hess_arr = out.h();
+        let (nll, grad_arr, hess_arr) = rigid_row_order2(&p, &inputs)?;
         // Convert stack arrays to ndarray types at the boundary.
         let grad = Array1::from_vec(grad_arr.to_vec());
         let mut hess = Array2::zeros((N_PRIMARY, N_PRIMARY));

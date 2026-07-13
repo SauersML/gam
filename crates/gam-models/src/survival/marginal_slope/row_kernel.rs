@@ -8,185 +8,14 @@ use gam_math::jet_scalar::JetScalar;
 use gam_math::nested_dual::JetField;
 use gam_row_macros::row_program;
 
-// ── Static-sparsity (v,g,H) scalar (#932 perf) ─────────────────────────
-//
-// The rigid row primaries are `(q0, q1, qd1, g)`. Three of them — `q0`, `q1`,
-// `qd1` — enter every INDEX intermediate (`eta0 = q0·c + s·g·z`, `eta1`, `ad1`)
-// AFFINELY: each is a single linear coefficient times the shared curvature
-// factor `c(g)`. So the *index-space* second derivative between any two of those
-// three linear primaries is structurally zero — the only curvature they acquire
-// is the rank-1 outer-function term `f''·(∂η/∂q)·(∂η/∂q)` created at the leaf
-// composes (logΦ / logφ / log), which is genuinely dense and computed normally.
-//
-// [`SparseOrder2`] encodes "which axes are linear" as a compile-time bitmask and
-// ELIDES exactly the provably-zero work: the linear×linear self-Hessian READS in
-// `mul`/`compose_unary` (a linear axis carries a structurally-zero self-Hessian
-// block by the index-affine contract). Everything else — the gradient, the
-// linear×nonlinear cross curvature, and the dense leaf `g⊗g` — is computed bit
-// for bit as the dense [`Order2`]. The family writes the row NLL ONCE against
-// [`JetScalar`]; this is just a different instantiation that the compiler
-// monomorphizes into sparse-optimal code (proven: a single `mul` drops from 63
-// to 21 floating-point instructions in the emitted IR/asm). No hand chain rule,
-// so the #736 cross-block-sign-flip bug genus cannot reappear.
-//
-// CONTRACT: an axis may be declared linear only when the program never forms
-// curvature between it and another linear axis (the linear×linear index Hessian
-// stays zero for the life of every intermediate). [`SparseOrder2::check_contract`]
-// debug-asserts this at every elision site, so a wrong declaration panics loudly
-// in debug/test builds rather than silently dropping curvature.
-
 /// Bitmask of which `K=4` rigid primaries enter linearly: bit `a` set ⇒ axis `a`
-/// is linear. `q0 (0), q1 (1), qd1 (2)` are linear; `g (3)` is nonlinear.
+/// is linear. The higher-order sparse towers use this contract; order two is
+/// lowered directly from the [`row_program!`] SSA graph instead of using a jet.
 pub(crate) const RIGID_LINEAR_MASK: u32 = (1 << 0) | (1 << 1) | (1 << 2);
 
 #[inline(always)]
 const fn axis_is_linear(mask: u32, a: usize) -> bool {
     (mask >> a) & 1 == 1
-}
-
-/// Order-2 (value/gradient/Hessian) jet over `K=4` primaries, with compile-time
-/// static sparsity: the linear×linear self-Hessian block (axes both set in
-/// `LIN`) is never read in `mul`/`compose_unary` because it is structurally
-/// zero. Bit-identical to [`Order2<4>`] on every channel a consumer reads.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SparseOrder2<const LIN: u32> {
-    v: f64,
-    grad: [f64; 4],
-    hess: [[f64; 4]; 4],
-}
-
-impl<const LIN: u32> SparseOrder2<LIN> {
-    #[inline]
-    pub(crate) fn g(&self) -> [f64; 4] {
-        self.grad
-    }
-    #[inline]
-    pub(crate) fn h(&self) -> [[f64; 4]; 4] {
-        self.hess
-    }
-
-    /// Guard for the index-affine contract: the linear×linear self-Hessian
-    /// block must be exactly zero wherever we elide its read.
-    #[inline(always)]
-    fn check_contract(&self) {
-        for i in 0..4 {
-            if axis_is_linear(LIN, i) {
-                for j in 0..4 {
-                    if axis_is_linear(LIN, j) {
-                        assert!(
-                            self.hess[i][j] == 0.0,
-                            "static-sparsity contract violated: linear×linear Hessian h[{i}][{j}]={} != 0 (axes {i},{j} both declared linear but the program forms curvature between them)",
-                            self.hess[i][j]
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl<const LIN: u32> JetScalar<4> for SparseOrder2<LIN> {
-    fn constant(c: f64) -> Self {
-        Self {
-            v: c,
-            grad: [0.0; 4],
-            hess: [[0.0; 4]; 4],
-        }
-    }
-    fn variable(x: f64, axis: usize) -> Self {
-        let mut grad = [0.0; 4];
-        grad[axis] = 1.0;
-        Self {
-            v: x,
-            grad,
-            hess: [[0.0; 4]; 4],
-        }
-    }
-}
-
-impl<const LIN: u32> gam_math::nested_dual::JetField for SparseOrder2<LIN> {
-    fn value(&self) -> f64 {
-        self.v
-    }
-    // add / sub / scale are uniform-dense: after a leaf compose, a linear×linear
-    // entry can be legitimately nonzero (the dense `f''·g⊗g` term), so these must
-    // touch every entry. The elision lives ONLY in the h-reads of mul/compose.
-    fn add(&self, o: &Self) -> Self {
-        let mut r = *self;
-        r.v += o.v;
-        for i in 0..4 {
-            r.grad[i] += o.grad[i];
-            for j in 0..4 {
-                r.hess[i][j] += o.hess[i][j];
-            }
-        }
-        r
-    }
-    fn sub(&self, o: &Self) -> Self {
-        self.add(&o.neg())
-    }
-    fn neg(&self) -> Self {
-        self.scale(-1.0)
-    }
-    fn scale(&self, s: f64) -> Self {
-        let mut r = *self;
-        r.v *= s;
-        for i in 0..4 {
-            r.grad[i] *= s;
-            for j in 0..4 {
-                r.hess[i][j] *= s;
-            }
-        }
-        r
-    }
-    fn mul(&self, o: &Self) -> Self {
-        let a = self;
-        let b = o;
-        // Elision precondition: we skip reading a.hess/b.hess on the
-        // linear×linear block — assert those reads would indeed be zero.
-        a.check_contract();
-        b.check_contract();
-        let mut r = Self::constant(a.v * b.v);
-        for i in 0..4 {
-            r.grad[i] = a.v * b.grad[i] + a.grad[i] * b.v;
-        }
-        // H_out[i][j] = a.v·H_b + a.g[i]·b.g[j] + a.g[j]·b.g[i] + H_a·b.v. The
-        // self-Hessian reads H_a[i][j]/H_b[i][j] are structurally zero when both
-        // i,j are linear (contract), so they are elided; the `g⊗g` product-rule
-        // curvature term is always kept.
-        for i in 0..4 {
-            for j in 0..4 {
-                let mut hij = a.grad[i] * b.grad[j] + a.grad[j] * b.grad[i];
-                if !axis_is_linear(LIN, i) || !axis_is_linear(LIN, j) {
-                    hij += a.v * b.hess[i][j] + a.hess[i][j] * b.v;
-                }
-                r.hess[i][j] = hij;
-            }
-        }
-        r
-    }
-    fn compose_unary(&self, d: [f64; 5]) -> Self {
-        // Elision precondition: skipping self.hess on the linear×linear block.
-        self.check_contract();
-        let (f1, f2) = (d[1], d[2]);
-        let mut r = Self::constant(d[0]);
-        for i in 0..4 {
-            r.grad[i] = f1 * self.grad[i];
-        }
-        // H_out[i][j] = f1·H_self[i][j] + f2·g_i·g_j. The dense `f2·g⊗g` term is
-        // always kept (this is the leaf curvature, nonzero on linear×linear); the
-        // `f1·H_self` read skips linear×linear (structurally zero by contract).
-        for i in 0..4 {
-            for j in 0..4 {
-                let mut hij = f2 * self.grad[i] * self.grad[j];
-                if !axis_is_linear(LIN, i) || !axis_is_linear(LIN, j) {
-                    hij += f1 * self.hess[i][j];
-                }
-                r.hess[i][j] = hij;
-            }
-        }
-        r
-    }
 }
 
 // ── Static-sparsity order-≤3 / order-≤4 towers (#1591 perf) ───────────
@@ -202,13 +31,13 @@ impl<const LIN: u32> gam_math::nested_dual::JetField for SparseOrder2<LIN> {
 //
 // The earlier `#1591` pass cut the first-directional path with a plain
 // `Tower3<4>` (drops the `t4` build). [`SparseTower3`] / [`SparseTower4`] push
-// that further with the SAME static-sparsity contract the production `(v,g,H)`
-// path already ships in [`SparseOrder2`] (#932), now one and two tensor orders
-// higher: the rigid primaries `q0,q1,qd1` enter the index quantities
+// that further with the same index-affine contract used by the direct order-two
+// symbolic lowering, now one and two tensor orders higher: the rigid primaries
+// `q0,q1,qd1` enter the index quantities
 // (`eta0,eta1,ad1,c`) AFFINELY, so on EVERY intermediate that is `mul`/`compose`d
 // (all of which are pre-leaf affine quantities — see [`rigid_row_nll`]: the leaf
 // composes feed only `add`/`scale`) the structurally-zero derivative blocks are:
-//   * `h[i][j] == 0` when both `i,j` are linear (`SparseOrder2`'s contract),
+//   * `h[i][j] == 0` when both `i,j` are linear,
 //   * `t3[i][j][k] == 0` when ≥ 2 of `i,j,k` are linear,
 //   * `t4[i][j][k][l] == 0` when ≥ 2 of `i,j,k,l` are linear.
 // Every Leibniz / Faà-di-Bruno term that READS such a zero block is elided; the
@@ -222,8 +51,8 @@ impl<const LIN: u32> gam_math::nested_dual::JetField for SparseOrder2<LIN> {
 // reductions of 1.81× (t3 build) and 2.89× (t4 build: 114018 → 39399 ops/row).
 // [`check_contract`] debug-asserts the zero-block premise at every elision site,
 // so a wrong linearity declaration panics loudly (cf. the production
-// `rigid_row_kernel_sparse_wrong_mask_panics_932` safety test) rather than
-// silently dropping curvature.
+// the sparse-tower wrong-mask safety tests) rather than silently dropping
+// curvature.
 
 #[inline(always)]
 const fn h_block_is_zero(mask: u32, i: usize, j: usize) -> bool {
@@ -1024,6 +853,34 @@ pub(crate) fn rigid_row_nll<S: JetScalar<4>>(
     Ok(nll)
 }
 
+/// Direct value/gradient/Hessian lowering of the canonical rigid row program.
+///
+/// [`row_program!`] emits this scalar schedule and the generic/CUDA evaluators
+/// from the same parsed SSA graph and the same declared derivative-stack leaves.
+/// The order-two path therefore performs only the live symbolic arithmetic: it
+/// never constructs forward-jet identities, masks, or zero Hessian channels.
+#[inline(always)]
+pub(crate) fn rigid_row_order2(
+    primaries: &[f64; 4],
+    inputs: &RigidRowInputs,
+) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
+    let [q0, q1, qd1, g] = *primaries;
+    let (value, gradient, hessian, [neg_eta0, neg_eta1, adjusted_derivative]) =
+        rigid_row_program_order2(
+            q0,
+            q1,
+            qd1,
+            g,
+            inputs.wi,
+            inputs.di,
+            inputs.z_sum,
+            inputs.covariance_ones,
+            inputs.probit_scale,
+        );
+    validate_rigid_row_admission(qd1, inputs, neg_eta0, neg_eta1, adjusted_derivative)?;
+    Ok((value, gradient, hessian))
+}
+
 /// Apply the scalar domain contract shared by the ordinary row evaluator and
 /// the already-admitted GPU gather. The three witnesses come from the same
 /// [`row_program!`] declaration: directly from the generic program on CPU and
@@ -1108,17 +965,10 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     }
 
     fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
-        // #932: value/gradient/Hessian derive from the SAME single-sourced row
-        // NLL (`rigid_row_nll`) — no dense `Tower4<4>` (256-entry `t4` + 64-entry
-        // `t3`) is built and discarded on the inner-Newton hot path. Instantiated
-        // at the static-sparsity `SparseOrder2<RIGID_LINEAR_MASK>` scalar: q0/q1/
-        // qd1 enter the index quantities affinely, so their linear×linear self-
-        // Hessian block is structurally zero and the compiler elides those reads
-        // (proven 63→21 FP ops per `mul`), recovering the hand-kernel's sparsity
-        // throughput WITHOUT a hand chain rule (so no #736 sign-flip bug genus).
-        // Bit-identical to the dense `Order2<4>` / `Tower4<4>` channels by the
-        // `rigid_row_kernel_agrees_with_jet_tower_program_all_channels` oracle and
-        // `rigid_row_kernel_sparse_matches_dense_932`.
+        // #932: the macro lowers value/gradient/Hessian directly from the SAME
+        // parsed SSA graph as `rigid_row_nll` and CUDA. No dense higher-order
+        // tower, forward order-two jet, dependency mask, or hand chain rule is
+        // built on this inner-Newton hot path.
         let inputs = rigid_row_inputs(
             &self.family,
             &self.block_states,
@@ -1126,10 +976,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
             "survival marginal-slope rigid row kernel",
         )?;
         let p = rigid_row_kernel_primaries(&self.family, &self.block_states, row)?;
-        let vars: [SparseOrder2<RIGID_LINEAR_MASK>; 4] =
-            std::array::from_fn(|a| SparseOrder2::variable(p[a], a));
-        let out = rigid_row_nll(&vars, &inputs)?;
-        Ok((out.value(), out.g(), out.h()))
+        rigid_row_order2(&p, &inputs)
     }
 
     /// Batched all-rows `(nll, grad, hess)` via the A100 NVRTC survival row-jet
