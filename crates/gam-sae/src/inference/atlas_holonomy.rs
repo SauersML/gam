@@ -61,6 +61,7 @@ pub enum AtlasStatisticalRefusal {
         numerical_rank_threshold: f64,
     },
     PatchTailCrossesEigengap {
+        edge: AtlasHolonomyEdgeId,
         chart: usize,
         covariance_error_bound: f64,
         eigengap_lower: f64,
@@ -1372,6 +1373,57 @@ mod tests {
         assert!(large.orientation().certified_value().is_some());
     }
 
+    #[test]
+    fn orientation_occupancy_counts_distinct_projected_edge_incidences() {
+        let level = AtlasFamilywiseLevel::new(0.05).unwrap();
+        let single = GaussianPcaHolonomyAnalysis::certify(
+            vec![
+                patch(0, 0.0, 0.0, false, 1_000_000, 0),
+                patch(1, 0.2, 0.0, false, 1_000_000, 0),
+            ],
+            vec![ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap()],
+            level,
+            None,
+        )
+        .unwrap();
+        let two_incident_edges = GaussianPcaHolonomyAnalysis::certify(
+            vec![
+                patch(0, 0.0, 0.0, false, 1_000_000, 0),
+                patch(1, 0.2, 0.0, false, 1_000_000, 0),
+                patch(2, -0.2, 0.0, false, 1_000_000, 0),
+            ],
+            vec![
+                ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap(),
+                ProjectedAtlasEdgeSpec::new(0, 2, 0, 0.0).unwrap(),
+            ],
+            level,
+            None,
+        )
+        .unwrap();
+        let single_center = single
+            .sample_prescription()
+            .iter()
+            .find(|entry| entry.chart == 0)
+            .unwrap();
+        let two_edge_center = two_incident_edges
+            .sample_prescription()
+            .iter()
+            .find(|entry| entry.chart == 0)
+            .unwrap();
+        assert!(
+            two_edge_center.required_covariance_degrees_of_freedom
+                > single_center.required_covariance_degrees_of_freedom,
+            "the union bound must spend error probability on both non-nested edge projections"
+        );
+
+        let edge = &single.edges()[0];
+        let frame_budget = single_center.aligned_frame_error_budget;
+        assert_near(
+            2.0 * frame_budget + frame_budget * frame_budget,
+            edge.orientation_margin.min(edge.principal_angle_cosines[1]),
+        );
+    }
+
     fn cancellation_gauss_bonnet(remainder: f64) -> GaussBonnetInput {
         GaussBonnetInput::new(
             vec![GaussBonnetNoiseSource::new(7, arr2(&[[1.0]])).unwrap()],
@@ -1433,7 +1485,6 @@ struct EdgeWork {
 
 #[derive(Clone, Debug)]
 struct FundamentalCycle {
-    charts: Vec<usize>,
     steps: Vec<(usize, bool)>,
 }
 
@@ -1735,10 +1786,7 @@ fn fundamental_cycles(
         }
         let chord_from = walk[walk.len() - 2];
         steps.push((chord_index, chord_from == chord.a));
-        cycles.push(FundamentalCycle {
-            charts: walk,
-            steps,
-        });
+        cycles.push(FundamentalCycle { steps });
     }
     Ok(cycles)
 }
@@ -1777,6 +1825,62 @@ fn patch_tail(
     }
 }
 
+/// Largest common aligned-frame error at the two endpoints which cannot reach
+/// the singular-cross-Gram boundary. If both endpoint errors are at most `h`,
+/// the cross-Gram perturbation is at most `2h + h²`. Solving
+/// `2h + h² = m`, with `m = |det(U_b^T U_a)| <= sigma_min(U_b^T U_a)`, uses the
+/// complete determinant margin rather than a hand-chosen fraction of it.
+fn orientation_endpoint_frame_budget(edge: &EdgeWork) -> f64 {
+    let determinant_margin = edge
+        .public
+        .orientation_margin
+        .min(edge.smallest_singular_value)
+        .clamp(0.0, 1.0);
+    (1.0 + determinant_margin).sqrt() - 1.0
+}
+
+fn covariance_budget_ratio(patch: &GaussianPcaPatch, frame_budget: f64) -> f64 {
+    let projector_budget = projector_error_for_aligned_frame_error(frame_budget);
+    let covariance_budget = patch.population_bounds.eigengap_lower * projector_budget / 2.0;
+    covariance_budget / patch.population_bounds.spectral_radius_upper()
+}
+
+fn required_covariance_degrees_of_freedom(
+    patch: &GaussianPcaPatch,
+    projected_dimension: usize,
+    frame_budget: f64,
+    tail_parameter: f64,
+) -> usize {
+    let normalized_budget = covariance_budget_ratio(patch, frame_budget);
+    let u_budget = (1.0 + normalized_budget).sqrt() - 1.0;
+    if u_budget <= 0.0 {
+        return usize::MAX;
+    }
+    let numerator = (projected_dimension as f64).sqrt() + (2.0 * tail_parameter).sqrt();
+    let required = (numerator / u_budget).powi(2).ceil();
+    if required.is_finite() && required <= usize::MAX as f64 {
+        required as usize
+    } else {
+        usize::MAX
+    }
+}
+
+fn supported_tail_parameter(
+    patch: &GaussianPcaPatch,
+    projected_dimension: usize,
+    frame_budget: f64,
+) -> f64 {
+    let normalized_budget = covariance_budget_ratio(patch, frame_budget);
+    let u_budget = (1.0 + normalized_budget).sqrt() - 1.0;
+    let available = (patch.covariance_degrees_of_freedom() as f64).sqrt() * u_budget
+        - (projected_dimension as f64).sqrt();
+    if available > 0.0 {
+        available * available / 2.0
+    } else {
+        0.0
+    }
+}
+
 fn orientation_tail_and_prescription(
     patches: &[GaussianPcaPatch],
     edges: &[EdgeWork],
@@ -1806,46 +1910,41 @@ fn orientation_tail_and_prescription(
             Vec::new(),
         );
     }
-    let mut frame_budgets = vec![f64::INFINITY; patches.len()];
-    let mut projected_dimensions = vec![0usize; patches.len()];
+    // Each edge uses its own pairwise projection space. Distinct incident
+    // projections are not generally nested, so the finite-sample union bound
+    // must count edge endpoints, not merely distinct patches.
+    let incidence_count = 2 * edges.len();
+    let requested_tail_parameter = (2.0 * incidence_count as f64 / allocated_alpha).ln();
+    let mut patch_requirements = vec![None::<(usize, usize, f64)>; patches.len()];
+    let mut flip_probability_bound = 0.0_f64;
     for edge in edges {
-        // If both endpoints stay within m/4 in aligned-frame norm, their
-        // cross-Gram differs by at most m/2 < m, so its determinant cannot
-        // cross zero.  The unused half-margin makes the strict inequality
-        // explicit without a floating threshold.
-        let endpoint_budget = edge.public.orientation_margin / 4.0;
+        let frame_budget = orientation_endpoint_frame_budget(edge);
         for chart in [edge.public.a, edge.public.b] {
-            frame_budgets[chart] = frame_budgets[chart].min(endpoint_budget);
-            projected_dimensions[chart] =
-                projected_dimensions[chart].max(edge.public.projected_dimension);
+            let patch = &patches[chart];
+            let projected_dimension = edge.public.projected_dimension;
+            let required_dof = required_covariance_degrees_of_freedom(
+                patch,
+                projected_dimension,
+                frame_budget,
+                requested_tail_parameter,
+            );
+            let replace = patch_requirements[chart]
+                .as_ref()
+                .is_none_or(|&(current, _, _)| required_dof > current);
+            if replace {
+                patch_requirements[chart] = Some((required_dof, projected_dimension, frame_budget));
+            }
+            let supported = supported_tail_parameter(patch, projected_dimension, frame_budget);
+            flip_probability_bound += (2.0 * (-supported).exp()).min(1.0);
         }
     }
-    let active_patches = projected_dimensions
-        .iter()
-        .filter(|&&rank| rank > 0)
-        .count();
-    let requested_tail_parameter = (2.0 * active_patches as f64 / allocated_alpha).ln();
-    let mut prescriptions = Vec::with_capacity(active_patches);
-    let mut flip_probability_bound = 0.0_f64;
-    for (chart, patch) in patches.iter().enumerate() {
-        let projected_dimension = projected_dimensions[chart];
-        if projected_dimension == 0 {
+    flip_probability_bound = flip_probability_bound.min(1.0);
+    let mut prescriptions = Vec::with_capacity(patches.len());
+    for (chart, requirement) in patch_requirements.into_iter().enumerate() {
+        let Some((required_dof, projected_dimension, frame_budget)) = requirement else {
             continue;
-        }
-        let frame_budget = frame_budgets[chart];
-        let projector_budget = projector_error_for_aligned_frame_error(frame_budget);
-        let covariance_budget = patch.population_bounds.eigengap_lower * projector_budget / 2.0;
-        let normalized_budget = covariance_budget / patch.population_bounds.spectral_radius_upper();
-        let u_budget = (1.0 + normalized_budget).sqrt() - 1.0;
-        let numerator =
-            (projected_dimension as f64).sqrt() + (2.0 * requested_tail_parameter).sqrt();
-        let required_dof_f64 = (numerator / u_budget).powi(2).ceil();
-        let required_dof = if required_dof_f64.is_finite() && required_dof_f64 <= usize::MAX as f64
-        {
-            required_dof_f64 as usize
-        } else {
-            usize::MAX
         };
+        let patch = &patches[chart];
         let required_rows = patch
             .centering
             .rows_for_degrees_of_freedom(required_dof)
@@ -1859,16 +1958,7 @@ fn orientation_tail_and_prescription(
             projected_dimension,
             aligned_frame_error_budget: frame_budget,
         });
-        let available = (patch.covariance_degrees_of_freedom() as f64).sqrt() * u_budget
-            - (projected_dimension as f64).sqrt();
-        let supported_tail_parameter = if available > 0.0 {
-            available * available / 2.0
-        } else {
-            0.0
-        };
-        flip_probability_bound += (2.0 * (-supported_tail_parameter).exp()).min(1.0);
     }
-    flip_probability_bound = flip_probability_bound.min(1.0);
     if flip_probability_bound > allocated_alpha {
         reasons.push(AtlasStatisticalRefusal::OrientationFlipBoundExceedsLevel {
             flip_probability_bound,
@@ -2076,43 +2166,39 @@ fn analyze_cycle(
         .atan2(holonomy[[0, 0]] + holonomy[[1, 1]])
         .abs();
 
-    let cycle_charts: BTreeSet<usize> = cycle.charts.iter().copied().collect();
-    let tail_parameter = (2.0 * cycle_charts.len() as f64 / subspace_tail_probability_bound).ln();
-    let mut patch_projected_dimension = vec![0usize; patches.len()];
-    for &(edge_index, _) in &cycle.steps {
-        let edge = &edges[edge_index].public;
-        patch_projected_dimension[edge.a] =
-            patch_projected_dimension[edge.a].max(edge.projected_dimension);
-        patch_projected_dimension[edge.b] =
-            patch_projected_dimension[edge.b].max(edge.projected_dimension);
-    }
-    let mut patch_tails = vec![None; patches.len()];
-    for chart in cycle_charts {
-        let tail = patch_tail(
-            &patches[chart],
-            patch_projected_dimension[chart],
-            tail_parameter,
-        );
-        if tail.covariance_error >= patches[chart].population_bounds.eigengap_lower / 2.0
-            || tail.projector_error >= 1.0
-        {
-            reasons.push(AtlasStatisticalRefusal::PatchTailCrossesEigengap {
-                chart,
-                covariance_error_bound: tail.covariance_error,
-                eigengap_lower: patches[chart].population_bounds.eigengap_lower,
-            });
-        }
-        patch_tails[chart] = Some(tail);
-    }
+    // Pairwise projection spaces on adjacent edges need not be nested. Allocate
+    // the subspace-tail probability over the 2L projected endpoint events,
+    // preserving the advertised familywise bound for arbitrary cycles.
+    let endpoint_event_count = 2 * cycle.steps.len();
+    let tail_parameter = (2.0 * endpoint_event_count as f64 / subspace_tail_probability_bound).ln();
     let mut polar_linearization_remainder_bound = 0.0_f64;
     for (position, &(edge_index, _)) in cycle.steps.iter().enumerate() {
         let edge = &edges[edge_index];
-        let tail_a = patch_tails[edge.public.a];
-        let tail_b = patch_tails[edge.public.b];
-        let (Some(tail_a), Some(tail_b)) = (tail_a, tail_b) else {
-            continue;
-        };
-        let cross_error = tail_a.aligned_frame_error + tail_b.aligned_frame_error;
+        let tail_a = patch_tail(
+            &patches[edge.public.a],
+            edge.public.projected_dimension,
+            tail_parameter,
+        );
+        let tail_b = patch_tail(
+            &patches[edge.public.b],
+            edge.public.projected_dimension,
+            tail_parameter,
+        );
+        for (chart, tail) in [(edge.public.a, tail_a), (edge.public.b, tail_b)] {
+            if tail.covariance_error >= patches[chart].population_bounds.eigengap_lower / 2.0
+                || tail.projector_error >= 1.0
+            {
+                reasons.push(AtlasStatisticalRefusal::PatchTailCrossesEigengap {
+                    edge: edge.public.identity(),
+                    chart,
+                    covariance_error_bound: tail.covariance_error,
+                    eigengap_lower: patches[chart].population_bounds.eigengap_lower,
+                });
+            }
+        }
+        let cross_error = tail_a.aligned_frame_error
+            + tail_b.aligned_frame_error
+            + tail_a.aligned_frame_error * tail_b.aligned_frame_error;
         if cross_error >= edge.smallest_singular_value {
             reasons.push(AtlasStatisticalRefusal::PolarLinearizationUnresolved {
                 cycle_index,
