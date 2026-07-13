@@ -2619,7 +2619,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_current: &Array1<f64>,
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    hyper_layout: &CustomFamilyHyperLayout,
     warm_start: Option<&CustomFamilyWarmStart>,
     eval_mode: EvalMode,
 ) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
@@ -2628,7 +2628,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         specs,
         options,
         rho_current,
-        derivative_blocks,
+        hyper_layout,
         warm_start,
         eval_mode,
     )?
@@ -2644,12 +2644,12 @@ pub fn evaluate_custom_family_joint_hyper_owned<
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_current: &Array1<f64>,
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    hyper_layout: &CustomFamilyHyperLayout,
     warm_start: Option<&CustomFamilyWarmStart>,
     eval_mode: EvalMode,
 ) -> Result<CustomFamilyJointHyperOwnedResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
-    let has_psi_derivatives = derivative_blocks.iter().any(|block| !block.is_empty());
+    let has_psi_derivatives = !hyper_layout.is_empty();
     let (eval_options, strict_warm_start) =
         derivative_quality_options_and_warm_start(options, warm_start, has_psi_derivatives);
     let eval_result = evaluate_custom_family_hyper_internal(
@@ -2658,7 +2658,7 @@ pub fn evaluate_custom_family_joint_hyper_owned<
         &eval_options,
         &penalty_counts,
         rho_current,
-        derivative_blocks,
+        hyper_layout,
         strict_warm_start
             .as_ref()
             .map(|w| &w.inner)
@@ -2678,7 +2678,7 @@ pub fn evaluate_custom_family_joint_hyper_shared<
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_current: &Array1<f64>,
-    derivative_blocks: SharedDerivativeBlocks,
+    hyper_layout: SharedCustomFamilyHyperLayout,
     warm_start: Option<&CustomFamilyWarmStart>,
     eval_mode: EvalMode,
 ) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
@@ -2687,14 +2687,14 @@ pub fn evaluate_custom_family_joint_hyper_shared<
         specs,
         options,
         rho_current,
-        derivative_blocks,
+        hyper_layout,
         warm_start,
         eval_mode,
     )?
     .result)
 }
 
-/// Shared-derivative-block variant of
+/// Shared-layout variant of
 /// [`evaluate_custom_family_joint_hyper_owned`].
 pub fn evaluate_custom_family_joint_hyper_owned_shared<
     F: CustomFamily + Clone + Send + Sync + 'static,
@@ -2703,12 +2703,12 @@ pub fn evaluate_custom_family_joint_hyper_owned_shared<
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_current: &Array1<f64>,
-    derivative_blocks: SharedDerivativeBlocks,
+    hyper_layout: SharedCustomFamilyHyperLayout,
     warm_start: Option<&CustomFamilyWarmStart>,
     eval_mode: EvalMode,
 ) -> Result<CustomFamilyJointHyperOwnedResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
-    let has_psi_derivatives = derivative_blocks.iter().any(|block| !block.is_empty());
+    let has_psi_derivatives = !hyper_layout.is_empty();
     let (eval_options, strict_warm_start) =
         derivative_quality_options_and_warm_start(options, warm_start, has_psi_derivatives);
     let eval_result = evaluate_custom_family_hyper_internal_shared(
@@ -2717,7 +2717,7 @@ pub fn evaluate_custom_family_joint_hyper_owned_shared<
         &eval_options,
         &penalty_counts,
         rho_current,
-        derivative_blocks,
+        hyper_layout,
         strict_warm_start
             .as_ref()
             .map(|w| &w.inner)
@@ -2761,7 +2761,7 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_current: &Array1<f64>,
-    derivative_blocks: SharedDerivativeBlocks,
+    hyper_layout: SharedCustomFamilyHyperLayout,
     candidates: &[Option<CustomFamilyWarmStart>],
     eval_mode: EvalMode,
 ) -> Result<CustomFamilyJointHyperModeSelection, CustomFamilyError> {
@@ -2777,7 +2777,7 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
     let mut screened_results: Vec<Option<OuterObjectiveEvalResult>> =
         (0..candidates.len()).map(|_| None).collect();
     let penalty_counts = validate_blockspecs(specs)?;
-    let has_psi_derivatives = derivative_blocks.iter().any(|block| !block.is_empty());
+    let has_psi_derivatives = !hyper_layout.is_empty();
     for (candidate_idx, warm_start) in candidates.iter().enumerate() {
         let (eval_options, strict_warm_start) = derivative_quality_options_and_warm_start(
             options,
@@ -2790,7 +2790,7 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
             &eval_options,
             &penalty_counts,
             rho_current,
-            Arc::clone(&derivative_blocks),
+            Arc::clone(&hyper_layout),
             strict_warm_start
                 .as_ref()
                 .map(|warm| &warm.inner)
@@ -2882,7 +2882,7 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         &eval_options,
         &penalty_counts,
         rho_current,
-        Arc::clone(&derivative_blocks),
+        Arc::clone(&hyper_layout),
         None,
         gam_problem::RhoPrior::Flat,
         eval_mode,
@@ -2904,7 +2904,7 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
     validate_requested_best_mode_derivatives(
         &derivative_eval,
         eval_mode,
-        rho_current.len() + derivative_blocks.iter().map(Vec::len).sum::<usize>(),
+        rho_current.len() + hyper_layout.len(),
         selected_candidate,
     )?;
     let owned = outer_eval_result_into_joint_hyper_owned_result(derivative_eval);
