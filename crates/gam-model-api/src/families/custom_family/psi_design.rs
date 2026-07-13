@@ -13,9 +13,9 @@ use std::sync::Arc;
 // `gam-problem`. Only the trait that couples to the `CustomFamily` evaluation
 // carrier (`ExactNewtonJointHessianWorkspace`) stays local below.
 pub use gam_problem::{
-    CustomFamilyBlockPsiDerivative, CustomFamilyPsiDerivativeOperator,
-    JointHessianSourcePreference, MaterializablePsiDerivativeOperator, MaterializationIntent,
-    SharedDerivativeBlocks,
+    CustomFamilyBlockPsiDerivative, CustomFamilyHyperAxis, CustomFamilyHyperLayout,
+    CustomFamilyPsiDerivativeOperator, JointHessianSourcePreference,
+    MaterializablePsiDerivativeOperator, MaterializationIntent, SharedCustomFamilyHyperLayout,
 };
 
 pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
