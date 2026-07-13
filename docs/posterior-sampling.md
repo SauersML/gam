@@ -53,12 +53,31 @@ synthetic responses from the fitted predictive distribution, use
 ```python
 rep = model.sample_replicates(test_df, n_draws=200, seed=42)
 # shape: (200, n_rows)
+
+# For large jobs, bound the output allocation explicitly. Chunk boundaries do
+# not affect the deterministic draw stream.
+for rep_chunk in model.iter_replicates(
+    test_df, n_draws=1_000_000, chunk_size=512, seed=42
+):
+    consume(rep_chunk)  # each shape is at most (512, n_rows)
 ```
 
-The replicate path uses the saved family and fitted dispersion
-(Gaussian / Poisson / Bernoulli / Gamma / Beta / Tweedie /
-negative-binomial) around the plug-in response mean. It is useful for
-simulation, posterior-predictive checks, and calibration probes.
+The replicate path dispatches from the saved fitted-family variant and fitted
+dispersion; callers never restate a family or refit the model. It covers the
+standard, location-scale, transformation-normal, exact spline-scan, latent
+survival, single-cause survival, and competing-risk saved-model paths. For a
+single-cause or latent survival fit the response is a conditional
+event-in-window indicator. For competing risks, zero means no event in the
+window and positive integer labels identify the persisted cause. Censoring and
+inspection records are study-design mechanisms rather than draws from those
+event laws, so this API does not invent them.
+
+`sample_replicates` is the convenient allocating form. `iter_replicates`
+requires an explicit positive `chunk_size` and retains only one draw chunk at a
+time. Adjacent chunks use seekable global draw indices, so concatenating them
+is bit-for-bit identical to the allocating call for the same data, draw count,
+and seed. Both forms are useful for simulation, posterior-predictive checks,
+and calibration probes.
 
 Multinomial models expose the categorical analogue, `posterior_predict`, which
 draws replicate class-label vectors (`Categorical(softmax(X·beta_hat))`) you can
