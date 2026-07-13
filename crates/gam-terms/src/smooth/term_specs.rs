@@ -6662,6 +6662,8 @@ impl SmoothDesign {
 pub struct LocalSmoothTermBuild {
     pub dim: usize,
     pub design: DesignMatrix,
+    /// Fixed row-wise term contribution for an affine basis chart.
+    pub affine_offset: Option<Array1<f64>>,
     pub penalties: Vec<Array2<f64>>,
     pub ops: Vec<Option<std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>>>,
     pub nullspaces: Vec<usize>,
@@ -7505,6 +7507,16 @@ pub fn apply_by_variable_to_local_build(
     for (mut row, &weight) in dense.rows_mut().into_iter().zip(weights.iter()) {
         row.mapv_inplace(|value| value * weight);
     }
+    if let Some(offset) = built.affine_offset.as_mut() {
+        if offset.len() != weights.len() {
+            crate::bail_dim_basis!(
+                "by-variable smooth term '{term_name}' affine offset has {} rows but the by-variable has {}",
+                offset.len(),
+                weights.len()
+            );
+        }
+        *offset *= &weights;
+    }
     built.design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(dense));
     built.kronecker_factored = None;
     Ok(built)
@@ -7670,6 +7682,10 @@ pub fn build_by_smooth_local(
             Ok(LocalSmoothTermBuild {
                 dim: q,
                 design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(combined)),
+                // Exactly one factor block is active on every row. Each block
+                // represents the same anchored marginal, so its fixed lift is
+                // the inner lift once, not once per level.
+                affine_offset: inner.affine_offset,
                 penalties,
                 ops,
                 nullspaces,
@@ -8116,6 +8132,9 @@ pub fn build_factor_smooth(
     Ok(LocalSmoothTermBuild {
         dim: q,
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(dense)),
+        // Exactly one group block is active on every row, so a common
+        // marginal anchor contributes its lift once for that row.
+        affine_offset: inner.affine_offset,
         penalties,
         ops,
         nullspaces,
@@ -8258,6 +8277,12 @@ pub fn build_single_local_smooth_term(
                 joint_null_rotation: None,
             };
             let mut inner_built = build_single_local_smooth_term(data, &inner_term, workspace)?;
+            if inner_built.affine_offset.is_some() {
+                crate::bail_invalid_basis!(
+                    "sum-to-zero factor smooth term '{}' cannot contain a non-zero endpoint anchor: a shared fixed affine lift would violate the per-covariate zero-sum deviation identity",
+                    term.name
+                );
+            }
             // Capture the marginal penalty's null directions BEFORE the penalty
             // vector is rebuilt below; the sum-to-zero null-space ridge replicates
             // these `z_k` into the contrast space (mgcv `bs="fs"` double-penalty).
@@ -8965,7 +8990,15 @@ pub fn build_single_local_smooth_term(
         built.penaltyinfo = penaltyinfo;
     }
 
+    if built.affine_offset.is_some() && term.shape != ShapeConstraint::None {
+        crate::bail_invalid_basis!(
+            "non-zero endpoint anchors cannot be combined with ShapeConstraint::{:?} on term '{}': the coefficient cone constrains only the homogeneous spline and would not certify the final affine function",
+            term.shape,
+            term.name
+        );
+    }
     let p_local = built.design.ncols();
+    let affine_offset = built.affine_offset;
     let mut metadata = built.metadata.clone();
     // Extract factored Kronecker representation before consuming fields.
     // Invalidate it if shape transforms will be applied (they break structure).
@@ -9168,6 +9201,7 @@ pub fn build_single_local_smooth_term(
     Ok(LocalSmoothTermBuild {
         dim: p_local,
         design: design_t,
+        affine_offset,
         penalties: penalties_t,
         ops: ops_t,
         nullspaces: nullspaces_t,
