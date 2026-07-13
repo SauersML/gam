@@ -810,14 +810,10 @@ mod topk_curved_budget_tests {
     /// Every byte figure in the ledger follows its documented formula exactly.
     #[test]
     fn topk_curved_budget_formulas_are_the_documented_arithmetic() {
-        let (n, p, k, d, s) = (4096usize, 512usize, 32_000usize, 1usize, 8usize);
-        let budget_bytes = 16 * 1024 * 1024 * 1024usize;
+        let (n, p, k, d, s) = (4096usize, 64usize, 10_000usize, 1usize, 8usize);
+        let budget_bytes = 8 * 1024 * 1024 * 1024usize;
         let ledger = sae_topk_curved_budget_from_budget(n, p, k, d, s, budget_bytes);
 
-        assert_eq!(
-            ledger.resident_seed_bytes,
-            n * k * (1 + d) * SAE_BYTES_PER_F64
-        );
         assert_eq!(
             ledger.active_state_bytes,
             n * s * (2 + d) * SAE_BYTES_PER_F64
@@ -828,76 +824,49 @@ mod topk_curved_budget_tests {
             32 + 3,
             "d_max=1: patch bound 32 + (2·3)/2 dominates 2d+1=3"
         );
-        let r_hat = p.min(SAE_TOPK_ADMISSION_FRAME_RANK_BOUND);
         assert_eq!(
-            ledger.framed_decoder_bytes,
-            k * m_hat * r_hat * SAE_BYTES_PER_F64
+            ledger.routing_workspace_bytes,
+            (p + s * (2 + d)) * SAE_BYTES_PER_F64
+        );
+        assert_eq!(
+            ledger.decoder_bytes,
+            k * m_hat * p * SAE_BYTES_PER_F64
         );
         assert_eq!(
             ledger.border_vector_bytes,
-            ledger.framed_decoder_bytes * SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER
-        );
-        assert_eq!(
-            ledger.routing_window_bytes,
-            ledger.seed_chunk_rows() * k * SAE_BYTES_PER_F64
+            ledger.decoder_bytes * SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER
         );
         assert_eq!(
             ledger.streaming_peak_bytes,
             ledger.active_state_bytes
-                + ledger.routing_window_bytes
-                + ledger.framed_decoder_bytes
+                + ledger.routing_workspace_bytes
+                + ledger.decoder_bytes
                 + ledger.border_vector_bytes
         );
         assert_eq!(
             ledger.streaming_budget_bytes,
             budget_bytes.max(SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES)
         );
-        // The honest assignment state is O(N·k_active): orders of magnitude
-        // below the dense N·K seed in the overcomplete regime.
-        assert!(ledger.active_state_bytes * 100 < ledger.resident_seed_bytes);
-        // This shape fits both sub-lanes at a 4 GiB budget.
-        assert!(ledger.resident_seed_admitted);
         assert!(ledger.streaming_admitted);
     }
 
-    /// The streaming lane admits shapes whose DENSE seed is over budget — the
-    /// exact region the chunked-seed integration seam exists for — and the
-    /// seam refuses only past the streaming budget, with the no-substitution
-    /// contract in the message.
+    /// Routing and assignment memory are support-shaped even when K grows.
     #[test]
-    fn topk_streaming_admits_beyond_resident_and_seam_validates() {
-        let (n, p, k, d, s) = (1_000_000usize, 512usize, 32_000usize, 1usize, 8usize);
-        // Resident seed = 1e6 · 32000 · 2 · 8 = 512 GB: never in core. The
-        // streamed peak is ~9.7 GB, dominated by the framed border workspace
-        // (K·M̂·r̂·8·32 ≈ 8.5 GiB), so a 16 GiB budget admits streaming.
-        let budget_bytes = 16 * 1024 * 1024 * 1024usize;
-        let ledger = sae_topk_curved_budget_from_budget(n, p, k, d, s, budget_bytes);
-        assert!(!ledger.resident_seed_admitted);
-        assert!(
-            ledger.streaming_admitted,
-            "streaming peak {} must fit the 16 GiB budget: the O(N·k_active) state is small",
-            ledger.streaming_peak_bytes
-        );
-        // Chunk sizing: floored at the minimum streaming chunk and capped at N.
-        assert!(ledger.seed_chunk_rows() >= SAE_MIN_STREAMING_CHUNK_ROWS);
-        assert!(ledger.seed_chunk_rows() <= n);
-
-        // Degenerate shapes are caller errors at the seam.
-        assert!(admit_topk_curved_lane(0, p, k, d, s).is_err());
-        assert!(admit_topk_curved_lane(n, p, k, 0, s).is_err());
-        assert!(admit_topk_curved_lane(n, p, k, d, 0).is_err());
-        assert!(admit_topk_curved_lane(n, p, k, d, k + 1).is_err());
-
-        // Past the streaming budget the ledger refuses; the refusal must carry
-        // the no-substitution contract.
-        let starved = sae_topk_curved_budget_from_budget(n, p, k, d, s, 0);
+    fn topk_routing_workspace_is_independent_of_atom_count() {
+        let shape = |k| sae_topk_curved_budget_from_budget(1024, 64, k, 2, 4, usize::MAX);
+        let ten_thousand = shape(10_000);
+        let twenty_thousand = shape(20_000);
         assert_eq!(
-            starved.streaming_budget_bytes,
-            SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES
+            ten_thousand.active_state_bytes,
+            twenty_thousand.active_state_bytes
         );
-        assert!(
-            !starved.streaming_admitted,
-            "the framed decoder + border workspace exceed the 64 MiB streaming floor at K=32000"
+        assert_eq!(
+            ten_thousand.routing_workspace_bytes,
+            twenty_thousand.routing_workspace_bytes
+        );
+        assert_eq!(
+            ten_thousand.routing_workspace_bytes,
+            (64 + 4 * (2 + 2)) * SAE_BYTES_PER_F64
         );
     }
 }

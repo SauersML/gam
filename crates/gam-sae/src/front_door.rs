@@ -120,18 +120,12 @@ pub fn admit_sae_fit(
 /// ([`crate::manifold::SaeTopKCurvedBudget`], SPEC "never OOM"):
 ///
 ///   * `K ≤ P` — the historical dense-certification admission, byte-identical;
-///   * `K > P`, resident seed (`N·K·(1+d_max)·8` bytes) within the in-core
-///     budget — admitted; the engine runs the fit with the dense seed in core;
-///   * `K > P`, resident seed over budget but the honest streaming shape
-///     (`O(N·k_active)` active sets + `O(K·M·r)` framed decoder + chunked
-///     routing window) within the streaming budget — ALSO admitted to the
-///     CURVED lane: the chunked-seed driver is wired
-///     ([`crate::manifold::admit_topk_curved_lane`] +
-///     `SaeManifoldTerm::seed_cold_start_disjoint_charts_streaming` +
-///     `SaeManifoldTerm::fit_topk_curved_streaming`), so the seed is built by
-///     accumulating each atom's decoder normal equations in
-///     `seed_chunk_rows()` row chunks — never a resident dense `(N, K)` seed;
-///   * over BOTH budgets — a typed Err. For a caller who asked for TOPK
+///   * `K > P` — exactly one representation: `O(N·k_active)` canonical active
+///     state, an `O(P+k_active·(2+d_max))` row-local routing workspace, and the
+///     final-function decoder / matrix-free border workspace. Atom scores are
+///     consumed one at a time into a bounded TopK heap; no resident or chunked
+///     dense `(N,K)` / `(*,K)` score array is a representation choice;
+///   * over the support-sparse budget — a typed Err. For a caller who asked for TOPK
 ///     MANIFOLD atoms, silently substituting the linear sparse-code lane is
 ///     the exact failure mode this front door exists to prevent (witnessed
 ///     2026-07-08: K>P fits returned `SparseDictionaryFit` through the
@@ -172,7 +166,7 @@ pub(crate) fn admit_topk_manifold_with_budget(
         // byte-identical to the penalty-gated admission.
         return Ok(admission);
     }
-    // K > P: the overcomplete curved lane. The streaming plan owns the ledger.
+    // K > P: the overcomplete support-sparse lane. The streaming plan owns the ledger.
     let ledger = crate::manifold::sae_topk_curved_budget_from_budget(
         n_obs,
         output_dim,
@@ -193,13 +187,17 @@ pub(crate) fn admit_topk_manifold_with_budget(
         });
     }
     Err(format!(
-        "topk manifold engine refused: the dense seed ({} bytes) exceeds the host in-core \
-         budget ({budget_bytes} bytes) AND the streamed curved shape (peak {} bytes) exceeds \
-         the streaming budget ({} bytes) at N={n_obs}, K={n_atoms}, k_active={support_k}, \
-         d_max={d_max}. Reduce n_obs (row-subsample; the HT outer subsampling keeps the \
-         criterion honest) or reduce support_k — a TOPK MANIFOLD request is never silently \
-         substituted with the linear sparse-code lane",
-        ledger.resident_seed_bytes, ledger.streaming_peak_bytes, ledger.streaming_budget_bytes,
+        "topk manifold engine refused: the canonical support-sparse peak {} bytes \
+         (active state {} + row-local routing workspace {} + decoder {} + border workspace {}) \
+         exceeds the support budget {} bytes at N={n_obs}, P={output_dim}, K={n_atoms}, \
+         k_active={support_k}, d_max={d_max}. Reduce n_obs or support_k — a TOPK MANIFOLD \
+         request is never silently substituted with the linear sparse-code lane",
+        ledger.streaming_peak_bytes,
+        ledger.active_state_bytes,
+        ledger.routing_workspace_bytes,
+        ledger.decoder_bytes,
+        ledger.border_vector_bytes,
+        ledger.streaming_budget_bytes,
     ))
 }
 
@@ -343,9 +341,8 @@ mod tests {
     /// K≤P → dense-certification lane unchanged.
     #[test]
     fn topk_manifold_admits_overcomplete_to_curved_lane_and_refuses_over() {
-        // K >> P (the massively-overcomplete shape) with a resident seed that
-        // fits the budget: N=4096, K=32000, d=1 → (1+1)·4096·32000·8 = 2.1 GB.
-        let bytes = 2 * 4096usize * 32_000 * 8;
+        // K >> P admits only through the canonical support-sparse ledger.
+        let bytes = usize::MAX / 2;
         let ok = admit_topk_manifold_with_budget(4096, 512, 32_000, 1, 8, bytes)
             .expect("within-budget topk admission");
         assert_eq!(
@@ -356,21 +353,14 @@ mod tests {
         // The admission carries the audit shape untouched.
         assert_eq!((ok.n_obs, ok.output_dim, ok.n_atoms), (4096, 512, 32_000));
 
-        // The admitted region matches the streaming plan's documented ledger:
-        // the resident-seed gate is the same arithmetic the plan owns.
+        // The admitted region matches the support plan's documented ledger.
         let ledger =
             crate::manifold::sae_topk_curved_budget_from_budget(4096, 512, 32_000, 1, 8, bytes);
-        assert!(ledger.resident_seed_admitted);
-        assert_eq!(ledger.resident_seed_bytes, bytes);
+        assert!(ledger.streaming_admitted);
 
-        // One byte under the resident seed: at this tiny (~2.1 GB) budget the
-        // streamed curved peak (~9.5 GB, dominated by the framed border
-        // workspace at K=32000) does NOT fit either, so the shape is over BOTH
-        // budgets and refuses — never silently demoted to the linear sparse-code
-        // lane. (The streaming region that IS runnable is exercised at a larger
-        // budget in `topk_manifold_streaming_region_admits_to_curved_lane`.)
-        let err = admit_topk_manifold_with_budget(4096, 512, 32_000, 1, 8, bytes - 1)
-            .expect_err("over-both-budgets topk must refuse");
+        // A starved support budget refuses; there is no dense retry or demotion.
+        let err = admit_topk_manifold_with_budget(4096, 512, 32_000, 1, 8, 0)
+            .expect_err("over-budget topk must refuse");
         assert!(
             err.contains("never silently substituted"),
             "refusal must state the no-substitution contract; got: {err}"
@@ -397,30 +387,28 @@ mod tests {
         assert!(admit_topk_manifold_with_budget(64, 8, 16, 1, 17, bytes).is_err());
     }
 
-    /// The chunked-seed region (dense seed over budget, streamed curved shape
-    /// within the streaming budget) is now RUNNABLE — the driver is wired
-    /// (`SaeManifoldTerm::seed_cold_start_disjoint_charts_streaming` +
-    /// `fit_topk_curved_streaming`), so the front door admits it to the CURVED
-    /// lane instead of refusing. Only a shape past BOTH budgets refuses, still
-    /// without substituting the linear sparse-code lane.
+    /// The public overcomplete route is admitted solely by its support-shaped
+    /// peak, independent of whether a dense seed would fit.
     #[test]
-    fn topk_manifold_streaming_region_admits_to_curved_lane() {
-        // N=1e6, K=32000, d=1: resident seed = 512 GB (over the 16 GiB in-core
-        // budget), streamed peak ≈ 9.6 GiB (dominated by the framed border
-        // workspace) — the region the chunked-seed driver exists to run.
+    fn topk_manifold_support_budget_admits_to_curved_lane() {
         let ledger = crate::manifold::sae_topk_curved_budget_from_budget(
-            1_000_000,
-            512,
-            32_000,
+            4096,
+            64,
+            10_000,
             1,
             8,
-            16 * 1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
         );
-        assert!(!ledger.resident_seed_admitted);
         assert!(ledger.streaming_admitted);
-        let admission =
-            admit_topk_manifold_with_budget(1_000_000, 512, 32_000, 1, 8, 16 * 1024 * 1024 * 1024)
-                .expect("streaming region is runnable and must admit to the curved lane");
+        let admission = admit_topk_manifold_with_budget(
+            4096,
+            64,
+            10_000,
+            1,
+            8,
+            8 * 1024 * 1024 * 1024,
+        )
+        .expect("support-sparse shape must admit to the curved lane");
         assert_eq!(
             admission.lane,
             SaeFitLane::CurvedStreaming,
@@ -428,15 +416,12 @@ mod tests {
         );
         assert_eq!(
             (admission.n_obs, admission.output_dim, admission.n_atoms),
-            (1_000_000, 512, 32_000)
+            (4096, 64, 10_000)
         );
 
-        // Over BOTH budgets (budget 0 → streaming floored at 64 MiB, still far
-        // below the K=32000 framed workspace): the plain refusal, no substitution.
-        let err = admit_topk_manifold_with_budget(1_000_000, 512, 32_000, 1, 8, 0)
-            .expect_err("over-both-budgets topk must refuse");
+        let err = admit_topk_manifold_with_budget(4096, 64, 10_000, 1, 8, 0)
+            .expect_err("over-budget topk must refuse");
         assert!(err.contains("never silently substituted"));
-        assert!(!err.contains("admit_topk_curved_lane"));
     }
 
     /// #2232 Inc 5b (Gap B) — an EXPLICIT linear-dictionary request takes the
