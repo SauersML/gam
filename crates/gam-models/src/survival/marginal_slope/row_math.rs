@@ -490,7 +490,6 @@ mod vector_hand_oracle_tests {
     /// covariance. The `_into` oracle below performs no success-path allocation.
     pub(super) struct ReusableHandVectorRowWorkspace {
         score_dimension: usize,
-        observed_slopes: Box<[f64]>,
         sigma_g: Box<[f64]>,
         c1: Box<[f64]>,
         c2: Box<[f64]>,
@@ -539,7 +538,6 @@ mod vector_hand_oracle_tests {
             };
             Ok(Self {
                 score_dimension,
-                observed_slopes: vec![0.0; score_dimension].into_boxed_slice(),
                 sigma_g: vec![0.0; score_dimension].into_boxed_slice(),
                 c1: vec![0.0; score_dimension].into_boxed_slice(),
                 c2: vec![0.0; score_hessian_cells].into_boxed_slice(),
@@ -657,11 +655,6 @@ mod vector_hand_oracle_tests {
                 "marginal-slope probit scale must be finite, got {probit_scale}"
             ));
         }
-        for (target, &slope) in workspace.observed_slopes.iter_mut().zip(slopes) {
-            *target = probit_scale * slope;
-        }
-        let variance = covariance.quadratic_form(&workspace.observed_slopes)?;
-        let c = (1.0 + variance).sqrt();
         marginal_slope_covariance_matvec_into(
             covariance,
             slopes,
@@ -669,6 +662,28 @@ mod vector_hand_oracle_tests {
             &mut workspace.low_rank_projection,
         )?;
         let s2 = probit_scale * probit_scale;
+        if slopes
+            .iter()
+            .any(|&slope| !(probit_scale * slope).is_finite())
+        {
+            return Err("marginal-slope covariance vector contains non-finite values".to_string());
+        }
+        let variance = s2
+            * slopes
+                .iter()
+                .zip(workspace.sigma_g.iter())
+                .map(|(&slope, &sigma_g)| slope * sigma_g)
+                .sum::<f64>();
+        let variance = if variance.is_finite()
+            && variance >= crate::bms::gradient_paths::COVARIANCE_QUADRATIC_FORM_PSD_TOL
+        {
+            variance.max(0.0)
+        } else {
+            return Err(format!(
+                "marginal-slope covariance quadratic form must be non-negative, got {variance}"
+            ));
+        };
+        let c = (1.0 + variance).sqrt();
         for a in 0..k {
             workspace.c1[a] = s2 * workspace.sigma_g[a] / c;
         }
