@@ -335,22 +335,36 @@ fn production_objective_forced_streaming_value_gradient_matches_dense() {
     term.atoms[0].basis_second_jet = Some(Arc::new(
         PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator"),
     ));
-    let rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
+    let seed_rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
     let mut dense = SaeManifoldOuterObjective::new(
         term.clone(),
         target.clone(),
         None,
-        rho.clone(),
+        seed_rho.clone(),
         40,
         1.0,
         1.0e-6,
         1.0e-6,
     );
-    let mut streaming =
-        SaeManifoldOuterObjective::new(term, target, None, rho.clone(), 40, 1.0, 1.0e-6, 1.0e-6);
+    let mut streaming = SaeManifoldOuterObjective::new(
+        term,  target, None, seed_rho, 40, 1.0, 1.0e-6, 1.0e-6,
+    );
 
-    let dense_eval =
-        OuterObjective::eval(&mut dense, &rho.to_flat()).expect("dense production value+gradient");
+    // Construction binds the outer-coordinate layout to the assignment family.
+    // In particular K=1 Softmax has no entropy-strength coordinate, so the
+    // unbound constructor seed has three coordinates while each objective owns
+    // the correct two-coordinate layout.  Drive each route from that owned
+    // authority; retaining the pre-construction seed here would test a phantom
+    // parameter that the production objective correctly refuses.
+    let rho_flat = dense.baseline_rho.to_flat();
+    let rho = streaming
+        .baseline_rho
+        .from_flat(rho_flat.view())
+        .expect("dense and streaming objectives must own the same typed rho layout");
+    assert_eq!(rho_flat.len(), 2, "K=1 Softmax has no assignment-strength coordinate");
+
+    let dense_eval = OuterObjective::eval(&mut dense, &rho_flat)
+        .expect("dense production value+gradient");
     let streaming_artifact = streaming
         .evaluate_outer_criterion_route(&rho, false, false)
         .expect("forced streaming production artifact");

@@ -349,6 +349,35 @@ mod tests {
     }
 
     #[test]
+    fn centered_bessel_second_log_derivative_matches_finite_difference() {
+        // c''(log η) must be the derivative of the third term (c'(log η)) of
+        // `bessel_i0_centered_terms`, across small, mid, and large arguments.
+        for eta in [0.05_f64, 0.25, 1.0, 3.74, 3.76, 12.0, 60.0, 900.0] {
+            let log_eta = eta.ln();
+            let analytic = bessel_i0_centered_second_log_derivative_from_log_abs(log_eta);
+
+            let log_step = 1.0e-6_f64;
+            let (_, _, first_plus) = bessel_i0_centered_terms(eta * log_step.exp());
+            let (_, _, first_minus) = bessel_i0_centered_terms(eta * (-log_step).exp());
+            let finite_difference = (first_plus - first_minus) / (2.0 * log_step);
+            assert!(
+                (analytic - finite_difference).abs() < 1.0e-4 + 1.0e-4 * analytic.abs(),
+                "centered Bessel second log-derivative mismatch at eta={eta}: \
+                 analytic={analytic}, finite_difference={finite_difference}"
+            );
+        }
+        // η → 0 and the overflow-free large-|η| gateway both round to 0.
+        assert_eq!(
+            bessel_i0_centered_second_log_derivative_from_log_abs(f64::NEG_INFINITY),
+            0.0
+        );
+        assert_eq!(
+            bessel_i0_centered_second_log_derivative_from_log_abs(1_200.0),
+            0.0
+        );
+    }
+
+    #[test]
     fn gauss_legendre_integrates_polynomials_exactly() {
         // An n-point rule is exact for polynomials of degree ≤ 2n−1.
         for n in [1usize, 2, 3, 5, 8, 40, 64] {
