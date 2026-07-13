@@ -27,6 +27,9 @@ pub struct SaeSupportSeedReport {
     pub assignment: SaeAssignmentState,
     pub atom_kinds: Vec<SaeAtomBasisKind>,
     pub effective_atom_dim: Vec<usize>,
+    /// Original requested atom index for each retained, occupied atom. Atoms
+    /// with zero support mass are structurally dead and never enter the fit.
+    pub retained_atom_indices: Vec<usize>,
     /// Maximum atom-score cells retained simultaneously, independent of `K`.
     pub peak_score_cells: usize,
 }
@@ -287,9 +290,45 @@ pub fn build_sae_support_seed(
         gates.push(row_gates);
         coords.push(row_coords);
     }
+    // A hard-support dictionary has no likelihood term for an atom that occurs
+    // in zero rows. Keeping such an atom would add an unidentifiable decoder
+    // block and a singular evidence direction. Remove it at the seed boundary
+    // and remap supports once, in ascending original-atom order.
+    let mut occupied = vec![false; k_atoms];
+    for row in &indices {
+        for &atom in row {
+            occupied[atom as usize] = true;
+        }
+    }
+    let retained_atom_indices = occupied
+        .iter()
+        .enumerate()
+        .filter_map(|(atom, &used)| used.then_some(atom))
+        .collect::<Vec<_>>();
+    let mut remap = vec![usize::MAX; k_atoms];
+    for (new, &old) in retained_atom_indices.iter().enumerate() {
+        remap[old] = new;
+    }
+    for row in &mut indices {
+        for atom in row {
+            *atom = remap[*atom as usize] as u32;
+        }
+    }
+    let atom_specs = retained_atom_indices
+        .iter()
+        .map(|&atom| atom_specs[atom].clone())
+        .collect::<Vec<_>>();
+    let atom_kinds = retained_atom_indices
+        .iter()
+        .map(|&atom| atom_kinds[atom].clone())
+        .collect::<Vec<_>>();
+    let effective_atom_dim = retained_atom_indices
+        .iter()
+        .map(|&atom| effective_atom_dim[atom])
+        .collect::<Vec<_>>();
     let assignment = SaeAssignmentState::from_topk_support_heterogeneous(
         n_obs,
-        k_atoms,
+        retained_atom_indices.len(),
         request.support_k,
         atom_specs,
         indices,
@@ -300,6 +339,7 @@ pub fn build_sae_support_seed(
         assignment,
         atom_kinds,
         effective_atom_dim,
+        retained_atom_indices,
         peak_score_cells: request.support_k,
     })
 }
