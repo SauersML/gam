@@ -28,7 +28,37 @@ thread_local! {
         std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
 }
 
-/// Bound the live directional jet work in one row-plan pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmpiricalBmsFlexCostClass {
+    Rigid,
+    ScoreWarp,
+    LinkDeviation,
+    MixedDeviation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmpiricalBmsDerivativeOrder {
+    Third,
+    Fourth,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmpiricalBmsJetSchedule {
+    FixedWidthFromPlan,
+    DynamicBatch { lanes: usize },
+}
+
+fn empirical_bms_flex_cost_class(primary: &PrimarySlices) -> EmpiricalBmsFlexCostClass {
+    match (primary.h.is_some(), primary.w.is_some()) {
+        (false, false) => EmpiricalBmsFlexCostClass::Rigid,
+        (true, false) => EmpiricalBmsFlexCostClass::ScoreWarp,
+        (false, true) => EmpiricalBmsFlexCostClass::LinkDeviation,
+        (true, true) => EmpiricalBmsFlexCostClass::MixedDeviation,
+    }
+}
+
+/// Bound the live directional jet work for widths without a fixed
+/// specialization.
 ///
 /// Each lane carries `r²` order-two coefficients, while the basis-dependent
 /// row program contributes `O(r)` live tape nodes. Bounding `lanes·r³` tracks
@@ -39,11 +69,31 @@ const EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET: usize = 4096;
 const EMPIRICAL_BMS_BATCH_LANE_CAP: usize = 8;
 
 #[inline]
-fn empirical_bms_directional_batch_lanes(r: usize) -> usize {
+fn empirical_bms_runtime_batch_lanes(r: usize) -> usize {
     let tape_work_per_lane = r.saturating_mul(r).saturating_mul(r).max(1);
     (EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET / tape_work_per_lane)
         .max(1)
         .min(EMPIRICAL_BMS_BATCH_LANE_CAP)
+}
+
+fn empirical_bms_jet_schedule(
+    cost: EmpiricalBmsFlexCostClass,
+    order: EmpiricalBmsDerivativeOrder,
+    r: usize,
+) -> EmpiricalBmsJetSchedule {
+    match (cost, order, r) {
+        (
+            EmpiricalBmsFlexCostClass::Rigid
+            | EmpiricalBmsFlexCostClass::ScoreWarp
+            | EmpiricalBmsFlexCostClass::LinkDeviation
+            | EmpiricalBmsFlexCostClass::MixedDeviation,
+            EmpiricalBmsDerivativeOrder::Third | EmpiricalBmsDerivativeOrder::Fourth,
+            4 | 8 | 12 | 18,
+        ) => EmpiricalBmsJetSchedule::FixedWidthFromPlan,
+        (_, _, runtime_width) => EmpiricalBmsJetSchedule::DynamicBatch {
+            lanes: empirical_bms_runtime_batch_lanes(runtime_width),
+        },
+    }
 }
 
 #[derive(Clone)]
@@ -1016,6 +1066,101 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
         Ok(out)
+    }
+
+    fn empirical_fixed_third_many_from_plan<const K: usize>(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        directions: &[Array1<f64>],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        directions
+            .iter()
+            .map(|direction| Self::empirical_fixed_third_contracted::<K>(plan, point, direction))
+            .collect()
+    }
+
+    fn empirical_fixed_third_many_dispatch(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        directions: &[Array1<f64>],
+        r: usize,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        match r {
+            4 => Self::empirical_fixed_third_many_from_plan::<4>(plan, point, directions),
+            8 => Self::empirical_fixed_third_many_from_plan::<8>(plan, point, directions),
+            12 => Self::empirical_fixed_third_many_from_plan::<12>(plan, point, directions),
+            18 => Self::empirical_fixed_third_many_from_plan::<18>(plan, point, directions),
+            _ => Err(format!(
+                "unsupported fixed empirical BMS third-many specialization width {r}"
+            )),
+        }
+    }
+
+    fn empirical_fixed_third_trace_from_plan<const K: usize>(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        gram: &[f64],
+    ) -> Result<Array1<f64>, String> {
+        let mut gradient = Array1::<f64>::zeros(K);
+        for axis in 0..K {
+            let mut basis = Array1::<f64>::zeros(K);
+            basis[axis] = 1.0;
+            let third = Self::empirical_fixed_third_contracted::<K>(plan, point, &basis)?;
+            gradient[axis] = Self::row_primary_trace_contract(&third, gram);
+        }
+        Ok(gradient)
+    }
+
+    fn empirical_fixed_third_trace_dispatch(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        gram: &[f64],
+        r: usize,
+    ) -> Result<Array1<f64>, String> {
+        match r {
+            4 => Self::empirical_fixed_third_trace_from_plan::<4>(plan, point, gram),
+            8 => Self::empirical_fixed_third_trace_from_plan::<8>(plan, point, gram),
+            12 => Self::empirical_fixed_third_trace_from_plan::<12>(plan, point, gram),
+            18 => Self::empirical_fixed_third_trace_from_plan::<18>(plan, point, gram),
+            _ => Err(format!(
+                "unsupported fixed empirical BMS third-trace specialization width {r}"
+            )),
+        }
+    }
+
+    fn empirical_fixed_fourth_many_from_plan<const K: usize>(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        direction_pairs
+            .iter()
+            .map(|(direction_u, direction_v)| {
+                Self::empirical_fixed_fourth_contracted::<K>(
+                    plan,
+                    point,
+                    direction_u,
+                    direction_v,
+                )
+            })
+            .collect()
+    }
+
+    fn empirical_fixed_fourth_many_dispatch(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
+        r: usize,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        match r {
+            4 => Self::empirical_fixed_fourth_many_from_plan::<4>(plan, point, direction_pairs),
+            8 => Self::empirical_fixed_fourth_many_from_plan::<8>(plan, point, direction_pairs),
+            12 => Self::empirical_fixed_fourth_many_from_plan::<12>(plan, point, direction_pairs),
+            18 => Self::empirical_fixed_fourth_many_from_plan::<18>(plan, point, direction_pairs),
+            _ => Err(format!(
+                "unsupported fixed empirical BMS fourth-many specialization width {r}"
+            )),
+        }
     }
 
     pub(super) fn empirical_flex_row_third_contracted(

@@ -224,9 +224,11 @@ fn frozen_raw_logdet(
     rho: &SaeManifoldRho,
     registry: Option<&AnalyticPenaltyRegistry>,
 ) -> Result<f64, String> {
-    let criterion_result = term.penalized_quasi_laplace_criterion_with_cache(
-        target, rho, registry, 0, 0.05, 1.0e-6, 1.0e-6,
-    )?;
+    let criterion_result = term
+        .penalized_quasi_laplace_criterion_with_cache(
+            target, rho, registry, 0, 0.05, 1.0e-6, 1.0e-6,
+        )
+        .map_err(|error| error.to_string())?;
     arrow_log_det_from_cache(&criterion_result.2)
         .ok_or_else(|| "frozen_raw_logdet: authoritative log determinant unavailable".to_string())
 }

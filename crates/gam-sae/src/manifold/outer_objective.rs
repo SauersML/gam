@@ -594,11 +594,17 @@ struct MatrixFreeOuterArtifacts {
     efs_inverse_probe_bundle: Option<(Vec<Array1<f64>>, Vec<Array1<f64>>)>,
 }
 
-struct OuterCriterionEvaluation {
+pub(crate) struct OuterCriterionEvaluation {
     cost: f64,
     loss: SaeManifoldLoss,
     cache: ArrowFactorCache,
     matrix_free: Option<MatrixFreeOuterArtifacts>,
+}
+
+impl OuterCriterionEvaluation {
+    pub(crate) fn cost(&self) -> f64 {
+        self.cost
+    }
 }
 
 pub struct SaeManifoldOuterObjective {
@@ -906,7 +912,7 @@ impl SaeManifoldOuterObjective {
     /// The streaming variant returns the exact matrix-free operator and frozen
     /// selected-inverse bundle that produced the value; callers must consume
     /// them together or reject the sample.
-    fn evaluate_outer_criterion_route(
+    pub(crate) fn evaluate_outer_criterion_route(
         &mut self,
         rho: &SaeManifoldRho,
         direct_logdet_admitted: bool,
@@ -965,7 +971,7 @@ impl SaeManifoldOuterObjective {
     /// `evaluation`. Dense and streaming storage differ only in their inverse
     /// action; all explicit, trace, Occam, rank-response, and single-adjoint IFT
     /// channels are assembled by the same authority.
-    fn analytic_gradient_for_outer_evaluation(
+    pub(crate) fn analytic_gradient_for_outer_evaluation(
         &self,
         rho: &SaeManifoldRho,
         evaluation: &OuterCriterionEvaluation,
