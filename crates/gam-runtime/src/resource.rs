@@ -151,6 +151,36 @@ impl std::fmt::Display for MemoryAvailability {
     }
 }
 
+/// Admit a cgroup observation only when it is a *real ceiling below the host*.
+///
+/// A cgroup binds this process' memory only if its controller ceiling sits below
+/// the host total. sysinfo reports cgroup v2 `memory.max = max` (no limit) as
+/// `total_memory = min(u64::MAX, host_total) = host_total`, and it derives
+/// `free_memory = total_memory - memory.current` where `memory.current` counts
+/// *reclaimable page cache* as used. So an unlimited cgroup on a healthy host
+/// reads `free ≈ 0` even though the host's `MemAvailable` (which excludes
+/// reclaimable cache) is ample — the exact #2317 failure, where the min of the
+/// two collapsed the governor budget to ~0 and refused every dense fit.
+///
+/// When `total >= host_total` the cgroup imposes no ceiling tighter than the
+/// host, so its cache-conflating `free` reading is discarded in favour of the
+/// host observation. A genuine sub-host ceiling (`total < host_total`) is
+/// preserved verbatim, including a real exhausted `free = 0` and a literal
+/// `memory.max = 0` hard-zero ceiling.
+fn admissible_cgroup_ceiling(
+    limits: &sysinfo::CGroupLimits,
+    host_total_bytes: u64,
+) -> Option<CgroupMemoryAvailability> {
+    if limits.total_memory >= host_total_bytes {
+        return None;
+    }
+    Some(CgroupMemoryAvailability {
+        total_bytes: limits.total_memory,
+        available_bytes: limits.free_memory,
+        resident_bytes: limits.rss,
+    })
+}
+
 /// Refresh and return the OS and cgroup observations that govern process
 /// memory admission. This is the single system-memory authority shared by the
 /// global governor and specialized runtime planners.
@@ -159,13 +189,10 @@ pub fn detect_memory_availability() -> MemoryAvailability {
     let system = SYSTEM.get_or_init(|| Mutex::new(sysinfo::System::new()));
     let mut system = system.lock().expect("sysinfo system mutex poisoned");
     system.refresh_memory();
+    let host_total_bytes = system.total_memory();
     let cgroup = system
         .cgroup_limits()
-        .map(|limits| CgroupMemoryAvailability {
-            total_bytes: limits.total_memory,
-            available_bytes: limits.free_memory,
-            resident_bytes: limits.rss,
-        });
+        .and_then(|limits| admissible_cgroup_ceiling(&limits, host_total_bytes));
     MemoryAvailability::from_observation(system.available_memory(), cgroup)
 }
 
@@ -1394,6 +1421,57 @@ mod resource_policy_tests {
             MemoryAvailabilitySource::Cgroup
         );
         assert_eq!(governor_budget_from_availability(zero_ceiling), 0);
+    }
+
+    #[test]
+    fn unlimited_cgroup_defers_to_host_available_memory_2317() {
+        const HOST_TOTAL: u64 = 64 * 1024 * 1024 * 1024;
+
+        // #2317: cgroup v2 `memory.max = max`. sysinfo clamps `total` to the host
+        // total and derives `free = total - memory.current`, where memory.current
+        // counts reclaimable page cache — so a healthy host reads ~0 free. This is
+        // NOT a ceiling below the host: it must be dropped so host MemAvailable
+        // governs, otherwise every dense fit is refused on a box with free memory.
+        let unlimited = sysinfo::CGroupLimits {
+            total_memory: HOST_TOTAL,
+            free_memory: 12_000, // cache-inflated memory.current drives this near zero
+            rss: HOST_TOTAL - 12_000,
+            ..Default::default()
+        };
+        assert_eq!(admissible_cgroup_ceiling(&unlimited, HOST_TOTAL), None);
+
+        // A cgroup whose total sits *below* the host total is a real ceiling and is
+        // admitted verbatim — including a genuinely exhausted `free = 0` (the RSS
+        // has consumed the whole real limit, not merely reclaimable cache).
+        let real_ceiling = sysinfo::CGroupLimits {
+            total_memory: 4 * 1024 * 1024 * 1024,
+            free_memory: 0,
+            rss: 4 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let admitted = admissible_cgroup_ceiling(&real_ceiling, HOST_TOTAL)
+            .expect("a sub-host ceiling is a real, binding observation");
+        assert_eq!(admitted.available_bytes(), 0);
+        assert_eq!(admitted.total_bytes(), 4 * 1024 * 1024 * 1024);
+
+        // A literal `memory.max = 0` (total 0 < host total) stays a hard-zero
+        // ceiling — the exhaustion contract the sibling test pins end-to-end.
+        let hard_zero = sysinfo::CGroupLimits {
+            total_memory: 0,
+            free_memory: 0,
+            rss: 0,
+            ..Default::default()
+        };
+        let admitted_zero = admissible_cgroup_ceiling(&hard_zero, HOST_TOTAL)
+            .expect("a zero-total ceiling below host is still a real observation");
+        assert_eq!(admitted_zero.available_bytes(), 0);
+        assert_eq!(
+            governor_budget_from_availability(MemoryAvailability::from_observation(
+                HOST_TOTAL,
+                Some(admitted_zero),
+            )),
+            0
+        );
     }
 
     #[test]
