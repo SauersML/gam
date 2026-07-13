@@ -3439,6 +3439,24 @@ fn round_up(x: f64) -> f64 {
     f64::from_bits(next)
 }
 
+fn add_down(lhs: f64, rhs: f64) -> f64 {
+    round_down(lhs + rhs)
+}
+
+fn add_up(lhs: f64, rhs: f64) -> f64 {
+    round_up(lhs + rhs)
+}
+
+fn mul_nonnegative_down(lhs: f64, rhs: f64) -> f64 {
+    debug_assert!(lhs >= 0.0 && rhs >= 0.0);
+    round_down(lhs * rhs).max(0.0)
+}
+
+fn mul_nonnegative_up(lhs: f64, rhs: f64) -> f64 {
+    debug_assert!(lhs >= 0.0 && rhs >= 0.0);
+    round_up(lhs * rhs)
+}
+
 /// Enclose accumulated nearest-rounded arithmetic under the standard
 /// `gamma_n = n*eps/(1-n*eps)` model, then step both endpoints outward once.
 /// `magnitude` is an absolute sum of the contributing terms, so cancellation
@@ -3517,14 +3535,14 @@ fn kernel_ranges(log_t_lo: f64, log_t_hi: f64) -> KernelRange {
     }
 
     KernelRange {
-        u_lo,
-        u_hi,
-        v_lo,
-        v_hi,
-        w_lo,
-        w_hi,
-        k_lo,
-        k_hi,
+        u_lo: round_down(u_lo).max(0.0),
+        u_hi: round_up(u_hi),
+        v_lo: round_down(v_lo).max(0.0),
+        v_hi: round_up(v_hi),
+        w_lo: round_down(w_lo).max(0.0),
+        w_hi: round_up(w_hi),
+        k_lo: round_down(k_lo),
+        k_hi: round_up(k_hi),
     }
 }
 
@@ -3584,14 +3602,14 @@ fn reml_deriv_enclosure_profile(
         if delta > 0.0 {
             let log_delta = delta.ln();
             let kr = kernel_ranges(a + log_delta, b + log_delta);
-            sum_u_lo += kr.u_lo;
-            sum_u_hi += kr.u_hi;
-            sum_w_lo += kr.w_lo;
-            sum_w_hi += kr.w_hi;
+            sum_u_lo = add_down(sum_u_lo, kr.u_lo);
+            sum_u_hi = add_up(sum_u_hi, kr.u_hi);
+            sum_w_lo = add_down(sum_w_lo, kr.w_lo);
+            sum_w_hi = add_up(sum_w_hi, kr.w_hi);
         }
     }
-    let g1_lo = half_d * (sum_u_lo - rank);
-    let g1_hi = half_d * (sum_u_hi - rank);
+    let g1_lo = round_down(half_d * round_down(sum_u_lo - rank));
+    let g1_hi = round_up(half_d * round_up(sum_u_hi - rank));
 
     // Dispersion contributions to V′ (g2) and V″, folded per output so no
     // per-output heap buffer is needed (the shared core is Vec-free).
@@ -3615,50 +3633,57 @@ fn reml_deriv_enclosure_profile(
                 delta.ln()
             };
             let kr = kernel_ranges(a + log_delta, b + log_delta);
-            num_lo += c2 * kr.w_lo;
-            num_hi += c2 * kr.w_hi;
-            sv_lo += c2 * kr.v_lo;
-            sv_hi += c2 * kr.v_hi;
-            dph_lo += c2 * kr.k_lo;
-            dph_hi += c2 * kr.k_hi;
+            num_lo = add_down(num_lo, mul_nonnegative_down(c2, kr.w_lo));
+            num_hi = add_up(num_hi, mul_nonnegative_up(c2, kr.w_hi));
+            sv_lo = add_down(sv_lo, mul_nonnegative_down(c2, kr.v_lo));
+            sv_hi = add_up(sv_hi, mul_nonnegative_up(c2, kr.v_hi));
+            dph_lo = add_down(dph_lo, round_down(c2 * kr.k_lo));
+            dph_hi = add_up(dph_hi, round_up(c2 * kr.k_hi));
         }
         // dp is monotone increasing. A non-positive conservative lower bound
         // means the profiled log residual cannot be certified on this cell;
         // never replace that mathematical failure with a tiny positive floor.
-        let dp_lo = ywy[j] - sv_hi;
-        let dp_hi = ywy[j] - sv_lo;
+        let dp_lo = round_down(ywy[j] - sv_hi);
+        let dp_hi = round_up(ywy[j] - sv_lo);
         if !(dp_lo.is_finite() && dp_hi.is_finite() && dp_lo > 0.0 && dp_hi >= dp_lo) {
             return (Interval::entire(), Interval::entire());
         }
 
         // g2_j = num_j / dp_j  (num ≥ 0, dp > 0).
-        g2_lo += num_lo / dp_hi;
-        g2_hi += num_hi / dp_lo;
+        let ratio_lo = round_down(num_lo / dp_hi).max(0.0);
+        let ratio_hi = round_up(num_hi / dp_lo);
+        g2_lo = add_down(g2_lo, ratio_lo);
+        g2_hi = add_up(g2_hi, ratio_hi);
 
         // dp″/dp with dp″ sign-indefinite: exact four-corner range over the
         // strictly positive denominator interval.
-        let c1 = dph_lo / dp_lo;
-        let c2c = dph_lo / dp_hi;
-        let c3 = dph_hi / dp_lo;
-        let c4 = dph_hi / dp_hi;
-        let adp_lo = c1.min(c2c).min(c3).min(c4);
-        let adp_hi = c1.max(c2c).max(c3).max(c4);
+        let quotients = [
+            dph_lo / dp_lo,
+            dph_lo / dp_hi,
+            dph_hi / dp_lo,
+            dph_hi / dp_hi,
+        ];
+        let adp_lo = round_down(quotients.iter().copied().fold(f64::INFINITY, f64::min));
+        let adp_hi = round_up(quotients.iter().copied().fold(f64::NEG_INFINITY, f64::max));
 
         // (dp′/dp)² with dp′ ≥ 0, dp > 0.
-        let bl = num_lo / dp_hi;
-        let bh = num_hi / dp_lo;
-        let sq_lo = bl * bl;
-        let sq_hi = bh * bh;
+        let bl = round_down(num_lo / dp_hi).max(0.0);
+        let bh = round_up(num_hi / dp_lo);
+        let sq_lo = mul_nonnegative_down(bl, bl);
+        let sq_hi = mul_nonnegative_up(bh, bh);
 
         // term_j = dp″/dp − (dp′/dp)².
-        vpp_disp_lo += adp_lo - sq_hi;
-        vpp_disp_hi += adp_hi - sq_lo;
+        vpp_disp_lo = add_down(vpp_disp_lo, round_down(adp_lo - sq_hi));
+        vpp_disp_hi = add_up(vpp_disp_hi, round_up(adp_hi - sq_lo));
     }
 
-    let vp_lo = g1_lo + half_nu * g2_lo;
-    let vp_hi = g1_hi + half_nu * g2_hi;
-    let vpp_lo = half_d * sum_w_lo + half_nu * vpp_disp_lo;
-    let vpp_hi = half_d * sum_w_hi + half_nu * vpp_disp_hi;
+    let vp_lo = add_down(g1_lo, round_down(half_nu * g2_lo));
+    let vp_hi = add_up(g1_hi, round_up(half_nu * g2_hi));
+    let vpp_lo = add_down(
+        round_down(half_d * sum_w_lo),
+        round_down(half_nu * vpp_disp_lo),
+    );
+    let vpp_hi = add_up(round_up(half_d * sum_w_hi), round_up(half_nu * vpp_disp_hi));
 
     let operations = 64usize.saturating_add(
         32usize.saturating_mul(

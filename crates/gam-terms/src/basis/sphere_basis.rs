@@ -86,6 +86,20 @@ pub fn build_spherical_spline_basis(
     };
     let gauge = gam_problem::Gauge::from_block_transforms(&[z.clone()]);
     let penalty = gauge.restrict_penalty(&raw_penalty);
+    // The selected sphere centers are the compact domain quadrature carried by
+    // this finite-rank Wahba representation. Evaluate the exact decomposed
+    // chart `[K_CC Z - H C | H]` on those centers, then apply the FINAL active
+    // coefficient chart before forming G. This makes the null ridge a penalty
+    // on the represented low-degree function, covariant under every frozen
+    // basis reparameterization.
+    let raw_center_design = build_wahba_decomposed_design(
+        center_kernel.view(),
+        centers.view(),
+        spec.radians,
+        &decomposition,
+    );
+    let center_design = gauge.restrict_design(&raw_center_design);
+    let function_gram = symmetrize_penalty(&fast_ata(&center_design));
     let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
         gauge.restrict_design(&raw_design),
     ));
@@ -99,37 +113,17 @@ pub fn build_spherical_spline_basis(
         op: None,
     }];
     if spec.double_penalty {
-        // The Marra & Wood double-penalty ridge must shrink the NULL SPACE of the
-        // primary RKHS penalty — the unpenalized low-degree spherical-harmonic
-        // block. `build_wahba_decomposed_null_shrinkage` instead put an identity
-        // on the KERNEL block (`[0..kernel_cols]`) whenever `low_degree_cols > 0`,
-        // i.e. it shrank the directions the primary ALREADY penalizes and left the
-        // genuinely-unpenalized low-degree harmonics free — the wrong subspace (a
-        // standalone numeric check gives ‖ridge·primary‖/(‖ridge‖‖primary‖) ≈ 0.41
-        // instead of 0). Build the ridge from the actual null space of the primary
-        // (`raw_penalty`, whose low-degree block is identically zero while the
-        // kernel block carries the RKHS Gram, so its structural null space is
-        // the low-degree block), matching the corrected
-        // thin-plate / Matérn / 1-D B-spline pattern. The local `gauge` is the
-        // identity for the fresh-fit `CenterSumToZero` chart (and the frozen
-        // transform otherwise), so restricting `Z_null Z_nullᵀ` here keeps the
-        // ridge co-located with the constrained primary; the global
-        // orthogonalization in `design_construction` rebuilds it again from the
-        // globally-constrained primary, so this is correct whether or not an outer
-        // parametric block is residualized out.
-        let null_shrinkage = build_nullspace_shrinkage_penalty(&raw_penalty)?
-            .map(|block| block.sym_penalty)
-            .unwrap_or_else(|| Array2::<f64>::zeros((raw_width, raw_width)));
-        let ridge = gauge.restrict_penalty(&null_shrinkage);
-        let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
-        candidates.push(PenaltyCandidate {
-            matrix: ridge_norm,
-            nullspace_dim_hint: 0,
-            source: PenaltySource::DoublePenaltyNullspace,
-            normalization_scale: c_ridge,
-            kronecker_factors: None,
-            op: None,
-        });
+        if let Some(ridge) = function_space_nullspace_shrinkage(&penalty, &function_gram)? {
+            let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
+            candidates.push(PenaltyCandidate {
+                matrix: ridge_norm,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::DoublePenaltyNullspace,
+                normalization_scale: c_ridge,
+                kronecker_factors: None,
+                op: None,
+            });
+        }
     }
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
@@ -3574,6 +3568,72 @@ mod wahba_penalty_invariants_tests {
         assert!(
             error <= 1.0e-12,
             "primary Wahba penalty must be exactly the normalized RKHS seminorm; max error={error:.3e}"
+        );
+    }
+
+    #[test]
+    fn wahba_null_shrinkage_is_center_function_metric_and_chart_covariant() {
+        let centers = array![
+            [-1.1, 0.1],
+            [-0.7, 1.0],
+            [-0.2, 2.0],
+            [0.3, 2.8],
+            [0.8, -2.5],
+            [1.1, -1.4],
+            [0.5, -0.4],
+            [-0.4, -1.8],
+        ];
+        let kernel = spherical_wahba_kernel_matrix_with_kind(
+            centers.view(),
+            centers.view(),
+            2,
+            true,
+            SphereWahbaKernel::Sobolev,
+        )
+        .expect("center kernel");
+        let decomposition = wahba_low_degree_decomposition(centers.view(), true, kernel.view())
+            .expect("low-degree decomposition");
+        let design =
+            build_wahba_decomposed_design(kernel.view(), centers.view(), true, &decomposition);
+        let penalty = build_wahba_decomposed_penalty(kernel.view(), &decomposition);
+        let gram = symmetrize_penalty(&fast_ata(&design));
+        let ridge = function_space_nullspace_shrinkage(&penalty, &gram)
+            .expect("metric construction")
+            .expect("Wahba low-degree null space");
+
+        let null = generalized_nullspace_basis(&penalty, &gram, "Wahba test")
+            .expect("generalized null frame")
+            .expect("nonempty null frame");
+        let metric_action_error = (&ridge.dot(&null) - &gram.dot(&null))
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            metric_action_error < 2.0e-9,
+            "ridge must equal the function metric on null directions; error={metric_action_error:.3e}"
+        );
+
+        let p = penalty.nrows();
+        let mut transform = Array2::<f64>::eye(p);
+        for j in 0..p {
+            transform[[j, j]] = if j % 2 == 0 { 0.2 } else { 3.0 };
+            if j + 1 < p {
+                transform[[j, j + 1]] = 0.07 * (j + 1) as f64;
+            }
+        }
+        let congruence = |matrix: &Array2<f64>| fast_atb(&transform, &fast_ab(matrix, &transform));
+        let transformed =
+            function_space_nullspace_shrinkage(&congruence(&penalty), &congruence(&gram))
+                .expect("transformed metric construction")
+                .expect("transformed null space");
+        let expected = congruence(&ridge);
+        let covariance_error = (&transformed - &expected)
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            covariance_error < 2.0e-8,
+            "Wahba null ridge changed under a harmless basis chart; error={covariance_error:.3e}"
         );
     }
 
