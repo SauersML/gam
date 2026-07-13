@@ -9071,8 +9071,7 @@ fn nb_location_scale_inner_solve_converges_on_heteroscedastic_counts() {
     // when the inner solve fails to converge — the non-convergence the profile
     // objective escalates to the fatal abort. Before the fix this returns
     // `Err(Optimization{ "...inner solve did not converge..." })`.
-    let result =
-        fit_custom_family_fixed_log_lambdas(&family, &specs, &options, None, 0, None, true);
+    let result = fit_custom_family_fixed_log_lambdas(&family, &specs, &options, None);
     let fit = result.unwrap_or_else(|e| {
         panic!(
             "NB location-scale inner solve must converge on heteroscedastic count data \

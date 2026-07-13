@@ -717,9 +717,6 @@ pub fn fit_latent_survival_terms(
             &blocks,
             options,
             None,
-            0,
-            None,
-            true,
         );
         let warm_fit = match warm_fit_result {
             Ok(fit) => fit,
@@ -757,9 +754,6 @@ pub fn fit_latent_survival_terms(
                     &blocks,
                     options,
                     None,
-                    0,
-                    None,
-                    true,
                 )
                 .map_err(|event_error| {
                     format!(
