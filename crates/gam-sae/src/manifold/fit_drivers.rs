@@ -5933,14 +5933,18 @@ impl SaeManifoldTerm {
             {
                 match self.closed_form_beta_gauge_directions() {
                     Ok(dirs) if !dirs.is_empty() => {
-                        if let Ok(quotient) = ArrowBetaGaugeQuotient::new(dirs) {
-                            // A width mismatch (a compact/active-set border whose
-                            // dim differs from the dense gauge vector) means the
-                            // closed-form gauge does not align with this layout's
-                            // border; skip the pin and fall back to the un-pinned
-                            // solve (prior behaviour) rather than fail the fit.
-                            let _ = sys.set_beta_gauge_quotient(quotient);
-                        }
+                        let quotient = ArrowBetaGaugeQuotient::new(dirs).map_err(|err| {
+                            format!(
+                                "SaeManifoldTerm::run_joint_fit_arrow_schur: invalid closed-form \
+                                 beta-gauge quotient: {err}"
+                            )
+                        })?;
+                        sys.set_beta_gauge_quotient(quotient).map_err(|err| {
+                            format!(
+                                "SaeManifoldTerm::run_joint_fit_arrow_schur: closed-form \
+                                 beta-gauge quotient does not match the assembled border: {err}"
+                            )
+                        })?;
                     }
                     Ok(_) => {}
                     Err(err) => {
