@@ -1816,6 +1816,40 @@ pub struct QuotientSpectralEvaluator {
     curved_columns: Vec<bool>,
 }
 
+/// Number of invariant real spherical harmonics on `RP²` through even cover
+/// degree `2H`: `sum_{r=0}^H (4r+1) = (H+1)(2H+1)`.
+pub fn projective_plane_basis_size(harmonic_order: usize) -> Result<usize, String> {
+    if harmonic_order == 0 {
+        return Err("projective_plane_basis_size requires harmonic_order >= 1".to_string());
+    }
+    harmonic_order
+        .checked_add(1)
+        .and_then(|left| {
+            harmonic_order
+                .checked_mul(2)
+                .and_then(|twice| twice.checked_add(1))
+                .and_then(|right| left.checked_mul(right))
+        })
+        .ok_or_else(|| "projective_plane_basis_size overflowed usize".to_string())
+}
+
+/// Number of invariant real torus harmonics on the flat Klein quotient through
+/// equal per-axis order `H`: `1 + 2 floor(H/2) + H + 2H²`.
+pub fn klein_bottle_basis_size(num_harmonics: usize) -> Result<usize, String> {
+    if num_harmonics == 0 {
+        return Err("klein_bottle_basis_size requires num_harmonics >= 1".to_string());
+    }
+    let cross_width = num_harmonics
+        .checked_mul(num_harmonics)
+        .and_then(|square| square.checked_mul(2))
+        .ok_or_else(|| "klein_bottle_basis_size overflowed usize".to_string())?;
+    1usize
+        .checked_add(2 * (num_harmonics / 2))
+        .and_then(|width| width.checked_add(num_harmonics))
+        .and_then(|width| width.checked_add(cross_width))
+        .ok_or_else(|| "klein_bottle_basis_size overflowed usize".to_string())
+}
+
 impl QuotientSpectralEvaluator {
     /// Build a quotient from a cover and its exact invariant-mode table.
     ///
@@ -1926,18 +1960,7 @@ impl QuotientSpectralEvaluator {
         cover_side.checked_mul(cover_side).ok_or_else(|| {
             "QuotientSpectralEvaluator::projective_plane: cover width overflowed usize".to_string()
         })?;
-        let expected_width = harmonic_order
-            .checked_add(1)
-            .and_then(|left| {
-                harmonic_order
-                    .checked_mul(2)
-                    .and_then(|twice| twice.checked_add(1))
-                    .and_then(|right| left.checked_mul(right))
-            })
-            .ok_or_else(|| {
-                "QuotientSpectralEvaluator::projective_plane: quotient width overflowed usize"
-                    .to_string()
-            })?;
+        let expected_width = projective_plane_basis_size(harmonic_order)?;
 
         let cover = SphericalHarmonicEvaluator::new(max_degree)?;
         let cover_width = cover.basis_size();
@@ -1972,21 +1995,7 @@ impl QuotientSpectralEvaluator {
                 "QuotientSpectralEvaluator::klein_bottle requires num_harmonics >= 1".to_string(),
             );
         }
-        let cross_width = num_harmonics
-            .checked_mul(num_harmonics)
-            .and_then(|square| square.checked_mul(2))
-            .ok_or_else(|| {
-                "QuotientSpectralEvaluator::klein_bottle: quotient width overflowed usize"
-                    .to_string()
-            })?;
-        let expected_width = 1usize
-            .checked_add(2 * (num_harmonics / 2))
-            .and_then(|width| width.checked_add(num_harmonics))
-            .and_then(|width| width.checked_add(cross_width))
-            .ok_or_else(|| {
-                "QuotientSpectralEvaluator::klein_bottle: quotient width overflowed usize"
-                    .to_string()
-            })?;
+        let expected_width = klein_bottle_basis_size(num_harmonics)?;
 
         let cover = TorusHarmonicEvaluator::new(2, num_harmonics)?;
         let cover_width = cover.basis_size();

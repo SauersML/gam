@@ -797,6 +797,262 @@ impl AtlasHolonomyCertificate {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{array, arr2};
+
+    fn projection_frame(angle: f64, padded_ambient: usize) -> Array2<f64> {
+        let mut frame = Array2::<f64>::zeros((3 + padded_ambient, 3));
+        let (cosine, sine) = (angle.cos(), angle.sin());
+        frame[[0, 0]] = cosine;
+        frame[[2, 0]] = sine;
+        frame[[1, 1]] = 1.0;
+        frame[[0, 2]] = -sine;
+        frame[[2, 2]] = cosine;
+        frame
+    }
+
+    fn tangent_gauge(angle: f64, reflected: bool) -> Array2<f64> {
+        let (cosine, sine) = (angle.cos(), angle.sin());
+        let reflection = if reflected { -1.0 } else { 1.0 };
+        arr2(&[
+            [cosine, -reflection * sine],
+            [sine, reflection * cosine],
+            [0.0, 0.0],
+        ])
+    }
+
+    fn patch(
+        chart: usize,
+        plane_angle: f64,
+        gauge_angle: f64,
+        reflected: bool,
+        inference_rows: usize,
+        padded_ambient: usize,
+    ) -> GaussianPcaPatch {
+        GaussianPcaPatch::new(
+            chart,
+            1_000,
+            inference_rows,
+            GaussianPatchCentering::MeanEstimatedOnInferenceRows,
+            projection_frame(plane_angle, padded_ambient),
+            tangent_gauge(gauge_angle, reflected),
+            0.01,
+            1.0,
+            GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn triangle_edges() -> Vec<ProjectedAtlasEdgeSpec> {
+        vec![
+            ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap(),
+            ProjectedAtlasEdgeSpec::new(1, 2, 0, 0.0).unwrap(),
+            ProjectedAtlasEdgeSpec::new(2, 0, 0, 0.0).unwrap(),
+        ]
+    }
+
+    fn triangle_analysis(
+        gauges: [(f64, bool); 3],
+        padded_ambient: usize,
+    ) -> GaussianPcaHolonomyAnalysis {
+        GaussianPcaHolonomyAnalysis::certify(
+            vec![
+                patch(
+                    0,
+                    0.0,
+                    gauges[0].0,
+                    gauges[0].1,
+                    1_000_000,
+                    padded_ambient,
+                ),
+                patch(
+                    1,
+                    0.2,
+                    gauges[1].0,
+                    gauges[1].1,
+                    1_000_000,
+                    padded_ambient,
+                ),
+                patch(
+                    2,
+                    -0.15,
+                    gauges[2].0,
+                    gauges[2].1,
+                    1_000_000,
+                    padded_ambient,
+                ),
+            ],
+            triangle_edges(),
+            AtlasFamilywiseLevel::new(0.05).unwrap(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn assert_near(left: f64, right: f64) {
+        let scale = left.abs().max(right.abs()).max(1.0);
+        assert!((left - right).abs() <= f64::EPSILON.sqrt() * scale);
+    }
+
+    #[test]
+    fn exact_parallel_overlap_components_form_their_own_orientation_cycle() {
+        let certificate = ExactAnalyticHolonomyCertificate::new(
+            2,
+            vec![
+                AtlasSignedEdge::new(0, 1, 0, 1).unwrap(),
+                AtlasSignedEdge::new(0, 1, 1, -1).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            certificate.orientability(),
+            AtlasOrientability::NonOrientable
+        );
+    }
+
+    #[test]
+    fn projector_cycle_is_invariant_to_o2_patch_gauges() {
+        let reference = triangle_analysis([(0.0, false); 3], 0);
+        let regauged = triangle_analysis(
+            [(0.37, true), (-0.91, false), (1.23, true)],
+            0,
+        );
+        assert_eq!(
+            reference.orientation.certified_value(),
+            regauged.orientation.certified_value()
+        );
+        assert_eq!(reference.cycles.len(), 1);
+        assert_eq!(regauged.cycles.len(), 1);
+        let left = &reference.cycles[0];
+        let right = &regauged.cycles[0];
+        assert_near(left.absolute_angle.unwrap(), right.absolute_angle.unwrap());
+        assert_near(
+            left.first_order_variance.unwrap(),
+            right.first_order_variance.unwrap(),
+        );
+        assert_near(
+            left.second_order_variance.unwrap(),
+            right.second_order_variance.unwrap(),
+        );
+    }
+
+    #[test]
+    fn shared_patch_covariance_is_aggregated_before_the_quadratic_form() {
+        let analysis = triangle_analysis([(0.0, false); 3], 0);
+        let cycle = &analysis.cycles[0];
+        let correct = cycle.first_order_variance.unwrap();
+        let naive = cycle.naive_edgewise_first_order_variance.unwrap();
+        let adjustment = cycle.shared_patch_covariance_adjustment.unwrap();
+        assert_near(correct - naive, adjustment);
+        assert!(adjustment.abs() > f64::EPSILON);
+    }
+
+    #[test]
+    fn ambient_zero_padding_does_not_enter_projected_variance_or_tail() {
+        let base = triangle_analysis([(0.0, false); 3], 0);
+        let padded = triangle_analysis([(0.0, false); 3], 97);
+        let base_ranks: Vec<_> = base
+            .edges
+            .iter()
+            .map(|edge| edge.projected_dimension)
+            .collect();
+        let padded_ranks: Vec<_> = padded
+            .edges
+            .iter()
+            .map(|edge| edge.projected_dimension)
+            .collect();
+        assert_eq!(base_ranks, padded_ranks);
+        assert_near(
+            base.cycles[0].first_order_variance.unwrap(),
+            padded.cycles[0].first_order_variance.unwrap(),
+        );
+        assert_near(
+            base.orientation_flip_probability_bound,
+            padded.orientation_flip_probability_bound,
+        );
+    }
+
+    #[test]
+    fn orientation_bound_decreases_with_rows_and_prescription_is_closed_form() {
+        let build = |rows| {
+            GaussianPcaHolonomyAnalysis::certify(
+                vec![
+                    patch(0, 0.0, 0.0, false, rows, 0),
+                    patch(1, 0.2, 0.0, false, rows, 0),
+                ],
+                vec![ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap()],
+                AtlasFamilywiseLevel::new(0.05).unwrap(),
+                None,
+            )
+            .unwrap()
+        };
+        let small = build(16);
+        let large = build(1_000_000);
+        assert!(
+            large.orientation_flip_probability_bound
+                < small.orientation_flip_probability_bound
+        );
+        assert_eq!(
+            small.sample_prescription[0].required_rows,
+            large.sample_prescription[0].required_rows
+        );
+        assert!(
+            small.sample_prescription[0].current_rows
+                < small.sample_prescription[0].required_rows
+        );
+        assert!(large.orientation.certified_value().is_some());
+    }
+
+    fn cancellation_gauss_bonnet(remainder: f64) -> GaussBonnetInput {
+        GaussBonnetInput::new(
+            vec![GaussBonnetNoiseSource::new(7, arr2(&[[1.0]])).unwrap()],
+            vec![
+                GaussBonnetContribution::new(
+                    std::f64::consts::PI,
+                    remainder,
+                    0.0,
+                    vec![GaussBonnetSourceGradient::new(7, array![1.0]).unwrap()],
+                )
+                .unwrap(),
+                GaussBonnetContribution::new(
+                    std::f64::consts::PI,
+                    0.0,
+                    0.0,
+                    vec![GaussBonnetSourceGradient::new(7, array![-1.0]).unwrap()],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn gauss_bonnet_uses_shared_source_covariance_before_integer_rounding() {
+        let confidence = gauss_bonnet_confidence(&cancellation_gauss_bonnet(0.0), 0.05)
+            .unwrap();
+        assert_eq!(confidence.first_order_variance, 0.0);
+        assert_eq!(confidence.naive_contribution_variance, 2.0);
+        assert_eq!(confidence.shared_source_covariance_adjustment, -2.0);
+        assert_eq!(confidence.decision.certified_value(), Some(&1));
+    }
+
+    #[test]
+    fn gauss_bonnet_refuses_when_remainder_consumes_rounding_cell() {
+        let confidence = gauss_bonnet_confidence(
+            &cancellation_gauss_bonnet(std::f64::consts::PI),
+            0.05,
+        )
+        .unwrap();
+        assert!(confidence.decision.certified_value().is_none());
+        assert!(matches!(
+            confidence.decision.refusals(),
+            [AtlasStatisticalRefusal::GaussBonnetRoundingMarginExhausted { .. }]
+        ));
+    }
+}
+
 #[derive(Clone, Debug)]
 struct EdgeWork {
     public: ProjectedAtlasEdgeGeometry,
