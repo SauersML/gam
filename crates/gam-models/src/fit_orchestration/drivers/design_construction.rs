@@ -5641,9 +5641,16 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err(
+                "spatial adaptive exact family does not declare family-owned hyper axes"
+                    .to_string(),
+            );
+        }
+        let derivative_blocks = hyper_layout.design_derivative_blocks();
         if block_states.len() != 1 || specs.len() != 1 || derivative_blocks.len() != 1 {
             return Err(SmoothError::dimension_mismatch(format!(
                 "spatial adaptive exact family expects one block/state/spec/psi payload, got states={} specs={} deriv_blocks={}",
@@ -5697,10 +5704,17 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err(
+                "spatial adaptive exact family does not declare family-owned hyper axes"
+                    .to_string(),
+            );
+        }
+        let derivative_blocks = hyper_layout.design_derivative_blocks();
         if block_states.len() != 1 || specs.len() != 1 || derivative_blocks.len() != 1 {
             return Err(SmoothError::dimension_mismatch(format!(
                 "spatial adaptive exact family expects one block/state/spec/psi payload, got states={} specs={} deriv_blocks={}",
@@ -5741,10 +5755,17 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_index: usize,
         direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err(
+                "spatial adaptive exact family does not declare family-owned hyper axes"
+                    .to_string(),
+            );
+        }
+        let derivative_blocks = hyper_layout.design_derivative_blocks();
         if block_states.len() != 1 || specs.len() != 1 || derivative_blocks.len() != 1 {
             return Err(SmoothError::dimension_mismatch(format!(
                 "spatial adaptive exact family expects one block/state/spec/psi payload, got states={} specs={} deriv_blocks={}",
