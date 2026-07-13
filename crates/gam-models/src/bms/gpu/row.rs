@@ -326,11 +326,9 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
         check_len("rho_u", self.rho_u.len(), nr)?;
         check_len("tau_u", self.tau_u.len(), nr)?;
         check_len("r_uv", self.r_uv.len(), nrr)?;
-        let offsets_len = n
-            .checked_add(1)
-            .ok_or_else(|| GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row inputs: n_rows={n} cannot form n+1 offsets"),
-            })?;
+        let offsets_len = n.checked_add(1).ok_or_else(|| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row inputs: n_rows={n} cannot form n+1 offsets"),
+        })?;
         check_len("cell_offsets", self.cell_offsets.len(), offsets_len)?;
         let total_cells_u32 = self.cell_offsets[n];
         let total_cells = total_cells_u32 as usize;
@@ -371,10 +369,7 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
         check_len(
             "cell_moments",
             self.cell_moments.len(),
-            checked_shape_len(
-                "validate cell_moments",
-                &[total_cells, MOMENT_STRIDE],
-            )?,
+            checked_shape_len("validate cell_moments", &[total_cells, MOMENT_STRIDE])?,
         )?;
         // Bonus: when the moments came from `CellMomentsSource::Device`, the
         // launcher needs to know the source is from a device buffer; nothing
@@ -774,8 +769,7 @@ fn build_generated_row_kernel_source() -> String {
                     );
                 }
                 BmsFlexRowOrder2FinalizerPhase::ObservedFirst => {
-                    source
-                        .push_str("    // Observed first derivatives are derived on demand.\n");
+                    source.push_str("    // Observed first derivatives are derived on demand.\n");
                 }
                 BmsFlexRowOrder2FinalizerPhase::ObservedScoreSensitivity => {
                     source.push_str(
@@ -989,16 +983,14 @@ pub(crate) fn launch_linux(
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("bms_flex_row alloc neglog: {err}"),
         })?;
-    let mut d_grad =
-        stream
-            .alloc_zeros::<f64>(nr)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row alloc grad: {err}"),
-            })?;
-    let mut d_hess =
-        stream
-            .alloc_zeros::<f64>(nrr)
-            .map_err(|err| GpuError::DriverCallFailed {
+    let mut d_grad = stream
+        .alloc_zeros::<f64>(nr)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row alloc grad: {err}"),
+        })?;
+    let mut d_hess = stream
+        .alloc_zeros::<f64>(nrr)
+        .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("bms_flex_row alloc hess: {err}"),
         })?;
     let mut d_f_au = stream
@@ -2034,18 +2026,16 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("bms_flex_row device-resident alloc neglog: {err}"),
         })?;
-    let mut d_grad =
-        stream
-            .alloc_zeros::<f64>(nr)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row device-resident alloc grad: {err}"),
-            })?;
-    let mut d_hess =
-        stream
-            .alloc_zeros::<f64>(nrr)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row device-resident alloc hess: {err}"),
-            })?;
+    let mut d_grad = stream
+        .alloc_zeros::<f64>(nr)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident alloc grad: {err}"),
+        })?;
+    let mut d_hess = stream
+        .alloc_zeros::<f64>(nrr)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident alloc hess: {err}"),
+        })?;
     let mut d_f_au = stream
         .alloc_zeros::<f64>(nr)
         .map_err(|err| GpuError::DriverCallFailed {
@@ -2065,9 +2055,7 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
         })?;
 
     let n_u32 = u32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!(
-            "bms_flex_row device-resident: n_rows={n} exceeds CUDA grid range"
-        ),
+        reason: format!("bms_flex_row device-resident: n_rows={n} exceeds CUDA grid range"),
     })?;
     let cfg = LaunchConfig {
         grid_dim: (n_u32, 1, 1),
@@ -2477,49 +2465,51 @@ impl PreparedBmsFlexRowLaunchArgs {
             .ok_or_else(|| GpuError::DriverCallFailed {
                 reason: "bms_flex_row launch: p_m+p_g overflow".to_string(),
             })?;
-        let w_block_start = h_block_start.checked_add(h_block_len).ok_or_else(|| {
+        let w_block_start =
+            h_block_start
+                .checked_add(h_block_len)
+                .ok_or_else(|| GpuError::DriverCallFailed {
+                    reason: "bms_flex_row launch: h block end overflow".to_string(),
+                })?;
+        let expected_p_total =
+            w_block_start
+                .checked_add(w_block_len)
+                .ok_or_else(|| GpuError::DriverCallFailed {
+                    reason: "bms_flex_row launch: w block end overflow".to_string(),
+                })?;
+        let w_primary_start =
+            2_usize
+                .checked_add(h_primary_len)
+                .ok_or_else(|| GpuError::DriverCallFailed {
+                    reason: "bms_flex_row launch: h primary end overflow".to_string(),
+                })?;
+        let expected_r = w_primary_start.checked_add(w_primary_len).ok_or_else(|| {
             GpuError::DriverCallFailed {
-                reason: "bms_flex_row launch: h block end overflow".to_string(),
-            }
-        })?;
-        let expected_p_total = w_block_start.checked_add(w_block_len).ok_or_else(|| {
-            GpuError::DriverCallFailed {
-                reason: "bms_flex_row launch: w block end overflow".to_string(),
-            }
-        })?;
-        let w_primary_start = 2_usize.checked_add(h_primary_len).ok_or_else(|| {
-            GpuError::DriverCallFailed {
-                reason: "bms_flex_row launch: h primary end overflow".to_string(),
-            }
-        })?;
-        let expected_r = w_primary_start
-            .checked_add(w_primary_len)
-            .ok_or_else(|| GpuError::DriverCallFailed {
                 reason: "bms_flex_row launch: w primary end overflow".to_string(),
-            })?;
-        let check_range =
-            |name: &str,
-             range: Option<&std::ops::Range<usize>>,
-             expected_start: usize,
-             expected_len: usize|
-             -> Result<(), GpuError> {
-                match (range, expected_len) {
-                    (None, 0) => Ok(()),
-                    (Some(range), len)
-                        if len > 0
-                            && range.start == expected_start
-                            && range.end == expected_start + len =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err(GpuError::DriverCallFailed {
-                        reason: format!(
-                            "bms_flex_row launch: {name}={range:?} must be {expected_start}..{}",
-                            expected_start + expected_len
-                        ),
-                    }),
+            }
+        })?;
+        let check_range = |name: &str,
+                           range: Option<&std::ops::Range<usize>>,
+                           expected_start: usize,
+                           expected_len: usize|
+         -> Result<(), GpuError> {
+            match (range, expected_len) {
+                (None, 0) => Ok(()),
+                (Some(range), len)
+                    if len > 0
+                        && range.start == expected_start
+                        && range.end == expected_start + len =>
+                {
+                    Ok(())
                 }
-            };
+                _ => Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "bms_flex_row launch: {name}={range:?} must be {expected_start}..{}",
+                        expected_start + expected_len
+                    ),
+                }),
+            }
+        };
         check_range(
             "block.h",
             storage.block.h.as_ref(),
@@ -2575,9 +2565,7 @@ impl PreparedBmsFlexRowLaunchArgs {
         ] {
             if have != want {
                 return Err(GpuError::DriverCallFailed {
-                    reason: format!(
-                        "bms_flex_row launch: storage {name}.len()={have} != {want}"
-                    ),
+                    reason: format!("bms_flex_row launch: storage {name}.len()={have} != {want}"),
                 });
             }
         }
@@ -2685,11 +2673,12 @@ pub(crate) fn run_bms_flex_row_partial_reduce(
         &format!("{ctx} partial [num_chunks,p_total]"),
         &[args.num_chunks, p_total],
     )?;
-    let mut d_partial = stream
-        .alloc_zeros::<f64>(partial_len)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row {ctx} alloc partial: {err}"),
-        })?;
+    let mut d_partial =
+        stream
+            .alloc_zeros::<f64>(partial_len)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row {ctx} alloc partial: {err}"),
+            })?;
 
     let partial_kernel_name = mode.partial_kernel_name();
     let part_func = backend
@@ -3274,35 +3263,26 @@ pub fn launch_bms_flex_row_dense_block(
             ),
         }
     })?;
-    let num_chunks_u32 = u32::try_from(num_chunks).map_err(|_| {
-        GpuError::DriverCallFailed {
-            reason: format!(
-                "bms_flex_row dense_block: num_chunks={num_chunks} exceeds u32 range"
-            ),
-        }
+    let num_chunks_u32 = u32::try_from(num_chunks).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row dense_block: num_chunks={num_chunks} exceeds u32 range"),
     })?;
-    let num_chunks_i32 = i32::try_from(num_chunks).map_err(|_| {
-        GpuError::DriverCallFailed {
-            reason: format!(
-                "bms_flex_row dense_block: num_chunks={num_chunks} exceeds i32 range"
-            ),
-        }
+    let num_chunks_i32 = i32::try_from(num_chunks).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row dense_block: num_chunks={num_chunks} exceeds i32 range"),
     })?;
     let pp_u32 = u32::try_from(pp).map_err(|_| GpuError::DriverCallFailed {
         reason: format!("bms_flex_row dense_block: p_total²={pp} exceeds u32 range"),
     })?;
 
     // Per-CTA shmem accumulator: p_total² doubles.
-    let shmem_bytes_usize = pp.checked_mul(std::mem::size_of::<f64>()).ok_or_else(|| {
-        GpuError::DriverCallFailed {
-            reason: format!("dense_block shmem bytes overflow for p_total={p_total}"),
-        }
-    })?;
-    let shmem_bytes: u32 = u32::try_from(shmem_bytes_usize).map_err(|_| {
-        GpuError::DriverCallFailed {
+    let shmem_bytes_usize =
+        pp.checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| GpuError::DriverCallFailed {
+                reason: format!("dense_block shmem bytes overflow for p_total={p_total}"),
+            })?;
+    let shmem_bytes: u32 =
+        u32::try_from(shmem_bytes_usize).map_err(|_| GpuError::DriverCallFailed {
             reason: format!("dense_block shmem bytes overflow u32 for p_total={p_total}"),
-        }
-    })?;
+        })?;
 
     let cfg_part = LaunchConfig {
         grid_dim: (num_chunks_u32, 1, 1),
@@ -3394,17 +3374,24 @@ mod row_kernel_tests {
         /// populated by the production cell-moment assembly (never hand-faked).
         fn make_flex_parity_family(
             n: usize,
+            score_internal_knots: usize,
+            link_internal_knots: usize,
         ) -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
             let score_seed = Array1::linspace(-2.0, 2.0, n.max(6));
             let link_seed = Array1::linspace(-1.8, 1.8, n.max(6));
-            let cfg = DeviationBlockConfig {
-                num_internal_knots: 3,
+            let score_cfg = DeviationBlockConfig {
+                num_internal_knots: score_internal_knots,
                 ..DeviationBlockConfig::default()
             };
-            let score_prepared = build_score_warp_deviation_block_from_seed(&score_seed, &cfg)
-                .expect("build score warp block");
+            let link_cfg = DeviationBlockConfig {
+                num_internal_knots: link_internal_knots,
+                ..DeviationBlockConfig::default()
+            };
+            let score_prepared =
+                build_score_warp_deviation_block_from_seed(&score_seed, &score_cfg)
+                    .expect("build score warp block");
             let link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-                &link_seed, &link_seed, &cfg,
+                &link_seed, &link_seed, &link_cfg,
             )
             .expect("build link deviation block");
 
@@ -3481,10 +3468,14 @@ mod row_kernel_tests {
         /// One real StandardNormal full-FLEX fit drives both the production CPU
         /// lowering and the generated CUDA kernel. No mirrored host algebra is
         /// involved.
-        #[test]
-        fn generated_cuda_row_kernel_matches_canonical_cpu_lowering_415() {
-            let n = 12usize;
-            let (family, states) = make_flex_parity_family(n);
+        fn assert_generated_cuda_row_kernel_matches_canonical_cpu_lowering(
+            n: usize,
+            score_internal_knots: usize,
+            link_internal_knots: usize,
+            expected_r: Option<usize>,
+        ) {
+            let (family, states) =
+                make_flex_parity_family(n, score_internal_knots, link_internal_knots);
             let cache = family
                 .build_exact_eval_cache(&states)
                 .expect("flex exact eval cache");
@@ -3501,6 +3492,12 @@ mod row_kernel_tests {
                 "fixture must activate both deviation blocks"
             );
             assert_eq!(r, 2 + p_h + p_w);
+            if let Some(expected_r) = expected_r {
+                assert_eq!(
+                    r, expected_r,
+                    "fixture knot counts must exercise the requested primary width"
+                );
+            }
 
             let owned = family
                 .pack_bms_flex_row_kernel_inputs(&states, &cache)
@@ -3608,6 +3605,19 @@ mod row_kernel_tests {
                     check("hessian", index, cpu, device);
                 }
             }
+        }
+
+        #[test]
+        fn generated_cuda_row_kernel_matches_canonical_cpu_lowering_415() {
+            assert_generated_cuda_row_kernel_matches_canonical_cpu_lowering(12, 3, 3, None);
+        }
+
+        #[test]
+        fn generated_cuda_row_kernel_r33_matches_canonical_cpu_lowering_932() {
+            // Cubic deviation runtimes with the third-order smoothness null
+            // space removed expose `num_internal_knots + 2` live controls.
+            // These unequal blocks therefore give p_h=16, p_w=15, r=33.
+            assert_generated_cuda_row_kernel_matches_canonical_cpu_lowering(40, 14, 13, Some(33));
         }
     }
 }
@@ -3792,7 +3802,9 @@ mod tests {
             n_rows: 0,
             ..minimal_inputs(&buffers)
         };
-        let err = inputs.validate().expect_err("zero-row launch must fail closed");
+        let err = inputs
+            .validate()
+            .expect_err("zero-row launch must fail closed");
         assert!(err.to_string().contains("n_rows must be > 0"));
     }
 
@@ -3998,6 +4010,7 @@ mod tests {
         let source = generated_row_kernel_source();
         assert!(!source.contains("__BMS_FLEX_CALIBRATION_ORDER2__"));
         assert!(!source.contains("__BMS_FLEX_ORDER2_FINALIZER__"));
+        assert!(!source.contains("__BMS_FLEX_ROW_THREADS__"));
         assert!(source.contains("for (int u = 1; u < r; ++u)"));
         assert!(source.contains("for (int v = u; v < r; ++v)"));
         assert!(source.contains("Canonical implicit-first stage complete"));
@@ -4457,9 +4470,8 @@ mod tests {
             for row in 0..n {
                 for u in 0..r {
                     for v in u..r {
-                        let val = 0.001
-                            * ((row + 1) as f64)
-                            * (1.0 + (u as f64) + 2.0 * (v as f64));
+                        let val =
+                            0.001 * ((row + 1) as f64) * (1.0 + (u as f64) + 2.0 * (v as f64));
                         row_hessians[row * r * r + u * r + v] = val;
                         row_hessians[row * r * r + v * r + u] = val;
                     }
