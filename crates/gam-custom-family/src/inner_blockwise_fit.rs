@@ -19,6 +19,23 @@ impl ExactJointModeCurvatureCertificate {
     }
 }
 
+pub(crate) fn fused_first_attempt_log_likelihood<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    options: &BlockwiseFitOptions,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    trust_attempt: usize,
+    joint_workspace_requested: bool,
+) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
+    if trust_attempt == 0 && joint_workspace_requested {
+        joint_line_search_log_likelihood_with_workspace(family, options, specs, states)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Rebuild the exact penalized coefficient Hessian at the coefficient vector
 /// that an inner solve is about to return.
 ///
@@ -3197,12 +3214,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // not an infeasible trial: silently replaying the scalar family
                 // path could change the row measure and let structurally invalid
                 // Hessian/gradient evidence participate in the trust ratio.
-                let fused_first_attempt = if trust_attempt == 0 && joint_workspace_requested {
-                    joint_line_search_log_likelihood_with_workspace(family, options, specs, &states)
-                        ?
-                } else {
-                    None
-                };
+                let fused_first_attempt = fused_first_attempt_log_likelihood(
+                    family,
+                    options,
+                    specs,
+                    &states,
+                    trust_attempt,
+                    joint_workspace_requested,
+                )?;
                 let trial_ll = if let Some((value, workspace)) = fused_first_attempt {
                     accepted_joint_workspace = Some(workspace);
                     value
