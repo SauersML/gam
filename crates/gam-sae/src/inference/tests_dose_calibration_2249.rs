@@ -46,7 +46,7 @@ mod tests {
         SaeFitSeedRequest, SaeManifoldTerm, SaeMinimalSeedReport, SaeMinimalSeedRequest,
         build_sae_fit_seed, build_sae_minimal_seed,
     };
-    use gam_problem::RowMetric;
+    use gam_problem::{FisherFactorKind, RowMetric};
     use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
     use ndarray::{Array1, Array2, Array3, ArrayView1};
     use std::sync::Arc;
@@ -119,7 +119,10 @@ mod tests {
             }
         }
         let u = Array2::from_shape_vec((n, p * p), flat).expect("U shape");
-        RowMetric::output_fisher(Arc::new(u), p, p).expect("full-rank output-Fisher metric")
+        RowMetric::output_fisher(Arc::new(u), p, p)
+            .expect("full-rank output-Fisher metric")
+            .with_fisher_factor_kind(FisherFactorKind::ExactFull)
+            .expect("closed-form categorical factor is exact")
     }
 
     /// A smooth `p`-dim periodic embedding of the circle plus tiny deterministic
@@ -420,6 +423,31 @@ mod tests {
 
         // Target a fraction of the unit dose so the amplitude stays in-radius.
         let target_nats = 0.5 * unit_nats;
+
+        let uncertified_metric = metric
+            .clone()
+            .with_fisher_factor_kind(FisherFactorKind::UncertifiedApproximation)
+            .expect("downgrade factor status for refusal test");
+        let error = steer_to_target_nats(
+            &term,
+            &uncertified_metric,
+            TargetDoseRequest {
+                atom_k: 0,
+                metric_row: row,
+                t_from: &[t_from],
+                t_to: &[t_to],
+                target_nats,
+                config: TargetDoseConfig::default(),
+            },
+            None,
+        )
+        .expect_err("an uncertified factor cannot solve a full-KL target without a probe");
+        assert!(matches!(
+            error,
+            crate::inference::steering::TargetDoseError::FactorNeedsPatchedForward {
+                kind: crate::inference::steering::FisherDoseKind::UncertifiedApproximation
+            }
+        ));
 
         // Probe-free closed-form seed: predicted_nats must equal the target
         // exactly (a0² · unit_nats = q*).

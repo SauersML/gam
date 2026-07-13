@@ -69,7 +69,7 @@ use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::encode::EncodeAtlas;
 use crate::manifold::{SaeManifoldAtom, SaeManifoldTerm};
-use gam_problem::{MetricProvenance, RowMetric};
+use gam_problem::{FisherFactorKind, MetricProvenance, RowMetric};
 
 /// Number of sub-steps the latent path `[t_from, t_to]` is integrated over for
 /// the dosimetry path integral. The decoder curve is smooth, so a modest
@@ -87,22 +87,22 @@ const VALIDITY_DIVERGENCE_FRACTION: f64 = 0.1;
 pub enum FisherDoseKind {
     /// Euclidean/no-behavior metric: no nats dose exists.
     Unavailable,
-    /// A behavioral factor metric exists, but no omitted-mass audit was supplied.
-    UnauditedFactorMetric,
-    /// The harvest reports zero omitted Fisher trace.
-    FullMass,
-    /// A non-negative Fisher tail was omitted; the local quadratic is a lower
-    /// bound on the full-Fisher local KL.
-    TruncatedLowerBound,
+    /// The supplied factor exactly represents the complete local Fisher.
+    ExactFull,
+    /// The producer certified the retained PSD operator as a lower bound.
+    CertifiedPsdLowerBound,
+    /// The factor is randomized, stochastic, truncated, or otherwise lacks an
+    /// operator-order certificate.
+    UncertifiedApproximation,
 }
 
 impl FisherDoseKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unavailable => "unavailable",
-            Self::UnauditedFactorMetric => "unaudited_factor_metric",
-            Self::FullMass => "full_mass",
-            Self::TruncatedLowerBound => "truncated_lower_bound",
+            Self::ExactFull => "exact_full",
+            Self::CertifiedPsdLowerBound => "certified_psd_lower_bound",
+            Self::UncertifiedApproximation => "uncertified_approximation",
         }
     }
 }
@@ -131,9 +131,7 @@ pub struct SteerPlan {
     /// `None` when the metric carries no behavioral information (Euclidean
     /// provenance) — the dose is *not available*, not zero.
     pub predicted_nats: Option<f64>,
-    /// Whether `predicted_nats` is full-mass, unaudited, or a low-rank lower
-    /// bound. This prevents consumers from treating every factor rank as an
-    /// equally calibrated full-Fisher dose.
+    /// Mathematical status of the factor used for `predicted_nats`.
     pub predicted_nats_kind: FisherDoseKind,
     /// Captured trace `tr(U_n U_n^T)` at `metric_row`, when behavior is present.
     pub fisher_mass_captured: Option<f64>,
@@ -462,10 +460,19 @@ pub fn steer_delta(
     let predicted_nats_kind = if !behavior_available {
         FisherDoseKind::Unavailable
     } else {
-        match fisher_mass_residual {
-            None => FisherDoseKind::UnauditedFactorMetric,
-            Some(0.0) => FisherDoseKind::FullMass,
-            Some(_) => FisherDoseKind::TruncatedLowerBound,
+        match metric.fisher_factor_kind() {
+            Some(FisherFactorKind::ExactFull) => FisherDoseKind::ExactFull,
+            Some(FisherFactorKind::CertifiedPsdLowerBound) => {
+                FisherDoseKind::CertifiedPsdLowerBound
+            }
+            Some(FisherFactorKind::UncertifiedApproximation) => {
+                FisherDoseKind::UncertifiedApproximation
+            }
+            None => {
+                return Err(format!(
+                    "steer_delta: behavioral metric provenance {provenance:?} has no explicit Fisher factor status"
+                ));
+            }
         }
     };
 
@@ -658,6 +665,7 @@ pub enum TargetDoseError {
     InvalidRequest(String),
     Steering(String),
     Probe(String),
+    FactorNeedsPatchedForward { kind: FisherDoseKind },
     UnreachableTarget {
         target_nats: f64,
         amplitude: f64,
@@ -677,6 +685,11 @@ impl std::fmt::Display for TargetDoseError {
             Self::InvalidRequest(message) | Self::Steering(message) | Self::Probe(message) => {
                 f.write_str(message)
             }
+            Self::FactorNeedsPatchedForward { kind } => write!(
+                f,
+                "steer_to_target_nats: factor kind {} cannot solve a full-KL target without a patched-forward probe",
+                kind.as_str()
+            ),
             Self::UnreachableTarget {
                 target_nats,
                 amplitude,
@@ -794,6 +807,11 @@ pub fn steer_to_target_nats(
              Fisher mass in metric row {metric_row}); cannot solve for a target amplitude"
         )));
     }
+    if probe.is_none() && unit.predicted_nats_kind != FisherDoseKind::ExactFull {
+        return Err(TargetDoseError::FactorNeedsPatchedForward {
+            kind: unit.predicted_nats_kind,
+        });
+    }
     // Closed-form first-order seed: a0²·unit_nats = q*.
     let seed_amplitude = (target_nats / unit_nats).sqrt();
     let quad = |a: f64| a * a * unit_nats;
@@ -828,6 +846,7 @@ pub fn steer_to_target_nats(
         // No model in the loop: return the unvalidated closed-form seed.
         None => return finish(seed_amplitude, None, 0, None),
     };
+    let can_establish_readout_radius = unit.predicted_nats_kind == FisherDoseKind::ExactFull;
 
     // Track a contiguous probed prefix of quadratic agreement. Once an amplitude
     // fails the contract, no later probe at or beyond it can enlarge the radius.
@@ -843,14 +862,16 @@ pub fn steer_to_target_nats(
     let mut hi_a = seed_amplitude;
     let mut hi_kl = probe_kl(probe, hi_a)?;
     probes += 1;
-    record_readout_probe(
-        hi_a,
-        hi_kl,
-        quad(hi_a),
-        config.readout_tol_rel,
-        &mut first_readout_failure,
-        &mut readout_kl_radius,
-    );
+    if can_establish_readout_radius {
+        record_readout_probe(
+            hi_a,
+            hi_kl,
+            quad(hi_a),
+            config.readout_tol_rel,
+            &mut first_readout_failure,
+            &mut readout_kl_radius,
+        );
+    }
     if (hi_kl - target_nats).abs() / target_nats <= config.tol_rel {
         return finish(hi_a, Some(hi_kl), probes, readout_kl_radius);
     }
@@ -866,14 +887,16 @@ pub fn steer_to_target_nats(
         let next_a = hi_a * 2.0;
         let next_kl = probe_kl(probe, next_a)?;
         probes += 1;
-        record_readout_probe(
-            next_a,
-            next_kl,
-            quad(next_a),
-            config.readout_tol_rel,
-            &mut first_readout_failure,
-            &mut readout_kl_radius,
-        );
+        if can_establish_readout_radius {
+            record_readout_probe(
+                next_a,
+                next_kl,
+                quad(next_a),
+                config.readout_tol_rel,
+                &mut first_readout_failure,
+                &mut readout_kl_radius,
+            );
+        }
         if next_kl <= hi_kl {
             return Err(TargetDoseError::UnreachableTarget {
                 target_nats,
@@ -902,14 +925,16 @@ pub fn steer_to_target_nats(
         };
         let measured = probe_kl(probe, candidate)?;
         probes += 1;
-        record_readout_probe(
-            candidate,
-            measured,
-            quad(candidate),
-            config.readout_tol_rel,
-            &mut first_readout_failure,
-            &mut readout_kl_radius,
-        );
+        if can_establish_readout_radius {
+            record_readout_probe(
+                candidate,
+                measured,
+                quad(candidate),
+                config.readout_tol_rel,
+                &mut first_readout_failure,
+                &mut readout_kl_radius,
+            );
+        }
         if (measured - target_nats).abs() / target_nats <= config.tol_rel {
             return finish(candidate, Some(measured), probes, readout_kl_radius);
         }

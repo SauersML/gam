@@ -241,6 +241,22 @@ pub enum MetricProvenance {
     WhitenedStructured { factor_rank: usize },
 }
 
+/// Scientific status of a factored output-Fisher approximation.
+///
+/// This is independent of both factor rank and a scalar trace diagnostic. A
+/// zero estimated tail trace does not prove an exact factorization, and a
+/// positive tail estimate does not prove the retained operator is below the
+/// true Fisher in Loewner order (#2249).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FisherFactorKind {
+    /// The supplied factor exactly represents the complete local Fisher.
+    ExactFull,
+    /// The producer certified `0 <= U U^T <= F` as an operator inequality.
+    CertifiedPsdLowerBound,
+    /// Randomized, stochastic, truncated, or otherwise uncertified factor.
+    UncertifiedApproximation,
+}
+
 /// The single per-row metric object. Holds one low-rank factor stack `U_n` (or
 /// none, for Euclidean) plus the validated PSD blocks, tagged with its
 /// [`MetricProvenance`].
@@ -277,11 +293,13 @@ pub struct RowMetric {
     /// `δ` is deliberately *not* baked in here, so this is the
     /// criterion-facing trace.
     traces: ndarray::Array1<f64>,
-    /// Optional per-row non-negative Fisher trace omitted by a truncated factor
-    /// stack. Diagnostic only: it never changes `M_n = U_n U_n^T`, the
-    /// criterion, or solver. Steering threads it into its dose contract so a
-    /// low-rank quadratic is identified as a lower bound instead of being
-    /// presented as an audited full-rank KL (#2249/#2263).
+    /// Explicit output-Fisher factor status. `None` for Euclidean and structured
+    /// residual metrics, which do not claim to approximate an output Fisher.
+    fisher_factor_kind: Option<FisherFactorKind>,
+    /// Optional per-row non-negative Fisher tail-trace diagnostic. It never
+    /// changes `M_n = U_n U_n^T`, the criterion, solver, or factor status: only
+    /// [`FisherFactorKind`] can distinguish exact, certified-lower-bound, and
+    /// uncertified operators (#2249/#2263).
     truncation_mass_residual: Option<Arc<ndarray::Array1<f64>>>,
 }
 
@@ -302,6 +320,7 @@ impl RowMetric {
             factors: None,
             solver_delta: 0.0,
             traces: ndarray::Array1::<f64>::from_elem(n_rows, p as f64),
+            fisher_factor_kind: None,
             truncation_mass_residual: None,
         })
     }
@@ -458,8 +477,47 @@ impl RowMetric {
             factors: Some(u),
             solver_delta,
             traces,
+            fisher_factor_kind: match provenance {
+                MetricProvenance::OutputFisher { .. }
+                | MetricProvenance::OutputFisherDownstream { .. }
+                | MetricProvenance::BehavioralFisher { .. } => {
+                    Some(FisherFactorKind::UncertifiedApproximation)
+                }
+                MetricProvenance::Euclidean | MetricProvenance::WhitenedStructured { .. } => None,
+            },
             truncation_mass_residual: None,
         })
+    }
+
+    /// Attach an explicit mathematical certificate to a factored output-Fisher
+    /// metric. Constructors deliberately default to `UncertifiedApproximation`:
+    /// exactness or Loewner-order dominance must be asserted by the producer,
+    /// never inferred from rank or residual trace.
+    pub fn with_fisher_factor_kind(mut self, kind: FisherFactorKind) -> Result<Self, String> {
+        if self.fisher_factor_kind.is_none() {
+            return Err(
+                "RowMetric::with_fisher_factor_kind requires an output-Fisher metric".to_string(),
+            );
+        }
+        match kind {
+            FisherFactorKind::ExactFull if self.truncation_mass_residual.is_some() => {
+                return Err(
+                    "RowMetric::with_fisher_factor_kind ExactFull forbids an omitted-trace record"
+                        .to_string(),
+                );
+            }
+            FisherFactorKind::CertifiedPsdLowerBound
+                if self.truncation_mass_residual.is_none() =>
+            {
+                return Err(
+                    "RowMetric::with_fisher_factor_kind CertifiedPsdLowerBound requires an exact omitted-trace record"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+        self.fisher_factor_kind = Some(kind);
+        Ok(self)
     }
 
     /// Attach the harvested per-row omitted Fisher trace to this factored
@@ -522,13 +580,14 @@ impl RowMetric {
                 // Re-runs the shared PSD normalizer on the subset (a subset of
                 // valid rows stays valid) and preserves the exact provenance and
                 // solver floor.
-                let metric = Self::from_factors(
+                let mut metric = Self::from_factors(
                     self.provenance,
                     Arc::new(sub),
                     self.p,
                     self.rank,
                     self.solver_delta,
                 )?;
+                metric.fisher_factor_kind = self.fisher_factor_kind;
                 match self.truncation_mass_residual.as_ref() {
                     None => Ok(metric),
                     Some(residual) => {
@@ -544,6 +603,11 @@ impl RowMetric {
     /// The provenance tag (consumed by Object 4 to certify the inner product).
     pub fn provenance(&self) -> MetricProvenance {
         self.provenance
+    }
+
+    /// Explicit output-Fisher factor status, never inferred from diagnostics.
+    pub fn fisher_factor_kind(&self) -> Option<FisherFactorKind> {
+        self.fisher_factor_kind
     }
 
     /// Whether this metric is allowed to **whiten the likelihood** (i.e. replace
@@ -1085,6 +1149,33 @@ mod tests {
         let m = RowMetric::output_fisher_downstream(u, 1, 1).unwrap();
         assert!(m.is_output_fisher_like());
         assert!(m.drives_gauge());
+    }
+
+    #[test]
+    fn fisher_factor_status_is_never_inferred_from_zero_residual_2249() {
+        let factors = Arc::new(Array2::from_elem((1, 1), 2.0));
+        let metric = RowMetric::output_fisher(factors, 1, 1)
+            .unwrap()
+            .with_truncation_mass_residual(Arc::new(array![0.0]))
+            .unwrap();
+        assert_eq!(
+            metric.fisher_factor_kind(),
+            Some(FisherFactorKind::UncertifiedApproximation)
+        );
+        let certified = metric
+            .clone()
+            .with_fisher_factor_kind(FisherFactorKind::CertifiedPsdLowerBound)
+            .unwrap();
+        assert_eq!(
+            certified.fisher_factor_kind(),
+            Some(FisherFactorKind::CertifiedPsdLowerBound)
+        );
+        assert!(
+            metric
+                .with_fisher_factor_kind(FisherFactorKind::ExactFull)
+                .is_err(),
+            "an omitted-trace record is incompatible with an exact-full claim"
+        );
     }
 
     // ── WeightField::project_jac_row_with_u ──────────────────────────────────

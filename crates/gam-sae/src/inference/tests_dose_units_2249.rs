@@ -66,7 +66,10 @@ fn categorical_fisher_row_metric(p_probs: &[f64]) -> RowMetric {
         }
     }
     let u = Array2::from_shape_vec((1, k * k), flat).unwrap();
-    RowMetric::output_fisher(Arc::new(u), k, k).unwrap()
+    RowMetric::output_fisher(Arc::new(u), k, k)
+        .unwrap()
+        .with_fisher_factor_kind(gam_problem::FisherFactorKind::ExactFull)
+        .unwrap()
 }
 
 /// Closed-form `F = diag(p) − ppᵀ` applied as a quadratic form, computed
