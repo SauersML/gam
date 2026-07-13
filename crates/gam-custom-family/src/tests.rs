@@ -168,9 +168,16 @@ pub(crate) fn batched_outer_hessian_terms_materialize_to_exact_small_matrix() {
     let family = BatchedOuterHessianTestFamily {
         matrix: exact.clone(),
     };
+    let hyper_layout = test_design_hyper_layout(Vec::new());
     // rho.len() must equal sum(spec.penalties.len()); empty specs ⇒ empty rho.
     let terms = family
-        .batched_outer_hessian_terms(&[], &[], &[], &Array1::<f64>::zeros(0), None)
+        .batched_outer_hessian_terms(
+            &[],
+            &[],
+            &hyper_layout,
+            &Array1::<f64>::zeros(0),
+            None,
+        )
         .expect("batched Hessian hook succeeds")
         .expect("test family exposes batched HVP terms");
     let operator = match terms.outer_hessian {
