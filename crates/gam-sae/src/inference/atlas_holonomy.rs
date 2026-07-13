@@ -290,8 +290,8 @@ impl ExactAnalyticHolonomyCertificate {
         for (position, edge) in edges.iter().enumerate() {
             if edge.b >= chart_count {
                 return Err(format!(
-                    "exact atlas edge ({}, {}) is outside the {chart_count}-chart atlas",
-                    edge.a, edge.b
+                    "exact atlas edge ({}, {}, overlap {}) is outside the {chart_count}-chart atlas",
+                    edge.a, edge.b, edge.overlap
                 ));
             }
             if position > 0
@@ -631,7 +631,6 @@ impl ProjectedAtlasEdgeSpec {
             geometric_remainder_bound,
         })
     }
-
 }
 
 /// Public relative geometry of one projected two-patch edge.
@@ -1103,6 +1102,34 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_edge_constructors_enforce_canonical_identity() {
+        assert!(AtlasHolonomyEdgeId::new(1, 1, 0).is_err());
+        assert_eq!(
+            AtlasHolonomyEdgeId::new(4, 2, 9).unwrap(),
+            AtlasHolonomyEdgeId::new(2, 4, 9).unwrap()
+        );
+        assert!(AtlasSignedEdge::new(0, 1, 0, 0).is_err());
+        assert!(ProjectedAtlasEdgeSpec::new(0, 1, 0, f64::NAN).is_err());
+        assert!(
+            ExactAnalyticHolonomyCertificate::new(
+                2,
+                vec![
+                    AtlasSignedEdge::new(0, 1, 3, 1).unwrap(),
+                    AtlasSignedEdge::new(0, 1, 3, -1).unwrap(),
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            ExactAnalyticHolonomyCertificate::new(
+                2,
+                vec![AtlasSignedEdge::new(0, 2, 0, 1).unwrap()],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn exact_parallel_overlap_components_form_their_own_orientation_cycle() {
         let certificate = ExactAnalyticHolonomyCertificate::new(
             2,
@@ -1296,8 +1323,7 @@ mod tests {
         let small = build(16);
         let large = build(1_000_000);
         assert!(
-            large.orientation_flip_probability_bound()
-                < small.orientation_flip_probability_bound()
+            large.orientation_flip_probability_bound() < small.orientation_flip_probability_bound()
         );
         assert_eq!(
             small.sample_prescription()[0].required_rows,
@@ -1453,14 +1479,14 @@ fn build_projected_edge(
         .assign(&patch_b.projection_frame);
     let (union_left, union_singular, _) = joined.svd(true, false).map_err(|error| {
         format!(
-            "edge ({}, {}) projection SVD failed: {error}",
-            spec.a, spec.b
+            "edge ({}, {}, overlap {}) projection SVD failed: {error}",
+            spec.a, spec.b, spec.overlap
         )
     })?;
     let union_left = union_left.ok_or_else(|| {
         format!(
-            "edge ({}, {}) projection SVD did not return requested left vectors",
-            spec.a, spec.b
+            "edge ({}, {}, overlap {}) projection SVD did not return requested left vectors",
+            spec.a, spec.b, spec.overlap
         )
     })?;
     let largest_union_singular = union_singular.first().copied().unwrap_or(0.0);
@@ -1472,8 +1498,8 @@ fn build_projected_edge(
         .count();
     if projected_dimension < INTRINSIC_DIMENSION {
         return Err(format!(
-            "edge ({}, {}) projected union rank {projected_dimension} is below intrinsic dimension {INTRINSIC_DIMENSION}",
-            spec.a, spec.b
+            "edge ({}, {}, overlap {}) projected union rank {projected_dimension} is below intrinsic dimension {INTRINSIC_DIMENSION}",
+            spec.a, spec.b, spec.overlap
         ));
     }
     let union = union_left.slice(s![.., 0..projected_dimension]);
@@ -1485,27 +1511,28 @@ fn build_projected_edge(
     let cross = tangent_b_projected.t().dot(&tangent_a_projected);
     let (left, singular, right_t) = cross.svd(true, true).map_err(|error| {
         format!(
-            "edge ({}, {}) cross-Gram SVD failed: {error}",
-            spec.a, spec.b
+            "edge ({}, {}, overlap {}) cross-Gram SVD failed: {error}",
+            spec.a, spec.b, spec.overlap
         )
     })?;
     let left = left.ok_or_else(|| {
         format!(
-            "edge ({}, {}) cross-Gram SVD omitted requested left vectors",
-            spec.a, spec.b
+            "edge ({}, {}, overlap {}) cross-Gram SVD omitted requested left vectors",
+            spec.a, spec.b, spec.overlap
         )
     })?;
     let right_t = right_t.ok_or_else(|| {
         format!(
-            "edge ({}, {}) cross-Gram SVD omitted requested right vectors",
-            spec.a, spec.b
+            "edge ({}, {}, overlap {}) cross-Gram SVD omitted requested right vectors",
+            spec.a, spec.b, spec.overlap
         )
     })?;
     if singular.len() != INTRINSIC_DIMENSION {
         return Err(format!(
-            "edge ({}, {}) cross-Gram has {} singular values, expected {INTRINSIC_DIMENSION}",
+            "edge ({}, {}, overlap {}) cross-Gram has {} singular values, expected {INTRINSIC_DIMENSION}",
             spec.a,
             spec.b,
+            spec.overlap,
             singular.len()
         ));
     }
@@ -1636,8 +1663,8 @@ fn fundamental_cycles(
             path_b.push(cursor);
             cursor = parent[cursor].ok_or_else(|| {
                 format!(
-                    "non-tree edge ({}, {}) joins different spanning-forest components",
-                    chord.a, chord.b
+                    "non-tree edge ({}, {}, overlap {}) joins different spanning-forest components",
+                    chord.a, chord.b, chord.overlap
                 )
             })?;
         };
@@ -1895,8 +1922,10 @@ fn analyze_cycle(
         .map(|&(edge, forward)| {
             edge_step_matrix(&edges[edge], forward).ok_or_else(|| {
                 format!(
-                    "cycle {cycle_index} edge ({}, {}) lost its validated polar transition",
-                    edges[edge].public.a, edges[edge].public.b
+                    "cycle {cycle_index} edge ({}, {}, overlap {}) lost its validated polar transition",
+                    edges[edge].public.a,
+                    edges[edge].public.b,
+                    edges[edge].public.overlap
                 )
             })
         })
@@ -1943,8 +1972,10 @@ fn analyze_cycle(
             .dot(&before[position].t());
         let canonical = edges[edge_index].transition.as_ref().ok_or_else(|| {
             format!(
-                "cycle {cycle_index} edge ({}, {}) lost its validated transition during derivative assembly",
-                edges[edge_index].public.a, edges[edge_index].public.b
+                "cycle {cycle_index} edge ({}, {}, overlap {}) lost its validated transition during derivative assembly",
+                edges[edge_index].public.a,
+                edges[edge_index].public.b,
+                edges[edge_index].public.overlap
             )
         })?;
         let canonical_tangent = canonical.dot(&generator);
@@ -1968,14 +1999,14 @@ fn analyze_cycle(
         let edge = &edges[edge_index];
         let gradient_a = edge.patch_gradient_a.as_ref().ok_or_else(|| {
             format!(
-                "cycle {cycle_index} edge ({}, {}) lost patch-a projector gradient",
-                edge.public.a, edge.public.b
+                "cycle {cycle_index} edge ({}, {}, overlap {}) lost patch-a projector gradient",
+                edge.public.a, edge.public.b, edge.public.overlap
             )
         })?;
         let gradient_b = edge.patch_gradient_b.as_ref().ok_or_else(|| {
             format!(
-                "cycle {cycle_index} edge ({}, {}) lost patch-b projector gradient",
-                edge.public.a, edge.public.b
+                "cycle {cycle_index} edge ({}, {}, overlap {}) lost patch-b projector gradient",
+                edge.public.a, edge.public.b, edge.public.overlap
             )
         })?;
         patch_gradients[edge.public.a].scaled_add(coefficient, gradient_a);
@@ -2304,8 +2335,8 @@ impl GaussianPcaHolonomyAnalysis {
         for (position, edge) in edge_specs.iter().enumerate() {
             if edge.b >= chart_count {
                 return Err(format!(
-                    "projected atlas edge ({}, {}) is outside the {chart_count}-chart atlas",
-                    edge.a, edge.b
+                    "projected atlas edge ({}, {}, overlap {}) is outside the {chart_count}-chart atlas",
+                    edge.a, edge.b, edge.overlap
                 ));
             }
             if position > 0
