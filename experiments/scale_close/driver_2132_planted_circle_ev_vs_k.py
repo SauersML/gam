@@ -41,13 +41,15 @@ import numpy as np
 
 
 # --------------------------------------------------------------------------- #
-def held_out_ev(x_test: np.ndarray, recon: np.ndarray, mean_train: np.ndarray) -> float:
-    """EV = 1 - ||X_test - recon||_F^2 / ||X_test - mean_train||_F^2 (train-mean
-    baseline). Both the curved fit and the PCA bar are scored with this identical
-    formula on the identical held-out split, always in float64."""
+def held_out_ev(x_test: np.ndarray, recon: np.ndarray) -> float:
+    """EV = 1 - ||X_test - recon||_F^2 / ||X_test - mean_test||_F^2.
+
+    Both the curved fit and the PCA bar are scored with this identical formula on
+    the identical held-out split, always in float64.
+    """
     xt = x_test.astype(np.float64)
     rc = recon.astype(np.float64)
-    mt = mean_train.astype(np.float64)
+    mt = xt.mean(axis=0)
     ssr = float(np.sum((xt - rc) ** 2))
     sst = float(np.sum((xt - mt[None, :]) ** 2))
     return 1.0 - ssr / max(sst, 1e-300)
@@ -83,7 +85,7 @@ def pca_rank_ev(x_tr, x_te, mean_tr, rank):
     vr = vecs[:, order[:rank]]
     tc = x_te.astype(np.float64) - mean_tr[None, :]
     recon = (tc @ vr) @ vr.T + mean_tr[None, :]
-    return held_out_ev(x_te, recon, mean_tr)
+    return held_out_ev(x_te, recon)
 
 
 def curved_ev(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, assignment,
@@ -94,7 +96,7 @@ def curved_ev(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, assignment,
         x_tr, K=K, d_atom=d_atom, atom_topology=topology,
         assignment=assignment, top_k=top_k, n_iter=n_iter, random_state=seed)
     recon = np.asarray(model.reconstruct(x_te), dtype=np.float64)
-    return held_out_ev(x_te, recon, mean_tr)
+    return held_out_ev(x_te, recon)
 
 
 def preflight(assignment, top_k, d_atom, topology):
