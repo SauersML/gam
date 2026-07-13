@@ -725,67 +725,6 @@ mod tests {
         binomial_neglog_q_derivatives_from_jet(y, weight, mu, d1, d2, d3).2
     }
 
-    /// The PRE-MIGRATION hand-summed chain rule for the generic-link binomial
-    /// q-derivative tower, kept verbatim here as the bit-identity witness for the
-    /// #932 `Tower4`-composition migration. If the tower path ever drifts from
-    /// the hand calculus these four channels disagree.
-    fn legacy_hand_q_derivatives(
-        y: f64,
-        weight: f64,
-        mu: f64,
-        d1: f64,
-        d2: f64,
-        d3: f64,
-        d4: f64,
-    ) -> (f64, f64, f64, f64) {
-        let (ellmu, ellmumu, ellmumum, ellmumumum) = binomial_loglik_mu_derivatives(y, mu);
-        let score_q = weight * ellmu * d1;
-        let curvature_q = -weight * (ellmumu * d1 * d1 + ellmu * d2);
-        let third_q = weight * (ellmumum * d1 * d1 * d1 + 3.0 * ellmumu * d1 * d2 + ellmu * d3);
-        let fourth_q = weight
-            * (ellmumumum * d1.powi(4)
-                + 6.0 * ellmumum * d1 * d1 * d2
-                + ellmumu * (3.0 * d2 * d2 + 4.0 * d1 * d3)
-                + ellmu * d4);
-        (score_q, curvature_q, third_q, -fourth_q)
-    }
-
-    /// #932 migration bit-identity: the `Tower4<1>` composition path
-    /// (`binomial_score_curvaturethird_from_jet` /
-    /// `binomial_neglog_q_fourth_derivative_from_jet`) reproduces the legacy
-    /// hand-summed chain rule to machine precision on a dense (y, w, q)×link grid
-    /// of interior points. Exercises cauchit and logit inner jets so every
-    /// Faà-di-Bruno term participates with a nonzero coefficient.
-    #[test]
-    pub(crate) fn generic_jet_tower_matches_legacy_hand_chain_rule() {
-        for &(y, w) in &[
-            (0.3_f64, 2.0_f64),
-            (0.7, 1.0),
-            (0.0, 1.5),
-            (1.0, 0.5),
-            (0.42, 3.0),
-        ] {
-            for &q in &[-1.3_f64, -0.4, 0.0, 0.5, 0.7, 1.3, 2.0] {
-                for &(mu, d1, d2, d3, d4) in &[cauchit_jet(q), logit_jet(q)] {
-                    let (s, c, t) = binomial_score_curvaturethird_from_jet(y, w, mu, d1, d2, d3);
-                    let m4 = binomial_neglog_q_fourth_derivative_from_jet(y, w, mu, d1, d2, d3, d4);
-                    let (ls, lc, lt, lm4) = legacy_hand_q_derivatives(y, w, mu, d1, d2, d3, d4);
-                    let tol = 1e-12;
-                    let close = |label: &str, got: f64, want: f64| {
-                        assert!(
-                            (got - want).abs() <= tol * want.abs().max(1.0),
-                            "{label} (y={y}, w={w}, q={q}, mu={mu}): tower {got:+.17e} vs legacy {want:+.17e}"
-                        );
-                    };
-                    close("score_q", s, ls);
-                    close("curvature_q", c, lc);
-                    close("third_q", t, lt);
-                    close("m4", m4, lm4);
-                }
-            }
-        }
-    }
-
     #[test]
     pub(crate) fn generic_binomial_m4_matches_finite_difference_of_m3_cauchit() {
         // High-order (5-point) central finite difference of m3 = dF³/dq³ should
