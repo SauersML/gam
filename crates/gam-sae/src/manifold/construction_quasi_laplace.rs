@@ -14,7 +14,14 @@ pub(crate) struct StreamingOuterEvaluation {
     pub(crate) loss: SaeManifoldLoss,
     pub(crate) cache: ArrowFactorCache,
     pub(crate) system: ArrowSchurSystem,
-    pub(crate) inverse_probe_bundle: (Vec<Array1<f64>>, Vec<Array1<f64>>),
+    /// Lossless low-rank derivative of the rational value (all shifts and the
+    /// frozen deflation block). This, never the raw shift-zero inverse probes,
+    /// owns the outer logdet trace and theta-adjoint channels.
+    pub(crate) logdet_derivative_bundle: RationalLogdetDerivativeBundle,
+    /// Optional raw `(z, S^-1 z)` bundle used only for EFS/MacKay proposal
+    /// traces. Its root is not the rational surrogate derivative and it must
+    /// never enter the authoritative outer gradient.
+    pub(crate) efs_inverse_probe_bundle: Option<(Vec<Array1<f64>>, Vec<Array1<f64>>)>,
 }
 
 impl SaeManifoldTerm {
@@ -2322,8 +2329,12 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
         lane: &mut SurrogateLaneState,
+        need_efs_inverse_probes: bool,
     ) -> Result<StreamingOuterEvaluation, SaeCriterionError> {
-        lane.request_inverse_probes();
+        lane.request_logdet_derivative_bundle();
+        if need_efs_inverse_probes {
+            lane.request_inverse_probes();
+        }
         let evaluated = self
             .penalized_quasi_laplace_criterion_streaming_exact_with_cache_lane_and_system(
                 target,
@@ -2338,16 +2349,24 @@ impl SaeManifoldTerm {
         let (cost, loss, cache, system) = match evaluated {
             Ok(evaluated) => evaluated,
             Err(error) => {
+                let _ = lane.take_logdet_derivative_bundle();
                 let _ = lane.take_inverse_probes();
                 return Err(error);
             }
         };
-        let inverse_probe_bundle = lane.take_inverse_probes().ok_or_else(|| {
+        let logdet_derivative_bundle = lane.take_logdet_derivative_bundle().ok_or_else(|| {
             SaeCriterionError::Numerical(
-                "streaming outer evaluation did not emit the requested selected-inverse probe bundle"
+                "streaming outer evaluation did not emit the rational value's derivative bundle"
                     .to_string(),
             )
         })?;
+        let efs_inverse_probe_bundle = lane.take_inverse_probes();
+        if need_efs_inverse_probes && efs_inverse_probe_bundle.is_none() {
+            return Err(SaeCriterionError::Numerical(
+                "streaming EFS evaluation did not emit its requested shift-zero inverse probes"
+                    .to_string(),
+            ));
+        }
         let system = system.ok_or_else(|| {
             SaeCriterionError::Numerical(
                 "streaming outer evaluation did not retain its matrix-free evidence system"
@@ -2372,7 +2391,8 @@ impl SaeManifoldTerm {
             loss,
             cache,
             system,
-            inverse_probe_bundle,
+            logdet_derivative_bundle,
+            efs_inverse_probe_bundle,
         })
     }
 

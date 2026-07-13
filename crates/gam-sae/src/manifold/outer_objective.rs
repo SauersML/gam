@@ -590,7 +590,8 @@ struct ReactiveWaypointCheckpoint {
 
 struct MatrixFreeOuterArtifacts {
     system: ArrowSchurSystem,
-    inverse_probe_bundle: (Vec<Array1<f64>>, Vec<Array1<f64>>),
+    logdet_derivative_bundle: RationalLogdetDerivativeBundle,
+    efs_inverse_probe_bundle: Option<(Vec<Array1<f64>>, Vec<Array1<f64>>)>,
 }
 
 struct OuterCriterionEvaluation {
@@ -909,6 +910,7 @@ impl SaeManifoldOuterObjective {
         &mut self,
         rho: &SaeManifoldRho,
         direct_logdet_admitted: bool,
+        need_efs_inverse_probes: bool,
     ) -> Result<OuterCriterionEvaluation, SaeCriterionError> {
         if direct_logdet_admitted {
             let (cost, loss, cache) = self.term.penalized_quasi_laplace_criterion_with_cache(
@@ -945,6 +947,7 @@ impl SaeManifoldOuterObjective {
                 self.ridge_ext_coord,
                 self.ridge_beta,
                 lane,
+                need_efs_inverse_probes,
             )?;
         Ok(OuterCriterionEvaluation {
             cost: evaluated.cost,
@@ -952,7 +955,8 @@ impl SaeManifoldOuterObjective {
             cache: evaluated.cache,
             matrix_free: Some(MatrixFreeOuterArtifacts {
                 system: evaluated.system,
-                inverse_probe_bundle: evaluated.inverse_probe_bundle,
+                logdet_derivative_bundle: evaluated.logdet_derivative_bundle,
+                efs_inverse_probe_bundle: evaluated.efs_inverse_probe_bundle,
             }),
         })
     }
@@ -967,7 +971,7 @@ impl SaeManifoldOuterObjective {
         evaluation: &OuterCriterionEvaluation,
     ) -> Result<Array1<f64>, OuterGradientError> {
         let components = if let Some(matrix_free) = evaluation.matrix_free.as_ref() {
-            let (probes, inverse_probes) = &matrix_free.inverse_probe_bundle;
+            let derivative_vectors = &matrix_free.logdet_derivative_bundle.vectors;
             let solver = DeflatedArrowSolver::plain(&evaluation.cache);
             self.term
                 .analytic_outer_rho_gradient_components_with_bundle(
@@ -976,7 +980,7 @@ impl SaeManifoldOuterObjective {
                     &evaluation.loss,
                     &evaluation.cache,
                     &solver,
-                    Some((probes, inverse_probes)),
+                    Some((derivative_vectors, derivative_vectors)),
                     Some(&matrix_free.system),
                 )?
         } else {
@@ -1016,7 +1020,7 @@ impl SaeManifoldOuterObjective {
         rho: &SaeManifoldRho,
     ) -> Result<OuterEval, String> {
         let evaluated = self
-            .evaluate_outer_criterion_route(rho, false)
+            .evaluate_outer_criterion_route(rho, false, false)
             .map_err(|error| error.to_string())?;
         let gradient = self
             .analytic_gradient_for_outer_evaluation(rho, &evaluated)
@@ -2927,7 +2931,8 @@ impl SaeManifoldOuterObjective {
         // value would both duplicate the dominant pass and risk differentiating
         // a different functional.
         let direct_logdet_admitted = self.term.streaming_plan().direct_logdet_admitted();
-        let criterion = self.evaluate_outer_criterion_route(&rho, direct_logdet_admitted);
+        let criterion =
+            self.evaluate_outer_criterion_route(&rho, direct_logdet_admitted, true);
         let infeasible_evaluation = |reason: &str| {
             (
                 EfsEval {
@@ -3014,7 +3019,7 @@ impl SaeManifoldOuterObjective {
         let inverse_probe_bundle = evaluation
             .matrix_free
             .as_ref()
-            .map(|artifacts| &artifacts.inverse_probe_bundle);
+            .and_then(|artifacts| artifacts.efs_inverse_probe_bundle.as_ref());
         let traces = if let Some((probes, sinv)) = inverse_probe_bundle.as_ref() {
             self.term
                 .ard_inverse_traces_from_probes(cache, probes, sinv)
@@ -3965,7 +3970,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // non-recoverable error still propagates.
         let direct_logdet_admitted = self.term.streaming_plan().direct_logdet_admitted();
         let evaluation = match self
-            .evaluate_outer_criterion_route(&rho_state, direct_logdet_admitted)
+            .evaluate_outer_criterion_route(&rho_state, direct_logdet_admitted, false)
         {
             Ok(evaluated) => evaluated,
             Err(SaeCriterionError::VanishedAtoms(atoms)) => {
