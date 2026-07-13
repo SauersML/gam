@@ -40,10 +40,16 @@ pub(crate) struct SurvivalRowInputs {
 const DEVICE_ROW_THRESHOLD: usize = 100_000;
 
 /// Whether this batch is admitted to the production CUDA V/G/H path.
+///
+/// Admission is a capability decision made before execution, not an
+/// operating-system guess. A large CPU-only Linux fit therefore stays on the
+/// ordinary row-kernel schedule; once a real device is admitted, subsequent
+/// compile/launch failures remain errors and are never hidden by a retry.
 #[inline]
 #[must_use]
-pub(crate) const fn survival_rigid_row_vgh_device_selected(n_rows: usize) -> bool {
-    cfg!(target_os = "linux") && n_rows >= DEVICE_ROW_THRESHOLD
+pub(crate) fn survival_rigid_row_vgh_device_selected(n_rows: usize) -> bool {
+    n_rows >= DEVICE_ROW_THRESHOLD
+        && gam_gpu::device_runtime::GpuRuntime::global().is_some()
 }
 
 /// Execute an already-admitted production V/G/H batch on CUDA.
@@ -309,6 +315,49 @@ mod tests {
         SurvivalRowVghChannels { value, grad, hess }
     }
 
+    /// The retired strongest hand-expanded K=1 V/G/H schedule. It exists only
+    /// in tests so production cannot diverge from the canonical row program.
+    /// The historical scalar formula assumes unit score covariance, hence the
+    /// explicit fixture contract below.
+    #[must_use]
+    fn survival_rigid_row_vgh_hand(
+        rows: &[SurvivalRowInputs],
+        probit_scale: f64,
+    ) -> SurvivalRowVghChannels {
+        use crate::survival::marginal_slope::row_primary_closed_form_hand_reference;
+
+        let n = rows.len();
+        let mut value = vec![0.0_f64; n];
+        let mut grad = vec![0.0_f64; n * 4];
+        let mut hess = vec![0.0_f64; n * 16];
+        for (row, input) in rows.iter().enumerate() {
+            assert_eq!(
+                input.cov_ones, 1.0,
+                "strongest hand K=1 witness requires unit score covariance",
+            );
+            let (row_value, row_gradient, row_hessian) =
+                row_primary_closed_form_hand_reference(
+                    input.primaries[0],
+                    input.primaries[1],
+                    input.primaries[2],
+                    input.primaries[3],
+                    input.z_sum,
+                    input.wi,
+                    input.di,
+                    f64::NEG_INFINITY,
+                    probit_scale,
+                )
+                .expect("valid strongest-hand survival row");
+            value[row] = row_value;
+            grad[row * 4..row * 4 + 4].copy_from_slice(&row_gradient);
+            for a in 0..4 {
+                hess[row * 16 + a * 4..row * 16 + a * 4 + 4]
+                    .copy_from_slice(&row_hessian[a]);
+            }
+        }
+        SurvivalRowVghChannels { value, grad, hess }
+    }
+
     #[cfg(target_os = "linux")]
     fn survival_rigid_row_vgh_device_only(
         rows: &[SurvivalRowInputs],
@@ -392,41 +441,44 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn assert_channel_parity(name: &str, cpu: &[f64], device: &[f64]) {
         assert_eq!(cpu.len(), device.len(), "{name} channel length");
-        let scale = cpu
-            .iter()
-            .fold(0.0_f64, |current, value| current.max(value.abs()));
-        let tolerance = PARITY_ABS_TOLERANCE + PARITY_REL_TOLERANCE * scale;
-        let (worst_index, worst) = cpu
-            .iter()
-            .zip(device)
-            .enumerate()
-            .map(|(index, (left, right))| (index, (left - right).abs()))
-            .max_by(|left, right| left.1.total_cmp(&right.1))
-            .unwrap_or((0, 0.0));
-        assert!(
-            worst <= tolerance,
-            "survival VGH {name} device drift {worst:.3e} at {worst_index} exceeds \
-             {tolerance:.3e} (scale {scale:.3e})",
-        );
+        for (index, (&left, &right)) in cpu.iter().zip(device).enumerate() {
+            let same_nonfinite = left == right && left.is_infinite();
+            let scale = left.abs().max(right.abs());
+            let tolerance = PARITY_ABS_TOLERANCE + PARITY_REL_TOLERANCE * scale;
+            assert!(
+                same_nonfinite
+                    || (left.is_finite()
+                        && right.is_finite()
+                        && (left - right).abs() <= tolerance),
+                "survival VGH {name}[{index}] device drift: cpu={left:+.16e}, \
+                 device={right:+.16e}, tolerance={tolerance:.3e}",
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn admitted_dispatch_and_device_path_match_cpu_vgh() {
         let rows = fixture(DEVICE_ROW_THRESHOLD + 1024);
+        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+            assert!(
+                !survival_rigid_row_vgh_device_selected(rows.len()),
+                "CPU-only Linux must not admit the CUDA row path",
+            );
+            return;
+        }
+        assert!(survival_rigid_row_vgh_device_selected(rows.len()));
         let cpu = survival_rigid_row_vgh_cpu(&rows, 0.7);
         let dispatched = survival_rigid_row_vgh(&rows, 0.7).expect("admitted CUDA VGH batch");
         assert_channel_parity("dispatched value", &cpu.value, &dispatched.value);
         assert_channel_parity("dispatched gradient", &cpu.grad, &dispatched.grad);
         assert_channel_parity("dispatched Hessian", &cpu.hess, &dispatched.hess);
 
-        if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
-            let device = survival_rigid_row_vgh_device_only(&rows, 0.7)
-                .expect("CUDA runtime present but survival VGH device path failed");
-            assert_channel_parity("device value", &cpu.value, &device.value);
-            assert_channel_parity("device gradient", &cpu.grad, &device.grad);
-            assert_channel_parity("device Hessian", &cpu.hess, &device.hess);
-        }
+        let device = survival_rigid_row_vgh_device_only(&rows, 0.7)
+            .expect("CUDA runtime present but survival VGH device path failed");
+        assert_channel_parity("device value", &cpu.value, &device.value);
+        assert_channel_parity("device gradient", &cpu.grad, &device.grad);
+        assert_channel_parity("device Hessian", &cpu.hess, &device.hess);
     }
 
     #[cfg(target_os = "linux")]
@@ -460,13 +512,25 @@ mod tests {
             return;
         }
         const ROWS: usize = 1_000_000;
-        let rows = fixture(ROWS);
+        let rows = fixture(ROWS)
+            .into_iter()
+            .map(|mut row| {
+                row.cov_ones = 1.0;
+                row
+            })
+            .collect::<Vec<_>>();
         let warm =
             survival_rigid_row_vgh_device_only(&rows, 0.7).expect("warm survival VGH device call");
 
-        let cpu_start = Instant::now();
-        let cpu = survival_rigid_row_vgh_cpu(&rows, 0.7);
-        let cpu_elapsed = cpu_start.elapsed();
+        let hand_start = Instant::now();
+        let hand = survival_rigid_row_vgh_hand(&rows, 0.7);
+        let hand_elapsed = hand_start.elapsed();
+        let canonical_start = Instant::now();
+        let canonical = survival_rigid_row_vgh_cpu(&rows, 0.7);
+        let canonical_elapsed = canonical_start.elapsed();
+        assert_channel_parity("canonical/hand value", &hand.value, &canonical.value);
+        assert_channel_parity("canonical/hand gradient", &hand.grad, &canonical.grad);
+        assert_channel_parity("canonical/hand Hessian", &hand.hess, &canonical.hess);
 
         let mut best_elapsed = Duration::MAX;
         let mut best_device = warm;
@@ -482,16 +546,25 @@ mod tests {
             }
         }
 
-        assert_channel_parity("measured value", &cpu.value, &best_device.value);
-        assert_channel_parity("measured gradient", &cpu.grad, &best_device.grad);
-        assert_channel_parity("measured Hessian", &cpu.hess, &best_device.hess);
-        let cpu_ns = cpu_elapsed.as_secs_f64() * 1e9 / ROWS as f64;
+        assert_channel_parity("measured value", &hand.value, &best_device.value);
+        assert_channel_parity("measured gradient", &hand.grad, &best_device.grad);
+        assert_channel_parity("measured Hessian", &hand.hess, &best_device.hess);
+        let hand_ns = hand_elapsed.as_secs_f64() * 1e9 / ROWS as f64;
+        let canonical_ns = canonical_elapsed.as_secs_f64() * 1e9 / ROWS as f64;
         let device_ns = best_elapsed.as_secs_f64() * 1e9 / ROWS as f64;
         eprintln!(
-            "SURVIVAL-VGH-CUDA-932 rows={ROWS} cpu={cpu_ns:.2} ns/row device-e2e={device_ns:.2} ns/row speedup={:.2}x",
-            cpu_ns / device_ns,
+            "SURVIVAL-VGH-CUDA-932 rows={ROWS} strongest-hand={hand_ns:.2} ns/row canonical-cpu={canonical_ns:.2} ns/row device-e2e={device_ns:.2} ns/row canonical/hand={:.3}x device/hand={:.3}x",
+            canonical_ns / hand_ns,
+            device_ns / hand_ns,
         );
-        assert!(cpu_ns.is_finite() && device_ns.is_finite() && device_ns > 0.0);
+        assert!(
+            hand_ns.is_finite()
+                && canonical_ns.is_finite()
+                && device_ns.is_finite()
+                && hand_ns > 0.0
+                && canonical_ns > 0.0
+                && device_ns > 0.0
+        );
     }
 
     #[cfg(target_os = "linux")]
