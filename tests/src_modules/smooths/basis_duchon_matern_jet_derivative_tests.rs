@@ -3659,6 +3659,16 @@ fn test_pair_block_derivative_branch_matrix_is_fully_fd_gated_2315() {
             true,
         ),
         (
+            "ordinary-schwinger-even",
+            1,
+            2,
+            0.8,
+            vec![0.1, -0.07, 0.03, -0.02, 0.05, -0.04],
+            vec![0.7, -0.5, 0.4, 0.3, -0.2, 0.6],
+            false,
+            true,
+        ),
+        (
             "small-chi-odd",
             1,
             1,
@@ -3703,6 +3713,65 @@ fn test_pair_block_derivative_branch_matrix_is_fully_fd_gated_2315() {
                     pair_block_radial_with_j_second_derivatives(q, m, s, kappa_at, eta_at, &r).value
                 },
             );
+        }
+    }
+}
+
+#[test]
+fn test_pair_block_pure_riesz_kappa_independence_is_exactly_gated_2315() {
+    use super::closed_form_penalty::pair_block_radial_with_j_second_derivatives;
+
+    // `s == 0` is a separate production match arm: the hybrid factor is absent,
+    // so the value and every eta derivative are exactly independent of kappa,
+    // while all kappa and eta-kappa derivatives are exactly zero. Exercise both
+    // ambient parities and every supported q arm. Merely checking finiteness or
+    // zero derivatives would be vacuous if the value accidentally acquired a
+    // hidden kappa dependence, so the value itself is compared across 18 orders
+    // of magnitude as the independent semantic authority.
+    for d in [3usize, 4usize] {
+        let eta: Vec<f64> = (0..d).map(|axis| 0.05 * axis as f64 - 0.08).collect();
+        let r: Vec<f64> = (0..d)
+            .map(|axis| if axis % 2 == 0 { 0.7 } else { -0.4 })
+            .collect();
+        for q in 0..=2 {
+            let reference = pair_block_radial_with_j_second_derivatives(q, 2, 0, 1.0, &eta, &r);
+            assert!(
+                reference.value.is_finite() && reference.value != 0.0,
+                "pure-Riesz d={d} q={q}: fixture must carry nonzero value signal"
+            );
+            assert!(
+                reference.d_eta.iter().any(|value| value.abs() > 0.0),
+                "pure-Riesz d={d} q={q}: fixture must carry eta-derivative signal"
+            );
+
+            for kappa in [1e-9_f64, 1.0, 1e9] {
+                let bundle = pair_block_radial_with_j_second_derivatives(q, 2, 0, kappa, &eta, &r);
+                assert_eq!(
+                    bundle.value.to_bits(),
+                    reference.value.to_bits(),
+                    "pure-Riesz d={d} q={q}: value changed with kappa={kappa}"
+                );
+                assert_eq!(
+                    bundle.d_eta, reference.d_eta,
+                    "pure-Riesz d={d} q={q}: eta gradient changed with kappa={kappa}"
+                );
+                assert_eq!(
+                    bundle.d2_eta, reference.d2_eta,
+                    "pure-Riesz d={d} q={q}: eta Hessian changed with kappa={kappa}"
+                );
+                assert_eq!(
+                    bundle.d_kappa, 0.0,
+                    "pure-Riesz d={d} q={q}: d_kappa must vanish"
+                );
+                assert_eq!(
+                    bundle.d2_kappa, 0.0,
+                    "pure-Riesz d={d} q={q}: d2_kappa must vanish"
+                );
+                assert!(
+                    bundle.d2_eta_kappa.iter().all(|&value| value == 0.0),
+                    "pure-Riesz d={d} q={q}: mixed eta-kappa derivatives must vanish"
+                );
+            }
         }
     }
 }
