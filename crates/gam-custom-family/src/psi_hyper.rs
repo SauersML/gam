@@ -2758,8 +2758,7 @@ fn validate_requested_best_mode_derivatives(
     if eval_mode != EvalMode::ValueGradientHessian {
         return Ok(());
     }
-    if !result.outer_hessian.is_analytic()
-        || result.outer_hessian.dim() != Some(expected_theta_dim)
+    if !result.outer_hessian.is_analytic() || result.outer_hessian.dim() != Some(expected_theta_dim)
     {
         return Err(CustomFamilyError::UnsupportedConfiguration {
             reason: format!(

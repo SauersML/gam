@@ -1318,11 +1318,11 @@ pub(crate) fn compute_joint_covariance_required<F: CustomFamily + Clone + Send +
         options,
         preferred_unpenalized_hessian,
     )
-        .map(Some)
-        .map_err(|e| CustomFamilyError::InvalidInput {
-            context: "compute_joint_covariance_required",
-            reason: format!("joint covariance computation failed: {e}"),
-        })
+    .map(Some)
+    .map_err(|e| CustomFamilyError::InvalidInput {
+        context: "compute_joint_covariance_required",
+        reason: format!("joint covariance computation failed: {e}"),
+    })
 }
 
 /// Compute joint working-set geometry at convergence for ALO diagnostics.
@@ -1442,9 +1442,7 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
     });
     let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
     let mut h = if let Some(hessian) = preferred_unpenalized_hessian {
-        if hessian.dim() != (total_p, total_p)
-            || hessian.iter().any(|value| !value.is_finite())
-        {
+        if hessian.dim() != (total_p, total_p) || hessian.iter().any(|value| !value.is_finite()) {
             return Err(format!(
                 "preferred joint geometry Hessian must be finite with shape {total_p}x{total_p}, got {}x{}",
                 hessian.nrows(),

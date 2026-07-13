@@ -1972,8 +1972,9 @@ pub fn fit_custom_family_fixed_log_lambdas_from_mode_selection<
     if !beta_matches {
         return Err(CustomFamilyError::Optimization {
             context: "fit_custom_family_fixed_log_lambdas_from_mode_selection coefficient identity",
-            reason: "the selected result carrier and owned inner mode have different coefficient bits"
-                .to_string(),
+            reason:
+                "the selected result carrier and owned inner mode have different coefficient bits"
+                    .to_string(),
         });
     }
 
@@ -1998,8 +1999,9 @@ pub fn fit_custom_family_fixed_log_lambdas_from_mode_selection<
     let workspace = inner.joint_workspace.as_ref().ok_or_else(|| {
         CustomFamilyError::Optimization {
             context: "fit_custom_family_fixed_log_lambdas_from_mode_selection curvature identity",
-            reason: "the selected mode did not retain its certified returned-beta Hessian workspace"
-                .to_string(),
+            reason:
+                "the selected mode did not retain its certified returned-beta Hessian workspace"
+                    .to_string(),
         }
     })?;
     let hessian_source = exact_newton_joint_hessian_source_from_workspace(
