@@ -2816,46 +2816,73 @@ pub(crate) mod whitened_spectrum {
 
             // Boundary solution: find λ ≥ λ_lo with ‖η(λ)‖ = trust_radius.
             let lambda_lo = (-gamma_min_id).max(0.0);
-            // Hard case detection: is rhs orthogonal to the minimal-curvature
-            // eigenspace? If so ‖η(λ_lo)‖ is finite and may be below the radius.
-            let min_mode_tol = self.null_cutoff.max(self.lambda_max_abs * 1e-12);
+            // Hard case detection uses the ACTUAL pole eigenspace of the
+            // computed symmetric problem. The convergence-rank cutoff is much
+            // broader and must not be used as an eigenvalue-multiplicity
+            // tolerance: on an ill-conditioned CTN Hessian it can group a weak
+            // negative minimum with zero or positive modes and choose the
+            // hard-case boundary component along the wrong eigenvector.
+            //
+            // Build the Moore-Penrose base directly at λ_lo, omitting only
+            // eigenvalues exactly equal to the computed minimum. This is also
+            // the norm of the step that `assemble(lambda_lo, ...)` constructs;
+            // the old code estimated it at a λ_max-scaled offset from the pole
+            // and then assembled at λ_lo, so its τ did not put the returned
+            // step on the trust boundary.
             let mut hard_case_component_sq = 0.0;
+            let mut rhs_norm_sq = 0.0;
+            let mut hard_case_base_norm_sq = 0.0;
             let mut k_min_witness = None;
             for k in 0..self.gamma.len() {
-                // Step floor (gam#979/#1449): identified set is above the
-                // machine-rank floor.
                 if self.gamma[k].abs() <= self.numerical_floor {
                     continue;
                 }
-                if (self.gamma[k] - gamma_min_id).abs() <= min_mode_tol {
+                rhs_norm_sq += self.c[k] * self.c[k];
+                if self.gamma[k] == gamma_min_id {
                     hard_case_component_sq += self.c[k] * self.c[k];
-                    k_min_witness = Some(k);
-                }
-            }
-            // Evaluate the norm just above the pole. With a real rhs component at the
-            // minimal mode the norm diverges at λ_lo, so the secular root is interior
-            // to (λ_lo, ∞) and a small relative offset brackets it. With no such
-            // component (hard case) the norm at λ_lo is finite.
-            let lambda_lo_eval = lambda_lo + self.lambda_max_abs.max(1.0) * 1e-12;
-            if hard_case_component_sq <= (self.lambda_max_abs.max(1.0) * 1e-12).powi(2) {
-                let norm_at_lo = self.step_norm_sq(lambda_lo_eval).sqrt();
-                if norm_at_lo < trust_radius {
-                    // Hard case: λ = λ_lo, then add τ·v_min to reach the boundary.
-                    if let Some(k_min) = k_min_witness {
-                        let deficit =
-                            (trust_radius * trust_radius - norm_at_lo * norm_at_lo).max(0.0);
-                        let tau = deficit.sqrt();
-                        return self.assemble(lambda_lo, Some((k_min, tau)));
+                    if k_min_witness.is_none() {
+                        k_min_witness = Some(k);
                     }
-                    return self.assemble(lambda_lo, None);
+                } else {
+                    let denominator = self.gamma[k] + lambda_lo;
+                    if denominator > 0.0 {
+                        let coefficient = self.c[k] / denominator;
+                        hard_case_base_norm_sq += coefficient * coefficient;
+                    }
                 }
             }
+            let hard_case_rhs_floor = rhs_norm_sq.sqrt()
+                * (self.gamma.len() as f64).sqrt()
+                * f64::EPSILON;
+            if hard_case_component_sq.sqrt() <= hard_case_rhs_floor
+                && hard_case_base_norm_sq < trust_radius * trust_radius
+            {
+                // At the hard case, H+λ_lo D is PSD-singular, the base is its
+                // Moore-Penrose solution, and the missing norm is supplied in
+                // the true minimum eigenspace. Its sign is immaterial for an
+                // exactly orthogonal RHS; preserve the sign of a tiny rounded
+                // component to maximize the linear decrease when present.
+                if let Some(k_min) = k_min_witness {
+                    let deficit = (trust_radius * trust_radius - hard_case_base_norm_sq).max(0.0);
+                    let tau = deficit.sqrt().copysign(self.c[k_min]);
+                    return self.assemble(lambda_lo, Some((k_min, tau)));
+                }
+                return self.assemble(lambda_lo, None);
+            }
+            // With a real RHS component at the pole the norm diverges at
+            // λ_lo, so the secular root is strictly above it. `next_up` is the
+            // closest representable lower bracket and is scale-covariant; an
+            // absolute `max(λ_max, 1)·1e-12` offset can jump past the root when
+            // the whole problem or its negative mode is small.
+            let lambda_lo_eval = lambda_lo.next_up();
             // Safeguarded Newton on φ(λ) = 1/‖η(λ)‖ − 1/r (well-behaved, ~linear),
             // bracketed in [lo, hi]. φ is increasing in λ (‖η‖ decreasing), φ(lo)<0,
             // and we grow hi until φ(hi)>0.
             let target = trust_radius;
             let mut lo = lambda_lo_eval;
-            let mut hi = lambda_lo_eval.max(self.lambda_max_abs).max(1.0);
+            let mut hi = lambda_lo_eval
+                .max(self.lambda_max_abs)
+                .max(f64::MIN_POSITIVE);
             let mut grow_guard = 0;
             while self.step_norm_sq(hi).sqrt() > target && grow_guard < 200 {
                 hi *= 2.0;
