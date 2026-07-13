@@ -1757,8 +1757,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         global_penalty: Array2<f64>,
         nullspace_dim: usize,
         log_lambda: f64,
-        col_range: Range<usize>,
-        hessian_piece: Array2<f64>,
     }
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
     let retained_setups = baseline
@@ -1781,8 +1779,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     .copied()
                     .unwrap_or(0),
                 log_lambda: baseline_log_lambdas[idx],
-                col_range: bp.col_range.clone(),
-                hessian_piece: bp.local.mapv(|v| lambda * v),
             })
         })
         .collect::<Vec<_>>();
@@ -1794,15 +1790,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let mut retained_nullspace_dims = Vec::<usize>::with_capacity(retained_count);
     let mut retained_log_lambdas = Vec::<f64>::with_capacity(retained_count);
     let mut retained_global_indices = Vec::<usize>::with_capacity(retained_count);
-    let mut fixed_quadratichessian = Array2::<f64>::zeros((p_total, p_total));
     for setup in retained_setups.into_iter().flatten() {
         retained_penalties.push(setup.global_penalty);
         retained_nullspace_dims.push(setup.nullspace_dim);
         retained_log_lambdas.push(setup.log_lambda);
         retained_global_indices.push(setup.global_idx);
-        fixed_quadratichessian
-            .slice_mut(s![setup.col_range.clone(), setup.col_range])
-            .scaled_add(1.0, &setup.hessian_piece);
     }
 
     let (eps_0_init, eps_g_init, eps_c_init) = compute_initial_epsilons(
@@ -1904,10 +1896,10 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let shared_offset = Arc::new(offset.to_owned());
     let shared_runtime_caches = Arc::new(runtime_caches.to_vec());
     let shared_hyperspecs = Arc::new(hyperspecs.clone());
-    let zero_quadratic = Arc::new(Array2::<f64>::zeros((
+    let zero_quadratic = ValidatedFixedQuadraticHessian::zero(
         baseline.design.design.ncols(),
-        baseline.design.design.ncols(),
-    )));
+    )
+    .map_err(EstimationError::InvalidInput)?;
     let base_family = SpatialAdaptiveExactFamily {
         family: family.clone(),
         latent_cloglog_state,
@@ -1920,7 +1912,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         linear_constraints: baseline.design.linear_constraints.clone(),
         runtime_caches: shared_runtime_caches.clone(),
         adaptive_params: Vec::new(),
-        fixed_quadratichessian: zero_quadratic.clone(),
+        fixed_quadratic_hessian: zero_quadratic.clone(),
         hyperspecs: shared_hyperspecs.clone(),
         exact_eval_cache: Arc::new(Mutex::new(None)),
     };
@@ -2411,8 +2403,17 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         adaptive_params.clone(),
         zero_quadratic.clone(),
     );
+    let fixed_total = ValidatedFixedQuadraticHessian::try_from_dense(
+        fixed_total.clone(),
+        baseline.design.design.ncols(),
+    )
+    .map_err(|error| {
+        EstimationError::InvalidInput(format!(
+            "optimized spatial adaptive fixed quadratic Hessian is invalid: {error}"
+        ))
+    })?;
     let final_family =
-        base_family.with_adaptive_params(adaptive_params.clone(), Arc::new(fixed_total.clone()));
+        base_family.with_adaptive_params(adaptive_params.clone(), fixed_total);
     let final_blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
         design: baseline.design.design.clone(),
@@ -4595,6 +4596,63 @@ struct SpatialAdaptiveTermHyperParams {
     epsilon: [f64; 3],
 }
 
+/// Immutable proof that a dense fixed quadratic Hessian is a finite symmetric
+/// positive-semidefinite matrix on one exact coefficient space.
+///
+/// The adaptive family evaluates `q(beta) = beta^T H beta / 2` and its gradient
+/// as `H beta`. Those are derivatives of the same scalar function only when
+/// `H` is symmetric. Keeping the raw matrix behind this private carrier makes
+/// that invariant structural: arbitrary dense input has exactly one admission
+/// boundary, which rejects rather than symmetrizes a defective matrix.
+#[derive(Clone, Debug)]
+struct ValidatedFixedQuadraticHessian {
+    dense: Arc<Array2<f64>>,
+}
+
+impl ValidatedFixedQuadraticHessian {
+    fn try_from_dense(dense: Array2<f64>, coefficient_dim: usize) -> Result<Self, String> {
+        gam_linalg::utils::validate_finite_symmetric_matrix(
+            &dense,
+            "spatial adaptive fixed quadratic Hessian",
+        )
+        .map_err(|error| error.to_string())?;
+        PenaltyMatrix::Dense(dense.clone())
+            .validate(coefficient_dim)
+            .map_err(|error| {
+                format!(
+                    "spatial adaptive fixed quadratic Hessian failed quadratic-form validation: {error}"
+                )
+            })?;
+        Ok(Self {
+            dense: Arc::new(dense),
+        })
+    }
+
+    fn zero(coefficient_dim: usize) -> Result<Self, String> {
+        Self::try_from_dense(
+            Array2::<f64>::zeros((coefficient_dim, coefficient_dim)),
+            coefficient_dim,
+        )
+    }
+
+    fn as_dense(&self) -> &Array2<f64> {
+        self.dense.as_ref()
+    }
+
+    fn quadratic_terms(&self, beta: &Array1<f64>) -> Result<(f64, Array1<f64>), String> {
+        if beta.len() != self.dense.ncols() {
+            return Err(format!(
+                "spatial adaptive fixed quadratic beta length {} does not match validated Hessian dimension {}",
+                beta.len(),
+                self.dense.ncols()
+            ));
+        }
+        let gradient = self.dense.dot(beta);
+        let value = 0.5 * beta.dot(&gradient);
+        Ok((value, gradient))
+    }
+}
+
 #[derive(Clone)]
 struct SpatialAdaptiveExactEvaluation {
     obs: StandardFamilyObservationState,
@@ -4604,7 +4662,7 @@ struct SpatialAdaptiveExactEvaluation {
     adaptive_penaltyhessian: Array2<f64>,
     fixed_quadraticvalue: f64,
     fixed_quadraticgradient: Array1<f64>,
-    fixed_quadratichessian: Array2<f64>,
+    fixed_quadratic_hessian: ValidatedFixedQuadraticHessian,
 }
 
 #[derive(Clone)]
@@ -4623,7 +4681,7 @@ impl SpatialAdaptiveExactEvaluation {
     }
 
     fn total_penaltyhessian(&self) -> Array2<f64> {
-        &self.adaptive_penaltyhessian + &self.fixed_quadratichessian
+        &self.adaptive_penaltyhessian + self.fixed_quadratic_hessian.as_dense()
     }
 
     fn totalobjectivehessian(&self, design: &Array2<f64>) -> Result<Array2<f64>, String> {
@@ -4646,7 +4704,7 @@ struct SpatialAdaptiveExactFamily {
     linear_constraints: Option<LinearInequalityConstraints>,
     runtime_caches: Arc<Vec<SpatialOperatorRuntimeCache>>,
     adaptive_params: Vec<SpatialAdaptiveTermHyperParams>,
-    fixed_quadratichessian: Arc<Array2<f64>>,
+    fixed_quadratic_hessian: ValidatedFixedQuadraticHessian,
     hyperspecs: Arc<Vec<SpatialAdaptiveHyperSpec>>,
     exact_eval_cache: Arc<Mutex<Option<CachedSpatialAdaptiveExactEvaluation>>>,
 }
@@ -4655,7 +4713,7 @@ impl SpatialAdaptiveExactFamily {
     fn with_adaptive_params(
         &self,
         adaptive_params: Vec<SpatialAdaptiveTermHyperParams>,
-        fixed_quadratichessian: Arc<Array2<f64>>,
+        fixed_quadratic_hessian: ValidatedFixedQuadraticHessian,
     ) -> Self {
         Self {
             family: self.family.clone(),
@@ -4669,7 +4727,7 @@ impl SpatialAdaptiveExactFamily {
             linear_constraints: self.linear_constraints.clone(),
             runtime_caches: self.runtime_caches.clone(),
             adaptive_params,
-            fixed_quadratichessian,
+            fixed_quadratic_hessian,
             hyperspecs: self.hyperspecs.clone(),
             exact_eval_cache: Arc::new(Mutex::new(None)),
         }
@@ -4679,10 +4737,11 @@ impl SpatialAdaptiveExactFamily {
         gam_linalg::faer_ndarray::fast_av(self.design.as_ref(), beta) + self.offset.as_ref()
     }
 
-    fn fixed_quadratic_terms(&self, beta: &Array1<f64>) -> (f64, Array1<f64>) {
-        let grad = self.fixed_quadratichessian.dot(beta);
-        let value = 0.5 * beta.dot(&grad);
-        (value, grad)
+    fn fixed_quadratic_terms(
+        &self,
+        beta: &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>), String> {
+        self.fixed_quadratic_hessian.quadratic_terms(beta)
     }
 
     fn adaptive_penalty_value_only(&self, beta: &Array1<f64>) -> Result<f64, String> {
@@ -5171,7 +5230,8 @@ impl SpatialAdaptiveExactFamily {
             adaptive_states.push(state);
         }
 
-        let (fixed_quadraticvalue, fixed_quadraticgradient) = self.fixed_quadratic_terms(beta);
+        let (fixed_quadraticvalue, fixed_quadraticgradient) =
+            self.fixed_quadratic_terms(beta)?;
         Ok(SpatialAdaptiveExactEvaluation {
             obs,
             adaptive_states,
@@ -5180,7 +5240,7 @@ impl SpatialAdaptiveExactFamily {
             adaptive_penaltyhessian: penaltyhessian,
             fixed_quadraticvalue,
             fixed_quadraticgradient,
-            fixed_quadratichessian: self.fixed_quadratichessian.as_ref().clone(),
+            fixed_quadratic_hessian: self.fixed_quadratic_hessian.clone(),
         })
     }
 
@@ -5551,7 +5611,7 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         )
         .map_err(|e| e.to_string())?;
         let adaptive_penalty = self.adaptive_penalty_value_only(beta)?;
-        let (fixed_quadratic, _) = self.fixed_quadratic_terms(beta);
+        let (fixed_quadratic, _) = self.fixed_quadratic_terms(beta)?;
         Ok(obs.log_likelihood - adaptive_penalty - fixed_quadratic)
     }
 
