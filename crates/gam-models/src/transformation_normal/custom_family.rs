@@ -486,8 +486,8 @@ impl CustomFamily for TransformationNormalFamily {
                 row.endpoint_q.as_slice(),
                 None,
             )?;
-        let hessian_psi_psi_operator: Box<dyn HyperOperator> =
-            Box::new(TransformationNormalPsiPsiHessianOperator::new(
+        let hessian_psi_psi_operator: Arc<dyn HyperOperator> =
+            Arc::new(TransformationNormalPsiPsiHessianOperator::new(
                 Arc::new(self.clone()),
                 beta.clone(),
                 Arc::clone(
