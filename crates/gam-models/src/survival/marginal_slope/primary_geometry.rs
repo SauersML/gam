@@ -134,11 +134,6 @@ pub(crate) struct DenestedCellPrimaryFixedPartials {
     pub(crate) coeff_bbbu: Vec<[f64; 4]>,
 }
 
-// #932-2 cutover: `COEFF_SUPPORT_GHW`/`COEFF_SUPPORT_GW` moved to the test-masked
-// `flex_oracle_structs_tests` module — they parametrize only the now test-only hand
-// directional/bidirectional oracle (the production jet path's `observed_fixed_for`
-// gates the h/w channels by `family.score_warp`/`link_dev` directly).
-
 /// Pre-computed partition cell data for a single timepoint evaluation.
 /// Built once per (a, b, β_h, β_w) and reused across the three passes
 /// (F, D, D_uv) that previously each rebuilt partition cells independently.
@@ -199,13 +194,6 @@ pub(crate) struct SurvivalFlexTimepointFirstOrderExact {
     pub(crate) chi_u: Array1<f64>,
     pub(crate) d_u: Array1<f64>,
 }
-
-// #932-2 cutover: `SurvivalFlexTimepoint{Directional,BiDirectional}Exact` are the
-// return shapes of the now test-only hand directional/bidirectional oracle
-// producers; they moved to the test-masked `flex_oracle_structs_tests` module
-// (consumed only by the `*_oracle_tests` hand oracle + the `tests.rs` FD witnesses),
-// since the production contracted path reads the Block-10 packs straight from the
-// `Jet3`/`Jet4` builders.
 
 #[derive(Clone)]
 pub(crate) struct SurvivalTimeWiggleGeometry {
@@ -381,13 +369,6 @@ pub(crate) fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f
         .into()),
     }
 }
-
-// #932-2 cutover: `scalar_composite_bilinear` / `coeff4_fixed_bilinear` /
-// `coeff4_composite_bilinear` moved to the test-masked `flex_oracle_structs_tests`
-// module — these `MultiDirJet`-bilinear coefficient assemblers feed only the now
-// test-only hand bidirectional oracle (the production jet path builds the
-// second-directional coefficient channels through `flex_jet::cell_coeff_jets` over
-// the `Jet4` algebra).
 
 /// Derive a primary-space direction from a precomputed psi design row and beta,
 /// avoiding a redundant psi design row build inside `row_primary_psi_direction`.

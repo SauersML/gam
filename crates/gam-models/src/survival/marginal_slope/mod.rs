@@ -147,8 +147,6 @@ mod joint_workspace;
 mod kkt_refusal;
 mod logslope_layout;
 mod newton_operators;
-#[cfg(test)]
-mod poly_arith_tests;
 mod primary_geometry;
 mod psi_terms;
 mod pullback;
@@ -175,7 +173,5 @@ pub(crate) use row_kernel::*;
 pub use row_math::*;
 pub use spec::*;
 
-#[cfg(test)]
-mod flex_oracle_structs_tests;
 #[cfg(test)]
 mod tests;

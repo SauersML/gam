@@ -158,7 +158,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let (x_t, x_ls) = self
             .exact_joint_dense_block_designs(None)?
             .ok_or("BinomialLocationScaleWiggleFamily: joint block designs unavailable")?;
-        let pieces = self.wiggle_hessian_row_pieces(block_states)?;
+        let pieces = self.wiggle_order2_rows(block_states)?;
         let (h_tt, h_ll, h_ww) = pieces.assemble_block_diagonals(&x_t, &x_ls)?;
         Ok(FamilyEvaluation {
             log_likelihood: core.log_likelihood,
@@ -348,16 +348,13 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         //   mu = Phi(q),
         //   F  = -sum_i ell_i(mu_i).
         //
-        // The shared rowwise weights (coeff_tt, coeff_tl, coeff_ll, coeff_tw_b,
-        // coeff_tw_d, coeff_lw_b, coeff_lw_d, coeffww) plus the realized B/B'
-        // basis arrays are computed once by `wiggle_hessian_row_pieces` and
-        // assembled here into the dense p×p matrix. The matrix-free workspace
-        // path reuses the exact same row pieces to apply H to a vector
-        // without ever forming the dense matrix.
+        // The typed probe lowering evaluates the canonical row expression once
+        // per observation and extracts its structured B/B' channels.  Dense
+        // and matrix-free paths consume those identical generated rows.
         let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
             return Ok(None);
         };
-        let pieces = self.wiggle_hessian_row_pieces(block_states)?;
+        let pieces = self.wiggle_order2_rows(block_states)?;
         Ok(Some(pieces.assemble_dense(&x_t, &x_ls)?))
     }
 

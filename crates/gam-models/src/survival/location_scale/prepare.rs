@@ -941,8 +941,16 @@ pub(crate) fn finalize_survival_location_scale_fit(
         stable_penalty_term: fit.stable_penalty_term,
         penalized_objective: fit.penalized_objective,
         used_device: false,
-        outer_iterations: fit.outer_iterations,
+        outer_iterations: fit.convergence_evidence().outer_iterations(),
         outer_gradient_norm: fit.outer_gradient_norm,
+        criterion_certificate: fit
+            .convergence_evidence()
+            .outer_certificate()
+            .cloned(),
+        // A `UnifiedFitResult` can only exist after its checked constructor has
+        // consumed converged inner and outer evidence. Finalization is a pure
+        // coefficient-gauge transformation, so convergence is derived from the
+        // sealed source fit rather than a second status decision.
         outer_converged: true,
         covariance_conditional,
         geometry,

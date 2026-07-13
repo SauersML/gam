@@ -5,14 +5,14 @@
 use super::*;
 
 /// Matrix-free joint-Hessian operator for the 3-block binomial
-/// location-scale wiggle family. See `BinomialLocationScaleWiggleHessianRowPieces`
+/// location-scale wiggle family. See `BinomialWiggleOrder2Rows`
 /// for the per-row weight structure.
 pub(crate) struct BinomialLocationScaleWiggleHessianWorkspace {
     pub(crate) family: BinomialLocationScaleWiggleFamily,
     pub(crate) block_states: Vec<ParameterBlockState>,
     pub(crate) x_t: Arc<Array2<f64>>,
     pub(crate) x_ls: Arc<Array2<f64>>,
-    pub(crate) pieces: BinomialLocationScaleWiggleHessianRowPieces,
+    pub(crate) pieces: BinomialWiggleOrder2Rows,
 }
 
 impl BinomialLocationScaleWiggleHessianWorkspace {
@@ -22,7 +22,7 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
         x_t: Array2<f64>,
         x_ls: Array2<f64>,
     ) -> Result<Self, String> {
-        let pieces = family.wiggle_hessian_row_pieces(&block_states)?;
+        let pieces = family.wiggle_order2_rows(&block_states)?;
         Ok(Self {
             family,
             block_states,
@@ -55,7 +55,7 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
         let mut mask_tw_d = Array1::<f64>::zeros(n);
         let mut mask_lw_b = Array1::<f64>::zeros(n);
         let mut mask_lw_d = Array1::<f64>::zeros(n);
-        let mut maskww = Array1::<f64>::zeros(n);
+        let mut mask_ww = Array1::<f64>::zeros(n);
         for r in rows {
             let i = r.index;
             let w = r.weight;
@@ -66,7 +66,7 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
             mask_tw_d[i] = self.pieces.coeff_tw_d[i] * w;
             mask_lw_b[i] = self.pieces.coeff_lw_b[i] * w;
             mask_lw_d[i] = self.pieces.coeff_lw_d[i] * w;
-            maskww[i] = self.pieces.coeffww[i] * w;
+            mask_ww[i] = self.pieces.coeff_ww[i] * w;
         }
         self.pieces.coeff_tt = mask_tt;
         self.pieces.coeff_tl = mask_tl;
@@ -75,7 +75,7 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
         self.pieces.coeff_tw_d = mask_tw_d;
         self.pieces.coeff_lw_b = mask_lw_b;
         self.pieces.coeff_lw_d = mask_lw_d;
-        self.pieces.coeffww = maskww;
+        self.pieces.coeff_ww = mask_ww;
     }
 }
 
@@ -143,7 +143,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
             + &self.pieces.coeff_lw_d * &u_d;
         let r_b = &self.pieces.coeff_tw_b * &u_t
             + &self.pieces.coeff_lw_b * &u_ls
-            + &self.pieces.coeffww * &u_b;
+            + &self.pieces.coeff_ww * &u_b;
         let r_d = &self.pieces.coeff_tw_d * &u_t + &self.pieces.coeff_lw_d * &u_ls;
 
         let out_t = fast_atv(self.x_t.as_ref(), &r_t);
@@ -187,7 +187,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
             let mut acc = 0.0;
             for i in 0..n {
                 let v = col[i];
-                acc += self.pieces.coeffww[i] * v * v;
+                acc += self.pieces.coeff_ww[i] * v * v;
             }
             diag[pt + pls + j] = acc;
         }

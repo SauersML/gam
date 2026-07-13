@@ -299,6 +299,14 @@ pub struct SurvivalLocationScaleFitResultParts {
     /// `None` = no gradient measured at termination; `Some(g)` = measured.
     /// `outer_converged` is the authoritative convergence signal.
     pub outer_gradient_norm: Option<f64>,
+    /// Exact analytic stationarity certificate owned by the nested smoothing /
+    /// spatial solve. `None` is valid only when `outer_iterations == 0`.
+    ///
+    /// Finalization changes coefficient coordinates, not the optimized
+    /// criterion, so it must carry this proof through instead of replacing it
+    /// with a convergence boolean.
+    pub criterion_certificate:
+        Option<gam_solve::rho_optimizer::OuterCriterionCertificate>,
     pub outer_converged: bool,
     pub covariance_conditional: Option<Array2<f64>>,
     pub geometry: Option<FitGeometry>,
@@ -419,6 +427,7 @@ pub fn survival_fit_from_parts(
         used_device,
         outer_iterations,
         outer_gradient_norm,
+        criterion_certificate,
         outer_converged,
         covariance_conditional,
         geometry,
@@ -770,7 +779,7 @@ pub fn survival_fit_from_parts(
             null_space_dim: None,
             survival_link_wiggle_knots: link_wiggle_knots,
             survival_link_wiggle_degree: link_wiggle_degree,
-            criterion_certificate: None,
+            criterion_certificate,
             rho_posterior_certificate: None,
             rho_posterior_escalation: None,
             rho_covariance: None,

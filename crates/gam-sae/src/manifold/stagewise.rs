@@ -579,18 +579,25 @@ fn birth_anchor_weights(term: &SaeManifoldTerm) -> Array1<f64> {
     }
 }
 
-/// A birth-candidate seed. `decoder` is the born atom's decoder in atom-0's basis;
-/// `energy` is the chosen direction's explained variance (the reported dose). When
-/// the residual carries a genuine rank-2 (circular) structure, `circle_coords` is
-/// `Some(t)` — a PHASE-ALIGNED per-row coordinate `(n, 1)` — so the born atom is
-/// seeded directly ON a circle (harmonic decoder rows + aligned chart) rather than
-/// at the DC-row stationary point that leaves cos/sin dead (#2101). `None` is the
-/// rank-1 / shared-factor fallback: the historical row-0 (DC) seed that
-/// [`crate::structure_harvest::apply_structure_move`]'s `Birth` races the topology on.
+/// A birth-candidate seed. `decoder` is the born atom's decoder; `energy` is the
+/// chosen direction's explained variance (the reported dose). Geometry-specific
+/// circle state is an atomic variant: the exact persisted plan, phase chart, and
+/// own-presence gate cannot drift independently or be reconstructed from decoder
+/// width at the birth boundary.
 struct BirthSeed {
     decoder: Array2<f64>,
     energy: f64,
-    circle_coords: Option<Array2<f64>>,
+    kind: BirthSeedKind,
+}
+
+enum BirthSeedKind {
+    ResidualFactor,
+    Circle(CircleBirthSeed),
+}
+
+struct CircleBirthSeed {
+    geometry: SaeAtomGeometryPlan,
+    coords: Array2<f64>,
     /// Per-row OWN-PRESENCE gate seed for the born circle (#2109): on a row where its
     /// 2-plane energy `ρ_i²` clears the derived noise floor `2·λ₊`, the entry is the
     /// log signal-to-noise ratio `ln(ρ_i² / 2·λ₊)` — a routing logit derived from the
@@ -601,8 +608,17 @@ struct BirthSeed {
     /// (low/negative `inc_max`) still gets a gate strong enough to ESTABLISH under ordered Beta--Bernoulli
     /// (the flat `BIRTH_SEED_LOGIT` starves it, and the incumbent scale is weak where
     /// the circle actually lives). Derived from `ρ_i` + the existing `λ₊` floor, no new
-    /// constant. `None` for the rank-1 / shared-factor DC fallback.
-    circle_gate: Option<Vec<f64>>,
+    /// constant.
+    gate: Vec<f64>,
+}
+
+impl BirthSeed {
+    fn circle(&self) -> Option<&CircleBirthSeed> {
+        match &self.kind {
+            BirthSeedKind::ResidualFactor => None,
+            BirthSeedKind::Circle(circle) => Some(circle),
+        }
+    }
 }
 
 fn template_circle_geometry(term: &SaeManifoldTerm) -> Option<&SaeAtomGeometryPlan> {
@@ -720,8 +736,7 @@ fn top_factor_birth_decoder(
     Some(BirthSeed {
         decoder,
         energy,
-        circle_coords: None,
-        circle_gate: None,
+        kind: BirthSeedKind::ResidualFactor,
     })
 }
 
@@ -836,8 +851,11 @@ fn residual_principal_birth_candidate(
             return Some(BirthSeed {
                 decoder,
                 energy,
-                circle_coords: Some(cand.phases_turns),
-                circle_gate: Some(cand.gate_logits),
+                kind: BirthSeedKind::Circle(CircleBirthSeed {
+                    geometry: template_circle_geometry(term)?.clone(),
+                    coords: cand.phases_turns,
+                    gate: cand.gate_logits,
+                }),
             });
         }
     }
@@ -867,8 +885,7 @@ fn residual_principal_birth_candidate(
     Some(BirthSeed {
         decoder,
         energy,
-        circle_coords: None,
-        circle_gate: None,
+        kind: BirthSeedKind::ResidualFactor,
     })
 }
 
@@ -881,11 +898,11 @@ fn isa_birth_seed_batch(
         return Ok(Vec::new());
     }
     let harvest = isa_deflationary_producer(residual, max_planes, &IsaSeedConfig::default())?;
-    Ok(harvest
+    harvest
         .planes
         .iter()
         .map(|cand| plane_to_birth_seed(term, cand))
-        .collect())
+        .collect()
 }
 
 /// Refit a SINGLE atom `k` in place on its leave-one-atom-out partial residual —
@@ -1874,7 +1891,14 @@ struct RacedCandidate {
 /// cos/sin rows + phase-aligned chart + own-presence gate) — the same seed the
 /// serial `residual_principal_birth_candidate` circle path builds, so a raced
 /// plane is byte-identical to the serial per-round pick.
-fn plane_to_birth_seed(term: &SaeManifoldTerm, cand: &IsaPlaneCandidate) -> BirthSeed {
+fn plane_to_birth_seed(
+    term: &SaeManifoldTerm,
+    cand: &IsaPlaneCandidate,
+) -> Result<BirthSeed, String> {
+    let geometry = template_circle_geometry(term).cloned().ok_or_else(|| {
+        "plane_to_birth_seed: certified circle requires the template atom's persisted periodic geometry plan"
+            .to_string()
+    })?;
     let m = term.atoms[0].basis_size();
     let p = term.output_dim();
     let mut decoder = Array2::<f64>::zeros((m, p));
@@ -1883,12 +1907,15 @@ fn plane_to_birth_seed(term: &SaeManifoldTerm, cand: &IsaPlaneCandidate) -> Birt
         decoder[[2, j]] = cand.amplitudes[1] * cand.basis[[j, 1]];
     }
     let energy = cand.amplitudes[0].powi(2) + cand.amplitudes[1].powi(2);
-    BirthSeed {
+    Ok(BirthSeed {
         decoder,
         energy,
-        circle_coords: Some(cand.phases_turns.clone()),
-        circle_gate: Some(cand.gate_logits.clone()),
-    }
+        kind: BirthSeedKind::Circle(CircleBirthSeed {
+            geometry,
+            coords: cand.phases_turns.clone(),
+            gate: cand.gate_logits.clone(),
+        }),
+    })
 }
 
 /// Race ONE birth seed: build the born atom (circle-direct for a rank-2 plane
@@ -2378,8 +2405,7 @@ pub fn terminal_joint_assembly(
 mod tests {
     use super::*;
     use crate::manifold::{
-        AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-        SaeBasisEvaluator, SaeManifoldAtom,
+        AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
     };
 
     /// Unscreened pooled-residual covariance oracle: `Σ` fit on the full
@@ -2396,7 +2422,6 @@ mod tests {
     }
     use gam_terms::latent::LatentManifold;
     use ndarray::Array2;
-    use std::sync::Arc;
 
     const ON: f64 = 6.0;
     const OFF: f64 = -6.0;
@@ -2422,13 +2447,19 @@ mod tests {
     /// its reconstruction is a distinct direction in output space.
     fn circle_atom(
         name: &str,
-        evaluator: &Arc<PeriodicHarmonicEvaluator>,
         coords: &Array2<f64>,
         dir_a: usize,
         dir_b: usize,
         p: usize,
     ) -> (SaeManifoldAtom, Array2<f64>) {
-        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let geometry = SaeAtomGeometryPlan::new(
+            SaeAtomBasisKind::Periodic,
+            1,
+            SaeBasisResolution::PeriodicHarmonics { order: 1 },
+            SaeReferenceMetricPlan::UnitCircle,
+        )
+        .unwrap();
+        let bundle = geometry.evaluate_bundle(coords.view()).unwrap();
         let mut decoder = Array2::<f64>::zeros((3, p));
         decoder[[1, dir_a % p]] = 1.0;
         decoder[[2, dir_b % p]] = 1.0;
@@ -2436,13 +2467,15 @@ mod tests {
             name.to_string(),
             SaeAtomBasisKind::Periodic,
             1,
-            phi,
-            jet,
+            bundle.basis_values,
+            bundle.basis_jacobian,
             decoder,
-            Array2::<f64>::eye(3),
+            bundle.reference_penalty,
         )
         .unwrap()
-        .with_basis_second_jet(evaluator.clone());
+        .with_basis_second_jet(bundle.evaluator)
+        .with_geometry_plan(geometry)
+        .unwrap();
         (atom, coords.clone())
     }
 
@@ -2511,9 +2544,8 @@ mod tests {
     fn residual_covariance_propagates_invalid_residual_errors() {
         let n = 8usize;
         let p = 2usize;
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
+        let (atom0, cb0) = circle_atom("seed", &coords, 0, 1, p);
         let (term, _rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
         let mut target = Array2::<f64>::zeros((n, p));
         target[[3, 1]] = f64::NAN;
@@ -2536,10 +2568,9 @@ mod tests {
     fn stagewise_recovers_planted_two_circles_ev_monotone() {
         let n = 48usize;
         let p = 4usize;
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
-        let (atom1, cb1) = circle_atom("t1", &evaluator, &coords, 2, 3, p);
+        let (atom0, cb0) = circle_atom("t0", &coords, 0, 1, p);
+        let (atom1, cb1) = circle_atom("t1", &coords, 2, 3, p);
         // Truth: two atoms, first active on the top half, second on the bottom.
         let active_truth: Vec<Vec<bool>> = (0..n).map(|r| vec![r < n / 2, r >= n / 2]).collect();
         let (truth, _truth_rho) = build_term(
@@ -2590,9 +2621,8 @@ mod tests {
     fn duplicate_atom_birth_is_rejected() {
         let n = 40usize;
         let p = 4usize;
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (atom0, cb0) = circle_atom("t0", &coords, 0, 1, p);
         let (truth, _rho) =
             build_term(vec![atom0.clone()], vec![cb0.clone()], &vec![vec![true]; n]);
         let target = truth.fitted();
@@ -2663,9 +2693,8 @@ mod tests {
         assert!(model.factor_rank() >= 2, "need both planted factors");
 
         // Seed atom over the row-fraction coordinate.
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (atom0, cb0) = circle_atom("t0", &coords, 0, 1, p);
 
         // Helper: build a 1-atom ordered Beta--Bernoulli term from a per-row logit column.
         let build_ordered_beta_bernoulli = |logit: &dyn Fn(usize) -> f64| -> SaeManifoldTerm {
@@ -2728,9 +2757,8 @@ mod tests {
         let n = 400usize;
         let p = 8usize;
         // 1-atom term (only basis_size + activity are read by the fallback).
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (atom0, cb0) = circle_atom("t0", &coords, 0, 1, p);
         let (term, _rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
 
         let mut state = 0xC0FFEE_1234_5678_u64;
@@ -2801,9 +2829,8 @@ mod tests {
     fn residual_principal_seeds_circle_as_rank2_not_dc_2101() {
         let n = 240usize;
         let p = 8usize;
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (atom0, cb0) = circle_atom("t0", &coords, 0, 1, p);
         let (term, _rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
 
         // A real circle on channels (2,3): equal-variance cos/sin axes + tiny noise.
@@ -2912,9 +2939,8 @@ mod tests {
     fn certificate_rejects_two_circle_blend_2111() {
         let n = 400usize;
         let p = 8usize;
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (atom0, cb0) = circle_atom("t0", &coords, 0, 1, p);
         let (term, _rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
 
         let mut state = 0x2111_B1E4_u64;
@@ -2978,9 +3004,8 @@ mod tests {
         let amps: Vec<f64> = (0..ncirc)
             .map(|c| 1.0 - 0.45 * (c as f64) / ((ncirc - 1) as f64))
             .collect();
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (atom0, cb0) = circle_atom("t0", &coords, 0, 1, p);
         let (term, _rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
 
         let mut s = 0x2111_D0BE_u64;
@@ -3076,9 +3101,8 @@ mod tests {
         // Incumbent K=1 ordered Beta--Bernoulli term: one circle atom on channels (4,5), co-present on
         // [0,h) (high logit) and INACTIVE on [h,n) (very negative logit) — so `inc_max`
         // is deeply negative exactly where the born circle lives.
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (inc_atom, inc_cb) = circle_atom("inc", &evaluator, &coords, 4, 5, p);
+        let (inc_atom, inc_cb) = circle_atom("inc", &coords, 4, 5, p);
         let mut inc_logits = Array2::<f64>::zeros((n, 1));
         for row in 0..n {
             inc_logits[[row, 0]] = if row < h { 4.0 } else { -6.0 };
@@ -3219,9 +3243,8 @@ mod tests {
             }
         }
 
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
+        let (atom0, cb0) = circle_atom("t0", &coords, 0, 1, p);
         // Uniform routing (matches the proven factor-detection regime): the mirror fires
         // on the degenerate 2-plane before the anchor scoring, independent of contrast.
         let logits = Array2::<f64>::from_elem((n, 1), 0.5);
@@ -3288,10 +3311,9 @@ mod tests {
     fn progress_callback_emits_pre_birth_checkpoints() {
         let n = 32usize;
         let p = 4usize;
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
-        let (atom1, cb1) = circle_atom("t1", &evaluator, &coords, 2, 3, p);
+        let (atom0, cb0) = circle_atom("t0", &coords, 0, 1, p);
+        let (atom1, cb1) = circle_atom("t1", &coords, 2, 3, p);
         let active_truth: Vec<Vec<bool>> = (0..n).map(|r| vec![r < n / 2, r >= n / 2]).collect();
         let (truth, _rho) = build_term(
             vec![atom0.clone(), atom1],
@@ -3377,10 +3399,9 @@ mod tests {
     fn backfitting_ev_is_monotone() {
         let n = 48usize;
         let p = 4usize;
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
-        let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
-        let (atom1, cb1) = circle_atom("t1", &evaluator, &coords, 2, 3, p);
+        let (atom0, cb0) = circle_atom("t0", &coords, 0, 1, p);
+        let (atom1, cb1) = circle_atom("t1", &coords, 2, 3, p);
         let active_truth: Vec<Vec<bool>> = (0..n).map(|r| vec![r < n / 2, r >= n / 2]).collect();
         let (truth, _rho) = build_term(
             vec![atom0.clone(), atom1.clone()],
@@ -3514,7 +3535,6 @@ mod tests {
         let n = 40usize;
         let p = 6usize;
         let h = n / 2;
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
 
         // Target: circle A on [0,h) in dirs (0,1); circle B on [h,n) in dirs (2,3).
@@ -3532,7 +3552,7 @@ mod tests {
 
         // K=1 ThresholdGate seed: a circle atom on dirs (0,1), active on [0,h).
         let mode = AssignmentMode::threshold_gate(1.0, -3.0);
-        let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
+        let (atom0, cb0) = circle_atom("seed", &coords, 0, 1, p);
         let active: Vec<Vec<bool>> = (0..n).map(|r| vec![r < h]).collect();
         let (mut seed, mut rho) = build_term_gate(vec![atom0], vec![cb0], &active, mode);
         seed.set_guards_enabled(false);
@@ -3667,7 +3687,6 @@ mod tests {
         let n = 900usize;
         let p = 16usize;
         let q = 3usize; // circles in ambient planes {0,1},{2,3},{4,5}; dims 6-15 noise
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
         let target = planted_axis_dense_circles(n, p, q, 1.0, 0.03, 0x2111_A11E_u64);
 
@@ -3679,7 +3698,7 @@ mod tests {
         // An UNFIT K=1 softmax seed (see the doc-comment): its near-zero
         // reconstruction leaves round 1 a clean q-circle residual to mine.
         let build_seed = || {
-            let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
+            let (atom0, cb0) = circle_atom("seed", &coords, 0, 1, p);
             let (mut seed, rho) =
                 build_term_gate(vec![atom0], vec![cb0], &vec![vec![true]; n], mode);
             seed.set_guards_enabled(false);
@@ -3764,13 +3783,12 @@ mod tests {
         let n = 40usize;
         let p = 8usize;
         let h = n / 2;
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
         let config = test_config();
 
         // A real raced candidate to use as a valid template (its born atom / coords /
         // ρ are genuine); we then clone it and set the support geometry per case.
-        let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
+        let (atom0, cb0) = circle_atom("seed", &coords, 0, 1, p);
         let (mut seed_t, rho_t) = build_term_gate(
             vec![atom0],
             vec![cb0],

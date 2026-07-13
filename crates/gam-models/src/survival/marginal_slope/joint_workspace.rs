@@ -137,30 +137,6 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
             }
             .into());
         }
-        // ── Step-6 dispatcher: try GPU joint-Hessian × v first ───────────
-        //
-        // Routes through
-        // [`crate::survival::marginal_slope::gpu::try_survival_flex_hvp`] via the
-        // `gpu::decide` policy.  Returns `Ok(None)` until the joint-β
-        // device HVP assembly lands; on `Ok(Some(hv))` we write straight
-        // into the caller-owned `out` buffer and skip the prebuilt
-        // operator matvec.  The CPU `mul_vec_into` below remains the
-        // production fallback path and is byte-for-byte identical to the
-        // pre-Step-6 hot path.
-        if self.family.effective_flex_active(&self.block_states)?
-            && !self.family.flex_timewiggle_active()
-        {
-            let slices = block_slices(&self.family, &self.block_states);
-            if let Some(hv) =
-                self.family
-                    .try_survival_flex_joint_dispatch_hvp(&self.block_states, &slices, v)?
-            {
-                if hv.len() == out.len() {
-                    out.assign(&hv);
-                    return Ok(true);
-                }
-            }
-        }
         self.joint_hessian_operator
             .mul_vec_into(v.view(), out.view_mut());
         Ok(true)

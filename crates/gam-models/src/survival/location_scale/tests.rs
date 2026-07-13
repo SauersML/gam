@@ -420,6 +420,7 @@ fn test_survival_fit(
         used_device: false,
         outer_iterations: 0,
         outer_gradient_norm: None,
+        criterion_certificate: None,
         outer_converged: true,
         covariance_conditional: None,
         geometry: None,
@@ -427,6 +428,83 @@ fn test_survival_fit(
         edf_by_block: Vec::new(),
     })
     .expect("valid survival test fit")
+}
+
+fn survival_fit_parts_with_outer_evidence(
+    outer_iterations: usize,
+    criterion_certificate: Option<gam_solve::rho_optimizer::OuterCriterionCertificate>,
+) -> SurvivalLocationScaleFitResultParts {
+    SurvivalLocationScaleFitResultParts {
+        beta_time: array![0.1],
+        beta_threshold: array![0.2],
+        beta_log_sigma: array![0.0],
+        beta_link_wiggle: None,
+        link_wiggle_knots: None,
+        link_wiggle_degree: None,
+        lambdas_time: Array1::zeros(0),
+        lambdas_threshold: Array1::zeros(0),
+        lambdas_log_sigma: Array1::zeros(0),
+        lambdas_linkwiggle: None,
+        log_likelihood: -1.0,
+        reml_score: 1.0,
+        stable_penalty_term: 0.0,
+        penalized_objective: 1.0,
+        used_device: false,
+        outer_iterations,
+        outer_gradient_norm: Some(0.0),
+        criterion_certificate,
+        outer_converged: true,
+        covariance_conditional: None,
+        geometry: None,
+        penalty_block_trace: Vec::new(),
+        edf_by_block: Vec::new(),
+    }
+}
+
+#[test]
+fn survival_fit_finalization_rejects_dropped_outer_certificate() {
+    let error = survival_fit_from_parts(survival_fit_parts_with_outer_evidence(2, None))
+        .expect_err("positive outer iterations without their certificate must not mint a fit");
+    assert!(
+        error.contains("analytic stationarity certificate"),
+        "unexpected missing-certificate error: {error}"
+    );
+}
+
+#[test]
+fn survival_fit_finalization_preserves_outer_certificate() {
+    let certificate = gam_solve::rho_optimizer::OuterCriterionCertificate {
+        stationarity: gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
+            grad_norm: 0.0,
+            projected_grad_norm: 0.0,
+            bound: 1.0e-8,
+        },
+        hessian_psd: Some(true),
+        lambdas_railed: Vec::new(),
+    };
+    let expected = certificate.summary();
+    let fit = survival_fit_from_parts(survival_fit_parts_with_outer_evidence(
+        2,
+        Some(certificate),
+    ))
+    .expect("a carried certifying outer proof must survive finalization");
+
+    assert_eq!(fit.outer_iterations, 2);
+    assert_eq!(
+        fit.convergence_evidence()
+            .outer_certificate()
+            .expect("finalized fit must retain analytic outer evidence")
+            .summary(),
+        expected
+    );
+    assert_eq!(
+        fit.artifacts
+            .criterion_certificate
+            .as_ref()
+            .expect("fit artifacts must retain the same outer evidence")
+            .summary(),
+        expected
+    );
 }
 
 fn survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {

@@ -1,12 +1,15 @@
 use crate::estimate::EstimationError;
 use crate::quadrature::latent_cloglog_jet5;
-use gam_math::probability::{normal_cdf, normal_pdf};
+use gam_math::{
+    jet_tower::trigamma,
+    probability::{normal_cdf, normal_pdf},
+};
 use gam_math::special::stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg;
 use gam_problem::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
     MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState, StandardLink,
 };
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 use statrs::function::beta::{beta_reg, ln_beta};
 use statrs::function::gamma::digamma;
 use std::ops::Neg;
@@ -639,6 +642,10 @@ pub struct MixtureJetWithRhoPartials {
     /// Partial derivatives wrt free logits rho_j, j in [0, K-2].
     /// Each entry stores derivatives of (mu, d1, d2, d3) wrt one rho_j.
     pub djet_drho: Vec<InverseLinkJet>,
+    /// Exact symmetric Hessian of `mu` in the free-logit coordinates.
+    pub d2mu_drho2: Array2<f64>,
+    /// Exact symmetric Hessian of `d1 = dmu/deta` in the free-logit coordinates.
+    pub d2d1_drho2: Array2<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -646,6 +653,12 @@ pub struct SasJetWithParamPartials {
     pub jet: InverseLinkJet,
     pub djet_depsilon: InverseLinkJet,
     pub djet_dlog_delta: InverseLinkJet,
+    /// Exact symmetric Hessian of `mu` in `(epsilon, raw_log_delta)` order.
+    /// For Beta-Logistic the second coordinate is its unbounded
+    /// `log_shape_center`, matching the shared optimizer state field.
+    pub d2mu_dparams2: Array2<f64>,
+    /// Exact symmetric Hessian of `d1 = dmu/deta` in the same parameter order.
+    pub d2d1_dparams2: Array2<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1586,7 +1599,36 @@ pub fn mixture_inverse_link_jetwith_rho_partials(
         m
     ];
     let jet = mixture_inverse_link_jetwith_rho_partials_into(state, eta, &mut djet_drho);
-    MixtureJetWithRhoPartials { jet, djet_drho }
+    // If `g_j = pi_j (f_j - f_mix)`, differentiating once more gives
+    //
+    //   H_jk = (1[j=k] - pi_k) g_j - pi_j g_k.
+    //
+    // This form reuses the first derivatives already in `djet_drho`, avoids
+    // dividing by a possibly tiny mixture weight, and is algebraically
+    // symmetric even though floating-point evaluation visits `(j,k)` in one
+    // direction. Fill one triangle and mirror it bit-for-bit so downstream PSD
+    // certification receives an exactly symmetric matrix.
+    let mut d2mu_drho2 = Array2::<f64>::zeros((m, m));
+    let mut d2d1_drho2 = Array2::<f64>::zeros((m, m));
+    for j in 0..m {
+        for k in j..m {
+            let diagonal = if j == k { 1.0 } else { 0.0 };
+            let mu = (diagonal - state.pi[k]) * djet_drho[j].mu
+                - state.pi[j] * djet_drho[k].mu;
+            let d1 = (diagonal - state.pi[k]) * djet_drho[j].d1
+                - state.pi[j] * djet_drho[k].d1;
+            d2mu_drho2[[j, k]] = mu;
+            d2mu_drho2[[k, j]] = mu;
+            d2d1_drho2[[j, k]] = d1;
+            d2d1_drho2[[k, j]] = d1;
+        }
+    }
+    MixtureJetWithRhoPartials {
+        jet,
+        djet_drho,
+        d2mu_drho2,
+        d2d1_drho2,
+    }
 }
 
 /// Computes mixture jet and writes exact rho partial jets into `out` (length >= K-1).
@@ -1681,14 +1723,56 @@ fn beta_reg_logistic(a: f64, b: f64, logistic: LogisticU) -> f64 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct BetaShapePartials {
+    value: f64,
+    da: f64,
+    db: f64,
+    daa: f64,
+    dab: f64,
+    dbb: f64,
+}
+
+impl BetaShapePartials {
+    #[inline]
+    fn constant(value: f64) -> Self {
+        Self {
+            value,
+            da: 0.0,
+            db: 0.0,
+            daa: 0.0,
+            dab: 0.0,
+            dbb: 0.0,
+        }
+    }
+}
+
 #[inline]
-fn beta_reg_with_shape_partials_logistic(a: f64, b: f64, logistic: LogisticU) -> (f64, f64, f64) {
+fn beta_reg_with_shape_partials_logistic(
+    a: f64,
+    b: f64,
+    logistic: LogisticU,
+) -> BetaShapePartials {
     if logistic.ln_u.is_nan() || logistic.ln_one_minus_u.is_nan() {
-        return (f64::NAN, f64::NAN, f64::NAN);
+        return BetaShapePartials {
+            value: f64::NAN,
+            da: f64::NAN,
+            db: f64::NAN,
+            daa: f64::NAN,
+            dab: f64::NAN,
+            dbb: f64::NAN,
+        };
     }
     if logistic.use_upper_tail {
-        let (tail, dtail_db, dtail_da) = beta_reg_with_shape_partials(b, a, logistic.one_minus_u);
-        (1.0 - tail, -dtail_da, -dtail_db)
+        let tail = beta_reg_with_shape_partials(b, a, logistic.one_minus_u);
+        BetaShapePartials {
+            value: 1.0 - tail.value,
+            da: -tail.db,
+            db: -tail.da,
+            daa: -tail.dbb,
+            dab: -tail.dab,
+            dbb: -tail.daa,
+        }
     } else {
         beta_reg_with_shape_partials(a, b, logistic.u)
     }
@@ -1704,6 +1788,9 @@ struct ShapeDual {
     v: f64,
     da: f64,
     db: f64,
+    daa: f64,
+    dab: f64,
+    dbb: f64,
 }
 
 impl ShapeDual {
@@ -1713,12 +1800,22 @@ impl ShapeDual {
             v,
             da: 0.0,
             db: 0.0,
+            daa: 0.0,
+            dab: 0.0,
+            dbb: 0.0,
         }
     }
 
     #[inline]
     fn from_value_partials(v: f64, da: f64, db: f64) -> Self {
-        Self { v, da, db }
+        Self {
+            v,
+            da,
+            db,
+            daa: 0.0,
+            dab: 0.0,
+            dbb: 0.0,
+        }
     }
 
     #[inline]
@@ -1740,6 +1837,9 @@ impl std::ops::Add for ShapeDual {
             v: self.v + rhs.v,
             da: self.da + rhs.da,
             db: self.db + rhs.db,
+            daa: self.daa + rhs.daa,
+            dab: self.dab + rhs.dab,
+            dbb: self.dbb + rhs.dbb,
         }
     }
 }
@@ -1753,6 +1853,9 @@ impl std::ops::Sub for ShapeDual {
             v: self.v - rhs.v,
             da: self.da - rhs.da,
             db: self.db - rhs.db,
+            daa: self.daa - rhs.daa,
+            dab: self.dab - rhs.dab,
+            dbb: self.dbb - rhs.dbb,
         }
     }
 }
@@ -1766,6 +1869,12 @@ impl std::ops::Mul for ShapeDual {
             v: self.v * rhs.v,
             da: self.da * rhs.v + self.v * rhs.da,
             db: self.db * rhs.v + self.v * rhs.db,
+            daa: self.daa * rhs.v + 2.0 * self.da * rhs.da + self.v * rhs.daa,
+            dab: self.dab * rhs.v
+                + self.da * rhs.db
+                + self.db * rhs.da
+                + self.v * rhs.dab,
+            dbb: self.dbb * rhs.v + 2.0 * self.db * rhs.db + self.v * rhs.dbb,
         }
     }
 }
@@ -1777,11 +1886,16 @@ impl std::ops::Div for ShapeDual {
     fn div(self, rhs: Self) -> Self {
         let inv = 1.0 / rhs.v;
         let inv2 = inv * inv;
-        Self {
-            v: self.v * inv,
-            da: (self.da * rhs.v - self.v * rhs.da) * inv2,
-            db: (self.db * rhs.v - self.v * rhs.db) * inv2,
-        }
+        let inv3 = inv2 * inv;
+        let reciprocal = Self {
+            v: inv,
+            da: -rhs.da * inv2,
+            db: -rhs.db * inv2,
+            daa: 2.0 * rhs.da * rhs.da * inv3 - rhs.daa * inv2,
+            dab: 2.0 * rhs.da * rhs.db * inv3 - rhs.dab * inv2,
+            dbb: 2.0 * rhs.db * rhs.db * inv3 - rhs.dbb * inv2,
+        };
+        self * reciprocal
     }
 }
 
@@ -1794,6 +1908,9 @@ impl std::ops::Neg for ShapeDual {
             v: -self.v,
             da: -self.da,
             db: -self.db,
+            daa: -self.daa,
+            dab: -self.dab,
+            dbb: -self.dbb,
         }
     }
 }
@@ -1806,12 +1923,12 @@ fn shape_dual(v: f64) -> ShapeDual {
 // Analytic shape partials for I_x(a,b), obtained by differentiating the same
 // regularized-beta continued fraction used by statrs. The normalizing term uses
 // d log B(a,b) / da = psi(a) - psi(a+b) and likewise for b.
-fn beta_reg_with_shape_partials(a0: f64, b0: f64, x0: f64) -> (f64, f64, f64) {
+fn beta_reg_with_shape_partials(a0: f64, b0: f64, x0: f64) -> BetaShapePartials {
     if x0 <= 0.0 {
-        return (0.0, 0.0, 0.0);
+        return BetaShapePartials::constant(0.0);
     }
     if x0 >= 1.0 {
-        return (1.0, 0.0, 0.0);
+        return BetaShapePartials::constant(1.0);
     }
 
     let symm_transform = x0 >= (a0 + 1.0) / (a0 + b0 + 2.0);
@@ -1840,10 +1957,34 @@ fn beta_reg_with_shape_partials(a0: f64, b0: f64, x0: f64) -> (f64, f64, f64) {
     let bt_v = log_bt.exp();
     let log_bt_a = psi_ab - digamma(a.v) + ln_x;
     let log_bt_b = psi_ab - digamma(b.v) + ln_1mx;
+    let trigamma_ab = trigamma(a.v + b.v);
+    let log_bt_aa = trigamma_ab - trigamma(a.v);
+    let log_bt_ab = trigamma_ab;
+    let log_bt_bb = trigamma_ab - trigamma(b.v);
+    let log_bt_da = log_bt_a * a.da + log_bt_b * b.da;
+    let log_bt_db = log_bt_a * a.db + log_bt_b * b.db;
+    let log_bt_daa = log_bt_aa * a.da * a.da
+        + 2.0 * log_bt_ab * a.da * b.da
+        + log_bt_bb * b.da * b.da
+        + log_bt_a * a.daa
+        + log_bt_b * b.daa;
+    let log_bt_dab = log_bt_aa * a.da * a.db
+        + log_bt_ab * (a.da * b.db + b.da * a.db)
+        + log_bt_bb * b.da * b.db
+        + log_bt_a * a.dab
+        + log_bt_b * b.dab;
+    let log_bt_dbb = log_bt_aa * a.db * a.db
+        + 2.0 * log_bt_ab * a.db * b.db
+        + log_bt_bb * b.db * b.db
+        + log_bt_a * a.dbb
+        + log_bt_b * b.dbb;
     let bt = ShapeDual {
         v: bt_v,
-        da: bt_v * (log_bt_a * a.da + log_bt_b * b.da),
-        db: bt_v * (log_bt_a * a.db + log_bt_b * b.db),
+        da: bt_v * log_bt_da,
+        db: bt_v * log_bt_db,
+        daa: bt_v * (log_bt_da * log_bt_da + log_bt_daa),
+        dab: bt_v * (log_bt_da * log_bt_db + log_bt_dab),
+        dbb: bt_v * (log_bt_db * log_bt_db + log_bt_dbb),
     };
 
     let eps = 0.00000000000000011102230246251565;
@@ -1878,17 +2019,45 @@ fn beta_reg_with_shape_partials(a0: f64, b0: f64, x0: f64) -> (f64, f64, f64) {
         if (del.v - 1.0).abs() <= eps {
             let reg = bt * h / a;
             return if symm_transform {
-                (1.0 - reg.v, -reg.da, -reg.db)
+                BetaShapePartials {
+                    value: 1.0 - reg.v,
+                    da: -reg.da,
+                    db: -reg.db,
+                    daa: -reg.daa,
+                    dab: -reg.dab,
+                    dbb: -reg.dbb,
+                }
             } else {
-                (reg.v, reg.da, reg.db)
+                BetaShapePartials {
+                    value: reg.v,
+                    da: reg.da,
+                    db: reg.db,
+                    daa: reg.daa,
+                    dab: reg.dab,
+                    dbb: reg.dbb,
+                }
             };
         }
     }
     let reg = bt * h / a;
     if symm_transform {
-        (1.0 - reg.v, -reg.da, -reg.db)
+        BetaShapePartials {
+            value: 1.0 - reg.v,
+            da: -reg.da,
+            db: -reg.db,
+            daa: -reg.daa,
+            dab: -reg.dab,
+            dbb: -reg.dbb,
+        }
     } else {
-        (reg.v, reg.da, reg.db)
+        BetaShapePartials {
+            value: reg.v,
+            da: reg.da,
+            db: reg.db,
+            daa: reg.daa,
+            dab: reg.dab,
+            dbb: reg.dbb,
+        }
     }
 }
 
@@ -1991,9 +2160,10 @@ pub fn beta_logistic_inverse_link_jetwith_param_partials(
     let logistic = logistic_uwith_derivatives(eta);
     let a = (log_shape_center - epsilon).exp();
     let b = (log_shape_center + epsilon).exp();
-    let (mu, dmu_da, dmu_db) = beta_reg_with_shape_partials_logistic(a, b, logistic);
-    let dmu_dlog_shape_center = a * dmu_da + b * dmu_db;
-    let dmu_depsilon = -a * dmu_da + b * dmu_db;
+    let shape = beta_reg_with_shape_partials_logistic(a, b, logistic);
+    let mu = shape.value;
+    let dmu_dlog_shape_center = a * shape.da + b * shape.db;
+    let dmu_depsilon = -a * shape.da + b * shape.db;
     let log_d1 = beta_logistic_log_d1(a, b, logistic);
     let d1 = log_d1.exp();
     let t = a * logistic.one_minus_u - b * logistic.u;
@@ -2024,10 +2194,53 @@ pub fn beta_logistic_inverse_link_jetwith_param_partials(
     };
     let djet_dlog_shape_center = partials_for(a, b, dmu_dlog_shape_center);
     let djet_depsilon = partials_for(-a, b, dmu_depsilon);
+    // Parameter order is `(epsilon, log_shape_center)`. The beta shapes obey
+    // `a=exp(l-e)`, `b=exp(l+e)`, so their first and second parameter jets are
+    // closed form. Contract those jets with the exact `(a,b)` Hessian of the
+    // regularized beta CDF for `mu`, and with the exact log-density Hessian for
+    // `d1`. No numerical differencing or profile replay enters this path.
+    let a_first = [-a, a];
+    let b_first = [b, b];
+    let a_second = [[a, -a], [-a, a]];
+    let b_second = [[b, b], [b, b]];
+    let logd1_first = [
+        a_first[0] * la + b_first[0] * lb,
+        a_first[1] * la + b_first[1] * lb,
+    ];
+    let trigamma_ab = trigamma(a + b);
+    let la_a = trigamma_ab - trigamma(a);
+    let la_b = trigamma_ab;
+    let lb_a = trigamma_ab;
+    let lb_b = trigamma_ab - trigamma(b);
+    let mut d2mu_dparams2 = Array2::<f64>::zeros((2, 2));
+    let mut d2d1_dparams2 = Array2::<f64>::zeros((2, 2));
+    for j in 0..2 {
+        for k in j..2 {
+            let mu_jk = shape.daa * a_first[j] * a_first[k]
+                + shape.dab
+                    * (a_first[j] * b_first[k] + b_first[j] * a_first[k])
+                + shape.dbb * b_first[j] * b_first[k]
+                + shape.da * a_second[j][k]
+                + shape.db * b_second[j][k];
+            let logd1_jk = la_a * a_first[j] * a_first[k]
+                + la_b * a_first[j] * b_first[k]
+                + lb_a * b_first[j] * a_first[k]
+                + lb_b * b_first[j] * b_first[k]
+                + la * a_second[j][k]
+                + lb * b_second[j][k];
+            let d1_jk = d1 * (logd1_first[j] * logd1_first[k] + logd1_jk);
+            d2mu_dparams2[[j, k]] = mu_jk;
+            d2mu_dparams2[[k, j]] = mu_jk;
+            d2d1_dparams2[[j, k]] = d1_jk;
+            d2d1_dparams2[[k, j]] = d1_jk;
+        }
+    }
     SasJetWithParamPartials {
         jet,
         djet_depsilon,
         djet_dlog_delta: djet_dlog_shape_center,
+        d2mu_dparams2,
+        d2d1_dparams2,
     }
 }
 

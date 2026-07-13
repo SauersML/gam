@@ -1,5 +1,5 @@
-//! The exact-Newton joint evaluation methods on the family: GPU flex
-//! dispatch, dense/gradient dynamic-q evaluation, time-wiggle and
+//! The exact-Newton joint evaluation methods on the family: dense/gradient
+//! dynamic-q evaluation, time-wiggle and
 //! flex-no-wiggle directional derivatives, and the blockwise exact-Newton
 //! dispatchers (rigid / per-z / flexible / time-wiggle / mixed / dense /
 //! sparse).
@@ -16,46 +16,6 @@ impl SurvivalMarginalSlopeFamily {
             self.validate_exact_monotonicity(block_states)?;
         }
         let slices = block_slices(self, block_states);
-        // ── Step-6 dispatcher: try GPU dense H + gradient first ──────────
-        //
-        // The two `try_survival_flex_joint_dispatch_*` entries route the
-        // joint-β work through
-        // [`crate::survival::marginal_slope::gpu::try_survival_flex_dense_hessian`]
-        // and [`crate::survival::marginal_slope::gpu::try_survival_flex_gradient`]
-        // respectively, with the standard `gpu::decide` policy.
-        //
-        // State of the seam (#1133): the host-side Step-5 primary G/H
-        // assembly (`try_device_step5_primary_assembly`) and the Step-6
-        // joint-β pullback (`pullback_step6_joint_beta`) are both LANDED as
-        // pure host algebra and CPU-verified — Step 5 is already the hot
-        // per-row path in `compute_row_flex_primary_gradient_hessian_from_parts`
-        // (the CPU sweep below routes every row through it). What remains is
-        // ONLY the device substrate: an NVRTC/CUDA kernel that produces the
-        // per-row jets + folds the Step-6 contraction on-device. Until that
-        // kernel exists these batch entry points are called with `step6 =
-        // None` and return `Ok(None)`, so the CPU per-row sweep below is the
-        // production path. Threading assembled Step-5/Step-6 rows through the
-        // batch entry points here would only duplicate the already-complete
-        // per-block pullback in `accumulate_dynamic_q_joint_row` on the host,
-        // so it is deliberately deferred to the device-kernel work.
-        if flex_active && !self.flex_timewiggle_active() {
-            if let Some(h) =
-                self.try_survival_flex_joint_dispatch_dense_hessian(block_states, &slices)?
-            {
-                let (nll, grad) =
-                    match self.try_survival_flex_joint_dispatch_gradient(block_states, &slices)? {
-                        Some(pair) => pair,
-                        None => {
-                            return Err(
-                                "survival-flex GPU dense H succeeded but gradient declined; \
-                             prep dispatchers must compose consistently"
-                                    .to_string(),
-                            );
-                        }
-                    };
-                return Ok((nll, grad, h));
-            }
-        }
         let primary = flex_primary_slices(self);
         let p_total = slices.total;
         let identity_blocks = if flex_active {
@@ -145,23 +105,6 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<(f64, Array1<f64>), String> {
         let flex_active = self.effective_flex_active(block_states)?;
         let slices = block_slices(self, block_states);
-        // ── Step-6 dispatcher: try GPU joint-β gradient first ────────────
-        //
-        // Routes through
-        // [`crate::survival::marginal_slope::gpu::try_survival_flex_gradient`] via
-        // the `gpu::decide` policy.  Returns `Ok(None)` until the device
-        // CUDA kernel lands: the host-side Step-5 assembly + Step-6 joint-β
-        // pullback are already LANDED + CPU-verified (Step 5 is the hot
-        // per-row path), so only the on-device jet/contraction substrate is
-        // outstanding (#1133). Until then the CPU per-row sweep below is the
-        // production path and this dispatch is a no-op fast-fail.
-        if flex_active && !self.flex_timewiggle_active() {
-            if let Some(pair) =
-                self.try_survival_flex_joint_dispatch_gradient(block_states, &slices)?
-            {
-                return Ok(pair);
-            }
-        }
         let primary = flex_primary_slices(self);
         let identity_blocks = if flex_active {
             flex_identity_block_pairs(&primary, &slices)
