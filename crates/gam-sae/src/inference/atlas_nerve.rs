@@ -11,6 +11,7 @@
 //! five or more charts share an overlap.
 
 use crate::chart_transfer::TransferCertificate;
+use crate::inference::atlas_holonomy::{AtlasHolonomyCertificate, AtlasHolonomyEdgeId};
 use crate::inference::layer_transport::FittedTransport;
 use crate::manifold::{
     AtlasOrientability, BettiSignature, GraphCompressionKind, GraphCompressionReport,
@@ -181,6 +182,9 @@ impl AtlasTransferGate {
 pub struct AtlasNerveEdge {
     pub a: usize,
     pub b: usize,
+    /// Connected overlap-component identity.  The sparse nerve builder owns
+    /// one aggregate component per chart pair and assigns it identity zero.
+    pub overlap: usize,
     pub coactivation_mass: f64,
     pub coactivation_threshold: f64,
     pub transfer_valid: bool,
@@ -249,71 +253,6 @@ pub struct AtlasGoodCoverCertificate {
     proofs: BTreeMap<Vec<usize>, ConvexIntersectionProof>,
 }
 
-/// Orientation sign of one certified chart transition.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AtlasOrientationEdge {
-    a: usize,
-    b: usize,
-    sign: i8,
-}
-
-impl AtlasOrientationEdge {
-    #[must_use = "orientation-edge construction errors must be handled"]
-    pub fn new(a: usize, b: usize, sign: i8) -> Result<Self, String> {
-        if a == b {
-            return Err("an orientation transition cannot be a self-edge".to_string());
-        }
-        if !matches!(sign, -1 | 1) {
-            return Err(format!(
-                "an orientation transition sign must be +1 or -1, got {sign}"
-            ));
-        }
-        Ok(Self {
-            a: a.min(b),
-            b: a.max(b),
-            sign,
-        })
-    }
-}
-
-/// Exact signed transition cocycle for the admitted atlas overlaps.
-///
-/// The certificate must contain exactly the nerve's admitted edges.  The nerve
-/// then propagates local orientations through this cocycle: a contradiction is
-/// a negative-holonomy cycle, while a consistent assignment is the explicit
-/// trivial-orientation proof needed to distinguish cylinder from Möbius and
-/// torus from Klein bottle over GF(2).
-#[derive(Clone, Debug)]
-pub struct AtlasOrientationHolonomyCertificate {
-    chart_count: usize,
-    edge_signs: BTreeMap<(usize, usize), i8>,
-}
-
-impl AtlasOrientationHolonomyCertificate {
-    #[must_use = "orientation certificate construction errors must be handled"]
-    pub fn new(chart_count: usize, edges: Vec<AtlasOrientationEdge>) -> Result<Self, String> {
-        let mut edge_signs = BTreeMap::new();
-        for edge in edges {
-            if edge.b >= chart_count {
-                return Err(format!(
-                    "orientation edge ({}, {}) is outside the {chart_count}-chart atlas",
-                    edge.a, edge.b
-                ));
-            }
-            if edge_signs.insert((edge.a, edge.b), edge.sign).is_some() {
-                return Err(format!(
-                    "duplicate orientation proof for atlas edge ({}, {})",
-                    edge.a, edge.b
-                ));
-            }
-        }
-        Ok(Self {
-            chart_count,
-            edge_signs,
-        })
-    }
-}
-
 impl AtlasGoodCoverCertificate {
     #[must_use = "good-cover certificate construction errors must be handled"]
     pub fn new(chart_count: usize, proofs: Vec<ConvexIntersectionProof>) -> Result<Self, String> {
@@ -356,9 +295,9 @@ pub struct AtlasNerveDiagram {
     /// Whether every non-empty intersection was matched to an explicit
     /// contractibility proof.
     pub good_cover_certified: bool,
-    /// Orientability read from an explicit signed transition cocycle. `None`
-    /// means no orientation proof was supplied, never "assume orientable".
-    pub orientation_holonomy: Option<AtlasOrientability>,
+    /// The authoritative holonomy proof, including statistical refusals and
+    /// every scalar needed to audit a noisy decision.
+    pub holonomy_certificate: Option<AtlasHolonomyCertificate>,
     pub sampled_support_size: usize,
     pub covering_side: AtlasCoveringSide,
     pub max_filtration: f64,
@@ -367,6 +306,16 @@ pub struct AtlasNerveDiagram {
 }
 
 impl AtlasNerveDiagram {
+    /// Orientability only when the preserved authoritative certificate signed
+    /// that claim.  Missing and statistically refused certificates both remain
+    /// non-promotable, while the certificate itself retains the distinction.
+    #[must_use]
+    pub fn certified_orientability(&self) -> Option<AtlasOrientability> {
+        self.holonomy_certificate
+            .as_ref()
+            .and_then(AtlasHolonomyCertificate::certified_orientability)
+    }
+
     /// Certified named compression of the atlas nerve. The name is a codebook
     /// compression of the exact nerve homology, never an input topology choice.
     pub fn certified_compression(&self) -> GraphCompressionReport {
@@ -378,7 +327,9 @@ impl AtlasNerveDiagram {
                 simplex_selection_bits(self.n_vertices, dimension + 1, present)
             })
             .sum();
-        if !self.good_cover_certified {
+        if !self.good_cover_certified
+            || self.certified_orientability() != Some(AtlasOrientability::Orientable)
+        {
             return GraphCompressionReport::unnamed(generic);
         }
         let log_vertices = (self.n_vertices.max(2) as f64).log2();
@@ -387,17 +338,16 @@ impl AtlasNerveDiagram {
             self.betti.b1,
             self.betti.b2,
             self.euler_characteristic,
-            self.orientation_holonomy,
         ) {
-            (1, 2, Some(1), 0, Some(AtlasOrientability::Orientable)) => {
+            (1, 2, Some(1), 0) => {
                 Some((GraphCompressionKind::Torus, "torus", 2.0 * log_vertices))
             }
-            (1, 1, Some(0), 0, Some(AtlasOrientability::Orientable)) => Some((
+            (1, 1, Some(0), 0) => Some((
                 GraphCompressionKind::Cylinder,
                 "cylinder",
                 2.0 * log_vertices,
             )),
-            (1, 0, Some(1), 2, _) => Some((GraphCompressionKind::Sphere, "sphere", log_vertices)),
+            (1, 0, Some(1), 2) => Some((GraphCompressionKind::Sphere, "sphere", log_vertices)),
             _ => None,
         };
         if let Some((kind, name, named_bits)) = named {
@@ -859,34 +809,26 @@ fn enumerate_full_nerve(
     Ok(inventory)
 }
 
-fn certify_orientation_holonomy(
-    adjacency: &[BTreeSet<usize>],
-    certificate: Option<&AtlasOrientationHolonomyCertificate>,
-) -> Result<Option<AtlasOrientability>, String> {
+fn validate_holonomy_certificate(
+    chart_count: usize,
+    admitted_edges: &BTreeSet<AtlasHolonomyEdgeId>,
+    certificate: Option<&AtlasHolonomyCertificate>,
+) -> Result<(), String> {
     let Some(certificate) = certificate else {
-        return Ok(None);
+        return Ok(());
     };
-    if certificate.chart_count != adjacency.len() {
+    if certificate.chart_count() != chart_count {
         return Err(format!(
-            "orientation certificate is for {} charts but the atlas has {}",
-            certificate.chart_count,
-            adjacency.len()
+            "holonomy certificate is for {} charts but the atlas has {chart_count}",
+            certificate.chart_count(),
         ));
     }
-    let admitted_edges: BTreeSet<(usize, usize)> = adjacency
-        .iter()
-        .enumerate()
-        .flat_map(|(a, neighbors)| {
-            neighbors
-                .iter()
-                .copied()
-                .filter(move |&b| a < b)
-                .map(move |b| (a, b))
-        })
-        .collect();
-    let certified_edges: BTreeSet<(usize, usize)> =
-        certificate.edge_signs.keys().copied().collect();
-    if admitted_edges != certified_edges {
+    let inventory = certificate.edge_inventory();
+    let certified_edges: BTreeSet<AtlasHolonomyEdgeId> = inventory.iter().copied().collect();
+    if certified_edges.len() != inventory.len() {
+        return Err("holonomy certificate contains duplicate overlap-edge identities".to_string());
+    }
+    if admitted_edges != &certified_edges {
         let missing: Vec<_> = admitted_edges
             .difference(&certified_edges)
             .copied()
@@ -896,36 +838,10 @@ fn certify_orientation_holonomy(
             .copied()
             .collect();
         return Err(format!(
-            "orientation certificate does not match admitted atlas edges: missing={missing:?}, surplus={surplus:?}"
+            "holonomy certificate does not match the full admitted (a, b, overlap) inventory: missing={missing:?}, surplus={surplus:?}"
         ));
     }
-
-    let mut orientations = vec![None; adjacency.len()];
-    for root in 0..adjacency.len() {
-        if orientations[root].is_some() {
-            continue;
-        }
-        orientations[root] = Some(1_i8);
-        let mut queue = std::collections::VecDeque::from([root]);
-        while let Some(chart) = queue.pop_front() {
-            let here = orientations[chart].expect("queued chart has an orientation");
-            for &next in &adjacency[chart] {
-                let sign = certificate.edge_signs[&gate_key(chart, next)];
-                let required = here * sign;
-                match orientations[next] {
-                    Some(existing) if existing != required => {
-                        return Ok(Some(AtlasOrientability::NonOrientable));
-                    }
-                    Some(_) => {}
-                    None => {
-                        orientations[next] = Some(required);
-                        queue.push_back(next);
-                    }
-                }
-            }
-        }
-    }
-    Ok(Some(AtlasOrientability::Orientable))
+    Ok(())
 }
 
 /// Build the certificate-gated atlas nerve and read Betti numbers through H2.
@@ -934,7 +850,7 @@ pub fn build_atlas_nerve(
     charts: &[AtlasChart],
     transfer_gates: &[AtlasTransferGate],
     good_cover: Option<&AtlasGoodCoverCertificate>,
-    orientation: Option<&AtlasOrientationHolonomyCertificate>,
+    holonomy_certificate: Option<AtlasHolonomyCertificate>,
 ) -> Result<AtlasNerveDiagram, String> {
     let row_count = validate_charts(charts)?;
     let n = charts.len();

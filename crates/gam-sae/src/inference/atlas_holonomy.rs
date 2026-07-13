@@ -138,6 +138,33 @@ impl<T> AtlasStatisticalDecision<T> {
     }
 }
 
+/// Canonical identity of one connected overlap component between two charts.
+///
+/// A chart pair is not an edge identity: disconnected overlap components are
+/// distinct transition domains and can form a two-edge holonomy cycle.  The
+/// endpoint order is canonical so this value can be compared directly across
+/// geometry, statistical, nerve, and persistence layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AtlasHolonomyEdgeId {
+    pub a: usize,
+    pub b: usize,
+    pub overlap: usize,
+}
+
+impl AtlasHolonomyEdgeId {
+    #[must_use = "atlas edge identity validation errors must be handled"]
+    pub fn new(a: usize, b: usize, overlap: usize) -> Result<Self, String> {
+        if a == b {
+            return Err("an atlas transition cannot be a self-edge".to_string());
+        }
+        Ok(Self {
+            a: a.min(b),
+            b: a.max(b),
+            overlap,
+        })
+    }
+}
+
 /// One canonical undirected transition sign.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AtlasSignedEdge {
@@ -153,20 +180,27 @@ pub struct AtlasSignedEdge {
 impl AtlasSignedEdge {
     #[must_use = "signed-edge validation errors must be handled"]
     pub fn new(a: usize, b: usize, overlap: usize, sign: i8) -> Result<Self, String> {
-        if a == b {
-            return Err("an atlas transition cannot be a self-edge".to_string());
-        }
+        let identity = AtlasHolonomyEdgeId::new(a, b, overlap)?;
         if !matches!(sign, -1 | 1) {
             return Err(format!(
                 "an atlas transition sign must be +1 or -1, got {sign}"
             ));
         }
         Ok(Self {
-            a: a.min(b),
-            b: a.max(b),
-            overlap,
+            a: identity.a,
+            b: identity.b,
+            overlap: identity.overlap,
             sign,
         })
+    }
+
+    #[must_use]
+    pub fn identity(self) -> AtlasHolonomyEdgeId {
+        AtlasHolonomyEdgeId {
+            a: self.a,
+            b: self.b,
+            overlap: self.overlap,
+        }
     }
 }
 
@@ -450,6 +484,52 @@ impl GaussianPcaPatch {
     fn tangent_frame(&self) -> Array2<f64> {
         self.projection_frame.dot(&self.tangent_coordinates)
     }
+
+    fn audit_summary(&self) -> GaussianPcaPatchSummary {
+        GaussianPcaPatchSummary {
+            chart: self.chart,
+            projection_fit_rows: self.projection_fit_rows,
+            inference_rows: self.inference_rows,
+            centering: self.centering,
+            covariance_degrees_of_freedom: self.covariance_degrees_of_freedom,
+            ambient_dimension: self.ambient_dimension(),
+            retained_dimension: self.retained_dimension(),
+            noise_variance_estimate: self.noise_variance_estimate,
+            signal_variance_estimate: self.signal_variance_estimate,
+            population_bounds: self.population_bounds,
+        }
+    }
+}
+
+/// Scalar provenance retained for every patch used by a noisy certificate.
+///
+/// These are exactly the sample-split, dimension, variance, and population
+/// inputs that determine projector variance and the finite-sample tail.  Raw
+/// frames remain edge-construction inputs rather than being duplicated into the
+/// certificate, while every scalar entering a reported probability remains
+/// independently auditable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GaussianPcaPatchSummary {
+    pub chart: usize,
+    pub projection_fit_rows: usize,
+    pub inference_rows: usize,
+    pub centering: GaussianPatchCentering,
+    pub covariance_degrees_of_freedom: usize,
+    pub ambient_dimension: usize,
+    pub retained_dimension: usize,
+    pub noise_variance_estimate: f64,
+    pub signal_variance_estimate: f64,
+    pub population_bounds: GaussianPcaPopulationBounds,
+}
+
+impl GaussianPcaPatchSummary {
+    #[must_use]
+    pub fn projector_variance_scale(self) -> f64 {
+        let noise = self.noise_variance_estimate;
+        let signal = self.signal_variance_estimate;
+        noise * (signal + noise)
+            / (signal * signal * self.covariance_degrees_of_freedom as f64)
+    }
 }
 
 /// One edge requested from the Gaussian-PCA atlas.
@@ -472,20 +552,27 @@ impl ProjectedAtlasEdgeSpec {
         overlap: usize,
         geometric_remainder_bound: f64,
     ) -> Result<Self, String> {
-        if a == b {
-            return Err("a projected atlas edge cannot be a self-edge".to_string());
-        }
+        let identity = AtlasHolonomyEdgeId::new(a, b, overlap)?;
         if !(geometric_remainder_bound.is_finite() && geometric_remainder_bound >= 0.0) {
             return Err(format!(
                 "edge geometric remainder must be finite and nonnegative, got {geometric_remainder_bound}"
             ));
         }
         Ok(Self {
-            a: a.min(b),
-            b: a.max(b),
-            overlap,
+            a: identity.a,
+            b: identity.b,
+            overlap: identity.overlap,
             geometric_remainder_bound,
         })
+    }
+
+    #[must_use]
+    pub fn identity(self) -> AtlasHolonomyEdgeId {
+        AtlasHolonomyEdgeId {
+            a: self.a,
+            b: self.b,
+            overlap: self.overlap,
+        }
     }
 }
 
@@ -503,6 +590,17 @@ pub struct ProjectedAtlasEdgeGeometry {
     pub estimated_sign: Option<i8>,
     pub transition_a_to_b: Option<[[f64; INTRINSIC_DIMENSION]; INTRINSIC_DIMENSION]>,
     pub geometric_remainder_bound: f64,
+}
+
+impl ProjectedAtlasEdgeGeometry {
+    #[must_use]
+    pub fn identity(&self) -> AtlasHolonomyEdgeId {
+        AtlasHolonomyEdgeId {
+            a: self.a,
+            b: self.b,
+            overlap: self.overlap,
+        }
+    }
 }
 
 /// Required occupancy for one patch at the requested orientation error level.
@@ -530,6 +628,10 @@ pub struct AtlasCycleHolonomy {
     pub cycle_index: usize,
     /// Closed chart walk, so the first chart is repeated at the end.
     pub charts: Vec<usize>,
+    /// Canonical overlap-component identity for each step in `charts` order.
+    /// This has length `charts.len() - 1`; the chart walk supplies direction,
+    /// while this inventory distinguishes parallel transitions.
+    pub edges: Vec<AtlasHolonomyEdgeId>,
     pub absolute_angle: Option<f64>,
     pub first_order_variance: Option<f64>,
     pub naive_edgewise_first_order_variance: Option<f64>,
@@ -732,6 +834,7 @@ pub struct GaussBonnetConfidence {
 pub struct GaussianPcaHolonomyAnalysis {
     pub familywise_level: AtlasFamilywiseLevel,
     pub chart_count: usize,
+    pub patch_summaries: Vec<GaussianPcaPatchSummary>,
     pub edges: Vec<ProjectedAtlasEdgeGeometry>,
     pub orientation: AtlasStatisticalDecision<AtlasOrientability>,
     pub orientation_flip_probability_bound: f64,
@@ -753,6 +856,29 @@ impl AtlasHolonomyCertificate {
         match self {
             Self::ExactAnalytic(certificate) => certificate.chart_count(),
             Self::GaussianPcaPlugin(analysis) => analysis.chart_count,
+        }
+    }
+
+    /// Complete canonical edge inventory, including overlap component.
+    ///
+    /// Unlike [`Self::certified_edges`], this remains available when a noisy
+    /// orientation decision is refused.  Consumers can therefore validate
+    /// that a refusal belongs to exactly the atlas they are reporting without
+    /// converting the refusal into a promotable signed cocycle.
+    #[must_use]
+    pub fn edge_inventory(&self) -> Vec<AtlasHolonomyEdgeId> {
+        match self {
+            Self::ExactAnalytic(certificate) => certificate
+                .edges()
+                .iter()
+                .copied()
+                .map(AtlasSignedEdge::identity)
+                .collect(),
+            Self::GaussianPcaPlugin(analysis) => analysis
+                .edges
+                .iter()
+                .map(ProjectedAtlasEdgeGeometry::identity)
+                .collect(),
         }
     }
 
@@ -911,6 +1037,61 @@ mod tests {
         assert_eq!(
             certificate.orientability(),
             AtlasOrientability::NonOrientable
+        );
+        let authoritative = AtlasHolonomyCertificate::ExactAnalytic(certificate);
+        assert_eq!(
+            authoritative.edge_inventory(),
+            vec![
+                AtlasHolonomyEdgeId::new(0, 1, 0).unwrap(),
+                AtlasHolonomyEdgeId::new(0, 1, 1).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn gaussian_certificate_retains_auditable_patch_inputs() {
+        let analysis = triangle_analysis([(0.0, false); 3], 0);
+        assert_eq!(analysis.patch_summaries.len(), 3);
+        let patch = analysis.patch_summaries[0];
+        assert_eq!(patch.chart, 0);
+        assert_eq!(patch.projection_fit_rows, 1_000);
+        assert_eq!(patch.inference_rows, 1_000_000);
+        assert_eq!(patch.covariance_degrees_of_freedom, 999_999);
+        assert_eq!(patch.ambient_dimension, 3);
+        assert_eq!(patch.retained_dimension, 3);
+        assert_eq!(
+            patch.centering,
+            GaussianPatchCentering::MeanEstimatedOnInferenceRows
+        );
+        assert_near(
+            patch.projector_variance_scale(),
+            0.01 * 1.01 / 999_999.0,
+        );
+    }
+
+    #[test]
+    fn fundamental_cycle_preserves_parallel_overlap_identity() {
+        let analysis = GaussianPcaHolonomyAnalysis::certify(
+            vec![
+                patch(0, 0.0, 0.0, false, 1_000_000, 0),
+                patch(1, 0.0, 0.0, false, 1_000_000, 0),
+            ],
+            vec![
+                ProjectedAtlasEdgeSpec::new(0, 1, 7, 0.0).unwrap(),
+                ProjectedAtlasEdgeSpec::new(0, 1, 3, 0.0).unwrap(),
+            ],
+            AtlasFamilywiseLevel::new(0.05).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(analysis.cycles.len(), 1);
+        assert_eq!(analysis.cycles[0].charts, vec![0, 1, 0]);
+        assert_eq!(
+            analysis.cycles[0].edges,
+            vec![
+                AtlasHolonomyEdgeId::new(0, 1, 3).unwrap(),
+                AtlasHolonomyEdgeId::new(0, 1, 7).unwrap(),
+            ]
         );
     }
 
@@ -1557,6 +1738,11 @@ fn analyze_cycle(
 ) -> Result<AtlasCycleHolonomy, String> {
     let gaussian_error_budget = allocated_alpha / 2.0;
     let subspace_tail_probability_bound = allocated_alpha - gaussian_error_budget;
+    let cycle_edges: Vec<AtlasHolonomyEdgeId> = cycle
+        .steps
+        .iter()
+        .map(|&(edge, _)| edges[edge].public.identity())
+        .collect();
     let geometric_remainder_bound: f64 = cycle
         .steps
         .iter()
@@ -1578,6 +1764,7 @@ fn analyze_cycle(
         return Ok(AtlasCycleHolonomy {
             cycle_index,
             charts: cycle.charts.clone(),
+            edges: cycle_edges,
             absolute_angle: None,
             first_order_variance: None,
             naive_edgewise_first_order_variance: None,
@@ -1614,6 +1801,7 @@ fn analyze_cycle(
         return Ok(AtlasCycleHolonomy {
             cycle_index,
             charts: cycle.charts.clone(),
+            edges: cycle_edges,
             absolute_angle: None,
             first_order_variance: None,
             naive_edgewise_first_order_variance: None,
@@ -1786,6 +1974,7 @@ fn analyze_cycle(
         return Ok(AtlasCycleHolonomy {
             cycle_index,
             charts: cycle.charts.clone(),
+            edges: cycle_edges,
             absolute_angle: Some(absolute_angle),
             first_order_variance: Some(first_order_variance),
             naive_edgewise_first_order_variance: Some(naive_first_order_variance),
@@ -1811,6 +2000,7 @@ fn analyze_cycle(
         return Ok(AtlasCycleHolonomy {
             cycle_index,
             charts: cycle.charts.clone(),
+            edges: cycle_edges,
             absolute_angle: Some(absolute_angle),
             first_order_variance: Some(first_order_variance),
             naive_edgewise_first_order_variance: Some(naive_first_order_variance),
@@ -1840,6 +2030,7 @@ fn analyze_cycle(
     Ok(AtlasCycleHolonomy {
         cycle_index,
         charts: cycle.charts.clone(),
+        edges: cycle_edges,
         absolute_angle: Some(absolute_angle),
         first_order_variance: Some(first_order_variance),
         naive_edgewise_first_order_variance: Some(naive_first_order_variance),
@@ -2018,6 +2209,10 @@ impl GaussianPcaHolonomyAnalysis {
                 }
             }
         }
+        let patch_summaries = patches
+            .iter()
+            .map(GaussianPcaPatch::audit_summary)
+            .collect();
         edge_specs.sort_by_key(|edge| (edge.a, edge.b, edge.overlap));
         for (position, edge) in edge_specs.iter().enumerate() {
             if edge.b >= chart_count {
@@ -2063,6 +2258,7 @@ impl GaussianPcaHolonomyAnalysis {
         Ok(Self {
             familywise_level,
             chart_count,
+            patch_summaries,
             edges: edge_work.into_iter().map(|edge| edge.public).collect(),
             orientation,
             orientation_flip_probability_bound,
