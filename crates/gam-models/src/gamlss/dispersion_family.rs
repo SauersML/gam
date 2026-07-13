@@ -862,6 +862,65 @@ pub(crate) fn dispersion_row_observed_hessian_weights(
     (h[0][0], h[0][1], h[1][1])
 }
 
+/// Exact row-local geometry consumed by saved-model case deletion.
+///
+/// The score is the gradient of the weighted negative log-likelihood in the
+/// affine coordinates `(eta_mu, eta_d)`.  `observed_hessian` is its observed
+/// Hessian, not a Fisher working-weight surrogate and not the outer product of
+/// the score.  Keeping those two objects separate is essential for ALO: the
+/// observed Hessian controls the deletion denominator, while the score outer
+/// product controls the sandwich variance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DispersionAloRowGeometry {
+    pub nll_score: [f64; 2],
+    pub observed_hessian: [[f64; 2]; 2],
+}
+
+/// Replay the exact fitted row likelihood in its two affine predictor
+/// coordinates for saved-model ALO.
+///
+/// This is intentionally a thin public boundary over the same order-two jet
+/// program used by the fitter, so diagnostics cannot drift onto a second,
+/// hand-maintained approximation of the dispersion likelihood.
+pub fn dispersion_alo_row_geometry(
+    kind: DispersionFamilyKind,
+    row: usize,
+    y: f64,
+    eta_mu: f64,
+    eta_d: f64,
+    prior_weight: f64,
+) -> Result<DispersionAloRowGeometry, String> {
+    validate_dispersion_row_geometry_inputs(kind, row, y, eta_mu, eta_d, prior_weight)?;
+    if prior_weight == 0.0 {
+        return Ok(DispersionAloRowGeometry {
+            nll_score: [0.0; 2],
+            observed_hessian: [[0.0; 2]; 2],
+        });
+    }
+    let tower = dispersion_eta_nll_order2(kind, y, eta_mu, eta_d, prior_weight);
+    let gradient = tower.g();
+    let hessian = tower.h();
+    let geometry = DispersionAloRowGeometry {
+        nll_score: gradient,
+        observed_hessian: hessian,
+    };
+    if geometry
+        .nll_score
+        .iter()
+        .chain(geometry.observed_hessian.iter().flatten())
+        .any(|value| !value.is_finite())
+    {
+        return Err(GamlssError::RowGeometryUnrepresentable {
+            row,
+            quantity: "dispersion-family ALO row geometry",
+            eta: eta_mu,
+            value: f64::NAN,
+        }
+        .into());
+    }
+    Ok(geometry)
+}
+
 #[inline]
 pub(crate) fn tower_score_info<const K: usize>(
     tower: &gam_math::jet_scalar::Order2<K>,
@@ -1950,6 +2009,65 @@ mod tests {
     use super::*;
     use crate::gamlss::test_support::dispersion_tweedie_nll_generic;
     use gam_math::nested_dual::JetField;
+
+    #[test]
+    fn saved_alo_gamma_row_geometry_matches_closed_form_and_keeps_meat_distinct() {
+        let y = 4.0;
+        let mu = 2.0;
+        let nu = 3.0;
+        let weight = 1.7;
+        let geometry = dispersion_alo_row_geometry(
+            DispersionFamilyKind::Gamma,
+            0,
+            y,
+            mu.ln(),
+            nu.ln(),
+            weight,
+        )
+        .expect("Gamma row geometry must be representable");
+
+        let ratio = y / mu;
+        let a = gam_math::jet_tower::digamma(nu) - nu.ln() - 1.0 + mu.ln() - y.ln() + ratio;
+        let expected_score = [weight * nu * (1.0 - ratio), weight * nu * a];
+        let expected_hessian = [
+            [weight * nu * ratio, weight * nu * (1.0 - ratio)],
+            [
+                weight * nu * (1.0 - ratio),
+                weight * nu * (a + nu * gam_math::jet_tower::trigamma(nu) - 1.0),
+            ],
+        ];
+        for coordinate in 0..2 {
+            assert_close(
+                "Gamma ALO score",
+                geometry.nll_score[coordinate],
+                expected_score[coordinate],
+                2e-12,
+            );
+            for other in 0..2 {
+                assert_close(
+                    "Gamma ALO observed Hessian",
+                    geometry.observed_hessian[coordinate][other],
+                    expected_hessian[coordinate][other],
+                    2e-12,
+                );
+            }
+        }
+
+        let score_meat = [
+            [
+                expected_score[0] * expected_score[0],
+                expected_score[0] * expected_score[1],
+            ],
+            [
+                expected_score[1] * expected_score[0],
+                expected_score[1] * expected_score[1],
+            ],
+        ];
+        assert_ne!(
+            geometry.observed_hessian, score_meat,
+            "the deletion curvature must not be replaced by score covariance"
+        );
+    }
 
     /// Order-≤1 `ln Γ` compose: only the value (`d[0] = lnΓ`) and first-derivative
     /// (`d[1] = ψ`) stack slots are consumed by an [`Order1`] jet, so we evaluate

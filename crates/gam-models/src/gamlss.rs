@@ -38,8 +38,8 @@ use crate::custom_family::{
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction,
     CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiDirectCache, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix, PsiDesignMap, evaluate_custom_family_joint_hyper,
+    ExactNewtonJointPsiDirectCache, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix, PsiDesignMap, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
     resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
     shared_dense_arc, weighted_crossprod_psi_maps,
@@ -136,8 +136,9 @@ use std::sync::{Arc, Mutex};
 
 mod dispersion_family;
 pub use dispersion_family::{
-    DispersionFamilyKind, DispersionGlmLocationScaleTermSpec, FAMILY_BETA_LOCATION_SCALE,
-    FAMILY_GAMMA_LOCATION_SCALE, FAMILY_NEGBIN_LOCATION_SCALE, FAMILY_TWEEDIE_LOCATION_SCALE,
+    DispersionAloRowGeometry, DispersionFamilyKind, DispersionGlmLocationScaleTermSpec,
+    FAMILY_BETA_LOCATION_SCALE, FAMILY_GAMMA_LOCATION_SCALE, FAMILY_NEGBIN_LOCATION_SCALE,
+    FAMILY_TWEEDIE_LOCATION_SCALE, dispersion_alo_row_geometry,
     fit_dispersion_glm_location_scale_terms,
 };
 
