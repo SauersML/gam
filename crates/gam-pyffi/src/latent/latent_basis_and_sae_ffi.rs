@@ -2355,14 +2355,10 @@ fn sae_manifold_fit_inner<'py>(
     if let Some(json) = structure_search_json {
         out.set_item("structure_search", json)?;
     }
-    // Anytime-valid structure certificate (#1058 / #984): the e-BH certificate
-    // over the ledger's per-claim e-processes at the search FDR level α = 0.05.
-    // Serialized onto the payload (alongside the raw `structure_search` rounds)
-    // so the post-fit `ManifoldSAE.structure_certificate()` can surface which
-    // discovered atoms / bindings / geometries the held-out data confirmed vs
-    // left contested — without re-running any fitting. Valid at this (or any)
-    // data-dependent stopping time because each claim is an e-process.
-    out.set_item("structure_certificate", structure_certificate_json)?;
+    match structure_certificate_json {
+        Some(json) => out.set_item("structure_certificate", json)?,
+        None => out.set_item("structure_certificate", py.None())?,
+    }
     Ok(out.unbind())
 }
 

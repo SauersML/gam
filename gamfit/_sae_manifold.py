@@ -271,6 +271,8 @@ def sae_manifold_certify_external(
     log_lambda_smooth: Sequence[float],
     log_ard: Sequence[Sequence[float]],
     *,
+    tier0_mean: Any = None,
+    tier0_scale: Any = None,
     duchon_centers: Sequence[Any | None] | None = None,
     n_harmonics: Sequence[int | None] | None = None,
     assignment: str = "softmax",
@@ -300,6 +302,11 @@ def sae_manifold_certify_external(
     that produced the decoder (the same "regularization the decoder was
     trained under" contract the frozen-decoder OOS encode carries) — an
     initial-strength substitute certifies a different model.
+
+    `tier0_mean` and `tier0_scale` identify the output frame in which training
+    ran. Persisted decoder blocks and `X` stay in physical units; native Rust
+    maps both into that exact centered/standardized frame for the audit and
+    lifts a certified reconstruction back afterward.
 
     The native entry takes no optimization step. It first measures the exact
     installed-state inner KKT residual and outer criterion stationarity. A
@@ -335,6 +342,8 @@ def sae_manifold_certify_external(
         float(log_lambda_sparse),
         [float(v) for v in log_lambda_smooth],
         [[float(v) for v in atom_ard] for atom_ard in log_ard],
+        tier0_mean=_optional_array(tier0_mean, dimensions=1),
+        tier0_scale=_optional_array(tier0_scale, dimensions=1),
         learnable_alpha=bool(learnable_alpha),
         top_k=None if top_k is None else int(top_k),
         threshold_gate_threshold=float(threshold_gate_threshold),

@@ -1002,6 +1002,8 @@ fn sae_manifold_predict_oos<'py>(
 /// `log_ard` are the trained terminal regularization state the certificate is
 /// evaluated under — the same "must supply the regularization that produced
 /// the decoder" contract `sae_manifold_predict_oos` already carries.
+/// `tier0_mean` / `tier0_scale` identify the centered and standardized frame
+/// used by training while the target and persisted decoders remain physical.
 /// The native entry first audits the supplied state without taking an optimizer
 /// step. A nonstationary state returns a typed evaluation-only diagnostic with
 /// no fit payload or structure evidence. A passing state alone reaches the
@@ -1023,6 +1025,8 @@ fn sae_manifold_predict_oos<'py>(
     log_lambda_sparse,
     log_lambda_smooth,
     log_ard,
+    tier0_mean = None,
+    tier0_scale = None,
     learnable_alpha = false,
     top_k = None,
     threshold_gate_threshold = 0.0,
@@ -1055,6 +1059,8 @@ fn sae_manifold_certify_external<'py>(
     log_lambda_sparse: f64,
     log_lambda_smooth: Vec<f64>,
     log_ard: Vec<Vec<f64>>,
+    tier0_mean: Option<PyReadonlyArray1<'py, f64>>,
+    tier0_scale: Option<PyReadonlyArray1<'py, f64>>,
     learnable_alpha: bool,
     top_k: Option<usize>,
     threshold_gate_threshold: f64,
@@ -1198,6 +1204,8 @@ fn sae_manifold_certify_external<'py>(
     let request = gam::terms::sae::manifold::SaeCertifyExternalRequest {
         target: z_view.to_owned(),
         atoms,
+        tier0_mean: tier0_mean.map(|values| values.as_array().to_owned()),
+        tier0_scale: tier0_scale.map(|values| values.as_array().to_owned()),
         coords,
         logits: initial_logits.as_array().to_owned(),
         assignment,
@@ -1500,7 +1508,10 @@ fn sae_manifold_certify_external<'py>(
     if let Some(json) = structure_search_json {
         out.set_item("structure_search", json)?;
     }
-    out.set_item("structure_certificate", structure_certificate_json)?;
+    match structure_certificate_json {
+        Some(json) => out.set_item("structure_certificate", json)?,
+        None => out.set_item("structure_certificate", py.None())?,
+    }
     Ok(out.unbind())
 }
 

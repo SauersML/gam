@@ -56,6 +56,7 @@ def test_dense_array_getters() -> None:
     np.testing.assert_array_equal(
         core.training_mean, np.asarray(golden["training_mean"])
     )
+    np.testing.assert_array_equal(core.tier0_scale, np.asarray(golden["tier0_scale"]))
     # coords / decoder_blocks / duchon_centers are per-atom lists of arrays.
     assert isinstance(core.coords, list) and len(core.coords) == len(golden["coords"])
     np.testing.assert_array_equal(core.coords[0], np.asarray(golden["coords"][0]))

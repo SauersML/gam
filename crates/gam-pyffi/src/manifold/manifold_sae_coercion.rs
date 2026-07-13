@@ -521,6 +521,7 @@ pub(crate) fn build_manifold_sae_payload(
     let atom_topology = topology_for_bases(&basis_kinds)?
         .ok_or_else(|| "converged SAE payload contains no atoms".to_string())?;
     let metric_provenance = vstr(raw, "metric_provenance")?;
+    let tier0_scale = vopt(raw, "tier0_scale").map(v_arr1).transpose()?;
     let fisher_mass_residual = vopt(raw, "fisher_mass_residual").map(v_arr1).transpose()?;
     let selected_log_lambda_sparse = match vopt(raw, "log_lambda_sparse") {
         None => None,
@@ -574,6 +575,7 @@ pub(crate) fn build_manifold_sae_payload(
         basis_sizes: sizes,
         n_harmonics,
         training_mean,
+        tier0_scale,
         fitted: v_arr2(vget(raw, "fitted")?)?,
         assignments,
         low_level_logits: logits,
@@ -614,7 +616,7 @@ pub(crate) fn build_manifold_sae_payload(
         selected_log_ard,
         structured_residual_diagnostics,
         // #2235 — termination ledger carried straight from the raw fit payload
-        // into the persisted v3 artifact.
+        // into the persisted v5 artifact.
         termination: report("termination"),
     })
 }

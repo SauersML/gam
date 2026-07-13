@@ -6503,7 +6503,7 @@ impl ManifoldSaeCore {
         Self::from_json(py, &payload_json)
     }
 
-    /// Re-serialize the complete v3 artifact as a Python dict.
+    /// Re-serialize the complete v5 artifact as a Python dict.
     fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
         let json_str = self.inner.to_json().map_err(py_value_error)?;
         let value: serde_json::Value =
@@ -7152,6 +7152,13 @@ impl ManifoldSaeCore {
     #[getter]
     fn training_mean<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         manifold_sae_vec1(py, &self.inner.training_mean)
+    }
+    #[getter]
+    fn tier0_scale<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
+        self.inner
+            .tier0_scale
+            .as_ref()
+            .map(|scale| manifold_sae_vec1(py, scale))
     }
     #[getter]
     fn coords<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {

@@ -1,11 +1,11 @@
 //! Rust-owned serde schema for the fitted `ManifoldSAE` model artifact (#2091).
 //!
 //! The fitted SAE-manifold model is serialized to a JSON payload tagged
-//! `"gamfit.ManifoldSAE/v4"` schema. Version 4 is deliberately breaking: it
-//! makes the optional crosscoder layout a first-class typed field instead of
-//! accepting legacy payloads that cannot say whether decoder columns are one
-//! ambient or a stack of relevance-weighted layers. Historically the
-//! schema lived only in the Python dataclass `gamfit/_sae_manifold.py::ManifoldSAE`
+//! `"gamfit.ManifoldSAE/v5"` schema. Version 5 is deliberately breaking: it
+//! persists the Tier-0 column scale required to replay the exact standardized
+//! optimization frame instead of retaining only physical decoder blocks.
+//! Historically the schema lived only in the Python dataclass
+//! `gamfit/_sae_manifold.py::ManifoldSAE`
 //! (`to_dict` / `from_dict`), so a field-name / default / None-handling change
 //! there silently corrupts saved models. This module mirrors that schema in Rust
 //! (serde), so the round-trip is owned where the math lives and the contract is
@@ -31,7 +31,7 @@ use serde_json::Value;
 
 /// The on-disk schema tag. `from_json` rejects any other value, matching the
 /// Python `from_dict` guard.
-pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v4";
+pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v5";
 
 /// Per-atom payload (`atoms[k]`), one per `SaeManifoldAtomFit`.
 ///
@@ -117,6 +117,9 @@ pub(crate) struct ManifoldSaePayload {
 
     // --- C. dense numeric -------------------------------------------------
     pub(crate) training_mean: Vec<f64>,
+    /// Required key, nullable only for model families that did not standardize
+    /// the output columns before fitting.
+    pub(crate) tier0_scale: Option<Vec<f64>>,
     pub(crate) fitted: Vec<Vec<f64>>,
     pub(crate) assignments: Vec<Vec<f64>>,
     #[serde(rename = "logits")]
@@ -197,6 +200,7 @@ impl ManifoldSaePayload {
         "basis_sizes",
         "n_harmonics",
         "training_mean",
+        "tier0_scale",
         "fitted",
         "assignments",
         "logits",
@@ -245,7 +249,7 @@ impl ManifoldSaePayload {
         "functional_evidence",
     ];
 
-    /// Parse the exact v3 artifact schema. Missing optional-valued fields are
+    /// Parse the exact v5 artifact schema. Missing optional-valued fields are
     /// still errors: `null` is the explicit absence representation.
     pub(crate) fn from_json(json: &str) -> Result<Self, String> {
         let value: Value =
@@ -288,6 +292,18 @@ impl ManifoldSaePayload {
                 "ManifoldSAE.from_json: assignment_label {:?} must equal canonical assignment {:?}",
                 payload.assignment_label, payload.assignment
             ));
+        }
+        if let Some(scale) = payload.tier0_scale.as_ref() {
+            if scale.len() != payload.training_mean.len()
+                || !scale
+                    .iter()
+                    .all(|value| value.is_finite() && *value > 0.0)
+            {
+                return Err(format!(
+                    "ManifoldSAE.from_json: tier0_scale must be a finite positive length-{} vector",
+                    payload.training_mean.len()
+                ));
+            }
         }
         if (payload.assignment == "topk") != payload.top_k.is_some() {
             return Err(
@@ -431,7 +447,7 @@ mod manifold_sae_payload_serde_tests {
     }
 
     #[test]
-    fn crosscoder_layout_and_reports_round_trip_in_v3() {
+    fn crosscoder_layout_and_reports_round_trip_in_v5() {
         let mut payload = load_value("golden_full.json");
         payload.as_object_mut().unwrap().insert(
             "crosscoder".to_string(),

@@ -1,6 +1,6 @@
 """Golden round-trip contract for ``ManifoldSAE`` serialization (issue #2091).
 
-These fixtures are the exact v3 output of the Rust-owned
+These fixtures are the exact v5 output of the Rust-owned
 ``ManifoldSAE.to_dict()`` on a representative model exercising every optional
 field (see ``tests/fixtures/manifold_sae/generate_golden.py``). They pin the
 on-disk schema so the Rust-owned ``ManifoldSaePayload`` port (and the eventual
@@ -29,9 +29,9 @@ def _load(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def test_golden_fixture_exists_and_is_schema_v3() -> None:
+def test_golden_fixture_exists_and_is_schema_v5() -> None:
     payload = _load(GOLDEN_FULL)
-    assert payload["schema"] == "gamfit.ManifoldSAE/v4"
+    assert payload["schema"] == "gamfit.ManifoldSAE/v5"
     # The representative model exercises the full optional surface.
     assert len(payload["atoms"]) == 3
     assert payload["fisher_factors"] is not None

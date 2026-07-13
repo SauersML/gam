@@ -15,8 +15,7 @@ reproduces the SAME pinned contract the Rust test checks:
 
 * ``termination["verdict"] == "audited_stationary"`` and
   ``termination["evals"] == 0`` (no optimization ran on this path);
-* ``structure_certificate`` is a non-empty serialized certificate even with
-  structure search disabled (a trivially-certifying empty ledger);
+* ``structure_certificate`` is absent when structure search is disabled;
 * ``reconstruction_r2`` is finite and ``fitted`` / ``assignments_z`` carry the
   right shapes;
 * the certified atom count matches the seeded dictionary (structure search is
@@ -26,8 +25,6 @@ These tests are authored under the campaign rule "write the test, do NOT run
 it"; they are HQ-verified centrally.
 """
 from __future__ import annotations
-
-import json
 
 import numpy as np
 import pytest
@@ -83,6 +80,7 @@ def test_certify_external_round_trips_a_genuinely_converged_native_fit():
     log_lambda_smooth = [float(v) for v in fit.selected_log_lambda_smooth]
     log_ard = [[float(v) for v in atom_ard] for atom_ard in fit.selected_log_ard]
     log_lambda_sparse = float(fit.selected_log_lambda_sparse)
+    assert fit.tier0_scale is not None, "the native fit must expose its Tier-0 scale"
 
     report = gamfit.sae_manifold_certify_external(
         X=x,
@@ -99,6 +97,8 @@ def test_certify_external_round_trips_a_genuinely_converged_native_fit():
         alpha=float(fit.alpha),
         tau=float(fit.tau),
         log_lambda_sparse=log_lambda_sparse,
+        tier0_mean=np.asarray(fit.training_mean, dtype=float),
+        tier0_scale=np.asarray(fit.tier0_scale, dtype=float),
         learnable_alpha=bool(fit.learnable_alpha),
         top_k=None if fit.top_k is None else int(fit.top_k),
         threshold_gate_threshold=float(fit.threshold_gate_threshold),
@@ -116,19 +116,12 @@ def test_certify_external_round_trips_a_genuinely_converged_native_fit():
         "the fit must identify the exact-point audit rather than claim a search ran"
     )
     assert report["termination"]["evals"] == 0, (
-        "no outer/inner evaluation should run on the certify path"
+        "the exact-point audit must not claim an optimization iteration"
     )
     assert np.isfinite(report["reconstruction_r2"]), "reconstruction R^2 must be finite"
 
-    assert isinstance(report["structure_certificate"], str)
-    assert report["structure_certificate"] != "", (
-        "the anytime-valid structure certificate must serialize even when the "
-        "structure search did not run (a trivially-certifying empty ledger)"
-    )
-    # It must be well-formed JSON with the e-BH confirmation shape, not just a
-    # non-empty string.
-    certificate = json.loads(report["structure_certificate"])
-    assert "alpha" in certificate or "claims" in certificate or isinstance(certificate, dict)
+    assert report["structure_search"] is None
+    assert report["structure_certificate"] is None
 
     assert "certificates" in report
     assert isinstance(report["certificates"], dict)
@@ -136,6 +129,13 @@ def test_certify_external_round_trips_a_genuinely_converged_native_fit():
 
     fitted = np.asarray(report["fitted"])
     assert fitted.shape == x.shape, "the certified reconstruction must match the target shape"
+    np.testing.assert_allclose(fitted, np.asarray(fit.fitted), rtol=1e-11, atol=1e-11)
+    np.testing.assert_allclose(report["tier0_mean"], fit.training_mean)
+    np.testing.assert_allclose(report["tier0_scale"], fit.tier0_scale)
+    for certified_atom, decoder in zip(report["atoms"], decoder_blocks):
+        np.testing.assert_allclose(
+            certified_atom["decoder_B"], decoder, rtol=1e-12, atol=1e-12
+        )
 
     assignments = np.asarray(report["assignments_z"])
     assert assignments.shape[0] == x.shape[0], (
@@ -154,6 +154,7 @@ def test_certify_external_round_trips_a_genuinely_converged_native_fit():
 
 def test_certify_external_returns_typed_nonfit_for_perturbed_state():
     fit, x = _fit_circle(seed=11)
+    assert fit.tier0_scale is not None, "the native fit must expose its Tier-0 scale"
     decoder_blocks = [np.asarray(block, dtype=float).copy() for block in fit.decoder_blocks]
     decoder_blocks[0].flat[0] += 0.25
     report = gamfit.sae_manifold_certify_external(
@@ -174,6 +175,8 @@ def test_certify_external_returns_typed_nonfit_for_perturbed_state():
         alpha=float(fit.alpha),
         tau=float(fit.tau),
         log_lambda_sparse=float(fit.selected_log_lambda_sparse),
+        tier0_mean=np.asarray(fit.training_mean, dtype=float),
+        tier0_scale=np.asarray(fit.tier0_scale, dtype=float),
         learnable_alpha=bool(fit.learnable_alpha),
         top_k=None if fit.top_k is None else int(fit.top_k),
         threshold_gate_threshold=float(fit.threshold_gate_threshold),

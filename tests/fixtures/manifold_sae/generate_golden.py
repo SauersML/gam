@@ -119,7 +119,7 @@ def build_payload() -> dict[str, Any]:
     selected_log_ard = [np.array([0.1]), np.array([0.2, -0.3]), np.array([0.4, 0.5])]
 
     return {
-        "schema": "gamfit.ManifoldSAE/v4",
+        "schema": "gamfit.ManifoldSAE/v5",
         "atoms": atoms,
         "atom_topology": "mixed",
         "atom_topologies": ["circle", "euclidean", "euclidean"],
@@ -135,6 +135,7 @@ def build_payload() -> dict[str, Any]:
         "penalized_quasi_laplace_criterion": 41.25,
         "reconstruction_r2": 0.8123,
         "training_mean": training_mean.tolist(),
+        "tier0_scale": _arange(p, start=1.0, step=0.2).tolist(),
         "logits": logits.tolist(),
         "diagnostics": diagnostics,
         "basis_kinds": list(kinds),

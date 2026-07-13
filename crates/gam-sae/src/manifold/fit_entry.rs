@@ -227,8 +227,9 @@ pub struct SaeFitReport {
     /// `None` when the search did not run (skipped by K ceiling or
     /// `run_structure_search == false`).
     pub structure_search_json: Option<String>,
-    /// The anytime-valid structure certificate (#1058/#984), serialized JSON.
-    pub structure_certificate_json: String,
+    /// The anytime-valid structure certificate (#1058/#984), serialized JSON;
+    /// absent when no genuine structure search ran.
+    pub structure_certificate_json: Option<String>,
     /// The reported `log_alpha` (ordered Beta--Bernoulli concentration or the caller's α fallback).
     pub reported_log_alpha: f64,
 }
@@ -1513,13 +1514,20 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitOutcom
         _ => alpha.ln(),
     };
 
-    // Anytime-valid structure certificate (#1058 / #984): the e-BH certificate
-    // over the ledger's per-claim e-processes at the search FDR level α = 0.05.
-    let structure_certificate = structure_ledger
-        .certify(0.05)
-        .map_err(|error| error.to_string())?;
-    let structure_certificate_json =
-        serde_json::to_string(&structure_certificate).map_err(|e| e.to_string())?;
+    // A structure certificate is evidence about a structure search, not a
+    // generic stationary-fit badge. An absent/skipped search therefore carries
+    // no empty-ledger certificate.
+    let structure_certificate_json = structure_search_json
+        .as_ref()
+        .map(|_| {
+            structure_ledger
+                .certify(0.05)
+                .map_err(|error| error.to_string())
+                .and_then(|certificate| {
+                    serde_json::to_string(&certificate).map_err(|error| error.to_string())
+                })
+        })
+        .transpose()?;
 
     Ok(SaeFitOutcome::Manifold(SaeFitReport {
         term,
@@ -1884,14 +1892,20 @@ pub fn run_sae_manifold_certify(
         _ => alpha.ln(),
     };
 
-    // Anytime-valid structure certificate (#1058 / #984), exactly as the fit
-    // entry produces it — empty ledger certifies trivially when the search did
-    // not run.
-    let structure_certificate = structure_ledger
-        .certify(0.05)
-        .map_err(|error| error.to_string())?;
-    let structure_certificate_json =
-        serde_json::to_string(&structure_certificate).map_err(|e| e.to_string())?;
+    // A structure certificate exists only when this entry genuinely ran the
+    // structure search. Stationarity alone certifies the installed fit state,
+    // not unsearched dictionary alternatives.
+    let structure_certificate_json = structure_search_json
+        .as_ref()
+        .map(|_| {
+            structure_ledger
+                .certify(0.05)
+                .map_err(|error| error.to_string())
+                .and_then(|certificate| {
+                    serde_json::to_string(&certificate).map_err(|error| error.to_string())
+                })
+        })
+        .transpose()?;
     let loss = term.loss(z.view(), &rho)?;
 
     Ok(SaeExternalCertificationOutcome::Certified(SaeFitReport {

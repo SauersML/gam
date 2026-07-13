@@ -1193,11 +1193,20 @@ pub fn run_sae_manifold_steer_to_target(
 /// without pretending a stationarity certificate exists for state this entry
 /// never optimized.
 pub struct SaeCertifyExternalRequest {
-    /// The training target the externally-trained decoder was fit against.
+    /// The training target in the same physical output frame exposed by the
+    /// persisted decoder blocks.
     pub target: Array2<f64>,
     /// Persisted trained atoms (decoder + basis schema), identical to the OOS
     /// dictionary definition.
     pub atoms: Vec<SaeOosAtomSpec>,
+    /// Optional shared Tier-0 mean peeled before training. When present, the
+    /// installed state is audited against `target - mean`, then certified
+    /// reconstructions are lifted back into the physical frame.
+    pub tier0_mean: Option<Array1<f64>>,
+    /// Optional positive Tier-0 column scale used during training. Persisted
+    /// decoder blocks are physical, so both target and decoder columns are
+    /// divided by this scale before the exact installed-state audit.
+    pub tier0_scale: Option<Array1<f64>>,
     /// The model's TRAINED per-row on-manifold coordinates, one `(n_obs,
     /// latent_dim)` block per atom.
     pub coords: Vec<Array2<f64>>,
@@ -1242,8 +1251,10 @@ pub fn run_sae_manifold_certify_external(
     request: SaeCertifyExternalRequest,
 ) -> Result<super::SaeExternalCertificationOutcome, SaeFitError> {
     let SaeCertifyExternalRequest {
-        target,
-        atoms: atom_specs,
+        mut target,
+        atoms: mut atom_specs,
+        tier0_mean,
+        tier0_scale,
         coords,
         logits,
         assignment,
@@ -1282,6 +1293,53 @@ pub fn run_sae_manifold_certify_external(
             "run_sae_manifold_certify_external: n_obs and p_out must be positive; got ({n_obs}, {p_out})"
         )
         .into());
+    }
+    if !target.iter().all(|value| value.is_finite()) {
+        return Err("run_sae_manifold_certify_external: target must be finite"
+            .to_string()
+            .into());
+    }
+    if let Some(mean) = tier0_mean.as_ref() {
+        if mean.len() != p_out || !mean.iter().all(|value| value.is_finite()) {
+            return Err(format!(
+                "run_sae_manifold_certify_external: tier0_mean must be a finite length-{p_out} vector; got length {}",
+                mean.len()
+            )
+            .into());
+        }
+        for mut row in target.rows_mut() {
+            row -= mean;
+        }
+    }
+    if let Some(scale) = tier0_scale.as_ref() {
+        if scale.len() != p_out
+            || !scale
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+        {
+            return Err(format!(
+                "run_sae_manifold_certify_external: tier0_scale must be a finite positive length-{p_out} vector; got length {}",
+                scale.len()
+            )
+            .into());
+        }
+        for (atom_index, spec) in atom_specs.iter_mut().enumerate() {
+            if spec.decoder.ncols() != p_out {
+                return Err(format!(
+                    "run_sae_manifold_certify_external: atoms[{atom_index}] decoder must have {p_out} output columns before Tier-0 conversion; got {}",
+                    spec.decoder.ncols()
+                )
+                .into());
+            }
+            for (column, value) in spec.decoder.columns_mut().into_iter().zip(scale) {
+                for coefficient in column {
+                    *coefficient /= *value;
+                }
+            }
+        }
+        for mut row in target.rows_mut() {
+            row /= scale;
+        }
     }
     if logits.dim() != (n_obs, k_atoms) || !logits.iter().all(|value| value.is_finite()) {
         return Err(format!(
@@ -1374,7 +1432,7 @@ pub fn run_sae_manifold_certify_external(
 
     let initial_rho = build_rho(regularization, &latent_dims, mode)?;
 
-    run_sae_manifold_certify(SaeCertifyRequest {
+    let outcome = run_sae_manifold_certify(SaeCertifyRequest {
         base_term,
         target,
         registry,
@@ -1388,7 +1446,36 @@ pub fn run_sae_manifold_certify_external(
         metric_provenance,
         run_structure_search,
         cancel: None,
-    })
+    })?;
+    let mut report = match outcome {
+        super::SaeExternalCertificationOutcome::Certified(report) => report,
+        super::SaeExternalCertificationOutcome::NonStationary(report) => {
+            return Ok(super::SaeExternalCertificationOutcome::NonStationary(
+                report,
+            ));
+        }
+    };
+    if let Some(mean) = tier0_mean.as_ref() {
+        report
+            .term
+            .set_tier0_mean(mean.clone())
+            .map_err(SaeFitError::Fit)?;
+    }
+    if let Some(scale) = tier0_scale.as_ref() {
+        report
+            .term
+            .set_tier0_scale(scale.clone())
+            .map_err(SaeFitError::Fit)?;
+    }
+    for mut row in report.fitted.rows_mut() {
+        if let Some(scale) = tier0_scale.as_ref() {
+            row *= scale;
+        }
+        if let Some(mean) = tier0_mean.as_ref() {
+            row += mean;
+        }
+    }
+    Ok(super::SaeExternalCertificationOutcome::Certified(report))
 }
 
 #[cfg(test)]
