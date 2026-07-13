@@ -764,18 +764,20 @@ where
         unary_derivatives_sqrt(correction_argument),
         workspace,
     );
-    let eta0 = vars[0].multiply_add(&correction, &linear);
-    let eta1 = vars[1].multiply_add(&correction, &linear);
-    let adjusted_derivative = vars[2].product(&correction);
-    let neg_eta0 = -eta0.value();
-    let neg_eta1 = -eta1.value();
+    let correction_value = correction.value();
+    let linear_value = linear.value();
+    let eta0_value = vars[0].value() * correction_value + linear_value;
+    let eta1_value = vars[1].value() * correction_value + linear_value;
+    let adjusted_derivative_value = vars[2].value() * correction_value;
+    let neg_eta0 = -eta0_value;
+    let neg_eta1 = -eta1_value;
 
     validate_rigid_row_admission(
         vars[2].value(),
         inputs,
         neg_eta0,
         neg_eta1,
-        adjusted_derivative.value(),
+        adjusted_derivative_value,
     )?;
 
     let mut entry_stack = unary_derivatives_neglog_phi(neg_eta0, inputs.wi);
@@ -785,21 +787,36 @@ where
     let exit_stack = unary_derivatives_neglog_phi(neg_eta1, inputs.wi * (1.0 - inputs.di));
     if inputs.di > 0.0 {
         let scale = (-inputs.wi) * inputs.di;
-        let mut event_stack = unary_derivatives_log_normal_pdf(eta1.value());
-        let mut time_stack = unary_derivatives_log(adjusted_derivative.value());
+        let mut event_stack = unary_derivatives_log_normal_pdf(eta1_value);
+        let mut time_stack = unary_derivatives_log(adjusted_derivative_value);
         for derivative in event_stack.iter_mut().chain(&mut time_stack) {
             *derivative *= scale;
         }
-        Ok(S::affine_composed_sum(
-            &[eta1.clone(), eta0, eta1, adjusted_derivative],
+        let zero = S::constant(0.0, dimension, workspace);
+        Ok(S::multiply_add_affine_composed_sum(
+            &[
+                vars[1].clone(),
+                vars[0].clone(),
+                vars[1].clone(),
+                vars[2].clone(),
+            ],
+            &[
+                correction.clone(),
+                correction.clone(),
+                correction.clone(),
+                correction,
+            ],
+            &[linear.clone(), linear.clone(), linear, zero],
             &[-1.0, -1.0, 1.0, 1.0],
             &[exit_stack, entry_stack, event_stack, time_stack],
             dimension,
             workspace,
         ))
     } else {
-        Ok(S::affine_composed_sum(
-            &[eta1, eta0],
+        Ok(S::multiply_add_affine_composed_sum(
+            &[vars[1].clone(), vars[0].clone()],
+            &[correction.clone(), correction],
+            &[linear.clone(), linear],
             &[-1.0, -1.0],
             &[exit_stack, entry_stack],
             dimension,

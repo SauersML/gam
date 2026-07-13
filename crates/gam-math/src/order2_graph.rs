@@ -13,7 +13,9 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 
-use crate::jet_scalar::{Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients};
+use crate::jet_scalar::{
+    MAX_COMPOSED_PRODUCT_TERMS, Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients,
+};
 
 #[derive(Clone, Copy, Debug)]
 struct GraphNode {
@@ -802,6 +804,115 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 owner: owner as u8,
                 term_start: term_start as u16,
                 len: inputs.len() as u16,
+            },
+        );
+        let node = Order2GraphWorkspace::push(tape, value, support, gradient, edge_start);
+        Self { workspace, node }
+    }
+
+    #[inline(always)]
+    fn multiply_add_affine_composed_sum(
+        lefts: &[Self],
+        rights: &[Self],
+        addends: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        workspace: &'arena Self::Workspace,
+    ) -> Self {
+        assert_eq!(dimension, K, "compiled graph dimension mismatch");
+        let terms = lefts.len();
+        assert_eq!(rights.len(), terms);
+        assert_eq!(addends.len(), terms);
+        assert_eq!(input_scales.len(), terms);
+        assert_eq!(derivative_stacks.len(), terms);
+        assert!(
+            terms <= MAX_COMPOSED_PRODUCT_TERMS,
+            "fused product-composition term capacity exceeded"
+        );
+        assert!(
+            lefts
+                .iter()
+                .chain(rights)
+                .chain(addends)
+                .all(|input| std::ptr::eq(input.workspace, workspace)),
+            "compiled fused product-composition inputs belong to different workspaces"
+        );
+
+        let tape = workspace.tape_mut();
+        let mut term_gradients = [[0.0; K]; MAX_COMPOSED_PRODUCT_TERMS];
+        let mut firsts = [0.0; MAX_COMPOSED_PRODUCT_TERMS];
+        let mut seconds = [0.0; MAX_COMPOSED_PRODUCT_TERMS];
+        let mut value = 0.0;
+        let mut gradient = [0.0; K];
+        let mut support = 0_u16;
+        for term in 0..terms {
+            let left = lefts[term].node;
+            let right = rights[term].node;
+            let addend = addends[term].node;
+            let left_value = tape.nodes[left].value;
+            let right_value = tape.nodes[right].value;
+            let first = derivative_stacks[term][1] * input_scales[term];
+            let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
+            firsts[term] = first;
+            seconds[term] = second;
+            value += derivative_stacks[term][0];
+            support |=
+                tape.nodes[left].support | tape.nodes[right].support | tape.nodes[addend].support;
+            for primary in 0..K {
+                let inner_gradient = left_value * tape.gradients[right * K + primary]
+                    + tape.gradients[left * K + primary] * right_value
+                    + tape.gradients[addend * K + primary];
+                term_gradients[term][primary] = inner_gradient;
+                gradient[primary] += first * inner_gradient;
+            }
+        }
+
+        let supported_dimension = support.count_ones() as usize;
+        let curvature_len = supported_dimension * (supported_dimension + 1) / 2;
+        assert!(
+            curvature_len <= MAX_PROJECTED_CURVATURE_VALUES - tape.projected_curvature_len,
+            "compiled graph projected-curvature capacity exceeded"
+        );
+        let curvature_start = tape.projected_curvature_len;
+        tape.projected_curvature_len += curvature_len;
+        let mut curvature_offset = 0;
+        for_each_supported_upper_by_column(support, |primary, other| {
+            let mut channel = 0.0;
+            for term in 0..terms {
+                let left = lefts[term].node;
+                let right = rights[term].node;
+                let cross = tape.gradients[left * K + primary] * tape.gradients[right * K + other]
+                    + tape.gradients[left * K + other] * tape.gradients[right * K + primary];
+                channel += firsts[term] * cross
+                    + seconds[term] * term_gradients[term][primary] * term_gradients[term][other];
+            }
+            tape.projected_curvatures[curvature_start + curvature_offset] = channel;
+            curvature_offset += 1;
+        });
+        assert_eq!(
+            curvature_offset, curvature_len,
+            "compiled fused product-composition must fill its packed curvature"
+        );
+
+        let owner = tape.node_len;
+        let edge_start = tape.edge_len;
+        for term in 0..terms {
+            let left = lefts[term].node;
+            let right = rights[term].node;
+            let addend = addends[term].node;
+            let left_first = firsts[term] * tape.nodes[right].value;
+            let right_first = firsts[term] * tape.nodes[left].value;
+            Order2GraphWorkspace::push_edge(tape, left, left_first);
+            Order2GraphWorkspace::push_edge(tape, right, right_first);
+            Order2GraphWorkspace::push_edge(tape, addend, firsts[term]);
+        }
+        Order2GraphWorkspace::push_event(
+            tape,
+            CurvatureEvent::Projected {
+                owner: owner as u8,
+                curvature_start: curvature_start as u16,
+                support,
             },
         );
         let node = Order2GraphWorkspace::push(tape, value, support, gradient, edge_start);

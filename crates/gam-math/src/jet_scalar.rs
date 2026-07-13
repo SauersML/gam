@@ -230,6 +230,38 @@ fn affine_composed_sum_default<T>(
     )
 }
 
+/// Maximum number of product-composition terms carried by the allocation-free
+/// fused lowering scratch. Row programs use only small fixed expressions; the
+/// bound keeps every fixed and graph backend stack-resident.
+pub(crate) const MAX_COMPOSED_PRODUCT_TERMS: usize = 8;
+
+fn multiply_add_affine_composed_sum_default<T>(
+    lefts: &[T],
+    rights: &[T],
+    addends: &[T],
+    input_scales: &[f64],
+    derivative_stacks: &[[f64; 5]],
+    constant: impl Fn(f64) -> T,
+    add: impl Fn(&T, &T) -> T,
+    multiply_add: impl Fn(&T, &T, &T) -> T,
+    affine_compose: impl Fn(&T, f64, f64, [f64; 5]) -> T,
+) -> T {
+    let terms = lefts.len();
+    assert_eq!(rights.len(), terms);
+    assert_eq!(addends.len(), terms);
+    assert_eq!(input_scales.len(), terms);
+    assert_eq!(derivative_stacks.len(), terms);
+    assert!(
+        terms <= MAX_COMPOSED_PRODUCT_TERMS,
+        "fused product-composition term capacity exceeded"
+    );
+    (0..terms).fold(constant(0.0), |sum, term| {
+        let inner = multiply_add(&lefts[term], &rights[term], &addends[term]);
+        let composed = affine_compose(&inner, input_scales[term], 0.0, derivative_stacks[term]);
+        add(&sum, &composed)
+    })
+}
+
 /// A truncated-Taylor scalar carrying derivatives in `K` primaries.
 ///
 /// All concrete scalars here ([`Order2`], [`OneSeed`], [`TwoSeed`]) and the full
@@ -341,6 +373,30 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
             crate::nested_dual::JetField::scale,
             Self::add_constant,
             crate::nested_dual::JetField::compose_unary,
+        )
+    }
+
+    /// Evaluate `Σ_i f_i(scale_i · (left_i · right_i + addend_i))` from the
+    /// certified derivative stack of each `f_i`. Backends may fuse the product,
+    /// affine map, and outer composition into one channel pass; the default is
+    /// the exact ordinary scalar program.
+    fn multiply_add_affine_composed_sum(
+        lefts: &[Self],
+        rights: &[Self],
+        addends: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+    ) -> Self {
+        multiply_add_affine_composed_sum_default(
+            lefts,
+            rights,
+            addends,
+            input_scales,
+            derivative_stacks,
+            Self::constant,
+            crate::nested_dual::JetField::add,
+            Self::multiply_add,
+            Self::affine_compose,
         )
     }
 
@@ -544,6 +600,32 @@ pub trait RuntimeJetScalar<'arena>: Clone {
             Self::compose_unary,
         )
     }
+
+    /// Runtime-dimension lowering of
+    /// `Σ_i f_i(scale_i · (left_i · right_i + addend_i))` from certified
+    /// derivative stacks. The semantic expression is shared; eager and graph
+    /// backends may eliminate the otherwise repeated Hessian passes.
+    fn multiply_add_affine_composed_sum(
+        lefts: &[Self],
+        rights: &[Self],
+        addends: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        workspace: &'arena Self::Workspace,
+    ) -> Self {
+        multiply_add_affine_composed_sum_default(
+            lefts,
+            rights,
+            addends,
+            input_scales,
+            derivative_stacks,
+            |value| Self::constant(value, dimension, workspace),
+            Self::add,
+            Self::multiply_add,
+            |input, scale, shift, stack| input.affine_compose(scale, shift, stack, workspace),
+        )
+    }
     /// Number of primary derivative axes carried by this scalar.
     fn dimension(&self) -> usize;
     /// Value channel.
@@ -706,6 +788,34 @@ impl<'arena> RuntimeJetScalar<'arena> for RuntimeValue {
         assert_eq!(inputs.len(), input_scales.len());
         assert_eq!(inputs.len(), derivative_stacks.len());
         assert!(inputs.iter().all(|input| input.dimension == dimension));
+        Self {
+            value: derivative_stacks.iter().map(|stack| stack[0]).sum(),
+            dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn multiply_add_affine_composed_sum(
+        lefts: &[Self],
+        rights: &[Self],
+        addends: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        let terms = lefts.len();
+        assert_eq!(rights.len(), terms);
+        assert_eq!(addends.len(), terms);
+        assert_eq!(input_scales.len(), terms);
+        assert_eq!(derivative_stacks.len(), terms);
+        assert!(
+            lefts
+                .iter()
+                .chain(rights)
+                .chain(addends)
+                .all(|input| input.dimension == dimension)
+        );
         Self {
             value: derivative_stacks.iter().map(|stack| stack[0]).sum(),
             dimension,
@@ -937,6 +1047,38 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
             unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
         Self {
             inner: S::affine_composed_sum(inner, input_scales, derivative_stacks),
+        }
+    }
+
+    #[inline(always)]
+    fn multiply_add_affine_composed_sum(
+        lefts: &[Self],
+        rights: &[Self],
+        addends: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        assert_eq!(dimension, K, "fixed jet dimension mismatch");
+        let terms = lefts.len();
+        assert_eq!(rights.len(), terms);
+        assert_eq!(addends.len(), terms);
+        // SAFETY: `FixedRuntimeJet<S, K>` is transparent over `S`; each cast
+        // preserves allocation, provenance, element count, alignment, and the
+        // shared lifetime, and no mutable reference is created.
+        let left_inner = unsafe { std::slice::from_raw_parts(lefts.as_ptr().cast::<S>(), terms) };
+        let right_inner = unsafe { std::slice::from_raw_parts(rights.as_ptr().cast::<S>(), terms) };
+        let addend_inner =
+            unsafe { std::slice::from_raw_parts(addends.as_ptr().cast::<S>(), terms) };
+        Self {
+            inner: S::multiply_add_affine_composed_sum(
+                left_inner,
+                right_inner,
+                addend_inner,
+                input_scales,
+                derivative_stacks,
+            ),
         }
     }
 
@@ -1466,6 +1608,78 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         for primary in 0..dimension {
             for other in primary + 1..dimension {
                 hessian[other * dimension + primary] = hessian[primary * dimension + other];
+            }
+        }
+        Self {
+            arena,
+            v: value,
+            g: gradient,
+            h: hessian,
+        }
+    }
+
+    #[inline(always)]
+    fn multiply_add_affine_composed_sum(
+        lefts: &[Self],
+        rights: &[Self],
+        addends: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
+        let terms = lefts.len();
+        assert_eq!(rights.len(), terms);
+        assert_eq!(addends.len(), terms);
+        assert_eq!(input_scales.len(), terms);
+        assert_eq!(derivative_stacks.len(), terms);
+        assert!(
+            terms <= MAX_COMPOSED_PRODUCT_TERMS,
+            "fused product-composition term capacity exceeded"
+        );
+        assert!(
+            lefts.iter().chain(rights).chain(addends).all(|input| {
+                input.dimension() == dimension && std::ptr::eq(input.arena, arena)
+            }),
+            "dynamic fused product-composition jets must share dimension and arena"
+        );
+        let term_gradients = arena.zeros(terms * dimension);
+        let firsts = arena.zeros(terms);
+        let seconds = arena.zeros(terms);
+        let gradient = arena.zeros(dimension);
+        let hessian = arena.zeros(dimension * dimension);
+        let mut value = 0.0;
+        for term in 0..terms {
+            let first = derivative_stacks[term][1] * input_scales[term];
+            let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
+            firsts[term] = first;
+            seconds[term] = second;
+            value += derivative_stacks[term][0];
+            for primary in 0..dimension {
+                let inner_gradient = lefts[term].v * rights[term].g[primary]
+                    + lefts[term].g[primary] * rights[term].v
+                    + addends[term].g[primary];
+                term_gradients[term * dimension + primary] = inner_gradient;
+                gradient[primary] += first * inner_gradient;
+            }
+        }
+        for primary in 0..dimension {
+            for other in primary..dimension {
+                let index = primary * dimension + other;
+                let mut channel = 0.0;
+                for term in 0..terms {
+                    let inner_hessian = lefts[term].v * rights[term].h[index]
+                        + lefts[term].g[primary] * rights[term].g[other]
+                        + lefts[term].g[other] * rights[term].g[primary]
+                        + lefts[term].h[index] * rights[term].v
+                        + addends[term].h[index];
+                    channel += firsts[term] * inner_hessian
+                        + seconds[term]
+                            * term_gradients[term * dimension + primary]
+                            * term_gradients[term * dimension + other];
+                }
+                hessian[index] = channel;
+                hessian[other * dimension + primary] = channel;
             }
         }
         Self {
@@ -3089,6 +3303,62 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
         for primary in 0..K {
             for other in primary + 1..K {
                 out.h[other][primary] = out.h[primary][other];
+            }
+        }
+        Order2(out)
+    }
+
+    #[inline(always)]
+    fn multiply_add_affine_composed_sum(
+        lefts: &[Self],
+        rights: &[Self],
+        addends: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+    ) -> Self {
+        let terms = lefts.len();
+        assert_eq!(rights.len(), terms);
+        assert_eq!(addends.len(), terms);
+        assert_eq!(input_scales.len(), terms);
+        assert_eq!(derivative_stacks.len(), terms);
+        assert!(
+            terms <= MAX_COMPOSED_PRODUCT_TERMS,
+            "fused product-composition term capacity exceeded"
+        );
+        let mut term_gradients = [[0.0; K]; MAX_COMPOSED_PRODUCT_TERMS];
+        let mut firsts = [0.0; MAX_COMPOSED_PRODUCT_TERMS];
+        let mut seconds = [0.0; MAX_COMPOSED_PRODUCT_TERMS];
+        let mut out = crate::jet_tower::Tower2::zero();
+        for term in 0..terms {
+            let first = derivative_stacks[term][1] * input_scales[term];
+            let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
+            firsts[term] = first;
+            seconds[term] = second;
+            out.v += derivative_stacks[term][0];
+            for primary in 0..K {
+                let inner_gradient = lefts[term].0.v * rights[term].0.g[primary]
+                    + lefts[term].0.g[primary] * rights[term].0.v
+                    + addends[term].0.g[primary];
+                term_gradients[term][primary] = inner_gradient;
+                out.g[primary] += first * inner_gradient;
+            }
+        }
+        for primary in 0..K {
+            for other in primary..K {
+                let mut channel = 0.0;
+                for term in 0..terms {
+                    let inner_hessian = lefts[term].0.v * rights[term].0.h[primary][other]
+                        + lefts[term].0.g[primary] * rights[term].0.g[other]
+                        + lefts[term].0.g[other] * rights[term].0.g[primary]
+                        + lefts[term].0.h[primary][other] * rights[term].0.v
+                        + addends[term].0.h[primary][other];
+                    channel += firsts[term] * inner_hessian
+                        + seconds[term]
+                            * term_gradients[term][primary]
+                            * term_gradients[term][other];
+                }
+                out.h[primary][other] = channel;
+                out.h[other][primary] = channel;
             }
         }
         Order2(out)
