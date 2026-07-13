@@ -567,12 +567,10 @@ fn target_dose_saturating_probe_secant_corrects_upward() {
     let t0 = 0.0;
     let (term, metric) = planted_circle(t0);
     let delta = 0.05_f64;
-    let unit = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("unit");
-    let unit_nats = unit.predicted_nats.expect("unit dose");
     let target = 0.5_f64; // nats, below the saturation ceiling K = 1.0
 
     // Saturating monotone KL: measured = K·(1 − exp(−quad/K)), ≈ quad for small
-    // quad, bounded by K. quad(a) = a²·unit_nats.
+    // quad, bounded by K.
     let k_sat = 1.0_f64;
     let mut probe = |plan: &SteerPlan| -> Result<AppliedDoseObservation, String> {
         let exact = plan.predicted_nats.expect("exact local dose");
