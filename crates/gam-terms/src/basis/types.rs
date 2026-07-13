@@ -278,8 +278,8 @@ pub enum BSplineEndpointBoundaryCondition {
     Free,
     /// Pin the first derivative to zero at this endpoint.
     Clamped,
-    /// Pin the value at this endpoint to `value` (currently only `value == 0`
-    /// is accepted in the builder; non-zero anchors require an affine offset).
+    /// Hermite pin: fix the endpoint value to `value` and its first derivative
+    /// to zero.
     Anchored { value: f64 },
 }
 

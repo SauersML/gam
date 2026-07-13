@@ -131,7 +131,7 @@ y ~ s(x, knots=10)          # 10 interior knots
 y ~ s(x, degree=3, penalty_order=2)
 y ~ s(x, type=ps)           # explicit P-spline
 y ~ s(x, double_penalty=true)
-y ~ s(x, bc_left=anchored, anchor_left=0)  # start at a known value only
+y ~ s(x, bc_left=anchored, anchor_left=0)  # known start value and zero start slope
 y ~ s(x, bc=clamped)        # zero slope at both endpoints
 ```
 
@@ -146,11 +146,11 @@ second-order difference penalty.
 | `penalty_order` | 2 | Derivative order penalised (1 = slope, 2 = curvature). |
 | `type` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`, `sphere`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the difference penalty. |
-| `bc` | `none` | Boundary condition for both endpoints: `none`, `clamped` (zero first derivative), or `anchored` (fixed value). Combine with `side=left`/`right` for half-open smooths. |
+| `bc` | `none` | Boundary condition for both endpoints: `none`, `clamped` (zero first derivative), or `anchored` (fixed value and zero first derivative). Combine with `side=left`/`right` for half-open smooths. |
 | `bc_left`, `bc_right` | inherit from `bc` | Per-endpoint overrides, with aliases `start_bc`/`end_bc`. |
 | `anchor`, `anchor_left`, `anchor_right` | `0` for anchored endpoints | Fixed endpoint value(s) when an endpoint uses `anchored`. |
 
-Boundary conditions are available for 1-D P-spline smooths. They are useful for trajectories with a known start or end: `bc_left=anchored, anchor_left=0` fixes only the left endpoint, while leaving the right endpoint open; `bc_right=clamped` forces a flat terminal slope.
+Boundary conditions are available for 1-D P-spline smooths. They are useful for trajectories with a known start or end: `bc_left=anchored, anchor_left=0` fixes the left endpoint value and slope while leaving the right endpoint open; `bc_right=clamped` forces a flat terminal slope.
 
 The 1-D B-spline path accepts these options plus `periodic`, `period`,
 `periods`, `period_start`, `period_end`, `origin`, `identifiability`.
@@ -174,14 +174,14 @@ and `knots` is an error.
 
 Boundary-condition values: `free`/`none`/`open`,
 `clamped`/`zero_derivative`, `anchored`/`zero`/`zero_value`. `clamped`
-forces zero first derivative at the endpoint; `anchored` pins the
-endpoint value (anchor defaults to 0, currently the only supported
-anchor value).
+forces zero first derivative at the endpoint; `anchored` is a Hermite pin that
+fixes both the endpoint value and its first derivative (anchor defaults to 0,
+currently the only supported anchor value).
 
 ```
 y ~ s(x, bc=clamped)                       # zero slope at both endpoints
 y ~ s(x, bc_left=clamped)                  # zero slope at the start, free at end
-y ~ s(x, bc_left=anchored, anchor_left=0)  # endpoint value pinned to 0
+y ~ s(x, bc_left=anchored, anchor_left=0)  # endpoint value 0 and slope 0
 y ~ s(x, start_bc=clamped, end_bc=anchored, anchor_right=0)
 ```
 

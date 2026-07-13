@@ -1773,6 +1773,51 @@ pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
         .map(|(value, _)| value)
 }
 
+/// Return the data log-kernel carried by a P-IRLS working state.
+///
+/// A profiled Gaussian has no physical dispersion until the outer REML
+/// objective resolves it from the penalized deviance. Its inner data kernel is
+/// therefore exactly `-D/2`, where `D` is the already-computed conventional
+/// Gaussian deviance (raw weighted RSS). Every likelihood whose scale is
+/// already resolved delegates to the strict eta-space likelihood oracle above.
+/// Keeping these surfaces separate prevents HMC and reporting callers from
+/// silently interpreting `ProfiledGaussian` as unit physical variance, while
+/// also avoiding a duplicate row pass in the Gaussian P-IRLS path.
+pub(crate) fn pirls_data_log_kernel_from_eta(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+    conventional_deviance: f64,
+) -> Result<f64, EstimationError> {
+    let resolved_scale = likelihood.resolved_scale().map_err(|error| {
+        EstimationError::InvalidInput(format!(
+            "{} P-IRLS data-log-kernel scale: {error}",
+            likelihood.spec.response.name()
+        ))
+    })?;
+    if matches!(
+        resolved_scale,
+        gam_problem::ResolvedLikelihoodScale::ProfiledGaussian
+    ) {
+        if !(conventional_deviance.is_finite() && conventional_deviance >= 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "profiled-Gaussian P-IRLS data log-kernel requires a finite non-negative conventional deviance, got {conventional_deviance}"
+            )));
+        }
+        Ok(-0.5 * conventional_deviance)
+    } else {
+        calculate_loglikelihood_omitting_constants_from_eta(
+            y,
+            eta,
+            likelihood,
+            inverse_link,
+            priorweights,
+        )
+    }
+}
+
 #[inline]
 pub(crate) fn log_gamma_stirling_correction(x: f64) -> f64 {
     let inv = 1.0 / x;

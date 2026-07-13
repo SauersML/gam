@@ -3038,7 +3038,7 @@ mod function_space_null_shrinkage_tests {
     }
 
     #[test]
-    fn one_sided_endpoint_constraint_keeps_surviving_null_recovery() {
+    fn one_sided_clamped_constraint_keeps_surviving_constant_null_recovery() {
         let data = Array1::linspace(0.0, 1.0, 32);
         let spec = BSplineBasisSpec {
             degree: 3,
@@ -3051,16 +3051,16 @@ mod function_space_null_shrinkage_tests {
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions {
-                left: BSplineEndpointBoundaryCondition::Anchored { value: 0.0 },
+                left: BSplineEndpointBoundaryCondition::Clamped,
                 right: BSplineEndpointBoundaryCondition::Free,
             },
         };
         let built = build_bspline_basis_1d(data.view(), &spec)
-            .expect("one-sided anchored double-penalty basis");
+            .expect("one-sided clamped double-penalty basis");
         assert_eq!(
             built.penalties.len(),
             2,
-            "the anchor removes the constant null direction but the linear direction must remain shrinkable"
+            "the slope constraint removes the linear null direction but the constant direction must remain shrinkable"
         );
         assert!(built.penaltyinfo.iter().any(|info| {
             info.active
@@ -3191,7 +3191,10 @@ mod anchor_offset_tests {
             .zip(base.iter())
             .map(|(&s, &b)| (s - 3.5 * b).abs())
             .fold(0.0_f64, f64::max);
-        assert!(max_dev < 1e-12, "offset must be linear in anchor: dev={max_dev}");
+        assert!(
+            max_dev < 1e-12,
+            "offset must be linear in anchor: dev={max_dev}"
+        );
 
         // A zero anchor is the ordinary homogeneous pin — no offset function.
         assert!(

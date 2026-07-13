@@ -1120,12 +1120,13 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             &self.link_kind,
             self.priorweights,
         )?;
-        let log_likelihood = calculate_loglikelihood_omitting_constants_from_eta(
+        let log_likelihood = pirls_data_log_kernel_from_eta(
             self.y,
             &self.workspace.eta_buf,
             &self.likelihood,
             &self.link_kind,
             self.priorweights,
+            deviance,
         )?;
 
         let mut penalty_term = self.penalty.shifted_quadratic(beta.as_ref());

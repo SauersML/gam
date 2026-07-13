@@ -750,9 +750,7 @@ fn atlas_nerve_from_sparse_route(
         }
     }
     let diagram =
-        gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(
-            &charts, &gates, None, None,
-        )?;
+        gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates, None, None)?;
     Ok(Some(AuditAtlasReport {
         chart_blocks,
         diagram,
@@ -785,9 +783,7 @@ fn atlas_nerve_dict<'py>(
         "orientation_holonomy",
         match diagram.certified_orientability() {
             Some(gam::terms::sae::manifold::AtlasOrientability::Orientable) => "orientable",
-            Some(gam::terms::sae::manifold::AtlasOrientability::NonOrientable) => {
-                "non_orientable"
-            }
+            Some(gam::terms::sae::manifold::AtlasOrientability::NonOrientable) => "non_orientable",
             None => "uncertified",
         },
     )?;
@@ -1298,9 +1294,7 @@ fn standing_sparse_null_calibration(
         nulls,
         roc,
     )?;
-    Ok(Some(nb::ClaimNullCalibration::from_calibrated_roc(
-        report,
-    )?))
+    Ok(Some(nb::ClaimNullCalibration::from_calibrated_roc(report)?))
 }
 
 /// Typed knob bundle for `audit_sae`, decoded from the single Python-side
@@ -1849,6 +1843,60 @@ mod sae_spectral_ffi_tests {
                 .is_some(),
             "missing key {key}"
         );
+    }
+
+    #[test]
+    fn atlas_nerve_uses_canonical_overlap_zero_without_fabricating_holonomy() {
+        let route = AuditSparseRoute::new(
+            ndarray::array![[0_u32, 1_u32], [0_u32, 1_u32]],
+            ndarray::array![
+                [[1.0_f32, 0.0_f32], [1.0_f32, 0.0_f32]],
+                [[0.0_f32, 1.0_f32], [0.0_f32, 1.0_f32]],
+            ],
+            2,
+            2,
+            "atlas test route",
+        )
+        .unwrap();
+        let report = atlas_nerve_from_sparse_route(&route, 0.0, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.diagram.edges.len(), 1);
+        assert_eq!(report.diagram.edges[0].overlap, 0);
+        assert!(report.diagram.edges[0].transfer_valid);
+        assert!(report.diagram.edges[0].admitted);
+        assert!(report.diagram.holonomy_certificate.is_none());
+        assert_eq!(report.diagram.certified_orientability(), None);
+
+        Python::attach(|py| {
+            let dict = atlas_nerve_dict(py, Some(&report), "unused").unwrap();
+            let orientation: String = dict
+                .get_item("orientation_holonomy")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(orientation, "uncertified");
+        });
+    }
+
+    #[test]
+    fn uncertifiable_chart_transfer_emits_no_gate() {
+        let route = AuditSparseRoute::new(
+            ndarray::array![[0_u32, 1_u32], [0_u32, 1_u32]],
+            ndarray::Array3::<f32>::ones((2, 2, 3)),
+            2,
+            3,
+            "atlas uncertified route",
+        )
+        .unwrap();
+        let report = atlas_nerve_from_sparse_route(&route, 0.0, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.diagram.edges.len(), 1);
+        assert_eq!(report.diagram.edges[0].overlap, 0);
+        assert!(!report.diagram.edges[0].transfer_valid);
+        assert!(!report.diagram.edges[0].admitted);
     }
 
     #[test]

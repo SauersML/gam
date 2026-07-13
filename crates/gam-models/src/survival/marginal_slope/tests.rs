@@ -135,12 +135,30 @@ fn base_time_block() -> TimeBlockInput {
     }
 }
 
+/// Endpoint evaluations whose average empirical function Gram is exactly
+/// `(2/3) I`.  Both endpoint charts span the two coefficient directions, so
+/// they exercise function-space shrinkage without the singular all-zero
+/// design that the production generalized eigensolve correctly rejects.
+fn full_span_time_endpoint_designs() -> (DesignMatrix, DesignMatrix) {
+    (
+        DesignMatrix::from(array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+        DesignMatrix::from(array![[1.0, 0.0], [0.0, 1.0], [1.0, -1.0]]),
+    )
+}
+
 #[test]
 fn time_nullspace_shrinkage_adds_precision_for_uncontrolled_time_direction() {
+    let (design_entry, design_exit) = full_span_time_endpoint_designs();
     let mut block = TimeBlockInput {
-        design_entry: DesignMatrix::from(Array2::zeros((3, 2))),
-        design_exit: DesignMatrix::from(Array2::zeros((3, 2))),
+        design_entry,
+        design_exit,
         design_derivative_exit: DesignMatrix::from(Array2::ones((3, 2))),
+        offset_entry: Array1::zeros(3),
+        offset_exit: Array1::zeros(3),
+        derivative_offset_exit: Array1::from_elem(
+            3,
+            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+        ),
         penalties: vec![array![[1.0, 0.0], [0.0, 0.0]]],
         nullspace_dims: vec![1],
         initial_beta: Some(Array1::zeros(2)),
@@ -154,16 +172,32 @@ fn time_nullspace_shrinkage_adds_precision_for_uncontrolled_time_direction() {
     );
     assert_eq!(block.penalties.len(), 2);
     assert_eq!(block.nullspace_dims, vec![1, 0]);
-    assert!((block.penalties[1][[0, 0]]).abs() <= 1e-12);
-    assert!((block.penalties[1][[1, 1]] - 1.0).abs() <= 1e-12);
+    let expected = array![[0.0, 0.0], [0.0, 2.0 / 3.0]];
+    for i in 0..2 {
+        for j in 0..2 {
+            assert_close(
+                block.penalties[1][[i, j]],
+                expected[[i, j]],
+                1e-12,
+                &format!("time nullspace function-metric ridge ({i},{j})"),
+            );
+        }
+    }
 }
 
 #[test]
 fn time_nullspace_shrinkage_is_noop_for_full_rank_time_penalty() {
+    let (design_entry, design_exit) = full_span_time_endpoint_designs();
     let mut block = TimeBlockInput {
-        design_entry: DesignMatrix::from(Array2::zeros((3, 2))),
-        design_exit: DesignMatrix::from(Array2::zeros((3, 2))),
+        design_entry,
+        design_exit,
         design_derivative_exit: DesignMatrix::from(Array2::ones((3, 2))),
+        offset_entry: Array1::zeros(3),
+        offset_exit: Array1::zeros(3),
+        derivative_offset_exit: Array1::from_elem(
+            3,
+            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+        ),
         penalties: vec![Array2::<f64>::eye(2)],
         nullspace_dims: vec![0],
         initial_beta: Some(Array1::zeros(2)),

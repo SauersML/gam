@@ -17,7 +17,8 @@ use super::{
     solve_sparse_spd,
 };
 use super::{
-    calculate_loglikelihood_omitting_constants_from_eta, computeworkingweight_derivatives_from_eta,
+    calculate_deviance_from_eta, computeworkingweight_derivatives_from_eta,
+    pirls_data_log_kernel_from_eta,
 };
 use crate::estimate::EstimationError;
 use faer::sparse::SparseColMat;
@@ -100,12 +101,20 @@ impl GaussianFrozenRows {
                 &eta_owned,
                 weights,
             )?;
-        let log_likelihood = calculate_loglikelihood_omitting_constants_from_eta(
+        let deviance = calculate_deviance_from_eta(
+            y.view(),
+            &eta_owned,
+            likelihood,
+            inverse_link,
+            weights.view(),
+        )?;
+        let log_likelihood = pirls_data_log_kernel_from_eta(
             y,
             &eta_owned,
             likelihood,
             inverse_link,
             weights,
+            deviance,
         )?;
         let max_abs_eta = inf_norm(eta_owned.iter().copied());
         Ok(Self {

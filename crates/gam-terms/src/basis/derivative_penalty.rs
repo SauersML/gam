@@ -706,11 +706,34 @@ mod tests {
                     derivative_factor.powi(2) * width.powi((2 * residual_degree + 1) as i32)
                         / (2 * residual_degree + 1) as f64
                 };
-                let relative_error = (observed - expected).abs() / expected.abs().max(1.0);
-                assert!(
-                    relative_error < 2e-10,
-                    "I-spline degree={value_degree}, order={order}, polynomial degree={polynomial_degree}: expected {expected}, observed {observed}, relative error {relative_error}"
-                );
+                if expected == 0.0 {
+                    // This is a cancellation test, not an absolute-value test:
+                    // the derivative Gram can be large on narrowly separated
+                    // knots even though the represented polynomial is in its
+                    // exact null space. Use the same source-quadratic backward-
+                    // error envelope as generalized null classification.
+                    let penalty_scale = built
+                        .roughness
+                        .rows()
+                        .into_iter()
+                        .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
+                        .fold(0.0_f64, f64::max);
+                    let backward_error = default_rrqr_rank_alpha()
+                        * f64::EPSILON
+                        * built.roughness.nrows().max(1) as f64
+                        * penalty_scale
+                        * alpha.dot(&alpha);
+                    assert!(
+                        observed.abs() <= backward_error,
+                        "I-spline degree={value_degree}, order={order}, polynomial degree={polynomial_degree}: expected exact zero, observed {observed}, backward-error envelope {backward_error}"
+                    );
+                } else {
+                    let relative_error = (observed - expected).abs() / expected.abs();
+                    assert!(
+                        relative_error < 2e-10,
+                        "I-spline degree={value_degree}, order={order}, polynomial degree={polynomial_degree}: expected {expected}, observed {observed}, relative error {relative_error}"
+                    );
+                }
             }
         }
     }

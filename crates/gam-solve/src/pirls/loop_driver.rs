@@ -40,10 +40,10 @@ use super::{
     // edf helpers
     calculate_edf_with_penalty,
     calculate_edfwithworkspace_with_penalty,
-    calculate_loglikelihood_omitting_constants_from_eta,
     compute_constraint_kkt_diagnostics,
     computeworkingweight_derivatives_from_eta,
     inf_norm,
+    pirls_data_log_kernel_from_eta,
     runworking_model_pirls,
     should_use_sparse_native_pirls,
     solve_penalized_least_squares_implicit,
@@ -1264,18 +1264,20 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             let weighted_rss = (cache.centered_weighted_y_sq - 2.0 * qbeta.dot(&cache.xtwy_orig)
                 + qbeta.dot(&cache.xtwx_orig.dot(&qbeta)))
             .max(0.0);
-            let phi = match resolved_likelihood_scale {
-                // Profiled Gaussian deliberately leaves the row geometry
-                // scale-free; the residual variance is profiled after fitting.
-                ResolvedLikelihoodScale::ProfiledGaussian => 1.0,
-                ResolvedLikelihoodScale::FixedGaussian { phi } => phi.value(),
+            match resolved_likelihood_scale {
+                ResolvedLikelihoodScale::ProfiledGaussian
+                | ResolvedLikelihoodScale::FixedGaussian { .. } => {}
                 other => {
                     return Err(EstimationError::InvalidInput(format!(
                         "Gaussian identity cache received non-Gaussian resolved scale {other:?}"
                     )));
                 }
-            };
-            let deviance = weighted_rss / phi;
+            }
+            // Conventional Gaussian deviance is raw weighted RSS for both a
+            // profiled and a fixed dispersion. Scale enters the fixed
+            // likelihood kernel and working curvature, never this reporting
+            // statistic.
+            let deviance = weighted_rss;
 
             if let Some(bundle) = cache.frozen_rows.as_ref() {
                 // Zero length-`n` touches: every row array is an O(1) Arc clone
@@ -1313,12 +1315,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                         &final_eta,
                         priorweights_owned.view(),
                     )?;
-                let log_likelihood = calculate_loglikelihood_omitting_constants_from_eta(
+                let log_likelihood = pirls_data_log_kernel_from_eta(
                     y,
                     &final_eta,
                     likelihood,
                     &config.link_kind,
                     priorweights,
+                    deviance,
                 )?;
                 let max_abs_eta = inf_norm(finalmu.iter().copied());
                 ZeroIterRows {
@@ -1365,12 +1368,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 &config.link_kind,
                 priorweights,
             )?;
-            let log_likelihood = calculate_loglikelihood_omitting_constants_from_eta(
+            let log_likelihood = pirls_data_log_kernel_from_eta(
                 y,
                 &final_eta,
                 likelihood,
                 &config.link_kind,
                 priorweights,
+                deviance,
             )?;
             let max_abs_eta = inf_norm(finalmu.iter().copied());
             let (c, d, dmu_deta, d2mu_deta2, d3mu_deta3) =
