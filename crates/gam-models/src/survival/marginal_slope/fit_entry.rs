@@ -2342,13 +2342,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 BlockDesignCoords::RematerializedRaw,
             )?;
             let fit = match provenance {
-                SpatialFitProvenance::NoOuterOptimization => {
-                    inner_fit(&family, &blocks, options)?
-                }
+                SpatialFitProvenance::NoOuterOptimization => inner_fit(&family, &blocks, options)?,
                 SpatialFitProvenance::Certified { outer, mode } => {
-                    inner_fit_from_certified_outer(
-                        &family, &blocks, options, mode, theta, outer,
-                    )?
+                    inner_fit_from_certified_outer(&family, &blocks, options, mode, theta, outer)?
                 }
             };
             let mut hints_mut = hints.borrow_mut();
@@ -2484,7 +2480,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             {
                 return Err(
                     "exact survival marginal-slope joint objective did not return an outer Hessian"
-                    .to_string(),
+                        .to_string(),
                 );
             }
             Ok(ExactJointEvaluation {

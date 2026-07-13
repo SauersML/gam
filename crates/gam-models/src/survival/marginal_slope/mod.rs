@@ -28,8 +28,7 @@ pub(crate) use crate::custom_family::{
     evaluate_custom_family_joint_hyper_efs_owned_shared,
     evaluate_custom_family_joint_hyper_owned_shared, fit_custom_family,
     fit_custom_family_fixed_log_lambda_warm_start,
-    fit_custom_family_fixed_log_lambdas_from_owned_mode,
-    joint_hyper_options_for_outer_tolerance,
+    fit_custom_family_fixed_log_lambdas_from_owned_mode, joint_hyper_options_for_outer_tolerance,
 };
 pub(crate) use gam_problem::{
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
@@ -40,9 +39,9 @@ pub(crate) use crate::model_types::UnifiedFitResult;
 pub(crate) use gam_linalg::faer_ndarray::{FaerCholesky, fast_atv, fast_av, fast_xt_diag_x};
 
 pub(crate) use crate::bms::{
-    CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime,
-    LatentZNormalization, LatentZPolicy, MarginalSlopeCovariance, MarginalSlopeCovarianceRef,
-    ParametricAnchorBlock, marginal_slope_covariance_from_scores, marginal_slope_preserving_scale,
+    CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime, LatentZNormalization,
+    LatentZPolicy, MarginalSlopeCovariance, MarginalSlopeCovarianceRef, ParametricAnchorBlock,
+    marginal_slope_covariance_from_scores, marginal_slope_preserving_scale,
     marginal_slope_probit_eta, padded_deviation_seed,
 };
 
@@ -63,7 +62,7 @@ pub(crate) use crate::marginal_slope_shared::{
     ObservedDenestedCellPartials, add_optional_matrix, add_optional_vector,
     add_two_surface_psi_outer, build_denested_partition_cells as shared_denested_partition_cells,
     chunked_row_reduction, eval_coeff4_at, first_parameter_directional_order2_terms,
-    first_parameter_order2_terms, is_sigma_aux_index as shared_is_sigma_aux_index,
+    first_parameter_order2_terms,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
     outer_row_weights_by_index, outer_weighted_rows, parameter_block_specs_match_rows,
     probit_frailty_scale, psi_derivative_location, scale_coeff4, second_parameter_order2_terms,
@@ -156,8 +155,8 @@ mod spec;
 mod timepoint_exact;
 mod timewiggle_geometry;
 
-pub use block_jacobians::*;
 pub use alo_replay::*;
+pub use block_jacobians::*;
 pub(crate) use block_layout::*;
 pub use error::*;
 pub(crate) use family::*;

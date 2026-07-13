@@ -159,6 +159,7 @@ impl FrailtySpec {
     /// the `String`-returning entry point above is preserved as a one-line
     /// shim for external callers.
     pub fn validate_for_marginal_slope_typed(&self) -> Result<(), LognormalKernelError> {
+        self.validate()?;
         match self {
             Self::None | Self::GaussianShift { .. } => Ok(()),
             Self::HazardMultiplier { .. } => Err(LognormalKernelError::InvalidSpec {

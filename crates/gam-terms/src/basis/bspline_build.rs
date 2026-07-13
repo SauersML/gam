@@ -2822,10 +2822,12 @@ pub fn function_space_nullspace_shrinkage(
 ///
 ///   `N = null(S_c)`,  `W = R_c N (= G_c N)`,  `ridge = W (NᵀW)⁻¹ Wᵀ`.
 ///
-/// Null classification is itself generalized, using the strictly-positive
-/// metric `H=S_c+R_c`. This avoids reintroducing a coefficient-scale-dependent
-/// ordinary eigenvalue cutoff during a later chart change. Returns `Ok(None)`
-/// when the constrained primary has no null space.
+/// The structural null space is revealed from the authoritative energy factor
+/// `A_c` (`S_c=A_cᵀA_c`) with rank-revealing QR, rather than recovered from
+/// signed eigenvalues of the rounded dense Gram.  This avoids squaring the
+/// factor's condition number and makes negative-curvature classification
+/// impossible by construction (#2318). Returns `Ok(None)` when the constrained
+/// primary has no null space.
 pub(crate) fn rebuild_metric_consistent_ridge(
     primary_constrained: &ConstructiveQuadratic,
     ridge_constrained: &ConstructiveQuadratic,
@@ -3296,44 +3298,50 @@ mod function_space_null_shrinkage_tests {
 
     #[test]
     fn metric_ridge_rebuild_adjudicates_whitening_amplified_roundoff_2318() {
-        // A data-dependent identifiability congruence preserves PSD in exact
-        // arithmetic, but forming Mᵀ S M can leave a working-precision negative
-        // residue in a structural null direction.  Relative to the source
-        // penalty below, -1e-14 is inside the standard matrix-product backward
-        // error envelope.  Relative to the nearly singular function metric,
-        // however, Cholesky whitening magnifies it into the generalized
-        // eigenvalue -1e-14 / (1e-12 - 1e-14) ≈ -1.01e-2.  The 0.1.253
-        // classifier compared that amplified value to an eigensolver tolerance
-        // and falsely rejected otherwise ordinary fold-specific smooths.
-        let primary = array![[-1.0e-14, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0]];
-        let ridge = array![[1.0e-12, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
-        let amplified_negative = primary[[0, 0]] / (primary[[0, 0]] + ridge[[0, 0]]);
+        // This is the rounded dense artifact that triggered #2318.  A tiny
+        // negative residue in a structural null direction is magnified by an
+        // ill-scaled metric into a macroscopically negative generalized value.
+        // It is deliberately *not* admitted as a PenaltyCandidate: the actual
+        // construction below retains A for S=AᵀA through every chart change.
+        let poisoned_dense =
+            array![[-1.0e-14, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0]];
+        let ridge_dense =
+            array![[1.0e-12, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        let amplified_negative =
+            poisoned_dense[[0, 0]] / (poisoned_dense[[0, 0]] + ridge_dense[[0, 0]]);
         assert!(
             amplified_negative < -1.0e-3,
             "fixture must be decisively negative after whitening"
         );
 
+        let primary = ConstructiveQuadratic::from_energy_factor(
+            array![[0.0, 1.0, 0.0], [0.0, 0.0, 2.0_f64.sqrt()]],
+            "#2318 constructive primary",
+        )
+        .expect("finite primary factor");
+        let ridge = ConstructiveQuadratic::from_energy_factor(
+            array![[1.0e-6, 0.0, 0.0]],
+            "#2318 constructive null ridge",
+        )
+        .expect("finite ridge factor");
         let rebuilt = rebuild_metric_consistent_ridge(&primary, &ridge)
-            .expect("source-frame roundoff must not invalidate a PSD construction")
+            .expect("constructive PSD provenance must survive the ill-scaled metric")
             .expect("the structural null direction must survive");
         assert!(rebuilt.iter().all(|value| value.is_finite()));
         assert!(
-            max_abs_difference(&rebuilt, &ridge) < 1.0e-20,
-            "metric ridge changed after source-frame adjudication:\nactual={rebuilt:?}\nexpected={ridge:?}"
+            max_abs_difference(rebuilt.dense(), ridge.dense()) < 1.0e-20,
+            "metric ridge changed after constructive rebuild:\nactual={rebuilt:?}\nexpected={ridge:?}"
         );
 
-        // This is an adjudication of construction roundoff, not a PSD repair or
-        // fallback.  A negative source quadratic outside its backward-error
-        // envelope remains a hard typed error even when S + R is SPD.
+        // The checked legacy bridge remains strict: material negative curvature
+        // is a typed error, not repaired or hidden by a stabilizing ridge.
         let indefinite = array![[-1.0e-8, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0]];
-        let stabilizing_ridge = array![[1.0e-6, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
-        let error = rebuild_metric_consistent_ridge(&indefinite, &stabilizing_ridge)
-            .expect_err("materially indefinite source penalty must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("generalized penalty is not positive semidefinite")
-        );
+        let error = ConstructiveQuadratic::try_from_dense_psd(
+            indefinite,
+            "#2318 materially indefinite legacy penalty",
+        )
+        .expect_err("materially indefinite source penalty must be rejected");
+        assert!(matches!(error, BasisError::IndefinitePenalty { .. }));
     }
 
     #[test]
@@ -3377,16 +3385,33 @@ mod function_space_null_shrinkage_tests {
         let ridge = function_space_nullspace_shrinkage(&penalty, &gram)
             .expect("raw ridge")
             .expect("raw null space");
+        let raw_primary = ConstructiveQuadratic::from_energy_factor(
+            array![[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 2.0_f64.sqrt()]],
+            "test raw primary",
+        )
+        .expect("finite primary factor");
+        let raw_ridge = ConstructiveQuadratic::try_from_dense_psd(ridge, "test raw ridge")
+            .expect("PSD function-space ridge");
         let penalty_t = congruence(&penalty, &transform);
         let gram_t = congruence(&gram, &transform);
-        let restricted_ridge = congruence(&ridge, &transform);
-        let rebuilt = rebuild_metric_consistent_ridge(&penalty_t, &restricted_ridge)
+        let restricted_primary = ConstructiveQuadratic::from_energy_factor(
+            raw_primary.factor().dot(&transform),
+            "test restricted primary",
+        )
+        .expect("finite restricted primary factor");
+        let restricted_ridge = ConstructiveQuadratic::from_energy_factor(
+            raw_ridge.factor().dot(&transform),
+            "test restricted ridge",
+        )
+        .expect("finite restricted ridge factor");
+        assert!(max_abs_difference(restricted_primary.dense(), &penalty_t) < 2.0e-15);
+        let rebuilt = rebuild_metric_consistent_ridge(&restricted_primary, &restricted_ridge)
             .expect("metric rebuild")
             .expect("surviving null direction");
         let direct = function_space_nullspace_shrinkage(&penalty_t, &gram_t)
             .expect("direct constrained ridge")
             .expect("surviving null direction");
-        assert!(max_abs_difference(&rebuilt, &direct) < 2.0e-10);
+        assert!(max_abs_difference(rebuilt.dense(), &direct) < 2.0e-10);
     }
 
     #[test]

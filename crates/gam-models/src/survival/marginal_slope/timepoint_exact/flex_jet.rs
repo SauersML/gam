@@ -80,9 +80,7 @@ pub(crate) struct FlexTimepointBidirectionalPack {
     pub(crate) d_uv_uv: Vec<f64>,
 }
 
-pub(crate) fn pack_flex_timepoint_base(
-    base: &SurvivalFlexTimepointExact,
-) -> FlexTimepointBasePack {
+pub(crate) fn pack_flex_timepoint_base(base: &SurvivalFlexTimepointExact) -> FlexTimepointBasePack {
     FlexTimepointBasePack {
         eta: base.eta,
         chi: base.chi,
@@ -4107,8 +4105,7 @@ mod moment_engine_tests {
         let primary = flex_primary_slices(&family);
         let row = 5usize;
         let g = 0.21_f64;
-        let q1 = family.offset_exit[row]
-            + family.marginal_design.to_dense()[[row, 0]] * 0.15;
+        let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * 0.15;
         let a1 = family
             .solve_row_survival_intercept_with_slot(
                 q1,
@@ -4122,26 +4119,13 @@ mod moment_engine_tests {
         let cached = family
             .build_cached_partition(&primary, a1, g, None, None)
             .expect("cached partition");
-        let dir = Array1::from_iter(
-            (0..primary.total).map(|axis| 0.1 + 0.03 * axis as f64),
-        );
+        let dir = Array1::from_iter((0..primary.total).map(|axis| 0.1 + 0.03 * axis as f64));
 
         let run = || {
             with_flex_third_jet_arena(|arena| {
                 family
                     .compute_survival_timepoint_directional_jet_from_cached(
-                        row,
-                        &primary,
-                        q1,
-                        primary.q1,
-                        a1,
-                        g,
-                        None,
-                        None,
-                        0.0,
-                        &cached,
-                        &dir,
-                        arena,
+                        row, &primary, q1, primary.q1, a1, g, None, None, 0.0, &cached, &dir, arena,
                     )
                     .expect("production third-order timepoint")
             })

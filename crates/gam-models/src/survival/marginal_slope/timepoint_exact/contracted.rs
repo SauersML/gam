@@ -4,10 +4,10 @@
 //! primary-space NLL Hessian on top of the exact timepoint evaluations, and
 //! routes the general entry points to the model-selected flex or rigid path.
 
-use super::*;
 use super::flex_jet::{
     FlexTimepointBasePack, FlexTimepointDirectionalPack, pack_flex_timepoint_base,
 };
+use super::*;
 
 /// Direction-independent geometry shared by the single-direction fused Jet3
 /// route and the build-once all-axis route.

@@ -894,6 +894,10 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     penalty
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&omega);
+    let raw_primary = ConstructiveQuadratic::try_from_dense_psd(
+        penalty,
+        "periodic Duchon raw primary penalty",
+    )?;
     let base_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(basis));
     let identifiability_transform = spatial_identifiability_transform_from_design_matrix(
         data,
@@ -903,12 +907,16 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     )?;
     let (design, primary) = if let Some(transform) = identifiability_transform.as_ref() {
         let design = wrap_dense_design_with_transform(base_design, transform, "periodic Duchon")?;
-        let transformed = fast_ab(&fast_atb(transform, &penalty), transform);
+        let gauge = gam_problem::Gauge::from_block_transforms(&[transform.clone()]);
+        let transformed = raw_primary.restricted(
+            &gauge,
+            "periodic Duchon identified primary penalty",
+        )?;
         (design, transformed)
     } else {
-        (base_design, penalty)
+        (base_design, raw_primary)
     };
-    let candidates = vec![normalize_penalty_candidate(
+    let candidates = vec![normalize_constructive_penalty_candidate(
         primary,
         PenaltySource::Primary,
     )?];
@@ -1112,6 +1120,10 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
     penalty
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&omega);
+    let raw_primary = ConstructiveQuadratic::try_from_dense_psd(
+        penalty,
+        "mixed-periodicity Duchon raw primary penalty",
+    )?;
 
     let base_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(basis));
     let identifiability_transform = spatial_identifiability_transform_from_design_matrix(
@@ -1123,12 +1135,16 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
     let (design, primary) = if let Some(transform) = identifiability_transform.as_ref() {
         let design =
             wrap_dense_design_with_transform(base_design, transform, "mixed-periodicity Duchon")?;
-        let transformed = fast_ab(&fast_atb(transform, &penalty), transform);
+        let gauge = gam_problem::Gauge::from_block_transforms(&[transform.clone()]);
+        let transformed = raw_primary.restricted(
+            &gauge,
+            "mixed-periodicity Duchon identified primary penalty",
+        )?;
         (design, transformed)
     } else {
-        (base_design, penalty)
+        (base_design, raw_primary)
     };
-    let candidates = vec![normalize_penalty_candidate(
+    let candidates = vec![normalize_constructive_penalty_candidate(
         primary,
         PenaltySource::Primary,
     )?];

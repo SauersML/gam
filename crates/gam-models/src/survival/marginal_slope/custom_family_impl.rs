@@ -680,81 +680,136 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        if self.is_sigma_aux_index(derivative_blocks, psi_index) {
-            return self.sigma_exact_joint_psi_terms(block_states, specs);
+        match hyper_layout.axis(psi_index) {
+            Some(crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. }) => self
+                .psi_terms(
+                    block_states,
+                    hyper_layout.design_derivative_blocks(),
+                    psi_index,
+                ),
+            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 }) => {
+                self.sigma_exact_joint_psi_terms(block_states, specs)
+            }
+            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }) => {
+                Err(format!(
+                    "SurvivalMarginalSlopeFamily does not declare family hyper axis {family_axis}"
+                ))
+            }
+            None => Err(format!(
+                "SurvivalMarginalSlopeFamily hyper axis {psi_index} is out of range for {} axes",
+                hyper_layout.len()
+            )),
         }
-        self.psi_terms(block_states, derivative_blocks, psi_index)
     }
 
     fn exact_newton_joint_psisecond_order_terms(
         &self,
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        if self.is_sigma_aux_index(derivative_blocks, psi_i)
-            || self.is_sigma_aux_index(derivative_blocks, psi_j)
-        {
-            if psi_i == psi_j {
-                return self.sigma_exact_joint_psisecond_order_terms(block_states);
+        let axis_i = hyper_layout.axis(psi_i).ok_or_else(|| {
+            format!(
+                "SurvivalMarginalSlopeFamily hyper axis {psi_i} is out of range for {} axes",
+                hyper_layout.len()
+            )
+        })?;
+        let axis_j = hyper_layout.axis(psi_j).ok_or_else(|| {
+            format!(
+                "SurvivalMarginalSlopeFamily hyper axis {psi_j} is out of range for {} axes",
+                hyper_layout.len()
+            )
+        })?;
+        match (axis_i, axis_j) {
+            (
+                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
+                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
+            ) => self.psi_second_order_terms(
+                block_states,
+                hyper_layout.design_derivative_blocks(),
+                psi_i,
+                psi_j,
+            ),
+            (
+                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
+                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
+            ) => self.sigma_exact_joint_psisecond_order_terms(block_states),
+            (
+                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
+                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
+            )
+            | (
+                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
+                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
+            ) => Ok(None),
+            (crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }, _)
+            | (_, crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }) => {
+                Err(format!(
+                    "SurvivalMarginalSlopeFamily does not declare family hyper axis {family_axis}"
+                ))
             }
-            return Ok(None);
         }
-        self.psi_second_order_terms(block_states, derivative_blocks, psi_i, psi_j)
     }
 
     fn exact_newton_joint_psihessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.is_sigma_aux_index(derivative_blocks, psi_index) {
-            return self
-                .sigma_exact_joint_psihessian_directional_derivative(block_states, d_beta_flat);
+        match hyper_layout.axis(psi_index) {
+            Some(crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. }) => self
+                .psi_hessian_directional_derivative(
+                    block_states,
+                    hyper_layout.design_derivative_blocks(),
+                    psi_index,
+                    d_beta_flat,
+                ),
+            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 }) => {
+                self.sigma_exact_joint_psihessian_directional_derivative(block_states, d_beta_flat)
+            }
+            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }) => {
+                Err(format!(
+                    "SurvivalMarginalSlopeFamily does not declare family hyper axis {family_axis}"
+                ))
+            }
+            None => Err(format!(
+                "SurvivalMarginalSlopeFamily hyper axis {psi_index} is out of range for {} axes",
+                hyper_layout.len()
+            )),
         }
-        self.psi_hessian_directional_derivative(
-            block_states,
-            derivative_blocks,
-            psi_index,
-            d_beta_flat,
-        )
     }
 
     fn exact_newton_joint_psi_workspace(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         if self.per_z_logslope_active() {
             return Ok(None);
         }
-        Ok(Some(Arc::new(
-            crate::marginal_slope_shared::MarginalSlopeExactNewtonPsiWorkspace::new(
-                SurvivalMarginalSlopePsiWorkspace::new(
-                    self.clone(),
-                    block_states.to_vec(),
-                    specs.to_vec(),
-                    derivative_blocks.to_vec(),
-                    BlockwiseFitOptions::default(),
-                )?,
-            ),
-        )))
+        Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            specs.to_vec(),
+            hyper_layout.clone(),
+            BlockwiseFitOptions::default(),
+        )?)))
     }
 
     fn exact_newton_joint_psi_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         let owned;
@@ -766,17 +821,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             }
             None => options,
         };
-        Ok(Some(Arc::new(
-            crate::marginal_slope_shared::MarginalSlopeExactNewtonPsiWorkspace::new(
-                SurvivalMarginalSlopePsiWorkspace::new(
-                    self.clone(),
-                    block_states.to_vec(),
-                    specs.to_vec(),
-                    derivative_blocks.to_vec(),
-                    options.clone(),
-                )?,
-            ),
-        )))
+        Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            specs.to_vec(),
+            hyper_layout.clone(),
+            options.clone(),
+        )?)))
     }
 
     fn block_linear_constraints(

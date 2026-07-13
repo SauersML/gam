@@ -3575,16 +3575,38 @@ pub(crate) fn normalize_penalty_candidate(
     matrix: Array2<f64>,
     source: PenaltySource,
 ) -> Result<PenaltyCandidate, BasisError> {
+    let matrix = ConstructiveQuadratic::try_from_dense_psd(
+        matrix,
+        "function penalty candidate before normalization",
+    )?;
+    normalize_constructive_penalty_candidate(matrix, source)
+}
+
+/// Normalize a witnessed PSD quadratic without discarding its energy factor.
+///
+/// In particular, callers that have already restricted `A` as `A M` must not
+/// materialize and re-factor `MᵀAᵀAM`: that would recreate the rounded dense
+/// congruence boundary that caused #2318.
+pub(crate) fn normalize_constructive_penalty_candidate(
+    matrix: ConstructiveQuadratic,
+    source: PenaltySource,
+) -> Result<PenaltyCandidate, BasisError> {
     let (matrix, normalization_scale) = if matrix.iter().all(|v| v.abs() <= 1e-12) {
         (matrix, 1.0)
     } else {
-        normalize_penalty(&matrix)
+        let norm = matrix
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt()
+            .max(1e-12);
+        (
+            matrix.scaled(1.0 / norm, "normalized constructive function penalty")?,
+            norm,
+        )
     };
     Ok(PenaltyCandidate {
-        matrix: ConstructiveQuadratic::try_from_dense_psd(
-            matrix,
-            "normalized function penalty candidate",
-        )?,
+        matrix,
         source,
         normalization_scale,
         kronecker_factors: None,

@@ -91,14 +91,6 @@ impl SurvivalMarginalSlopeFamily {
         .map(|opt| opt.unwrap_or(0.0))
     }
 
-    pub(crate) fn is_sigma_aux_index(
-        &self,
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
-    ) -> bool {
-        shared_is_sigma_aux_index(self.gaussian_frailty_sd, derivative_blocks, psi_index)
-    }
-
     fn sigma_scale_derivatives(
         &self,
     ) -> Result<crate::survival::lognormal_kernel::ProbitFrailtyScaleJet, String> {

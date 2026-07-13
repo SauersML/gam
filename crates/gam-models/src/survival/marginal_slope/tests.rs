@@ -6333,7 +6333,6 @@ fn flex_production_fourth_contraction_matches_scalar_fd_witness() {
                     );
                 }
             }
-
         }
     }
 }

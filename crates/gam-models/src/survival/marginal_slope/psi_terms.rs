@@ -460,12 +460,6 @@ impl SurvivalMarginalSlopeFamily {
         if self.effective_flex_active(block_states)? || self.flex_timewiggle_active() {
             return Ok(None);
         }
-        for &psi_index in psi_indices {
-            if self.is_sigma_aux_index(derivative_blocks, psi_index) {
-                return Ok(None);
-            }
-        }
-
         let k = psi_indices.len();
         if k == 0 {
             return Ok(Some(Vec::new()));
