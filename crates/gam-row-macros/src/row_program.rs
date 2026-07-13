@@ -1045,6 +1045,7 @@ struct SymbolicSchedule {
     result: SymbolicJet,
     result_preludes: Vec<String>,
     mutable_support: HashMap<String, SymbolicSupport>,
+    assigned: HashSet<String>,
     witness_values: Vec<String>,
 }
 
@@ -1080,6 +1081,7 @@ fn symbolic_schedule(
         );
     }
     let mut mutable_support = HashMap::<String, SymbolicSupport>::new();
+    let mut assigned = HashSet::new();
     let mut symbolic_statements = Vec::new();
     // One source-wide namespace makes temporary declarations collision-free,
     // including repeated assignments to the same mutable local in one scope.
@@ -1124,6 +1126,7 @@ fn symbolic_schedule(
             } => {
                 let mut symbolic_assignments = Vec::new();
                 for (target_name, value) in assignments {
+                    assigned.insert(target_name.to_string());
                     let mut preludes = Vec::new();
                     let value = symbolic_expression(
                         value,
@@ -1185,7 +1188,165 @@ fn symbolic_schedule(
         result,
         result_preludes,
         mutable_support,
+        assigned,
         witness_values,
+    })
+}
+
+fn rust_order2_body(
+    primaries: &[Ident],
+    constants: &HashSet<String>,
+    leaves: &[Leaf],
+    statements: &[Statement],
+    result: &ProgramExpr,
+    witnesses: &[Ident],
+) -> Result<syn::Block> {
+    let dimension = primaries.len();
+    let schedule = symbolic_schedule(
+        primaries,
+        constants,
+        leaves,
+        statements,
+        result,
+        witnesses,
+        SymbolicTarget::Rust,
+    )?;
+    let mut source = "{\n".to_string();
+    for statement in &schedule.statements {
+        match statement {
+            SymbolicStatement::Local(local) => {
+                push_preludes(&mut source, &local.preludes, "    ");
+                let mutable = if schedule.assigned.contains(&local.name) {
+                    "mut "
+                } else {
+                    ""
+                };
+                let support = if local.mutable {
+                    schedule
+                        .mutable_support
+                        .get(&local.name)
+                        .expect("mutable symbolic support exists")
+                        .clone()
+                } else {
+                    local.value.support()
+                };
+                source.push_str(&format!(
+                    "    let {mutable}{}_v: f64 = {};\n",
+                    local.name, local.value.value
+                ));
+                for axis in 0..dimension {
+                    if support.gradient[axis] {
+                        source.push_str(&format!(
+                            "    let {mutable}{}_g{axis}: f64 = {};\n",
+                            local.name,
+                            symbolic_component(&local.value.gradient[axis]),
+                        ));
+                    }
+                    for other in axis..dimension {
+                        let index = axis * dimension + other;
+                        if support.hessian[index] {
+                            source.push_str(&format!(
+                                "    let {mutable}{}_h{axis}_{other}: f64 = {};\n",
+                                local.name,
+                                symbolic_component(&local.value.hessian[index]),
+                            ));
+                        }
+                    }
+                }
+            }
+            SymbolicStatement::If {
+                condition,
+                assignments,
+            } => {
+                source.push_str(&format!("    if {condition} {{\n"));
+                for assignment in assignments {
+                    push_preludes(&mut source, &assignment.preludes, "        ");
+                    let support = schedule
+                        .mutable_support
+                        .get(&assignment.target)
+                        .expect("mutable symbolic assignment support exists");
+                    source.push_str(&format!(
+                        "        {}_v = {};\n",
+                        assignment.target, assignment.value.value,
+                    ));
+                    for axis in 0..dimension {
+                        if support.gradient[axis] {
+                            source.push_str(&format!(
+                                "        {}_g{axis} = {};\n",
+                                assignment.target,
+                                symbolic_component(&assignment.value.gradient[axis]),
+                            ));
+                        }
+                        for other in axis..dimension {
+                            let index = axis * dimension + other;
+                            if support.hessian[index] {
+                                source.push_str(&format!(
+                                    "        {}_h{axis}_{other} = {};\n",
+                                    assignment.target,
+                                    symbolic_component(&assignment.value.hessian[index]),
+                                ));
+                            }
+                        }
+                    }
+                }
+                source.push_str("    }\n");
+            }
+        }
+    }
+    push_preludes(&mut source, &schedule.result_preludes, "    ");
+    source.push_str(&format!(
+        "    let __row_program_value: f64 = {};\n",
+        schedule.result.value
+    ));
+    for axis in 0..dimension {
+        source.push_str(&format!(
+            "    let __row_program_g{axis}: f64 = {};\n",
+            symbolic_component(&schedule.result.gradient[axis]),
+        ));
+        for other in axis..dimension {
+            let index = axis * dimension + other;
+            source.push_str(&format!(
+                "    let __row_program_h{axis}_{other}: f64 = {};\n",
+                symbolic_component(&schedule.result.hessian[index]),
+            ));
+        }
+    }
+    source.push_str("    (\n        __row_program_value,\n        [");
+    for axis in 0..dimension {
+        if axis != 0 {
+            source.push_str(", ");
+        }
+        source.push_str(&format!("__row_program_g{axis}"));
+    }
+    source.push_str("],\n        [\n");
+    for axis in 0..dimension {
+        source.push_str("            [");
+        for other in 0..dimension {
+            if other != 0 {
+                source.push_str(", ");
+            }
+            let (row, column) = if axis <= other {
+                (axis, other)
+            } else {
+                (other, axis)
+            };
+            source.push_str(&format!("__row_program_h{row}_{column}"));
+        }
+        source.push_str("],\n");
+    }
+    source.push_str("        ],\n        [");
+    for (index, witness) in schedule.witness_values.iter().enumerate() {
+        if index != 0 {
+            source.push_str(", ");
+        }
+        source.push_str(witness);
+    }
+    source.push_str("]\n    )\n}\n");
+    syn::parse_str(&source).map_err(|error| {
+        syn::Error::new(
+            error.span(),
+            format!("failed to parse generated Rust order-2 row program: {error}\n{source}"),
+        )
     })
 }
 
@@ -1503,6 +1664,15 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
         }
     };
     let dimension = primaries.len();
+    let order2_name = format_ident!("{}_order2", name);
+    let order2_body = rust_order2_body(
+        &primaries,
+        &constant_names,
+        &leaves,
+        &statements,
+        &result,
+        &witnesses,
+    )?;
     let cuda = cuda_source(
         &name,
         &primaries,
@@ -1524,6 +1694,17 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
             let emitted_row_program_value = #rust_result;
             (emitted_row_program_value, [#(#witness_values),*])
         }
+
+        #[inline(always)]
+        #visibility fn #order2_name(
+            #(#primaries: f64,)*
+            #(#constants: f64),*
+        ) -> (
+            f64,
+            [f64; #dimension],
+            [[f64; #dimension]; #dimension],
+            [f64; #witness_count],
+        ) #order2_body
 
         #scalar_witness_function
 
@@ -1573,7 +1754,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_one_generic_and_cuda_schedule_with_branch_and_leaves() {
+    fn emits_generic_and_shared_symbolic_rust_cuda_schedules() {
         let input = syn::parse2::<Input>(quote! {
             pub(crate) fn sample(q, g; weight, event, scale)
             leaves {
@@ -1596,12 +1777,61 @@ mod tests {
         .expect("parse row program");
         let expanded = expand(input).expect("expand row program").to_string();
         assert!(expanded.contains("JetScalar < 2usize >"));
+        assert!(expanded.contains("fn sample_order2"));
+        assert!(expanded.contains("sqrt_stack"));
+        assert!(expanded.contains("log_stack"));
         assert!(expanded.contains("SAMPLE_CUDA_VGH"));
         assert!(expanded.contains("double event_term_v = 0.0"));
         assert!(expanded.contains("if ((in.event > 0.0))"));
         assert!(expanded.contains("d_log(adjusted_v"));
         assert!(!expanded.contains("J2"));
         assert!(!expanded.contains("j2_"));
+    }
+
+    #[test]
+    fn rust_order2_formulas_pin_sparse_mul_compose_branch_witness_and_symmetry() {
+        let rust = emitted_function(
+            quote! {
+                fn formulas(x, y; take)
+                leaves { curve => curve_stack => d_curve }
+                witnesses [curved];
+                {
+                    let product = mul(x, y);
+                    let curved = compose(curve, product);
+                    let mut out = x;
+                    if (take > 0.0) { out = add(curved, y); }
+                    return out;
+                }
+            },
+            "formulas_order2",
+        )
+        .replace(' ', "");
+
+        for formula in [
+            "fnformulas_order2(x:f64,y:f64,take:f64)",
+            "letproduct_g0:f64=y;",
+            "letproduct_h0_1:f64=1.0;",
+            "letproduct_g1:f64=x;",
+            "letcurved_stack0=curve_stack(product_v);",
+            "letcurved_g0:f64=(product_g0*curved_stack0[1]);",
+            "letcurved_h0_0:f64=(curved_stack0[2]*(product_g0*product_g0));",
+            "letcurved_h0_1:f64=((product_h0_1*curved_stack0[1])+(curved_stack0[2]*(product_g0*product_g1)));",
+            "letcurved_g1:f64=(product_g1*curved_stack0[1]);",
+            "letcurved_h1_1:f64=(curved_stack0[2]*(product_g1*product_g1));",
+            "letmutout_g0:f64=1.0;",
+            "letmutout_h0_1:f64=0.0;",
+            "iftake>0.0{",
+            "out_g1=(curved_g1+1.0);",
+            "[__row_program_h0_0,__row_program_h0_1],",
+            "[__row_program_h0_1,__row_program_h1_1],",
+            "[curved_v]",
+        ] {
+            assert!(rust.contains(formula), "missing generated formula: {formula}");
+        }
+        assert!(!rust.contains("JetScalar"));
+        assert!(!rust.contains("SparseOrder2"));
+        assert!(!rust.contains("*0.0"));
+        assert!(!rust.contains("0.0*"));
     }
 
     #[test]
@@ -1688,6 +1918,26 @@ mod tests {
         assert_eq!(cuda.matches("double out_stack0[3]").count(), 1);
         assert_eq!(cuda.matches("double out_stack1[3]").count(), 1);
         assert_eq!(cuda.matches("d_log(out_v, out_stack").count(), 2);
+
+        let rust = emitted_function(
+            quote! {
+                fn repeated(q; event)
+                leaves { log => log_stack => d_log }
+                witnesses [];
+                {
+                    let mut out = q;
+                    if (event > 0.0) {
+                        out = compose(log, out);
+                        out = compose(log, out);
+                    }
+                    return out;
+                }
+            },
+            "repeated_order2",
+        );
+        assert_eq!(rust.matches("let out_stack0").count(), 1);
+        assert_eq!(rust.matches("let out_stack1").count(), 1);
+        assert_eq!(rust.matches("log_stack (out_v)").count(), 2);
     }
 
     #[test]
