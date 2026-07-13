@@ -3878,7 +3878,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // penalized quasi-Laplace cost (paired with a zero gradient it never consumes) and the fit
         // proceeds on the EFS lane. Dense-admitted fits never enter this branch and
         // are byte-for-byte unchanged.
-        if !self.term.streaming_plan().direct_logdet_admitted() {
+        if !self.audit_installed_state && !self.term.streaming_plan().direct_logdet_admitted() {
             let (cost, _beta_hat) = match self.evaluate_with_refine_policy(rho.view(), false) {
                 Ok(evaluated) => evaluated,
                 // A recoverable refusal means the streaming quasi-Laplace score is
