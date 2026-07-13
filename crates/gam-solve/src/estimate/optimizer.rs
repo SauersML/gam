@@ -2938,7 +2938,7 @@ mod reported_loglikelihood_normalization_tests {
 
     #[test]
     fn gaussian_reported_loglikelihood_is_finite() {
-        // #2096/#2305 follow-through: the reporting field uses the
+        // #2096 follow-through: the reporting field uses the
         // fully-normalized Gaussian kernel, which requires a CONCRETE
         // dispersion `φ = σ̂²`. The reporting site must resolve that temporary
         // likelihood without rewriting the fit's canonical scale-ownership

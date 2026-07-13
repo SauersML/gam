@@ -2188,7 +2188,7 @@ mod tests {
     }
 
     #[test]
-    fn profiled_gaussian_pirls_data_kernel_is_exactly_negative_half_raw_deviance_2305() {
+    fn profiled_gaussian_pirls_data_kernel_is_exactly_negative_half_raw_deviance() {
         let y = array![2.0, -1.0, 4.0];
         let eta = array![1.0, 0.5, 3.0];
         let weights = array![2.0, 0.5, 1.5];
@@ -2225,7 +2225,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_gaussian_pirls_keeps_raw_deviance_but_scales_likelihood_kernel_2305() {
+    fn fixed_gaussian_pirls_keeps_raw_deviance_but_scales_likelihood_kernel() {
         let y = array![2.0, -1.0, 4.0];
         let eta = array![1.0, 0.5, 3.0];
         let weights = array![2.0, 0.5, 1.5];
