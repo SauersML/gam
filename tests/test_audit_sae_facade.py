@@ -88,5 +88,11 @@ def test_audit_sae_surfaces_atlas_nerve_covering_side_next_to_betti():
     assert atlas_nerve["computed"] is True
     assert "betti" in atlas_nerve
     assert "covering_side" in atlas_nerve
+    assert "euler_characteristic" not in atlas_nerve
+    assert isinstance(atlas_nerve["nerve_euler_characteristic"], int)
+    assert atlas_nerve["certified_euler_characteristic"] is None
+    assert atlas_nerve["holonomy_status"] == "not_analyzed"
+    assert atlas_nerve["certified_orientability"] is None
+    assert atlas_nerve["topology_promotion"]["certified"] is False
     assert "null_pvalue" in atlas_nerve
     assert "spikein_power" in atlas_nerve

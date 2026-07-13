@@ -777,16 +777,63 @@ fn atlas_nerve_dict<'py>(
     out.set_item("n_triangles", diagram.n_triangles)?;
     out.set_item("n_tetrahedra", diagram.n_tetrahedra)?;
     out.set_item("simplex_counts", diagram.simplex_counts.clone())?;
-    out.set_item("euler_characteristic", diagram.euler_characteristic)?;
+    // The alternating simplex sum is an exact statistic of the admitted
+    // finite nerve. It is not, by itself, a finite-sample Gauss--Bonnet claim
+    // about the sampled manifold, so keep the two values separately named.
+    out.set_item("nerve_euler_characteristic", diagram.euler_characteristic)?;
+    match diagram.certified_gauss_bonnet_euler_characteristic() {
+        Some(value) => out.set_item("certified_euler_characteristic", value.value())?,
+        None => out.set_item("certified_euler_characteristic", py.None())?,
+    }
     out.set_item("good_cover_certified", diagram.good_cover_certified)?;
-    out.set_item(
-        "orientation_holonomy",
-        match diagram.certified_orientability() {
-            Some(gam::terms::sae::manifold::AtlasOrientability::Orientable) => "orientable",
-            Some(gam::terms::sae::manifold::AtlasOrientability::NonOrientable) => "non_orientable",
-            None => "uncertified",
+    match diagram.holonomy_certificate.as_ref() {
+        Some(certificate) => {
+            out.set_item("holonomy_status", "analyzed")?;
+            out.set_item("holonomy_provenance", certificate.provenance_label())?;
+            out.set_item("holonomy_missing_inputs", py.None())?;
+        }
+        None => {
+            // Sparse block routing supplies fitted pairwise transfers, but not
+            // the independent PCA fit/inference splits, population spectral
+            // bounds, or shared-source curvature covariance required by the
+            // Gaussian finite-sample proof. Absence is not a negative result.
+            out.set_item("holonomy_status", "not_analyzed")?;
+            out.set_item("holonomy_provenance", py.None())?;
+            out.set_item(
+                "holonomy_missing_inputs",
+                "independent PCA fit/inference splits, population spectral bounds, and shared-source Gauss-Bonnet covariance",
+            )?;
+        }
+    }
+    match diagram.certified_orientability() {
+        Some(gam::terms::sae::manifold::AtlasOrientability::Orientable) => {
+            out.set_item("certified_orientability", "orientable")?
+        }
+        Some(gam::terms::sae::manifold::AtlasOrientability::NonOrientable) => {
+            out.set_item("certified_orientability", "non_orientable")?
+        }
+        None => out.set_item("certified_orientability", py.None())?,
+    }
+    let promotion = diagram.certified_compression();
+    let promotion_dict = PyDict::new(py);
+    promotion_dict.set_item("certified", promotion.earns_standard_name())?;
+    promotion_dict.set_item(
+        "kind",
+        match promotion.kind {
+            gam::terms::sae::manifold::GraphCompressionKind::Circle => "circle",
+            gam::terms::sae::manifold::GraphCompressionKind::Interval => "interval",
+            gam::terms::sae::manifold::GraphCompressionKind::FiniteSet => "finite_set",
+            gam::terms::sae::manifold::GraphCompressionKind::Cylinder => "cylinder",
+            gam::terms::sae::manifold::GraphCompressionKind::Torus => "torus",
+            gam::terms::sae::manifold::GraphCompressionKind::Sphere => "sphere",
+            gam::terms::sae::manifold::GraphCompressionKind::Graph => "graph",
         },
     )?;
+    promotion_dict.set_item("name", promotion.name)?;
+    promotion_dict.set_item("generic_bits", promotion.generic_edge_bits)?;
+    promotion_dict.set_item("named_bits", promotion.named_bits)?;
+    promotion_dict.set_item("bits_saved", promotion.bits_saved)?;
+    out.set_item("topology_promotion", promotion_dict)?;
     out.set_item("sampled_support_size", diagram.sampled_support_size)?;
     out.set_item("covering_side", diagram.covering_side.as_str())?;
     out.set_item("max_filtration", diagram.max_filtration)?;
@@ -1870,13 +1917,57 @@ mod sae_spectral_ffi_tests {
 
         Python::attach(|py| {
             let dict = atlas_nerve_dict(py, Some(&report), "unused").unwrap();
-            let orientation: String = dict
-                .get_item("orientation_holonomy")
+            assert!(
+                dict.get_item("euler_characteristic")
+                    .expect("read retired ambiguous Euler key")
+                    .is_none()
+            );
+            let nerve_euler: i128 = dict
+                .get_item("nerve_euler_characteristic")
                 .unwrap()
                 .unwrap()
                 .extract()
                 .unwrap();
-            assert_eq!(orientation, "uncertified");
+            assert_eq!(nerve_euler, report.diagram.euler_characteristic);
+            let status: String = dict
+                .get_item("holonomy_status")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(status, "not_analyzed");
+            assert!(
+                dict.get_item("holonomy_provenance")
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                dict.get_item("certified_orientability")
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                dict.get_item("certified_euler_characteristic")
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+            let promotion = dict
+                .get_item("topology_promotion")
+                .unwrap()
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            assert!(
+                !promotion
+                    .get_item("certified")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
         });
     }
 

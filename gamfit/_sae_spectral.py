@@ -821,8 +821,14 @@ class AtlasNerveDiagram:
     ``computed`` is False for shapes the nerve does not apply to (scalar
     ``block_size == 1`` or fewer than two selected charts), in which case only
     ``reason`` is populated. When ``computed`` is True, ``betti`` is the
-    ``{b0, b1, b2}`` signature and the simplex counts / covering side describe the
-    reduced nerve complex.
+    ``{b0, b1, b2}`` signature and the simplex counts / covering side describe
+    the reduced nerve complex. ``nerve_euler_characteristic`` is the exact
+    alternating sum of those admitted simplices; it is deliberately distinct
+    from ``certified_euler_characteristic``, which is populated only by a
+    finite-sample Gauss--Bonnet certificate. Sparse routing alone has no
+    independent PCA split or population spectral bounds, so its holonomy status
+    remains ``not_analyzed`` and its topology cannot be promoted to a standard
+    name.
     """
 
     computed: bool
@@ -833,6 +839,14 @@ class AtlasNerveDiagram:
     n_edges: int | None = None
     n_triangles: int | None = None
     n_tetrahedra: int | None = None
+    nerve_euler_characteristic: int | None = None
+    certified_euler_characteristic: int | None = None
+    good_cover_certified: bool | None = None
+    holonomy_status: str | None = None
+    holonomy_provenance: str | None = None
+    holonomy_missing_inputs: str | None = None
+    certified_orientability: str | None = None
+    topology_promotion: dict[str, bool | str | float] | None = None
     sampled_support_size: int | None = None
     covering_side: str | None = None
     max_filtration: float | None = None
@@ -879,6 +893,37 @@ def atlas_nerve_diagram(
         n_edges=int(payload["n_edges"]),
         n_triangles=int(payload["n_triangles"]),
         n_tetrahedra=int(payload["n_tetrahedra"]),
+        nerve_euler_characteristic=int(payload["nerve_euler_characteristic"]),
+        certified_euler_characteristic=(
+            None
+            if payload["certified_euler_characteristic"] is None
+            else int(payload["certified_euler_characteristic"])
+        ),
+        good_cover_certified=bool(payload["good_cover_certified"]),
+        holonomy_status=str(payload["holonomy_status"]),
+        holonomy_provenance=(
+            None
+            if payload["holonomy_provenance"] is None
+            else str(payload["holonomy_provenance"])
+        ),
+        holonomy_missing_inputs=(
+            None
+            if payload["holonomy_missing_inputs"] is None
+            else str(payload["holonomy_missing_inputs"])
+        ),
+        certified_orientability=(
+            None
+            if payload["certified_orientability"] is None
+            else str(payload["certified_orientability"])
+        ),
+        topology_promotion={
+            "certified": bool(payload["topology_promotion"]["certified"]),
+            "kind": str(payload["topology_promotion"]["kind"]),
+            "name": str(payload["topology_promotion"]["name"]),
+            "generic_bits": float(payload["topology_promotion"]["generic_bits"]),
+            "named_bits": float(payload["topology_promotion"]["named_bits"]),
+            "bits_saved": float(payload["topology_promotion"]["bits_saved"]),
+        },
         sampled_support_size=int(payload["sampled_support_size"]),
         covering_side=str(payload["covering_side"]),
         max_filtration=float(payload["max_filtration"]),

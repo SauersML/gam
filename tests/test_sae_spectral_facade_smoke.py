@@ -184,6 +184,15 @@ def test_atlas_nerve_diagram_smoke():
     assert report.betti["b0"] >= 1
     assert report.n_vertices >= 2
     assert report.n_edges >= 1
+    assert isinstance(report.nerve_euler_characteristic, int)
+    assert report.certified_euler_characteristic is None
+    assert report.good_cover_certified is False
+    assert report.holonomy_status == "not_analyzed"
+    assert report.holonomy_provenance is None
+    assert report.holonomy_missing_inputs is not None
+    assert report.certified_orientability is None
+    assert report.topology_promotion["certified"] is False
+    assert report.topology_promotion["kind"] == "graph"
     assert math.isfinite(report.max_filtration)
     assert isinstance(report.note, str)
     # A scalar (block_size == 1) shape is not applicable: computed is False.
