@@ -605,11 +605,15 @@ struct BirthSeed {
     circle_gate: Option<Vec<f64>>,
 }
 
-fn template_accepts_circle_births(term: &SaeManifoldTerm) -> bool {
+fn template_circle_geometry(term: &SaeManifoldTerm) -> Option<&SaeAtomGeometryPlan> {
     term.atoms
         .first()
-        .map(|atom| atom.basis_kind() == &SaeAtomBasisKind::Periodic && atom.basis_size() >= 3)
-        .unwrap_or(false)
+        .and_then(SaeManifoldAtom::geometry_plan)
+        .filter(|plan| plan.kind() == &SaeAtomBasisKind::Periodic && plan.latent_dim() == 1)
+}
+
+fn template_accepts_circle_births(term: &SaeManifoldTerm) -> bool {
+    template_circle_geometry(term).is_some()
 }
 
 /// Lift a residual-factor direction to an `(m, p)` birth decoder in atom 0's basis:
@@ -1276,6 +1280,12 @@ pub fn fit_stagewise(
             Some(coords) => crate::structure_harvest::born_circle_atom(
                 &term,
                 &rho,
+                template_circle_geometry(&term)
+                    .cloned()
+                    .ok_or_else(|| {
+                        "fit_stagewise: circle seed requires the template atom's persisted periodic geometry plan"
+                            .to_string()
+                    })?,
                 seed.decoder.clone(),
                 coords.clone(),
                 seed.circle_gate.clone().unwrap_or_else(|| vec![0.0; n]),
@@ -1907,6 +1917,12 @@ fn race_birth_seed(
         Some(coords) => crate::structure_harvest::born_circle_atom(
             term,
             rho,
+            template_circle_geometry(term)
+                .cloned()
+                .ok_or_else(|| {
+                    "race_birth_seed: circle seed requires the template atom's persisted periodic geometry plan"
+                        .to_string()
+                })?,
             seed.decoder.clone(),
             coords.clone(),
             seed.circle_gate.clone().unwrap_or_else(|| vec![0.0; n]),
@@ -3103,6 +3119,13 @@ mod tests {
         let (child, mut child_rho) = crate::structure_harvest::born_circle_atom(
             &term,
             &rho,
+            SaeAtomGeometryPlan::new(
+                SaeAtomBasisKind::Periodic,
+                1,
+                SaeBasisResolution::PeriodicHarmonics { order: 1 },
+                SaeReferenceMetricPlan::UnitCircle,
+            )
+            .unwrap(),
             seed.decoder.clone(),
             born_coords,
             gate,

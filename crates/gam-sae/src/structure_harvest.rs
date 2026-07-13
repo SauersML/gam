@@ -2225,8 +2225,10 @@ pub enum BirthSeed {
     /// born via the topology race (the legacy birth path).
     ResidualFactor(Array2<f64>),
     /// A curl circle seed: periodic-harmonic `(m, p)` decoder (`m` odd, `>= 3`),
-    /// per-row phase coordinate `(n, 1)`, and per-row own-presence gate (`n`).
+    /// its exact analytic geometry plan, per-row phase coordinate `(n, 1)`, and
+    /// per-row own-presence gate (`n`).
     Circle {
+        geometry: SaeAtomGeometryPlan,
         decoder: Array2<f64>,
         phase_coords: Array2<f64>,
         gate: Vec<f64>,
@@ -2258,12 +2260,14 @@ pub fn apply_structure_move_seeded(
             match seed {
                 BirthSeed::ResidualFactor(decoder) => born_atom(term, rho, decoder.view()),
                 BirthSeed::Circle {
+                    geometry,
                     decoder,
                     phase_coords,
                     gate,
                 } => born_circle_atom(
                     term,
                     rho,
+                    geometry.clone(),
                     decoder.clone(),
                     phase_coords.clone(),
                     gate.clone(),
@@ -4828,6 +4832,7 @@ fn born_atom(
 pub(crate) fn born_circle_atom(
     term: &SaeManifoldTerm,
     rho: &SaeManifoldRho,
+    geometry: SaeAtomGeometryPlan,
     harmonic_decoder: Array2<f64>,
     phase_coords: Array2<f64>,
     circle_gate: Vec<f64>,
@@ -4836,21 +4841,19 @@ pub(crate) fn born_circle_atom(
     if term.atoms.is_empty() {
         return Err("born_circle_atom: cannot birth from an empty dictionary".to_string());
     }
-    // The periodic-harmonic width `m` comes from the SEED decoder's own row
-    // count, not the template atom's basis size (#2101 tied it to `atoms[0]`,
-    // which forced every born circle to match atom-0's width). Curl seeds
-    // (`crate::manifold::curl`) carry their own odd harmonic width, and existing
-    // circle-seed callers pass a decoder already shaped to `atoms[0]` (odd, since
-    // `PeriodicHarmonicEvaluator::new` demands it), so deriving `m` here is
-    // backward-compatible AND lets curl birth a circle into a dictionary whose
-    // template atom is linear/even-width. A born atom carries its own
-    // `basis_values`, so a heterogeneous width is well-formed.
-    let m = harmonic_decoder.nrows();
-    let p = term.output_dim();
-    if m % 2 != 1 || m < 3 {
+    if geometry.kind() != &SaeAtomBasisKind::Periodic || geometry.latent_dim() != 1 {
         return Err(format!(
-            "born_circle_atom: harmonic decoder must have odd height >= 3 (constant + \
-             >= 1 sin/cos harmonic pair); got height {m}"
+            "born_circle_atom: geometry must declare a one-dimensional periodic atom; got kind={:?}, latent_dim={}",
+            geometry.kind(),
+            geometry.latent_dim()
+        ));
+    }
+    let m = geometry.basis_size()?;
+    let p = term.output_dim();
+    if harmonic_decoder.nrows() != m {
+        return Err(format!(
+            "born_circle_atom: decoder height {} != geometry basis width {m}",
+            harmonic_decoder.nrows()
         ));
     }
     if harmonic_decoder.ncols() != p {
@@ -4866,23 +4869,21 @@ pub(crate) fn born_circle_atom(
             phase_coords.dim()
         ));
     }
-    // A Periodic harmonic basis of the template's width, evaluated at the FRESH
-    // phase coordinate the born circle lives on.
-    let evaluator = std::sync::Arc::new(crate::manifold::PeriodicHarmonicEvaluator::new(m)?);
-    let (phi, jet) = {
-        use crate::manifold::SaeBasisEvaluator;
-        evaluator.evaluate(phase_coords.view())?
-    };
+    // The plan is the sole authority for the basis, its analytic jets, and the
+    // declared unit-circle function Gram. The decoder is only a coefficient
+    // realization and cannot redefine any of those geometry fields.
+    let bundle = geometry.evaluate_bundle(phase_coords.view())?;
     let born = SaeManifoldAtom::new_with_provided_function_gram(
         format!("atom_born_{k}"),
-        SaeAtomBasisKind::Periodic,
-        1,
-        phi,
-        jet,
+        geometry.kind().clone(),
+        geometry.latent_dim(),
+        bundle.basis_values,
+        bundle.basis_jacobian,
         harmonic_decoder,
-        Array2::<f64>::eye(m),
+        bundle.reference_penalty,
     )?
-    .with_basis_second_jet(evaluator.clone());
+    .with_basis_second_jet(bundle.evaluator)
+    .with_geometry_plan(geometry)?;
 
     let born_coord_block = gam_terms::latent::LatentCoordValues::from_matrix_with_manifold(
         phase_coords.view(),
@@ -5278,7 +5279,7 @@ pub fn run_structure_search_rounds(
             std::collections::HashMap::new();
         let mut flatten_atoms: std::collections::HashSet<usize> = std::collections::HashSet::new();
         if let Some(cfg) = curl {
-            for cand in curl_candidates(&term, residuals.view(), &cfg) {
+            for cand in curl_candidates(&term, residuals.view(), &cfg)? {
                 if cooldown.blocked(&cand.members) {
                     continue;
                 }
@@ -5652,10 +5653,18 @@ fn curl_candidates(
     term: &SaeManifoldTerm,
     residuals: ArrayView2<'_, f64>,
     cfg: &CurlConfig,
-) -> Vec<CurlCandidate> {
+) -> Result<Vec<CurlCandidate>, String> {
+    let geometry = SaeAtomGeometryPlan::new(
+        SaeAtomBasisKind::Periodic,
+        1,
+        SaeBasisResolution::PeriodicHarmonics {
+            order: cfg.harmonics,
+        },
+        SaeReferenceMetricPlan::UnitCircle,
+    )?;
     let frames = linear_atom_frames(term);
     if frames.len() < 2 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let n = term.assignment.logits.nrows();
     let p = term.output_dim();
@@ -5807,6 +5816,7 @@ fn curl_candidates(
         cands.push(CurlCandidate {
             members,
             seed: BirthSeed::Circle {
+                geometry: geometry.clone(),
                 decoder: seed_circle.decoder,
                 phase_coords,
                 gate,
@@ -5832,7 +5842,7 @@ fn curl_candidates(
             break;
         }
     }
-    out
+    Ok(out)
 }
 
 /// Audit fitted circle atoms for degeneration (INTEGRATION_PLAN Phase 4.5). A
@@ -8515,7 +8525,7 @@ mod tests {
         let (term, rho) = shattered_plane_term(false);
         let residuals = residuals_of(&term);
         let cfg = CurlConfig::default();
-        let cands = curl_candidates(&term, residuals.view(), &cfg);
+        let cands = curl_candidates(&term, residuals.view(), &cfg).unwrap();
         assert!(
             !cands.is_empty(),
             "curl must recover the shattered circle (got no candidate)"
@@ -8582,7 +8592,7 @@ mod tests {
         let (term, _rho) = shattered_plane_term(true);
         let residuals = residuals_of(&term);
         let cfg = CurlConfig::default();
-        let cands = curl_candidates(&term, residuals.view(), &cfg);
+        let cands = curl_candidates(&term, residuals.view(), &cfg).unwrap();
         assert!(
             cands.is_empty(),
             "a Gaussian-fill plane must not be curled (κ ≈ 2)"
@@ -8658,7 +8668,8 @@ mod tests {
     fn curl_killer_demo_planted_circle_wins_race() {
         let (term, _rho) = shattered_plane_term(false);
         let residuals = residuals_of(&term);
-        let cands = curl_candidates(&term, residuals.view(), &CurlConfig::default());
+        let cands =
+            curl_candidates(&term, residuals.view(), &CurlConfig::default()).unwrap();
         assert!(
             !cands.is_empty(),
             "curl must recover the shattered circle before the race"
@@ -8743,7 +8754,7 @@ mod tests {
         let (gauss_term, _) = shattered_plane_term(true);
         let gauss_residuals = residuals_of(&gauss_term);
         let gauss_cands =
-            curl_candidates(&gauss_term, gauss_residuals.view(), &CurlConfig::default());
+            curl_candidates(&gauss_term, gauss_residuals.view(), &CurlConfig::default()).unwrap();
         assert!(
             gauss_cands.is_empty(),
             "a Gaussian-fill plane must not be curled"

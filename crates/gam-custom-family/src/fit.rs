@@ -2027,6 +2027,28 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
     }
     let penalty_counts = validate_blockspecs(specs)?;
     let per_block = split_log_lambdas(&rho, &penalty_counts)?;
+    let canonical = gam_identifiability::canonical::canonicalize_for_identifiability(specs)?;
+    if !canonical.gauge.is_identity()
+        || canonical.reduced_specs.len() != specs.len()
+        || canonical
+            .reduced_specs
+            .iter()
+            .zip(specs.iter())
+            .any(|(reduced, exact)| reduced.design.ncols() != exact.design.ncols())
+    {
+        return Err(CustomFamilyError::InvalidInput {
+            context: "fit_custom_family_fixed_log_lambdas_from_owned_mode canonical geometry",
+            reason: "the terminal outer evaluator returned a mode in a coefficient geometry that still requires identifiability reduction; exact outer evaluation must own the canonical geometry before certification"
+                .to_string(),
+        });
+    }
+    audit_converged_identifiability(
+        family,
+        specs,
+        &canonical,
+        &inner.block_states,
+        outer_iterations,
+    )?;
 
     let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
     let workspace = inner.joint_workspace.as_ref().ok_or_else(|| {
@@ -2085,7 +2107,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
             rho_physical: rho,
             covariance_conditional,
             geometry,
-            canonical: None,
+            canonical: Some(&canonical),
             result_specs: specs,
             penalized_objective: selected_objective,
             outer_iterations,
