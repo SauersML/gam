@@ -273,12 +273,9 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
     let registry = AnalyticPenaltyRegistry::new();
     let seed = build_sae_fit_seed(SaeFitSeedRequest {
         target: z.view(),
-        atom_basis: &minimal.atom_basis,
-        atom_dim: &minimal.effective_atom_dim,
-        atom_centers: &minimal.atom_centers,
+        geometry_plans: &minimal.geometry_plans,
         basis_values: minimal.basis_values.view(),
         basis_jacobian: minimal.basis_jacobian.view(),
-        basis_sizes: &minimal.basis_sizes,
         decoder_coefficients: minimal.decoder_coefficients.view(),
         smooth_penalties: minimal.smooth_penalties.view(),
         initial_logits: minimal.initial_logits.view(),

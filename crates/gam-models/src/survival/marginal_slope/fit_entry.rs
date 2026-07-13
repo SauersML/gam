@@ -5,6 +5,33 @@ use super::*;
 /// Per-matrix byte budget for the construction-time identifiability preflight.
 const PREFLIGHT_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// Derive the exact outer-evaluation options from the row measure selected by
+/// the spatial optimizer.
+///
+/// The callback's `RowSet` is the sole authority for this evaluation.  Reusing
+/// the caller's staged/automatic pilot here can otherwise make the inner fit,
+/// gradient, and Hessian describe different Horvitz--Thompson measures.  `All`
+/// therefore clears every stale pilot just as deliberately as `Subsample`
+/// installs the optimizer-selected weighted rows.
+pub(crate) fn survival_marginal_slope_exact_outer_options(
+    options: &BlockwiseFitOptions,
+    row_set: &crate::row_kernel::RowSet,
+) -> BlockwiseFitOptions {
+    let mut effective = options.clone();
+    effective.auto_outer_subsample = false;
+    effective.outer_score_subsample = match row_set {
+        crate::row_kernel::RowSet::All => None,
+        crate::row_kernel::RowSet::Subsample { rows, n_full } => Some(Arc::new(
+            crate::outer_subsample::OuterScoreSubsample::from_weighted_rows(
+                rows.as_ref().clone(),
+                *n_full,
+                0,
+            ),
+        )),
+    };
+    effective
+}
+
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: SurvivalMarginalSlopeTermSpec,
@@ -2437,8 +2464,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             };
             let eval_id = outer_eval_counter.get();
             outer_eval_counter.set(eval_id.wrapping_add(1));
-            let mut outer_options =
+            let tolerance_options =
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
+            let mut outer_options =
+                survival_marginal_slope_exact_outer_options(&tolerance_options, row_set);
             outer_options.outer_eval_context = Some(crate::custom_family::OuterEvalContext {
                 rho: std::sync::Arc::new(rho.clone()),
                 eval_id,

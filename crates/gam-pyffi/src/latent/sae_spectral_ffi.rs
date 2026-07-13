@@ -945,7 +945,9 @@ fn atlas_refusal_dict<'py>(
     use gam::terms::sae::inference::atlas_holonomy::AtlasStatisticalRefusal;
     let out = PyDict::new(py);
     out.set_item("code", atlas_refusal_code(refusal))?;
-    let set_edge = |out: &Bound<'py, PyDict>, edge| -> PyResult<()> {
+    let set_edge = |out: &Bound<'py, PyDict>,
+                    edge: gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyEdgeId|
+     -> PyResult<()> {
         out.set_item("edge_a", edge.a())?;
         out.set_item("edge_b", edge.b())?;
         out.set_item("overlap", edge.overlap())?;
@@ -1072,7 +1074,8 @@ fn gaussian_holonomy_analysis_dict<'py>(
 ) -> PyResult<(Bound<'py, PyDict>, Vec<&'static str>, bool)> {
     use gam::terms::sae::inference::atlas_holonomy::{
         AtlasCycleAsymptoticRegime, CrossPatchCovarianceProvenance, GaussianPcaCovarianceAuthority,
-        GaussianPcaSpectrumProvenance, PilotProjectionProvenance,
+        GaussianPcaSpectrumProvenance, GaussBonnetCovarianceAuthority,
+        PilotProjectionProvenance,
     };
     let out = PyDict::new(py);
     out.set_item("familywise_alpha", analysis.familywise_level().alpha())?;
@@ -1243,6 +1246,15 @@ fn gaussian_holonomy_analysis_dict<'py>(
     out.set_item("cycles", cycles)?;
     if let Some(confidence) = analysis.gauss_bonnet() {
         let gauss_bonnet = PyDict::new(py);
+        gauss_bonnet.set_item(
+            "covariance_authority",
+            match confidence.covariance_authority {
+                GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources => {
+                    "certified_independent_gaussian_sources"
+                }
+                GaussBonnetCovarianceAuthority::AsymptoticPlugIn => "asymptotic_plugin",
+            },
+        )?;
         gauss_bonnet.set_item("first_order_variance", confidence.first_order_variance)?;
         gauss_bonnet.set_item("standard_error", confidence.standard_error)?;
         gauss_bonnet.set_item(

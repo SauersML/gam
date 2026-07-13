@@ -18,7 +18,7 @@
 //! PCA gauge cancels exactly, and adjacent edges do not double-count their
 //! shared patch.
 
-use crate::manifold::AtlasOrientability;
+use crate::manifold::{AtlasOrientability, SphereChartTransition};
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use ndarray::{Array1, Array2, ArrayView2, s};
 use statrs::distribution::{ContinuousCDF, Normal};
@@ -417,7 +417,7 @@ pub struct AtlasSignedEdge {
 
 impl AtlasSignedEdge {
     #[must_use = "signed-edge validation errors must be handled"]
-    pub fn new(a: usize, b: usize, overlap: usize, sign: i8) -> Result<Self, String> {
+    pub fn new_analytic(a: usize, b: usize, overlap: usize, sign: i8) -> Result<Self, String> {
         let identity = AtlasHolonomyEdgeId::new(a, b, overlap)?;
         if !matches!(sign, -1 | 1) {
             return Err(format!(
@@ -430,6 +430,26 @@ impl AtlasSignedEdge {
             overlap: identity.overlap,
             sign,
         })
+    }
+
+    /// Extract an exact sign only from an analytically derived sphere seam.
+    /// Fitted polar factors are rejected even when their stored matrix is
+    /// perfectly orthogonal.
+    #[must_use = "analytic sphere transition provenance must be handled"]
+    pub fn from_analytic_sphere_transition(
+        transition: &SphereChartTransition,
+        overlap: usize,
+    ) -> Result<Self, String> {
+        let sign = transition.analytic_sign().ok_or_else(|| {
+            "a fitted sphere transition cannot enter an exact analytic holonomy certificate"
+                .to_string()
+        })?;
+        Self::new_analytic(
+            transition.from_chart(),
+            transition.to_chart(),
+            overlap,
+            sign,
+        )
     }
 
     #[must_use]
@@ -1500,8 +1520,31 @@ pub enum GaussBonnetCovarianceAuthority {
 }
 
 impl GaussBonnetInput {
-    #[must_use = "Gauss-Bonnet input validation errors must be handled"]
-    pub fn new(
+    #[must_use = "certified Gauss-Bonnet input validation errors must be handled"]
+    pub fn certified_independent_gaussian(
+        sources: Vec<GaussBonnetNoiseSource>,
+        contributions: Vec<GaussBonnetContribution>,
+    ) -> Result<Self, String> {
+        Self::validate(
+            GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources,
+            sources,
+            contributions,
+        )
+    }
+
+    #[must_use = "plug-in Gauss-Bonnet input validation errors must be handled"]
+    pub fn asymptotic_plugin(
+        sources: Vec<GaussBonnetNoiseSource>,
+        contributions: Vec<GaussBonnetContribution>,
+    ) -> Result<Self, String> {
+        Self::validate(
+            GaussBonnetCovarianceAuthority::AsymptoticPlugIn,
+            sources,
+            contributions,
+        )
+    }
+
+    fn validate(
         covariance_authority: GaussBonnetCovarianceAuthority,
         mut sources: Vec<GaussBonnetNoiseSource>,
         contributions: Vec<GaussBonnetContribution>,
@@ -1561,6 +1604,7 @@ impl AtlasEulerCharacteristic {
 /// Integer Gauss--Bonnet readout and its shared-source covariance audit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GaussBonnetConfidence {
+    pub covariance_authority: GaussBonnetCovarianceAuthority,
     pub total_curvature_estimate: f64,
     pub nearest_integer_candidate: AtlasEulerCharacteristic,
     pub residual_to_integer_curvature: f64,
@@ -2044,7 +2088,7 @@ mod tests {
             AtlasHolonomyEdgeId::new(4, 2, 9).unwrap(),
             AtlasHolonomyEdgeId::new(2, 4, 9).unwrap()
         );
-        assert!(AtlasSignedEdge::new(0, 1, 0, 0).is_err());
+        assert!(AtlasSignedEdge::new_analytic(0, 1, 0, 0).is_err());
         assert!(
             ProjectedAtlasEdgeSpec::new(
                 0,
@@ -2059,8 +2103,8 @@ mod tests {
             ExactAnalyticHolonomyCertificate::new(
                 2,
                 vec![
-                    AtlasSignedEdge::new(0, 1, 3, 1).unwrap(),
-                    AtlasSignedEdge::new(0, 1, 3, -1).unwrap(),
+                    AtlasSignedEdge::new_analytic(0, 1, 3, 1).unwrap(),
+                    AtlasSignedEdge::new_analytic(0, 1, 3, -1).unwrap(),
                 ],
             )
             .is_err()
@@ -2068,9 +2112,32 @@ mod tests {
         assert!(
             ExactAnalyticHolonomyCertificate::new(
                 2,
-                vec![AtlasSignedEdge::new(0, 2, 0, 1).unwrap()],
+                vec![AtlasSignedEdge::new_analytic(0, 2, 0, 1).unwrap()],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn fitted_sphere_seam_cannot_construct_an_exact_analytic_edge() {
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let fitted =
+            SphereChartTransition::new_fitted(0, 1, identity, crate::manifold::AtlasSeamKind::Pole)
+                .unwrap();
+        assert!(AtlasSignedEdge::from_analytic_sphere_transition(&fitted, 0).is_err());
+
+        let analytic = SphereChartTransition::new_analytic(
+            0,
+            1,
+            identity,
+            crate::manifold::AtlasSeamKind::Pole,
+        )
+        .unwrap();
+        assert_eq!(
+            AtlasSignedEdge::from_analytic_sphere_transition(&analytic, 0)
+                .unwrap()
+                .sign(),
+            1
         );
     }
 
@@ -2079,8 +2146,8 @@ mod tests {
         let certificate = ExactAnalyticHolonomyCertificate::new(
             2,
             vec![
-                AtlasSignedEdge::new(0, 1, 0, 1).unwrap(),
-                AtlasSignedEdge::new(0, 1, 1, -1).unwrap(),
+                AtlasSignedEdge::new_analytic(0, 1, 0, 1).unwrap(),
+                AtlasSignedEdge::new_analytic(0, 1, 1, -1).unwrap(),
             ],
         )
         .unwrap();
@@ -2152,6 +2219,16 @@ mod tests {
                 joint.clone(),
             )
             .is_err()
+        );
+        let plugin_model = GaussianPcaErrorModel::plugin_joint(
+            &patches,
+            CrossPatchCovarianceProvenance::ExplicitJointCovariance,
+            joint.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            plugin_model.authority(),
+            GaussianPcaCovarianceAuthority::AsymptoticPlugIn
         );
         let model = GaussianPcaErrorModel::certified_joint(
             &patches,
@@ -2811,8 +2888,7 @@ mod tests {
     }
 
     fn cancellation_gauss_bonnet(remainder: f64) -> GaussBonnetInput {
-        GaussBonnetInput::new(
-            GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources,
+        GaussBonnetInput::certified_independent_gaussian(
             vec![GaussBonnetNoiseSource::new(7, arr2(&[[1.0]])).unwrap()],
             vec![
                 GaussBonnetContribution::new(
@@ -2838,10 +2914,8 @@ mod tests {
         remainder: f64,
         authority: GaussBonnetCovarianceAuthority,
     ) -> GaussBonnetInput {
-        GaussBonnetInput::new(
-            authority,
-            vec![GaussBonnetNoiseSource::new(7, arr2(&[[1.0]])).unwrap()],
-            vec![
+        let sources = vec![GaussBonnetNoiseSource::new(7, arr2(&[[1.0]])).unwrap()];
+        let contributions = vec![
                 GaussBonnetContribution::new(
                     std::f64::consts::TAU,
                     remainder,
@@ -2849,9 +2923,15 @@ mod tests {
                     vec![GaussBonnetSourceGradient::new(7, array![1.0]).unwrap()],
                 )
                 .unwrap(),
-            ],
-        )
-        .unwrap()
+            ];
+        match authority {
+            GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources => {
+                GaussBonnetInput::certified_independent_gaussian(sources, contributions).unwrap()
+            }
+            GaussBonnetCovarianceAuthority::AsymptoticPlugIn => {
+                GaussBonnetInput::asymptotic_plugin(sources, contributions).unwrap()
+            }
+        }
     }
 
     #[test]
@@ -2910,8 +2990,7 @@ mod tests {
         let standard_error = (std::f64::consts::PI - deterministic_remainder) / critical;
         let source_standard_deviation = standard_error / 1.5;
         let true_chi = AtlasEulerCharacteristic(2);
-        let template = GaussBonnetInput::new(
-            GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources,
+        let template = GaussBonnetInput::certified_independent_gaussian(
             vec![
                 GaussBonnetNoiseSource::new(
                     0,
@@ -4103,6 +4182,7 @@ fn gauss_bonnet_confidence(
         }
     };
     Ok(GaussBonnetConfidence {
+        covariance_authority: input.covariance_authority,
         total_curvature_estimate,
         nearest_integer_candidate,
         residual_to_integer_curvature,

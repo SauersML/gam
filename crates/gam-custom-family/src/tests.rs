@@ -4116,47 +4116,50 @@ pub(crate) fn certified_test_outer(
     theta: Array1<f64>,
     objective: f64,
 ) -> gam_solve::rho_optimizer::CertifiedOuterResult {
-    let mut raw_outer = gam_solve::rho_optimizer::OuterResult::new(
-        theta,
-        objective,
-        7,
-        true,
-        gam_solve::rho_optimizer::OuterPlan {
-            solver: gam_solve::rho_optimizer::Solver::Arc,
-            hessian_source: gam_solve::rho_optimizer::HessianSource::Analytic,
+    assert!(!theta.is_empty(), "certificate fixture requires one real outer coordinate");
+    let dimension = theta.len();
+    let cost_center = theta.clone();
+    let gradient_center = theta.clone();
+    let problem = gam_solve::rho_optimizer::OuterProblem::new(dimension)
+        .with_gradient(gam_problem::Derivative::Analytic)
+        .with_hessian(gam_problem::DeclaredHessianForm::Dense)
+        .with_disable_fixed_point(true)
+        .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
+        .with_initial_rho(theta)
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..gam_problem::SeedConfig::default()
+        });
+    let mut outer_objective = problem.build_objective(
+        (),
+        move |_: &mut (), point: &Array1<f64>| {
+            let displacement = point - &cost_center;
+            Ok(objective + displacement.dot(&displacement))
         },
-    );
-    raw_outer.final_grad_norm = Some(0.0);
-    raw_outer.criterion_certificate = Some(
-        gam_solve::rho_optimizer::OuterCriterionCertificate {
-            stationarity: gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
-                grad_norm: 0.0,
-                projected_grad_norm: 0.0,
-                bound: 1.0e-8,
-            },
-            hessian_psd: Some(true),
-            lambdas_railed: Vec::new(),
+        move |_: &mut (), point: &Array1<f64>| {
+            let displacement = point - &gradient_center;
+            Ok(gam_problem::OuterEval {
+                cost: objective + displacement.dot(&displacement),
+                gradient: displacement.mapv(|value| 2.0 * value),
+                hessian: gam_problem::HessianValue::Dense(Array2::from_shape_fn(
+                    (dimension, dimension),
+                    |(row, column)| if row == column { 2.0 } else { 0.0 },
+                )),
+                inner_beta_hint: None,
+            })
         },
+        None::<fn(&mut ())>,
+        None::<
+            fn(
+                &mut (),
+                &Array1<f64>,
+            ) -> Result<gam_problem::EfsEval, gam_problem::EstimationError>,
+        >,
     );
-    gam_solve::rho_optimizer::CertifiedOuterResult::try_from(raw_outer)
-        .expect("the test outer optimum should carry a valid analytic certificate")
-}
-
-#[test]
-pub(crate) fn certified_outer_result_rejects_status_without_analytic_proof() {
-    let raw_outer = gam_solve::rho_optimizer::OuterResult::new(
-        Array1::zeros(0),
-        1.0,
-        7,
-        true,
-        gam_solve::rho_optimizer::OuterPlan {
-            solver: gam_solve::rho_optimizer::Solver::Arc,
-            hessian_source: gam_solve::rho_optimizer::HessianSource::Analytic,
-        },
-    );
-    let error = gam_solve::rho_optimizer::CertifiedOuterResult::try_from(raw_outer)
-        .expect_err("a convergence boolean without analytic evidence is not provenance");
-    assert!(error.contains("no analytic certificate"), "unexpected error: {error}");
+    problem
+        .run_certified(&mut outer_objective, "custom-family certificate fixture")
+        .expect("a real convex outer solve should issue the test certificate")
 }
 
 #[test]
@@ -4190,15 +4193,16 @@ pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay
         .collect();
     let evaluations_before_finalization = family.evaluations.load(Ordering::Relaxed);
 
+    let selected_theta = Array1::zeros(1);
     let certified_outer =
-        certified_test_outer(Array1::zeros(0), f64::from_bits(selected_objective_bits));
+        certified_test_outer(selected_theta.clone(), f64::from_bits(selected_objective_bits));
 
     let fit = fit_custom_family_fixed_log_lambdas_from_mode_selection(
         &family,
         &specs,
         &options,
         selection,
-        &Array1::zeros(0),
+        &selected_theta,
         &certified_outer,
     )
     .expect("the exact selected mode should finalize without another inner solve");
@@ -4209,7 +4213,7 @@ pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay
         "finalization must consume the selected mode and cached Hessian without replaying the family",
     );
     assert_eq!(fit.penalized_objective.to_bits(), selected_objective_bits);
-    assert_eq!(fit.outer_iterations, 7);
+    assert_eq!(fit.outer_iterations, certified_outer.iterations());
     assert_eq!(fit.outer_gradient_norm, Some(0.0));
     assert!(
         fit.convergence_evidence()
@@ -4288,13 +4292,15 @@ pub(crate) fn returned_mode_finalizer_rejects_different_certified_objective() {
         EvalMode::ValueOnly,
     )
     .expect("the bounded hard case should select a mode");
-    let certified_outer = certified_test_outer(Array1::zeros(0), selection.result.objective + 1.0);
+    let selected_theta = Array1::zeros(1);
+    let certified_outer =
+        certified_test_outer(selected_theta.clone(), selection.result.objective + 1.0);
     let error = fit_custom_family_fixed_log_lambdas_from_mode_selection(
         &family,
         &specs,
         &options,
         selection,
-        &Array1::zeros(0),
+        &selected_theta,
         &certified_outer,
     )
     .expect_err("a different certified objective cannot mint the selected-mode fit");

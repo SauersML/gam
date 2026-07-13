@@ -11,9 +11,8 @@ use crate::front_door::{SaeFitAdmission, SaeFitLane};
 use ndarray::{Array2, Array3, ArrayView2, s};
 
 use super::{
-    SaeAtomBasisKind, SaeManifoldAtom, SaeReferenceRoughness, build_sae_basis_evaluators,
-    sae_atom_basis_kind_from_str, sae_build_atom_plans, sae_build_padded_basis_stacks,
-    sae_pick_duchon_center_indices,
+    SaeAtomBasisKind, SaeManifoldAtom, SaeReferenceRoughness, sae_atom_basis_kind_from_str,
+    sae_build_atom_plans, sae_build_padded_basis_stacks, sae_pick_duchon_center_indices,
 };
 
 pub struct SaeSupportSeedRequest<'a> {
@@ -115,7 +114,11 @@ fn effective_atom(
     let latent_dim = match kind {
         // Public periodic dimension is harmonic resolution; its chart is 1-D.
         SaeAtomBasisKind::Periodic => 1,
-        SaeAtomBasisKind::Sphere | SaeAtomBasisKind::Mobius => {
+        SaeAtomBasisKind::Sphere
+        | SaeAtomBasisKind::ProjectivePlane
+        | SaeAtomBasisKind::Torus
+        | SaeAtomBasisKind::KleinBottle
+        | SaeAtomBasisKind::Mobius => {
             if public_dim != 2 {
                 return Err(format!(
                     "build_sae_support_seed: atom {atom} basis requires atom_dim == 2; got {public_dim}"
@@ -190,11 +193,13 @@ pub fn sae_support_effective_atom_dims(
 
 pub(super) fn chart_coordinate(kind: &SaeAtomBasisKind, axis: usize, raw: f64) -> f64 {
     match kind {
-        SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => {
+        SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus | SaeAtomBasisKind::KleinBottle => {
             0.5 + raw.atan() / std::f64::consts::PI
         }
-        SaeAtomBasisKind::Sphere if axis == 0 => raw.atan(),
-        SaeAtomBasisKind::Sphere => std::f64::consts::PI + 2.0 * raw.atan(),
+        SaeAtomBasisKind::Sphere | SaeAtomBasisKind::ProjectivePlane if axis == 0 => raw.atan(),
+        SaeAtomBasisKind::Sphere | SaeAtomBasisKind::ProjectivePlane => {
+            std::f64::consts::PI + 2.0 * raw.atan()
+        }
         SaeAtomBasisKind::Mobius if axis == 0 => 1.0 + 2.0 * raw.atan() / std::f64::consts::PI,
         SaeAtomBasisKind::Mobius => raw.tanh(),
         _ => raw,
@@ -511,43 +516,27 @@ pub fn build_sae_support_term_seed(
         let plan = plans.pop().ok_or_else(|| {
             "build_sae_support_term_seed: atom planner returned no plan".to_string()
         })?;
-        if plan.latent_dim != effective_dim {
+        if plan.latent_dim() != effective_dim {
             return Err(format!(
                 "build_sae_support_term_seed: atom {atom} plan latent dim {} != sparse state dim {effective_dim}",
-                plan.latent_dim
+                plan.latent_dim()
             ));
         }
         let mut probe_seed = Array3::<f64>::zeros((1, 1, effective_dim));
         for axis in 0..effective_dim {
             probe_seed[[0, 0, axis]] = chart_samples[[0, axis]];
         }
-        let (phi_stack, jet_stack, penalty_stack, basis_sizes, coord_blocks) =
+        let (phi_stack, jet_stack, penalty_stack, basis_sizes, _) =
             sae_build_padded_basis_stacks(std::slice::from_ref(&plan), probe_seed.view(), 1)?;
-        let evaluators = build_sae_basis_evaluators(
-            std::slice::from_ref(&plan.kind),
-            &basis_sizes,
-            std::slice::from_ref(&effective_dim),
-            &coord_blocks,
-            std::slice::from_ref(&plan.duchon_centers),
-        )?;
-        let evaluator =
-            evaluators.into_iter().next().flatten().ok_or_else(|| {
-                format!("build_sae_support_term_seed: atom {atom} has no evaluator")
-            })?;
+        let evaluator = plan.geometry.build_evaluator()?;
         let m = basis_sizes[0];
         let phi = phi_stack.slice(s![0, 0..1, 0..m]).to_owned();
         let jet = jet_stack
             .slice(s![0, 0..1, 0..m, 0..effective_dim])
             .to_owned();
-        let reference = if matches!(kind, SaeAtomBasisKind::Poincare) {
-            SaeReferenceRoughness::PoincareConformalDirichlet {
-                reference_coords: coord_blocks[0].clone(),
-            }
-        } else {
-            SaeReferenceRoughness::ProvidedFunctionGram(
-                penalty_stack.slice(s![0, 0..m, 0..m]).to_owned(),
-            )
-        };
+        let reference = SaeReferenceRoughness::ProvidedFunctionGram(
+            penalty_stack.slice(s![0, 0..m, 0..m]).to_owned(),
+        );
         let atom_template = SaeManifoldAtom::new(
             format!("atom_{atom}"),
             kind,
@@ -557,7 +546,8 @@ pub fn build_sae_support_term_seed(
             Array2::<f64>::zeros((m, request.output_dim)),
             reference,
         )?
-        .with_basis_second_jet(evaluator);
+        .with_basis_second_jet(evaluator)
+        .with_geometry_plan(plan.geometry.clone())?;
         atoms.push(atom_template);
         atom_plans.push(plan);
     }

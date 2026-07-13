@@ -1,24 +1,11 @@
-//! Atom basis-width policy and analytic-evaluator rebuild (issue #2236).
+//! Atom resolution policy and analytic-evaluator rebuild (issue #2236).
 //!
-//! One home for the width conventions that tie a fitted atom's basis width to
-//! its analytic evaluator — the Duchon nullspace knob, the periodic/torus
-//! harmonic-width algebra, the Euclidean-patch degree recovery, the cylinder
-//! and Möbius production layouts — plus [`build_sae_basis_evaluators`], which
-//! rebuilds every atom's second-jet evaluator from that metadata so the inner
-//! Newton loop can refresh `Phi_k`/`dPhi_k/dt` without Python in the loop.
-//! Moved verbatim from `gam-pyffi` so the CLI, Rust users, and the binding
-//! share one policy.
+//! Widths are derived only from constructor-validated [`SaeAtomGeometryPlan`]s.
+//! There is intentionally no evaluator reconstruction from realized widths.
 
 use std::sync::Arc;
 
-use gam_terms::basis::monomial_exponents;
-use ndarray::Array2;
-
-use super::{
-    CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
-    MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SaeAtomBasisKind, SaeBasisSecondJet,
-    SphereChartEvaluator, TorusHarmonicEvaluator,
-};
+use super::{SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisSecondJet};
 
 /// Default per-axis harmonic order for a torus atom (Φ has `(2H+1)^d`
 /// columns). Three harmonics per axis gives a 7-column 1-D factor and a
@@ -87,31 +74,6 @@ pub const SAE_CYLINDER_LINE_DEGREE: usize = 2;
 pub const SAE_MOBIUS_CIRCLE_HARMONICS: usize = 3;
 pub const SAE_MOBIUS_WIDTH_DEGREE: usize = 2;
 
-/// Recover the cylinder evaluator's `(circle_harmonics H, line_degree D)` from
-/// its fitted product basis width `m = (2H + 1)·(D + 1)` and the production
-/// line-degree convention (`D = SAE_CYLINDER_LINE_DEGREE`). The line factor width
-/// `Ml = D + 1` must divide `m`, and the recovered circle width `Mc = m / Ml`
-/// must be odd (`= 2H + 1`); otherwise the basis width is inconsistent with a
-/// cylinder product and the error is surfaced rather than guessed.
-pub fn sae_cylinder_harmonics_degree(m: usize) -> Result<(usize, usize), String> {
-    let d_line = SAE_CYLINDER_LINE_DEGREE;
-    let ml = d_line + 1;
-    if ml == 0 || m == 0 || m % ml != 0 {
-        return Err(format!(
-            "sae_cylinder_harmonics_degree: basis size {m} is not (2H+1)·{ml} for a cylinder \
-             with line degree {d_line}"
-        ));
-    }
-    let mc = m / ml;
-    if mc < 3 || mc % 2 == 0 {
-        return Err(format!(
-            "sae_cylinder_harmonics_degree: recovered circle width {mc} (= {m}/{ml}) is not an \
-             odd 2H+1 ≥ 3 for a cylinder"
-        ));
-    }
-    Ok(((mc - 1) / 2, d_line))
-}
-
 pub const SAE_MAX_PERIODIC_HARMONICS: usize = 4096;
 
 pub fn sae_periodic_basis_size(n_harmonics: usize) -> Result<usize, String> {
@@ -128,231 +90,19 @@ pub fn sae_periodic_basis_size(n_harmonics: usize) -> Result<usize, String> {
         })
 }
 
-/// Compute the per-axis basis size `axis_m = (m)^(1/d)` for a torus atom and
-/// verify that `m = axis_m^d` with `axis_m` odd (i.e. `2H+1`). Returns
-/// `axis_m`.
-pub fn sae_torus_axis_basis_size(m: usize, d: usize) -> Result<usize, String> {
-    if d == 0 {
-        return Err("sae_torus_axis_basis_size: d must be >= 1".to_string());
-    }
-    if m == 0 {
-        return Err("sae_torus_axis_basis_size: m must be >= 1".to_string());
-    }
-    // Integer d-th root via search; m is small (`<= 4096^d` in practice).
-    let mut axis_m: usize = 1;
-    loop {
-        let mut prod: usize = 1;
-        let mut overflow = false;
-        for _ in 0..d {
-            match prod.checked_mul(axis_m) {
-                Some(p) => prod = p,
-                None => {
-                    overflow = true;
-                    break;
-                }
-            }
-        }
-        if overflow || prod > m {
-            return Err(format!(
-                "sae_torus_axis_basis_size: m={m} is not a perfect d-th power for d={d}"
-            ));
-        }
-        if prod == m {
-            if axis_m % 2 == 0 {
-                return Err(format!(
-                    "sae_torus_axis_basis_size: m={m} = {axis_m}^{d} but axis size must be odd (2H+1)"
-                ));
-            }
-            return Ok(axis_m);
-        }
-        axis_m += 1;
-    }
-}
-
-pub fn sae_euclidean_degree_for_basis_size(dim: usize, basis_size: usize) -> Result<usize, String> {
-    // Recover up to the BORN ceiling (degree 3), not just the seed degree 2: a
-    // structure-search birth grows a `d=1` EuclideanPatch line at degree 3
-    // (`M = 4`), and its OOS rebuild / refresh must map that trained width back to
-    // its degree. Widths are strictly increasing in the degree per `dim`, so the
-    // recovery is unique.
-    for degree in 0..=SAE_EUCLIDEAN_PATCH_RECOVERY_MAX_DEGREE {
-        if monomial_exponents(dim, degree).len() == basis_size {
-            return Ok(degree);
-        }
-    }
-    Err(format!(
-        "euclidean patch basis size {basis_size} is not a valid monomial width for latent_dim={dim} with max_degree<={SAE_EUCLIDEAN_PATCH_RECOVERY_MAX_DEGREE}"
-    ))
-}
-
 /// Build per-atom Rust basis evaluators so the Newton loop can refresh
 /// `Phi_k` and `dPhi_k/dt` between steps without bouncing back to Python.
 ///
-/// Every supported kind has a concrete analytic evaluator: `Periodic`
-/// (`latent_dim == 1`) → harmonic, `Sphere` (`latent_dim == 2`) → chart,
-/// `Torus` → tensor harmonic, `Duchon` → radial+polynomial coordinate
-/// evaluator (requires the atom's centers in `atom_centers`), and
-/// `EuclideanPatch` → monomial patch. A `Precomputed` atom — or a kind whose
-/// refresh metadata is missing (e.g. a Duchon atom with no centers) — has no
-/// way to re-evaluate `Phi(t)` at updated coordinates, so construction errors
-/// rather than freezing a stale snapshot.
+/// Every evaluator is rebuilt directly from its tagged resolution. No
+/// harmonic order, polynomial degree, or Duchon centers are inferred from a
+/// realized width or coordinate snapshot.
 pub fn build_sae_basis_evaluators(
-    basis_kinds: &[SaeAtomBasisKind],
-    basis_sizes: &[usize],
-    atom_dim: &[usize],
-    coord_blocks: &[Array2<f64>],
-    atom_centers: &[Option<Array2<f64>>],
-) -> Result<Vec<Option<Arc<dyn SaeBasisSecondJet>>>, String> {
-    let k_atoms = basis_kinds.len();
-    if atom_dim.len() != k_atoms
-        || basis_sizes.len() != k_atoms
-        || coord_blocks.len() != k_atoms
-        || atom_centers.len() != k_atoms
-    {
-        return Err(format!(
-            "build_sae_basis_evaluators: K-length metadata mismatch (kinds={k_atoms}, dims={}, sizes={}, coords={}, centers={})",
-            atom_dim.len(),
-            basis_sizes.len(),
-            coord_blocks.len(),
-            atom_centers.len()
-        ));
-    }
-    let mut out: Vec<Option<Arc<dyn SaeBasisSecondJet>>> = Vec::with_capacity(k_atoms);
-    for k in 0..k_atoms {
-        let m = basis_sizes[k];
-        let d = atom_dim[k];
-        // Every production atom evaluator implements `SaeBasisSecondJet` (it
-        // exposes the analytic basis Hessian). Returning the second-jet trait
-        // object lets the term builder install it through
-        // `with_basis_second_jet`, which is the slot the #1117 rank-revealing
-        // reduction reads to reparametrize a rank-deficient decoder.
-        let evaluator: Arc<dyn SaeBasisSecondJet> = match &basis_kinds[k] {
-            SaeAtomBasisKind::Periodic if d == 1 && m % 2 == 1 => {
-                Arc::new(PeriodicHarmonicEvaluator::new(m)?)
-            }
-            SaeAtomBasisKind::Sphere if d == 2 && m == SAE_SPHERE_BASIS_SIZE => {
-                Arc::new(SphereChartEvaluator)
-            }
-            SaeAtomBasisKind::Torus if d >= 1 => {
-                // Recover the per-axis harmonic count `H` from `m = (2H+1)^d`.
-                let axis_m = sae_torus_axis_basis_size(m, d)?;
-                let h = (axis_m - 1) / 2;
-                Arc::new(TorusHarmonicEvaluator::new(d, h)?)
-            }
-            SaeAtomBasisKind::Duchon => {
-                let centers = atom_centers[k].as_ref().ok_or_else(|| {
-                    format!(
-                        "build_sae_basis_evaluators: Duchon atom {k} cannot refresh its basis without centers; \
-                         build the atom through the SAE auto path so its Duchon centers are threaded in"
-                    )
-                })?;
-                // Same dimension-aware `m` the seed build
-                // (`sae_build_duchon_atom`) used: both read `centers.ncols()`,
-                // so the refreshed `Φ`/jet stays column-consistent with the
-                // seed design and its native (Primary) penalty (issue-247 invariant).
-                Arc::new(DuchonCoordinateEvaluator::new(
-                    centers.clone(),
-                    sae_duchon_atom_m(centers.ncols()),
-                )?)
-            }
-            SaeAtomBasisKind::Cylinder if d == 2 => {
-                // Cylinder `S¹ × ℝ`: recover the circle harmonic count `H` and
-                // line degree `D` from the fitted product width
-                // `m = (2H+1)·(D+1)` (the production line-degree convention), so
-                // the refreshed `Φ`/jet stays column-consistent with the seed
-                // design. An inconsistent width is surfaced, not guessed.
-                let (h, d_line) = sae_cylinder_harmonics_degree(m)?;
-                Arc::new(CylinderHarmonicEvaluator::new(h, d_line)?)
-            }
-            // #1221 — the genuinely-linear (affine) atom is the degree-1 monomial
-            // patch `{1, t}`. It shares the `EuclideanPatchEvaluator`, built at
-            // `max_degree = 1` recovered from its basis width `m = d + 1` so the
-            // refreshed Φ/jet stays column-consistent with the seed design.
-            SaeAtomBasisKind::Linear => Arc::new(EuclideanPatchEvaluator::new(
-                d,
-                sae_euclidean_degree_for_basis_size(d, m)?,
-            )?),
-            SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => {
-                // Recover the patch degree from the TRAINED width `m`, not the
-                // seed default 2: a structure-search-born `d=1` EuclideanPatch line
-                // is degree 3 (`m = 4`), so freezing degree 2 here would re-emit a
-                // 3-column Φ that disagrees with the trained 4-row decoder and break
-                // the inner-Newton latent refresh / OOS reconstruct on a born line.
-                Arc::new(EuclideanPatchEvaluator::new(
-                    d,
-                    sae_euclidean_degree_for_basis_size(d, m)?,
-                )?)
-            }
-            SaeAtomBasisKind::Mobius if d == 2 => {
-                // Möbius production convention: H = 3 double-cover circle
-                // harmonics, width degree 2 (deck-invariant width 10, see
-                // `MobiusHarmonicEvaluator`). Verify the fitted width instead
-                // of guessing an alternative layout.
-                let evaluator = MobiusHarmonicEvaluator::new(
-                    SAE_MOBIUS_CIRCLE_HARMONICS,
-                    SAE_MOBIUS_WIDTH_DEGREE,
-                )?;
-                if evaluator.basis_size() != m {
-                    return Err(format!(
-                        "build_sae_basis_evaluators: Mobius atom {k} width {m} does not match \
-                         the production deck-invariant layout ({} columns)",
-                        evaluator.basis_size()
-                    ));
-                }
-                Arc::new(evaluator)
-            }
-            SaeAtomBasisKind::Mobius => {
-                return Err(format!(
-                    "build_sae_basis_evaluators: Mobius atom {k} requires latent_dim == 2; got dim={d}, m={m}"
-                ));
-            }
-            SaeAtomBasisKind::Cylinder => {
-                return Err(format!(
-                    "build_sae_basis_evaluators: Cylinder atom {k} requires latent_dim == 2; got dim={d}, m={m}"
-                ));
-            }
-            SaeAtomBasisKind::FiniteSet => {
-                // A finite-set atom's latent is CATEGORICAL (a discrete anchor
-                // index), so it has no continuous Phi(t)/dPhi/dt for the inner
-                // Newton latent update to refresh. The candidate is inert
-                // scaffolding not enrolled in the topology race
-                // (`structure_harvest::finite_set_race_enrolled` is false by
-                // default), so it cannot reach here from a discovered dictionary;
-                // surface loudly if the enrolment flag is flipped before the
-                // first-class continuous-optimizer integration lands, rather than
-                // mis-refreshing a categorical basis as a smooth one.
-                return Err(format!(
-                    "build_sae_basis_evaluators: atom {k} 'finite_set' is a discrete-anchor \
-                     (categorical) candidate with no continuous Phi(t) refresh; it is not yet \
-                     wired into the inner Newton latent-update path"
-                ));
-            }
-            SaeAtomBasisKind::Precomputed(label) => {
-                return Err(format!(
-                    "build_sae_basis_evaluators: atom {k} basis {label:?} is precomputed and has no \
-                     analytic refresh routine; the inner Newton latent update requires a basis kind \
-                     that can re-evaluate Phi(t)/dPhi/dt at updated coordinates"
-                ));
-            }
-            SaeAtomBasisKind::Periodic => {
-                return Err(format!(
-                    "build_sae_basis_evaluators: Periodic atom {k} requires latent_dim == 1 and odd basis size; got dim={d}, m={m}"
-                ));
-            }
-            SaeAtomBasisKind::Sphere => {
-                return Err(format!(
-                    "build_sae_basis_evaluators: Sphere atom {k} requires latent_dim == 2 and basis size {SAE_SPHERE_BASIS_SIZE}; got dim={d}, m={m}"
-                ));
-            }
-            SaeAtomBasisKind::Torus => {
-                return Err(format!(
-                    "build_sae_basis_evaluators: Torus atom {k} requires latent_dim >= 1; got dim={d}, m={m}"
-                ));
-            }
-        };
-        out.push(Some(evaluator));
-    }
-    Ok(out)
+    geometry_plans: &[SaeAtomGeometryPlan],
+) -> Result<Vec<Arc<dyn SaeBasisSecondJet>>, String> {
+    geometry_plans
+        .iter()
+        .map(SaeAtomGeometryPlan::build_evaluator)
+        .collect()
 }
 
 /// Native [`SaeAtomBasisKind`] for an exact canonical basis token. Public and
@@ -364,6 +114,8 @@ pub fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
         "periodic" => SaeAtomBasisKind::Periodic,
         "sphere" => SaeAtomBasisKind::Sphere,
         "torus" => SaeAtomBasisKind::Torus,
+        "projective_plane" => SaeAtomBasisKind::ProjectivePlane,
+        "klein_bottle" => SaeAtomBasisKind::KleinBottle,
         // The genuinely-linear atom is the degree-1 monomial patch, distinct
         // from the degree-2 canonical `euclidean` patch.
         "linear" => SaeAtomBasisKind::Linear,
@@ -396,6 +148,8 @@ pub fn sae_atom_basis_kind_name(kind: &SaeAtomBasisKind) -> String {
         SaeAtomBasisKind::Duchon => "duchon".to_string(),
         SaeAtomBasisKind::Sphere => "sphere".to_string(),
         SaeAtomBasisKind::Torus => "torus".to_string(),
+        SaeAtomBasisKind::ProjectivePlane => "projective_plane".to_string(),
+        SaeAtomBasisKind::KleinBottle => "klein_bottle".to_string(),
         // The degree-1 and degree-2 patch families have distinct canonical names.
         SaeAtomBasisKind::Linear => "linear".to_string(),
         SaeAtomBasisKind::EuclideanPatch => "euclidean".to_string(),

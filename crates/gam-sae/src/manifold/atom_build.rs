@@ -531,10 +531,13 @@ mod tests {
         .expect("periodic plan");
 
         assert_eq!(plans.len(), 1);
-        assert!(matches!(plans[0].kind, SaeAtomBasisKind::Periodic));
-        assert_eq!(plans[0].latent_dim, 1);
-        assert_eq!(plans[0].n_harmonics, 2);
-        assert_eq!(plans[0].basis_size, 5);
+        assert_eq!(plans[0].kind(), &SaeAtomBasisKind::Periodic);
+        assert_eq!(plans[0].latent_dim(), 1);
+        assert_eq!(plans[0].basis_size().unwrap(), 5);
+        assert_eq!(
+            plans[0].geometry.resolution(),
+            &SaeBasisResolution::PeriodicHarmonics { order: 2 }
+        );
 
         let (phi, jet, penalty, basis_sizes, coords) =
             sae_build_padded_basis_stacks(&plans, seed_coords.view(), 4)
@@ -545,8 +548,8 @@ mod tests {
         assert_eq!(basis_sizes, vec![5]);
         assert_eq!(coords[0].dim(), (4, 1));
         assert!(phi.slice(s![0, .., 0]).iter().all(|&value| value == 1.0));
-        assert_eq!(penalty[[0, 0, 0]], 1.0e-8);
-        assert_eq!(penalty[[0, 3, 3]], 16.0);
-        assert_eq!(penalty[[0, 4, 4]], 16.0);
+        assert_eq!(penalty[[0, 0, 0]], 0.0);
+        assert_eq!(penalty[[0, 3, 3]], 8.0);
+        assert_eq!(penalty[[0, 4, 4]], 8.0);
     }
 }

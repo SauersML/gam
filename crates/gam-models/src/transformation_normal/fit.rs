@@ -556,15 +556,6 @@ pub fn fit_transformation_normal(
          specs: &[TermCollectionSpec],
          designs: &[TermCollectionDesign],
          provenance| {
-            let certified_outer = match provenance {
-                SpatialFitProvenance::Certified(outer) => outer,
-                SpatialFitProvenance::NoOuterOptimization => {
-                    return Err(
-                        "transformation selected-mode finalization requires certified spatial outer provenance"
-                            .to_string(),
-                    );
-                }
-            };
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             ensure_exact_geometry(&specs[0], &designs[0], &rho)?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
@@ -572,10 +563,14 @@ pub fn fit_transformation_normal(
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let warm_starts = exact_mode_candidates(gam_problem::EvalMode::ValueOnly, &rho);
+            let final_options = transformation_exact_outer_options(
+                &options,
+                &gam_problem::outer_subsample::RowSet::All,
+            );
             let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
                 &geometry.family,
                 &geometry.blocks,
-                &options,
+                &final_options,
                 &rho,
                 Arc::clone(&geometry.derivative_blocks),
                 &warm_starts,
@@ -588,14 +583,26 @@ pub fn fit_transformation_normal(
                 selection.selected_candidate,
                 selected_objective,
             );
-            let fit = fit_custom_family_fixed_log_lambdas_from_mode_selection(
-                &geometry.family,
-                &geometry.blocks,
-                &options,
-                selection,
-                theta,
-                certified_outer,
-            )
+            let fit = match provenance {
+                SpatialFitProvenance::NoOuterOptimization => {
+                    fit_custom_family_user_fixed_log_lambdas_from_mode_selection(
+                        &geometry.family,
+                        &geometry.blocks,
+                        &final_options,
+                        selection,
+                    )
+                }
+                SpatialFitProvenance::Certified(outer) => {
+                    fit_custom_family_fixed_log_lambdas_from_mode_selection(
+                        &geometry.family,
+                        &geometry.blocks,
+                        &final_options,
+                        selection,
+                        theta,
+                        outer,
+                    )
+                }
+            }
             .map_err(|e| format!("transformation fit_fn: {e}"))?;
             if let Some(block) = fit.block_states.first() {
                 *geometry
