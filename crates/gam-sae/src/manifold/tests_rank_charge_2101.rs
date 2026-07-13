@@ -579,17 +579,45 @@ fn rank_charge_vetoes_zero_realised_rank_atom() {
         "real rank-2 circle must NOT be vetoed: {v_real}"
     );
 
-    // A vanishing decoder (×1e-6 → rank_eff=0, d_eff=0) is vetoed.
+    // A vanishing decoder (×1e-6 → rank_eff=0, d_eff=0) is a typed structural
+    // boundary in both storage routes, never an Ok(+inf) scalar.
     term.atoms[0].decoder_coefficients.assign(&(&saved * 1e-6));
-    let (v_vanish, _, _) = term
+    let dense = term
         .penalized_quasi_laplace_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
-        .unwrap();
-    eprintln!("[#5 veto] vanishing atom v={v_vanish} (must be +∞)");
-    assert!(
-        v_vanish.is_infinite() && v_vanish > 0.0,
-        "a zero-realised-rank (vanishing) atom must be VETOED to +∞; got {v_vanish}"
-    );
+        .unwrap_err();
+    let streaming = term
+        .penalized_quasi_laplace_criterion_streaming_exact(
+            tgt.view(),
+            &rho,
+            None,
+            0,
+            1.0,
+            1e-6,
+            1e-6,
+        )
+        .unwrap_err();
+    for error in [&dense, &streaming] {
+        let super::SaeCriterionError::VanishedAtoms(atoms) = error else {
+            panic!("vanishing decoder must return typed VanishedAtoms, got {error}");
+        };
+        assert_eq!(atoms.iter().collect::<Vec<_>>(), vec![0]);
+    }
     term.atoms[0].decoder_coefficients.assign(&saved);
+}
+
+#[test]
+fn rank_charge_does_not_mask_invalid_dof_behind_vanishing_atom() {
+    let error = super::construction::rank_adjusted_quasi_laplace_complexity(
+        1.0,
+        0.5,
+        &[0.0, f64::NAN],
+        &[10.0, 10.0],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, super::SaeCriterionError::Numerical(_)),
+        "a simultaneous invalid DOF must remain a numerical error, not {error}"
+    );
 }
 
 /// The reconstruction target the fitted circle was built against (re-derived from

@@ -726,12 +726,54 @@ pub(crate) fn neglog_derivatives(x: f64) -> (f64, f64, f64, f64) {
     (-inv, inv2, -2.0 * inv2 * inv, 6.0 * inv2 * inv2)
 }
 
-/// Row-level primary gradient (4-vector) and Hessian (4×4 symmetric)
-/// computed entirely from closed-form scalar formulas.
+/// Row-level primary value, gradient, and Hessian lowered from the canonical
+/// [`rigid_row_nll`] program.
 ///
-/// Returns (nll, gradient[4], hessian[4][4]) on the stack.
+/// Every live K=1 caller (pilot initialization, sigma evaluation,
+/// identifiability compilation, KKT refusal, and the `RowKernel`) therefore
+/// executes the same scalar expression. [`SparseOrder2`] changes only the
+/// generated execution schedule: the three index-affine primaries carry a
+/// compile-time sparsity certificate, while all leaf curvature and cross terms
+/// still come from the one row program.
 #[inline]
 pub(crate) fn row_primary_closed_form(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    g: f64,
+    z: f64,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
+    use gam_math::jet_scalar::JetScalar;
+    use gam_math::nested_dual::JetField;
+
+    let primaries = [q0, q1, qd1, g];
+    let vars: [SparseOrder2<RIGID_LINEAR_MASK>; N_PRIMARY] =
+        std::array::from_fn(|axis| SparseOrder2::variable(primaries[axis], axis));
+    let inputs = RigidRowInputs {
+        row: 0,
+        wi: w,
+        di: d,
+        z_sum: z,
+        covariance_ones: 1.0,
+        probit_scale,
+        qd1_lower: derivative_guard,
+    };
+    let row = rigid_row_nll(&vars, &inputs)?;
+    Ok((row.value(), row.g(), row.h()))
+}
+
+/// Historical hand-expanded K=1 V/G/H schedule, retained only as an
+/// independent strongest-hand test and performance witness for the generated
+/// [`row_primary_closed_form`] lowering. Production must never call this body:
+/// keeping the duplicate chain rule live would reintroduce the #736/#932
+/// desynchronization class.
+#[cfg(test)]
+#[inline]
+pub(crate) fn row_primary_closed_form_hand_reference(
     q0: f64,
     q1: f64,
     qd1: f64,
@@ -982,6 +1024,53 @@ mod tests {
                     (probit_scale - fd_s).abs() < 1e-6,
                     "s'(g) must equal probit_scale"
                 );
+            }
+        }
+    }
+
+    /// #932 cutover gate: every live K=1 scalar caller now uses the packed
+    /// lowering of `rigid_row_nll`. Pin every returned channel against the
+    /// retired strongest hand schedule over both event branches, ordinary
+    /// rows, and opposite probability tails.
+    #[test]
+    fn canonical_rigid_order2_matches_strongest_hand_schedule_932() {
+        let cases = [
+            (-0.7, 0.4, 0.8, -0.3, 0.6, 1.0, 0.0, 0.75),
+            (0.2, -0.5, 1.4, 0.9, -1.1, 0.8, 1.0, 1.0),
+            (7.0, 6.2, 0.15, 1.7, -2.0, 1.3, 0.0, 0.55),
+            (-7.5, -6.8, 2.1, -1.4, 1.8, 0.7, 1.0, 0.9),
+        ];
+        let close = |label: &str, actual: f64, expected: f64| {
+            let tolerance = 2.0e-11 * actual.abs().max(expected.abs()).max(1.0);
+            assert!(
+                actual.is_finite()
+                    && expected.is_finite()
+                    && (actual - expected).abs() <= tolerance,
+                "{label}: canonical={actual:+.16e}, hand={expected:+.16e}, tolerance={tolerance:.3e}",
+            );
+        };
+
+        for (case, &(q0, q1, qd1, g, z, w, d, scale)) in cases.iter().enumerate() {
+            let canonical = row_primary_closed_form(q0, q1, qd1, g, z, w, d, 1.0e-8, scale)
+                .expect("canonical rigid row");
+            let hand = row_primary_closed_form_hand_reference(
+                q0, q1, qd1, g, z, w, d, 1.0e-8, scale,
+            )
+            .expect("strongest hand rigid row");
+            close(&format!("case {case} value"), canonical.0, hand.0);
+            for a in 0..N_PRIMARY {
+                close(
+                    &format!("case {case} gradient[{a}]"),
+                    canonical.1[a],
+                    hand.1[a],
+                );
+                for b in 0..N_PRIMARY {
+                    close(
+                        &format!("case {case} Hessian[{a},{b}]"),
+                        canonical.2[a][b],
+                        hand.2[a][b],
+                    );
+                }
             }
         }
     }

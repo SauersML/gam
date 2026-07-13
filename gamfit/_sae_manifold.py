@@ -13,6 +13,7 @@ from ._penalty_bridge import GumbelTemperatureSchedule
 
 
 ManifoldSAE = rust_module().ManifoldSAE
+Tier0SAE = rust_module().Tier0SAE
 _FISHER_SHARD_SCHEMA = "gamfit.FisherHarvest/v1"
 
 
@@ -186,7 +187,7 @@ def sae_manifold_fit(
     promote_from_residual: bool = False,
     run_structure_search: bool = False,
     structured_residual_passes: int = 0,
-) -> ManifoldSAE:
+) -> ManifoldSAE | Tier0SAE:
     """Fit and return the immutable Rust-owned manifold-SAE model.
 
     Python only converts user containers to contiguous arrays and literal
@@ -367,6 +368,7 @@ def plot(atom: Any, **kwargs: Any) -> Any:
 __all__ = [
     "GumbelTemperatureSchedule",
     "ManifoldSAE",
+    "Tier0SAE",
     "flat_block_assignment",
     "gumbel_geometric_schedule",
     "gumbel_linear_schedule",
