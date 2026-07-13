@@ -898,8 +898,7 @@ pub fn dispersion_alo_row_geometry(
         });
     }
     let tower = dispersion_eta_nll_order2(kind, y, eta_mu, eta_d, prior_weight);
-    let gradient = tower.g();
-    let hessian = tower.h();
+    let (_, gradient, hessian) = tower.into_channels();
     let geometry = DispersionAloRowGeometry {
         nll_score: gradient,
         observed_hessian: hessian,
