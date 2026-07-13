@@ -1996,6 +1996,33 @@ mod tests {
         assert!(production_workspace.retained_bytes() > 0);
     }
 
+    #[test]
+    fn vector_workspace_is_compact_and_rejects_cross_width_reuse_932() {
+        assert!(
+            std::mem::size_of::<RigidVectorRowWorkspace>() <= 128,
+            "backend selector must not inline the fixed graph tape"
+        );
+        assert!(RigidVectorRowWorkspace::new(0).is_err());
+
+        let mut workspace = RigidVectorRowWorkspace::new(3).expect("k=3 workspace");
+        let covariance = MarginalSlopeCovariance::Diagonal(Array1::ones(2));
+        let error = row_primary_closed_form_vector(
+            -0.2,
+            0.4,
+            1.1,
+            &[0.3, -0.5],
+            &[0.7, -1.2],
+            &covariance,
+            1.0,
+            1.0,
+            1.0e-8,
+            0.9,
+            &mut workspace,
+        )
+        .expect_err("a row cannot reuse workspace configured for another score width");
+        assert!(error.contains("workspace width mismatch"), "{error}");
+    }
+
     /// Temporary #932 release measurement for the runtime-width row program.
     /// Correctness remains pinned by
     /// `runtime_vector_row_program_matches_strongest_hand_mixed_score_vgh_932`;
