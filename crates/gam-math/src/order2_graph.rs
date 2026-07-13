@@ -191,15 +191,9 @@ impl Order2GraphWorkspace {
         tape.projected_curvature_len = 0;
     }
 
-    /// Bytes retained by the fixed graph and reverse-sweep tape.
-    #[must_use]
-    pub fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<GraphTape>()
-    }
-
     /// Number of active nodes in the current row schedule.
     #[must_use]
-    pub fn node_count(&self) -> usize {
+    fn node_count(&self) -> usize {
         self.tape().node_len
     }
 
