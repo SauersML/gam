@@ -588,48 +588,10 @@ pub fn build_contracted_psi_hook(
             ));
         }
 
-        for (i, axis_i) in axes.iter().enumerate() {
-            let p_block = axis_i.end - axis_i.start;
-            let beta_block = beta_arc.slice(s![axis_i.start..axis_i.end]).to_owned();
-            // Combined same-block penalty second derivative
-            //   S_{ψi ψ(α)}_local = Σ_{j: block_j == block_i} α_j S_{ψi ψj}_local,
-            // and the combined first-leg penalty derivative
-            //   S_ψ(α)_local = Σ_{j: block_j == block_i} α_j S_ψj_local
-            // (the second leg of the bilinear penalty-logdet cross term).
-            let mut s_psi_psi_alpha = Array2::<f64>::zeros((p_block, p_block));
-            let mut s_psi_alpha = Array2::<f64>::zeros((p_block, p_block));
-            for (j, axis_j) in axes.iter().enumerate() {
-                let aj = alpha_psi[j];
-                if aj == 0.0 || axis_j.block != axis_i.block {
-                    continue;
-                }
-                let deriv_i = &derivative_blocks[axis_i.block][axis_i.local];
-                let s_ij = assemble_block_local_s_psi_psi(
-                    deriv_i,
-                    axis_j.local,
-                    &per_block_lambdas[axis_i.block],
-                    p_block,
-                );
-                s_psi_psi_alpha.scaled_add(aj, &s_ij);
-                s_psi_alpha.scaled_add(aj, &axis_j.s_psi_local);
-            }
-
-            // objective += 0.5 βᵀ S_{ψi ψ(α)} β  (matches ext_ext `a`).
-            let s_beta = s_psi_psi_alpha.dot(&beta_block);
-            objective[i] += 0.5 * beta_block.dot(&s_beta);
-            // score[i] (block-local slice) += S_{ψi ψ(α)} β  (matches ext_ext `g`).
-            {
-                let mut score_local = score.row_mut(i);
-                let mut slot = score_local.slice_mut(s![axis_i.start..axis_i.end]);
-                slot += &s_beta;
-            }
+        for i in 0..psi_dim {
             // EXPLICIT Firth/Jeffreys ψψ VALUE second derivative (gam#1607):
-            //   objective[i] -= ∂_{ψ_i}∂_{ψ(α)}Φ
-            // computed from the β-fixed perturbations `∂_{ψ_i}H_info` (pert_first[i]),
-            // `∂_{ψ(α)}H_info = Σ_j α_j ∂_{ψ_j}H_info`, and the contracted likelihood
-            // second derivative `∂_{ψ_i}∂_{ψ(α)}H_info` (= `hessian[i]` BEFORE the
-            // penalty drift below — the Jeffreys info is the unpenalized data
-            // Hessian, so the `S_{ψ_i ψ_j}` motion must NOT enter it).
+            //   objective[i] -= ∂_{ψ_i}∂_{ψ(α)}Φ.
+            // This applies to both design/penalty and family-owned axes.
             if let Some((z_j, h_joint, pert_first)) = firth_ctx.as_ref() {
                 let pert_i_alpha = match &hessian[i] {
                     DriftDerivResult::Dense(m) => m.clone(),
@@ -652,6 +614,49 @@ pub fn build_contracted_psi_hook(
                 objective[i] -= phi_psi_psi;
             }
 
+            // Family-owned axes have no generic penalty motion. Their complete
+            // V_ij/g_ij/H_ij contribution is already in the workspace result.
+            let Some(axis_i) = axes[i].as_ref() else {
+                continue;
+            };
+            let p_block = axis_i.end - axis_i.start;
+            let beta_block = beta_arc.slice(s![axis_i.start..axis_i.end]).to_owned();
+            // Combined same-block penalty second derivative
+            //   S_{ψi ψ(α)}_local = Σ_{j: block_j == block_i} α_j S_{ψi ψj}_local,
+            // and the combined first-leg penalty derivative
+            //   S_ψ(α)_local = Σ_{j: block_j == block_i} α_j S_ψj_local
+            // (the second leg of the bilinear penalty-logdet cross term).
+            let mut s_psi_psi_alpha = Array2::<f64>::zeros((p_block, p_block));
+            let mut s_psi_alpha = Array2::<f64>::zeros((p_block, p_block));
+            for (j, axis_j) in axes.iter().enumerate() {
+                let Some(axis_j) = axis_j.as_ref() else {
+                    continue;
+                };
+                let aj = alpha_psi[j];
+                if aj == 0.0 || axis_j.block != axis_i.block {
+                    continue;
+                }
+                let deriv_i =
+                    &hyper_layout.design_derivative_blocks()[axis_i.block][axis_i.local];
+                let s_ij = assemble_block_local_s_psi_psi(
+                    deriv_i,
+                    axis_j.local,
+                    &per_block_lambdas[axis_i.block],
+                    p_block,
+                );
+                s_psi_psi_alpha.scaled_add(aj, &s_ij);
+                s_psi_alpha.scaled_add(aj, &axis_j.s_psi_local);
+            }
+
+            // objective += 0.5 βᵀ S_{ψi ψ(α)} β  (matches ext_ext `a`).
+            let s_beta = s_psi_psi_alpha.dot(&beta_block);
+            objective[i] += 0.5 * beta_block.dot(&s_beta);
+            // score[i] (block-local slice) += S_{ψi ψ(α)} β  (matches ext_ext `g`).
+            {
+                let mut score_local = score.row_mut(i);
+                let mut slot = score_local.slice_mut(s![axis_i.start..axis_i.end]);
+                slot += &s_beta;
+            }
             // hessian[i] += S_{ψi ψ(α)} as a block-local drift (matches the
             // ext_ext `b_operator` BlockLocalDrift composite).
             let block_drift: Arc<dyn HyperOperator> = Arc::new(BlockLocalDrift {
