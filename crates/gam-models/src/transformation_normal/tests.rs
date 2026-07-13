@@ -2391,3 +2391,187 @@ pub(crate) fn ctn_exact_newton_joint_gradient_evaluation_matches_evaluate() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// SPEC-5 response-direction function-space penalty (#2306)
+// ---------------------------------------------------------------------------
+
+/// Deterministic well-spread response sample for the response-basis penalty
+/// tests. A monotone spread over [-2, 2] gives well-separated I-spline knots.
+fn spec5_penalty_response() -> Array1<f64> {
+    Array1::from_iter((0..200).map(|i| (i as f64) / 199.0 * 4.0 - 2.0))
+}
+
+/// The realized response-direction penalty is the EXACT function-space
+/// I-spline roughness Gram embedded with an unpenalized location row/column —
+/// never a coefficient-difference operator. This is the concrete #2306
+/// cutover: `build_response_basis` must emit `ispline_function_penalties`, not
+/// `create_difference_penalty_matrix`.
+#[test]
+pub(crate) fn ctn_response_penalty_is_exact_ispline_function_roughness() {
+    let config = TransformationNormalConfig::default();
+    let response = spec5_penalty_response();
+    let (val_basis, _deriv, penalties, knots, _transform) =
+        build_response_basis(&response, &config).expect("response basis builds");
+    assert!(
+        !penalties.is_empty(),
+        "response basis must carry at least the primary roughness penalty"
+    );
+    let p_resp = val_basis.ncols();
+    let p_shape = p_resp - 1;
+    let order = config.response_penalty_order;
+
+    let expected = ispline_function_penalties(knots.view(), config.response_degree, order, false)
+        .expect("exact I-spline function roughness")
+        .roughness;
+    assert_eq!(expected.dim(), (p_shape, p_shape));
+
+    let primary = &penalties[0];
+    assert_eq!(primary.dim(), (p_resp, p_resp));
+    // Location row/column is unpenalized.
+    for j in 0..p_resp {
+        assert!(
+            primary[[0, j]].abs() < 1e-15 && primary[[j, 0]].abs() < 1e-15,
+            "location row/column must be unpenalized at index {j}"
+        );
+    }
+    // Shape block equals the exact function-space roughness bitwise-close.
+    let block = primary.slice(s![1.., 1..]);
+    for r in 0..p_shape {
+        for c in 0..p_shape {
+            assert!(
+                (block[[r, c]] - expected[[r, c]]).abs()
+                    <= 1e-12 * expected[[r, c]].abs().max(1.0),
+                "shape block ({r},{c}) = {:.6e} but exact function roughness = {:.6e}",
+                block[[r, c]],
+                expected[[r, c]],
+            );
+        }
+    }
+
+    // Discriminator: the retired coefficient-difference operator is a DIFFERENT
+    // matrix, so the cutover genuinely changed the penalized metric.
+    let difference =
+        gam_terms::basis::create_difference_penalty_matrix(p_shape, order, None).unwrap();
+    let mut max_rel = 0.0_f64;
+    for r in 0..p_shape {
+        for c in 0..p_shape {
+            let scale = expected[[r, c]].abs().max(difference[[r, c]].abs()).max(1e-9);
+            max_rel = max_rel.max((expected[[r, c]] - difference[[r, c]]).abs() / scale);
+        }
+    }
+    assert!(
+        max_rel > 0.1,
+        "function-space roughness must differ materially from the difference operator (max rel {max_rel:.3e})"
+    );
+}
+
+/// The response-direction penalty is the roughness of the represented
+/// I-spline value function: `βᵀ S β = ∫ (dᵐ/dyᵐ Σ_k β_k I_k(y))² dy`.
+/// Matching this quadrature (and NOT the scale-free difference operator)
+/// proves the penalty is a scale/knot-width-aware function-space metric.
+#[test]
+pub(crate) fn ctn_response_penalty_matches_direct_function_roughness_quadrature() {
+    let config = TransformationNormalConfig::default();
+    let response = spec5_penalty_response();
+    let (val_basis, _deriv, penalties, knots, _transform) =
+        build_response_basis(&response, &config).expect("response basis builds");
+    let p_resp = val_basis.ncols();
+    let p_shape = p_resp - 1;
+    let order = config.response_penalty_order;
+
+    // Deterministic shape coefficients, location coefficient left at zero.
+    let beta_shape = toy_probe_vector(p_shape, 0x5C0F_u64.wrapping_add(order as u64));
+    let mut beta = Array1::<f64>::zeros(p_resp);
+    beta.slice_mut(s![1..]).assign(&beta_shape);
+
+    let quad_form = beta.dot(&penalties[0].dot(&beta));
+    assert!(quad_form > 0.0, "roughness of a nontrivial shape must be positive");
+
+    // Direct Simpson quadrature of the m-th derivative squared over the full
+    // knot support.
+    let lower = *knots.first().unwrap();
+    let upper = *knots.last().unwrap();
+    let panels = 40_000usize; // even -> composite Simpson
+    let step = (upper - lower) / panels as f64;
+    let grid = Array1::from_iter((0..=panels).map(|i| lower + step * i as f64));
+    let deriv_basis =
+        create_ispline_derivative_dense(grid.view(), &knots, config.response_degree, order)
+            .expect("m-th derivative basis on quadrature grid");
+    assert_eq!(deriv_basis.dim(), (panels + 1, p_shape));
+    let fm = deriv_basis.dot(&beta_shape);
+    let mut integral = fm[0] * fm[0] + fm[panels] * fm[panels];
+    for i in 1..panels {
+        let weight = if i % 2 == 1 { 4.0 } else { 2.0 };
+        integral += weight * fm[i] * fm[i];
+    }
+    integral *= step / 3.0;
+
+    let rel = (quad_form - integral).abs() / quad_form.abs();
+    assert!(
+        rel < 2e-4,
+        "penalty quadratic form {quad_form:.8e} must match direct function roughness {integral:.8e} (rel {rel:.3e})"
+    );
+
+    // The scale-free difference operator does NOT reproduce the function-space
+    // roughness — this is exactly why the difference operator was wrong.
+    let difference =
+        gam_terms::basis::create_difference_penalty_matrix(p_shape, order, None).unwrap();
+    let difference_form = beta_shape.dot(&difference.dot(&beta_shape));
+    let diff_rel = (difference_form - integral).abs() / integral.abs();
+    assert!(
+        diff_rel > 0.1,
+        "difference operator quadratic form {difference_form:.8e} must NOT match the function roughness {integral:.8e} (rel {diff_rel:.3e})"
+    );
+}
+
+/// Unsupported response-direction derivative orders are hard errors, not
+/// silently skipped no-ops (the retired `if order==0 || order>=p {return Ok}`
+/// path). Order 0 is the value function; an order above the I-spline value
+/// degree has an identically-zero derivative and carries no roughness.
+#[test]
+pub(crate) fn ctn_response_penalty_rejects_unsupported_derivative_order() {
+    let response = spec5_penalty_response();
+
+    // response_degree = 1 -> value_degree = 2; order 3 is unsupported.
+    let too_high = TransformationNormalConfig {
+        response_degree: 1,
+        response_penalty_order: 3,
+        response_extra_penalty_orders: vec![],
+        ..TransformationNormalConfig::default()
+    };
+    let err = build_response_basis(&response, &too_high)
+        .expect_err("derivative order above the value degree must be rejected");
+    assert!(
+        err.contains("exceeds the I-spline value degree"),
+        "unexpected too-high-order error: {err}"
+    );
+
+    // Order 0 is not a roughness penalty.
+    let zero_order = TransformationNormalConfig {
+        response_penalty_order: 0,
+        response_extra_penalty_orders: vec![],
+        ..TransformationNormalConfig::default()
+    };
+    let err0 = build_response_basis(&response, &zero_order)
+        .expect_err("derivative order 0 must be rejected");
+    assert!(
+        err0.contains("derivative order must be >= 1"),
+        "unexpected zero-order error: {err0}"
+    );
+
+    // An unsupported order supplied only through the EXTRA orders list is also
+    // rejected (no silent skip on the secondary path).
+    let extra_bad = TransformationNormalConfig {
+        response_degree: 1,
+        response_penalty_order: 1,
+        response_extra_penalty_orders: vec![3],
+        ..TransformationNormalConfig::default()
+    };
+    let err_extra = build_response_basis(&response, &extra_bad)
+        .expect_err("unsupported extra derivative order must be rejected");
+    assert!(
+        err_extra.contains("exceeds the I-spline value degree"),
+        "unexpected extra-order error: {err_extra}"
+    );
+}
