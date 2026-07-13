@@ -4,6 +4,28 @@
 
 use super::*;
 
+/// Family-owned survival-baseline coordinates for the joint LAML surface.
+///
+/// `Linear` is structurally fixed and contributes no family hyperparameter
+/// axes. `Nonlinear` owns one frozen offset chart; its theta coordinates are
+/// optimized jointly with smoothing, spatial, and learned-frailty axes.
+#[derive(Clone, Debug)]
+pub enum SurvivalMarginalSlopeBaselineHyperSpec {
+    Linear,
+    Nonlinear {
+        chart: crate::survival::construction::SurvivalMarginalSlopeFrozenOffsetChart,
+    },
+}
+
+impl SurvivalMarginalSlopeBaselineHyperSpec {
+    pub(crate) fn initial_theta(&self) -> Option<&Array1<f64>> {
+        match self {
+            Self::Linear => None,
+            Self::Nonlinear { chart } => Some(chart.initial_theta()),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SurvivalMarginalSlopeTermSpec {
     pub age_entry: Array1<f64>,
@@ -29,6 +51,7 @@ pub struct SurvivalMarginalSlopeTermSpec {
     /// Strict lower bound on q'(t) used by both the likelihood domain and
     /// the monotonicity constraints.
     pub derivative_guard: f64,
+    pub baseline_hyper: SurvivalMarginalSlopeBaselineHyperSpec,
     pub time_block: TimeBlockInput,
     pub timewiggle_block: Option<TimeWiggleBlockInput>,
     pub logslopespec: TermCollectionSpec,
@@ -218,6 +241,17 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
             }
             .into());
         }
+    }
+    if matches!(
+        &spec.baseline_hyper,
+        SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear { .. }
+    ) && !spec.time_block.time_monotonicity.is_coordinate_cone()
+    {
+        return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+            reason: "learned survival marginal-slope baseline coordinates require a StructuralISpline coordinate cone; rowwise derivative constraints would move with the baseline offsets"
+                .to_string(),
+        }
+        .into());
     }
     if spec.event_target.iter().any(|&d| d != 0.0 && d != 1.0) {
         return Err(SurvivalMarginalSlopeError::InvalidInput {

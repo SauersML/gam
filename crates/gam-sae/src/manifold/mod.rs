@@ -201,6 +201,7 @@ mod cross_fit;
 mod crosscoder_drift;
 mod crosscoder_fit;
 mod curl;
+pub mod curve_promotion;
 mod derivative_oracle;
 mod dual;
 mod evaluator_rebuild;
