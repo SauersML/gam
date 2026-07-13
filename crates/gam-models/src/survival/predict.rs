@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use ndarray::{Array1, Array2, ArrayView2, s};
 
+use crate::fit_orchestration::prepare_survival_time_stack;
 use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, SavedBaselineTimeWiggleRuntime,
     load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
@@ -27,6 +28,7 @@ use crate::survival::construction::{
     require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build,
     survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
+use crate::survival::latent::fixed_latent_hazard_frailty;
 use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::survival::{CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints};
 use crate::wiggle::buildwiggle_block_input_from_knots;
@@ -261,6 +263,232 @@ pub struct SurvivalPredictResult {
     /// exit time.  Length `n`.  Populated under the same conditions as
     /// `survival_se`.
     pub eta_se: Option<Array1<f64>>,
+}
+
+/// Exact plug-in survival probability over each requested latent-hazard window.
+///
+/// The latent survival and latent-binary fits share the same persisted hazard
+/// law; they differ only in which response functional is presented to users.
+/// This result deliberately exposes the common probability
+/// `P(T > exit | T > entry, x)`. Observation generation can therefore sample
+/// the fitted window event indicator as Bernoulli with probability
+/// `1 - window_survival` without reconstructing a censoring or inspection law.
+pub struct LatentWindowSurvivalResult {
+    pub window_survival: Array1<f64>,
+    pub likelihood_mode: SurvivalLikelihoodMode,
+}
+
+/// Evaluate the saved latent hazard-multiplier law over the rows' own windows.
+///
+/// This is the library authority for both `latent` and `latent-binary` saved
+/// models. It replays the persisted covariate design, anchored time basis,
+/// loaded/unloaded baseline decomposition, fitted mean/time coefficients, and
+/// fixed lognormal hazard multiplier. No response column, refit, or surrogate
+/// family participates in the calculation.
+pub fn predict_latent_window_survival(
+    req: SurvivalPredictRequest<'_>,
+) -> Result<LatentWindowSurvivalResult, SurvivalPredictError> {
+    let SurvivalPredictRequest {
+        model,
+        data,
+        col_map,
+        training_headers,
+        primary_offset,
+        noise_offset,
+        time_grid,
+        with_uncertainty,
+        estimand,
+    } = req;
+    if time_grid.is_some() {
+        return Err(SurvivalPredictError::InvalidInput {
+            reason: "latent-window prediction consumes each row's saved entry/exit columns; an independent time_grid is not a window law".to_string(),
+        });
+    }
+    if with_uncertainty || estimand != SurvivalPredictEstimand::Plugin {
+        return Err(SurvivalPredictError::UnsupportedConfiguration {
+            reason: "latent-window observation generation requires the fitted plug-in hazard law; posterior coefficient integration is a different sampling target".to_string(),
+        });
+    }
+
+    let likelihood_mode = require_saved_survival_likelihood_mode(model)?;
+    if !matches!(
+        likelihood_mode,
+        SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
+    ) {
+        return Err(SurvivalPredictError::UnsupportedConfiguration {
+            reason: format!(
+                "latent-window prediction requires latent or latent-binary likelihood mode, got {}",
+                survival_likelihood_modename(likelihood_mode)
+            ),
+        });
+    }
+    if model.has_baseline_time_wiggle() {
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason:
+                "saved latent survival/binary model contains forbidden baseline timewiggle metadata"
+                    .to_string(),
+        });
+    }
+
+    let n = data.nrows();
+    if primary_offset.len() != n || noise_offset.len() != n {
+        return Err(SurvivalPredictError::InvalidInput {
+            reason: format!(
+                "latent-window offset length mismatch: rows={n}, primary={}, noise={}",
+                primary_offset.len(),
+                noise_offset.len()
+            ),
+        });
+    }
+    if noise_offset.iter().any(|value| *value != 0.0) {
+        return Err(SurvivalPredictError::InvalidInput {
+            reason: "latent-window survival has no secondary offset coordinate".to_string(),
+        });
+    }
+
+    let termspec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )?;
+    let clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let covariate_input = clipped.as_ref().map_or(data, |array| array.view());
+    let covariate_design = build_term_collection_design(covariate_input, &termspec)
+        .map_err(|error| format!("failed to build latent-window covariate design: {error}"))?;
+    let effective_primary_offset = covariate_design
+        .compose_offset(primary_offset.view(), "latent-window covariate block")
+        .map_err(|error| error.to_string())?;
+
+    let time_columns = resolve_saved_survival_time_columns(model, col_map)?;
+    let mut age_entry = Array1::<f64>::zeros(n);
+    let mut age_exit = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let (entry, exit) = normalize_survival_time_pair(
+            time_columns.row_entry_time(data, row),
+            data[[row, time_columns.exit_col]],
+            row,
+        )?;
+        age_entry[row] = entry;
+        age_exit[row] = exit;
+    }
+
+    let time_config = load_survival_time_basis_config_from_model(model)?;
+    let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_config, None)?;
+    let resolved_time_config = resolved_survival_time_basis_config_from_build(
+        &time_build.basisname,
+        time_build.degree,
+        time_build.knots.as_ref(),
+        time_build.keep_cols.as_ref(),
+        time_build.smooth_lambda,
+    )?;
+    let time_anchor =
+        model
+            .survival_time_anchor
+            .ok_or_else(|| SurvivalPredictError::MissingFitMetadata {
+                reason: "saved latent-window model is missing survival_time_anchor".to_string(),
+            })?;
+    let anchor_row = evaluate_survival_time_basis_row(time_anchor, &resolved_time_config)?;
+    center_survival_time_designs_at_anchor(
+        &mut time_build.x_entry_time,
+        &mut time_build.x_exit_time,
+        &anchor_row,
+    )?;
+    require_structural_survival_time_basis(
+        &time_build.basisname,
+        "saved latent-window prediction",
+    )?;
+
+    let frailty =
+        model
+            .family_state
+            .frailty()
+            .ok_or_else(|| SurvivalPredictError::MissingFitMetadata {
+                reason: "saved latent-window model is missing its hazard-multiplier frailty"
+                    .to_string(),
+            })?;
+    let (sigma, loading) = fixed_latent_hazard_frailty(frailty, "saved latent-window prediction")
+        .map_err(|reason| SurvivalPredictError::MissingFitMetadata { reason })?;
+    let baseline_config = saved_survival_runtime_baseline_config(model)?;
+    let prepared = prepare_survival_time_stack(
+        &age_entry,
+        &age_exit,
+        &baseline_config,
+        likelihood_mode,
+        None,
+        time_anchor,
+        survival_derivative_guard_for_likelihood(likelihood_mode),
+        &time_build,
+        None,
+        Some(loading),
+    )?;
+
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let mean_block = fit.block_by_role(BlockRole::Mean).ok_or_else(|| {
+        SurvivalPredictError::MissingFitMetadata {
+            reason: "saved latent-window model is missing its mean coefficient block".to_string(),
+        }
+    })?;
+    let time_block = fit.block_by_role(BlockRole::Time).ok_or_else(|| {
+        SurvivalPredictError::MissingFitMetadata {
+            reason: "saved latent-window model is missing its time coefficient block".to_string(),
+        }
+    })?;
+    if mean_block.beta.len() != covariate_design.design.ncols() {
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "latent-window mean/design mismatch: beta has {} coefficients but design has {} columns",
+                mean_block.beta.len(),
+                covariate_design.design.ncols()
+            ),
+        });
+    }
+    if time_block.beta.len() != prepared.time_design_exit.ncols() {
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "latent-window time/design mismatch: beta has {} coefficients but design has {} columns",
+                time_block.beta.len(),
+                prepared.time_design_exit.ncols()
+            ),
+        });
+    }
+
+    let eta = covariate_design.design.dot(&mean_block.beta) + &effective_primary_offset;
+    let q_entry = prepared.time_design_entry.dot(&time_block.beta) + &prepared.eta_offset_entry;
+    let q_exit = prepared.time_design_exit.dot(&time_block.beta) + &prepared.eta_offset_exit;
+    let quadrature = gam_solve::quadrature::QuadratureContext::new();
+    let mut window_survival = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let latent_row = crate::survival::lognormal_kernel::LatentSurvivalRow::right_censored(
+            q_entry[row].exp(),
+            q_exit[row].exp(),
+            prepared.unloaded_mass_entry[row],
+            prepared.unloaded_mass_exit[row],
+        );
+        let jet = crate::survival::lognormal_kernel::LatentSurvivalRowJet::evaluate(
+            &quadrature,
+            &latent_row,
+            eta[row],
+            sigma,
+        )
+        .map_err(|error| SurvivalPredictError::NumericalFailure {
+            reason: format!("latent-window row {row} evaluation failed: {error}"),
+        })?;
+        let survival = jet.log_lik.exp();
+        if !(survival.is_finite() && (0.0..=1.0).contains(&survival)) {
+            return Err(SurvivalPredictError::NumericalFailure {
+                reason: format!(
+                    "latent-window row {row} produced invalid conditional survival {survival}"
+                ),
+            });
+        }
+        window_survival[row] = survival;
+    }
+
+    Ok(LatentWindowSurvivalResult {
+        window_survival,
+        likelihood_mode,
+    })
 }
 
 fn select_survival_prediction_covariance<'a>(
@@ -2953,8 +3181,7 @@ fn predict_survival_location_scale_batch(
     use crate::survival::construction::evaluate_survival_time_basis_row;
     use crate::survival::location_scale::{
         SurvivalLocationScalePredictInput, predict_survival_location_scale,
-        predict_survival_location_scalewith_uncertainty,
-        replay_survival_covariate_channels,
+        predict_survival_location_scalewith_uncertainty, replay_survival_covariate_channels,
     };
     use gam_linalg::matrix::DesignMatrix;
 
@@ -3221,9 +3448,9 @@ fn predict_survival_location_scale_batch(
     // fit's `checked_log_survival_times` (issue #892).
     if reduced_parametric_aft {
         for (slot, &t) in threshold_replay.offset.iter_mut().zip(eval_exit.iter()) {
-                *slot -= t
-                    .max(crate::survival::construction::SURVIVAL_TIME_FLOOR)
-                    .ln();
+            *slot -= t
+                .max(crate::survival::construction::SURVIVAL_TIME_FLOOR)
+                .ln();
         }
     }
     // Build the SurvivalLocationScalePredictInput once, with replicated /
@@ -3329,8 +3556,8 @@ fn predict_survival_location_scale_batch(
     };
     let inv_sigma = eta_log_sigma.mapv(crate::sigma_link::exp_sigma_inverse_from_eta_scalar);
     let q_base = -&eta_threshold * &inv_sigma;
-    let mut qdot = &inv_sigma
-        * &(&eta_threshold * &eta_log_sigma_derivative - &eta_threshold_derivative);
+    let mut qdot =
+        &inv_sigma * &(&eta_threshold * &eta_log_sigma_derivative - &eta_threshold_derivative);
     if let Some(beta_wiggle) = saved_fit.beta_link_wiggle() {
         let knots = link_wiggle_knots.as_ref().ok_or_else(|| {
             "saved location-scale link-wiggle coefficients are missing knots".to_string()
