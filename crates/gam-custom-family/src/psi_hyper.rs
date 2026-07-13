@@ -729,7 +729,7 @@ pub fn build_contracted_psi_hook(
 /// * `family` - The custom family instance (must be `Send + Sync + 'static`).
 /// * `synced_states` - Synchronized block states at the current inner mode.
 /// * `specs` - Parameter block specifications.
-/// * `derivative_blocks` - Per-block ψ derivative payloads.
+/// * `hyper_layout` - Typed global non-rho coordinate layout.
 /// * `beta_flat` - Flattened joint coefficient vector at the inner mode.
 /// * `rho` - Current log-smoothing parameters (flat).
 /// * `penalty_counts` - Number of penalties per block.
@@ -738,7 +738,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     family: &F,
     synced_states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
-    derivative_blocks: SharedDerivativeBlocks,
+    hyper_layout: SharedCustomFamilyHyperLayout,
     beta_flat: &Array1<f64>,
     rho: &[f64],
     penalty_counts: &[usize],
@@ -792,11 +792,18 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     // Build the psi coordinate cache once. These block-local S_psi matrices are
     // reused by ψψ and ρψ callbacks, avoiding repeated assembly inside the
     // O(q²) ext-ext loop.
-    let mut psi_penalty_cache: Vec<PsiPenaltyCacheEntry> = Vec::new();
-    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-        let (start, end) = ranges_arc[block_idx];
-        let p_block = end - start;
-        for (local_idx, deriv) in block_derivs.iter().enumerate() {
+    let mut psi_penalty_cache: Vec<Option<PsiPenaltyCacheEntry>> =
+        Vec::with_capacity(hyper_layout.len());
+    for axis_idx in 0..hyper_layout.len() {
+        if let Some((block_idx, deriv)) = hyper_layout.design_derivative(axis_idx) {
+            let local_idx = match hyper_layout.axis(axis_idx) {
+                Some(CustomFamilyHyperAxis::DesignPenalty {
+                    derivative_index, ..
+                }) => derivative_index,
+                _ => unreachable!("design derivative must have a design axis identity"),
+            };
+            let (start, end) = ranges_arc[block_idx];
+            let p_block = end - start;
             let s_local = assemble_block_local_s_psi(deriv, &per_block_lambdas[block_idx], p_block);
             // Store the block-local S_ψ matrix when penalty logdet is active;
             // PenaltyPseudologdet methods will handle pseudoinverse and leakage internally.
@@ -805,13 +812,15 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             } else {
                 None
             };
-            psi_penalty_cache.push(PsiPenaltyCacheEntry {
+            psi_penalty_cache.push(Some(PsiPenaltyCacheEntry {
                 block_idx,
                 local_idx,
                 start,
                 end,
                 s_local: s_local_opt,
-            });
+            }));
+        } else {
+            psi_penalty_cache.push(None);
         }
     }
     let psi_penalty_cache = Arc::new(psi_penalty_cache);
@@ -833,7 +842,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             Some((z_j, h_joint))
                 if z_j.nrows() == total && h_joint.nrows() == total && h_joint.ncols() == total =>
             {
-                let psi_dim = psi_penalty_cache.len();
+                let psi_dim = hyper_layout.len();
                 let batched_first: Option<Vec<ExactNewtonJointPsiTerms>> =
                     match psi_workspace.as_ref() {
                         Some(ws) => ws.first_order_terms_all()?,
@@ -852,20 +861,26 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                                 .exact_newton_joint_psi_terms(
                                     synced_states,
                                     specs,
-                                    &derivative_blocks,
+                                    &hyper_layout,
                                     axis,
                                 )?
-                                .unwrap_or_else(|| ExactNewtonJointPsiTerms::zeros(total))
+                                .ok_or_else(|| {
+                                    format!(
+                                        "typed hyper axis {axis} has no exact first-order terms"
+                                    )
+                                })?
                         }
                     } else {
                         family
                             .exact_newton_joint_psi_terms(
                                 synced_states,
                                 specs,
-                                &derivative_blocks,
+                                &hyper_layout,
                                 axis,
                             )?
-                            .unwrap_or_else(|| ExactNewtonJointPsiTerms::zeros(total))
+                            .ok_or_else(|| {
+                                format!("typed hyper axis {axis} has no exact first-order terms")
+                            })?
                     };
                     if let Some(op) = terms.hessian_psi_operator.as_ref() {
                         pert_first.push(op.mul_mat(&Array2::<f64>::eye(total)));
