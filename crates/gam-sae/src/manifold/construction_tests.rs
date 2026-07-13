@@ -1,3 +1,5 @@
+use crate::manifold::tests::gamma_fd_tiny_fixture;
+
 #[cfg(test)]
 mod exact_hessian_fixture_tests {
     use super::*;

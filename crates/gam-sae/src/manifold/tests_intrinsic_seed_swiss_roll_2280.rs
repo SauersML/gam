@@ -204,7 +204,8 @@ fn swiss_roll_auto_seed_propagates_unfolded_coords_end_to_end() {
     })
     .expect("auto swiss-roll seed builds");
     assert_eq!(
-        report.effective_atom_dim[0], 2,
+        report.geometry_plans[0].latent_dim(),
+        2,
         "a swiss roll is an intrinsically 2-D sheet; auto discovery must resolve d=2"
     );
     let r2 = heldout_tps_r2(&chart_of(&report.initial_coords, 0), &z);

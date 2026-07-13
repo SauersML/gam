@@ -57,11 +57,11 @@ impl SaeManifoldAtom {
              caller-managed basis cannot be re-evaluated at steered coordinates"
                 .to_string()
         })?;
-        if coords.ncols() != self.latent_dim {
+        if coords.ncols() != self.latent_dim() {
             return Err(format!(
                 "SaeManifoldAtom::decode_at_coords: coords have {} columns, latent_dim is {}",
                 coords.ncols(),
-                self.latent_dim
+                self.latent_dim()
             ));
         }
         let phi = if self.homotopy_eta == 1.0 {

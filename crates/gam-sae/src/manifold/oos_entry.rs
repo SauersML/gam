@@ -1298,7 +1298,7 @@ mod tests {
     #[test]
     fn typed_oos_entry_rejects_decoder_schema_drift() {
         let mut request = periodic_request();
-        request.atoms[0].basis_size = 5;
+        request.atoms[0].decoder = Array2::zeros((5, 2));
         let error = run_sae_manifold_oos(request).err().unwrap();
         assert!(error.contains("decoder shape"), "{error}");
     }
