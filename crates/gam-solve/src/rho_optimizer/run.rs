@@ -1065,6 +1065,85 @@ impl OuterResult {
     }
 }
 
+/// Validated evidence that an outer optimization terminated at a finite,
+/// analytically certified optimum.
+///
+/// The inner [`OuterResult`] is private so downstream fit assembly cannot turn
+/// a status boolean into convergence provenance. Construction consumes the
+/// optimizer result and revalidates the certificate at the ownership boundary.
+#[derive(Clone, Debug)]
+pub struct CertifiedOuterResult {
+    result: OuterResult,
+}
+
+impl TryFrom<OuterResult> for CertifiedOuterResult {
+    type Error = String;
+
+    fn try_from(result: OuterResult) -> Result<Self, Self::Error> {
+        if !result.converged {
+            return Err(format!(
+                "outer optimization did not converge after {} iterations",
+                result.iterations
+            ));
+        }
+        if !result.final_value.is_finite() {
+            return Err(format!(
+                "outer optimization returned a non-finite objective: {}",
+                result.final_value
+            ));
+        }
+        if result.rho.iter().any(|value| !value.is_finite()) {
+            return Err("outer optimization returned non-finite hyperparameters".to_string());
+        }
+        if result
+            .final_grad_norm
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(format!(
+                "outer optimization returned an invalid gradient norm: {:?}",
+                result.final_grad_norm
+            ));
+        }
+        let certificate = result
+            .criterion_certificate
+            .as_ref()
+            .ok_or_else(|| "outer optimization returned no analytic certificate".to_string())?;
+        if !certificate.certifies() {
+            return Err(format!(
+                "outer optimization certificate does not certify: {}",
+                certificate.summary()
+            ));
+        }
+        Ok(Self { result })
+    }
+}
+
+impl CertifiedOuterResult {
+    /// Exact optimizer-owned hyperparameter vector covered by the certificate.
+    pub fn rho(&self) -> &Array1<f64> {
+        &self.result.rho
+    }
+
+    pub fn iterations(&self) -> usize {
+        self.result.iterations
+    }
+
+    pub fn final_value(&self) -> f64 {
+        self.result.final_value
+    }
+
+    pub fn final_grad_norm(&self) -> Option<f64> {
+        self.result.final_grad_norm
+    }
+
+    pub fn criterion_certificate(&self) -> &OuterCriterionCertificate {
+        self.result
+            .criterion_certificate
+            .as_ref()
+            .expect("CertifiedOuterResult always owns a validated certificate")
+    }
+}
+
 /// Typed refusal from [`audit_stationary_point`]. The rejected point and every
 /// analytic certificate field measured before refusal remain available to the
 /// caller; `source` records why those measurements did not certify.

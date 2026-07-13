@@ -66,7 +66,7 @@ pub use run::OuterProblem;
 // Re-export the outer-loop result struct at `pub` (the blanket `run` re-export
 // above is `pub(crate)`) so the lifted gam-models fit-orchestration driver can
 // name `gam_solve::rho_optimizer::OuterResult` (#1521).
-pub use run::OuterResult;
+pub use run::{CertifiedOuterResult, OuterResult};
 // Re-export the converged-via certificate vocabulary (#2235/#2241) so callers
 // that thread the termination verdict into their own payloads (gam-sae's
 // SaeOuterTermination) can name the variants.
