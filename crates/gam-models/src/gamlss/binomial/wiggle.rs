@@ -3174,20 +3174,10 @@ impl BinomialLocationScaleWiggleFamily {
         x_ls_arc: Arc<Array2<f64>>,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
-        let (n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
         let pt = x_t_arc.ncols();
         let pls = x_ls_arc.ncols();
-        let betaw0 = block_states[Self::BLOCK_WIGGLE].beta.clone();
-        let core0 = binomial_location_scale_core(
-            &self.y,
-            &self.weights,
-            eta_t,
-            eta_ls,
-            Some(etaw),
-            &self.link_kind,
-        )?;
-        let b0 = self.wiggle_design(core0.q0.view())?;
-        let pw = b0.ncols();
+        let program = BinomialLocationScaleWiggleRowProgram::new(self, block_states, 3)?;
+        let pw = program.beta_w.len();
         let beta_layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
         let total = beta_layout.total();
         if d_beta_flat.len() != total {
@@ -3204,29 +3194,7 @@ impl BinomialLocationScaleWiggleFamily {
             beta_layout.split_three(d_beta_flat, "wiggle joint dH operator d_beta")?;
         let d_eta_t = fast_av(x_t_arc.as_ref(), &u_t);
         let d_eta_ls = fast_av(x_ls_arc.as_ref(), &u_ls);
-
-        let d0 =
-            self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::first_derivative())?;
-        let dd0 =
-            self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::second_derivative())?;
-        let d3q = self.wiggle_d3q_dq03(core0.q0.view(), betaw0.view())?;
-        if d0.ncols() != betaw0.len() || dd0.ncols() != betaw0.len() {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "wiggle derivative/beta mismatch in dH operator: B'={} B''={} betaw={}",
-                    d0.ncols(),
-                    dd0.ncols(),
-                    betaw0.len()
-                ),
-            }
-            .into());
-        }
-        let m = d0.dot(&betaw0) + 1.0;
-        let g2 = dd0.dot(&betaw0);
-        let g3 = d3q;
-        let (sigma, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
-
-        let BinomialWiggleDhRowCoeffs {
+        let BinomialWiggleFirstDirectionalRows {
             coeff_tt,
             coeff_tl,
             coeff_ll,
@@ -3236,30 +3204,13 @@ impl BinomialLocationScaleWiggleFamily {
             coeff_lw_b,
             coeff_lw_d,
             coeff_lw_dd,
-            coeffww_bb,
-            coeffww_db,
-        } = self.binomial_wiggle_dh_row_coeffs(
-            n,
-            &BinomialWiggleDhRowInputs {
-                core0: &core0,
-                eta_t,
-                etaw,
-                sigma: &sigma,
-                m: &m,
-                g2: &g2,
-                g3: &g3,
-                b0: &b0,
-                d0: &d0,
-                dd0: &dd0,
-                uw: &uw,
-                d_eta_t: &d_eta_t,
-                d_eta_ls: &d_eta_ls,
-            },
-        );
+            coeff_ww_bb,
+            coeff_ww_bd,
+        } = program.first_directional_rows(&d_eta_t, &d_eta_ls, uw.view())?;
 
-        let basis: Arc<Array2<f64>> = Arc::new(b0);
-        let basis_d1: Arc<Array2<f64>> = Arc::new(d0);
-        let basis_d2: Arc<Array2<f64>> = Arc::new(dd0);
+        let basis: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[0].clone());
+        let basis_d1: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[1].clone());
+        let basis_d2: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[2].clone());
 
         Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pt, pls, pw],
@@ -3287,14 +3238,13 @@ impl BinomialLocationScaleWiggleFamily {
                 (1, 2, coeff_lw_b),
                 (1, 3, coeff_lw_d),
                 (1, 4, coeff_lw_dd),
-                // (B, B) ← `xt_diag_x_dense(&b0, &coeffww_bb)`
-                (2, 2, coeffww_bb),
-                // (B, B') ← `xt_diag_y_dense(&d0, &coeffww_db, &b0) +
-                // xt_diag_y_dense(&b0, &coeffww_db, &d0)` =
+                // (B, B) and (B, B') are probe Hessian channels.
+                (2, 2, coeff_ww_bb),
+                // `d0^T diag(c) b0 + b0^T diag(c) d0` =
                 // d0^T diag(c) b0 + b0^T diag(c) d0 (symmetric pair)
-                (2, 3, coeffww_db),
+                (2, 3, coeff_ww_bd),
             ],
-            n,
+            self.y.len(),
         ))))
     }
 

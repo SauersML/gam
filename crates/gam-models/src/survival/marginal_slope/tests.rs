@@ -1638,11 +1638,7 @@ fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
 /// gam#932/#979: INDEPENDENT witness for the survival marginal-slope FLEX
 /// higher-order tower (`row_flex_primary_{third,fourth}_contracted_exact`).
 ///
-/// The production CPU↔GPU parity tests
-/// (`block10_cpu_oracle_{third,fourth}_contraction_matches_family_shared_fixtures`)
-/// feed BOTH sides the SAME `flex_primary_timepoint_jets_for_test` inputs the
-/// family produces, so a shared-input bug in the flex calculus passes both — they
-/// are not an independent witness. The rigid K=1 path is independently guarded by
+/// The rigid K=1 path is independently guarded by
 /// `SurvivalMarginalSlopeRigidNllProgram` (a single-expression `Tower4` algebra
 /// re-derivation, no shared jet code); the flex path was not.
 ///
@@ -6042,15 +6038,11 @@ fn survival_auto_subsample_phase_counter_field_initializes_to_zero() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Block 10 parity — third T_uv[r] and fourth Q_uv[r,s] contractions:
-// crate::survival::marginal_slope::gpu::cpu_oracle_third_contraction /
-// cpu_oracle_fourth_contraction must match the family CPU paths
-// (row_flex_primary_third_contracted_exact / _fourth_contracted_exact)
-// to within 5e-8 absolute / 5e-7 relative.
+// Independent fourth-contraction finite-difference fixtures.
 // ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
-struct B10ParityFixture {
+struct FlexContractionFixture {
     label: &'static str,
     event: f64,
     weight: f64,
@@ -6063,8 +6055,8 @@ struct B10ParityFixture {
     w_scale: f64,
 }
 
-const B10_PARITY_FIXTURES: &[B10ParityFixture] = &[
-    B10ParityFixture {
+const FLEX_CONTRACTION_FIXTURES: &[FlexContractionFixture] = &[
+    FlexContractionFixture {
         label: "event_nonzero_warps",
         event: 1.0,
         weight: 0.75,
@@ -6076,7 +6068,7 @@ const B10_PARITY_FIXTURES: &[B10ParityFixture] = &[
         h_scale: 0.05,
         w_scale: 0.04,
     },
-    B10ParityFixture {
+    FlexContractionFixture {
         label: "censored_left_tail",
         event: 0.0,
         weight: 1.35,
@@ -6088,7 +6080,7 @@ const B10_PARITY_FIXTURES: &[B10ParityFixture] = &[
         h_scale: -0.035,
         w_scale: 0.025,
     },
-    B10ParityFixture {
+    FlexContractionFixture {
         label: "near_boundary_derivative",
         event: 1.0,
         weight: 0.2,
@@ -6100,7 +6092,7 @@ const B10_PARITY_FIXTURES: &[B10ParityFixture] = &[
         h_scale: 0.015,
         w_scale: -0.02,
     },
-    B10ParityFixture {
+    FlexContractionFixture {
         label: "zero_warp_edge",
         event: 0.0,
         weight: 0.9,
@@ -6114,8 +6106,8 @@ const B10_PARITY_FIXTURES: &[B10ParityFixture] = &[
     },
 ];
 
-fn b10_flex_family_for_parity(
-    fixture: B10ParityFixture,
+fn flex_contraction_fixture_family(
+    fixture: FlexContractionFixture,
 ) -> (SurvivalMarginalSlopeFamily, Vec<ParameterBlockState>) {
     let score_runtime = test_deviation_runtime();
     let link_runtime = test_deviation_runtime();
@@ -6181,7 +6173,7 @@ fn b10_flex_family_for_parity(
     (family, block_states)
 }
 
-fn b10_direction_set(p: usize) -> Vec<(&'static str, Array1<f64>)> {
+fn flex_contraction_directions(p: usize) -> Vec<(&'static str, Array1<f64>)> {
     let mixed: Array1<f64> = (0..p)
         .map(|k| 0.1 + 0.07 * ((k as f64 + 1.7).sin()))
         .collect::<Vec<_>>()
@@ -6209,7 +6201,7 @@ fn b10_direction_set(p: usize) -> Vec<(&'static str, Array1<f64>)> {
 /// (block_states[4].beta) components are applied — exactly the axes the
 /// directional contraction differentiates through the score/link coefficient
 /// chain (the #1454-sensitive cross channels).
-fn b10_perturb_ghw_block_states(
+fn perturb_flex_ghw_block_states(
     block_states: &[ParameterBlockState],
     primary: &FlexPrimarySlices,
     dir: &Array1<f64>,
@@ -6233,33 +6225,23 @@ fn b10_perturb_ghw_block_states(
     bs
 }
 
-/// #932-2 / #1454 arbitration: the PRODUCTION fourth contraction
+/// #932-2 / #1454: the production fourth contraction
 /// `D_u D_v H = row_flex_primary_fourth_contracted_exact` is the single-source
 /// jet path (`flex_jet` `flex_timepoint_inputs_generic` at `Jet4`). It is checked
 /// here against an INDEPENDENT scalar finite difference of the production THIRD
 /// contraction `D_u H = row_flex_primary_third_contracted_exact` along the second
 /// direction `v` (g/h/w axes), re-solving the moving-boundary intercept exactly at
-/// every perturbed point — no hand symbolic re-derivation. The third contraction is
+/// every perturbed point. The third contraction is
 /// itself pinned to the same FD ground truth by
 /// `flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation`, so a
 /// central difference of it is a faithful fourth-order ground truth.
-///
-/// This REPLACES the former parity against the hand `cpu_oracle_fourth_contraction`
-/// (`b10_fourth_ordered`): that hand 4th-order quotient/probit assembly is the
-/// deprecated path the single-source jet superseded and is KNOWN #1454-INCOMPLETE at
-/// fourth order (its g/h/w cross-channel quotient terms are ~14% off the scalar-FD
-/// ground truth, while the production jet matches FD; the third-order hand oracle is
-/// correct and still cross-checked in
-/// `block10_cpu_oracle_third_contraction_matches_family_shared_fixtures`). Comparing
-/// production against the buggy hand oracle would assert a wrong reference, so the
-/// reference here is the FD ground truth the production path already satisfies.
 #[test]
-fn block10_production_fourth_contraction_matches_scalar_fd_witness() {
-    for &fixture in B10_PARITY_FIXTURES {
-        let (family, block_states) = b10_flex_family_for_parity(fixture);
+fn flex_production_fourth_contraction_matches_scalar_fd_witness() {
+    for &fixture in FLEX_CONTRACTION_FIXTURES {
+        let (family, block_states) = flex_contraction_fixture_family(fixture);
         let primary = flex_primary_slices(&family);
         let p = primary.total;
-        let dirs = b10_direction_set(p);
+        let dirs = flex_contraction_directions(p);
         let pairs = [(0usize, 0usize), (0, 1), (1, 0), (1, 2), (2, 3), (3, 0)];
         for &(u_idx, v_idx) in &pairs {
             let (u_label, dir_u) = &dirs[u_idx];
@@ -6296,7 +6278,7 @@ fn block10_production_fourth_contraction_matches_scalar_fd_witness() {
             // Central difference (Richardson) of the production THIRD contraction
             // `D_u H` along the g/h/w direction `dir_v`.
             let third_at = |step: f64| -> ndarray::Array2<f64> {
-                let bs = b10_perturb_ghw_block_states(&block_states, &primary, &dir_v, step);
+                let bs = perturb_flex_ghw_block_states(&block_states, &primary, &dir_v, step);
                 family
                     .row_flex_primary_third_contracted_exact(0, &bs, dir_u)
                     .unwrap_or_else(|err| {
