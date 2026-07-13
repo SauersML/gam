@@ -55,8 +55,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod alo_replay;
 pub mod deviation_runtime;
 pub mod gpu;
+pub use alo_replay::{
+    BernoulliMarginalSlopeAloRowGeometry, BernoulliMarginalSlopeAloRowInput,
+    bernoulli_marginal_slope_alo_row_geometry,
+};
 pub use deviation_runtime::DeviationRuntime;
 pub use deviation_runtime::ParametricAnchorBlock;
 
@@ -1364,9 +1369,7 @@ pub(crate) fn weighted_ridge_sandwich_cov(
         }
     }
     let m_pinv = gam_linalg::utils::rank_certified_psd_pseudoinverse(&m_scaled, 1.0e-10)
-        .map_err(|e| {
-            format!("conditional latent calibration sandwich pseudo-inverse failed: {e}")
-        })?
+        .map_err(|e| format!("conditional latent calibration sandwich pseudo-inverse failed: {e}"))?
         .into_pseudoinverse();
     let mut cov = m_pinv.dot(&meat_scaled).dot(&m_pinv);
     // Undo the symmetric scaling: cov_raw = D⁻¹ cov_scaled D⁻¹.

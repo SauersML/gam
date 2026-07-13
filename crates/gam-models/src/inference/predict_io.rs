@@ -57,6 +57,15 @@ pub struct BernoulliMarginalSlopePredictor {
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
 }
 
+/// Saved rigid marginal-slope row coordinates after replaying every fitted
+/// latent-score transformation.
+pub struct BernoulliMarginalSlopeRigidAloState {
+    pub marginal_eta: Array1<f64>,
+    pub slope: Array1<f64>,
+    pub latent_z: Array1<f64>,
+    pub probit_frailty_scale: f64,
+}
+
 /// Per-runtime predict-time anchor correction matrices.
 ///
 /// Built once per top-level predict call from the marginal + logslope
@@ -321,6 +330,95 @@ impl BernoulliMarginalSlopePredictor {
 
     pub(crate) fn probit_frailty_scale(&self) -> f64 {
         marginal_slope_probit_frailty_scale(self.gaussian_frailty_sd)
+    }
+
+    /// Reconstruct the affine row coordinates consumed by the rigid fitted
+    /// likelihood, including the exact saved latent-score calibration.
+    pub fn rigid_saved_alo_state(
+        &self,
+        input: &PredictInput,
+    ) -> Result<BernoulliMarginalSlopeRigidAloState, EstimationError> {
+        if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
+            return Err(EstimationError::InvalidInput(
+                "saved rigid marginal-slope ALO requires the fitted standard-normal latent measure"
+                    .to_string(),
+            ));
+        }
+        if self.score_warp_runtime.is_some()
+            || self.link_deviation_runtime.is_some()
+            || self.beta_score_warp.is_some()
+            || self.beta_link_dev.is_some()
+        {
+            return Err(EstimationError::InvalidInput(
+                "saved rigid marginal-slope ALO received a fitted flexible deviation block"
+                    .to_string(),
+            ));
+        }
+        let latent_z_raw = input.auxiliary_scalar.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "saved marginal-slope ALO requires auxiliary z column '{}'",
+                self.z_column
+            ))
+        })?;
+        let secondary_design = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "saved marginal-slope ALO requires the fitted slope design".to_string(),
+            )
+        })?;
+        let n = input.design.nrows();
+        if latent_z_raw.len() != n
+            || secondary_design.nrows() != n
+            || input.offset.len() != n
+            || input
+                .offset_noise
+                .as_ref()
+                .is_some_and(|offset| offset.len() != n)
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "saved marginal-slope ALO row mismatch: primary={n}, slope={}, z={}, primary_offset={}, slope_offset={}",
+                secondary_design.nrows(),
+                latent_z_raw.len(),
+                input.offset.len(),
+                input.offset_noise.as_ref().map_or(n, Array1::len),
+            )));
+        }
+        if input.design.ncols() != self.beta_marginal.len()
+            || secondary_design.ncols() != self.beta_logslope.len()
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "saved marginal-slope ALO coefficient mismatch: marginal design/beta={}/{}, slope design/beta={}/{}",
+                input.design.ncols(),
+                self.beta_marginal.len(),
+                secondary_design.ncols(),
+                self.beta_logslope.len(),
+            )));
+        }
+
+        let normalized = self
+            .latent_z_normalization
+            .apply(latent_z_raw, "saved marginal-slope ALO")
+            .map_err(EstimationError::from)?;
+        let calibrated = self.apply_latent_z_calibration(&normalized);
+        let latent_z = self.apply_latent_z_conditional_calibration(&calibrated, input)?;
+        let marginal_eta = input
+            .design
+            .dot(&self.beta_marginal)
+            .mapv(|value| value + self.baseline_marginal)
+            + &input.offset;
+        let slope_offset = input
+            .offset_noise
+            .as_ref()
+            .map_or_else(|| Array1::zeros(n), Clone::clone);
+        let slope = secondary_design
+            .dot(&self.beta_logslope)
+            .mapv(|value| value + self.baseline_logslope)
+            + &slope_offset;
+        Ok(BernoulliMarginalSlopeRigidAloState {
+            marginal_eta,
+            slope,
+            latent_z,
+            probit_frailty_scale: self.probit_frailty_scale(),
+        })
     }
 
     /// Apply the (optional) rank-INT latent-z calibration to a batch of
@@ -961,8 +1059,7 @@ impl BernoulliMarginalSlopePredictor {
             InverseLink::Standard(gam_problem::types::StandardLink::Probit)
         ) {
             return Err(
-                "bernoulli marginal-slope predictor requires link(type=probit); saved non-probit marginal-slope models must be refit"
-                    .to_string(),
+                "bernoulli marginal-slope predictor requires a saved probit link".to_string(),
             );
         }
         if let Some(runtime) = score_warp_runtime.as_ref() {

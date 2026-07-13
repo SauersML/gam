@@ -1,6 +1,9 @@
 use std::ops::Range;
 
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+use gam_models::bms::{
+    BernoulliMarginalSlopeAloRowInput, bernoulli_marginal_slope_alo_row_geometry,
+};
 use gam_models::gamlss::{
     BinomialLocationScaleAloRowInput, DispersionFamilyKind, GaussianLocationScaleAloRowInput,
     binomial_location_scale_alo_row_geometry, dispersion_alo_row_geometry,
@@ -17,7 +20,7 @@ use gam_solve::inference::alo::{
 use gam_terms::basis::BasisOptions;
 use ndarray::{Array1, Array2};
 
-use crate::PredictInput;
+use crate::{FittedModelPredictExt, PredictInput};
 
 /// Observed row data needed to replay a saved likelihood for ALO.
 pub struct SavedAloObservations<'a> {
@@ -532,4 +535,99 @@ pub fn compute_saved_location_scale_alo(
             class.name()
         ))),
     }
+}
+
+/// Replay exact saved-H ALO for a rigid Bernoulli marginal-slope fit.
+pub fn compute_saved_bernoulli_marginal_slope_alo(
+    model: &FittedModel,
+    input: &PredictInput,
+    observations: SavedAloObservations<'_>,
+) -> Result<SavedModelAloDiagnostics, EstimationError> {
+    let class = PredictModelClass::BernoulliMarginalSlope;
+    if model.predict_model_class() != class {
+        return Err(invalid(format!(
+            "saved marginal-slope ALO dispatcher received model class {}",
+            model.predict_model_class().name()
+        )));
+    }
+    let n = observations.response.len();
+    if n == 0
+        || observations.prior_weights.len() != n
+        || input.design.nrows() != n
+        || input
+            .design_noise
+            .as_ref()
+            .is_none_or(|design| design.nrows() != n)
+    {
+        return Err(invalid(format!(
+            "saved marginal-slope ALO row mismatch: response={n}, weights={}, marginal_design={}, slope_design={}",
+            observations.prior_weights.len(),
+            input.design.nrows(),
+            input.design_noise.as_ref().map_or(0, DesignMatrix::nrows),
+        )));
+    }
+    if let Some((row, weight)) = observations
+        .prior_weights
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, weight)| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err(invalid(format!(
+            "saved marginal-slope ALO prior weight[{row}] must be finite and non-negative, got {weight}"
+        )));
+    }
+    let predictor = model
+        .bernoulli_marginal_slope_predictor()
+        .map_err(|reason| invalid(format!("saved marginal-slope ALO predictor: {reason}")))?;
+    let state = predictor.rigid_saved_alo_state(input)?;
+    let parameter_dimension = predictor.beta_marginal.len() + predictor.beta_logslope.len();
+    let hessian = require_saved_hessian(model, class, parameter_dimension)?;
+    let mut observed_hessians = Vec::with_capacity(n);
+    let mut scores = Vec::with_capacity(n);
+    let mut coordinate_values = Vec::with_capacity(n);
+    for row in 0..n {
+        let geometry =
+            bernoulli_marginal_slope_alo_row_geometry(BernoulliMarginalSlopeAloRowInput {
+                base_link: &predictor.base_link,
+                marginal_eta: state.marginal_eta[row],
+                slope: state.slope[row],
+                latent_z: state.latent_z[row],
+                response: observations.response[row],
+                prior_weight: observations.prior_weights[row],
+                probit_frailty_scale: state.probit_frailty_scale,
+            })
+            .map_err(|reason| invalid(format!("saved marginal-slope ALO row {row}: {reason}")))?;
+        scores.push(Array1::from_vec(geometry.nll_score.to_vec()));
+        observed_hessians.push(
+            Array2::from_shape_vec(
+                (2, 2),
+                geometry.observed_hessian.into_iter().flatten().collect(),
+            )
+            .expect("fixed 2x2 marginal-slope geometry"),
+        );
+        coordinate_values.push(Array1::from_vec(vec![
+            state.marginal_eta[row],
+            state.slope[row],
+        ]));
+    }
+    let secondary_design = input
+        .design_noise
+        .as_ref()
+        .expect("validated marginal-slope design");
+    let coordinate_designs = vec![input.design.clone(), secondary_design.clone()];
+    let coordinate_ranges = vec![
+        0..predictor.beta_marginal.len(),
+        predictor.beta_marginal.len()..parameter_dimension,
+    ];
+    compute_location_scale_core(
+        class,
+        vec!["marginal-eta".to_string(), "slope".to_string()],
+        coordinate_designs,
+        coordinate_ranges,
+        hessian,
+        observed_hessians,
+        scores,
+        coordinate_values,
+    )
 }

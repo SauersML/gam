@@ -57,6 +57,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         PredictModelClass::GaussianLocationScale
             | PredictModelClass::BinomialLocationScale
             | PredictModelClass::DispersionLocationScale
+            | PredictModelClass::BernoulliMarginalSlope
     ) {
         let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
         require_dataset_rows("diagnose", &args.data, ds.values.nrows())?;
@@ -76,14 +77,20 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             &noise_offset,
             model.payload().noise_offset_column.is_some(),
         )?;
-        let alo = gam_predict::compute_saved_location_scale_alo(
-            &model,
-            &input,
-            gam_predict::SavedAloObservations {
-                response: &response,
-                prior_weights: &prior_weights,
-            },
-        )
+        let observations = gam_predict::SavedAloObservations {
+            response: &response,
+            prior_weights: &prior_weights,
+        };
+        let alo = match model.predict_model_class() {
+            PredictModelClass::BernoulliMarginalSlope => {
+                gam_predict::compute_saved_bernoulli_marginal_slope_alo(
+                    &model,
+                    &input,
+                    observations,
+                )
+            }
+            _ => gam_predict::compute_saved_location_scale_alo(&model, &input, observations),
+        }
         .map_err(|error| format!("saved-model ALO failed: {error}"))?;
         print_multicoordinate_alo(&alo);
         return Ok(());
