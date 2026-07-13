@@ -1,5 +1,113 @@
 use super::*;
 
+/// Exact monotone time-wiggle basis stack at one set of unwarped time indices.
+///
+/// The derivatives are with respect to the affine base index `h_base`, not
+/// clock time.  Keeping all four tables together prevents saved replay from
+/// silently substituting a zero third derivative in the event-rate map
+/// `h_dot = (1 + B'(h_base) beta_w) h_dot_base`.
+#[derive(Clone, Debug)]
+pub struct SurvivalLocationScaleTimeWiggleBasisStack {
+    pub value: Array2<f64>,
+    pub d1: Array2<f64>,
+    pub d2: Array2<f64>,
+    pub d3: Array2<f64>,
+}
+
+/// Row-aligned entry/exit basis authority for exact saved location-scale
+/// replay.
+#[derive(Clone, Debug)]
+pub struct SurvivalLocationScaleTimeWiggleBasisAuthority {
+    pub entry: SurvivalLocationScaleTimeWiggleBasisStack,
+    pub exit: SurvivalLocationScaleTimeWiggleBasisStack,
+}
+
+pub(crate) fn build_survival_location_scale_time_wiggle_basis_stack(
+    h_base: ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    coefficient_width: usize,
+    label: &str,
+) -> Result<SurvivalLocationScaleTimeWiggleBasisStack, String> {
+    if coefficient_width == 0 {
+        return Err(format!(
+            "survival location-scale {label} time-wiggle basis requires at least one coefficient"
+        ));
+    }
+    if h_base.is_empty() || h_base.iter().any(|value| !value.is_finite()) {
+        return Err(format!(
+            "survival location-scale {label} time-wiggle base indices must be non-empty and finite"
+        ));
+    }
+    if knots.is_empty() || knots.iter().any(|value| !value.is_finite()) {
+        return Err(format!(
+            "survival location-scale {label} time-wiggle knots must be non-empty and finite"
+        ));
+    }
+    let value = monotone_wiggle_basis_with_derivative_order(h_base, knots, degree, 0)?;
+    let d1 = monotone_wiggle_basis_with_derivative_order(h_base, knots, degree, 1)?;
+    let d2 = monotone_wiggle_basis_with_derivative_order(h_base, knots, degree, 2)?;
+    let d3 = monotone_wiggle_basis_with_derivative_order(h_base, knots, degree, 3)?;
+    for (channel, matrix) in [("B", &value), ("B'", &d1), ("B''", &d2), ("B'''", &d3)] {
+        if matrix.ncols() != coefficient_width {
+            return Err(format!(
+                "survival location-scale {label} time-wiggle {channel} has {} columns; fitted beta tail has {coefficient_width}",
+                matrix.ncols(),
+            ));
+        }
+        if matrix.nrows() != h_base.len() || matrix.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "survival location-scale {label} time-wiggle {channel} is not a finite {}x{coefficient_width} table",
+                h_base.len(),
+            ));
+        }
+    }
+    Ok(SurvivalLocationScaleTimeWiggleBasisStack {
+        value,
+        d1,
+        d2,
+        d3,
+    })
+}
+
+/// Rebuild the exact fit-time monotone time-wiggle basis tables on saved rows.
+///
+/// This is basis authority only: callers must compose the affine base channels
+/// and `beta_w` inside their order-two row program.  Returning a post-warp
+/// Jacobian would omit the score-times-map-Hessian term from observed ALO
+/// curvature.
+pub fn survival_location_scale_time_wiggle_basis_authority(
+    h_entry_base: ArrayView1<'_, f64>,
+    h_exit_base: ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    coefficient_width: usize,
+) -> Result<SurvivalLocationScaleTimeWiggleBasisAuthority, String> {
+    if h_entry_base.len() != h_exit_base.len() {
+        return Err(format!(
+            "survival location-scale saved time-wiggle entry/exit row mismatch: {}/{}",
+            h_entry_base.len(),
+            h_exit_base.len(),
+        ));
+    }
+    Ok(SurvivalLocationScaleTimeWiggleBasisAuthority {
+        entry: build_survival_location_scale_time_wiggle_basis_stack(
+            h_entry_base,
+            knots,
+            degree,
+            coefficient_width,
+            "entry",
+        )?,
+        exit: build_survival_location_scale_time_wiggle_basis_stack(
+            h_exit_base,
+            knots,
+            degree,
+            coefficient_width,
+            "exit",
+        )?,
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct SurvivalWiggleGeometry {
     pub(crate) basis: Array2<f64>,

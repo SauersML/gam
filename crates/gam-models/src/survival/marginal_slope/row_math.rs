@@ -437,26 +437,104 @@ pub fn survival_marginal_slope_vector_eta(
         .map_err(|err| format!("survival marginal-slope vector eta: {err}"))
 }
 
+enum BoundRigidValueCovariance<'covariance> {
+    Diagonal(&'covariance Array1<f64>),
+    Full(&'covariance Array2<f64>),
+    LowRank(&'covariance Array2<f64>),
+}
+
+/// Allocation-free value-only workspace bound to one covariance whose shape,
+/// finiteness, symmetry, and positive-semidefinite contract were validated once
+/// at construction. Per-row evaluation dispatches directly to the bound
+/// representation and never constructs primary-width runtime jets.
+pub struct RigidVectorValueWorkspace<'covariance> {
+    covariance: BoundRigidValueCovariance<'covariance>,
+    dimension: usize,
+}
+
+impl<'covariance> RigidVectorValueWorkspace<'covariance> {
+    pub fn new(covariance: &'covariance MarginalSlopeCovariance) -> Result<Self, String> {
+        covariance.validate("survival marginal-slope vector value workspace")?;
+        let dimension = covariance.dim();
+        let covariance = match covariance {
+            MarginalSlopeCovariance::Diagonal(diagonal) => {
+                BoundRigidValueCovariance::Diagonal(diagonal)
+            }
+            MarginalSlopeCovariance::Full(matrix) => BoundRigidValueCovariance::Full(matrix),
+            MarginalSlopeCovariance::LowRank(factor) => BoundRigidValueCovariance::LowRank(factor),
+        };
+        Ok(Self {
+            covariance,
+            dimension,
+        })
+    }
+
+    #[inline(always)]
+    fn quadratic_value(&self, slopes: &[f64]) -> f64 {
+        match self.covariance {
+            BoundRigidValueCovariance::Diagonal(diagonal) => {
+                let mut value = 0.0;
+                for axis in 0..self.dimension {
+                    value += diagonal[axis] * slopes[axis] * slopes[axis];
+                }
+                value
+            }
+            BoundRigidValueCovariance::Full(matrix) => {
+                let mut value = 0.0;
+                for row in 0..self.dimension {
+                    let mut projected = 0.0;
+                    for column in 0..self.dimension {
+                        projected += matrix[[row, column]] * slopes[column];
+                    }
+                    value += slopes[row] * projected;
+                }
+                value
+            }
+            BoundRigidValueCovariance::LowRank(factor) => {
+                let mut value = 0.0;
+                for rank in 0..factor.ncols() {
+                    let mut projection = 0.0;
+                    for axis in 0..self.dimension {
+                        projection += factor[[axis, rank]] * slopes[axis];
+                    }
+                    value += projection * projection;
+                }
+                value
+            }
+        }
+    }
+}
+
 pub fn survival_marginal_slope_vector_neglog(
     q0: f64,
     q1: f64,
     qd1: f64,
     slopes: &[f64],
     z: &[f64],
-    covariance: &MarginalSlopeCovariance,
+    workspace: &RigidVectorValueWorkspace<'_>,
     weight: f64,
     event: f64,
     derivative_guard: f64,
     probit_scale: f64,
 ) -> Result<f64, String> {
-    let dimension = 3 + slopes.len();
-    let mut vars = Vec::with_capacity(dimension);
-    for (axis, value) in [q0, q1, qd1]
-        .into_iter()
-        .chain(slopes.iter().copied())
-        .enumerate()
+    if slopes.len() != workspace.dimension || z.len() != workspace.dimension {
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope vector value dimension mismatch: slopes={}, z={}, covariance={}",
+                slopes.len(),
+                z.len(),
+                workspace.dimension,
+            ),
+        }
+        .into());
+    }
+    if slopes.iter().any(|value| !value.is_finite())
+        || z.iter().any(|value| !value.is_finite())
     {
-        vars.push(RuntimeValue::variable(value, axis, dimension, &()));
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: "survival marginal-slope vector scores and slopes must be finite".to_string(),
+        }
+        .into());
     }
     let inputs = RigidRowInputs {
         row: 0,
@@ -467,7 +545,22 @@ pub fn survival_marginal_slope_vector_neglog(
         probit_scale,
         qd1_lower: derivative_guard,
     };
-    Ok(rigid_vector_row_nll(&vars, z, covariance, &inputs, &())?.value())
+    validate_vector_probit_scale(&inputs)?;
+    let mut linear_dot = 0.0;
+    for axis in 0..workspace.dimension {
+        linear_dot += slopes[axis] * z[axis];
+    }
+    let linear = probit_scale * linear_dot;
+    let variance = validated_vector_variance(workspace.quadratic_value(slopes), probit_scale)?;
+    let features = [q0, q1, qd1, linear, variance]
+        .map(|value| RuntimeValue::constant(value, RIGID_FEATURE_DIMENSION, &()));
+    Ok(rigid_feature_runtime_nll(
+        &features,
+        &inputs,
+        RIGID_FEATURE_DIMENSION,
+        &(),
+    )?
+    .value())
 }
 
 #[cfg(test)]

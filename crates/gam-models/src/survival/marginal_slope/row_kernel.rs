@@ -5,7 +5,6 @@
 use super::*;
 
 use gam_math::jet_scalar::JetScalar;
-use gam_row_macros::row_program;
 
 /// Bitmask of which `K=4` rigid primaries enter linearly: bit `a` set ⇒ axis `a`
 /// is linear. The higher-order sparse towers use this contract; order two is
@@ -672,15 +671,8 @@ mod rigid_row_admission_tests {
     }
 
     fn admit(primaries: [f64; 4], inputs: &RigidRowInputs) -> Result<(), String> {
-        let [neg_eta0, neg_eta1, adjusted_derivative] = rigid_row_program_witnesses(
-            primaries[0],
-            primaries[1],
-            primaries[2],
-            primaries[3],
-            inputs.z_sum,
-            inputs.covariance_ones,
-            inputs.probit_scale,
-        );
+        let [neg_eta0, neg_eta1, adjusted_derivative] =
+            rigid_row_admission_witnesses(&primaries, inputs);
         validate_rigid_row_admission(
             primaries[2],
             inputs,
@@ -751,58 +743,52 @@ pub(crate) fn rigid_row_inputs(
     })
 }
 
-row_program! {
-    pub(crate) fn rigid_row_program(
-        q0, q1, qd1, g;
-        wi, di, z_sum, covariance_ones, probit_scale
-    )
-    emit [generic, order2, witnesses, cuda];
-    leaves {
-        sqrt => unary_derivatives_sqrt => d_sqrt,
-        neglog_phi => unary_derivatives_neglog_phi => neglog_phi_stack,
-        log_normal_pdf => unary_derivatives_log_normal_pdf => d_lognormpdf,
-        log => unary_derivatives_log => d_log,
-    }
-    witnesses [neg_eta0, neg_eta1, adjusted_derivative];
-    {
-        let observed_g = scale(g, probit_scale);
-        let one_plus_b2 = add_constant(
-            scale(mul(observed_g, observed_g), covariance_ones),
-            1.0
-        );
-        let correction = compose(sqrt, one_plus_b2);
-        let observed_gz = scale(observed_g, z_sum);
-        let eta0 = add(mul(q0, correction), observed_gz);
-        let eta1 = add(mul(q1, correction), observed_gz);
-        let adjusted_derivative = mul(qd1, correction);
-
-        let neg_eta0 = neg(eta0);
-        let entry = scale(compose(neglog_phi, neg_eta0, wi), -1.0);
-        let neg_eta1 = neg(eta1);
-        let exit = compose(neglog_phi, neg_eta1, wi * (1.0 - di));
-
-        let mut event_density = zero();
-        let mut time_derivative = zero();
-        if (di > 0.0) {
-            event_density = scale(
-                compose(log_normal_pdf, eta1),
-                (-wi) * di
-            );
-            time_derivative = scale(
-                compose(log, adjusted_derivative),
-                (-wi) * di
-            );
-        }
-        return add(
-            add(exit, entry),
-            add(event_density, time_derivative)
-        );
-    }
+#[inline(always)]
+fn rigid_row_feature_jets<S: JetScalar<4>>(
+    vars: &[S; 4],
+    inputs: &RigidRowInputs,
+) -> [S; RIGID_FEATURE_DIMENSION] {
+    let observed_g = vars[3].scale(inputs.probit_scale);
+    let linear = observed_g.scale(inputs.z_sum);
+    let variance = vars[3]
+        .mul(&vars[3])
+        .scale(inputs.covariance_ones);
+    [vars[0], vars[1], vars[2], linear, variance]
 }
 
-/// The rigid survival marginal-slope row negative log-likelihood, written ONCE
-/// over a generic [`JetScalar<4>`] so a single expression yields every
-/// derivative channel a consumer needs (#736/#932 single-source contract):
+#[inline(always)]
+fn rigid_row_feature_values(
+    primaries: &[f64; 4],
+    inputs: &RigidRowInputs,
+) -> [f64; RIGID_FEATURE_DIMENSION] {
+    let [q0, q1, qd1, g] = *primaries;
+    let observed_g = inputs.probit_scale * g;
+    [
+        q0,
+        q1,
+        qd1,
+        observed_g * inputs.z_sum,
+        (g * g) * inputs.covariance_ones,
+    ]
+}
+
+/// Admission witnesses for the scalar/shared four-primary geometry, obtained by
+/// applying its `(q0,q1,qd1,g) -> (q0,q1,qd1,L,V)` feature map to the sliced
+/// witness surface emitted from the sole rigid likelihood declaration.
+#[inline(always)]
+pub(crate) fn rigid_row_admission_witnesses(
+    primaries: &[f64; 4],
+    inputs: &RigidRowInputs,
+) -> [f64; 3] {
+    let [q0, q1, qd1, linear, variance] = rigid_row_feature_values(primaries, inputs);
+    rigid_feature_program_witnesses(q0, q1, qd1, linear, variance, inputs.probit_scale)
+}
+
+/// The rigid survival marginal-slope row negative log-likelihood, evaluated
+/// over a generic four-primary [`JetScalar`] after mechanically constructing
+/// the five semantic features consumed by the sole `rigid_feature_program` AST.
+/// The same expression therefore yields every derivative channel a consumer
+/// needs (#736/#932 single-source contract):
 ///
 /// * `S = Order2<4>`  → `(v, g, H)` (inner Newton / `row_kernel`, 168 B/row),
 /// * `S = OneSeed<4>` → contracted third `Σ_c ℓ_{abc} dir_c`
@@ -812,35 +798,22 @@ row_program! {
 /// * `S = Tower4<4>`  → the full dense `(v,g,H,t3,t4)` oracle / #979 all-axes
 ///   build-once truth (via [`gam_math::jet_tower::program_full_tower`]).
 ///
-/// The four primaries are `(q0, q1, qd1, g)`. From them
-///   `c(g) = √(1 + (s·g)²·covariance_ones)`,
-///   `η0 = q0·c + s·g·z_sum`, `η1 = q1·c + s·g·z_sum`, `ad1 = qd1·c`,
-/// and the NLL is `+w logΦ(−η0) + w(1−d) logΦ(−η1) − w·d·(logφ(η1) + log ad1)`,
-/// each special-function stack supplied as a hand-certified `[f64; 5]` through
-/// [`JetScalar::compose_unary`] — there is no separate hand-derivative channel.
+/// The feature map is `L=(s·g)·z_sum`, `V=g²·covariance_ones`; all probability
+/// algebra and special-function composition lives only in the feature program.
 pub(crate) fn rigid_row_nll<S: JetScalar<4>>(
     vars: &[S; 4],
     inputs: &RigidRowInputs,
 ) -> Result<S, String> {
-    let RigidRowInputs {
-        wi,
-        di,
-        z_sum,
-        covariance_ones,
-        probit_scale,
-        ..
-    } = *inputs;
-
-    let (nll, [neg_eta0, neg_eta1, adjusted_derivative]) = rigid_row_program(
-        &vars[0],
-        &vars[1],
-        &vars[2],
-        &vars[3],
-        wi,
-        di,
-        z_sum,
-        covariance_ones,
-        probit_scale,
+    let features = rigid_row_feature_jets(vars, inputs);
+    let (nll, [neg_eta0, neg_eta1, adjusted_derivative]) = rigid_feature_program::<4, S>(
+        &features[FEATURE_Q0],
+        &features[FEATURE_Q1],
+        &features[FEATURE_QD1],
+        &features[FEATURE_LINEAR],
+        &features[FEATURE_VARIANCE],
+        inputs.wi,
+        inputs.di,
+        inputs.probit_scale,
     );
 
     validate_rigid_row_admission(
@@ -853,31 +826,92 @@ pub(crate) fn rigid_row_nll<S: JetScalar<4>>(
     Ok(nll)
 }
 
-/// Direct value/gradient/Hessian lowering of the canonical rigid row program.
-///
-/// [`row_program!`] emits this scalar schedule and the generic/CUDA evaluators
-/// from the same parsed SSA graph and the same declared derivative-stack leaves.
-/// The order-two path therefore performs only the live symbolic arithmetic: it
-/// never constructs forward-jet identities, masks, or zero Hessian channels.
+/// Direct value/gradient/Hessian lowering of the canonical five-feature row
+/// program followed by the universal second-order pullback into the scalar/shared
+/// four-primary geometry. The fixed stack buffers and active-feature map expose
+/// only the three identity rows plus the two `g -> (L,V)` channels.
 #[inline(always)]
 pub(crate) fn rigid_row_order2(
     primaries: &[f64; 4],
     inputs: &RigidRowInputs,
 ) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
-    let [q0, q1, qd1, g] = *primaries;
-    let (value, gradient, hessian, [neg_eta0, neg_eta1, adjusted_derivative]) =
-        rigid_row_program_order2(
+    let [q0, q1, qd1, linear, variance] = rigid_row_feature_values(primaries, inputs);
+    let (value, feature_gradient, feature_hessian, [neg_eta0, neg_eta1, adjusted_derivative]) =
+        rigid_feature_program_order2(
             q0,
             q1,
             qd1,
-            g,
+            linear,
+            variance,
             inputs.wi,
             inputs.di,
-            inputs.z_sum,
-            inputs.covariance_ones,
             inputs.probit_scale,
         );
-    validate_rigid_row_admission(qd1, inputs, neg_eta0, neg_eta1, adjusted_derivative)?;
+    validate_rigid_row_admission(
+        primaries[FEATURE_QD1],
+        inputs,
+        neg_eta0,
+        neg_eta1,
+        adjusted_derivative,
+    )?;
+
+    const DIMENSION: usize = 4;
+    let mut jacobian = [0.0; RIGID_FEATURE_DIMENSION * DIMENSION];
+    jacobian[FEATURE_Q0 * DIMENSION + FEATURE_Q0] = 1.0;
+    jacobian[FEATURE_Q1 * DIMENSION + FEATURE_Q1] = 1.0;
+    jacobian[FEATURE_QD1 * DIMENSION + FEATURE_QD1] = 1.0;
+    jacobian[FEATURE_LINEAR * DIMENSION + 3] = inputs.probit_scale * inputs.z_sum;
+    jacobian[FEATURE_VARIANCE * DIMENSION + 3] =
+        2.0 * primaries[3] * inputs.covariance_ones;
+
+    let mut gradient = [0.0; DIMENSION];
+    let mut flat_hessian = [0.0; DIMENSION * DIMENSION];
+    order2_feature_pullback_into(
+        &feature_gradient,
+        &feature_hessian,
+        &jacobian,
+        |axis| if axis < 3 { 1 } else { 2 },
+        |axis, slot| {
+            if axis < 3 {
+                axis
+            } else {
+                FEATURE_LINEAR + slot
+            }
+        },
+        DIMENSION,
+        &mut gradient,
+        &mut flat_hessian,
+        |gradient, hessian| {
+            hessian[3 * DIMENSION + 3] +=
+                gradient[FEATURE_VARIANCE] * 2.0 * inputs.covariance_ones;
+        },
+    );
+    let hessian = [
+        [
+            flat_hessian[0],
+            flat_hessian[1],
+            flat_hessian[2],
+            flat_hessian[3],
+        ],
+        [
+            flat_hessian[4],
+            flat_hessian[5],
+            flat_hessian[6],
+            flat_hessian[7],
+        ],
+        [
+            flat_hessian[8],
+            flat_hessian[9],
+            flat_hessian[10],
+            flat_hessian[11],
+        ],
+        [
+            flat_hessian[12],
+            flat_hessian[13],
+            flat_hessian[14],
+            flat_hessian[15],
+        ],
+    ];
     Ok((value, gradient, hessian))
 }
 
@@ -1016,15 +1050,8 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
                         row,
                         "survival marginal-slope rigid row kernel (batched)",
                     )?;
-                    let [neg_eta0, neg_eta1, adjusted_derivative] = rigid_row_program_witnesses(
-                        p[0],
-                        p[1],
-                        p[2],
-                        p[3],
-                        inputs.z_sum,
-                        inputs.covariance_ones,
-                        probit_scale,
-                    );
+                    let [neg_eta0, neg_eta1, adjusted_derivative] =
+                        rigid_row_admission_witnesses(&p, &inputs);
                     validate_rigid_row_admission(
                         p[2],
                         &inputs,

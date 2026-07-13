@@ -1198,16 +1198,6 @@ pub(crate) fn use_exact_newton_strict_spd<F: CustomFamily + ?Sized>(family: &F) 
     family.exact_newton_outerobjective() == ExactNewtonOuterObjective::StrictPseudoLaplace
 }
 
-pub(crate) fn blockwise_logdet_terms<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    states: &mut [ParameterBlockState],
-    block_log_lambdas: &[Array1<f64>],
-    options: &BlockwiseFitOptions,
-) -> Result<(f64, f64), String> {
-    blockwise_logdet_terms_with_workspace(family, specs, states, block_log_lambdas, options, None)
-}
-
 pub(crate) fn blockwise_logdet_terms_with_workspace<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
@@ -2851,9 +2841,8 @@ pub(crate) mod whitened_spectrum {
                     }
                 }
             }
-            let hard_case_rhs_floor = rhs_norm_sq.sqrt()
-                * (self.gamma.len() as f64).sqrt()
-                * f64::EPSILON;
+            let hard_case_rhs_floor =
+                rhs_norm_sq.sqrt() * (self.gamma.len() as f64).sqrt() * f64::EPSILON;
             if hard_case_component_sq.sqrt() <= hard_case_rhs_floor
                 && hard_case_base_norm_sq < trust_radius * trust_radius
             {
@@ -3113,11 +3102,7 @@ mod trust_region_subproblem_tests {
     /// broad rank band.
     #[test]
     pub(crate) fn weak_negative_hard_case_uses_true_minimum_mode() {
-        let h = array![
-            [-1.0e-3, 0.0, 0.0],
-            [0.0, 2.0e-3, 0.0],
-            [0.0, 0.0, 1.0e8]
-        ];
+        let h = array![[-1.0e-3, 0.0, 0.0], [0.0, 2.0e-3, 0.0], [0.0, 0.0, 1.0e8]];
         let rhs = array![0.0, 0.0, 0.0];
         let d = array![1.0, 1.0, 1.0];
         let spec = WhitenedHessianSpectrum::decompose(&h, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();

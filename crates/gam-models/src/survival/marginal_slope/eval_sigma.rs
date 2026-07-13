@@ -44,9 +44,14 @@ impl SurvivalMarginalSlopeFamily {
         let score_dim = self.score_dim();
         gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
             row_iter.len(),
-            |range| -> Result<f64, String> {
-                let mut ll = 0.0;
-                let mut logslope_workspace = self.logslope_row_workspace()?;
+                |range| -> Result<f64, String> {
+                    let mut ll = 0.0;
+                    let mut logslope_workspace = self.logslope_row_workspace()?;
+                    let value_workspace = if score_dim > 1 {
+                        Some(RigidVectorValueWorkspace::new(&self.score_covariance)?)
+                    } else {
+                        None
+                    };
                 for idx in range {
                     let weighted = row_iter[idx];
                     let i = weighted.index;
@@ -59,6 +64,9 @@ impl SurvivalMarginalSlopeFamily {
                                 block_states,
                                 probit_scale,
                                 &mut logslope_workspace,
+                                value_workspace.as_ref().expect(
+                                    "vector value workspace is constructed for multi-score rows",
+                                ),
                             )?;
                         continue;
                     }

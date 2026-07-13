@@ -2,8 +2,8 @@
 //!
 //! The production cache builder requests exactly the order-2 channels
 //! `(value, gradient[4], Hessian[4][4])`. Large admitted batches execute the
-//! order-2 CUDA lowering of
-//! [`crate::survival::marginal_slope::row_kernel::rigid_row_nll`]; smaller or
+//! order-2 CUDA lowering of the canonical five-feature row program followed by
+//! its mechanical four-primary pullback; smaller or
 //! unavailable-device batches use the ordinary per-row cache path. Contracted
 //! third/fourth derivatives have separate live CPU consumers whose directions
 //! vary by row and are intentionally not part of this batch API.
@@ -14,7 +14,7 @@
 //! rows against the CPU row program.
 
 #[cfg(target_os = "linux")]
-use crate::survival::marginal_slope::row_kernel::RIGID_ROW_PROGRAM_CUDA_VGH;
+use crate::survival::marginal_slope::RIGID_FEATURE_PROGRAM_CUDA_VGH;
 #[cfg(target_os = "linux")]
 use cudarc::nvrtc::Ptx;
 #[cfg(target_os = "linux")]
@@ -80,6 +80,74 @@ const SURVIVAL_ROWJET_TEMPLATE: &str = include_str!("survival_rowjet_kernel.cu")
 #[cfg(target_os = "linux")]
 const ROW_PROGRAM_MARKER: &str = "// __GAM_ROW_PROGRAM_CUDA_VGH__";
 
+/// Mechanical `(q0,q1,qd1,g) -> (q0,q1,qd1,L,V)` order-two pullback for the
+/// generated CUDA feature evaluator. This contains only the feature map and
+/// chain rule; the likelihood expression exists solely in the row program.
+#[cfg(target_os = "linux")]
+const RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA: &str = r#"
+__device__ __forceinline__ void rigid_feature_program_pullback4(
+        double q0,
+        double q1,
+        double qd1,
+        double g,
+        const RowIn& in,
+        double* row_value,
+        double* row_gradient,
+        double* row_hessian) {
+    const double observed_g = in.probit_scale * g;
+    const double linear = observed_g * in.z_sum;
+    const double variance = (g * g) * in.covariance_ones;
+    double feature_gradient[5];
+    double feature_hessian[25];
+    rigid_feature_program(
+        q0,
+        q1,
+        qd1,
+        linear,
+        variance,
+        in,
+        row_value,
+        feature_gradient,
+        feature_hessian);
+
+    const double d_linear = in.probit_scale * in.z_sum;
+    const double d_variance = 2.0 * g * in.covariance_ones;
+    const double d2_variance = 2.0 * in.covariance_ones;
+    row_gradient[0] = feature_gradient[0];
+    row_gradient[1] = feature_gradient[1];
+    row_gradient[2] = feature_gradient[2];
+    row_gradient[3] = feature_gradient[3] * d_linear
+        + feature_gradient[4] * d_variance;
+
+    row_hessian[0] = feature_hessian[0];
+    row_hessian[1] = feature_hessian[1];
+    row_hessian[4] = feature_hessian[5];
+    row_hessian[2] = feature_hessian[2];
+    row_hessian[8] = feature_hessian[10];
+    row_hessian[5] = feature_hessian[6];
+    row_hessian[6] = feature_hessian[7];
+    row_hessian[9] = feature_hessian[11];
+    row_hessian[10] = feature_hessian[12];
+
+    const double h0g = feature_hessian[3] * d_linear
+        + feature_hessian[4] * d_variance;
+    const double h1g = feature_hessian[8] * d_linear
+        + feature_hessian[9] * d_variance;
+    const double h2g = feature_hessian[13] * d_linear
+        + feature_hessian[14] * d_variance;
+    row_hessian[3] = h0g;
+    row_hessian[12] = h0g;
+    row_hessian[7] = h1g;
+    row_hessian[13] = h1g;
+    row_hessian[11] = h2g;
+    row_hessian[14] = h2g;
+    row_hessian[15] = feature_hessian[18] * d_linear * d_linear
+        + 2.0 * feature_hessian[19] * d_linear * d_variance
+        + feature_hessian[24] * d_variance * d_variance
+        + feature_gradient[4] * d2_variance;
+}
+"#;
+
 #[cfg(target_os = "linux")]
 fn survival_rowjet_source() -> &'static str {
     static SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -91,10 +159,15 @@ fn survival_rowjet_source() -> &'static str {
             !kernel.contains(ROW_PROGRAM_MARKER),
             "survival rowjet CUDA template must contain exactly one row-program marker",
         );
-        let mut source =
-            String::with_capacity(preamble.len() + RIGID_ROW_PROGRAM_CUDA_VGH.len() + kernel.len());
+        let mut source = String::with_capacity(
+            preamble.len()
+                + RIGID_FEATURE_PROGRAM_CUDA_VGH.len()
+                + RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA.len()
+                + kernel.len(),
+        );
         source.push_str(preamble);
-        source.push_str(RIGID_ROW_PROGRAM_CUDA_VGH);
+        source.push_str(RIGID_FEATURE_PROGRAM_CUDA_VGH);
+        source.push_str(RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA);
         source.push_str(kernel);
         source
     })
@@ -524,11 +597,19 @@ mod tests {
             1
         );
         assert!(!SURVIVAL_ROWJET_TEMPLATE.contains("struct J2"));
-        assert!(RIGID_ROW_PROGRAM_CUDA_VGH.contains("void rigid_row_program"));
-        assert!(!RIGID_ROW_PROGRAM_CUDA_VGH.contains("j2_"));
-        assert!(!RIGID_ROW_PROGRAM_CUDA_VGH.contains("* 0.0"));
-        assert!(!RIGID_ROW_PROGRAM_CUDA_VGH.contains("0.0 *"));
+        assert!(RIGID_FEATURE_PROGRAM_CUDA_VGH.contains("void rigid_feature_program"));
+        assert!(RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA
+            .contains("void rigid_feature_program_pullback4"));
+        assert!(RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA.contains("rigid_feature_program("));
+        assert!(!RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA.contains("neglog_phi"));
+        assert!(!RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA.contains("log_normal_pdf"));
+        assert!(!RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA.contains("d_sqrt"));
+        assert!(!RIGID_FEATURE_PROGRAM_CUDA_VGH.contains("j2_"));
+        assert!(!RIGID_FEATURE_PROGRAM_CUDA_VGH.contains("* 0.0"));
+        assert!(!RIGID_FEATURE_PROGRAM_CUDA_VGH.contains("0.0 *"));
         assert!(source.contains("survival_rowjet_vgh"));
+        assert_eq!(source.matches("void rigid_feature_program(").count(), 1);
+        assert!(!source.contains("rigid_row_program"));
         assert_eq!(source.matches("extern \"C\" __global__").count(), 1,);
         for removed in [
             "survival_rowjet_no_t4",

@@ -896,20 +896,42 @@ pub(crate) fn sls_row_nll_wiggle<'arena, S: RuntimeJetScalar<'arena>>(
     nll
 }
 
+/// Saved monotone time-wiggle inputs for one survival location-scale ALO row.
+///
+/// The affine time channels remain the first three ALO coordinates. `beta`
+/// owns the protected tail of the same raw time-coefficient block, and the row
+/// program composes
+/// `h = h_base + B(h_base) beta` and
+/// `h_dot = (1 + B'(h_base) beta) h_dot_base` inside its order-two jet. This is
+/// essential: a post-warp Jacobian alone omits score-times-map-Hessian
+/// curvature.
+pub struct SurvivalLocationScaleAloTimeWiggleInput<'a> {
+    pub beta: &'a [f64],
+    pub entry_basis: &'a [f64],
+    pub entry_basis_d1: &'a [f64],
+    pub entry_basis_d2: &'a [f64],
+    pub entry_basis_d3: &'a [f64],
+    pub exit_basis: &'a [f64],
+    pub exit_basis_d1: &'a [f64],
+    pub exit_basis_d2: &'a [f64],
+    pub exit_basis_d3: &'a [f64],
+}
+
 /// Saved link-wiggle inputs for one survival location-scale ALO row.
 ///
 /// Every slice is evaluated at the unwarped standardized residual for the
-/// same row. Second derivatives are required because the observed row Hessian
-/// includes the score-times-map-Hessian chain-rule term; a post-warp Jacobian
-/// alone is not exact.
+/// same row. The exit third derivative is required even for an order-two
+/// observed Hessian because the event-rate multiplier contains `B'(q_exit)`.
 pub struct SurvivalLocationScaleAloWiggleInput<'a> {
     pub beta: &'a [f64],
     pub entry_basis: &'a [f64],
     pub entry_basis_d1: &'a [f64],
     pub entry_basis_d2: &'a [f64],
+    pub entry_basis_d3: &'a [f64],
     pub exit_basis: &'a [f64],
     pub exit_basis_d1: &'a [f64],
     pub exit_basis_d2: &'a [f64],
+    pub exit_basis_d3: &'a [f64],
 }
 
 /// Exact affine local coordinates consumed by the fitted survival
@@ -919,7 +941,7 @@ pub struct SurvivalLocationScaleAloWiggleInput<'a> {
 ///
 /// `[h_entry, h_exit, hdot_exit, eta_t_exit, eta_t_entry, eta_t_dot_exit,
 ///   eta_log_sigma_exit, eta_log_sigma_entry, eta_log_sigma_dot_exit,
-///   link_wiggle_beta...]`.
+///   time_wiggle_beta..., link_wiggle_beta...]`.
 ///
 /// These are deliberately the affine predictor channels, not the post-warp
 /// indices `(u_entry, u_exit, g)`: the latter have a nonlinear parameter map
@@ -938,6 +960,7 @@ pub struct SurvivalLocationScaleAloRowInput<'a> {
     pub eta_log_sigma_exit: f64,
     pub eta_log_sigma_entry: f64,
     pub eta_log_sigma_derivative_exit: f64,
+    pub time_wiggle: Option<SurvivalLocationScaleAloTimeWiggleInput<'a>>,
     pub link_wiggle: Option<SurvivalLocationScaleAloWiggleInput<'a>>,
 }
 
@@ -963,7 +986,36 @@ pub fn survival_location_scale_alo_row_geometry(
             input.prior_weight
         ));
     }
-    let wiggle_dimension = input
+    let time_wiggle_dimension = input
+        .time_wiggle
+        .as_ref()
+        .map_or(0, |wiggle| wiggle.beta.len());
+    if let Some(wiggle) = input.time_wiggle.as_ref() {
+        for (label, values) in [
+            ("entry basis", wiggle.entry_basis),
+            ("entry basis d1", wiggle.entry_basis_d1),
+            ("entry basis d2", wiggle.entry_basis_d2),
+            ("entry basis d3", wiggle.entry_basis_d3),
+            ("exit basis", wiggle.exit_basis),
+            ("exit basis d1", wiggle.exit_basis_d1),
+            ("exit basis d2", wiggle.exit_basis_d2),
+            ("exit basis d3", wiggle.exit_basis_d3),
+        ] {
+            if values.len() != time_wiggle_dimension {
+                return Err(format!(
+                    "survival location-scale ALO time-wiggle {label} has {} entries; beta has {time_wiggle_dimension}",
+                    values.len()
+                ));
+            }
+        }
+        if time_wiggle_dimension == 0 {
+            return Err(
+                "survival location-scale ALO time-wiggle metadata has zero coefficients"
+                    .to_string(),
+            );
+        }
+    }
+    let link_wiggle_dimension = input
         .link_wiggle
         .as_ref()
         .map_or(0, |wiggle| wiggle.beta.len());
@@ -972,25 +1024,27 @@ pub fn survival_location_scale_alo_row_geometry(
             ("entry basis", wiggle.entry_basis),
             ("entry basis d1", wiggle.entry_basis_d1),
             ("entry basis d2", wiggle.entry_basis_d2),
+            ("entry basis d3", wiggle.entry_basis_d3),
             ("exit basis", wiggle.exit_basis),
             ("exit basis d1", wiggle.exit_basis_d1),
             ("exit basis d2", wiggle.exit_basis_d2),
+            ("exit basis d3", wiggle.exit_basis_d3),
         ] {
-            if values.len() != wiggle_dimension {
+            if values.len() != link_wiggle_dimension {
                 return Err(format!(
-                    "survival location-scale ALO {label} has {} entries; link-wiggle beta has {wiggle_dimension}",
+                    "survival location-scale ALO link-wiggle {label} has {} entries; beta has {link_wiggle_dimension}",
                     values.len()
                 ));
             }
         }
-        if wiggle_dimension == 0 {
+        if link_wiggle_dimension == 0 {
             return Err(
                 "survival location-scale ALO link-wiggle metadata has zero coefficients"
                     .to_string(),
             );
         }
     }
-    let dimension = SLS_ROW_K + wiggle_dimension;
+    let dimension = SLS_ROW_K + time_wiggle_dimension + link_wiggle_dimension;
     let mut coordinate_values = vec![
         input.h_entry,
         input.h_exit,
@@ -1002,6 +1056,9 @@ pub fn survival_location_scale_alo_row_geometry(
         input.eta_log_sigma_entry,
         input.eta_log_sigma_derivative_exit,
     ];
+    if let Some(wiggle) = input.time_wiggle.as_ref() {
+        coordinate_values.extend_from_slice(wiggle.beta);
+    }
     if let Some(wiggle) = input.link_wiggle.as_ref() {
         coordinate_values.extend_from_slice(wiggle.beta);
     }
@@ -1020,6 +1077,21 @@ pub fn survival_location_scale_alo_row_geometry(
         ));
     }
 
+    let (h_entry, h_exit, hdot_exit) = match input.time_wiggle.as_ref() {
+        Some(wiggle) => {
+            let mut h_entry = input.h_entry;
+            let mut h_exit = input.h_exit;
+            let mut derivative_multiplier = 1.0;
+            for coefficient in 0..time_wiggle_dimension {
+                let beta = wiggle.beta[coefficient];
+                h_entry += beta * wiggle.entry_basis[coefficient];
+                h_exit += beta * wiggle.exit_basis[coefficient];
+                derivative_multiplier += beta * wiggle.exit_basis_d1[coefficient];
+            }
+            (h_entry, h_exit, derivative_multiplier * input.hdot_exit)
+        }
+        None => (input.h_entry, input.h_exit, input.hdot_exit),
+    };
     let inv_sigma_entry = (-input.eta_log_sigma_entry).exp();
     let inv_sigma_exit = (-input.eta_log_sigma_exit).exp();
     let q_base_entry = -input.eta_threshold_entry * inv_sigma_entry;
@@ -1043,9 +1115,9 @@ pub fn survival_location_scale_alo_row_geometry(
         None => (q_base_entry, q_base_exit, qdot_base_exit),
     };
     let state = survival_predictor_state(
-        input.h_entry,
-        input.h_exit,
-        input.hdot_exit,
+        h_entry,
+        h_exit,
+        hdot_exit,
         q_entry,
         q_exit,
         qdot_exit,
@@ -2811,34 +2883,20 @@ impl SurvivalLocationScaleFamily {
         else {
             return Ok(None);
         };
-        let basis = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 0)?;
-        let basis_d1 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 1)?;
-        let basis_d2 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 2)?;
-        let basis_d3 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 3)?;
-        if basis.ncols() != beta_w.len()
-            || basis_d1.ncols() != beta_w.len()
-            || basis_d2.ncols() != beta_w.len()
-            || basis_d3.ncols() != beta_w.len()
-        {
-            return Err(SurvivalLocationScaleError::DimensionMismatch {
-                reason: format!(
-                    "survival timewiggle basis/beta mismatch: B={} B'={} B''={} B'''={} betaw={}",
-                    basis.ncols(),
-                    basis_d1.ncols(),
-                    basis_d2.ncols(),
-                    basis_d3.ncols(),
-                    beta_w.len()
-                ),
-            }
-            .into());
-        }
-        let dq = fast_av(&basis_d1, &beta_w) + 1.0;
-        let d2 = fast_av(&basis_d2, &beta_w);
-        let d3 = fast_av(&basis_d3, &beta_w);
+        let stack = build_survival_location_scale_time_wiggle_basis_stack(
+            h0,
+            knots,
+            degree,
+            beta_w.len(),
+            "fitting",
+        )?;
+        let dq = fast_av(&stack.d1, &beta_w) + 1.0;
+        let d2 = fast_av(&stack.d2, &beta_w);
+        let d3 = fast_av(&stack.d3, &beta_w);
         Ok(Some(SurvivalWiggleGeometry {
-            basis,
-            basis_d1,
-            basis_d2,
+            basis: stack.value,
+            basis_d1: stack.d1,
+            basis_d2: stack.d2,
             dq_dq0: dq,
             d2q_dq02: d2,
             d3q_dq03: d3,

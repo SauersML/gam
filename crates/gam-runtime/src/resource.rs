@@ -52,9 +52,8 @@ impl std::fmt::Display for MemoryAvailabilitySource {
 
 /// The current process' cgroup memory observation.
 ///
-/// `available_bytes == 0` is an authoritative exhaustion signal. An absent or
-/// unlimited controller is represented by no cgroup observation, never by a
-/// fabricated zero.
+/// `available_bytes == 0` is an authoritative exhaustion signal. The detector
+/// never fabricates a cgroup zero when the OS reports no controller ceiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CgroupMemoryAvailability {
     total_bytes: u64,
@@ -95,7 +94,7 @@ impl MemoryAvailability {
         cgroup: Option<CgroupMemoryAvailability>,
     ) -> Self {
         let (available_bytes, limiting_source) = match cgroup {
-            Some(observation) if observation.available_bytes < host_available_bytes => (
+            Some(observation) if observation.available_bytes <= host_available_bytes => (
                 observation.available_bytes,
                 MemoryAvailabilitySource::Cgroup,
             ),
@@ -145,7 +144,7 @@ impl std::fmt::Display for MemoryAvailability {
             ),
             None => write!(
                 formatter,
-                "{} bytes limited by host (no finite cgroup observation)",
+                "{} bytes limited by host (no cgroup ceiling observation)",
                 self.available_bytes,
             ),
         }
@@ -160,11 +159,13 @@ pub fn detect_memory_availability() -> MemoryAvailability {
     let system = SYSTEM.get_or_init(|| Mutex::new(sysinfo::System::new()));
     let mut system = system.lock().expect("sysinfo system mutex poisoned");
     system.refresh_memory();
-    let cgroup = system.cgroup_limits().map(|limits| CgroupMemoryAvailability {
-        total_bytes: limits.total_memory,
-        available_bytes: limits.free_memory,
-        resident_bytes: limits.rss,
-    });
+    let cgroup = system
+        .cgroup_limits()
+        .map(|limits| CgroupMemoryAvailability {
+            total_bytes: limits.total_memory,
+            available_bytes: limits.free_memory,
+            resident_bytes: limits.rss,
+        });
     MemoryAvailability::from_observation(system.available_memory(), cgroup)
 }
 
@@ -181,6 +182,7 @@ fn governor_budget_from_availability(availability: MemoryAvailability) -> usize 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryBudgetSource {
     Detected(MemoryAvailability),
+    #[cfg(test)]
     Explicit,
 }
 
@@ -188,6 +190,7 @@ impl std::fmt::Display for MemoryBudgetSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Detected(availability) => write!(formatter, "detected {availability}"),
+            #[cfg(test)]
             Self::Explicit => formatter.write_str("explicit test budget"),
         }
     }
@@ -273,6 +276,7 @@ impl MemoryGovernor {
     /// cannot create independent budgets — every production reservation shares
     /// [`global`](Self::global), which calls this exactly once with the
     /// detected budget. Unit tests use it for isolated ledgers.
+    #[cfg(test)]
     fn with_budget(budget_bytes: usize) -> Self {
         Self::with_budget_source(budget_bytes, MemoryBudgetSource::Explicit)
     }
@@ -1317,6 +1321,10 @@ mod resource_policy_tests {
         assert_eq!(host_only.limiting_source(), MemoryAvailabilitySource::Host);
         assert_eq!(governor_budget_from_availability(host_only), 750);
 
+        let exhausted_host = MemoryAvailability::from_observation(0, None);
+        assert_eq!(exhausted_host.available_bytes(), 0);
+        assert_eq!(governor_budget_from_availability(exhausted_host), 0);
+
         let finite_cgroup = MemoryAvailability::from_observation(
             1_000,
             Some(CgroupMemoryAvailability {
@@ -1347,6 +1355,8 @@ mod resource_policy_tests {
         );
         assert_eq!(governor_budget_from_availability(exhausted_cgroup), 0);
 
+        // An absent/unlimited cgroup is either `None` or a host-clamped
+        // observation. Neither is allowed to manufacture a zero.
         let host_is_tighter = MemoryAvailability::from_observation(
             1_000,
             Some(CgroupMemoryAvailability {
@@ -1359,6 +1369,33 @@ mod resource_policy_tests {
         assert_eq!(
             host_is_tighter.limiting_source(),
             MemoryAvailabilitySource::Host
+        );
+
+        let equal_cgroup_ceiling = MemoryAvailability::from_observation(
+            1_000,
+            Some(CgroupMemoryAvailability {
+                total_bytes: 1_200,
+                available_bytes: 1_000,
+                resident_bytes: 200,
+            }),
+        );
+        assert_eq!(equal_cgroup_ceiling.available_bytes(), 1_000);
+        assert_eq!(
+            equal_cgroup_ceiling.limiting_source(),
+            MemoryAvailabilitySource::Cgroup
+        );
+
+        let both_exhausted = MemoryAvailability::from_observation(
+            0,
+            Some(CgroupMemoryAvailability {
+                total_bytes: 600,
+                available_bytes: 0,
+                resident_bytes: 600,
+            }),
+        );
+        assert_eq!(
+            both_exhausted.limiting_source(),
+            MemoryAvailabilitySource::Cgroup
         );
     }
 

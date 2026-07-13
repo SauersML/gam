@@ -12,15 +12,18 @@ use gam_models::inference::model::{
 };
 use gam_models::survival::{
     CauseSpecificSurvivalAloRowInput, SurvivalLikelihoodMode,
-    SurvivalMarginalSlopeSavedAloReplayInput, cause_specific_survival_alo_row_geometry,
-    replay_saved_survival_marginal_slope_alo, require_saved_survival_likelihood_mode,
-    survival_event_code_from_value,
+    SurvivalLocationScaleAloRowInput, SurvivalLocationScaleAloTimeWiggleInput,
+    SurvivalLocationScaleAloWiggleInput, SurvivalMarginalSlopeSavedAloReplayInput,
+    cause_specific_survival_alo_row_geometry, replay_saved_survival_marginal_slope_alo,
+    require_saved_survival_likelihood_mode, survival_event_code_from_value,
+    survival_location_scale_alo_row_geometry,
+    survival_location_scale_time_wiggle_basis_authority,
 };
 use gam_models::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalAloRowInput,
     transformation_normal_alo_row_geometry,
 };
-use gam_problem::{EstimationError, Gauge, ResponseFamily};
+use gam_problem::{BlockRole, EstimationError, Gauge, ResponseFamily};
 use gam_solve::inference::alo::{
     AloInput, MultiBlockAloDiagnostics, MultiBlockAloInput, compute_alo_from_input,
     compute_multiblock_alo,
@@ -75,6 +78,165 @@ pub struct SavedMarginalSlopeSurvivalAloInput {
     marginal_offset: Array1<f64>,
     logslope_design: DesignMatrix,
     logslope_offset: Array1<f64>,
+}
+
+/// One fitted affine block evaluated on survival entry, exit, and exit-time
+/// derivative channels.
+///
+/// Every design has the same raw coefficient width. A structurally static
+/// block uses its exit design at entry and an exact-zero derivative design;
+/// callers must make that topology explicit instead of relying on a replay
+/// fallback inside the ALO likelihood.
+pub struct SavedSurvivalAffineBlockAloInput {
+    design_entry: DesignMatrix,
+    design_exit: DesignMatrix,
+    design_derivative_exit: DesignMatrix,
+    offset_entry: Array1<f64>,
+    offset_exit: Array1<f64>,
+    derivative_offset_exit: Array1<f64>,
+}
+
+impl SavedSurvivalAffineBlockAloInput {
+    pub fn new(
+        design_entry: DesignMatrix,
+        design_exit: DesignMatrix,
+        design_derivative_exit: DesignMatrix,
+        offset_entry: Array1<f64>,
+        offset_exit: Array1<f64>,
+        derivative_offset_exit: Array1<f64>,
+    ) -> Result<Self, String> {
+        let n = design_exit.nrows();
+        let width = design_exit.ncols();
+        if n == 0
+            || design_entry.nrows() != n
+            || design_derivative_exit.nrows() != n
+            || offset_entry.len() != n
+            || offset_exit.len() != n
+            || derivative_offset_exit.len() != n
+        {
+            return Err(format!(
+                "saved survival affine ALO block row mismatch: entry={}, exit={n}, derivative={}, offsets={}/{}/{}",
+                design_entry.nrows(),
+                design_derivative_exit.nrows(),
+                offset_entry.len(),
+                offset_exit.len(),
+                derivative_offset_exit.len(),
+            ));
+        }
+        if width == 0
+            || design_entry.ncols() != width
+            || design_derivative_exit.ncols() != width
+        {
+            return Err(format!(
+                "saved survival affine ALO block width mismatch: entry={}, exit={width}, derivative={}",
+                design_entry.ncols(),
+                design_derivative_exit.ncols(),
+            ));
+        }
+        for (label, values) in [
+            ("entry offset", &offset_entry),
+            ("exit offset", &offset_exit),
+            ("derivative offset", &derivative_offset_exit),
+        ] {
+            if let Some((row, value)) = values
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(format!(
+                    "saved survival affine ALO {label}[{row}] must be finite, got {value}"
+                ));
+            }
+        }
+        Ok(Self {
+            design_entry,
+            design_exit,
+            design_derivative_exit,
+            offset_entry,
+            offset_exit,
+            derivative_offset_exit,
+        })
+    }
+
+    fn evaluate(
+        &self,
+        beta: &Array1<f64>,
+        label: &str,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        if self.design_exit.ncols() != beta.len() {
+            return Err(invalid(format!(
+                "saved survival {label} ALO design has {} columns; fitted affine block has {} coefficients",
+                self.design_exit.ncols(),
+                beta.len(),
+            )));
+        }
+        Ok((
+            self.design_entry.dot(beta) + &self.offset_entry,
+            self.design_exit.dot(beta) + &self.offset_exit,
+            self.design_derivative_exit.dot(beta) + &self.derivative_offset_exit,
+        ))
+    }
+}
+
+/// Exact saved-row carrier for a survival location-scale fit.
+///
+/// `time_base` contains only the affine pre-time-wiggle coefficients. The
+/// baseline time-wiggle tail is deliberately reconstructed by the fitting row
+/// program, alongside the link wiggle, so its score-times-map-Hessian term is
+/// retained in observed row curvature.
+pub struct SavedLocationScaleSurvivalAloInput {
+    event: Array1<f64>,
+    derivative_guard: f64,
+    time_base: SavedSurvivalAffineBlockAloInput,
+    threshold: SavedSurvivalAffineBlockAloInput,
+    log_sigma: SavedSurvivalAffineBlockAloInput,
+}
+
+impl SavedLocationScaleSurvivalAloInput {
+    pub fn new(
+        event: Array1<f64>,
+        derivative_guard: f64,
+        time_base: SavedSurvivalAffineBlockAloInput,
+        threshold: SavedSurvivalAffineBlockAloInput,
+        log_sigma: SavedSurvivalAffineBlockAloInput,
+    ) -> Result<Self, String> {
+        let n = event.len();
+        if n == 0
+            || time_base.design_exit.nrows() != n
+            || threshold.design_exit.nrows() != n
+            || log_sigma.design_exit.nrows() != n
+        {
+            return Err(format!(
+                "saved survival location-scale ALO row mismatch: event={n}, time={}, threshold={}, log_sigma={}",
+                time_base.design_exit.nrows(),
+                threshold.design_exit.nrows(),
+                log_sigma.design_exit.nrows(),
+            ));
+        }
+        if !derivative_guard.is_finite() || derivative_guard <= 0.0 {
+            return Err(format!(
+                "saved survival location-scale ALO derivative guard must be positive and finite, got {derivative_guard}"
+            ));
+        }
+        if let Some((row, value)) = event
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| *value != 0.0 && *value != 1.0)
+        {
+            return Err(format!(
+                "saved survival location-scale ALO event[{row}] must be exactly 0 or 1, got {value}"
+            ));
+        }
+        Ok(Self {
+            event,
+            derivative_guard,
+            time_base,
+            threshold,
+            log_sigma,
+        })
+    }
 }
 
 impl SavedMarginalSlopeSurvivalAloInput {
@@ -231,6 +393,7 @@ impl SavedCauseSpecificSurvivalAloInput {
 /// Typed survival row carriers accepted by saved-model ALO.
 pub enum SavedSurvivalAloInput {
     CauseSpecific(SavedCauseSpecificSurvivalAloInput),
+    LocationScale(SavedLocationScaleSurvivalAloInput),
     MarginalSlope(SavedMarginalSlopeSurvivalAloInput),
 }
 
@@ -1590,6 +1753,395 @@ fn compute_saved_cause_specific_survival_alo(
         coordinate_names,
         input.coordinate_designs.clone(),
         input.coordinate_ranges.clone(),
+        geometry,
+        observed_hessians,
+        scores,
+        coordinate_values,
+    )
+}
+
+fn compute_saved_location_scale_survival_alo(
+    model: &FittedModel,
+    input: &SavedLocationScaleSurvivalAloInput,
+    observations: SavedAloObservations<'_>,
+) -> Result<SavedModelAloDiagnostics, EstimationError> {
+    let class = PredictModelClass::Survival;
+    let likelihood_mode = require_saved_survival_likelihood_mode(model)
+        .map_err(|error| invalid(format!("saved survival ALO likelihood mode: {error}")))?;
+    if likelihood_mode != SurvivalLikelihoodMode::LocationScale {
+        return Err(invalid(format!(
+            "saved location-scale survival ALO row geometry cannot replay {likelihood_mode:?}"
+        )));
+    }
+    let n = input.event.len();
+    if observations.response.len() != n || observations.prior_weights.len() != n {
+        return Err(invalid(format!(
+            "saved survival location-scale ALO row mismatch: carrier={n}, response={}, weights={}",
+            observations.response.len(),
+            observations.prior_weights.len(),
+        )));
+    }
+    for row in 0..n {
+        if observations.response[row] != input.event[row] {
+            return Err(invalid(format!(
+                "saved survival location-scale ALO event mismatch at row {row}: carrier={}, observations={}",
+                input.event[row], observations.response[row],
+            )));
+        }
+        let weight = observations.prior_weights[row];
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(invalid(format!(
+                "saved survival location-scale ALO prior weight[{row}] must be finite and non-negative, got {weight}"
+            )));
+        }
+    }
+
+    let payload = model.payload();
+    let structure = payload
+        .survival_location_scale_structure
+        .as_ref()
+        .ok_or_else(|| {
+            invalid("saved survival location-scale ALO is missing exact replay structure")
+        })?;
+    let fit = payload.fit_result.as_ref().ok_or_else(|| {
+        invalid("saved survival location-scale ALO requires a canonical fitted coefficient state")
+    })?;
+    let runtime = model.saved_prediction_runtime().map_err(|error| {
+        invalid(format!(
+            "saved survival location-scale ALO runtime: {error}"
+        ))
+    })?;
+    let inverse_link = runtime.inverse_link.ok_or_else(|| {
+        invalid("saved survival location-scale ALO is missing its resolved inverse link")
+    })?;
+
+    let block_range = |role: BlockRole, label: &str| -> Result<Range<usize>, EstimationError> {
+        let mut cursor = 0usize;
+        let mut found = None;
+        for block in &fit.blocks {
+            let next = cursor.checked_add(block.beta.len()).ok_or_else(|| {
+                invalid("saved survival location-scale ALO coefficient layout overflows usize")
+            })?;
+            if block.role == role {
+                if found.is_some() {
+                    return Err(invalid(format!(
+                        "saved survival location-scale ALO has duplicate {label} blocks"
+                    )));
+                }
+                found = Some(cursor..next);
+            }
+            cursor = next;
+        }
+        if cursor != fit.beta.len() {
+            return Err(invalid(format!(
+                "saved survival location-scale ALO block widths sum to {cursor}; fitted beta has {} entries",
+                fit.beta.len(),
+            )));
+        }
+        found.ok_or_else(|| {
+            invalid(format!(
+                "saved survival location-scale ALO is missing its {label} block"
+            ))
+        })
+    };
+    let time_range = block_range(BlockRole::Time, "time")?;
+    let threshold_range = block_range(BlockRole::Threshold, "threshold")?;
+    let log_sigma_range = block_range(BlockRole::Scale, "log-sigma")?;
+    let link_range = match runtime.link_wiggle.as_ref() {
+        Some(_) => Some(block_range(BlockRole::LinkWiggle, "link-wiggle")?),
+        None => {
+            if fit
+                .blocks
+                .iter()
+                .any(|block| block.role == BlockRole::LinkWiggle)
+            {
+                return Err(invalid(
+                    "saved survival location-scale ALO fit has a link-wiggle block without runtime authority",
+                ));
+            }
+            None
+        }
+    };
+    let expected_blocks = 3 + usize::from(link_range.is_some());
+    if fit.blocks.len() != expected_blocks {
+        return Err(invalid(format!(
+            "saved survival location-scale ALO expects {expected_blocks} fitted blocks, got {}",
+            fit.blocks.len(),
+        )));
+    }
+
+    let time_wiggle_width = runtime
+        .baseline_time_wiggle
+        .as_ref()
+        .map_or(0, |wiggle| wiggle.beta.len());
+    if time_wiggle_width >= time_range.len() && time_wiggle_width != 0 {
+        return Err(invalid(format!(
+            "saved survival location-scale ALO time-wiggle width {time_wiggle_width} must leave a non-empty affine time block within {} coefficients",
+            time_range.len(),
+        )));
+    }
+    let time_base_width = time_range.len() - time_wiggle_width;
+    if input.time_base.design_exit.ncols() != time_base_width {
+        return Err(invalid(format!(
+            "saved survival location-scale ALO affine time design has {} columns; fitted base time block has {time_base_width}",
+            input.time_base.design_exit.ncols(),
+        )));
+    }
+    let beta_time_base = fit
+        .beta
+        .slice(s![time_range.start..time_range.start + time_base_width])
+        .to_owned();
+    let (h_base_entry, h_base_exit, hdot_base_exit) = input
+        .time_base
+        .evaluate(&beta_time_base, "location-scale base-time")?;
+    let beta_threshold = fit.beta.slice(s![threshold_range.clone()]).to_owned();
+    let (eta_threshold_entry, eta_threshold_exit, eta_threshold_derivative_exit) = input
+        .threshold
+        .evaluate(&beta_threshold, "location-scale threshold")?;
+    let beta_log_sigma = fit.beta.slice(s![log_sigma_range.clone()]).to_owned();
+    let (eta_log_sigma_entry, eta_log_sigma_exit, eta_log_sigma_derivative_exit) = input
+        .log_sigma
+        .evaluate(&beta_log_sigma, "location-scale log-sigma")?;
+
+    let reduced_parametric_aft = matches!(
+        structure.time_parameterization,
+        gam_models::survival::SurvivalLocationScaleTimeParameterization::ReducedParametricAft
+    );
+    if reduced_parametric_aft {
+        if runtime.baseline_time_wiggle.is_some() || runtime.link_wiggle.is_some() {
+            return Err(invalid(
+                "saved reduced parametric-AFT location-scale ALO cannot carry time/link wiggles",
+            ));
+        }
+        for (label, design) in [
+            ("entry", &input.time_base.design_entry),
+            ("exit", &input.time_base.design_exit),
+            ("derivative", &input.time_base.design_derivative_exit),
+        ] {
+            if design.to_dense().iter().any(|value| *value != 0.0) {
+                return Err(invalid(format!(
+                    "saved reduced parametric-AFT location-scale ALO {label} time design must be the exact zero affine lift"
+                )));
+            }
+        }
+        if h_base_entry.iter().any(|value| *value != 0.0)
+            || h_base_exit.iter().any(|value| *value != 0.0)
+            || hdot_base_exit.iter().any(|value| *value != 0.0)
+        {
+            return Err(invalid(
+                "saved reduced parametric-AFT location-scale ALO time coordinates must be exact zero",
+            ));
+        }
+    }
+
+    let time_wiggle_beta = fit
+        .beta
+        .slice(s![time_range.start + time_base_width..time_range.end]);
+    let time_wiggle_basis = match runtime.baseline_time_wiggle.as_ref() {
+        Some(wiggle) => {
+            if wiggle.beta.as_slice() != time_wiggle_beta.as_slice().unwrap_or(&[]) {
+                return Err(invalid(
+                    "saved survival location-scale ALO time-wiggle runtime disagrees with the fitted time-block tail",
+                ));
+            }
+            let knots = Array1::from_vec(wiggle.knots.clone());
+            Some(
+                survival_location_scale_time_wiggle_basis_authority(
+                    h_base_entry.view(),
+                    h_base_exit.view(),
+                    &knots,
+                    wiggle.degree,
+                    time_wiggle_width,
+                )
+                .map_err(|reason| {
+                    invalid(format!(
+                        "saved survival location-scale ALO time-wiggle basis: {reason}"
+                    ))
+                })?,
+            )
+        }
+        None => None,
+    };
+
+    let inv_sigma_entry = eta_log_sigma_entry.mapv(|value| (-value).exp());
+    let inv_sigma_exit = eta_log_sigma_exit.mapv(|value| (-value).exp());
+    let q_base_entry = -&eta_threshold_entry * &inv_sigma_entry;
+    let q_base_exit = -&eta_threshold_exit * &inv_sigma_exit;
+    let link_wiggle = runtime.link_wiggle.as_ref();
+    let (link_entry, link_entry_d1, link_entry_d2, link_entry_d3) = match link_wiggle {
+        Some(wiggle) => (
+            wiggle.constrained_basis(&q_base_entry, BasisOptions::value()),
+            wiggle.constrained_basis(&q_base_entry, BasisOptions::first_derivative()),
+            wiggle.constrained_basis(&q_base_entry, BasisOptions::second_derivative()),
+            wiggle.constrained_basis(&q_base_entry, BasisOptions::third_derivative()),
+        ),
+        None => (
+            Ok(Array2::zeros((n, 0))),
+            Ok(Array2::zeros((n, 0))),
+            Ok(Array2::zeros((n, 0))),
+            Ok(Array2::zeros((n, 0))),
+        ),
+    };
+    let (link_exit, link_exit_d1, link_exit_d2, link_exit_d3) = match link_wiggle {
+        Some(wiggle) => {
+            wiggle.derivative_q0(&q_base_exit).map_err(|error| {
+                invalid(format!(
+                    "saved survival location-scale ALO link-wiggle monotonicity: {error}"
+                ))
+            })?;
+            (
+                wiggle.constrained_basis(&q_base_exit, BasisOptions::value()),
+                wiggle.constrained_basis(&q_base_exit, BasisOptions::first_derivative()),
+                wiggle.constrained_basis(&q_base_exit, BasisOptions::second_derivative()),
+                wiggle.constrained_basis(&q_base_exit, BasisOptions::third_derivative()),
+            )
+        }
+        None => (
+            Ok(Array2::zeros((n, 0))),
+            Ok(Array2::zeros((n, 0))),
+            Ok(Array2::zeros((n, 0))),
+            Ok(Array2::zeros((n, 0))),
+        ),
+    };
+    let map_link_basis_error = |channel: &str, error| {
+        invalid(format!(
+            "saved survival location-scale ALO link-wiggle {channel}: {error}"
+        ))
+    };
+    let link_entry = link_entry.map_err(|error| map_link_basis_error("entry value", error))?;
+    let link_entry_d1 =
+        link_entry_d1.map_err(|error| map_link_basis_error("entry d1", error))?;
+    let link_entry_d2 =
+        link_entry_d2.map_err(|error| map_link_basis_error("entry d2", error))?;
+    let link_entry_d3 =
+        link_entry_d3.map_err(|error| map_link_basis_error("entry d3", error))?;
+    let link_exit = link_exit.map_err(|error| map_link_basis_error("exit value", error))?;
+    let link_exit_d1 =
+        link_exit_d1.map_err(|error| map_link_basis_error("exit d1", error))?;
+    let link_exit_d2 =
+        link_exit_d2.map_err(|error| map_link_basis_error("exit d2", error))?;
+    let link_exit_d3 =
+        link_exit_d3.map_err(|error| map_link_basis_error("exit d3", error))?;
+    let link_wiggle_beta = link_wiggle.map_or(&[][..], |wiggle| wiggle.beta.as_slice());
+
+    let parameter_dimension = fit.beta.len();
+    let geometry = require_saved_geometry(model, class, parameter_dimension)?;
+    let mut observed_hessians = Vec::with_capacity(n);
+    let mut scores = Vec::with_capacity(n);
+    let mut coordinate_values = Vec::with_capacity(n);
+    for row in 0..n {
+        let time_wiggle_row = time_wiggle_basis.as_ref().map(|basis| {
+            SurvivalLocationScaleAloTimeWiggleInput {
+                beta: time_wiggle_beta.as_slice().expect("fitted beta slice contiguous"),
+                entry_basis: basis.entry.value.row(row).as_slice().expect("basis row contiguous"),
+                entry_basis_d1: basis.entry.d1.row(row).as_slice().expect("basis row contiguous"),
+                entry_basis_d2: basis.entry.d2.row(row).as_slice().expect("basis row contiguous"),
+                entry_basis_d3: basis.entry.d3.row(row).as_slice().expect("basis row contiguous"),
+                exit_basis: basis.exit.value.row(row).as_slice().expect("basis row contiguous"),
+                exit_basis_d1: basis.exit.d1.row(row).as_slice().expect("basis row contiguous"),
+                exit_basis_d2: basis.exit.d2.row(row).as_slice().expect("basis row contiguous"),
+                exit_basis_d3: basis.exit.d3.row(row).as_slice().expect("basis row contiguous"),
+            }
+        });
+        let link_wiggle_row = link_wiggle.map(|_| SurvivalLocationScaleAloWiggleInput {
+            beta: link_wiggle_beta,
+            entry_basis: link_entry.row(row).as_slice().expect("basis row contiguous"),
+            entry_basis_d1: link_entry_d1.row(row).as_slice().expect("basis row contiguous"),
+            entry_basis_d2: link_entry_d2.row(row).as_slice().expect("basis row contiguous"),
+            entry_basis_d3: link_entry_d3.row(row).as_slice().expect("basis row contiguous"),
+            exit_basis: link_exit.row(row).as_slice().expect("basis row contiguous"),
+            exit_basis_d1: link_exit_d1.row(row).as_slice().expect("basis row contiguous"),
+            exit_basis_d2: link_exit_d2.row(row).as_slice().expect("basis row contiguous"),
+            exit_basis_d3: link_exit_d3.row(row).as_slice().expect("basis row contiguous"),
+        });
+        let row_geometry =
+            survival_location_scale_alo_row_geometry(SurvivalLocationScaleAloRowInput {
+                inverse_link: &inverse_link,
+                prior_weight: observations.prior_weights[row],
+                event: input.event[row],
+                derivative_guard: input.derivative_guard,
+                h_entry: h_base_entry[row],
+                h_exit: h_base_exit[row],
+                hdot_exit: hdot_base_exit[row],
+                eta_threshold_exit: eta_threshold_exit[row],
+                eta_threshold_entry: eta_threshold_entry[row],
+                eta_threshold_derivative_exit: eta_threshold_derivative_exit[row],
+                eta_log_sigma_exit: eta_log_sigma_exit[row],
+                eta_log_sigma_entry: eta_log_sigma_entry[row],
+                eta_log_sigma_derivative_exit: eta_log_sigma_derivative_exit[row],
+                time_wiggle: time_wiggle_row,
+                link_wiggle: link_wiggle_row,
+            })
+            .map_err(|reason| {
+                invalid(format!(
+                    "saved survival location-scale ALO row {row}: {reason}"
+                ))
+            })?;
+        observed_hessians.push(row_geometry.observed_hessian);
+        scores.push(row_geometry.nll_score);
+        coordinate_values.push(row_geometry.coordinate_values);
+    }
+
+    let mut coordinate_designs = vec![
+        input.time_base.design_entry.clone(),
+        input.time_base.design_exit.clone(),
+        input.time_base.design_derivative_exit.clone(),
+        input.threshold.design_exit.clone(),
+        input.threshold.design_entry.clone(),
+        input.threshold.design_derivative_exit.clone(),
+        input.log_sigma.design_exit.clone(),
+        input.log_sigma.design_entry.clone(),
+        input.log_sigma.design_derivative_exit.clone(),
+    ];
+    let time_base_range = time_range.start..time_range.start + time_base_width;
+    let mut coordinate_ranges = vec![
+        time_base_range.clone(),
+        time_base_range.clone(),
+        time_base_range,
+        threshold_range.clone(),
+        threshold_range.clone(),
+        threshold_range,
+        log_sigma_range.clone(),
+        log_sigma_range.clone(),
+        log_sigma_range,
+    ];
+    let mut coordinate_names = vec![
+        "time-base-entry".to_string(),
+        "time-base-exit".to_string(),
+        "time-base-derivative-exit".to_string(),
+        "threshold-exit".to_string(),
+        "threshold-entry".to_string(),
+        "threshold-derivative-exit".to_string(),
+        "log-sigma-exit".to_string(),
+        "log-sigma-entry".to_string(),
+        "log-sigma-derivative-exit".to_string(),
+    ];
+    for coefficient in 0..time_wiggle_width {
+        coordinate_designs.push(constant_scalar_design(n));
+        let raw = time_range.start + time_base_width + coefficient;
+        coordinate_ranges.push(raw..raw + 1);
+        coordinate_names.push(format!("time-wiggle[{coefficient}]"));
+    }
+    if let Some(range) = link_range {
+        if range.len() != link_wiggle_beta.len() {
+            return Err(invalid(format!(
+                "saved survival location-scale ALO link-wiggle block has {} coefficients; runtime has {}",
+                range.len(),
+                link_wiggle_beta.len(),
+            )));
+        }
+        for coefficient in 0..range.len() {
+            coordinate_designs.push(constant_scalar_design(n));
+            let raw = range.start + coefficient;
+            coordinate_ranges.push(raw..raw + 1);
+            coordinate_names.push(format!("link-wiggle[{coefficient}]"));
+        }
+    }
+    compute_saved_multicoordinate_core(
+        class,
+        coordinate_names,
+        coordinate_designs,
+        coordinate_ranges,
         geometry,
         observed_hessians,
         scores,

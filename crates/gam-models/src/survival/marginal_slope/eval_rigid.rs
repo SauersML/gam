@@ -28,16 +28,20 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         probit_scale: f64,
         logslope_workspace: &mut LogslopeRowWorkspace,
+        value_workspace: &RigidVectorValueWorkspace<'_>,
     ) -> Result<f64, String> {
         self.fill_logslope_values_for_row(row, block_states, logslope_workspace)?;
-        let z = self.z.row(row).to_vec();
+        let z_row = self.z.row(row);
+        let z = z_row.as_slice().ok_or_else(|| {
+            "survival marginal-slope vector value score row must be contiguous".to_string()
+        })?;
         survival_marginal_slope_vector_neglog(
             q_geom.q0,
             q_geom.q1,
             q_geom.qd1,
             logslope_workspace.values(),
-            &z,
-            &self.score_covariance,
+            z,
+            value_workspace,
             self.weights[row],
             self.event[row],
             self.derivative_guard,

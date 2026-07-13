@@ -245,7 +245,7 @@ pub fn sae_streaming_plan_for_shape(
                     let per_device_budget = aggregate_budget / rt.device_count();
                     let window = (per_device_budget / 16)
                         .max(SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE);
-                    let host_available = sae_host_available_memory_bytes();
+                    let host_available = sae_process_available_memory_bytes();
                     (
                         (aggregate_budget / 4).min(host_available),
                         window,
@@ -410,13 +410,12 @@ pub struct SaeTopKCurvedBudget {
     /// Support-lane peak: `active_state + routing_workspace + decoder +
     /// border_vector` bytes.
     pub streaming_peak_bytes: usize,
-    /// Budget the streaming peak is admitted against:
-    /// `max(in_core_budget_bytes, SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES)`,
-    /// the same starved-box floor convention as the matrix-free plan.
+    /// Authoritative process-memory admission ceiling retained alongside the
+    /// estimate so refusal diagnostics expose both sides of the inequality.
     pub streaming_budget_bytes: usize,
-    /// The un-floored host budget used to derive the support budget.
+    /// The headroom-reserved process budget used to derive the support budget.
     pub in_core_budget_bytes: usize,
-    /// True when the canonical support-sparse peak fits the (floored) budget.
+    /// True when the canonical support-sparse peak fits that process budget.
     pub streaming_admitted: bool,
 }
 
@@ -455,7 +454,7 @@ pub(crate) fn sae_topk_curved_budget_from_budget(
         decoder_bytes,
         border_vector_bytes,
         streaming_peak_bytes: 0,
-        streaming_budget_bytes: in_core_budget_bytes.max(SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES),
+        streaming_budget_bytes: in_core_budget_bytes,
         in_core_budget_bytes,
         streaming_admitted: false,
     };
@@ -468,67 +467,14 @@ pub(crate) fn sae_topk_curved_budget_from_budget(
     budget
 }
 
-pub(crate) fn sae_host_available_memory_bytes() -> usize {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    let available = sys.available_memory() as usize;
-    let available = if available == 0 {
-        SAE_HOST_IN_CORE_FALLBACK_BYTES
-    } else {
-        available
-    };
-    // In a container/cgroup the global "available" can vastly exceed the cgroup
-    // memory budget the process is actually allowed; admitting against the host
-    // figure OOM-kills the container. Clamp to the cgroup headroom (limit −
-    // current usage) whenever a finite limit is present.
-    match sae_cgroup_available_bytes() {
-        Some(cgroup) => available.min(cgroup),
-        None => available,
-    }
-}
-
-/// Bytes still available to this process under its cgroup memory controller, if
-/// a finite limit is configured (`limit − current`). Returns `None` when there
-/// is no cgroup limit (unlimited / `max`) or the controller cannot be read
-/// (non-Linux, missing files) — in which case the global figure stands.
-fn sae_cgroup_available_bytes() -> Option<usize> {
-    // cgroup v2 unified hierarchy.
-    if let Some(limit) = sae_read_usize_file("/sys/fs/cgroup/memory.max") {
-        let current = sae_read_usize_file("/sys/fs/cgroup/memory.current").unwrap_or(0);
-        return Some(limit.saturating_sub(current));
-    }
-    // cgroup v1 memory controller.
-    if let Some(limit) = sae_read_usize_file("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
-        let current =
-            sae_read_usize_file("/sys/fs/cgroup/memory/memory.usage_in_bytes").unwrap_or(0);
-        return Some(limit.saturating_sub(current));
-    }
-    None
-}
-
-/// Parse a single unsigned integer from a sysfs/cgroup file. Returns `None`
-/// for `max` (cgroup v2 "no limit"), a v1 sentinel limit larger than any sane
-/// physical budget (effectively unlimited), an unreadable file, or unparseable
-/// contents.
-fn sae_read_usize_file(path: &str) -> Option<usize> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let trimmed = raw.trim();
-    if trimmed == "max" {
-        return None;
-    }
-    let value: usize = trimmed.parse().ok()?;
-    // cgroup v1 encodes "unlimited" as a near-`u64::MAX` sentinel; treat any
-    // implausibly large limit (≥ 2^62 bytes) as no limit.
-    if value >= (1usize << 62) {
-        return None;
-    }
-    Some(value)
+pub(crate) fn sae_process_available_memory_bytes() -> usize {
+    gam_runtime::resource::detect_memory_availability().available_bytes_usize()
 }
 
 /// Pure in-core budget rule, factored out of [`sae_host_in_core_budget_bytes`]
 /// so the admission bound can be tested without reading live system memory.
 ///
-/// The in-core fallback floor is a *useful-work* minimum, not a license to
+/// The in-core useful-work floor is a minimum target, not a license to
 /// admit more than the box actually has. The budget is `max(fraction, floor)`
 /// capped at the *usable* memory `available − reserve`, where the reserve keeps
 /// OS/allocator headroom free (`available` is an over-estimate). A dense direct
@@ -548,10 +494,10 @@ pub(crate) const fn sae_host_in_core_budget_from_available(available: usize) -> 
     let usable = available.saturating_sub(reserve);
     let fraction = (available.saturating_mul(SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR))
         / SAE_HOST_MEMORY_BUDGET_FRACTION_DENOMINATOR;
-    let floored = if fraction > SAE_HOST_IN_CORE_FALLBACK_BYTES {
+    let floored = if fraction > SAE_HOST_IN_CORE_USEFUL_WORK_FLOOR_BYTES {
         fraction
     } else {
-        SAE_HOST_IN_CORE_FALLBACK_BYTES
+        SAE_HOST_IN_CORE_USEFUL_WORK_FLOOR_BYTES
     };
     // Cap at usable: if the floor exceeds usable memory the budget collapses to
     // usable, so the direct-plan admission gate refuses and the term streams.
@@ -559,7 +505,7 @@ pub(crate) const fn sae_host_in_core_budget_from_available(available: usize) -> 
 }
 
 pub(crate) fn sae_host_in_core_budget_bytes() -> (usize, usize) {
-    let available = sae_host_available_memory_bytes();
+    let available = sae_process_available_memory_bytes();
     (sae_host_in_core_budget_from_available(available), available)
 }
 
@@ -649,9 +595,9 @@ mod host_in_core_budget_tests {
         for &avail in &[
             0usize,
             1,
-            SAE_HOST_IN_CORE_FALLBACK_BYTES - 1,
-            SAE_HOST_IN_CORE_FALLBACK_BYTES,
-            SAE_HOST_IN_CORE_FALLBACK_BYTES + 1,
+            SAE_HOST_IN_CORE_USEFUL_WORK_FLOOR_BYTES - 1,
+            SAE_HOST_IN_CORE_USEFUL_WORK_FLOOR_BYTES,
+            SAE_HOST_IN_CORE_USEFUL_WORK_FLOOR_BYTES + 1,
             16 * 1024 * 1024 * 1024,
         ] {
             let budget = sae_host_in_core_budget_from_available(avail);
@@ -671,7 +617,7 @@ mod host_in_core_budget_tests {
         let fraction = avail * SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR
             / SAE_HOST_MEMORY_BUDGET_FRACTION_DENOMINATOR;
         assert_eq!(budget, fraction);
-        assert!(budget >= SAE_HOST_IN_CORE_FALLBACK_BYTES);
+        assert!(budget >= SAE_HOST_IN_CORE_USEFUL_WORK_FLOOR_BYTES);
     }
 
     /// The budget must keep an OS/allocator reserve free: it can never exceed
@@ -712,7 +658,7 @@ mod host_in_core_budget_tests {
             budget, usable,
             "below-floor budget must collapse to usable {usable}, got {budget}"
         );
-        assert!(budget < SAE_HOST_IN_CORE_FALLBACK_BYTES);
+        assert!(budget < SAE_HOST_IN_CORE_USEFUL_WORK_FLOOR_BYTES);
 
         // A direct plan needing 1.5 GiB (> usable) must NOT be admitted.
         let plan = sae_streaming_plan_from_budget(
@@ -824,10 +770,7 @@ mod topk_curved_budget_tests {
                 + ledger.decoder_bytes
                 + ledger.border_vector_bytes
         );
-        assert_eq!(
-            ledger.streaming_budget_bytes,
-            budget_bytes.max(SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES)
-        );
+        assert_eq!(ledger.streaming_budget_bytes, budget_bytes);
         assert!(ledger.streaming_admitted);
     }
 

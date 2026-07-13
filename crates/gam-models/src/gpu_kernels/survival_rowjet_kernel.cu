@@ -1,7 +1,8 @@
 // NVRTC device source for the survival marginal-slope rigid per-row V/G/H jet.
-// This is the order-2 CUDA lowering of the canonical CPU `rigid_row_nll`
-// program. The generated schedule differentiates its SSA graph symbolically,
-// computes only nonzero channels, and uses full f64 arithmetic without fast-math.
+// This is the order-2 CUDA lowering of the canonical five-feature rigid row
+// program plus its mechanical scalar/shared pullback. The generated schedule
+// differentiates the sole likelihood SSA graph symbolically, computes only
+// nonzero channels, and uses full f64 arithmetic without fast-math.
 
 // NVRTC does not include <math.h>/<cmath>, so define the constants it omits.
 #ifndef M_PI
@@ -148,7 +149,7 @@ extern "C" __global__ void __launch_bounds__(128, 1) survival_rowjet_vgh(
     in.z_sum = z_sum[row];
     in.covariance_ones = cov_ones[row];
     in.probit_scale = probit_scale;
-    rigid_row_program(
+    rigid_feature_program_pullback4(
         q0[row],
         q1[row],
         qd1[row],
