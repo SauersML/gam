@@ -1417,9 +1417,14 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         psi_index: usize,
     ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("BinomialMeanWiggleFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
+        let derivative_blocks = hyper_layout.design_derivative_blocks();
         validate_block_count::<GamlssError>("BinomialMeanWiggleFamily", 2, block_states.len())?;
         if derivative_blocks.len() != 2 {
             return Err(GamlssError::DimensionMismatch { reason: format!(
