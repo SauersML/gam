@@ -1270,9 +1270,7 @@ enum PsiWarmStartScope {
     CurrentEvaluation,
 }
 
-fn evaluate_custom_family_hyper_internal_shared<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
+fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -1316,8 +1314,9 @@ fn evaluate_custom_family_hyper_internal_shared<
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, penalty_counts)?;
     let psi_safe_warm_start = match warm_start_scope {
-        PsiWarmStartScope::UnknownGeometry =>
-            warm_start_without_cached_inner_for_psi_derivatives(warm_start, psi_dim > 0),
+        PsiWarmStartScope::UnknownGeometry => {
+            warm_start_without_cached_inner_for_psi_derivatives(warm_start, psi_dim > 0)
+        }
         PsiWarmStartScope::CurrentEvaluation => warm_start.cloned(),
     };
 
@@ -2645,8 +2644,7 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         screened_objectives[*left]
             .expect("ranked candidate has a finite objective")
             .total_cmp(
-                &screened_objectives[*right]
-                    .expect("ranked candidate has a finite objective"),
+                &screened_objectives[*right].expect("ranked candidate has a finite objective"),
             )
             .then_with(|| left.cmp(right))
     });
@@ -2767,7 +2765,11 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
     let reasons = rejected_candidates
         .iter()
         .enumerate()
-        .filter_map(|(idx, reason)| reason.as_ref().map(|reason| format!("candidate {idx}: {reason}")))
+        .filter_map(|(idx, reason)| {
+            reason
+                .as_ref()
+                .map(|reason| format!("candidate {idx}: {reason}"))
+        })
         .collect::<Vec<_>>()
         .join("; ");
     Err(CustomFamilyError::UnsupportedConfiguration {

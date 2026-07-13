@@ -11,43 +11,78 @@ use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 /// - `q0_i`: entry-time probit argument (per-row, length n)
 /// - `q1_i`: exit-time probit argument (per-row, length n)
 /// - `qd1_i`: derivative probit argument (per-row, length n)
-/// - `g_i`: per-row log-slope value `g = logslope_design · β_logslope`
-/// - `c_i`: `sqrt(1 + (s·g_i)²)` (per-row, length n)
+/// - `slopes`: per-row physical log-slope vector `(n × K)`
+/// - `c_i`: `sqrt(1 + s² g_iᵀΣg_i)` (per-row, length n)
 /// - `s`: probit scale (scalar, = `probit_frailty_scale()`)
-/// - `z_i`: per-row covariate score (length n)
 pub struct SurvivalMarginalSlopeFamilyScalars {
-    pub q0_i: Vec<f64>,
-    pub q1_i: Vec<f64>,
-    pub qd1_i: Vec<f64>,
-    pub g_i: Vec<f64>,
-    pub c_i: Vec<f64>,
-    pub s: f64,
-    pub z_i: Vec<f64>,
+    pub(crate) q0_i: Vec<f64>,
+    pub(crate) q1_i: Vec<f64>,
+    pub(crate) qd1_i: Vec<f64>,
+    pub(crate) slopes: Array2<f64>,
+    pub(crate) c_i: Vec<f64>,
+    pub(crate) s: f64,
 }
 
 impl SurvivalMarginalSlopeFamilyScalars {
-    /// Construct with c_i computed from g_i and s.
+    /// Construct the exact current primary geometry. The score covariance is
+    /// part of the construction contract, so `c_i` cannot drift away from the
+    /// vector likelihood's `g_iᵀΣg_i` scale.
     pub fn new(
         q0_i: Vec<f64>,
         q1_i: Vec<f64>,
         qd1_i: Vec<f64>,
-        g_i: Vec<f64>,
+        slopes: Array2<f64>,
         s: f64,
-        z_i: Vec<f64>,
-    ) -> Self {
-        let c_i: Vec<f64> = g_i
+        covariance: &MarginalSlopeCovariance,
+    ) -> Result<Self, String> {
+        if !(s.is_finite() && s > 0.0) {
+            return Err(format!(
+                "survival marginal-slope family scalars require a positive finite probit scale, got {s}"
+            ));
+        }
+        covariance.validate("survival marginal-slope family scalars covariance")?;
+        let n = q0_i.len();
+        if q1_i.len() != n
+            || qd1_i.len() != n
+            || slopes.nrows() != n
+            || slopes.ncols() != covariance.dim()
+        {
+            return Err(format!(
+                "survival marginal-slope family scalar dimensions disagree: q0={n}, q1={}, qd1={}, slopes={}x{}, covariance K={}",
+                q1_i.len(),
+                qd1_i.len(),
+                slopes.nrows(),
+                slopes.ncols(),
+                covariance.dim(),
+            ));
+        }
+        if q0_i
             .iter()
-            .map(|&g| (1.0 + (s * g).powi(2)).sqrt())
-            .collect();
-        Self {
+            .chain(q1_i.iter())
+            .chain(qd1_i.iter())
+            .chain(slopes.iter())
+            .any(|value| !value.is_finite())
+        {
+            return Err(
+                "survival marginal-slope family scalars contain a non-finite primary value"
+                    .to_string(),
+            );
+        }
+        let mut c_i = Vec::with_capacity(n);
+        for row in slopes.rows() {
+            let variance = covariance.quadratic_form(row.as_slice().ok_or_else(|| {
+                "survival marginal-slope slope row is not contiguous".to_string()
+            })?)?;
+            c_i.push((1.0 + s * s * variance).sqrt());
+        }
+        Ok(Self {
             q0_i,
             q1_i,
             qd1_i,
-            g_i,
+            slopes,
             c_i,
             s,
-            z_i,
-        }
+        })
     }
 }
 
@@ -425,7 +460,6 @@ pub struct SmsTimewiggleTimeJacobian {
     pub(crate) design_exit: Arc<Array2<f64>>,
     pub(crate) design_deriv: Arc<Array2<f64>>,
     pub(crate) design_marginal: Arc<Array2<f64>>,
-    pub(crate) design_logslope: Arc<Array2<f64>>,
     pub(crate) offset_entry: Arc<Array1<f64>>,
     pub(crate) offset_exit: Arc<Array1<f64>>,
     pub(crate) offset_deriv: Arc<Array1<f64>>,
@@ -441,10 +475,6 @@ pub struct SmsTimewiggleTimeJacobian {
     pub(crate) p_tw: usize,
     /// Marginal block width (for joint β parsing).
     pub(crate) p_m: usize,
-    /// Logslope block width (for joint β parsing).
-    pub(crate) p_g: usize,
-    /// Probit frailty scale s.
-    pub(crate) probit_scale: f64,
 }
 
 impl SmsTimewiggleTimeJacobian {
@@ -454,7 +484,6 @@ impl SmsTimewiggleTimeJacobian {
         design_exit: Arc<Array2<f64>>,
         design_deriv: Arc<Array2<f64>>,
         design_marginal: Arc<Array2<f64>>,
-        design_logslope: Arc<Array2<f64>>,
         offset_entry: Arc<Array1<f64>>,
         offset_exit: Arc<Array1<f64>>,
         offset_deriv: Arc<Array1<f64>>,
@@ -463,8 +492,6 @@ impl SmsTimewiggleTimeJacobian {
         time_wiggle_degree: usize,
         p_tw: usize,
         p_m: usize,
-        p_g: usize,
-        probit_scale: f64,
     ) -> Self {
         let p_time = design_entry.ncols();
         Self {
@@ -472,7 +499,6 @@ impl SmsTimewiggleTimeJacobian {
             design_exit,
             design_deriv,
             design_marginal,
-            design_logslope,
             offset_entry,
             offset_exit,
             offset_deriv,
@@ -482,8 +508,6 @@ impl SmsTimewiggleTimeJacobian {
             p_time,
             p_tw,
             p_m,
-            p_g,
-            probit_scale,
         }
     }
 }
@@ -527,14 +551,32 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
             let e = (s + self.p_m).min(beta.len());
             if e > s { &beta[s..e] } else { &[][..] }
         };
-        // β_g = joint β[p_time + p_m .. p_time + p_m + p_g]
-        let beta_g = {
-            let s = p + self.p_m;
-            let e = (s + self.p_g).min(beta.len());
-            if e > s { &beta[s..e] } else { &[][..] }
-        };
-
-        let sc = self.probit_scale;
+        let scalars = state
+            .family_scalars
+            .as_ref()
+            .map(|value| {
+                value
+                    .downcast_ref::<SurvivalMarginalSlopeFamilyScalars>()
+                    .ok_or_else(|| {
+                        "timewiggle time Jacobian received the wrong family-scalar type"
+                            .to_string()
+                    })
+            })
+            .transpose()?;
+        if beta.iter().any(|&value| value != 0.0) && scalars.is_none() {
+            return Err(
+                "timewiggle time Jacobian requires current survival marginal-slope family scalars at nonzero beta"
+                    .to_string(),
+            );
+        }
+        if let Some(values) = scalars
+            && values.c_i.len() != n
+        {
+            return Err(format!(
+                "timewiggle time Jacobian c length {} does not match n={n}",
+                values.c_i.len(),
+            ));
+        }
         let knots = &self.time_wiggle_knots;
         let degree = self.time_wiggle_degree;
 
@@ -542,14 +584,7 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
 
         for i in rows.clone() {
             let local_i = i - rows.start;
-            // c_i computed directly from logslope design and joint β_g.
-            let g_i: f64 = beta_g
-                .iter()
-                .enumerate()
-                .filter(|&(j, _)| j < self.design_logslope.ncols())
-                .map(|(j, &b)| self.design_logslope[[i, j]] * b)
-                .sum();
-            let c_i = (1.0_f64 + (sc * g_i).powi(2)).sqrt();
+            let c_i = scalars.map_or(1.0, |values| values.c_i[i]);
 
             // Base marginal η contribution.
             let eta_m: f64 = beta_m
@@ -652,7 +687,6 @@ pub struct SmsTimewiggleMarginalJacobian {
     pub(crate) design_exit: Arc<Array2<f64>>,
     pub(crate) design_deriv: Arc<Array2<f64>>,
     pub(crate) design_marginal: Arc<Array2<f64>>,
-    pub(crate) design_logslope: Arc<Array2<f64>>,
     pub(crate) offset_entry: Arc<Array1<f64>>,
     pub(crate) offset_exit: Arc<Array1<f64>>,
     pub(crate) offset_deriv: Arc<Array1<f64>>,
@@ -663,8 +697,6 @@ pub struct SmsTimewiggleMarginalJacobian {
     pub(crate) time_wiggle_degree: usize,
     pub(crate) p_time: usize,
     pub(crate) p_tw: usize,
-    pub(crate) p_g: usize,
-    pub(crate) probit_scale: f64,
 }
 
 impl SmsTimewiggleMarginalJacobian {
@@ -674,7 +706,6 @@ impl SmsTimewiggleMarginalJacobian {
         design_exit: Arc<Array2<f64>>,
         design_deriv: Arc<Array2<f64>>,
         design_marginal: Arc<Array2<f64>>,
-        design_logslope: Arc<Array2<f64>>,
         offset_entry: Arc<Array1<f64>>,
         offset_exit: Arc<Array1<f64>>,
         offset_deriv: Arc<Array1<f64>>,
@@ -683,15 +714,12 @@ impl SmsTimewiggleMarginalJacobian {
         time_wiggle_degree: usize,
         p_time: usize,
         p_tw: usize,
-        p_g: usize,
-        probit_scale: f64,
     ) -> Self {
         Self {
             design_entry,
             design_exit,
             design_deriv,
             design_marginal,
-            design_logslope,
             offset_entry,
             offset_exit,
             offset_deriv,
@@ -700,8 +728,6 @@ impl SmsTimewiggleMarginalJacobian {
             time_wiggle_degree,
             p_time,
             p_tw,
-            p_g,
-            probit_scale,
         }
     }
 }
@@ -736,13 +762,32 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
             let e = (s + p_m).min(beta.len());
             if e > s { &beta[s..e] } else { &[][..] }
         };
-        let beta_g = {
-            let s = p_t + p_m;
-            let e = (s + self.p_g).min(beta.len());
-            if e > s { &beta[s..e] } else { &[][..] }
-        };
-
-        let sc = self.probit_scale;
+        let scalars = state
+            .family_scalars
+            .as_ref()
+            .map(|value| {
+                value
+                    .downcast_ref::<SurvivalMarginalSlopeFamilyScalars>()
+                    .ok_or_else(|| {
+                        "timewiggle marginal Jacobian received the wrong family-scalar type"
+                            .to_string()
+                    })
+            })
+            .transpose()?;
+        if beta.iter().any(|&value| value != 0.0) && scalars.is_none() {
+            return Err(
+                "timewiggle marginal Jacobian requires current survival marginal-slope family scalars at nonzero beta"
+                    .to_string(),
+            );
+        }
+        if let Some(values) = scalars
+            && values.c_i.len() != n
+        {
+            return Err(format!(
+                "timewiggle marginal Jacobian c length {} does not match n={n}",
+                values.c_i.len(),
+            ));
+        }
         let knots = &self.time_wiggle_knots;
         let degree = self.time_wiggle_degree;
 
@@ -750,13 +795,7 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
 
         for i in rows.clone() {
             let local_i = i - rows.start;
-            let g_i: f64 = beta_g
-                .iter()
-                .enumerate()
-                .filter(|&(j, _)| j < self.design_logslope.ncols())
-                .map(|(j, &b)| self.design_logslope[[i, j]] * b)
-                .sum();
-            let c_i = (1.0_f64 + (sc * g_i).powi(2)).sqrt();
+            let c_i = scalars.map_or(1.0, |values| values.c_i[i]);
 
             let eta_m: f64 = beta_m
                 .iter()

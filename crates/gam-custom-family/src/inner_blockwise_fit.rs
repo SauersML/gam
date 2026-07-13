@@ -42,8 +42,8 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
     total_p: usize,
 ) -> Result<ExactJointModeCurvatureCertificate, String> {
-    let workspace = family
-        .exact_newton_joint_hessian_workspace_with_options(states, specs, options)?;
+    let workspace =
+        family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?;
     let source = match workspace.as_ref() {
         Some(workspace) => exact_newton_joint_hessian_source_from_workspace(
             workspace,
@@ -106,11 +106,7 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
         &metric,
         KKT_REFUSAL_RANK_TOL,
     )?;
-    let minimum_whitened_eigenvalue = spectrum
-        .gamma
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let minimum_whitened_eigenvalue = spectrum.gamma.iter().copied().fold(f64::INFINITY, f64::min);
     Ok(ExactJointModeCurvatureCertificate {
         workspace,
         minimum_whitened_eigenvalue,
@@ -395,10 +391,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     total_joint_p,
                 ) {
                     Ok(certificate) => {
-                        cached_mode_acceptable =
-                            !certificate.has_resolvable_negative_curvature();
-                        let minimum_whitened_eigenvalue =
-                            certificate.minimum_whitened_eigenvalue;
+                        cached_mode_acceptable = !certificate.has_resolvable_negative_curvature();
+                        let minimum_whitened_eigenvalue = certificate.minimum_whitened_eigenvalue;
                         let numerical_floor = certificate.numerical_floor;
                         certified_workspace = certificate.workspace;
                         if !cached_mode_acceptable {
@@ -5751,8 +5745,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 if has_negative_curvature {
                     return Err(format!(
                         "joint Newton tentative convergence rejected by fresh exact returned-mode curvature: lambda_min={:.6e} < -floor={:.6e}; an indefinite coefficient point cannot define a Laplace mode",
-                        minimum_whitened_eigenvalue,
-                        numerical_floor,
+                        minimum_whitened_eigenvalue, numerical_floor,
                     ));
                 } else {
                     log::info!(
@@ -7144,12 +7137,12 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
     let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
     let joint_constraints =
         assemble_joint_linear_constraints(&block_constraints, &local_ranges, local_total_p)?;
-    let joint_mode_diagonal_ridge =
-        if ridge > 0.0 && options.ridge_policy.accounts_for_objective() {
-            ridge
-        } else {
-            0.0
-        };
+    let joint_mode_diagonal_ridge = if ridge > 0.0 && options.ridge_policy.accounts_for_objective()
+    {
+        ridge
+    } else {
+        0.0
+    };
     let mut certified_workspace = None;
     if converged
         && exact_joint_curvature_available

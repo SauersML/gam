@@ -3504,10 +3504,7 @@ impl ExactNewtonJointHessianWorkspace for ReturnedModeSaddleWorkspace {
 }
 
 impl OneStepReturnedSaddleFamily {
-    pub(crate) fn coordinates(
-        &self,
-        states: &[ParameterBlockState],
-    ) -> Result<(f64, f64), String> {
+    pub(crate) fn coordinates(&self, states: &[ParameterBlockState]) -> Result<(f64, f64), String> {
         let x = states
             .first()
             .and_then(|state| state.beta.first())
@@ -3535,8 +3532,7 @@ impl CustomFamily for OneStepReturnedSaddleFamily {
         let y_curvature = 1.0 - 2.0 * x / self.target;
         let score_x = self.target - x + y * y / self.target;
         let score_y = -y_curvature * y;
-        let negative_log_likelihood =
-            0.5 * (x - self.target).powi(2) + 0.5 * y_curvature * y * y;
+        let negative_log_likelihood = 0.5 * (x - self.target).powi(2) + 0.5 * y_curvature * y * y;
         Ok(FamilyEvaluation {
             log_likelihood: -negative_log_likelihood,
             blockworking_sets: vec![
@@ -3585,9 +3581,7 @@ pub(crate) fn one_step_returned_saddle_specs() -> Vec<ParameterBlockSpec> {
         .into_iter()
         .map(|name| ParameterBlockSpec {
             name: name.to_string(),
-            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
-                1.0
-            ]])),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: Vec::new(),
             nullspace_dims: Vec::new(),
@@ -3619,15 +3613,7 @@ pub(crate) fn fresh_exact_mode_curvature_certificate_detects_returned_strict_sad
         },
     ];
     let start_certificate = exact_joint_mode_curvature_certificate(
-        &family,
-        &at_start,
-        &specs,
-        &options,
-        &ranges,
-        &s_lambdas,
-        0.0,
-        None,
-        2,
+        &family, &at_start, &specs, &options, &ranges, &s_lambdas, 0.0, None, 2,
     )
     .expect("positive-curvature start should be certifiable");
     assert!(start_certificate.workspace.is_some());

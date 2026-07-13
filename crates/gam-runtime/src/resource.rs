@@ -178,24 +178,6 @@ fn governor_budget_from_availability(availability: MemoryAvailability) -> usize 
     usize::try_from(scaled).unwrap_or(usize::MAX)
 }
 
-/// Origin of a governor budget, retained in every typed refusal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemoryBudgetSource {
-    Detected(MemoryAvailability),
-    #[cfg(test)]
-    Explicit,
-}
-
-impl std::fmt::Display for MemoryBudgetSource {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Detected(availability) => write!(formatter, "detected {availability}"),
-            #[cfg(test)]
-            Self::Explicit => formatter.write_str("explicit test budget"),
-        }
-    }
-}
-
 /// Typed refusal from [`MemoryGovernor::try_reserve`].
 ///
 /// Carries the full ledger evidence so callers can route to a chunked or
@@ -206,14 +188,14 @@ impl std::fmt::Display for MemoryBudgetSource {
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum MemoryReservationError {
     #[error(
-        "{context}: cannot reserve {requested_bytes} bytes; {reserved_bytes} of {budget_bytes} bytes already reserved process-wide; budget source: {budget_source}"
+        "{context}: cannot reserve {requested_bytes} bytes; {reserved_bytes} of {budget_bytes} bytes already reserved process-wide; detected availability: {availability}"
     )]
     BudgetExceeded {
         context: Box<str>,
         requested_bytes: usize,
         reserved_bytes: usize,
         budget_bytes: usize,
-        budget_source: MemoryBudgetSource,
+        availability: MemoryAvailability,
     },
 
     #[error(
@@ -230,7 +212,7 @@ pub enum MemoryReservationError {
 #[derive(Debug)]
 struct GovernorLedger {
     budget_bytes: usize,
-    budget_source: MemoryBudgetSource,
+    availability: MemoryAvailability,
     reserved_bytes: std::sync::atomic::AtomicUsize,
 }
 
@@ -266,17 +248,10 @@ impl MemoryGovernor {
     }
 
     fn with_detected_availability(availability: MemoryAvailability) -> Self {
-        Self::with_budget_source(
-            governor_budget_from_availability(availability),
-            MemoryBudgetSource::Detected(availability),
-        )
-    }
-
-    fn with_budget_source(budget_bytes: usize, budget_source: MemoryBudgetSource) -> Self {
         Self {
             ledger: Arc::new(GovernorLedger {
-                budget_bytes,
-                budget_source,
+                budget_bytes: governor_budget_from_availability(availability),
+                availability,
                 reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
@@ -286,8 +261,8 @@ impl MemoryGovernor {
         self.ledger.budget_bytes
     }
 
-    pub fn budget_source(&self) -> MemoryBudgetSource {
-        self.ledger.budget_source
+    pub fn availability(&self) -> MemoryAvailability {
+        self.ledger.availability
     }
 
     pub fn reserved_bytes(&self) -> usize {
@@ -331,7 +306,7 @@ impl MemoryGovernor {
                         requested_bytes: bytes,
                         reserved_bytes: current,
                         budget_bytes: self.ledger.budget_bytes,
-                        budget_source: self.ledger.budget_source,
+                        availability: self.ledger.availability,
                     });
                 }
             };
@@ -1054,7 +1029,15 @@ mod resource_policy_tests {
     use super::*;
 
     fn test_governor(budget_bytes: usize) -> MemoryGovernor {
-        MemoryGovernor::with_budget_source(budget_bytes, MemoryBudgetSource::Explicit)
+        let available_bytes = (budget_bytes as u128 * GOVERNOR_BUDGET_DENOMINATOR)
+            .div_ceil(GOVERNOR_BUDGET_NUMERATOR);
+        let availability = MemoryAvailability::from_observation(
+            u64::try_from(available_bytes).expect("test budget has a representable observation"),
+            None,
+        );
+        let governor = MemoryGovernor::with_detected_availability(availability);
+        assert_eq!(governor.budget_bytes(), budget_bytes);
+        governor
     }
 
     // ── rows_for_target_bytes ─────────────────────────────────────────────────
@@ -1204,6 +1187,7 @@ mod resource_policy_tests {
         // this is exactly the independent-budgets failure the ledger exists
         // to prevent.
         let governor = test_governor(1_000);
+        let availability = governor.availability();
         let held = governor.try_reserve(600, "test-held").expect("fits alone");
         let refusal = governor
             .try_reserve(600, "test-joint")
@@ -1215,7 +1199,7 @@ mod resource_policy_tests {
                 requested_bytes: 600,
                 reserved_bytes: 600,
                 budget_bytes: 1_000,
-                budget_source: MemoryBudgetSource::Explicit,
+                availability,
             }
         );
         // After releasing the holder, the same request succeeds: refusal is a
@@ -1240,9 +1224,8 @@ mod resource_policy_tests {
         governor
             .try_reserve_dense_f64(usize::MAX, 2, "test-overflow")
             .expect_err("overflowing footprint cannot be reserved");
-        let unlimited = test_governor(usize::MAX);
         assert!(matches!(
-            unlimited.try_reserve_dense_f64(usize::MAX, 2, "test-overflow"),
+            governor.try_reserve_dense_f64(usize::MAX, 2, "test-overflow"),
             Err(MemoryReservationError::SizeOverflow { .. })
         ));
     }

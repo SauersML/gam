@@ -15,7 +15,7 @@ import numpy as np
 COMPOSE_SCHEMA = "gam.compose_per_atom"
 NULL_CONTROL_SCHEMA = "gam.null_control"
 SCHEMA_VERSION = 1
-MIN_GAMFIT_VERSION = "0.1.254"
+MIN_GAMFIT_VERSION = "0.1.255"
 EV_BASELINE = "train_mean"
 EV_TSS_MEAN_SOURCE = "train_split_column_mean"
 

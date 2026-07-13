@@ -1961,24 +1961,33 @@ fn compute_saved_location_scale_survival_alo(
         None => None,
     };
 
-    let inv_sigma_entry = eta_log_sigma_entry.mapv(|value| (-value).exp());
-    let inv_sigma_exit = eta_log_sigma_exit.mapv(|value| (-value).exp());
+    let inv_sigma_entry =
+        eta_log_sigma_entry.mapv(gam_model_kernels::sigma_link::exp_sigma_inverse_from_eta_scalar);
+    let inv_sigma_exit =
+        eta_log_sigma_exit.mapv(gam_model_kernels::sigma_link::exp_sigma_inverse_from_eta_scalar);
     let q_base_entry = -&eta_threshold_entry * &inv_sigma_entry;
     let q_base_exit = -&eta_threshold_exit * &inv_sigma_exit;
     let link_wiggle = runtime.link_wiggle.as_ref();
     let (link_entry, link_entry_d1, link_entry_d2, link_entry_d3) = match link_wiggle {
-        Some(wiggle) => (
-            wiggle.constrained_basis(&q_base_entry, BasisOptions::value()),
-            wiggle.constrained_basis(&q_base_entry, BasisOptions::first_derivative()),
-            wiggle.constrained_basis(&q_base_entry, BasisOptions::second_derivative()),
-            wiggle.constrained_basis(
-                &q_base_entry,
-                BasisOptions {
-                    derivative_order: 3,
-                    ..BasisOptions::value()
-                },
-            ),
-        ),
+        Some(wiggle) => {
+            wiggle.derivative_q0(&q_base_entry).map_err(|error| {
+                invalid(format!(
+                    "saved survival location-scale ALO entry link-wiggle monotonicity: {error}"
+                ))
+            })?;
+            (
+                wiggle.constrained_basis(&q_base_entry, BasisOptions::value()),
+                wiggle.constrained_basis(&q_base_entry, BasisOptions::first_derivative()),
+                wiggle.constrained_basis(&q_base_entry, BasisOptions::second_derivative()),
+                wiggle.constrained_basis(
+                    &q_base_entry,
+                    BasisOptions {
+                        derivative_order: 3,
+                        ..BasisOptions::value()
+                    },
+                ),
+            )
+        }
         None => (
             Ok(Array2::zeros((n, 0))),
             Ok(Array2::zeros((n, 0))),

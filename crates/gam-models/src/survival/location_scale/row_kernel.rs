@@ -1092,8 +1092,8 @@ pub fn survival_location_scale_alo_row_geometry(
         }
         None => (input.h_entry, input.h_exit, input.hdot_exit),
     };
-    let inv_sigma_entry = (-input.eta_log_sigma_entry).exp();
-    let inv_sigma_exit = (-input.eta_log_sigma_exit).exp();
+    let inv_sigma_entry = exp_sigma_inverse_from_eta_scalar(input.eta_log_sigma_entry);
+    let inv_sigma_exit = exp_sigma_inverse_from_eta_scalar(input.eta_log_sigma_exit);
     let q_base_entry = -input.eta_threshold_entry * inv_sigma_entry;
     let q_base_exit = -input.eta_threshold_exit * inv_sigma_exit;
     let qdot_base_exit = inv_sigma_exit
