@@ -359,6 +359,99 @@ fn public_fit_penalties(
 // above, which has the same shape and no allow either); clippy is not run in
 // CI here, so the ban-scanner's anti-`#[allow]` rule is the only gate, and it
 // is satisfied by simply not writing the attribute.
+#[pyclass(module = "gamfit._rust", name = "Tier0SAE")]
+pub(crate) struct Tier0SaeCore {
+    mean: Vec<f64>,
+    fitted: Vec<Vec<f64>>,
+    residual_sum_squares: f64,
+    reconstruction_r2: f64,
+    metric_provenance: String,
+    vanished_atoms: Vec<usize>,
+}
+
+#[pymethods]
+impl Tier0SaeCore {
+    #[getter]
+    fn chosen_k(&self) -> usize {
+        0
+    }
+
+    #[getter]
+    fn training_mean<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        Array1::from_vec(self.mean.clone()).into_pyarray(py)
+    }
+
+    #[getter]
+    fn fitted<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let rows = self.fitted.len();
+        let cols = self.mean.len();
+        let flat = self.fitted.iter().flatten().copied().collect::<Vec<_>>();
+        Array2::from_shape_vec((rows, cols), flat)
+            .map(|array| array.into_pyarray(py))
+            .map_err(|error| py_value_error(format!("Tier0SAE fitted shape is invalid: {error}")))
+    }
+
+    #[getter]
+    fn residual_sum_squares(&self) -> f64 {
+        self.residual_sum_squares
+    }
+
+    #[getter]
+    fn reconstruction_r2(&self) -> f64 {
+        self.reconstruction_r2
+    }
+
+    #[getter]
+    fn metric_provenance(&self) -> &str {
+        &self.metric_provenance
+    }
+
+    #[getter]
+    fn vanished_atoms(&self) -> Vec<usize> {
+        self.vanished_atoms.clone()
+    }
+
+    fn reconstruct<'py>(
+        &self,
+        py: Python<'py>,
+        x_new: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        if x_new.as_array().ncols() != self.mean.len() {
+            return Err(py_value_error(format!(
+                "Tier0SAE.reconstruct expected {} columns; got {}",
+                self.mean.len(),
+                x_new.as_array().ncols()
+            )));
+        }
+        Ok(Array2::from_shape_fn(
+            (x_new.as_array().nrows(), self.mean.len()),
+            |(_, col)| self.mean[col],
+        )
+        .into_pyarray(py))
+    }
+
+    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let out = PyDict::new(py);
+        out.set_item("schema", "gamfit.Tier0SAE/v1")?;
+        out.set_item("training_mean", self.mean.clone())?;
+        out.set_item("fitted", self.fitted.clone())?;
+        out.set_item("residual_sum_squares", self.residual_sum_squares)?;
+        out.set_item("reconstruction_r2", self.reconstruction_r2)?;
+        out.set_item("metric_provenance", self.metric_provenance.clone())?;
+        out.set_item("vanished_atoms", self.vanished_atoms.clone())?;
+        Ok(out.unbind().into_any())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Tier0SAE(n={}, p={}, r2={:.3})",
+            self.fitted.len(),
+            self.mean.len(),
+            self.reconstruction_r2
+        )
+    }
+}
+
 fn sae_manifold_fit_model<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
@@ -398,7 +491,7 @@ fn sae_manifold_fit_model<'py>(
     promote_from_residual: bool,
     run_structure_search: bool,
     structured_residual_passes: usize,
-) -> PyResult<Py<crate::ManifoldSaeCore>> {
+) -> PyResult<PyObject> {
     if k_atoms == 0 {
         return Err(py_value_error(
             "sae_manifold_fit requires K >= 1".to_string(),
@@ -527,6 +620,45 @@ fn sae_manifold_fit_model<'py>(
         structured_residual_passes,
     )?;
     let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(raw.bind(py).as_any())?;
+    if raw.get("model_kind").and_then(serde_json::Value::as_str) == Some("tier0_null") {
+        let mean = serde_json::from_value(
+            raw.get("training_mean")
+                .cloned()
+                .ok_or_else(|| py_value_error("Tier0SAE report is missing training_mean".to_string()))?,
+        )
+        .map_err(|error| py_value_error(format!("Tier0SAE training_mean: {error}")))?;
+        let fitted = serde_json::from_value(
+            raw.get("fitted")
+                .cloned()
+                .ok_or_else(|| py_value_error("Tier0SAE report is missing fitted".to_string()))?,
+        )
+        .map_err(|error| py_value_error(format!("Tier0SAE fitted: {error}")))?;
+        let vanished_atoms = serde_json::from_value(
+            raw.get("vanished_atoms")
+                .cloned()
+                .ok_or_else(|| py_value_error("Tier0SAE report is missing vanished_atoms".to_string()))?,
+        )
+        .map_err(|error| py_value_error(format!("Tier0SAE vanished_atoms: {error}")))?;
+        let core = Tier0SaeCore {
+            mean,
+            fitted,
+            residual_sum_squares: raw
+                .get("residual_sum_squares")
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| py_value_error("Tier0SAE report has invalid residual_sum_squares".to_string()))?,
+            reconstruction_r2: raw
+                .get("reconstruction_r2")
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| py_value_error("Tier0SAE report has invalid reconstruction_r2".to_string()))?,
+            metric_provenance: raw
+                .get("metric_provenance")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| py_value_error("Tier0SAE report has invalid metric_provenance".to_string()))?
+                .to_string(),
+            vanished_atoms,
+        };
+        return Ok(Py::new(py, core)?.into_any());
+    }
     let fisher_nested = fisher_factors.map(|array| {
         array
             .as_array()
@@ -564,7 +696,7 @@ fn sae_manifold_fit_model<'py>(
         &config,
     )
     .map_err(py_value_error)?;
-    Py::new(py, crate::ManifoldSaeCore::from_payload(payload)?)
+    Ok(Py::new(py, crate::ManifoldSaeCore::from_payload(payload)?)?.into_any())
 }
 
 /// Out-of-sample inference: same Newton driver as the fit path, with the

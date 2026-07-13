@@ -1983,6 +1983,24 @@ fn sae_manifold_fit_inner<'py>(
         gam::terms::sae::manifold::run_sae_manifold_fit(request)
     })?
     .map_err(|err| sae_fit_error_to_pyerr(py, err))?;
+    let report = match report {
+        gam::terms::sae::manifold::SaeFitOutcome::Manifold(report) => report,
+        gam::terms::sae::manifold::SaeFitOutcome::Null(report) => {
+            let out = PyDict::new(py);
+            out.set_item("model_kind", "tier0_null")?;
+            out.set_item("training_mean", report.tier0.mean.into_pyarray(py))?;
+            out.set_item("fitted", report.fitted.into_pyarray(py))?;
+            out.set_item("residual_sum_squares", report.residual_sum_squares)?;
+            out.set_item("reconstruction_r2", report.reconstruction_r2)?;
+            out.set_item("metric_provenance", report.metric_provenance)?;
+            out.set_item(
+                "vanished_atoms",
+                report.vanished_atoms.iter().collect::<Vec<_>>(),
+            )?;
+            out.set_item("chosen_k", 0usize)?;
+            return Ok(out.unbind());
+        }
+    };
     let gam::terms::sae::manifold::SaeFitReport {
         term,
         rho,

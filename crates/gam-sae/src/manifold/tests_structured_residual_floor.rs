@@ -163,6 +163,8 @@ mod tests {
             cancel: None,
         })
         .expect("primary fit certifies (structured pass must degrade gracefully)")
+        .manifold_or_error()
+        .expect("planted circle must retain a manifold atom")
     }
 
     /// A near-exactly-explained target: the primary fit must CERTIFY (not refuse),

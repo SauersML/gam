@@ -1410,7 +1410,9 @@ fn production_circle_coords_at_seed(
         structured_residual_passes: 0,
         cancel: None,
     })
-    .expect("production circle fit");
+    .expect("production circle fit")
+    .manifold_or_error()
+    .expect("planted circle must retain a manifold atom");
     let coords = report.term.assignment.coords[0].as_matrix();
     ndarray::Array1::from_iter((0..coords.nrows()).map(|i| coords[[i, 0]]))
 }

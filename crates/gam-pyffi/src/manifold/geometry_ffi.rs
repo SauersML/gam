@@ -4945,6 +4945,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_manifold_description_length, module)?)?;
     module.add_function(wrap_pyfunction!(sae_eq4_description_length, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_model, module)?)?;
+    module.add_class::<Tier0SaeCore>()?;
     module.add_function(wrap_pyfunction!(sae_crosscoder_fit, module)?)?;
     module.add_class::<ManifoldCrosscoderCore>()?;
     module.add_function(wrap_pyfunction!(sae_behavior_fit, module)?)?;

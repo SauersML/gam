@@ -256,6 +256,18 @@ pub enum SaeFitOutcome {
     Null(SaeNullFitReport),
 }
 
+impl SaeFitOutcome {
+    pub fn manifold_or_error(self) -> Result<SaeFitReport, String> {
+        match self {
+            Self::Manifold(report) => Ok(report),
+            Self::Null(report) => Err(format!(
+                "fit selected the exact Tier-0 null after {} atom(s) vanished",
+                report.vanished_atoms.len()
+            )),
+        }
+    }
+}
+
 /// Optimization phase that owns an SAE wall-survival checkpoint and convergence
 /// verdict. Structured phases include the configured pass count because their
 /// residual-metric damping `γ = pass / (total_passes + 1)` depends on it.

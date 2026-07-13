@@ -36,7 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         random_state: 0,
         initial_logits: None,
         initial_coords: None,
-    })?;
+    })?
+    .manifold_or_error()?;
     let SaeMinimalSeedReport {
         atom_basis,
         effective_atom_dim,

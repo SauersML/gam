@@ -1149,6 +1149,23 @@ impl SaeManifoldTerm {
             third_order_correction[coord] = -0.5 * dot;
         }
 
+        {
+            let finite = |a: &Array1<f64>| a.iter().all(|v| v.is_finite());
+            if !finite(&explicit)
+                || !finite(&logdet_trace)
+                || !finite(&occam)
+                || !finite(&third_order_correction)
+            {
+                eprintln!(
+                    "[DIAG lambda-floor] rho={:?}\n  explicit={:?} finite={}\n  logdet_trace={:?} finite={}\n  occam={:?} finite={}\n  third_order={:?} finite={}",
+                    rho.to_flat(),
+                    explicit, finite(&explicit),
+                    logdet_trace, finite(&logdet_trace),
+                    occam, finite(&occam),
+                    third_order_correction, finite(&third_order_correction),
+                );
+            }
+        }
         Ok(SaeOuterRhoGradientComponents {
             explicit,
             logdet_trace,
