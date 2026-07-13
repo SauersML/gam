@@ -1656,6 +1656,10 @@ impl ExactNewtonJointHessianWorkspace for FusedTrialWorkspace {
         Ok(())
     }
 
+    fn directional_derivative(&self, _: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
+
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
         match self.outcome {
             FusedTrialWorkspaceOutcome::MissingLogLikelihood => Ok(None),
