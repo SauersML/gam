@@ -3,6 +3,7 @@
 //! logslope, score-warp, link-dev) plus the primary->joint row chain.
 
 use super::*;
+use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 
 /// Per-row scalars for survival marginal-slope Jacobian evaluation at a given β.
 ///
@@ -83,22 +84,6 @@ impl LogslopeBlockJacobian {
             covariance,
         })
     }
-
-    fn covariance_times(&self, values: &[f64]) -> Array1<f64> {
-        match &self.covariance {
-            MarginalSlopeCovariance::Diagonal(diagonal) => Array1::from_iter(
-                diagonal
-                    .iter()
-                    .zip(values.iter())
-                    .map(|(variance, value)| variance * value),
-            ),
-            MarginalSlopeCovariance::Full(covariance) => covariance.dot(&ArrayView1::from(values)),
-            MarginalSlopeCovariance::LowRank(factor) => {
-                let projected = factor.t().dot(&ArrayView1::from(values));
-                factor.dot(&projected)
-            }
-        }
-    }
 }
 
 impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
@@ -123,16 +108,16 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
                 "logslope effective Jacobian requires a positive finite probit scale, got {s}"
             ));
         }
-        let beta = if state.beta.is_empty() {
-            Array1::<f64>::zeros(p)
-        } else {
-            if state.beta.len() != p {
-                return Err(format!(
-                    "logslope effective Jacobian beta length {} does not match width {p}",
-                    state.beta.len(),
-                ));
-            }
-            Array1::from_vec(state.beta.to_vec())
+        if !state.beta.is_empty() && state.beta.len() != p {
+            return Err(format!(
+                "logslope effective Jacobian beta length {} does not match width {p}",
+                state.beta.len(),
+            ));
+        }
+        let structural_zero = state.beta.is_empty().then(|| Array1::<f64>::zeros(p));
+        let beta = match structural_zero.as_ref() {
+            Some(zero) => zero.view(),
+            None => ArrayView1::from(state.beta),
         };
         let scalars = state
             .family_scalars
@@ -162,11 +147,29 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
         }
         let mut jac = Array2::<f64>::zeros((3 * chunk, p));
         let mut workspace = self.layout.row_workspace(self.z.ncols())?;
+        let mut sigma_g = vec![0.0; self.z.ncols()];
         for i in rows.clone() {
             let local_i = i - rows.start;
-            self.layout.fill_callback_row(i, &beta, &mut workspace)?;
-            let sigma_g = self.covariance_times(workspace.values());
-            let variance = self.covariance.quadratic_form(workspace.values())?;
+            self.layout
+                .fill_callback_row(i, beta.view(), &mut workspace)?;
+            let values = workspace.values();
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "logslope effective Jacobian row {i} contains a non-finite physical slope"
+                ));
+            }
+            self.covariance.multiply(values, &mut sigma_g);
+            let variance = values
+                .iter()
+                .zip(sigma_g.iter())
+                .map(|(value, sigma_value)| value * sigma_value)
+                .sum::<f64>();
+            if !(variance.is_finite() && variance >= COVARIANCE_QUADRATIC_FORM_PSD_TOL) {
+                return Err(format!(
+                    "logslope effective Jacobian covariance quadratic form must be non-negative, got {variance} at row {i}"
+                ));
+            }
+            let variance = variance.max(0.0);
             let c = (1.0 + s * s * variance).sqrt();
             let (q0, q1, qd1) = match scalars {
                 Some(values) => (values.q0_i[i], values.q1_i[i], values.qd1_i[i]),

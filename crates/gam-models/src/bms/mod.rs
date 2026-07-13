@@ -2219,6 +2219,7 @@ pub(crate) use family::{
     build_link_deviation_block_from_knots_design_seed_and_weights,
     build_score_warp_deviation_block_from_seed,
 };
+pub(crate) use gradient_paths::COVARIANCE_QUADRATIC_FORM_PSD_TOL;
 pub(crate) use gradient_paths::signed_probit_neglog_unary_stack;
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use gradient_paths::{

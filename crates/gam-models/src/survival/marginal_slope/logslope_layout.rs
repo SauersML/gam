@@ -284,7 +284,7 @@ impl LogslopeLayout {
     pub(crate) fn fill_per_score_row(
         &self,
         row: usize,
-        beta: &Array1<f64>,
+        beta: ArrayView1<'_, f64>,
         workspace: &mut LogslopeRowWorkspace,
     ) -> Result<(), String> {
         let LogslopeChannels::PerScore {
@@ -333,7 +333,7 @@ impl LogslopeLayout {
                 }
             }
             workspace.values[channel] =
-                workspace.channel_rows.row(channel).dot(beta) + offsets[[row, channel]];
+                workspace.channel_rows.row(channel).dot(&beta) + offsets[[row, channel]];
         }
         Ok(())
     }
@@ -346,7 +346,7 @@ impl LogslopeLayout {
     pub(crate) fn fill_callback_row(
         &self,
         row: usize,
-        beta: &Array1<f64>,
+        beta: ArrayView1<'_, f64>,
         workspace: &mut LogslopeRowWorkspace,
     ) -> Result<(), String> {
         match &self.channels {
@@ -383,7 +383,7 @@ impl LogslopeLayout {
                         workspace.channel_rows[[channel, col]] = workspace.channel_rows[[0, col]];
                     }
                 }
-                let value = self.coefficient_design.dot_row(row, beta) + offset[row];
+                let value = self.coefficient_design.dot_row_view(row, beta) + offset[row];
                 workspace.values.fill(value);
                 Ok(())
             }
@@ -506,7 +506,9 @@ mod tests {
             .unwrap();
         let beta = array![17.0, 19.0, 23.0];
         let mut workspace = layout.row_workspace(2).unwrap();
-        layout.fill_per_score_row(0, &beta, &mut workspace).unwrap();
+        layout
+            .fill_per_score_row(0, beta.view(), &mut workspace)
+            .unwrap();
 
         assert_eq!(
             workspace.channel_rows(),
@@ -538,7 +540,7 @@ mod tests {
         let expected_current_channels = raw_channels.dot(&current_from_raw);
         let mut workspace = layout.row_workspace(2).unwrap();
         layout
-            .fill_per_score_row(0, &theta, &mut workspace)
+            .fill_per_score_row(0, theta.view(), &mut workspace)
             .unwrap();
         assert_close(
             &workspace.channel_rows().to_owned(),

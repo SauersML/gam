@@ -200,9 +200,11 @@ impl SurvivalMarginalSlopeFamily {
         workspace: &mut LogslopeRowWorkspace,
     ) -> Result<(), String> {
         if self.per_z_logslope_active() {
-            return self
-                .logslope_layout
-                .fill_per_score_row(row, &block_states[2].beta, workspace);
+            return self.logslope_layout.fill_per_score_row(
+                row,
+                block_states[2].beta.view(),
+                workspace,
+            );
         }
         if block_states[2].eta.len() != self.n {
             return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
