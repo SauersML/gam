@@ -110,9 +110,9 @@ pub use penalty_coordinate::PenaltyCoordinate;
 pub use penalty_matrix::PenaltyMatrix;
 pub use pseudo_logdet::PseudoLogdetMode;
 pub use psi_design_contract::{
-    CustomFamilyBlockPsiDerivative, CustomFamilyPsiDerivativeOperator,
-    JointHessianSourcePreference, MaterializablePsiDerivativeOperator, MaterializationIntent,
-    SharedDerivativeBlocks,
+    CustomFamilyBlockPsiDerivative, CustomFamilyHyperAxis, CustomFamilyHyperLayout,
+    CustomFamilyPsiDerivativeOperator, JointHessianSourcePreference,
+    MaterializablePsiDerivativeOperator, MaterializationIntent, SharedCustomFamilyHyperLayout,
 };
 pub use psi_terms::{
     ExactNewtonJointPsiSecondOrderContracted, ExactNewtonJointPsiSecondOrderTerms,
