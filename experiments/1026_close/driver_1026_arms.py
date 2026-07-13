@@ -37,6 +37,15 @@ import numpy as np
 
 PAIR_SCHEMA = "gam.issue2283.eq4-pair.v1"
 FLAT_CHECKPOINT_SCHEMA = "gam.issue2283.flat-checkpoint.v1"
+FLAT_CHECKPOINT_ARRAYS = {
+    "decoder",
+    "train_indices",
+    "train_codes",
+    "held_out_indices",
+    "held_out_codes",
+    "train_reconstruction",
+    "held_out_reconstruction",
+}
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 HEX_GIT_SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -83,6 +92,10 @@ def _write_flat_checkpoint(path: str, arrays: dict[str, np.ndarray], metadata: d
     destination = Path(path).resolve()
     if destination.suffix != ".npz":
         raise ValueError("--flat-checkpoint must end in .npz")
+    if destination.exists():
+        raise FileExistsError(f"flat checkpoint already exists: {destination}")
+    if set(arrays) != FLAT_CHECKPOINT_ARRAYS:
+        raise ValueError("flat checkpoint arrays do not match the required schema")
     destination.parent.mkdir(parents=True, exist_ok=True)
     contiguous = {name: np.ascontiguousarray(values) for name, values in arrays.items()}
     payload = dict(metadata)
@@ -111,6 +124,8 @@ def _read_flat_checkpoint(path: str, expected_pair_identity: dict, expected_conf
             raise ValueError("flat checkpoint is missing metadata_json")
         metadata = json.loads(payload["metadata_json"].tobytes().decode("utf-8"))
         expected_names = set(metadata.get("arrays", {})) | {"metadata_json"}
+        if expected_names != FLAT_CHECKPOINT_ARRAYS | {"metadata_json"}:
+            raise ValueError("flat checkpoint manifest does not match the required schema")
         if names != expected_names:
             raise ValueError(
                 f"flat checkpoint arrays {sorted(names)} do not match manifest {sorted(expected_names)}"
@@ -140,6 +155,18 @@ def _append_jsonl(path: str, record: dict) -> None:
         handle.flush()
         os.fsync(handle.fileno())
         fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _assert_required_device_routes(route_stats: dict) -> None:
+    for phase, stats in route_stats.items():
+        minibatches = int(stats["minibatches"])
+        admitted = int(stats["admitted_minibatches"])
+        device = int(stats["device_minibatches"])
+        cpu = int(stats["cpu_minibatches"])
+        if minibatches <= 0 or admitted != minibatches or device != minibatches or cpu != 0:
+            raise RuntimeError(
+                f"fail-closed sparse route {phase!r} was not wholly device-resident: {stats}"
+            )
 
 
 def _validate_measurement_identity(run_id: str, code_revision: str, wheel_sha256: str) -> None:
@@ -415,6 +442,7 @@ def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, minibatch, score_mode,
         "fit": fit.score_route_stats,
         "held_out": tr.score_route_stats,
     }
+    _assert_required_device_routes(collect["sparse_route_stats"])
     collect["sparse_convergence"] = _convergence_payload(fit)
     return held_out_ev(x_te, recon, mean_tr), fit.explained_variance
 
@@ -486,6 +514,7 @@ def fit_hybrid_flat_checkpoint(
         "train": tr_tr.score_route_stats,
         "held_out": tr_te.score_route_stats,
     }
+    _assert_required_device_routes(route_stats)
     convergence = _convergence_payload(flat)
     arrays = {
         "decoder": np.asarray(flat.decoder, dtype=np.float32),
@@ -617,6 +646,7 @@ def score_bits_for_arm(
     out["bits_row_ids_sha256"] = _array_sha256(test_row_ids[bits_idx])
     if fitted.extras is not None and "score_route_stats" in fitted.extras:
         out["bits_score_route_stats"] = fitted.extras["score_route_stats"]
+        _assert_required_device_routes({"bits": fitted.extras["score_route_stats"]})
     # gam#2233 self-certification: the Eq-4 dictionary term is
     # 0.5*dictionary_params/N*log2(N), ~95% of the score at K=32768, so the
     # crossover verdict is meaningful ONLY when the hybrid's dictionary_params do
@@ -666,10 +696,9 @@ def main() -> int:
     ap.add_argument("--atom-topology", default="circle")
     ap.add_argument("--curved-atoms", type=int, default=256)
     ap.add_argument("--k-flat", type=int, default=None,
-                    help="gam#2233 theorem-faithful hybrid: flat-tier ATOM COUNT "
-                         "(default None == --K, the legacy stacked arm that "
-                         "SURCHARGES dict params). Set REDUCED so curved atoms "
-                         "REPLACE flat ones: k_flat*P + curved_atoms*b*P <= K*P, "
+                    help="required theorem-faithful flat-tier atom count. Set it "
+                         "so curved atoms replace flat atoms: "
+                         "k_flat*P + curved_atoms*b*P <= K*P, "
                          "b = curved decoder-block width (2H+1 for an H-harmonic "
                          "circle). Self-certified via dict_params_faithful in the "
                          "result record.")
@@ -829,6 +858,7 @@ def main() -> int:
     if "sparse_route_stats" in collect:
         extra["sparse_route_stats"] = collect["sparse_route_stats"]
         extra["sparse_convergence"] = collect["sparse_convergence"]
+    if args.arm == "hybrid_rust" and args.hybrid_phase == "curved-resume":
         extra["curved_certificates"] = collect.get("curved_certificates")
         extra["curved_termination"] = collect.get("curved_termination")
         extra["flat_checkpoint_sha256"] = collect.get("flat_checkpoint_sha256")
@@ -840,7 +870,7 @@ def main() -> int:
            "sparse_score_mode": args.sparse_score_mode,
            "hybrid_phase": args.hybrid_phase,
            "max_rows": args.max_rows, "test_frac": args.test_frac,
-           "bits_max_rows": args.bits_max_rows if args.bits else None,
+           "bits_max_rows": args.bits_max_rows,
            "steps": args.steps, "lr": args.lr, "batch_size": args.batch_size,
            "max_epochs": args.max_epochs, "atom_topology": args.atom_topology,
            "seed": args.seed, "ev": ev, "wall_s": round(wall, 1),
@@ -849,7 +879,7 @@ def main() -> int:
            "pair_identity_sha256": _payload_sha256(pair_identity),
            "execution_provenance": _execution_provenance(),
            **extra}
-    print("[#2283] RESULT " + json.dumps(rec), flush=True)
+    print("[#2283] RESULT " + _canonical_json(rec), flush=True)
     _append_jsonl(args.out, rec)
     return 0
 

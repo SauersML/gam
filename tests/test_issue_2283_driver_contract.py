@@ -129,3 +129,64 @@ def test_measurement_identity_rejects_abbreviated_or_noncanonical_digests():
     ):
         with np.testing.assert_raises(ValueError):
             driver._validate_measurement_identity(run_id, git_sha, wheel_sha)
+
+
+def test_flat_checkpoint_round_trip_is_manifested_and_pair_bound(tmp_path):
+    driver = _load_driver()
+    arrays = {
+        "decoder": np.eye(2, dtype=np.float32),
+        "train_indices": np.zeros((2, 1), dtype=np.uint32),
+        "train_codes": np.ones((2, 1), dtype=np.float32),
+        "held_out_indices": np.ones((1, 1), dtype=np.uint32),
+        "held_out_codes": -np.ones((1, 1), dtype=np.float32),
+        "train_reconstruction": np.eye(2, dtype=np.float32),
+        "held_out_reconstruction": np.ones((1, 2), dtype=np.float32),
+    }
+    pair = {"schema": driver.PAIR_SCHEMA, "run_id": "issue2283-seed0"}
+    config = {"K_flat": 2, "score_mode": "required"}
+    metadata = {
+        "pair_identity": pair,
+        "flat_config": config,
+        "route_stats": {},
+        "convergence": {},
+        "explained_variance": 1.0,
+        "held_out_ev": 1.0,
+    }
+    path = tmp_path / "flat.npz"
+
+    digest = driver._write_flat_checkpoint(str(path), arrays, metadata)
+    loaded, loaded_metadata, loaded_digest = driver._read_flat_checkpoint(
+        str(path), pair, config
+    )
+
+    assert digest == loaded_digest == driver._file_sha256(path)
+    assert loaded_metadata["schema"] == driver.FLAT_CHECKPOINT_SCHEMA
+    for name, expected in arrays.items():
+        np.testing.assert_array_equal(loaded[name], expected)
+    with np.testing.assert_raises_regex(ValueError, "configuration"):
+        driver._read_flat_checkpoint(str(path), pair, {"K_flat": 3})
+
+
+def test_required_route_certificate_rejects_any_cpu_minibatch():
+    driver = _load_driver()
+    driver._assert_required_device_routes(
+        {
+            "fit": {
+                "minibatches": 3,
+                "admitted_minibatches": 3,
+                "device_minibatches": 3,
+                "cpu_minibatches": 0,
+            }
+        }
+    )
+    with np.testing.assert_raises_regex(RuntimeError, "not wholly device-resident"):
+        driver._assert_required_device_routes(
+            {
+                "fit": {
+                    "minibatches": 3,
+                    "admitted_minibatches": 3,
+                    "device_minibatches": 2,
+                    "cpu_minibatches": 1,
+                }
+            }
+        )
