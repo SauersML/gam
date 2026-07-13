@@ -830,7 +830,7 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                         "categorical probabilities at row {row} sum to {total}, expected one within {tolerance}"
                     );
                 }
-                let uniform = rand::Rng::random::<f64>(rng);
+                let uniform = rng.random::<f64>();
                 let mut cumulative = 0.0_f64;
                 let mut selected = labels.len() - 1;
                 for category in 0..labels.len() - 1 {
