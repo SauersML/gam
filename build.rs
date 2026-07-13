@@ -4678,6 +4678,7 @@ const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
             "pub struct MultinomialLogitRowProgram<'row>",
             "impl<const M: usize> gam_math::jet_tower::RowProgram<M> for MultinomialLogitRowProgram<'_>",
             "fn eval_expression<S: JetField>",
+            "fn negative_log_likelihood_from_normalization",
             "pub(crate) fn value_gradient_hessian_into",
             "fn softmax_fisher_perturbation<S: FisherPerturbation>",
         ],
