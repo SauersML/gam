@@ -160,15 +160,9 @@ def _sae_fit_worker(
         n_iter=n_iter,
         random_state=seed,
         separation_barrier_strength=separation_barrier_strength,
-        # This is a fixed-K EV-vs-K sweep on the SHIPPED default fit path: fit
-        # exactly `k` atoms and stop. The default bundled pipeline additionally
-        # runs a topology race (run_structure_search) and TWO structured-whitening
-        # residual passes (structured_residual_passes, default 2) — each re-running
-        # the whole outer rho search from scratch — which is what pushed this
-        # example past the 900s budget (gh#2267) while adding atoms the sweep does
-        # not want. Disable both to take the genuinely unbundled direct path
-        # (structured_residual_passes=0 is the load-bearing one — the two passes
-        # are NOT reachable via run_structure_search alone).
+        # This is a fixed-K EV-vs-K sweep: fit exactly `k` atoms and stop. Keep
+        # both optional pipeline stages explicit so this example cannot silently
+        # turn back into topology search plus repeated full outer refits (#2267).
         run_structure_search=False,
         structured_residual_passes=0,
     )

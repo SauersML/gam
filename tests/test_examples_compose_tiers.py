@@ -63,8 +63,7 @@ def test_stratified_subsample_matches_rho_cascade_contract() -> None:
 def test_compose_adds_reconstruction_over_linear_tier(planted: np.ndarray) -> None:
     result = ct.compose_tiers(
         planted, k1=16, k2=8, atom_topology="circle",
-        assignment="threshold_gate", residual_passes=3,
-        promote_from_residual=True, subsample_tokens=2500,
+        assignment="threshold_gate", subsample_tokens=2500,
         alternation=True, random_state=0,
     )
     assert result.combined_recon.shape == planted.shape

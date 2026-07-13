@@ -140,6 +140,10 @@ def _fit(z_tr, z_te, k, topology, seed, n_iter, lift=None, x_te_raw=None):
         assignment="ordered_beta_bernoulli",
         n_iter=n_iter,
         random_state=seed,
+        # This example is specifically the explicit discovery workflow. The
+        # public fit default is the direct, fixed-dictionary stage, so opt in
+        # here rather than relying on a hidden bundled default (#2267).
+        run_structure_search=True,
     )
     fit_s = time.perf_counter() - t0
     t1 = time.perf_counter()

@@ -1540,7 +1540,13 @@ fn latent_kernel_term_sequence_inline(
 ) -> LatentTermBuffer {
     let mut terms = LatentTermBuffer::from_slice(base_terms);
     terms.retain(|term| term.coeff != 0.0);
-    for direction in axes.iter().chain(suffix.iter()) {
+    // The canonical subset-cache recurrence strips the least-significant
+    // selected slot and applies it after recursively building the remaining
+    // mask. Its deterministic floating-point order is therefore highest slot
+    // to lowest slot. Preserve that order here so the allocation-free packed
+    // path and the independent MultiDir layout accumulate identical analytic
+    // coefficients, including cancellation-heavy tail derivatives.
+    for direction in axes.iter().chain(suffix.iter()).rev() {
         terms = latent_kernel_differentiate_terms_inline(&terms, *direction);
     }
     terms
@@ -1663,10 +1669,10 @@ mod tests_multidir_kernel {
 /// `suffixes` describes the nilpotent parts carried by the requested scalar:
 /// `[]` for the ordinary order-two base, `[u]` for the `OneSeed` epsilon part,
 /// and `[u]`, `[v]`, `[u,v]` for the three non-base `TwoSeed` parts.  For each
-/// part we differentiate the SAME kernel-term program in the order
-/// `[primary_a, primary_b, suffix...]`.  That ordering is deliberately the
-/// pre-cutover `MultiDirJet` ordering, so every requested raw derivative is
-/// assembled by the same recurrence and signed-log reduction as its oracle.
+/// part we differentiate the SAME kernel-term program in the canonical
+/// highest-slot-to-lowest-slot order used by the pre-cutover `MultiDirJet`
+/// subset cache. Every requested raw derivative is therefore assembled by the
+/// same recurrence, accumulation order, and signed-log reduction as its oracle.
 /// The expensive quadrature bundle is then evaluated ONCE at the maximum `k`
 /// required by the complete output instead of once per Hessian cell.
 fn latent_kernel_sum_order2_parts<const K: usize>(

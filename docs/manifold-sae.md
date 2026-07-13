@@ -71,7 +71,9 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `fisher_factors` | `None` | per-token Fisher reweighting factors |
 | `weights` | `None` | per-row observation weights |
 | `separation_barrier_strength` | `None` | optional native cross-atom separation strength override |
-| `promote_from_residual` | `True` | admit evidence-certified residual promotions during native structure search |
+| `promote_from_residual` | `False` | allow residual promotion during an explicitly requested structured-residual stage |
+| `run_structure_search` | `False` | opt into topology/birth/death structure search around the direct fit |
+| `structured_residual_passes` | `0` | number of structured-residual refit stages; each stage is a separate certified outer fit |
 
 ## Topology types
 

@@ -138,7 +138,6 @@ def compose_tiers(
     d_atom: int = 2,
     atom_topology: str = "circle",
     assignment: str = "threshold_gate",
-    promote_from_residual: bool = True,
     t2_n_iter: int = 50,
     subsample_tokens: int = 1_000_000,
     alternation: bool = True,
@@ -171,7 +170,12 @@ def compose_tiers(
             d_atom=d_atom,
             atom_topology=atom_topology,
             assignment=assignment,
-            promote_from_residual=promote_from_residual,
+            # Tier composition already supplies the residual explicitly. Fit one
+            # certified curved stage; do not recursively launch another residual
+            # pipeline inside it (#2267).
+            promote_from_residual=False,
+            run_structure_search=False,
+            structured_residual_passes=0,
             n_iter=t2_n_iter,
             random_state=random_state,
         )
@@ -599,10 +603,6 @@ def build_parser() -> argparse.ArgumentParser:
                        help="skip the block-vs-chart f* MDL scoring")
 
     resid = ap.add_argument_group("residual / composition")
-    resid.add_argument("--promote-from-residual", dest="promote_from_residual",
-                       action="store_true", default=True)
-    resid.add_argument("--no-promote-from-residual", dest="promote_from_residual",
-                       action="store_false")
     resid.add_argument("--alternation", dest="alternation",
                        action="store_true", default=True,
                        help="one deflation alternation (default on)")
@@ -681,7 +681,6 @@ def main(argv: list[str] | None = None) -> Any:
         d_atom=args.d_atom,
         atom_topology=args.atom_topology,
         assignment=args.assignment,
-        promote_from_residual=args.promote_from_residual,
         t2_n_iter=args.t2_n_iter,
         subsample_tokens=args.subsample_tokens,
         alternation=args.alternation,
