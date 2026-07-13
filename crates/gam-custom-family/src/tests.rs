@@ -4112,6 +4112,53 @@ pub(crate) fn joint_newton_recovers_from_returned_strict_saddle_with_remaining_c
     assert!(!certificate.has_resolvable_negative_curvature());
 }
 
+pub(crate) fn certified_test_outer(
+    theta: Array1<f64>,
+    objective: f64,
+) -> gam_solve::rho_optimizer::CertifiedOuterResult {
+    let mut raw_outer = gam_solve::rho_optimizer::OuterResult::new(
+        theta,
+        objective,
+        7,
+        true,
+        gam_solve::rho_optimizer::OuterPlan {
+            solver: gam_solve::rho_optimizer::Solver::Arc,
+            hessian_source: gam_solve::rho_optimizer::HessianSource::Analytic,
+        },
+    );
+    raw_outer.final_grad_norm = Some(0.0);
+    raw_outer.criterion_certificate = Some(
+        gam_solve::rho_optimizer::OuterCriterionCertificate {
+            stationarity: gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
+                grad_norm: 0.0,
+                projected_grad_norm: 0.0,
+                bound: 1.0e-8,
+            },
+            hessian_psd: Some(true),
+            lambdas_railed: Vec::new(),
+        },
+    );
+    gam_solve::rho_optimizer::CertifiedOuterResult::try_from(raw_outer)
+        .expect("the test outer optimum should carry a valid analytic certificate")
+}
+
+#[test]
+pub(crate) fn certified_outer_result_rejects_status_without_analytic_proof() {
+    let raw_outer = gam_solve::rho_optimizer::OuterResult::new(
+        Array1::zeros(0),
+        1.0,
+        7,
+        true,
+        gam_solve::rho_optimizer::OuterPlan {
+            solver: gam_solve::rho_optimizer::Solver::Arc,
+            hessian_source: gam_solve::rho_optimizer::HessianSource::Analytic,
+        },
+    );
+    let error = gam_solve::rho_optimizer::CertifiedOuterResult::try_from(raw_outer)
+        .expect_err("a convergence boolean without analytic evidence is not provenance");
+    assert!(error.contains("no analytic certificate"), "unexpected error: {error}");
+}
+
 #[test]
 pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay() {
     let family = OneStepReturnedSaddleFamily::new(0.125);
@@ -4143,30 +4190,8 @@ pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay
         .collect();
     let evaluations_before_finalization = family.evaluations.load(Ordering::Relaxed);
 
-    let mut raw_outer = gam_solve::rho_optimizer::OuterResult::new(
-        Array1::zeros(0),
-        f64::from_bits(selected_objective_bits),
-        7,
-        true,
-        gam_solve::rho_optimizer::OuterPlan {
-            solver: gam_solve::rho_optimizer::Solver::Arc,
-            hessian_source: gam_solve::rho_optimizer::HessianSource::Analytic,
-        },
-    );
-    raw_outer.final_grad_norm = Some(0.0);
-    raw_outer.criterion_certificate = Some(
-        gam_solve::rho_optimizer::OuterCriterionCertificate {
-            stationarity: gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
-                grad_norm: 0.0,
-                projected_grad_norm: 0.0,
-                bound: 1.0e-8,
-            },
-            hessian_psd: Some(true),
-            lambdas_railed: Vec::new(),
-        },
-    );
-    let certified_outer = gam_solve::rho_optimizer::CertifiedOuterResult::try_from(raw_outer)
-        .expect("the test outer optimum should carry a valid analytic certificate");
+    let certified_outer =
+        certified_test_outer(Array1::zeros(0), f64::from_bits(selected_objective_bits));
 
     let fit = fit_custom_family_fixed_log_lambdas_from_mode_selection(
         &family,
@@ -4204,6 +4229,79 @@ pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay
             *expected,
         );
     }
+}
+
+#[test]
+pub(crate) fn returned_mode_finalizer_rejects_different_certified_theta() {
+    let family = OneStepReturnedSaddleFamily::new(0.125);
+    let specs = one_step_returned_saddle_specs();
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 2,
+        use_remlobjective: false,
+        compute_covariance: true,
+        ..BlockwiseFitOptions::default()
+    };
+    let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
+        &family,
+        &specs,
+        &options,
+        &Array1::zeros(0),
+        Arc::new((0..specs.len()).map(|_| Vec::new()).collect()),
+        &[None],
+        EvalMode::ValueOnly,
+    )
+    .expect("the bounded hard case should select a mode");
+    let objective = selection.result.objective;
+    let certified_outer = certified_test_outer(array![2.0], objective);
+    let error = fit_custom_family_fixed_log_lambdas_from_mode_selection(
+        &family,
+        &specs,
+        &options,
+        selection,
+        &array![1.0],
+        &certified_outer,
+    )
+    .expect_err("a certificate at a different full theta cannot mint the fit");
+    assert!(
+        error.to_string().contains("full hyperparameter vector"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+pub(crate) fn returned_mode_finalizer_rejects_different_certified_objective() {
+    let family = OneStepReturnedSaddleFamily::new(0.125);
+    let specs = one_step_returned_saddle_specs();
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 2,
+        use_remlobjective: false,
+        compute_covariance: true,
+        ..BlockwiseFitOptions::default()
+    };
+    let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
+        &family,
+        &specs,
+        &options,
+        &Array1::zeros(0),
+        Arc::new((0..specs.len()).map(|_| Vec::new()).collect()),
+        &[None],
+        EvalMode::ValueOnly,
+    )
+    .expect("the bounded hard case should select a mode");
+    let certified_outer = certified_test_outer(Array1::zeros(0), selection.result.objective + 1.0);
+    let error = fit_custom_family_fixed_log_lambdas_from_mode_selection(
+        &family,
+        &specs,
+        &options,
+        selection,
+        &Array1::zeros(0),
+        &certified_outer,
+    )
+    .expect_err("a different certified objective cannot mint the selected-mode fit");
+    assert!(
+        error.to_string().contains("does not belong to the certified outer optimum"),
+        "unexpected error: {error}",
+    );
 }
 
 /// gam#1088 fixture. A coupled two-block family whose joint Hessian carries
