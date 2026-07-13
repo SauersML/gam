@@ -59,7 +59,7 @@ impl BernoulliMarginalSlopeFamily {
                                 .row_cell_moments
                                 .as_ref()
                                 .and_then(|bundle| bundle.row(row, 3));
-                            let neglog = self.compute_row_analytic_flex_into_with_moments(
+                            let neglog = self.lower_bms_flex_row_order2_with_moments(
                                 row,
                                 block_states,
                                 primary,
@@ -567,7 +567,7 @@ impl BernoulliMarginalSlopeFamily {
                                     .row_cell_moments
                                     .as_ref()
                                     .and_then(|bundle| bundle.row(row, 9));
-                                self.compute_row_analytic_flex_into_with_moments(
+                                self.lower_bms_flex_row_order2_with_moments(
                                     row,
                                     block_states,
                                     primary,
@@ -1090,7 +1090,7 @@ impl BernoulliMarginalSlopeFamily {
                                 .row_cell_moments
                                 .as_ref()
                                 .and_then(|bundle| bundle.row(row, 9));
-                            self.compute_row_analytic_flex_into_with_moments(
+                            self.lower_bms_flex_row_order2_with_moments(
                                 row,
                                 block_states,
                                 primary,
@@ -3769,7 +3769,7 @@ impl BernoulliMarginalSlopeFamily {
                             .row_cell_moments
                             .as_ref()
                             .and_then(|bundle| bundle.row(row, 9));
-                        let row_neglog = self.compute_row_analytic_flex_into_with_moments(
+                        let row_neglog = self.lower_bms_flex_row_order2_with_moments(
                             row,
                             block_states,
                             &primary,

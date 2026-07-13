@@ -86,27 +86,13 @@ pub(super) enum BmsFlexCalibrationOrder4Node {
 /// device backends after calibration moments have been lowered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BmsFlexRowOrder2FinalizerNode {
-    ImplicitFirst {
-        primary: usize,
-    },
+    ImplicitFirst { primary: usize },
     ImplicitFirstComplete,
-    ImplicitSecond {
-        left: usize,
-        right: usize,
-    },
-    ObservedFirst {
-        primary: usize,
-    },
-    ObservedScoreSensitivity {
-        primary: usize,
-    },
-    ObservedSecond {
-        left: usize,
-        right: usize,
-    },
-    NegLogFirst {
-        primary: usize,
-    },
+    ImplicitSecond { left: usize, right: usize },
+    ObservedFirst { primary: usize },
+    ObservedScoreSensitivity { primary: usize },
+    ObservedSecond { left: usize, right: usize },
+    NegLogFirst { primary: usize },
 }
 
 /// Borrowed scalar coordinates of the canonical BMS FLEX row program.
@@ -292,21 +278,52 @@ impl BmsFlexRowProgram {
     pub(super) fn try_for_each_calibration_order2<E>(
         active_primaries: &[usize],
         need_hessian: bool,
+        visit: impl FnMut(BmsFlexCalibrationOrder2Node) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Self::try_for_each_calibration_order2_indexed(
+            active_primaries.len(),
+            |position| active_primaries[position],
+            need_hessian,
+            visit,
+        )
+    }
+
+    pub(super) fn try_for_each_calibration_order2_contiguous<E>(
+        active_primaries: std::ops::Range<usize>,
+        need_hessian: bool,
+        visit: impl FnMut(BmsFlexCalibrationOrder2Node) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let start = active_primaries.start;
+        Self::try_for_each_calibration_order2_indexed(
+            active_primaries.len(),
+            |position| start + position,
+            need_hessian,
+            visit,
+        )
+    }
+
+    fn try_for_each_calibration_order2_indexed<E>(
+        active_count: usize,
+        active_at: impl Fn(usize) -> usize,
+        need_hessian: bool,
         mut visit: impl FnMut(BmsFlexCalibrationOrder2Node) -> Result<(), E>,
     ) -> Result<(), E> {
         visit(BmsFlexCalibrationOrder2Node::InterceptFirst)?;
         if need_hessian {
             visit(BmsFlexCalibrationOrder2Node::InterceptSecond)?;
         }
-        for &primary in active_primaries {
+        for position in 0..active_count {
+            let primary = active_at(position);
             visit(BmsFlexCalibrationOrder2Node::PrimaryFirst { primary })?;
             if need_hessian {
                 visit(BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary })?;
             }
         }
         if need_hessian {
-            for (position, &left) in active_primaries.iter().enumerate() {
-                for &right in &active_primaries[position..] {
+            for left_position in 0..active_count {
+                let left = active_at(left_position);
+                for right_position in left_position..active_count {
+                    let right = active_at(right_position);
                     visit(BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left, right })?;
                 }
             }
@@ -320,13 +337,42 @@ impl BmsFlexRowProgram {
     pub(super) fn try_for_each_calibration_order3<E>(
         active_primaries: &[usize],
         direction_count: usize,
+        visit: impl FnMut(BmsFlexCalibrationOrder3Node) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Self::try_for_each_calibration_order3_indexed(
+            active_primaries.len(),
+            |position| active_primaries[position],
+            direction_count,
+            visit,
+        )
+    }
+
+    pub(super) fn try_for_each_calibration_order3_contiguous<E>(
+        active_primaries: std::ops::Range<usize>,
+        direction_count: usize,
+        visit: impl FnMut(BmsFlexCalibrationOrder3Node) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let start = active_primaries.start;
+        Self::try_for_each_calibration_order3_indexed(
+            active_primaries.len(),
+            |position| start + position,
+            direction_count,
+            visit,
+        )
+    }
+
+    fn try_for_each_calibration_order3_indexed<E>(
+        active_count: usize,
+        active_at: impl Fn(usize) -> usize,
+        direction_count: usize,
         mut visit: impl FnMut(BmsFlexCalibrationOrder3Node) -> Result<(), E>,
     ) -> Result<(), E> {
         for direction in 0..direction_count {
             visit(BmsFlexCalibrationOrder3Node::DirectionStart { direction })?;
             visit(BmsFlexCalibrationOrder3Node::InterceptDirectionalSecond { direction })?;
             visit(BmsFlexCalibrationOrder3Node::InterceptDirectionalThird { direction })?;
-            for &primary in active_primaries {
+            for position in 0..active_count {
+                let primary = active_at(position);
                 visit(
                     BmsFlexCalibrationOrder3Node::InterceptPrimaryDirectionalThird {
                         direction,
@@ -334,8 +380,10 @@ impl BmsFlexRowProgram {
                     },
                 )?;
             }
-            for (position, &left) in active_primaries.iter().enumerate() {
-                for &right in &active_primaries[position..] {
+            for left_position in 0..active_count {
+                let left = active_at(left_position);
+                for right_position in left_position..active_count {
+                    let right = active_at(right_position);
                     visit(BmsFlexCalibrationOrder3Node::PrimaryPairDirectionalThird {
                         direction,
                         left,
@@ -352,17 +400,48 @@ impl BmsFlexRowProgram {
     pub(super) fn try_for_each_calibration_order4<E>(
         active_primaries: &[usize],
         direction_pair_count: usize,
+        visit: impl FnMut(BmsFlexCalibrationOrder4Node) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Self::try_for_each_calibration_order4_indexed(
+            active_primaries.len(),
+            |position| active_primaries[position],
+            direction_pair_count,
+            visit,
+        )
+    }
+
+    pub(super) fn try_for_each_calibration_order4_contiguous<E>(
+        active_primaries: std::ops::Range<usize>,
+        direction_pair_count: usize,
+        visit: impl FnMut(BmsFlexCalibrationOrder4Node) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let start = active_primaries.start;
+        Self::try_for_each_calibration_order4_indexed(
+            active_primaries.len(),
+            |position| start + position,
+            direction_pair_count,
+            visit,
+        )
+    }
+
+    fn try_for_each_calibration_order4_indexed<E>(
+        active_count: usize,
+        active_at: impl Fn(usize) -> usize,
+        direction_pair_count: usize,
         mut visit: impl FnMut(BmsFlexCalibrationOrder4Node) -> Result<(), E>,
     ) -> Result<(), E> {
         for pair in 0..direction_pair_count {
             visit(BmsFlexCalibrationOrder4Node::DirectionPairStart { pair })?;
             visit(BmsFlexCalibrationOrder4Node::InterceptMixedThird { pair })?;
             visit(BmsFlexCalibrationOrder4Node::InterceptMixedFourth { pair })?;
-            for &primary in active_primaries {
+            for position in 0..active_count {
+                let primary = active_at(position);
                 visit(BmsFlexCalibrationOrder4Node::InterceptPrimaryMixedFourth { pair, primary })?;
             }
-            for (position, &left) in active_primaries.iter().enumerate() {
-                for &right in &active_primaries[position..] {
+            for left_position in 0..active_count {
+                let left = active_at(left_position);
+                for right_position in left_position..active_count {
+                    let right = active_at(right_position);
                     visit(BmsFlexCalibrationOrder4Node::PrimaryPairMixedFourth {
                         pair,
                         left,

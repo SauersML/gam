@@ -3,7 +3,7 @@
 //! row gradient and row-primary `r × r` Hessian.
 //!
 //! Math (mirrors the CPU reference
-//! `BernoulliMarginalSlope::compute_row_analytic_flex_from_parts_into` in
+//! `BernoulliMarginalSlope::lower_bms_flex_row_order2_from_parts` in
 //! `src/families/bernoulli_marginal_slope.rs`):
 //!
 //! For each row `i`, with per-cell cubic predictor coefficients
@@ -374,13 +374,13 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
 /// passing to `cudarc::nvrtc::compile_ptx`.
 ///
 /// **CPU parity reference**: the body mirrors
-/// `compute_row_analytic_flex_from_parts_into` in
+/// `lower_bms_flex_row_order2_from_parts` in
 /// `src/families/bernoulli_marginal_slope.rs`.
 #[cfg(target_os = "linux")]
 pub(crate) const ROW_KERNEL_BODY: &str = r#"
 // One block per row. blockDim.x = 32; threadIdx.x parallises per-cell sums.
 // CPU parity reference: src/families/bernoulli_marginal_slope.rs
-//                      ::compute_row_analytic_flex_from_parts_into.
+//                      ::lower_bms_flex_row_order2_from_parts.
 
 #define INV_TWO_PI     0.15915494309189535
 
@@ -700,7 +700,7 @@ extern "C" __global__ void bms_flex_row_kernel(
     // FIRST-derivative jet (`chi·a_0 + rho_0 = dη_obs/dq`). The host packs
     // the observed value directly in `row_e_obs[row]` (see
     // `pack_bms_flex_row_kernel_inputs`, `eta_val = eval_coeff4_at(obs.coeff,
-    // z_obs)`), matching the CPU family `compute_row_analytic_flex_from_parts_into`
+    // z_obs)`), matching the CPU family `lower_bms_flex_row_order2_from_parts`
     // which forms `signed_margin = s_y · eta_val`. #415 parity lock.
     double e_obs = row_e_obs[row];
     double m_arg = s * e_obs;
@@ -3182,7 +3182,7 @@ mod oracle_parity_tests {
         //! GATES the device row kernel via
         //! `bms_flex_row_kernel_matches_cpu_oracle_when_cuda_available`) must
         //! reproduce the CPU family reference
-        //! `compute_row_analytic_flex_from_parts_into` element-for-element, from
+        //! `lower_bms_flex_row_order2_from_parts` element-for-element, from
         //! ONE fitted `(family, block_states, cache)`.
         //!
         //! Before this test the only ties between the two were (1) an FD lock on
@@ -3392,7 +3392,7 @@ mod oracle_parity_tests {
                 }
 
                 let value = family
-                    .compute_row_analytic_flex_into_with_moments(
+                    .lower_bms_flex_row_order2_with_moments(
                         row,
                         &states,
                         primary,
@@ -4075,7 +4075,7 @@ mod tests {
         // wires this to bms_flex.rs cross-checks parity against the CPU
         // function named here.
         #[cfg(target_os = "linux")]
-        assert!(ROW_KERNEL_BODY.contains("compute_row_analytic_flex_from_parts_into"));
+        assert!(ROW_KERNEL_BODY.contains("lower_bms_flex_row_order2_from_parts"));
         #[cfg(target_os = "linux")]
         assert!(ROW_KERNEL_BODY.contains("cell_first_derivative_from_moments"));
     }

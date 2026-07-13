@@ -1030,7 +1030,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(None);
         }
         // Empirical-grid rows take a non-cell code path inside
-        // `compute_row_analytic_flex_from_parts_into`, so the bundle would
+        // `lower_bms_flex_row_order2_from_parts`, so the bundle would
         // never be consulted. Skip the build to avoid wasted work.
         if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
             return Ok(None);
@@ -1261,7 +1261,7 @@ impl BernoulliMarginalSlopeFamily {
     /// link-deviation runtimes are missing); the caller then falls back to
     /// the CPU rayon loop.
     ///
-    /// The packed bundle mirrors `compute_row_analytic_flex_from_parts_into`
+    /// The packed bundle mirrors `lower_bms_flex_row_order2_from_parts`
     /// (`StandardNormal` branch at lines 9047–9314) field-for-field. The
     /// per-cell coefficient families are built here on the host (cheap
     /// scalar work) so the device kernel reads only flat SoA buffers and
@@ -2245,7 +2245,7 @@ impl BernoulliMarginalSlopeFamily {
                             .row_cell_moments
                             .as_ref()
                             .and_then(|bundle| bundle.row(row, 9));
-                        let neglog = self.compute_row_analytic_flex_into_with_moments(
+                        let neglog = self.lower_bms_flex_row_order2_with_moments(
                             row,
                             block_states,
                             &cache.primary,
@@ -2744,7 +2744,7 @@ impl BernoulliMarginalSlopeFamily {
                 .row_cell_moments
                 .as_ref()
                 .and_then(|bundle| bundle.row(row, 3));
-            self.compute_row_analytic_flex_into_with_moments(
+            self.lower_bms_flex_row_order2_with_moments(
                 row,
                 block_states,
                 primary,
@@ -2771,7 +2771,7 @@ impl BernoulliMarginalSlopeFamily {
         need_hessian: bool,
         scratch: &mut BernoulliMarginalSlopeFlexRowScratch,
     ) -> Result<f64, String> {
-        self.compute_row_analytic_flex_into_with_moments(
+        self.lower_bms_flex_row_order2_with_moments(
             row,
             block_states,
             primary,
@@ -2843,7 +2843,7 @@ impl BernoulliMarginalSlopeFamily {
                         .row_cell_moments
                         .as_ref()
                         .and_then(|bundle| bundle.row(row, 9));
-                    self.compute_row_analytic_flex_into_with_moments(
+                    self.lower_bms_flex_row_order2_with_moments(
                         row,
                         block_states,
                         primary,
@@ -2889,7 +2889,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    pub(super) fn compute_row_analytic_flex_into_with_moments(
+    pub(super) fn lower_bms_flex_row_order2_with_moments(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -2904,7 +2904,7 @@ impl BernoulliMarginalSlopeFamily {
         let b = block_states[1].eta[row];
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
-        self.compute_row_analytic_flex_from_parts_into(
+        self.lower_bms_flex_row_order2_from_parts(
             row,
             primary,
             q,
@@ -2946,7 +2946,7 @@ impl BernoulliMarginalSlopeFamily {
         empirical_grid: &crate::bms::EmpiricalZGrid,
         need_hessian: bool,
         // Per-row coefficient scratch, owned by the caller and reused across rows
-        // (`compute_row_analytic_flex_from_parts_into` sizes these to `r` on its
+        // (`lower_bms_flex_row_order2_from_parts` sizes these to `r` on its
         // `BernoulliMarginalSlopeFlexRowScratch`). Threading them in keeps the
         // empirical-grid Hessian path allocation-free per row. The active-index
         // buffer is the output tape of the sparse coefficient-jet compiler.
@@ -3117,7 +3117,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(f_aa)
     }
 
-    pub(super) fn compute_row_analytic_flex_from_parts_into(
+    pub(super) fn lower_bms_flex_row_order2_from_parts(
         &self,
         row: usize,
         primary: &PrimarySlices,
@@ -3553,103 +3553,90 @@ impl BernoulliMarginalSlopeFamily {
             zero_family,
         );
 
-        let a_u = &mut scratch.a_u;
-        for u in 0..r {
-            a_u[u] = -f_u[u] * inv_ma;
-        }
-        self.cache_row_intercept_predictor(row, a, q, b, beta_h, beta_w, a_u);
-        let a_uv = &mut scratch.a_uv;
-        if need_hessian {
-            for u in 0..r {
-                for v in u..r {
-                    let value = -(f_uv[[u, v]]
-                        + f_au[u] * a_u[v]
-                        + f_au[v] * a_u[u]
-                        + f_aa * a_u[u] * a_u[v])
-                        * inv_ma;
-                    a_uv[[u, v]] = value;
-                    a_uv[[v, u]] = value;
-                }
-            }
-        }
-
-        // `scratch.reset(need_hessian)` at the top of this function zeroed both
-        // `rho` and `tau` unconditionally, so no manual fill is needed here.
-        // `tau` is consumed only by the symmetric-Hessian assembly below, so
-        // its per-row eval_coeff4_at sweep is dead work in gradient-only mode.
-        let rho = &mut scratch.rho;
-        let tau = &mut scratch.tau;
-        for u in 1..r {
-            rho[u] = eval_coeff4_at(&g_jet.first[u], z_obs);
-        }
-        if need_hessian {
-            for u in 1..r {
-                tau[u] = eval_coeff4_at(&g_jet.a_first[u], z_obs);
-            }
-        }
-
-        let eta_u = &mut scratch.grad;
-        for u in 0..r {
-            eta_u[u] = chi_obs * a_u[u] + rho[u];
-        }
-
         let signed_margin = s_y * eta_val;
         let probit = normal_logcdf_derivatives(signed_margin);
         let neglog_val = -w_i * probit[0];
         let d1_m = -w_i * probit[1];
         let d2_m = -w_i * probit[2];
-
-        // #2303 Murphy–Topel generated-regressor channel for the FULL flex
-        // primary vector. Within the selected denested score/link spans every
-        // observed-index quantity is a cubic polynomial in z, so its z
-        // derivative is exact from the SAME coefficient jets used above — no
-        // finite differences and no second row-kernel definition.
-        //
-        // NLL gradient: l_u = l_eta * eta_u.
-        // LOG-LIKELIHOOD score sensitivity:
-        //   d score_u / dz
-        //     = -(l_eta_eta * eta_z * eta_u + l_eta * eta_uz).
-        // `a_u` is independent of the observed row z (the marginal-calibration
-        // root integrates over the fitted latent measure), while
-        //   eta_u  = eta_a * a_u + eta_u|a,
-        // hence
-        //   eta_uz = eta_az * a_u + d(eta_u|a)/dz.
         let eta_z = eval_coeff4_derivative_at(&obs.coeff, z_obs);
         let chi_z = eval_coeff4_derivative_at(&obs.dc_da, z_obs);
+
+        let a_u = &mut scratch.a_u;
+        let a_uv = &mut scratch.a_uv;
+        let rho = &mut scratch.rho;
+        let tau = &mut scratch.tau;
+        let eta_u = &mut scratch.grad;
         let score_zeta = &mut scratch.score_zeta;
-        for u in 0..r {
-            let rho_z = eval_coeff4_derivative_at(&g_jet.first[u], z_obs);
-            let eta_uz = chi_z * a_u[u] + rho_z;
-            score_zeta[u] = -(d2_m * eta_z * eta_u[u] + d1_m * s_y * eta_uz);
+        let hess = &mut scratch.hess;
+        if need_hessian {
+            hess.fill(0.0);
         }
+
+        BmsFlexRowProgram::try_for_each_order2_finalizer(
+            r,
+            need_hessian,
+            |node| -> Result<(), String> {
+                match node {
+                    BmsFlexRowOrder2FinalizerNode::ImplicitFirst { primary } => {
+                        a_u[primary] = -f_u[primary] * inv_ma;
+                    }
+                    BmsFlexRowOrder2FinalizerNode::ImplicitFirstComplete => {
+                        self.cache_row_intercept_predictor(row, a, q, b, beta_h, beta_w, a_u);
+                    }
+                    BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left, right } => {
+                        let value = -(f_uv[[left, right]]
+                            + f_au[left] * a_u[right]
+                            + f_au[right] * a_u[left]
+                            + f_aa * a_u[left] * a_u[right])
+                            * inv_ma;
+                        a_uv[[left, right]] = value;
+                        a_uv[[right, left]] = value;
+                    }
+                    BmsFlexRowOrder2FinalizerNode::ObservedFirst { primary } => {
+                        rho[primary] = eval_coeff4_at(&g_jet.first[primary], z_obs);
+                        if need_hessian {
+                            tau[primary] = eval_coeff4_at(&g_jet.a_first[primary], z_obs);
+                        }
+                        eta_u[primary] = chi_obs * a_u[primary] + rho[primary];
+                    }
+                    BmsFlexRowOrder2FinalizerNode::ObservedScoreSensitivity { primary } => {
+                        let rho_z = eval_coeff4_derivative_at(&g_jet.first[primary], z_obs);
+                        let eta_uz = chi_z * a_u[primary] + rho_z;
+                        score_zeta[primary] =
+                            -(d2_m * eta_z * eta_u[primary] + d1_m * s_y * eta_uz);
+                    }
+                    BmsFlexRowOrder2FinalizerNode::ObservedSecond { left, right } => {
+                        let fixed_second = eval_coeff4_at(
+                            &g_jet.pair_from_b_family(
+                                g_jet.b_first,
+                                left,
+                                right,
+                                COEFF_SUPPORT_BHW,
+                            ),
+                            z_obs,
+                        );
+                        let eta_second = chi_obs * a_uv[[left, right]]
+                            + eta_aa_obs * a_u[left] * a_u[right]
+                            + tau[left] * a_u[right]
+                            + a_u[left] * tau[right]
+                            + fixed_second;
+                        let value = d2_m * eta_u[left] * eta_u[right] + d1_m * s_y * eta_second;
+                        hess[[left, right]] = value;
+                        hess[[right, left]] = value;
+                    }
+                    BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary } => {
+                        eta_u[primary] *= d1_m * s_y;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+
         if score_zeta.iter().any(|value| !value.is_finite()) {
             return Err(format!(
                 "BMS Murphy-Topel flex z-sensitivity produced a non-finite value at row {row}"
             ));
         }
-
-        if need_hessian {
-            let hess = &mut scratch.hess;
-            hess.fill(0.0);
-            for u in 0..r {
-                for v in u..r {
-                    let r_uv = eval_coeff4_at(
-                        &g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_BHW),
-                        z_obs,
-                    );
-                    let eta_uv = chi_obs * a_uv[[u, v]]
-                        + eta_aa_obs * a_u[u] * a_u[v]
-                        + tau[u] * a_u[v]
-                        + a_u[u] * tau[v]
-                        + r_uv;
-                    let val = d2_m * eta_u[u] * eta_u[v] + d1_m * s_y * eta_uv;
-                    hess[[u, v]] = val;
-                    hess[[v, u]] = val;
-                }
-            }
-        }
-
-        eta_u.mapv_inplace(|eu| d1_m * s_y * eu);
         Ok(neglog_val)
     }
 
@@ -5323,8 +5310,6 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<(), String> {
         use super::exact_kernel as exact;
 
-        let active_primaries = (1..r).collect::<Vec<_>>();
-
         for entry in cells {
             let partition_cell = entry.partition_cell;
             let cell = partition_cell.cell;
@@ -5429,8 +5414,8 @@ impl BernoulliMarginalSlopeFamily {
                 zero_family,
             );
 
-            BmsFlexRowProgram::try_for_each_calibration_order2(
-                &active_primaries,
+            BmsFlexRowProgram::try_for_each_calibration_order2_contiguous(
+                1..r,
                 true,
                 |node| -> Result<(), String> {
                     match node {
@@ -5491,8 +5476,8 @@ impl BernoulliMarginalSlopeFamily {
             let mut coeff_aa_dir = [0.0; 4];
             let mut coeff_u_dir = vec![[0.0; 4]; r];
             let mut coeff_au_dir = vec![[0.0; 4]; r];
-            BmsFlexRowProgram::try_for_each_calibration_order3(
-                &active_primaries,
+            BmsFlexRowProgram::try_for_each_calibration_order3_contiguous(
+                1..r,
                 row_dirs.len(),
                 |node| -> Result<(), String> {
                     match node {
@@ -5513,7 +5498,7 @@ impl BernoulliMarginalSlopeFamily {
                                 dir,
                                 COEFF_SUPPORT_BW,
                             );
-                            for &primary in &active_primaries {
+                            for primary in 1..r {
                                 coeff_u_dir[primary] = coeff_jet.param_directional_from_b_family(
                                     coeff_jet.b_first,
                                     primary,
@@ -6055,7 +6040,6 @@ impl BernoulliMarginalSlopeFamily {
 
         let directions = [dir_u, dir_v];
         let direction_pairs = [(0usize, 1usize)];
-        let active_primaries = (1..r).collect::<Vec<_>>();
         let mut f_a_dir = [0.0; 2];
         let mut f_aa_dir = [0.0; 2];
         let mut f_au_dir = vec![0.0; 2 * r];
@@ -6200,8 +6184,8 @@ impl BernoulliMarginalSlopeFamily {
                 &coeff_bbbu,
             );
 
-            BmsFlexRowProgram::try_for_each_calibration_order2(
-                &active_primaries,
+            BmsFlexRowProgram::try_for_each_calibration_order2_contiguous(
+                1..r,
                 true,
                 |node| -> Result<(), String> {
                     match node {
@@ -6262,8 +6246,8 @@ impl BernoulliMarginalSlopeFamily {
             let mut coeff_aa_dirs = [[0.0; 4]; 2];
             let mut coeff_u_dirs = vec![[0.0; 4]; 2 * r];
             let mut coeff_au_dirs = vec![[0.0; 4]; 2 * r];
-            BmsFlexRowProgram::try_for_each_calibration_order3(
-                &active_primaries,
+            BmsFlexRowProgram::try_for_each_calibration_order3_contiguous(
+                1..r,
                 directions.len(),
                 |node| -> Result<(), String> {
                     match node {
@@ -6285,7 +6269,7 @@ impl BernoulliMarginalSlopeFamily {
                                 COEFF_SUPPORT_BW,
                             );
                             let base = direction * r;
-                            for &primary in &active_primaries {
+                            for primary in 1..r {
                                 coeff_u_dirs[base + primary] = coeff_jet
                                     .param_directional_from_b_family(
                                         coeff_jet.b_first,
@@ -6387,8 +6371,8 @@ impl BernoulliMarginalSlopeFamily {
             let mut coeff_aa_dir_mixed = [0.0; 4];
             let mut coeff_u_mixed = vec![[0.0; 4]; r];
             let mut coeff_au_mixed = vec![[0.0; 4]; r];
-            BmsFlexRowProgram::try_for_each_calibration_order4(
-                &active_primaries,
+            BmsFlexRowProgram::try_for_each_calibration_order4_contiguous(
+                1..r,
                 direction_pairs.len(),
                 |node| -> Result<(), String> {
                     match node {
@@ -6414,7 +6398,7 @@ impl BernoulliMarginalSlopeFamily {
                                 right_dir,
                                 COEFF_SUPPORT_W,
                             );
-                            for &primary in &active_primaries {
+                            for primary in 1..r {
                                 coeff_u_mixed[primary] = coeff_jet.param_mixed_from_bb_family(
                                     coeff_jet.bb_first,
                                     primary,
@@ -7510,7 +7494,7 @@ impl BernoulliMarginalSlopeFamily {
                                     .row_cell_moments
                                     .as_ref()
                                     .and_then(|bundle| bundle.row(row, 9));
-                                self.compute_row_analytic_flex_into_with_moments(
+                                self.lower_bms_flex_row_order2_with_moments(
                                     row,
                                     block_states,
                                     primary,
@@ -7741,7 +7725,7 @@ impl BernoulliMarginalSlopeFamily {
                                 .as_ref()
                                 .and_then(|bundle| bundle.row(row, 9));
                             let computed_neglog =
-                                self.compute_row_analytic_flex_into_with_moments(
+                                self.lower_bms_flex_row_order2_with_moments(
                                     row,
                                     block_states,
                                     primary,

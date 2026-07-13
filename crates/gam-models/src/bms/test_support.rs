@@ -2,7 +2,7 @@
 //! Bernoulli-marginal-slope **flex** interior (#932).
 //!
 //! The flex interior derivative tower
-//! ([`super::row_primary_hessian::…::compute_row_analytic_flex_from_parts_into`])
+//! ([`super::row_primary_hessian::…::lower_bms_flex_row_order2_from_parts`])
 //! is the last hand-coded BMS derivative chain: it assembles the per-row
 //! gradient and Hessian over the runtime primary count `r = 2 + |β_h| + |β_w|`
 //! (marginal-η, slope, score-warp basis, link-deviation basis) from cell moments

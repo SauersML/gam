@@ -4,7 +4,7 @@
 //! branch via `Auto`, and cannot attribute per-row allocations).
 //!
 //! This module measures the EXACT production call
-//! [`compute_row_analytic_flex_from_parts_into`] on a forced 65-node
+//! [`lower_bms_flex_row_order2_from_parts`] on a forced 65-node
 //! `LatentMeasureKind::GlobalEmpirical` grid (the branch d1a7a0bc6 optimized),
 //! with the intercept root, row context, and row scratch precomputed OUTSIDE
 //! the measured region:
@@ -305,7 +305,7 @@ fn measure_branch(is_score_warp: bool) {
 
     let call = |scratch: &mut BernoulliMarginalSlopeFlexRowScratch| -> f64 {
         fx.family
-            .compute_row_analytic_flex_from_parts_into(
+            .lower_bms_flex_row_order2_from_parts(
                 0,
                 &fx.primary,
                 pt.q,
@@ -372,7 +372,7 @@ fn measure_branch(is_score_warp: bool) {
     let mut cold_scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
     let cold_value = fx
         .family
-        .compute_row_analytic_flex_from_parts_into(
+        .lower_bms_flex_row_order2_from_parts(
             0,
             &fx.primary,
             pt.q,

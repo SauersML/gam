@@ -5141,7 +5141,7 @@ mod empirical_flex_jet_oracle_tests {
 
     /// #932 P3 GATE (direct hand-vs-jet certificate): the single-source
     /// runtime-jet flex row NLL ([`canonical_flex_row_program_order2`]) reproduces the
-    /// production HAND path `compute_row_analytic_flex_from_parts_into` — value,
+    /// production HAND path `lower_bms_flex_row_order2_from_parts` — value,
     /// dense `r`-gradient, AND full `r×r` Hessian — to ≤1e-9 on the
     /// empirical-grid branch (the branch the empirical fixture routes the hand
     /// path through). This pins the jet against the EXACT function the cutover
@@ -5221,7 +5221,7 @@ mod empirical_flex_jet_oracle_tests {
                 crate::bms::hessian_paths::BernoulliMarginalSlopeFlexRowScratch::new(r);
             let neglog = fx
                 .family
-                .compute_row_analytic_flex_from_parts_into(
+                .lower_bms_flex_row_order2_from_parts(
                     0,
                     &fx.primary,
                     q0,
@@ -5265,7 +5265,7 @@ mod empirical_flex_jet_oracle_tests {
 
     /// #932 BMS-flex cutover INC-1(b) GATE: the per-denested-cell moment
     /// compiler (production `flex_grid_calibration_derivs_compiled_jet2`, reached
-    /// through `compute_row_analytic_flex_from_parts_into`) reproduces the
+    /// through `lower_bms_flex_row_order2_from_parts`) reproduces the
     /// INDEPENDENT grid jet `canonical_flex_row_program_order2` (value / dense gradient /
     /// full Hessian) to ≤1e-9 on DEGENERATE empirical grids — a sparse grid whose
     /// four nodes leave several denested cells EMPTY and at least one holding a
@@ -5345,7 +5345,7 @@ mod empirical_flex_jet_oracle_tests {
                     crate::bms::hessian_paths::BernoulliMarginalSlopeFlexRowScratch::new(r);
                 let neglog = fx
                     .family
-                    .compute_row_analytic_flex_from_parts_into(
+                    .lower_bms_flex_row_order2_from_parts(
                         0,
                         &fx.primary,
                         q0,

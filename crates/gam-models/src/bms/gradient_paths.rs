@@ -2903,7 +2903,7 @@ mod jet_tower_oracle_tests {
 mod flex_primary_hessian_oracle_tests {
     //! #932 correctness gate for the BMS-FLEX per-row primary Hessian assembled
     //! by hand product-rule in
-    //! [`super::super::row_primary_hessian::BernoulliMarginalSlopeFamily::compute_row_analytic_flex_from_parts_into`]
+    //! [`super::super::row_primary_hessian::BernoulliMarginalSlopeFamily::lower_bms_flex_row_order2_from_parts`]
     //! (`f_aa += w·φ·(η_aa − η·η_a·η_a)`, the `f_au`/`f_uv`/`a_uv` chain, and the
     //! final `d2_m·η_u·η_v + d1_m·s_y·η_uv` contraction).
     //!

@@ -3,7 +3,7 @@
 //!
 //! This module is the separate witness for the last hand-coded BMS derivative
 //! chain: the per-row gradient / Hessian assembled by
-//! [`super::row_primary_hessian::…::compute_row_analytic_flex_from_parts_into`]
+//! [`super::row_primary_hessian::…::lower_bms_flex_row_order2_from_parts`]
 //! (the `coeff_au` / `coeff_bu` / `g_au_fixed` / `g_bu_fixed` + implicit-
 //! function-theorem `a_u`/`a_uv` chains).
 //!
@@ -282,7 +282,7 @@ fn hand_value(fx: &VFixture, p: &[f64]) -> f64 {
     };
     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(fx.primary.total);
     fx.family
-        .compute_row_analytic_flex_from_parts_into(
+        .lower_bms_flex_row_order2_from_parts(
             0,
             &fx.primary,
             q,
@@ -322,7 +322,7 @@ fn hand_grad_hess(fx: &VFixture, p: &[f64]) -> (f64, Vec<f64>, Vec<f64>) {
     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
     let v = fx
         .family
-        .compute_row_analytic_flex_from_parts_into(
+        .lower_bms_flex_row_order2_from_parts(
             0,
             &fx.primary,
             q,
