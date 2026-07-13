@@ -1017,13 +1017,11 @@ impl GaussianPcaErrorModel {
         offsets
     }
 
-    /// Construct the exact block-diagonal operator implied by pairwise-disjoint
-    /// inference rows and the isotropic-spike patch law.
+    /// Construct the block-diagonal plug-in operator implied by pairwise-
+    /// disjoint inference rows and fitted isotropic-spike patch scalars.
+    /// Estimated noise/signal values can never select certified authority.
     #[must_use = "Gaussian PCA error-model validation errors must be handled"]
-    pub fn independent(
-        patches: &[GaussianPcaPatch],
-        authority: GaussianPcaCovarianceAuthority,
-    ) -> Result<Self, String> {
+    pub fn independent(patches: &[GaussianPcaPatch]) -> Result<Self, String> {
         for left in 0..patches.len() {
             for right in (left + 1)..patches.len() {
                 if patches[left]
@@ -1059,18 +1057,46 @@ impl GaussianPcaErrorModel {
                 }
             }
         }
-        Self::new(
+        Self::validate_joint(
             patches,
-            authority,
+            GaussianPcaCovarianceAuthority::AsymptoticPlugIn,
             CrossPatchCovarianceProvenance::DisjointInferenceRows,
             covariance,
         )
     }
 
-    /// Construct a caller-supplied joint operator, including every shared-row
-    /// cross block.
+    /// Construct an authoritative Gaussian linearized-error law from an exact
+    /// caller-supplied joint covariance, including every shared-row cross block.
     #[must_use = "Gaussian PCA error-model validation errors must be handled"]
-    pub fn new(
+    pub fn certified_joint(
+        patches: &[GaussianPcaPatch],
+        cross_patch_provenance: CrossPatchCovarianceProvenance,
+        covariance: Array2<f64>,
+    ) -> Result<Self, String> {
+        Self::validate_joint(
+            patches,
+            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
+            cross_patch_provenance,
+            covariance,
+        )
+    }
+
+    /// Construct an explicitly supplied asymptotic plug-in joint covariance.
+    #[must_use = "Gaussian PCA error-model validation errors must be handled"]
+    pub fn plugin_joint(
+        patches: &[GaussianPcaPatch],
+        cross_patch_provenance: CrossPatchCovarianceProvenance,
+        covariance: Array2<f64>,
+    ) -> Result<Self, String> {
+        Self::validate_joint(
+            patches,
+            GaussianPcaCovarianceAuthority::AsymptoticPlugIn,
+            cross_patch_provenance,
+            covariance,
+        )
+    }
+
+    fn validate_joint(
         patches: &[GaussianPcaPatch],
         authority: GaussianPcaCovarianceAuthority,
         cross_patch_provenance: CrossPatchCovarianceProvenance,
@@ -1466,7 +1492,10 @@ pub struct GaussBonnetInput {
 /// Gaussian probability or is only an asymptotic plug-in diagnostic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GaussBonnetCovarianceAuthority {
-    CertifiedGaussianLinearization,
+    /// Every source vector is jointly Gaussian and distinct source IDs are
+    /// certified independent. Correlated quantities must occupy one shared
+    /// vector source so their covariance is never discarded between IDs.
+    CertifiedIndependentGaussianSources,
     AsymptoticPlugIn,
 }
 
@@ -1759,9 +1788,33 @@ mod tests {
         level: AtlasFamilywiseLevel,
         gauss_bonnet: Option<GaussBonnetInput>,
     ) -> GaussianPcaHolonomyAnalysis {
-        let error_model = GaussianPcaErrorModel::independent(
+        let offsets = GaussianPcaErrorModel::coordinate_offsets(&patches);
+        let dimension = offsets.last().copied().unwrap_or(0);
+        let mut covariance = Array2::<f64>::zeros((dimension, dimension));
+        for (patch_index, patch) in patches.iter().enumerate() {
+            let retained = patch.retained_dimension();
+            let normal = identity_square(retained)
+                - patch
+                    .tangent_coordinates
+                    .dot(&patch.tangent_coordinates.t());
+            // Exact DGP parameters of the test fixtures, not fitted patch
+            // scalars: sigma^2=0.01 and lambda=1.
+            let scale = 0.01 * 1.01 / patch.covariance_degrees_of_freedom() as f64;
+            for row_left in 0..retained {
+                for row_right in 0..retained {
+                    for tangent in 0..INTRINSIC_DIMENSION {
+                        covariance[[
+                            offsets[patch_index] + row_left * INTRINSIC_DIMENSION + tangent,
+                            offsets[patch_index] + row_right * INTRINSIC_DIMENSION + tangent,
+                        ]] = scale * normal[[row_left, row_right]];
+                    }
+                }
+            }
+        }
+        let error_model = GaussianPcaErrorModel::certified_joint(
             &patches,
-            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
+            CrossPatchCovarianceProvenance::DisjointInferenceRows,
+            covariance,
         )
         .unwrap();
         GaussianPcaHolonomyAnalysis::certify(patches, edges, error_model, level, gauss_bonnet)
@@ -2018,16 +2071,115 @@ mod tests {
     }
 
     #[test]
+    fn shared_inference_rows_require_an_explicit_joint_covariance() {
+        let make_patch = |chart, pilot_rows| {
+            GaussianPcaPatch::new(
+                chart,
+                GaussianPatchRowSplit::new(pilot_rows, (100..200).collect()).unwrap(),
+                PilotProjectionProvenance::ExactAnalyticCapture,
+                GaussianPatchCentering::MeanEstimatedOnInferenceRows,
+                identity_projection(3),
+                arr2(&[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]),
+                0.01,
+                1.0,
+                GaussianPcaSpectrumProvenance::CertifiedPopulation(
+                    GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
+                ),
+            )
+            .unwrap()
+        };
+        let patches = vec![make_patch(0, (0..50).collect()), make_patch(1, (50..100).collect())];
+
+        assert!(GaussianPcaErrorModel::independent(&patches).is_err());
+        let dimension = GaussianPcaErrorModel::coordinate_offsets(&patches)
+            .last()
+            .copied()
+            .unwrap();
+        let joint = Array2::<f64>::zeros((dimension, dimension));
+        assert!(
+            GaussianPcaErrorModel::certified_joint(
+                &patches,
+                CrossPatchCovarianceProvenance::DisjointInferenceRows,
+                joint.clone(),
+            )
+            .is_err()
+        );
+        let model = GaussianPcaErrorModel::certified_joint(
+            &patches,
+            CrossPatchCovarianceProvenance::ExplicitJointCovariance,
+            joint,
+        )
+        .unwrap();
+        assert_eq!(
+            model.cross_patch_provenance(),
+            &CrossPatchCovarianceProvenance::ExplicitJointCovariance
+        );
+    }
+
+    #[test]
+    fn nonnested_pilot_frames_use_the_retained_normal_cross_operator() {
+        let frame_a = arr2(&[
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+        ]);
+        let frame_b = arr2(&[
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]);
+        let tangent = arr2(&[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]);
+        let make_patch = |chart, frame| {
+            GaussianPcaPatch::new(
+                chart,
+                GaussianPatchRowSplit::from_disjoint_ranges(
+                    chart * 1_000,
+                    100,
+                    chart * 1_000 + 500,
+                    100,
+                )
+                .unwrap(),
+                PilotProjectionProvenance::ExactAnalyticCapture,
+                GaussianPatchCentering::MeanEstimatedOnInferenceRows,
+                frame,
+                tangent.clone(),
+                0.01,
+                1.0,
+                GaussianPcaSpectrumProvenance::CertifiedPopulation(
+                    GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
+                ),
+            )
+            .unwrap()
+        };
+        let patches = vec![make_patch(0, frame_a), make_patch(1, frame_b)];
+        let edge = build_projected_edge(&patches, certified_edge(0, 1, 0, 0.0)).unwrap();
+        let normal = identity_square(3) - tangent.dot(&tangent.t());
+        let normal_cross_operator = normal
+            .dot(&edge.projection_cross_gram_ba)
+            .dot(&normal);
+
+        assert_eq!(edge.public.projected_dimension, 4);
+        assert_near(frobenius_squared(normal_cross_operator.view()), 0.0);
+        assert_near(
+            frobenius_squared(edge.patch_gradient_a.unwrap().view()),
+            0.0,
+        );
+        assert_near(
+            frobenius_squared(edge.patch_gradient_b.unwrap().view()),
+            0.0,
+        );
+    }
+
+    #[test]
     fn fundamental_cycle_preserves_parallel_overlap_identity() {
         let analysis = certified_analysis(
             vec![
                 patch(0, 0.0, 0.0, false, 1_000_000, 0),
                 patch(1, 0.0, 0.0, false, 1_000_000, 0),
             ],
-            vec![
-                certified_edge(0, 1, 7, 0.0),
-                certified_edge(0, 1, 3, 0.0),
-            ],
+            vec![certified_edge(0, 1, 7, 0.0), certified_edge(0, 1, 3, 0.0)],
             AtlasFamilywiseLevel::new(0.05).unwrap(),
             None,
         );
@@ -2077,10 +2229,7 @@ mod tests {
                 patch(0, 0.0, 0.0, false, 1_000_000, 0),
                 patch(1, std::f64::consts::FRAC_PI_2, 0.0, false, 1_000_000, 0),
             ],
-            vec![
-                certified_edge(0, 1, 7, 0.0),
-                certified_edge(0, 1, 3, 0.0),
-            ],
+            vec![certified_edge(0, 1, 7, 0.0), certified_edge(0, 1, 3, 0.0)],
             AtlasFamilywiseLevel::new(0.05).unwrap(),
             None,
         );
@@ -2158,15 +2307,17 @@ mod tests {
         );
 
         assert_eq!(analysis.cycles().len(), 1);
-        assert!(analysis.cycles()[0]
-            .decision
-            .refusals()
-            .iter()
-            .all(|reason| !matches!(
-                reason,
-                AtlasStatisticalRefusal::PilotProjectionUncertified { chart: 3 }
-                    | AtlasStatisticalRefusal::PopulationSpectrumUncertified { chart: 3 }
-            )));
+        assert!(
+            analysis.cycles()[0]
+                .decision
+                .refusals()
+                .iter()
+                .all(|reason| !matches!(
+                    reason,
+                    AtlasStatisticalRefusal::PilotProjectionUncertified { chart: 3 }
+                        | AtlasStatisticalRefusal::PopulationSpectrumUncertified { chart: 3 }
+                ))
+        );
     }
 
     #[test]
@@ -2304,11 +2455,7 @@ mod tests {
             patch(0, 0.0, 0.0, false, 1_000_000, 0),
             patch(1, 0.2, 0.0, false, 1_000_000, 0),
         ];
-        let error_model = GaussianPcaErrorModel::independent(
-            &patches,
-            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
-        )
-        .unwrap();
+        let error_model = GaussianPcaErrorModel::independent(&patches).unwrap();
         let analysis = GaussianPcaHolonomyAnalysis::certify(
             patches,
             vec![
@@ -2415,10 +2562,7 @@ mod tests {
                 patch(1, 0.2, 0.0, false, 1_000_000, 0),
                 patch(2, -0.2, 0.0, false, 1_000_000, 0),
             ],
-            vec![
-                certified_edge(0, 1, 0, 0.0),
-                certified_edge(0, 2, 0, 0.0),
-            ],
+            vec![certified_edge(0, 1, 0, 0.0), certified_edge(0, 2, 0, 0.0)],
             level,
             None,
         );
@@ -2442,15 +2586,13 @@ mod tests {
         let frame_budget = single_center.aligned_frame_error_budget;
         assert_near(
             2.0 * frame_budget + frame_budget * frame_budget,
-            edge.population_cross_gram
-                .certified_lower_bound()
-                .unwrap(),
+            edge.population_cross_gram.certified_lower_bound().unwrap(),
         );
     }
 
     fn cancellation_gauss_bonnet(remainder: f64) -> GaussBonnetInput {
         GaussBonnetInput::new(
-            GaussBonnetCovarianceAuthority::CertifiedGaussianLinearization,
+            GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources,
             vec![GaussBonnetNoiseSource::new(7, arr2(&[[1.0]])).unwrap()],
             vec![
                 GaussBonnetContribution::new(
@@ -2511,7 +2653,7 @@ mod tests {
         let confidence = gauss_bonnet_confidence(
             &nondegenerate_gauss_bonnet(
                 std::f64::consts::PI,
-                GaussBonnetCovarianceAuthority::CertifiedGaussianLinearization,
+                GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources,
             ),
             0.05,
         )
@@ -2547,7 +2689,7 @@ mod tests {
         let standard_error = std::f64::consts::PI / critical;
         let true_chi = AtlasEulerCharacteristic(2);
         let template = GaussBonnetInput::new(
-            GaussBonnetCovarianceAuthority::CertifiedGaussianLinearization,
+            GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources,
             vec![
                 GaussBonnetNoiseSource::new(0, arr2(&[[standard_error * standard_error]])).unwrap(),
             ],
@@ -2676,7 +2818,7 @@ fn project_retained_normal(patch: &GaussianPcaPatch, local: &Array2<f64>) -> Arr
     local
         - &patch
             .tangent_coordinates
-            .dot(&patch.tangent_coordinates.t().dot(&local))
+            .dot(&patch.tangent_coordinates.t().dot(local))
 }
 
 fn build_projected_edge(
@@ -2691,18 +2833,17 @@ fn build_projected_edge(
     // The intersection dimension is the multiplicity of singular value one
     // in W_b^T W_a, hence dim(span(W_a,W_b)) = r_a+r_b-dim(intersection).
     // This retained-coordinate SVD removes the ambient P-by-(r_a+r_b) SVD.
-    let (_, projection_cosines, _) = projection_cross_gram_ba
-        .svd(false, false)
-        .map_err(|error| {
-        format!(
-            "edge ({}, {}, overlap {}) retained projection cross-Gram SVD failed: {error}",
-            spec.a, spec.b, spec.overlap
-        )
-    })?;
-    let intersection_backward_error = f64::EPSILON
-        * patch_a
-            .ambient_dimension()
-            .max(retained_a + retained_b) as f64;
+    let (_, projection_cosines, _) =
+        projection_cross_gram_ba
+            .svd(false, false)
+            .map_err(|error| {
+                format!(
+                    "edge ({}, {}, overlap {}) retained projection cross-Gram SVD failed: {error}",
+                    spec.a, spec.b, spec.overlap
+                )
+            })?;
+    let intersection_backward_error =
+        f64::EPSILON * patch_a.ambient_dimension().max(retained_a + retained_b) as f64;
     let intersection_dimension = projection_cosines
         .iter()
         .filter(|&&cosine| (1.0 - cosine).abs() <= intersection_backward_error)
@@ -2715,9 +2856,10 @@ fn build_projected_edge(
         ));
     }
     // Coordinates are mapped from chart a to chart b, hence M = U_b^T U_a.
-    let cross = patch_b.tangent_coordinates.t().dot(
-        &projection_cross_gram_ba.dot(&patch_a.tangent_coordinates),
-    );
+    let cross = patch_b
+        .tangent_coordinates
+        .t()
+        .dot(&projection_cross_gram_ba.dot(&patch_a.tangent_coordinates));
     let (left, singular, right_t) = cross.svd(true, true).map_err(|error| {
         format!(
             "edge ({}, {}, overlap {}) cross-Gram SVD failed: {error}",
@@ -2961,10 +3103,7 @@ fn patch_tail(
 /// cross-Gram's smallest singular value. An observed random margin cannot set
 /// its own unconditional error threshold.
 fn orientation_endpoint_frame_budget(edge: &EdgeWork) -> Option<f64> {
-    let population_margin = edge
-        .public
-        .population_cross_gram
-        .certified_lower_bound()?;
+    let population_margin = edge.public.population_cross_gram.certified_lower_bound()?;
     Some((1.0 + population_margin).sqrt() - 1.0)
 }
 
@@ -3448,11 +3587,13 @@ fn analyze_cycle(
         reasons.push(AtlasStatisticalRefusal::GaussianLinearizationIsPlugin { cycle_index });
     }
     if degenerate {
-        reasons.push(AtlasStatisticalRefusal::DegenerateFirstOrderLimitUnresolved {
-            cycle_index,
-            bilinear_quadratic_bias_diagnostic: quadratic_bias,
-            bilinear_quadratic_variance_diagnostic: quadratic_variance,
-        });
+        reasons.push(
+            AtlasStatisticalRefusal::DegenerateFirstOrderLimitUnresolved {
+                cycle_index,
+                bilinear_quadratic_bias_diagnostic: quadratic_bias,
+                bilinear_quadratic_variance_diagnostic: quadratic_variance,
+            },
+        );
     }
 
     let endpoint_event_count = 2 * cycle.steps.len();
@@ -3474,10 +3615,7 @@ fn analyze_cycle(
         ) else {
             continue;
         };
-        let Some(population_margin) = edge
-            .public
-            .population_cross_gram
-            .certified_lower_bound()
+        let Some(population_margin) = edge.public.population_cross_gram.certified_lower_bound()
         else {
             continue;
         };
@@ -3655,13 +3793,14 @@ fn gauss_bonnet_confidence(
         input.covariance_authority,
         GaussBonnetCovarianceAuthority::AsymptoticPlugIn
     ) {
-        authority_refusals
-            .push(AtlasStatisticalRefusal::GaussBonnetGaussianLinearizationIsPlugin);
+        authority_refusals.push(AtlasStatisticalRefusal::GaussBonnetGaussianLinearizationIsPlugin);
     }
     if degenerate {
-        authority_refusals.push(AtlasStatisticalRefusal::GaussBonnetFirstOrderLimitDegenerate {
-            first_order_variance,
-        });
+        authority_refusals.push(
+            AtlasStatisticalRefusal::GaussBonnetFirstOrderLimitDegenerate {
+                first_order_variance,
+            },
+        );
     }
     let (misround_probability_bound, decision) = if !authority_refusals.is_empty() {
         (

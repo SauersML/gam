@@ -1043,11 +1043,10 @@ mod tests {
         AtlasFamilywiseLevel, AtlasHolonomyCertificate, AtlasHolonomyEdgeId, AtlasSignedEdge,
         AtlasStatisticalDecision, ExactAnalyticHolonomyCertificate, GaussBonnetContribution,
         GaussBonnetCovarianceAuthority, GaussBonnetInput, GaussBonnetNoiseSource,
-        GaussBonnetSourceGradient,
-        GaussianPatchCentering, GaussianPatchRowSplit, GaussianPcaCovarianceAuthority,
+        GaussBonnetSourceGradient, GaussianPatchCentering, GaussianPatchRowSplit,
         GaussianPcaErrorModel, GaussianPcaPatch, GaussianPcaPopulationBounds,
-        GaussianPcaSpectrumProvenance, PilotProjectionProvenance,
-        PopulationCrossGramProvenance, ProjectedAtlasEdgeSpec,
+        GaussianPcaSpectrumProvenance, PilotProjectionProvenance, PopulationCrossGramProvenance,
+        ProjectedAtlasEdgeSpec,
     };
     use crate::manifold::{AtlasOrientability, GraphCompressionKind};
     use ndarray::{Array2, arr2, array};
@@ -1204,11 +1203,7 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let error_model = GaussianPcaErrorModel::independent(
-            &patches,
-            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
-        )
-        .unwrap();
+        let error_model = GaussianPcaErrorModel::independent(&patches).unwrap();
         AtlasHolonomyCertificate::gaussian_pca(
             patches,
             edge_specs,
@@ -1276,7 +1271,7 @@ mod tests {
             })
             .collect();
         let gauss_bonnet = GaussBonnetInput::new(
-            GaussBonnetCovarianceAuthority::CertifiedGaussianLinearization,
+            GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources,
             vec![GaussBonnetNoiseSource::new(0, arr2(&[[1.0e-12]])).unwrap()],
             vec![
                 GaussBonnetContribution::new(
@@ -1289,11 +1284,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let error_model = GaussianPcaErrorModel::independent(
-            &patches,
-            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
-        )
-        .unwrap();
+        let error_model = GaussianPcaErrorModel::independent(&patches).unwrap();
         AtlasHolonomyCertificate::gaussian_pca(
             patches,
             edge_specs,

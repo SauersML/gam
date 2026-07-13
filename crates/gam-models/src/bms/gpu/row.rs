@@ -72,15 +72,11 @@
 //! ```
 //!
 //! Implementation choice (Stage 2): **one CUDA block per row**, with
-//! `blockDim.x = 32` threads. The block's `F_u`, `F_au`, `F_uv`, and `bar_e_u`
-//! live in shared memory; threads in the block parallelise the
-//! per-cell sums, then a single thread of the block (`threadIdx.x == 0`) does
-//! the IFT solve, the observed-point assembly, the Mills evaluation, and the
-//! final gradient + Hessian write-out. With the `r ≤ MAX_R` cap (32) the
-//! shared-memory footprint, including two 32-wide reductions and two scalars,
-//! is `r² + 3r + 66` ≤ 1 186 doubles ≈ 9.3 KiB, well below the V100 48 KiB
-//! per-block limit. This keeps the implementation simple and avoids per-thread global
-//! scratch (a per-thread `r*r` scratch arena would be ~2 GB at n=195k, r=20).
+//! `blockDim.x = 32` threads. The already-required output buffers are the
+//! width-general scratch authority: `out_grad[row]` evolves `F_u → a_u → g`,
+//! and `out_hess[row]` evolves `F_uv → a_uv → H`. One additional checked
+//! `[n, r]` buffer holds `F_au`. Only the fixed 32-thread scalar reduction is
+//! shared, so primary width has no shared-memory or thread-stack ceiling.
 
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
@@ -97,11 +93,6 @@ use cudarc::driver::{CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernel
 use super::super::flex_row_program::{
     BmsFlexCalibrationOrder2Phase, BmsFlexRowOrder2FinalizerPhase, BmsFlexRowProgram,
 };
-
-/// Hard ceiling on `r` (= 2 + p_h + p_w). Matches the shared-memory budget
-/// argument in the module docstring: with `MAX_R = 32` the per-block shared
-/// footprint is at most `2·32² + 3·32 = 2 144` doubles = 17 KB.
-pub(crate) const MAX_R: usize = 32;
 
 /// `blockDim.x` for the row kernel. Threads of a row-block parallelise the
 /// per-cell loop; thread 0 of the block finalises the IFT solve. Linux-only
@@ -265,6 +256,21 @@ pub(crate) struct BmsFlexRowKernelOutputs {
     pub hess: Vec<f64>,
 }
 
+fn checked_shape_len(context: &str, dimensions: &[usize]) -> Result<usize, GpuError> {
+    dimensions
+        .iter()
+        .copied()
+        .try_fold(1_usize, |product, dimension| {
+            product
+                .checked_mul(dimension)
+                .ok_or_else(|| GpuError::DriverCallFailed {
+                    reason: format!(
+                        "bms_flex_row {context}: shape product overflow for dimensions {dimensions:?}"
+                    ),
+                })
+        })
+}
+
 impl<'a> BmsFlexRowKernelInputs<'a> {
     /// Sanity-check every shape the kernel relies on. This is the only place
     /// length errors are surfaced — the device kernel assumes valid layout.
@@ -274,19 +280,20 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
                 reason: "bms_flex_row inputs: r must be > 0".to_string(),
             });
         }
-        if self.r > MAX_R {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row inputs: r={} exceeds MAX_R={MAX_R}", self.r),
-            });
-        }
-        if self.r != 2 + self.p_h + self.p_w {
+        let decomposed_r = 2_usize
+            .checked_add(self.p_h)
+            .and_then(|value| value.checked_add(self.p_w))
+            .ok_or_else(|| GpuError::DriverCallFailed {
+                reason: format!(
+                    "bms_flex_row inputs: primary decomposition overflow for p_h={} p_w={}",
+                    self.p_h, self.p_w
+                ),
+            })?;
+        if self.r != decomposed_r {
             return Err(GpuError::DriverCallFailed {
                 reason: format!(
                     "bms_flex_row inputs: r={} must equal 2 + p_h({}) + p_w({}) = {}",
-                    self.r,
-                    self.p_h,
-                    self.p_w,
-                    2 + self.p_h + self.p_w
+                    self.r, self.p_h, self.p_w, decomposed_r
                 ),
             });
         }
@@ -309,43 +316,60 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
         check_len("e_obs", self.e_obs.len(), n)?;
         check_len("chi_obs", self.chi_obs.len(), n)?;
         check_len("xi_obs", self.xi_obs.len(), n)?;
-        check_len("rho_u", self.rho_u.len(), n * self.r)?;
-        check_len("tau_u", self.tau_u.len(), n * self.r)?;
-        check_len("r_uv", self.r_uv.len(), n * self.r * self.r)?;
-        check_len("cell_offsets", self.cell_offsets.len(), n + 1)?;
+        let nr = checked_shape_len("validate [n,r]", &[n, self.r])?;
+        let nrr = checked_shape_len("validate [n,r,r]", &[n, self.r, self.r])?;
+        check_len("rho_u", self.rho_u.len(), nr)?;
+        check_len("tau_u", self.tau_u.len(), nr)?;
+        check_len("r_uv", self.r_uv.len(), nrr)?;
+        let offsets_len = n
+            .checked_add(1)
+            .ok_or_else(|| GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row inputs: n_rows={n} cannot form n+1 offsets"),
+            })?;
+        check_len("cell_offsets", self.cell_offsets.len(), offsets_len)?;
         let total_cells_u32 = self.cell_offsets[n];
         let total_cells = total_cells_u32 as usize;
         check_len("cell_c0", self.cell_c0.len(), total_cells)?;
         check_len("cell_c1", self.cell_c1.len(), total_cells)?;
         check_len("cell_c2", self.cell_c2.len(), total_cells)?;
         check_len("cell_c3", self.cell_c3.len(), total_cells)?;
-        check_len("cell_a", self.cell_a.len(), total_cells * COEFF4)?;
-        check_len("cell_aa", self.cell_aa.len(), total_cells * COEFF4)?;
+        let cells_coeff4 = checked_shape_len("validate cell coeff4", &[total_cells, COEFF4])?;
+        check_len("cell_a", self.cell_a.len(), cells_coeff4)?;
+        check_len("cell_aa", self.cell_aa.len(), cells_coeff4)?;
         check_len(
             "cell_r",
             self.cell_r.len(),
-            total_cells * self.r.saturating_sub(1) * COEFF4,
+            checked_shape_len(
+                "validate cell_r",
+                &[total_cells, self.r.saturating_sub(1), COEFF4],
+            )?,
         )?;
         check_len(
             "cell_ar",
             self.cell_ar.len(),
-            total_cells * self.r.saturating_sub(1) * COEFF4,
+            checked_shape_len(
+                "validate cell_ar",
+                &[total_cells, self.r.saturating_sub(1), COEFF4],
+            )?,
         )?;
-        check_len("cell_sbb", self.cell_sbb.len(), total_cells * COEFF4)?;
+        check_len("cell_sbb", self.cell_sbb.len(), cells_coeff4)?;
         check_len(
             "cell_sbh",
             self.cell_sbh.len(),
-            total_cells * self.p_h * COEFF4,
+            checked_shape_len("validate cell_sbh", &[total_cells, self.p_h, COEFF4])?,
         )?;
         check_len(
             "cell_sbw",
             self.cell_sbw.len(),
-            total_cells * self.p_w * COEFF4,
+            checked_shape_len("validate cell_sbw", &[total_cells, self.p_w, COEFF4])?,
         )?;
         check_len(
             "cell_moments",
             self.cell_moments.len(),
-            total_cells * MOMENT_STRIDE,
+            checked_shape_len(
+                "validate cell_moments",
+                &[total_cells, MOMENT_STRIDE],
+            )?,
         )?;
         // Bonus: when the moments came from `CellMomentsSource::Device`, the
         // launcher needs to know the source is from a device buffer; nothing
@@ -411,12 +435,14 @@ nan_fill_outputs(int r,
     double nan_value = __longlong_as_double(0x7ff8000000000000ULL);
     out_status[row] = 1U;
     out_neglog[row] = nan_value;
+    size_t row_r = (size_t)row * (size_t)r;
     for (int u = 0; u < r; ++u) {
-        out_grad[row * r + u] = nan_value;
+        out_grad[row_r + (size_t)u] = nan_value;
     }
-    int rr = r * r;
-    for (int idx = 0; idx < rr; ++idx) {
-        out_hess[row * rr + idx] = nan_value;
+    size_t rr = (size_t)r * (size_t)r;
+    size_t row_rr = (size_t)row * rr;
+    for (size_t idx = 0; idx < rr; ++idx) {
+        out_hess[row_rr + idx] = nan_value;
     }
 }
 
@@ -455,6 +481,7 @@ extern "C" __global__ void bms_flex_row_kernel(
     const double * __restrict__ row_tau,      // [n_rows, r]
     const double * __restrict__ row_ruv,      // [n_rows, r*r]
     const double * __restrict__ row_e_obs,    // [n_rows] observed predictor VALUE
+    double       * __restrict__ row_f_au,      // [n_rows, r] general-width scratch
     double       * __restrict__ out_neglog,
     double       * __restrict__ out_grad,
     double       * __restrict__ out_hess,
@@ -464,19 +491,15 @@ extern "C" __global__ void bms_flex_row_kernel(
     if (row >= n_rows) return;
     int tid = threadIdx.x;
 
-    // ── shared scratch (sized to MAX_R = 32) ──────────────────────────────
-    // Layout (doubles):
-    //   F_u      [r]
-    //   F_au     [r]
-    //   F_uv     [r*r]
-    //   bar_e_u  [r]
-    //   reduce_a [blockDim.x]
-    //   reduce_b [blockDim.x]
-    // Sized for the worst case (r = MAX_R = 32).
-    __shared__ double F_u[32];
-    __shared__ double F_au[32];
-    __shared__ double F_uv[32 * 32];
-    __shared__ double bar_e_u[32];
+    // Width-general row scratch. Reuse the final output allocations in-place:
+    // F_u → a_u → gradient and F_uv → a_uv → Hessian. Only F_au needs one
+    // additional checked [n,r] device allocation.
+    size_t row_r_base = (size_t)row * (size_t)r;
+    size_t rr = (size_t)r * (size_t)r;
+    size_t row_rr_base = (size_t)row * rr;
+    double *F_u = out_grad + row_r_base;
+    double *F_au = row_f_au + row_r_base;
+    double *F_uv = out_hess + row_rr_base;
     __shared__ double reduce_a[32];
     __shared__ double reduce_b[32];
     __shared__ double F_a_shared;
@@ -488,7 +511,7 @@ extern "C" __global__ void bms_flex_row_kernel(
         F_u[u]  = 0.0;
         F_au[u] = 0.0;
     }
-    for (int uv = tid; uv < r * r; uv += blockDim.x) {
+    for (size_t uv = (size_t)tid; uv < rr; uv += (size_t)blockDim.x) {
         F_uv[uv] = 0.0;
     }
     __syncthreads();
@@ -583,10 +606,10 @@ extern "C" __global__ void bms_flex_row_kernel(
     F_au[0] = 0.0;
     // Zero the q-cross row/column of F_uv (u == 0 or v == 0), then plant -mu_2 at (0,0).
     for (int v = 0; v < r; ++v) {
-        F_uv[0 * r + v] = 0.0;
-        F_uv[v * r + 0] = 0.0;
+        F_uv[(size_t)v] = 0.0;
+        F_uv[(size_t)v * (size_t)r] = 0.0;
     }
-    F_uv[0 * r + 0] = -mu_2;
+    F_uv[0] = -mu_2;
 
     // Guard: degenerate F_a ⇒ NaN-fill this row's outputs.
     if (!isfinite(F_a) || F_a <= 0.0) {
@@ -595,14 +618,15 @@ extern "C" __global__ void bms_flex_row_kernel(
     }
     double inv_Fa = 1.0 / F_a;
 
-    // Storage consumed by the generated dependency-ordered finalizer.
-    double a_u[32];
-    double a_uv[32 * 32];
+    // Storage consumed by the generated dependency-ordered finalizer. Both
+    // aliases overwrite their no-longer-needed calibration predecessors.
+    double *a_u = F_u;
+    double *a_uv = F_uv;
     double chi = row_chi[row];
     double xi  = row_xi[row];
     const double *rho = row_rho + (size_t)row * r;
     const double *tau = row_tau + (size_t)row * r;
-    const double *ruv = row_ruv + (size_t)row * r * r;
+    const double *ruv = row_ruv + row_rr_base;
 
     // Probit Mills.
     double y    = row_y[row];
@@ -628,12 +652,12 @@ extern "C" __global__ void bms_flex_row_kernel(
         out_status[row] = 2U;
     }
     for (int u = 0; u < r; ++u) {
-        if (!isfinite(out_grad[row * r + u])) {
+        if (!isfinite(out_grad[row_r_base + (size_t)u])) {
             out_status[row] = 2U;
         }
     }
-    for (int uv = 0; uv < r * r; ++uv) {
-        if (!isfinite(out_hess[row * r * r + uv])) {
+    for (size_t uv = 0; uv < rr; ++uv) {
+        if (!isfinite(out_hess[row_rr_base + uv])) {
             out_status[row] = 2U;
         }
     }
@@ -694,7 +718,7 @@ fn build_generated_row_kernel_source() -> String {
                     int l = v - (2 + p_h);
                     explicit_second = D_OF(cell_sbw + ((size_t)c * (size_t)p_w + (size_t)l) * 4);
                 }
-                atomic_add_f64(&F_uv[u * r + v], explicit_second - Q_OF(R_u, R_v));
+                atomic_add_f64(&F_uv[(size_t)u * (size_t)r + (size_t)v], explicit_second - Q_OF(R_u, R_v));
             }
         }
 "#,
@@ -727,25 +751,23 @@ fn build_generated_row_kernel_source() -> String {
                     source.push_str(
                         r#"    for (int u = 0; u < r; ++u) {
         for (int v = u; v < r; ++v) {
-            double term = F_uv[u * r + v]
+            size_t uv = (size_t)u * (size_t)r + (size_t)v;
+            size_t vu = (size_t)v * (size_t)r + (size_t)u;
+            double term = F_uv[uv]
                         + F_au[v] * a_u[u]
                         + F_au[u] * a_u[v]
                         + F_aa * a_u[u] * a_u[v];
             double value = -term * inv_Fa;
-            a_uv[u * r + v] = value;
-            a_uv[v * r + u] = value;
+            a_uv[uv] = value;
+            a_uv[vu] = value;
         }
     }
 "#,
                     );
                 }
                 BmsFlexRowOrder2FinalizerPhase::ObservedFirst => {
-                    source.push_str(
-                        r#"    for (int u = 0; u < r; ++u) {
-        bar_e_u[u] = chi * a_u[u] + rho[u];
-    }
-"#,
-                    );
+                    source
+                        .push_str("    // Observed first derivatives are derived on demand.\n");
                 }
                 BmsFlexRowOrder2FinalizerPhase::ObservedScoreSensitivity => {
                     source.push_str(
@@ -756,15 +778,19 @@ fn build_generated_row_kernel_source() -> String {
                     source.push_str(
                         r#"    for (int u = 0; u < r; ++u) {
         for (int v = u; v < r; ++v) {
-            double observed_second = chi * a_uv[u * r + v]
+            size_t uv = (size_t)u * (size_t)r + (size_t)v;
+            size_t vu = (size_t)v * (size_t)r + (size_t)u;
+            double bar_e_u = chi * a_u[u] + rho[u];
+            double bar_e_v = chi * a_u[v] + rho[v];
+            double observed_second = chi * a_uv[uv]
                                    + xi * a_u[u] * a_u[v]
                                    + tau[u] * a_u[v]
                                    + a_u[u] * tau[v]
-                                   + ruv[u * r + v];
+                                   + ruv[uv];
             double hessian_value =
-                B_i * bar_e_u[u] * bar_e_u[v] + A_i * observed_second;
-            out_hess[row * r * r + u * r + v] = hessian_value;
-            out_hess[row * r * r + v * r + u] = hessian_value;
+                B_i * bar_e_u * bar_e_v + A_i * observed_second;
+            out_hess[row_rr_base + uv] = hessian_value;
+            out_hess[row_rr_base + vu] = hessian_value;
         }
     }
 "#,
@@ -773,7 +799,8 @@ fn build_generated_row_kernel_source() -> String {
                 BmsFlexRowOrder2FinalizerPhase::NegLogFirst => {
                     source.push_str(
                         r#"    for (int u = 0; u < r; ++u) {
-        out_grad[row * r + u] = A_i * bar_e_u[u];
+        double bar_e_u = chi * a_u[u] + rho[u];
+        out_grad[row_r_base + (size_t)u] = A_i * bar_e_u;
     }
 "#,
                     );
@@ -944,6 +971,8 @@ pub(crate) fn launch_linux(
 
     let n = inputs.n_rows;
     let r = inputs.r;
+    let nr = checked_shape_len("launch [n,r]", &[n, r])?;
+    let nrr = checked_shape_len("launch [n,r,r]", &[n, r, r])?;
     let mut d_neglog = stream
         .alloc_zeros::<f64>(n)
         .map_err(|err| GpuError::DriverCallFailed {
@@ -951,16 +980,21 @@ pub(crate) fn launch_linux(
         })?;
     let mut d_grad =
         stream
-            .alloc_zeros::<f64>(n * r)
+            .alloc_zeros::<f64>(nr)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex_row alloc grad: {err}"),
             })?;
     let mut d_hess =
         stream
-            .alloc_zeros::<f64>(n * r * r)
+            .alloc_zeros::<f64>(nrr)
             .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row alloc hess: {err}"),
-            })?;
+            reason: format!("bms_flex_row alloc hess: {err}"),
+        })?;
+    let mut d_f_au = stream
+        .alloc_zeros::<f64>(nr)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row alloc F_au scratch: {err}"),
+        })?;
     let mut d_status = stream
         .alloc_zeros::<u32>(n)
         .map_err(|err| GpuError::DriverCallFailed {
@@ -974,8 +1008,11 @@ pub(crate) fn launch_linux(
             reason: format!("bms_flex_row load_function: {err}"),
         })?;
 
+    let n_u32 = u32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row: n_rows={n} exceeds CUDA grid range"),
+    })?;
     let cfg = LaunchConfig {
-        grid_dim: (n as u32, 1, 1),
+        grid_dim: (n_u32, 1, 1),
         block_dim: (ROW_KERNEL_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -1026,6 +1063,7 @@ pub(crate) fn launch_linux(
         .arg(&d_tau)
         .arg(&d_ruv)
         .arg(&d_e_obs)
+        .arg(&mut d_f_au)
         .arg(&mut d_neglog)
         .arg(&mut d_grad)
         .arg(&mut d_hess)
@@ -1034,9 +1072,9 @@ pub(crate) fn launch_linux(
     // SAFETY: every kernel parameter above is either a primitive `i32` /
     // `f64` (passed by value), a const device pointer to a buffer whose
     // length the host validated against the input struct, or an output
-    // buffer pre-allocated to `n_rows`, `n_rows*r`, `n_rows*r*r`
-    // doubles. The kernel's shared-memory arrays are sized to MAX_R = 32
-    // and validate() rejects r > MAX_R.
+    // buffers pre-allocated to checked `n_rows`, `n_rows*r`, and
+    // `n_rows*r*r` lengths. Primary-width scratch aliases those outputs plus
+    // the checked `d_f_au` allocation; no fixed-width device array exists.
     unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
         reason: format!("bms_flex_row launch: {err}"),
     })?;
@@ -1256,6 +1294,29 @@ pub(crate) const HVP_KERNEL_SOURCE: &str = r#"
 
 #define MAX_MULTI_RHS 8
 
+__device__ __forceinline__ double bms_flex_primary_direction(
+    int primary_idx,
+    int h_block_start,
+    int h_block_len,
+    int w_block_start,
+    int w_block_len,
+    int h_primary_start,
+    int w_primary_start,
+    double direction_q,
+    double direction_g,
+    const double * __restrict__ v)
+{
+    if (primary_idx == 0) return direction_q;
+    if (primary_idx == 1) return direction_g;
+    if (primary_idx >= h_primary_start && primary_idx < h_primary_start + h_block_len) {
+        return v[h_block_start + primary_idx - h_primary_start];
+    }
+    if (primary_idx >= w_primary_start && primary_idx < w_primary_start + w_block_len) {
+        return v[w_block_start + primary_idx - w_primary_start];
+    }
+    return 0.0;
+}
+
 extern "C" __global__ void bms_flex_row_hvp_partial(
     int                  n_rows,
     int                  r,
@@ -1288,16 +1349,13 @@ extern "C" __global__ void bms_flex_row_hvp_partial(
     }
     __syncthreads();
 
-    // Each thread serially processes a stride-of-blockDim set of rows so
-    // every write to `out[..]` happens from one thread → no atomics within
-    // the chunk. To keep writes race-free across threads of the same chunk,
-    // we serialize the cross-row accumulation through a per-row barrier:
-    // thread 0 of the block processes all rows in the chunk. The per-row
-    // work is dominated by the dot/axpy over `p_m + p_g`, which is large.
-    // For Stage 3 we ship the simple, correct path (thread 0 sequential
-    // per row, blockDim.x threads parallel within a row's dot/axpy).
-    __shared__ double row_dir[32];
-    __shared__ double action[32];
+    // Width-general scratch: only the two design directions/actions are
+    // shared. Every h/w direction is read directly from v, and the thread
+    // owning primary coordinate u accumulates that coordinate's action.
+    __shared__ double direction_q;
+    __shared__ double direction_g;
+    __shared__ double action_q;
+    __shared__ double action_g;
     __shared__ double dot_reduce[128];
 
     for (int row = row_lo; row < row_hi; ++row) {
@@ -1316,7 +1374,7 @@ extern "C" __global__ void bms_flex_row_hvp_partial(
             if (tid < stride) dot_reduce[tid] += dot_reduce[tid + stride];
             __syncthreads();
         }
-        if (tid == 0) row_dir[0] = dot_reduce[0];
+        if (tid == 0) direction_q = dot_reduce[0];
 
         // row_dir[1] = grow · v[p_m..p_m+p_g]
         local = 0.0;
@@ -1329,46 +1387,40 @@ extern "C" __global__ void bms_flex_row_hvp_partial(
             if (tid < stride) dot_reduce[tid] += dot_reduce[tid + stride];
             __syncthreads();
         }
-        if (tid == 0) row_dir[1] = dot_reduce[0];
-
-        // h/w blocks: direct copy.
-        if (tid == 0) {
-            for (int k = 0; k < h_block_len; ++k) {
-                row_dir[h_primary_start + k] = v[h_block_start + k];
-            }
-            for (int k = 0; k < w_block_len; ++k) {
-                row_dir[w_primary_start + k] = v[w_block_start + k];
-            }
-        }
+        if (tid == 0) direction_g = dot_reduce[0];
         __syncthreads();
 
-        // action[u] = Σ_v Hrow[u*r+v] · row_dir[v], computed by thread u (u < r).
-        if (tid < r) {
+        for (int u = tid; u < r; u += blockDim.x) {
             double acc = 0.0;
             for (int vv = 0; vv < r; ++vv) {
-                acc += Hrow[tid * r + vv] * row_dir[vv];
+                double row_direction = bms_flex_primary_direction(
+                    vv,
+                    h_block_start, h_block_len,
+                    w_block_start, w_block_len,
+                    h_primary_start, w_primary_start,
+                    direction_q, direction_g, v);
+                acc += Hrow[(size_t)u * (size_t)r + (size_t)vv] * row_direction;
             }
-            action[tid] = acc;
+            if (u == 0) {
+                action_q = acc;
+            } else if (u == 1) {
+                action_g = acc;
+            } else if (u >= h_primary_start && u < h_primary_start + h_block_len) {
+                out[h_block_start + u - h_primary_start] += acc;
+            } else if (u >= w_primary_start && u < w_primary_start + w_block_len) {
+                out[w_block_start + u - w_primary_start] += acc;
+            }
         }
         __syncthreads();
 
         // Pull back into joint β slot.
-        //   marginal: out[j] += action[0] · mrow[j]   (parallel j)
-        double a0 = action[0];
+        double a0 = action_q;
         for (int j = tid; j < p_m; j += blockDim.x) {
             out[j] += a0 * mrow[j];
         }
-        double a1 = action[1];
+        double a1 = action_g;
         for (int j = tid; j < p_g; j += blockDim.x) {
             out[p_m + j] += a1 * grow[j];
-        }
-        if (tid == 0) {
-            for (int k = 0; k < h_block_len; ++k) {
-                out[h_block_start + k] += action[h_primary_start + k];
-            }
-            for (int k = 0; k < w_block_len; ++k) {
-                out[w_block_start + k] += action[w_primary_start + k];
-            }
         }
         __syncthreads();
     }
@@ -1502,8 +1554,10 @@ extern "C" __global__ void bms_flex_row_hvp_multi_partial(
     }
     __syncthreads();
 
-    __shared__ double row_dir[MAX_MULTI_RHS * 32];
-    __shared__ double action[MAX_MULTI_RHS * 32];
+    __shared__ double direction_q[MAX_MULTI_RHS];
+    __shared__ double direction_g[MAX_MULTI_RHS];
+    __shared__ double action_q[MAX_MULTI_RHS];
+    __shared__ double action_g[MAX_MULTI_RHS];
     __shared__ double dot_reduce[128];
 
     for (int row = row_lo; row < row_hi; ++row) {
@@ -1524,7 +1578,7 @@ extern "C" __global__ void bms_flex_row_hvp_multi_partial(
                 if (tid < stride) dot_reduce[tid] += dot_reduce[tid + stride];
                 __syncthreads();
             }
-            if (tid == 0) row_dir[rhs * 32 + 0] = dot_reduce[0];
+            if (tid == 0) direction_q[rhs] = dot_reduce[0];
 
             local = 0.0;
             for (int j = tid; j < p_g; j += blockDim.x) {
@@ -1536,47 +1590,47 @@ extern "C" __global__ void bms_flex_row_hvp_multi_partial(
                 if (tid < stride) dot_reduce[tid] += dot_reduce[tid + stride];
                 __syncthreads();
             }
-            if (tid == 0) {
-                row_dir[rhs * 32 + 1] = dot_reduce[0];
-                for (int k = 0; k < h_block_len; ++k) {
-                    row_dir[rhs * 32 + h_primary_start + k] = v[h_block_start + k];
-                }
-                for (int k = 0; k < w_block_len; ++k) {
-                    row_dir[rhs * 32 + w_primary_start + k] = v[w_block_start + k];
-                }
-            }
+            if (tid == 0) direction_g[rhs] = dot_reduce[0];
             __syncthreads();
         }
 
-        for (int idx = tid; idx < rhs_count * r; idx += blockDim.x) {
-            int rhs = idx / r;
-            int u = idx - rhs * r;
+        size_t total_actions = (size_t)rhs_count * (size_t)r;
+        for (size_t idx = (size_t)tid; idx < total_actions; idx += (size_t)blockDim.x) {
+            int rhs = (int)(idx / (size_t)r);
+            int u = (int)(idx - (size_t)rhs * (size_t)r);
+            const double *v = v_rhs + (size_t)rhs * (size_t)p_total;
+            double *out = partial + ((size_t)rhs * (size_t)num_chunks + (size_t)chunk) * (size_t)p_total;
             double acc = 0.0;
-            const double *dir = row_dir + rhs * 32;
             for (int vv = 0; vv < r; ++vv) {
-                acc += Hrow[u * r + vv] * dir[vv];
+                double row_direction = bms_flex_primary_direction(
+                    vv,
+                    h_block_start, h_block_len,
+                    w_block_start, w_block_len,
+                    h_primary_start, w_primary_start,
+                    direction_q[rhs], direction_g[rhs], v);
+                acc += Hrow[(size_t)u * (size_t)r + (size_t)vv] * row_direction;
             }
-            action[rhs * 32 + u] = acc;
+            if (u == 0) {
+                action_q[rhs] = acc;
+            } else if (u == 1) {
+                action_g[rhs] = acc;
+            } else if (u >= h_primary_start && u < h_primary_start + h_block_len) {
+                out[h_block_start + u - h_primary_start] += acc;
+            } else if (u >= w_primary_start && u < w_primary_start + w_block_len) {
+                out[w_block_start + u - w_primary_start] += acc;
+            }
         }
         __syncthreads();
 
         for (int rhs = 0; rhs < rhs_count; ++rhs) {
             double *out = partial + ((size_t)rhs * (size_t)num_chunks + (size_t)chunk) * (size_t)p_total;
-            double a0 = action[rhs * 32 + 0];
+            double a0 = action_q[rhs];
             for (int j = tid; j < p_m; j += blockDim.x) {
                 out[j] += a0 * mrow[j];
             }
-            double a1 = action[rhs * 32 + 1];
+            double a1 = action_g[rhs];
             for (int j = tid; j < p_g; j += blockDim.x) {
                 out[p_m + j] += a1 * grow[j];
-            }
-            if (tid == 0) {
-                for (int k = 0; k < h_block_len; ++k) {
-                    out[h_block_start + k] += action[rhs * 32 + h_primary_start + k];
-                }
-                for (int k = 0; k < w_block_len; ++k) {
-                    out[w_block_start + k] += action[rhs * 32 + w_primary_start + k];
-                }
             }
             __syncthreads();
         }
@@ -2103,21 +2157,25 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     }
     let n = inputs.n_rows;
     let r = inputs.r;
-    if marginal_design_row_major.len() != n * block.p_m {
+    let nr = checked_shape_len("device-resident [n,r]", &[n, r])?;
+    let nrr = checked_shape_len("device-resident [n,r,r]", &[n, r, r])?;
+    let marginal_len = checked_shape_len("device-resident marginal design", &[n, block.p_m])?;
+    let logslope_len = checked_shape_len("device-resident logslope design", &[n, block.p_g])?;
+    if marginal_design_row_major.len() != marginal_len {
         return Err(GpuError::DriverCallFailed {
             reason: format!(
                 "bms_flex_row device-resident: marginal_design len={} != n*p_m={}",
                 marginal_design_row_major.len(),
-                n * block.p_m
+                marginal_len
             ),
         });
     }
-    if logslope_design_row_major.len() != n * block.p_g {
+    if logslope_design_row_major.len() != logslope_len {
         return Err(GpuError::DriverCallFailed {
             reason: format!(
                 "bms_flex_row device-resident: logslope_design len={} != n*p_g={}",
                 logslope_design_row_major.len(),
-                n * block.p_g
+                logslope_len
             ),
         });
     }
@@ -2196,16 +2254,21 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
         })?;
     let mut d_grad =
         stream
-            .alloc_zeros::<f64>(n * r)
+            .alloc_zeros::<f64>(nr)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex_row device-resident alloc grad: {err}"),
             })?;
     let mut d_hess =
         stream
-            .alloc_zeros::<f64>(n * r * r)
+            .alloc_zeros::<f64>(nrr)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex_row device-resident alloc hess: {err}"),
             })?;
+    let mut d_f_au = stream
+        .alloc_zeros::<f64>(nr)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident alloc F_au scratch: {err}"),
+        })?;
     let mut d_status = stream
         .alloc_zeros::<u32>(n)
         .map_err(|err| GpuError::DriverCallFailed {
@@ -2219,8 +2282,13 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
             reason: format!("bms_flex_row device-resident load_function: {err}"),
         })?;
 
+    let n_u32 = u32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!(
+            "bms_flex_row device-resident: n_rows={n} exceeds CUDA grid range"
+        ),
+    })?;
     let cfg = LaunchConfig {
-        grid_dim: (n as u32, 1, 1),
+        grid_dim: (n_u32, 1, 1),
         block_dim: (ROW_KERNEL_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -2277,6 +2345,7 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
         .arg(&d_tau)
         .arg(&d_ruv)
         .arg(&d_e_obs)
+        .arg(&mut d_f_au)
         .arg(&mut d_neglog)
         .arg(&mut d_grad)
         .arg(&mut d_hess)
@@ -2312,6 +2381,7 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
         });
     }
     drop(d_status);
+    drop(d_f_au);
 
     // Drop the per-cell uploads; keep the canonical row value, gradient,
     // Hessian, and both pullback designs in one device-resident authority.

@@ -687,8 +687,8 @@ fn cross_fitted_holonomy_from_ambient(
 ) -> Result<gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyCertificate, String> {
     use gam::terms::sae::inference::atlas_holonomy::{
         AtlasFamilywiseLevel, AtlasHolonomyCertificate, GaussianPatchRowSplit,
-        GaussianPcaCovarianceAuthority, GaussianPcaErrorModel, GaussianPcaPatch,
-        PopulationCrossGramProvenance, ProjectedAtlasEdgeSpec,
+        GaussianPcaErrorModel, GaussianPcaPatch, PopulationCrossGramProvenance,
+        ProjectedAtlasEdgeSpec,
     };
     if data.ncols() < 3 {
         return Err(format!(
@@ -733,10 +733,7 @@ fn cross_fitted_holonomy_from_ambient(
             data.ncols(),
         )?);
     }
-    let error_model = GaussianPcaErrorModel::independent(
-        &patches,
-        GaussianPcaCovarianceAuthority::AsymptoticPlugIn,
-    )?;
+    let error_model = GaussianPcaErrorModel::independent(&patches)?;
     let edge_specs = admitted_edges
         .iter()
         .copied()
