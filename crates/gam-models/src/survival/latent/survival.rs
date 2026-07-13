@@ -4768,9 +4768,7 @@ pub fn latent_binary_alo_row_geometry(
             let source_left = primary_indices[left];
             let source_right = primary_indices[right];
             binary.neg_hess_scale * survival_negative_hessian[[source_left, source_right]]
-                + binary.outer_scale
-                    * survival_score[source_left]
-                    * survival_score[source_right]
+                + binary.outer_scale * survival_score[source_left] * survival_score[source_right]
         });
     let nll_score = checked_saved_alo_scale_vector(
         binary_log_likelihood_score,

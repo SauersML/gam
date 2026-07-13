@@ -10,6 +10,8 @@ use gam_models::inference::model::{
     FittedFamily, FittedModel, PredictModelClass, binomial_location_scale_threshold_beta,
     gaussian_location_scale_mean_beta, location_scale_noise_beta,
 };
+use gam_models::quadrature::QuadratureContext;
+use gam_models::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
 use gam_models::survival::{
     CauseSpecificSurvivalAloRowInput, LatentBinaryAloRowInput, LatentSurvivalAloRowInput,
     LatentSurvivalAloSigma, SurvivalLikelihoodMode, SurvivalLocationScaleAloRowInput,
@@ -20,18 +22,16 @@ use gam_models::survival::{
     survival_event_code_from_value, survival_location_scale_alo_row_geometry,
     survival_location_scale_time_wiggle_basis_authority,
 };
-use gam_models::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
-use gam_models::quadrature::QuadratureContext;
 use gam_models::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalAloRowInput,
     transformation_normal_alo_row_geometry,
 };
 use gam_problem::{BlockRole, EstimationError, Gauge, ResponseFamily};
-use gam_solve::model_types::UnifiedFitResult;
 use gam_solve::inference::alo::{
     AloInput, MultiBlockAloDiagnostics, MultiBlockAloInput, compute_alo_from_input,
     compute_multiblock_alo,
 };
+use gam_solve::model_types::UnifiedFitResult;
 use gam_spec::{GlmLikelihoodSpec, LinkFunction};
 use gam_terms::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
@@ -1961,8 +1961,10 @@ fn saved_latent_block_ranges(
         )));
     }
     Ok(SavedLatentBlockRanges {
-        time: time.ok_or_else(|| invalid(format!("saved {context} ALO is missing its time block")))?,
-        mean: mean.ok_or_else(|| invalid(format!("saved {context} ALO is missing its mean block")))?,
+        time: time
+            .ok_or_else(|| invalid(format!("saved {context} ALO is missing its time block")))?,
+        mean: mean
+            .ok_or_else(|| invalid(format!("saved {context} ALO is missing its mean block")))?,
         scale,
     })
 }
@@ -2248,7 +2250,11 @@ fn compute_saved_latent_binary_alo(
     }
     compute_saved_multicoordinate_core(
         class,
-        vec!["q-entry".to_string(), "q-exit".to_string(), "mu".to_string()],
+        vec![
+            "q-entry".to_string(),
+            "q-exit".to_string(),
+            "mu".to_string(),
+        ],
         vec![
             input.rows.time.design_entry.clone(),
             input.rows.time.design_exit.clone(),

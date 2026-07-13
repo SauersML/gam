@@ -256,34 +256,6 @@ impl LogslopeLayout {
         })
     }
 
-    /// Evaluate every physical log-slope channel at one current-coordinate
-    /// coefficient vector. This is the sole batch evaluator for pilot,
-    /// identifiability, and converged-state geometry; it delegates each row to
-    /// the same callback kernel used by the likelihood.
-    pub(crate) fn physical_values(
-        &self,
-        score_dim: usize,
-        beta: ArrayView1<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        self.validate_for(score_dim)?;
-        if beta.len() != self.current_width {
-            return Err(format!(
-                "logslope physical-value beta length {} does not match current width {}",
-                beta.len(),
-                self.current_width,
-            ));
-        }
-        let mut values = Array2::<f64>::zeros((self.nrows, score_dim));
-        let mut workspace = self.row_workspace(score_dim)?;
-        for row in 0..self.nrows {
-            self.fill_callback_row(row, beta.view(), &mut workspace)?;
-            for channel in 0..score_dim {
-                values[[row, channel]] = workspace.values[channel];
-            }
-        }
-        Ok(values)
-    }
-
     /// Stream the physical-channel coefficient Jacobian for a row range.
     ///
     /// `out` is row-major in the primary channel: row
@@ -575,6 +547,30 @@ mod tests {
             );
             self.current_width = design.ncols();
             self.coefficient_design = design;
+        }
+
+        fn physical_values(
+            &self,
+            score_dim: usize,
+            beta: ArrayView1<'_, f64>,
+        ) -> Result<Array2<f64>, String> {
+            self.validate_for(score_dim)?;
+            if beta.len() != self.current_width {
+                return Err(format!(
+                    "logslope physical-value beta length {} does not match current width {}",
+                    beta.len(),
+                    self.current_width,
+                ));
+            }
+            let mut values = Array2::<f64>::zeros((self.nrows, score_dim));
+            let mut workspace = self.row_workspace(score_dim)?;
+            for row in 0..self.nrows {
+                self.fill_callback_row(row, beta.view(), &mut workspace)?;
+                for channel in 0..score_dim {
+                    values[[row, channel]] = workspace.values[channel];
+                }
+            }
+            Ok(values)
         }
     }
 

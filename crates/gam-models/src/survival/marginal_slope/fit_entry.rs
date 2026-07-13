@@ -5,6 +5,33 @@ use super::*;
 /// Per-matrix byte budget for the construction-time identifiability preflight.
 const PREFLIGHT_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// Materialize physical log-slope channels only at the two fit-entry
+/// boundaries that require a dense row-state matrix.  Every row is evaluated
+/// by the same callback authority as the likelihood; the layout deliberately
+/// does not expose a second batch-evaluation API.
+fn stream_logslope_channel_values(
+    layout: &LogslopeLayout,
+    row_count: usize,
+    score_dim: usize,
+    beta: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    if layout.coefficient_design().nrows() != row_count {
+        return Err(format!(
+            "logslope layout has {} rows but the fit boundary requires {row_count}",
+            layout.coefficient_design().nrows(),
+        ));
+    }
+    let mut workspace = layout.row_workspace(score_dim)?;
+    let mut values = Array2::<f64>::zeros((row_count, score_dim));
+    for row in 0..row_count {
+        layout.fill_callback_row(row, beta.view(), &mut workspace)?;
+        for (channel, value) in workspace.values().iter().copied().enumerate() {
+            values[[row, channel]] = value;
+        }
+    }
+    Ok(values)
+}
+
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: SurvivalMarginalSlopeTermSpec,
@@ -159,8 +186,12 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     }
     let origin_logslope_beta =
         Array1::<f64>::zeros(raw_logslope_layout.coefficient_design().ncols());
-    let origin_slopes =
-        raw_logslope_layout.physical_values(spec.z.ncols(), origin_logslope_beta.view())?;
+    let origin_slopes = stream_logslope_channel_values(
+        &raw_logslope_layout,
+        n,
+        spec.z.ncols(),
+        origin_logslope_beta.view(),
+    )?;
 
     // Phase-4b parametric identifiability pre-flight (observability-only).
     //
@@ -2668,9 +2699,12 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 q1[i] = time_q1[i] + ctx.offset_exit[i] + marginal_eta[i];
                 qd1[i] = time_qd1[i] + ctx.derivative_offset_exit[i];
             }
-            let slopes = ctx
-                .logslope_layout
-                .physical_values(ctx.z.ncols(), beta_logslope.view())?;
+            let slopes = stream_logslope_channel_values(
+                &ctx.logslope_layout,
+                n_rows,
+                ctx.z.ncols(),
+                beta_logslope.view(),
+            )?;
             let row_hess = SurvivalRowHessian::from_pilot_primary_state(
                 &q0,
                 &q1,

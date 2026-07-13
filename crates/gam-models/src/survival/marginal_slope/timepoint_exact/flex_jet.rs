@@ -153,6 +153,12 @@ trait FlexJet: JetField + Clone {
     /// A value-zero perturbation raised to `ORDER + 1` is identically zero, so
     /// generic Taylor-polynomial builders must stop at this exact order.
     const ORDER: usize;
+
+    /// Scale every derivative channel by its total homogeneous order. Entry
+    /// `factors[r]` applies to channels carrying exactly `r` derivatives.
+    /// This is the representation-independent Euler-operator seam used by the
+    /// distinguished calibration projector.
+    fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self;
 }
 
 const FLEX_OUTER_SOURCE_COUNT: usize = 6;
@@ -562,6 +568,24 @@ impl Jet2 {
     fn p(&self) -> usize {
         self.g.len()
     }
+
+    #[inline]
+    fn scale_homogeneous_from(&self, offset: usize, factors: [f64; 5]) -> Self {
+        assert!(offset + 2 < factors.len());
+        Jet2 {
+            v: factors[offset] * self.v,
+            g: self
+                .g
+                .iter()
+                .map(|&channel| factors[offset + 1] * channel)
+                .collect(),
+            h: self
+                .h
+                .iter()
+                .map(|&channel| factors[offset + 2] * channel)
+                .collect(),
+        }
+    }
 }
 
 impl JetField for Jet2 {
@@ -653,6 +677,11 @@ impl JetField for Jet2 {
 
 impl FlexJet for Jet2 {
     const ORDER: usize = 2;
+
+    #[inline]
+    fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
+        self.scale_homogeneous_from(0, factors)
+    }
 }
 
 // ── Jet1: value + gradient only (grad-only path, no discarded Hessian) ──────
@@ -749,6 +778,18 @@ impl JetField for Jet1 {
 
 impl FlexJet for Jet1 {
     const ORDER: usize = 1;
+
+    #[inline]
+    fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
+        Jet1 {
+            v: factors[0] * self.v,
+            g: self
+                .g
+                .iter()
+                .map(|&channel| factors[1] * channel)
+                .collect(),
+        }
+    }
 }
 
 // ── Jet3: one-seed directional, contracted third (doc §A.2) ────────────────
@@ -820,6 +861,14 @@ impl JetField for Jet3 {
 
 impl FlexJet for Jet3 {
     const ORDER: usize = 3;
+
+    #[inline]
+    fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
+        Jet3 {
+            base: self.base.scale_homogeneous_from(0, factors),
+            eps: self.eps.scale_homogeneous_from(1, factors),
+        }
+    }
 }
 
 /// Arena-backed one-seed scalar for the production directional timepoint
@@ -910,6 +959,29 @@ impl JetField for ArenaJet3<'_> {
 
 impl FlexJet for ArenaJet3<'_> {
     const ORDER: usize = 3;
+
+    #[inline]
+    fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
+        let dimension = self.inner.base.g.len();
+        let scale_order2 = |channels: &DynamicOrder2<'_>, offset: usize| {
+            DynamicOrder2::from_channel_functions(
+                factors[offset] * channels.v,
+                dimension,
+                self.arena,
+                |axis| factors[offset + 1] * channels.g[axis],
+                |row, column| {
+                    factors[offset + 2] * channels.h[row * dimension + column]
+                },
+            )
+        };
+        Self {
+            arena: self.arena,
+            inner: DynamicOneSeed {
+                base: scale_order2(&self.inner.base, 0),
+                eps: scale_order2(&self.inner.eps, 1),
+            },
+        }
+    }
 }
 
 /// Inline fixed-width one-seed scalar for the common eight-primary FLEX row.
@@ -988,6 +1060,30 @@ impl<const K: usize> JetField for FixedJet3<K> {
 
 impl<const K: usize> FlexJet for FixedJet3<K> {
     const ORDER: usize = 3;
+
+    #[inline]
+    fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
+        let scale_order2 = |channels: &Order2<K>, offset: usize| {
+            let mut scaled = Tower2::<K>::zero();
+            scaled.v = factors[offset] * channels.0.v;
+            for axis in 0..K {
+                scaled.g[axis] = factors[offset + 1] * channels.0.g[axis];
+            }
+            for row in 0..K {
+                for column in 0..K {
+                    scaled.h[row][column] =
+                        factors[offset + 2] * channels.0.h[row][column];
+                }
+            }
+            Order2(scaled)
+        };
+        Self {
+            inner: OneSeed {
+                base: scale_order2(&self.inner.base, 0),
+                eps: scale_order2(&self.inner.eps, 1),
+            },
+        }
+    }
 }
 
 trait FlexThirdOutput: FlexJet + MomentTerm {
@@ -1168,6 +1264,16 @@ impl JetField for Jet4 {
 
 impl FlexJet for Jet4 {
     const ORDER: usize = 4;
+
+    #[inline]
+    fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
+        Jet4 {
+            base: self.base.scale_homogeneous_from(0, factors),
+            eps: self.eps.scale_homogeneous_from(1, factors),
+            del: self.del.scale_homogeneous_from(1, factors),
+            eps_del: self.eps_del.scale_homogeneous_from(2, factors),
+        }
+    }
 }
 
 /// `Σ_i x[i]·y[i]` over equal-length slices.
@@ -1578,48 +1684,26 @@ fn add_const<J: FlexJet>(x: &J, c: f64) -> J {
 /// contracted-channel helpers, avoiding the orphaned-`dead_code` gate while
 /// preserving the exact derivations.
 trait MomentTerm: FlexJet {
-    fn moment_term(&self, m: &Self) -> Self;
-}
-
-impl MomentTerm for Jet2 {
-    fn moment_term(&self, m: &Self) -> Self {
-        // `self` = c_k (value stripped here, only θ-derivatives enter the residual),
-        // `m` = M_k. The exact residual term keeps the j/(j+m) Leibniz weights:
-        //   R.g[i]    = c_g[i]·M_v                                   (j=1: weight 1)
-        //   R.h[i][j] = c_h[i][j]·M_v                                (j=2: weight 1)
-        //             + ½·(c_g[i]·M_g[j] + c_g[j]·M_g[i])            (j=1,m=1: weight ½)
-        let p = self.p();
-        let mut g = vec![0.0; p];
-        let mut h = vec![0.0; p * p];
-        for i in 0..p {
-            g[i] = self.g[i] * m.v;
-        }
-        for i in 0..p {
-            for j in 0..p {
-                h[i * p + j] =
-                    self.h[i * p + j] * m.v + 0.5 * (self.g[i] * m.g[j] + self.g[j] * m.g[i]);
-            }
-        }
-        Jet2 { v: 0.0, g, h }
+    fn moment_term(&self, moment: &Self) -> Self {
+        // Let E be the Euler operator that multiplies every homogeneous
+        // derivative channel of order j by j. For total order n=j+m,
+        //
+        //     E⁻¹((E C) M)
+        //
+        // assigns the ordinary Leibniz split C_A M_B the required
+        // distinguished-slot weight j/n. The jet product supplies every
+        // partition and its multiplicity; the two order maps below therefore
+        // generate the complete projector for every represented order without
+        // an order-specific coefficient table.
+        const EULER: [f64; 5] = [0.0, 1.0, 2.0, 3.0, 4.0];
+        const EULER_INVERSE: [f64; 5] = [0.0, 1.0, 0.5, 1.0 / 3.0, 0.25];
+        self.scale_homogeneous_orders(EULER)
+            .mul(moment)
+            .scale_homogeneous_orders(EULER_INVERSE)
     }
 }
 
-impl MomentTerm for Jet1 {
-    fn moment_term(&self, m: &Self) -> Self {
-        // Grad-only calibration residual term: the order-≤1 truncation of the
-        // [`Jet2`] `moment_term`. The value is stripped (F's VALUE is carried by
-        // the scalar seed) and the gradient keeps the same `j=1` Leibniz weight 1:
-        //   R.g[i] = c_g[i]·M_v
-        // (bit-identical to the `Jet2` gradient line). The order-2 Hessian channel
-        // the `Jet2` term also assembles is simply absent at this order.
-        let p = self.p();
-        let mut g = vec![0.0; p];
-        for i in 0..p {
-            g[i] = self.g[i] * m.v;
-        }
-        Jet1 { v: 0.0, g }
-    }
-}
+impl<J: FlexJet> MomentTerm for J {}
 
 /// #932 item-2 Phase B-base: the normalization base moments `M_0..M_4` as jets,
 /// carrying their exact θ-derivatives (incl. the moving-edge flux), built from

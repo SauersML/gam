@@ -1491,17 +1491,14 @@ fn build_saved_latent_window_alo_input(
     let mean_build = build_term_collection_design(design_input, &termspec)
         .map_err(|error| format!("failed to build saved latent-window ALO mean design: {error}"))?;
     let mean_offset = mean_build
-        .compose_offset(
-            primary_offset.view(),
-            "saved latent-window ALO mean block",
-        )
+        .compose_offset(primary_offset.view(), "saved latent-window ALO mean block")
         .map_err(|error| error.to_string())?;
 
     let time_config = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_config, None)?;
-    let anchor = model
-        .survival_time_anchor
-        .ok_or_else(|| "saved latent-window ALO model is missing survival_time_anchor".to_string())?;
+    let anchor = model.survival_time_anchor.ok_or_else(|| {
+        "saved latent-window ALO model is missing survival_time_anchor".to_string()
+    })?;
     let resolved_time_config = resolved_survival_time_basis_config_from_build(
         &time_build.basisname,
         time_build.degree,
@@ -1515,10 +1512,7 @@ fn build_saved_latent_window_alo_input(
         &mut time_build.x_exit_time,
         &anchor_row,
     )?;
-    require_structural_survival_time_basis(
-        &time_build.basisname,
-        "saved latent-window ALO",
-    )?;
+    require_structural_survival_time_basis(&time_build.basisname, "saved latent-window ALO")?;
     let baseline_config = saved_survival_runtime_baseline_config(model)?;
     let (_, loading) = fixed_hazard_multiplier_from_saved_family(&model.family_state)?;
     let prepared = prepare_survival_time_stack(
