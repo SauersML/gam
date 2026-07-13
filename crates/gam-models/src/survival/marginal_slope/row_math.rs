@@ -1075,8 +1075,9 @@ mod tests {
         }
     }
 
-    /// Temporary #932 release measurement. Removed immediately after the
-    /// exact-SHA MSI result is captured.
+    /// #932 release measurement of the canonical lowering against the retired
+    /// strongest hand schedule. Timing is diagnostic only; channel parity is
+    /// the deterministic test contract.
     #[test]
     fn release_measure_canonical_rigid_order2_vs_strongest_hand_932() {
         use std::hint::black_box;
