@@ -4,8 +4,8 @@
 // `SaeManifoldTerm` methods that turn the converged cache into the per-row
 // `SaeRowJets` the streaming log-det consumes: the row reconstruction program
 // builder, the const-generic reconstruction / β-border channel fills (and
-// their dynamic dispatchers), the scalar and 4-row-SIMD-batch row-jet
-// builders, and the bounded look-ahead window refill. Included via `include!`
+// their dynamic dispatchers), the unified structure-compiled row-jet builder,
+// and the bounded tile refill. Included via `include!`
 // from `construction.rs` so they keep the SAME module scope (`use super::*`),
 // the same `impl SaeManifoldTerm` surface, and full private-field access.
 
@@ -410,8 +410,8 @@ mod tests_softmax_hand_reference {
         ///
         /// The generic jet is retained as an independent oracle: the program
         /// tower (`SaeReconstructionRowProgram::reconstruction_column` /
-        /// `reconstruction_all_columns_packed` / `beta_border_tower`, plus the SIMD
-        /// `reconstruction_all_columns_batch4`) is cross-checked against this hand
+        /// `reconstruction_all_columns_packed` / `beta_border_tower`) is
+        /// cross-checked against this hand
         /// arithmetic to ≤1e-9 (value/grad) / ≤1e-8 (Hessian) by
         /// `sae_row_jet_program_matches_production_row_jets_on_converged_cache` (on a
         /// real converged cache, weighted + unweighted √w arms) and by the
@@ -702,8 +702,8 @@ impl SaeManifoldTerm {
             | AssignmentMode::TopK { .. } => {
                 // PER-ATOM modes keep the jet path: value-preserving (their hand
                 // gate prior diverged from the live ordered-geometric prior, and
-                // the batched SIMD speedup that motivated the revert is
-                // softmax-only anyway). TopK is the degenerate member: its gates
+                // the structure-compiled softmax schedule does not apply to
+                // these gate graphs). TopK is the degenerate member: its gates
                 // are constants {0, 1} with NO logit variables in the row block
                 // (`assignment_coord_dim() == 0`), so the program simply carries
                 // no gate channels.

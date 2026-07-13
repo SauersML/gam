@@ -3888,8 +3888,7 @@ impl SaeManifoldTerm {
     // [#780 line-count gate] The per-row jet / reconstruction-channel cluster
     // (`reconstruction_row_program_for_logdet`, the const-generic
     // reconstruction / β-border channel fills and their dynamic dispatchers,
-    // `row_jets_for_logdet`, `row_jets_for_logdet_batch4`, `batch4_assemble`,
-    // and `refill_jet_window`) lives in the sibling
+    // `row_jets_for_logdet`, and `refill_jet_window`) lives in the sibling
     // `construction_row_jet_logdet_channels.rs` file, inlined via `include!`
     // below at module scope as a second `impl SaeManifoldTerm` block. Splitting
     // it out keeps this tracked file under the 10k limit; `include!` preserves
@@ -4433,9 +4432,9 @@ impl SaeManifoldTerm {
 
         // #1557 — reuse one K-sized scratch row across all N rows (alias-free).
         let mut assignments = Array1::<f64>::zeros(self.k_atoms());
-        // #932 SIMD: jets are built in aligned 4-row SIMD batches through a
-        // bounded (≤4-row) look-ahead window; unaligned / non-softmax / remainder
-        // rows fall back to the scalar per-row path (bit-identical either way).
+        // #932 complete schedule: softmax rows are built in memory-ledgered
+        // CPU/CUDA tiles through one bounded look-ahead window; non-softmax
+        // gates use their distinct dynamic row program.
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
