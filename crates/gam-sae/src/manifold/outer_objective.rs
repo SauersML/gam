@@ -309,13 +309,10 @@ pub enum SaeOuterVerdict {
     /// No outer ρ-search ran: the caller pinned ρ, so only the inner solve's
     /// KKT certificate applies.
     FixedRho,
-    /// #2266 — neither an outer ρ-search NOR an inner solve ran: the decoder /
-    /// coordinates / gate logits / ρ were installed verbatim from an
-    /// externally-trained (e.g. torch-lane) fit by
-    /// `run_sae_manifold_certify` (#2266). There is no first-order
-    /// stationarity certificate for this state — only the post-fit
-    /// diagnostics/certificates computed AT it.
-    External,
+    /// No optimizer ran: the caller-installed inner state and ρ independently
+    /// passed the same analytic inner-KKT and outer-criterion stationarity
+    /// authorities a native fit must pass (#2263).
+    Audited(OuterConvergedVia),
 }
 
 impl SaeOuterVerdict {
@@ -325,7 +322,7 @@ impl SaeOuterVerdict {
         match self {
             Self::Search(via) => via.as_str(),
             Self::FixedRho => "fixed_rho",
-            Self::External => "external",
+            Self::Audited(_) => "audited_stationary",
         }
     }
 }
@@ -689,6 +686,11 @@ pub struct SaeManifoldOuterObjective {
     /// only [`Self::fit_at_fixed_rho`] or [`Self::certify_outer_result`] may
     /// stamp a fit-producing verdict.
     fit_verdict: Option<SaeOuterVerdict>,
+    /// True only while auditing a caller-installed external state (#2263). The
+    /// ordinary analytic outer evaluation warm-starts coordinates from the
+    /// amortized encoder before refining; that is an optimization action and is
+    /// forbidden when the subject is the exact installed state.
+    audit_installed_state: bool,
     /// SPEC wall-survival: the full-`N` data fingerprint + content-addressed
     /// store path for the fit checkpoint (see [`super::checkpoint`]). Computed
     /// once at construction on the full-data target. Checkpoints are written
@@ -895,6 +897,7 @@ impl SaeManifoldOuterObjective {
             // only ever exists from a converged optimization).
             termination: OuterTerminationLedger::new(),
             fit_verdict: None,
+            audit_installed_state: false,
             checkpoint_fingerprint,
             checkpoint_path,
             crosscoder_blocks: None,
@@ -1540,6 +1543,62 @@ impl SaeManifoldOuterObjective {
         }
         self.terminal_penalized_quasi_laplace_criterion = Some(result.final_value);
         self.fit_verdict = Some(SaeOuterVerdict::Search(via));
+        Ok(())
+    }
+
+    /// Freeze every basin-entry accelerator so the next analytic evaluation
+    /// audits the exact installed `(term, rho)` rather than moving coordinates
+    /// before measuring stationarity.
+    pub(crate) fn for_installed_state_audit(mut self) -> Self {
+        self.audit_installed_state = true;
+        self.inner_max_iter = 0;
+        self
+    }
+
+    /// Stamp a caller-installed state only after the shared exact-point outer
+    /// certificate has passed. No search ran, so its provenance is distinct from
+    /// [`Self::certify_outer_result`].
+    pub(crate) fn certify_installed_state_audit(
+        &mut self,
+        result: &OuterResult,
+    ) -> Result<(), String> {
+        self.fit_verdict = None;
+        self.terminal_penalized_quasi_laplace_criterion = None;
+        if !self.audit_installed_state {
+            return Err("installed-state audit was not enabled on this objective".to_string());
+        }
+        if result.iterations != 0 || !result.converged {
+            return Err("installed-state audit result is not a zero-step convergence".to_string());
+        }
+        let via = result
+            .converged_via
+            .ok_or_else(|| "installed-state audit is missing converged_via".to_string())?;
+        let certificate = result.criterion_certificate.as_ref().ok_or_else(|| {
+            "installed-state audit is missing its analytic criterion certificate".to_string()
+        })?;
+        if !certificate.certifies() {
+            return Err(format!(
+                "installed-state outer certificate does not certify: {}",
+                certificate.summary()
+            ));
+        }
+        if self.last_loss.is_none() {
+            return Err("installed-state audit has no evaluated inner loss".to_string());
+        }
+        let installed_rho = self.current_rho.to_flat();
+        if installed_rho.len() != result.rho.len()
+            || installed_rho
+                .iter()
+                .zip(result.rho.iter())
+                .any(|(installed, certified)| installed.to_bits() != certified.to_bits())
+        {
+            return Err("installed-state audit rho does not match the evaluated state".to_string());
+        }
+        if !result.final_value.is_finite() {
+            return Err("installed-state audit produced a non-finite criterion".to_string());
+        }
+        self.terminal_penalized_quasi_laplace_criterion = Some(result.final_value);
+        self.fit_verdict = Some(SaeOuterVerdict::Audited(via));
         Ok(())
     }
 
@@ -2455,7 +2514,7 @@ impl SaeManifoldOuterObjective {
         // λ-gradient is untouched). A first-build / degenerate atlas may
         // certify zero rows, but an actual encoder/atlas error aborts the
         // evaluation rather than silently selecting a different basin-entry path.
-        if !probe_handoff_installed {
+        if !probe_handoff_installed && !self.audit_installed_state {
             let warm_start_outcome = self
                 .term
                 .warm_start_latents_from_amortized_encoder(self.target.view(), &rho);
