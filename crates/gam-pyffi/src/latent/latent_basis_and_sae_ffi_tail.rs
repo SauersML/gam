@@ -312,53 +312,6 @@ fn public_fit_penalties(
     Ok((json, names))
 }
 
-/// Public fitted-model front door. Python supplies only arrays and literal
-/// options; assignment/basis canonicalization, defaults, penalty descriptors,
-/// native fitting, and artifact construction all terminate in Rust.
-#[pyfunction(signature = (
-    z,
-    k_atoms,
-    atom_dim,
-    atom_topology=None,
-    atom_basis=None,
-    assignment_kind="softmax",
-    gumbel_schedule=None,
-    isometry_weight=1.0,
-    native_ard_enabled=true,
-    decoder_feature_sparsity_groups=None,
-    max_iter=50,
-    sparsity_strength=1.0,
-    coord_sparsity="scad",
-    scad_mcp_gamma=None,
-    smoothness=1.0,
-    alpha=None,
-    learnable_alpha=false,
-    learning_rate=None,
-    random_state=0,
-    block_orthogonality_weight=0.0,
-    nuclear_norm_weight=1.0,
-    nuclear_norm_max_rank=None,
-    decoder_incoherence_weight=1.0,
-    top_k=None,
-    initial_coords=None,
-    initial_logits=None,
-    tau=None,
-    threshold_gate_threshold=0.0,
-    fisher_factors=None,
-    fisher_mass_residual=None,
-    fisher_provenance=None,
-    fisher_factor_kind=None,
-    row_loss_weights=None,
-    separation_barrier_strength_override=None,
-    promote_from_residual=false,
-    run_structure_search=false,
-    structured_residual_passes=0,
-))]
-// No #[allow(clippy::too_many_arguments)]: this is the flat `#[pyfunction]`
-// kwarg surface Python calls by name (mirroring `sae_manifold_fit_minimal`
-// above, which has the same shape and no allow either); clippy is not run in
-// CI here, so the ban-scanner's anti-`#[allow]` rule is the only gate, and it
-// is satisfied by simply not writing the attribute.
 #[pyclass(module = "gamfit._rust", name = "Tier0SAE")]
 pub(crate) struct Tier0SaeCore {
     mean: Vec<f64>,
@@ -452,6 +405,53 @@ impl Tier0SaeCore {
     }
 }
 
+/// Public fitted-model front door. Python supplies only arrays and literal
+/// options; assignment/basis canonicalization, defaults, penalty descriptors,
+/// native fitting, and artifact construction all terminate in Rust.
+#[pyfunction(signature = (
+    z,
+    k_atoms,
+    atom_dim,
+    atom_topology=None,
+    atom_basis=None,
+    assignment_kind="softmax",
+    gumbel_schedule=None,
+    isometry_weight=1.0,
+    native_ard_enabled=true,
+    decoder_feature_sparsity_groups=None,
+    max_iter=50,
+    sparsity_strength=1.0,
+    coord_sparsity="scad",
+    scad_mcp_gamma=None,
+    smoothness=1.0,
+    alpha=None,
+    learnable_alpha=false,
+    learning_rate=None,
+    random_state=0,
+    block_orthogonality_weight=0.0,
+    nuclear_norm_weight=1.0,
+    nuclear_norm_max_rank=None,
+    decoder_incoherence_weight=1.0,
+    top_k=None,
+    initial_coords=None,
+    initial_logits=None,
+    tau=None,
+    threshold_gate_threshold=0.0,
+    fisher_factors=None,
+    fisher_mass_residual=None,
+    fisher_provenance=None,
+    fisher_factor_kind=None,
+    row_loss_weights=None,
+    separation_barrier_strength_override=None,
+    promote_from_residual=false,
+    run_structure_search=false,
+    structured_residual_passes=0,
+))]
+// No #[allow(clippy::too_many_arguments)]: this is the flat `#[pyfunction]`
+// kwarg surface Python calls by name (mirroring `sae_manifold_fit_minimal`
+// above, which has the same shape and no allow either); clippy is not run in
+// CI here, so the ban-scanner's anti-`#[allow]` rule is the only gate, and it
+// is satisfied by simply not writing the attribute.
 fn sae_manifold_fit_model<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,

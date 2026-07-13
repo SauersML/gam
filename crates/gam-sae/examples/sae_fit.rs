@@ -36,8 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         random_state: 0,
         initial_logits: None,
         initial_coords: None,
-    })?
-    .manifold_or_error()?;
+    })?;
     let SaeMinimalSeedReport {
         atom_basis,
         effective_atom_dim,
@@ -111,7 +110,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_outer_rho_search: false,
         structured_residual_passes: 0,
         cancel: None,
-    })?;
+    })?
+    .manifold_or_error()?;
 
     println!("reconstruction_r2={:.6}", report.reconstruction_r2);
     Ok(())
