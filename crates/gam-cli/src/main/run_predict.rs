@@ -33,6 +33,27 @@ pub(crate) fn effective_predict_offset_columns<'a>(
     )
 }
 
+/// Resolve the observed likelihood channel consumed by saved ALO.
+///
+/// Ordinary formulas expose a scalar response name. A survival formula's
+/// syntactic response is `Surv(...)`, while its fitted likelihood consumes the
+/// persisted event column; diagnose and report must therefore resolve that
+/// typed role instead of looking for a literal `Surv(...)` table column.
+pub(crate) fn resolve_saved_alo_response_col(
+    model: &SavedModel,
+    parsed: &ParsedFormula,
+    col_map: &HashMap<String, usize>,
+) -> Result<usize, String> {
+    if model.predict_model_class() == PredictModelClass::Survival {
+        let event = model.survival_event.as_ref().ok_or_else(|| {
+            "saved survival ALO model is missing its fitted event-column authority".to_string()
+        })?;
+        resolve_role_col(col_map, event, "survival event")
+    } else {
+        resolve_role_col(col_map, &parsed.response, "response")
+    }
+}
+
 /// Resolve `(mean_offset, noise_offset)` for the report path.
 ///
 /// Centralises the lookup of the saved offset/noise-offset column names and
@@ -62,6 +83,269 @@ pub(crate) fn report_offset_for(
 /// persisted covariate design that parameterises every local gamma coordinate.
 /// Keeping that distinction here gives `diagnose` and `report` one assembly
 /// authority while the likelihood replay itself remains in `gam-predict`.
+fn build_saved_cause_specific_survival_alo_input(
+    model: &SavedModel,
+    data: ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    primary_offset: &Array1<f64>,
+    noise_offset_supplied: bool,
+) -> Result<gam_predict::SavedModelAloInput, String> {
+    if noise_offset_supplied {
+        return Err(
+            "saved transformation/weibull survival ALO has no secondary offset coordinate"
+                .to_string(),
+        );
+    }
+    let likelihood_mode = require_saved_survival_likelihood_mode(model)?;
+    if !matches!(
+        likelihood_mode,
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+    ) {
+        return Err(format!(
+            "saved {likelihood_mode:?} survival ALO requires its typed fitted row geometry"
+        ));
+    }
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let cause_count = model
+        .survival_cause_count
+        .unwrap_or(fit.blocks.len())
+        .max(1);
+    if fit.blocks.len() != cause_count {
+        return Err(format!(
+            "saved cause-specific ALO metadata says {cause_count} causes but the fit has {} endpoint blocks",
+            fit.blocks.len()
+        ));
+    }
+    let n = data.nrows();
+    if n == 0 || primary_offset.len() != n {
+        return Err(format!(
+            "saved cause-specific ALO row mismatch: data={n}, primary_offset={}",
+            primary_offset.len()
+        ));
+    }
+    let event_name = model.survival_event.as_ref().ok_or_else(|| {
+        "saved survival ALO model is missing its fitted event-column authority".to_string()
+    })?;
+    let event_col = resolve_role_col(col_map, event_name, "survival event")?;
+    let event_codes = Array1::from_vec(
+        data.column(event_col)
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(row, value)| survival_event_code_from_value(value, row))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+
+    let time_columns = resolve_saved_survival_time_columns(model, col_map)?;
+    let mut age_entry = Array1::<f64>::zeros(n);
+    let mut age_exit = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let (entry, exit) = normalize_survival_time_pair(
+            time_columns.row_entry_time(data, row),
+            data[[row, time_columns.exit_col]],
+            row,
+        )?;
+        age_entry[row] = entry;
+        age_exit[row] = exit;
+    }
+    let entry_active = age_entry
+        .iter()
+        .map(|&entry| entry > gam::families::survival::SURVIVAL_DELAYED_ENTRY_THRESHOLD)
+        .collect::<Vec<_>>();
+
+    let termspec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )?;
+    let clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let covariate_input = clipped.as_ref().map_or(data, |values| values.view());
+    let covariate_design = build_term_collection_design(covariate_input, &termspec)
+        .map_err(|error| format!("failed to build saved survival ALO covariate design: {error}"))?;
+    let effective_primary_offset = covariate_design
+        .compose_offset(primary_offset.view(), "saved survival ALO covariate block")
+        .map_err(|error| error.to_string())?;
+
+    let weibull_baseline_in_beta = likelihood_mode == SurvivalLikelihoodMode::Weibull
+        && !baseline_timewiggle_is_present(model);
+    let time_config = load_survival_time_basis_config_from_model(model)?;
+    let mut time_build =
+        build_survival_time_basis(&age_entry, &age_exit, time_config.clone(), None)?;
+    let resolved_time_config = resolved_survival_time_basis_config_from_build(
+        &time_build.basisname,
+        time_build.degree,
+        time_build.knots.as_ref(),
+        time_build.keep_cols.as_ref(),
+        time_build.smooth_lambda,
+    )?;
+    if weibull_baseline_in_beta {
+        let anchor = model
+            .survival_time_anchor
+            .ok_or_else(|| "saved survival ALO model missing survival_time_anchor".to_string())?;
+        let anchor_row = evaluate_survival_time_basis_row(anchor, &resolved_time_config)?;
+        center_survival_time_designs_at_anchor(
+            &mut time_build.x_entry_time,
+            &mut time_build.x_exit_time,
+            &anchor_row,
+        )?;
+    }
+    if likelihood_mode != SurvivalLikelihoodMode::Weibull && !baseline_timewiggle_is_present(model)
+    {
+        require_structural_survival_time_basis(
+            &time_build.basisname,
+            "saved transformation survival ALO",
+        )?;
+    }
+    let baseline_config = if weibull_baseline_in_beta {
+        SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Linear,
+            scale: None,
+            shape: None,
+            rate: None,
+            makeham: None,
+        }
+    } else {
+        saved_survival_runtime_baseline_config(model)?
+    };
+    let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
+        build_survival_time_offsets_for_likelihood(
+            &age_entry,
+            &age_exit,
+            &baseline_config,
+            likelihood_mode,
+            None,
+        )?;
+
+    let p_time = time_build.x_exit_time.ncols();
+    let p_covariate = covariate_design.design.ncols();
+    let mut coefficient_ranges = Vec::with_capacity(cause_count);
+    let mut parameter_start = 0usize;
+    let mut p_timewiggle = None;
+    for (cause, block) in fit.blocks.iter().enumerate() {
+        let fixed_width = p_time
+            .checked_add(p_covariate)
+            .ok_or_else(|| "saved survival ALO fixed design width overflows usize".to_string())?;
+        let width = block.beta.len();
+        let wiggle_width = width.checked_sub(fixed_width).ok_or_else(|| {
+            format!(
+                "saved survival ALO cause {} has {width} coefficients, fewer than time+covariate width {fixed_width}",
+                cause + 1
+            )
+        })?;
+        match p_timewiggle {
+            None => p_timewiggle = Some(wiggle_width),
+            Some(expected) if expected != wiggle_width => {
+                return Err(format!(
+                    "saved cause-specific ALO endpoint widths disagree: cause 1 timewiggle={expected}, cause {} timewiggle={wiggle_width}",
+                    cause + 1
+                ));
+            }
+            Some(_) => {}
+        }
+        let end = parameter_start
+            .checked_add(width)
+            .ok_or_else(|| "saved survival ALO coefficient range overflows usize".to_string())?;
+        coefficient_ranges.push(parameter_start..end);
+        parameter_start = end;
+    }
+    if parameter_start != fit.beta.len() {
+        return Err(format!(
+            "saved cause-specific ALO block widths sum to {parameter_start}, but fitted beta has {} entries",
+            fit.beta.len()
+        ));
+    }
+    let p_timewiggle = p_timewiggle.unwrap_or(0);
+    let timewiggle_components = if p_timewiggle == 0 {
+        if baseline_timewiggle_is_present(model) {
+            return Err(
+                "saved survival ALO carries baseline-timewiggle metadata but its fitted endpoint blocks contain no timewiggle coefficients"
+                    .to_string(),
+            );
+        }
+        None
+    } else {
+        let knots = Array1::from_vec(model.baseline_timewiggle_knots.clone().ok_or_else(|| {
+            "saved survival ALO timewiggle coefficients are missing their knots".to_string()
+        })?);
+        let degree = model.baseline_timewiggle_degree.ok_or_else(|| {
+            "saved survival ALO timewiggle coefficients are missing their degree".to_string()
+        })?;
+        let entry =
+            buildwiggle_block_input_from_knots(eta_offset_entry.view(), &knots, degree, 2, false)?
+                .design;
+        let exit =
+            buildwiggle_block_input_from_knots(eta_offset_exit.view(), &knots, degree, 2, false)?
+                .design;
+        let derivative = DesignMatrix::from(build_survival_timewiggle_derivative_design(
+            &eta_offset_exit,
+            &derivative_offset_exit,
+            &knots,
+            degree,
+        )?);
+        if entry.ncols() != p_timewiggle
+            || exit.ncols() != p_timewiggle
+            || derivative.ncols() != p_timewiggle
+        {
+            return Err(format!(
+                "saved survival ALO timewiggle width mismatch: fitted={p_timewiggle}, entry={}, exit={}, derivative={}",
+                entry.ncols(),
+                exit.ncols(),
+                derivative.ncols()
+            ));
+        }
+        Some((entry, exit, derivative))
+    };
+
+    let zero_covariate_derivative = DesignMatrix::from(Array2::<f64>::zeros((n, p_covariate)));
+    let mut entry_parts = vec![time_build.x_entry_time.clone()];
+    let mut exit_parts = vec![time_build.x_exit_time.clone()];
+    let mut derivative_parts = vec![time_build.x_derivative_time.clone()];
+    if let Some((entry, exit, derivative)) = timewiggle_components {
+        entry_parts.push(entry);
+        exit_parts.push(exit);
+        derivative_parts.push(derivative);
+    }
+    entry_parts.push(covariate_design.design.clone());
+    exit_parts.push(covariate_design.design.clone());
+    derivative_parts.push(zero_covariate_derivative);
+    let entry_design = DesignMatrix::hstack(entry_parts)
+        .map_err(|error| format!("saved survival ALO entry design: {error}"))?;
+    let exit_design = DesignMatrix::hstack(exit_parts)
+        .map_err(|error| format!("saved survival ALO exit design: {error}"))?;
+    let derivative_design = DesignMatrix::hstack(derivative_parts)
+        .map_err(|error| format!("saved survival ALO derivative design: {error}"))?;
+
+    let eta_entry = &eta_offset_entry + &effective_primary_offset;
+    let eta_exit = &eta_offset_exit + &effective_primary_offset;
+    let mut coordinate_designs = Vec::with_capacity(cause_count * 3);
+    let mut coordinate_offsets = Vec::with_capacity(cause_count * 3);
+    let mut coordinate_ranges = Vec::with_capacity(cause_count * 3);
+    for range in coefficient_ranges {
+        coordinate_designs.push(exit_design.clone());
+        coordinate_offsets.push(eta_exit.clone());
+        coordinate_ranges.push(range.clone());
+        coordinate_designs.push(entry_design.clone());
+        coordinate_offsets.push(eta_entry.clone());
+        coordinate_ranges.push(range.clone());
+        coordinate_designs.push(derivative_design.clone());
+        coordinate_offsets.push(derivative_offset_exit.clone());
+        coordinate_ranges.push(range);
+    }
+    let input = gam_predict::SavedCauseSpecificSurvivalAloInput::new(
+        event_codes,
+        entry_active,
+        coordinate_designs,
+        coordinate_offsets,
+        coordinate_ranges,
+        cause_count,
+    )?;
+    Ok(gam_predict::SavedModelAloInput::survival(
+        gam_predict::SavedSurvivalAloInput::CauseSpecific(input),
+    ))
+}
+
 pub(crate) fn build_saved_alo_predict_input(
     model: &SavedModel,
     data: ArrayView2<'_, f64>,
@@ -70,7 +354,17 @@ pub(crate) fn build_saved_alo_predict_input(
     offset: &Array1<f64>,
     noise_offset: &Array1<f64>,
     noise_offset_supplied: bool,
-) -> Result<PredictInput, String> {
+) -> Result<gam_predict::SavedModelAloInput, String> {
+    if model.predict_model_class() == PredictModelClass::Survival {
+        return build_saved_cause_specific_survival_alo_input(
+            model,
+            data,
+            col_map,
+            training_headers,
+            offset,
+            noise_offset_supplied,
+        );
+    }
     if model.predict_model_class() != PredictModelClass::TransformationNormal {
         return build_predict_input_for_model(
             model,
@@ -80,7 +374,8 @@ pub(crate) fn build_saved_alo_predict_input(
             offset,
             noise_offset,
             noise_offset_supplied,
-        );
+        )
+        .map(gam_predict::SavedModelAloInput::affine);
     }
     if noise_offset_supplied {
         return Err(
@@ -100,14 +395,14 @@ pub(crate) fn build_saved_alo_predict_input(
     let effective_offset = design
         .compose_offset(offset.view(), "saved transformation-normal ALO design")
         .map_err(|error| error.to_string())?;
-    Ok(PredictInput {
+    Ok(gam_predict::SavedModelAloInput::affine(PredictInput {
         design: design.design,
         offset: effective_offset,
         design_noise: None,
         offset_noise: None,
         auxiliary_scalar: None,
         auxiliary_matrix: None,
-    })
+    }))
 }
 
 pub(crate) fn resolve_predict_offsets(

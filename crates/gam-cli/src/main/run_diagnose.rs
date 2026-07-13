@@ -80,7 +80,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
     require_dataset_rows("diagnose", &args.data, ds.values.nrows())?;
     let col_map = ds.column_map();
-    let y_col = resolve_role_col(&col_map, &parsed.response, "response")?;
+    let y_col = resolve_saved_alo_response_col(&model, &parsed, &col_map)?;
     let y = ds.values.column(y_col).to_owned();
     let weights = resolve_weight_column(&ds, &col_map, model.weight_column.as_deref())
         .map_err(|error| format!("failed to resolve saved diagnose weights: {error}"))?;
@@ -113,11 +113,12 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     if model.predict_model_class() == PredictModelClass::Standard
         && let Some(unified) = model.unified()
     {
+        let affine_input = input.require_affine(PredictModelClass::Standard)?;
         let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
         let beta = fit_saved.blocks.first().ok_or_else(|| {
             "saved standard model comparison requires its affine coefficient block".to_string()
         })?;
-        let eta_hat = input.design.dot(&beta.beta) + &input.offset;
+        let eta_hat = affine_input.design.dot(&beta.beta) + &affine_input.offset;
         let eta_loo = Array1::from_iter(
             alo.diagnostics
                 .eta_tilde

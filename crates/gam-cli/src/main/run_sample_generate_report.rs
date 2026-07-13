@@ -606,7 +606,15 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         let (saved_offset_column, saved_noise_offset_column) = saved_offset_columns(&model);
         let parsed = parse_formula(&model.formula)?;
 
-        if let Some(y_col) = col_map.get(&parsed.response).copied() {
+        let saved_alo_response_col = match resolve_saved_alo_response_col(&model, &parsed, &col_map)
+        {
+            Ok(column) => Some(column),
+            Err(error) => {
+                notes.push(format!("ALO diagnostics unavailable: {error}"));
+                None
+            }
+        };
+        if let Some(y_col) = saved_alo_response_col {
             let alo_response = ds.values.column(y_col).to_owned();
             let alo_weights =
                 resolve_weight_column(&ds, &col_map, model.payload().weight_column.as_deref())

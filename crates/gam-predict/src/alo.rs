@@ -1252,8 +1252,7 @@ fn compute_saved_cause_specific_survival_alo(
         }
         let beta = fit.beta.slice(s![range.clone()]).to_owned();
         coordinate_arrays.push(
-            input.coordinate_designs[coordinate].dot(&beta)
-                + &input.coordinate_offsets[coordinate],
+            input.coordinate_designs[coordinate].dot(&beta) + &input.coordinate_offsets[coordinate],
         );
     }
 
@@ -1272,22 +1271,21 @@ fn compute_saved_cause_specific_survival_alo(
             values[start] = eta_exit;
             values[start + 1] = eta_entry;
             values[start + 2] = derivative_exit;
-            let geometry = cause_specific_survival_alo_row_geometry(
-                CauseSpecificSurvivalAloRowInput {
+            let geometry =
+                cause_specific_survival_alo_row_geometry(CauseSpecificSurvivalAloRowInput {
                     eta_exit,
                     eta_entry,
                     derivative_exit,
                     prior_weight: observations.prior_weights[row],
                     entry_active: input.entry_active[row],
                     event: usize::from(input.event_codes[row]) == cause + 1,
-                },
-            )
-            .map_err(|reason| {
-                invalid(format!(
-                    "saved survival ALO row {row}, cause {}: {reason}",
-                    cause + 1
-                ))
-            })?;
+                })
+                .map_err(|reason| {
+                    invalid(format!(
+                        "saved survival ALO row {row}, cause {}: {reason}",
+                        cause + 1
+                    ))
+                })?;
             for left in 0..3 {
                 score[start + left] = geometry.nll_score[left];
                 for right in 0..3 {
@@ -1356,15 +1354,13 @@ pub fn compute_saved_model_alo(
                 observations,
             )
         }
-        PredictModelClass::BernoulliMarginalSlope => {
-            compute_saved_bernoulli_marginal_slope_alo(
-                model,
-                input
-                    .require_affine(PredictModelClass::BernoulliMarginalSlope)
-                    .map_err(invalid)?,
-                observations,
-            )
-        }
+        PredictModelClass::BernoulliMarginalSlope => compute_saved_bernoulli_marginal_slope_alo(
+            model,
+            input
+                .require_affine(PredictModelClass::BernoulliMarginalSlope)
+                .map_err(invalid)?,
+            observations,
+        ),
         PredictModelClass::TransformationNormal => compute_saved_transformation_normal_alo(
             model,
             &input
