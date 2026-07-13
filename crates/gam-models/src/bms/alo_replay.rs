@@ -131,7 +131,7 @@ fn dense_anchor_correction(rows: &[Vec<f64>], basis_dim: usize) -> Result<Array2
     .map_err(|error| format!("saved anchor correction shape: {error}"))
 }
 
-fn exact_runtime_from_saved(
+pub(crate) fn exact_runtime_from_saved(
     saved: &SavedCompiledFlexBlock,
     anchor_rows: Option<&Array2<f64>>,
     label: &str,

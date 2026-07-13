@@ -1273,24 +1273,26 @@ fn validate_marginal_slope_saved_fit(
         "bernoulli",
         2,
         "marginal, logslope",
+        None,
     )
 }
 
 fn validate_survival_marginal_slope_saved_fit(
+    payload: &FittedModelPayload,
     fit: &UnifiedFitResult,
-    score_warp: Option<&SavedCompiledFlexBlock>,
-    link_deviation: Option<&SavedCompiledFlexBlock>,
     fit_label: &str,
 ) -> Result<(), FittedModelError> {
     validate_marginal_slope_saved_fit_impl(
         fit,
-        score_warp,
-        link_deviation,
+        payload.score_warp_runtime.as_ref(),
+        payload.link_deviation_runtime.as_ref(),
         fit_label,
         "survival",
         3,
         "time, marginal, slope",
+        payload.influence_absorber_width,
     )
+    .and_then(|()| validate_survival_marginal_slope_replay_state(payload, fit, fit_label))
 }
 
 /// Shared block-count + coefficient-dimension validation for the bernoulli
@@ -1308,10 +1310,12 @@ fn validate_marginal_slope_saved_fit_impl(
     family_kind: &str,
     base_block_count: usize,
     base_block_role_list: &str,
+    influence_absorber_width: Option<usize>,
 ) -> Result<(), FittedModelError> {
     let expected_blocks = base_block_count
         + usize::from(score_warp.is_some())
-        + usize::from(link_deviation.is_some());
+        + usize::from(link_deviation.is_some())
+        + usize::from(influence_absorber_width.is_some());
     if fit.blocks.len() != expected_blocks {
         let score_warp_suffix = if score_warp.is_some() {
             ", score-warp"
@@ -1323,9 +1327,14 @@ fn validate_marginal_slope_saved_fit_impl(
         } else {
             ""
         };
+        let influence_suffix = if influence_absorber_width.is_some() {
+            ", influence-absorber"
+        } else {
+            ""
+        };
         return Err(FittedModelError::SchemaMismatch {
             reason: format!(
-                "{family_kind} marginal-slope saved {fit_label} requires {expected_blocks} blocks [{base_block_role_list}{score_warp_suffix}{link_deviation_suffix}], got {}",
+                "{family_kind} marginal-slope saved {fit_label} requires {expected_blocks} blocks [{base_block_role_list}{score_warp_suffix}{link_deviation_suffix}{influence_suffix}], got {}",
                 fit.blocks.len(),
             ),
         });
@@ -1354,6 +1363,97 @@ fn validate_marginal_slope_saved_fit_impl(
                 ),
             });
         }
+    }
+    if let Some(width) = influence_absorber_width {
+        let idx = base_block_count
+            + usize::from(score_warp.is_some())
+            + usize::from(link_deviation.is_some());
+        if width == 0 || fit.blocks[idx].beta.len() != width {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "{family_kind} marginal-slope saved {fit_label} influence absorber width is {width}, but its fitted block has {} coefficients",
+                    fit.blocks[idx].beta.len(),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_survival_marginal_slope_replay_state(
+    payload: &FittedModelPayload,
+    fit: &UnifiedFitResult,
+    fit_label: &str,
+) -> Result<(), FittedModelError> {
+    match (
+        payload.influence_absorber_width,
+        payload.influence_absorber_design.as_ref(),
+    ) {
+        (None, None) => {}
+        (Some(width), Some(rows)) => {
+            if rows.is_empty()
+                || rows.iter().any(|row| {
+                    row.len() != width || row.iter().any(|value| !value.is_finite())
+                })
+            {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "survival marginal-slope saved {fit_label} influence absorber must be a non-empty finite rectangular matrix with width {width}"
+                    ),
+                });
+            }
+        }
+        _ => {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "survival marginal-slope saved {fit_label} influence absorber width and exact training-row design must be present together"
+                ),
+            });
+        }
+    }
+
+    let timewiggle_metadata = (
+        payload.baseline_timewiggle_knots.as_ref(),
+        payload.baseline_timewiggle_degree,
+        payload.beta_baseline_timewiggle.as_ref(),
+    );
+    match timewiggle_metadata {
+        (None, None, None) => {}
+        (Some(knots), Some(degree), Some(beta)) => {
+            if beta.is_empty()
+                || knots.len() < degree.saturating_add(2)
+                || knots.iter().chain(beta).any(|value| !value.is_finite())
+            {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "survival marginal-slope saved {fit_label} has invalid exact baseline-timewiggle authority"
+                    ),
+                });
+            }
+            let time_beta = &fit.blocks[0].beta;
+            if time_beta.len() < beta.len()
+                || time_beta.slice(ndarray::s![time_beta.len() - beta.len()..]).to_vec() != *beta
+            {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "survival marginal-slope saved {fit_label} baseline-timewiggle beta does not equal the protected tail of the fitted time block"
+                    ),
+                });
+            }
+        }
+        _ => {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "survival marginal-slope saved {fit_label} baseline-timewiggle knots, degree, and beta must be present together"
+                ),
+            });
+        }
+    }
+    if payload.beta_baseline_timewiggle_by_cause.is_some() {
+        return Err(FittedModelError::SchemaMismatch {
+            reason: "survival marginal-slope saved fit cannot carry cause-specific timewiggle coefficients"
+                .to_string(),
+        });
     }
     Ok(())
 }
@@ -3322,9 +3422,8 @@ impl FittedModel {
                 }
             })?;
             validate_survival_marginal_slope_saved_fit(
+                self.payload(),
                 fit,
-                runtime.score_warp.as_ref(),
-                runtime.link_deviation.as_ref(),
                 "fit_result",
             )?;
         }
@@ -4644,16 +4743,14 @@ impl FittedModel {
             .is_some_and(|value| value.eq_ignore_ascii_case("marginal-slope"))
         {
             validate_survival_marginal_slope_saved_fit(
+                self,
                 self.fit_result.as_ref().expect("checked above"),
-                self.score_warp_runtime.as_ref(),
-                self.link_deviation_runtime.as_ref(),
                 "fit_result",
             )?;
             if let Some(unified) = self.unified.as_ref() {
                 validate_survival_marginal_slope_saved_fit(
+                    self,
                     unified,
-                    self.score_warp_runtime.as_ref(),
-                    self.link_deviation_runtime.as_ref(),
                     "unified",
                 )?;
             }

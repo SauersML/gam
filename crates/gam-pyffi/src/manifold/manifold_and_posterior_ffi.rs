@@ -4802,8 +4802,10 @@ fn build_survival_marginal_slope_ffi_payload(
 ) -> Result<FittedModelPayload, String> {
     use gam::families::survival::construction::{
         build_survival_time_basis, parse_survival_baseline_config, parse_survival_likelihood_mode,
-        parse_survival_time_basis_config, resolve_survival_time_anchor_value,
+        parse_survival_time_basis_config, resolve_survival_marginal_slope_time_anchor_value,
+        survival_marginal_slope_offset_baseline_config,
     };
+    use ndarray::s;
 
     let frozen_marginal = freeze_term_collection_from_design(
         &ms_result.marginalspec_resolved,
@@ -4879,7 +4881,8 @@ fn build_survival_marginal_slope_ffi_payload(
             fit_config.time_smooth_lambda,
         )?
     };
-    let time_anchor = resolve_survival_time_anchor_value(&age_entry, None)?;
+    let time_anchor =
+        resolve_survival_marginal_slope_time_anchor_value(&age_entry, &age_exit, None)?;
     let time_build = build_survival_time_basis(
         &age_entry,
         &age_exit,
@@ -4889,6 +4892,52 @@ fn build_survival_marginal_slope_ffi_payload(
             fit_config.time_smooth_lambda,
         )),
     )?;
+    let timewiggle = match (
+        ms_result.time_wiggle_knots.as_ref(),
+        ms_result.time_wiggle_degree,
+        ms_result.time_wiggle_ncols,
+    ) {
+        (None, None, 0) => None,
+        (Some(knots), Some(degree), ncols) if ncols > 0 => {
+            let beta_time = &ms_result
+                .fit
+                .blocks
+                .first()
+                .ok_or_else(|| {
+                    "survival marginal-slope FFI fit is missing its time block".to_string()
+                })?
+                .beta;
+            let p_base = time_build.x_exit_time.ncols();
+            if beta_time.len() != p_base + ncols {
+                return Err(format!(
+                    "survival marginal-slope FFI timewiggle width mismatch: time beta={}, base={p_base}, wiggle={ncols}",
+                    beta_time.len(),
+                ));
+            }
+            Some(SurvivalTimewiggle {
+                degree,
+                knots: knots.to_vec(),
+                penalty_orders: parsed
+                    .timewiggle
+                    .as_ref()
+                    .map(|config| config.penalty_orders.clone()),
+                double_penalty: parsed
+                    .timewiggle
+                    .as_ref()
+                    .map(|config| config.double_penalty),
+                beta: SurvivalTimewiggleBeta::Single(
+                    beta_time.slice(s![p_base..]).to_vec(),
+                ),
+            })
+        }
+        _ => {
+            return Err(
+                "survival marginal-slope FFI fit has incomplete timewiggle authority".to_string(),
+            );
+        }
+    };
+    let saved_offset_baseline =
+        survival_marginal_slope_offset_baseline_config(&age_exit, &baseline_cfg);
 
     // Thin adapter over the shared core assembler. The FFI's source-specific
     // work is re-deriving the survival response columns, baseline config, and
@@ -4899,13 +4948,13 @@ fn build_survival_marginal_slope_ffi_payload(
         SurvivalMarginalSlopeInputs {
             formula,
             data_schema: dataset.schema.clone(),
-            fit_result: ms_result.fit,
+            fit_result: ms_result.fit.clone(),
             frailty,
             survival_entry: entryname,
             survival_exit: exitname,
             survival_event: eventname,
             survivalspec: "net".to_string(),
-            baseline_cfg,
+            baseline_cfg: saved_offset_baseline,
             time_basis: SavedSurvivalTimeBasis::from_build(&time_build, time_anchor),
             ridge_lambda: fit_config.ridge_lambda,
             survival_likelihood_label: survival_likelihood_modename(likelihood_mode).to_string(),
@@ -4918,9 +4967,11 @@ fn build_survival_marginal_slope_ffi_payload(
                 sd: ms_result.z_normalization.sd,
             },
             baseline_logslope: ms_result.baseline_slope,
+            timewiggle,
             score_warp_runtime: ms_result.score_warp_runtime.as_ref(),
             link_dev_runtime: ms_result.link_dev_runtime.as_ref(),
             influence_absorber_width: ms_result.influence_absorber_width,
+            influence_absorber_design: ms_result.influence_absorber_design.as_ref(),
         },
         SavedModelSourceMetadata {
             training_headers: dataset.headers.clone(),

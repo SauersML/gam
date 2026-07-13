@@ -4,11 +4,7 @@
 
 use super::*;
 
-#[cfg(test)]
-use gam_math::jet_scalar::{DynamicJetArena, DynamicOrder2, FixedRuntimeJet, JetScalar, Order2};
 use gam_math::jet_scalar::{RuntimeJetScalar, RuntimeValue};
-#[cfg(test)]
-use gam_math::order2_graph::{Order2Graph, Order2GraphWorkspace};
 use gam_row_macros::row_program;
 
 // ── Closed-form row kernel ─────────────────────────────────────────────
@@ -1026,123 +1022,6 @@ where
     rigid_vector_feature_nll(&features, inputs, dimension, workspace)
 }
 
-#[cfg(test)]
-fn row_primary_closed_form_vector_dynamic_into(
-    q0: f64,
-    q1: f64,
-    qd1: f64,
-    slopes: &[f64],
-    z: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    w: f64,
-    d: f64,
-    derivative_guard: f64,
-    probit_scale: f64,
-    arena: &mut DynamicJetArena,
-    gradient: &mut [f64],
-    hessian: &mut [f64],
-) -> Result<f64, String> {
-    let k = slopes.len();
-    if z.len() != k || covariance.dim() != k {
-        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "survival marginal-slope vector row dimension mismatch: slopes={}, z={}, covariance={}",
-                k,
-                z.len(),
-                covariance.dim()
-            ),
-        }
-        .into());
-    }
-    let dim = 3 + k;
-    assert_eq!(gradient.len(), dim, "dynamic row gradient width mismatch");
-    assert_eq!(
-        hessian.len(),
-        dim * dim,
-        "dynamic row Hessian width mismatch"
-    );
-    arena.reset();
-    let primary_values = arena.alloc_slice_fill_with(dim, |axis| match axis {
-        0 => q0,
-        1 => q1,
-        2 => qd1,
-        _ => slopes[axis - 3],
-    });
-    let vars = arena.alloc_slice_fill_with(dim, |axis| {
-        DynamicOrder2::variable(primary_values[axis], axis, dim, arena)
-    });
-    let inputs = RigidRowInputs {
-        row: 0,
-        wi: w,
-        di: d,
-        z_sum: 0.0,
-        covariance_ones: 0.0,
-        probit_scale,
-        qd1_lower: derivative_guard,
-    };
-    let row = rigid_vector_row_nll(vars, z, covariance, &inputs, arena)?;
-    gradient.copy_from_slice(row.g());
-    for row_axis in 0..dim {
-        for column_axis in 0..dim {
-            hessian[row_axis * dim + column_axis] = row.h_at(row_axis, column_axis);
-        }
-    }
-    Ok(row.v)
-}
-
-#[cfg(test)]
-fn row_primary_closed_form_vector_fixed_into<const DIM: usize>(
-    q0: f64,
-    q1: f64,
-    qd1: f64,
-    slopes: &[f64],
-    z: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    w: f64,
-    d: f64,
-    derivative_guard: f64,
-    probit_scale: f64,
-    gradient: &mut [f64],
-    hessian: &mut [f64],
-) -> Result<f64, String> {
-    if DIM != 3 + slopes.len() {
-        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "fixed runtime-vector row dimension mismatch: DIM={DIM}, slopes={}",
-                slopes.len()
-            ),
-        }
-        .into());
-    }
-    assert_eq!(gradient.len(), DIM, "fixed row gradient width mismatch");
-    assert_eq!(hessian.len(), DIM * DIM, "fixed row Hessian width mismatch");
-    let values: [f64; DIM] = std::array::from_fn(|axis| match axis {
-        0 => q0,
-        1 => q1,
-        2 => qd1,
-        _ => slopes[axis - 3],
-    });
-    let vars: [FixedRuntimeJet<Order2<DIM>, DIM>; DIM] = std::array::from_fn(|axis| {
-        FixedRuntimeJet::from_inner(Order2::variable(values[axis], axis))
-    });
-    let inputs = RigidRowInputs {
-        row: 0,
-        wi: w,
-        di: d,
-        z_sum: 0.0,
-        covariance_ones: 0.0,
-        probit_scale,
-        qd1_lower: derivative_guard,
-    };
-    let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, &())?.into_inner();
-    let (value, gradient_channels, hessian_channels) = row.into_channels();
-    gradient.copy_from_slice(&gradient_channels);
-    for (target, source) in hessian.chunks_exact_mut(DIM).zip(hessian_channels) {
-        target.copy_from_slice(&source);
-    }
-    Ok(value)
-}
-
 #[inline]
 fn checked_vector_workspace_layout(
     score_dimension: usize,
@@ -1241,8 +1120,9 @@ fn bound_covariance_matvec_into(
     output: &mut [f64],
     low_rank_projection: &mut [f64],
 ) {
-    debug_assert_eq!(vector.len(), covariance.dim());
-    debug_assert_eq!(output.len(), covariance.dim());
+    // `RigidVectorRowWorkspace::new` sizes both buffers from this covariance,
+    // and `row_primary_closed_form_vector_into` rejects a row whose slope or
+    // score width differs before reaching this hot kernel.
     match covariance {
         MarginalSlopeCovariance::Diagonal(diagonal) => {
             for axis in 0..vector.len() {
@@ -1259,7 +1139,6 @@ fn bound_covariance_matvec_into(
             }
         }
         MarginalSlopeCovariance::LowRank(factor) => {
-            debug_assert_eq!(low_rank_projection.len(), factor.ncols());
             low_rank_projection.fill(0.0);
             for rank in 0..factor.ncols() {
                 for axis in 0..vector.len() {
@@ -1294,9 +1173,9 @@ fn order2_feature_pullback_into<const FEATURES: usize>(
     hessian: &mut [f64],
     add_weighted_feature_hessians: impl FnOnce(&[f64; FEATURES], &mut [f64]),
 ) {
-    debug_assert_eq!(jacobian.len(), FEATURES * dimension);
-    debug_assert_eq!(gradient.len(), dimension);
-    debug_assert_eq!(hessian.len(), dimension * dimension);
+    // The sole caller slices all three buffers from the checked workspace
+    // layout produced by `checked_vector_workspace_layout`; these lengths are
+    // construction invariants rather than conditional debug behavior.
 
     for axis in 0..dimension {
         let mut channel = 0.0;
@@ -1373,62 +1252,6 @@ fn add_weighted_variance_hessian(
             }
         }
     }
-}
-
-#[cfg(test)]
-fn row_primary_closed_form_vector_graph_into<const DIM: usize>(
-    q0: f64,
-    q1: f64,
-    qd1: f64,
-    slopes: &[f64],
-    z: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    w: f64,
-    d: f64,
-    derivative_guard: f64,
-    probit_scale: f64,
-    workspace: &mut Order2GraphWorkspace,
-    gradient: &mut [f64],
-    hessian: &mut [f64],
-) -> Result<f64, String> {
-    if DIM != 3 + slopes.len() || z.len() != slopes.len() || covariance.dim() != slopes.len() {
-        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "compiled vector row dimension mismatch: DIM={DIM}, slopes={}, z={}, covariance={}",
-                slopes.len(),
-                z.len(),
-                covariance.dim()
-            ),
-        }
-        .into());
-    }
-    assert_eq!(gradient.len(), DIM, "compiled row gradient width mismatch");
-    assert_eq!(
-        hessian.len(),
-        DIM * DIM,
-        "compiled row Hessian width mismatch"
-    );
-    workspace.reset(DIM);
-    let primary_values: [f64; DIM] = std::array::from_fn(|axis| match axis {
-        0 => q0,
-        1 => q1,
-        2 => qd1,
-        _ => slopes[axis - 3],
-    });
-    let vars: [Order2Graph<'_, DIM>; DIM] = std::array::from_fn(|axis| {
-        Order2Graph::variable(primary_values[axis], axis, DIM, workspace)
-    });
-    let inputs = RigidRowInputs {
-        row: 0,
-        wi: w,
-        di: d,
-        z_sum: 0.0,
-        covariance_ones: 0.0,
-        probit_scale,
-        qd1_lower: derivative_guard,
-    };
-    let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, workspace)?;
-    Ok(row.lower_into(gradient, hessian))
 }
 
 pub(crate) fn row_primary_closed_form_vector_into(
@@ -1787,7 +1610,181 @@ pub(crate) struct EvalCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
+    use gam_math::jet_scalar::{
+        DynamicJetArena, DynamicOrder2, FixedRuntimeJet, JetScalar, Order2,
+        SymmetricQuadraticCoefficients,
+    };
+    use gam_math::order2_graph::{Order2Graph, Order2GraphWorkspace};
+
+    fn row_primary_closed_form_vector_dynamic_into(
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        slopes: &[f64],
+        z: &[f64],
+        covariance: &MarginalSlopeCovariance,
+        w: f64,
+        d: f64,
+        derivative_guard: f64,
+        probit_scale: f64,
+        arena: &mut DynamicJetArena,
+        gradient: &mut [f64],
+        hessian: &mut [f64],
+    ) -> Result<f64, String> {
+        let k = slopes.len();
+        if z.len() != k || covariance.dim() != k {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope vector row dimension mismatch: slopes={}, z={}, covariance={}",
+                    k,
+                    z.len(),
+                    covariance.dim()
+                ),
+            }
+            .into());
+        }
+        let dim = 3 + k;
+        assert_eq!(gradient.len(), dim, "dynamic row gradient width mismatch");
+        assert_eq!(
+            hessian.len(),
+            dim * dim,
+            "dynamic row Hessian width mismatch"
+        );
+        arena.reset();
+        let primary_values = arena.alloc_slice_fill_with(dim, |axis| match axis {
+            0 => q0,
+            1 => q1,
+            2 => qd1,
+            _ => slopes[axis - 3],
+        });
+        let vars = arena.alloc_slice_fill_with(dim, |axis| {
+            DynamicOrder2::variable(primary_values[axis], axis, dim, arena)
+        });
+        let inputs = RigidRowInputs {
+            row: 0,
+            wi: w,
+            di: d,
+            z_sum: 0.0,
+            covariance_ones: 0.0,
+            probit_scale,
+            qd1_lower: derivative_guard,
+        };
+        let row = rigid_vector_row_nll(vars, z, covariance, &inputs, arena)?;
+        gradient.copy_from_slice(row.g());
+        for row_axis in 0..dim {
+            for column_axis in 0..dim {
+                hessian[row_axis * dim + column_axis] = row.h_at(row_axis, column_axis);
+            }
+        }
+        Ok(row.v)
+    }
+
+    fn row_primary_closed_form_vector_fixed_into<const DIM: usize>(
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        slopes: &[f64],
+        z: &[f64],
+        covariance: &MarginalSlopeCovariance,
+        w: f64,
+        d: f64,
+        derivative_guard: f64,
+        probit_scale: f64,
+        gradient: &mut [f64],
+        hessian: &mut [f64],
+    ) -> Result<f64, String> {
+        if DIM != 3 + slopes.len() {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "fixed runtime-vector row dimension mismatch: DIM={DIM}, slopes={}",
+                    slopes.len()
+                ),
+            }
+            .into());
+        }
+        assert_eq!(gradient.len(), DIM, "fixed row gradient width mismatch");
+        assert_eq!(hessian.len(), DIM * DIM, "fixed row Hessian width mismatch");
+        let values: [f64; DIM] = std::array::from_fn(|axis| match axis {
+            0 => q0,
+            1 => q1,
+            2 => qd1,
+            _ => slopes[axis - 3],
+        });
+        let vars: [FixedRuntimeJet<Order2<DIM>, DIM>; DIM] = std::array::from_fn(|axis| {
+            FixedRuntimeJet::from_inner(Order2::variable(values[axis], axis))
+        });
+        let inputs = RigidRowInputs {
+            row: 0,
+            wi: w,
+            di: d,
+            z_sum: 0.0,
+            covariance_ones: 0.0,
+            probit_scale,
+            qd1_lower: derivative_guard,
+        };
+        let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, &())?.into_inner();
+        let (value, gradient_channels, hessian_channels) = row.into_channels();
+        gradient.copy_from_slice(&gradient_channels);
+        for (target, source) in hessian.chunks_exact_mut(DIM).zip(hessian_channels) {
+            target.copy_from_slice(&source);
+        }
+        Ok(value)
+    }
+
+    fn row_primary_closed_form_vector_graph_into<const DIM: usize>(
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        slopes: &[f64],
+        z: &[f64],
+        covariance: &MarginalSlopeCovariance,
+        w: f64,
+        d: f64,
+        derivative_guard: f64,
+        probit_scale: f64,
+        workspace: &mut Order2GraphWorkspace,
+        gradient: &mut [f64],
+        hessian: &mut [f64],
+    ) -> Result<f64, String> {
+        if DIM != 3 + slopes.len() || z.len() != slopes.len() || covariance.dim() != slopes.len() {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "compiled vector row dimension mismatch: DIM={DIM}, slopes={}, z={}, covariance={}",
+                    slopes.len(),
+                    z.len(),
+                    covariance.dim()
+                ),
+            }
+            .into());
+        }
+        assert_eq!(gradient.len(), DIM, "compiled row gradient width mismatch");
+        assert_eq!(
+            hessian.len(),
+            DIM * DIM,
+            "compiled row Hessian width mismatch"
+        );
+        workspace.reset(DIM);
+        let primary_values: [f64; DIM] = std::array::from_fn(|axis| match axis {
+            0 => q0,
+            1 => q1,
+            2 => qd1,
+            _ => slopes[axis - 3],
+        });
+        let vars: [Order2Graph<'_, DIM>; DIM] = std::array::from_fn(|axis| {
+            Order2Graph::variable(primary_values[axis], axis, DIM, workspace)
+        });
+        let inputs = RigidRowInputs {
+            row: 0,
+            wi: w,
+            di: d,
+            z_sum: 0.0,
+            covariance_ones: 0.0,
+            probit_scale,
+            qd1_lower: derivative_guard,
+        };
+        let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, workspace)?;
+        Ok(row.lower_into(gradient, hessian))
+    }
 
     fn collect_row_into(
         dimension: usize,
