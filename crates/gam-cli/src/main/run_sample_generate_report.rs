@@ -244,7 +244,7 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
         saved_noise_offset_column.is_some(),
     )?;
 
-    let mut rng = StdRng::seed_from_u64(args.seed.unwrap_or(42));
+    let seed = args.seed.unwrap_or(42);
     let out = args
         .out
         .unwrap_or_else(|| default_output_path_from_model(&args.model, ".generated.csv"));
@@ -266,11 +266,12 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
     )
     .min(args.n_draws)
     .max(1);
-    gam::generative::sampleobservation_replicate_chunks(
+    gam::generative::sampleobservation_seeded_replicate_chunks(
         &spec,
+        0,
         args.n_draws,
         chunk_draws,
-        &mut rng,
+        seed,
         |draw_start, chunk| {
             for local_draw in 0..chunk.nrows() {
                 let draw = draw_start + local_draw;
