@@ -939,8 +939,8 @@ impl RigidVectorRowWorkspace {
                 }
                 .into());
             }
-            1..=6 => RigidVectorRowBackend::Fixed,
-            7..=13 => RigidVectorRowBackend::Graph(Order2GraphWorkspace::new()),
+            1..=5 => RigidVectorRowBackend::Fixed,
+            6..=13 => RigidVectorRowBackend::Graph(Order2GraphWorkspace::new()),
             14.. => RigidVectorRowBackend::Dynamic(DynamicJetArena::new()),
         };
         Ok(Self {
@@ -1077,7 +1077,7 @@ pub(crate) fn row_primary_closed_form_vector(
         (RigidVectorRowBackend::Fixed, 3) => fixed_row!(6),
         (RigidVectorRowBackend::Fixed, 4) => fixed_row!(7),
         (RigidVectorRowBackend::Fixed, 5) => fixed_row!(8),
-        (RigidVectorRowBackend::Fixed, 6) => fixed_row!(9),
+        (RigidVectorRowBackend::Graph(graph), 6) => graph_row!(9, graph),
         (RigidVectorRowBackend::Graph(graph), 7) => graph_row!(10, graph),
         (RigidVectorRowBackend::Graph(graph), 8) => graph_row!(11, graph),
         (RigidVectorRowBackend::Graph(graph), 9) => graph_row!(12, graph),
@@ -1758,7 +1758,7 @@ mod tests {
                     )
                     .expect("zero-order canonical vector row");
                     if shape_index == 0 && event == 0.0 {
-                        let expected_backend = if k <= 6 { "fixed" } else { "graph" };
+                        let expected_backend = if k <= 5 { "fixed" } else { "graph" };
                         assert_eq!(production_workspace.backend_name(), expected_backend);
                     }
                     let graph = row_primary_closed_form_vector_graph::<DIM>(
