@@ -1896,7 +1896,6 @@ fn compute_multiblock_alo_chunk(
                 ),
             });
         }
-        let width = design_chunk.ncols();
         let coefficient_range = input.coordinate_coefficient_ranges[coordinate].clone();
         let mut rhs = Array2::<f64>::zeros((p_tot, chunk_len));
         rhs.slice_mut(s![coefficient_range, ..])

@@ -2,8 +2,7 @@
 //! channel and matches the CPU row program on every packed output.
 
 use gam::terms::sae::gpu_kernels::sae_rowjet::{
-    SaeRowJetPath, SaeRowJetPrimary, SaeSoftmaxRowJetInput,
-    execute_softmax_row_jet_tile,
+    SaeRowJetPath, SaeRowJetPrimary, SaeSoftmaxRowJetInput, execute_softmax_row_jet_tile,
 };
 
 fn fixture(n: usize) -> Vec<SaeSoftmaxRowJetInput> {
@@ -73,9 +72,7 @@ fn maximum_channel_error(
                 .chain(&right.beta)
                 .chain(&right.beta_mixed),
         )
-        .fold(0.0_f64, |maximum, (a, b)| {
-            maximum.max((a - b).abs())
-        })
+        .fold(0.0_f64, |maximum, (a, b)| maximum.max((a - b).abs()))
 }
 
 #[test]
@@ -109,7 +106,7 @@ fn complete_sae_rowjet_gpu_parity_2304() {
     #[cfg(target_os = "linux")]
     if gam::gpu::GpuRuntime::global().is_some() {
         let device = execute_softmax_row_jet_tile(&rows, 1.0 / 0.7, SaeRowJetPath::Device)
-            .expect("admitted CUDA device must run; no CPU fallback is permitted");
+            .expect("admitted CUDA device must run; no host retry is permitted");
         let maximum = maximum_channel_error(&cpu, &device);
         assert!(
             maximum <= 1.0e-12,

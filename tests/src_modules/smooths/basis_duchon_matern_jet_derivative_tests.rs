@@ -3352,6 +3352,345 @@ fn test_full_dim_validity_d4_d8_d16_with_resolved_orders() {
     }
 }
 
+fn assert_pair_block_bundle_fully_fd_gated<F>(
+    label: &str,
+    eta: &[f64],
+    kappa: f64,
+    bundle: &super::closed_form_penalty::PairBlockBundle,
+    value_at: F,
+) where
+    F: Fn(&[f64], f64) -> f64,
+{
+    fn assert_fd_close(
+        label: &str,
+        channel: &str,
+        analytic: f64,
+        finite_difference: f64,
+        value_scale: f64,
+        relative_tolerance: f64,
+    ) {
+        assert!(
+            analytic.is_finite() && finite_difference.is_finite(),
+            "{label} {channel}: non-finite analytic={analytic} fd={finite_difference}"
+        );
+        let scale = analytic
+            .abs()
+            .max(finite_difference.abs())
+            .max(1e-8 * value_scale)
+            .max(f64::MIN_POSITIVE);
+        let relative_error = (analytic - finite_difference).abs() / scale;
+        assert!(
+            relative_error <= relative_tolerance,
+            "{label} {channel}: analytic={analytic:.12e} fd={finite_difference:.12e} \
+             rel={relative_error:.3e} tol={relative_tolerance:.3e}"
+        );
+    }
+
+    assert!(kappa > 0.0 && kappa.is_finite(), "{label}: invalid kappa");
+    assert_eq!(bundle.d_eta.len(), eta.len(), "{label}: d_eta shape");
+    assert_eq!(bundle.d2_eta.len(), eta.len(), "{label}: d2_eta rows");
+    assert_eq!(
+        bundle.d2_eta_kappa.len(),
+        eta.len(),
+        "{label}: d2_eta_kappa shape"
+    );
+    assert!(
+        bundle
+            .d2_eta
+            .iter()
+            .all(|row| row.len() == eta.len()),
+        "{label}: d2_eta columns"
+    );
+
+    let value = value_at(eta, kappa);
+    let value_scale = value.abs().max(1e-14);
+    assert_fd_close(label, "value", bundle.value, value, value_scale, 1e-13);
+
+    // Two axes exercise both the diagonal and off-diagonal eta-Hessian paths
+    // without multiplying the cost of the branch matrix by ambient dimension.
+    let axes = [0usize, eta.len() - 1];
+    let eta_step = 2e-3_f64;
+    let kappa_step = 2e-3 * kappa;
+
+    for &axis in &axes {
+        let eta_value = |delta: f64| {
+            let mut shifted = eta.to_vec();
+            shifted[axis] += delta;
+            value_at(&shifted, kappa)
+        };
+        let eta_m2 = eta_value(-2.0 * eta_step);
+        let eta_m1 = eta_value(-eta_step);
+        let eta_p1 = eta_value(eta_step);
+        let eta_p2 = eta_value(2.0 * eta_step);
+        let eta_first_fd =
+            (eta_m2 - 8.0 * eta_m1 + 8.0 * eta_p1 - eta_p2) / (12.0 * eta_step);
+        let eta_second_fd = (-eta_p2 + 16.0 * eta_p1 - 30.0 * value + 16.0 * eta_m1
+            - eta_m2)
+            / (12.0 * eta_step * eta_step);
+        assert_fd_close(
+            label,
+            &format!("d_eta[{axis}]"),
+            bundle.d_eta[axis],
+            eta_first_fd,
+            value_scale,
+            5e-5,
+        );
+        assert_fd_close(
+            label,
+            &format!("d2_eta[{axis},{axis}]"),
+            bundle.d2_eta[axis][axis],
+            eta_second_fd,
+            value_scale,
+            2e-3,
+        );
+
+        let mixed_eta_kappa_at = |eta_h: f64, kappa_h: f64| {
+            let mut plus_eta = eta.to_vec();
+            let mut minus_eta = eta.to_vec();
+            plus_eta[axis] += eta_h;
+            minus_eta[axis] -= eta_h;
+            (value_at(&plus_eta, kappa + kappa_h)
+                - value_at(&plus_eta, kappa - kappa_h)
+                - value_at(&minus_eta, kappa + kappa_h)
+                + value_at(&minus_eta, kappa - kappa_h))
+                / (4.0 * eta_h * kappa_h)
+        };
+        let mixed_coarse = mixed_eta_kappa_at(eta_step, kappa_step);
+        let mixed_fine = mixed_eta_kappa_at(0.5 * eta_step, 0.5 * kappa_step);
+        let mixed_fd = (4.0 * mixed_fine - mixed_coarse) / 3.0;
+        assert_fd_close(
+            label,
+            &format!("d2_eta_kappa[{axis}]"),
+            bundle.d2_eta_kappa[axis],
+            mixed_fd,
+            value_scale,
+            2e-3,
+        );
+    }
+
+    let (axis_a, axis_b) = (axes[0], axes[1]);
+    let eta_cross_at = |step: f64| {
+        let mut pp = eta.to_vec();
+        let mut pm = eta.to_vec();
+        let mut mp = eta.to_vec();
+        let mut mm = eta.to_vec();
+        pp[axis_a] += step;
+        pp[axis_b] += step;
+        pm[axis_a] += step;
+        pm[axis_b] -= step;
+        mp[axis_a] -= step;
+        mp[axis_b] += step;
+        mm[axis_a] -= step;
+        mm[axis_b] -= step;
+        (value_at(&pp, kappa) - value_at(&pm, kappa) - value_at(&mp, kappa)
+            + value_at(&mm, kappa))
+            / (4.0 * step * step)
+    };
+    let eta_cross_coarse = eta_cross_at(eta_step);
+    let eta_cross_fine = eta_cross_at(0.5 * eta_step);
+    let eta_cross_fd = (4.0 * eta_cross_fine - eta_cross_coarse) / 3.0;
+    assert_fd_close(
+        label,
+        &format!("d2_eta[{axis_a},{axis_b}]"),
+        bundle.d2_eta[axis_a][axis_b],
+        eta_cross_fd,
+        value_scale,
+        2e-3,
+    );
+    assert_fd_close(
+        label,
+        &format!("d2_eta symmetry [{axis_b},{axis_a}]"),
+        bundle.d2_eta[axis_b][axis_a],
+        bundle.d2_eta[axis_a][axis_b],
+        value_scale,
+        1e-13,
+    );
+
+    let kappa_m2 = value_at(eta, kappa - 2.0 * kappa_step);
+    let kappa_m1 = value_at(eta, kappa - kappa_step);
+    let kappa_p1 = value_at(eta, kappa + kappa_step);
+    let kappa_p2 = value_at(eta, kappa + 2.0 * kappa_step);
+    let kappa_first_fd = (kappa_m2 - 8.0 * kappa_m1 + 8.0 * kappa_p1 - kappa_p2)
+        / (12.0 * kappa_step);
+    let kappa_second_fd = (-kappa_p2 + 16.0 * kappa_p1 - 30.0 * value
+        + 16.0 * kappa_m1
+        - kappa_m2)
+        / (12.0 * kappa_step * kappa_step);
+    assert_fd_close(
+        label,
+        "d_kappa",
+        bundle.d_kappa,
+        kappa_first_fd,
+        value_scale,
+        5e-5,
+    );
+    assert_fd_close(
+        label,
+        "d2_kappa",
+        bundle.d2_kappa,
+        kappa_second_fd,
+        value_scale,
+        2e-3,
+    );
+
+    // A branch fixture with zero derivative signal would turn its FD gate into
+    // a tautology. Require every derivative family to carry observable signal.
+    let eta_first_signal = axes
+        .iter()
+        .map(|&axis| bundle.d_eta[axis].abs())
+        .fold(0.0_f64, f64::max);
+    let eta_second_signal = axes
+        .iter()
+        .map(|&axis| bundle.d2_eta[axis][axis].abs())
+        .chain(std::iter::once(bundle.d2_eta[axis_a][axis_b].abs()))
+        .fold(0.0_f64, f64::max);
+    let mixed_signal = axes
+        .iter()
+        .map(|&axis| bundle.d2_eta_kappa[axis].abs())
+        .fold(0.0_f64, f64::max);
+    let signal_floor = 1e-10 * value_scale;
+    assert!(eta_first_signal > signal_floor, "{label}: vacuous d_eta gate");
+    assert!(eta_second_signal > signal_floor, "{label}: vacuous d2_eta gate");
+    assert!(bundle.d_kappa.abs() > signal_floor, "{label}: vacuous d_kappa gate");
+    assert!(bundle.d2_kappa.abs() > signal_floor, "{label}: vacuous d2_kappa gate");
+    assert!(mixed_signal > signal_floor, "{label}: vacuous mixed gate");
+}
+
+#[test]
+fn test_pair_block_derivative_branch_matrix_is_fully_fd_gated_2315() {
+    use super::closed_form_penalty::{
+        analytic_self_pair_bundle, aniso_invariants, hybrid_self_pair_bundle_odd_d,
+        pair_block_radial_with_j_second_derivatives, schoenberg_self_pair_bundle,
+        schwinger_radial_is_convergent, use_duchon_small_chi_riesz_series,
+    };
+
+    // Zero lag has two independent analytic implementations. Exercise every
+    // q match arm in convergent odd/even Schoenberg regimes and in the
+    // IR-singular odd-dimensional collision branch that motivated #2291.
+    let zero_lag_cases = [
+        ("zero-schoenberg-odd", 5usize, 1usize, 2usize, true),
+        ("zero-schoenberg-even", 6, 1, 2, true),
+        ("zero-hybrid-ir-singular-odd", 3, 2, 2, false),
+    ];
+    for (case_label, d, m, s, expect_schoenberg) in zero_lag_cases {
+        let eta: Vec<f64> = (0..d)
+            .map(|axis| 0.06 * axis as f64 - 0.1)
+            .collect();
+        let r = vec![0.0_f64; d];
+        let kappa = 0.9_f64;
+        for q in 0..=2 {
+            let schoenberg = schoenberg_self_pair_bundle(q, m, s, kappa, &eta);
+            let hybrid = hybrid_self_pair_bundle_odd_d(q, m, s, kappa, &eta);
+            if expect_schoenberg {
+                assert!(schoenberg.is_some(), "{case_label} q={q}: wrong zero-lag branch");
+            } else {
+                assert!(schoenberg.is_none(), "{case_label} q={q}: IR gate not exercised");
+                assert!(hybrid.is_some(), "{case_label} q={q}: hybrid branch not exercised");
+            }
+
+            let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
+            let label = format!("{case_label}-q{q}");
+            assert_pair_block_bundle_fully_fd_gated(
+                &label,
+                &eta,
+                kappa,
+                &bundle,
+                |eta_at, kappa_at| {
+                    analytic_self_pair_bundle(q, m, s, kappa_at, eta_at)
+                        .expect("finite analytic self-pair throughout FD stencil")
+                        .value
+                },
+            );
+        }
+    }
+
+    // Nonzero lag has three radial charts: small-chi finite-part series,
+    // ordinary low-d partial fractions, and ordinary high-d Schwinger form.
+    // Include both parities and keep each fixture well away from its dispatch
+    // boundary so the finite-difference stencil never changes charts.
+    let nonzero_cases = [
+        (
+            "ordinary-pf-odd",
+            1usize,
+            1usize,
+            0.9_f64,
+            vec![0.12, -0.08, 0.04],
+            vec![0.7, -0.4, 0.5],
+            false,
+            false,
+        ),
+        (
+            "ordinary-pf-even",
+            1,
+            2,
+            0.8,
+            vec![0.1, -0.07, 0.03, -0.02],
+            vec![0.6, -0.5, 0.4, 0.3],
+            false,
+            false,
+        ),
+        (
+            "ordinary-schwinger-odd",
+            1,
+            2,
+            0.8,
+            vec![0.1, -0.07, 0.03, -0.02, 0.05],
+            vec![0.7, -0.5, 0.4, 0.3, -0.2],
+            false,
+            true,
+        ),
+        (
+            "small-chi-odd",
+            1,
+            1,
+            0.9,
+            vec![0.12, -0.08, 0.04],
+            vec![0.03, -0.02, 0.015],
+            true,
+            false,
+        ),
+        (
+            "small-chi-even",
+            1,
+            2,
+            0.8,
+            vec![0.1, -0.07, 0.03, -0.02],
+            vec![0.025, -0.02, 0.015, 0.01],
+            true,
+            false,
+        ),
+    ];
+    for (case_label, m, s, kappa, eta, r, expect_small_chi, expect_schwinger) in nonzero_cases {
+        let big_r = aniso_invariants(&eta, &r).0;
+        assert_eq!(
+            use_duchon_small_chi_riesz_series(kappa, big_r),
+            expect_small_chi,
+            "{case_label}: wrong small-chi fixture classification"
+        );
+        assert_eq!(
+            schwinger_radial_is_convergent(eta.len(), m),
+            expect_schwinger,
+            "{case_label}: wrong ordinary-chart fixture classification"
+        );
+        for q in 0..=2 {
+            let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
+            let label = format!("{case_label}-q{q}");
+            assert_pair_block_bundle_fully_fd_gated(
+                &label,
+                &eta,
+                kappa,
+                &bundle,
+                |eta_at, kappa_at| {
+                    pair_block_radial_with_j_second_derivatives(
+                        q, m, s, kappa_at, eta_at, &r,
+                    )
+                    .value
+                },
+            );
+        }
+    }
+}
+
 #[test]
 fn test_kappa_derivative_matches_finite_difference() {
     use super::closed_form_penalty::{

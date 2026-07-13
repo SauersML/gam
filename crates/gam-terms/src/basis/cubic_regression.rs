@@ -400,6 +400,40 @@ mod tests {
         }
     }
 
+    /// Natural cubic rows depend only on relative abscissa geometry. Exercise
+    /// interior knots, exact endpoints, and both linear-extrapolation arms so an
+    /// absolute coordinate epsilon cannot silently alter any design branch.
+    #[test]
+    fn natural_cubic_full_design_is_abscissa_scale_invariant_2315() {
+        let knots = Array1::from(vec![0.0, 0.17, 0.43, 0.71, 1.0]);
+        let points = Array1::from(vec![-0.35, 0.0, 0.09, 0.43, 0.86, 1.0, 1.28]);
+        let reference = CubicRegressionBasis::new(knots.clone())
+            .unwrap()
+            .design(points.view());
+        assert!(
+            reference.iter().any(|value| value.abs() > 1.0),
+            "extrapolation fixture must exercise nontrivial cubic design weights"
+        );
+
+        for scale in [1e-9_f64, 1.0, 1e9] {
+            let scaled_knots = knots.mapv(|value| value * scale);
+            let scaled_points = points.mapv(|value| value * scale);
+            let actual = CubicRegressionBasis::new(scaled_knots)
+                .unwrap()
+                .design(scaled_points.view());
+            assert_eq!(actual.dim(), reference.dim());
+            for ((row, col), &expected) in reference.indexed_iter() {
+                let observed = actual[[row, col]];
+                let tolerance = 2e-10 * (1.0 + expected.abs());
+                assert!(
+                    (observed - expected).abs() <= tolerance,
+                    "natural cubic design[{row},{col}] changed under x,knots *= {scale}: \
+                     observed={observed:.16e} expected={expected:.16e}"
+                );
+            }
+        }
+    }
+
     /// Knot placement returns endpoints = min/max and strictly increasing knots.
     #[test]
     fn cr_knots_span_data_and_increase() {

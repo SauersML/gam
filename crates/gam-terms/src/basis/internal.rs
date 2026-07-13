@@ -474,6 +474,19 @@ mod knot_scale_invariance_tests {
         local_sum
     }
 
+    fn full_basis_vector_at(x: f64, knots: ArrayView1<f64>, degree: usize) -> Vec<f64> {
+        let mut values = vec![0.0; knots.len() - degree - 1];
+        let mut scratch = BsplineScratch::new(degree);
+        evaluate_splines_at_point_full_support_into(
+            x,
+            degree,
+            knots,
+            &mut values,
+            &mut scratch,
+        );
+        values
+    }
+
     /// Regression for #2292: the Cox–de Boor recurrence is scale-free (its terms
     /// are ratios `(x - t_i)/(t_{i+k} - t_i)`), so partition-of-unity must hold
     /// on a small-magnitude domain exactly as it does at unit scale. The old
@@ -511,32 +524,84 @@ mod knot_scale_invariance_tests {
         }
     }
 
+    /// Standing affine-abscissa property for #2315: partition-of-unity alone
+    /// cannot detect a scale-dependent permutation or distortion whose row still
+    /// sums to one, so compare every basis coordinate at each required scale.
+    #[test]
+    fn clamped_bspline_full_basis_is_abscissa_scale_invariant_2315() {
+        let degree = 3;
+        let reference_knots = clamped_cubic_knots(1.0);
+        for frac in [0.0_f64, 0.05, 0.3, 0.55, 0.72, 0.95, 1.0] {
+            let reference = full_basis_vector_at(frac, reference_knots.view(), degree);
+            assert!(
+                reference.iter().any(|value| value.abs() > 0.1),
+                "reference row must carry nontrivial basis signal at {frac}"
+            );
+            for scale in [1e-9_f64, 1.0, 1e9] {
+                let scaled_knots = clamped_cubic_knots(scale);
+                let scaled =
+                    full_basis_vector_at(frac * scale, scaled_knots.view(), degree);
+                for (basis_idx, (&actual, &expected)) in
+                    scaled.iter().zip(reference.iter()).enumerate()
+                {
+                    assert!(
+                        (actual - expected).abs() <= 2e-12,
+                        "basis[{basis_idx}] changed under x,knots *= {scale} at fraction {frac}: \
+                         actual={actual:.16e} expected={expected:.16e}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn bspline_derivatives_transform_covariantly_under_coordinate_scaling() {
         let degree = 3;
-        let scale = 1e-12;
         let knots = clamped_cubic_knots(1.0);
-        let tiny_knots = clamped_cubic_knots(scale);
         let num_basis = knots.len() - degree - 1;
-        let mut d1 = vec![0.0; num_basis];
-        let mut d1_tiny = vec![0.0; num_basis];
-        let mut d2 = vec![0.0; num_basis];
-        let mut d2_tiny = vec![0.0; num_basis];
-        evaluate_bspline_derivative_scalar(0.37, knots.view(), degree, &mut d1).unwrap();
-        evaluate_bspline_derivative_scalar(0.37 * scale, tiny_knots.view(), degree, &mut d1_tiny)
-            .unwrap();
-        evaluate_bsplinesecond_derivative_scalar(0.37, knots.view(), degree, &mut d2).unwrap();
-        evaluate_bsplinesecond_derivative_scalar(
-            0.37 * scale,
-            tiny_knots.view(),
-            degree,
-            &mut d2_tiny,
-        )
-        .unwrap();
+        for frac in [0.13_f64, 0.37, 0.81] {
+            let mut d1 = vec![0.0; num_basis];
+            let mut d2 = vec![0.0; num_basis];
+            evaluate_bspline_derivative_scalar(frac, knots.view(), degree, &mut d1).unwrap();
+            evaluate_bsplinesecond_derivative_scalar(frac, knots.view(), degree, &mut d2)
+                .unwrap();
+            assert!(d1.iter().any(|value| value.abs() > 0.1));
+            assert!(d2.iter().any(|value| value.abs() > 0.1));
 
-        for i in 0..num_basis {
-            assert!((d1_tiny[i] * scale - d1[i]).abs() < 1e-10);
-            assert!((d2_tiny[i] * scale * scale - d2[i]).abs() < 1e-9);
+            for scale in [1e-9_f64, 1.0, 1e9] {
+                let scaled_knots = clamped_cubic_knots(scale);
+                let mut d1_scaled = vec![0.0; num_basis];
+                let mut d2_scaled = vec![0.0; num_basis];
+                evaluate_bspline_derivative_scalar(
+                    frac * scale,
+                    scaled_knots.view(),
+                    degree,
+                    &mut d1_scaled,
+                )
+                .unwrap();
+                evaluate_bsplinesecond_derivative_scalar(
+                    frac * scale,
+                    scaled_knots.view(),
+                    degree,
+                    &mut d2_scaled,
+                )
+                .unwrap();
+
+                for i in 0..num_basis {
+                    let first_covariant = d1_scaled[i] * scale;
+                    let second_covariant = d2_scaled[i] * scale * scale;
+                    assert!(
+                        (first_covariant - d1[i]).abs() <= 1e-10 * (1.0 + d1[i].abs()),
+                        "first derivative basis[{i}] violated c*dB(c*x;c*t)=dB(x;t), \
+                         c={scale} frac={frac}"
+                    );
+                    assert!(
+                        (second_covariant - d2[i]).abs() <= 1e-9 * (1.0 + d2[i].abs()),
+                        "second derivative basis[{i}] violated c^2*d2B(c*x;c*t)=d2B(x;t), \
+                         c={scale} frac={frac}"
+                    );
+                }
+            }
         }
     }
 

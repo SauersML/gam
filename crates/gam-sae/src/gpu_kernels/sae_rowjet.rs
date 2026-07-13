@@ -26,8 +26,7 @@
 //! they are never hidden by retrying the tile on the CPU.
 
 use crate::row_jet_program::{
-    SaeRowPrimary, SaeScheduledRowJets, SaeSoftmaxRowProgramSource,
-    execute_softmax_row_program,
+    SaeRowPrimary, SaeScheduledRowJets, SaeSoftmaxRowProgramSource, execute_softmax_row_program,
 };
 
 /// One primary in a complete SAE reconstruction row.
@@ -37,21 +36,17 @@ pub enum SaeRowJetPrimary {
     Coordinate { atom: usize, axis: usize },
 }
 
-impl From<SaeRowPrimary> for SaeRowJetPrimary {
-    fn from(value: SaeRowPrimary) -> Self {
-        match value {
-            SaeRowPrimary::Logit { atom } => Self::Logit { atom },
-            SaeRowPrimary::Coord { atom, axis } => Self::Coordinate { atom, axis },
-        }
+fn public_primary(value: SaeRowPrimary) -> SaeRowJetPrimary {
+    match value {
+        SaeRowPrimary::Logit { atom } => SaeRowJetPrimary::Logit { atom },
+        SaeRowPrimary::Coord { atom, axis } => SaeRowJetPrimary::Coordinate { atom, axis },
     }
 }
 
-impl From<SaeRowJetPrimary> for SaeRowPrimary {
-    fn from(value: SaeRowJetPrimary) -> Self {
-        match value {
-            SaeRowJetPrimary::Logit { atom } => Self::Logit { atom },
-            SaeRowJetPrimary::Coordinate { atom, axis } => Self::Coord { atom, axis },
-        }
+fn scheduled_primary(value: SaeRowJetPrimary) -> SaeRowPrimary {
+    match value {
+        SaeRowJetPrimary::Logit { atom } => SaeRowPrimary::Logit { atom },
+        SaeRowJetPrimary::Coordinate { atom, axis } => SaeRowPrimary::Coord { atom, axis },
     }
 }
 
@@ -101,8 +96,9 @@ impl SaeSoftmaxRowJetInput {
         let out_dim = source.out_dim();
         let q = source.n_primaries();
         let n_beta = source.n_beta_borders();
-        let primaries: Vec<SaeRowJetPrimary> =
-            (0..q).map(|slot| source.primary(slot).into()).collect();
+        let primaries: Vec<SaeRowJetPrimary> = (0..q)
+            .map(|slot| public_primary(source.primary(slot)))
+            .collect();
 
         let decoded_len = n_atoms
             .checked_mul(out_dim)
@@ -194,9 +190,7 @@ impl SaeSoftmaxRowJetInput {
             n_atoms,
             out_dim,
             primaries,
-            gate_values: (0..n_atoms)
-                .map(|atom| source.gate_value(atom))
-                .collect(),
+            gate_values: (0..n_atoms).map(|atom| source.gate_value(atom)).collect(),
             active_atoms: (0..n_atoms)
                 .map(|atom| source.atom_is_active(atom))
                 .collect(),
@@ -262,10 +256,37 @@ impl SaeSoftmaxRowJetInput {
                 ));
             }
         }
+        if let Some((atom, value)) = self
+            .gate_values
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| *value < 0.0 || *value > 1.0)
+        {
+            return Err(format!(
+                "SAE row-jet gate_values[{atom}] must be a probability; got {value}"
+            ));
+        }
+        let gate_sum: f64 = self.gate_values.iter().sum();
+        let rounding_mass = (k as f64) * f64::EPSILON;
+        if rounding_mass >= 1.0 {
+            return Err(format!(
+                "SAE row-jet K={k} is too large to certify a normalized f64 softmax"
+            ));
+        }
+        let summation_bound = rounding_mass / (1.0 - rounding_mass);
+        let normalization_bound =
+            f64::EPSILON + summation_bound + f64::EPSILON * summation_bound;
+        if (gate_sum - 1.0).abs() > normalization_bound * gate_sum.abs().max(1.0) {
+            return Err(format!(
+                "SAE row-jet gate values must sum to one within the f64 normalization bound {normalization_bound:e}; got {gate_sum:e}"
+            ));
+        }
         for (slot, primary) in self.primaries.iter().copied().enumerate() {
             let atom = match primary {
-                SaeRowJetPrimary::Logit { atom }
-                | SaeRowJetPrimary::Coordinate { atom, .. } => atom,
+                SaeRowJetPrimary::Logit { atom } | SaeRowJetPrimary::Coordinate { atom, .. } => {
+                    atom
+                }
             };
             if atom >= k {
                 return Err(format!(
@@ -334,7 +355,13 @@ pub struct SaeRowJetChannels {
 }
 
 impl SaeRowJetChannels {
-    fn zeros(n_rows: usize, n_atoms: usize, q: usize, p: usize, n_beta: usize) -> Result<Self, String> {
+    fn zeros(
+        n_rows: usize,
+        n_atoms: usize,
+        q: usize,
+        p: usize,
+        n_beta: usize,
+    ) -> Result<Self, String> {
         Ok(Self {
             n_rows,
             n_atoms,
@@ -376,7 +403,9 @@ impl SaeRowJetChannels {
                 for slot in 0..self.q {
                     let source = row * mixed_row_len + (slot * self.n_beta + border) * self.p;
                     let values = &self.beta_mixed[source..source + self.p];
-                    scheduled.beta_deriv_mut(slot, border).copy_from_slice(values);
+                    scheduled
+                        .beta_deriv_mut(slot, border)
+                        .copy_from_slice(values);
                     scheduled
                         .beta_l_deriv_mut(slot, border)
                         .copy_from_slice(values);
@@ -393,6 +422,7 @@ impl SaeRowJetChannels {
 pub struct SaeRowJetMemoryLedger {
     pub fixed_device_bytes: usize,
     pub device_bytes_per_row: usize,
+    pub cpu_host_bytes_per_row: usize,
     pub host_bytes_per_row: usize,
 }
 
@@ -401,19 +431,40 @@ impl SaeRowJetMemoryLedger {
         let f64_bytes = std::mem::size_of::<f64>();
         let i32_bytes = std::mem::size_of::<i32>();
         let f64_count = |shape: &[usize]| -> Result<usize, String> {
-            checked_product(shape)?.checked_mul(f64_bytes).ok_or_else(|| {
-                format!("SAE row-jet f64 byte count overflow for {shape:?}")
-            })
+            checked_product(shape)?
+                .checked_mul(f64_bytes)
+                .ok_or_else(|| format!("SAE row-jet f64 byte count overflow for {shape:?}"))
         };
         let i32_count = |shape: &[usize]| -> Result<usize, String> {
-            checked_product(shape)?.checked_mul(i32_bytes).ok_or_else(|| {
-                format!("SAE row-jet i32 byte count overflow for {shape:?}")
-            })
+            checked_product(shape)?
+                .checked_mul(i32_bytes)
+                .ok_or_else(|| format!("SAE row-jet i32 byte count overflow for {shape:?}"))
         };
 
-        let fixed_device_bytes = f64_count(&[n_beta, p])?
+        let mut fixed_device_bytes = f64_count(&[n_beta, p])?
             .checked_add(i32_count(&[n_beta])?)
             .ok_or_else(|| "SAE row-jet fixed device-byte sum overflow".to_string())?;
+        let mut empty_handle_bytes = 0usize;
+        let mut add_empty_handle = |bytes: usize| -> Result<(), String> {
+            empty_handle_bytes = empty_handle_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| "SAE row-jet empty-handle byte sum overflow".to_string())?;
+            Ok(())
+        };
+        if q == 0 {
+            add_empty_handle(i32_count(&[2])?)?; // primary kind + atom
+            add_empty_handle(f64_count(&[4])?)?; // d1 + d2 + first + second
+        }
+        if n_beta == 0 {
+            add_empty_handle(i32_count(&[1])?)?; // beta atom
+            add_empty_handle(f64_count(&[3])?)?; // beta phi + output + beta result
+        }
+        if q == 0 || n_beta == 0 {
+            add_empty_handle(f64_count(&[2])?)?; // beta first + mixed result
+        }
+        fixed_device_bytes = fixed_device_bytes
+            .checked_add(empty_handle_bytes)
+            .ok_or_else(|| "SAE row-jet fixed empty-handle byte sum overflow".to_string())?;
         let input_f64 = [
             f64_count(&[k])?,
             f64_count(&[1])?,
@@ -450,6 +501,11 @@ impl SaeRowJetMemoryLedger {
         let scheduled_output = output
             .checked_add(f64_count(&[q, n_beta, p])?)
             .ok_or_else(|| "SAE row-jet scheduled-output byte sum overflow".to_string())?;
+        let cpu_host_bytes_per_row = input_f64
+            .checked_add(input_i32)
+            .and_then(|value| value.checked_add(output))
+            .and_then(|value| value.checked_add(scheduled_output))
+            .ok_or_else(|| "SAE row-jet CPU host row-byte sum overflow".to_string())?;
         let host_bytes_per_row = input_f64
             .checked_add(input_i32)
             .and_then(|value| value.checked_mul(2))
@@ -459,6 +515,7 @@ impl SaeRowJetMemoryLedger {
         Ok(Self {
             fixed_device_bytes,
             device_bytes_per_row,
+            cpu_host_bytes_per_row,
             host_bytes_per_row,
         })
     }
@@ -494,6 +551,11 @@ pub fn plan_softmax_row_jets(
     n_beta: usize,
     mode: gam_gpu::GpuPolicy,
 ) -> Result<SaeRowJetExecutionPlan, String> {
+    if k == 0 || p == 0 {
+        return Err(format!(
+            "complete SAE row-jet plan requires nonzero K and p; got K={k}, p={p}"
+        ));
+    }
     let ledger = SaeRowJetMemoryLedger::for_shape(k, q, p, n_beta)?;
     if total_rows == 0 {
         return Ok(SaeRowJetExecutionPlan {
@@ -503,10 +565,10 @@ pub fn plan_softmax_row_jets(
         });
     }
     let host_budget = crate::manifold::sae_host_in_core_budget_bytes().0;
-    if ledger.host_bytes_per_row > host_budget {
+    if ledger.cpu_host_bytes_per_row > host_budget {
         return Err(format!(
             "complete SAE row jet needs {} host bytes for one K={k}, q={q}, p={p}, beta={n_beta} row, exceeding the cgroup-aware budget {host_budget}",
-            ledger.host_bytes_per_row
+            ledger.cpu_host_bytes_per_row
         ));
     }
     if mode == gam_gpu::GpuPolicy::Off {
@@ -532,7 +594,10 @@ pub fn plan_softmax_row_jets(
     #[cfg(not(target_os = "linux"))]
     {
         if mode == gam_gpu::GpuPolicy::Required {
-            return Err("complete SAE row jet requires CUDA, which is unavailable on this platform".to_string());
+            return Err(
+                "complete SAE row jet requires CUDA, which is unavailable on this platform"
+                    .to_string(),
+            );
         }
         Ok(SaeRowJetExecutionPlan {
             path: SaeRowJetPath::Cpu,
@@ -545,7 +610,9 @@ pub fn plan_softmax_row_jets(
     {
         let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
             if mode == gam_gpu::GpuPolicy::Required {
-                return Err("complete SAE row jet requires CUDA, but no runtime was admitted".to_string());
+                return Err(
+                    "complete SAE row jet requires CUDA, but no runtime was admitted".to_string(),
+                );
             }
             return Ok(SaeRowJetExecutionPlan {
                 path: SaeRowJetPath::Cpu,
@@ -664,9 +731,7 @@ impl InputSource<'_> {
         self.input
             .primaries
             .iter()
-            .position(|candidate| {
-                *candidate == SaeRowJetPrimary::Coordinate { atom, axis }
-            })
+            .position(|candidate| *candidate == SaeRowJetPrimary::Coordinate { atom, axis })
             .expect("validated row source requested a present coordinate")
     }
 }
@@ -682,7 +747,7 @@ impl SaeSoftmaxRowProgramSource for InputSource<'_> {
         self.input.n_primaries()
     }
     fn primary(&self, slot: usize) -> SaeRowPrimary {
-        self.input.primaries[slot].into()
+        scheduled_primary(self.input.primaries[slot])
     }
     fn gate_value(&self, atom: usize) -> f64 {
         self.input.gate_values[atom]
@@ -737,18 +802,14 @@ fn cpu_tile(
 ) -> Result<SaeRowJetChannels, String> {
     let mut out = SaeRowJetChannels::zeros(rows.len(), k, q, p, n_beta)?;
     for (row, input) in rows.iter().enumerate() {
-        let scheduled = execute_softmax_row_program(
-            &InputSource { input },
-            inv_tau,
-            input.sqrt_row_weight,
-        );
+        let scheduled =
+            execute_softmax_row_program(&InputSource { input }, inv_tau, input.sqrt_row_weight);
         for slot in 0..q {
             let target = row * q * p + slot * p;
             out.first[target..target + p].copy_from_slice(scheduled.first(slot));
             for other in 0..q {
                 let target = row * q * q * p + (slot * q + other) * p;
-                out.second[target..target + p]
-                    .copy_from_slice(scheduled.second(slot, other));
+                out.second[target..target + p].copy_from_slice(scheduled.second(slot, other));
             }
         }
         for border in 0..n_beta {
@@ -903,8 +964,8 @@ extern "C" __global__ void sae_rowjet_beta_mixed(
 #[cfg(target_os = "linux")]
 mod device {
     use super::{
-        COMPLETE_SOFTMAX_KERNEL_SOURCE, SaeRowJetChannels, SaeRowJetPrimary,
-        SaeSoftmaxRowJetInput,
+        COMPLETE_SOFTMAX_KERNEL_SOURCE, SaeRowJetChannels, SaeRowJetPrimary, SaeSoftmaxRowJetInput,
+        checked_product,
     };
     use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
@@ -951,6 +1012,10 @@ mod device {
         })
     }
 
+    fn device_length(shape: &[usize]) -> Result<usize, GpuError> {
+        checked_product(shape).map_err(|reason| gam_gpu::gpu_err!("{reason}"))
+    }
+
     pub(super) fn device_tile(
         rows: &[SaeSoftmaxRowJetInput],
         inv_tau: f64,
@@ -963,16 +1028,16 @@ mod device {
         let b = backend()?;
         let stream = b.stream.clone();
 
-        let mut z = Vec::with_capacity(n * k);
-        let mut active = Vec::with_capacity(n * k);
-        let mut kind = Vec::with_capacity(n * q);
-        let mut atom = Vec::with_capacity(n * q);
-        let mut decoded = Vec::with_capacity(n * k * p);
-        let mut d1 = Vec::with_capacity(n * q * p);
-        let mut d2 = Vec::with_capacity(n * q * q * p);
+        let mut z = Vec::with_capacity(device_length(&[n, k])?);
+        let mut active = Vec::with_capacity(device_length(&[n, k])?);
+        let mut kind = Vec::with_capacity(device_length(&[n, q])?);
+        let mut atom = Vec::with_capacity(device_length(&[n, q])?);
+        let mut decoded = Vec::with_capacity(device_length(&[n, k, p])?);
+        let mut d1 = Vec::with_capacity(device_length(&[n, q, p])?);
+        let mut d2 = Vec::with_capacity(device_length(&[n, q, q, p])?);
         let mut sqrt_w = Vec::with_capacity(n);
-        let mut beta_phi = Vec::with_capacity(n * n_beta);
-        let mut beta_first = Vec::with_capacity(n * q * n_beta);
+        let mut beta_phi = Vec::with_capacity(device_length(&[n, n_beta])?);
+        let mut beta_first = Vec::with_capacity(device_length(&[n, q, n_beta])?);
         for input in rows {
             z.extend_from_slice(&input.gate_values);
             active.extend(input.active_atoms.iter().map(|&value| i32::from(value)));
@@ -1060,10 +1125,10 @@ mod device {
             .clone_htod(&nonempty(&rows[0].beta_outputs))
             .gpu_ctx("SAE row-jet htod beta outputs")?;
 
-        let first_len = n * q * p;
-        let second_len = n * q * q * p;
-        let beta_len = n * n_beta * p;
-        let mixed_len = n * q * n_beta * p;
+        let first_len = device_length(&[n, q, p])?;
+        let second_len = device_length(&[n, q, q, p])?;
+        let beta_len = device_length(&[n, n_beta, p])?;
+        let mixed_len = device_length(&[n, q, n_beta, p])?;
         let mut first_dev = stream
             .alloc_zeros::<f64>(first_len.max(1))
             .gpu_ctx("SAE row-jet alloc first")?;
@@ -1076,63 +1141,135 @@ mod device {
         let mut mixed_dev = stream
             .alloc_zeros::<f64>(mixed_len.max(1))
             .gpu_ctx("SAE row-jet alloc beta mixed")?;
-        let k_i32 = i32::try_from(k).map_err(|_| gam_gpu::gpu_err!("SAE row-jet K overflows i32"))?;
-        let q_i32 = i32::try_from(q).map_err(|_| gam_gpu::gpu_err!("SAE row-jet q overflows i32"))?;
-        let p_i32 = i32::try_from(p).map_err(|_| gam_gpu::gpu_err!("SAE row-jet p overflows i32"))?;
-        let nb_i32 = i32::try_from(n_beta).map_err(|_| gam_gpu::gpu_err!("SAE row-jet beta count overflows i32"))?;
+        let k_i32 =
+            i32::try_from(k).map_err(|_| gam_gpu::gpu_err!("SAE row-jet K overflows i32"))?;
+        let q_i32 =
+            i32::try_from(q).map_err(|_| gam_gpu::gpu_err!("SAE row-jet q overflows i32"))?;
+        let p_i32 =
+            i32::try_from(p).map_err(|_| gam_gpu::gpu_err!("SAE row-jet p overflows i32"))?;
+        let nb_i32 = i32::try_from(n_beta)
+            .map_err(|_| gam_gpu::gpu_err!("SAE row-jet beta count overflows i32"))?;
 
         if first_len != 0 {
-            let function = b.module.load_function("sae_rowjet_first").gpu_ctx("SAE row-jet first load")?;
-            let total = u64::try_from(first_len).map_err(|_| gam_gpu::gpu_err!("SAE row-jet first length overflows u64"))?;
+            let function = b
+                .module
+                .load_function("sae_rowjet_first")
+                .gpu_ctx("SAE row-jet first load")?;
+            let total = u64::try_from(first_len)
+                .map_err(|_| gam_gpu::gpu_err!("SAE row-jet first length overflows u64"))?;
             let mut launch = stream.launch_builder(&function);
-            launch.arg(&z_dev).arg(&active_dev).arg(&kind_dev).arg(&atom_dev)
-                .arg(&decoded_dev).arg(&d1_dev).arg(&sqrt_w_dev).arg(&inv_tau)
-                .arg(&k_i32).arg(&q_i32).arg(&p_i32).arg(&total).arg(&mut first_dev);
+            launch
+                .arg(&z_dev)
+                .arg(&active_dev)
+                .arg(&kind_dev)
+                .arg(&atom_dev)
+                .arg(&decoded_dev)
+                .arg(&d1_dev)
+                .arg(&sqrt_w_dev)
+                .arg(&inv_tau)
+                .arg(&k_i32)
+                .arg(&q_i32)
+                .arg(&p_i32)
+                .arg(&total)
+                .arg(&mut first_dev);
             unsafe { launch.launch(grid(first_len)?) }.gpu_ctx("SAE row-jet first launch")?;
         }
         if second_len != 0 {
-            let function = b.module.load_function("sae_rowjet_second").gpu_ctx("SAE row-jet second load")?;
-            let total = u64::try_from(second_len).map_err(|_| gam_gpu::gpu_err!("SAE row-jet second length overflows u64"))?;
+            let function = b
+                .module
+                .load_function("sae_rowjet_second")
+                .gpu_ctx("SAE row-jet second load")?;
+            let total = u64::try_from(second_len)
+                .map_err(|_| gam_gpu::gpu_err!("SAE row-jet second length overflows u64"))?;
             let mut launch = stream.launch_builder(&function);
-            launch.arg(&z_dev).arg(&active_dev).arg(&kind_dev).arg(&atom_dev)
-                .arg(&decoded_dev).arg(&d1_dev).arg(&d2_dev).arg(&sqrt_w_dev)
-                .arg(&inv_tau).arg(&k_i32).arg(&q_i32).arg(&p_i32).arg(&total)
+            launch
+                .arg(&z_dev)
+                .arg(&active_dev)
+                .arg(&kind_dev)
+                .arg(&atom_dev)
+                .arg(&decoded_dev)
+                .arg(&d1_dev)
+                .arg(&d2_dev)
+                .arg(&sqrt_w_dev)
+                .arg(&inv_tau)
+                .arg(&k_i32)
+                .arg(&q_i32)
+                .arg(&p_i32)
+                .arg(&total)
                 .arg(&mut second_dev);
             unsafe { launch.launch(grid(second_len)?) }.gpu_ctx("SAE row-jet second launch")?;
         }
         if beta_len != 0 {
-            let function = b.module.load_function("sae_rowjet_beta").gpu_ctx("SAE row-jet beta load")?;
-            let total = u64::try_from(beta_len).map_err(|_| gam_gpu::gpu_err!("SAE row-jet beta length overflows u64"))?;
+            let function = b
+                .module
+                .load_function("sae_rowjet_beta")
+                .gpu_ctx("SAE row-jet beta load")?;
+            let total = u64::try_from(beta_len)
+                .map_err(|_| gam_gpu::gpu_err!("SAE row-jet beta length overflows u64"))?;
             let mut launch = stream.launch_builder(&function);
-            launch.arg(&z_dev).arg(&active_dev).arg(&beta_atom_dev).arg(&beta_phi_dev)
-                .arg(&beta_output_dev).arg(&sqrt_w_dev).arg(&k_i32).arg(&p_i32)
-                .arg(&nb_i32).arg(&total).arg(&mut beta_dev);
+            launch
+                .arg(&z_dev)
+                .arg(&active_dev)
+                .arg(&beta_atom_dev)
+                .arg(&beta_phi_dev)
+                .arg(&beta_output_dev)
+                .arg(&sqrt_w_dev)
+                .arg(&k_i32)
+                .arg(&p_i32)
+                .arg(&nb_i32)
+                .arg(&total)
+                .arg(&mut beta_dev);
             unsafe { launch.launch(grid(beta_len)?) }.gpu_ctx("SAE row-jet beta launch")?;
         }
         if mixed_len != 0 {
-            let function = b.module.load_function("sae_rowjet_beta_mixed").gpu_ctx("SAE row-jet beta mixed load")?;
-            let total = u64::try_from(mixed_len).map_err(|_| gam_gpu::gpu_err!("SAE row-jet mixed length overflows u64"))?;
+            let function = b
+                .module
+                .load_function("sae_rowjet_beta_mixed")
+                .gpu_ctx("SAE row-jet beta mixed load")?;
+            let total = u64::try_from(mixed_len)
+                .map_err(|_| gam_gpu::gpu_err!("SAE row-jet mixed length overflows u64"))?;
             let mut launch = stream.launch_builder(&function);
-            launch.arg(&z_dev).arg(&active_dev).arg(&kind_dev).arg(&atom_dev)
-                .arg(&beta_atom_dev).arg(&beta_phi_dev).arg(&beta_first_dev)
-                .arg(&beta_output_dev).arg(&sqrt_w_dev).arg(&inv_tau).arg(&k_i32)
-                .arg(&q_i32).arg(&p_i32).arg(&nb_i32).arg(&total).arg(&mut mixed_dev);
+            launch
+                .arg(&z_dev)
+                .arg(&active_dev)
+                .arg(&kind_dev)
+                .arg(&atom_dev)
+                .arg(&beta_atom_dev)
+                .arg(&beta_phi_dev)
+                .arg(&beta_first_dev)
+                .arg(&beta_output_dev)
+                .arg(&sqrt_w_dev)
+                .arg(&inv_tau)
+                .arg(&k_i32)
+                .arg(&q_i32)
+                .arg(&p_i32)
+                .arg(&nb_i32)
+                .arg(&total)
+                .arg(&mut mixed_dev);
             unsafe { launch.launch(grid(mixed_len)?) }.gpu_ctx("SAE row-jet beta mixed launch")?;
         }
 
         let mut out = SaeRowJetChannels::zeros(n, k, q, p, n_beta)
             .map_err(|reason| gam_gpu::gpu_err!("{reason}"))?;
         if first_len != 0 {
-            stream.memcpy_dtoh(&first_dev, &mut out.first).gpu_ctx("SAE row-jet dtoh first")?;
+            stream
+                .memcpy_dtoh(&first_dev, &mut out.first)
+                .gpu_ctx("SAE row-jet dtoh first")?;
         }
         if second_len != 0 {
-            stream.memcpy_dtoh(&second_dev, &mut out.second).gpu_ctx("SAE row-jet dtoh second")?;
+            stream
+                .memcpy_dtoh(&second_dev, &mut out.second)
+                .gpu_ctx("SAE row-jet dtoh second")?;
         }
         if beta_len != 0 {
-            stream.memcpy_dtoh(&beta_dev, &mut out.beta).gpu_ctx("SAE row-jet dtoh beta")?;
+            stream
+                .memcpy_dtoh(&beta_dev, &mut out.beta)
+                .gpu_ctx("SAE row-jet dtoh beta")?;
         }
         if mixed_len != 0 {
-            stream.memcpy_dtoh(&mixed_dev, &mut out.beta_mixed).gpu_ctx("SAE row-jet dtoh beta mixed")?;
+            stream
+                .memcpy_dtoh(&mixed_dev, &mut out.beta_mixed)
+                .gpu_ctx("SAE row-jet dtoh beta mixed")?;
         }
         stream.synchronize().gpu_ctx("SAE row-jet synchronize")?;
         Ok(out)
@@ -1225,9 +1362,17 @@ mod tests {
         let out = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Cpu)
             .expect("complete CPU row jet");
         assert_eq!(out.q, 6);
-        assert!(out.first[2 * out.p..3 * out.p].iter().any(|value| *value != 0.0));
+        assert!(
+            out.first[2 * out.p..3 * out.p]
+                .iter()
+                .any(|value| *value != 0.0)
+        );
         let mixed = (0 * out.q * out.q + 0 * out.q + 2) * out.p;
-        assert!(out.second[mixed..mixed + out.p].iter().any(|value| *value != 0.0));
+        assert!(
+            out.second[mixed..mixed + out.p]
+                .iter()
+                .any(|value| *value != 0.0)
+        );
         let transpose = (0 * out.q * out.q + 2 * out.q) * out.p;
         assert_eq!(
             &out.second[mixed..mixed + out.p],
@@ -1242,8 +1387,12 @@ mod tests {
         let ledger = SaeRowJetMemoryLedger::for_shape(3, 6, 2, 3).expect("ledger");
         assert!(ledger.fixed_device_bytes > 0);
         assert!(ledger.device_bytes_per_row > ledger.fixed_device_bytes);
+        assert!(ledger.host_bytes_per_row > ledger.cpu_host_bytes_per_row);
         assert!(ledger.host_bytes_per_row > ledger.device_bytes_per_row);
-        assert_eq!(ledger.maximum_rows(ledger.fixed_device_bytes, usize::MAX), 0);
+        assert_eq!(
+            ledger.maximum_rows(ledger.fixed_device_bytes, usize::MAX),
+            0
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1253,10 +1402,9 @@ mod tests {
             return;
         }
         let rows = complete_fixture(37);
-        let cpu = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Cpu)
-            .expect("CPU oracle");
+        let cpu = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Cpu).expect("CPU oracle");
         let device = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Device)
-            .expect("admitted device must execute without fallback");
+            .expect("admitted device must execute without a host retry");
         let max_error = cpu
             .first
             .iter()
