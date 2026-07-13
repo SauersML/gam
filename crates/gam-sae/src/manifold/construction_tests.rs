@@ -165,6 +165,151 @@ mod amortized_encoder_tests {
         }
     }
 
+    /// PATH C (#2253) — the exact fixed-stratum second derivative of the outer
+    /// gradient's log-determinant Daleckii–Krein trace channel (`logdet_trace`)
+    /// must equal a central finite difference of that SAME production channel at a
+    /// frozen inner state. Third HVP channel gate; it exercises the full-`H⁻¹`
+    /// selected-inverse curvature (`−tr(G C_j G Cᵢ)`) for both the decoder
+    /// smoothness EDF trace and the periodic-ARD log-precision Hessian trace, plus
+    /// their cross coupling and the rank-charge coordinate-block subtraction. The
+    /// FD rebuilds the fixed-θ̂ cache at each ρ ± h so `H⁻¹` MOVES with ρ — the
+    /// Daleckii–Krein term the analytic block carries.
+    #[test]
+    fn logdet_daleckii_krein_hessian_matches_finite_difference_2253() {
+        use crate::manifold::arrow_solver::DeflatedArrowSolver;
+        use crate::manifold::tests::gamma_fd_tiny_fixture;
+        use ndarray::{array, Array1};
+        // gamma_fd_tiny sits at a ρ = −6 floor with no interior PD minimum (the
+        // sibling rank-charge gate documents the same). Lift ρ_sparse into the PD
+        // basin AND lift ρ_smooth / ρ_ard off the floor so the decoder-smoothness
+        // EDF (λ_smooth ≈ 1.35) and the periodic-ARD log-precision Hessian traces
+        // (α ≈ 0.9, 1.1) carry a non-trivial curvature signal. A ρ perturbation
+        // scales only α, never the frozen circle coordinate t, so the max(·,0)
+        // majorizer active set is invariant — no subgradient ambiguity at the FD.
+        let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+        rho.log_lambda_sparse = 0.5;
+        for v in rho.log_lambda_smooth.iter_mut() {
+            *v = 0.3;
+        }
+        rho.log_ard = vec![array![-0.1_f64], array![0.1_f64]];
+        // Converge to a well-conditioned PD stationary state (mutates `term` to the
+        // fitted θ̂), then re-derive the fixed-θ̂ cache with a zero inner budget:
+        // H(ρ) = H_data(θ̂) + penalty(ρ) with θ̂ frozen — the fixed stratum the
+        // analytic Hessian differentiates.
+        term.penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            200,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
+        .expect("converged PD stationary cache");
+        let (_value, _loss, cache) = term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                0,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("fixed-theta base cache");
+
+        let n_params = rho.to_flat().len();
+        let analytic = term
+            .logdet_daleckii_krein_hessian(&rho, &cache)
+            .expect("logdet Daleckii-Krein Hessian block assembles");
+
+        // The smooth + ARD coordinates this channel covers (sparse/block excluded).
+        let mut coord_indices: Vec<usize> = Vec::new();
+        for a in 0..rho.log_lambda_smooth.len() {
+            coord_indices.push(rho.smooth_flat_index(a));
+        }
+        for kk in 0..rho.log_ard.len() {
+            for axis in 0..rho.log_ard[kk].len() {
+                let idx = rho.ard_flat_index(kk, axis);
+                if !coord_indices.contains(&idx) {
+                    coord_indices.push(idx);
+                }
+            }
+        }
+
+        // Non-vacuity: a smoothing AND an ARD diagonal must carry real curvature,
+        // else the gate would pass on an all-zero block.
+        let smooth0 = rho.smooth_flat_index(0);
+        let ard0 = rho.ard_flat_index(0, 0);
+        assert!(
+            analytic[[smooth0, smooth0]].abs() > 1.0e-6,
+            "smoothing logdet curvature must be non-trivial: {}",
+            analytic[[smooth0, smooth0]]
+        );
+        assert!(
+            analytic[[ard0, ard0]].abs() > 1.0e-6,
+            "ARD logdet curvature must be non-trivial: {}",
+            analytic[[ard0, ard0]]
+        );
+
+        // The production `logdet_trace` channel in ISOLATION, reproduced exactly as
+        // `analytic_outer_rho_gradient_components` assembles it (smooth EDF trace +
+        // ARD joint minus coordinate-block trace), so this validates CH4
+        // independently of the rank-charge / third-order channels.
+        let base = rho.to_flat();
+        let h = 1.0e-5;
+        let logdet_trace_at = |sign: f64, j: usize| -> Array1<f64> {
+            let mut flat = base.clone();
+            flat[j] += sign * h;
+            let r = rho.from_flat(flat.view()).unwrap();
+            let mut t = term.clone();
+            let (_value, _loss, cache) = t
+                .penalized_quasi_laplace_criterion_with_cache(
+                    target.view(),
+                    &r,
+                    None,
+                    0,
+                    0.4,
+                    1.0e-6,
+                    1.0e-6,
+                )
+                .expect("perturbed fixed-theta cache");
+            let solver = DeflatedArrowSolver::plain(&cache);
+            let lambda = r.lambda_smooth_vec().unwrap();
+            let smooth_logdet = t
+                .decoder_smoothness_effective_dof_with_solver_per_atom(&cache, &solver, &lambda)
+                .expect("smooth EDF trace");
+            let ard_joint = t
+                .ard_log_precision_hessian_trace(&r, &cache, &solver)
+                .expect("ard joint logdet trace");
+            let ard_coord = t
+                .coordinate_block_ard_log_precision_hessian_trace(&r, &cache)
+                .expect("ard coordinate-block logdet trace");
+            let mut v = Array1::<f64>::zeros(n_params);
+            for a in 0..r.log_lambda_smooth.len() {
+                v[r.smooth_flat_index(a)] = 0.5 * smooth_logdet[a];
+            }
+            for kk in 0..r.log_ard.len() {
+                for axis in 0..r.log_ard[kk].len() {
+                    v[r.ard_flat_index(kk, axis)] += ard_joint[kk][axis] - ard_coord[kk][axis];
+                }
+            }
+            v
+        };
+        for &j in &coord_indices {
+            let fd_col = (logdet_trace_at(1.0, j) - logdet_trace_at(-1.0, j)) / (2.0 * h);
+            for &i in &coord_indices {
+                let analytic_ij = analytic[[i, j]];
+                let fd_ij = fd_col[i];
+                assert!(
+                    (analytic_ij - fd_ij).abs() < 1.0e-5 + 1.0e-4 * analytic_ij.abs(),
+                    "logdet Daleckii-Krein Hessian [{i},{j}] mismatch: \
+                     analytic={analytic_ij}, fd={fd_ij}"
+                );
+            }
+        }
+    }
+
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
     /// coordinates used by reconstruction. Decoder magnitude stays in `B`, so
     /// there is no second radial-scale channel to fold into these values.
