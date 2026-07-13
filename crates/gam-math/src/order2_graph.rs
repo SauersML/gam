@@ -415,6 +415,14 @@ fn for_each_supported_upper_by_column(support: u16, mut visit: impl FnMut(usize,
     }
 }
 
+/// Packed column-major upper-triangle offset for two axes in `support`.
+#[inline(always)]
+fn supported_upper_offset(support: u16, primary: usize, other: usize) -> usize {
+    let primary_rank = (support & ((1_u16 << primary) - 1)).count_ones() as usize;
+    let other_rank = (support & ((1_u16 << other) - 1)).count_ones() as usize;
+    other_rank * (other_rank + 1) / 2 + primary_rank
+}
+
 #[inline(always)]
 fn for_each_supported_upper(mut rows: u16, mut visit: impl FnMut(usize, usize)) {
     while rows != 0 {
@@ -916,6 +924,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let (value, source_derivatives) =
             aggregate_shared_source_derivatives(&term_sources, input_scales, derivative_stacks);
         let mut source_gradients = [[0.0; K]; N];
+        let mut source_primary_axes = [NO_PRIMARY_AXIS; N];
         let mut gradient = [0.0; K];
         let mut support = 0_u16;
         let mut right_first = 0.0;
@@ -932,12 +941,13 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             let left_value = tape.nodes[left].value;
             let right_value = tape.nodes[right_node].value;
             let first = source_derivatives[source][1];
+            let left_primary_axis = tape.nodes[left].primary_axis;
+            source_primary_axes[source] = left_primary_axis;
             support |= tape.nodes[left].support;
             right_first += first * left_value;
             addend_first += first * addend_scales[term];
             for primary in 0..K {
-                let product_gradient = left_value * tape.gradients[right_node * K + primary]
-                    + tape.gradients[left * K + primary] * right_value;
+                let product_gradient = left_value * tape.gradients[right_node * K + primary];
                 let inner_gradient = if addend_scales[term] == 0.0 {
                     product_gradient
                 } else if addend_scales[term] == 1.0 {
@@ -947,7 +957,17 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                         + addend_scales[term] * tape.gradients[addend_node * K + primary]
                 };
                 source_gradients[source][primary] = inner_gradient;
-                gradient[primary] += first * tape.gradients[left * K + primary] * right_value;
+            }
+            if left_primary_axis == NO_PRIMARY_AXIS {
+                for primary in 0..K {
+                    let left_contribution = tape.gradients[left * K + primary] * right_value;
+                    source_gradients[source][primary] += left_contribution;
+                    gradient[primary] += first * left_contribution;
+                }
+            } else {
+                let primary = left_primary_axis as usize;
+                source_gradients[source][primary] += right_value;
+                gradient[primary] += first * right_value;
             }
         }
         if N != 0 {
@@ -973,19 +993,41 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         for_each_supported_upper_by_column(support, |primary, other| {
             let mut channel = 0.0;
             for source in 0..source_count {
-                let term = representatives[source];
-                let left = lefts[term].node;
-                let cross = tape.gradients[left * K + primary]
-                    * tape.gradients[right_node * K + other]
-                    + tape.gradients[left * K + other] * tape.gradients[right_node * K + primary];
-                channel += source_derivatives[source][1] * cross
-                    + source_derivatives[source][2]
-                        * source_gradients[source][primary]
-                        * source_gradients[source][other];
+                channel += source_derivatives[source][2]
+                    * source_gradients[source][primary]
+                    * source_gradients[source][other];
+                if source_primary_axes[source] == NO_PRIMARY_AXIS {
+                    let term = representatives[source];
+                    let left = lefts[term].node;
+                    let cross = tape.gradients[left * K + primary]
+                        * tape.gradients[right_node * K + other]
+                        + tape.gradients[left * K + other]
+                            * tape.gradients[right_node * K + primary];
+                    channel += source_derivatives[source][1] * cross;
+                }
             }
             tape.projected_curvatures[curvature_start + curvature_offset] = channel;
             curvature_offset += 1;
         });
+        for source in 0..source_count {
+            let primary_axis = source_primary_axes[source];
+            if primary_axis == NO_PRIMARY_AXIS {
+                continue;
+            }
+            let primary_axis = primary_axis as usize;
+            let first = source_derivatives[source][1];
+            let mut right_support = tape.nodes[right_node].support;
+            while right_support != 0 {
+                let right_axis = right_support.trailing_zeros() as usize;
+                right_support &= right_support - 1;
+                let primary = primary_axis.min(right_axis);
+                let other = primary_axis.max(right_axis);
+                let offset = supported_upper_offset(support, primary, other);
+                let diagonal_scale = if primary_axis == right_axis { 2.0 } else { 1.0 };
+                let cross = diagonal_scale * tape.gradients[right_node * K + right_axis];
+                tape.projected_curvatures[curvature_start + offset] += first * cross;
+            }
+        }
         assert_eq!(
             curvature_offset, curvature_len,
             "compiled fused product-composition must fill its packed curvature"
@@ -1460,6 +1502,60 @@ mod tests {
         let channels = output.into_order2();
         assert_eq!(channels.g()[2], 0.0);
         assert_eq!(channels.h()[2][2], 1.0);
+    }
+
+    fn mixed_primary_derived_fused_expression<'arena, S: RuntimeJetScalar<'arena>>(
+        vars: &[S; 5],
+        workspace: &'arena S::Workspace,
+    ) -> S {
+        let right = vars[4].affine_compose(1.2, -0.1, [0.7, -1.2, 0.45, 0.0, 0.0], workspace);
+        let derived_left = vars[2].multiply_add(&vars[3], &vars[0]);
+        let addend = S::linear_combination(vars, &[0.3, -0.8, 0.5, 1.1, -0.4], 5, workspace);
+        S::shared_multiply_add_affine_composed_sum(
+            &[&vars[1], &vars[0], &vars[1], &derived_left],
+            &right,
+            &addend,
+            &[1.0, 1.0, 1.0, -0.4],
+            &[-1.0, -1.0, 1.0, 0.75],
+            &[
+                [0.4, -0.8, 0.3, 0.0, 0.0],
+                [-0.2, 0.5, -0.7, 0.0, 0.0],
+                [0.9, 1.1, 0.2, 0.0, 0.0],
+                [-0.6, 0.4, 0.8, 0.0, 0.0],
+            ],
+            5,
+            workspace,
+        )
+    }
+
+    #[test]
+    fn compiled_fused_primary_scatter_matches_eager_with_mixed_lefts() {
+        let values = [0.4, -0.7, 1.1, -0.3, 0.8];
+        let eager_vars: [FixedRuntimeJet<Order2<5>, 5>; 5] = std::array::from_fn(|axis| {
+            FixedRuntimeJet::from_inner(Order2::variable(values[axis], axis))
+        });
+        let eager = mixed_primary_derived_fused_expression(&eager_vars, &()).into_inner();
+
+        let mut workspace = Order2GraphWorkspace::new();
+        workspace.reset(5);
+        let graph_vars: [Order2Graph<'_, 5>; 5] =
+            std::array::from_fn(|axis| Order2Graph::variable(values[axis], axis, 5, &workspace));
+        let graph_output = mixed_primary_derived_fused_expression(&graph_vars, &workspace);
+        let output_node = workspace.tape().nodes[graph_output.node];
+        assert_eq!(output_node.edge_len, 5);
+        let graph = graph_output.into_order2();
+
+        let close = |actual: f64, expected: f64| {
+            let tolerance = 2.0e-12 * actual.abs().max(expected.abs()).max(1.0);
+            assert!((actual - expected).abs() <= tolerance);
+        };
+        close(graph.value(), eager.value());
+        for primary in 0..5 {
+            close(graph.g()[primary], eager.g()[primary]);
+            for other in 0..5 {
+                close(graph.h()[primary][other], eager.h()[primary][other]);
+            }
+        }
     }
 
     fn expression<'arena, S: RuntimeJetScalar<'arena>>(
