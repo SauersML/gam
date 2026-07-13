@@ -6091,9 +6091,12 @@ fn manifold_sae_resident_fisher_metric(
     let p_out = payload.fitted.first().map_or(0, Vec::len);
     match &payload.fisher_factors {
         None => {
-            if payload.fisher_provenance.is_some() || payload.fisher_mass_residual.is_some() {
+            if payload.fisher_provenance.is_some()
+                || payload.fisher_factor_kind.is_some()
+                || payload.fisher_mass_residual.is_some()
+            {
                 return Err(py_value_error(
-                    "ManifoldSAE: Fisher provenance and residual mass require retained fisher_factors"
+                    "ManifoldSAE: Fisher provenance, factor status, and residual mass require retained fisher_factors"
                         .to_string(),
                 ));
             }
@@ -6116,6 +6119,12 @@ fn manifold_sae_resident_fisher_metric(
                         .to_string(),
                 )
             })?;
+            let factor_kind = payload.fisher_factor_kind.as_deref().ok_or_else(|| {
+                py_value_error(
+                    "ManifoldSAE: fisher_factor_kind is required when fisher_factors are present"
+                        .to_string(),
+                )
+            })?;
             let factors = manifold_sae_owned3(factors)?;
             let mass = payload
                 .fisher_mass_residual
@@ -6126,6 +6135,7 @@ fn manifold_sae_resident_fisher_metric(
                 n_rows,
                 p_out,
                 Some(provenance),
+                Some(factor_kind),
                 mass.as_ref().map(|values| values.view()),
             )
             .map_err(py_value_error)?;
@@ -7177,11 +7187,12 @@ impl ManifoldSaeCore {
     /// Atomically validate, pack, and install an output-Fisher shard.  No field
     /// becomes visible until the complete `RowMetric` has been constructed, so
     /// a failed attach leaves the prior model state untouched.
-    #[pyo3(signature = (factors, provenance, mass_residual=None))]
+    #[pyo3(signature = (factors, provenance, factor_kind, mass_residual=None))]
     fn attach_fisher<'py>(
         &mut self,
         factors: PyReadonlyArray3<'py, f64>,
         provenance: String,
+        factor_kind: String,
         mass_residual: Option<PyReadonlyArray1<'py, f64>>,
     ) -> PyResult<()> {
         let n_rows = self.inner.fitted.len();
@@ -7191,6 +7202,7 @@ impl ManifoldSaeCore {
             n_rows,
             p_out,
             Some(&provenance),
+            Some(&factor_kind),
             mass_residual.as_ref().map(|values| values.as_array()),
         )
         .map_err(py_value_error)?;
@@ -7207,6 +7219,7 @@ impl ManifoldSaeCore {
         self.inner.fisher_factors = Some(factors_nested);
         self.inner.fisher_mass_residual = mass_nested;
         self.inner.fisher_provenance = Some(provenance);
+        self.inner.fisher_factor_kind = Some(factor_kind);
         self.inner.metric_provenance = metric_label;
         self.fisher_metric = Some(metric);
         self.fisher_metric_build_count += 1;
@@ -7219,6 +7232,7 @@ impl ManifoldSaeCore {
         self.inner.fisher_factors = None;
         self.inner.fisher_mass_residual = None;
         self.inner.fisher_provenance = None;
+        self.inner.fisher_factor_kind = None;
         self.inner.metric_provenance = "Euclidean".to_string();
         self.fisher_metric = None;
     }
@@ -7298,6 +7312,10 @@ impl ManifoldSaeCore {
     #[getter]
     fn fisher_provenance(&self) -> Option<String> {
         self.inner.fisher_provenance.clone()
+    }
+    #[getter]
+    fn fisher_factor_kind(&self) -> Option<String> {
+        self.inner.fisher_factor_kind.clone()
     }
     #[getter]
     fn structure_certificate_json(&self) -> Option<String> {

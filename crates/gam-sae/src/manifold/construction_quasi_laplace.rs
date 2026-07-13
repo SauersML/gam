@@ -5,6 +5,18 @@
 // it keeps the SAME module scope and private-field access. Keeps the tracked
 // construction.rs under the 10k limit.
 
+/// One coherent matrix-free outer sample. The value, factor cache, reduced
+/// operator, and selected-inverse probes are all emitted by the same frozen
+/// surrogate evaluation, so no consumer can accidentally differentiate a
+/// reassembled or differently-randomized operator.
+pub(crate) struct StreamingOuterEvaluation {
+    pub(crate) cost: f64,
+    pub(crate) loss: SaeManifoldLoss,
+    pub(crate) cache: ArrowFactorCache,
+    pub(crate) system: ArrowSchurSystem,
+    pub(crate) inverse_probe_bundle: (Vec<Array1<f64>>, Vec<Array1<f64>>),
+}
+
 impl SaeManifoldTerm {
     /// Custom penalized quasi-Laplace score for the SAE term at a fixed `ρ`.
     ///
@@ -2279,6 +2291,99 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         lane: Option<&mut SurrogateLaneState>,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+        let (cost, loss, cache, _system) = self
+            .penalized_quasi_laplace_criterion_streaming_exact_with_cache_lane_and_system(
+                target,
+                rho,
+                registry,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+                lane,
+            )?;
+        Ok((cost, loss, cache))
+    }
+
+    /// Matrix-free outer value/gradient artifact. Unlike the scalar/cache
+    /// convenience entries, this requires the rational surrogate to emit its
+    /// frozen `(z, S^-1 z)` bundle and retains the exact `ArrowSchurSystem` used
+    /// to produce it. Per-row spectral deflation is rejected explicitly: the
+    /// border-only bundle does not contain the Daleckii--Krein correction, and a
+    /// dense retry would violate both the declared memory route and the single-
+    /// functional derivative contract.
+    pub(crate) fn penalized_quasi_laplace_streaming_outer_evaluation(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        lane: &mut SurrogateLaneState,
+    ) -> Result<StreamingOuterEvaluation, String> {
+        lane.request_inverse_probes();
+        let (cost, loss, cache, system) = self
+            .penalized_quasi_laplace_criterion_streaming_exact_with_cache_lane_and_system(
+                target,
+                rho,
+                registry,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+                Some(lane),
+            )?;
+        let system = system.ok_or_else(|| {
+            "streaming outer evaluation did not retain its matrix-free evidence system"
+                .to_string()
+        })?;
+        let inverse_probe_bundle = lane.take_inverse_probes().ok_or_else(|| {
+            "streaming outer evaluation did not emit the requested selected-inverse probe bundle"
+                .to_string()
+        })?;
+        if let Some((row, directions)) = cache
+            .deflated_row_directions
+            .iter()
+            .enumerate()
+            .find(|(_, directions)| !directions.is_empty())
+        {
+            return Err(format!(
+                "streaming outer derivative is undefined for row {row} with {} spectral \
+                 deflation direction(s): the selected-inverse bundle does not carry the \
+                 Daleckii--Krein correction",
+                directions.len()
+            ));
+        }
+        Ok(StreamingOuterEvaluation {
+            cost,
+            loss,
+            cache,
+            system,
+            inverse_probe_bundle,
+        })
+    }
+
+    fn penalized_quasi_laplace_criterion_streaming_exact_with_cache_lane_and_system(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        lane: Option<&mut SurrogateLaneState>,
+    ) -> Result<
+        (
+            f64,
+            SaeManifoldLoss,
+            ArrowFactorCache,
+            Option<ArrowSchurSystem>,
+        ),
+        String,
+    > {
         self.assignment.validate_rho_domain(rho)?;
         let mut rho_fixed = rho.clone();
         let initial_fit = self.run_joint_fit_arrow_schur_for_quasi_laplace(
@@ -2327,7 +2432,7 @@ impl SaeManifoldTerm {
         // #9: accumulate the per-atom Grams + N_eff + log_det_tt in the same
         // log-det pass. These are required by the canonical rank-charge criterion.
         let mut rank_inputs = StreamingRankInputs::default();
-        let log_det = self.streaming_exact_arrow_log_det_with_lane(
+        let (log_det, evidence_system) = self.streaming_exact_arrow_log_det_with_lane_and_system(
             target,
             rho,
             registry,
@@ -2384,7 +2489,7 @@ impl SaeManifoldTerm {
                 rank_adjusted_quasi_laplace_complexity(log_det, ri.log_det_tt, &d_eff, &ri.n_eff)?;
             loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam
         };
-        Ok((v, loss, converged_cache))
+        Ok((v, loss, converged_cache, evidence_system))
     }
 
     /// Value-only streaming criterion — the cache-returning
@@ -2511,9 +2616,27 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         registry: Option<&AnalyticPenaltyRegistry>,
-        mut rank_inputs: Option<&mut StreamingRankInputs>,
+        rank_inputs: Option<&mut StreamingRankInputs>,
         lane: Option<&mut SurrogateLaneState>,
     ) -> Result<f64, String> {
+        self.streaming_exact_arrow_log_det_with_lane_and_system(
+            target,
+            rho,
+            registry,
+            rank_inputs,
+            lane,
+        )
+        .map(|(log_det, _system)| log_det)
+    }
+
+    fn streaming_exact_arrow_log_det_with_lane_and_system(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        mut rank_inputs: Option<&mut StreamingRankInputs>,
+        mut lane: Option<&mut SurrogateLaneState>,
+    ) -> Result<(f64, Option<ArrowSchurSystem>), String> {
         if target.dim() != (self.n_obs(), self.output_dim()) {
             return Err(format!(
                 "SaeManifoldTerm::streaming_exact_arrow_log_det: target must be ({}, {}); got {:?}",
@@ -2536,7 +2659,12 @@ impl SaeManifoldTerm {
             self.output_dim(),
             self.k_atoms(),
         )?;
-        if plan.estimated_dense_schur_bytes > plan.in_core_budget_bytes {
+        // A gradient-bearing streaming evaluation always uses the rational
+        // matrix-free value, even when a chunked dense Schur would barely fit:
+        // only the rational lane emits the frozen selected-inverse bundle whose
+        // contractions are the exact derivative of that value. Value-only SLQ
+        // callers retain the historical memory-derived split.
+        if plan.estimated_dense_schur_bytes > plan.in_core_budget_bytes || lane.is_some() {
             // #988 memory-matrix-free evidence route. The dense k×k reduced Schur
             // (≈8 GB at the K=32k manifold border) does NOT fit the in-core
             // budget, so estimate log|S| via Stochastic Lanczos Quadrature on the
@@ -2570,7 +2698,7 @@ impl SaeManifoldTerm {
                 SCHUR_SLQ_LOGDET_PROBES,
                 SCHUR_SLQ_LOGDET_LANCZOS_STEPS,
                 SCHUR_SLQ_LOGDET_SEED,
-                lane,
+                lane.as_deref_mut(),
             )
             .map_err(|err| {
                 format!(
@@ -2586,7 +2714,7 @@ impl SaeManifoldTerm {
             if let Some(ri) = rank_inputs.as_deref_mut() {
                 ri.log_det_tt = log_det_tt;
             }
-            return Ok(log_det_tt + log_det_schur);
+            return Ok((log_det_tt + log_det_schur, Some(sys)));
         }
         let n_total = self.n_obs();
         let chunk_size = plan.chunk_size.min(n_total.max(1));
@@ -2661,7 +2789,7 @@ impl SaeManifoldTerm {
         if let Some(ri) = rank_inputs.as_deref_mut() {
             ri.log_det_tt = log_det_tt;
         }
-        Ok(log_det_tt + log_det_schur)
+        Ok((log_det_tt + log_det_schur, None))
     }
 
     /// Per-atom decoder-smoothness penalty quadratic form (#1556): entry `k` is
