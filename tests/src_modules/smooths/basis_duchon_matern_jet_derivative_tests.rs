@@ -3776,6 +3776,146 @@ fn test_pair_block_pure_riesz_kappa_independence_is_exactly_gated_2315() {
     }
 }
 
+/// #2315 Gap 3: DIRECT finite-difference gate on the even-ambient-dimension
+/// Duchon collision derivative `phi^(2j)(0)`
+/// (`duchon_phi_even_derivative_collision`). Until now this branch was reached
+/// only *indirectly*, through the odd-d hybrid self-pair zero-lag path
+/// (`hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d`), so its
+/// even-d behaviour carried no direct reference.
+///
+/// The even-d regime is the interesting one: the polyharmonic block that lands
+/// on radial order `r^{2j}` sits at `m = d/2 + j >= d/2`, so it is a `ln(r)`
+/// block whose pure Taylor part is zero and whose log part must cancel exactly
+/// against the Matérn-block log parts before the surviving pure coefficient
+/// yields `phi^{(2j)}(0) = (2j)! * a_{2j}`. A wrong `r^{2j}` exponent, a dropped
+/// `(2j)!` factor, or a broken log cancellation is exactly the silent-derivative
+/// class #2315 targets, and each fails here.
+///
+/// The analytic collision derivative is gated against a central finite
+/// difference of the *underlying* radial kernel value
+/// `duchon_matern_kernel_general_from_distance`. The stencil is sampled strictly
+/// OUTSIDE the near-collision Taylor radius (`r > DUCHON_COLLISION_TAYLOR_REL *
+/// ell`), so the finite-difference reference is the independent direct
+/// partial-fraction / single-integral kernel — never the
+/// collision-derivative-based Taylor carrier that the near-collision branch uses
+/// (which would make the gate circular). Every fixture carries a smoothness
+/// margin of two extra orders (`2(p+s) > d + 2j + 2`) so the truncation term is
+/// a bounded higher derivative, not a log-divergent borderline limit.
+#[test]
+fn test_even_d_duchon_collision_derivative_matches_finite_difference_2315() {
+    use super::duchon_kernel_math::{
+        duchon_matern_kernel_general_from_distance, duchon_partial_fraction_coeffs,
+        DUCHON_COLLISION_TAYLOR_REL,
+    };
+    use super::duchon_psi_derivatives::{
+        duchon_phi_even_derivative_collision, duchon_polyharmonic_block_taylor_r2j,
+    };
+
+    // (even d, p_order, s_order, j, fd step h, tol). Each fixture satisfies the
+    // finite-collision smoothness bound with two orders of margin
+    // (2(p+s) > d + 2j + 2) and places the r^{2j} polyharmonic block on the
+    // even-d ln(r) branch at m = d/2 + j <= p, so the log-cancellation path is
+    // genuinely live. j=1 uses the 3-point second-derivative stencil (tol 1e-5,
+    // matching the Matern/Riesz radial ladders); j=2 uses the 5-point
+    // fourth-derivative stencil (tol 1e-3, matching the isotropic-kappa
+    // second-difference gate).
+    let cases: &[(usize, usize, usize, usize, f64, f64)] = &[
+        (2, 2, 2, 1, 5e-3, 1e-5),
+        (4, 3, 2, 1, 5e-3, 1e-5),
+        (2, 3, 2, 2, 3e-3, 1e-3),
+        (4, 4, 2, 2, 3e-3, 1e-3),
+    ];
+
+    let length_scale = 1.0_f64;
+    let kappa = 1.0_f64 / length_scale;
+
+    for &(d, p, s, j, h, tol) in cases {
+        assert!(
+            d.is_multiple_of(2),
+            "d={d}: this gate targets even ambient dimension"
+        );
+        assert!(
+            2 * (p + s) > d + 2 * j + 2,
+            "d={d} p={p} s={s} j={j}: fixture must carry the two-order collision-smoothness margin"
+        );
+
+        // Prove the even-d ln(r) branch is genuinely exercised: the polyharmonic
+        // block carrying radial order r^{2j} sits at m = d/2 + j and, for even d,
+        // must be a log block (pure part zero, log part nonzero) whose
+        // contribution has to cancel inside the collision sum.
+        let m_log = d / 2 + j;
+        assert!(
+            m_log <= p,
+            "d={d} j={j}: log-carrying block m={m_log} must be within p={p}"
+        );
+        let (poly_pure, poly_log) = duchon_polyharmonic_block_taylor_r2j(m_log, d, j);
+        assert_eq!(
+            poly_pure, 0.0,
+            "d={d} j={j}: even-d block m={m_log} must be pure-free (ln(r) branch)"
+        );
+        assert!(
+            poly_log != 0.0,
+            "d={d} j={j}: even-d block m={m_log} must carry a nonzero log term that the sum cancels"
+        );
+
+        let coeffs = duchon_partial_fraction_coeffs(p, s, kappa);
+        assert!(
+            coeffs.a[m_log] != 0.0,
+            "d={d} j={j}: log block m={m_log} must have a nonzero partial-fraction coefficient"
+        );
+
+        // Analytic even-order collision derivative phi^{(2j)}(0). `.expect`
+        // panics if the internal log cancellation fails, so this also gates the
+        // even-d cancellation itself.
+        let analytic = duchon_phi_even_derivative_collision(length_scale, p, s, d, &coeffs, j)
+            .expect("even-d collision derivative must take the finite analytic path");
+        assert!(
+            analytic.is_finite(),
+            "d={d} j={j}: analytic collision derivative not finite"
+        );
+
+        // Central finite difference of the underlying kernel value, sampled
+        // strictly outside the near-collision Taylor radius so the reference is
+        // the independent direct kernel evaluation (not the collision-derivative
+        // Taylor carrier).
+        let taylor_radius = DUCHON_COLLISION_TAYLOR_REL * length_scale;
+        assert!(
+            h > taylor_radius,
+            "d={d}: FD step h={h} must exceed the near-collision radius {taylor_radius:.3e} to stay on the independent kernel path"
+        );
+        let phi = |rr: f64| {
+            duchon_matern_kernel_general_from_distance(
+                rr,
+                Some(length_scale),
+                p,
+                s,
+                d,
+                Some(&coeffs),
+            )
+            .expect("underlying Duchon kernel value must be finite across the FD stencil")
+        };
+        let phi0 = phi(0.0);
+        // phi is an even radial function, so phi(-k h) = phi(k h). Central
+        // even-order collision stencils (truncation O(h^2)):
+        //   phi''(0)   = (2 phi(h) - 2 phi(0)) / h^2
+        //   phi''''(0) = (2 phi(2h) - 8 phi(h) + 6 phi(0)) / h^4
+        let fd = match j {
+            1 => (2.0 * phi(h) - 2.0 * phi0) / (h * h),
+            2 => (2.0 * phi(2.0 * h) - 8.0 * phi(h) + 6.0 * phi0) / (h * h * h * h),
+            other => unreachable!("only j in {{1, 2}} are gated here, got {other}"),
+        };
+
+        let scale = analytic.abs().max(phi0.abs()).max(1.0);
+        assert!(
+            (analytic - fd).abs() <= tol * scale,
+            "even-d collision derivative FD mismatch: d={d} p={p} s={s} j={j} \
+             analytic={analytic:.12e} fd={fd:.12e} diff={:.3e} tol={:.3e}",
+            (analytic - fd).abs(),
+            tol * scale
+        );
+    }
+}
+
 #[test]
 fn test_kappa_derivative_matches_finite_difference() {
     use super::closed_form_penalty::{
