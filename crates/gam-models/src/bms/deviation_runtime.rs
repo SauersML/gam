@@ -373,6 +373,165 @@ pub(crate) fn build_quadratic_derivative_bernstein_constraints(
 }
 
 impl DeviationRuntime {
+    /// Rehydrate the exact post-compilation cubic tables carried by a saved
+    /// model for likelihood replay.
+    ///
+    /// This is deliberately not a spline constructor: rebuilding a runtime
+    /// from knots would rerun rank selection and cross-block
+    /// orthogonalisation, potentially changing both the coefficient frame and
+    /// the function.  Saved-model inference must instead consume the frozen
+    /// span coefficients and anchor map byte-for-byte.  The caller is
+    /// responsible for validating the saved schema marker before entering
+    /// this constructor.
+    pub(crate) fn from_exact_cubic_tables(
+        breakpoints: Array1<f64>,
+        span_c0: Array2<f64>,
+        span_c1: Array2<f64>,
+        span_c2: Array2<f64>,
+        span_c3: Array2<f64>,
+        installed_flex_block: Option<InstalledFlexBlock>,
+        anchor_rows_at_training: Option<Array2<f64>>,
+    ) -> Result<Self, String> {
+        validate_breakpoints(
+            breakpoints.as_slice().ok_or_else(|| {
+                String::from(DeviationRuntimeError::InvalidInput {
+                    reason: "saved deviation breakpoints are not contiguous".to_string(),
+                })
+            })?,
+            "saved deviation replay breakpoints",
+        )?;
+        let n_spans = breakpoints.len() - 1;
+        let basis_dim = span_c0.ncols();
+        if basis_dim == 0 {
+            return Err(DeviationRuntimeError::DimensionMismatch {
+                reason: "saved deviation replay requires at least one basis column".to_string(),
+            }
+            .into());
+        }
+        let expected = (n_spans, basis_dim);
+        for (label, coefficients) in [
+            ("c0", &span_c0),
+            ("c1", &span_c1),
+            ("c2", &span_c2),
+            ("c3", &span_c3),
+        ] {
+            if coefficients.dim() != expected {
+                return Err(DeviationRuntimeError::DimensionMismatch {
+                    reason: format!(
+                        "saved deviation replay {label} table is {}x{}; expected {}x{}",
+                        coefficients.nrows(),
+                        coefficients.ncols(),
+                        expected.0,
+                        expected.1,
+                    ),
+                }
+                .into());
+            }
+            if let Some(((row, column), value)) = coefficients
+                .indexed_iter()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(DeviationRuntimeError::InvalidInput {
+                    reason: format!(
+                        "saved deviation replay {label}[{row},{column}] is non-finite ({value})"
+                    ),
+                }
+                .into());
+            }
+        }
+
+        let final_span = n_spans - 1;
+        let width = breakpoints[n_spans] - breakpoints[final_span];
+        let mut right_boundary_value_row = Array1::<f64>::zeros(basis_dim);
+        for basis in 0..basis_dim {
+            right_boundary_value_row[basis] = span_c0[[final_span, basis]]
+                + width
+                    * (span_c1[[final_span, basis]]
+                        + width
+                            * (span_c2[[final_span, basis]]
+                                + width * span_c3[[final_span, basis]]));
+        }
+        if let Some((basis, value)) = right_boundary_value_row
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "saved deviation replay right-boundary value[{basis}] is non-finite ({value})"
+                ),
+            }
+            .into());
+        }
+        let monotonicity_constraint_rows = build_quadratic_derivative_bernstein_constraints(
+            &breakpoints,
+            &span_c1,
+            &span_c2,
+            &span_c3,
+        )?;
+
+        match (&installed_flex_block, &anchor_rows_at_training) {
+            (Some(installed), Some(rows)) => {
+                if rows.ncols() != installed.anchor_correction.nrows() {
+                    return Err(DeviationRuntimeError::DimensionMismatch {
+                        reason: format!(
+                            "saved deviation replay anchor rows have {} columns; anchor correction requires {}",
+                            rows.ncols(),
+                            installed.anchor_correction.nrows(),
+                        ),
+                    }
+                    .into());
+                }
+                if installed.anchor_correction.ncols() != basis_dim {
+                    return Err(DeviationRuntimeError::DimensionMismatch {
+                        reason: format!(
+                            "saved deviation replay anchor correction has {} columns; basis has {basis_dim}",
+                            installed.anchor_correction.ncols(),
+                        ),
+                    }
+                    .into());
+                }
+            }
+            (Some(_), None) => {
+                return Err(DeviationRuntimeError::DimensionMismatch {
+                    reason: "saved deviation replay has an anchor correction but no row-aligned anchor design"
+                        .to_string(),
+                }
+                .into());
+            }
+            (None, Some(rows)) if rows.ncols() != 0 => {
+                return Err(DeviationRuntimeError::DimensionMismatch {
+                    reason: format!(
+                        "saved deviation replay has {} anchor columns but no anchor correction",
+                        rows.ncols()
+                    ),
+                }
+                .into());
+            }
+            _ => {}
+        }
+
+        Ok(Self {
+            degree: 2,
+            value_span_degree: 3,
+            basis_dim,
+            // The persisted tables are already the fitted constrained
+            // function.  Replay never re-solves feasibility, so there is no
+            // configuration-space epsilon to reconstruct here.
+            monotonicity_eps: 0.0,
+            endpoint_points: breakpoints,
+            span_c0,
+            span_c1,
+            span_c2,
+            span_c3,
+            monotonicity_constraint_rows,
+            right_boundary_value_row,
+            installed_flex_block,
+            anchor_rows_at_training,
+        })
+    }
+
     /// Construct the link-deviation runtime with a smoothness-null-space-drop
     /// basis transform. `max_penalty_derivative_order` is the highest
     /// derivative order of any penalty that will subsequently be applied to
