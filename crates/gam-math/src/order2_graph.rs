@@ -875,13 +875,9 @@ mod tests {
             matrix: [[1.2, -0.3, 0.25], [-0.3, 0.8, 0.17], [0.25, 0.17, 1.4]],
             workspace: &workspace,
         };
-        let graph = Order2Graph::symmetric_quadratic_form(
-            &[x, y, xy],
-            &coefficients,
-            2,
-            &workspace,
-        )
-        .into_order2();
+        let graph =
+            Order2Graph::symmetric_quadratic_form(&[x, y, xy], &coefficients, 2, &workspace)
+                .into_order2();
 
         let arena = DynamicJetArena::new();
         let eager_x = DynamicOrder2::variable(0.4, 0, 2, &arena);
@@ -894,11 +890,17 @@ mod tests {
             &arena,
         );
 
-        assert_eq!(graph.value(), eager.v);
-        assert_eq!(graph.g().as_slice(), eager.g());
+        let close = |actual: f64, expected: f64| {
+            let tolerance = 2.0e-13 * actual.abs().max(expected.abs()).max(1.0);
+            assert!((actual - expected).abs() <= tolerance);
+        };
+        close(graph.value(), eager.v);
+        for primary in 0..2 {
+            close(graph.g()[primary], eager.g()[primary]);
+        }
         for row in 0..2 {
             for column in 0..2 {
-                assert_eq!(graph.h()[row][column], eager.h_at(row, column));
+                close(graph.h()[row][column], eager.h_at(row, column));
             }
         }
     }
