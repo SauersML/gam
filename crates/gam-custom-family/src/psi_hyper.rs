@@ -3474,6 +3474,7 @@ pub fn evaluate_custom_family_joint_hyper_efs_owned_shared<
             specs.len()
         );
     }
+    let hyper_values = hyper_layout.values().clone();
     let (efs_eval, warm_start, inner_converged, inner) =
         if hyper_layout.is_empty() {
             outerobjectiveefs(
@@ -3493,13 +3494,14 @@ pub fn evaluate_custom_family_joint_hyper_efs_owned_shared<
                 options,
                 &penalty_counts,
                 rho_current,
-                hyper_layout,
+                Arc::clone(&hyper_layout),
                 warm_start.map(|w| &w.inner),
             )?
         };
     let mode = CustomFamilyOwnedMode {
         objective: efs_eval.cost,
         rho: warm_start.rho.clone(),
+        hyper_values: hyper_values.clone(),
         inner,
     };
     Ok(CustomFamilyJointHyperEfsOwnedResult {
@@ -3507,6 +3509,7 @@ pub fn evaluate_custom_family_joint_hyper_efs_owned_shared<
             efs_eval,
             warm_start,
             inner_converged,
+            hyper_values,
         ),
         mode,
     })
