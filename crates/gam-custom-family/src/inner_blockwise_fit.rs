@@ -3191,16 +3191,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // dominant accept-on-first-attempt cycle. Later backtracking
                 // attempts keep the cheap early-exiting sweep (they are expected
                 // to reject and the workspace they would build is discarded).
-                // A workspace build that *errors* (e.g. an infeasible trial η on
-                // the radius-bumped first proposal) must NOT abort the whole
-                // solve: the cheap-sweep path below classifies that same failure
-                // as a recoverable likelihood-reject and shrinks the radius. So
-                // treat an `Err`/`None` here as "fast path unavailable" and fall
-                // through to the cheap sweep, which owns the reject bookkeeping.
+                // Capability absence is the only reason to use the scalar path.
+                // Once the family advertises fused likelihood evidence, an error
+                // or a missing advertised value is a broken workspace contract,
+                // not an infeasible trial: silently replaying the scalar family
+                // path could change the row measure and let structurally invalid
+                // Hessian/gradient evidence participate in the trust ratio.
                 let fused_first_attempt = if trust_attempt == 0 && joint_workspace_requested {
                     joint_line_search_log_likelihood_with_workspace(family, options, specs, &states)
-                        .ok()
-                        .flatten()
+                        ?
                 } else {
                     None
                 };

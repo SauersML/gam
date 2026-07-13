@@ -4072,17 +4072,19 @@ pub(crate) fn joint_line_search_log_likelihood_with_workspace<
     if !family.inner_joint_workspace_log_likelihood_available(specs) {
         return Ok(None);
     }
-    let Some(workspace) =
-        family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
-    else {
-        return Ok(None);
-    };
-    match workspace.joint_log_likelihood_evaluation()? {
-        Some(log_likelihood) => Ok(Some((log_likelihood, workspace))),
-        // The workspace advertised a log-likelihood but did not produce one;
-        // fall back to the cheap scalar sweep rather than fabricating a value.
-        None => Ok(None),
-    }
+    let workspace = family
+        .exact_newton_joint_hessian_workspace_with_options(states, specs, options)?
+        .ok_or_else(|| {
+            "family advertises inner joint workspace log-likelihoods, but returned no workspace"
+                .to_string()
+        })?;
+    let log_likelihood = workspace
+        .joint_log_likelihood_evaluation()?
+        .ok_or_else(|| {
+            "family advertises inner joint workspace log-likelihoods, but its workspace returned no log-likelihood"
+                .to_string()
+        })?;
+    Ok(Some((log_likelihood, workspace)))
 }
 
 pub(crate) fn coefficient_line_search_options(
