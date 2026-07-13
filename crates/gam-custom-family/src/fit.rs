@@ -1881,26 +1881,42 @@ fn fit_custom_family_fixed_log_lambdas_with_provenance<
             ),
         });
     }
-    let penalized_objective = inner_penalized_objective(
-        &inner,
-        include_exact_newton_logdet_h(family, options),
-        include_exact_newton_logdet_s(family, options),
-        "custom-family fixed-log-lambda fit",
-    )
-    .map_err(|reason| CustomFamilyError::Optimization {
-        context: "fit_custom_family_fixed_log_lambdas penalized objective",
-        reason,
-    })?;
-    if let Some(certified_objective) = certified_objective
-        && penalized_objective.to_bits() != certified_objective.to_bits()
-    {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas objective identity",
-            reason: format!(
-                "the recomputed coefficient mode does not belong to the certified outer optimum: recomputed={penalized_objective:.17e}, certified={certified_objective:.17e}; no fit was assembled"
-            ),
-        });
-    }
+    let penalized_objective = if let Some(certified_objective) = certified_objective {
+        // Reconstruct the complete profiled/Laplace scalar from this exact
+        // owned mode. `inner_penalized_objective` is deliberately only
+        // -loglik + quadratic penalty + the basic logdet pair; it omits the
+        // gated Jeffreys/Firth value, its H_phi logdet geometry, and the KKT
+        // profile correction that the joint outer evaluator certified.
+        let replay = evaluate_custom_family_profile_objective_from_inner(
+            family, specs, options, &rho, inner,
+        )
+        .map_err(|error| CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas objective replay",
+            reason: format!("{error}; no fit was assembled"),
+        })?;
+        let recomputed_objective = replay.objective;
+        inner = replay.inner;
+        if recomputed_objective.to_bits() != certified_objective.to_bits() {
+            return Err(CustomFamilyError::Optimization {
+                context: "fit_custom_family_fixed_log_lambdas objective identity",
+                reason: format!(
+                    "the recomputed coefficient mode does not belong to the certified outer optimum: recomputed={recomputed_objective:.17e}, certified={certified_objective:.17e}; no fit was assembled"
+                ),
+            });
+        }
+        recomputed_objective
+    } else {
+        inner_penalized_objective(
+            &inner,
+            include_exact_newton_logdet_h(family, options),
+            include_exact_newton_logdet_s(family, options),
+            "custom-family fixed-log-lambda fit",
+        )
+        .map_err(|reason| CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas penalized objective",
+            reason,
+        })?
+    };
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     audit_converged_identifiability(
         family,
