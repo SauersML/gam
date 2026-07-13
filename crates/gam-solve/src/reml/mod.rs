@@ -622,10 +622,7 @@ mod tests {
         .expect("state")
     }
 
-    fn bundle_with_inner_kkt_residual(
-        bundle: &EvalShared,
-        residual: Array1<f64>,
-    ) -> EvalShared {
+    fn bundle_with_inner_kkt_residual(bundle: &EvalShared, residual: Array1<f64>) -> EvalShared {
         let mut pirls_result = bundle.pirls_result.as_ref().clone();
         pirls_result.lastgradient_norm = residual.dot(&residual).sqrt();
         pirls_result.penalized_gradient_transformed = residual;
@@ -643,6 +640,13 @@ mod tests {
         let mut assembly = state
             .build_auto_assembly(rho, bundle, mode, true, false)
             .expect("uncorrected synthetic-psi assembly");
+        assert!(
+            matches!(
+                &assembly.dispersion,
+                super::reml_outer_engine::DispersionHandling::Fixed { .. }
+            ),
+            "the #2305 bridge fixture must exercise the fixed-dispersion LAML identity"
+        );
         let p_dim = assembly.beta.len();
         assembly.ext_coords = vec![super::reml_outer_engine::HyperCoord {
             a: 0.0,
@@ -663,7 +667,11 @@ mod tests {
 
     #[test]
     fn psi_value_bridge_corrects_nonstationary_inner_mode_2305() {
-        let y = array![0.4, -0.2, 0.8, 0.1, -0.6, 0.5];
+        // The residual correction implemented by the unified evaluator is the
+        // fixed-dispersion LAML identity. Gaussian-identity uses profiled-scale
+        // REML and deliberately does not enter that gate, so use a genuine
+        // fixed-dispersion design-moving model here.
+        let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
             [1.0, -1.0, 0.2],
@@ -674,7 +682,7 @@ mod tests {
             [1.0, 1.2, 0.6],
         ];
         let s = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.15], [0.0, 0.15, 0.8]];
-        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-12, false);
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-12, false);
         let state = build_logit_state(&y, &w, &x, &s, &cfg);
         let rho = array![0.2];
         let base = state.obtain_eval_bundle(&rho).expect("base inner mode");
@@ -683,22 +691,31 @@ mod tests {
 
         let corrected = state
             .evaluate_unified_value_only_with_synthetic_ext_count(&rho, &capped, 1, false)
-            .expect("psi value with inner-KKT correction")
-            .cost;
+            .expect("psi value with inner-KKT correction");
         let exact_kkt_assumption =
             evaluate_synthetic_psi_value_without_inner_kkt(&state, &rho, &capped);
+        let residual_energy = corrected
+            .ift_residual_energy
+            .expect("design-moving bridge must attach the nonstationary KKT residual");
 
         assert!(
-            corrected < exact_kkt_assumption - 1e-10,
-            "a nonstationary inner residual must lower the psi objective by its positive \
-             Newton-decrement correction: corrected={corrected:.12e}, \
-             exact-kkt={exact_kkt_assumption:.12e}"
+            residual_energy.abs() > 1e-10,
+            "the synthetic nonstationary residual must produce a material fixed-dispersion \
+             IFT correction, got residual_energy={residual_energy:.12e}"
+        );
+        assert_eq!(
+            corrected.cost,
+            exact_kkt_assumption - residual_energy,
+            "the psi value bridge must apply exactly the correction reported by the unified \
+             evaluator: corrected={:.12e}, exact-kkt={exact_kkt_assumption:.12e}, \
+             residual-energy={residual_energy:.12e}",
+            corrected.cost,
         );
     }
 
     #[test]
     fn psi_value_bridge_correction_vanishes_at_stationarity_2305() {
-        let y = array![0.4, -0.2, 0.8, 0.1, -0.6, 0.5];
+        let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
             [1.0, -1.0, 0.2],
@@ -709,7 +726,7 @@ mod tests {
             [1.0, 1.2, 0.6],
         ];
         let s = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.15], [0.0, 0.15, 0.8]];
-        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-12, false);
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-12, false);
         let state = build_logit_state(&y, &w, &x, &s, &cfg);
         let rho = array![0.2];
         let base = state.obtain_eval_bundle(&rho).expect("base inner mode");
@@ -717,13 +734,18 @@ mod tests {
 
         let corrected = state
             .evaluate_unified_value_only_with_synthetic_ext_count(&rho, &stationary, 1, false)
-            .expect("stationary psi value with correction enabled")
-            .cost;
+            .expect("stationary psi value with correction enabled");
         let exact_kkt_assumption =
             evaluate_synthetic_psi_value_without_inner_kkt(&state, &rho, &stationary);
 
         assert_eq!(
-            corrected, exact_kkt_assumption,
+            corrected.ift_residual_energy,
+            Some(0.0),
+            "the design-moving bridge must attach the residual, whose correction is exactly \
+             zero at stationarity"
+        );
+        assert_eq!(
+            corrected.cost, exact_kkt_assumption,
             "the generic inner-KKT correction must be exactly zero at a stationary inner mode"
         );
     }
