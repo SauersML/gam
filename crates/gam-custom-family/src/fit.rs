@@ -1912,14 +1912,18 @@ pub fn fit_custom_family_fixed_log_lambdas_from_mode_selection<
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     selection: CustomFamilyJointHyperModeSelection,
-    outer_iterations: usize,
-    outer_gradient_norm: Option<f64>,
-    outer_converged: bool,
+    selected_theta: &Array1<f64>,
+    outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
 ) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
-    if !outer_converged {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection",
-            reason: "the enclosing outer optimization did not certify convergence; refusing to assemble its selected coefficient checkpoint"
+    if selected_theta.len() != outer.rho().len()
+        || selected_theta
+            .iter()
+            .zip(outer.rho().iter())
+            .any(|(selected, certified)| selected.to_bits() != certified.to_bits())
+    {
+        return Err(CustomFamilyError::InvalidInput {
+            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection outer identity",
+            reason: "the selected full hyperparameter vector does not bitwise match the certified outer optimum"
                 .to_string(),
         });
     }
@@ -1955,6 +1959,15 @@ pub fn fit_custom_family_fixed_log_lambdas_from_mode_selection<
             ),
         });
     }
+    if selected_objective.to_bits() != outer.final_value().to_bits() {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection objective identity",
+            reason: format!(
+                "selected profile objective does not belong to the certified outer optimum: selected={selected_objective:.17e}, certified={:.17e}",
+                outer.final_value(),
+            ),
+        });
+    }
 
     let selected_warm_start = result.warm_start.inner;
     let beta_matches = selected_warm_start.block_beta.len() == inner.block_states.len()
@@ -1979,6 +1992,19 @@ pub fn fit_custom_family_fixed_log_lambdas_from_mode_selection<
     }
 
     let rho = selected_warm_start.rho;
+    if outer.rho().len() < rho.len()
+        || outer
+            .rho()
+            .iter()
+            .zip(rho.iter())
+            .any(|(certified, selected)| certified.to_bits() != selected.to_bits())
+    {
+        return Err(CustomFamilyError::InvalidInput {
+            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection smoothing identity",
+            reason: "the selected smoothing coordinates do not bitwise match the certified outer optimum prefix"
+                .to_string(),
+        });
+    }
     let spec_rho = flatten_log_lambdas(specs);
     if rho.len() != spec_rho.len()
         || rho
@@ -2055,9 +2081,9 @@ pub fn fit_custom_family_fixed_log_lambdas_from_mode_selection<
             canonical: None,
             result_specs: specs,
             penalized_objective: selected_objective,
-            outer_iterations,
-            outer_gradient_norm,
-            criterion_certificate: None,
+            outer_iterations: outer.iterations(),
+            outer_gradient_norm: outer.final_grad_norm(),
+            criterion_certificate: Some(outer.criterion_certificate().clone()),
             outer_converged: true,
             joint_log_lambdas: None,
         },
