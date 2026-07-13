@@ -764,15 +764,11 @@ mod vector_hand_oracle_tests {
                 .zip(workspace.sigma_g.iter())
                 .map(|(&slope, &sigma_g)| slope * sigma_g)
                 .sum::<f64>();
-        let variance = if variance.is_finite()
-            && variance >= crate::bms::gradient_paths::COVARIANCE_QUADRATIC_FORM_PSD_TOL
-        {
-            variance.max(0.0)
-        } else {
+        if !(variance.is_finite() && variance >= 0.0) {
             return Err(format!(
                 "marginal-slope covariance quadratic form must be non-negative, got {variance}"
             ));
-        };
+        }
         let c = (1.0 + variance).sqrt();
         for a in 0..k {
             workspace.c1[a] = s2 * workspace.sigma_g[a] / c;
@@ -999,9 +995,7 @@ fn validate_vector_probit_scale(inputs: &RigidRowInputs) -> Result<(), String> {
 #[inline]
 fn validated_vector_variance(raw_variance: f64, probit_scale: f64) -> Result<f64, String> {
     let scaled_variance = probit_scale * probit_scale * raw_variance;
-    if !(scaled_variance.is_finite()
-        && scaled_variance >= crate::bms::gradient_paths::COVARIANCE_QUADRATIC_FORM_PSD_TOL)
-    {
+    if !(scaled_variance.is_finite() && scaled_variance >= 0.0) {
         return Err(SurvivalMarginalSlopeError::NumericalFailure {
             reason: format!(
                 "survival marginal-slope covariance quadratic form must be non-negative, got {scaled_variance}"
@@ -1009,13 +1003,7 @@ fn validated_vector_variance(raw_variance: f64, probit_scale: f64) -> Result<f64
         }
         .into());
     }
-    // At a mathematical zero, floating accumulation may land a few ulps below
-    // zero. Shift only the primal constant; derivative channels are unchanged.
-    Ok(if scaled_variance < 0.0 {
-        0.0
-    } else {
-        raw_variance
-    })
+    Ok(raw_variance)
 }
 
 #[inline(always)]

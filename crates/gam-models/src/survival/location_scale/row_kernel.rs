@@ -1250,6 +1250,39 @@ pub fn survival_location_scale_alo_row_geometry(
 mod saved_alo_row_tests {
     use super::*;
 
+    fn cubic_value_derivatives(x: f64, coefficients: [f64; 4]) -> [f64; 4] {
+        let [c0, c1, c2, c3] = coefficients;
+        [
+            c0 + c1 * x + c2 * x * x + c3 * x * x * x,
+            c1 + 2.0 * c2 * x + 3.0 * c3 * x * x,
+            2.0 * c2 + 6.0 * c3 * x,
+            6.0 * c3,
+        ]
+    }
+
+    fn cubic_jet<'arena>(
+        x: &DynamicOrder2<'arena>,
+        coefficients: [f64; 4],
+    ) -> DynamicOrder2<'arena> {
+        let [c0, c1, c2, c3] = coefficients;
+        let x2 = x.mul(x);
+        let x3 = x2.mul(x);
+        x.compose_unary([c0, 0.0, 0.0, 0.0, 0.0])
+            .add(&x.scale(c1))
+            .add(&x2.scale(c2))
+            .add(&x3.scale(c3))
+    }
+
+    fn cubic_derivative_jet<'arena>(
+        x: &DynamicOrder2<'arena>,
+        coefficients: [f64; 4],
+    ) -> DynamicOrder2<'arena> {
+        let [_c0, c1, c2, c3] = coefficients;
+        x.compose_unary([c1, 0.0, 0.0, 0.0, 0.0])
+            .add(&x.scale(2.0 * c2))
+            .add(&x.mul(x).scale(3.0 * c3))
+    }
+
     #[test]
     fn saved_censored_cloglog_row_matches_independent_closed_form_jet() {
         let weight = 1.7;
@@ -1292,6 +1325,111 @@ mod saved_alo_row_tests {
                 assert!(
                     (geometry.observed_hessian[[axis, other]] - oracle.h_at(axis, other)).abs()
                         <= 3e-12
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saved_time_and_link_wiggles_match_independent_cubic_cloglog_oracle() {
+        let weight = 1.3_f64;
+        let time_coefficients = [0.1, 0.2, 0.03, 0.004];
+        let link_coefficients = [-0.05, 0.15, -0.02, 0.003];
+        let h_entry = -0.2_f64;
+        let h_exit = 0.4_f64;
+        let time_entry = cubic_value_derivatives(h_entry, time_coefficients);
+        let time_exit = cubic_value_derivatives(h_exit, time_coefficients);
+        let eta_threshold_exit = -0.3_f64;
+        let eta_threshold_entry = -0.5_f64;
+        let eta_log_sigma_exit = 0.1_f64;
+        let eta_log_sigma_entry = 0.15_f64;
+        let q_entry = -eta_threshold_entry * (-eta_log_sigma_entry).exp();
+        let q_exit = -eta_threshold_exit * (-eta_log_sigma_exit).exp();
+        let link_entry = cubic_value_derivatives(q_entry, link_coefficients);
+        let link_exit = cubic_value_derivatives(q_exit, link_coefficients);
+        let time_beta = [0.25];
+        let link_beta = [-0.12];
+        let geometry = survival_location_scale_alo_row_geometry(SurvivalLocationScaleAloRowInput {
+            inverse_link: &InverseLink::Standard(StandardLink::CLogLog),
+            prior_weight: weight,
+            event: 1.0,
+            derivative_guard: 1e-8,
+            h_entry,
+            h_exit,
+            hdot_exit: 1.1,
+            eta_threshold_exit,
+            eta_threshold_entry,
+            eta_threshold_derivative_exit: 0.1,
+            eta_log_sigma_exit,
+            eta_log_sigma_entry,
+            eta_log_sigma_derivative_exit: 0.05,
+            time_wiggle: Some(SurvivalLocationScaleAloTimeWiggleInput {
+                beta: &time_beta,
+                entry_basis: &time_entry[0..1],
+                entry_basis_d1: &time_entry[1..2],
+                entry_basis_d2: &time_entry[2..3],
+                entry_basis_d3: &time_entry[3..4],
+                exit_basis: &time_exit[0..1],
+                exit_basis_d1: &time_exit[1..2],
+                exit_basis_d2: &time_exit[2..3],
+                exit_basis_d3: &time_exit[3..4],
+            }),
+            link_wiggle: Some(SurvivalLocationScaleAloWiggleInput {
+                beta: &link_beta,
+                entry_basis: &link_entry[0..1],
+                entry_basis_d1: &link_entry[1..2],
+                entry_basis_d2: &link_entry[2..3],
+                entry_basis_d3: &link_entry[3..4],
+                exit_basis: &link_exit[0..1],
+                exit_basis_d1: &link_exit[1..2],
+                exit_basis_d2: &link_exit[2..3],
+                exit_basis_d3: &link_exit[3..4],
+            }),
+        })
+        .expect("exact saved time/link wiggle row geometry");
+
+        let dimension = SLS_ROW_K + 2;
+        let arena = DynamicJetArena::new();
+        let variables = arena.alloc_slice_fill_with(dimension, |axis| {
+            DynamicOrder2::variable(geometry.coordinate_values[axis], axis, dimension, &arena)
+        });
+        let h0 = variables[0].add(&variables[9].mul(&cubic_jet(&variables[0], time_coefficients)));
+        let h1 = variables[1].add(&variables[9].mul(&cubic_jet(&variables[1], time_coefficients)));
+        let hdot = variables[2].mul(
+            &variables[0]
+                .compose_unary([1.0, 0.0, 0.0, 0.0, 0.0])
+                .add(&variables[9].mul(&cubic_derivative_jet(&variables[1], time_coefficients))),
+        );
+        let inv_sigma_entry = variables[7].neg().exp();
+        let q0_base = variables[4].mul(&inv_sigma_entry).neg();
+        let inv_sigma_exit = variables[6].neg().exp();
+        let q1_base = variables[3].mul(&inv_sigma_exit).neg();
+        let qdot_base = inv_sigma_exit.mul(&variables[3].mul(&variables[8]).sub(&variables[5]));
+        let q0 = q0_base.add(&variables[10].mul(&cubic_jet(&q0_base, link_coefficients)));
+        let q1 = q1_base.add(&variables[10].mul(&cubic_jet(&q1_base, link_coefficients)));
+        let qdot = qdot_base.mul(
+            &variables[0]
+                .compose_unary([1.0, 0.0, 0.0, 0.0, 0.0])
+                .add(&variables[10].mul(&cubic_derivative_jet(&q1_base, link_coefficients))),
+        );
+        let u0 = h0.add(&q0);
+        let u1 = h1.add(&q1);
+        let g = hdot.add(&qdot);
+        // CLogLog event-row identity:
+        // NLL = w[-exp(u_entry) - u_exit + exp(u_exit) - log(g)].
+        let oracle = u0
+            .exp()
+            .neg()
+            .sub(&u1)
+            .add(&u1.exp())
+            .sub(&g.ln())
+            .scale(weight);
+        for axis in 0..dimension {
+            assert!((geometry.nll_score[axis] - oracle.g()[axis]).abs() <= 4e-11);
+            for other in 0..dimension {
+                assert!(
+                    (geometry.observed_hessian[[axis, other]] - oracle.h_at(axis, other)).abs()
+                        <= 8e-11
                 );
             }
         }

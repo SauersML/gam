@@ -540,6 +540,277 @@ fn build_saved_marginal_slope_survival_alo_input(
     ))
 }
 
+fn build_saved_location_scale_survival_alo_input(
+    model: &SavedModel,
+    data: ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    primary_offset: &Array1<f64>,
+    noise_offset: &Array1<f64>,
+) -> Result<gam_predict::SavedModelAloInput, String> {
+    let likelihood_mode = require_saved_survival_likelihood_mode(model)?;
+    if likelihood_mode != SurvivalLikelihoodMode::LocationScale {
+        return Err(format!(
+            "saved location-scale ALO carrier cannot rebuild {likelihood_mode:?} survival"
+        ));
+    }
+    let n = data.nrows();
+    if n == 0 || primary_offset.len() != n || noise_offset.len() != n {
+        return Err(format!(
+            "saved survival location-scale ALO row mismatch: data={n}, primary_offset={}, noise_offset={}",
+            primary_offset.len(),
+            noise_offset.len(),
+        ));
+    }
+    let event_name = model.survival_event.as_ref().ok_or_else(|| {
+        "saved survival location-scale ALO model is missing its event column".to_string()
+    })?;
+    let event_col = resolve_role_col(col_map, event_name, "survival event")?;
+    let event = Array1::from_vec(
+        data.column(event_col)
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(row, value)| {
+                let code = survival_event_code_from_value(value, row)?;
+                if code > 1 {
+                    return Err(format!(
+                        "saved survival location-scale ALO event[{row}] must be binary, got cause code {code}"
+                    ));
+                }
+                Ok(f64::from(code))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    );
+
+    let time_columns = resolve_saved_survival_time_columns(model, col_map)?;
+    let mut age_entry = Array1::<f64>::zeros(n);
+    let mut age_exit = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let (entry, exit) = normalize_survival_time_pair(
+            time_columns.row_entry_time(data, row),
+            data[[row, time_columns.exit_col]],
+            row,
+        )?;
+        age_entry[row] = entry;
+        age_exit[row] = exit;
+    }
+
+    let clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let design_input = clipped.as_ref().map_or(data, |values| values.view());
+    let threshold_spec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )?;
+    let threshold_build = build_term_collection_design(design_input, &threshold_spec)
+        .map_err(|error| format!("failed to build saved survival threshold design: {error}"))?;
+    let log_sigma_spec = resolve_termspec_for_prediction(
+        &model.resolved_termspec_noise,
+        training_headers,
+        col_map,
+        "resolved_termspec_noise",
+    )?;
+    let log_sigma_build = build_term_collection_design(design_input, &log_sigma_spec)
+        .map_err(|error| format!("failed to build saved survival log-sigma design: {error}"))?;
+    let structure = model
+        .survival_location_scale_structure
+        .as_ref()
+        .ok_or_else(|| {
+            "saved survival location-scale ALO is missing exact replay structure".to_string()
+        })?;
+    let threshold_effective_offset = match structure.threshold_time_basis.as_ref() {
+        None => threshold_build
+            .compose_offset(
+                primary_offset.view(),
+                "saved survival location-scale ALO threshold block",
+            )
+            .map_err(|error| error.to_string())?,
+        Some(_) => {
+            if threshold_build
+                .affine_offset
+                .iter()
+                .any(|value| *value != 0.0)
+            {
+                return Err(
+                    "saved time-varying survival threshold cannot carry a non-zero smooth anchor"
+                        .to_string(),
+                );
+            }
+            primary_offset.clone()
+        }
+    };
+    let log_sigma_effective_offset = match structure.log_sigma_time_basis.as_ref() {
+        None => log_sigma_build
+            .compose_offset(
+                noise_offset.view(),
+                "saved survival location-scale ALO log-sigma block",
+            )
+            .map_err(|error| error.to_string())?,
+        Some(_) => {
+            if log_sigma_build
+                .affine_offset
+                .iter()
+                .any(|value| *value != 0.0)
+            {
+                return Err(
+                    "saved time-varying survival log-sigma cannot carry a non-zero smooth anchor"
+                        .to_string(),
+                );
+            }
+            noise_offset.clone()
+        }
+    };
+    let threshold_replay = replay_survival_covariate_channels(
+        &threshold_build.design,
+        &threshold_effective_offset,
+        &age_entry,
+        &age_exit,
+        structure.threshold_time_basis.as_ref(),
+        "saved survival location-scale ALO threshold",
+    )?;
+    let log_sigma_replay = replay_survival_covariate_channels(
+        &log_sigma_build.design,
+        &log_sigma_effective_offset,
+        &age_entry,
+        &age_exit,
+        structure.log_sigma_time_basis.as_ref(),
+        "saved survival location-scale ALO log-sigma",
+    )?;
+
+    let zero_derivative_design = |width| DesignMatrix::from(Array2::zeros((n, width)));
+    let mut threshold_entry_offset = threshold_replay.offset.clone();
+    let mut threshold_exit_offset = threshold_replay.offset.clone();
+    let mut threshold_derivative_offset = Array1::<f64>::zeros(n);
+    if structure.time_parameterization
+        == SurvivalLocationScaleTimeParameterization::ReducedParametricAft
+    {
+        for row in 0..n {
+            threshold_entry_offset[row] -= age_entry[row]
+                .max(gam::families::survival::SURVIVAL_TIME_FLOOR)
+                .ln();
+            threshold_exit_offset[row] -= age_exit[row]
+                .max(gam::families::survival::SURVIVAL_TIME_FLOOR)
+                .ln();
+            threshold_derivative_offset[row] =
+                -1.0 / age_exit[row].max(gam::families::survival::SURVIVAL_TIME_FLOOR);
+        }
+    }
+    let threshold_exit_design = threshold_replay.design_exit;
+    let threshold_entry_design = threshold_replay
+        .design_entry
+        .unwrap_or_else(|| threshold_exit_design.clone());
+    let threshold_derivative_design = threshold_replay
+        .design_derivative_exit
+        .unwrap_or_else(|| zero_derivative_design(threshold_exit_design.ncols()));
+    let threshold = gam_predict::SavedSurvivalAffineBlockAloInput::new(
+        threshold_entry_design,
+        threshold_exit_design,
+        threshold_derivative_design,
+        threshold_entry_offset,
+        threshold_exit_offset,
+        threshold_derivative_offset,
+    )?;
+
+    let log_sigma_exit_design = log_sigma_replay.design_exit;
+    let log_sigma_entry_design = log_sigma_replay
+        .design_entry
+        .unwrap_or_else(|| log_sigma_exit_design.clone());
+    let log_sigma_derivative_design = log_sigma_replay
+        .design_derivative_exit
+        .unwrap_or_else(|| zero_derivative_design(log_sigma_exit_design.ncols()));
+    let log_sigma = gam_predict::SavedSurvivalAffineBlockAloInput::new(
+        log_sigma_entry_design,
+        log_sigma_exit_design,
+        log_sigma_derivative_design,
+        log_sigma_replay.offset.clone(),
+        log_sigma_replay.offset,
+        Array1::zeros(n),
+    )?;
+
+    let time_config = load_survival_time_basis_config_from_model(model)?;
+    let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_config, None)?;
+    let anchor = model.survival_time_anchor.ok_or_else(|| {
+        "saved survival location-scale ALO model is missing survival_time_anchor".to_string()
+    })?;
+    let resolved_time_config = resolved_survival_time_basis_config_from_build(
+        &time_build.basisname,
+        time_build.degree,
+        time_build.knots.as_ref(),
+        time_build.keep_cols.as_ref(),
+        time_build.smooth_lambda,
+    )?;
+    let anchor_row = evaluate_survival_time_basis_row(anchor, &resolved_time_config)?;
+    center_survival_time_designs_at_anchor(
+        &mut time_build.x_entry_time,
+        &mut time_build.x_exit_time,
+        &anchor_row,
+    )?;
+    let baseline_config = saved_survival_runtime_baseline_config(model)?;
+    let inverse_link = resolve_survival_inverse_link_from_saved(model)?;
+    let (mut time_offset_entry, mut time_offset_exit, mut time_derivative_offset_exit) =
+        build_survival_time_offsets_for_likelihood(
+            &age_entry,
+            &age_exit,
+            &baseline_config,
+            likelihood_mode,
+            Some(&inverse_link),
+        )?;
+    let derivative_guard = survival_derivative_guard_for_likelihood(likelihood_mode);
+    add_survival_time_derivative_guard_offset(
+        &age_entry,
+        &age_exit,
+        anchor,
+        derivative_guard,
+        &mut time_offset_entry,
+        &mut time_offset_exit,
+        &mut time_derivative_offset_exit,
+    )?;
+    let time_base = match structure.time_parameterization {
+        SurvivalLocationScaleTimeParameterization::MonotoneWarp => {
+            gam_predict::SavedSurvivalAffineBlockAloInput::new(
+                time_build.x_entry_time,
+                time_build.x_exit_time,
+                time_build.x_derivative_time,
+                time_offset_entry,
+                time_offset_exit,
+                time_derivative_offset_exit,
+            )?
+        }
+        SurvivalLocationScaleTimeParameterization::ReducedParametricAft => {
+            let fit = fit_result_from_saved_model_for_prediction(model)?;
+            let width = fit
+                .block_by_role(BlockRole::Time)
+                .ok_or_else(|| {
+                    "saved reduced parametric-AFT location-scale model is missing its zero-lift time block"
+                        .to_string()
+                })?
+                .beta
+                .len();
+            let fixed = || DesignMatrix::from(Array2::<f64>::zeros((n, width)));
+            gam_predict::SavedSurvivalAffineBlockAloInput::new(
+                fixed(),
+                fixed(),
+                fixed(),
+                Array1::zeros(n),
+                Array1::zeros(n),
+                Array1::zeros(n),
+            )?
+        }
+    };
+    let input = gam_predict::SavedLocationScaleSurvivalAloInput::new(
+        event,
+        derivative_guard,
+        time_base,
+        threshold,
+        log_sigma,
+    )?;
+    Ok(gam_predict::SavedModelAloInput::survival(
+        gam_predict::SavedSurvivalAloInput::LocationScale(input),
+    ))
+}
+
 pub(crate) fn build_saved_alo_predict_input(
     model: &SavedModel,
     data: ArrayView2<'_, f64>,
@@ -551,6 +822,14 @@ pub(crate) fn build_saved_alo_predict_input(
 ) -> Result<gam_predict::SavedModelAloInput, String> {
     if model.predict_model_class() == PredictModelClass::Survival {
         return match require_saved_survival_likelihood_mode(model)? {
+            SurvivalLikelihoodMode::LocationScale => build_saved_location_scale_survival_alo_input(
+                model,
+                data,
+                col_map,
+                training_headers,
+                offset,
+                noise_offset,
+            ),
             SurvivalLikelihoodMode::MarginalSlope => build_saved_marginal_slope_survival_alo_input(
                 model,
                 data,
@@ -1797,6 +2076,12 @@ pub(crate) fn run_predict_survival(
     let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
     if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         let saved_fit = saved_survival_location_scale_fit_result(model)?;
+        let saved_structure = model
+            .survival_location_scale_structure
+            .as_ref()
+            .ok_or_else(|| {
+                "saved survival location-scale model is missing exact replay structure".to_string()
+            })?;
         let survival_inverse_link = saved_location_scale_inverse_link
             .clone()
             .ok_or_else(|| "saved location-scale model missing inverse link".to_string())?;
@@ -1818,22 +2103,80 @@ pub(crate) fn run_predict_survival(
         )?;
         let raw_sigma_design = build_term_collection_design(threshold_input, &log_sigmaspec)
             .map_err(|e| format!("failed to build survival log-sigma design: {e}"))?;
+        if saved_structure.threshold_time_basis.is_some()
+            && threshold_design
+                .affine_offset
+                .iter()
+                .any(|value| *value != 0.0)
+        {
+            return Err(
+                "saved time-varying survival threshold cannot carry a non-zero smooth anchor"
+                    .to_string(),
+            );
+        }
+        if saved_structure.log_sigma_time_basis.is_some()
+            && raw_sigma_design
+                .affine_offset
+                .iter()
+                .any(|value| *value != 0.0)
+        {
+            return Err(
+                "saved time-varying survival log-sigma cannot carry a non-zero smooth anchor"
+                    .to_string(),
+            );
+        }
         let effective_noise_offset = raw_sigma_design
             .compose_offset(noise_offset.view(), "survival CLI log-sigma block")
             .map_err(|error| error.to_string())?;
-        let x_time_exit_dense = time_build
-            .x_exit_time
-            .try_to_dense_arc("survival location-scale prediction time-exit design")?;
-        let x_time_exit = if let Some(runtime) = saved_timewiggle_runtime.as_ref() {
-            let mut full =
-                Array2::<f64>::zeros((n, x_time_exit_dense.ncols() + runtime.beta.len()));
-            full.slice_mut(s![.., 0..x_time_exit_dense.ncols()])
-                .assign(&x_time_exit_dense);
-            full
-        } else {
-            x_time_exit_dense.as_ref().clone()
+        let mut threshold_replay = replay_survival_covariate_channels(
+            &threshold_design.design,
+            &effective_primary_offset,
+            &age_entry,
+            &age_exit,
+            saved_structure.threshold_time_basis.as_ref(),
+            "survival CLI location-scale threshold",
+        )?;
+        let sigma_replay = replay_survival_covariate_channels(
+            &raw_sigma_design.design,
+            &effective_noise_offset,
+            &age_entry,
+            &age_exit,
+            saved_structure.log_sigma_time_basis.as_ref(),
+            "survival CLI location-scale log-sigma",
+        )?;
+        let x_time_exit = match saved_structure.time_parameterization {
+            SurvivalLocationScaleTimeParameterization::MonotoneWarp => {
+                let x_time_exit_dense = time_build
+                    .x_exit_time
+                    .try_to_dense_arc("survival location-scale prediction time-exit design")?;
+                if let Some(runtime) = saved_timewiggle_runtime.as_ref() {
+                    let mut full =
+                        Array2::<f64>::zeros((n, x_time_exit_dense.ncols() + runtime.beta.len()));
+                    full.slice_mut(s![.., 0..x_time_exit_dense.ncols()])
+                        .assign(&x_time_exit_dense);
+                    full
+                } else {
+                    x_time_exit_dense.as_ref().clone()
+                }
+            }
+            SurvivalLocationScaleTimeParameterization::ReducedParametricAft => {
+                if saved_timewiggle_runtime.is_some() {
+                    return Err(
+                        "saved reduced parametric-AFT location-scale model cannot carry a time wiggle"
+                            .to_string(),
+                    );
+                }
+                for (offset, &time) in threshold_replay.offset.iter_mut().zip(age_exit.iter()) {
+                    *offset -= time.max(gam::families::survival::SURVIVAL_TIME_FLOOR).ln();
+                }
+                eta_offset_exit.fill(0.0);
+                time_build
+                    .x_exit_time
+                    .try_to_dense_arc("survival reduced-AFT prediction zero-lift time design")?
+                    .as_ref()
+                    .clone()
+            }
         };
-        let prepared_sigma_design = raw_sigma_design.design.clone();
         let link_wiggle_knots = model
             .linkwiggle_knots
             .as_ref()
@@ -1849,10 +2192,10 @@ pub(crate) fn run_predict_survival(
             time_wiggle_ncols: saved_timewiggle_runtime
                 .as_ref()
                 .map_or(0, |w| w.beta.len()),
-            x_threshold: threshold_design.design.clone(),
-            eta_threshold_offset: effective_primary_offset.clone(),
-            x_log_sigma: prepared_sigma_design,
-            eta_log_sigma_offset: effective_noise_offset,
+            x_threshold: threshold_replay.design_exit,
+            eta_threshold_offset: threshold_replay.offset,
+            x_log_sigma: sigma_replay.design_exit,
+            eta_log_sigma_offset: sigma_replay.offset,
             x_link_wiggle: None,
             link_wiggle_knots: link_wiggle_knots.clone(),
             link_wiggle_degree,
