@@ -757,11 +757,7 @@ where
     match covariance {
         MarginalSlopeCovariance::Diagonal(diagonal) => {
             for axis in 0..k {
-                variance = variance.add(
-                    &vars[3 + axis]
-                        .mul(&vars[3 + axis])
-                        .scale(diagonal[axis]),
-                );
+                variance = variance.add(&vars[3 + axis].mul(&vars[3 + axis]).scale(diagonal[axis]));
             }
         }
         MarginalSlopeCovariance::Full(matrix) => {
