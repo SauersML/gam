@@ -357,7 +357,7 @@ impl SaeSoftmaxRowJetInput {
             ("decoded_second", self.decoded_second.as_slice()),
             ("beta_basis_values", self.beta_basis_values.as_slice()),
             ("beta_basis_first", self.beta_basis_first.as_slice()),
-            ("beta_outputs", self.beta_outputs.as_slice()),
+            ("beta_outputs", self.beta_outputs.as_ref()),
         ] {
             if let Some((index, value)) = values
                 .iter()
@@ -830,8 +830,8 @@ struct InputSource<'a> {
     structural_error: std::cell::RefCell<Option<String>>,
 }
 
-impl InputSource<'_> {
-    fn new(input: &SaeSoftmaxRowJetInput) -> Self {
+impl<'a> InputSource<'a> {
+    fn new(input: &'a SaeSoftmaxRowJetInput) -> Self {
         Self {
             input,
             structural_error: std::cell::RefCell::new(None),
