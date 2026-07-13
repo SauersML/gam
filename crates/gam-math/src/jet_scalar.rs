@@ -257,6 +257,34 @@ fn shared_multiply_add_affine_composed_sum_default<T, const N: usize>(
     })
 }
 
+/// Canonical representatives for repeated inner sources in a shared composed sum.
+///
+/// Backends define source identity at their representation boundary: eager jets
+/// use reference identity, while compiled graphs use node identity. Terms are
+/// equivalent only when their left operand and structural addend coefficient
+/// name the same inner expression. The returned term-to-source map lets every
+/// backend sum outer first/second coefficients before propagating that source.
+#[inline(always)]
+pub(crate) fn canonical_shared_source_schedule<const N: usize>(
+    mut equivalent: impl FnMut(usize, usize) -> bool,
+) -> ([usize; N], [usize; N], usize) {
+    let mut representatives = [0; N];
+    let mut term_sources = [0; N];
+    let mut source_count = 0;
+    for term in 0..N {
+        let mut source = 0;
+        while source < source_count && !equivalent(term, representatives[source]) {
+            source += 1;
+        }
+        if source == source_count {
+            representatives[source] = term;
+            source_count += 1;
+        }
+        term_sources[term] = source;
+    }
+    (representatives, term_sources, source_count)
+}
+
 /// A truncated-Taylor scalar carrying derivatives in `K` primaries.
 ///
 /// All concrete scalars here ([`Order2`], [`OneSeed`], [`TwoSeed`]) and the full
@@ -1615,9 +1643,14 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             !addend_live || (addend.dimension() == dimension && std::ptr::eq(addend.arena, arena)),
             "live dynamic fused addends must share dimension and arena"
         );
-        let term_gradients = arena.zeros(N * dimension);
-        let mut firsts = [0.0; N];
-        let mut seconds = [0.0; N];
+        let (representatives, term_sources, source_count) =
+            canonical_shared_source_schedule(|term, representative| {
+                std::ptr::eq(lefts[term], lefts[representative])
+                    && addend_scales[term] == addend_scales[representative]
+            });
+        let source_gradients = arena.zeros(source_count * dimension);
+        let mut source_firsts = [0.0; N];
+        let mut source_seconds = [0.0; N];
         let gradient = arena.zeros(dimension);
         let hessian = arena.zeros(dimension * dimension);
         let mut value = 0.0;
@@ -1626,9 +1659,14 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         for term in 0..N {
             let first = derivative_stacks[term][1] * input_scales[term];
             let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
-            firsts[term] = first;
-            seconds[term] = second;
+            let source = term_sources[term];
+            source_firsts[source] += first;
+            source_seconds[source] += second;
             value += derivative_stacks[term][0];
+        }
+        for source in 0..source_count {
+            let term = representatives[source];
+            let first = source_firsts[source];
             right_first += first * lefts[term].v;
             addend_first += first * addend_scales[term];
             for primary in 0..dimension {
@@ -1641,7 +1679,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
                 } else {
                     product_gradient + addend_scales[term] * addend.g[primary]
                 };
-                term_gradients[term * dimension + primary] = inner_gradient;
+                source_gradients[source * dimension + primary] = inner_gradient;
                 gradient[primary] += first * lefts[term].g[primary] * right.v;
             }
         }
@@ -1666,14 +1704,15 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
                 if addend_live {
                     channel += addend_first * addend.h[index];
                 }
-                for term in 0..N {
+                for source in 0..source_count {
+                    let term = representatives[source];
                     let local_product_hessian = lefts[term].g[primary] * right.g[other]
                         + lefts[term].g[other] * right.g[primary]
                         + lefts[term].h[index] * right.v;
-                    channel += firsts[term] * local_product_hessian
-                        + seconds[term]
-                            * term_gradients[term * dimension + primary]
-                            * term_gradients[term * dimension + other];
+                    channel += source_firsts[source] * local_product_hessian
+                        + source_seconds[source]
+                            * source_gradients[source * dimension + primary]
+                            * source_gradients[source * dimension + other];
                 }
                 hessian[index] = channel;
                 hessian[other * dimension + primary] = channel;
@@ -3314,18 +3353,28 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
     ) -> Self {
-        let mut term_gradients = [[0.0; K]; N];
-        let mut firsts = [0.0; N];
-        let mut seconds = [0.0; N];
+        let (representatives, term_sources, source_count) =
+            canonical_shared_source_schedule(|term, representative| {
+                std::ptr::eq(lefts[term], lefts[representative])
+                    && addend_scales[term] == addend_scales[representative]
+            });
+        let mut source_gradients = [[0.0; K]; N];
+        let mut source_firsts = [0.0; N];
+        let mut source_seconds = [0.0; N];
         let mut out = crate::jet_tower::Tower2::zero();
         let mut right_first = 0.0;
         let mut addend_first = 0.0;
         for term in 0..N {
             let first = derivative_stacks[term][1] * input_scales[term];
             let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
-            firsts[term] = first;
-            seconds[term] = second;
+            let source = term_sources[term];
+            source_firsts[source] += first;
+            source_seconds[source] += second;
             out.v += derivative_stacks[term][0];
+        }
+        for source in 0..source_count {
+            let term = representatives[source];
+            let first = source_firsts[source];
             right_first += first * lefts[term].0.v;
             addend_first += first * addend_scales[term];
             for primary in 0..K {
@@ -3338,7 +3387,7 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
                 } else {
                     product_gradient + addend_scales[term] * addend.0.g[primary]
                 };
-                term_gradients[term][primary] = inner_gradient;
+                source_gradients[source][primary] = inner_gradient;
                 out.g[primary] += first * lefts[term].0.g[primary] * right.0.v;
             }
         }
@@ -3363,14 +3412,15 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
                 if addend_live {
                     channel += addend_first * addend.0.h[primary][other];
                 }
-                for term in 0..N {
+                for source in 0..source_count {
+                    let term = representatives[source];
                     let local_product_hessian = lefts[term].0.g[primary] * right.0.g[other]
                         + lefts[term].0.g[other] * right.0.g[primary]
                         + lefts[term].0.h[primary][other] * right.0.v;
-                    channel += firsts[term] * local_product_hessian
-                        + seconds[term]
-                            * term_gradients[term][primary]
-                            * term_gradients[term][other];
+                    channel += source_firsts[source] * local_product_hessian
+                        + source_seconds[source]
+                            * source_gradients[source][primary]
+                            * source_gradients[source][other];
                 }
                 out.h[primary][other] = channel;
                 out.h[other][primary] = channel;
@@ -5543,8 +5593,9 @@ mod tests {
             let fixed_inputs: [Order2<K>; TERMS] =
                 std::array::from_fn(|_| arbitrary_order2(&mut state));
             let mut input_scales: [f64; TERMS] = std::array::from_fn(|_| sample(&mut state));
-            input_scales[0] = 0.0;
-            input_scales[1] = -1.25;
+            input_scales[0] = -1.25;
+            input_scales[1] = 0.0;
+            input_scales[4] = 1.25;
             let addend_scales: [f64; TERMS] = std::array::from_fn(|term| match term % 4 {
                 0 => 0.0,
                 1 => 1.0,
@@ -5554,7 +5605,9 @@ mod tests {
             let derivative_stacks: [[f64; 5]; TERMS] =
                 std::array::from_fn(|_| std::array::from_fn(|_| sample(&mut state)));
             let input_shift = sample(&mut state);
-            let fixed_lefts = std::array::from_fn(|term| &fixed_inputs[term]);
+            let mut fixed_lefts = std::array::from_fn(|term| &fixed_inputs[term]);
+            fixed_lefts[4] = &fixed_inputs[0];
+            fixed_lefts[5] = &fixed_inputs[0];
             let fixed_right = &fixed_inputs[1];
             let fixed_addend = &fixed_inputs[2];
 
@@ -5650,7 +5703,9 @@ mod tests {
                 |input, constant| input.add_constant(constant, &arena),
                 RuntimeJetScalar::compose_unary,
             );
-            let dynamic_lefts = std::array::from_fn(|term| &dynamic_inputs[term]);
+            let mut dynamic_lefts = std::array::from_fn(|term| &dynamic_inputs[term]);
+            dynamic_lefts[4] = &dynamic_inputs[0];
+            dynamic_lefts[5] = &dynamic_inputs[0];
             let dynamic_right = &dynamic_inputs[1];
             let dynamic_addend = &dynamic_inputs[2];
             let dynamic_fused_direct = DynamicOrder2::shared_multiply_add_affine_composed_sum(

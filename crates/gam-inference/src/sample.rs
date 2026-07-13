@@ -769,7 +769,12 @@ fn sample_standard(
     let penalty =
         weighted_blockwise_penalty_sum(&design.penalties, fit.lambdas.as_slice().unwrap(), p);
 
-    let offset_vec = saved_offset(model, data, col_map)?;
+    let saved_offset_vec = saved_offset(model, data, col_map)?;
+    let base_offset = saved_offset_vec
+        .unwrap_or_else(|| Array1::<f64>::zeros(design.design.nrows()));
+    let offset_vec = design
+        .compose_offset(base_offset.view(), "saved standard model sampling")
+        .map_err(|error| error.to_string())?;
 
     let result = run_nuts_sampling_flattened_family(
         likelihood,
@@ -789,7 +794,7 @@ fn sample_standard(
             // from a Firth fit samples a different posterior (#2245
             // finding 16). Persisted on the fit artifacts at fit time.
             firth_bias_reduction: fit.artifacts.firth_bias_reduction,
-            offset: offset_vec.as_ref().map(|o| o.view()),
+            offset: Some(offset_vec.view()),
         }),
         cfg,
     )
@@ -1088,12 +1093,14 @@ fn sample_standard_link_wiggle(
     // wiggle abscissa q₀ = Xβ + offset below, matching the target's basis
     // evaluation.
     let weights = saved_prior_weights(model, data, col_map)?;
-    let offset_vec = saved_offset(model, data, col_map)?;
+    let saved_offset_vec = saved_offset(model, data, col_map)?;
+    let base_offset = saved_offset_vec
+        .unwrap_or_else(|| Array1::<f64>::zeros(design.design.nrows()));
+    let offset_vec = design
+        .compose_offset(base_offset.view(), "saved link-wiggle model sampling")
+        .map_err(|error| error.to_string())?;
 
-    let mut q0 = design.design.dot(&mode_beta);
-    if let Some(offset) = offset_vec.as_ref() {
-        q0 += offset;
-    }
+    let q0 = design.design.dot(&mode_beta) + &offset_vec;
     let (q0_min, q0_max) = q0
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
@@ -1169,7 +1176,7 @@ fn sample_standard_link_wiggle(
         wiggle_nuts_dense.view(),
         y.view(),
         weights.view(),
-        offset_vec.as_ref().map(|o| o.view()),
+        Some(offset_vec.view()),
         penalty_base.view(),
         penalty_link.view(),
         mode_beta.view(),
@@ -1285,6 +1292,11 @@ fn sample_survival(
             &mut derivative_offset_exit,
         )?;
     }
+    // A covariate term's inhomogeneous boundary lift contributes to both
+    // cumulative-hazard evaluations. It is independent of time, so it does
+    // not contribute to the time derivative channel.
+    eta_offset_entry += &cov_design.affine_offset;
+    eta_offset_exit += &cov_design.affine_offset;
     let saved_timewiggle = saved_baseline_timewiggle_components(
         &eta_offset_entry,
         &eta_offset_exit,

@@ -92,6 +92,9 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // `alo_eta_update`. `report_offset_for` reads the saved offset column and
     // returns a zero noise-offset for standard models.
     let (offset, _noise_offset) = report_offset_for(&model, &ds, &col_map)?;
+    let effective_offset = design
+        .compose_offset(offset.view(), "diagnose saved-model design")
+        .map_err(|error| error.to_string())?;
 
     // Try geometry-based ALO from the unified result first (avoids refit).
     let alo = if let Some((unified, geom)) = model
@@ -111,7 +114,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         // included); it re-centres internally via the separate `offset` arg to
         // match the offset-inclusive saved working response. The refit branch
         // below already adds `offset` here — the geometry path must too (#881).
-        let eta = &design.design.dot(&fit_saved.beta) + &offset;
+        let eta = &design.design.dot(&fit_saved.beta) + &effective_offset;
         // ALO needs a dense X — materialize from row chunks when the design
         // is an operator-backed (lazy) one. `as_dense_cow` panicked on lazy
         // designs ("called on operator-backed design; use row chunks or
@@ -142,7 +145,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             geom,
             &alo_design_dense,
             &eta,
-            &offset,
+            &effective_offset,
             phi,
             &recomputed.working_weights,
             &recomputed.working_response,
@@ -185,7 +188,11 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 .map_err(|e| {
                     format!("fit_term_collection_forspec failed during diagnose refit: {e}")
                 })?;
-                let eta = &fitted.design.design.dot(&fitted.fit.beta) + &offset;
+                let fitted_offset = fitted
+                    .design
+                    .compose_offset(offset.view(), "diagnose refit design")
+                    .map_err(|error| error.to_string())?;
+                let eta = &fitted.design.design.dot(&fitted.fit.beta) + &fitted_offset;
                 let dense_alo_design = fitted.design.design.to_dense();
                 // φ for Gaussian (Identity) is the estimated dispersion σ̂², not
                 // 1.0 — same SE-scale bug as the geometry path. Mirrors the
@@ -196,7 +203,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                     &fitted.fit,
                     &dense_alo_design,
                     &eta,
-                    &offset,
+                    &fitted_offset,
                     phi,
                 )
                 .map_err(|e| {
@@ -210,7 +217,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                     design.design.clone(),
                     y.view(),
                     weights.view(),
-                    offset.view(),
+                    effective_offset.view(),
                     &design.penalties,
                     family,
                     &fit_options,
@@ -253,7 +260,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // already reused the fit's factored Hessian, so the LOO channel is free here.
     if let Some(unified) = model.unified() {
         let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
-        let eta_hat = &design.design.dot(&fit_saved.beta) + &offset;
+        let eta_hat = &design.design.dot(&fit_saved.beta) + &effective_offset;
         let comparison = gam::model_comparison::model_comparison_from_unified(
             unified,
             y.view(),

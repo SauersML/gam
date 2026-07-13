@@ -13,7 +13,9 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 
-use crate::jet_scalar::{Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients};
+use crate::jet_scalar::{
+    Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients, canonical_shared_source_schedule,
+};
 
 #[derive(Clone, Copy, Debug)]
 struct GraphNode {
@@ -697,6 +699,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             "compiled graph linear inputs belong to different workspaces"
         );
         let tape = workspace.tape_mut();
+        let all_inputs_primary = inputs
+            .iter()
+            .all(|input| tape.nodes[input.node].primary_axis != NO_PRIMARY_AXIS);
         let edge_start = tape.edge_len;
         let mut value = 0.0;
         let mut gradient = [0.0; K];
@@ -705,8 +710,13 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             value += weight * tape.nodes[input.node].value;
             Order2GraphWorkspace::push_edge(tape, input.node, weight);
             support |= tape.nodes[input.node].support;
-            for primary in 0..K {
-                gradient[primary] += weight * tape.gradients[input.node * K + primary];
+            if all_inputs_primary {
+                let primary = tape.nodes[input.node].primary_axis as usize;
+                gradient[primary] += weight;
+            } else {
+                for primary in 0..K {
+                    gradient[primary] += weight * tape.gradients[input.node * K + primary];
+                }
             }
         }
         let node = Order2GraphWorkspace::push(tape, value, support, gradient, edge_start);
@@ -897,9 +907,14 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let tape = workspace.tape_mut();
         let right_node = right.node;
         let addend_node = addend.node;
-        let mut term_gradients = [[0.0; K]; N];
-        let mut firsts = [0.0; N];
-        let mut seconds = [0.0; N];
+        let (representatives, term_sources, source_count) =
+            canonical_shared_source_schedule(|term, representative| {
+                lefts[term].node == lefts[representative].node
+                    && addend_scales[term] == addend_scales[representative]
+            });
+        let mut source_gradients = [[0.0; K]; N];
+        let mut source_firsts = [0.0; N];
+        let mut source_seconds = [0.0; N];
         let mut value = 0.0;
         let mut gradient = [0.0; K];
         let mut support = 0_u16;
@@ -912,14 +927,19 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             support |= tape.nodes[addend_node].support;
         }
         for term in 0..N {
+            let first = derivative_stacks[term][1] * input_scales[term];
+            let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
+            let source = term_sources[term];
+            source_firsts[source] += first;
+            source_seconds[source] += second;
+            value += derivative_stacks[term][0];
+        }
+        for source in 0..source_count {
+            let term = representatives[source];
             let left = lefts[term].node;
             let left_value = tape.nodes[left].value;
             let right_value = tape.nodes[right_node].value;
-            let first = derivative_stacks[term][1] * input_scales[term];
-            let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
-            firsts[term] = first;
-            seconds[term] = second;
-            value += derivative_stacks[term][0];
+            let first = source_firsts[source];
             support |= tape.nodes[left].support;
             right_first += first * left_value;
             addend_first += first * addend_scales[term];
@@ -934,7 +954,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                     product_gradient
                         + addend_scales[term] * tape.gradients[addend_node * K + primary]
                 };
-                term_gradients[term][primary] = inner_gradient;
+                source_gradients[source][primary] = inner_gradient;
                 gradient[primary] += first * tape.gradients[left * K + primary] * right_value;
             }
         }
@@ -960,13 +980,16 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let mut curvature_offset = 0;
         for_each_supported_upper_by_column(support, |primary, other| {
             let mut channel = 0.0;
-            for term in 0..N {
+            for source in 0..source_count {
+                let term = representatives[source];
                 let left = lefts[term].node;
                 let cross = tape.gradients[left * K + primary]
                     * tape.gradients[right_node * K + other]
                     + tape.gradients[left * K + other] * tape.gradients[right_node * K + primary];
-                channel += firsts[term] * cross
-                    + seconds[term] * term_gradients[term][primary] * term_gradients[term][other];
+                channel += source_firsts[source] * cross
+                    + source_seconds[source]
+                        * source_gradients[source][primary]
+                        * source_gradients[source][other];
             }
             tape.projected_curvatures[curvature_start + curvature_offset] = channel;
             curvature_offset += 1;
@@ -978,9 +1001,10 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
 
         let owner = tape.node_len;
         let edge_start = tape.edge_len;
-        for term in 0..N {
+        for source in 0..source_count {
+            let term = representatives[source];
             let left = lefts[term].node;
-            let left_first = firsts[term] * tape.nodes[right_node].value;
+            let left_first = source_firsts[source] * tape.nodes[right_node].value;
             Order2GraphWorkspace::push_edge(tape, left, left_first);
         }
         if N != 0 {
@@ -1262,6 +1286,16 @@ mod tests {
         workspace.reset(4);
         let x = Order2Graph::<4>::variable(0.4, 0, 4, &workspace);
         let z = Order2Graph::<4>::variable(1.1, 2, 4, &workspace);
+        let linear = Order2Graph::linear_combination(
+            &[z, x, z],
+            &[0.3, -0.7, 1.1],
+            4,
+            &workspace,
+        )
+        .into_order2();
+        assert!((linear.value() - 1.26).abs() <= 2.0e-13);
+        assert_eq!(linear.g(), [-0.7, 0.0, 1.4, 0.0]);
+        assert!(linear.h().iter().flatten().all(|&channel| channel == 0.0));
         let coefficients = MatrixFreeDense3 {
             matrix: [[1.2, -0.3, 0.25], [-0.3, 0.8, 0.17], [0.25, 0.17, 1.4]],
             workspace: &workspace,
@@ -1465,7 +1499,9 @@ mod tests {
             vars[2].affine_compose(scales[0], scales[1], stacks[0], workspace),
             vars[3].multiply_add(&vars[4], &vars[5]),
         ];
-        let lefts: [&S; N] = std::array::from_fn(|term| &upstream[term % upstream.len()]);
+        let repeated_left = upstream[1].clone();
+        let mut lefts: [&S; N] = std::array::from_fn(|term| &upstream[term % upstream.len()]);
+        lefts[9] = &repeated_left;
         let right = &upstream[1];
         let addend = &vars[2];
         let addend_scales: [f64; N] = std::array::from_fn(|term| match term % 4 {
@@ -1474,11 +1510,12 @@ mod tests {
             2 => -0.75,
             _ => 0.35,
         });
-        let input_scales: [f64; N] = std::array::from_fn(|term| match term {
+        let mut input_scales: [f64; N] = std::array::from_fn(|term| match term {
             0 => 0.0,
             1 => -1.25,
             _ => scales[term % scales.len()],
         });
+        input_scales[9] = 1.25;
         let derivative_stacks: [[f64; 5]; N] =
             std::array::from_fn(|term| stacks[term % stacks.len()]);
         S::shared_multiply_add_affine_composed_sum(

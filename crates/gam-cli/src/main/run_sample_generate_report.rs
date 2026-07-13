@@ -593,10 +593,13 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                     .map_err(|e| format!("failed to build design for report diagnostics: {e}"))?;
 
                 let (offset, _report_noise_offset) = report_offset_for(&model, &ds, &col_map)?;
+                let effective_offset = design
+                    .compose_offset(offset.view(), "report saved-model design")
+                    .map_err(|error| error.to_string())?;
                 let pred = predict_gam(
                     design.design.clone(),
                     fit.beta.view(),
-                    offset.view(),
+                    effective_offset.view(),
                     family.clone(),
                 )
                 .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
@@ -738,7 +741,10 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                     let alo_result = if let Some(unified) = model.unified() {
                         let (report_offset, _report_noise_offset) =
                             report_offset_for(&model, &ds, &col_map)?;
-                        let eta = &design.design.dot(&fit.beta) + &report_offset;
+                        let effective_report_offset = design
+                            .compose_offset(report_offset.view(), "report ALO design")
+                            .map_err(|error| error.to_string())?;
+                        let eta = &design.design.dot(&fit.beta) + &effective_report_offset;
                         let dense_alo_design = design.design.to_dense();
                         // φ must match the PIRLS-backed refit fallback: Gaussian
                         // (Identity) uses σ̂², not a hard-coded 1.0, or the
@@ -748,7 +754,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                             unified,
                             &dense_alo_design,
                             &eta,
-                            &report_offset,
+                            &effective_report_offset,
                             phi,
                         )
                     } else {
