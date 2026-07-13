@@ -2114,6 +2114,52 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
+    /// Closed-form chart-gauge directions restricted to the reduced β border.
+    ///
+    /// Each returned vector is the β (decoder-border) component of a
+    /// [`Self::dense_step_gauge_vectors`] orbit — the exact decoder compensation
+    /// `δβ` that, paired with the coordinate motion `δt`, leaves the atom
+    /// reconstruction invariant (`Φ(t+δt)·(β+δβ) = Φ(t)·β` to first order).
+    ///
+    /// By the arrow-Schur identity these β-components are exactly the null
+    /// directions of the reduced β-Schur complement `S_β = H_ββ − H_βt H_tt⁻¹
+    /// H_tβ`: from `H·(δt,δβ)ᵀ = 0` the elimination `δt = −H_tt⁻¹ H_tβ δβ` gives
+    /// `S_β δβ = 0`. Installing them as an [`ArrowBetaGaugeQuotient`] therefore
+    /// gauge-fixes the reduced Newton solve to the Faddeev–Popov quotient
+    /// `P S_β P + Q Qᵀ` (`P = I − Q Qᵀ`), replacing an exactly-singular `S_β`
+    /// with a well-conditioned operator whose gauge directions carry curvature
+    /// `1`. The identifiable complement is untouched, so the step is unchanged
+    /// off the orbit — only the orbit drift (the #2228 circle-rotation crawl that
+    /// walks `t` off the manifold over the outer ρ-walk) is removed.
+    ///
+    /// The count is a structural property of the chart menu (one per circle /
+    /// torus phase, translation+scale for the linear/euclidean/Duchon patches),
+    /// so — unlike a spectral-floor discovery — it does not flicker across the
+    /// ρ-walk (#2253).
+    pub(crate) fn closed_form_beta_gauge_directions(&self) -> Result<Vec<Array1<f64>>, String> {
+        let border = self.factored_border_dim();
+        if border == 0 {
+            return Ok(Vec::new());
+        }
+        let coord_len = self.n_obs() * self.assignment.row_block_dim();
+        let mut out = Vec::new();
+        for gauge in self.dense_step_gauge_vectors()? {
+            if gauge.len() != coord_len + border {
+                continue;
+            }
+            let beta_part = gauge.slice(s![coord_len..]).to_owned();
+            let norm_sq = beta_part.iter().map(|&v| v * v).sum::<f64>();
+            // A gauge whose reconstruction motion is entirely absorbed by the
+            // coordinate block (no decoder compensation) contributes no β-Schur
+            // null direction; skip it so the quotient stays exactly the reduced
+            // border nullspace.
+            if norm_sq.is_finite() && norm_sq > 1.0e-24 {
+                out.push(beta_part);
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn row_gauge_deflation_for_layout(
         &self,
         row_layout: Option<&SaeRowLayout>,
@@ -5858,6 +5904,53 @@ impl SaeManifoldTerm {
                 .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             let mut solve_options = plan.solve_options_for_border_dim(sys.k);
+            // #2228 — gauge-fix the inner Newton STEP on the reduced β border.
+            //
+            // The closed-form chart gauge (circle/torus phase, patch
+            // translation+scale) is an exact reconstruction symmetry whose β
+            // component is a null direction of the reduced β-Schur `S_β`. Left
+            // un-deflated, the dense Direct/SqrtBA step solves an exactly-singular
+            // `S_β`, so the orbit component of Δβ is arbitrary: it drifts the state
+            // along the orbit (walking `t` off the circle over the outer ρ-walk,
+            // fit_drivers.rs' second-root note) and starves the identifiable
+            // descent, so the fit crawls at ~0.997 contraction and eventually
+            // reports a non-stationary plateau (#2228 repro A / #2253). Installing
+            // the closed-form gauge as an [`ArrowBetaGaugeQuotient`] makes the dense
+            // step solve the Faddeev–Popov quotient `P S_β P + Q Qᵀ`, projecting Δβ
+            // onto the identifiable complement. The criterion evaluation and the
+            // outer-ρ gradient assemble their own systems and are untouched, and
+            // the loss/criterion are gauge-invariant, so this only changes the
+            // convergence path, converging to a gauge-fixed representative.
+            //
+            // Scoped to the dense solve modes (the reduced matrix-free operator
+            // already projects the quotient for the large-border InexactPCG lane;
+            // installing it there is deferred to keep the wide-`p` lane byte-exact).
+            if sys.k > 0
+                && matches!(
+                    solve_options.mode,
+                    ArrowSolverMode::Direct | ArrowSolverMode::SqrtBA
+                )
+            {
+                match self.closed_form_beta_gauge_directions() {
+                    Ok(dirs) if !dirs.is_empty() => {
+                        if let Ok(quotient) = ArrowBetaGaugeQuotient::new(dirs) {
+                            // A width mismatch (a compact/active-set border whose
+                            // dim differs from the dense gauge vector) means the
+                            // closed-form gauge does not align with this layout's
+                            // border; skip the pin and fall back to the un-pinned
+                            // solve (prior behaviour) rather than fail the fit.
+                            let _ = sys.set_beta_gauge_quotient(quotient);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        return Err(format!(
+                            "SaeManifoldTerm::run_joint_fit_arrow_schur: closed-form gauge \
+                             directions: {err}"
+                        ));
+                    }
+                }
+            }
             // #1017 allocation residency across ACCEPTED nonlinear iterates.
             // The retained handle owns device allocations only; `prepare_*`
             // overwrites every ridge-independent operand from this freshly

@@ -2174,8 +2174,22 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
-    let beta_gauge_active = false;
-    let rhs_beta_evidence = rhs_beta.clone();
+    // #2228 — when the caller declares a reduced-β gauge quotient, the dense
+    // Direct/SqrtBA step is solved on the Faddeev–Popov quotient
+    // `P S_β P + Q Qᵀ` (`pin_evidence_beta_schur`) with the RHS projected onto
+    // the identifiable complement `P r_β`. The pinned operator has the gauge
+    // orbit at curvature 1 (never singular), and the projected RHS has no orbit
+    // component, so Δβ solves the identifiable system exactly and carries zero
+    // orbit motion — the state stays on the chart instead of drifting along the
+    // symmetry. Only the SAE inner fit step installs this carrier; every other
+    // caller leaves `beta_gauge_quotient == None` and this stays byte-identical
+    // (the InexactPCG lane, which has no dense factor, keeps refusing an
+    // evidence gauge below and is not reached by the fit step's dense modes).
+    let beta_gauge_active = sys.beta_gauge_quotient.is_some();
+    let rhs_beta_evidence = match sys.beta_gauge_quotient.as_ref() {
+        Some(quotient) => quotient.project_complement(rhs_beta.view()),
+        None => rhs_beta.clone(),
+    };
     // The Schur solve is over the reduced β vector. Latent manifold metric
     // weights live on each d-dimensional t_i block, so the induced metric for
     // this β-only Steihaug problem is Euclidean.
