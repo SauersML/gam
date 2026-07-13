@@ -1927,11 +1927,26 @@ impl<'a> RemlState<'a> {
         Box::new(
             move |ext_idx: usize,
                   direction: &Array1<f64>|
-                  -> Option<super::reml_outer_engine::DriftDerivResult> {
-                let x_tau = x_tau_dense_list.get(ext_idx)?;
-                let x_tau_beta = x_tau_beta_list.get(ext_idx)?;
+                  -> Result<Option<super::reml_outer_engine::DriftDerivResult>, String> {
+                let x_tau = x_tau_dense_list.get(ext_idx).ok_or_else(|| {
+                    format!(
+                        "tau fixed-drift derivative coordinate {ext_idx} is out of range for {} tau coordinates",
+                        x_tau_dense_list.len()
+                    )
+                })?;
+                let x_tau_beta = x_tau_beta_list.get(ext_idx).ok_or_else(|| {
+                    format!(
+                        "tau fixed-drift derivative coordinate {ext_idx} has no cached X_tau beta value"
+                    )
+                })?;
                 if x_tau.ncols() != direction.len() || x_tau_beta.len() != x_tau.nrows() {
-                    return None;
+                    return Err(format!(
+                        "tau fixed-drift derivative shape mismatch for coordinate {ext_idx}: X_tau={}x{}, X_tau_beta={}, direction={}",
+                        x_tau.nrows(),
+                        x_tau.ncols(),
+                        x_tau_beta.len(),
+                        direction.len()
+                    ));
                 }
 
                 let x_u = x_design.matrixvectormultiply(direction);
@@ -1976,7 +1991,11 @@ impl<'a> RemlState<'a> {
                     }));
                 }
 
-                drift_deriv_result_from_parts(dense.take(), operators, direction.len())
+                Ok(drift_deriv_result_from_parts(
+                    dense.take(),
+                    operators,
+                    direction.len(),
+                ))
             },
         )
     }
