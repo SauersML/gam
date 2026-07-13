@@ -121,8 +121,8 @@ use gam_linalg::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, rrqr_nullspace
 
 use super::{
     AnisoBasisPsiDerivatives, AnisoPenaltyCrossProvider, BasisBuildResult, BasisError,
-    BasisMetadata, CenterStrategy, PenaltyCandidate, PenaltySource, filter_penalty_candidates,
-    normalize_penalty, normalize_penalty_cross_psi_derivative,
+    BasisMetadata, CenterStrategy, ConstructiveQuadratic, PenaltyCandidate, PenaltySource,
+    filter_penalty_candidates, normalize_penalty, normalize_penalty_cross_psi_derivative,
     normalize_penaltywith_psi_derivatives, select_centers_by_strategy, trace_of_product,
 };
 

@@ -1,8 +1,9 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
-    BasisMetadata, CenterStrategy, CenterStrategyKind, ConstantCurvatureBasisSpec, DuchonBasisSpec,
-    ActivePenalty, ActivePenaltyInfo, DroppedPenaltyInfo, KroneckerFactoredBasis, MaternBasisSpec,
-    MeasureJetBasisSpec, PenaltyCandidate, PenaltySource, SpatialIdentifiability,
+    BasisMetadata, CenterStrategy, CenterStrategyKind, ConstantCurvatureBasisSpec,
+    ConstructiveQuadratic, DuchonBasisSpec, ActivePenalty, ActivePenaltyInfo, DroppedPenaltyInfo,
+    KroneckerFactoredBasis, MaternBasisSpec, MeasureJetBasisSpec, PenaltyCandidate, PenaltySource,
+    SpatialIdentifiability,
     SphericalSplineBasisSpec, ThinPlateBasisSpec,
     apply_sum_to_zero_constraint, build_bspline_basis_1d, build_constant_curvature_basis,
     build_duchon_basiswithworkspace, build_matern_basiswithworkspace,

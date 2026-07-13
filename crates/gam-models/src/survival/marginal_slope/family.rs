@@ -5,6 +5,52 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SurvivalMarginalSlopeFamilyHyperAxis {
+    Baseline(usize),
+    LogSigma,
+}
+
+/// Explicit local role map for family-owned hyperparameter coordinates.
+///
+/// Baseline coordinates are first and log-sigma, when learned, is last. Fixed
+/// frailty scale has no log-sigma coordinate. The role map is stored on every
+/// realized family so callbacks never infer semantics from empty derivative
+/// matrices or floating-point values.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SurvivalMarginalSlopeFamilyHyperAxes {
+    baseline_axis_count: usize,
+    log_sigma_axis: Option<usize>,
+}
+
+impl SurvivalMarginalSlopeFamilyHyperAxes {
+    pub(crate) fn new(baseline_axis_count: usize, learned_sigma: bool) -> Self {
+        Self {
+            baseline_axis_count,
+            log_sigma_axis: learned_sigma.then_some(baseline_axis_count),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.baseline_axis_count + usize::from(self.log_sigma_axis.is_some())
+    }
+
+    pub(crate) fn role(
+        &self,
+        family_axis: usize,
+    ) -> Option<SurvivalMarginalSlopeFamilyHyperAxis> {
+        if family_axis < self.baseline_axis_count {
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(
+                family_axis,
+            ))
+        } else if self.log_sigma_axis == Some(family_axis) {
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma)
+        } else {
+            None
+        }
+    }
+}
+
 /// The time block has one beta vector but THREE design matrices (entry, exit,
 /// derivative-at-exit). The ParameterBlockSpec uses the exit design as its
 /// "official" design, so block_states[0].eta = design_exit @ beta + offset_exit.
@@ -20,6 +66,7 @@ pub(crate) struct SurvivalMarginalSlopeFamily {
     pub(crate) z: Arc<Array2<f64>>,
     pub(crate) score_covariance: MarginalSlopeCovariance,
     pub(crate) gaussian_frailty_sd: Option<f64>,
+    pub(crate) family_hyper_axes: SurvivalMarginalSlopeFamilyHyperAxes,
     pub(crate) derivative_guard: f64,
     /// Time block: 3 designs sharing one beta vector.
     /// Stored as DesignMatrix to support sparse local-support bases at
@@ -92,6 +139,38 @@ pub(crate) struct SurvivalMarginalSlopeFamily {
 /// spends in Phase 1 before reverting to full data. Mirrors the BMS
 /// budget so the two families share an empirical noise-floor schedule.
 pub(crate) const SURVIVAL_MGS_AUTO_SUBSAMPLE_PHASE1_BUDGET: usize = 12;
+
+impl SurvivalMarginalSlopeFamily {
+    pub(crate) fn family_hyper_role(
+        &self,
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        global_axis: usize,
+    ) -> Result<Option<SurvivalMarginalSlopeFamilyHyperAxis>, String> {
+        if hyper_layout.family_axis_count() != self.family_hyper_axes.len() {
+            return Err(format!(
+                "SurvivalMarginalSlopeFamily declares {} family hyper axes, manifest carries {}",
+                self.family_hyper_axes.len(),
+                hyper_layout.family_axis_count(),
+            ));
+        }
+        match hyper_layout.axis(global_axis) {
+            Some(crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. }) => Ok(None),
+            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }) => self
+                .family_hyper_axes
+                .role(family_axis)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "SurvivalMarginalSlopeFamily has no local family hyper axis {family_axis}"
+                    )
+                }),
+            None => Err(format!(
+                "SurvivalMarginalSlopeFamily hyper axis {global_axis} is out of range for {} axes",
+                hyper_layout.len()
+            )),
+        }
+    }
+}
 
 /// Discriminates the two intercept slots per row: the entry-time intercept
 /// (solved against `q0`) and the exit-time intercept (solved against `q1`).

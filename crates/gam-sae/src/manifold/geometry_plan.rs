@@ -424,11 +424,9 @@ impl SaeAtomGeometryPlan {
                 SaeReferenceMetricPlan::FlatRectangularTorus { tau },
             ) => flat_rectangular_torus_reference_penalty(*per_axis_order, *tau),
             (
-                SaeBasisResolution::TorusHarmonics { .. },
+                SaeBasisResolution::TorusHarmonics { per_axis_order },
                 SaeReferenceMetricPlan::EmbeddedDonutTorus { tau },
-            ) => Err(format!(
-                "embedded-donut reference penalty at tau={tau} requires the exact closed-form dense Fourier operator from Phase 4; refusing to substitute the flat rectangular penalty"
-            )),
+            ) => embedded_donut_torus_reference_penalty(*per_axis_order, tau.cosh()),
             (
                 SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order },
                 SaeReferenceMetricPlan::RoundProjectivePlane,
