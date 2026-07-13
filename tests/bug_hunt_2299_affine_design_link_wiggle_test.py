@@ -1,10 +1,12 @@
 """Regression contract for #2299: fitted predictors have one typed affine API.
 
 The old public design-matrix endpoint returned a bare matrix for ordinary GAMs
-and rejected link-wiggle fits.  That shape encoded neither a model offset nor
-the coefficient coordinate system.  A link-wiggle predictor is affine at its
-fitted state as ``base + B(warp_index) @ beta_w``; critically, #2141 requires
-``B`` to be evaluated at the saved frozen index, not at the de-aliased base.
+and rejected link-wiggle fits. That shape encoded neither a model offset nor
+the coefficient or covariance coordinate system. A link-wiggle predictor is
+affine at its fitted state as ``offset + X @ beta_mean + B(index) @ beta_w``;
+critically, #2141 requires ``B`` to be evaluated at the saved frozen index, not
+at the de-aliased base. The joint frame is necessary for mean uncertainty and
+mean--wiggle cross-covariance to remain available to external contrasts.
 """
 
 import numpy as np
@@ -31,6 +33,29 @@ def _assert_affine_identity(model, data, expected_frame: str) -> gamfit.AffineDe
         affine.offset.shape[0],
         affine.coefficients.shape[0],
     )
+    conditional = affine.covariance_conditional
+    assert conditional is not None
+    for covariance in (
+        affine.covariance_conditional,
+        affine.covariance_smoothing_corrected,
+        affine.covariance_frequentist,
+    ):
+        if covariance is None:
+            continue
+        assert covariance.shape == (
+            affine.coefficients.shape[0],
+            affine.coefficients.shape[0],
+        )
+        assert np.all(np.isfinite(covariance))
+
+    eta_variance = np.einsum(
+        "ij,jk,ik->i",
+        affine.matrix,
+        conditional,
+        affine.matrix,
+    )
+    assert np.all(np.isfinite(eta_variance))
+    assert float(np.min(eta_variance)) >= -1e-12
 
     reconstructed = affine.offset + affine.matrix @ affine.coefficients
     expected = _linear_predictor(model, data)
@@ -54,7 +79,7 @@ def test_ordinary_affine_design_exposes_model_offset_and_full_frame() -> None:
     np.testing.assert_allclose(affine.offset, offset, rtol=0.0, atol=0.0)
 
 
-def test_link_wiggle_affine_design_uses_saved_base_and_exact_2141_index() -> None:
+def test_link_wiggle_affine_design_uses_joint_frame_and_exact_2141_index() -> None:
     # Deterministic flexible-link repro inherited from #2141.  On this geometry
     # the de-alias shift is material: evaluating B at the base predictor instead
     # of the saved frozen index produced a dramatically different fitted link.
@@ -74,11 +99,13 @@ def test_link_wiggle_affine_design_uses_saved_base_and_exact_2141_index() -> Non
         offset="offset",
         flexible_link=True,
     )
-    affine = _assert_affine_identity(model, data, "link_wiggle")
+    affine = _assert_affine_identity(model, data, "link_wiggle_joint")
 
-    # The link-wiggle row offset is the fitted base predictor, not the raw model
-    # offset.  A coincidental equality would mean the Mean block was dropped.
-    assert float(np.max(np.abs(affine.offset - offset))) > 0.1
+    # The complete joint frame keeps the model offset separate and represents
+    # the fitted Mean block in the matrix. Treating the fitted base as a fixed
+    # row offset would discard its uncertainty and every Mean--wiggle cross
+    # term from external variance calculations.
+    np.testing.assert_allclose(affine.offset, offset, rtol=0.0, atol=0.0)
 
 
 def test_design_matrix_array_returns_the_same_typed_affine_contract() -> None:

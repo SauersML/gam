@@ -285,14 +285,36 @@ affine = model.design_matrix(test_df)
 fitted_eta = affine.offset + affine.matrix @ affine.coefficients
 ```
 
-The object has six explicit fields:
+The object has nine explicit fields:
 
 - `offset`: one value per row;
 - `matrix`: the materialised matrix in the named coefficient frame;
 - `coefficients`: the exact fitted vector multiplied by `matrix`;
-- `coefficient_frame`: `"full"` or `"link_wiggle"`;
+- `coefficient_frame`: `"full"` or `"link_wiggle_joint"`;
 - `coefficient_start` / `coefficient_stop`: the represented half-open slice in
   that frame (`coefficient_slice` exposes the corresponding Python `slice`).
+- `covariance_conditional`: conditional Bayesian coefficient covariance `Vb`,
+  or `None` when the fit did not produce it;
+- `covariance_smoothing_corrected`: smoothing-parameter-corrected Bayesian
+  covariance `Vp`, or `None` when unavailable;
+- `covariance_frequentist`: frequentist sandwich covariance `Ve`, or `None`
+  when unavailable.
+
+Every available covariance is in exactly `coefficient_frame` and has one row
+and column per entry of `coefficients`. Definitions are never substituted: in
+particular, a missing smoothing-corrected covariance stays `None` rather than
+silently becoming the conditional covariance. Pointwise linear-predictor
+variance can therefore be computed without constructing the full row-by-row
+covariance:
+
+```python
+covariance = affine.covariance_smoothing_corrected
+if covariance is None:
+    raise RuntimeError("this fit has no smoothing-corrected covariance")
+eta_variance = np.einsum(
+    "ij,jk,ik->i", affine.matrix, covariance, affine.matrix
+)
+```
 
 For an ordinary GAM, `offset` is the model offset, `matrix` is the full saved
 design (including deployment extensions), and the coefficient frame is
@@ -306,13 +328,16 @@ eta_draws = affine.offset + posterior.samples @ affine.matrix.T
 ```
 
 For a link-wiggle fit, the final predictor at the fitted state is
-`base + B(warp_index) @ beta_w`. Accordingly, `offset` is the saved fitted base
-predictor, `matrix` is `B` evaluated at the exact saved warp index (including
-the frozen-index shift used by the fit), and `coefficient_frame` is
-`"link_wiggle"`. The returned `coefficients` are the exact saved
-standard-basis prediction coordinates. They can be a lift of the identifiable
-reduced coordinates used by the joint optimizer, so do not slice a joint
-posterior sample vector by shape and treat it as this frame.
+`model_offset + X @ beta_mean + B(warp_index) @ beta_w`. Accordingly, `offset`
+is the model row offset, `matrix` is the joint `[X, B]` design with `B`
+evaluated at the exact saved warp index (including the frozen-index shift used
+by the fit), and `coefficient_frame` is `"link_wiggle_joint"`. The returned
+coefficients and covariances are the exact complete saved `[Mean, LinkWiggle]`
+frame. Keeping both blocks is what preserves mean uncertainty and the
+mean--wiggle covariance in custom contrasts. The basis is frozen at the fitted
+state; this is an exact representation of the fitted predictor and its saved
+coefficient covariance, not a claim that `B` is globally independent of the
+coefficients away from that state.
 
 Exact scan smoothers and coupled multi-surface model classes do not possess one
 finite affine coefficient frame; `design_matrix` rejects them with a typed,

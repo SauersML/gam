@@ -68,9 +68,7 @@ pub struct AffineDesign {
     pub covariances: AffineCovariances,
 }
 
-fn fitted_covariances(
-    fit: &gam_solve::estimate::UnifiedFitResult,
-) -> AffineCovariances {
+fn fitted_covariances(fit: &gam_solve::estimate::UnifiedFitResult) -> AffineCovariances {
     AffineCovariances {
         conditional: fit.beta_covariance().cloned(),
         smoothing_corrected: fit.beta_covariance_corrected().cloned(),

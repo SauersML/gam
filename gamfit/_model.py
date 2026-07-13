@@ -38,7 +38,7 @@ from ._survival import (
 from ._tables import normalize_table, response_column_name, restore_output_table
 
 
-AffineCoefficientFrame = Literal["full", "link_wiggle"]
+AffineCoefficientFrame = Literal["full", "link_wiggle_joint"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,9 +48,9 @@ class AffineDesign:
     ``offset + matrix @ coefficients`` reproduces the fitted linear predictor.
     ``coefficient_frame`` names the coordinate system containing those exact
     coefficients; ``coefficient_slice`` is the represented half-open slice in
-    that frame.  A link-wiggle frame can be a saved standard-basis lift of the
-    fit's identifiable reduced coordinates, so it must not be reinterpreted as
-    a slice of the joint posterior sample vector.
+    that frame. The three covariance fields use that exact same frame. Each
+    covariance definition remains separately optional: an unavailable
+    smoothing-corrected covariance is never replaced by a conditional one.
     """
 
     offset: NDArray[np.float64]
@@ -59,6 +59,9 @@ class AffineDesign:
     coefficient_frame: AffineCoefficientFrame
     coefficient_start: int
     coefficient_stop: int
+    covariance_conditional: NDArray[np.float64] | None
+    covariance_smoothing_corrected: NDArray[np.float64] | None
+    covariance_frequentist: NDArray[np.float64] | None
 
     @property
     def coefficient_slice(self) -> slice:
@@ -75,6 +78,11 @@ def _affine_design_from_payload(payload: Any) -> AffineDesign:
         coefficient_frame=cast(AffineCoefficientFrame, payload["coefficient_frame"]),
         coefficient_start=int(payload["coefficient_start"]),
         coefficient_stop=int(payload["coefficient_stop"]),
+        covariance_conditional=payload["covariance_conditional"],
+        covariance_smoothing_corrected=payload[
+            "covariance_smoothing_corrected"
+        ],
+        covariance_frequentist=payload["covariance_frequentist"],
     )
 
 
@@ -757,14 +765,18 @@ class Model:
 
         The result always has one typed shape.  For an ordinary standard GAM,
         ``offset`` is the model's row offset, ``matrix`` is the full saved-model
-        design, and the coefficient frame is ``"full"``.  For a link-wiggle
-        fit, ``offset`` is the fitted base predictor and ``matrix`` is the saved
-        warp basis evaluated at its exact fitted index (including the frozen
-        #2141 index shift); its frame is ``"link_wiggle"``.
+        design, and the coefficient frame is ``"full"``. For a link-wiggle
+        fit, ``offset`` is the model row offset and ``matrix`` is the joint
+        ``[X, B(warp_index)]`` design, with the warp basis evaluated at its
+        exact fitted index (including the frozen #2141 shift); its frame is
+        ``"link_wiggle_joint"``.
 
         In both cases, ``offset + matrix @ coefficients`` reproduces the fitted
-        linear predictor.  Scan-routed and coupled multi-surface models have no
-        finite single-frame affine representation and are rejected explicitly.
+        linear predictor. Available conditional, smoothing-corrected, and
+        frequentist covariances are returned separately in the same frame, so
+        ``matrix @ covariance @ matrix.T`` includes all cross-block terms.
+        Scan-routed and coupled multi-surface models have no finite single-frame
+        affine representation and are rejected explicitly.
         """
         headers, rows, _ = normalize_table(data)
         try:

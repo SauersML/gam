@@ -2350,9 +2350,7 @@ fn dense_affine_design_to_python(
     out.set_item("coefficient_start", affine.coefficient_start)?;
     out.set_item("coefficient_stop", affine.coefficient_stop)?;
     match affine.covariance_conditional {
-        Some(covariance) => {
-            out.set_item("covariance_conditional", covariance.into_pyarray(py))?
-        }
+        Some(covariance) => out.set_item("covariance_conditional", covariance.into_pyarray(py))?,
         None => out.set_item("covariance_conditional", py.None())?,
     }
     match affine.covariance_smoothing_corrected {
@@ -2363,9 +2361,7 @@ fn dense_affine_design_to_python(
         None => out.set_item("covariance_smoothing_corrected", py.None())?,
     }
     match affine.covariance_frequentist {
-        Some(covariance) => {
-            out.set_item("covariance_frequentist", covariance.into_pyarray(py))?
-        }
+        Some(covariance) => out.set_item("covariance_frequentist", covariance.into_pyarray(py))?,
         None => out.set_item("covariance_frequentist", py.None())?,
     }
     Ok(out.unbind())

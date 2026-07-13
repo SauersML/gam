@@ -4611,11 +4611,11 @@ fn build_standard_payload(
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
     payload.linkwiggle_penalty_metadata = wiggle_penalty_metadata;
-    // #1596: the standard link-wiggle warp is fit in a reduced, identifiable
-    // coordinate `γ` (`β_w = Z·γ`); the saved fit_result block carries `γ`, so
-    // persist the full-width standard-basis lift `β_w` here for the predict
-    // runtime, which reconstructs the warp as `B(η_new)·β_w`. `None` (the
-    // dynamic-basis / non-de-aliased path) leaves predict reading the block.
+    // The frozen standard link-wiggle fit residualizes its design in
+    // observation space without changing the coefficient chart. Persist the
+    // exact LinkWiggle block copy used by replay; saved-model validation
+    // requires it to agree bit-for-bit with the joint fit so point prediction
+    // and covariance cannot drift into different frames.
     payload.beta_link_wiggle = wiggle_saved_warp_beta;
     // #2141: persist the frozen-index shift so predict evaluates the warp basis
     // at the frozen index `η̂` the fit pinned `B(η̂)` at, not at the de-aliased
