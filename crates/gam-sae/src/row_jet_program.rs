@@ -2424,12 +2424,32 @@ mod tests {
                             );
                             let fd = (fm2 - q(8.0) * fm1 + q(8.0) * fp1 - fp2) / q(12.0 * h);
                             let fd_error = (q_to_f64(fd) - exact_f64).abs();
-                            let fd_allowance = 2.0e-12 * condition + 1.0e-300;
+                            // A five-point stencil subtracts four nearby function
+                            // values. In a saturated softmax tail the derivative
+                            // can be tiny while every value is O(phi), so the
+                            // truncation bound alone does not cover Quad rounding
+                            // amplified by 1/h. Bound that cancellation by the
+                            // stencil's absolute condition number and Quad's own
+                            // machine epsilon; this remains scale-aware instead of
+                            // introducing an arbitrary absolute floor.
+                            let stencil_condition = (q_to_f64(fm2).abs()
+                                + 8.0 * q_to_f64(fm1).abs()
+                                + 8.0 * q_to_f64(fp1).abs()
+                                + q_to_f64(fp2).abs())
+                                / (12.0 * h);
+                            let fd_roundoff_allowance =
+                                64.0 * Quad::EPSILON.0 * stencil_condition;
+                            let fd_allowance = 2.0e-12 * condition
+                                + fd_roundoff_allowance
+                                + 1.0e-300;
                             max_fd_conditioned_error =
                                 max_fd_conditioned_error.max(fd_error / fd_allowance);
                             assert!(
                                 fd_error <= fd_allowance,
-                                "quad five-point derivative error {fd_error:e} > {fd_allowance:e}"
+                                "quad five-point derivative error {fd_error:e} > {fd_allowance:e}; \
+                                 truncation_condition={condition:e} \
+                                 stencil_condition={stencil_condition:e} \
+                                 gated={gated_atom} logit={logit_atom} r={inv_tau} phi={phi:e}"
                             );
                             comparisons += 1;
                         }
