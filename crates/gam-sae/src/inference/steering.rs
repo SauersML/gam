@@ -1074,8 +1074,10 @@ pub fn steer_to_target_nats(
         lo_kl = hi_kl;
         hi_a = next_a;
         hi_kl = next_kl;
-        hi_plan = next_plan;
-        hi_probe = next_probe;
+        if hi_kl > target_nats {
+            hi_plan = next_plan;
+            hi_probe = next_probe;
+        }
     }
 
     // Safeguarded secant inside the measured bracket. If roundoff puts the

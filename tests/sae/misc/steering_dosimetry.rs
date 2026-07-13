@@ -656,13 +656,14 @@ fn target_dose_plateau_is_an_explicit_unreachable_error() {
         Some(&mut probe),
     )
     .expect_err("a certified global envelope below the target is unreachable");
-    assert!(matches!(
-        error,
-        TargetDoseError::UnreachableTarget {
-            certified_attainable_upper_nats: 0.1,
-            ..
-        }
-    ));
+    let TargetDoseError::UnreachableTarget {
+        certified_attainable_upper_nats,
+        ..
+    } = error
+    else {
+        panic!("expected a certified unreachable-target error");
+    };
+    assert_eq!(certified_attainable_upper_nats, 0.1);
 }
 
 #[test]

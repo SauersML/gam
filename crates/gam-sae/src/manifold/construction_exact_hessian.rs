@@ -1130,18 +1130,23 @@ impl SaeManifoldTerm {
     /// now for the pending solver-bound channels.
     pub(crate) fn exact_fixed_stratum_outer_hessian(
         &self,
+        target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         loss: &SaeManifoldLoss,
-        _cache: &ArrowFactorCache,
+        cache: &ArrowFactorCache,
     ) -> Result<Array2<f64>, String> {
-        let explicit = self.outer_explicit_smoothness_ard_hessian(rho, loss.smoothness)?;
+        let mut hessian = self.outer_explicit_smoothness_ard_hessian(rho, loss.smoothness)?;
+        hessian += &self.rank_charge_direct_rho_hessian(target, rho, loss, cache)?;
+        // Landed: explicit smoothness/ARD + rank-charge direct channels. Pending:
+        // the deflated log-determinant Daleckii–Krein trace and the third-order
+        // forward-sensitivity channel. Refuse partial curvature until both land.
         Err(format!(
             "PATH C exact fixed-stratum outer Hessian is incomplete: the {}×{} explicit \
-             smoothness/ARD block is landed, but the rank-charge, deflated \
-             log-determinant, and third-order channels are still pending; refusing to \
+             smoothness/ARD + rank-charge blocks are landed, but the deflated \
+             log-determinant and third-order channels are still pending; refusing to \
              advertise partial curvature",
-            explicit.nrows(),
-            explicit.ncols()
+            hessian.nrows(),
+            hessian.ncols()
         ))
     }
 }

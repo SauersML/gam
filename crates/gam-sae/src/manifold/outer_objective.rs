@@ -4055,6 +4055,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // succeeds, this becomes a `Dense` curvature, and `capability()` flips to
         // `Dense` so the small-dense planner routes ARC through it.
         let hessian = match self.term.exact_fixed_stratum_outer_hessian(
+            self.target.view(),
             &rho_state,
             &evaluation.loss,
             &evaluation.cache,

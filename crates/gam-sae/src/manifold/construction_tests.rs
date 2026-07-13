@@ -102,6 +102,58 @@ mod amortized_encoder_tests {
         }
     }
 
+    /// PATH C (#2253) — the exact fixed-stratum second derivative of the
+    /// rank-charge `direct_rho` channel must equal a central finite difference of
+    /// `production_rank_charge_derivative(...).direct_rho` at a frozen inner state
+    /// (frozen `loss`/`cache`), on the converged two-atom circle fixture. Second
+    /// HVP channel gate; exercises the `A⁻¹G (A⁻¹S)²` curvature trace.
+    #[test]
+    fn rank_charge_direct_rho_hessian_matches_finite_difference_2253() {
+        use ndarray::Array1;
+        let (mut term, target, rho) = small_two_atom_periodic_term();
+        let (_cost, loss, cache) = term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                8,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("converged joint cache for the frozen stratum");
+
+        let n_params = rho.to_flat().len();
+        let analytic = term
+            .rank_charge_direct_rho_hessian(target.view(), &rho, &loss, &cache)
+            .expect("rank-charge direct_rho Hessian assembles");
+
+        let base = rho.to_flat();
+        let eps = 1.0e-6;
+        for j in 0..n_params {
+            // FD of the production rank-charge direct_rho gradient at ρ ± ε e_j
+            // with the inner state (loss, cache) held frozen.
+            let direct_rho = |sign: f64| -> Array1<f64> {
+                let mut flat = base.clone();
+                flat[j] += sign * eps;
+                let r = rho.from_flat(flat.view()).unwrap();
+                term.production_rank_charge_derivative(target.view(), &r, &loss, &cache)
+                    .unwrap()
+                    .direct_rho
+            };
+            let fd_col = (direct_rho(1.0) - direct_rho(-1.0)) / (2.0 * eps);
+            for i in 0..n_params {
+                let analytic_ij = analytic[[i, j]];
+                let fd_ij = fd_col[i];
+                assert!(
+                    (analytic_ij - fd_ij).abs() < 1.0e-5 + 1.0e-4 * analytic_ij.abs(),
+                    "rank-charge direct_rho Hessian [{i},{j}] mismatch: \
+                     analytic={analytic_ij}, fd={fd_ij}"
+                );
+            }
+        }
+    }
+
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
     /// coordinates used by reconstruction. Decoder magnitude stays in `B`, so
     /// there is no second radial-scale channel to fold into these values.
