@@ -331,6 +331,57 @@ pub(crate) struct GlsWiggleSecondDirCoeffs {
     pub(crate) dw_uv: Array1<f64>,
 }
 
+pub(crate) struct GlsWiggleFirstDirCoeffs {
+    pub(crate) coeff_mm_u: Array1<f64>,
+    pub(crate) coeff_ml_u: Array1<f64>,
+    pub(crate) coeff_ll_u: Array1<f64>,
+    pub(crate) mean_wiggle_u: Array1<f64>,
+    pub(crate) gradient_mu_u: Array1<f64>,
+    pub(crate) scale_wiggle_u: Array1<f64>,
+    pub(crate) mean_wiggle_base: Array1<f64>,
+    pub(crate) gradient_mu_base: Array1<f64>,
+    pub(crate) scale_wiggle_base: Array1<f64>,
+    pub(crate) hessian_mm_base: Array1<f64>,
+    pub(crate) hessian_mm_u: Array1<f64>,
+}
+
+pub(crate) fn gls_wiggle_first_directional_coeffs(
+    rows: &GaussianJointRowScalars,
+    geom: &GaussianLocationScaleWiggleGeometry,
+    q_u: &Array1<f64>,
+    zeta_u: &Array1<f64>,
+    s1_u: &Array1<f64>,
+    g2_u: &Array1<f64>,
+) -> GlsWiggleFirstDirCoeffs {
+    let tower = gaussian_row_first_tower(rows, q_u, zeta_u);
+    let base = &tower.base;
+    let first = &tower.first;
+    let d = &geom.dq_dq0;
+    let coeff_mm_u = &first.hessian_mm * &d.mapv(|value| value * value)
+        + &(2.0 * &base.hessian_mm * d * s1_u)
+        + &(&first.gradient_mu * &geom.d2q_dq02)
+        + &(&base.gradient_mu * g2_u);
+    let coeff_ml_u = &first.hessian_ml * d + &base.hessian_ml * s1_u;
+    let coeff_ll_u = first.hessian_ll.clone();
+    let mean_wiggle_u = &first.hessian_mm * d + &base.hessian_mm * s1_u;
+    let gradient_mu_u = first.gradient_mu.clone();
+    let scale_wiggle_u = first.hessian_ml.clone();
+    let mean_wiggle_base = &base.hessian_mm * d;
+    GlsWiggleFirstDirCoeffs {
+        coeff_mm_u,
+        coeff_ml_u,
+        coeff_ll_u,
+        mean_wiggle_u,
+        gradient_mu_u,
+        scale_wiggle_u,
+        mean_wiggle_base,
+        gradient_mu_base: base.gradient_mu.clone(),
+        scale_wiggle_base: base.hessian_ml.clone(),
+        hessian_mm_base: base.hessian_mm.clone(),
+        hessian_mm_u: first.hessian_mm.clone(),
+    }
+}
+
 /// The two probe directions resolved to row space for the GLS Wiggle joint
 /// second directional derivative: `xi`/`zeta` are the X_mu/X_ls contractions,
 /// and `q`/`s1`/`g2` are the mixed first/second-derivative wiggle pieces.
