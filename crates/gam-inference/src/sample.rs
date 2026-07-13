@@ -933,15 +933,22 @@ fn sample_standard_truncated(
              unconstrained Gaussian center; refit with exact geometry export"
                 .to_string()
         })?;
+        let working = geometry.working.as_ref().ok_or_else(|| {
+            "standard constrained-coefficient posterior: an inequality constraint is active at \
+             the mode but the saved coefficient geometry has no owned single-diagonal working \
+             evidence; Exact-Newton and multi-parameter fits cannot reconstruct the \
+             unconstrained Gaussian center from row geometry"
+                .to_string()
+        })?;
         let n = design.nrows();
-        if geometry.working_weights.len() != n || geometry.working_response.len() != n {
+        if working.working_weights.len() != n || working.working_response.len() != n {
             return Err(format!(
                 "standard constrained-coefficient posterior: saved working geometry has {} rows \
                  but the rebuilt design has {n}",
-                geometry.working_weights.len(),
+                working.working_weights.len(),
             ));
         }
-        let wz = &geometry.working_weights * &geometry.working_response;
+        let wz = &working.working_weights * &working.working_response;
         let rhs = design.transpose_vector_multiply(&wz);
         let chol = penalized_hessian.cholesky(Side::Lower).map_err(|e| {
             format!(

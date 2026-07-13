@@ -1,4 +1,6 @@
-use crate::estimate::{EstimationError, FitGeometry, UnifiedFitResult, dispersion_from_likelihood};
+use crate::estimate::{
+    EstimationError, FitGeometry, UnifiedFitResult, WorkingGeometry, dispersion_from_likelihood,
+};
 use crate::pirls;
 use faer::Mat as FaerMat;
 use faer::linalg::matmul::matmul;
@@ -1034,6 +1036,7 @@ impl<'a> AloInput<'a> {
     /// that frame transition explicit at the public fit boundary.
     fn from_active_geometry(
         geom: &'a FitGeometry,
+        working: &'a WorkingGeometry,
         design: &'a Array2<f64>,
         eta: &'a Array1<f64>,
         offset: &'a Array1<f64>,
@@ -1045,13 +1048,13 @@ impl<'a> AloInput<'a> {
         // diagonal is the Fisher weight `h'²/(φ V(μ)) ≥ 0`, so the PSD
         // obligation is discharged algebraically without a runtime scan;
         // `as_signed()` re-views the same buffer for the Hessian-side slot.
-        let psd_w = PsdWeightsView::from_view_unchecked(geom.working_weights.view());
+        let psd_w = PsdWeightsView::from_view_unchecked(working.working_weights.view());
         Self {
             design,
             penalized_hessian: &geom.penalized_hessian,
             hessian_weights: psd_w.as_signed(),
             score_weights: psd_w,
-            working_response: &geom.working_response,
+            working_response: &working.working_response,
             eta,
             offset,
             phi,
@@ -1382,6 +1385,12 @@ pub fn compute_alo_diagnostics_from_unified(
                 .to_string(),
         })
         .map_err(EstimationError::from)?;
+    let working = geom.working.as_ref().ok_or_else(|| {
+        EstimationError::from(AloError::InvalidInput {
+            reason: "UnifiedFitResult coefficient geometry has no owned single-diagonal working evidence; ALO diagnostics are unavailable for Exact-Newton and multi-parameter terminal geometry"
+                .to_string(),
+        })
+    })?;
     geom.coefficient_gauge
         .validate()
         .map_err(|reason| AloError::InvalidInput {
@@ -1399,7 +1408,8 @@ pub fn compute_alo_diagnostics_from_unified(
         .into());
     }
     let active_design = geom.coefficient_gauge.restrict_design(design);
-    let input = AloInput::from_active_geometry(geom, &active_design, eta, offset, phi);
+    let input =
+        AloInput::from_active_geometry(geom, working, &active_design, eta, offset, phi);
     compute_alo_from_input(&input)
 }
 

@@ -1378,12 +1378,10 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
         // * `Diagonal` — IRLS/GLM families expose only the diagonal working
         //   weights, so the likelihood curvature is reconstructed as the
         //   Gauss–Newton gram `XᵀWX`.
-        // * `ExactNewton` — coefficient-space exact-curvature families (CTN
-        //   transformation-normal, …) already carry the dense negative
-        //   log-likelihood Hessian `−∇²log L = H_lik` directly. Materialize it
-        //   and add the penalties, so these families report inference / total
-        //   edf instead of dropping geometry (and therefore inference) for the
-        //   whole fit (#720).
+        // * `ExactNewton` — coefficient-space exact curvature has no paired
+        //   score-side IRLS row measure, so it cannot populate `FitGeometry`.
+        //   Its owned Hessian feeds covariance and EDF through separate typed
+        //   coefficient-space channels.
         let (mut h, working_weights, working_response) = if let Some(hessian) =
             preferred_unpenalized_hessian
         {

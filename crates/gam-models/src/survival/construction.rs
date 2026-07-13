@@ -3021,7 +3021,7 @@ pub fn marginal_slope_baseline_offset_theta_geometry(
         first_out.push((a * h_i, a * (inst_i + instant_hazard * b * h_i)));
     }
     for i in 0..dim {
-        for j in 0..dim {
+        for j in i..dim {
             let (h_i, inst_i) = first[i];
             let (h_j, inst_j) = first[j];
             let (h_ij, inst_ij) = second[i][j];
@@ -3031,7 +3031,9 @@ pub fn marginal_slope_baseline_offset_theta_geometry(
             let qt_inner_i = inst_i + instant_hazard * b * h_i;
             let qt_ij = a_j * qt_inner_i
                 + a * (inst_ij + inst_j * b * h_i + instant_hazard * (b_j * h_i + b * h_ij));
-            second_out[i][j] = (q_ij, qt_ij);
+            let mixed = (q_ij, qt_ij);
+            second_out[i][j] = mixed;
+            second_out[j][i] = mixed;
         }
     }
     Ok(Some(MarginalSlopeBaselineOffsetThetaGeometry {
@@ -3336,6 +3338,14 @@ pub fn build_survival_marginal_slope_baseline_geometry(
     let Some(theta) = survival_baseline_theta_from_config(cfg)? else {
         return Ok(None);
     };
+    if theta.iter().any(|value| !value.is_finite()) {
+        return Err(
+            "survival marginal-slope baseline theta coordinates must be finite".to_string(),
+        );
+    }
+    // Round-trip through the public chart decoder before touching row storage.
+    // This validates every target-specific config value even when `n == 0`.
+    survival_baseline_config_from_theta(cfg.target, &theta)?;
     let dim = theta.len();
     let zero = || MarginalSlopeBaselineOffsetThetaGeometry {
         value: (0.0, 0.0),
@@ -3353,12 +3363,18 @@ pub fn build_survival_marginal_slope_baseline_geometry(
                 String,
             > {
                 let entry_age = age_entry[row_index];
-                if !entry_age.is_finite() {
+                if !entry_age.is_finite() || entry_age < 0.0 {
                     return Err(format!(
-                        "non-finite survival marginal-slope entry age at row {row_index}"
+                        "survival marginal-slope entry age must be finite and non-negative at row {row_index}"
                     ));
                 }
-                let entry = if entry_age <= 0.0 {
+                let exit_age = age_exit[row_index];
+                if !exit_age.is_finite() || exit_age < 0.0 {
+                    return Err(format!(
+                        "survival marginal-slope exit age must be finite and non-negative at row {row_index}"
+                    ));
+                }
+                let entry = if entry_age == 0.0 {
                     zero()
                 } else {
                     marginal_slope_baseline_offset_theta_geometry(entry_age, cfg)?.ok_or_else(
@@ -3368,10 +3384,7 @@ pub fn build_survival_marginal_slope_baseline_geometry(
                         },
                     )?
                 };
-                let exit = marginal_slope_baseline_offset_theta_geometry(
-                    age_exit[row_index],
-                    cfg,
-                )?
+                let exit = marginal_slope_baseline_offset_theta_geometry(exit_age, cfg)?
                 .ok_or_else(|| {
                     "nonlinear survival baseline unexpectedly has no exit geometry".to_string()
                 })?;
@@ -4237,6 +4250,15 @@ mod tests {
             candidate.derivative_offset_exit_theta_second,
             candidate_baseline.derivative_offset_exit_theta_second
         );
+        assert_eq!(candidate_baseline.offset_entry[0], 0.0);
+        assert_eq!(candidate_baseline.offset_entry_theta_first.row(0).sum(), 0.0);
+        assert_eq!(
+            candidate_baseline
+                .offset_entry_theta_second
+                .index_axis(ndarray::Axis(0), 0)
+                .sum(),
+            0.0
+        );
         assert!(
             candidate
                 .offset_entry_theta_first
@@ -4251,6 +4273,26 @@ mod tests {
                 .iter()
                 .all(|value| *value == 0.0)
         );
+        for row in 0..age_exit.len() {
+            for axis in 0..candidate_theta.len() {
+                for other_axis in 0..candidate_theta.len() {
+                    assert_eq!(
+                        candidate.offset_entry_theta_second[[row, axis, other_axis]],
+                        candidate.offset_entry_theta_second[[row, other_axis, axis]],
+                    );
+                    assert_eq!(
+                        candidate.offset_exit_theta_second[[row, axis, other_axis]],
+                        candidate.offset_exit_theta_second[[row, other_axis, axis]],
+                    );
+                    assert_eq!(
+                        candidate.derivative_offset_exit_theta_second
+                            [[row, axis, other_axis]],
+                        candidate.derivative_offset_exit_theta_second
+                            [[row, other_axis, axis]],
+                    );
+                }
+            }
+        }
     }
 
     #[test]
