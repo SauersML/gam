@@ -56,7 +56,7 @@ pub(crate) use crate::bms::{
 
 pub(crate) use crate::cubic_cell_kernel as exact_kernel;
 
-pub(crate) use crate::survival::lognormal_kernel::FrailtySpec;
+pub(crate) use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec};
 
 pub(crate) use crate::marginal_slope_shared::{
     ObservedDenestedCellPartials, add_optional_matrix, add_optional_vector,

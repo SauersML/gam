@@ -210,24 +210,7 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
     spec.frailty.validate_for_marginal_slope()?;
     match &spec.frailty {
         FrailtySpec::None => {}
-        FrailtySpec::GaussianShift { sigma_fixed } => {
-            let Some(sigma) = sigma_fixed else {
-                return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
-                    reason:
-                        "survival-marginal-slope requires GaussianShift sigma_fixed or FrailtySpec::None; learnable GaussianShift sigma is not implemented for the exact marginal-slope outer solver"
-                            .to_string(),
-                }
-                .into());
-            };
-            if !sigma.is_finite() || *sigma < 0.0 {
-                return Err(SurvivalMarginalSlopeError::InvalidInput {
-                    reason: format!(
-                        "survival-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
-                    ),
-                }
-                .into());
-            }
-        }
+        FrailtySpec::GaussianShift { .. } => {}
         FrailtySpec::HazardMultiplier { .. } => {
             return Err(SurvivalMarginalSlopeError::InvalidInput {
                 reason: "survival-marginal-slope does not support FrailtySpec::HazardMultiplier"

@@ -369,7 +369,7 @@ pub(crate) fn joint_setup(
     logslope_penalties: usize,
     core_rho0_seed: &[f64],
     extra_rho0: &[f64],
-    initial_sigma: Option<f64>,
+    learned_sigma_initial: Option<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
     let (marginal_terms, logslope_terms) = if kappa_options.enabled {
@@ -471,7 +471,7 @@ pub(crate) fn joint_setup(
         log_kappa_lower,
         log_kappa_upper,
     );
-    if let Some(sigma) = initial_sigma.filter(|sigma| *sigma > 0.0) {
+    if let Some(sigma) = learned_sigma_initial {
         setup.with_auxiliary(
             Array1::from_vec(vec![sigma.ln()]),
             Array1::from_vec(vec![-12.0]),

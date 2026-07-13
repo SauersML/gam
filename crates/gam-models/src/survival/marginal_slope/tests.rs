@@ -659,7 +659,9 @@ fn validate_spec_rejects_learnable_gaussian_shift_sigma() {
         base_link: InverseLink::Standard(StandardLink::Probit),
         marginalspec: empty_termspec(),
         marginal_offset: Array1::zeros(2),
-        frailty: FrailtySpec::GaussianShift { sigma_fixed: None },
+        frailty: FrailtySpec::GaussianShift {
+            scale: FrailtyScale::Learned { initial_sigma: 0.5 },
+        },
         derivative_guard: 1e-4,
         time_block: base_time_block(),
         timewiggle_block: None,

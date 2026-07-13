@@ -47,12 +47,15 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let score_covariance = marginal_slope_covariance_from_scores(spec.z.view(), &spec.weights)?;
     let z_primary = spec.z.column(0).to_owned();
     let n = spec.age_entry.len();
-    let initial_sigma = match &spec.frailty {
+    let (initial_sigma, learned_sigma_initial) = match &spec.frailty {
         FrailtySpec::GaussianShift {
-            sigma_fixed: Some(s),
-        } => Some(*s),
-        FrailtySpec::None => None,
-        FrailtySpec::GaussianShift { sigma_fixed: None } | FrailtySpec::HazardMultiplier { .. } => {
+            scale: FrailtyScale::Fixed { sigma },
+        } => (Some(*sigma), None),
+        FrailtySpec::GaussianShift {
+            scale: FrailtyScale::Learned { initial_sigma },
+        } => (Some(*initial_sigma), Some(*initial_sigma)),
+        FrailtySpec::None => (None, None),
+        FrailtySpec::HazardMultiplier { .. } => {
             return Err(SurvivalMarginalSlopeError::InvalidInput {
                 reason:
                     "internal: validate_spec should have rejected unsupported marginal-slope frailty"
@@ -742,7 +745,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         logslope_design.penalties.len(),
         &core_rho0_seed,
         &extra_rho0,
-        initial_sigma,
+        learned_sigma_initial,
         kappa_options_effective,
     );
 
@@ -764,7 +767,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     {
         hints.borrow_mut().logslope_beta = Some(pilot_logslope_beta.clone());
     }
-    let sigma_hint = RefCell::new(initial_sigma);
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
     // Outer ρ-cache β-seed staging slot. The spatial-joint optimizer fires
     // `seed_inner_beta_fn` on a cache hit before any eval has run at the
@@ -2204,10 +2206,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         derivative_probe_started.elapsed().as_secs_f64(),
     );
     let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = kappa_options_effective;
-    let derivative_block_cache = RefCell::new(
+    let hyper_layout_cache = RefCell::new(
         None::<(
             Array1<f64>,
-            Arc<Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>>,
+            crate::custom_family::SharedCustomFamilyHyperLayout,
         )>,
     );
     let theta_matches = |left: &Array1<f64>, right: &Array1<f64>| -> bool {
@@ -2215,22 +2217,26 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             && left
                 .iter()
                 .zip(right.iter())
-                .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12 * (1.0 + lhs.abs().max(rhs.abs())))
+                .all(|(lhs, rhs)| lhs.to_bits() == rhs.to_bits())
     };
     let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
-        initial_sigma.map(|_| theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
+        if learned_sigma_initial.is_some() {
+            Some(theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
+        } else {
+            initial_sigma
+        }
     };
-    let get_derivative_blocks = |theta: &Array1<f64>,
-                                 specs: &[TermCollectionSpec],
-                                 designs: &[TermCollectionDesign]|
+    let get_hyper_layout = |theta: &Array1<f64>,
+                            specs: &[TermCollectionSpec],
+                            designs: &[TermCollectionDesign]|
      -> Result<
-        Arc<Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>>,
+        crate::custom_family::SharedCustomFamilyHyperLayout,
         String,
     > {
-        if let Some((cached_theta, cached_blocks)) = derivative_block_cache.borrow().as_ref()
+        if let Some((cached_theta, cached_layout)) = hyper_layout_cache.borrow().as_ref()
             && theta_matches(cached_theta, theta)
         {
-            return Ok(Arc::clone(cached_blocks));
+            return Ok(Arc::clone(cached_layout));
         }
 
         let mut derivative_blocks = vec![
@@ -2262,24 +2268,19 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         if link_dev_runtime.is_some() {
             derivative_blocks.push(Vec::new());
         }
-        if initial_sigma.is_some_and(|sigma| sigma > 0.0) {
-            let sigma_aux = crate::custom_family::CustomFamilyBlockPsiDerivative::new(
-                None,
-                Array2::zeros((0, 0)),
-                Array2::zeros((0, 0)),
-                None,
-                None,
-                None,
-                None,
-            );
-            derivative_blocks
-                .last_mut()
-                .ok_or_else(|| "survival marginal-slope missing derivative blocks".to_string())?
-                .push(sigma_aux);
-        }
-        let derivative_blocks = Arc::new(derivative_blocks);
-        derivative_block_cache.replace(Some((theta.clone(), Arc::clone(&derivative_blocks))));
-        Ok(derivative_blocks)
+        let family_axes = if learned_sigma_initial.is_some() {
+            vec![0]
+        } else {
+            Vec::new()
+        };
+        let hyper_values = theta.slice(s![setup.rho_dim()..]).to_owned();
+        let layout = Arc::new(crate::custom_family::CustomFamilyHyperLayout::new(
+            derivative_blocks,
+            family_axes,
+            hyper_values,
+        )?);
+        hyper_layout_cache.replace(Some((theta.clone(), Arc::clone(&layout))));
+        Ok(layout)
     };
 
     log::info!(
@@ -2333,7 +2334,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 BlockDesignCoords::RematerializedRaw,
             )?;
             let sigma = sigma_from_theta(theta);
-            sigma_hint.replace(sigma);
             let family = make_family(
                 &designs[0],
                 &designs[1],
@@ -2418,7 +2418,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 }
             }
             let sigma = sigma_from_theta(theta);
-            sigma_hint.replace(sigma);
             // Preserve ValueOnly probes and request the Hessian exactly when
             // this realized family advertised analytic joint second-order
             // support.
@@ -2435,11 +2434,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 FlexActivation::On,
                 BlockDesignCoords::RematerializedRaw,
             )?;
-            let derivative_blocks = if matches!(effective_mode, EvalMode::ValueOnly) {
-                Arc::new(vec![Vec::new(); blocks.len()])
-            } else {
-                get_derivative_blocks(theta, specs, designs)?
-            };
+            let hyper_layout = get_hyper_layout(theta, specs, designs)?;
             let eval_id = outer_eval_counter.get();
             outer_eval_counter.set(eval_id.wrapping_add(1));
             let tolerance_options =
@@ -2458,7 +2453,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 &blocks,
                 &outer_options,
                 &rho,
-                derivative_blocks,
+                hyper_layout,
                 exact_warm_start.borrow().as_ref(),
                 effective_mode,
             )?;
@@ -2524,7 +2519,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 }
             }
             let sigma = sigma_from_theta(theta);
-            sigma_hint.replace(sigma);
             let family = make_family(
                 &designs[0],
                 &designs[1],
@@ -2532,7 +2526,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 FlexActivation::On,
                 BlockDesignCoords::RematerializedRaw,
             )?;
-            let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
+            let hyper_layout = get_hyper_layout(theta, specs, designs)?;
             let eval_id = outer_eval_counter.get();
             outer_eval_counter.set(eval_id.wrapping_add(1));
             let tolerance_options =
@@ -2551,7 +2545,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 &blocks,
                 &outer_options,
                 &rho,
-                derivative_blocks,
+                hyper_layout,
                 exact_warm_start.borrow().as_ref(),
             )?;
             exact_warm_start.replace(Some(owned.result.warm_start.clone()));
@@ -2786,11 +2780,20 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         }
     }
 
+    let certified_theta = solved
+        .certified_outer
+        .as_ref()
+        .ok_or_else(|| {
+            "survival marginal-slope fit completed without a certified joint hyperparameter vector"
+                .to_string()
+        })?
+        .rho();
+    let final_sigma = sigma_from_theta(certified_theta);
     let (baseline_offset_residuals, baseline_offset_curvatures) = {
         let final_family = make_family(
             &solved.designs[0],
             &solved.designs[1],
-            *sigma_hint.borrow(),
+            final_sigma,
             FlexActivation::On,
             BlockDesignCoords::RematerializedRaw,
         )?;
@@ -2909,7 +2912,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         logslopespec_resolved: resolved_specs.remove(0),
         marginal_design: designs[0].clone(),
         logslope_design: designs[1].clone(),
-        gaussian_frailty_sd: *sigma_hint.borrow(),
+        gaussian_frailty_sd: final_sigma,
         baseline_slope,
         baseline_offset_residuals,
         baseline_offset_curvatures,
