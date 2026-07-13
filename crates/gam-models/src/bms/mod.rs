@@ -60,7 +60,11 @@ pub mod deviation_runtime;
 pub mod gpu;
 pub use alo_replay::{
     BernoulliMarginalSlopeAloRowGeometry, BernoulliMarginalSlopeAloRowInput,
+    BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloRowGeometry,
     bernoulli_marginal_slope_alo_row_geometry,
+};
+pub(crate) use alo_replay::{
+    BernoulliMarginalSlopeSavedAloReplayInput, replay_saved_bernoulli_marginal_slope_alo,
 };
 pub use deviation_runtime::DeviationRuntime;
 pub use deviation_runtime::ParametricAnchorBlock;

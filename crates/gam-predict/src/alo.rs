@@ -1,9 +1,6 @@
 use std::ops::Range;
 
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam_models::bms::{
-    BernoulliMarginalSlopeAloRowInput, bernoulli_marginal_slope_alo_row_geometry,
-};
 use gam_models::gamlss::{
     BinomialLocationScaleAloRowInput, DispersionFamilyKind, GaussianLocationScaleAloRowInput,
     binomial_location_scale_alo_row_geometry, dispersion_alo_row_geometry,
@@ -687,7 +684,7 @@ fn compute_saved_location_scale_alo(
     }
 }
 
-/// Replay exact saved-H ALO for a rigid Bernoulli marginal-slope fit.
+/// Replay exact saved-H ALO for every fitted Bernoulli marginal-slope mode.
 fn compute_saved_bernoulli_marginal_slope_alo(
     model: &FittedModel,
     input: &PredictInput,
@@ -730,49 +727,64 @@ fn compute_saved_bernoulli_marginal_slope_alo(
     let predictor = model
         .bernoulli_marginal_slope_predictor()
         .map_err(|reason| invalid(format!("saved marginal-slope ALO predictor: {reason}")))?;
-    let state = predictor.rigid_saved_alo_state(input)?;
-    let parameter_dimension = predictor.beta_marginal.len() + predictor.beta_logslope.len();
+    let replay =
+        predictor.saved_alo_replay(input, observations.response, observations.prior_weights)?;
+    let marginal_dimension = predictor.beta_marginal.len();
+    let logslope_dimension = predictor.beta_logslope.len();
+    let parameter_dimension = marginal_dimension
+        + logslope_dimension
+        + replay.score_warp_dimension
+        + replay.link_deviation_dimension;
     let hessian = require_saved_hessian(model, class, parameter_dimension)?;
     let mut observed_hessians = Vec::with_capacity(n);
     let mut scores = Vec::with_capacity(n);
     let mut coordinate_values = Vec::with_capacity(n);
-    for row in 0..n {
-        let geometry =
-            bernoulli_marginal_slope_alo_row_geometry(BernoulliMarginalSlopeAloRowInput {
-                base_link: &predictor.base_link,
-                marginal_eta: state.marginal_eta[row],
-                slope: state.slope[row],
-                latent_z: state.latent_z[row],
-                response: observations.response[row],
-                prior_weight: observations.prior_weights[row],
-                probit_frailty_scale: state.probit_frailty_scale,
-            })
-            .map_err(|reason| invalid(format!("saved marginal-slope ALO row {row}: {reason}")))?;
-        scores.push(Array1::from_vec(geometry.nll_score.to_vec()));
-        observed_hessians.push(
-            Array2::from_shape_vec(
-                (2, 2),
-                geometry.observed_hessian.into_iter().flatten().collect(),
-            )
-            .expect("fixed 2x2 marginal-slope geometry"),
-        );
-        coordinate_values.push(Array1::from_vec(vec![
-            state.marginal_eta[row],
-            state.slope[row],
-        ]));
+    if replay.rows.len() != n {
+        return Err(invalid(format!(
+            "saved marginal-slope ALO replay returned {} rows; expected {n}",
+            replay.rows.len(),
+        )));
+    }
+    for geometry in replay.rows {
+        scores.push(geometry.nll_score);
+        observed_hessians.push(geometry.observed_hessian);
+        coordinate_values.push(geometry.coordinate_values);
     }
     let secondary_design = input
         .design_noise
         .as_ref()
         .expect("validated marginal-slope design");
-    let coordinate_designs = vec![input.design.clone(), secondary_design.clone()];
-    let coordinate_ranges = vec![
-        0..predictor.beta_marginal.len(),
-        predictor.beta_marginal.len()..parameter_dimension,
-    ];
+    let mut coordinate_designs =
+        Vec::with_capacity(2 + replay.score_warp_dimension + replay.link_deviation_dimension);
+    let mut coordinate_ranges = Vec::with_capacity(coordinate_designs.capacity());
+    let mut coordinate_names = Vec::with_capacity(coordinate_designs.capacity());
+    coordinate_designs.push(input.design.clone());
+    coordinate_ranges.push(0..marginal_dimension);
+    coordinate_names.push("marginal-eta".to_string());
+    coordinate_designs.push(secondary_design.clone());
+    coordinate_ranges.push(marginal_dimension..marginal_dimension + logslope_dimension);
+    coordinate_names.push("slope".to_string());
+    let mut coefficient = marginal_dimension + logslope_dimension;
+    for coordinate in 0..replay.score_warp_dimension {
+        coordinate_designs.push(constant_scalar_design(n));
+        coordinate_ranges.push(coefficient..coefficient + 1);
+        coordinate_names.push(format!("score-warp[{coordinate}]"));
+        coefficient += 1;
+    }
+    for coordinate in 0..replay.link_deviation_dimension {
+        coordinate_designs.push(constant_scalar_design(n));
+        coordinate_ranges.push(coefficient..coefficient + 1);
+        coordinate_names.push(format!("link-deviation[{coordinate}]"));
+        coefficient += 1;
+    }
+    if coefficient != parameter_dimension {
+        return Err(invalid(format!(
+            "saved marginal-slope ALO coordinate layout ends at {coefficient}; fitted parameter dimension is {parameter_dimension}"
+        )));
+    }
     compute_saved_multicoordinate_core(
         class,
-        vec!["marginal-eta".to_string(), "slope".to_string()],
+        coordinate_names,
         coordinate_designs,
         coordinate_ranges,
         hessian,

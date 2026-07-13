@@ -1,6 +1,17 @@
-use super::family::bernoulli_marginal_link_map;
+use std::sync::Arc;
+
+use super::deviation_runtime::{AnchorComponentTag, InstalledFlexBlock};
+use super::family::{BernoulliMarginalSlopeFamily, bernoulli_marginal_link_map};
 use super::gradient_paths::rigid_standard_normal_row_kernel;
+use super::hessian_paths::{
+    block_slices, new_cell_moment_cache_stats, new_cell_moment_lru_cache, primary_slices,
+};
+use super::{DeviationRuntime, LatentMeasureKind};
+use crate::inference::model::{SavedAnchorKind, SavedCompiledFlexBlock};
+use gam_linalg::matrix::DesignMatrix;
 use gam_problem::InverseLink;
+use gam_problem::ParameterBlockState;
+use ndarray::{Array1, Array2};
 
 /// Complete saved-row state for exact rigid Bernoulli marginal-slope ALO replay.
 pub struct BernoulliMarginalSlopeAloRowInput<'a> {
@@ -44,6 +55,366 @@ pub fn bernoulli_marginal_slope_alo_row_geometry(
         negative_log_likelihood,
         nll_score,
         observed_hessian,
+    })
+}
+
+/// Exact saved-row geometry in the full local primary frame
+/// `[marginal eta, slope, score-warp coefficients..., link-deviation
+/// coefficients...]`.
+#[derive(Clone, Debug)]
+pub struct BernoulliMarginalSlopeSavedAloRowGeometry {
+    pub nll_score: Array1<f64>,
+    pub observed_hessian: Array2<f64>,
+    pub coordinate_values: Array1<f64>,
+}
+
+/// Row-aligned replay of the fitted Bernoulli marginal-slope likelihood.
+#[derive(Clone, Debug)]
+pub struct BernoulliMarginalSlopeSavedAloReplay {
+    pub rows: Vec<BernoulliMarginalSlopeSavedAloRowGeometry>,
+    pub score_warp_dimension: usize,
+    pub link_deviation_dimension: usize,
+}
+
+pub(crate) struct BernoulliMarginalSlopeSavedAloReplayInput<'a> {
+    pub base_link: &'a InverseLink,
+    pub marginal_design: &'a DesignMatrix,
+    pub logslope_design: &'a DesignMatrix,
+    pub marginal_beta: &'a Array1<f64>,
+    pub logslope_beta: &'a Array1<f64>,
+    pub score_warp_beta: Option<&'a Array1<f64>>,
+    pub link_deviation_beta: Option<&'a Array1<f64>>,
+    pub marginal_eta: &'a Array1<f64>,
+    pub slope: &'a Array1<f64>,
+    pub latent_z: &'a Array1<f64>,
+    pub response: &'a Array1<f64>,
+    pub prior_weights: &'a Array1<f64>,
+    pub latent_measure: LatentMeasureKind,
+    pub gaussian_frailty_sd: Option<f64>,
+    pub score_warp_runtime: Option<&'a SavedCompiledFlexBlock>,
+    pub link_deviation_runtime: Option<&'a SavedCompiledFlexBlock>,
+    pub score_warp_anchor_rows: Option<&'a Array2<f64>>,
+    pub link_deviation_anchor_rows: Option<&'a Array2<f64>>,
+}
+
+fn dense_saved_table(
+    rows: &[Vec<f64>],
+    n_spans: usize,
+    basis_dim: usize,
+    label: &str,
+) -> Result<Array2<f64>, String> {
+    if rows.len() != n_spans || rows.iter().any(|row| row.len() != basis_dim) {
+        return Err(format!(
+            "saved {label} table is ragged or mis-sized: rows={}, expected={n_spans}, basis_dim={basis_dim}",
+            rows.len(),
+        ));
+    }
+    let values = rows
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .collect::<Vec<_>>();
+    Array2::from_shape_vec((n_spans, basis_dim), values)
+        .map_err(|error| format!("saved {label} table shape: {error}"))
+}
+
+fn dense_anchor_correction(rows: &[Vec<f64>], basis_dim: usize) -> Result<Array2<f64>, String> {
+    let nrows = rows.len();
+    if rows.iter().any(|row| row.len() != basis_dim) {
+        return Err(format!(
+            "saved anchor correction is ragged or has a row outside basis dimension {basis_dim}"
+        ));
+    }
+    Array2::from_shape_vec(
+        (nrows, basis_dim),
+        rows.iter().flat_map(|row| row.iter().copied()).collect(),
+    )
+    .map_err(|error| format!("saved anchor correction shape: {error}"))
+}
+
+fn exact_runtime_from_saved(
+    saved: &SavedCompiledFlexBlock,
+    anchor_rows: Option<&Array2<f64>>,
+    label: &str,
+) -> Result<DeviationRuntime, String> {
+    saved
+        .validate_exact_replay_contract()
+        .map_err(|error| format!("{label}: {error}"))?;
+    let n_spans = saved.breakpoints.len() - 1;
+    let c0 = dense_saved_table(
+        &saved.span_c0,
+        n_spans,
+        saved.basis_dim,
+        &format!("{label} c0"),
+    )?;
+    let c1 = dense_saved_table(
+        &saved.span_c1,
+        n_spans,
+        saved.basis_dim,
+        &format!("{label} c1"),
+    )?;
+    let c2 = dense_saved_table(
+        &saved.span_c2,
+        n_spans,
+        saved.basis_dim,
+        &format!("{label} c2"),
+    )?;
+    let c3 = dense_saved_table(
+        &saved.span_c3,
+        n_spans,
+        saved.basis_dim,
+        &format!("{label} c3"),
+    )?;
+    let installed = match saved.anchor_correction.as_ref() {
+        Some(correction) => {
+            let anchor_rows = anchor_rows.ok_or_else(|| {
+                format!(
+                    "saved {label} has a cross-block anchor map but no row-aligned anchor design"
+                )
+            })?;
+            let anchor_components = saved
+                .anchor_components
+                .iter()
+                .map(|component| match &component.kind {
+                    SavedAnchorKind::Parametric { block, ncols } => {
+                        AnchorComponentTag::Parametric {
+                            block: *block,
+                            ncols: *ncols,
+                        }
+                    }
+                    SavedAnchorKind::FlexEvaluation { ncols } => {
+                        AnchorComponentTag::FlexEvaluation { ncols: *ncols }
+                    }
+                })
+                .collect::<Vec<_>>();
+            let expected_anchor_columns = anchor_components
+                .iter()
+                .map(|component| match component {
+                    AnchorComponentTag::Parametric { ncols, .. }
+                    | AnchorComponentTag::FlexEvaluation { ncols } => *ncols,
+                })
+                .sum::<usize>();
+            if anchor_rows.ncols() != expected_anchor_columns {
+                return Err(format!(
+                    "saved {label} anchor design has {} columns; component layout requires {expected_anchor_columns}",
+                    anchor_rows.ncols(),
+                ));
+            }
+            Some(InstalledFlexBlock {
+                anchor_correction: dense_anchor_correction(correction, saved.basis_dim)?,
+                anchor_components,
+            })
+        }
+        None => {
+            if anchor_rows.is_some_and(|rows| rows.ncols() != 0) {
+                return Err(format!(
+                    "saved {label} received anchor rows without a persisted anchor map"
+                ));
+            }
+            None
+        }
+    };
+    DeviationRuntime::from_exact_cubic_tables(
+        Array1::from_vec(saved.breakpoints.clone()),
+        c0,
+        c1,
+        c2,
+        c3,
+        installed,
+        anchor_rows.cloned(),
+    )
+}
+
+fn validate_optional_flex_block(
+    runtime: Option<&SavedCompiledFlexBlock>,
+    beta: Option<&Array1<f64>>,
+    label: &str,
+) -> Result<usize, String> {
+    match (runtime, beta) {
+        (None, None) => Ok(0),
+        (Some(runtime), Some(beta)) if runtime.basis_dim == beta.len() => Ok(beta.len()),
+        (Some(runtime), Some(beta)) => Err(format!(
+            "saved {label} runtime has basis dimension {}; beta has {} entries",
+            runtime.basis_dim,
+            beta.len(),
+        )),
+        (Some(_), None) => Err(format!(
+            "saved {label} runtime has no fitted coefficient block"
+        )),
+        (None, Some(_)) => Err(format!("saved {label} coefficients have no exact runtime")),
+    }
+}
+
+/// Replay the exact fit-time BMS row program from frozen saved state.
+///
+/// No basis compilation, fitting, numerical differentiation, or alternate
+/// likelihood is permitted here.  The saved cubic tables are rehydrated in
+/// their fitted coefficient frame and passed to the same observed-Hessian
+/// row authority used by the optimizer.
+pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
+    input: BernoulliMarginalSlopeSavedAloReplayInput<'_>,
+) -> Result<BernoulliMarginalSlopeSavedAloReplay, String> {
+    let n = input.response.len();
+    if n == 0
+        || input.prior_weights.len() != n
+        || input.marginal_design.nrows() != n
+        || input.logslope_design.nrows() != n
+        || input.marginal_eta.len() != n
+        || input.slope.len() != n
+        || input.latent_z.len() != n
+    {
+        return Err(format!(
+            "saved BMS ALO row mismatch: response={n}, weights={}, marginal_design={}, logslope_design={}, marginal_eta={}, slope={}, z={}",
+            input.prior_weights.len(),
+            input.marginal_design.nrows(),
+            input.logslope_design.nrows(),
+            input.marginal_eta.len(),
+            input.slope.len(),
+            input.latent_z.len(),
+        ));
+    }
+    if input.marginal_design.ncols() != input.marginal_beta.len()
+        || input.logslope_design.ncols() != input.logslope_beta.len()
+    {
+        return Err(format!(
+            "saved BMS ALO affine frame mismatch: marginal design/beta={}/{}, logslope design/beta={}/{}",
+            input.marginal_design.ncols(),
+            input.marginal_beta.len(),
+            input.logslope_design.ncols(),
+            input.logslope_beta.len(),
+        ));
+    }
+    if let Some((row, weight)) = input
+        .prior_weights
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, weight)| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err(format!(
+            "saved BMS ALO prior weight[{row}] must be finite and non-negative, got {weight}"
+        ));
+    }
+    input
+        .latent_measure
+        .validate("saved BMS ALO latent measure")?;
+    let score_warp_dimension = validate_optional_flex_block(
+        input.score_warp_runtime,
+        input.score_warp_beta,
+        "score-warp",
+    )?;
+    let link_deviation_dimension = validate_optional_flex_block(
+        input.link_deviation_runtime,
+        input.link_deviation_beta,
+        "link-deviation",
+    )?;
+    let score_warp = input
+        .score_warp_runtime
+        .map(|runtime| {
+            exact_runtime_from_saved(runtime, input.score_warp_anchor_rows, "score-warp")
+        })
+        .transpose()?;
+    let link_dev = input
+        .link_deviation_runtime
+        .map(|runtime| {
+            exact_runtime_from_saved(runtime, input.link_deviation_anchor_rows, "link-deviation")
+        })
+        .transpose()?;
+
+    let policy = gam_runtime::resource::ResourcePolicy::default_library();
+    let family = BernoulliMarginalSlopeFamily {
+        y: Arc::new(input.response.clone()),
+        weights: Arc::new(input.prior_weights.clone()),
+        z: Arc::new(input.latent_z.clone()),
+        latent_measure: input.latent_measure,
+        gaussian_frailty_sd: input.gaussian_frailty_sd,
+        base_link: input.base_link.clone(),
+        marginal_design: input.marginal_design.clone(),
+        logslope_design: input.logslope_design.clone(),
+        score_warp,
+        link_dev,
+        policy: policy.clone(),
+        cell_moment_lru: new_cell_moment_lru_cache(&policy),
+        cell_moment_cache_stats: new_cell_moment_cache_stats(),
+        intercept_warm_starts: None,
+        auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        auto_subsample_last_rho: Arc::new(std::sync::Mutex::new(None)),
+    };
+    let slices = block_slices(&family);
+    let primary = primary_slices(&slices);
+    let mut block_states = vec![
+        ParameterBlockState {
+            beta: input.marginal_beta.clone(),
+            eta: input.marginal_eta.clone(),
+        },
+        ParameterBlockState {
+            beta: input.logslope_beta.clone(),
+            eta: input.slope.clone(),
+        },
+    ];
+    if let Some(beta) = input.score_warp_beta {
+        block_states.push(ParameterBlockState {
+            beta: beta.clone(),
+            // The exact row program consumes the fitted flex coefficient
+            // vector directly.  Its framework-level block eta is shape-only
+            // state and never enters the likelihood geometry.
+            eta: Array1::zeros(n),
+        });
+    }
+    if let Some(beta) = input.link_deviation_beta {
+        block_states.push(ParameterBlockState {
+            beta: beta.clone(),
+            eta: Array1::zeros(n),
+        });
+    }
+    family.validate_exact_block_state_shapes(&block_states)?;
+
+    let mut rows = Vec::with_capacity(n);
+    for row in 0..n {
+        let row_context = family.build_row_exact_context_with_stats_and_cell_cache(
+            row,
+            &block_states,
+            None,
+            false,
+        )?;
+        let (negative_log_likelihood, nll_score, observed_hessian) = family
+            .compute_row_primary_gradient_hessian(row, &block_states, &primary, &row_context)?;
+        if nll_score.len() != primary.total
+            || observed_hessian.dim() != (primary.total, primary.total)
+            || !negative_log_likelihood.is_finite()
+            || nll_score.iter().any(|value| !value.is_finite())
+            || observed_hessian.iter().any(|value| !value.is_finite())
+        {
+            return Err(format!(
+                "saved BMS ALO row {row} returned invalid local geometry: nll={negative_log_likelihood}, score={}, hessian={}x{}, expected primary width {}",
+                nll_score.len(),
+                observed_hessian.nrows(),
+                observed_hessian.ncols(),
+                primary.total,
+            ));
+        }
+        let mut coordinate_values = Array1::<f64>::zeros(primary.total);
+        coordinate_values[primary.q] = input.marginal_eta[row];
+        coordinate_values[primary.logslope] = input.slope[row];
+        if let (Some(range), Some(beta)) = (primary.h.as_ref(), input.score_warp_beta) {
+            coordinate_values
+                .slice_mut(ndarray::s![range.clone()])
+                .assign(beta);
+        }
+        if let (Some(range), Some(beta)) = (primary.w.as_ref(), input.link_deviation_beta) {
+            coordinate_values
+                .slice_mut(ndarray::s![range.clone()])
+                .assign(beta);
+        }
+        rows.push(BernoulliMarginalSlopeSavedAloRowGeometry {
+            nll_score,
+            observed_hessian,
+            coordinate_values,
+        });
+    }
+    Ok(BernoulliMarginalSlopeSavedAloReplay {
+        rows,
+        score_warp_dimension,
+        link_deviation_dimension,
     })
 }
 

@@ -486,55 +486,137 @@ mod vector_hand_oracle_tests {
         (-inv, inv2, -2.0 * inv2 * inv, 6.0 * inv2 * inv2)
     }
 
-    fn marginal_slope_covariance_matvec(
-        covariance: &MarginalSlopeCovariance,
-        vector: &[f64],
-    ) -> Result<Vec<f64>, String> {
-        covariance.validate("survival marginal-slope covariance matvec")?;
-        if vector.len() != covariance.dim() {
-            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "survival marginal-slope covariance matvec dimension mismatch: vector={}, covariance={}",
-                vector.len(),
-                covariance.dim()
-            ),
-        }
-        .into());
-        }
-        Ok(match covariance {
-            MarginalSlopeCovariance::Diagonal(diag) => vector
-                .iter()
-                .zip(diag.iter())
-                .map(|(&v, &sigma)| sigma * v)
-                .collect(),
-            MarginalSlopeCovariance::Full(cov) => {
-                let mut out = vec![0.0; cov.nrows()];
-                for i in 0..cov.nrows() {
-                    for j in 0..cov.ncols() {
-                        out[i] += cov[[i, j]] * vector[j];
-                    }
-                }
-                out
-            }
-            MarginalSlopeCovariance::LowRank(factor) => {
-                let mut projected = vec![0.0; factor.ncols()];
-                for r in 0..factor.ncols() {
-                    for k in 0..factor.nrows() {
-                        projected[r] += factor[[k, r]] * vector[k];
-                    }
-                }
-                let mut out = vec![0.0; factor.nrows()];
-                for k in 0..factor.nrows() {
-                    for r in 0..factor.ncols() {
-                        out[k] += factor[[k, r]] * projected[r];
-                    }
-                }
-                out
-            }
-        })
+    pub(super) struct ReusableHandVectorRowWorkspace {
+        score_dimension: usize,
+        observed_slopes: Box<[f64]>,
+        sigma_g: Box<[f64]>,
+        c1: Box<[f64]>,
+        c2: Box<[f64]>,
+        low_rank_projection: Box<[f64]>,
+        derivative_cells: Box<[f64]>,
     }
 
-    pub(super) fn row_primary_closed_form_vector_hand_reference(
+    impl ReusableHandVectorRowWorkspace {
+        pub(super) fn new(covariance: &MarginalSlopeCovariance) -> Result<Self, String> {
+            let score_dimension = covariance.dim();
+            let dimension = score_dimension.checked_add(3).ok_or_else(|| {
+                SurvivalMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "reusable hand row score width {score_dimension} overflows its primary dimension"
+                    ),
+                }
+                .to_string()
+            })?;
+            let score_hessian_cells = score_dimension
+                .checked_mul(score_dimension)
+                .ok_or_else(|| SurvivalMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "reusable hand row score width {score_dimension} overflows its score Hessian storage"
+                    ),
+                }
+                .to_string())?;
+            let hessian_cells = dimension.checked_mul(dimension).ok_or_else(|| {
+                SurvivalMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "reusable hand row primary width {dimension} overflows its Hessian storage"
+                    ),
+                }
+                .to_string()
+            })?;
+            let derivative_cells = dimension.checked_add(hessian_cells).ok_or_else(|| {
+                SurvivalMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "reusable hand row primary width {dimension} overflows its derivative storage"
+                    ),
+                }
+                .to_string()
+            })?;
+            let projection_dimension = match covariance {
+                MarginalSlopeCovariance::LowRank(factor) => factor.ncols(),
+                MarginalSlopeCovariance::Diagonal(_) | MarginalSlopeCovariance::Full(_) => 0,
+            };
+            Ok(Self {
+                score_dimension,
+                observed_slopes: vec![0.0; score_dimension].into_boxed_slice(),
+                sigma_g: vec![0.0; score_dimension].into_boxed_slice(),
+                c1: vec![0.0; score_dimension].into_boxed_slice(),
+                c2: vec![0.0; score_hessian_cells].into_boxed_slice(),
+                low_rank_projection: vec![0.0; projection_dimension].into_boxed_slice(),
+                derivative_cells: vec![0.0; derivative_cells].into_boxed_slice(),
+            })
+        }
+
+        pub(super) fn derivatives(&self) -> (ArrayView1<'_, f64>, ArrayView2<'_, f64>) {
+            let dimension = 3 + self.score_dimension;
+            let (gradient, hessian) = self.derivative_cells.split_at(dimension);
+            (
+                ArrayView1::from(gradient),
+                ArrayView2::from_shape((dimension, dimension), hessian)
+                    .expect("reusable hand row derivative buffer shape is invariant"),
+            )
+        }
+    }
+
+    fn marginal_slope_covariance_matvec_into(
+        covariance: &MarginalSlopeCovariance,
+        vector: &[f64],
+        output: &mut [f64],
+        low_rank_projection: &mut [f64],
+    ) -> Result<(), String> {
+        covariance.validate("survival marginal-slope covariance matvec")?;
+        if vector.len() != covariance.dim() || output.len() != covariance.dim() {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope covariance matvec dimension mismatch: vector={}, output={}, covariance={}",
+                    vector.len(),
+                    output.len(),
+                    covariance.dim()
+                ),
+            }
+            .into());
+        }
+        output.fill(0.0);
+        match covariance {
+            MarginalSlopeCovariance::Diagonal(diag) => {
+                for axis in 0..vector.len() {
+                    output[axis] = diag[axis] * vector[axis];
+                }
+            }
+            MarginalSlopeCovariance::Full(cov) => {
+                for i in 0..cov.nrows() {
+                    for j in 0..cov.ncols() {
+                        output[i] += cov[[i, j]] * vector[j];
+                    }
+                }
+            }
+            MarginalSlopeCovariance::LowRank(factor) => {
+                if low_rank_projection.len() != factor.ncols() {
+                    return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                        reason: format!(
+                            "reusable hand row low-rank projection mismatch: workspace={}, covariance={}",
+                            low_rank_projection.len(),
+                            factor.ncols()
+                        ),
+                    }
+                    .into());
+                }
+                low_rank_projection.fill(0.0);
+                for r in 0..factor.ncols() {
+                    for k in 0..factor.nrows() {
+                        low_rank_projection[r] += factor[[k, r]] * vector[k];
+                    }
+                }
+                for k in 0..factor.nrows() {
+                    for r in 0..factor.ncols() {
+                        output[k] += factor[[k, r]] * low_rank_projection[r];
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn row_primary_closed_form_vector_hand_reference_into(
         q0: f64,
         q1: f64,
         qd1: f64,
@@ -545,27 +627,49 @@ mod vector_hand_oracle_tests {
         d: f64,
         derivative_guard: f64,
         probit_scale: f64,
-    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        workspace: &mut ReusableHandVectorRowWorkspace,
+    ) -> Result<f64, String> {
         let k = slopes.len();
         if z.len() != k || covariance.dim() != k {
             return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "survival marginal-slope vector row dimension mismatch: slopes={}, z={}, covariance={}",
-                k,
-                z.len(),
-                covariance.dim()
-            ),
+                reason: format!(
+                    "survival marginal-slope vector row dimension mismatch: slopes={}, z={}, covariance={}",
+                    k,
+                    z.len(),
+                    covariance.dim()
+                ),
+            }
+            .into());
         }
-        .into());
+        if workspace.score_dimension != k {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "reusable hand row workspace width mismatch: configured={}, row={k}",
+                    workspace.score_dimension
+                ),
+            }
+            .into());
         }
-        let c = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale)?;
-        let sigma_g = marginal_slope_covariance_matvec(covariance, slopes)?;
+        if !probit_scale.is_finite() {
+            return Err(format!(
+                "marginal-slope probit scale must be finite, got {probit_scale}"
+            ));
+        }
+        for (target, &slope) in workspace.observed_slopes.iter_mut().zip(slopes) {
+            *target = probit_scale * slope;
+        }
+        let variance = covariance.quadratic_form(&workspace.observed_slopes)?;
+        let c = (1.0 + variance).sqrt();
+        marginal_slope_covariance_matvec_into(
+            covariance,
+            slopes,
+            &mut workspace.sigma_g,
+            &mut workspace.low_rank_projection,
+        )?;
         let s2 = probit_scale * probit_scale;
-        let mut c1 = vec![0.0; k];
         for a in 0..k {
-            c1[a] = s2 * sigma_g[a] / c;
+            workspace.c1[a] = s2 * workspace.sigma_g[a] / c;
         }
-        let mut c2 = Array2::<f64>::zeros((k, k));
         for a in 0..k {
             for b in 0..k {
                 let sigma_ab = match covariance {
@@ -585,8 +689,9 @@ mod vector_hand_oracle_tests {
                         value
                     }
                 };
-                c2[[a, b]] =
-                    s2 * sigma_ab / c - (s2 * sigma_g[a]) * (s2 * sigma_g[b]) / (c * c * c);
+                workspace.c2[a * k + b] = s2 * sigma_ab / c
+                    - (s2 * workspace.sigma_g[a]) * (s2 * workspace.sigma_g[b])
+                        / (c * c * c);
             }
         }
 
@@ -638,42 +743,74 @@ mod vector_hand_oracle_tests {
         let u2_ad1 = td_u2;
 
         let dim = 3 + k;
-        let mut grad = Array1::<f64>::zeros(dim);
-        let mut hess = Array2::<f64>::zeros((dim, dim));
-        grad[0] = u1_eta0 * c;
-        grad[1] = u1_eta1 * c;
-        grad[2] = u1_ad1 * c;
-        hess[[0, 0]] = u2_eta0 * c * c;
-        hess[[1, 1]] = u2_eta1 * c * c;
-        hess[[2, 2]] = u2_ad1 * c * c;
+        let (gradient, hessian) = workspace.derivative_cells.split_at_mut(dim);
+        gradient.fill(0.0);
+        hessian.fill(0.0);
+        gradient[0] = u1_eta0 * c;
+        gradient[1] = u1_eta1 * c;
+        gradient[2] = u1_ad1 * c;
+        hessian[0] = u2_eta0 * c * c;
+        hessian[dim + 1] = u2_eta1 * c * c;
+        hessian[2 * dim + 2] = u2_ad1 * c * c;
         for a in 0..k {
             let idx = 3 + a;
             let dlin = probit_scale * z[a];
-            let deta0 = q0 * c1[a] + dlin;
-            let deta1 = q1 * c1[a] + dlin;
-            let dad1 = qd1 * c1[a];
-            grad[idx] = u1_eta0 * deta0 + u1_eta1 * deta1 + u1_ad1 * dad1;
-            hess[[0, idx]] = u2_eta0 * c * deta0 + u1_eta0 * c1[a];
-            hess[[idx, 0]] = hess[[0, idx]];
-            hess[[1, idx]] = u2_eta1 * c * deta1 + u1_eta1 * c1[a];
-            hess[[idx, 1]] = hess[[1, idx]];
-            hess[[2, idx]] = u2_ad1 * c * dad1 + u1_ad1 * c1[a];
-            hess[[idx, 2]] = hess[[2, idx]];
+            let deta0 = q0 * workspace.c1[a] + dlin;
+            let deta1 = q1 * workspace.c1[a] + dlin;
+            let dad1 = qd1 * workspace.c1[a];
+            gradient[idx] = u1_eta0 * deta0 + u1_eta1 * deta1 + u1_ad1 * dad1;
+            hessian[idx] = u2_eta0 * c * deta0 + u1_eta0 * workspace.c1[a];
+            hessian[idx * dim] = hessian[idx];
+            hessian[dim + idx] = u2_eta1 * c * deta1 + u1_eta1 * workspace.c1[a];
+            hessian[idx * dim + 1] = hessian[dim + idx];
+            hessian[2 * dim + idx] = u2_ad1 * c * dad1 + u1_ad1 * workspace.c1[a];
+            hessian[idx * dim + 2] = hessian[2 * dim + idx];
             for b in 0..k {
                 let jdx = 3 + b;
                 let dlin_b = probit_scale * z[b];
-                let deta0_b = q0 * c1[b] + dlin_b;
-                let deta1_b = q1 * c1[b] + dlin_b;
-                let dad1_b = qd1 * c1[b];
-                hess[[idx, jdx]] = u2_eta0 * deta0 * deta0_b
-                    + u1_eta0 * q0 * c2[[a, b]]
+                let deta0_b = q0 * workspace.c1[b] + dlin_b;
+                let deta1_b = q1 * workspace.c1[b] + dlin_b;
+                let dad1_b = qd1 * workspace.c1[b];
+                let c2 = workspace.c2[a * k + b];
+                hessian[idx * dim + jdx] = u2_eta0 * deta0 * deta0_b
+                    + u1_eta0 * q0 * c2
                     + u2_eta1 * deta1 * deta1_b
-                    + u1_eta1 * q1 * c2[[a, b]]
+                    + u1_eta1 * q1 * c2
                     + u2_ad1 * dad1 * dad1_b
-                    + u1_ad1 * qd1 * c2[[a, b]];
+                    + u1_ad1 * qd1 * c2;
             }
         }
-        Ok((nll, grad, hess))
+        Ok(nll)
+    }
+
+    pub(super) fn row_primary_closed_form_vector_hand_reference(
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        slopes: &[f64],
+        z: &[f64],
+        covariance: &MarginalSlopeCovariance,
+        w: f64,
+        d: f64,
+        derivative_guard: f64,
+        probit_scale: f64,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let mut workspace = ReusableHandVectorRowWorkspace::new(covariance)?;
+        let value = row_primary_closed_form_vector_hand_reference_into(
+            q0,
+            q1,
+            qd1,
+            slopes,
+            z,
+            covariance,
+            w,
+            d,
+            derivative_guard,
+            probit_scale,
+            &mut workspace,
+        )?;
+        let (gradient, hessian) = workspace.derivatives();
+        Ok((value, gradient.to_owned(), hessian.to_owned()))
     }
 }
 
@@ -949,23 +1086,48 @@ pub(crate) struct RigidVectorRowWorkspace {
 
 impl RigidVectorRowWorkspace {
     pub(crate) fn new(score_dimension: usize) -> Result<Self, String> {
-        let backend = match score_dimension {
-            0 => {
-                return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-                    reason: "survival marginal-slope vector row requires at least one score slope"
-                        .to_string(),
-                }
-                .into());
+        if score_dimension == 0 {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: "survival marginal-slope vector row requires at least one score slope"
+                    .to_string(),
             }
-            1..=5 => RigidVectorRowBackend::Fixed,
-            6..=13 => RigidVectorRowBackend::Graph(Order2GraphWorkspace::new()),
-            14.. => RigidVectorRowBackend::Dynamic(DynamicJetArena::new()),
+            .into());
+        }
+        let dimension = score_dimension.checked_add(3).ok_or_else(|| {
+            SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope score width {score_dimension} overflows its primary dimension"
+                ),
+            }
+            .to_string()
+        })?;
+        let hessian_cells = dimension.checked_mul(dimension).ok_or_else(|| {
+            SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope primary width {dimension} overflows its Hessian storage"
+                ),
+            }
+            .to_string()
+        })?;
+        let derivative_cells = dimension.checked_add(hessian_cells).ok_or_else(|| {
+            SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope primary width {dimension} overflows its derivative storage"
+                ),
+            }
+            .to_string()
+        })?;
+        let backend = if score_dimension <= 5 {
+            RigidVectorRowBackend::Fixed
+        } else if score_dimension <= 13 {
+            RigidVectorRowBackend::Graph(Order2GraphWorkspace::new())
+        } else {
+            RigidVectorRowBackend::Dynamic(DynamicJetArena::new())
         };
-        let dimension = 3 + score_dimension;
         Ok(Self {
             score_dimension,
             backend,
-            derivative_cells: vec![0.0; dimension + dimension * dimension].into_boxed_slice(),
+            derivative_cells: vec![0.0; derivative_cells].into_boxed_slice(),
         })
     }
 
@@ -1071,7 +1233,7 @@ pub(crate) fn row_primary_closed_form_vector_into(
     }
 
     macro_rules! graph_row {
-        ($dimension:literal, $graph:expr) => {
+        ($dimension:literal, $graph:expr, $gradient:expr, $hessian:expr) => {
             row_primary_closed_form_vector_graph_into::<$dimension>(
                 q0,
                 q1,
@@ -1084,14 +1246,14 @@ pub(crate) fn row_primary_closed_form_vector_into(
                 derivative_guard,
                 probit_scale,
                 $graph,
-                gradient,
-                hessian,
+                $gradient,
+                $hessian,
             )
         };
     }
 
     macro_rules! fixed_row {
-        ($dimension:literal) => {
+        ($dimension:literal, $gradient:expr, $hessian:expr) => {
             row_primary_closed_form_vector_fixed_into::<$dimension>(
                 q0,
                 q1,
@@ -1103,8 +1265,8 @@ pub(crate) fn row_primary_closed_form_vector_into(
                 d,
                 derivative_guard,
                 probit_scale,
-                gradient,
-                hessian,
+                $gradient,
+                $hessian,
             )
         };
     }
@@ -1117,19 +1279,27 @@ pub(crate) fn row_primary_closed_form_vector_into(
     } = workspace;
     let (gradient, hessian) = derivative_cells.split_at_mut(dimension);
     match (backend, k) {
-        (RigidVectorRowBackend::Fixed, 1) => fixed_row!(4),
-        (RigidVectorRowBackend::Fixed, 2) => fixed_row!(5),
-        (RigidVectorRowBackend::Fixed, 3) => fixed_row!(6),
-        (RigidVectorRowBackend::Fixed, 4) => fixed_row!(7),
-        (RigidVectorRowBackend::Fixed, 5) => fixed_row!(8),
-        (RigidVectorRowBackend::Graph(graph), 6) => graph_row!(9, graph),
-        (RigidVectorRowBackend::Graph(graph), 7) => graph_row!(10, graph),
-        (RigidVectorRowBackend::Graph(graph), 8) => graph_row!(11, graph),
-        (RigidVectorRowBackend::Graph(graph), 9) => graph_row!(12, graph),
-        (RigidVectorRowBackend::Graph(graph), 10) => graph_row!(13, graph),
-        (RigidVectorRowBackend::Graph(graph), 11) => graph_row!(14, graph),
-        (RigidVectorRowBackend::Graph(graph), 12) => graph_row!(15, graph),
-        (RigidVectorRowBackend::Graph(graph), 13) => graph_row!(16, graph),
+        (RigidVectorRowBackend::Fixed, 1) => fixed_row!(4, gradient, hessian),
+        (RigidVectorRowBackend::Fixed, 2) => fixed_row!(5, gradient, hessian),
+        (RigidVectorRowBackend::Fixed, 3) => fixed_row!(6, gradient, hessian),
+        (RigidVectorRowBackend::Fixed, 4) => fixed_row!(7, gradient, hessian),
+        (RigidVectorRowBackend::Fixed, 5) => fixed_row!(8, gradient, hessian),
+        (RigidVectorRowBackend::Graph(graph), 6) => graph_row!(9, graph, gradient, hessian),
+        (RigidVectorRowBackend::Graph(graph), 7) => graph_row!(10, graph, gradient, hessian),
+        (RigidVectorRowBackend::Graph(graph), 8) => graph_row!(11, graph, gradient, hessian),
+        (RigidVectorRowBackend::Graph(graph), 9) => graph_row!(12, graph, gradient, hessian),
+        (RigidVectorRowBackend::Graph(graph), 10) => {
+            graph_row!(13, graph, gradient, hessian)
+        }
+        (RigidVectorRowBackend::Graph(graph), 11) => {
+            graph_row!(14, graph, gradient, hessian)
+        }
+        (RigidVectorRowBackend::Graph(graph), 12) => {
+            graph_row!(15, graph, gradient, hessian)
+        }
+        (RigidVectorRowBackend::Graph(graph), 13) => {
+            graph_row!(16, graph, gradient, hessian)
+        }
         (RigidVectorRowBackend::Dynamic(arena), 14..) => {
             row_primary_closed_form_vector_dynamic_into(
                 q0,
@@ -2106,6 +2276,7 @@ mod tests {
             "backend selector must not inline the fixed graph tape"
         );
         assert!(RigidVectorRowWorkspace::new(0).is_err());
+        assert!(RigidVectorRowWorkspace::new(usize::MAX).is_err());
 
         let mut workspace = RigidVectorRowWorkspace::new(3).expect("k=3 workspace");
         let covariance = MarginalSlopeCovariance::Diagonal(Array1::ones(2));
@@ -2186,6 +2357,11 @@ mod tests {
                     for event in [0.0, 1.0] {
                         let mut workspace = RigidVectorRowWorkspace::new($k)
                             .expect("packed production workspace");
+                        let mut hand_workspace =
+                            vector_hand_oracle_tests::ReusableHandVectorRowWorkspace::new(
+                                covariance,
+                            )
+                            .expect("reusable strongest-hand workspace");
                         let mut graph_workspace = Order2GraphWorkspace::new();
                         let mut dynamic_arena = DynamicJetArena::new();
                         let mut fixed_gradient = [0.0; $dim];
@@ -2204,7 +2380,27 @@ mod tests {
                             black_box(derivatives);
                             value
                         };
+                        let evaluate_hand = |workspace: &mut vector_hand_oracle_tests::ReusableHandVectorRowWorkspace| {
+                            let value = vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference_into(
+                                -0.28,
+                                0.53,
+                                1.18,
+                                &slopes,
+                                &scores,
+                                covariance,
+                                1.21,
+                                event,
+                                1.0e-8,
+                                0.87,
+                                workspace,
+                            )
+                            .expect("reusable strongest-hand width");
+                            let derivatives = workspace.derivatives();
+                            black_box(derivatives);
+                            value
+                        };
                         black_box(evaluate_production(&mut workspace));
+                        black_box(evaluate_hand(&mut hand_workspace));
 
                         let production_ns =
                             best_ns(5_000, || evaluate_production(&mut workspace));
@@ -2257,21 +2453,8 @@ mod tests {
                             black_box((&dynamic_gradient, &dynamic_hessian));
                             value
                         });
-                        let hand_ns = best_ns(5_000, || {
-                            vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
-                                -0.28,
-                                0.53,
-                                1.18,
-                                &slopes,
-                                &scores,
-                                covariance,
-                                1.21,
-                                event,
-                                1.0e-8,
-                                0.87,
-                            )
-                            .expect("strongest-hand width")
-                        });
+                        let hand_ns =
+                            best_ns(5_000, || evaluate_hand(&mut hand_workspace));
                         let fastest_canonical_ns = fixed_ns.min(graph_ns).min(dynamic_ns);
                         eprintln!(
                             "G932_PACKED_WIDTH_RELEASE covariance={label} event={event:.0} \

@@ -1,6 +1,8 @@
 use crate::bms::{
+    BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloReplayInput,
     EmpiricalZGrid, LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
     bernoulli_marginal_link_map, empirical_intercept_from_marginal,
+    replay_saved_bernoulli_marginal_slope_alo,
 };
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
 use crate::marginal_slope_shared::{
@@ -15,6 +17,7 @@ use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::estimate::{EstimationError, UnifiedFitResult};
 use ndarray::{Array1, Array2, ArrayView1};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use std::sync::Arc;
 
 pub struct PredictResult {
     pub eta: Array1<f64>,
@@ -57,13 +60,12 @@ pub struct BernoulliMarginalSlopePredictor {
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
 }
 
-/// Saved rigid marginal-slope row coordinates after replaying every fitted
+/// Saved marginal-slope affine row coordinates after replaying every fitted
 /// latent-score transformation.
-pub struct BernoulliMarginalSlopeRigidAloState {
-    pub marginal_eta: Array1<f64>,
-    pub slope: Array1<f64>,
-    pub latent_z: Array1<f64>,
-    pub probit_frailty_scale: f64,
+struct BernoulliMarginalSlopeSavedAloAffineState {
+    marginal_eta: Array1<f64>,
+    slope: Array1<f64>,
+    latent_z: Array1<f64>,
 }
 
 /// Per-runtime predict-time anchor correction matrices.
@@ -332,28 +334,12 @@ impl BernoulliMarginalSlopePredictor {
         marginal_slope_probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
-    /// Reconstruct the affine row coordinates consumed by the rigid fitted
+    /// Reconstruct the affine row coordinates consumed by the fitted
     /// likelihood, including the exact saved latent-score calibration.
-    pub fn rigid_saved_alo_state(
+    fn saved_alo_affine_state(
         &self,
         input: &PredictInput,
-    ) -> Result<BernoulliMarginalSlopeRigidAloState, EstimationError> {
-        if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
-            return Err(EstimationError::InvalidInput(
-                "saved rigid marginal-slope ALO requires the fitted standard-normal latent measure"
-                    .to_string(),
-            ));
-        }
-        if self.score_warp_runtime.is_some()
-            || self.link_deviation_runtime.is_some()
-            || self.beta_score_warp.is_some()
-            || self.beta_link_dev.is_some()
-        {
-            return Err(EstimationError::InvalidInput(
-                "saved rigid marginal-slope ALO received a fitted flexible deviation block"
-                    .to_string(),
-            ));
-        }
+    ) -> Result<BernoulliMarginalSlopeSavedAloAffineState, EstimationError> {
         let latent_z_raw = input.auxiliary_scalar.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(format!(
                 "saved marginal-slope ALO requires auxiliary z column '{}'",
@@ -413,12 +399,110 @@ impl BernoulliMarginalSlopePredictor {
             .dot(&self.beta_logslope)
             .mapv(|value| value + self.baseline_logslope)
             + &slope_offset;
-        Ok(BernoulliMarginalSlopeRigidAloState {
+        Ok(BernoulliMarginalSlopeSavedAloAffineState {
             marginal_eta,
             slope,
             latent_z,
-            probit_frailty_scale: self.probit_frailty_scale(),
         })
+    }
+
+    fn saved_alo_latent_measure(
+        &self,
+        input: &PredictInput,
+        n_rows: usize,
+    ) -> Result<LatentMeasureKind, EstimationError> {
+        match &self.latent_measure {
+            LatentMeasureKind::StandardNormal => Ok(LatentMeasureKind::StandardNormal),
+            LatentMeasureKind::GlobalEmpirical { grid } => {
+                Ok(LatentMeasureKind::GlobalEmpirical { grid: grid.clone() })
+            }
+            LatentMeasureKind::LocalEmpirical {
+                feature_cols,
+                input_scales,
+                centers,
+                grids,
+                top_k,
+                bandwidth,
+                ..
+            } => {
+                let conditioning = input.auxiliary_matrix.as_ref().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "saved BMS ALO with a local empirical latent measure requires the persisted conditioning matrix"
+                            .to_string(),
+                    )
+                })?;
+                let expected_dimension = centers.first().map_or(0, Vec::len);
+                if conditioning.dim() != (n_rows, expected_dimension) {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "saved BMS ALO local empirical conditioning is {}x{}; expected {n_rows}x{expected_dimension}",
+                        conditioning.nrows(),
+                        conditioning.ncols(),
+                    )));
+                }
+                let mixtures = conditioning
+                    .rows()
+                    .into_iter()
+                    .map(|row| {
+                        Self::local_empirical_mixture_for_point(
+                            row.as_slice().expect("conditioning row contiguous"),
+                            centers,
+                            *top_k,
+                            *bandwidth,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(LatentMeasureKind::LocalEmpirical {
+                    feature_cols: feature_cols.clone(),
+                    input_scales: input_scales.clone(),
+                    centers: centers.clone(),
+                    grids: grids.clone(),
+                    top_k: *top_k,
+                    bandwidth: *bandwidth,
+                    train_row_mixtures: Arc::new(mixtures),
+                })
+            }
+        }
+    }
+
+    /// Replay the exact fitted row likelihood and observed Hessian for saved-H
+    /// ALO.  This is the sole BMS saved-row authority for rigid, flexible,
+    /// standard-normal, global-empirical, and local-empirical fits.
+    pub fn saved_alo_replay(
+        &self,
+        input: &PredictInput,
+        response: &Array1<f64>,
+        prior_weights: &Array1<f64>,
+    ) -> Result<BernoulliMarginalSlopeSavedAloReplay, EstimationError> {
+        let affine = self.saved_alo_affine_state(input)?;
+        let logslope_design = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "saved BMS ALO requires the persisted slope design".to_string(),
+            )
+        })?;
+        let anchor_corrections =
+            self.build_anchor_correction_matrices(input, logslope_design, &affine.latent_z)?;
+        let latent_measure = self.saved_alo_latent_measure(input, response.len())?;
+        replay_saved_bernoulli_marginal_slope_alo(BernoulliMarginalSlopeSavedAloReplayInput {
+            base_link: &self.base_link,
+            marginal_design: &input.design,
+            logslope_design,
+            marginal_beta: &self.beta_marginal,
+            logslope_beta: &self.beta_logslope,
+            score_warp_beta: self.beta_score_warp.as_ref(),
+            link_deviation_beta: self.beta_link_dev.as_ref(),
+            marginal_eta: &affine.marginal_eta,
+            slope: &affine.slope,
+            latent_z: &affine.latent_z,
+            response,
+            prior_weights,
+            latent_measure,
+            gaussian_frailty_sd: self.gaussian_frailty_sd,
+            score_warp_runtime: self.score_warp_runtime.as_ref(),
+            link_deviation_runtime: self.link_deviation_runtime.as_ref(),
+            score_warp_anchor_rows: anchor_corrections.score_warp_anchor_rows.as_ref(),
+            link_deviation_anchor_rows: anchor_corrections.link_dev_anchor_rows.as_ref(),
+        })
+        .map_err(EstimationError::InvalidInput)
     }
 
     /// Apply the (optional) rank-INT latent-z calibration to a batch of
