@@ -35,13 +35,16 @@ thread_local! {
 /// growth of an all-directions pass while every chunk still evaluates the same
 /// frozen [`EmpiricalBmsRowJetPlan`].
 const EMPIRICAL_BMS_BATCH_HESSIAN_CHANNEL_BUDGET: usize = 576;
+/// Preserve pairwise reuse even when two lanes exceed the cache budget: a
+/// one-lane chunk pays the batching traversal cost without sharing any work.
+const EMPIRICAL_BMS_BATCH_LANE_FLOOR: usize = 2;
 const EMPIRICAL_BMS_BATCH_LANE_CAP: usize = 8;
 
 #[inline]
 fn empirical_bms_directional_batch_lanes(r: usize) -> usize {
     let channels_per_lane = r.saturating_mul(r).max(1);
     (EMPIRICAL_BMS_BATCH_HESSIAN_CHANNEL_BUDGET / channels_per_lane)
-        .clamp(1, EMPIRICAL_BMS_BATCH_LANE_CAP)
+        .clamp(EMPIRICAL_BMS_BATCH_LANE_FLOOR, EMPIRICAL_BMS_BATCH_LANE_CAP)
 }
 
 #[derive(Clone)]
@@ -3944,14 +3947,17 @@ mod empirical_flex_jet_oracle_tests {
         assert_eq!(empirical_bms_directional_batch_lanes(4), 8);
         assert_eq!(empirical_bms_directional_batch_lanes(8), 8);
         assert_eq!(empirical_bms_directional_batch_lanes(12), 4);
-        assert_eq!(empirical_bms_directional_batch_lanes(18), 1);
+        assert_eq!(empirical_bms_directional_batch_lanes(18), 2);
 
         for r in 1..=128 {
             let lanes = empirical_bms_directional_batch_lanes(r);
-            assert!((1..=EMPIRICAL_BMS_BATCH_LANE_CAP).contains(&lanes));
+            assert!(
+                (EMPIRICAL_BMS_BATCH_LANE_FLOOR..=EMPIRICAL_BMS_BATCH_LANE_CAP).contains(&lanes)
+            );
             let channels = lanes.saturating_mul(r.saturating_mul(r));
             assert!(
-                channels <= EMPIRICAL_BMS_BATCH_HESSIAN_CHANNEL_BUDGET || lanes == 1,
+                channels <= EMPIRICAL_BMS_BATCH_HESSIAN_CHANNEL_BUDGET
+                    || lanes == EMPIRICAL_BMS_BATCH_LANE_FLOOR,
                 "r={r} lanes={lanes} carries {channels} Hessian channels"
             );
         }
