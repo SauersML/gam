@@ -3349,6 +3349,39 @@ mod tests {
     use super::row_kernel_tests::*;
     use super::*;
 
+    #[test]
+    fn dense_hvp_batches_transpose_column_images_in_bounded_groups_932() {
+        let p_total = 2 * BMS_FLEX_ROW_HVP_MAX_RHS + 3;
+        let matrix = (0..p_total * p_total)
+            .map(|index| {
+                let row = index / p_total;
+                let column = index % p_total;
+                1000.0 * row as f64 + column as f64 + 0.25
+            })
+            .collect::<Vec<_>>();
+        let mut observed_batch_sizes = Vec::new();
+        let dense = materialize_dense_from_hvp_batches(p_total, |basis, rhs_count| {
+            observed_batch_sizes.push(rhs_count);
+            let mut images = vec![0.0_f64; rhs_count * p_total];
+            for rhs in 0..rhs_count {
+                for row in 0..p_total {
+                    images[rhs * p_total + row] = (0..p_total)
+                        .map(|column| {
+                            matrix[row * p_total + column] * basis[rhs * p_total + column]
+                        })
+                        .sum();
+                }
+            }
+            Ok(images)
+        })
+        .expect("synthetic H*I batches must materialize");
+        assert_eq!(dense, matrix);
+        assert_eq!(
+            observed_batch_sizes,
+            vec![BMS_FLEX_ROW_HVP_MAX_RHS, BMS_FLEX_ROW_HVP_MAX_RHS, 3]
+        );
+    }
+
     pub(crate) fn minimal_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
         BmsFlexRowKernelInputs {
             n_rows: 1,
@@ -4779,6 +4812,82 @@ mod tests {
             }
             eprintln!(
                 "[bms_flex_row dense_block parity] n={n} r={r} p={p_total}: max|Δ|={max_abs:.3e}"
+            );
+        }
+    }
+
+    #[test]
+    pub(crate) fn bms_flex_row_dense_hvp_materialization_matches_cpu_above_block_cap_932() {
+        let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
+            eprintln!("[bms_flex_row dense HVP parity] no CUDA runtime — skipping");
+            return;
+        };
+        let n = 1_usize;
+        let r = 2_usize;
+        let p_m = 37_usize;
+        let p_g = 36_usize;
+        let p_total = p_m + p_g;
+        assert_eq!(p_total, DENSE_BLOCK_MAX_P + 1);
+        let block = BmsFlexBlockLayout {
+            p_m,
+            p_g,
+            h: None,
+            w: None,
+            p_total,
+        };
+        let primary = BmsFlexPrimaryLayout {
+            h: None,
+            w: None,
+            r,
+        };
+        let row_hessians = vec![2.5_f64, -0.75, -0.75, 1.25];
+        let marginal = (0..p_m)
+            .map(|column| 0.15 + (column as f64 * 0.17).sin())
+            .collect::<Vec<_>>();
+        let logslope = (0..p_g)
+            .map(|column| -0.2 + (column as f64 * 0.11).cos())
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0_f64; p_total * p_total];
+        for row in 0..p_total {
+            for column in 0..p_total {
+                expected[row * p_total + column] = match (row < p_m, column < p_m) {
+                    (true, true) => row_hessians[0] * marginal[row] * marginal[column],
+                    (true, false) => row_hessians[1] * marginal[row] * logslope[column - p_m],
+                    (false, true) => row_hessians[2] * logslope[row - p_m] * marginal[column],
+                    (false, false) => {
+                        row_hessians[3] * logslope[row - p_m] * logslope[column - p_m]
+                    }
+                };
+            }
+        }
+
+        let backend = HvpKernelBackend::probe()
+            .expect("[bms_flex_row dense HVP parity] backend probe must succeed");
+        let stream = backend.stream.clone();
+        let storage = DeviceResidentRowHess {
+            hess: stream
+                .clone_htod(&row_hessians)
+                .expect("dense HVP parity hessian upload"),
+            marginal_design: stream
+                .clone_htod(&marginal)
+                .expect("dense HVP parity marginal upload"),
+            logslope_design: stream
+                .clone_htod(&logslope)
+                .expect("dense HVP parity logslope upload"),
+            n,
+            r,
+            block,
+            primary,
+            bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+        };
+        let actual = launch_bms_flex_row_dense(&storage)
+            .expect("wide dense HVP materialization must stay on CUDA");
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = 1.0e-10 * actual.abs().max(expected.abs()).max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "wide dense entry {index}: CUDA={actual:.17e} CPU={expected:.17e} tolerance={tolerance:.3e}"
             );
         }
     }

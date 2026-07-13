@@ -268,10 +268,9 @@ impl Drop for RowPrimaryEvalPin {
 ///   [`BernoulliMarginalSlopeFamily::cached_row_primary_eval`].
 /// - `Device` (Linux/CUDA only): row Hessian + designs live on the GPU.
 ///   HVP / diagonal / dense-block consumers route through the device-aware
-///   GPU entry points; the fused CPU gradient pass is the rare fallback (only
-///   when `p_total` exceeds the dense-block kernel's shared-memory cap) and
-///   recomputes the row kernel on the fly in that case, so the GPU output
-///   for `(neglog, grad)` is not mirrored on the host.
+///   GPU entry points. Widths above the direct dense kernel's shared-memory
+///   bound materialize through bounded multi-RHS device HVPs; device failures
+///   propagate instead of changing algorithms.
 pub enum RowPrimaryEvalCache {
     Empty,
     Host(RowPrimaryEvalPin),
@@ -310,9 +309,8 @@ impl RowPrimaryEvalCache {
 
     /// Returns the host-resident pin when the cache is materialised as a
     /// host pin. Returns `None` for the device-resident variant — callers
-    /// that need to read the full `r x r` Hessian per row must either
-    /// route through the device-aware HVP / diagonal entry points or fall
-    /// back to recomputing the row Hessian on the fly.
+    /// that need to read the full `r x r` Hessian per row must route through
+    /// the device-aware HVP / diagonal entry points.
     #[inline]
     pub(crate) fn host_pin(&self) -> Option<&RowPrimaryEvalPin> {
         match self {
@@ -378,8 +376,7 @@ pub(super) struct FlexAxisFourthRowTensors {
 /// forces degree-21 moments. Sharing the outer row slot removes the former
 /// pair of parallel cache hierarchies without coupling their work budgets.
 pub(super) struct BmsFlexRowProgramDerivativeCache {
-    pub(super) third:
-        gam_runtime::resource::RayonSafeOnce<Result<FlexAxisThirdRowTensors, String>>,
+    pub(super) third: gam_runtime::resource::RayonSafeOnce<Result<FlexAxisThirdRowTensors, String>>,
     pub(super) fourth:
         gam_runtime::resource::RayonSafeOnce<Result<FlexAxisFourthRowTensors, String>>,
 }

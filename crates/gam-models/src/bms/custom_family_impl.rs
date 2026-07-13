@@ -1554,6 +1554,29 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
             .clone()
     }
 
+    /// Materialize the joint Hessian from an already-selected device cache.
+    /// Width selects between the direct dense CUDA kernel and bounded
+    /// multi-RHS `H * I` inside `launch_bms_flex_row_dense`; every CUDA error
+    /// propagates and therefore cannot reach the CPU fused evaluator.
+    #[cfg(target_os = "linux")]
+    fn selected_device_dense_hessian(
+        &self,
+        operation: &str,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let Some(device_state) = self.cache.row_primary_hessians.device() else {
+            return Ok(None);
+        };
+        let p_total = self.cache.slices.total;
+        let flat = crate::bms::gpu::flex::require_selected_gpu_result(
+            operation,
+            crate::bms::gpu::row::launch_bms_flex_row_dense(device_state),
+        )?;
+        let dense = Array2::from_shape_vec((p_total, p_total), flat).map_err(|error| {
+            format!("BMS {operation}: {p_total}x{p_total} reshape failed: {error}")
+        })?;
+        Ok(Some(dense))
+    }
+
     /// Matrix-free inner-Newton/CG route for BMS flex large-n.
     ///
     /// Auto-selected when the workspace's per-row primary Hessian cache could
@@ -1612,34 +1635,12 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             }
             return Ok(None);
         }
-        // Device dense-block shortcut: when the row-primary Hessian is pinned on
-        // the GPU and `p_total` fits the shared-memory cap, dispatch the
-        // device-resident dense build instead of the CPU fused gradient pass.
+        // Device-resident state is a committed algorithm choice. The CUDA
+        // implementation selects direct dense vs bounded multi-RHS H*I by
+        // width and propagates every failure.
         #[cfg(target_os = "linux")]
-        {
-            if let Some(device_state) = self.cache.row_primary_hessians.device() {
-                let p_total = self.cache.slices.total;
-                if p_total <= crate::bms::gpu::row::DENSE_BLOCK_MAX_P {
-                    match crate::bms::gpu::row::launch_bms_flex_row_dense_block(device_state) {
-                        Ok(flat) => {
-                            let h_arr =
-                                Array2::from_shape_vec((p_total, p_total), flat).map_err(|e| {
-                                    format!(
-                                        "BMS hessian_dense: dense_block reshape \
-                                             {p_total}x{p_total} failed: {e}"
-                                    )
-                                })?;
-                            return Ok(Some(h_arr));
-                        }
-                        Err(err) => {
-                            log::info!(
-                                "[BMS hessian_dense] gpu_dense_block_failed: {err}; \
-                                 falling back to CPU fused-gradient dense build"
-                            );
-                        }
-                    }
-                }
-            }
+        if let Some(dense) = self.selected_device_dense_hessian("hessian_dense")? {
+            return Ok(Some(dense));
         }
         if log_exact_work(self.family.y.len()) {
             log::info!(
@@ -1678,35 +1679,11 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         // calls `hessian_dense_forced` (it pulls HVPs through `hessian_matvec`),
         // so serving the structural one-pass build here does not regress the
         // inner solve it was designed to keep matrix-free.
-        // shared-memory cap, dispatch the device-resident dense build
-        // instead of round-tripping through the CPU fused gradient pass.
-        // Numerics match the CPU pullback to within reduction-order f.p.
-        // noise (see `bms_flex_row_dense_block_kernel_matches_cpu_pullback`).
+        // Device-resident state stays on the selected CUDA algorithm. Wide
+        // matrices use multi-RHS H*I rather than crossing to CPU.
         #[cfg(target_os = "linux")]
-        {
-            if let Some(device_state) = self.cache.row_primary_hessians.device() {
-                let p_total = self.cache.slices.total;
-                if p_total <= crate::bms::gpu::row::DENSE_BLOCK_MAX_P {
-                    match crate::bms::gpu::row::launch_bms_flex_row_dense_block(device_state) {
-                        Ok(flat) => {
-                            let h_arr =
-                                Array2::from_shape_vec((p_total, p_total), flat).map_err(|e| {
-                                    format!(
-                                        "BMS hessian_dense_forced: dense_block reshape \
-                                             {p_total}x{p_total} failed: {e}"
-                                    )
-                                })?;
-                            return Ok(Some(h_arr));
-                        }
-                        Err(err) => {
-                            log::info!(
-                                "[BMS hessian_dense_forced] gpu_dense_block_failed: {err}; \
-                                 falling back to CPU fused-gradient dense build"
-                            );
-                        }
-                    }
-                }
-            }
+        if let Some(dense) = self.selected_device_dense_hessian("hessian_dense_forced")? {
+            return Ok(Some(dense));
         }
         self.fused_gradient_dense()
             .map(|fused| Some(fused.hessian.clone()))

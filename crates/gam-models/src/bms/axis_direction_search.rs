@@ -447,11 +447,11 @@ impl BernoulliMarginalSlopeFamily {
             // shared path and no serial bottleneck across the ~`n/tile_rows`
             // tiles.
             let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
-                    tiles.tiles.len(),
-                    |tile_range| -> Result<_, String> {
-                        let mut tile_out = Array1::<f64>::zeros(slices.total);
-                        let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
-                        for tile in &tiles.tiles[tile_range] {
+                tiles.tiles.len(),
+                |tile_range| -> Result<_, String> {
+                    let mut tile_out = Array1::<f64>::zeros(slices.total);
+                    let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
+                    for tile in &tiles.tiles[tile_range] {
                         let tile_rows = tile.rows.hess().nrows();
                         let mut v_rows = vec![0.0_f64; tile_rows * r_pr];
                         for local in 0..tile_rows {
@@ -466,9 +466,10 @@ impl BernoulliMarginalSlopeFamily {
                             v_rows[local * r_pr..(local + 1) * r_pr]
                                 .copy_from_slice(row_dir_scratch.as_slice().expect("contiguous"));
                         }
-                        let h_rows_slice = tile.rows.hess().as_slice().expect(
-                            "tiled row_primary_hessians.hess() is row-major contiguous",
-                        );
+                        let h_rows_slice =
+                            tile.rows.hess().as_slice().expect(
+                                "tiled row_primary_hessians.hess() is row-major contiguous",
+                            );
                         let inputs = row_hessian_ops::RowHessianMatvecInputs {
                             n_rows: tile_rows,
                             r: r_pr,
@@ -515,15 +516,15 @@ impl BernoulliMarginalSlopeFamily {
                                 &mut tile_out,
                             )?;
                         }
-                        }
-                        Ok(tile_out)
-                    },
-                    |mut left, right| -> Result<_, String> {
-                        left += &right;
-                        Ok(left)
-                    },
-                )?
-                .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
+                    }
+                    Ok(tile_out)
+                },
+                |mut left, right| -> Result<_, String> {
+                    left += &right;
+                    Ok(left)
+                },
+            )?
+            .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
             *out += &partial;
             return Ok(());
         }
@@ -658,16 +659,17 @@ impl BernoulliMarginalSlopeFamily {
             }
             let r_pr = primary.total;
             let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
-                    tiles.tiles.len(),
-                    |tile_range| -> Result<_, String> {
-                        let mut tile_out = Array2::<f64>::zeros((total, n_rhs));
-                        let mut col_scratch = Array1::<f64>::zeros(total);
-                        let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
-                        for tile in &tiles.tiles[tile_range] {
+                tiles.tiles.len(),
+                |tile_range| -> Result<_, String> {
+                    let mut tile_out = Array2::<f64>::zeros((total, n_rhs));
+                    let mut col_scratch = Array1::<f64>::zeros(total);
+                    let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
+                    for tile in &tiles.tiles[tile_range] {
                         let tile_rows = tile.rows.hess().nrows();
-                        let h_rows_slice = tile.rows.hess().as_slice().expect(
-                            "tiled row_primary_hessians.hess() is row-major contiguous",
-                        );
+                        let h_rows_slice =
+                            tile.rows.hess().as_slice().expect(
+                                "tiled row_primary_hessians.hess() is row-major contiguous",
+                            );
                         // One `v_rows` / `y_rows` buffer reused across all RHS
                         // columns within this tile so the per-tile working set
                         // stays one column wide regardless of `n_rhs`.
@@ -735,15 +737,15 @@ impl BernoulliMarginalSlopeFamily {
                                 )?;
                             }
                         }
-                        }
-                        Ok(tile_out)
-                    },
-                    |mut left, right| -> Result<_, String> {
-                        left += &right;
-                        Ok(left)
-                    },
-                )?
-                .unwrap_or_else(|| Array2::<f64>::zeros((total, n_rhs)));
+                    }
+                    Ok(tile_out)
+                },
+                |mut left, right| -> Result<_, String> {
+                    left += &right;
+                    Ok(left)
+                },
+            )?
+            .unwrap_or_else(|| Array2::<f64>::zeros((total, n_rhs)));
             *out += &partial;
             return Ok(());
         }

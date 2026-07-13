@@ -1008,3 +1008,26 @@ fn planted_corruption_tripwire_fails_932() {
         "#932 verify tripwire: corrupt err={err:.3e} > bound={bound:.3e}  (oracle has teeth)"
     );
 }
+
+#[test]
+fn selected_gpu_consumers_cannot_retry_on_cpu_932() {
+    let axis_source = include_str!("axis_direction_search.rs");
+    let workspace_source = include_str!("custom_family_impl.rs");
+
+    assert_eq!(
+        axis_source.matches("require_selected_gpu_result(").count(),
+        7,
+        "every device/host-pin/tiled HVP or diagonal CUDA dispatch must share the fail-closed contract"
+    );
+    assert_eq!(
+        workspace_source
+            .matches("require_selected_gpu_result(")
+            .count(),
+        1,
+        "dense and forced-dense must share one selected-device materializer"
+    );
+    assert!(!axis_source.contains("falling back to CPU"));
+    assert!(!workspace_source.contains("falling back to CPU"));
+    assert!(!workspace_source.contains("p_total <= crate::bms::gpu::row::DENSE_BLOCK_MAX_P"));
+    assert!(workspace_source.contains("launch_bms_flex_row_dense(device_state)"));
+}
