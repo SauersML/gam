@@ -1818,13 +1818,16 @@ impl SurvivalMarginalSlopeFamily {
                             block_states,
                             &mut logslope_workspace,
                         )?;
-                        let z = self.z.row(row).to_vec();
+                        let z_row = self.z.row(row);
+                        let z = z_row.as_slice().ok_or_else(|| {
+                            "per-score blockwise score row must be contiguous".to_string()
+                        })?;
                         let nll = row_primary_closed_form_vector_into(
                             q0,
                             q1,
                             qd1,
                             logslope_workspace.values(),
-                            &z,
+                            z,
                             &self.score_covariance,
                             self.weights[row],
                             self.event[row],
@@ -1947,6 +1950,7 @@ impl SurvivalMarginalSlopeFamily {
                     let mut acc = make_per_z_joint_acc();
                     let mut row_jet_arena = RigidVectorRowWorkspace::new(k)?;
                     let mut logslope_workspace = self.logslope_row_workspace()?;
+                    let mut j = Array2::<f64>::zeros((dim, total));
                     for row in range {
                         let q0 = self.design_entry.dot_row(row, beta_time)
                             + self.offset_entry[row]
@@ -1961,13 +1965,16 @@ impl SurvivalMarginalSlopeFamily {
                             block_states,
                             &mut logslope_workspace,
                         )?;
-                        let z = self.z.row(row).to_vec();
+                        let z_row = self.z.row(row);
+                        let z = z_row.as_slice().ok_or_else(|| {
+                            "per-score dense-joint score row must be contiguous".to_string()
+                        })?;
                         let nll = row_primary_closed_form_vector_into(
                             q0,
                             q1,
                             qd1,
                             logslope_workspace.values(),
-                            &z,
+                            z,
                             &self.score_covariance,
                             self.weights[row],
                             self.event[row],
@@ -1977,38 +1984,43 @@ impl SurvivalMarginalSlopeFamily {
                         )?;
                         let (f_pi, f_pipi) = row_jet_arena.derivatives();
                         acc.0 -= nll;
-                        let mut j = Array2::<f64>::zeros((dim, total));
-                        let entry = self.design_entry.try_row_chunk(row..row + 1).map_err(|e| {
-                            format!("evaluate_exact_newton_joint_dense_per_z entry row: {e}")
-                        })?;
-                        let exit = self.design_exit.try_row_chunk(row..row + 1).map_err(|e| {
-                            format!("evaluate_exact_newton_joint_dense_per_z exit row: {e}")
-                        })?;
-                        let deriv = self
-                            .design_derivative_exit
-                            .try_row_chunk(row..row + 1)
+                        self.design_entry
+                            .row_chunk_into(
+                                row..row + 1,
+                                j.slice_mut(s![0..1, slices.time.clone()]),
+                            )
+                            .map_err(|e| {
+                                format!("evaluate_exact_newton_joint_dense_per_z entry row: {e}")
+                            })?;
+                        self.design_exit
+                            .row_chunk_into(
+                                row..row + 1,
+                                j.slice_mut(s![1..2, slices.time.clone()]),
+                            )
+                            .map_err(|e| {
+                                format!("evaluate_exact_newton_joint_dense_per_z exit row: {e}")
+                            })?;
+                        self.design_derivative_exit
+                            .row_chunk_into(
+                                row..row + 1,
+                                j.slice_mut(s![2..3, slices.time.clone()]),
+                            )
                             .map_err(|e| {
                                 format!(
                                     "evaluate_exact_newton_joint_dense_per_z derivative row: {e}"
                                 )
                             })?;
-                        let marginal =
-                            self.marginal_design
-                                .try_row_chunk(row..row + 1)
-                                .map_err(|e| {
-                                    format!(
-                                        "evaluate_exact_newton_joint_dense_per_z marginal row: {e}"
-                                    )
-                                })?;
-                        j.slice_mut(s![0, slices.time.clone()])
-                            .assign(&entry.row(0));
-                        j.slice_mut(s![1, slices.time.clone()]).assign(&exit.row(0));
-                        j.slice_mut(s![2, slices.time.clone()])
-                            .assign(&deriv.row(0));
-                        j.slice_mut(s![0, slices.marginal.clone()])
-                            .assign(&marginal.row(0));
-                        j.slice_mut(s![1, slices.marginal.clone()])
-                            .assign(&marginal.row(0));
+                        self.marginal_design
+                            .row_chunk_into(
+                                row..row + 1,
+                                j.slice_mut(s![0..1, slices.marginal.clone()]),
+                            )
+                            .map_err(|e| {
+                                format!("evaluate_exact_newton_joint_dense_per_z marginal row: {e}")
+                            })?;
+                        for col in slices.marginal.clone() {
+                            j[[1, col]] = j[[0, col]];
+                        }
                         let channel_rows = logslope_workspace.channel_rows();
                         for coord in 0..k {
                             j.slice_mut(s![3 + coord, slices.logslope.clone()])
