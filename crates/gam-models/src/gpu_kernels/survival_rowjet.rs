@@ -15,6 +15,10 @@
 
 #[cfg(target_os = "linux")]
 use crate::survival::marginal_slope::row_kernel::RIGID_ROW_PROGRAM_CUDA_VGH;
+#[cfg(target_os = "linux")]
+use cudarc::nvrtc::Ptx;
+#[cfg(target_os = "linux")]
+use gam_gpu::gpu_error::GpuError;
 
 /// Flattened row-major value, gradient, and Hessian channels for `K = 4`.
 #[cfg(target_os = "linux")]
@@ -96,9 +100,15 @@ fn survival_rowjet_source() -> &'static str {
     })
 }
 
+/// Compile the exact CUDA source used by the production survival V/G/H module.
+#[cfg(target_os = "linux")]
+pub fn compile_survival_rowjet_ptx() -> Result<Ptx, GpuError> {
+    gam_gpu::device_cache::compile_ptx_arch(survival_rowjet_source())
+}
+
 #[cfg(target_os = "linux")]
 mod device {
-    use super::{SurvivalRowInputs, SurvivalRowVghChannels, survival_rowjet_source};
+    use super::{SurvivalRowInputs, SurvivalRowVghChannels, compile_survival_rowjet_ptx};
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -133,7 +143,7 @@ mod device {
         }
         // The shared compiler pins the real device architecture and disables
         // FMA contraction for close parity with separately rounded host ops.
-        let ptx = gam_gpu::device_cache::compile_ptx_arch(survival_rowjet_source())
+        let ptx = compile_survival_rowjet_ptx()
             .gpu_ctx_with(|error| format!("survival_rowjet NVRTC compile: {error}"))?;
         let module = backend
             .ctx
