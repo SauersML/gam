@@ -8073,19 +8073,20 @@ mod tests {
             .expect("line race has a realizable candidate");
 
         assert_eq!(
-            circle_fit.basis_kind,
-            SaeAtomBasisKind::Periodic,
+            circle_fit.geometry.kind(),
+            &SaeAtomBasisKind::Periodic,
             "a circular birth residual must win the circle (Periodic) topology"
         );
         assert_eq!(
-            line_fit.basis_kind,
-            SaeAtomBasisKind::EuclideanPatch,
+            line_fit.geometry.kind(),
+            &SaeAtomBasisKind::EuclideanPatch,
             "a straight birth residual must win the line (EuclideanPatch) topology"
         );
         // The crux: the two atoms get DIFFERENT topologies by evidence — the
         // dictionary is heterogeneous, not all-circle.
         assert_ne!(
-            circle_fit.basis_kind, line_fit.basis_kind,
+            circle_fit.geometry.kind(),
+            line_fit.geometry.kind(),
             "the discovery must assign DIFFERENT topologies to the circle and line \
              atoms (evidence-chosen, not inherited)"
         );
@@ -8116,21 +8117,24 @@ mod tests {
         let specs = topology_candidates_for_dim(coords.view(), 2).expect("d=2 candidates build");
         let has_cylinder = specs
             .iter()
-            .any(|s| s.basis_kind == SaeAtomBasisKind::Cylinder);
+            .any(|s| s.geometry.kind() == &SaeAtomBasisKind::Cylinder);
         assert!(
             has_cylinder,
             "the d=2 topology-race candidate set MUST include the Cylinder kind; got {:?}",
-            specs.iter().map(|s| &s.basis_kind).collect::<Vec<_>>()
+            specs
+                .iter()
+                .map(|s| s.geometry.kind())
+                .collect::<Vec<_>>()
         );
         let has_torus = specs
             .iter()
-            .any(|s| s.basis_kind == SaeAtomBasisKind::Torus);
+            .any(|s| s.geometry.kind() == &SaeAtomBasisKind::Torus);
         let has_sphere = specs
             .iter()
-            .any(|s| s.basis_kind == SaeAtomBasisKind::Sphere);
+            .any(|s| s.geometry.kind() == &SaeAtomBasisKind::Sphere);
         let has_patch = specs
             .iter()
-            .any(|s| s.basis_kind == SaeAtomBasisKind::EuclideanPatch);
+            .any(|s| s.geometry.kind() == &SaeAtomBasisKind::EuclideanPatch);
         assert!(
             has_torus && has_sphere && has_patch,
             "the d=2 race must be COMPLETE (torus + sphere + euclidean + cylinder)"
@@ -8155,11 +8159,11 @@ mod tests {
             .expect("cylinder race runs")
             .expect("cylinder race has a realizable candidate");
         assert_eq!(
-            cyl_fit.basis_kind,
-            SaeAtomBasisKind::Cylinder,
+            cyl_fit.geometry.kind(),
+            &SaeAtomBasisKind::Cylinder,
             "a cylindrical birth residual (periodic along one axis, linear along the \
              other) must win the Cylinder topology by evidence; got {:?}",
-            cyl_fit.basis_kind
+            cyl_fit.geometry.kind()
         );
     }
 
