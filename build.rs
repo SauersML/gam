@@ -5040,16 +5040,22 @@ fn derivative_declarations(source: &str, test_mask: &[bool]) -> Vec<DerivativeDe
             continue;
         }
         let trimmed = lines[line_index].trim();
+        // `row_atom!` accepts normal Rust visibility (`pub`, `pub(crate)`,
+        // `pub(super)`, and `pub(in path)`).  Canonicalize those declarations to
+        // their `fn ...` identity before classification so visibility cannot be
+        // used to hide a generated third/fourth-order specialization from this
+        // registry.  Trait implementations have no visibility and stay intact.
+        let canonical_function = function_declaration_without_visibility(trimmed);
         let starts_relevant_declaration = trimmed.starts_with("impl ")
             || trimmed.starts_with("impl<")
-            || trimmed.starts_with("fn ");
+            || canonical_function.is_some();
         if !starts_relevant_declaration {
             line_index += 1;
             continue;
         }
 
         let start = line_index;
-        let mut source = trimmed.to_string();
+        let mut source = canonical_function.unwrap_or(trimmed).to_string();
         while !source.contains('{') && !source.ends_with(';') && line_index + 1 < lines.len() {
             line_index += 1;
             if test_mask.get(line_index).copied().unwrap_or(false) {
@@ -5065,6 +5071,39 @@ fn derivative_declarations(source: &str, test_mask: &[bool]) -> Vec<DerivativeDe
         line_index += 1;
     }
     declarations
+}
+
+fn function_declaration_without_visibility(source: &str) -> Option<&str> {
+    let mut declaration = source.trim_start();
+    if let Some(after_pub) = declaration.strip_prefix("pub") {
+        declaration = if let Some(after_space) = after_pub.strip_prefix(char::is_whitespace) {
+            after_space.trim_start()
+        } else if let Some(scoped) = after_pub.strip_prefix('(') {
+            let mut depth = 1usize;
+            let mut scope_end = None;
+            for (index, byte) in scoped.bytes().enumerate() {
+                match byte {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            scope_end = Some(index + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let after_scope = scoped.get(scope_end?..) ?;
+            if !after_scope.starts_with(char::is_whitespace) {
+                return None;
+            }
+            after_scope.trim_start()
+        } else {
+            return None;
+        };
+    }
+    declaration.starts_with("fn ").then_some(declaration)
 }
 
 fn implemented_trait_from_declaration(declaration: &str) -> Option<&str> {
