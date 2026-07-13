@@ -313,6 +313,10 @@ pub struct GaussianPcaPatch {
     pub projection_fit_rows: usize,
     pub inference_rows: usize,
     pub centering: GaussianPatchCentering,
+    /// Exact Wishart degrees of freedom implied by `inference_rows` and
+    /// `centering`, validated once at construction and carried into every
+    /// variance, tail, and occupancy prescription.
+    pub covariance_degrees_of_freedom: usize,
     pub projection_frame: Array2<f64>,
     pub tangent_coordinates: Array2<f64>,
     pub noise_variance_estimate: f64,
@@ -406,12 +410,12 @@ impl GaussianPcaPatch {
                 }
             }
         }
-        let _ = covariance_dof;
         Ok(Self {
             chart,
             projection_fit_rows,
             inference_rows,
             centering,
+            covariance_degrees_of_freedom: covariance_dof,
             projection_frame,
             tangent_coordinates,
             noise_variance_estimate,
@@ -432,9 +436,7 @@ impl GaussianPcaPatch {
 
     #[must_use]
     pub fn covariance_degrees_of_freedom(&self) -> usize {
-        self.centering
-            .covariance_degrees_of_freedom(self.inference_rows)
-            .unwrap_or(0)
+        self.covariance_degrees_of_freedom
     }
 
     #[must_use]
