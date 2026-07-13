@@ -2336,8 +2336,7 @@ impl SaeManifoldTerm {
                 for direction in directions {
                     let mut decoded_motion = vec![0.0_f64; self.output_dim()];
                     for axis in 0..2 {
-                        self.atoms[atom_idx]
-                            .fill_decoded_derivative_row(row, axis, &mut tangent);
+                        self.atoms[atom_idx].fill_decoded_derivative_row(row, axis, &mut tangent);
                         for output in 0..decoded_motion.len() {
                             decoded_motion[output] += direction[axis] * tangent[output];
                         }

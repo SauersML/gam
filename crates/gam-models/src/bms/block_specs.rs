@@ -63,94 +63,6 @@ pub(super) const GAUGE_PRIORITY_LINK_DEV: u8 = 60;
 /// inner-solve-reported objective without moving the selected length scale.
 pub(crate) const EXACT_SPATIAL_OUTER_TOL_FLOOR: f64 = 1e-6;
 
-/// Derive the BMS exact outer-evaluation options from the row measure selected
-/// by the spatial optimizer.
-///
-/// The callback's [`RowSet`](crate::row_kernel::RowSet) is the sole authority
-/// for this evaluation. Reusing either a caller-carried pilot mask or automatic
-/// sampling would let the inner fit and its outer derivatives describe a
-/// different Horvitz--Thompson measure. `All` therefore clears every stale
-/// pilot just as deliberately as `Subsample` installs the optimizer-selected
-/// weighted rows.
-pub(crate) fn bms_exact_outer_options(
-    options: &BlockwiseFitOptions,
-    row_set: &crate::row_kernel::RowSet,
-) -> BlockwiseFitOptions {
-    let mut effective = options.clone();
-    effective.auto_outer_subsample = false;
-    effective.outer_score_subsample = match row_set {
-        crate::row_kernel::RowSet::All => None,
-        crate::row_kernel::RowSet::Subsample { rows, n_full } => Some(Arc::new(
-            crate::outer_subsample::OuterScoreSubsample::from_weighted_rows(
-                rows.as_ref().clone(),
-                *n_full,
-                0,
-            ),
-        )),
-    };
-    effective
-}
-
-#[cfg(test)]
-mod exact_outer_options_tests {
-    use super::*;
-
-    #[test]
-    fn exact_outer_options_follow_authoritative_row_set() {
-        let mut options = BlockwiseFitOptions::default();
-        options.auto_outer_subsample = true;
-        options.outer_score_subsample = Some(Arc::new(
-            crate::outer_subsample::OuterScoreSubsample::from_uniform_inclusion_mask(
-                vec![9],
-                10,
-                17,
-            ),
-        ));
-
-        let rows = Arc::new(vec![
-            gam_problem::outer_subsample::WeightedOuterRow {
-                index: 1,
-                weight: 2.5,
-                stratum: 3,
-            },
-            gam_problem::outer_subsample::WeightedOuterRow {
-                index: 7,
-                weight: 4.0,
-                stratum: 8,
-            },
-        ]);
-        let sampled = bms_exact_outer_options(
-            &options,
-            &crate::row_kernel::RowSet::Subsample { rows, n_full: 11 },
-        );
-        assert!(!sampled.auto_outer_subsample);
-        let installed = sampled
-            .outer_score_subsample
-            .as_ref()
-            .expect("BMS exact outer pilot row measure");
-        assert_eq!(installed.n_full, 11);
-        assert_eq!(installed.seed, 0);
-        assert_eq!(installed.rows.len(), 2);
-        assert_eq!(installed.rows[0].index, 1);
-        assert_eq!(installed.rows[0].weight.to_bits(), 2.5_f64.to_bits());
-        assert_eq!(installed.rows[0].stratum, 3);
-        assert_eq!(installed.rows[1].index, 7);
-        assert_eq!(installed.rows[1].weight.to_bits(), 4.0_f64.to_bits());
-        assert_eq!(installed.rows[1].stratum, 8);
-
-        let full = bms_exact_outer_options(&options, &crate::row_kernel::RowSet::All);
-        assert!(!full.auto_outer_subsample);
-        assert!(
-            full.outer_score_subsample.is_none(),
-            "full-data replay must clear every stale pilot mask"
-        );
-        assert!(
-            options.outer_score_subsample.is_some(),
-            "deriving the effective measure must not mutate caller options"
-        );
-    }
-}
-
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
 //
 // BMS has a single Bernoulli output per row (n_outputs = 1). The observed η is
@@ -2017,6 +1929,31 @@ fn inner_fit(
     fit_custom_family(family, blocks, &options).map_err(|e| e.to_string())
 }
 
+fn inner_fit_from_certified_outer(
+    family: &BernoulliMarginalSlopeFamily,
+    blocks: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    warm_start: Option<&CustomFamilyWarmStart>,
+    theta: &Array1<f64>,
+    outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
+) -> Result<UnifiedFitResult, String> {
+    let mut options = crate::outer_subsample::exact_outer_options_for_row_set(
+        options,
+        &crate::row_kernel::RowSet::All,
+    );
+    options.use_outer_hessian = false;
+    options.outer_tol = options.outer_tol.max(2.0e-5);
+    fit_custom_family_fixed_log_lambdas_from_outer(
+        family,
+        blocks,
+        &options,
+        warm_start,
+        theta,
+        outer,
+    )
+    .map_err(|error| error.to_string())
+}
+
 pub fn fit_bernoulli_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: BernoulliMarginalSlopeTermSpec,
@@ -2832,7 +2769,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         true,
         None,
         outer_policy,
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], _provenance| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
             if let Some(err) = runaway_error.borrow().as_ref().cloned() {
                 return Err(err);
             }
@@ -2846,7 +2783,22 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let sigma = sigma_from_theta(theta);
             final_sigma_cell.set(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
-            let fit = inner_fit(&family, &blocks, options)?;
+            let fit = match provenance {
+                SpatialFitProvenance::NoOuterOptimization => {
+                    inner_fit(&family, &blocks, options)?
+                }
+                SpatialFitProvenance::Certified(outer) => {
+                    let warm_start = exact_warm_start.borrow();
+                    inner_fit_from_certified_outer(
+                        &family,
+                        &blocks,
+                        options,
+                        warm_start.as_ref(),
+                        theta,
+                        outer,
+                    )?
+                }
+            };
             if let Some(block) = fit.block_states.first()
                 && let Some(err) = bernoulli_marginal_slope_runaway_error_from_beta(
                     block.beta.view(),
@@ -2940,7 +2892,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
             };
             let tolerance_options =
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
-            let eval_options = bms_exact_outer_options(&tolerance_options, row_set);
+            let eval_options = crate::outer_subsample::exact_outer_options_for_row_set(
+                &tolerance_options,
+                row_set,
+            );
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
                 &blocks,
@@ -2975,7 +2930,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
             }
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta,
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign],
+         row_set: &crate::row_kernel::RowSet| {
             if let Some(err) = runaway_error.borrow().as_ref().cloned() {
                 return Err(err);
             }
@@ -2998,10 +2956,13 @@ pub fn fit_bernoulli_marginal_slope_terms(
             final_sigma_cell.set(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
+            let tolerance_options =
+                joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
+            let eval_options = bms_exact_outer_options(&tolerance_options, row_set);
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
                 &blocks,
-                &joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol),
+                &eval_options,
                 &rho,
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),

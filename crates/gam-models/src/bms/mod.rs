@@ -5,10 +5,11 @@ use crate::custom_family::{
     ExactNewtonJointHessianWorkspace, FamilyEvaluation, FamilyLinearizationState,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
-    fit_custom_family, joint_hyper_options_for_outer_tolerance,
+    fit_custom_family, fit_custom_family_fixed_log_lambdas_from_outer,
+    joint_hyper_options_for_outer_tolerance,
 };
 use crate::fit_orchestration::drivers::{
-    ExactJointHyperSetup, apply_spatial_anisotropy_pilot_initializer,
+    ExactJointHyperSetup, SpatialFitProvenance, apply_spatial_anisotropy_pilot_initializer,
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };

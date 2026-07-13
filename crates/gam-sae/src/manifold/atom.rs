@@ -341,8 +341,8 @@ impl ArdAxisPrior {
 #[derive(Debug, Clone)]
 pub struct SaeManifoldAtom {
     pub name: String,
-    pub basis_kind: SaeAtomBasisKind,
-    pub latent_dim: usize,
+    basis_kind: SaeAtomBasisKind,
+    latent_dim: usize,
     pub basis_values: Array2<f64>,
     pub basis_jacobian: Array3<f64>,
     pub decoder_coefficients: Array2<f64>,
@@ -358,13 +358,13 @@ pub struct SaeManifoldAtom {
     /// the declared final-function seminorm, with exact gradient
     /// `lambda * S_ref * B` and Hessian `lambda * (S_ref tensor I)`. It is not
     /// the moving intrinsic bending energy of the current decoder.
-    pub smooth_penalty: Array2<f64>,
+    smooth_penalty: Array2<f64>,
     /// Which explicit declaration produced [`Self::smooth_penalty`].
-    pub reference_roughness_kind: SaeReferenceRoughnessKind,
+    reference_roughness_kind: SaeReferenceRoughnessKind,
     /// Persisted analytic geometry authority for atoms built by the native
     /// lifecycle. Hand-assembled/precomputed atoms may omit it, but an atom
     /// without this plan cannot be serialized for analytic rebuild or OOS.
-    pub geometry_plan: Option<SaeAtomGeometryPlan>,
+    geometry_plan: Option<SaeAtomGeometryPlan>,
     pub basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
     /// Same evaluator upcast to `dyn SaeBasisSecondJet` when the
     /// implementation provides a closed-form Hessian. `None` for
@@ -452,6 +452,59 @@ pub struct SaeManifoldAtom {
 }
 
 impl SaeManifoldAtom {
+    pub fn basis_kind(&self) -> &SaeAtomBasisKind {
+        &self.basis_kind
+    }
+
+    pub fn latent_dim(&self) -> usize {
+        self.latent_dim
+    }
+
+    pub fn smooth_penalty(&self) -> &Array2<f64> {
+        &self.smooth_penalty
+    }
+
+    pub fn reference_roughness_kind(&self) -> SaeReferenceRoughnessKind {
+        self.reference_roughness_kind
+    }
+
+    pub fn geometry_plan(&self) -> Option<&SaeAtomGeometryPlan> {
+        self.geometry_plan.as_ref()
+    }
+
+    /// Install the congruence-transformed representation of the already
+    /// declared reference-function Gram after an exact basis change. This is
+    /// the only mutation seam for the Gram outside this type; it validates the
+    /// new matrix before making the atomic replacement and never changes the
+    /// reference metric provenance or geometry plan.
+    pub(crate) fn install_transported_smooth_penalty(
+        &mut self,
+        penalty: Array2<f64>,
+    ) -> Result<(), String> {
+        self.smooth_penalty =
+            Self::validate_reference_function_gram(penalty, self.basis_size(), false)?;
+        Ok(())
+    }
+
+    /// Restore an exact Gram captured from this same atom by the line-search
+    /// snapshot. The shape check prevents a stale snapshot from crossing a
+    /// structural basis change; no eigendecomposition is repeated on this hot
+    /// rollback path because the snapshot was copied from validated state.
+    pub(crate) fn restore_smooth_penalty_snapshot(
+        &mut self,
+        penalty: &Array2<f64>,
+    ) -> Result<(), String> {
+        if penalty.dim() != self.smooth_penalty.dim() {
+            return Err(format!(
+                "SaeManifoldAtom::restore_smooth_penalty_snapshot: snapshot shape {:?} != live shape {:?}",
+                penalty.dim(),
+                self.smooth_penalty.dim()
+            ));
+        }
+        self.smooth_penalty.assign(penalty);
+        Ok(())
+    }
+
     #[must_use = "build error must be handled"]
     pub fn new(
         name: impl Into<String>,

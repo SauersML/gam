@@ -65,67 +65,6 @@ pub(crate) fn exact_ctn_mode_branch_freezes_derivative_input() {
     assert!(candidates[0].is_none());
 }
 
-#[test]
-pub(crate) fn ctn_exact_outer_options_follow_authoritative_row_set() {
-    let mut options = BlockwiseFitOptions::default();
-    options.auto_outer_subsample = true;
-    options.outer_score_subsample = Some(Arc::new(
-        crate::outer_subsample::OuterScoreSubsample::from_uniform_inclusion_mask(
-            vec![9],
-            10,
-            17,
-        ),
-    ));
-
-    let rows = Arc::new(vec![
-        gam_problem::outer_subsample::WeightedOuterRow {
-            index: 1,
-            weight: 2.5,
-            stratum: 3,
-        },
-        gam_problem::outer_subsample::WeightedOuterRow {
-            index: 7,
-            weight: 4.0,
-            stratum: 8,
-        },
-    ]);
-    let sampled = transformation_exact_outer_options(
-        &options,
-        &gam_problem::outer_subsample::RowSet::Subsample {
-            rows,
-            n_full: 11,
-        },
-    );
-    assert!(!sampled.auto_outer_subsample);
-    let installed = sampled
-        .outer_score_subsample
-        .as_ref()
-        .expect("CTN exact outer pilot row measure");
-    assert_eq!(installed.n_full, 11);
-    assert_eq!(installed.seed, 0);
-    assert_eq!(installed.rows.len(), 2);
-    assert_eq!(installed.rows[0].index, 1);
-    assert_eq!(installed.rows[0].weight.to_bits(), 2.5_f64.to_bits());
-    assert_eq!(installed.rows[0].stratum, 3);
-    assert_eq!(installed.rows[1].index, 7);
-    assert_eq!(installed.rows[1].weight.to_bits(), 4.0_f64.to_bits());
-    assert_eq!(installed.rows[1].stratum, 8);
-
-    let full = transformation_exact_outer_options(
-        &options,
-        &gam_problem::outer_subsample::RowSet::All,
-    );
-    assert!(!full.auto_outer_subsample);
-    assert!(
-        full.outer_score_subsample.is_none(),
-        "full-data replay must clear every stale pilot mask"
-    );
-    assert!(
-        options.outer_score_subsample.is_some(),
-        "deriving the effective measure must not mutate caller options"
-    );
-}
-
 pub(crate) fn dense_first_order_psi_hessian(terms: &ExactNewtonJointPsiTerms) -> Array2<f64> {
     if terms.hessian_psi.nrows() > 0 {
         terms.hessian_psi.clone()

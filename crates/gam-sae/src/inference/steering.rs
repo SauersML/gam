@@ -405,7 +405,7 @@ pub fn steer_delta(
         ));
     }
     let atom = &model.atoms[atom_k];
-    let d = atom.latent_dim;
+    let d = atom.latent_dim();
     let p = atom.output_dim();
     if t_from.len() != d || t_to.len() != d {
         return Err(format!(
@@ -561,7 +561,7 @@ pub fn predicted_response(
         ));
     }
     let atom = &model.atoms[atom_k];
-    let d = atom.latent_dim;
+    let d = atom.latent_dim();
     let p = atom.output_dim();
     if t_at.len() != d {
         return Err(format!(
@@ -1194,7 +1194,7 @@ fn decode_tangents_at(
         "steer_delta::decode_tangents_at: atom has no installed basis evaluator".to_string()
     })?;
     let p = atom.output_dim();
-    let d = atom.latent_dim;
+    let d = atom.latent_dim();
     let coords = Array2::from_shape_vec((1, d), t.to_vec())
         .map_err(|e| format!("steer_delta::decode_tangents_at: coord shape: {e}"))?;
     let jet = if atom.homotopy_eta == 1.0 {
@@ -1541,7 +1541,7 @@ pub fn collateral_curve(
             "collateral_curve: atom index {atom_k} out of range (term has {k} atoms)"
         ));
     }
-    let d_k = model.atoms[atom_k].latent_dim;
+    let d_k = model.atoms[atom_k].latent_dim();
     if axis >= d_k {
         return Err(format!(
             "collateral_curve: axis {axis} out of range for atom {atom_k} latent_dim {d_k}"

@@ -186,6 +186,29 @@ pub(crate) fn inner_fit(
     fit_custom_family(family, blocks, options).map_err(|e| e.to_string())
 }
 
+pub(crate) fn inner_fit_from_certified_outer(
+    family: &SurvivalMarginalSlopeFamily,
+    blocks: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    warm_start: Option<&CustomFamilyWarmStart>,
+    theta: &Array1<f64>,
+    outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
+) -> Result<UnifiedFitResult, String> {
+    let options = survival_marginal_slope_exact_outer_options(
+        options,
+        &crate::row_kernel::RowSet::All,
+    );
+    fit_custom_family_fixed_log_lambdas_from_outer(
+        family,
+        blocks,
+        &options,
+        warm_start,
+        theta,
+        outer,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Marginal-slope guard policy: the guard is required to be strictly positive
 /// (`q'(t) ≥ guard > 0`), because the row-wise representation here is the *only*
 /// place the monotonicity barrier lives — a zero guard would silently collapse

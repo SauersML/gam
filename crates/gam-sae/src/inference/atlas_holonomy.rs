@@ -1137,7 +1137,7 @@ impl GaussianPcaErrorModel {
             .iter()
             .map(|value| value.abs())
             .fold(0.0_f64, f64::max)
-            .max(1.0);
+            .max(f64::MIN_POSITIVE);
         let backward_error = f64::EPSILON * dimension.max(1) as f64 * scale;
         let mut symmetric = covariance;
         for row in 0..dimension {
@@ -1440,7 +1440,7 @@ impl GaussBonnetNoiseSource {
             .iter()
             .map(|value| value.abs())
             .fold(0.0_f64, f64::max)
-            .max(1.0);
+            .max(f64::MIN_POSITIVE);
         let backward_error = f64::EPSILON * rows as f64 * scale;
         let mut symmetric = covariance.clone();
         for i in 0..rows {
@@ -2263,6 +2263,17 @@ mod tests {
             .copied()
             .unwrap();
         let joint = Array2::<f64>::zeros((dimension, dimension));
+        let mut tiny_indefinite = joint.clone();
+        tiny_indefinite[[0, 0]] = -1.0e-30;
+        assert!(
+            GaussianPcaErrorModel::certified_joint(
+                &patches,
+                CrossPatchCovarianceProvenance::ExplicitJointCovariance,
+                tiny_indefinite,
+            )
+            .is_err(),
+            "covariance validation must be relative to its own scale"
+        );
         assert!(
             GaussianPcaErrorModel::certified_joint(
                 &patches,
@@ -2572,6 +2583,9 @@ mod tests {
         let rejection_rate = rejections as f64 / REPLICATES as f64;
         let nominal = cycle.gaussian_error_budget;
         let binomial_standard_error = (nominal * (1.0 - nominal) / REPLICATES as f64).sqrt();
+        eprintln!(
+            "ATLAS_CALIBRATION linearized_projectors replicates={REPLICATES} plugin_sd={plugin_standard_error:.9e} empirical_sd={empirical_sd:.9e} nominal={nominal:.6} rejection_rate={rejection_rate:.6}"
+        );
         assert!(
             (rejection_rate - nominal).abs() <= 5.0 * binomial_standard_error,
             "nominal={nominal:.6}, empirical rejection={rejection_rate:.6}"
@@ -2645,6 +2659,9 @@ mod tests {
         let rejection_rate = rejections as f64 / REPLICATES as f64;
         let nominal = 0.05;
         let binomial_standard_error = (nominal * (1.0 - nominal) / REPLICATES as f64).sqrt();
+        eprintln!(
+            "ATLAS_CALIBRATION actual_row_pca replicates={REPLICATES} rows_per_patch={ROWS_PER_PATCH} plugin_sd={plugin_standard_error:.9e} empirical_sd={empirical_sd:.9e} nominal={nominal:.6} rejection_rate={rejection_rate:.6}"
+        );
         assert!(
             (rejection_rate - nominal).abs() <= 5.0 * binomial_standard_error,
             "nominal={nominal:.6}, actual-row PCA rejection={rejection_rate:.6}"
@@ -2675,6 +2692,9 @@ mod tests {
         let power = alternative_rejections as f64 / REPLICATES as f64;
         let null_mc_se = (alpha * (1.0 - alpha) / REPLICATES as f64).sqrt();
         let power_mc_se = (expected_power * (1.0 - expected_power) / REPLICATES as f64).sqrt();
+        eprintln!(
+            "ATLAS_CALIBRATION gaussian_oracle replicates={REPLICATES} nominal={alpha:.6} null_rate={null_rate:.6} expected_power={expected_power:.6} observed_power={power:.6}"
+        );
         assert!((null_rate - alpha).abs() <= 5.0 * null_mc_se);
         assert!((power - expected_power).abs() <= 5.0 * power_mc_se);
         assert!(power > null_rate);
@@ -2708,6 +2728,9 @@ mod tests {
             flips += usize::from(determinant_2(fitted_b.t().dot(&fitted_a).view()) < 0.0);
         }
         let observed = flips as f64 / REPLICATES as f64;
+        eprintln!(
+            "ATLAS_CALIBRATION linearized_orientation replicates={REPLICATES} flips={flips} observed_rate={observed:.9e} bound={bound:.9e}"
+        );
         assert!(
             observed <= bound + 1.0 / REPLICATES as f64,
             "observed flip rate {observed:.6e} exceeded finite-sample bound {bound:.6e}"
@@ -2782,6 +2805,9 @@ mod tests {
                 smallest_row_flips = flips;
             }
             let observed = flips as f64 / REPLICATES as f64;
+            eprintln!(
+                "ATLAS_CALIBRATION wishart_orientation rows={rows} replicates={REPLICATES} flips={flips} observed_rate={observed:.9e} bound={bound:.9e}"
+            );
             assert!(
                 observed <= bound + 1.0 / REPLICATES as f64,
                 "rows={rows}, observed Wishart-PCA flips={observed:.6}, bound={bound:.6}"
@@ -2844,6 +2870,13 @@ mod tests {
             .map(|edge| edge.projected_dimension)
             .collect();
         assert_eq!(base_ranks, padded_ranks);
+        eprintln!(
+            "ATLAS_PROJECTION ambient_base=3 ambient_padded=100 projected_ranks={base_ranks:?} base_variance={:.9e} padded_variance={:.9e} base_tail={:.9e} padded_tail={:.9e}",
+            base.cycles()[0].first_order_variance.unwrap(),
+            padded.cycles()[0].first_order_variance.unwrap(),
+            base.orientation_flip_probability_bound().unwrap(),
+            padded.orientation_flip_probability_bound().unwrap(),
+        );
         assert_near(
             base.cycles()[0].first_order_variance.unwrap(),
             padded.cycles()[0].first_order_variance.unwrap(),
@@ -3075,6 +3108,10 @@ mod tests {
     #[test]
     fn gauss_bonnet_degeneracy_is_relative_to_the_covariance_scale() {
         let variance = 1.0e-30;
+        assert!(
+            GaussBonnetNoiseSource::new(0, arr2(&[[-variance]])).is_err(),
+            "a tiny negative variance must not hide below an absolute tolerance"
+        );
         let input = GaussBonnetInput::certified_independent_gaussian(
             vec![GaussBonnetNoiseSource::new(0, arr2(&[[variance]])).unwrap()],
             vec![
@@ -3168,6 +3205,10 @@ mod tests {
         let binomial_standard_error =
             (target_misround_probability * (1.0 - target_misround_probability) / REPLICATES as f64)
                 .sqrt();
+        eprintln!(
+            "ATLAS_CALIBRATION gauss_bonnet replicates={REPLICATES} target_bound={target_misround_probability:.6} observed_misround={observed:.6} shared_covariance_adjustment={:.9e} deterministic_remainder={deterministic_remainder:.6}",
+            template_confidence.shared_source_covariance_adjustment
+        );
         assert!(
             observed <= target_misround_probability + 5.0 * binomial_standard_error,
             "declared upper bound={target_misround_probability:.6}, observed={observed:.6}"

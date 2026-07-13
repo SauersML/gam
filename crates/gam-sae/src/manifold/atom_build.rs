@@ -467,19 +467,19 @@ impl SaeFittedAtomPlan {
 pub fn sae_fitted_atom_plans(term: &SaeManifoldTerm) -> Result<Vec<SaeFittedAtomPlan>, String> {
     let mut plans = Vec::with_capacity(term.k_atoms());
     for (atom_idx, atom) in term.atoms.iter().enumerate() {
-        let geometry = atom.geometry_plan.as_ref().ok_or_else(|| {
+        let geometry = atom.geometry_plan().ok_or_else(|| {
             format!(
                 "sae_fitted_atom_plans: analytic atom {atom_idx} ({:?}) has no persisted geometry plan",
-                atom.basis_kind
+                atom.basis_kind()
             )
         })?;
-        if geometry.kind() != &atom.basis_kind || geometry.latent_dim() != atom.latent_dim {
+        if geometry.kind() != atom.basis_kind() || geometry.latent_dim() != atom.latent_dim() {
             return Err(format!(
                 "sae_fitted_atom_plans: atom {atom_idx} plan ({:?}, dim={}) disagrees with atom ({:?}, dim={})",
                 geometry.kind(),
                 geometry.latent_dim(),
-                atom.basis_kind,
-                atom.latent_dim
+                atom.basis_kind(),
+                atom.latent_dim()
             ));
         }
         let planned_width = geometry.basis_size()?;

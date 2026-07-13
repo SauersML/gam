@@ -147,8 +147,13 @@ pub(crate) fn fit_reduced_parametric_aft(
 /// runs, because the location-scale finalizer empties `UnifiedFitResult::block_states`
 /// (see `survival_fit_from_parts` — `block_states: Vec::new()`), and the family's
 /// `offset_channel_geometry` method needs the raw, populated per-block state.
-pub(crate) fn fit_survival_location_scale_with_geometry(
+fn fit_survival_location_scale_with_geometry_authority(
     spec: SurvivalLocationScaleSpec,
+    certified_outer: Option<(
+        &Array1<f64>,
+        &gam_solve::rho_optimizer::CertifiedOuterResult,
+        Option<&CustomFamilyWarmStart>,
+    )>,
 ) -> Result<(UnifiedFitResult, SurvivalLocationScaleConvergedGeometry), String> {
     let prepared = prepare_survival_location_scale_model(&spec)?;
     let options = survival_blockwise_fit_options(&spec);
@@ -163,7 +168,27 @@ pub(crate) fn fit_survival_location_scale_with_geometry(
     // genuinely flexible or penalized survival LS fit keeps the full coupled
     // path below.
     let fit = if prepared.is_reduced_parametric_aft() {
+        if certified_outer.is_some() {
+            return Err(SurvivalLocationScaleError::InternalInvariant {
+                reason: "a reduced unpenalized AFT fit cannot carry an optimized smoothing certificate"
+                    .to_string(),
+            }
+            .into());
+        }
         fit_reduced_parametric_aft(&prepared, &options)?
+    } else if let Some((theta, outer, warm_start)) = certified_outer {
+        let exact_options = survival_location_scale_exact_outer_options(
+            &options,
+            &crate::row_kernel::RowSet::All,
+        );
+        fit_custom_family_fixed_log_lambdas_from_outer(
+            &prepared.family,
+            &prepared.blockspecs,
+            &exact_options,
+            warm_start,
+            theta,
+            outer,
+        )?
     } else {
         fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?
     };
@@ -187,6 +212,24 @@ pub(crate) fn fit_survival_location_scale_with_geometry(
         finalized,
         (residuals, curvatures, link_param_data_fit_gradient),
     ))
+}
+
+pub(crate) fn fit_survival_location_scale_with_geometry(
+    spec: SurvivalLocationScaleSpec,
+) -> Result<(UnifiedFitResult, SurvivalLocationScaleConvergedGeometry), String> {
+    fit_survival_location_scale_with_geometry_authority(spec, None)
+}
+
+fn fit_survival_location_scale_with_geometry_from_outer(
+    spec: SurvivalLocationScaleSpec,
+    theta: &Array1<f64>,
+    outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
+    warm_start: Option<&CustomFamilyWarmStart>,
+) -> Result<(UnifiedFitResult, SurvivalLocationScaleConvergedGeometry), String> {
+    fit_survival_location_scale_with_geometry_authority(
+        spec,
+        Some((theta, outer, warm_start)),
+    )
 }
 
 /// Converged-fit geometry returned alongside the finalized location-scale fit:
@@ -753,15 +796,29 @@ pub(crate) fn fit_survival_location_scale_terms(
         true,
         None,
         outer_policy,
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], _provenance| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            let (fit, geom) = fit_survival_location_scale_with_geometry(build_spec(
+            let assembled = build_spec(
                 &rho,
                 &specs[0],
                 &specs[1],
                 &designs[0],
                 &designs[1],
-            )?)?;
+            )?;
+            let (fit, geom) = match provenance {
+                SpatialFitProvenance::NoOuterOptimization => {
+                    fit_survival_location_scale_with_geometry(assembled)?
+                }
+                SpatialFitProvenance::Certified(outer) => {
+                    let warm_start = exact_warm_start.borrow();
+                    fit_survival_location_scale_with_geometry_from_outer(
+                        assembled,
+                        theta,
+                        outer,
+                        warm_start.as_ref(),
+                    )?
+                }
+            };
             time_beta_hint.replace(Some(fit.beta_time()));
             threshold_beta_hint.replace(Some(fit.beta_threshold()));
             log_sigma_beta_hint.replace(Some(fit.beta_log_sigma()));
@@ -849,7 +906,10 @@ pub(crate) fn fit_survival_location_scale_terms(
             }
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta,
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign],
+         row_set: &crate::row_kernel::RowSet| {
             if !analytic_joint_gradient_available {
                 return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "analytic spatial psi derivatives are unavailable for survival exact two-block path"
                         .to_string(), }.into());
@@ -892,10 +952,14 @@ pub(crate) fn fit_survival_location_scale_terms(
             if prepared.family.x_link_wiggle.is_some() {
                 derivative_blocks.push(Vec::new());
             }
+            let eval_options = survival_location_scale_exact_outer_options(
+                &survival_blockwise_fit_options(&assembled),
+                row_set,
+            );
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &prepared.family,
                 &prepared.blockspecs,
-                &survival_blockwise_fit_options(&assembled),
+                &eval_options,
                 &rho,
                 &derivative_blocks,
                 exact_warm_start.borrow().as_ref(),

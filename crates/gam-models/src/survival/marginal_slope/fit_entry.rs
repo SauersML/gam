@@ -2337,7 +2337,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         true,
         None,
         outer_policy,
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], _provenance| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
             assert_eq!(
                 specs.len(),
                 designs.len(),
@@ -2368,7 +2368,22 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 FlexActivation::On,
                 BlockDesignCoords::RematerializedRaw,
             )?;
-            let fit = inner_fit(&family, &blocks, options)?;
+            let fit = match provenance {
+                SpatialFitProvenance::NoOuterOptimization => {
+                    inner_fit(&family, &blocks, options)?
+                }
+                SpatialFitProvenance::Certified(outer) => {
+                    let warm_start = exact_warm_start.borrow();
+                    inner_fit_from_certified_outer(
+                        &family,
+                        &blocks,
+                        options,
+                        warm_start.as_ref(),
+                        theta,
+                        outer,
+                    )?
+                }
+            };
             let mut hints_mut = hints.borrow_mut();
             if let Some(block) = fit.block_states.first() {
                 hints_mut.time_beta = Some(block.beta.clone());
@@ -2505,7 +2520,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             }
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta,
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign],
+         row_set: &crate::row_kernel::RowSet| {
             let eval_started = std::time::Instant::now();
             log::info!(
                 "[survival-marginal-slope/outer-efs] start theta_dim={}",
@@ -2547,8 +2565,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval_id = outer_eval_counter.get();
             outer_eval_counter.set(eval_id.wrapping_add(1));
-            let mut outer_options =
+            let tolerance_options =
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
+            let mut outer_options =
+                survival_marginal_slope_exact_outer_options(&tolerance_options, row_set);
             outer_options.outer_eval_context = Some(crate::custom_family::OuterEvalContext {
                 rho: std::sync::Arc::new(rho.clone()),
                 eval_id,

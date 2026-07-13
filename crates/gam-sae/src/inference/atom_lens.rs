@@ -209,7 +209,7 @@ pub fn atom_two_lens(
         // Physical decoder norm, matching the derivatives used by coupling.
         let decoder_norm = atom.contribution_frobenius_scale();
 
-        let latent_dim = atom.latent_dim;
+        let latent_dim = atom.latent_dim();
 
         let support = SupportMeasure::from_assignment_matrix(assignments, atom_idx)?;
         let support_mass = support.mass();

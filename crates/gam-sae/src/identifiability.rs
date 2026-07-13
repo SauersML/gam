@@ -2222,10 +2222,7 @@ fn exact_orbit_fields(
             out.push((
                 GeneratorFamily::IsomAtom,
                 dt,
-                format!(
-                    "{}: Klein S1 theta translation [exact orbit]",
-                    atom.name
-                ),
+                format!("{}: Klein S1 theta translation [exact orbit]", atom.name),
             ));
         }
         AtomTopology::ProjectivePlane => {
@@ -2241,24 +2238,17 @@ fn exact_orbit_fields(
             for row in 0..n {
                 let latitude = view.coords[[row, 0]];
                 let longitude = view.coords[[row, 1]];
-                let directions = projective_plane_cover_killing_directions(
-                    latitude,
-                    longitude,
-                )
-                .map_err(|error| {
-                    format!("exact_orbit_fields({}): RP2 row {row}: {error}", atom.name)
-                })?;
+                let directions = projective_plane_cover_killing_directions(latitude, longitude)
+                    .map_err(|error| {
+                        format!("exact_orbit_fields({}): RP2 row {row}: {error}", atom.name)
+                    })?;
                 for axis in 0..2 {
                     rotation_x[[row, axis]] = directions[0][axis];
                     rotation_y[[row, axis]] = directions[1][axis];
                     rotation_z[[row, axis]] = directions[2][axis];
                 }
             }
-            for (axis, field) in [
-                ("x", rotation_x),
-                ("y", rotation_y),
-                ("z", rotation_z),
-            ] {
+            for (axis, field) in [("x", rotation_x), ("y", rotation_y), ("z", rotation_z)] {
                 out.push((
                     GeneratorFamily::IsomAtom,
                     field,

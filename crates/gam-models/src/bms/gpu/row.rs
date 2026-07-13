@@ -3358,7 +3358,7 @@ mod row_kernel_tests {
 
     // #415 parity lock: one fitted StandardNormal FLEX family supplies both
     // the production CPU lowering and the generated CUDA launch.
-    mod parity_415 {
+    pub(crate) mod parity_415 {
         use crate::bms::family::*;
         use crate::bms::hessian_paths::*;
         use crate::bms::{DeviationBlockConfig, LatentMeasureKind, exact_kernel};
@@ -3372,7 +3372,7 @@ mod row_kernel_tests {
         /// link-deviation (`p_w > 0`) block active, plus mixed labels y ∈ {0,1}.
         /// Ported from the `gradient_paths` flex oracle fixture so the cache is
         /// populated by the production cell-moment assembly (never hand-faked).
-        fn make_flex_parity_family(
+        pub(crate) fn make_flex_parity_family(
             n: usize,
             score_internal_knots: usize,
             link_internal_knots: usize,
@@ -3626,6 +3626,425 @@ mod row_kernel_tests {
 mod tests {
     use super::row_kernel_tests::*;
     use super::*;
+    use crate::bms::exact_eval_cache::RowPrimaryEvalCache;
+    use crate::bms::row_kernel::BernoulliMarginalSlopeExactNewtonJointHessianWorkspace;
+    use crate::custom_family::{BlockwiseFitOptions, ExactNewtonJointHessianWorkspace};
+    use gam_gpu::{GpuPolicy, configure_global_policy};
+    use ndarray::{Array1, Array2};
+    use std::hint::black_box;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    fn assert_array1_close_932(label: &str, expected: &Array1<f64>, actual: &Array1<f64>) {
+        assert_eq!(expected.len(), actual.len(), "{label}: length mismatch");
+        for (index, (&want, &got)) in expected.iter().zip(actual).enumerate() {
+            let tolerance = 2.0e-8 * (1.0 + want.abs());
+            assert!(
+                want.is_finite() && got.is_finite() && (want - got).abs() <= tolerance,
+                "{label}[{index}]: expected={want:.17e} actual={got:.17e} tolerance={tolerance:.3e}"
+            );
+        }
+    }
+
+    /// Mandatory A100 acceptance hook. Run this exact test in a fresh process:
+    /// configuring `Required` is deliberately the first GPU action, and every
+    /// missing-runtime, probe, upload, launch, synchronization, status, or
+    /// download failure aborts the test instead of turning into a skip.
+    #[test]
+    fn mandatory_required_gpu_workspace_consumes_device_cache_end_to_end_932() {
+        configure_global_policy(GpuPolicy::Required);
+        assert_eq!(
+            gam_gpu::global_policy(),
+            GpuPolicy::Required,
+            "fresh-process acceptance test must claim Required before any competing policy"
+        );
+        gam_gpu::device_runtime::GpuRuntime::global_or_fail(GpuPolicy::Required)
+            .expect("#932 mandatory CUDA runtime");
+
+        let (family, states) = row_kernel_tests::parity_415::make_flex_parity_family(256, 8, 6);
+        let mut workspace = BernoulliMarginalSlopeExactNewtonJointHessianWorkspace::new(
+            family,
+            states,
+            BlockwiseFitOptions::default(),
+        )
+        .expect("#932 Required workspace must build its device row cache");
+
+        assert!(
+            matches!(
+                &workspace.cache.row_primary_hessians,
+                RowPrimaryEvalCache::Device(_)
+            ),
+            "Required full-FLEX workspace must retain RowPrimaryEvalCache::Device"
+        );
+        {
+            let device = workspace
+                .cache
+                .row_primary_hessians
+                .device()
+                .expect("device cache variant");
+            assert!(
+                device
+                    .primary
+                    .h
+                    .as_ref()
+                    .is_some_and(|range| !range.is_empty())
+                    && device
+                        .primary
+                        .w
+                        .as_ref()
+                        .is_some_and(|range| !range.is_empty()),
+                "mandatory fixture must carry active h and w primary blocks"
+            );
+            assert!(
+                device
+                    .block
+                    .h
+                    .as_ref()
+                    .is_some_and(|range| !range.is_empty())
+                    && device
+                        .block
+                        .w
+                        .as_ref()
+                        .is_some_and(|range| !range.is_empty()),
+                "mandatory fixture must carry active h and w coefficient blocks"
+            );
+        }
+        for operation in ["host HVP replay", "host diagonal replay"] {
+            let error = workspace
+                .cache
+                .row_primary_hessians
+                .reject_device_cpu_recompute(operation)
+                .expect_err("a selected device cache must reject host row recomputation");
+            assert!(
+                error.contains("device-resident row evaluation selected")
+                    && error.contains("CPU row recomputation is forbidden"),
+                "unexpected fail-closed diagnostic: {error}"
+            );
+        }
+
+        let total = workspace.cache.slices.total;
+        let direction = Array1::from_shape_fn(total, |index| {
+            let sign = if index % 2 == 0 { 1.0 } else { -1.0 };
+            sign * (0.025 + 0.0075 * index as f64)
+        });
+        let joint_ll = workspace
+            .joint_log_likelihood_evaluation()
+            .expect("device joint log-likelihood")
+            .expect("device joint log-likelihood must be present");
+        let joint = workspace
+            .joint_gradient_evaluation()
+            .expect("device joint gradient")
+            .expect("device joint gradient must be present");
+        assert!(joint_ll.is_finite());
+        assert_eq!(joint.log_likelihood.to_bits(), joint_ll.to_bits());
+        assert_eq!(joint.gradient.len(), total);
+        assert!(joint.gradient.iter().all(|value| value.is_finite()));
+
+        let hvp = workspace
+            .hessian_matvec(&direction)
+            .expect("device HVP")
+            .expect("device HVP must be present");
+        let mut hvp_into = Array1::from_elem(total, f64::NAN);
+        assert!(
+            workspace
+                .hessian_matvec_into(&direction, &mut hvp_into)
+                .expect("device HVP-into"),
+            "device HVP-into must report that it handled the direction"
+        );
+        assert_array1_close_932("HVP owned/into", &hvp, &hvp_into);
+
+        let rhs = Array2::from_shape_fn((total, 3), |(row, column)| {
+            (row as f64 + 1.0)
+                * (column as f64 + 0.5)
+                * 0.011
+                * if (row + column) % 3 == 0 { -1.0 } else { 1.0 }
+        });
+        let mut applied = Array2::<f64>::from_elem((total, rhs.ncols()), f64::NAN);
+        assert!(
+            workspace
+                .hessian_apply_mat(&rhs, &mut applied)
+                .expect("device multi-RHS apply"),
+            "device multi-RHS apply must report that it handled the matrix"
+        );
+        let diagonal = workspace
+            .hessian_diagonal()
+            .expect("device diagonal")
+            .expect("device diagonal must be present");
+        let dense = workspace
+            .hessian_dense_forced()
+            .expect("device forced dense Hessian")
+            .expect("device forced dense Hessian must be present");
+        assert_eq!(dense.dim(), (total, total));
+        assert_array1_close_932("dense * v / HVP", &dense.dot(&direction), &hvp);
+        assert_array1_close_932("dense diagonal", &dense.diag().to_owned(), &diagonal);
+        let dense_applied = dense.dot(&rhs);
+        for column in 0..rhs.ncols() {
+            assert_array1_close_932(
+                &format!("dense * V / apply_mat column {column}"),
+                &dense_applied.column(column).to_owned(),
+                &applied.column(column).to_owned(),
+            );
+        }
+
+        // The resident cache is the numerical authority. Poisoning every host
+        // block-state number after construction must not alter HVP/diagonal;
+        // any accidental host replay would either propagate NaNs or error.
+        for state in &mut workspace.block_states {
+            state.beta.fill(f64::NAN);
+            state.eta.fill(f64::NAN);
+        }
+        let poisoned_hvp = workspace
+            .hessian_matvec(&direction)
+            .expect("device HVP after host-state poison")
+            .expect("device HVP after host-state poison must be present");
+        let poisoned_diagonal = workspace
+            .hessian_diagonal()
+            .expect("device diagonal after host-state poison")
+            .expect("device diagonal after host-state poison must be present");
+        assert_eq!(
+            hvp.as_slice(),
+            poisoned_hvp.as_slice(),
+            "fixed-order device HVP changed after poisoning host block state"
+        );
+        assert_eq!(
+            diagonal.as_slice(),
+            poisoned_diagonal.as_slice(),
+            "fixed-order device diagonal changed after poisoning host block state"
+        );
+    }
+
+    /// Temporary #932 release-only evidence hook. It times the strongest
+    /// production CPU row batch (the Rayon `build_row_primary_hessian_pin`)
+    /// against the complete generated GPU row path: host packing, device
+    /// moment production, every transfer/allocation, row launch, synchronize,
+    /// and status download. Run this exact test in a fresh release process so
+    /// `cold_gpu_e2e_nvrtc_ms` includes the first NVRTC loads and the 21 ABBA
+    /// samples describe only the subsequently cached compiler state.
+    #[test]
+    fn release_measure_generated_bms_full_row_vs_strongest_cpu_932() {
+        const N: usize = 32_768;
+        const WARMUPS: usize = 3;
+        const SAMPLES: usize = 21;
+
+        configure_global_policy(GpuPolicy::Required);
+        assert_eq!(gam_gpu::global_policy(), GpuPolicy::Required);
+        gam_gpu::device_runtime::GpuRuntime::global_or_fail(GpuPolicy::Required)
+            .expect("#932 full-row release measurement requires CUDA");
+
+        let (family, states) = row_kernel_tests::parity_415::make_flex_parity_family(N, 8, 6);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("full-row timing exact cache");
+        let r = cache.primary.total;
+        assert_eq!(r, 20, "8/6 knot fixture must expose primary width r=20");
+        let marginal = family
+            .marginal_design
+            .as_dense_ref()
+            .expect("timing fixture marginal design must be dense");
+        let logslope = family
+            .logslope_design
+            .as_dense_ref()
+            .expect("timing fixture logslope design must be dense");
+        assert!(marginal.is_standard_layout() && logslope.is_standard_layout());
+        let marginal_slice = marginal
+            .as_slice()
+            .expect("timing fixture marginal design is contiguous");
+        let logslope_slice = logslope
+            .as_slice()
+            .expect("timing fixture logslope design is contiguous");
+        let block = BmsFlexBlockLayout {
+            p_m: cache.slices.marginal.len(),
+            p_g: cache.slices.logslope.len(),
+            h: cache.slices.h.clone(),
+            w: cache.slices.w.clone(),
+            p_total: cache.slices.total,
+        };
+        let primary = BmsFlexPrimaryLayout {
+            h: cache.primary.h.clone(),
+            w: cache.primary.w.clone(),
+            r,
+        };
+        assert!(
+            primary.h.as_ref().is_some_and(|range| !range.is_empty())
+                && primary.w.as_ref().is_some_and(|range| !range.is_empty()),
+            "full-row timing fixture must exercise both h and w"
+        );
+        let pin_bytes = crate::bms::BernoulliMarginalSlopeFamily::row_primary_eval_tile_bytes(N, r);
+
+        let run_cpu = || {
+            let completed = AtomicUsize::new(0);
+            family
+                .build_row_primary_hessian_pin(
+                    &states,
+                    &cache,
+                    0..N,
+                    &completed,
+                    N.saturating_add(1),
+                    Instant::now(),
+                    pin_bytes,
+                )
+                .expect("production Rayon row-primary batch")
+        };
+        let run_gpu = || {
+            let owned = family
+                .pack_bms_flex_row_kernel_inputs(&states, &cache)
+                .expect("production BMS GPU packing")
+                .expect("StandardNormal full-FLEX timing fixture must pack");
+            launch_bms_flex_row_kernel_device_resident(
+                owned.as_borrowed(),
+                marginal_slice,
+                logslope_slice,
+                block.clone(),
+                primary.clone(),
+            )
+            .expect("production device-resident row launch")
+        };
+        let measure_cpu = || {
+            let started = Instant::now();
+            let output = black_box(run_cpu());
+            (started.elapsed(), output)
+        };
+        let measure_gpu = || {
+            let started = Instant::now();
+            let output = black_box(run_gpu());
+            (started.elapsed(), output)
+        };
+
+        let cold_started = Instant::now();
+        let cold_gpu = black_box(run_gpu());
+        let cold_gpu_e2e_nvrtc = cold_started.elapsed();
+        drop(cold_gpu);
+        for _ in 0..WARMUPS {
+            black_box(run_cpu());
+            black_box(run_gpu());
+        }
+
+        let mut cpu_samples = Vec::<Duration>::with_capacity(SAMPLES);
+        let mut gpu_samples = Vec::<Duration>::with_capacity(SAMPLES);
+        let mut last_cpu = None;
+        let mut last_gpu = None;
+        for sample in 0..SAMPLES {
+            // Alternating AB/BA pairs yield the repeating ABBA ordering and
+            // cancel monotone thermal/frequency drift without averaging away
+            // an individually slow cell.
+            if sample % 2 == 0 {
+                let (cpu_elapsed, cpu) = measure_cpu();
+                cpu_samples.push(cpu_elapsed);
+                let (gpu_elapsed, gpu) = measure_gpu();
+                gpu_samples.push(gpu_elapsed);
+                if sample + 1 == SAMPLES {
+                    last_cpu = Some(cpu);
+                    last_gpu = Some(gpu);
+                }
+            } else {
+                let (gpu_elapsed, gpu) = measure_gpu();
+                gpu_samples.push(gpu_elapsed);
+                let (cpu_elapsed, cpu) = measure_cpu();
+                cpu_samples.push(cpu_elapsed);
+                drop(gpu);
+                drop(cpu);
+            }
+        }
+        let cpu = last_cpu.expect("final CPU sample retained for parity");
+        let gpu = last_gpu.expect("final GPU sample retained for parity");
+
+        let stream = HvpKernelBackend::probe()
+            .expect("HVP backend remains available")
+            .stream
+            .clone();
+        let gpu_neglog = stream
+            .clone_dtoh(&gpu.neglog)
+            .expect("download timed GPU neglog for parity");
+        let gpu_grad = stream
+            .clone_dtoh(&gpu.grad)
+            .expect("download timed GPU gradient for parity");
+        let gpu_hess = stream
+            .clone_dtoh(&gpu.hess)
+            .expect("download timed GPU Hessian for parity");
+        let cpu_channels = [
+            cpu.neglog().as_slice().expect("CPU neglog is contiguous"),
+            cpu.grad().as_slice().expect("CPU gradient is contiguous"),
+            cpu.hess().as_slice().expect("CPU Hessian is contiguous"),
+        ];
+        let gpu_channels = [
+            gpu_neglog.as_slice(),
+            gpu_grad.as_slice(),
+            gpu_hess.as_slice(),
+        ];
+        let mut nonfinite = 0_usize;
+        let mut max_abs = 0.0_f64;
+        let mut max_scaled = 0.0_f64;
+        let mut cpu_digest = 0.0_f64;
+        let mut gpu_digest = 0.0_f64;
+        let mut digest_index = 0_usize;
+        for (cpu_channel, gpu_channel) in cpu_channels.iter().zip(gpu_channels) {
+            assert_eq!(cpu_channel.len(), gpu_channel.len());
+            for (&host, &device) in cpu_channel.iter().zip(gpu_channel) {
+                if !host.is_finite() || !device.is_finite() {
+                    nonfinite += 1;
+                }
+                let difference = (host - device).abs();
+                let tolerance = 1.0e-8 * (1.0 + host.abs());
+                max_abs = max_abs.max(difference);
+                max_scaled = max_scaled.max(difference / tolerance);
+                let weight = 1.0 + (digest_index % 251) as f64 / 251.0;
+                cpu_digest += weight * host;
+                gpu_digest += weight * device;
+                digest_index += 1;
+            }
+        }
+        assert_eq!(
+            nonfinite, 0,
+            "full-row CPU/GPU output contains non-finite values"
+        );
+        assert!(
+            max_scaled <= 1.0,
+            "full-row CPU/GPU parity exceeded tolerance: max_abs={max_abs:.3e} max_scaled={max_scaled:.3e}"
+        );
+
+        let mut cpu_ms = cpu_samples
+            .iter()
+            .map(|sample| sample.as_secs_f64() * 1.0e3)
+            .collect::<Vec<_>>();
+        let mut gpu_ms = gpu_samples
+            .iter()
+            .map(|sample| sample.as_secs_f64() * 1.0e3)
+            .collect::<Vec<_>>();
+        cpu_ms.sort_by(f64::total_cmp);
+        gpu_ms.sort_by(f64::total_cmp);
+        let p25 = SAMPLES / 4;
+        let p50 = SAMPLES / 2;
+        let p75 = 3 * SAMPLES / 4;
+        let conservative_speedup = cpu_ms[p25] / gpu_ms[p75];
+        let median_speedup = cpu_ms[p50] / gpu_ms[p50];
+        let cpu_distribution = cpu_ms
+            .iter()
+            .map(|value| format!("{value:.6}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let gpu_distribution = gpu_ms
+            .iter()
+            .map(|value| format!("{value:.6}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "G932_BMS_FULL_ROW n={N} r={r} warmups={WARMUPS} samples={SAMPLES} \
+             cold_gpu_e2e_nvrtc_ms={:.6} cpu_ms_p25={:.6} cpu_ms_p50={:.6} cpu_ms_p75={:.6} \
+             gpu_ms_p25={:.6} gpu_ms_p50={:.6} gpu_ms_p75={:.6} \
+             speedup_conservative_cpu_p25_over_gpu_p75={conservative_speedup:.6} \
+             speedup_median={median_speedup:.6} parity_max_abs={max_abs:.9e} \
+             parity_max_scaled={max_scaled:.9e} cpu_digest={cpu_digest:.17e} \
+             gpu_digest={gpu_digest:.17e} nonfinite={nonfinite} \
+             cpu_ms_sorted=[{cpu_distribution}] gpu_ms_sorted=[{gpu_distribution}]",
+            cold_gpu_e2e_nvrtc.as_secs_f64() * 1.0e3,
+            cpu_ms[p25],
+            cpu_ms[p50],
+            cpu_ms[p75],
+            gpu_ms[p25],
+            gpu_ms[p50],
+            gpu_ms[p75],
+        );
+    }
 
     #[test]
     fn dense_hvp_batches_transpose_column_images_in_bounded_groups_932() {

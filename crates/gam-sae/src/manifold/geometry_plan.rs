@@ -11,15 +11,27 @@ use super::*;
 /// Basis-native resolution of one analytic atom family.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SaeBasisResolution {
-    PeriodicHarmonics { order: usize },
+    PeriodicHarmonics {
+        order: usize,
+    },
     SphereChart,
-    TorusHarmonics { per_axis_order: usize },
-    ProjectivePlaneHarmonics { quotient_order: usize },
-    KleinBottleHarmonics { per_axis_order: usize },
+    TorusHarmonics {
+        per_axis_order: usize,
+    },
+    ProjectivePlaneHarmonics {
+        quotient_order: usize,
+    },
+    KleinBottleHarmonics {
+        per_axis_order: usize,
+    },
     /// Duchon centers are the resolution authority. The evaluator derives its
     /// width from these centers and the dimension-derived null-space order.
-    DuchonCoordinates { centers: Array2<f64> },
-    Polynomial { degree: usize },
+    DuchonCoordinates {
+        centers: Array2<f64>,
+    },
+    Polynomial {
+        degree: usize,
+    },
     CylinderHarmonics {
         circle_order: usize,
         line_degree: usize,
@@ -28,8 +40,12 @@ pub enum SaeBasisResolution {
         circle_order: usize,
         width_degree: usize,
     },
-    FiniteAnchors { anchors: usize },
-    Precomputed { basis_size: usize },
+    FiniteAnchors {
+        anchors: usize,
+    },
+    Precomputed {
+        basis_size: usize,
+    },
 }
 
 /// Reference geometry whose function-space seminorm the atom stores.
@@ -40,9 +56,13 @@ pub enum SaeReferenceMetricPlan {
     /// Flat rectangular torus with aspect `A = cosh(tau) >= 1`; `tau = 0`
     /// is square. This is the exact flat comparator for the donut at the same
     /// `tau` and therefore the same aspect.
-    FlatRectangularTorus { tau: f64 },
+    FlatRectangularTorus {
+        tau: f64,
+    },
     /// Embedded donut torus with aspect `A = cosh(tau) > 1`.
-    EmbeddedDonutTorus { tau: f64 },
+    EmbeddedDonutTorus {
+        tau: f64,
+    },
     RoundProjectivePlane,
     FlatKleinBottle,
     EuclideanDuchon,
@@ -50,7 +70,9 @@ pub enum SaeReferenceMetricPlan {
     /// Unit-curvature Poincare ball with the fixed reference rows that define
     /// the conformal Dirichlet function Gram. These rows are model data: OOS
     /// rebuild must replay them exactly, never replace them with query rows.
-    UnitPoincareBall { reference_coords: Array2<f64> },
+    UnitPoincareBall {
+        reference_coords: Array2<f64>,
+    },
     CylinderProduct,
     MobiusQuotient,
     DiscreteCounting,
@@ -135,11 +157,8 @@ impl SaeAtomGeometryPlan {
                 _,
                 SaeBasisResolution::Polynomial { degree },
                 SaeReferenceMetricPlan::EuclideanPolynomial,
-            ) => {
-                (SAE_EUCLIDEAN_PATCH_MAX_DEGREE
-                    ..=SAE_EUCLIDEAN_PATCH_RECOVERY_MAX_DEGREE)
-                    .contains(degree)
-            }
+            ) => (SAE_EUCLIDEAN_PATCH_MAX_DEGREE..=SAE_EUCLIDEAN_PATCH_RECOVERY_MAX_DEGREE)
+                .contains(degree),
             (
                 SaeAtomBasisKind::Poincare,
                 _,
@@ -254,13 +273,11 @@ impl SaeAtomGeometryPlan {
                     sae_duchon_atom_m(self.latent_dim),
                 )?;
                 let probe = Array2::<f64>::zeros((1, self.latent_dim));
-                evaluator
-                    .evaluate(probe.view())
-                    .map(|(phi, _)| phi.ncols())
+                evaluator.evaluate(probe.view()).map(|(phi, _)| phi.ncols())
             }
-            SaeBasisResolution::Polynomial { degree } => Ok(
-                gam_terms::basis::monomial_exponents(self.latent_dim, *degree).len(),
-            ),
+            SaeBasisResolution::Polynomial { degree } => {
+                Ok(gam_terms::basis::monomial_exponents(self.latent_dim, *degree).len())
+            }
             SaeBasisResolution::CylinderHarmonics {
                 circle_order,
                 line_degree,
@@ -289,32 +306,26 @@ impl SaeAtomGeometryPlan {
             SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order } => Arc::new(
                 QuotientSpectralEvaluator::projective_plane(*quotient_order)?,
             ),
-            SaeBasisResolution::KleinBottleHarmonics { per_axis_order } => Arc::new(
-                QuotientSpectralEvaluator::klein_bottle(*per_axis_order)?,
-            ),
+            SaeBasisResolution::KleinBottleHarmonics { per_axis_order } => {
+                Arc::new(QuotientSpectralEvaluator::klein_bottle(*per_axis_order)?)
+            }
             SaeBasisResolution::DuchonCoordinates { centers } => {
                 Arc::new(DuchonCoordinateEvaluator::new(
                     centers.clone(),
                     sae_duchon_atom_m(self.latent_dim),
                 )?)
             }
-            SaeBasisResolution::Polynomial { degree } => Arc::new(
-                EuclideanPatchEvaluator::new(self.latent_dim, *degree)?,
-            ),
+            SaeBasisResolution::Polynomial { degree } => {
+                Arc::new(EuclideanPatchEvaluator::new(self.latent_dim, *degree)?)
+            }
             SaeBasisResolution::CylinderHarmonics {
                 circle_order,
                 line_degree,
-            } => Arc::new(CylinderHarmonicEvaluator::new(
-                *circle_order,
-                *line_degree,
-            )?),
+            } => Arc::new(CylinderHarmonicEvaluator::new(*circle_order, *line_degree)?),
             SaeBasisResolution::MobiusHarmonics {
                 circle_order,
                 width_degree,
-            } => Arc::new(MobiusHarmonicEvaluator::new(
-                *circle_order,
-                *width_degree,
-            )?),
+            } => Arc::new(MobiusHarmonicEvaluator::new(*circle_order, *width_degree)?),
             SaeBasisResolution::FiniteAnchors { .. } => {
                 return Err("finite-set atoms have no continuous analytic evaluator".to_string());
             }
@@ -378,13 +389,11 @@ impl SaeAtomGeometryPlan {
             basis_values,
             basis_jacobian,
             reference_penalty,
+            evaluator,
         })
     }
 
-    fn reference_penalty(
-        &self,
-        evaluator: &dyn SaeBasisSecondJet,
-    ) -> Result<Array2<f64>, String> {
+    fn reference_penalty(&self, evaluator: &dyn SaeBasisSecondJet) -> Result<Array2<f64>, String> {
         match (&self.resolution, &self.reference_metric) {
             (
                 SaeBasisResolution::PeriodicHarmonics { order },
@@ -406,13 +415,11 @@ impl SaeAtomGeometryPlan {
             (
                 SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order },
                 SaeReferenceMetricPlan::RoundProjectivePlane,
-            ) => QuotientSpectralEvaluator::projective_plane(*quotient_order)?
-                .spectral_penalty(2),
+            ) => QuotientSpectralEvaluator::projective_plane(*quotient_order)?.spectral_penalty(2),
             (
                 SaeBasisResolution::KleinBottleHarmonics { per_axis_order },
                 SaeReferenceMetricPlan::FlatKleinBottle,
-            ) => QuotientSpectralEvaluator::klein_bottle(*per_axis_order)?
-                .spectral_penalty(2),
+            ) => QuotientSpectralEvaluator::klein_bottle(*per_axis_order)?.spectral_penalty(2),
             (
                 SaeBasisResolution::DuchonCoordinates { centers },
                 SaeReferenceMetricPlan::EuclideanDuchon,
@@ -459,10 +466,9 @@ impl SaeAtomGeometryPlan {
                 SaeBasisResolution::FiniteAnchors { .. },
                 SaeReferenceMetricPlan::DiscreteCounting,
             ) => Err("finite-set atoms have no continuous analytic evaluation bundle".to_string()),
-            (
-                SaeBasisResolution::Precomputed { .. },
-                SaeReferenceMetricPlan::CallerProvided,
-            ) => Err("precomputed atoms require a caller-supplied evaluation bundle".to_string()),
+            (SaeBasisResolution::Precomputed { .. }, SaeReferenceMetricPlan::CallerProvided) => {
+                Err("precomputed atoms require a caller-supplied evaluation bundle".to_string())
+            }
             _ => Err(format!(
                 "SaeAtomGeometryPlan::reference_penalty: internally inconsistent plan {:?}",
                 self
@@ -475,6 +481,7 @@ pub(crate) struct SaeAtomEvaluationBundle {
     pub(crate) basis_values: Array2<f64>,
     pub(crate) basis_jacobian: Array3<f64>,
     pub(crate) reference_penalty: Array2<f64>,
+    pub(crate) evaluator: Arc<dyn SaeBasisSecondJet>,
 }
 
 /// Coordinate velocities of the three `SO(3)` Killing fields on the spherical
@@ -563,8 +570,7 @@ fn flat_rectangular_torus_reference_penalty(
     for (column, mode) in modes.iter().enumerate() {
         let long_frequency = mode.components[0].harmonic() as f64;
         let short_frequency = mode.components[1].harmonic() as f64;
-        let eigenvalue = long_frequency.powi(2) * inverse_aspect_squared
-            + short_frequency.powi(2);
+        let eigenvalue = long_frequency.powi(2) * inverse_aspect_squared + short_frequency.powi(2);
         penalty[[column, column]] = eigenvalue.powi(2) * mode.l2_gram_weight;
     }
     Ok(penalty)
@@ -638,13 +644,10 @@ mod tests {
     fn projective_plane_killing_fields_descend_through_antipodal_deck_map() {
         let latitude = 0.37;
         let longitude = -0.81;
-        let original =
-            projective_plane_cover_killing_directions(latitude, longitude).unwrap();
-        let deck = projective_plane_cover_killing_directions(
-            -latitude,
-            longitude + std::f64::consts::PI,
-        )
-        .unwrap();
+        let original = projective_plane_cover_killing_directions(latitude, longitude).unwrap();
+        let deck =
+            projective_plane_cover_killing_directions(-latitude, longitude + std::f64::consts::PI)
+                .unwrap();
 
         // Dg = diag(-1, 1) for g(lat, lon) = (-lat, lon + pi).
         for generator in 0..3 {
@@ -656,8 +659,7 @@ mod tests {
     #[test]
     fn projective_plane_killing_fields_refuse_cover_poles() {
         assert!(
-            projective_plane_cover_killing_directions(std::f64::consts::FRAC_PI_2, 0.0)
-                .is_err()
+            projective_plane_cover_killing_directions(std::f64::consts::FRAC_PI_2, 0.0).is_err()
         );
     }
 }

@@ -223,7 +223,7 @@ pub fn atom_geometry(
         let masses = assignments.slice(s![.., atom_idx]);
         atoms.push(atom_geometry_entry_from_parts(
             atom.name.clone(),
-            &atom.basis_kind,
+            atom.basis_kind(),
             atom.basis_values.view(),
             atom.basis_jacobian.view(),
             atom.decoder_coefficients.view(),

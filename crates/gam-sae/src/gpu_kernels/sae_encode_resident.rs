@@ -115,7 +115,7 @@ impl EncodeAtomDevice {
         atom_atlas: &AtomEncodeAtlas,
         config: &AtlasConfig,
     ) -> Result<Self, String> {
-        let d = atom.latent_dim;
+        let d = atom.latent_dim();
         let p = atom.output_dim();
         // FULL inner-basis width + full-width decoder pre-image `B = Q B̃`, never
         // the stored (possibly #1117 rank-reduced) width/decoder. The device
