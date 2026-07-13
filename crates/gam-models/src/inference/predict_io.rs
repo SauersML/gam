@@ -443,12 +443,8 @@ impl BernoulliMarginalSlopePredictor {
                     .rows()
                     .into_iter()
                     .map(|row| {
-                        Self::local_empirical_mixture_for_point(
-                            row.as_slice().expect("conditioning row contiguous"),
-                            centers,
-                            *top_k,
-                            *bandwidth,
-                        )
+                        let point = row.iter().copied().collect::<Vec<_>>();
+                        Self::local_empirical_mixture_for_point(&point, centers, *top_k, *bandwidth)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(LatentMeasureKind::LocalEmpirical {

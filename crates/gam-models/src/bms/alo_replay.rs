@@ -193,6 +193,9 @@ fn exact_runtime_from_saved(
                     | AnchorComponentTag::FlexEvaluation { ncols } => *ncols,
                 })
                 .sum::<usize>();
+            if expected_anchor_columns == 0 {
+                return Err(format!("saved {label} anchor map has no anchor components"));
+            }
             if anchor_rows.ncols() != expected_anchor_columns {
                 return Err(format!(
                     "saved {label} anchor design has {} columns; component layout requires {expected_anchor_columns}",
@@ -293,6 +296,63 @@ pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
         return Err(format!(
             "saved BMS ALO prior weight[{row}] must be finite and non-negative, got {weight}"
         ));
+    }
+    if let Some((row, response)) = input
+        .response
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, response)| *response != 0.0 && *response != 1.0)
+    {
+        return Err(format!(
+            "saved BMS ALO response[{row}] must be exactly 0 or 1, got {response}"
+        ));
+    }
+    for (label, values) in [
+        ("marginal eta", input.marginal_eta),
+        ("slope", input.slope),
+        ("latent z", input.latent_z),
+        ("marginal beta", input.marginal_beta),
+        ("logslope beta", input.logslope_beta),
+    ] {
+        if let Some((row, value)) = values
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "saved BMS ALO {label}[{row}] must be finite, got {value}"
+            ));
+        }
+    }
+    for (label, beta) in [
+        ("score-warp", input.score_warp_beta),
+        ("link-deviation", input.link_deviation_beta),
+    ] {
+        if let Some((coordinate, value)) = beta.and_then(|beta| {
+            beta.iter()
+                .copied()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+        }) {
+            return Err(format!(
+                "saved BMS ALO {label} beta[{coordinate}] must be finite, got {value}"
+            ));
+        }
+    }
+    for (label, rows) in [
+        ("score-warp", input.score_warp_anchor_rows),
+        ("link-deviation", input.link_deviation_anchor_rows),
+    ] {
+        if let Some(rows) = rows
+            && rows.nrows() != n
+        {
+            return Err(format!(
+                "saved BMS ALO {label} anchor design has {} rows; expected {n}",
+                rows.nrows(),
+            ));
+        }
     }
     input
         .latent_measure
