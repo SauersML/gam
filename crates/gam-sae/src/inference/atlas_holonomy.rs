@@ -499,10 +499,7 @@ impl GaussianPcaPatch {
             }
         }
         let tangent_gram = tangent_coordinates.t().dot(&tangent_coordinates);
-        let tangent_scale: f64 = tangent_coordinates
-            .iter()
-            .map(|value| value * value)
-            .sum();
+        let tangent_scale: f64 = tangent_coordinates.iter().map(|value| value * value).sum();
         let tangent_backward_error =
             f64::EPSILON * retained.max(INTRINSIC_DIMENSION) as f64 * tangent_scale.max(1.0);
         for i in 0..INTRINSIC_DIMENSION {
@@ -548,8 +545,7 @@ impl GaussianPcaPatch {
     pub fn projector_variance_scale(&self) -> f64 {
         let noise = self.noise_variance_estimate;
         let signal = self.signal_variance_estimate;
-        noise * (signal + noise)
-            / (signal * signal * self.covariance_degrees_of_freedom() as f64)
+        noise * (signal + noise) / (signal * signal * self.covariance_degrees_of_freedom() as f64)
     }
 
     fn tangent_frame(&self) -> Array2<f64> {
@@ -598,8 +594,7 @@ impl GaussianPcaPatchSummary {
     pub fn projector_variance_scale(self) -> f64 {
         let noise = self.noise_variance_estimate;
         let signal = self.signal_variance_estimate;
-        noise * (signal + noise)
-            / (signal * signal * self.covariance_degrees_of_freedom as f64)
+        noise * (signal + noise) / (signal * signal * self.covariance_degrees_of_freedom as f64)
     }
 }
 
@@ -637,14 +632,6 @@ impl ProjectedAtlasEdgeSpec {
         })
     }
 
-    #[must_use]
-    pub fn identity(self) -> AtlasHolonomyEdgeId {
-        AtlasHolonomyEdgeId {
-            a: self.a,
-            b: self.b,
-            overlap: self.overlap,
-        }
-    }
 }
 
 /// Public relative geometry of one projected two-patch edge.
@@ -772,9 +759,9 @@ impl GaussBonnetNoiseSource {
                 symmetric[[j, i]] = value;
             }
         }
-        let (eigenvalues, _) = symmetric
-            .eigh(faer::Side::Lower)
-            .map_err(|error| format!("Gauss-Bonnet covariance eigendecomposition failed: {error}"))?;
+        let (eigenvalues, _) = symmetric.eigh(faer::Side::Lower).map_err(|error| {
+            format!("Gauss-Bonnet covariance eigendecomposition failed: {error}")
+        })?;
         if eigenvalues.iter().any(|&value| value < -backward_error) {
             return Err(format!(
                 "Gauss-Bonnet covariance source {source} is not positive semidefinite"
@@ -829,10 +816,7 @@ impl GaussBonnetContribution {
             ));
         }
         for (name, value) in [
-            (
-                "polar linearization",
-                polar_linearization_remainder_bound,
-            ),
+            ("polar linearization", polar_linearization_remainder_bound),
             ("geometric", geometric_remainder_bound),
         ] {
             if !(value.is_finite() && value >= 0.0) {
@@ -1020,9 +1004,7 @@ impl AtlasHolonomyCertificate {
     pub fn certified_orientability(&self) -> Option<AtlasOrientability> {
         match self {
             Self::ExactAnalytic(certificate) => Some(certificate.orientability()),
-            Self::GaussianPcaPlugin(analysis) => {
-                analysis.orientation.certified_value().copied()
-            }
+            Self::GaussianPcaPlugin(analysis) => analysis.orientation.certified_value().copied(),
         }
     }
 
@@ -1038,7 +1020,7 @@ impl AtlasHolonomyCertificate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, arr2};
+    use ndarray::{arr2, array};
 
     fn projection_frame(angle: f64, padded_ambient: usize) -> Array2<f64> {
         let mut frame = Array2::<f64>::zeros((3 + padded_ambient, 3));
@@ -1097,22 +1079,8 @@ mod tests {
     ) -> GaussianPcaHolonomyAnalysis {
         GaussianPcaHolonomyAnalysis::certify(
             vec![
-                patch(
-                    0,
-                    0.0,
-                    gauges[0].0,
-                    gauges[0].1,
-                    1_000_000,
-                    padded_ambient,
-                ),
-                patch(
-                    1,
-                    0.2,
-                    gauges[1].0,
-                    gauges[1].1,
-                    1_000_000,
-                    padded_ambient,
-                ),
+                patch(0, 0.0, gauges[0].0, gauges[0].1, 1_000_000, padded_ambient),
+                patch(1, 0.2, gauges[1].0, gauges[1].1, 1_000_000, padded_ambient),
                 patch(
                     2,
                     -0.15,
@@ -1161,8 +1129,8 @@ mod tests {
     #[test]
     fn gaussian_certificate_retains_auditable_patch_inputs() {
         let analysis = triangle_analysis([(0.0, false); 3], 0);
-        assert_eq!(analysis.patch_summaries.len(), 3);
-        let patch = analysis.patch_summaries[0];
+        assert_eq!(analysis.patch_summaries().len(), 3);
+        let patch = analysis.patch_summaries()[0];
         assert_eq!(patch.chart, 0);
         assert_eq!(patch.projection_fit_rows, 1_000);
         assert_eq!(patch.inference_rows, 1_000_000);
@@ -1173,10 +1141,7 @@ mod tests {
             patch.centering,
             GaussianPatchCentering::MeanEstimatedOnInferenceRows
         );
-        assert_near(
-            patch.projector_variance_scale(),
-            0.01 * 1.01 / 999_999.0,
-        );
+        assert_near(patch.projector_variance_scale(), 0.01 * 1.01 / 999_999.0);
     }
 
     #[test]
@@ -1194,10 +1159,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(analysis.cycles.len(), 1);
-        assert_eq!(analysis.cycles[0].closed_chart_walk(), vec![0, 1, 0]);
+        assert_eq!(analysis.cycles().len(), 1);
+        assert_eq!(analysis.cycles()[0].closed_chart_walk(), vec![0, 1, 0]);
         assert_eq!(
-            analysis.cycles[0]
+            analysis.cycles()[0]
                 .steps()
                 .iter()
                 .copied()
@@ -1209,7 +1174,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            analysis.cycles[0]
+            analysis.cycles()[0]
                 .steps()
                 .iter()
                 .copied()
@@ -1223,20 +1188,50 @@ mod tests {
     }
 
     #[test]
+    fn singular_parallel_overlap_refusals_name_each_edge_identity() {
+        let analysis = GaussianPcaHolonomyAnalysis::certify(
+            vec![
+                patch(0, 0.0, 0.0, false, 1_000_000, 0),
+                patch(1, std::f64::consts::FRAC_PI_2, 0.0, false, 1_000_000, 0),
+            ],
+            vec![
+                ProjectedAtlasEdgeSpec::new(0, 1, 7, 0.0).unwrap(),
+                ProjectedAtlasEdgeSpec::new(0, 1, 3, 0.0).unwrap(),
+            ],
+            AtlasFamilywiseLevel::new(0.05).unwrap(),
+            None,
+        )
+        .unwrap();
+        let refused_edges: BTreeSet<_> = analysis
+            .orientation()
+            .refusals()
+            .iter()
+            .filter_map(|reason| match reason {
+                AtlasStatisticalRefusal::SingularProjectedCrossGram { edge, .. } => Some(*edge),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            refused_edges,
+            BTreeSet::from([
+                AtlasHolonomyEdgeId::new(0, 1, 3).unwrap(),
+                AtlasHolonomyEdgeId::new(0, 1, 7).unwrap(),
+            ])
+        );
+    }
+
+    #[test]
     fn projector_cycle_is_invariant_to_o2_patch_gauges() {
         let reference = triangle_analysis([(0.0, false); 3], 0);
-        let regauged = triangle_analysis(
-            [(0.37, true), (-0.91, false), (1.23, true)],
-            0,
-        );
+        let regauged = triangle_analysis([(0.37, true), (-0.91, false), (1.23, true)], 0);
         assert_eq!(
-            reference.orientation.certified_value(),
-            regauged.orientation.certified_value()
+            reference.orientation().certified_value(),
+            regauged.orientation().certified_value()
         );
-        assert_eq!(reference.cycles.len(), 1);
-        assert_eq!(regauged.cycles.len(), 1);
-        let left = &reference.cycles[0];
-        let right = &regauged.cycles[0];
+        assert_eq!(reference.cycles().len(), 1);
+        assert_eq!(regauged.cycles().len(), 1);
+        let left = &reference.cycles()[0];
+        let right = &regauged.cycles()[0];
         assert_near(left.absolute_angle.unwrap(), right.absolute_angle.unwrap());
         assert_near(
             left.first_order_variance.unwrap(),
@@ -1251,7 +1246,7 @@ mod tests {
     #[test]
     fn shared_patch_covariance_is_aggregated_before_the_quadratic_form() {
         let analysis = triangle_analysis([(0.0, false); 3], 0);
-        let cycle = &analysis.cycles[0];
+        let cycle = &analysis.cycles()[0];
         let correct = cycle.first_order_variance.unwrap();
         let naive = cycle.naive_edgewise_first_order_variance.unwrap();
         let adjustment = cycle.shared_patch_covariance_adjustment.unwrap();
@@ -1264,23 +1259,23 @@ mod tests {
         let base = triangle_analysis([(0.0, false); 3], 0);
         let padded = triangle_analysis([(0.0, false); 3], 97);
         let base_ranks: Vec<_> = base
-            .edges
+            .edges()
             .iter()
             .map(|edge| edge.projected_dimension)
             .collect();
         let padded_ranks: Vec<_> = padded
-            .edges
+            .edges()
             .iter()
             .map(|edge| edge.projected_dimension)
             .collect();
         assert_eq!(base_ranks, padded_ranks);
         assert_near(
-            base.cycles[0].first_order_variance.unwrap(),
-            padded.cycles[0].first_order_variance.unwrap(),
+            base.cycles()[0].first_order_variance.unwrap(),
+            padded.cycles()[0].first_order_variance.unwrap(),
         );
         assert_near(
-            base.orientation_flip_probability_bound,
-            padded.orientation_flip_probability_bound,
+            base.orientation_flip_probability_bound(),
+            padded.orientation_flip_probability_bound(),
         );
     }
 
@@ -1301,18 +1296,18 @@ mod tests {
         let small = build(16);
         let large = build(1_000_000);
         assert!(
-            large.orientation_flip_probability_bound
-                < small.orientation_flip_probability_bound
+            large.orientation_flip_probability_bound()
+                < small.orientation_flip_probability_bound()
         );
         assert_eq!(
-            small.sample_prescription[0].required_rows,
-            large.sample_prescription[0].required_rows
+            small.sample_prescription()[0].required_rows,
+            large.sample_prescription()[0].required_rows
         );
         assert!(
-            small.sample_prescription[0].current_rows
-                < small.sample_prescription[0].required_rows
+            small.sample_prescription()[0].current_rows
+                < small.sample_prescription()[0].required_rows
         );
-        assert!(large.orientation.certified_value().is_some());
+        assert!(large.orientation().certified_value().is_some());
     }
 
     fn cancellation_gauss_bonnet(remainder: f64) -> GaussBonnetInput {
@@ -1340,8 +1335,7 @@ mod tests {
 
     #[test]
     fn gauss_bonnet_uses_shared_source_covariance_before_integer_rounding() {
-        let confidence = gauss_bonnet_confidence(&cancellation_gauss_bonnet(0.0), 0.05)
-            .unwrap();
+        let confidence = gauss_bonnet_confidence(&cancellation_gauss_bonnet(0.0), 0.05).unwrap();
         assert_eq!(confidence.first_order_variance, 0.0);
         assert_eq!(confidence.naive_contribution_variance, 2.0);
         assert_eq!(confidence.shared_source_covariance_adjustment, -2.0);
@@ -1350,11 +1344,9 @@ mod tests {
 
     #[test]
     fn gauss_bonnet_refuses_when_remainder_consumes_rounding_cell() {
-        let confidence = gauss_bonnet_confidence(
-            &cancellation_gauss_bonnet(std::f64::consts::PI),
-            0.05,
-        )
-        .unwrap();
+        let confidence =
+            gauss_bonnet_confidence(&cancellation_gauss_bonnet(std::f64::consts::PI), 0.05)
+                .unwrap();
         assert!(confidence.decision.certified_value().is_none());
         assert!(matches!(
             confidence.decision.refusals(),
@@ -1380,10 +1372,7 @@ struct FundamentalCycle {
     steps: Vec<(usize, bool)>,
 }
 
-fn orientability_from_edges(
-    chart_count: usize,
-    edges: &[AtlasSignedEdge],
-) -> AtlasOrientability {
+fn orientability_from_edges(chart_count: usize, edges: &[AtlasSignedEdge]) -> AtlasOrientability {
     let mut adjacency = vec![Vec::<(usize, i8)>::new(); chart_count];
     for edge in edges {
         adjacency[edge.a].push((edge.b, edge.sign));
@@ -1435,10 +1424,7 @@ fn rotation_generator() -> Array2<f64> {
 }
 
 fn frobenius_inner(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> f64 {
-    left.iter()
-        .zip(right.iter())
-        .map(|(&x, &y)| x * y)
-        .sum()
+    left.iter().zip(right.iter()).map(|(&x, &y)| x * y).sum()
 }
 
 fn frobenius_squared(matrix: ArrayView2<'_, f64>) -> f64 {
@@ -1465,9 +1451,12 @@ fn build_projected_edge(
     joined
         .slice_mut(s![.., retained_a..])
         .assign(&patch_b.projection_frame);
-    let (union_left, union_singular, _) = joined
-        .svd(true, false)
-        .map_err(|error| format!("edge ({}, {}) projection SVD failed: {error}", spec.a, spec.b))?;
+    let (union_left, union_singular, _) = joined.svd(true, false).map_err(|error| {
+        format!(
+            "edge ({}, {}) projection SVD failed: {error}",
+            spec.a, spec.b
+        )
+    })?;
     let union_left = union_left.ok_or_else(|| {
         format!(
             "edge ({}, {}) projection SVD did not return requested left vectors",
@@ -1475,9 +1464,8 @@ fn build_projected_edge(
         )
     })?;
     let largest_union_singular = union_singular.first().copied().unwrap_or(0.0);
-    let union_rank_threshold = f64::EPSILON
-        * ambient.max(retained_a + retained_b) as f64
-        * largest_union_singular;
+    let union_rank_threshold =
+        f64::EPSILON * ambient.max(retained_a + retained_b) as f64 * largest_union_singular;
     let projected_dimension = union_singular
         .iter()
         .take_while(|&&value| value > union_rank_threshold)
@@ -1495,9 +1483,12 @@ fn build_projected_edge(
     let tangent_b_projected = union.t().dot(&tangent_b);
     // Coordinates are mapped from chart a to chart b, hence M = U_b^T U_a.
     let cross = tangent_b_projected.t().dot(&tangent_a_projected);
-    let (left, singular, right_t) = cross
-        .svd(true, true)
-        .map_err(|error| format!("edge ({}, {}) cross-Gram SVD failed: {error}", spec.a, spec.b))?;
+    let (left, singular, right_t) = cross.svd(true, true).map_err(|error| {
+        format!(
+            "edge ({}, {}) cross-Gram SVD failed: {error}",
+            spec.a, spec.b
+        )
+    })?;
     let left = left.ok_or_else(|| {
         format!(
             "edge ({}, {}) cross-Gram SVD omitted requested left vectors",
@@ -1520,14 +1511,10 @@ fn build_projected_edge(
     }
     let largest_singular_value = singular[0];
     let smallest_singular_value = singular[INTRINSIC_DIMENSION - 1];
-    let numerical_rank_threshold = f64::EPSILON
-        * INTRINSIC_DIMENSION as f64
-        * largest_singular_value.max(1.0);
+    let numerical_rank_threshold =
+        f64::EPSILON * INTRINSIC_DIMENSION as f64 * largest_singular_value.max(1.0);
     let orientation_margin = determinant_2(cross.view()).abs();
-    let principal_angle_cosines = [
-        singular[0].clamp(0.0, 1.0),
-        singular[1].clamp(0.0, 1.0),
-    ];
+    let principal_angle_cosines = [singular[0].clamp(0.0, 1.0), singular[1].clamp(0.0, 1.0)];
     if smallest_singular_value <= numerical_rank_threshold {
         return Ok(EdgeWork {
             public: ProjectedAtlasEdgeGeometry {
@@ -1715,10 +1702,8 @@ fn patch_tail(
     let degrees_of_freedom = patch.covariance_degrees_of_freedom() as f64;
     let u = ((projected_dimension as f64).sqrt() + (2.0 * tail_parameter).sqrt())
         / degrees_of_freedom.sqrt();
-    let covariance_error =
-        patch.population_bounds.spectral_radius_upper() * (2.0 * u + u * u);
-    let projector_error =
-        2.0 * covariance_error / patch.population_bounds.eigengap_lower;
+    let covariance_error = patch.population_bounds.spectral_radius_upper() * (2.0 * u + u * u);
+    let projector_error = 2.0 * covariance_error / patch.population_bounds.eigengap_lower;
     PatchTail {
         covariance_error,
         projector_error,
@@ -1769,9 +1754,11 @@ fn orientation_tail_and_prescription(
                 projected_dimensions[chart].max(edge.public.projected_dimension);
         }
     }
-    let active_patches = projected_dimensions.iter().filter(|&&rank| rank > 0).count();
-    let requested_tail_parameter =
-        (2.0 * active_patches as f64 / allocated_alpha).ln();
+    let active_patches = projected_dimensions
+        .iter()
+        .filter(|&&rank| rank > 0)
+        .count();
+    let requested_tail_parameter = (2.0 * active_patches as f64 / allocated_alpha).ln();
     let mut prescriptions = Vec::with_capacity(active_patches);
     let mut flip_probability_bound = 0.0_f64;
     for (chart, patch) in patches.iter().enumerate() {
@@ -1781,16 +1768,13 @@ fn orientation_tail_and_prescription(
         }
         let frame_budget = frame_budgets[chart];
         let projector_budget = projector_error_for_aligned_frame_error(frame_budget);
-        let covariance_budget =
-            patch.population_bounds.eigengap_lower * projector_budget / 2.0;
-        let normalized_budget =
-            covariance_budget / patch.population_bounds.spectral_radius_upper();
+        let covariance_budget = patch.population_bounds.eigengap_lower * projector_budget / 2.0;
+        let normalized_budget = covariance_budget / patch.population_bounds.spectral_radius_upper();
         let u_budget = (1.0 + normalized_budget).sqrt() - 1.0;
-        let numerator = (projected_dimension as f64).sqrt()
-            + (2.0 * requested_tail_parameter).sqrt();
+        let numerator =
+            (projected_dimension as f64).sqrt() + (2.0 * requested_tail_parameter).sqrt();
         let required_dof_f64 = (numerator / u_budget).powi(2).ceil();
-        let required_dof = if required_dof_f64.is_finite()
-            && required_dof_f64 <= usize::MAX as f64
+        let required_dof = if required_dof_f64.is_finite() && required_dof_f64 <= usize::MAX as f64
         {
             required_dof_f64 as usize
         } else {
@@ -1820,12 +1804,10 @@ fn orientation_tail_and_prescription(
     }
     flip_probability_bound = flip_probability_bound.min(1.0);
     if flip_probability_bound > allocated_alpha {
-        reasons.push(
-            AtlasStatisticalRefusal::OrientationFlipBoundExceedsLevel {
-                flip_probability_bound,
-                allocated_alpha,
-            },
-        );
+        reasons.push(AtlasStatisticalRefusal::OrientationFlipBoundExceedsLevel {
+            flip_probability_bound,
+            allocated_alpha,
+        });
     }
     let decision = if reasons.is_empty() {
         let signs: Vec<AtlasSignedEdge> = edges
@@ -1941,9 +1923,7 @@ fn analyze_cycle(
             gaussian_error_budget,
             subspace_tail_probability_bound,
             decision: AtlasStatisticalDecision::Refused {
-                reasons: vec![AtlasStatisticalRefusal::ImproperCycleHolonomy {
-                    cycle_index,
-                }],
+                reasons: vec![AtlasStatisticalRefusal::ImproperCycleHolonomy { cycle_index }],
             },
         });
     }
@@ -1979,10 +1959,8 @@ fn analyze_cycle(
         ));
     }
     let ambient = patches[0].ambient_dimension();
-    let mut patch_gradients = vec![
-        Array2::<f64>::zeros((ambient, INTRINSIC_DIMENSION));
-        patches.len()
-    ];
+    let mut patch_gradients =
+        vec![Array2::<f64>::zeros((ambient, INTRINSIC_DIMENSION)); patches.len()];
     let mut naive_first_order_variance = 0.0_f64;
     let mut second_order_variance = 0.0_f64;
     for (position, &(edge_index, _)) in cycle.steps.iter().enumerate() {
@@ -2002,12 +1980,14 @@ fn analyze_cycle(
         })?;
         patch_gradients[edge.public.a].scaled_add(coefficient, gradient_a);
         patch_gradients[edge.public.b].scaled_add(coefficient, gradient_b);
-        naive_first_order_variance += coefficient * coefficient
+        naive_first_order_variance += coefficient
+            * coefficient
             * (patches[edge.public.a].projector_variance_scale()
                 * frobenius_squared(gradient_a.view())
                 + patches[edge.public.b].projector_variance_scale()
                     * frobenius_squared(gradient_b.view()));
-        second_order_variance += coefficient * coefficient
+        second_order_variance += coefficient
+            * coefficient
             * (edge.public.projected_dimension - INTRINSIC_DIMENSION) as f64
             * patches[edge.public.a].projector_variance_scale()
             * patches[edge.public.b].projector_variance_scale()
@@ -2020,16 +2000,14 @@ fn analyze_cycle(
             patch.projector_variance_scale() * frobenius_squared(gradient.view())
         })
         .sum();
-    let shared_patch_covariance_adjustment =
-        first_order_variance - naive_first_order_variance;
+    let shared_patch_covariance_adjustment = first_order_variance - naive_first_order_variance;
     let standard_error = (first_order_variance + second_order_variance).sqrt();
     let absolute_angle = (holonomy[[1, 0]] - holonomy[[0, 1]])
         .atan2(holonomy[[0, 0]] + holonomy[[1, 1]])
         .abs();
 
     let cycle_charts: BTreeSet<usize> = cycle.charts.iter().copied().collect();
-    let tail_parameter =
-        (2.0 * cycle_charts.len() as f64 / subspace_tail_probability_bound).ln();
+    let tail_parameter = (2.0 * cycle_charts.len() as f64 / subspace_tail_probability_bound).ln();
     let mut patch_projected_dimension = vec![0usize; patches.len()];
     for &(edge_index, _) in &cycle.steps {
         let edge = &edges[edge_index].public;
@@ -2091,10 +2069,9 @@ fn analyze_cycle(
             .as_ref()
             .map(|gradient| frobenius_squared(gradient.view()).sqrt())
             .unwrap_or(0.0);
-        let linear_change_bound =
-            gradient_norm * (INTRINSIC_DIMENSION as f64).sqrt() * cross_error;
-        polar_linearization_remainder_bound += coefficients[position].abs()
-            * (total_angle_change + linear_change_bound);
+        let linear_change_bound = gradient_norm * (INTRINSIC_DIMENSION as f64).sqrt() * cross_error;
+        polar_linearization_remainder_bound +=
+            coefficients[position].abs() * (total_angle_change + linear_change_bound);
     }
     if !reasons.is_empty() {
         return Ok(AtlasCycleHolonomy {
@@ -2106,9 +2083,7 @@ fn analyze_cycle(
             shared_patch_covariance_adjustment: Some(shared_patch_covariance_adjustment),
             second_order_variance: Some(second_order_variance),
             standard_error: Some(standard_error),
-            polar_linearization_remainder_bound: Some(
-                polar_linearization_remainder_bound,
-            ),
+            polar_linearization_remainder_bound: Some(polar_linearization_remainder_bound),
             geometric_remainder_bound,
             gaussian_error_budget,
             subspace_tail_probability_bound,
@@ -2118,9 +2093,8 @@ fn analyze_cycle(
     let normal = Normal::new(0.0, 1.0)
         .map_err(|error| format!("standard-normal construction failed: {error}"))?;
     let critical = normal.inverse_cdf(1.0 - gaussian_error_budget / 2.0);
-    let rejection_boundary = critical * standard_error
-        + polar_linearization_remainder_bound
-        + geometric_remainder_bound;
+    let rejection_boundary =
+        critical * standard_error + polar_linearization_remainder_bound + geometric_remainder_bound;
     if std::f64::consts::PI - absolute_angle <= rejection_boundary {
         return Ok(AtlasCycleHolonomy {
             cycle_index,
@@ -2131,9 +2105,7 @@ fn analyze_cycle(
             shared_patch_covariance_adjustment: Some(shared_patch_covariance_adjustment),
             second_order_variance: Some(second_order_variance),
             standard_error: Some(standard_error),
-            polar_linearization_remainder_bound: Some(
-                polar_linearization_remainder_bound,
-            ),
+            polar_linearization_remainder_bound: Some(polar_linearization_remainder_bound),
             geometric_remainder_bound,
             gaussian_error_budget,
             subspace_tail_probability_bound,
@@ -2166,8 +2138,7 @@ fn analyze_cycle(
         subspace_tail_probability_bound,
         decision: AtlasStatisticalDecision::Certified {
             value: conclusion,
-            error_probability_bound: gaussian_error_budget
-                + subspace_tail_probability_bound,
+            error_probability_bound: gaussian_error_budget + subspace_tail_probability_bound,
         },
     })
 }
@@ -2234,14 +2205,10 @@ fn gauss_bonnet_confidence(
         return Err("Gauss-Bonnet integer candidate is outside i64 range".to_string());
     }
     let nearest_integer_candidate = integer_f64 as i64;
-    let residual_to_integer_curvature = (total_curvature_estimate
-        - std::f64::consts::TAU * nearest_integer_candidate as f64)
-        .abs();
-    let total_remainder =
-        polar_linearization_remainder_bound + geometric_remainder_bound;
-    let rounding_margin = std::f64::consts::PI
-        - residual_to_integer_curvature
-        - total_remainder;
+    let residual_to_integer_curvature =
+        (total_curvature_estimate - std::f64::consts::TAU * nearest_integer_candidate as f64).abs();
+    let total_remainder = polar_linearization_remainder_bound + geometric_remainder_bound;
+    let rounding_margin = std::f64::consts::PI - residual_to_integer_curvature - total_remainder;
     let (misround_probability_bound, decision) = if rounding_margin <= 0.0 {
         (
             1.0,
@@ -2274,12 +2241,10 @@ fn gauss_bonnet_confidence(
             (
                 probability,
                 AtlasStatisticalDecision::Refused {
-                    reasons: vec![
-                        AtlasStatisticalRefusal::GaussBonnetErrorBoundExceedsLevel {
-                            misround_probability_bound: probability,
-                            allocated_alpha,
-                        },
-                    ],
+                    reasons: vec![AtlasStatisticalRefusal::GaussBonnetErrorBoundExceedsLevel {
+                        misround_probability_bound: probability,
+                        allocated_alpha,
+                    }],
                 },
             )
         }
@@ -2290,8 +2255,7 @@ fn gauss_bonnet_confidence(
         residual_to_integer_curvature,
         first_order_variance,
         naive_contribution_variance,
-        shared_source_covariance_adjustment: first_order_variance
-            - naive_contribution_variance,
+        shared_source_covariance_adjustment: first_order_variance - naive_contribution_variance,
         standard_error,
         polar_linearization_remainder_bound,
         geometric_remainder_bound,

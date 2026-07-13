@@ -130,12 +130,11 @@ impl AtlasChart {
     }
 }
 
-/// Existing transfer evidence for a chart pair, compressed to the validity
-/// verdict the nerve gate needs.
+/// Existing transfer evidence for one connected chart-overlap component,
+/// compressed to the validity verdict the nerve gate needs.
 #[derive(Clone, Debug)]
 pub struct AtlasTransferGate {
-    pub a: usize,
-    pub b: usize,
+    edge: AtlasHolonomyEdgeId,
     pub valid: bool,
     pub transport_defect: f64,
     pub equivariance_defect: f64,
@@ -143,8 +142,7 @@ pub struct AtlasTransferGate {
 
 impl AtlasTransferGate {
     pub fn from_square_transfer(
-        a: usize,
-        b: usize,
+        edge: AtlasHolonomyEdgeId,
         certificate: TransferCertificate,
         chart_dim: usize,
     ) -> Self {
@@ -154,26 +152,29 @@ impl AtlasTransferGate {
             && certificate.transport_defect <= scale
             && certificate.equivariance_defect <= scale;
         Self {
-            a,
-            b,
+            edge,
             valid,
             transport_defect: certificate.transport_defect,
             equivariance_defect: certificate.equivariance_defect,
         }
     }
 
-    pub fn from_fitted_transport(a: usize, b: usize, transport: &FittedTransport) -> Self {
+    pub fn from_fitted_transport(edge: AtlasHolonomyEdgeId, transport: &FittedTransport) -> Self {
         let valid = transport.topology_preserved
             && transport.isometry_defect.is_finite()
             && transport.isometry_defect_se.is_finite()
             && transport.isometry_defect <= transport.isometry_defect_se;
         Self {
-            a,
-            b,
+            edge,
             valid,
             transport_defect: transport.isometry_defect,
             equivariance_defect: transport.residual_rms,
         }
+    }
+
+    #[must_use]
+    pub fn edge(&self) -> AtlasHolonomyEdgeId {
+        self.edge
     }
 }
 
@@ -182,8 +183,9 @@ impl AtlasTransferGate {
 pub struct AtlasNerveEdge {
     pub a: usize,
     pub b: usize,
-    /// Connected overlap-component identity.  The sparse nerve builder owns
-    /// one aggregate component per chart pair and assigns it identity zero.
+    /// Connected overlap-component identity inherited from the transfer gate.
+    /// When no transfer evidence exists, the rejected aggregate audit row uses
+    /// identity zero and can never enter the certified inventory.
     pub overlap: usize,
     pub coactivation_mass: f64,
     pub coactivation_threshold: f64,
@@ -339,9 +341,7 @@ impl AtlasNerveDiagram {
             self.betti.b2,
             self.euler_characteristic,
         ) {
-            (1, 2, Some(1), 0) => {
-                Some((GraphCompressionKind::Torus, "torus", 2.0 * log_vertices))
-            }
+            (1, 2, Some(1), 0) => Some((GraphCompressionKind::Torus, "torus", 2.0 * log_vertices)),
             (1, 1, Some(0), 0) => Some((
                 GraphCompressionKind::Cylinder,
                 "cylinder",
@@ -431,10 +431,6 @@ fn validate_charts(charts: &[AtlasChart]) -> Result<usize, String> {
         }
     }
     Ok(n)
-}
-
-fn gate_key(a: usize, b: usize) -> (usize, usize) {
-    if a < b { (a, b) } else { (b, a) }
 }
 
 fn mutual_row_mass(charts: &[AtlasChart], simplex: &[usize]) -> (f64, f64) {
@@ -886,19 +882,28 @@ pub fn build_atlas_nerve(
         });
     }
 
-    let mut gate_map = HashMap::with_capacity(transfer_gates.len());
+    let mut gate_map = BTreeMap::<(usize, usize), BTreeMap<usize, &AtlasTransferGate>>::new();
     for gate in transfer_gates {
-        if gate.a >= n || gate.b >= n || gate.a == gate.b {
+        let edge = gate.edge();
+        if edge.b() >= n {
             return Err(format!(
-                "transfer gate ({}, {}) is outside the {n}-chart atlas or self-linked",
-                gate.a, gate.b
+                "transfer gate ({}, {}, overlap {}) is outside the {n}-chart atlas",
+                edge.a(),
+                edge.b(),
+                edge.overlap()
             ));
         }
-        if gate_map.insert(gate_key(gate.a, gate.b), gate).is_some() {
+        if gate_map
+            .entry((edge.a(), edge.b()))
+            .or_default()
+            .insert(edge.overlap(), gate)
+            .is_some()
+        {
             return Err(format!(
-                "duplicate transfer gate for atlas pair ({}, {})",
-                gate.a.min(gate.b),
-                gate.a.max(gate.b)
+                "duplicate transfer gate for atlas edge ({}, {}, overlap {})",
+                edge.a(),
+                edge.b(),
+                edge.overlap()
             ));
         }
     }
@@ -911,27 +916,37 @@ pub fn build_atlas_nerve(
     let mut max_filtration = 0.0_f64;
     for (&(a, b), overlap) in &overlaps {
         let threshold = overlap.mass / overlap.positive_rows as f64;
-        let transfer_valid = gate_map.get(&gate_key(a, b)).is_some_and(|gate| gate.valid);
         let coactive = overlap.mass.is_finite() && overlap.mass >= threshold;
         let filtration = chart_distance(&charts[a], &charts[b], overlap.mass)
             .max(dtm[a])
             .max(dtm[b]);
-        let admitted = coactive && transfer_valid;
-        if admitted {
-            adjacency[a].insert(b);
-            adjacency[b].insert(a);
-            max_filtration = max_filtration.max(filtration);
+        let mut record_component = |overlap_id: usize, transfer_valid: bool| {
+            let admitted = coactive && transfer_valid;
+            if admitted {
+                adjacency[a].insert(b);
+                adjacency[b].insert(a);
+                max_filtration = max_filtration.max(filtration);
+            }
+            edge_reports.push(AtlasNerveEdge {
+                a,
+                b,
+                overlap: overlap_id,
+                coactivation_mass: overlap.mass,
+                coactivation_threshold: threshold,
+                transfer_valid,
+                admitted,
+                filtration,
+            });
+        };
+        if let Some(component_gates) = gate_map.get(&(a, b)) {
+            for (&overlap_id, gate) in component_gates {
+                record_component(overlap_id, gate.valid);
+            }
+        } else {
+            // Preserve the observed overlap in the audit report, but without a
+            // transfer certificate it is deliberately not admitted.
+            record_component(0, false);
         }
-        edge_reports.push(AtlasNerveEdge {
-            a,
-            b,
-            overlap: 0,
-            coactivation_mass: overlap.mass,
-            coactivation_threshold: threshold,
-            transfer_valid,
-            admitted,
-            filtration,
-        });
     }
 
     // Enumerate each clique once in canonical vertex order.  Only the boundary
@@ -944,11 +959,7 @@ pub fn build_atlas_nerve(
         .filter(|edge| edge.admitted)
         .map(|edge| AtlasHolonomyEdgeId::new(edge.a, edge.b, edge.overlap))
         .collect::<Result<_, _>>()?;
-    validate_holonomy_certificate(
-        n,
-        &admitted_edge_inventory,
-        holonomy_certificate.as_ref(),
-    )?;
+    validate_holonomy_certificate(n, &admitted_edge_inventory, holonomy_certificate.as_ref())?;
     let certified_orientability = holonomy_certificate
         .as_ref()
         .and_then(AtlasHolonomyCertificate::certified_orientability);
@@ -1001,7 +1012,9 @@ mod tests {
     };
     use crate::chart_transfer::certify_square_transfer;
     use crate::inference::atlas_holonomy::{
-        AtlasHolonomyCertificate, AtlasSignedEdge, ExactAnalyticHolonomyCertificate,
+        AtlasFamilywiseLevel, AtlasHolonomyCertificate, AtlasHolonomyEdgeId, AtlasSignedEdge,
+        AtlasStatisticalDecision, ExactAnalyticHolonomyCertificate, GaussianPatchCentering,
+        GaussianPcaPatch, GaussianPcaPopulationBounds, ProjectedAtlasEdgeSpec,
     };
     use crate::manifold::{AtlasOrientability, GraphCompressionKind};
     use ndarray::{Array2, arr2};
@@ -1044,7 +1057,11 @@ mod tests {
                 let cert =
                     certify_square_transfer(identity.view(), generator.view(), generator.view())
                         .unwrap();
-                gates.push(AtlasTransferGate::from_square_transfer(a, b, cert, 2));
+                gates.push(AtlasTransferGate::from_square_transfer(
+                    AtlasHolonomyEdgeId::new(a, b, 0).unwrap(),
+                    cert,
+                    2,
+                ));
             }
         }
         gates
@@ -1095,22 +1112,60 @@ mod tests {
         let edges = pairs
             .into_iter()
             .map(|(a, b)| {
-                AtlasSignedEdge::new(
-                    a,
-                    b,
-                    0,
-                    if reversed_edge == Some((a, b)) {
-                        -1
-                    } else {
-                        1
-                    },
-                )
-                .unwrap()
+                AtlasSignedEdge::new(a, b, 0, if reversed_edge == Some((a, b)) { -1 } else { 1 })
+                    .unwrap()
             })
             .collect();
         AtlasHolonomyCertificate::ExactAnalytic(
             ExactAnalyticHolonomyCertificate::new(n_charts, edges).unwrap(),
         )
+    }
+
+    fn refused_gaussian_certificate(
+        n_charts: usize,
+        maximal_intersections: &[Vec<usize>],
+    ) -> AtlasHolonomyCertificate {
+        let projection_frame = arr2(&[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let tangent_coordinates = arr2(&[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]);
+        let bounds = GaussianPcaPopulationBounds::new(0.1, 2.0, 1.0).unwrap();
+        let patches = (0..n_charts)
+            .map(|chart| {
+                GaussianPcaPatch::new(
+                    chart,
+                    2,
+                    2,
+                    GaussianPatchCentering::MeanEstimatedOnInferenceRows,
+                    projection_frame.clone(),
+                    tangent_coordinates.clone(),
+                    0.1,
+                    1.0,
+                    bounds,
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut pairs = BTreeSet::new();
+        for intersection in maximal_intersections {
+            for left in 0..intersection.len() {
+                for right in (left + 1)..intersection.len() {
+                    pairs.insert((
+                        intersection[left].min(intersection[right]),
+                        intersection[left].max(intersection[right]),
+                    ));
+                }
+            }
+        }
+        let edge_specs = pairs
+            .into_iter()
+            .map(|(a, b)| ProjectedAtlasEdgeSpec::new(a, b, 0, 0.0).unwrap())
+            .collect();
+        AtlasHolonomyCertificate::gaussian_pca(
+            patches,
+            edge_specs,
+            AtlasFamilywiseLevel::new(0.05).unwrap(),
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1134,6 +1189,16 @@ mod tests {
         assert_eq!(
             diagram.covering_side,
             AtlasCoveringSide::AtOrAboveCoveringNumber
+        );
+
+        let cover = good_cover_certificate(4, &faces);
+        let orientation = orientation_certificate(4, &faces, None);
+        let certified =
+            build_atlas_nerve(&charts, &gates, Some(&cover), Some(orientation)).unwrap();
+        assert_eq!(
+            certified.certified_compression().kind,
+            GraphCompressionKind::Sphere,
+            "even the sphere name requires an authoritative orientability certificate"
         );
     }
 
@@ -1169,6 +1234,79 @@ mod tests {
         assert!(
             error.contains("no contractibility proof for non-empty intersection [0, 1]"),
             "unexpected certificate error: {error}"
+        );
+    }
+
+    #[test]
+    fn holonomy_certificate_must_match_chart_count_and_full_overlap_inventory() {
+        let faces = vec![vec![0, 1]];
+        let charts = charts_from_faces(2, &faces);
+        let generator = Array2::<f64>::zeros((2, 2));
+        let identity = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
+        let gates = [3, 7]
+            .into_iter()
+            .map(|overlap| {
+                let transfer =
+                    certify_square_transfer(identity.view(), generator.view(), generator.view())
+                        .unwrap();
+                AtlasTransferGate::from_square_transfer(
+                    AtlasHolonomyEdgeId::new(0, 1, overlap).unwrap(),
+                    transfer,
+                    2,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let wrong_chart_count = AtlasHolonomyCertificate::ExactAnalytic(
+            ExactAnalyticHolonomyCertificate::new(
+                3,
+                vec![
+                    AtlasSignedEdge::new(0, 1, 3, 1).unwrap(),
+                    AtlasSignedEdge::new(0, 1, 7, 1).unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+        let error = build_atlas_nerve(&charts, &gates, None, Some(wrong_chart_count)).unwrap_err();
+        assert!(error.contains("certificate is for 3 charts but the atlas has 2"));
+
+        let missing_overlap = AtlasHolonomyCertificate::ExactAnalytic(
+            ExactAnalyticHolonomyCertificate::new(
+                2,
+                vec![AtlasSignedEdge::new(0, 1, 3, 1).unwrap()],
+            )
+            .unwrap(),
+        );
+        let error = build_atlas_nerve(&charts, &gates, None, Some(missing_overlap)).unwrap_err();
+        assert!(error.contains("full admitted (a, b, overlap) inventory"));
+        assert!(error.contains("overlap: 7"));
+
+        let complete = AtlasHolonomyCertificate::ExactAnalytic(
+            ExactAnalyticHolonomyCertificate::new(
+                2,
+                vec![
+                    AtlasSignedEdge::new(0, 1, 3, 1).unwrap(),
+                    AtlasSignedEdge::new(0, 1, 7, -1).unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+        let diagram = build_atlas_nerve(&charts, &gates, None, Some(complete)).unwrap();
+        assert_eq!(diagram.edges.iter().filter(|edge| edge.admitted).count(), 2);
+        assert_eq!(
+            diagram.certified_orientability(),
+            Some(AtlasOrientability::NonOrientable)
+        );
+        assert_eq!(
+            diagram
+                .holonomy_certificate
+                .as_ref()
+                .unwrap()
+                .edge_inventory(),
+            vec![
+                AtlasHolonomyEdgeId::new(0, 1, 3).unwrap(),
+                AtlasHolonomyEdgeId::new(0, 1, 7).unwrap(),
+            ]
         );
     }
 
@@ -1211,6 +1349,36 @@ mod tests {
     }
 
     #[test]
+    fn refused_holonomy_is_preserved_and_cannot_name_a_surface() {
+        let n = 8usize;
+        let faces: Vec<Vec<usize>> = (0..n)
+            .map(|a| {
+                let mut edge = vec![a, (a + 1) % n];
+                edge.sort_unstable();
+                edge
+            })
+            .collect();
+        let charts = charts_from_faces(n, &faces);
+        let gates = all_valid_pair_gates(n);
+        let cover = good_cover_certificate(n, &faces);
+        let refused = refused_gaussian_certificate(n, &faces);
+        assert!(matches!(
+            &refused,
+            AtlasHolonomyCertificate::GaussianPcaPlugin(analysis)
+                if matches!(analysis.orientation(), AtlasStatisticalDecision::Refused { reasons } if !reasons.is_empty())
+        ));
+
+        let diagram = build_atlas_nerve(&charts, &gates, Some(&cover), Some(refused)).unwrap();
+        assert!(diagram.holonomy_certificate.is_some());
+        assert_eq!(diagram.certified_orientability(), None);
+        assert_eq!(
+            diagram.certified_compression().kind,
+            GraphCompressionKind::Graph,
+            "a retained statistical refusal must never be read as orientable"
+        );
+    }
+
+    #[test]
     fn inconsistent_transfer_rejects_cross_cluster_edge() {
         let faces = vec![vec![0, 1], vec![1, 2], vec![2, 3]];
         let charts = charts_from_faces(4, &faces);
@@ -1222,9 +1390,21 @@ mod tests {
         let invalid_cert =
             certify_square_transfer(scaled.view(), generator.view(), generator.view()).unwrap();
         let gates = vec![
-            AtlasTransferGate::from_square_transfer(0, 1, valid_cert, 2),
-            AtlasTransferGate::from_square_transfer(1, 2, invalid_cert, 2),
-            AtlasTransferGate::from_square_transfer(2, 3, valid_cert, 2),
+            AtlasTransferGate::from_square_transfer(
+                AtlasHolonomyEdgeId::new(0, 1, 0).unwrap(),
+                valid_cert,
+                2,
+            ),
+            AtlasTransferGate::from_square_transfer(
+                AtlasHolonomyEdgeId::new(1, 2, 0).unwrap(),
+                invalid_cert,
+                2,
+            ),
+            AtlasTransferGate::from_square_transfer(
+                AtlasHolonomyEdgeId::new(2, 3, 0).unwrap(),
+                valid_cert,
+                2,
+            ),
         ];
         let diagram = build_atlas_nerve(&charts, &gates, None, None).unwrap();
         assert_eq!(diagram.betti.b0, 2);
