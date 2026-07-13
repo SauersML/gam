@@ -515,22 +515,16 @@ pub(super) fn run(
                 }
             }
         }
-        accepted_births = accepted_mask
-            .into_iter()
-            .filter(|accepted| *accepted)
-            .count();
+        accepted_births = accepted_mask.iter().filter(|accepted| **accepted).count();
 
         // Rejected residual-row proposals are dormant capacity, not trained
         // model parameters. Null them before measuring/adopting the next state so
         // held-out transforms can never expose an arbitrary rejected direction.
+        // `accepted_mask` already records, for every revived atom, whether any
+        // fresh code fired it with a nonzero value — reuse it instead of
+        // rescanning all `n` codes per revived atom (O(revived·n·s) → O(revived)).
         for &atom in &revived_atoms {
-            let accepted = next_codes.iter().any(|code| {
-                code.indices
-                    .iter()
-                    .zip(code.codes.iter())
-                    .any(|(&candidate, &value)| candidate as usize == atom && value != 0.0)
-            });
-            if !accepted {
+            if !accepted_mask[atom] {
                 decoder.row_mut(atom).fill(0.0);
             }
         }
