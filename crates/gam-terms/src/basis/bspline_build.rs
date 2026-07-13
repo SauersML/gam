@@ -3194,6 +3194,48 @@ mod function_space_null_shrinkage_tests {
     }
 
     #[test]
+    fn metric_ridge_rebuild_adjudicates_whitening_amplified_roundoff_2318() {
+        // A data-dependent identifiability congruence preserves PSD in exact
+        // arithmetic, but forming Mᵀ S M can leave a working-precision negative
+        // residue in a structural null direction.  Relative to the source
+        // penalty below, -1e-14 is inside the standard matrix-product backward
+        // error envelope.  Relative to the nearly singular function metric,
+        // however, Cholesky whitening magnifies it into the generalized
+        // eigenvalue -1e-14 / (1e-12 - 1e-14) ≈ -1.01e-2.  The 0.1.253
+        // classifier compared that amplified value to an eigensolver tolerance
+        // and falsely rejected otherwise ordinary fold-specific smooths.
+        let primary = array![[-1.0e-14, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0]];
+        let ridge = array![[1.0e-12, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        let amplified_negative = primary[[0, 0]] / (primary[[0, 0]] + ridge[[0, 0]]);
+        assert!(
+            amplified_negative < -1.0e-3,
+            "fixture must be decisively negative after whitening"
+        );
+
+        let rebuilt = rebuild_metric_consistent_ridge(&primary, &ridge)
+            .expect("source-frame roundoff must not invalidate a PSD construction")
+            .expect("the structural null direction must survive");
+        assert!(rebuilt.iter().all(|value| value.is_finite()));
+        assert!(
+            max_abs_difference(&rebuilt, &ridge) < 1.0e-20,
+            "metric ridge changed after source-frame adjudication:\nactual={rebuilt:?}\nexpected={ridge:?}"
+        );
+
+        // This is an adjudication of construction roundoff, not a PSD repair or
+        // fallback.  A negative source quadratic outside its backward-error
+        // envelope remains a hard typed error even when S + R is SPD.
+        let indefinite = array![[-1.0e-8, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0]];
+        let stabilizing_ridge = array![[1.0e-6, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        let error = rebuild_metric_consistent_ridge(&indefinite, &stabilizing_ridge)
+            .expect_err("materially indefinite source penalty must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("generalized penalty is not positive semidefinite")
+        );
+    }
+
+    #[test]
     fn ridge_quadratic_is_l2_energy_of_g_orthogonal_null_component() {
         let penalty = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 2.0]];
         let gram = array![[2.0, 0.4, 0.2], [0.4, 1.5, 0.1], [0.2, 0.1, 1.2]];
