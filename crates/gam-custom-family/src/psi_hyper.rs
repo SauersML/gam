@@ -935,6 +935,8 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     // objective.  Probe coverage while this constructor can still return a
     // typed error.  The immutable workspace may cache the corresponding row
     // program, so the callback's later lookup remains cheap.
+    let mut family_pair_cache =
+        vec![vec![None::<ExactNewtonJointPsiSecondOrderTerms>; hyper_layout.len()]; hyper_layout.len()];
     for i in 0..hyper_layout.len() {
         for j in i..hyper_layout.len() {
             if hyper_layout.family_axis(i).is_none() && hyper_layout.family_axis(j).is_none() {
@@ -951,13 +953,16 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     j,
                 )?
             };
-            if pair.is_none() {
-                return Err(format!(
+            let pair = pair.ok_or_else(|| {
+                format!(
                     "typed family hyper pair ({i}, {j}) has no exact V_ij/g_ij/H_ij terms"
-                ));
-            }
+                )
+            })?;
+            family_pair_cache[i][j] = Some(pair.clone());
+            family_pair_cache[j][i] = Some(pair);
         }
     }
+    let family_pair_cache = Arc::new(family_pair_cache);
 
     // ψ-ψ pair callback
     let ext_ext = {
@@ -971,6 +976,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let family_arc = Arc::clone(&family_arc);
         let psi_workspace = psi_workspace.clone();
         let firth_pair_ctx = firth_pair_ctx.clone();
+        let family_pair_cache = Arc::clone(&family_pair_cache);
 
         Box::new(move |psi_i: usize, psi_j: usize| -> HyperCoordPair {
             assert!(
@@ -982,29 +988,28 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             let cache_j = psi_penalty_cache[psi_j].as_ref();
 
             // Get family-provided second-order likelihood terms.
-            let psi2_result = if let Some(workspace) = psi_workspace.as_ref() {
-                workspace.second_order_terms(psi_i, psi_j)
+            let family_pair_required = hyper_layout.family_axis(psi_i).is_some()
+                || hyper_layout.family_axis(psi_j).is_some();
+            let psi2 = if family_pair_required {
+                family_pair_cache[psi_i][psi_j].clone()
             } else {
-                family_arc
-                    .exact_newton_joint_psisecond_order_terms(
+                let result = if let Some(workspace) = psi_workspace.as_ref() {
+                    workspace.second_order_terms(psi_i, psi_j)
+                } else {
+                    family_arc.exact_newton_joint_psisecond_order_terms(
                         &synced_arc,
                         &specs_arc,
                         &hyper_layout,
                         psi_i,
                         psi_j,
                     )
-            };
-            let family_pair_required = hyper_layout.family_axis(psi_i).is_some()
-                || hyper_layout.family_axis(psi_j).is_some();
-            let psi2 = match psi2_result {
-                Ok(Some(terms)) => Some(terms),
-                Ok(None) if family_pair_required => panic!(
-                    "typed family hyper pair ({psi_i}, {psi_j}) lost exact V_ij/g_ij/H_ij coverage after preflight"
-                ),
-                Ok(None) => None,
-                Err(error) => panic!(
-                    "typed hyper pair ({psi_i}, {psi_j}) failed after successful layout construction: {error}"
-                ),
+                };
+                match result {
+                    Ok(terms) => terms,
+                    Err(error) => panic!(
+                        "typed design hyper pair ({psi_i}, {psi_j}) failed during immutable Hessian assembly: {error}"
+                    ),
+                }
             };
 
             let (obj_ll, score_ll, hess_ll, hess_ll_op) = match psi2 {
