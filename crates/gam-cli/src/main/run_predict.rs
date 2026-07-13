@@ -48,9 +48,9 @@ pub(crate) fn resolve_saved_alo_response_col(
         let event = model.survival_event.as_ref().ok_or_else(|| {
             "saved survival ALO model is missing its fitted event-column authority".to_string()
         })?;
-        resolve_role_col(col_map, event, "survival event")
+        Ok(resolve_role_col(col_map, event, "survival event")?)
     } else {
-        resolve_role_col(col_map, &parsed.response, "response")
+        Ok(resolve_role_col(col_map, &parsed.response, "response")?)
     }
 }
 
