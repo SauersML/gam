@@ -831,11 +831,11 @@ where
         variance = variance.add(&S::constant(-variance_value, dimension, workspace));
     }
 
-    let one_plus_variance = variance.add(&S::constant(1.0, dimension, workspace));
+    let one_plus_variance = variance.add_constant(1.0, workspace);
     let correction =
         one_plus_variance.compose_unary(unary_derivatives_sqrt(one_plus_variance.value()));
-    let eta0 = vars[0].mul(&correction).add(&linear);
-    let eta1 = vars[1].mul(&correction).add(&linear);
+    let eta0 = vars[0].multiply_add(&correction, &linear);
+    let eta1 = vars[1].multiply_add(&correction, &linear);
     let adjusted_derivative = vars[2].mul(&correction);
     let neg_eta0 = eta0.neg();
     let neg_eta1 = eta1.neg();
@@ -848,24 +848,32 @@ where
         adjusted_derivative.value(),
     )?;
 
-    let entry = neg_eta0
-        .compose_unary(unary_derivatives_neglog_phi(neg_eta0.value(), inputs.wi))
-        .scale(-1.0);
-    let exit = neg_eta1.compose_unary(unary_derivatives_neglog_phi(
-        neg_eta1.value(),
-        inputs.wi * (1.0 - inputs.di),
-    ));
-    let mut event_density = S::constant(0.0, dimension, workspace);
-    let mut time_derivative = S::constant(0.0, dimension, workspace);
-    if inputs.di > 0.0 {
-        event_density = eta1
-            .compose_unary(unary_derivatives_log_normal_pdf(eta1.value()))
-            .scale((-inputs.wi) * inputs.di);
-        time_derivative = adjusted_derivative
-            .compose_unary(unary_derivatives_log(adjusted_derivative.value()))
-            .scale((-inputs.wi) * inputs.di);
+    let mut entry_stack = unary_derivatives_neglog_phi(neg_eta0.value(), inputs.wi);
+    for derivative in &mut entry_stack {
+        *derivative = -*derivative;
     }
-    Ok(exit.add(&entry).add(&event_density.add(&time_derivative)))
+    let exit_stack = unary_derivatives_neglog_phi(neg_eta1.value(), inputs.wi * (1.0 - inputs.di));
+    if inputs.di > 0.0 {
+        let scale = (-inputs.wi) * inputs.di;
+        let mut event_stack = unary_derivatives_log_normal_pdf(eta1.value());
+        let mut time_stack = unary_derivatives_log(adjusted_derivative.value());
+        for derivative in event_stack.iter_mut().chain(&mut time_stack) {
+            *derivative *= scale;
+        }
+        Ok(S::composed_sum(
+            &[neg_eta1, neg_eta0, eta1, adjusted_derivative],
+            &[exit_stack, entry_stack, event_stack, time_stack],
+            dimension,
+            workspace,
+        ))
+    } else {
+        Ok(S::composed_sum(
+            &[neg_eta1, neg_eta0],
+            &[exit_stack, entry_stack],
+            dimension,
+            workspace,
+        ))
+    }
 }
 
 pub(crate) fn row_primary_closed_form_vector(
