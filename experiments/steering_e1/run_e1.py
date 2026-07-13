@@ -44,7 +44,7 @@ import argparse
 import json
 import math
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -62,8 +62,8 @@ def log(msg: str) -> None:
 # GPT-2 activation capture + residual patch.
 # Verbatim (with provenance) from experiments/interchange/qwen_calendar_interchange.py:
 # load_model_and_tokenizer / resolve_layers / model_input_device / run_clean /
-# run_patched / candidate_token_ids / full_vocab_kl / restricted_logprob. That
-# harness is the single source of the calendar hook path; copied here so E1 is a
+# run_patched / candidate_token_ids. That harness is the single source of the
+# calendar hook path; copied here so E1 is a
 # self-contained, wheel-only-deployable script (no cross-experiment import).
 # --------------------------------------------------------------------------- #
 def load_model_and_tokenizer(model_name: str, cache_dir: str, dtype_name: str):

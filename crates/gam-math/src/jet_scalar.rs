@@ -627,7 +627,9 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
     ) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         assert_eq!(inputs.len(), weights.len());
-        // `FixedRuntimeJet` is `repr(transparent)` over `S`.
+        // SAFETY: `FixedRuntimeJet<S, K>` is `repr(transparent)` over its sole
+        // non-zero-sized `S` field, so the shared slice has identical element
+        // layout, alignment, provenance, length, and lifetime after the cast.
         let inner =
             unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
         Self {
@@ -657,6 +659,9 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
         &(): &'arena Self::Workspace,
     ) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
+        // SAFETY: `FixedRuntimeJet<S, K>` is `repr(transparent)` over its sole
+        // non-zero-sized `S` field, so the shared slice has identical element
+        // layout, alignment, provenance, length, and lifetime after the cast.
         let inner =
             unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
         Self {
@@ -695,6 +700,9 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
         &(): &'arena Self::Workspace,
     ) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
+        // SAFETY: `FixedRuntimeJet<S, K>` is `repr(transparent)` over its sole
+        // non-zero-sized `S` field, so the shared slice has identical element
+        // layout, alignment, provenance, length, and lifetime after the cast.
         let inner =
             unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
         Self {
@@ -1164,11 +1172,12 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
     fn affine_compose(
         &self,
         input_scale: f64,
-        _input_shift: f64,
+        input_shift: f64,
         derivative_stack: [f64; 5],
         arena: &'arena DynamicJetArena,
     ) -> Self {
         assert!(std::ptr::eq(self.arena, arena));
+        assert!(input_shift.is_finite(), "affine input shift must be finite");
         let dimension = self.dimension();
         let first = derivative_stack[1] * input_scale;
         let second = derivative_stack[2] * input_scale * input_scale;
@@ -2805,9 +2814,10 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
     fn affine_compose(
         &self,
         input_scale: f64,
-        _input_shift: f64,
+        input_shift: f64,
         derivative_stack: [f64; 5],
     ) -> Self {
+        assert!(input_shift.is_finite(), "affine input shift must be finite");
         let first = derivative_stack[1] * input_scale;
         let second = derivative_stack[2] * input_scale * input_scale;
         let mut out = crate::jet_tower::Tower2::zero();

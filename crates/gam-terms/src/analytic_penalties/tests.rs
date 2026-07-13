@@ -950,7 +950,7 @@ fn isometry_pullback_metric_rejects_stale_cross_dimension_cache_2294() {
     let target = PsiSlice::full(n_obs, Some(1));
     let pen = IsometryPenalty::new_euclidean(target, p);
     pen.refresh_caches(Some(Arc::new(Array2::<f64>::zeros((n_obs, p * 2)))), None);
-    let _ = pen.pullback_metric(1);
+    assert!(pen.pullback_metric(1).is_some());
 }
 
 /// As the normalized residual `g/gbar − g_ref → 0` the exact Hessian collapses onto its

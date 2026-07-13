@@ -1,6 +1,6 @@
 use super::cell_moment_assembly::{
-    BernoulliInterceptSolveStats, EmpiricalBmsJetChannel, EmpiricalBmsJetSchedule,
-    empirical_bms_jet_schedule, fill_link_basis_cell_coeff_gradient,
+    BernoulliInterceptSolveStats, EmpiricalBmsFourthJetSchedule,
+    empirical_bms_fourth_jet_schedule, fill_link_basis_cell_coeff_gradient,
     fill_link_basis_cell_coeff_jet, fill_score_basis_cell_coeff_jet,
 };
 use super::exact_eval_cache::*;
@@ -6992,9 +6992,8 @@ impl BernoulliMarginalSlopeFamily {
                 .collect();
         }
 
-        let fourth_schedule =
-            empirical_bms_jet_schedule(EmpiricalBmsJetChannel::FourthMany, expected);
-        if fourth_schedule == EmpiricalBmsJetSchedule::RepeatedFixedWidth {
+        let fourth_schedule = empirical_bms_fourth_jet_schedule(expected);
+        if fourth_schedule == EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth {
             return direction_pairs
                 .iter()
                 .map(|(direction_u, direction_v)| {
@@ -7033,17 +7032,27 @@ impl BernoulliMarginalSlopeFamily {
                 ordered_pairs.push((direction_v, direction_u));
             }
             let ordered = match fourth_schedule {
-                EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
+                EmpiricalBmsFourthJetSchedule::FixedWidthFromPlan => {
                     Self::empirical_fixed_fourth_many_from_plan::<4>(
                         &plan,
                         &primary_point,
                         &ordered_pairs,
                     )
                 }
-                EmpiricalBmsJetSchedule::RepeatedFixedWidth => {
-                    unreachable!("repeated fixed-width fourth schedule returned above")
-                }
-                EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
+                EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth => pair_chunk
+                    .iter()
+                    .map(|&(direction_u, direction_v)| {
+                        self.row_primary_fourth_contracted(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            direction_u,
+                            direction_v,
+                        )
+                    })
+                    .collect(),
+                EmpiricalBmsFourthJetSchedule::DynamicBatch { lanes } => {
                     Self::empirical_dynamic_fourth_batch_from_plan(
                         &plan,
                         &primary_point,

@@ -29,14 +29,13 @@ thread_local! {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum EmpiricalBmsJetChannel {
-    ThirdMany,
-    ThirdTrace,
-    FourthMany,
+pub(super) enum EmpiricalBmsThirdJetSchedule {
+    FixedWidthFromPlan,
+    DynamicBatch { lanes: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum EmpiricalBmsJetSchedule {
+pub(super) enum EmpiricalBmsFourthJetSchedule {
     FixedWidthFromPlan,
     RepeatedFixedWidth,
     DynamicBatch { lanes: usize },
@@ -61,20 +60,20 @@ fn empirical_bms_runtime_batch_lanes(r: usize) -> usize {
         .min(EMPIRICAL_BMS_BATCH_LANE_CAP)
 }
 
-pub(super) fn empirical_bms_jet_schedule(
-    channel: EmpiricalBmsJetChannel,
-    r: usize,
-) -> EmpiricalBmsJetSchedule {
-    match (channel, r) {
-        (
-            EmpiricalBmsJetChannel::ThirdMany | EmpiricalBmsJetChannel::ThirdTrace,
-            4 | 8 | 12 | 18,
-        )
-        | (EmpiricalBmsJetChannel::FourthMany, 4) => EmpiricalBmsJetSchedule::FixedWidthFromPlan,
-        (EmpiricalBmsJetChannel::FourthMany, 8 | 12 | 18) => {
-            EmpiricalBmsJetSchedule::RepeatedFixedWidth
-        }
-        (_, runtime_width) => EmpiricalBmsJetSchedule::DynamicBatch {
+pub(super) fn empirical_bms_third_jet_schedule(r: usize) -> EmpiricalBmsThirdJetSchedule {
+    match r {
+        4 | 8 | 12 | 18 => EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan,
+        runtime_width => EmpiricalBmsThirdJetSchedule::DynamicBatch {
+            lanes: empirical_bms_runtime_batch_lanes(runtime_width),
+        },
+    }
+}
+
+pub(super) fn empirical_bms_fourth_jet_schedule(r: usize) -> EmpiricalBmsFourthJetSchedule {
+    match r {
+        4 => EmpiricalBmsFourthJetSchedule::FixedWidthFromPlan,
+        8 | 12 | 18 => EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth,
+        runtime_width => EmpiricalBmsFourthJetSchedule::DynamicBatch {
             lanes: empirical_bms_runtime_batch_lanes(runtime_width),
         },
     }
@@ -1319,14 +1318,11 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        match empirical_bms_jet_schedule(EmpiricalBmsJetChannel::ThirdMany, r) {
-            EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
+        match empirical_bms_third_jet_schedule(r) {
+            EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_third_many_dispatch(&plan, &point, row_dirs, r)
             }
-            EmpiricalBmsJetSchedule::RepeatedFixedWidth => {
-                unreachable!("third-many schedule cannot select repeated fixed-width evaluation")
-            }
-            EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
+            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => {
                 EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
                     let mut workspace = workspace.borrow_mut();
                     let mut contracted = Vec::with_capacity(row_dirs.len());
@@ -1395,14 +1391,11 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        match empirical_bms_jet_schedule(EmpiricalBmsJetChannel::ThirdTrace, r) {
-            EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
+        match empirical_bms_third_jet_schedule(r) {
+            EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_third_trace_dispatch(&plan, &point, gram, r)
             }
-            EmpiricalBmsJetSchedule::RepeatedFixedWidth => {
-                unreachable!("third-trace schedule cannot select repeated fixed-width evaluation")
-            }
-            EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
+            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => {
                 EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
                     let mut workspace = workspace.borrow_mut();
                     let mut gradient = Array1::<f64>::zeros(r);
@@ -1538,8 +1531,8 @@ impl BernoulliMarginalSlopeFamily {
         if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
             return Err("non-finite empirical flexible row context in fourth contraction".into());
         }
-        let schedule = empirical_bms_jet_schedule(EmpiricalBmsJetChannel::FourthMany, r);
-        if schedule == EmpiricalBmsJetSchedule::RepeatedFixedWidth {
+        let schedule = empirical_bms_fourth_jet_schedule(r);
+        if schedule == EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth {
             return direction_pairs
                 .iter()
                 .map(|(direction_u, direction_v)| {
@@ -1570,13 +1563,27 @@ impl BernoulliMarginalSlopeFamily {
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
         match schedule {
-            EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
+            EmpiricalBmsFourthJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_fourth_many_from_plan::<4>(&plan, &point, direction_pairs)
             }
-            EmpiricalBmsJetSchedule::RepeatedFixedWidth => {
-                unreachable!("repeated fixed-width fourth schedule returned above")
-            }
-            EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
+            EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth => direction_pairs
+                .iter()
+                .map(|(direction_u, direction_v)| {
+                    self.empirical_flex_row_fourth_contracted(
+                        row,
+                        primary,
+                        q,
+                        b,
+                        beta_h,
+                        beta_w,
+                        row_ctx,
+                        direction_u,
+                        direction_v,
+                        grid,
+                    )
+                })
+                .collect(),
+            EmpiricalBmsFourthJetSchedule::DynamicBatch { lanes } => {
                 Self::empirical_dynamic_fourth_batch_from_plan(
                     &plan,
                     &point,
@@ -4192,43 +4199,36 @@ mod empirical_flex_jet_oracle_tests {
     #[test]
     fn empirical_bms_schedule_maps_channels_to_measured_kernels_932() {
         for r in [4, 8, 12, 18] {
-            for channel in [
-                EmpiricalBmsJetChannel::ThirdMany,
-                EmpiricalBmsJetChannel::ThirdTrace,
-            ] {
-                assert_eq!(
-                    empirical_bms_jet_schedule(channel, r),
-                    EmpiricalBmsJetSchedule::FixedWidthFromPlan,
-                    "channel={channel:?} r={r} must reuse one fixed-width plan",
-                );
-            }
+            assert_eq!(
+                empirical_bms_third_jet_schedule(r),
+                EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan,
+                "third-order r={r} must reuse one fixed-width plan",
+            );
         }
         assert_eq!(
-            empirical_bms_jet_schedule(EmpiricalBmsJetChannel::FourthMany, 4),
-            EmpiricalBmsJetSchedule::FixedWidthFromPlan,
+            empirical_bms_fourth_jet_schedule(4),
+            EmpiricalBmsFourthJetSchedule::FixedWidthFromPlan,
             "fourth-many r=4 must reuse one fixed-width plan",
         );
         for r in [8, 12, 18] {
             assert_eq!(
-                empirical_bms_jet_schedule(EmpiricalBmsJetChannel::FourthMany, r),
-                EmpiricalBmsJetSchedule::RepeatedFixedWidth,
+                empirical_bms_fourth_jet_schedule(r),
+                EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth,
                 "fourth-many r={r} must use repeated canonical fixed evaluation",
             );
         }
         for r in [1, 2, 3, 5, 7, 9, 16, 19, 32, 128] {
-            for channel in [
-                EmpiricalBmsJetChannel::ThirdMany,
-                EmpiricalBmsJetChannel::ThirdTrace,
-                EmpiricalBmsJetChannel::FourthMany,
-            ] {
-                assert_eq!(
-                    empirical_bms_jet_schedule(channel, r),
-                    EmpiricalBmsJetSchedule::DynamicBatch {
-                        lanes: empirical_bms_runtime_batch_lanes(r),
-                    },
-                    "channel={channel:?} r={r} must use the bounded runtime schedule",
-                );
-            }
+            let lanes = empirical_bms_runtime_batch_lanes(r);
+            assert_eq!(
+                empirical_bms_third_jet_schedule(r),
+                EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes },
+                "third-order r={r} must use the bounded runtime schedule",
+            );
+            assert_eq!(
+                empirical_bms_fourth_jet_schedule(r),
+                EmpiricalBmsFourthJetSchedule::DynamicBatch { lanes },
+                "fourth-order r={r} must use the bounded runtime schedule",
+            );
         }
     }
 
