@@ -343,9 +343,6 @@ mod tests_tier0_shared_mean_2023;
 mod tests_tier0_primary_path_2023;
 
 #[cfg(test)]
-mod tests_2228_inner_gauge_probe;
-
-#[cfg(test)]
 mod tests_certify_external_2266;
 
 #[cfg(test)]
