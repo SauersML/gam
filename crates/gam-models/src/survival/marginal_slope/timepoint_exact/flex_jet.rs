@@ -4497,17 +4497,14 @@ mod moment_engine_tests {
     // ── §3c h/w channels: g+h+w directional/bidirectional gate ──────────────────
     //
     // With score-warp(`h`) AND link-dev(`w`) active, the OBSERVED eta/chi carry the
-    // `h`/`w` primaries, and their directional/bidirectional derivatives involve the
+    // `h`/`w` primaries, and their bidirectional derivatives involve the
     // h/w channel weights' OWN (a,b)-Taylor (w: `link_basis_cell_*partials`; h:
     // a-independent, `coeff_u[h]=b·H(z_obs)`/`coeff_bu[h]=H(z_obs)`). `observed_fixed_
     // for` packs these into a `DenestedCellPrimaryFixedPartials` at the observed point;
     // `cell_coeff_jets`/`cell_chi_poly_jets` raise them to all orders. This gate pins
-    // the g+h+w Jet3/Jet4 contractions term-for-term vs the hand directional/
-    // bidirectional packs — the cross h/w derivatives the frozen-scalar channels
-    // dropped.
+    // the g+h+w Jet4 contraction against an independent scalar finite difference.
 
-    /// A score-warp / link-dev deviation runtime for the g+h+w gate (mirrors the
-    /// `tests.rs` fixture: degree-3 cubic, 1 internal knot, penalty orders 1/2/3).
+    /// A score-warp / link-dev deviation runtime for the g+h+w gate.
     fn flex_test_deviation_runtime() -> DeviationRuntime {
         build_score_warp_deviation_block_from_seed(
             &Array1::from(vec![-1.0, 0.0, 1.0]),
@@ -4533,12 +4530,10 @@ mod moment_engine_tests {
         family
     }
 
-    /// #932 item-2 STEP 3c (h/w channels): `flex_timepoint_inputs_generic` at Jet3
-    /// (directional) AND Jet4 (bidirectional) == the hand directional/bidirectional
-    /// packs term-for-term (≤1e-6) on a model with ACTIVE `h` AND `w` primaries —
-    /// exercising the h/w channel-weight cross-derivatives to 3rd/4th order.
+    /// `flex_timepoint_inputs_generic` at Jet4 must match a scalar finite difference
+    /// of the real intercept solve with active score-warp and link-deviation primaries.
     #[test]
-    fn flex_timepoint_inputs_ghw_jet3_jet4_match_hand_932() {
+    fn flex_timepoint_inputs_ghw_jet4_matches_scalar_fd_932() {
         let n = 16usize;
         let family = make_ghw_flex_family(n);
         let primary = flex_primary_slices(&family);

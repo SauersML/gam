@@ -195,8 +195,36 @@ fn encode_numeric_dataset(headers: &[&str], rows: &[Vec<f64>]) -> (Array2<f64>, 
     (dataset.values, dataset.column_map())
 }
 
-/// Production saved-model ALO over the full fit, using the exact CLI input
-/// builder so no diagnose-table parsing is required.
+/// Dense coordinate-0 design of `model` on `data` — the same covariate design
+/// production ALO consumes for the leading local coordinate.
+///
+/// The frozen training spec is remapped to `data`'s column layout by name (the
+/// same `resolve_termspec_for_prediction` the CLI predict/diagnose paths use),
+/// so the reconstruction is column-order-independent.
+fn leading_coordinate_design(
+    model: &FittedModel,
+    data: &Array2<f64>,
+    col_map: &HashMap<String, usize>,
+) -> Array2<f64> {
+    let spec = resolve_termspec_for_prediction(
+        &model.payload().resolved_termspec,
+        model.payload().training_headers.as_ref(),
+        col_map,
+        "resolved_termspec",
+    )
+    .expect("resolve frozen covariate termspec for the leading ALO coordinate");
+    let design = build_term_collection_design(data.view(), &spec)
+        .expect("build the covariate design for the leading ALO coordinate");
+    design.design.to_dense()
+}
+
+/// Production saved-model ALO over the full fit.
+///
+/// Marginal-slope routes through the exact CLI input builder (which also
+/// assembles the log-slope and latent-score channels). Transformation-normal
+/// cannot: its predict input carries the response-scale conditional mean, not
+/// the covariate design ALO needs, so we assemble the covariate-design affine
+/// carrier here exactly as `gam diagnose --alo` does.
 fn production_saved_alo(
     model: &FittedModel,
     data: &Array2<f64>,
@@ -204,23 +232,48 @@ fn production_saved_alo(
     response: &Array1<f64>,
 ) -> SavedModelAloDiagnostics {
     let n = data.nrows();
-    let offset = Array1::<f64>::zeros(n);
-    let offset_noise = Array1::<f64>::zeros(n);
-    let training_headers = model.payload().training_headers.as_ref();
-    let input = build_predict_input_for_model(
-        model,
-        data.view(),
-        col_map,
-        training_headers,
-        &offset,
-        &offset_noise,
-        false,
-    )
-    .expect("build production saved-model ALO predict input");
     let weights = Array1::<f64>::ones(n);
+    let training_headers = model.payload().training_headers.as_ref();
+    let input = if model.predict_model_class().name() == "transformation-normal" {
+        let spec = resolve_termspec_for_prediction(
+            &model.payload().resolved_termspec,
+            training_headers,
+            col_map,
+            "resolved_termspec",
+        )
+        .expect("resolve transformation-normal covariate termspec");
+        let design = build_term_collection_design(data.view(), &spec)
+            .expect("build transformation-normal covariate design");
+        let base = Array1::<f64>::zeros(n);
+        let offset = design
+            .compose_offset(base.view(), "saved transformation-normal ALO design")
+            .expect("compose transformation-normal ALO offset");
+        SavedModelAloInput::affine(PredictInput {
+            design: design.design,
+            offset,
+            design_noise: None,
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        })
+    } else {
+        let offset = Array1::<f64>::zeros(n);
+        let offset_noise = Array1::<f64>::zeros(n);
+        let predict_input = build_predict_input_for_model(
+            model,
+            data.view(),
+            col_map,
+            training_headers,
+            &offset,
+            &offset_noise,
+            false,
+        )
+        .expect("build production saved-model ALO predict input");
+        SavedModelAloInput::affine(predict_input)
+    };
     compute_saved_model_alo(
         model,
-        &SavedModelAloInput::affine(input),
+        &input,
         SavedAloObservations {
             response,
             prior_weights: &weights,
@@ -242,21 +295,7 @@ fn fitted_leading_coordinate_at(
     col_map: &HashMap<String, usize>,
     row: usize,
 ) -> f64 {
-    let n = data.nrows();
-    let offset = Array1::<f64>::zeros(n);
-    let offset_noise = Array1::<f64>::zeros(n);
-    let training_headers = model.payload().training_headers.as_ref();
-    let input = build_predict_input_for_model(
-        model,
-        data.view(),
-        col_map,
-        training_headers,
-        &offset,
-        &offset_noise,
-        false,
-    )
-    .expect("build refit coordinate-0 predict input");
-    let dense = input.design.to_dense();
+    let dense = leading_coordinate_design(model, data, col_map);
     let leading_width = dense.ncols();
     let fit = model
         .payload()
