@@ -1,21 +1,21 @@
 //! Survival marginal-slope concrete impls for the family-agnostic
 //! identifiability compiler (`gam_identifiability::families::compiler`).
 //!
-//! Survival's row primary state is the 4-vector `u_i = (q0, q1, qd1, g)`,
-//! so `K = 4`. The row Hessian is the 4×4 second-derivative block of the
-//! per-row neg-log-likelihood kernel `row_primary_closed_form` at a pilot
-//! `β`, PSD-clamped via eigendecomposition (negative eigenvalues projected
-//! to zero) to handle pilot points far from the optimum.
+//! Survival's row primary state is
+//! `u_i = (q0, q1, qd1, g_0, …, g_{K-1})`, so its width is `3 + K` for a
+//! K-dimensional latent score. The row Hessian is derived from the same vector
+//! row program as the likelihood and PSD-projected at the pilot point.
 //!
 //! Each block exposes its row Jacobian as the contribution of `δβ_block`
 //! to the row primary-state vector:
 //!
-//! - **TimeBlockOperator**: `(δq0, δq1, δqd1, 0)` from `design_entry`,
+//! - **TimeBlockOperator**: `(δq0, δq1, δqd1, 0_K)` from `design_entry`,
 //!   `design_exit`, `design_derivative_exit` rows.
 //! - **MarginalBlockOperator**: `(δq, δq, δqd_marginal, 0)` from the
 //!   marginal design row (shared by q0 and q1; qd contribution zero unless
 //!   timewiggle is active — captured by an explicit derivative row matrix).
-//! - **LogslopeBlockOperator**: `(0, 0, 0, δg)` from the logslope design.
+//! - **LogslopeBlockOperator**: `(0, 0, 0, δg_0, …, δg_{K-1})` from the
+//!   canonical physical-channel layout.
 //! - **ScoreWarpBlockOperator**: `(δq, δq, δqd_warp, 0)` from the warp
 //!   basis (shifts q at entry/exit; chain rule via dq0_seed/dt for qd1).
 //! - **LinkDevBlockOperator**: `(δq, δq, δqd_link, 0)` from the link-dev
@@ -28,7 +28,7 @@
 
 use std::sync::Arc;
 
-use ndarray::{Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, s};
 
 use faer::Side;
 use gam_identifiability::families::compiler::{
@@ -39,17 +39,10 @@ use gam_linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, Design
 use gam_problem::gauge::assemble_block_triangular_t;
 use gam_problem::{FamilyChannelHessian, PenaltyMatrix};
 
-const K_SURVIVAL: usize = 4;
-
-/// Per-row 4×4 row Hessian for the survival marginal-slope likelihood at a
-/// pilot `β`. The pilot supplies the primary-state vector
-/// `(q0_i, q1_i, qd1_i, g_i)` and the per-row sample weight + event
-/// indicator + z + probit scale. The 4×4 block is evaluated via the
-/// existing `row_primary_closed_form` kernel (which already returns the
-/// full Hessian in `(q0, q1, qd1, g)` order) and PSD-clamped per row.
+/// Per-row `(3 + K) × (3 + K)` row Hessian for the survival marginal-slope
+/// likelihood at a pilot `β`.
 pub struct SurvivalRowHessian {
-    /// PSD-projected per-row 4×4 Hessian, stored row-major as
-    /// `(n × 4 × 4)`.
+    /// PSD-projected per-row Hessian, stored as `(n × (3+K) × (3+K))`.
     h: Array3<f64>,
     /// Immutable row data needed to refresh `h` exactly at a new primary
     /// state. These must not be replaced by unit weights/events: censoring and
@@ -57,19 +50,21 @@ pub struct SurvivalRowHessian {
     /// identifiability certificate.
     weights: Array1<f64>,
     event: Array1<f64>,
+    z: Array2<f64>,
+    covariance: crate::bms::MarginalSlopeCovariance,
     derivative_guard: f64,
 }
 
 impl SurvivalRowHessian {
-    /// Construct from explicit per-row pilot primary-state and the row
-    /// data needed by `row_primary_closed_form`. Negative eigenvalues are
-    /// projected to zero before storage so the matrix is PSD.
+    /// Construct from the full physical primary state. `slopes` and `z` are
+    /// both `(n × K)`; no score coordinate is privileged or discarded.
     pub fn from_pilot_primary_state(
         q0: &Array1<f64>,
         q1: &Array1<f64>,
         qd1: &Array1<f64>,
-        g: &Array1<f64>,
-        z: &Array1<f64>,
+        slopes: &Array2<f64>,
+        z: &Array2<f64>,
+        covariance: &crate::bms::MarginalSlopeCovariance,
         weights: &Array1<f64>,
         event: &Array1<f64>,
         derivative_guard: f64,
@@ -79,8 +74,8 @@ impl SurvivalRowHessian {
         if [
             q1.len(),
             qd1.len(),
-            g.len(),
-            z.len(),
+            slopes.nrows(),
+            z.nrows(),
             weights.len(),
             event.len(),
         ]
@@ -88,32 +83,49 @@ impl SurvivalRowHessian {
         .any(|&l| l != n)
         {
             return Err(format!(
-                "SurvivalRowHessian: length mismatch \
-                 q0={n}, q1={}, qd1={}, g={}, z={}, weights={}, event={}",
+                "SurvivalRowHessian: row mismatch \
+                 q0={n}, q1={}, qd1={}, slopes={}, z={}, weights={}, event={}",
                 q1.len(),
                 qd1.len(),
-                g.len(),
-                z.len(),
+                slopes.nrows(),
+                z.nrows(),
                 weights.len(),
                 event.len()
             ));
         }
-        let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+        covariance.validate("SurvivalRowHessian covariance")?;
+        let score_dim = covariance.dim();
+        if slopes.ncols() != score_dim || z.ncols() != score_dim {
+            return Err(format!(
+                "SurvivalRowHessian: score dimension mismatch slopes={}, z={}, covariance={score_dim}",
+                slopes.ncols(),
+                z.ncols(),
+            ));
+        }
+        let primary_width = 3 + score_dim;
+        let mut h_full = Array3::<f64>::zeros((n, primary_width, primary_width));
+        let mut workspace =
+            crate::survival::marginal_slope::RigidVectorRowWorkspace::new(covariance)?;
         for i in 0..n {
             let clamped = evaluated_psd_row_hessian(
                 q0[i],
                 q1[i],
                 qd1[i],
-                g[i],
-                z[i],
+                slopes.row(i).as_slice().ok_or_else(|| {
+                    "SurvivalRowHessian slope row is not contiguous".to_string()
+                })?,
+                z.row(i)
+                    .as_slice()
+                    .ok_or_else(|| "SurvivalRowHessian score row is not contiguous".to_string())?,
                 weights[i],
                 event[i],
                 derivative_guard,
                 probit_scale,
+                &mut workspace,
             )
             .map_err(|reason| format!("SurvivalRowHessian: row {i}: {reason}"))?;
-            for a in 0..K_SURVIVAL {
-                for b in 0..K_SURVIVAL {
+            for a in 0..primary_width {
+                for b in 0..primary_width {
                     h_full[[i, a, b]] = clamped[[a, b]];
                 }
             }
@@ -122,6 +134,8 @@ impl SurvivalRowHessian {
             h: h_full,
             weights: weights.clone(),
             event: event.clone(),
+            z: z.clone(),
+            covariance: covariance.clone(),
             derivative_guard,
         })
     }
@@ -129,16 +143,17 @@ impl SurvivalRowHessian {
 
 impl RowHessian for SurvivalRowHessian {
     fn k(&self) -> usize {
-        K_SURVIVAL
+        self.h.shape()[1]
     }
     fn nrows(&self) -> usize {
         self.h.shape()[0]
     }
     fn fill_row(&self, row: usize, out: &mut [f64]) {
-        assert_eq!(out.len(), K_SURVIVAL * K_SURVIVAL);
-        for a in 0..K_SURVIVAL {
-            for b in 0..K_SURVIVAL {
-                out[a * K_SURVIVAL + b] = self.h[[row, a, b]];
+        let k = self.k();
+        assert_eq!(out.len(), k * k);
+        for a in 0..k {
+            for b in 0..k {
+                out[a * k + b] = self.h[[row, a, b]];
             }
         }
     }

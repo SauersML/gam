@@ -1046,6 +1046,7 @@ where
 /// Every likelihood operation is delegated to the `rigid_feature_program`
 /// row-program declaration, whose runtime lowering lets these five features carry
 /// the full primary width.
+#[cfg(test)]
 fn rigid_vector_row_nll<'arena, S>(
     vars: &[S],
     z: &[f64],
