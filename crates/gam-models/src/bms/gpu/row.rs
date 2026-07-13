@@ -3613,7 +3613,6 @@ mod row_kernel_tests {
         }
 
         #[test]
-        #[ignore = "mandatory r=33 CUDA parity; run explicitly with --exact --ignored"]
         fn generated_cuda_row_kernel_r33_matches_canonical_cpu_lowering_932() {
             gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Required);
             assert_eq!(
@@ -3660,7 +3659,6 @@ mod tests {
     /// missing-runtime, probe, upload, launch, synchronization, status, or
     /// download failure aborts the test instead of turning into a skip.
     #[test]
-    #[ignore = "mandatory A100 acceptance; run explicitly with --exact --ignored"]
     fn mandatory_required_gpu_workspace_consumes_device_cache_end_to_end_932() {
         configure_global_policy(GpuPolicy::Required);
         assert_eq!(
@@ -3831,7 +3829,6 @@ mod tests {
     /// `cold_gpu_e2e_nvrtc_ms` includes the first NVRTC loads and the 21 ABBA
     /// samples describe only the subsequently cached compiler state.
     #[test]
-    #[ignore = "release-only A100 measurement; run explicitly with --exact --ignored"]
     fn release_measure_generated_bms_full_row_vs_strongest_cpu_932() {
         const N: usize = 32_768;
         const WARMUPS: usize = 3;
@@ -4860,7 +4857,6 @@ mod tests {
     /// allocating the device slices directly, uploading the same arrays the
     /// CPU oracle consumes, then dispatching the device kernels.
     #[test]
-    #[ignore = "mandatory r=33 CUDA consumers; run explicitly with --exact --ignored"]
     pub(crate) fn bms_flex_row_r33_consumers_match_cpu_oracles_when_cuda_available() {
         configure_global_policy(GpuPolicy::Required);
         assert_eq!(
