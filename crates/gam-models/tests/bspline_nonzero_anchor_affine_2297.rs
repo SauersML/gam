@@ -98,8 +98,12 @@ fn closed_form_nonzero_anchor_is_affine_and_the_fitted_chart_is_homogeneous() {
         (affine[0] - 1.5).abs() < 1e-10,
         "the particular solution must equal the requested endpoint value"
     );
+    let homogeneous_design = built.design.to_dense();
     assert!(
-        built.design.row(0).iter().all(|value| value.abs() < 1e-10),
+        homogeneous_design
+            .row(0)
+            .iter()
+            .all(|value| value.abs() < 1e-10),
         "every estimated basis column must obey the homogeneous endpoint pin"
     );
 }
