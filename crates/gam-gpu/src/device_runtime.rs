@@ -265,30 +265,30 @@ impl GpuRuntime {
         RESOLUTION_CALLS.fetch_add(1, Ordering::Relaxed);
         static RUNTIME: OnceLock<Result<GpuAvailability, GpuError>> = OnceLock::new();
         let cached = RUNTIME.get_or_init(|| {
-                let outcome = Self::probe();
-                if let Err(error) = &outcome {
-                    let reason = error.to_string();
-                    Self::record_cpu_reason(reason.clone());
-                    diagnostics::log_cuda_disabled(&reason);
-                }
-                // Install the dense-GEMM dispatch hook exactly when a usable
-                // device was probed. Without this, `gam_linalg::faer_ndarray::fast_ab`
-                // (and the `fast_atb`/`fast_av`/`xt_diag_x` family) never sees a
-                // dispatcher — `gpu_dispatch()` stays `None` — so every dense
-                // product in the engine silently runs on the CPU even when the
-                // V100 is present and the workload clears the policy flop floor.
-                // The hook is a first-write-wins `OnceLock` keyed only on the
-                // presence of a runtime; registering it here, inside the same
-                // `get_or_init` that decides the runtime, guarantees it is
-                // installed before any `fast_ab` caller can observe a `Some`
-                // runtime. The policy gate inside each `try_*` still decides
-                // CPU-vs-GPU per call, so small products are unaffected.
-                if matches!(outcome, Ok(GpuAvailability::Available(_))) {
-                    gam_linalg::gpu_hook::register_gpu_dispatch(Box::new(
-                        super::linalg_dispatch::CudaGemmDispatch,
-                    ));
-                }
-                outcome
+            let outcome = Self::probe();
+            if let Err(error) = &outcome {
+                let reason = error.to_string();
+                Self::record_cpu_reason(reason.clone());
+                diagnostics::log_cuda_disabled(&reason);
+            }
+            // Install the dense-GEMM dispatch hook exactly when a usable
+            // device was probed. Without this, `gam_linalg::faer_ndarray::fast_ab`
+            // (and the `fast_atb`/`fast_av`/`xt_diag_x` family) never sees a
+            // dispatcher — `gpu_dispatch()` stays `None` — so every dense
+            // product in the engine silently runs on the CPU even when the
+            // V100 is present and the workload clears the policy flop floor.
+            // The hook is a first-write-wins `OnceLock` keyed only on the
+            // presence of a runtime; registering it here, inside the same
+            // `get_or_init` that decides the runtime, guarantees it is
+            // installed before any `fast_ab` caller can observe an available
+            // runtime. The policy gate inside each `try_*` still decides
+            // CPU-vs-GPU per call, so small products are unaffected.
+            if matches!(outcome, Ok(GpuAvailability::Available(_))) {
+                gam_linalg::gpu_hook::register_gpu_dispatch(Box::new(
+                    super::linalg_dispatch::CudaGemmDispatch,
+                ));
+            }
+            outcome
         });
         match cached {
             Ok(GpuAvailability::Available(runtime)) => {
@@ -306,7 +306,14 @@ impl GpuRuntime {
         if policy == super::GpuPolicy::Off {
             return Ok(None);
         }
-        match Self::availability()? {
+        Self::resolve_availability(policy, Self::availability())
+    }
+
+    fn resolve_availability<'a>(
+        policy: super::GpuPolicy,
+        availability: Result<GpuAvailabilityRef<'a>, GpuError>,
+    ) -> Result<Option<&'a Self>, GpuError> {
+        match availability? {
             GpuAvailabilityRef::Available(runtime) => Ok(Some(runtime)),
             GpuAvailabilityRef::Absent(_reason) if policy == super::GpuPolicy::Auto => Ok(None),
             GpuAvailabilityRef::Absent(reason) => Err(GpuError::RequiredDeviceUnavailable {
@@ -350,9 +357,9 @@ impl GpuRuntime {
     /// device-calibrated) can carry, known WITHOUT a device — so the gate never
     /// needs a probe to decide it should not probe, and refusing below it can
     /// never block work that any policy would have dispatched. Work at or above
-    /// the floor falls through to the identical `global()` path (where the real,
-    /// possibly calibrated policy still gates each op), so device behaviour for
-    /// genuinely GPU-sized problems is unchanged.
+    /// the floor falls through to the identical lossless resolution path (where
+    /// the real, possibly calibrated policy still gates each op), so device
+    /// behaviour for genuinely GPU-sized problems is unchanged.
     pub fn resolve_if_dense_work_exceeds_floor(
         policy: super::GpuPolicy,
         work_flops: u128,
@@ -567,7 +574,7 @@ mod module_path_lock_tests {
     fn gpu_device_runtime_module_path_is_canonical() {
         // Resolving `GpuRuntime` through the `device_runtime` module path
         // pins the honest name; if the module is renamed this stops compiling.
-        _ = crate::device_runtime::GpuRuntime::is_available();
+        _ = crate::device_runtime::GpuRuntime::resolution_call_count();
         let type_name = std::any::type_name::<crate::device_runtime::GpuRuntime>();
         assert!(
             type_name.contains("device_runtime"),
@@ -579,12 +586,12 @@ mod module_path_lock_tests {
 #[cfg(test)]
 mod laziness_gate_tests {
     //! Pins the CUDA startup-tax ordering fix: a CPU-sized problem must reach
-    //! its size decision WITHOUT ever calling `GpuRuntime::global()` (which is
-    //! what triggers the one-time device probe + `cuDevicePrimaryCtxRetain`
+    //! its size decision WITHOUT ever resolving GPU availability (which is what
+    //! triggers the one-time device probe + `cuDevicePrimaryCtxRetain`
     //! primary-context creation on every GPU). Runs on any host — on a CUDA-less
     //! box the probe is a no-op, but the invariant under test is purely the
-    //! control-flow ordering (size check strictly before `global()`), which is
-    //! observable through the process-wide `global_call_count` counter.
+    //! control-flow ordering (size check strictly before resolution), which is
+    //! observable through the process-wide `resolution_call_count` counter.
     //!
     //! nextest runs each test in its own process, so the counter starts at a
     //! clean baseline per test; the assertions use a delta against `before` so
@@ -592,37 +599,43 @@ mod laziness_gate_tests {
     use super::*;
 
     #[test]
-    fn cpu_sized_dense_work_never_calls_global() {
-        let before = GpuRuntime::global_call_count();
+    fn cpu_sized_dense_work_never_resolves_availability() {
+        let before = GpuRuntime::resolution_call_count();
         // Dense work far below the GPU-dispatch flop floor: a CPU-sized fit.
         assert!(
-            GpuRuntime::global_if_dense_work_exceeds_floor(1_000).is_none(),
+            GpuRuntime::resolve_if_dense_work_exceeds_floor(super::super::GpuPolicy::Auto, 1_000)
+                .expect("the pre-probe size gate itself is infallible")
+                .is_none(),
             "CPU-sized work must not select the device"
         );
         assert_eq!(
-            GpuRuntime::global_call_count(),
+            GpuRuntime::resolution_call_count(),
             before,
-            "the size gate must short-circuit BEFORE global()/probe for CPU-sized \
+            "the size gate must short-circuit BEFORE resolution/probe for CPU-sized \
              work, so no CUDA context is ever created"
         );
     }
 
     #[test]
-    fn gpu_sized_dense_work_falls_through_to_global() {
-        let before = GpuRuntime::global_call_count();
+    fn gpu_sized_dense_work_falls_through_to_resolution() {
+        let before = GpuRuntime::resolution_call_count();
         // Above any plausible floor: must consult the runtime exactly once, i.e.
         // the gate does not change behaviour for genuinely GPU-sized problems.
         // The returned handle is irrelevant here (None on CPU-only boxes);
         // the observable is the consultation count below.
-        let runtime = GpuRuntime::global_if_dense_work_exceeds_floor(u128::MAX);
+        let runtime = GpuRuntime::resolve_if_dense_work_exceeds_floor(
+            super::super::GpuPolicy::Auto,
+            u128::MAX,
+        )
+        .expect("a probe fault must fail this gate instead of looking absent");
         assert!(
             runtime.is_none_or(|runtime| !runtime.devices.is_empty()),
-            "a successful global runtime probe must expose at least one usable device"
+            "an available runtime must expose at least one usable device"
         );
         assert_eq!(
-            GpuRuntime::global_call_count(),
+            GpuRuntime::resolution_call_count(),
             before + 1,
-            "GPU-sized work must fall through to global() (device path unchanged)"
+            "GPU-sized work must fall through to availability resolution"
         );
     }
 
@@ -633,16 +646,81 @@ mod laziness_gate_tests {
         // device, so the decision to NOT probe never needs a probe, and the
         // refusal can never block work some calibrated policy would dispatch.
         let floor = GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS;
-        let before = GpuRuntime::global_call_count();
-        assert!(GpuRuntime::global_if_dense_work_exceeds_floor(floor - 1).is_none());
-        assert_eq!(GpuRuntime::global_call_count(), before);
+        let before = GpuRuntime::resolution_call_count();
+        assert!(
+            GpuRuntime::resolve_if_dense_work_exceeds_floor(
+                super::super::GpuPolicy::Auto,
+                floor - 1,
+            )
+            .expect("the below-floor gate cannot probe or fail")
+            .is_none()
+        );
+        assert_eq!(GpuRuntime::resolution_call_count(), before);
         // At the floor the gate must consult the runtime (fall through).
-        let runtime = GpuRuntime::global_if_dense_work_exceeds_floor(floor);
+        let runtime = GpuRuntime::resolve_if_dense_work_exceeds_floor(
+            super::super::GpuPolicy::Auto,
+            floor,
+        )
+        .expect("a probe fault must fail the boundary gate instead of looking absent");
         assert!(
             runtime.is_none_or(|runtime| !runtime.devices.is_empty()),
             "a successful floor-boundary probe must expose at least one usable device"
         );
-        assert_eq!(GpuRuntime::global_call_count(), before + 1);
+        assert_eq!(GpuRuntime::resolution_call_count(), before + 1);
+    }
+}
+
+#[cfg(test)]
+mod policy_resolution_contract_tests {
+    use super::*;
+    use crate::GpuPolicy;
+
+    #[test]
+    fn auto_maps_only_typed_absence_to_none() {
+        let absence = GpuAbsence::NoDevice {
+            reason: "synthetic device-free absence".to_string(),
+        };
+        let resolved = GpuRuntime::resolve_availability(
+            GpuPolicy::Auto,
+            Ok(GpuAvailabilityRef::Absent(&absence)),
+        )
+        .expect("typed absence is expected under Auto");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn required_turns_only_typed_absence_into_required_unavailable() {
+        let absence = GpuAbsence::DriverUnavailable {
+            reason: "synthetic missing driver".to_string(),
+        };
+        let error = GpuRuntime::resolve_availability(
+            GpuPolicy::Required,
+            Ok(GpuAvailabilityRef::Absent(&absence)),
+        )
+        .expect_err("Required must reject typed absence");
+        assert!(matches!(
+            error,
+            GpuError::RequiredDeviceUnavailable { ref reason }
+                if reason == "synthetic missing driver"
+        ));
+    }
+
+    #[test]
+    fn auto_and_required_preserve_probe_fault_variants() {
+        for policy in [GpuPolicy::Auto, GpuPolicy::Required] {
+            let error = GpuRuntime::resolve_availability(
+                policy,
+                Err(GpuError::RuntimeDependencyUnavailable {
+                    reason: "synthetic missing cuBLAS".to_string(),
+                }),
+            )
+            .expect_err("probe faults must never project to absence");
+            assert!(matches!(
+                error,
+                GpuError::RuntimeDependencyUnavailable { ref reason }
+                    if reason == "synthetic missing cuBLAS"
+            ));
+        }
     }
 }
 
@@ -660,7 +738,7 @@ mod tests {
     ///
     /// On a host where libcuda *is* present the test still passes — it asserts
     /// only that calls don't panic and that `is_culib_present()` agrees with
-    /// `GpuRuntime::is_available()` about the absence of a driver.
+    /// the typed availability result about the absence of a driver.
     #[test]
     fn cpu_only_host_never_panics_on_gpu_entry_points() {
         // Without libcuda the runtime must report unavailable rather than
@@ -670,8 +748,11 @@ mod tests {
         let culib_present = crate::driver::cuda_driver_library_present();
         if !culib_present {
             assert!(
-                !GpuRuntime::is_available(),
-                "is_culib_present()=false but GpuRuntime::is_available() returned true; \
+                matches!(
+                    GpuRuntime::availability(),
+                    Ok(GpuAvailabilityRef::Absent(GpuAbsence::DriverUnavailable { .. }))
+                ),
+                "is_culib_present()=false but runtime availability was not typed driver absence; \
                  the probe guard from c10e6636 has regressed and downstream cudarc \
                  calls will panic"
             );
@@ -699,7 +780,10 @@ mod tests {
         let rhs = Array2::<f64>::zeros((3, 1));
         let solve_outcome = crate::solver::cholesky_solve_gpu(h.view(), rhs.view());
         let factor_outcome = crate::solver::cholesky_lower_gpu(h.view());
-        if !GpuRuntime::is_available() {
+        if matches!(
+            GpuRuntime::availability(),
+            Ok(GpuAvailabilityRef::Absent(_))
+        ) {
             assert!(
                 solve_outcome.is_err(),
                 "cholesky_solve_gpu must Err when runtime is unavailable"

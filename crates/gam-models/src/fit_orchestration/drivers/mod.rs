@@ -19,8 +19,8 @@ use gam_terms::basis::{
 
 use gam_custom_family::{
     BlockEffectiveJacobian, BlockGeometryDirectionalDerivative, BlockWorkingSet,
-    BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart,
-    CustomFamilyOwnedMode, ExactNewtonOuterObjective, FamilyEvaluation, FamilyLinearizationState,
+    BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyOwnedMode,
+    CustomFamilyWarmStart, ExactNewtonOuterObjective, FamilyEvaluation, FamilyLinearizationState,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
     evaluate_custom_family_joint_hyper_efs_owned, evaluate_custom_family_joint_hyper_owned,
     fit_custom_family, fit_custom_family_fixed_log_lambdas_from_owned_mode,

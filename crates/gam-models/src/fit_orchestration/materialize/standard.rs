@@ -75,10 +75,7 @@ pub(crate) fn materialize_standard<'a>(
     let term_parsed = latent_parsed.as_ref().unwrap_or(parsed);
     let term_col_map = term_data.column_map();
 
-    let policy = resolved_resource_policy(
-        config,
-        gam_runtime::resource::ProblemHints::default(),
-    );
+    let policy = resolved_resource_policy(config, gam_runtime::resource::ProblemHints::default());
     let mut spec = build_termspec_with_geometry_and_overrides(
         &term_parsed.terms,
         term_data,

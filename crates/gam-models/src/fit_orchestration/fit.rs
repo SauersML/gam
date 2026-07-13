@@ -97,7 +97,8 @@ mod profiled_outer_payload_tests {
                 fn(
                     &mut (),
                     &Array1<f64>,
-                ) -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
+                )
+                    -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
             >,
         );
         problem
@@ -200,8 +201,7 @@ fn survival_inverse_link_profile_objective(
     profile: &SurvivalLocationScaleProfile,
     context: &str,
 ) -> Result<f64, String> {
-    let objective =
-        -profile.fit.fit.log_likelihood + 0.5 * profile.fit.fit.stable_penalty_term;
+    let objective = -profile.fit.fit.log_likelihood + 0.5 * profile.fit.fit.stable_penalty_term;
     if objective.is_finite() {
         Ok(objective)
     } else {
@@ -1900,8 +1900,7 @@ fn survival_unified_fit_result(
     assert_eq!(edf_by_block.len(), lambdas.len());
     assert_eq!(penalty_block_trace.len(), lambdas.len());
 
-    let penalized_hessian =
-        gam_problem::dispersion_cov::UnscaledPrecision::wrap(penalized_hessian);
+    let penalized_hessian = gam_problem::dispersion_cov::UnscaledPrecision::wrap(penalized_hessian);
     let inference = gam_solve::estimate::FitInference {
         edf_by_block: edf_by_block.clone(),
         penalty_block_trace,
@@ -3148,31 +3147,29 @@ pub(crate) fn fit_survival_location_scale_model(
                 })
             };
             let cost_eval = eval_link.clone();
-            let cost_fn = move |selected: &mut Option<
-                ProfiledOuterPayload<SurvivalLocationScaleProfile>,
-            >,
-                                theta: &Array1<f64>| {
-                let payload = cost_eval(theta)
-                    .map_err(gam_solve::estimate::EstimationError::InvalidInput)?;
-                let cost = payload.objective;
-                *selected = Some(payload);
-                Ok(cost)
-            };
-            let eval_fn = move |selected: &mut Option<
-                ProfiledOuterPayload<SurvivalLocationScaleProfile>,
-            >,
-                                theta: &Array1<f64>| {
-                let payload = eval_link(theta)
-                    .map_err(gam_solve::estimate::EstimationError::InvalidInput)?;
-                let evaluation = OuterEval {
-                    cost: payload.objective,
-                    gradient: payload.gradient.clone(),
-                    hessian: HessianValue::Unavailable,
-                    inner_beta_hint: None,
+            let cost_fn =
+                move |selected: &mut Option<ProfiledOuterPayload<SurvivalLocationScaleProfile>>,
+                      theta: &Array1<f64>| {
+                    let payload = cost_eval(theta)
+                        .map_err(gam_solve::estimate::EstimationError::InvalidInput)?;
+                    let cost = payload.objective;
+                    *selected = Some(payload);
+                    Ok(cost)
                 };
-                *selected = Some(payload);
-                Ok(evaluation)
-            };
+            let eval_fn =
+                move |selected: &mut Option<ProfiledOuterPayload<SurvivalLocationScaleProfile>>,
+                      theta: &Array1<f64>| {
+                    let payload = eval_link(theta)
+                        .map_err(gam_solve::estimate::EstimationError::InvalidInput)?;
+                    let evaluation = OuterEval {
+                        cost: payload.objective,
+                        gradient: payload.gradient.clone(),
+                        hessian: HessianValue::Unavailable,
+                        inner_beta_hint: None,
+                    };
+                    *selected = Some(payload);
+                    Ok(evaluation)
+                };
             let mut obj = problem.build_objective(
                 None::<ProfiledOuterPayload<SurvivalLocationScaleProfile>>,
                 cost_fn,

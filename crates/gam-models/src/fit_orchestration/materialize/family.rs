@@ -392,10 +392,7 @@ pub fn resolve_family(
                     let (theta, theta_fixed) = resolve_negative_binomial_theta()?;
                     (
                         LikelihoodSpec::new(
-                            ResponseFamily::NegativeBinomial {
-                                theta,
-                                theta_fixed,
-                            },
+                            ResponseFamily::NegativeBinomial { theta, theta_fixed },
                             InverseLink::Standard(StandardLink::Log),
                         ),
                         false,
@@ -405,10 +402,7 @@ pub fn resolve_family(
                     let (theta, theta_fixed) = resolve_negative_binomial_theta()?;
                     (
                         LikelihoodSpec::new(
-                            ResponseFamily::NegativeBinomial {
-                                theta,
-                                theta_fixed,
-                            },
+                            ResponseFamily::NegativeBinomial { theta, theta_fixed },
                             InverseLink::Standard(StandardLink::Log),
                         ),
                         true,
