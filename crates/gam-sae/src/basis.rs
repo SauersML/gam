@@ -1780,31 +1780,56 @@ impl SaeBasisThirdJet for TorusHarmonicEvaluator {
     }
 }
 
-/// One invariant cover mode retained by a quotient spectral mask.
+/// One-dimensional real character of an involutive deck transformation.
 ///
-/// A finite isometry group commutes with the cover Laplacian, so its invariant
-/// projector acts independently inside every cover eigenspace.  When the cover
-/// basis diagonalizes the deck action up to sign—as the real spherical and
-/// torus harmonics do—this projector is exactly a static column selection.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct QuotientSpectralMode {
-    /// Column in the cover evaluator retained by the invariant projector.
-    pub cover_column: usize,
-    /// Positive-Laplacian eigenvalue inherited from the cover.
-    pub laplace_eigenvalue: f64,
-    /// Diagonal function-space Gram entry inherited from the cover.
-    pub l2_gram_weight: f64,
-    /// Whether the curvature homotopy scales this quotient column.
-    pub curved: bool,
+/// This type is deliberately narrower than a signed-permutation action.  It
+/// certifies that one cover column `f` is itself an eigenvector of pullback by
+/// the non-identity deck map `g`: `g*f = f` or `g*f = -f`.  The exact Reynolds
+/// projector is therefore
+///
+/// `P_Gamma f = (f + g*f) / 2 = f` for `Trivial`, and `0` for `Sign`.
+///
+/// A basis that is merely permuted by `g` cannot use this representation: for
+/// example, swapping two columns retains their orbit sum, not either column.
+/// Such an action requires an explicit restriction matrix `Q`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeckInvolutionCharacter {
+    Trivial,
+    Sign,
 }
 
-/// Exact spectral restriction of an analytic cover evaluator to a quotient.
+impl DeckInvolutionCharacter {
+    /// Eigenvalue of the exact group average `(I + g*) / 2` on this column.
+    fn reynolds_projector_eigenvalue(self) -> u8 {
+        match self {
+            Self::Trivial => 1,
+            Self::Sign => 0,
+        }
+    }
+}
+
+/// Spectral metadata for every cover column, in cover evaluator order.
 ///
-/// This is the shared implementation of the spectral-mask theorem.  Values and
-/// analytic first/second/third jets are selected from one cover evaluator, so a
-/// quotient cannot accidentally acquire formulas or indexing conventions that
-/// disagree with its parent.  Its function-space Gram, spectral penalties, and
-/// null space come from the same validated mode table.
+/// Requiring a full character table, rather than accepting a caller-selected
+/// mask, makes the group average the single authority for quotient width,
+/// column restriction, Gram entries, penalty eigenvalues, and nullity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CoverSpectralCharacter {
+    deck_character: DeckInvolutionCharacter,
+    laplace_eigenvalue: f64,
+    l2_gram_weight: f64,
+    curved_if_retained: bool,
+}
+
+/// Exact diagonal-character restriction of an analytic cover evaluator.
+///
+/// Static column selection is exact only because each supported cover column
+/// is a simultaneous one-dimensional character of the deck involution.  Mere
+/// signed permutation of a basis is insufficient; non-diagonal actions require
+/// orbit sums or a dense restriction matrix `Q`.  Values and analytic
+/// first/second/third jets are restricted from one cover evaluator, while the
+/// same complete character table determines width, Gram, spectral penalties,
+/// and null space.
 #[derive(Debug, Clone)]
 pub struct QuotientSpectralEvaluator {
     quotient_name: String,
@@ -1851,16 +1876,18 @@ pub fn klein_bottle_basis_size(num_harmonics: usize) -> Result<usize, String> {
 }
 
 impl QuotientSpectralEvaluator {
-    /// Build a quotient from a cover and its exact invariant-mode table.
+    /// Build a quotient from a cover and its complete diagonal character table.
     ///
-    /// Modes must be in strictly increasing cover-column order.  A connected
-    /// closed quotient has exactly one zero-eigenvalue mode (the constant), and
-    /// that mode must remain in the base block of the curvature homotopy.
-    pub fn from_invariant_modes(
+    /// `characters[cover_column]` must certify the pullback eigencharacter of
+    /// that exact cover column.  The Reynolds projector derives the retained
+    /// columns; callers cannot supply an already-filtered mask.  A connected
+    /// closed cover and quotient have one zero-eigenvalue mode (the constant),
+    /// whose character is trivial and which remains in the homotopy base.
+    fn from_diagonal_involution_characters(
         quotient_name: impl Into<String>,
         cover: Arc<dyn SaeBasisThirdJet>,
         cover_width: usize,
-        modes: Vec<QuotientSpectralMode>,
+        characters: Vec<CoverSpectralCharacter>,
     ) -> Result<Self, String> {
         let quotient_name = quotient_name.into();
         if quotient_name.trim().is_empty() {
@@ -1871,56 +1898,50 @@ impl QuotientSpectralEvaluator {
                 "QuotientSpectralEvaluator[{quotient_name}]: cover width must be positive"
             ));
         }
-        if modes.is_empty() {
+        if characters.len() != cover_width {
             return Err(format!(
-                "QuotientSpectralEvaluator[{quotient_name}]: invariant mask is empty"
+                "QuotientSpectralEvaluator[{quotient_name}]: diagonal character table width {} != cover width {cover_width}",
+                characters.len()
             ));
         }
 
-        let mut cover_columns = Vec::with_capacity(modes.len());
-        let mut laplace_eigenvalues = Vec::with_capacity(modes.len());
-        let mut l2_gram_weights = Vec::with_capacity(modes.len());
-        let mut curved_columns = Vec::with_capacity(modes.len());
-        let mut previous_cover_column = None;
+        let mut cover_columns = Vec::with_capacity(cover_width);
+        let mut laplace_eigenvalues = Vec::with_capacity(cover_width);
+        let mut l2_gram_weights = Vec::with_capacity(cover_width);
+        let mut curved_columns = Vec::with_capacity(cover_width);
         let mut nullity = 0usize;
-        for (quotient_column, mode) in modes.into_iter().enumerate() {
-            if mode.cover_column >= cover_width {
-                return Err(format!(
-                    "QuotientSpectralEvaluator[{quotient_name}]: quotient column {quotient_column} selects cover column {} outside width {cover_width}",
-                    mode.cover_column
-                ));
-            }
-            if previous_cover_column.is_some_and(|previous| mode.cover_column <= previous) {
-                return Err(format!(
-                    "QuotientSpectralEvaluator[{quotient_name}]: cover columns must be strictly increasing; quotient column {quotient_column} selected {} after {:?}",
-                    mode.cover_column, previous_cover_column
-                ));
-            }
+        for (cover_column, mode) in characters.into_iter().enumerate() {
             if !(mode.laplace_eigenvalue.is_finite() && mode.laplace_eigenvalue >= 0.0) {
                 return Err(format!(
-                    "QuotientSpectralEvaluator[{quotient_name}]: quotient column {quotient_column} has invalid Laplace eigenvalue {}",
+                    "QuotientSpectralEvaluator[{quotient_name}]: cover column {cover_column} has invalid Laplace eigenvalue {}",
                     mode.laplace_eigenvalue
                 ));
             }
             if !(mode.l2_gram_weight.is_finite() && mode.l2_gram_weight > 0.0) {
                 return Err(format!(
-                    "QuotientSpectralEvaluator[{quotient_name}]: quotient column {quotient_column} has invalid L2 Gram weight {}",
+                    "QuotientSpectralEvaluator[{quotient_name}]: cover column {cover_column} has invalid L2 Gram weight {}",
                     mode.l2_gram_weight
                 ));
             }
             if mode.laplace_eigenvalue == 0.0 {
+                if mode.deck_character != DeckInvolutionCharacter::Trivial {
+                    return Err(format!(
+                        "QuotientSpectralEvaluator[{quotient_name}]: the constant cover mode at column {cover_column} must have trivial deck character"
+                    ));
+                }
                 nullity += 1;
-                if mode.curved {
+                if mode.curved_if_retained {
                     return Err(format!(
                         "QuotientSpectralEvaluator[{quotient_name}]: the constant null mode cannot be curvature-scaled"
                     ));
                 }
             }
-            previous_cover_column = Some(mode.cover_column);
-            cover_columns.push(mode.cover_column);
-            laplace_eigenvalues.push(mode.laplace_eigenvalue);
-            l2_gram_weights.push(mode.l2_gram_weight);
-            curved_columns.push(mode.curved);
+            if mode.deck_character.reynolds_projector_eigenvalue() == 1 {
+                cover_columns.push(cover_column);
+                laplace_eigenvalues.push(mode.laplace_eigenvalue);
+                l2_gram_weights.push(mode.l2_gram_weight);
+                curved_columns.push(mode.curved_if_retained);
+            }
         }
         if nullity != 1 {
             return Err(format!(
@@ -1964,42 +1985,54 @@ impl QuotientSpectralEvaluator {
 
         let cover = SphericalHarmonicEvaluator::new(max_degree)?;
         let cover_width = cover.basis_size();
-        let modes = cover
+        let characters = cover
             .spectral_modes()
             .into_iter()
-            .enumerate()
-            .filter(|(_, mode)| mode.degree % 2 == 0)
-            .map(|(cover_column, mode)| QuotientSpectralMode {
-                cover_column,
+            .map(|mode| CoverSpectralCharacter {
+                deck_character: if mode.degree % 2 == 0 {
+                    DeckInvolutionCharacter::Trivial
+                } else {
+                    DeckInvolutionCharacter::Sign
+                },
                 laplace_eigenvalue: mode.laplace_eigenvalue,
                 l2_gram_weight: mode.l2_gram_weight,
                 // `l = 0,2` contains the constant and Veronese embedding; only
                 // higher even degrees are the curvature refinement.
-                curved: mode.degree > 2,
+                curved_if_retained: mode.degree > 2,
             })
             .collect::<Vec<_>>();
-        if modes.len() != expected_width {
+        let evaluator = Self::from_diagonal_involution_characters(
+            "projective-plane",
+            Arc::new(cover),
+            cover_width,
+            characters,
+        )?;
+        if evaluator.basis_size() != expected_width {
             return Err(format!(
-                "QuotientSpectralEvaluator::projective_plane: even-degree mask produced width {}, expected {expected_width}",
-                modes.len()
+                "QuotientSpectralEvaluator::projective_plane: group average produced width {}, expected {expected_width}",
+                evaluator.basis_size()
             ));
         }
-        Self::from_invariant_modes("projective-plane", Arc::new(cover), cover_width, modes)
+        Ok(evaluator)
     }
 
     /// Real harmonics on the flat Klein bottle
     /// `T²/{(theta, phi) ~ (theta + 1/2, -phi)}` through order `H` per axis.
+    /// `H >= 2` is required because the standard smooth `R⁴` Klein embedding
+    /// uses theta harmonics one and two; its constant plus six coordinate modes
+    /// form the seven-column homotopy base.
     pub fn klein_bottle(num_harmonics: usize) -> Result<Self, String> {
-        if num_harmonics == 0 {
+        if num_harmonics < 2 {
             return Err(
-                "QuotientSpectralEvaluator::klein_bottle requires num_harmonics >= 1".to_string(),
+                "QuotientSpectralEvaluator::klein_bottle requires num_harmonics >= 2 for the standard R4 embedding"
+                    .to_string(),
             );
         }
         let expected_width = klein_bottle_basis_size(num_harmonics)?;
 
         let cover = TorusHarmonicEvaluator::new(2, num_harmonics)?;
         let cover_width = cover.basis_size();
-        let mut modes = Vec::with_capacity(expected_width);
+        let mut characters = Vec::with_capacity(cover_width);
         for (cover_column, mode) in cover.spectral_modes().into_iter().enumerate() {
             let [theta_component, phi_component] = mode.components.as_slice() else {
                 return Err(format!(
@@ -2009,24 +2042,45 @@ impl QuotientSpectralEvaluator {
             let theta_harmonic = theta_component.harmonic();
             let phi_harmonic = phi_component.harmonic();
             let half_turn_sign = if theta_harmonic % 2 == 0 { 1 } else { -1 };
-            if half_turn_sign * phi_component.reflection_sign() == 1 {
-                modes.push(QuotientSpectralMode {
-                    cover_column,
-                    laplace_eigenvalue: mode.laplace_eigenvalue,
-                    l2_gram_weight: mode.l2_gram_weight,
-                    // The low invariant block contains the standard embedded
-                    // Klein coordinates; higher frequencies refine curvature.
-                    curved: !(theta_harmonic <= 2 && phi_harmonic <= 1),
-                });
-            }
+            let deck_character = if half_turn_sign * phi_component.reflection_sign() == 1 {
+                DeckInvolutionCharacter::Trivial
+            } else {
+                DeckInvolutionCharacter::Sign
+            };
+            // Standard R4 Klein embedding in this unit-period chart:
+            //   {1,
+            //    sin/cos(4πθ),
+            //    sin/cos(4πθ) cos(2πφ),
+            //    sin/cos(2πθ) sin(2πφ)}.
+            // These are exactly one constant plus six coordinate columns.
+            let embedding_mode = (theta_harmonic == 0 && phi_harmonic == 0)
+                || (theta_harmonic == 2 && phi_harmonic == 0)
+                || (theta_harmonic == 2
+                    && phi_harmonic == 1
+                    && phi_component.reflection_sign() == 1)
+                || (theta_harmonic == 1
+                    && phi_harmonic == 1
+                    && phi_component.reflection_sign() == -1);
+            characters.push(CoverSpectralCharacter {
+                deck_character,
+                laplace_eigenvalue: mode.laplace_eigenvalue,
+                l2_gram_weight: mode.l2_gram_weight,
+                curved_if_retained: !embedding_mode,
+            });
         }
-        if modes.len() != expected_width {
+        let evaluator = Self::from_diagonal_involution_characters(
+            "klein-bottle",
+            Arc::new(cover),
+            cover_width,
+            characters,
+        )?;
+        if evaluator.basis_size() != expected_width {
             return Err(format!(
-                "QuotientSpectralEvaluator::klein_bottle: parity mask produced width {}, expected {expected_width}",
-                modes.len()
+                "QuotientSpectralEvaluator::klein_bottle: group average produced width {}, expected {expected_width}",
+                evaluator.basis_size()
             ));
         }
-        Self::from_invariant_modes("klein-bottle", Arc::new(cover), cover_width, modes)
+        Ok(evaluator)
     }
 
     pub fn quotient_name(&self) -> &str {

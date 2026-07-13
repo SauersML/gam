@@ -64,10 +64,13 @@ pub enum AtlasStatisticalRefusal {
     GaussianLinearizationIsPlugin {
         cycle_index: usize,
     },
-    DegenerateQuadraticGaussianLimit {
+    DegenerateFirstOrderLimitUnresolved {
         cycle_index: usize,
-        quadratic_bias: f64,
-        quadratic_variance: f64,
+        bilinear_quadratic_bias_diagnostic: f64,
+        bilinear_quadratic_variance_diagnostic: f64,
+    },
+    PopulationCrossGramMarginUncertified {
+        edge: AtlasHolonomyEdgeId,
     },
     SingularProjectedCrossGram {
         edge: AtlasHolonomyEdgeId,
@@ -91,7 +94,7 @@ pub enum AtlasStatisticalRefusal {
         cycle_index: usize,
         edge: AtlasHolonomyEdgeId,
         cross_gram_error_bound: f64,
-        smallest_singular_value: f64,
+        population_smallest_singular_value_lower_bound: f64,
     },
     CycleAngleBranchCutCrossed {
         cycle_index: usize,
@@ -105,6 +108,10 @@ pub enum AtlasStatisticalRefusal {
     GaussBonnetErrorBoundExceedsLevel {
         misround_probability_bound: f64,
         allocated_alpha: f64,
+    },
+    GaussBonnetGaussianLinearizationIsPlugin,
+    GaussBonnetFirstOrderLimitDegenerate {
+        first_order_variance: f64,
     },
 }
 
@@ -242,11 +249,9 @@ impl GaussianPatchRowSplit {
 /// Why the pilot projection may replace the ambient space in a certificate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PilotProjectionProvenance {
-    /// A fixed analytic frame with a stated population-tangent leakage bound.
-    CertifiedFixed {
-        tangent_leakage_bound: f64,
-        error_probability_bound: f64,
-    },
+    /// The retained frame spans the entire ambient space. Capture is therefore
+    /// exact by algebra and spends no probability budget.
+    ExactFullAmbientCapture,
     /// A frame fitted on the independent pilot rows, without a population
     /// capture theorem. It remains useful computationally but cannot sign a
     /// topology claim about the original ambient tangent.
@@ -254,34 +259,8 @@ pub enum PilotProjectionProvenance {
 }
 
 impl PilotProjectionProvenance {
-    fn validate(self) -> Result<Self, String> {
-        if let Self::CertifiedFixed {
-            tangent_leakage_bound,
-            error_probability_bound,
-        } = self
-        {
-            if !(tangent_leakage_bound.is_finite()
-                && tangent_leakage_bound >= 0.0
-                && tangent_leakage_bound < 1.0)
-            {
-                return Err(format!(
-                    "pilot tangent-leakage bound must be finite in [0, 1), got {tangent_leakage_bound}"
-                ));
-            }
-            if !(error_probability_bound.is_finite()
-                && error_probability_bound >= 0.0
-                && error_probability_bound < 1.0)
-            {
-                return Err(format!(
-                    "pilot projection error probability must be finite in [0, 1), got {error_probability_bound}"
-                ));
-            }
-        }
-        Ok(self)
-    }
-
     fn is_certified(self) -> bool {
-        matches!(self, Self::CertifiedFixed { .. })
+        matches!(self, Self::ExactFullAmbientCapture)
     }
 }
 
@@ -692,7 +671,6 @@ impl GaussianPcaPatch {
         spectrum_provenance: GaussianPcaSpectrumProvenance,
     ) -> Result<Self, String> {
         let (ambient, retained) = projection_frame.dim();
-        let pilot_projection = pilot_projection.validate()?;
         let spectrum_provenance = spectrum_provenance.validate()?;
         let inference_rows = row_split.inference_rows.len();
         let covariance_dof = centering
@@ -758,6 +736,15 @@ impl GaussianPcaPatch {
                     ));
                 }
             }
+        }
+        if matches!(
+            pilot_projection,
+            PilotProjectionProvenance::ExactFullAmbientCapture
+        ) && retained != ambient
+        {
+            return Err(format!(
+                "Gaussian PCA patch {chart} claims exact full-ambient capture with retained dimension {retained} below ambient dimension {ambient}"
+            ));
         }
         Ok(Self {
             chart,
@@ -899,10 +886,7 @@ impl GaussianPcaPatch {
         }
         .validate()?;
         let pilot_projection = if retained_dimension == ambient {
-            PilotProjectionProvenance::CertifiedFixed {
-                tangent_leakage_bound: 0.0,
-                error_probability_bound: 0.0,
-            }
+            PilotProjectionProvenance::ExactFullAmbientCapture
         } else {
             PilotProjectionProvenance::IndependentPilotEstimate
         };
@@ -1188,10 +1172,42 @@ impl GaussianPcaErrorModel {
 
 /// One edge requested from the Gaussian-PCA atlas.
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PopulationCrossGramProvenance {
+    /// No population separation proof is available. The observed cross-Gram
+    /// remains useful geometry, but cannot set its own finite-sample threshold.
+    EstimatedOnly,
+    /// Deterministic lower bound on the smallest singular value of the true
+    /// population cross-Gram for this overlap component.
+    CertifiedSmallestSingularValue { lower_bound: f64 },
+}
+
+impl PopulationCrossGramProvenance {
+    fn validate(self) -> Result<Self, String> {
+        if let Self::CertifiedSmallestSingularValue { lower_bound } = self
+            && !(lower_bound.is_finite() && lower_bound > 0.0 && lower_bound <= 1.0)
+        {
+            return Err(format!(
+                "population cross-Gram singular-value lower bound must be finite in (0, 1], got {lower_bound}"
+            ));
+        }
+        Ok(self)
+    }
+
+    fn certified_lower_bound(self) -> Option<f64> {
+        match self {
+            Self::EstimatedOnly => None,
+            Self::CertifiedSmallestSingularValue { lower_bound } => Some(lower_bound),
+        }
+    }
+}
+
+/// One edge requested from the Gaussian-PCA atlas.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProjectedAtlasEdgeSpec {
     a: usize,
     b: usize,
     overlap: usize,
+    population_cross_gram: PopulationCrossGramProvenance,
     /// Deterministic continuum/discretization error for this edge, in radians.
     /// This is supplied by the geometry builder; it is never inferred from a
     /// grid or hidden angular threshold.
@@ -1204,9 +1220,11 @@ impl ProjectedAtlasEdgeSpec {
         a: usize,
         b: usize,
         overlap: usize,
+        population_cross_gram: PopulationCrossGramProvenance,
         geometric_remainder_bound: f64,
     ) -> Result<Self, String> {
         let identity = AtlasHolonomyEdgeId::new(a, b, overlap)?;
+        let population_cross_gram = population_cross_gram.validate()?;
         if !(geometric_remainder_bound.is_finite() && geometric_remainder_bound >= 0.0) {
             return Err(format!(
                 "edge geometric remainder must be finite and nonnegative, got {geometric_remainder_bound}"
@@ -1216,6 +1234,7 @@ impl ProjectedAtlasEdgeSpec {
             a: identity.a,
             b: identity.b,
             overlap: identity.overlap,
+            population_cross_gram,
             geometric_remainder_bound,
         })
     }
@@ -1232,6 +1251,7 @@ pub struct ProjectedAtlasEdgeGeometry {
     pub projected_dimension: usize,
     pub principal_angle_cosines: [f64; INTRINSIC_DIMENSION],
     pub orientation_margin: f64,
+    pub population_cross_gram: PopulationCrossGramProvenance,
     pub estimated_sign: Option<i8>,
     pub transition_a_to_b: Option<[[f64; INTRINSIC_DIMENSION]; INTRINSIC_DIMENSION]>,
     pub geometric_remainder_bound: f64,
@@ -1269,7 +1289,7 @@ pub enum AtlasCycleConclusion {
 
 /// Limiting law identified for one cycle before any hypothesis decision.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum AtlasCycleLimitLaw {
+pub enum AtlasCycleAsymptoticRegime {
     /// The nonzero first derivative contracts an authoritative joint Gaussian
     /// error law. The nonlinear contribution is handled by a separate
     /// high-probability remainder, never folded into a z standard error.
@@ -1278,8 +1298,12 @@ pub enum AtlasCycleLimitLaw {
         authority: GaussianPcaCovarianceAuthority,
     },
     /// The first derivative cancels at numerical backward-error scale. The
-    /// leading term is quadratic Gaussian chaos and a z-test is forbidden.
-    DegenerateQuadraticGaussian { bias: f64, variance: f64 },
+    /// displayed bilinear moments cover only the explicit endpoint product;
+    /// they are diagnostics, not the full Hessian or a claimed limit law.
+    FirstOrderDegenerate {
+        bilinear_quadratic_bias_diagnostic: f64,
+        bilinear_quadratic_variance_diagnostic: f64,
+    },
 }
 
 /// One fundamental-cycle readout with every uncertainty term exposed.
@@ -1290,7 +1314,7 @@ pub struct AtlasCycleHolonomy {
     /// overlap component, so parallel transitions remain distinguishable.
     steps: Vec<AtlasHolonomyCycleStep>,
     pub absolute_angle: Option<f64>,
-    pub limit_law: Option<AtlasCycleLimitLaw>,
+    pub asymptotic_regime: Option<AtlasCycleAsymptoticRegime>,
     pub first_order_variance: Option<f64>,
     pub naive_edgewise_first_order_variance: Option<f64>,
     pub covariance_aggregation_adjustment: Option<f64>,
@@ -1441,13 +1465,23 @@ impl GaussBonnetContribution {
 /// Inputs for the integer Gauss--Bonnet confidence calculation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GaussBonnetInput {
+    pub covariance_authority: GaussBonnetCovarianceAuthority,
     pub sources: Vec<GaussBonnetNoiseSource>,
     pub contributions: Vec<GaussBonnetContribution>,
+}
+
+/// Whether the propagated Gauss--Bonnet covariance supports a finite-sample
+/// Gaussian probability or is only an asymptotic plug-in diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GaussBonnetCovarianceAuthority {
+    CertifiedGaussianLinearization,
+    AsymptoticPlugIn,
 }
 
 impl GaussBonnetInput {
     #[must_use = "Gauss-Bonnet input validation errors must be handled"]
     pub fn new(
+        covariance_authority: GaussBonnetCovarianceAuthority,
         mut sources: Vec<GaussBonnetNoiseSource>,
         contributions: Vec<GaussBonnetContribution>,
     ) -> Result<Self, String> {
@@ -1481,6 +1515,7 @@ impl GaussBonnetInput {
             }
         }
         Ok(Self {
+            covariance_authority,
             sources,
             contributions,
         })
@@ -1511,7 +1546,7 @@ pub struct GaussBonnetConfidence {
     pub first_order_variance: f64,
     pub naive_contribution_variance: f64,
     pub shared_source_covariance_adjustment: f64,
-    pub standard_error: f64,
+    pub standard_error: Option<f64>,
     pub polar_linearization_remainder_bound: f64,
     pub geometric_remainder_bound: f64,
     /// Distance from this observed estimate to its nearest integer-cell
@@ -1521,7 +1556,7 @@ pub struct GaussBonnetConfidence {
     /// rounding selects the wrong integer, independent of the realized
     /// residual inside the selected cell.
     pub stochastic_rounding_margin: f64,
-    pub misround_probability_bound: f64,
+    pub misround_probability_bound: Option<f64>,
     pub decision: AtlasStatisticalDecision<AtlasEulerCharacteristic>,
 }
 
@@ -2091,6 +2126,39 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_uncertified_patch_does_not_refuse_another_cycle() {
+        let mut unrelated = patch(3, 0.0, 0.0, false, 1_000_000, 0);
+        unrelated.pilot_projection = PilotProjectionProvenance::IndependentPilotEstimate;
+        unrelated.spectrum_provenance = GaussianPcaSpectrumProvenance::PlugInEstimate {
+            noise_variance: 0.01,
+            signal_variance: 1.0,
+            eigengap: 1.0,
+        };
+        let analysis = certified_analysis(
+            vec![
+                patch(0, 0.0, 0.0, false, 1_000_000, 0),
+                patch(1, 0.2, 0.0, false, 1_000_000, 0),
+                patch(2, -0.15, 0.0, false, 1_000_000, 0),
+                unrelated,
+            ],
+            triangle_edges(),
+            AtlasFamilywiseLevel::new(0.05).unwrap(),
+            None,
+        );
+
+        assert_eq!(analysis.cycles().len(), 1);
+        assert!(analysis.cycles()[0]
+            .decision
+            .refusals()
+            .iter()
+            .all(|reason| !matches!(
+                reason,
+                AtlasStatisticalRefusal::PilotProjectionUncertified { chart: 3 }
+                    | AtlasStatisticalRefusal::PopulationSpectrumUncertified { chart: 3 }
+            )));
+    }
+
+    #[test]
     fn independent_projector_simulation_calibrates_cycle_plugin_variance() {
         const REPLICATES: usize = 2_048;
         let ambient = 4;
@@ -2511,9 +2579,8 @@ fn frobenius_squared(matrix: ArrayView2<'_, f64>) -> f64 {
     matrix.iter().map(|value| value * value).sum()
 }
 
-fn project_patch_normal(patch: &GaussianPcaPatch, value: &Array2<f64>) -> Array2<f64> {
-    let local = patch.projection_frame.t().dot(value);
-    &local
+fn project_retained_normal(patch: &GaussianPcaPatch, local: &Array2<f64>) -> Array2<f64> {
+    local
         - &patch
             .tangent_coordinates
             .dot(&patch.tangent_coordinates.t().dot(&local))
@@ -2526,48 +2593,38 @@ fn build_projected_edge(
     let patch_a = &patches[spec.a];
     let patch_b = &patches[spec.b];
     let projection_cross_gram_ba = patch_b.projection_frame.t().dot(&patch_a.projection_frame);
-    let ambient = patch_a.ambient_dimension();
     let retained_a = patch_a.retained_dimension();
     let retained_b = patch_b.retained_dimension();
-    let mut joined = Array2::<f64>::zeros((ambient, retained_a + retained_b));
-    joined
-        .slice_mut(s![.., 0..retained_a])
-        .assign(&patch_a.projection_frame);
-    joined
-        .slice_mut(s![.., retained_a..])
-        .assign(&patch_b.projection_frame);
-    let (union_left, union_singular, _) = joined.svd(true, false).map_err(|error| {
+    // The intersection dimension is the multiplicity of singular value one
+    // in W_b^T W_a, hence dim(span(W_a,W_b)) = r_a+r_b-dim(intersection).
+    // This retained-coordinate SVD removes the ambient P-by-(r_a+r_b) SVD.
+    let (_, projection_cosines, _) = projection_cross_gram_ba
+        .svd(false, false)
+        .map_err(|error| {
         format!(
-            "edge ({}, {}, overlap {}) projection SVD failed: {error}",
+            "edge ({}, {}, overlap {}) retained projection cross-Gram SVD failed: {error}",
             spec.a, spec.b, spec.overlap
         )
     })?;
-    let union_left = union_left.ok_or_else(|| {
-        format!(
-            "edge ({}, {}, overlap {}) projection SVD did not return requested left vectors",
-            spec.a, spec.b, spec.overlap
-        )
-    })?;
-    let largest_union_singular = union_singular.first().copied().unwrap_or(0.0);
-    let union_rank_threshold =
-        f64::EPSILON * ambient.max(retained_a + retained_b) as f64 * largest_union_singular;
-    let projected_dimension = union_singular
+    let intersection_backward_error = f64::EPSILON
+        * patch_a
+            .ambient_dimension()
+            .max(retained_a + retained_b) as f64;
+    let intersection_dimension = projection_cosines
         .iter()
-        .take_while(|&&value| value > union_rank_threshold)
+        .filter(|&&cosine| (1.0 - cosine).abs() <= intersection_backward_error)
         .count();
+    let projected_dimension = retained_a + retained_b - intersection_dimension;
     if projected_dimension < INTRINSIC_DIMENSION {
         return Err(format!(
             "edge ({}, {}, overlap {}) projected union rank {projected_dimension} is below intrinsic dimension {INTRINSIC_DIMENSION}",
             spec.a, spec.b, spec.overlap
         ));
     }
-    let union = union_left.slice(s![.., 0..projected_dimension]);
-    let tangent_a = patch_a.tangent_frame();
-    let tangent_b = patch_b.tangent_frame();
-    let tangent_a_projected = union.t().dot(&tangent_a);
-    let tangent_b_projected = union.t().dot(&tangent_b);
     // Coordinates are mapped from chart a to chart b, hence M = U_b^T U_a.
-    let cross = tangent_b_projected.t().dot(&tangent_a_projected);
+    let cross = patch_b.tangent_coordinates.t().dot(
+        &projection_cross_gram_ba.dot(&patch_a.tangent_coordinates),
+    );
     let (left, singular, right_t) = cross.svd(true, true).map_err(|error| {
         format!(
             "edge ({}, {}, overlap {}) cross-Gram SVD failed: {error}",
@@ -2610,6 +2667,7 @@ fn build_projected_edge(
                 projected_dimension,
                 principal_angle_cosines,
                 orientation_margin,
+                population_cross_gram: spec.population_cross_gram,
                 estimated_sign: None,
                 transition_a_to_b: None,
                 geometric_remainder_bound: spec.geometric_remainder_bound,
@@ -2633,10 +2691,15 @@ fn build_projected_edge(
     let angle_gradient = transition.dot(&rotation_generator()) / trace_h;
     // dM = dU_b^T U_a + U_b^T dU_a.  Remove the vertical gauge
     // component before cycle aggregation, leaving a projector derivative.
-    let raw_a = tangent_b.dot(&angle_gradient);
-    let raw_b = tangent_a.dot(&angle_gradient.t());
-    let patch_gradient_a = project_patch_normal(patch_a, &raw_a);
-    let patch_gradient_b = project_patch_normal(patch_b, &raw_b);
+    let raw_a = projection_cross_gram_ba
+        .t()
+        .dot(&patch_b.tangent_coordinates)
+        .dot(&angle_gradient);
+    let raw_b = projection_cross_gram_ba
+        .dot(&patch_a.tangent_coordinates)
+        .dot(&angle_gradient.t());
+    let patch_gradient_a = project_retained_normal(patch_a, &raw_a);
+    let patch_gradient_b = project_retained_normal(patch_b, &raw_b);
     let mut public_transition = [[0.0; INTRINSIC_DIMENSION]; INTRINSIC_DIMENSION];
     for i in 0..INTRINSIC_DIMENSION {
         for j in 0..INTRINSIC_DIMENSION {
@@ -2651,6 +2714,7 @@ fn build_projected_edge(
             projected_dimension,
             principal_angle_cosines,
             orientation_margin,
+            population_cross_gram: spec.population_cross_gram,
             estimated_sign: Some(sign),
             transition_a_to_b: Some(public_transition),
             geometric_remainder_bound: spec.geometric_remainder_bound,
@@ -2802,13 +2866,12 @@ fn patch_tail(
 /// the cross-Gram perturbation is at most `2h + h²`. Solving
 /// `2h + h² = m`, with `m = |det(U_b^T U_a)| <= sigma_min(U_b^T U_a)`, uses the
 /// complete determinant margin rather than a hand-chosen fraction of it.
-fn orientation_endpoint_frame_budget(edge: &EdgeWork) -> f64 {
-    let determinant_margin = edge
+fn orientation_endpoint_frame_budget(edge: &EdgeWork) -> Option<f64> {
+    let population_margin = edge
         .public
-        .orientation_margin
-        .min(edge.smallest_singular_value)
-        .clamp(0.0, 1.0);
-    (1.0 + determinant_margin).sqrt() - 1.0
+        .population_cross_gram
+        .certified_lower_bound()?;
+    Some((1.0 + population_margin).sqrt() - 1.0)
 }
 
 fn covariance_budget_ratio(patch: &GaussianPcaPatch, frame_budget: f64) -> f64 {
@@ -2862,22 +2925,53 @@ fn orientation_tail_and_prescription(
     allocated_alpha: f64,
 ) -> (
     AtlasStatisticalDecision<AtlasOrientability>,
-    f64,
+    Option<f64>,
     Vec<AtlasPatchSamplePrescription>,
 ) {
+    if edges.is_empty() {
+        return (
+            AtlasStatisticalDecision::Certified {
+                value: AtlasOrientability::Orientable,
+                error_probability_bound: 0.0,
+            },
+            Some(0.0),
+            Vec::new(),
+        );
+    }
     let mut reasons = Vec::new();
-    for patch in patches {
+    let incident_charts: BTreeSet<_> = edges
+        .iter()
+        .flat_map(|edge| [edge.public.a, edge.public.b])
+        .collect();
+    let mut bound_inputs_certified = true;
+    for chart in incident_charts {
+        let patch = &patches[chart];
         if !patch.pilot_projection.is_certified() {
+            bound_inputs_certified = false;
             reasons
                 .push(AtlasStatisticalRefusal::PilotProjectionUncertified { chart: patch.chart });
         }
         if patch.spectrum_provenance.certified_bounds().is_none() {
+            bound_inputs_certified = false;
             reasons.push(AtlasStatisticalRefusal::PopulationSpectrumUncertified {
                 chart: patch.chart,
             });
         }
     }
     for edge in edges {
+        if edge
+            .public
+            .population_cross_gram
+            .certified_lower_bound()
+            .is_none()
+        {
+            bound_inputs_certified = false;
+            reasons.push(
+                AtlasStatisticalRefusal::PopulationCrossGramMarginUncertified {
+                    edge: edge.public.identity(),
+                },
+            );
+        }
         if edge.public.estimated_sign.is_none() {
             reasons.push(AtlasStatisticalRefusal::SingularProjectedCrossGram {
                 edge: edge.public.identity(),
@@ -2885,16 +2979,6 @@ fn orientation_tail_and_prescription(
                 numerical_rank_threshold: edge.numerical_rank_threshold,
             });
         }
-    }
-    if edges.is_empty() {
-        return (
-            AtlasStatisticalDecision::Certified {
-                value: AtlasOrientability::Orientable,
-                error_probability_bound: 0.0,
-            },
-            0.0,
-            Vec::new(),
-        );
     }
     // Each edge uses its own pairwise projection space. Distinct incident
     // projections are not generally nested, so the finite-sample union bound
@@ -2904,7 +2988,9 @@ fn orientation_tail_and_prescription(
     let mut patch_requirements = vec![None::<(usize, usize, f64)>; patches.len()];
     let mut flip_probability_bound = 0.0_f64;
     for edge in edges {
-        let frame_budget = orientation_endpoint_frame_budget(edge);
+        let Some(frame_budget) = orientation_endpoint_frame_budget(edge) else {
+            continue;
+        };
         for chart in [edge.public.a, edge.public.b] {
             let patch = &patches[chart];
             if patch.spectrum_provenance.certified_bounds().is_none() {
@@ -2948,7 +3034,7 @@ fn orientation_tail_and_prescription(
             aligned_frame_error_budget: frame_budget,
         });
     }
-    if flip_probability_bound > allocated_alpha {
+    if bound_inputs_certified && flip_probability_bound > allocated_alpha {
         reasons.push(AtlasStatisticalRefusal::OrientationFlipBoundExceedsLevel {
             flip_probability_bound,
             allocated_alpha,
@@ -2973,7 +3059,11 @@ fn orientation_tail_and_prescription(
     } else {
         AtlasStatisticalDecision::Refused { reasons }
     };
-    (decision, flip_probability_bound, prescriptions)
+    (
+        decision,
+        bound_inputs_certified.then_some(flip_probability_bound),
+        prescriptions,
+    )
 }
 
 fn edge_step_matrix(edge: &EdgeWork, forward: bool) -> Option<Array2<f64>> {

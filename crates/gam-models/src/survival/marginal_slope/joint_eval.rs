@@ -391,7 +391,7 @@ impl SurvivalMarginalSlopeFamily {
             Ok((
                 row_kernel_log_likelihood(&cache, &rows),
                 -row_kernel_gradient(&kern, &cache, &rows),
-                row_kernel_hessian_dense(&kern, &cache, &rows),
+                row_kernel_hessian_dense(&kern, &cache, &rows)?,
             ))
         }
     }

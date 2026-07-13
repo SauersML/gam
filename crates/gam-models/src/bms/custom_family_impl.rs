@@ -1579,9 +1579,9 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     fn selected_device_joint_gradient(
         &self,
     ) -> Result<Option<Arc<ExactNewtonJointGradientEvaluation>>, String> {
-        let Some(_device_state) = self.cache.row_primary_hessians.device() else {
+        if self.cache.row_primary_hessians.device().is_none() {
             return Ok(None);
-        };
+        }
         let expected = self.cache.slices.total;
         self.device_joint_gradient
             .get_or_init(|| {
@@ -1616,9 +1616,9 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         &self,
         operation: &str,
     ) -> Result<Option<Array2<f64>>, String> {
-        let Some(_device_state) = self.cache.row_primary_hessians.device() else {
+        if self.cache.row_primary_hessians.device().is_none() {
             return Ok(None);
-        };
+        }
         self.family
             .selected_device_dense_hessian_from_cache(&self.cache, operation)
     }

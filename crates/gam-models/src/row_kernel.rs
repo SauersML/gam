@@ -427,7 +427,8 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// pullback is a pure design-row Gram can instead gather the per-row
     /// contraction weights and close each row chunk with `Xᵀ diag(w) X`
     /// BLAS-3 products. The default returns the exact generic per-row path;
-    /// overrides return `None` only for row sets they explicitly decline.
+    /// overrides return `None` only for row sets they explicitly decline and
+    /// surface failures from an algorithm they did select through `Err`.
     /// Overrides should claim only the full-data unit-weight `RowSet::All` case;
     /// under a subsample / non-unit-weight `RowSet` return `None` so the generic
     /// HT path runs.
@@ -435,12 +436,16 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
         &self,
         rows: &RowSet,
         row_hessians: &[[[f64; K]; K]],
-    ) -> Option<Array2<f64>> {
+    ) -> Option<Result<Array2<f64>, String>> {
         // Default = the exact generic per-row pullback, which consumes
         // `rows`/`row_hessians`. A kernel with a BLAS-3 fast path overrides this;
         // returning `Some` keeps the dispatcher fall-through reserved for an
         // override that declines (`None`) on a row-set it cannot accelerate.
-        Some(row_kernel_hessian_dense_generic(self, rows, row_hessians))
+        Some(Ok(row_kernel_hessian_dense_generic(
+            self,
+            rows,
+            row_hessians,
+        )))
     }
 
     /// Optional BLAS-3 fast path for the BATCHED all-axes second directional
@@ -996,11 +1001,15 @@ pub fn row_kernel_hessian_dense<const K: usize>(
     kern: &(impl RowKernel<K> + ?Sized),
     cache: &RowKernelCache<K>,
     rows: &RowSet,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, String> {
     if let Some(dense) = kern.hessian_dense_override(rows, &cache.hessians) {
         return dense;
     }
-    row_kernel_hessian_dense_generic(kern, rows, &cache.hessians)
+    Ok(row_kernel_hessian_dense_generic(
+        kern,
+        rows,
+        &cache.hessians,
+    ))
 }
 
 /// Generic per-row dense joint-Hessian pullback `H = Σ_i w_i · Jᵢᵀ Hᵢ Jᵢ`.
@@ -2000,7 +2009,7 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
             &*self.kern,
             &self.cache,
             &self.rows,
-        )))
+        )?))
     }
 
     fn hessian_source_preference_for_intent(

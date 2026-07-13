@@ -2937,7 +2937,7 @@ impl BernoulliMarginalSlopeFamily {
                             &w_mm[idx],
                             &w_mg[idx],
                             &w_gg[idx],
-                        );
+                        )?;
                     }
                     Ok(accs)
                 };
@@ -3145,7 +3145,7 @@ impl BernoulliMarginalSlopeFamily {
                             &w_mm[idx],
                             &w_mg[idx],
                             &w_gg[idx],
-                        );
+                        )?;
                     }
                     Ok(accs)
                 };
@@ -3956,8 +3956,8 @@ impl BernoulliMarginalSlopeFamily {
                                 hm_w[local_row] = h[0][0];
                                 hl_w[local_row] = h[1][1];
                             }
-                            add_weighted_chunk_gram(&marginal_chunk, hm_w, &mut hm);
-                            add_weighted_chunk_gram(&logslope_chunk, hl_w, &mut hl);
+                            add_weighted_chunk_gram(&marginal_chunk, hm_w, &mut hm)?;
+                            add_weighted_chunk_gram(&logslope_chunk, hl_w, &mut hl)?;
                         }
                         Ok((hm, hl))
                     },
@@ -4124,11 +4124,11 @@ impl BernoulliMarginalSlopeFamily {
                                     (Some(dense), _) => {
                                         let view = dense.slice(s![start..end, ..]);
                                         add_weighted_chunk_gradient(&view, gm_w, &mut gm);
-                                        add_weighted_chunk_gram(&view, hm_w, &mut hm);
+                                        add_weighted_chunk_gram(&view, hm_w, &mut hm)?;
                                     }
                                     (None, Some(owned)) => {
                                         add_weighted_chunk_gradient(owned, gm_w, &mut gm);
-                                        add_weighted_chunk_gram(owned, hm_w, &mut hm);
+                                        add_weighted_chunk_gram(owned, hm_w, &mut hm)?;
                                     }
                                     (None, None) => {
                                         return Err(
@@ -4142,11 +4142,11 @@ impl BernoulliMarginalSlopeFamily {
                                     (Some(dense), _) => {
                                         let view = dense.slice(s![start..end, ..]);
                                         add_weighted_chunk_gradient(&view, gl_w, &mut gl);
-                                        add_weighted_chunk_gram(&view, hl_w, &mut hl);
+                                        add_weighted_chunk_gram(&view, hl_w, &mut hl)?;
                                     }
                                     (None, Some(owned)) => {
                                         add_weighted_chunk_gradient(owned, gl_w, &mut gl);
-                                        add_weighted_chunk_gram(owned, hl_w, &mut hl);
+                                        add_weighted_chunk_gram(owned, hl_w, &mut hl)?;
                                     }
                                     (None, None) => {
                                         return Err(

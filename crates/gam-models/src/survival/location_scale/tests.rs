@@ -1833,7 +1833,8 @@ fn survival_ls_packed_targets_apply_ht_mask_once_932() {
     let kernel = family.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
     let rows = row_set_from_survival_mask(Some(&mask), family.n);
     let cache = build_row_kernel_cache(&kernel, &rows).expect("masked generic row cache");
-    let generic = row_kernel_hessian_dense(&kernel, &cache, &rows);
+    let generic = row_kernel_hessian_dense(&kernel, &cache, &rows)
+        .expect("generic masked row-kernel Hessian");
     assert_eq!(dense.dim(), generic.dim());
     for ((row, column), &expected) in generic.indexed_iter() {
         let got = dense[[row, column]];
@@ -1916,7 +1917,8 @@ fn survival_ls_row_kernel_matches_packed_coefficient_lowering_body() {
     };
 
     let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("row kernel cache");
-    let h_new = row_kernel_hessian_dense(&kernel, &cache, &RowSet::All);
+    let h_new = row_kernel_hessian_dense(&kernel, &cache, &RowSet::All)
+        .expect("generic row-kernel Hessian");
     let h_old = packed_sls_dense(&family, &states, 0.0);
     assert_eq!(h_new.dim(), h_old.dim(), "joint hessian shape");
     for ((a, b), &old) in h_old.indexed_iter() {
@@ -2073,7 +2075,8 @@ fn survival_ls_time_varying_joint_hessian_tower_body() {
         // Single-sourced tower joint Hessian: row kernel (Order2<9> over
         // sls_row_nll) → dense block assembly.
         let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("row kernel cache");
-        let h_tower = row_kernel_hessian_dense(&kernel, &cache, &RowSet::All);
+        let h_tower = row_kernel_hessian_dense(&kernel, &cache, &RowSet::All)
+            .expect("single-sourced tower row-kernel Hessian");
 
         let h_packed = packed_sls_dense(&family, &states, 0.0);
 

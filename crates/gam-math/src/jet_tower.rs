@@ -2183,16 +2183,21 @@ mod tests {
             1
         }
 
-        fn primaries(&self, _row: usize) -> Result<[f64; 10], String> {
-            Err("dense-tower storage check reached program primaries".to_string())
+        fn primaries(&self, row: usize) -> Result<[f64; 10], String> {
+            Err(format!(
+                "dense-tower storage check reached program primaries at row {row}"
+            ))
         }
 
         fn eval<S: crate::jet_scalar::JetScalar<10>>(
             &self,
-            _row: usize,
-            _p: &[S; 10],
+            row: usize,
+            primaries: &[S; 10],
         ) -> Result<S, String> {
-            Err("dense-tower storage check reached program evaluation".to_string())
+            Err(format!(
+                "dense-tower storage check reached program evaluation at row {row} with {} primaries",
+                primaries.len()
+            ))
         }
     }
 

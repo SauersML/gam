@@ -1013,21 +1013,38 @@ fn planted_corruption_tripwire_fails_932() {
 fn selected_gpu_consumers_cannot_retry_on_cpu_932() {
     let axis_source = include_str!("axis_direction_search.rs");
     let workspace_source = include_str!("custom_family_impl.rs");
+    let cache_source = include_str!("exact_eval_cache.rs");
+    let dense_source = include_str!("row_primary_hessian.rs");
+    let device_source = include_str!("gpu/row.rs");
 
     assert_eq!(
         axis_source.matches("require_selected_gpu_result(").count(),
-        7,
-        "every device/host-pin/tiled HVP or diagonal CUDA dispatch must share the fail-closed contract"
+        9,
+        "seven HVP/diagonal dispatches plus the joint-gradient and dense cache-boundary adapters must share the fail-closed contract"
     );
     assert_eq!(
         workspace_source
             .matches("require_selected_gpu_result(")
             .count(),
-        1,
-        "dense and forced-dense must share one selected-device materializer"
+        0,
+        "workspace must delegate to cache-boundary adapters instead of owning CUDA launch policy"
     );
     assert!(!axis_source.contains("falling back to CPU"));
     assert!(!workspace_source.contains("falling back to CPU"));
     assert!(!workspace_source.contains("p_total <= crate::bms::gpu::row::DENSE_BLOCK_MAX_P"));
-    assert!(workspace_source.contains("launch_bms_flex_row_dense(device_state)"));
+    assert!(axis_source.contains("launch_bms_flex_row_dense(device_state)"));
+    assert!(axis_source.contains("launch_bms_flex_row_joint_gradient(device_state)"));
+    assert!(workspace_source.contains("selected_device_joint_gradient_from_cache"));
+    assert!(workspace_source.contains("device_joint_gradient:"));
+    assert!(
+        workspace_source
+            .contains("OnceLock<Result<Arc<ExactNewtonJointGradientEvaluation>, String>>")
+    );
+    assert!(cache_source.contains("reject_device_cpu_recompute"));
+    assert!(dense_source.contains("selected_device_joint_gradient_from_cache"));
+    assert!(dense_source.contains("selected_device_dense_hessian_from_cache"));
+    assert!(device_source.contains("bms_flex_row_joint_gradient_partial"));
+    assert!(device_source.contains("bms_flex_row_joint_gradient_reduce"));
+    assert!(!device_source.contains("drop(d_neglog)"));
+    assert!(!device_source.contains("drop(d_grad)"));
 }
