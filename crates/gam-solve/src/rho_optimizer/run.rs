@@ -1795,6 +1795,28 @@ pub(crate) fn compute_rho_uncertainty_diagnostic(
     context: &str,
     result: &mut OuterResult,
 ) -> crate::rho_uncertainty::RhoUncertaintyDiagnostic {
+    let terminal_cap_guard = config
+        .outer_inner_cap
+        .as_ref()
+        .map(TerminalInnerCapGuard::lift);
+    // Do not reset here: successful certification immediately precedes this
+    // call and already installed a fresh cap=0 state.  Holding cap=0 makes the
+    // diagnostic reuse that exact cache identity (or extend it with analytic
+    // Hessian work) instead of reopening the selected rho under the restored
+    // search cap and leaving a coarse mode as the shipped state.
+    let diagnostic = compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
+        obj, config, context, result,
+    );
+    drop(terminal_cap_guard);
+    diagnostic
+}
+
+fn compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+    result: &mut OuterResult,
+) -> crate::rho_uncertainty::RhoUncertaintyDiagnostic {
     let cap = obj.capability();
     let layout = cap.theta_layout();
     let rho_dim = layout.rho_dim();
