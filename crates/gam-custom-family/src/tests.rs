@@ -3743,11 +3743,8 @@ pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay
         compute_covariance: true,
         ..BlockwiseFitOptions::default()
     };
-    let derivative_blocks: SharedDerivativeBlocks = Arc::new(
-        (0..specs.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>(),
-    );
+    let derivative_blocks: SharedDerivativeBlocks =
+        Arc::new((0..specs.len()).map(|_| Vec::new()).collect::<Vec<_>>());
     let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
         &family,
         &specs,
@@ -3783,7 +3780,11 @@ pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay
     assert_eq!(fit.block_states.len(), selected_beta_bits.len());
     for (state, expected) in fit.block_states.iter().zip(selected_beta_bits.iter()) {
         assert_eq!(
-            state.beta.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            state
+                .beta
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
             *expected,
         );
     }
