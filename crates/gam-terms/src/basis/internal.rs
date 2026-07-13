@@ -511,6 +511,84 @@ mod knot_scale_invariance_tests {
         }
     }
 
+    /// Regression for #2315 (same SPEC spirit as #2292's all-zero design row):
+    /// at the RIGHT clamped endpoint `x == t_max` the production B-spline row
+    /// must be a genuine partition of unity — the last basis function is exactly
+    /// `1` under the standard clamped convention `B_{n-1}(t_max) = 1` — never an
+    /// all-zero design row that would silently drop a boundary data point. The
+    /// half-open `[t_i, t_{i+1})` span convention places `x == t_max` in no span;
+    /// the production clamping evaluator (`evaluate_splines_at_point_into` via
+    /// `evaluate_spline_local_values`) clamps into `[t_degree, t_{num_basis}]`, so
+    /// the endpoint lands in the last non-degenerate span, and the full-support
+    /// evaluator special-cases `x == last_knot` (issue #1239). Both must produce
+    /// the identical nontrivial row, at any abscissa scale.
+    #[test]
+    fn clamped_bspline_right_endpoint_row_is_nontrivial_and_scale_invariant_2315() {
+        let degree = 3;
+        for scale in [1e-9_f64, 1.0, 1e9] {
+            let knots = clamped_cubic_knots(scale);
+            let num_basis = knots.len() - degree - 1;
+            // The right clamped endpoint: x == t_max (== scale here).
+            let x_max = knots[knots.len() - 1];
+
+            // Production clamping evaluator (the design-matrix workhorse).
+            let mut local = vec![0.0; num_basis];
+            let mut scratch = BsplineScratch::new(degree);
+            evaluate_splines_at_point_into(x_max, degree, knots.view(), &mut local, &mut scratch);
+
+            // Full-support evaluator (the derivative-recurrence path).
+            let mut full = vec![0.0; num_basis];
+            let mut full_scratch = BsplineScratch::new(degree);
+            evaluate_splines_at_point_full_support_into(
+                x_max,
+                degree,
+                knots.view(),
+                &mut full,
+                &mut full_scratch,
+            );
+
+            let local_sum: f64 = local.iter().sum();
+            let full_sum: f64 = full.iter().sum();
+
+            // NOT an all-zero row: a genuine partition of unity at the endpoint.
+            assert!(
+                (local_sum - 1.0).abs() < 1e-12,
+                "clamping evaluator row is not a partition of unity at t_max \
+                 (scale {scale}): sum {local_sum}"
+            );
+            assert!(
+                (full_sum - 1.0).abs() < 1e-12,
+                "full-support evaluator row is not a partition of unity at t_max \
+                 (scale {scale}): sum {full_sum}"
+            );
+
+            // Standard clamped convention: the last basis function is exactly 1,
+            // and the row is therefore identical (hence scale-invariant) at every
+            // abscissa scale.
+            assert!(
+                (local[num_basis - 1] - 1.0).abs() < 1e-12,
+                "expected B_last(t_max)=1 (clamping path), got {} (scale {scale})",
+                local[num_basis - 1]
+            );
+            assert!(
+                (full[num_basis - 1] - 1.0).abs() < 1e-12,
+                "expected B_last(t_max)=1 (full-support path), got {} (scale {scale})",
+                full[num_basis - 1]
+            );
+
+            // The two production paths must agree entry-by-entry at the endpoint.
+            for i in 0..num_basis {
+                assert!(
+                    (local[i] - full[i]).abs() < 1e-12,
+                    "clamping vs full-support disagree at basis[{i}] on the right \
+                     endpoint (scale {scale}): {} vs {}",
+                    local[i],
+                    full[i]
+                );
+            }
+        }
+    }
+
     #[test]
     fn bspline_derivatives_transform_covariantly_under_coordinate_scaling() {
         let degree = 3;
