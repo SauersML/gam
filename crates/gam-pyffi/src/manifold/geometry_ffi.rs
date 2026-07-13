@@ -4724,6 +4724,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(predict_table_full_conformal, module)?)?;
     // #1057: posterior-predictive replicate sampling from the fitted model.
     module.add_function(wrap_pyfunction!(generative_replicates, module)?)?;
+    module.add_function(wrap_pyfunction!(generative_replicate_chunk, module)?)?;
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
     module.add_function(wrap_pyfunction!(competing_risks_cif, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -8763,7 +8764,7 @@ fn predict_table_jackknife_plus(
 ///   1. Run the plug-in predictor to get `mean` (response scale).
 ///   2. Derive the `NoiseModel` from the saved `LikelihoodSpec` + fitted
 ///      dispersion (`standard_deviation` / `likelihood_scale`).
-///   3. Call `sampleobservation_replicates` with a seeded `StdRng`.
+///   3. Draw the seekable, independently seeded global replicate range.
 ///
 /// Returns a row-major flat `Vec<f64>` of shape `(n_draws, n_rows)` plus the
 /// two dimensions, so the Python side can reshape into a numpy array without
@@ -8781,7 +8782,7 @@ fn generative_replicates(
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let result =
-        py.detach(|| generative_replicates_encoded_impl(&model_bytes, dataset, n_draws, seed));
+        py.detach(|| generative_replicates_encoded_impl(&model_bytes, dataset, 0, n_draws, seed));
     match result {
         Ok((flat, n_rows)) => {
             let arr = ndarray::Array2::<f64>::from_shape_vec((n_draws, n_rows), flat)
@@ -8792,14 +8793,45 @@ fn generative_replicates(
     }
 }
 
+/// Seekable bounded-memory chunk of the saved-model replicate stream.
+///
+/// Each global draw index owns an independent deterministic RNG stream, so
+/// adjacent calls concatenate bit-for-bit to `generative_replicates` and the
+/// caller may change chunk size without changing any draw.
+#[pyfunction]
+fn generative_replicate_chunk(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: PyRef<'_, PyEncodedTable>,
+    draw_start: usize,
+    n_draws: usize,
+    seed: u64,
+) -> PyResult<PyObject> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
+    let result = py.detach(|| {
+        generative_replicates_encoded_impl(&model_bytes, dataset, draw_start, n_draws, seed)
+    });
+    match result {
+        Ok((flat, n_rows)) => {
+            let array = ndarray::Array2::<f64>::from_shape_vec((n_draws, n_rows), flat).map_err(
+                |error| py_value_error(format!("generative_replicate_chunk reshape: {error}")),
+            )?;
+            Ok(array.into_pyarray(py).into_any().unbind())
+        }
+        Err(error) => Err(py_value_error(error)),
+    }
+}
+
 fn generative_replicates_encoded_impl(
     model_bytes: &[u8],
     source: EncodedDataset,
+    draw_start: usize,
     n_draws: usize,
     seed: u64,
 ) -> Result<(Vec<f64>, usize), String> {
-    use gam::inference::generative::sampleobservation_replicates;
-    use rand::SeedableRng;
+    use gam::inference::generative::sampleobservation_seeded_replicates;
     let model = load_model_impl(model_bytes)?;
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let col_map = dataset.column_map();
@@ -8827,8 +8859,7 @@ fn generative_replicates_encoded_impl(
     )
     .map_err(|error| format!("generative_replicates: {error}"))?;
     let n_rows = spec.nobs();
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let draws = sampleobservation_replicates(&spec, n_draws, &mut rng)
+    let draws = sampleobservation_seeded_replicates(&spec, draw_start, n_draws, seed)
         .map_err(|e| format!("generative_replicates: sampling failed: {e}"))?;
     Ok((draws.into_raw_vec_and_offset().0, n_rows))
 }
