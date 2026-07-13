@@ -522,6 +522,7 @@ pub(crate) fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send +
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
+    eval_mode: EvalMode,
 ) -> Result<Option<(f64, Array2<f64>, Option<Array2<f64>>)>, String> {
     if !family.joint_jeffreys_term_required() {
         return Ok(None);
@@ -562,8 +563,12 @@ pub(crate) fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send +
     // divided-difference solve, preserving the value/gradient contract.
     let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     let mut completion: Option<Array2<f64>> = None;
-    let completion_requested =
-        family.joint_jeffreys_information_contracted_trace_hessian_available();
+    // Value-only probes consume only `Phi` and the divided-difference `H_Phi`
+    // in the outer logdet.  The completion exists solely to refine the
+    // derivative-bearing mode-response operator, so constructing it here would
+    // perform an unused fourth-order family pass on every line-search probe.
+    let completion_requested = eval_mode != EvalMode::ValueOnly
+        && family.joint_jeffreys_information_contracted_trace_hessian_available();
     if completion_requested
         && let Some(h_joint) = family.joint_jeffreys_information_with_specs(states, specs)?
         && h_joint.nrows() == total_p
@@ -609,7 +614,14 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
+    eval_mode: EvalMode,
 ) -> Result<Option<JeffreysHphiDriftBatchFn>, String> {
+    // The closure contributes only to outer derivatives.  A value-only probe
+    // never invokes a derivative provider, so do not even materialize the
+    // information matrix/eigensystem needed to construct this closure.
+    if eval_mode == EvalMode::ValueOnly {
+        return Ok(None);
+    }
     if !family.joint_jeffreys_term_required() {
         return Ok(None);
     }

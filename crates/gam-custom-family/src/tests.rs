@@ -3185,6 +3185,141 @@ pub(crate) fn jeffreys_seam_state(beta: Array1<f64>) -> ParameterBlockState {
     ParameterBlockState { beta, eta }
 }
 
+#[derive(Clone)]
+struct OuterJeffreysModeCountingFamily {
+    information_calls: Arc<AtomicUsize>,
+    axis_batch_calls: Arc<AtomicUsize>,
+    completion_calls: Arc<AtomicUsize>,
+}
+
+impl CustomFamily for OuterJeffreysModeCountingFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let n = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .eta
+            .len();
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                working_response: Array1::zeros(n),
+                working_weights: Array1::ones(n),
+            }],
+        })
+    }
+
+    fn joint_jeffreys_term_required(&self) -> bool {
+        true
+    }
+
+    fn joint_jeffreys_information_with_specs(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.information_calls.fetch_add(1, Ordering::Relaxed);
+        // Below the absolute conditioning threshold, so the exact gate is active.
+        Ok(Some(array![[0.5]]))
+    }
+
+    fn joint_jeffreys_information_directional_derivative_all_axes_with_specs(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        self.axis_batch_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(vec![array![[0.0]]]))
+    }
+
+    fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        _: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.completion_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(array![[0.0]]))
+    }
+
+    fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn value_only_outer_jeffreys_skips_completion_and_drift_construction() {
+    let information_calls = Arc::new(AtomicUsize::new(0));
+    let axis_batch_calls = Arc::new(AtomicUsize::new(0));
+    let completion_calls = Arc::new(AtomicUsize::new(0));
+    let family = OuterJeffreysModeCountingFamily {
+        information_calls: Arc::clone(&information_calls),
+        axis_batch_calls: Arc::clone(&axis_batch_calls),
+        completion_calls: Arc::clone(&completion_calls),
+    };
+    let specs = vec![jeffreys_seam_spec(1)];
+    let states = vec![jeffreys_seam_state(array![0.0])];
+    let ranges = block_param_ranges(&specs);
+
+    let (_, _, value_only_completion) = custom_family_outer_jeffreys_hphi(
+        &family,
+        &states,
+        &specs,
+        &ranges,
+        EvalMode::ValueOnly,
+    )
+    .expect("value-only Jeffreys term")
+    .expect("active value-only Jeffreys term");
+    assert!(value_only_completion.is_none());
+    assert_eq!(information_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(axis_batch_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(completion_calls.load(Ordering::Relaxed), 0);
+
+    let value_only_drift = custom_family_outer_jeffreys_hphi_drift_batched(
+        &family,
+        &states,
+        &specs,
+        &ranges,
+        EvalMode::ValueOnly,
+    )
+    .expect("value-only drift gate");
+    assert!(value_only_drift.is_none());
+    assert_eq!(
+        information_calls.load(Ordering::Relaxed),
+        1,
+        "value-only drift gating must happen before information construction",
+    );
+
+    let (_, _, derivative_completion) = custom_family_outer_jeffreys_hphi(
+        &family,
+        &states,
+        &specs,
+        &ranges,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("derivative-bearing Jeffreys term")
+    .expect("active derivative-bearing Jeffreys term");
+    assert!(derivative_completion.is_some());
+    assert_eq!(information_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(axis_batch_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(completion_calls.load(Ordering::Relaxed), 1);
+
+    let derivative_drift = custom_family_outer_jeffreys_hphi_drift_batched(
+        &family,
+        &states,
+        &specs,
+        &ranges,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("derivative-bearing drift construction");
+    assert!(derivative_drift.is_some());
+    assert_eq!(information_calls.load(Ordering::Relaxed), 4);
+    assert_eq!(
+        axis_batch_calls.load(Ordering::Relaxed),
+        2,
+        "drift axes stay lazy until the derivative provider consumes the closure",
+    );
+}
+
 /// Observed-default family for the gam#1020 seam contract: implements only
 /// the observed joint Newton Hessian (and its directional derivatives) and
 /// relies on the trait defaults for the Jeffreys information hooks.
@@ -4651,6 +4786,7 @@ pub(crate) fn owned_mode_finalizer_preserves_prior_and_active_jeffreys_without_r
         &states,
         &specs,
         &block_param_ranges(&specs),
+        EvalMode::ValueOnly,
     )
     .expect("Jeffreys profile probe")
     .expect("absolute curvature below one must arm the Jeffreys profile");

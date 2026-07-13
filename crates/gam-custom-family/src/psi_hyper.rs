@@ -1602,7 +1602,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         };
 
         let robust_jeffreys_hphi =
-            custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?;
+            custom_family_outer_jeffreys_hphi(
+                family,
+                &inner.block_states,
+                specs,
+                &ranges,
+                eval_mode,
+            )?;
         let has_configured_rho_prior = !matches!(rho_prior, gam_problem::RhoPrior::Flat);
         let batched_gradient_contract_allows_override =
             batched_outer_gradient_contract_allows_override(
@@ -1989,6 +1995,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 &inner.block_states,
                 specs,
                 &ranges,
+                eval_mode,
             )?,
         )?;
         if let Some(gradient) = batched_gradient_override {
@@ -2020,7 +2027,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // curvature is nonzero, the unified H_phi-aware evaluator owns the gradient.
     let has_configured_rho_prior = !matches!(rho_prior, gam_problem::RhoPrior::Flat);
     let robust_jeffreys_hphi =
-        custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?;
+        custom_family_outer_jeffreys_hphi(
+            family,
+            &inner.block_states,
+            specs,
+            &ranges,
+            eval_mode,
+        )?;
     let batched_gradient_contract_allows_override = batched_outer_gradient_contract_allows_override(
         robust_jeffreys_hphi
             .as_ref()
@@ -2256,12 +2269,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 inner.joint_workspace.clone(),
                 eval_mode,
             )?,
-            custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?,
+            robust_jeffreys_hphi,
             custom_family_outer_jeffreys_hphi_drift_batched(
                 family,
                 &inner.block_states,
                 specs,
                 &ranges,
+                eval_mode,
             )?,
         )?;
 
@@ -2580,6 +2594,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             &inner.block_states,
             specs,
             &ranges,
+            eval_mode,
         )?,
     )?;
 
