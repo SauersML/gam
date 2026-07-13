@@ -569,30 +569,15 @@ impl GaussianLocationScaleWiggleFamily {
             ) }.into());
         }
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
-        let coeff_mm = &rows.w * &geom.dq_dq0.mapv(|v| v * v) - &rows.m * &geom.d2q_dq02;
-        // OBSERVED joint LAML Hessian (Wood–Pya–Säfken 2016; #1561 cutover from
-        // the block-Fisher #566/#684 object). The LAML criterion `−½log|H+S|`
-        // and its ρ-gradient require the OBSERVED curvature at β̂; the earlier
-        // Fisher object (cross ≡ 0, σσ = 2κ²a) overstated σ-block information on
-        // the near-flat scale surface and over-smoothed log σ. μ AND the wiggle
-        // both enter the mean q = q0 + B(q0)·βw (see `let q = q0 + etaw`), so the
-        // whole mean side carries the observed cross-curvature 2κm against log σ.
-        // The single-source (mm, ml=2κm, ll=κ'(a−n)+2κ²n) is
-        // `gaussian_locscale_observed_joint_row_coeffs`; here it is warped by the
-        // wiggle mean-geometry: the μ-side Jacobian is ∂q/∂β_μ = dq_dq0·X_μ (cf.
-        // coeff_mm's dq_dq0² and coeff_mw_b's dq_dq0), so H_{μ,ls} = 2κm·dq_dq0,
-        // while the wiggle-side Jacobian is ∂q/∂β_w = B (no warp), so
-        // H_{w,ls} = 2κm (coeff_lw_b). At a flat/true-null σ surface n→a, m→0,
-        // so observed → Fisher and the null behavior is unchanged.
-        let (_, ml_base, ll) = gaussian_locscale_observed_joint_row_coeffs(&rows);
-        let coeff_ml = &ml_base * &geom.dq_dq0;
-        let coeff_ll = ll;
-        let coeff_mw_b = &rows.w * &geom.dq_dq0;
-        let coeff_mw_d = -&rows.m;
-        // OBSERVED ls↔wiggle cross H_{w,ls} = 2κm (wiggle is mean-side; ∂q/∂β_w
-        // = B, no dq_dq0 warp, unlike coeff_ml). Same single-source 2κm.
-        let coeff_lw_b = ml_base;
-        let coeff_ww = rows.w.clone();
+        let generated = gaussian_row_channels(&rows);
+        let coeff_mm = &generated.hessian_mm * &geom.dq_dq0.mapv(|value| value * value)
+            + &generated.gradient_mu * &geom.d2q_dq02;
+        let coeff_ml = &generated.hessian_ml * &geom.dq_dq0;
+        let coeff_ll = generated.hessian_ll;
+        let coeff_mw_b = &generated.hessian_mm * &geom.dq_dq0;
+        let coeff_mw_d = generated.gradient_mu;
+        let coeff_lw_b = generated.hessian_ml;
+        let coeff_ww = generated.hessian_mm;
         Ok(GaussianLocationScaleWiggleHessianRowPieces {
             coeff_mm,
             coeff_ml,
