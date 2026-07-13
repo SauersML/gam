@@ -616,8 +616,11 @@ impl RationalLogdetPlan {
 /// Plain CG on `(A + t·I) y = b` through the un-shifted `matvec(v) = A·v`,
 /// warm-started from `y0`. Returns the solution and the iteration count only
 /// after the TRUE residual meets `rel_tol`; exhaustion and non-finite/SPD
-/// breakdowns return `None`. Returning an iteration-capped last iterate would
-/// make the value consume an approximate inverse while the derivative formula
+/// breakdowns return `None`. When the recursively updated CG residual reaches
+/// tolerance before the true residual does, the recurrence is restarted from
+/// the true residual (reliable residual replacement) rather than rejecting a
+/// recoverable solve. Returning an iteration-capped last iterate would make the
+/// value consume an approximate inverse while the derivative formula
 /// differentiates an exact inverse, re-opening the #2080 objective/gradient
 /// desynchronisation this module exists to prevent.
 fn shifted_cg(
@@ -646,7 +649,34 @@ fn shifted_cg(
     }
     let tol = rel_tol * b_norm;
     let mut iters = 0usize;
-    while rs.sqrt() > tol && iters < max_iters {
+    loop {
+        if rs.sqrt() <= tol {
+            // Recursive CG residuals lose their equality to `b - A y` through
+            // roundoff, especially on the smallest shifts.  A recursive
+            // convergence report is therefore only a prompt to inspect the
+            // actual residual.  If it has not converged, restart the Krylov
+            // recurrence from that exact residual and spend the remaining
+            // caller-provided iteration budget.  The former terminal check
+            // returned `None` immediately here, even when one reliable update
+            // was enough to satisfy the requested contract.
+            let true_residual = b - &apply(y.view());
+            let true_rs = true_residual.dot(&true_residual);
+            if !true_rs.is_finite() {
+                return None;
+            }
+            if true_rs.sqrt() <= tol {
+                return Some((y, iters));
+            }
+            if iters >= max_iters {
+                return None;
+            }
+            r = true_residual;
+            rs = true_rs;
+            p = r.clone();
+        }
+        if iters >= max_iters {
+            return None;
+        }
         let ap = apply(p.view());
         let denom = p.dot(&ap);
         if !(denom.is_finite() && denom > 0.0) {
@@ -663,12 +693,6 @@ fn shifted_cg(
         rs = rs_new;
         iters += 1;
     }
-    // CG's recursively updated residual can drift from the actual residual on
-    // an ill-conditioned shifted system. The inverse bundle is admissible only
-    // when the operator's true residual meets the requested contract.
-    let true_residual = b - &apply(y.view());
-    let true_residual_norm = true_residual.dot(&true_residual).sqrt();
-    (true_residual_norm.is_finite() && true_residual_norm <= tol).then_some((y, iters))
 }
 
 /// Modified Gram-Schmidt orthonormalisation of a column block, DROPPING any
