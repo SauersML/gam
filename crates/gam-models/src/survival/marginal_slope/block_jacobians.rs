@@ -869,12 +869,12 @@ mod tests {
             .materialize_identity(DesignMatrix::from(array![[2.0, 3.0]]), &array![0.4])
             .unwrap();
         let covariance = MarginalSlopeCovariance::Diagonal(array![2.0, 0.5]);
-        let callback = LogslopeBlockJacobian::new(
-            layout,
-            Arc::new(array![[1.5, -0.5]]),
-            covariance,
-        )
-        .unwrap();
+        let callback =
+            LogslopeBlockJacobian::new(layout, Arc::new(array![[1.5, -0.5]]), covariance).unwrap();
+        assert_eq!(
+            crate::custom_family::BlockEffectiveJacobian::n_outputs(&callback),
+            3
+        );
         let scalars: Arc<dyn std::any::Any + Send + Sync> =
             Arc::new(SurvivalMarginalSlopeFamilyScalars::new(
                 vec![1.1],
