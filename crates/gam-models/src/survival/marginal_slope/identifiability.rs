@@ -170,8 +170,9 @@ impl RowHessian for SurvivalRowHessian {
 ///
 /// `channel_hessian_at` overrides the default β-independent path.  When
 /// `family_scalars` carries `SurvivalMarginalSlopeFamilyScalars`, the
-/// current per-row primary state `(q0_i, q1_i, qd1_i, g_i)` is read from
-/// those scalars and the 4×4 W_i is recomputed via `row_primary_for_compiler`.
+/// current per-row primary state `(q0_i, q1_i, qd1_i, g_{i,0}, …, g_{i,K-1})`
+/// is read from those scalars and the `(3 + K) × (3 + K)` `W_i` is recomputed
+/// by the same vector row program used by the fitted likelihood.
 /// This makes `I(β) = J(β)^T W(β) J(β)` accurate at the current β instead of
 /// at the frozen pilot β=0 state.
 ///

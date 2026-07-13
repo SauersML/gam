@@ -1600,24 +1600,6 @@ mod test_support {
     }
 }
 
-/// Crate-visible wrapper around `row_primary_closed_form` so the
-/// identifiability-compiler sibling module
-/// (`survival_marginal_slope_identifiability`) can build its 4×4
-/// `SurvivalRowHessian` without exposing the closed-form kernel publicly.
-pub(crate) fn row_primary_for_compiler(
-    q0: f64,
-    q1: f64,
-    qd1: f64,
-    g: f64,
-    z: f64,
-    w: f64,
-    d: f64,
-    derivative_guard: f64,
-    probit_scale: f64,
-) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
-    row_primary_closed_form(q0, q1, qd1, g, z, w, d, derivative_guard, probit_scale)
-}
-
 // ── Eval cache ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
