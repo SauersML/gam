@@ -4942,18 +4942,40 @@ const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
                 "fn gaussian_normalized_row [generic, order2, third, fourth]",
                 "pub struct GaussianJointRowProgram<'a>",
                 "impl gam_math::jet_tower::RowProgram<2> for GaussianJointRowProgram<'_>",
+                "fn row_order2(&self, row: usize) -> gam_math::jet_scalar::StaticOrder2Atom<2, 3, 3, 7>",
+                "fn row_third_contracted(&self, row: usize, direction: &[f64; 2])",
+                "fn row_fourth_contracted(",
+                "pub(crate) fn gaussian_joint_psi_firstweights(",
+                "pub(crate) fn gaussian_joint_psisecondweights(",
+                "pub(crate) fn gaussian_joint_psi_mixed_driftweights(",
+                "let atom = program.row_order2(i);",
+                "let hessian_direction = program.row_third_contracted(i, &direction);",
+                "let hessian_a_b = program.row_fourth_contracted(i, &direction_a, &direction_b);",
+                "program.row_fourth_contracted(i, &drift, &psi)",
             ],
         }],
         discovery_anchor: "fn gaussian_normalized_row [generic, order2, third, fourth]",
         parity_pins: &[DerivativeAnchorSet {
             path: "crates/gam-models/src/gamlss/gaussian/joint_psi.rs",
             anchors: &[
+                "fn generated_gaussian_psi_chain_matches_generic_nested_jet_all_channels_932()",
+                "fn generated_gaussian_psi_chain_matches_likelihood_finite_differences_932()",
                 "fn first_directional_weights_match_jet_third()",
                 "fn second_directional_weights_match_jet_fourth()",
                 "crate::gamlss::GaussianJointRowProgram::new(&rows)",
             ],
         }],
-        retired_identities: &[],
+        retired_identities: &[
+            "cross_eta",
+            "sea_seb",
+            "sdea",
+            "e_coef",
+            "seab",
+            "ma_mb",
+            "de_ea",
+            "kpi",
+            "kdpi",
+        ],
     },
     DerivativeSpecialization {
         family: "cause-specific survival",
@@ -5233,6 +5255,43 @@ fn enforce_derivative_policy_negative_probes() {
     assert_eq!(
         unregistered_generated, 2,
         "#932 policy self-test: separate generated-third/fourth declarations were not both discovered"
+    );
+
+    let registered_gaussian_path = "crates/gam-models/src/gamlss/gaussian/joint_psi.rs";
+    let registered_gaussian_atom =
+        "fn gaussian_normalized_row [generic, order2, third, fourth](delta_mu) { delta_mu }";
+    let registered_gaussian_mask = compute_test_mask(
+        registered_gaussian_atom,
+        Path::new(registered_gaussian_path),
+    );
+    assert!(
+        derivative_declarations(registered_gaussian_atom, &registered_gaussian_mask)
+            .iter()
+            .any(|declaration| {
+                generated_derivative_modes(&declaration.source).is_some()
+                    && specialization_site_is_registered(
+                        DerivativeSpecializationKind::RowAtom,
+                        registered_gaussian_path,
+                        &declaration.source,
+                    )
+            }),
+        "#932 policy self-test: the exact registered Gaussian row atom was not admitted"
+    );
+    let same_file_rogue_atom = "fn planted_gaussian_row [generic, order2, third, fourth](x) { x }";
+    let same_file_rogue_atom_mask =
+        compute_test_mask(same_file_rogue_atom, Path::new(registered_gaussian_path));
+    assert!(
+        derivative_declarations(same_file_rogue_atom, &same_file_rogue_atom_mask)
+            .iter()
+            .any(|declaration| {
+                generated_derivative_modes(&declaration.source).is_some()
+                    && !specialization_site_is_registered(
+                        DerivativeSpecializationKind::RowAtom,
+                        registered_gaussian_path,
+                        &declaration.source,
+                    )
+            }),
+        "#932 policy self-test: a rogue row atom in the registered Gaussian source was admitted"
     );
 
     let sae_source = "impl SaeSoftmaxRowProgramSource for PlantedSaeSource {}";
