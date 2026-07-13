@@ -1,51 +1,55 @@
-/// One authoritative off-manifold, fixed-stratum fixture for the #1418 exact
-/// stationarity and #2253 exact outer-Hessian gates.
-///
-/// The target excitation makes residual, entropy, and curvature-delta channels
-/// genuinely live.  Its fit must happen in this known non-vanishing
-/// regularization basin; derivative gates may subsequently freeze this state
-/// and assemble a Hessian at a different evaluation `rho`, but must never use
-/// that evaluation point to construct the fitted state.
 #[cfg(test)]
-fn converged_state_with_residual() -> (
-    SaeManifoldTerm,
-    Array2<f64>,
-    SaeManifoldRho,
-    ArrowFactorCache,
-) {
-    use crate::manifold::tests::gamma_fd_tiny_fixture;
+mod exact_hessian_fixture_tests {
+    use super::*;
 
-    let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
-    let (n, p) = (target.nrows(), target.ncols());
-    for row in 0..n {
-        for col in 0..p {
-            let phase = (row as f64 + 0.35) / n as f64;
-            let theta = std::f64::consts::TAU * phase;
-            target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
-        }
-    }
+    /// One authoritative off-manifold, fixed-stratum fixture for the #1418 exact
+    /// stationarity and #2253 exact outer-Hessian gates.
+    ///
+    /// The target excitation makes residual, entropy, and curvature-delta channels
+    /// genuinely live. Its fit must happen in this known non-vanishing
+    /// regularization basin; derivative gates may subsequently freeze this state
+    /// and assemble a Hessian at a different evaluation `rho`, but must never use
+    /// that evaluation point to construct the fitted state.
+    pub(super) fn converged_state_with_residual() -> (
+        SaeManifoldTerm,
+        Array2<f64>,
+        SaeManifoldRho,
+        ArrowFactorCache,
+    ) {
+        use crate::manifold::tests::gamma_fd_tiny_fixture;
 
-    rho.log_lambda_sparse = -0.5;
-    for value in rho.log_lambda_smooth.iter_mut() {
-        *value = -1.0;
-    }
-    for axis in rho.log_ard.iter_mut() {
-        for value in axis.iter_mut() {
-            *value = -0.5;
+        let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
+        let (n, p) = (target.nrows(), target.ncols());
+        for row in 0..n {
+            for col in 0..p {
+                let phase = (row as f64 + 0.35) / n as f64;
+                let theta = std::f64::consts::TAU * phase;
+                target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
+            }
         }
+
+        rho.log_lambda_sparse = -0.5;
+        for value in rho.log_lambda_smooth.iter_mut() {
+            *value = -1.0;
+        }
+        for axis in rho.log_ard.iter_mut() {
+            for value in axis.iter_mut() {
+                *value = -0.5;
+            }
+        }
+        let (_value, _loss, cache) = term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                40,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("off-manifold fixture must converge with both atoms alive");
+        (term, target, rho, cache)
     }
-    let (_value, _loss, cache) = term
-        .penalized_quasi_laplace_criterion_with_cache(
-            target.view(),
-            &rho,
-            None,
-            40,
-            0.4,
-            1.0e-6,
-            1.0e-6,
-        )
-        .expect("off-manifold fixture must converge with both atoms alive");
-    (term, target, rho, cache)
 }
 
 #[cfg(test)]
@@ -249,7 +253,8 @@ mod amortized_encoder_tests {
         // Construct θ̂ through the shared, independently exercised PD-basin
         // authority.  This is deliberately distinct from the lifted evaluation ρ
         // below: fitting at that point drives this tiny decoder to co-collapse.
-        let (mut term, target, rho, _stationary_cache) = super::converged_state_with_residual();
+        let (mut term, target, rho, _stationary_cache) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual();
 
         // Evaluation ρ: lift ρ_smooth / ρ_ard off the −6 floor so the Daleckii–Krein
         // CROSS terms — which scale as O(λ²) and O(α²) — sit well above FD noise. At
@@ -699,7 +704,8 @@ mod exact_stationarity_solve_1418_tests {
     /// implicit solve targets the exact stationarity Jacobian.
     #[test]
     fn solve_exact_stationarity_inverts_a_not_b_1418() {
-        let (term, target, rho, cache) = converged_state_with_residual();
+        let (term, target, rho, cache) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual();
         let solver = DeflatedArrowSolver::plain(&cache);
 
         // A deterministic, nonzero rhs spanning both the latent (t) and decoder
