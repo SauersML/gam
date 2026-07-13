@@ -118,17 +118,11 @@ impl TransformationNormalFamily {
         let mut hessian = Array2::<f64>::zeros((p_total, p_total));
         for (k, l, block) in blocks {
             hessian
-                .slice_mut(s![
-                    k * p_cov..(k + 1) * p_cov,
-                    l * p_cov..(l + 1) * p_cov
-                ])
+                .slice_mut(s![k * p_cov..(k + 1) * p_cov, l * p_cov..(l + 1) * p_cov])
                 .assign(&block);
             if k != l {
                 hessian
-                    .slice_mut(s![
-                        l * p_cov..(l + 1) * p_cov,
-                        k * p_cov..(k + 1) * p_cov
-                    ])
+                    .slice_mut(s![l * p_cov..(l + 1) * p_cov, k * p_cov..(k + 1) * p_cov])
                     .assign(&block.t());
             }
         }

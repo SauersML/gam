@@ -19,15 +19,13 @@ pub(crate) fn exact_ctn_mode_branch_freezes_derivative_input() {
     };
 
     let mut state = TransformationExactModeBranch::default();
-    let (froze, candidates) =
-        state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
+    let (froze, candidates) = state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
     assert!(!froze);
     assert_eq!(candidates.len(), 1);
     assert!(candidates[0].is_none());
 
     state.record_value(gam_problem::EvalMode::ValueOnly, warm(1.0));
-    let (_, candidates) =
-        state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
+    let (_, candidates) = state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
     assert_eq!(carried_beta(&candidates), 1.0);
     state.record_value(gam_problem::EvalMode::ValueOnly, warm(2.0));
 
@@ -49,8 +47,7 @@ pub(crate) fn exact_ctn_mode_branch_freezes_derivative_input() {
     state.record_value(gam_problem::EvalMode::ValueOnly, warm(4.0));
     state.record_value(gam_problem::EvalMode::ValueAndGradient, warm(5.0));
     assert!(!state.prepare(gam_problem::EvalMode::ValueAndGradient));
-    let (froze, candidates) =
-        state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
+    let (froze, candidates) = state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
     assert!(!froze);
     assert_eq!(candidates.len(), 2);
     assert!(candidates[0].is_none());

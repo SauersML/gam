@@ -623,11 +623,13 @@ pub fn fit_transformation_normal(
                 }
             }
             if competing_modes {
-                for (candidate_idx, objective) in
-                    selection.screened_objectives.iter().enumerate()
-                {
+                for (candidate_idx, objective) in selection.screened_objectives.iter().enumerate() {
                     if let Some(objective) = objective {
-                        let source = if candidate_idx == 0 { "cold" } else { "carried" };
+                        let source = if candidate_idx == 0 {
+                            "cold"
+                        } else {
+                            "carried"
+                        };
                         log::info!(
                             "[transformation-normal] exact coefficient-mode screen source={} objective={:.16e}",
                             source,
