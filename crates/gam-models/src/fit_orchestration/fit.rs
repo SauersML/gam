@@ -2010,7 +2010,12 @@ fn fit_cause_specific_survival_transformation_custom(
 
     let family = crate::survival::CauseSpecificRoystonParmarFamily::new(family_blocks)?;
     let fit_options = BlockwiseFitOptions {
-        compute_covariance: false,
+        // Joint posterior prediction and CIF uncertainty consume the complete
+        // cross-cause conditional covariance. Computing it here is part of the
+        // fitted competing-risks model contract; reconstructing independent
+        // per-cause approximations at prediction time would discard the
+        // cross-cause blocks and misstate CIF uncertainty (#2298).
+        compute_covariance: true,
         ..Default::default()
     };
     let rho_prior = cause_specific_survival_rho_prior(

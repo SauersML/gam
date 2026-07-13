@@ -4056,12 +4056,7 @@ fn exact_standard_observation_row(
             let scaled_weight = match resolved_scale {
                 gam_spec::ResolvedLikelihoodScale::ProfiledGaussian => weight,
                 gam_spec::ResolvedLikelihoodScale::FixedGaussian { phi } => {
-                    crate::gamlss::scaled_positive_product_quotient(
-                        weight,
-                        1.0,
-                        1.0,
-                        phi.value(),
-                    )
+                    crate::gamlss::scaled_positive_product_quotient(weight, 1.0, 1.0, phi.value())
                 }
                 _ => {
                     crate::bail_invalid_estim!(
@@ -4183,9 +4178,7 @@ fn exact_standard_observation_row(
             let phi = resolved_scale
                 .tweedie_phi()
                 .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            let weight = crate::gamlss::scaled_positive_product_quotient(
-                weight, 1.0, 1.0, phi,
-            );
+            let weight = crate::gamlss::scaled_positive_product_quotient(weight, 1.0, 1.0, phi);
             if !(weight.is_finite() && weight > 0.0) {
                 return Err(bounded_row_error(
                     row,
@@ -4348,16 +4341,15 @@ fn evaluate_resolved_standard_family_observations(
     let mut log_likelihood_compensation = 0.0;
 
     for i in 0..n {
-        let row =
-            exact_standard_observation_row(
-                likelihood,
-                resolved_scale,
-                &binomial_link,
-                i,
-                y[i],
-                weights[i],
-                eta[i],
-            )?;
+        let row = exact_standard_observation_row(
+            likelihood,
+            resolved_scale,
+            &binomial_link,
+            i,
+            y[i],
+            weights[i],
+            eta[i],
+        )?;
         score[i] = row.score;
         fisherweight[i] = row.fisherweight;
         neghessian_eta[i] = row.neghessian_eta;
@@ -6774,7 +6766,7 @@ fn fit_bounded_term_collection_with_design(
     let working_response = exact_standard_working_response(&eta_state)?;
 
     let geometry = Some(gam_solve::estimate::FitGeometry {
-        coefficient_gauge: gam_problem::gauge::Gauge::identity(&[beta.len()]),
+        coefficient_gauge: gam_problem::gauge::Gauge::identity(&[beta_user.len()]),
         penalized_hessian: penalized_hessian.clone().into(),
         working_weights: eta_state.fisherweight.clone(),
         working_response: working_response.clone(),

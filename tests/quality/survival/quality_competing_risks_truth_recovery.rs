@@ -38,7 +38,10 @@ use std::process::Command;
 
 use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
-use gam::families::survival::predict::{SurvivalPredictRequest, predict_competing_risks_survival};
+use gam::families::survival::predict::{
+    SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
+    predict_competing_risks_survival,
+};
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
 use gam::test_support::cli_harness::run_or_panic;
@@ -217,8 +220,11 @@ fn joint_competing_risks_transformation_recovers_true_cause_specific_cifs() {
         with_uncertainty: false,
         estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
-    let result =
-        predict_competing_risks_survival(request).expect("competing-risks survival predict");
+    let result = predict_competing_risks_survival(
+        request,
+        SurvivalPredictionCovarianceMode::Conditional,
+    )
+    .expect("competing-risks survival predict");
 
     assert_eq!(result.cif.len(), 2, "expected K=2 cause-specific CIFs");
     assert_eq!(result.overall_survival.nrows(), n_rows);

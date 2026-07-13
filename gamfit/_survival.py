@@ -72,6 +72,7 @@ class CompetingRisksPrediction:
     model_class: str
     likelihood_mode: str
     interval_level: float | None
+    covariance_source: str | None
     endpoint_names: tuple[str, ...]
     times: Any
     hazard: Any
@@ -731,6 +732,7 @@ def competing_risks_prediction_from_ffi_payload(
         model_class=parsed["model_class"],
         likelihood_mode=parsed["likelihood_mode"],
         interval_level=parsed["interval_level"],
+        covariance_source=parsed["covariance_source"],
         endpoint_names=tuple(parsed["endpoint_names"]),
         times=parsed["times"],
         hazard=parsed["hazard"],

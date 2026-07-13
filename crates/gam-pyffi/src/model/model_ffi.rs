@@ -1301,6 +1301,13 @@ fn competing_risks_prediction_payload_from_json(py: Python<'_>, raw: &str) -> Py
             .unwrap_or(""),
     )?;
     match object
+        .get("covariance_source")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(source) => out.set_item("covariance_source", source)?,
+        None => out.set_item("covariance_source", py.None())?,
+    }
+    match object
         .get("interval_level")
         .and_then(serde_json::Value::as_f64)
     {

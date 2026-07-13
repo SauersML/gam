@@ -78,6 +78,36 @@ pub trait SymmetricQuadraticCoefficients {
     /// One symmetric coefficient `A[row, column]`.
     fn coefficient(&self, row: usize, column: usize) -> f64;
 
+    /// Visit the operator's input-space upper triangle without materializing a
+    /// dense matrix. The default probes one basis direction at a time through
+    /// [`Self::multiply`], preserving matrix-free operators. Representations
+    /// with direct structure should override this hook so a packed curvature
+    /// lowering is O(K), O(K²), or O(K²R) as appropriate instead of performing
+    /// K full operator applications.
+    ///
+    /// `direction` and `projected` are caller-owned scratch of exact length
+    /// [`Self::dimension`]. Every `(row, column)` with `row <= column` is
+    /// visited exactly once, including structural zeros.
+    fn visit_upper_triangle(
+        &self,
+        direction: &mut [f64],
+        projected: &mut [f64],
+        mut visit: impl FnMut(usize, usize, f64),
+    ) {
+        let dimension = self.dimension();
+        assert_eq!(direction.len(), dimension);
+        assert_eq!(projected.len(), dimension);
+        direction.fill(0.0);
+        for column in 0..dimension {
+            direction[column] = 1.0;
+            self.multiply(direction, projected);
+            direction[column] = 0.0;
+            for row in 0..=column {
+                visit(row, column, projected[row]);
+            }
+        }
+    }
+
     /// Evaluate the primal quadratic form without materializing the input as a
     /// separate `f64` vector. Structured operators should override this to
     /// preserve their representation's natural complexity (for example O(KR)

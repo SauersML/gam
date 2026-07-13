@@ -5641,7 +5641,8 @@ fn predict_competing_risks_survival_result(
     options: &PyPredictOptions,
 ) -> Result<gam::families::survival::predict::CompetingRisksPredictResult, String> {
     use gam::families::survival::predict::{
-        SurvivalPredictEstimand, SurvivalPredictRequest, predict_competing_risks_survival,
+        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
+        predict_competing_risks_survival,
     };
 
     let col_map = dataset.column_map();
@@ -5651,6 +5652,22 @@ fn predict_competing_risks_survival_result(
         resolve_offset_column(dataset, &col_map, payload.offset_column.as_deref())?;
     let noise_offset = ndarray::Array1::<f64>::zeros(dataset.values.nrows());
     let time_grid_slice: Option<&[f64]> = options.time_grid.as_deref();
+    let covariance_mode = if options.interval.is_some() {
+        match parse_covariance_mode(options.covariance_mode.as_deref())?
+            .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
+        {
+            gam_predict::InferenceCovarianceMode::Conditional => {
+                SurvivalPredictionCovarianceMode::Conditional
+            }
+            gam_predict::InferenceCovarianceMode::SmoothingCorrected => {
+                SurvivalPredictionCovarianceMode::SmoothingCorrected
+            }
+        }
+    } else {
+        // Posterior-mean points always integrate the conditional posterior;
+        // covariance_mode controls uncertainty only.
+        SurvivalPredictionCovarianceMode::Conditional
+    };
     let request = SurvivalPredictRequest {
         model,
         data: dataset.values.view(),
@@ -5665,7 +5682,7 @@ fn predict_competing_risks_survival_result(
         with_uncertainty: options.interval.is_some(),
         estimand: SurvivalPredictEstimand::PosteriorMean,
     };
-    Ok(predict_competing_risks_survival(request)?)
+    Ok(predict_competing_risks_survival(request, covariance_mode)?)
 }
 
 fn predict_survival_result(
@@ -6146,6 +6163,9 @@ fn serialize_competing_risks_prediction_payload(
         "class": "competing_risks_prediction",
         "model_class": "competing risks survival",
         "likelihood_mode": likelihood_mode_str,
+        "covariance_source": result
+            .covariance_source
+            .map(gam::families::survival::predict::SurvivalPredictionCovarianceMode::as_str),
         "endpoint_names": result.endpoint_names,
         "times": result.times,
         "interval_level": interval_level,
