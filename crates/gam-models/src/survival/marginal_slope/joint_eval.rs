@@ -1793,86 +1793,86 @@ impl SurvivalMarginalSlopeFamily {
                 self.n,
                 |range| -> Result<_, String> {
                     let mut acc = make_per_z_acc();
-                    let mut row_jet_arena = gam_math::jet_scalar::DynamicJetArena::new();
+                    let mut row_jet_arena = RigidVectorRowWorkspace::new();
                     for row in range {
-                    let q0 = self.design_entry.dot_row(row, beta_time)
-                        + self.offset_entry[row]
-                        + block_states[1].eta[row];
-                    let q1 = self.design_exit.dot_row(row, beta_time)
-                        + self.offset_exit[row]
-                        + block_states[1].eta[row];
-                    let qd1 = self.design_derivative_exit.dot_row(row, beta_time)
-                        + self.derivative_offset_exit[row];
-                    let slopes = self.logslope_surface_values_for_row(row, beta_logslope)?;
-                    let z = self.z.row(row).to_vec();
-                    let (nll, f_pi, f_pipi) = row_primary_closed_form_vector(
-                        q0,
-                        q1,
-                        qd1,
-                        &slopes,
-                        &z,
-                        &self.score_covariance,
-                        self.weights[row],
-                        self.event[row],
-                        self.derivative_guard,
-                        probit_scale,
-                        &mut row_jet_arena,
-                    )?;
-                    acc.0 -= nll;
-                    self.design_entry
-                        .axpy_row_into(row, -f_pi[0], &mut acc.1.view_mut())?;
-                    self.design_exit
-                        .axpy_row_into(row, -f_pi[1], &mut acc.1.view_mut())?;
-                    self.design_derivative_exit.axpy_row_into(
-                        row,
-                        -f_pi[2],
-                        &mut acc.1.view_mut(),
-                    )?;
-                    self.marginal_design.axpy_row_into(
-                        row,
-                        -(f_pi[0] + f_pi[1]),
-                        &mut acc.2.view_mut(),
-                    )?;
-                    let g_row = self.logslope_surface_row(row)?;
-                    for (coord, range) in self.logslope_surface_ranges.iter().enumerate() {
-                        let alpha = -f_pi[3 + coord];
-                        for col in range.clone() {
-                            acc.3[col] += alpha * g_row[col];
-                        }
-                    }
-                    let time_designs = [
-                        &self.design_entry,
-                        &self.design_exit,
-                        &self.design_derivative_exit,
-                    ];
-                    for a in 0..3 {
-                        for b in 0..3 {
-                            time_designs[a].row_outer_into(
-                                row,
-                                time_designs[b],
-                                f_pipi[[a, b]],
-                                &mut acc.4,
-                            )?;
-                        }
-                    }
-                    let alpha_mm =
-                        f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]];
-                    self.marginal_design
-                        .syr_row_into(row, alpha_mm, &mut acc.5)?;
-                    for (a, range_a) in self.logslope_surface_ranges.iter().enumerate() {
-                        for (b, range_b) in self.logslope_surface_ranges.iter().enumerate() {
-                            let alpha = f_pipi[[3 + a, 3 + b]];
-                            if alpha == 0.0 {
-                                continue;
+                        let q0 = self.design_entry.dot_row(row, beta_time)
+                            + self.offset_entry[row]
+                            + block_states[1].eta[row];
+                        let q1 = self.design_exit.dot_row(row, beta_time)
+                            + self.offset_exit[row]
+                            + block_states[1].eta[row];
+                        let qd1 = self.design_derivative_exit.dot_row(row, beta_time)
+                            + self.derivative_offset_exit[row];
+                        let slopes = self.logslope_surface_values_for_row(row, beta_logslope)?;
+                        let z = self.z.row(row).to_vec();
+                        let (nll, f_pi, f_pipi) = row_primary_closed_form_vector(
+                            q0,
+                            q1,
+                            qd1,
+                            &slopes,
+                            &z,
+                            &self.score_covariance,
+                            self.weights[row],
+                            self.event[row],
+                            self.derivative_guard,
+                            probit_scale,
+                            &mut row_jet_arena,
+                        )?;
+                        acc.0 -= nll;
+                        self.design_entry
+                            .axpy_row_into(row, -f_pi[0], &mut acc.1.view_mut())?;
+                        self.design_exit
+                            .axpy_row_into(row, -f_pi[1], &mut acc.1.view_mut())?;
+                        self.design_derivative_exit.axpy_row_into(
+                            row,
+                            -f_pi[2],
+                            &mut acc.1.view_mut(),
+                        )?;
+                        self.marginal_design.axpy_row_into(
+                            row,
+                            -(f_pi[0] + f_pi[1]),
+                            &mut acc.2.view_mut(),
+                        )?;
+                        let g_row = self.logslope_surface_row(row)?;
+                        for (coord, range) in self.logslope_surface_ranges.iter().enumerate() {
+                            let alpha = -f_pi[3 + coord];
+                            for col in range.clone() {
+                                acc.3[col] += alpha * g_row[col];
                             }
-                            for ca in range_a.clone() {
-                                let va = g_row[ca] * alpha;
-                                for cb in range_b.clone() {
-                                    acc.6[[ca, cb]] += va * g_row[cb];
+                        }
+                        let time_designs = [
+                            &self.design_entry,
+                            &self.design_exit,
+                            &self.design_derivative_exit,
+                        ];
+                        for a in 0..3 {
+                            for b in 0..3 {
+                                time_designs[a].row_outer_into(
+                                    row,
+                                    time_designs[b],
+                                    f_pipi[[a, b]],
+                                    &mut acc.4,
+                                )?;
+                            }
+                        }
+                        let alpha_mm =
+                            f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]];
+                        self.marginal_design
+                            .syr_row_into(row, alpha_mm, &mut acc.5)?;
+                        for (a, range_a) in self.logslope_surface_ranges.iter().enumerate() {
+                            for (b, range_b) in self.logslope_surface_ranges.iter().enumerate() {
+                                let alpha = f_pipi[[3 + a, 3 + b]];
+                                if alpha == 0.0 {
+                                    continue;
+                                }
+                                for ca in range_a.clone() {
+                                    let va = g_row[ca] * alpha;
+                                    for cb in range_b.clone() {
+                                        acc.6[[ca, cb]] += va * g_row[cb];
+                                    }
                                 }
                             }
                         }
-                    }
                     }
                     Ok(acc)
                 },
@@ -1931,89 +1931,93 @@ impl SurvivalMarginalSlopeFamily {
                 self.n,
                 |range| -> Result<_, String> {
                     let mut acc = make_per_z_joint_acc();
-                    let mut row_jet_arena = gam_math::jet_scalar::DynamicJetArena::new();
+                    let mut row_jet_arena = RigidVectorRowWorkspace::new();
                     for row in range {
-                    let q0 = self.design_entry.dot_row(row, beta_time)
-                        + self.offset_entry[row]
-                        + block_states[1].eta[row];
-                    let q1 = self.design_exit.dot_row(row, beta_time)
-                        + self.offset_exit[row]
-                        + block_states[1].eta[row];
-                    let qd1 = self.design_derivative_exit.dot_row(row, beta_time)
-                        + self.derivative_offset_exit[row];
-                    let slopes = self.logslope_surface_values_for_row(row, beta_logslope)?;
-                    let z = self.z.row(row).to_vec();
-                    let (nll, f_pi, f_pipi) = row_primary_closed_form_vector(
-                        q0,
-                        q1,
-                        qd1,
-                        &slopes,
-                        &z,
-                        &self.score_covariance,
-                        self.weights[row],
-                        self.event[row],
-                        self.derivative_guard,
-                        probit_scale,
-                        &mut row_jet_arena,
-                    )?;
-                    acc.0 -= nll;
-                    let mut j = Array2::<f64>::zeros((dim, total));
-                    let entry = self.design_entry.try_row_chunk(row..row + 1).map_err(|e| {
-                        format!("evaluate_exact_newton_joint_dense_per_z entry row: {e}")
-                    })?;
-                    let exit = self.design_exit.try_row_chunk(row..row + 1).map_err(|e| {
-                        format!("evaluate_exact_newton_joint_dense_per_z exit row: {e}")
-                    })?;
-                    let deriv = self
-                        .design_derivative_exit
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| {
-                            format!("evaluate_exact_newton_joint_dense_per_z derivative row: {e}")
+                        let q0 = self.design_entry.dot_row(row, beta_time)
+                            + self.offset_entry[row]
+                            + block_states[1].eta[row];
+                        let q1 = self.design_exit.dot_row(row, beta_time)
+                            + self.offset_exit[row]
+                            + block_states[1].eta[row];
+                        let qd1 = self.design_derivative_exit.dot_row(row, beta_time)
+                            + self.derivative_offset_exit[row];
+                        let slopes = self.logslope_surface_values_for_row(row, beta_logslope)?;
+                        let z = self.z.row(row).to_vec();
+                        let (nll, f_pi, f_pipi) = row_primary_closed_form_vector(
+                            q0,
+                            q1,
+                            qd1,
+                            &slopes,
+                            &z,
+                            &self.score_covariance,
+                            self.weights[row],
+                            self.event[row],
+                            self.derivative_guard,
+                            probit_scale,
+                            &mut row_jet_arena,
+                        )?;
+                        acc.0 -= nll;
+                        let mut j = Array2::<f64>::zeros((dim, total));
+                        let entry = self.design_entry.try_row_chunk(row..row + 1).map_err(|e| {
+                            format!("evaluate_exact_newton_joint_dense_per_z entry row: {e}")
                         })?;
-                    let marginal =
-                        self.marginal_design
+                        let exit = self.design_exit.try_row_chunk(row..row + 1).map_err(|e| {
+                            format!("evaluate_exact_newton_joint_dense_per_z exit row: {e}")
+                        })?;
+                        let deriv = self
+                            .design_derivative_exit
                             .try_row_chunk(row..row + 1)
                             .map_err(|e| {
-                                format!("evaluate_exact_newton_joint_dense_per_z marginal row: {e}")
+                                format!(
+                                    "evaluate_exact_newton_joint_dense_per_z derivative row: {e}"
+                                )
                             })?;
-                    j.slice_mut(s![0, slices.time.clone()])
-                        .assign(&entry.row(0));
-                    j.slice_mut(s![1, slices.time.clone()]).assign(&exit.row(0));
-                    j.slice_mut(s![2, slices.time.clone()])
-                        .assign(&deriv.row(0));
-                    j.slice_mut(s![0, slices.marginal.clone()])
-                        .assign(&marginal.row(0));
-                    j.slice_mut(s![1, slices.marginal.clone()])
-                        .assign(&marginal.row(0));
-                    let g_row = self.logslope_surface_row(row)?;
-                    for (coord, range) in self.logslope_surface_ranges.iter().enumerate() {
-                        let global_range = (slices.logslope.start + range.start)
-                            ..(slices.logslope.start + range.end);
-                        j.slice_mut(s![3 + coord, global_range])
-                            .assign(&g_row.slice(s![range.clone()]));
-                    }
-                    for a in 0..dim {
-                        for col in 0..total {
-                            acc.1[col] -= f_pi[a] * j[[a, col]];
+                        let marginal =
+                            self.marginal_design
+                                .try_row_chunk(row..row + 1)
+                                .map_err(|e| {
+                                    format!(
+                                        "evaluate_exact_newton_joint_dense_per_z marginal row: {e}"
+                                    )
+                                })?;
+                        j.slice_mut(s![0, slices.time.clone()])
+                            .assign(&entry.row(0));
+                        j.slice_mut(s![1, slices.time.clone()]).assign(&exit.row(0));
+                        j.slice_mut(s![2, slices.time.clone()])
+                            .assign(&deriv.row(0));
+                        j.slice_mut(s![0, slices.marginal.clone()])
+                            .assign(&marginal.row(0));
+                        j.slice_mut(s![1, slices.marginal.clone()])
+                            .assign(&marginal.row(0));
+                        let g_row = self.logslope_surface_row(row)?;
+                        for (coord, range) in self.logslope_surface_ranges.iter().enumerate() {
+                            let global_range = (slices.logslope.start + range.start)
+                                ..(slices.logslope.start + range.end);
+                            j.slice_mut(s![3 + coord, global_range])
+                                .assign(&g_row.slice(s![range.clone()]));
                         }
-                    }
-                    for a in 0..dim {
-                        for b in 0..dim {
-                            let alpha = f_pipi[[a, b]];
-                            if alpha == 0.0 {
-                                continue;
+                        for a in 0..dim {
+                            for col in 0..total {
+                                acc.1[col] -= f_pi[a] * j[[a, col]];
                             }
-                            for ca in 0..total {
-                                let va = j[[a, ca]] * alpha;
-                                if va == 0.0 {
+                        }
+                        for a in 0..dim {
+                            for b in 0..dim {
+                                let alpha = f_pipi[[a, b]];
+                                if alpha == 0.0 {
                                     continue;
                                 }
-                                for cb in 0..total {
-                                    acc.2[[ca, cb]] += va * j[[b, cb]];
+                                for ca in 0..total {
+                                    let va = j[[a, ca]] * alpha;
+                                    if va == 0.0 {
+                                        continue;
+                                    }
+                                    for cb in 0..total {
+                                        acc.2[[ca, cb]] += va * j[[b, cb]];
+                                    }
                                 }
                             }
                         }
-                    }
                     }
                     Ok(acc)
                 },

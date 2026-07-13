@@ -7,6 +7,7 @@ use super::*;
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOrder2, RuntimeJetScalar, SymmetricQuadraticCoefficients,
 };
+use gam_math::order2_graph::{Order2Graph, Order2GraphWorkspace};
 
 // ── Closed-form row kernel ─────────────────────────────────────────────
 //
@@ -882,7 +883,7 @@ where
     }
 }
 
-pub(crate) fn row_primary_closed_form_vector(
+fn row_primary_closed_form_vector_dynamic(
     q0: f64,
     q1: f64,
     qd1: f64,
@@ -931,6 +932,152 @@ pub(crate) fn row_primary_closed_form_vector(
     let gradient = Array1::from_vec(row.g().to_vec());
     let hessian = Array2::from_shape_fn((dim, dim), |(a, b)| row.h_at(a, b));
     Ok((row.v, gradient, hessian))
+}
+
+/// Reusable storage for the production compiled graph and the uncommon
+/// runtime-width backend. The graph schedule covers the observed score widths;
+/// the dynamic packed algebra remains the exact same-expression backend for
+/// widths above the const-primary schedule.
+pub(crate) struct RigidVectorRowWorkspace {
+    graph: Order2GraphWorkspace,
+    dynamic: DynamicJetArena,
+}
+
+impl RigidVectorRowWorkspace {
+    pub(crate) fn new() -> Self {
+        Self {
+            graph: Order2GraphWorkspace::new(),
+            dynamic: DynamicJetArena::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.graph.retained_bytes() + self.dynamic.allocated_bytes()
+    }
+}
+
+fn row_primary_closed_form_vector_graph<const DIM: usize>(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    slopes: &[f64],
+    z: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+    workspace: &mut Order2GraphWorkspace,
+) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    if DIM != 3 + slopes.len() || z.len() != slopes.len() || covariance.dim() != slopes.len() {
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "compiled vector row dimension mismatch: DIM={DIM}, slopes={}, z={}, covariance={}",
+                slopes.len(),
+                z.len(),
+                covariance.dim()
+            ),
+        }
+        .into());
+    }
+    workspace.reset(DIM);
+    let primary_values: [f64; DIM] = std::array::from_fn(|axis| match axis {
+        0 => q0,
+        1 => q1,
+        2 => qd1,
+        _ => slopes[axis - 3],
+    });
+    let vars: [Order2Graph<'_, DIM>; DIM] = std::array::from_fn(|axis| {
+        Order2Graph::variable(primary_values[axis], axis, DIM, workspace)
+    });
+    let inputs = RigidRowInputs {
+        row: 0,
+        wi: w,
+        di: d,
+        z_sum: 0.0,
+        covariance_ones: 0.0,
+        probit_scale,
+        qd1_lower: derivative_guard,
+    };
+    let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, workspace)?.into_order2();
+    let gradient = Array1::from_vec(row.g().to_vec());
+    let hessian = Array2::from_shape_fn((DIM, DIM), |(a, b)| row.h()[a][b]);
+    Ok((row.0.v, gradient, hessian))
+}
+
+pub(crate) fn row_primary_closed_form_vector(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    slopes: &[f64],
+    z: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+    workspace: &mut RigidVectorRowWorkspace,
+) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    let k = slopes.len();
+    if z.len() != k || covariance.dim() != k {
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope vector row dimension mismatch: slopes={}, z={}, covariance={}",
+                k,
+                z.len(),
+                covariance.dim()
+            ),
+        }
+        .into());
+    }
+
+    macro_rules! graph_row {
+        ($dimension:literal) => {
+            row_primary_closed_form_vector_graph::<$dimension>(
+                q0,
+                q1,
+                qd1,
+                slopes,
+                z,
+                covariance,
+                w,
+                d,
+                derivative_guard,
+                probit_scale,
+                &mut workspace.graph,
+            )
+        };
+    }
+
+    match k {
+        0 => Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: "survival marginal-slope vector row requires at least one score slope"
+                .to_string(),
+        }
+        .into()),
+        1 => graph_row!(4),
+        2 => graph_row!(5),
+        3 => graph_row!(6),
+        4 => graph_row!(7),
+        5 => graph_row!(8),
+        6 => graph_row!(9),
+        7 => graph_row!(10),
+        8 => graph_row!(11),
+        9.. => row_primary_closed_form_vector_dynamic(
+            q0,
+            q1,
+            qd1,
+            slopes,
+            z,
+            covariance,
+            w,
+            d,
+            derivative_guard,
+            probit_scale,
+            &mut workspace.dynamic,
+        ),
+    }
 }
 
 pub(crate) fn standardize_latent_z_matrix_with_policy(
@@ -1418,7 +1565,8 @@ mod tests {
         ];
         let slopes = [0.55, -0.8, 0.35];
         let scores = [-1.2, 0.65, 1.4];
-        let mut arena = DynamicJetArena::new();
+        let mut workspace = RigidVectorRowWorkspace::new();
+        let mut dynamic_arena = DynamicJetArena::new();
         let close = |label: &str, actual: f64, expected: f64| {
             let tolerance = 5.0e-11 * actual.abs().max(expected.abs()).max(1.0);
             assert!(
@@ -1430,7 +1578,7 @@ mod tests {
         };
 
         for (case, &(covariance, event, q0, q1, qd1, probit_scale)) in cases.iter().enumerate() {
-            let runtime = row_primary_closed_form_vector(
+            let production = row_primary_closed_form_vector(
                 q0,
                 q1,
                 qd1,
@@ -1441,9 +1589,23 @@ mod tests {
                 event,
                 1.0e-8,
                 probit_scale,
-                &mut arena,
+                &mut workspace,
             )
-            .expect("runtime vector row program");
+            .expect("compiled vector row program");
+            let dynamic = row_primary_closed_form_vector_dynamic(
+                q0,
+                q1,
+                qd1,
+                &slopes,
+                &scores,
+                covariance,
+                1.3,
+                event,
+                1.0e-8,
+                probit_scale,
+                &mut dynamic_arena,
+            )
+            .expect("dynamic vector row program");
             let fixed = row_primary_closed_form_vector_fixed::<6>(
                 q0,
                 q1,
@@ -1471,12 +1633,18 @@ mod tests {
             )
             .expect("strongest-hand vector row");
 
-            close(&format!("case {case} value"), runtime.0, hand.0);
+            close(&format!("case {case} value"), production.0, hand.0);
+            close(&format!("case {case} dynamic value"), dynamic.0, hand.0);
             close(&format!("case {case} fixed value"), fixed.0, hand.0);
-            for axis_a in 0..runtime.1.len() {
+            for axis_a in 0..production.1.len() {
                 close(
                     &format!("case {case} gradient[{axis_a}]"),
-                    runtime.1[axis_a],
+                    production.1[axis_a],
+                    hand.1[axis_a],
+                );
+                close(
+                    &format!("case {case} dynamic gradient[{axis_a}]"),
+                    dynamic.1[axis_a],
                     hand.1[axis_a],
                 );
                 close(
@@ -1484,10 +1652,15 @@ mod tests {
                     fixed.1[axis_a],
                     hand.1[axis_a],
                 );
-                for axis_b in 0..runtime.1.len() {
+                for axis_b in 0..production.1.len() {
                     close(
                         &format!("case {case} Hessian[{axis_a},{axis_b}]"),
-                        runtime.2[[axis_a, axis_b]],
+                        production.2[[axis_a, axis_b]],
+                        hand.2[[axis_a, axis_b]],
+                    );
+                    close(
+                        &format!("case {case} dynamic Hessian[{axis_a},{axis_b}]"),
+                        dynamic.2[[axis_a, axis_b]],
                         hand.2[[axis_a, axis_b]],
                     );
                     close(
@@ -1498,10 +1671,10 @@ mod tests {
                 }
             }
 
-            let mixed_score_mass = runtime.2[[3, 4]]
+            let mixed_score_mass = production.2[[3, 4]]
                 .abs()
-                .max(runtime.2[[3, 5]].abs())
-                .max(runtime.2[[4, 5]].abs());
+                .max(production.2[[3, 5]].abs())
+                .max(production.2[[4, 5]].abs());
             assert!(
                 mixed_score_mass > 1.0e-6,
                 "case {case}: fixture must exercise a nonzero cross-score Hessian block"
@@ -1509,11 +1682,183 @@ mod tests {
         }
     }
 
+    /// Permanent backend-dispatch gate. Every scheduled compiled width and the
+    /// first dynamic width evaluate the same generic row expression through the
+    /// graph, eager fixed, eager dynamic, and retired strongest-hand authority.
+    /// All covariance representations and both survival branches are covered.
+    #[test]
+    fn compiled_graph_schedule_matches_all_backends_every_width_932() {
+        fn check_width<const DIM: usize>() {
+            let k = DIM - 3;
+            let slopes: Vec<f64> = (0..k)
+                .map(|axis| {
+                    let magnitude = 0.24 + 0.07 * axis as f64;
+                    if axis % 2 == 0 { magnitude } else { -magnitude }
+                })
+                .collect();
+            let scores: Vec<f64> = (0..k)
+                .map(|axis| -0.9 + 1.8 * (axis + 1) as f64 / (k + 1) as f64)
+                .collect();
+            let diagonal = MarginalSlopeCovariance::Diagonal(Array1::from_shape_fn(k, |axis| {
+                0.75 + 0.08 * axis as f64
+            }));
+            let full =
+                MarginalSlopeCovariance::Full(Array2::from_shape_fn((k, k), |(row, col)| {
+                    if row == col {
+                        1.0 + 0.06 * row as f64
+                    } else {
+                        0.025 / (1.0 + row.abs_diff(col) as f64)
+                    }
+                }));
+            let rank = k.min(3);
+            let low_rank = MarginalSlopeCovariance::LowRank(Array2::from_shape_fn(
+                (k, rank),
+                |(row, column)| {
+                    let sign = if (row + column) % 2 == 0 { 1.0 } else { -1.0 };
+                    sign * (0.18 + 0.03 * row as f64 + 0.05 * column as f64)
+                },
+            ));
+            let covariances = [diagonal, full, low_rank];
+            let q0 = -0.55 + 0.035 * k as f64;
+            let q1 = 0.72 - 0.025 * k as f64;
+            let qd1 = 0.85 + 0.04 * k as f64;
+            let probit_scale = 0.71 + 0.021 * k as f64;
+            let close = |backend: &str, channel: &str, actual: f64, expected: f64| {
+                let tolerance = 8.0e-11 * actual.abs().max(expected.abs()).max(1.0);
+                assert!(
+                    actual.is_finite()
+                        && expected.is_finite()
+                        && (actual - expected).abs() <= tolerance,
+                    "k={k} {backend} {channel}: actual={actual:+.16e}, hand={expected:+.16e}, tolerance={tolerance:.3e}"
+                );
+            };
+
+            let mut production_workspace = RigidVectorRowWorkspace::new();
+            let mut graph_workspace = Order2GraphWorkspace::new();
+            let mut dynamic_arena = DynamicJetArena::new();
+            for (shape_index, covariance) in covariances.iter().enumerate() {
+                for event in [0.0, 0.35, 1.0] {
+                    let production = row_primary_closed_form_vector(
+                        q0,
+                        q1,
+                        qd1,
+                        &slopes,
+                        &scores,
+                        covariance,
+                        1.17,
+                        event,
+                        1.0e-8,
+                        probit_scale,
+                        &mut production_workspace,
+                    )
+                    .expect("production vector row");
+                    let graph = row_primary_closed_form_vector_graph::<DIM>(
+                        q0,
+                        q1,
+                        qd1,
+                        &slopes,
+                        &scores,
+                        covariance,
+                        1.17,
+                        event,
+                        1.0e-8,
+                        probit_scale,
+                        &mut graph_workspace,
+                    )
+                    .expect("compiled graph vector row");
+                    let dynamic = row_primary_closed_form_vector_dynamic(
+                        q0,
+                        q1,
+                        qd1,
+                        &slopes,
+                        &scores,
+                        covariance,
+                        1.17,
+                        event,
+                        1.0e-8,
+                        probit_scale,
+                        &mut dynamic_arena,
+                    )
+                    .expect("dynamic vector row");
+                    let fixed = row_primary_closed_form_vector_fixed::<DIM>(
+                        q0,
+                        q1,
+                        qd1,
+                        &slopes,
+                        &scores,
+                        covariance,
+                        1.17,
+                        event,
+                        1.0e-8,
+                        probit_scale,
+                    )
+                    .expect("fixed vector row");
+                    let hand =
+                        vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
+                            q0,
+                            q1,
+                            qd1,
+                            &slopes,
+                            &scores,
+                            covariance,
+                            1.17,
+                            event,
+                            1.0e-8,
+                            probit_scale,
+                        )
+                        .expect("strongest-hand vector row");
+
+                    for (backend, actual) in [
+                        ("production", &production),
+                        ("graph", &graph),
+                        ("dynamic", &dynamic),
+                        ("fixed", &fixed),
+                    ] {
+                        close(
+                            backend,
+                            &format!("shape={shape_index} event={event} value"),
+                            actual.0,
+                            hand.0,
+                        );
+                        for primary in 0..DIM {
+                            close(
+                                backend,
+                                &format!("shape={shape_index} event={event} gradient[{primary}]"),
+                                actual.1[primary],
+                                hand.1[primary],
+                            );
+                            for other in 0..DIM {
+                                close(
+                                    backend,
+                                    &format!(
+                                        "shape={shape_index} event={event} Hessian[{primary},{other}]"
+                                    ),
+                                    actual.2[[primary, other]],
+                                    hand.2[[primary, other]],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        check_width::<4>();
+        check_width::<5>();
+        check_width::<6>();
+        check_width::<7>();
+        check_width::<8>();
+        check_width::<9>();
+        check_width::<10>();
+        check_width::<11>();
+        check_width::<12>();
+    }
+
     /// Temporary #932 release measurement for the runtime-width row program.
     /// Correctness remains pinned by
     /// `runtime_vector_row_program_matches_strongest_hand_mixed_score_vgh_932`;
-    /// this records the production `DynamicOrder2` cost against the test-only
-    /// strongest-hand witness and proves a warmed arena stops growing.
+    /// this records the compiled graph, eager dynamic, fixed eager, and
+    /// strongest-hand costs and proves a warmed graph stops growing.
     #[test]
     fn release_measure_runtime_vector_program_vs_strongest_hand_932() {
         use std::hint::black_box;
@@ -1552,9 +1897,26 @@ mod tests {
         let scores = [-1.2, 0.65, 1.4];
 
         for &(label, covariance, event, q0, q1, qd1, probit_scale) in &cases {
-            let mut arena = DynamicJetArena::new();
-            let evaluate_runtime = |arena: &mut DynamicJetArena| {
+            let mut workspace = RigidVectorRowWorkspace::new();
+            let mut dynamic_arena = DynamicJetArena::new();
+            let evaluate_production = |workspace: &mut RigidVectorRowWorkspace| {
                 row_primary_closed_form_vector(
+                    q0,
+                    q1,
+                    qd1,
+                    &slopes,
+                    &scores,
+                    covariance,
+                    1.3,
+                    event,
+                    1.0e-8,
+                    probit_scale,
+                    workspace,
+                )
+                .expect("compiled vector row program")
+            };
+            let evaluate_dynamic = |arena: &mut DynamicJetArena| {
+                row_primary_closed_form_vector_dynamic(
                     q0,
                     q1,
                     qd1,
@@ -1567,20 +1929,21 @@ mod tests {
                     probit_scale,
                     arena,
                 )
-                .expect("runtime vector row program")
+                .expect("dynamic vector row program")
             };
-            black_box(evaluate_runtime(&mut arena));
-            let first_warm_bytes = arena.allocated_bytes();
-            black_box(evaluate_runtime(&mut arena));
-            let stable_warm_bytes = arena.allocated_bytes();
-            black_box(evaluate_runtime(&mut arena));
+            black_box(evaluate_production(&mut workspace));
+            let first_warm_bytes = workspace.retained_bytes();
+            black_box(evaluate_production(&mut workspace));
+            let stable_warm_bytes = workspace.retained_bytes();
+            black_box(evaluate_production(&mut workspace));
             assert_eq!(
-                arena.allocated_bytes(),
+                workspace.retained_bytes(),
                 stable_warm_bytes,
-                "{label}: equal-size warmed row must not grow its arena"
+                "{label}: equal-size warmed row must not grow its graph"
             );
 
-            let runtime_ns = best_ns(20_000, || evaluate_runtime(&mut arena));
+            let production_ns = best_ns(20_000, || evaluate_production(&mut workspace));
+            let dynamic_ns = best_ns(20_000, || evaluate_dynamic(&mut dynamic_arena));
             let fixed_ns = best_ns(20_000, || {
                 row_primary_closed_form_vector_fixed::<6>(
                     q0,
@@ -1613,10 +1976,13 @@ mod tests {
             });
             eprintln!(
                 "G932_VECTOR_ORDER2_RELEASE covariance={label} k=3 event={event:.0} \
-                 runtime_ns={runtime_ns:.3} fixed_ns={fixed_ns:.3} hand_ns={hand_ns:.3} \
-                 hand_over_runtime={:.6} hand_over_fixed={:.6} first_warm_bytes={first_warm_bytes} \
+                 production_ns={production_ns:.3} dynamic_ns={dynamic_ns:.3} \
+                 fixed_ns={fixed_ns:.3} hand_ns={hand_ns:.3} \
+                 hand_over_production={:.6} hand_over_dynamic={:.6} hand_over_fixed={:.6} \
+                 first_warm_bytes={first_warm_bytes} \
                  stable_warm_bytes={stable_warm_bytes}",
-                hand_ns / runtime_ns,
+                hand_ns / production_ns,
+                hand_ns / dynamic_ns,
                 hand_ns / fixed_ns,
             );
         }
@@ -1668,5 +2034,4 @@ mod tests {
             }
         }
     }
-
 }
