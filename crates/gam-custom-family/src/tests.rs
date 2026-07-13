@@ -3487,6 +3487,7 @@ impl CustomFamily for TwoBlockPersistentGradientFamily {
 #[derive(Clone)]
 pub(crate) struct OneStepReturnedSaddleFamily {
     pub(crate) target: f64,
+    pub(crate) evaluations: Arc<AtomicUsize>,
 }
 
 pub(crate) struct ReturnedModeSaddleWorkspace {
@@ -3504,6 +3505,13 @@ impl ExactNewtonJointHessianWorkspace for ReturnedModeSaddleWorkspace {
 }
 
 impl OneStepReturnedSaddleFamily {
+    pub(crate) fn new(target: f64) -> Self {
+        Self {
+            target,
+            evaluations: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
     pub(crate) fn coordinates(&self, states: &[ParameterBlockState]) -> Result<(f64, f64), String> {
         let x = states
             .first()
@@ -3527,21 +3535,22 @@ impl OneStepReturnedSaddleFamily {
                 1.0 + 2.0 * y * y / target_squared,
                 4.0 * displacement * y / target_squared
             ],
-            [4.0 * displacement * y / target_squared, shape + 3.0 * y * y],
+            [4.0 * displacement * y / target_squared, shape + 6.0 * y * y],
         ]
     }
 }
 
 impl CustomFamily for OneStepReturnedSaddleFamily {
     fn evaluate(&self, states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        self.evaluations.fetch_add(1, Ordering::Relaxed);
         let (x, y) = self.coordinates(states)?;
         let displacement = x - self.target;
         let target_squared = self.target * self.target;
         let shape = -1.0 + 2.0 * displacement * displacement / target_squared;
         let score_x = -displacement * (1.0 + 2.0 * y * y / target_squared);
-        let score_y = -(shape * y + y.powi(3));
+        let score_y = -(shape * y + 2.0 * y.powi(3));
         let negative_log_likelihood =
-            0.5 * displacement * displacement + 0.5 * shape * y * y + 0.25 * y.powi(4);
+            0.5 * displacement * displacement + 0.5 * shape * y * y + 0.5 * y.powi(4);
         let hessian = self.hessian(x, y);
         Ok(FamilyEvaluation {
             log_likelihood: -negative_log_likelihood,
@@ -3607,7 +3616,7 @@ pub(crate) fn one_step_returned_saddle_specs() -> Vec<ParameterBlockSpec> {
 
 #[test]
 pub(crate) fn fresh_exact_mode_curvature_certificate_detects_returned_strict_saddle() {
-    let family = OneStepReturnedSaddleFamily { target: 0.125 };
+    let family = OneStepReturnedSaddleFamily::new(0.125);
     let specs = one_step_returned_saddle_specs();
     let options = BlockwiseFitOptions::default();
     let ranges = block_param_ranges(&specs);
@@ -3658,7 +3667,7 @@ pub(crate) fn fresh_exact_mode_curvature_certificate_detects_returned_strict_sad
 
 #[test]
 pub(crate) fn joint_newton_rejects_one_step_stationary_strict_saddle_at_returned_beta() {
-    let family = OneStepReturnedSaddleFamily { target: 0.125 };
+    let family = OneStepReturnedSaddleFamily::new(0.125);
     let specs = one_step_returned_saddle_specs();
     let result = inner_blockwise_fit(
         &family,
@@ -3682,7 +3691,7 @@ pub(crate) fn joint_newton_rejects_one_step_stationary_strict_saddle_at_returned
 
 #[test]
 pub(crate) fn joint_newton_recovers_from_returned_strict_saddle_with_remaining_cycle() {
-    let family = OneStepReturnedSaddleFamily { target: 0.125 };
+    let family = OneStepReturnedSaddleFamily::new(0.125);
     let specs = one_step_returned_saddle_specs();
     let options = BlockwiseFitOptions {
         inner_max_cycles: 2,
@@ -3704,7 +3713,10 @@ pub(crate) fn joint_newton_recovers_from_returned_strict_saddle_with_remaining_c
         .coordinates(&result.block_states)
         .expect("recovered mode should retain both coordinates");
     assert!((x - family.target).abs() <= 1.0e-12, "x={x}");
-    assert!((y.abs() - 1.0).abs() <= 1.0e-12, "y={y}");
+    assert!(
+        (y.abs() - std::f64::consts::FRAC_1_SQRT_2).abs() <= 1.0e-8,
+        "y={y}",
+    );
 
     let certificate = exact_joint_mode_curvature_certificate(
         &family,
@@ -3719,6 +3731,62 @@ pub(crate) fn joint_newton_recovers_from_returned_strict_saddle_with_remaining_c
     )
     .expect("recovered local minimum should have certifiable exact curvature");
     assert!(!certificate.has_resolvable_negative_curvature());
+}
+
+#[test]
+pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay() {
+    let family = OneStepReturnedSaddleFamily::new(0.125);
+    let specs = one_step_returned_saddle_specs();
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 2,
+        use_remlobjective: false,
+        compute_covariance: true,
+        ..BlockwiseFitOptions::default()
+    };
+    let derivative_blocks: SharedDerivativeBlocks = Arc::new(
+        (0..specs.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>(),
+    );
+    let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
+        &family,
+        &specs,
+        &options,
+        &Array1::zeros(0),
+        derivative_blocks,
+        &[None],
+        EvalMode::ValueOnly,
+    )
+    .expect("the bounded hard case should produce one selected local mode");
+    let selected_objective_bits = selection.result.objective.to_bits();
+    let selected_beta_bits: Vec<Vec<u64>> = selection
+        .selected_inner
+        .block_states
+        .iter()
+        .map(|state| state.beta.iter().map(|value| value.to_bits()).collect())
+        .collect();
+    let evaluations_before_finalization = family.evaluations.load(Ordering::Relaxed);
+
+    let fit = fit_custom_family_fixed_log_lambdas_from_mode_selection(
+        &family, &specs, &options, selection, 0, None, true,
+    )
+    .expect("the exact selected mode should finalize without another inner solve");
+
+    assert_eq!(
+        family.evaluations.load(Ordering::Relaxed),
+        evaluations_before_finalization,
+        "finalization must consume the selected mode and cached Hessian without replaying the family",
+    );
+    assert_eq!(fit.penalized_objective.to_bits(), selected_objective_bits);
+    assert!(fit.covariance_conditional.is_some());
+    assert!(fit.geometry.is_some());
+    assert_eq!(fit.block_states.len(), selected_beta_bits.len());
+    for (state, expected) in fit.block_states.iter().zip(selected_beta_bits.iter()) {
+        assert_eq!(
+            state.beta.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            *expected,
+        );
+    }
 }
 
 /// gam#1088 fixture. A coupled two-block family whose joint Hessian carries

@@ -2387,6 +2387,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     returned_mode_curvature_certified = false;
                     last_cycle_residual_below_tol = false;
                     last_cycle_obj_change_below_tol = false;
+                    min_certified_residual = f64::INFINITY;
                     best_residual_seen = f64::INFINITY;
                     cycles_since_residual_improved = 0;
                     residual_descent_history.clear();
