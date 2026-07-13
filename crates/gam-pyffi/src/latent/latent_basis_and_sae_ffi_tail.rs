@@ -44,6 +44,7 @@ fn sae_manifold_fit_minimal<'py>(
     // forward-looking `"output_fisher_downstream"`. Routed to the matching
     // `RowMetric` constructor; gauge/lens/dose consume either unchanged.
     fisher_provenance: Option<String>,
+    fisher_factor_kind: Option<String>,
     // Per-row design-honesty reconstruction weights (#977); `(n,)` √w. Absent ⇒
     // unweighted path. Installed on the term before the joint fit / ρ selection.
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -123,6 +124,7 @@ fn sae_manifold_fit_minimal<'py>(
         fisher_u,
         fisher_mr,
         fisher_provenance.as_deref(),
+        fisher_factor_kind.as_deref(),
         row_w,
         separation_barrier_strength_override,
         promote_from_residual,
@@ -345,6 +347,7 @@ fn public_fit_penalties(
     fisher_factors=None,
     fisher_mass_residual=None,
     fisher_provenance=None,
+    fisher_factor_kind=None,
     row_loss_weights=None,
     separation_barrier_strength_override=None,
     promote_from_residual=false,
@@ -389,6 +392,7 @@ fn sae_manifold_fit_model<'py>(
     fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
     fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
     fisher_provenance: Option<String>,
+    fisher_factor_kind: Option<String>,
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
     separation_barrier_strength_override: Option<f64>,
     promote_from_residual: bool,
@@ -515,6 +519,7 @@ fn sae_manifold_fit_model<'py>(
         fisher_factors.clone(),
         fisher_mass_residual,
         fisher_provenance.clone(),
+        fisher_factor_kind.clone(),
         row_loss_weights,
         separation_barrier_strength_override,
         promote_from_residual,
@@ -550,6 +555,7 @@ fn sae_manifold_fit_model<'py>(
         threshold_gate_threshold,
         fisher_factors: fisher_nested,
         fisher_provenance,
+        fisher_factor_kind,
         declared_bases,
     };
     let payload = crate::manifold::manifold_sae_coercion::build_manifold_sae_payload(
@@ -891,6 +897,7 @@ fn sae_manifold_predict_oos<'py>(
     fisher_factors = None,
     fisher_mass_residual = None,
     fisher_provenance = None,
+    fisher_factor_kind = None,
 ))]
 fn sae_manifold_certify_external<'py>(
     py: Python<'py>,
@@ -922,6 +929,7 @@ fn sae_manifold_certify_external<'py>(
     fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
     fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
     fisher_provenance: Option<String>,
+    fisher_factor_kind: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
     let z_view = z.as_array();
@@ -998,6 +1006,7 @@ fn sae_manifold_certify_external<'py>(
                 n_obs,
                 p_out,
                 fisher_provenance.as_deref(),
+                fisher_factor_kind.as_deref(),
                 fisher_mass_residual_owned
                     .as_ref()
                     .map(|values| values.view()),
