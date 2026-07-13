@@ -1129,14 +1129,11 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         start: usize,
         end: usize,
     ) -> Array2<f64> {
-        if factor.nrows() != self.slices.total {
-            // Shape contract broken (the tiled trace always passes the
-            // coefficient-width factor, so this is defensive only): fall back
-            // to the exact generic per-row build over the range.
-            return crate::row_kernel::row_kernel_jacobian_action_matrix_generic_rows(
-                self, factor, start, end,
-            );
-        }
+        assert_eq!(
+            factor.nrows(),
+            self.slices.total,
+            "survival marginal-slope tiled Jacobian factor width must match coefficients",
+        );
         // Block-tiled build for one row-tile: dense designs slice to a
         // contiguous row block and GEMM (`fast_ab`), operator/sparse designs
         // fall to a row-local dot over the range. Bounds peak memory to the
