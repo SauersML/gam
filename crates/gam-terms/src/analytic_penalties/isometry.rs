@@ -932,7 +932,6 @@ impl IsometryPenalty {
     pub fn pullback_metric(&self, latent_dim: usize) -> Option<Array2<f64>> {
         let jac = self.dimensioned_jacobian_cache("pullback_metric", latent_dim)?;
         let n_obs = jac.nrows();
-        let p = self.p_out;
         // `dimensioned_jacobian_cache` enforces the load-bearing `(n, p·d)`
         // shape contract before the reshape loop below. A stale cross-atom
         // cache is a hard owner/refresh invariant failure; it is never converted
