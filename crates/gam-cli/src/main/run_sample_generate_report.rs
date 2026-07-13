@@ -222,13 +222,6 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
     reject_multinomial_model(&args.model, "generate")?;
     let model = SavedModel::load_from_path(&args.model)?;
 
-    if model.predict_model_class() == PredictModelClass::Survival {
-        return Err(
-            "generate is not available for survival models in this command; use survival-specific simulation APIs"
-                .to_string(),
-        );
-    }
-
     let ds = load_datasetwith_model_schema(&args.data, &model)?;
     require_dataset_rows("generate", &args.data, ds.values.nrows())?;
     let col_map = ds.column_map();
@@ -252,26 +245,65 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
     )?;
 
     let mut rng = StdRng::seed_from_u64(args.seed.unwrap_or(42));
-    let draws = sampleobservation_replicates(&spec, args.n_draws, &mut rng)
-        .map_err(|e| format!("failed to sample synthetic observations: {e}"))?;
-
     let out = args
         .out
         .unwrap_or_else(|| default_output_path_from_model(&args.model, ".generated.csv"));
-    // `sampleobservation_replicates` returns shape (n_draws, nobs): each
-    // row is one synthetic observation vector. The natural CSV layout for
-    // users is: one row per input row, one column per draw — so column
-    // headers `draw_0..draw_{n_draws-1}` actually correspond to draws.
-    // Without this transpose the headers were misleading: the file had
-    // n_draws rows and nobs columns labeled "draw_*" even though each
-    // column was really an observation index.
-    let draws_per_row = draws.t().to_owned();
-    write_matrix_csv(&out, &draws_per_row, "draw")?;
+    let mut writer = csv::WriterBuilder::new()
+        .has_headers(true)
+        .from_path(&out)
+        .map_err(|error| {
+            format!(
+                "failed to create generated-data csv '{}': {error}",
+                out.display()
+            )
+        })?;
+    writer
+        .write_record(["draw", "row", "value"])
+        .map_err(|error| format!("failed to write generated-data header: {error}"))?;
+    let chunk_draws = gam_runtime::resource::rows_for_target_bytes(
+        gam::ResourcePolicy::default_library().row_chunk_target_bytes,
+        spec.nobs(),
+    )
+    .min(args.n_draws)
+    .max(1);
+    gam::generative::sampleobservation_replicate_chunks(
+        &spec,
+        args.n_draws,
+        chunk_draws,
+        &mut rng,
+        |draw_start, chunk| {
+            for local_draw in 0..chunk.nrows() {
+                let draw = draw_start + local_draw;
+                for row in 0..chunk.ncols() {
+                    writer
+                        .write_record([
+                            draw.to_string(),
+                            row.to_string(),
+                            format!("{:.17}", chunk[[local_draw, row]]),
+                        ])
+                        .map_err(|error| {
+                            gam::estimate::EstimationError::InvalidInput(format!(
+                                "failed to write generated-data row draw={draw}, row={row}: {error}"
+                            ))
+                        })?;
+                }
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| format!("failed to sample synthetic observations: {error}"))?;
+    writer.flush().map_err(|error| {
+        format!(
+            "failed to flush generated-data csv '{}': {error}",
+            out.display()
+        )
+    })?;
     cli_out!(
-        "wrote synthetic draws: {} (input_rows={}, draws={})",
+        "wrote synthetic draws: {} (long rows={}, input_rows={}, draws={})",
         out.display(),
-        draws_per_row.nrows(),
-        draws_per_row.ncols()
+        spec.nobs().saturating_mul(args.n_draws),
+        spec.nobs(),
+        args.n_draws
     );
     Ok(())
 }

@@ -548,7 +548,7 @@ pub(crate) struct GenerateArgs {
     pub(crate) seed: Option<u64>,
     #[arg(
         long = "out",
-        help = "Output CSV path; default: <model_stem>.generated.csv"
+        help = "Long-form output CSV (draw,row,value); default: <model_stem>.generated.csv"
     )]
     pub(crate) out: Option<PathBuf>,
 }
