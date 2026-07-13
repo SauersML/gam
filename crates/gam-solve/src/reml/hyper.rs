@@ -1042,7 +1042,7 @@ impl<'a> RemlState<'a> {
                     a: a_ij + a_firth,
                     g: &g_firth - &g_ij,
                     b_mat: Array2::<f64>::zeros((0, 0)),
-                    b_operator: Some(b_operator),
+                    b_operator: Some(std::sync::Arc::from(b_operator)),
                     ld_s: ld_s_ij,
                 }
             },
