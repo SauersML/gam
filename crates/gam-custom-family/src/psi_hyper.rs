@@ -974,7 +974,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     // ψ-ψ pair callback
     let ext_ext = {
         let per_block_lambdas = Arc::clone(&per_block_lambdas);
-        let derivative_blocks = Arc::clone(&derivative_blocks);
+        let hyper_layout = Arc::clone(&hyper_layout);
         let specs_arc = Arc::clone(&specs_arc);
         let beta_arc = Arc::clone(&beta_arc);
         let synced_arc = Arc::clone(&synced_arc);
@@ -985,31 +985,38 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let firth_pair_ctx = firth_pair_ctx.clone();
 
         Box::new(move |psi_i: usize, psi_j: usize| -> HyperCoordPair {
-            // Defensive bounds check: callers in the unified outer solver only ever
-            // pass indices in `0..psi_penalty_cache.len()`, but treating an OOB
-            // request as a documented zero-pair sentinel keeps integration code
-            // (which may probe spurious coordinate pairs while building joint
-            // Hessian sparsity patterns) panic-free.
-            if psi_i >= psi_penalty_cache.len() || psi_j >= psi_penalty_cache.len() {
-                return HyperCoordPair::zero();
-            }
-            let cache_i = &psi_penalty_cache[psi_i];
-            let cache_j = &psi_penalty_cache[psi_j];
+            assert!(
+                psi_i < hyper_layout.len() && psi_j < hyper_layout.len(),
+                "typed hyper pair index out of bounds: ({psi_i}, {psi_j}) for {} axes",
+                hyper_layout.len()
+            );
+            let cache_i = psi_penalty_cache[psi_i].as_ref();
+            let cache_j = psi_penalty_cache[psi_j].as_ref();
 
             // Get family-provided second-order likelihood terms.
-            let psi2 = if let Some(workspace) = psi_workspace.as_ref() {
-                workspace.second_order_terms(psi_i, psi_j).ok().flatten()
+            let psi2_result = if let Some(workspace) = psi_workspace.as_ref() {
+                workspace.second_order_terms(psi_i, psi_j)
             } else {
                 family_arc
                     .exact_newton_joint_psisecond_order_terms(
                         &synced_arc,
                         &specs_arc,
-                        &derivative_blocks,
+                        &hyper_layout,
                         psi_i,
                         psi_j,
                     )
-                    .ok()
-                    .flatten()
+            };
+            let family_pair_required = hyper_layout.family_axis(psi_i).is_some()
+                || hyper_layout.family_axis(psi_j).is_some();
+            let psi2 = match psi2_result {
+                Ok(Some(terms)) => Some(terms),
+                Ok(None) if family_pair_required => panic!(
+                    "typed family hyper pair ({psi_i}, {psi_j}) lost exact V_ij/g_ij/H_ij coverage after preflight"
+                ),
+                Ok(None) => None,
+                Err(error) => panic!(
+                    "typed hyper pair ({psi_i}, {psi_j}) failed after successful layout construction: {error}"
+                ),
             };
 
             let (obj_ll, score_ll, hess_ll, hess_ll_op) = match psi2 {
@@ -1071,9 +1078,12 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             }
 
             // Assemble S_{ψ_i ψ_j} only on the touched block.
-            let ld_s = if cache_i.block_idx == cache_j.block_idx {
+            let ld_s = if let (Some(cache_i), Some(cache_j)) = (cache_i, cache_j)
+                && cache_i.block_idx == cache_j.block_idx
+            {
                 let p_block = cache_i.end - cache_i.start;
-                let deriv_i = &derivative_blocks[cache_i.block_idx][cache_i.local_idx];
+                let deriv_i = &hyper_layout.design_derivative_blocks()[cache_i.block_idx]
+                    [cache_i.local_idx];
                 let s_local = assemble_block_local_s_psi_psi(
                     deriv_i,
                     cache_j.local_idx,
