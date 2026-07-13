@@ -442,6 +442,42 @@ fn launch_diag_linux(inputs: RowHessianDiagInputs<'_>) -> Result<RowHessianDiagO
     Ok(RowHessianDiagOutputs { d_rows })
 }
 
+/// CPU execution of the same per-row Hessian matvec. This is the live
+/// non-CUDA route used by the host-pin joint-Hessian consumers.
+pub(crate) fn cpu_row_hessian_matvec(inputs: &RowHessianMatvecInputs<'_>) -> Vec<f64> {
+    let n = inputs.n_rows;
+    let r = inputs.r;
+    let mut y = vec![0.0_f64; n * r];
+    for row in 0..n {
+        let h_base = row * r * r;
+        let v_base = row * r;
+        for u in 0..r {
+            let mut acc = 0.0_f64;
+            for v in 0..r {
+                acc += inputs.h_rows[h_base + u * r + v] * inputs.v_rows[v_base + v];
+            }
+            y[v_base + u] = acc;
+        }
+    }
+    y
+}
+
+/// CPU execution of the same per-row Hessian diagonal extraction. This is the
+/// live non-CUDA route used by the host-pin preconditioner consumers.
+pub(crate) fn cpu_row_hessian_diag(inputs: &RowHessianDiagInputs<'_>) -> Vec<f64> {
+    let n = inputs.n_rows;
+    let r = inputs.r;
+    let mut diagonal = vec![0.0_f64; n * r];
+    for row in 0..n {
+        let h_base = row * r * r;
+        let diagonal_base = row * r;
+        for u in 0..r {
+            diagonal[diagonal_base + u] = inputs.h_rows[h_base + u * r + u];
+        }
+    }
+    diagonal
+}
+
 #[cfg(test)]
 mod tests {
     // All items below are `#[cfg(target_os = "linux")]` (GPU parity), so the
@@ -449,40 +485,6 @@ mod tests {
     // error when compiling the lib tests on other platforms.
     #[cfg(target_os = "linux")]
     use super::*;
-
-    #[cfg(target_os = "linux")]
-    fn cpu_row_hessian_matvec(inputs: &RowHessianMatvecInputs<'_>) -> Vec<f64> {
-        let n = inputs.n_rows;
-        let r = inputs.r;
-        let mut y = vec![0.0_f64; n * r];
-        for row in 0..n {
-            let h_base = row * r * r;
-            let v_base = row * r;
-            for u in 0..r {
-                let mut acc = 0.0_f64;
-                for v in 0..r {
-                    acc += inputs.h_rows[h_base + u * r + v] * inputs.v_rows[v_base + v];
-                }
-                y[v_base + u] = acc;
-            }
-        }
-        y
-    }
-
-    #[cfg(target_os = "linux")]
-    fn cpu_row_hessian_diag(inputs: &RowHessianDiagInputs<'_>) -> Vec<f64> {
-        let n = inputs.n_rows;
-        let r = inputs.r;
-        let mut diagonal = vec![0.0_f64; n * r];
-        for row in 0..n {
-            let h_base = row * r * r;
-            let diagonal_base = row * r;
-            for u in 0..r {
-                diagonal[diagonal_base + u] = inputs.h_rows[h_base + u * r + u];
-            }
-        }
-        diagonal
-    }
 
     /// Deterministic non-trivial Hessian fixture. Generates per-row
     /// symmetric `r×r` blocks via `H_i = A_i + A_iᵀ + r·I` for a
