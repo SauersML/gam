@@ -6,7 +6,7 @@ use gam::inference::functionals::{
 };
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
-    BasisMetadata, OneDimensionalBoundary, build_bspline_basis_1d,
+    BasisMetadata, OneDimensionalBoundary, PenaltySource, build_bspline_basis_1d,
     evaluate_bspline_derivative_scalar,
 };
 use ndarray::{Array1, Array2};
@@ -30,9 +30,11 @@ fn bspline_design_and_derivative(x: &Array1<f64>) -> (Array2<f64>, Array2<f64>, 
     let built = build_bspline_basis_1d(x.view(), &spec).expect("B-spline design");
     let design = built.design.to_dense();
     let penalty = built
-        .penalties
-        .first()
+        .active_penalties
+        .iter()
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
         .expect("B-spline roughness penalty")
+        .matrix
         .clone();
     let BasisMetadata::BSpline1D {
         knots,

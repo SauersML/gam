@@ -56,11 +56,12 @@ fn cyclic_duchon_penalty_output_is_all_finite() {
         .expect("cyclic Duchon basis build");
 
     assert!(
-        !built.penalties.is_empty(),
+        !built.active_penalties.is_empty(),
         "INVARIANT VIOLATED [cyclic Duchon emits a penalty]: a penalized smooth with no \
          penalty block silently drops its smoothing constraint."
     );
-    for (k, pen) in built.penalties.iter().enumerate() {
+    for (k, active) in built.active_penalties.iter().enumerate() {
+        let pen = &active.matrix;
         if let Some((r, c)) = pen
             .indexed_iter()
             .find(|(_, v)| !v.is_finite())

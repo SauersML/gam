@@ -44,7 +44,7 @@
 //! tool's output.
 
 use gam::terms::basis::{
-    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, build_duchon_basis,
+    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, PenaltySource, build_duchon_basis,
 };
 use ndarray::Array2;
 
@@ -163,10 +163,15 @@ fn high_dim_hybrid_duchon_matern_penalty_is_psd_1424() {
     let built = build_duchon_basis(data.view(), &spec)
         .expect("d=6 hybrid Duchon–Matérn build should succeed via the stable-integral kernel");
     assert!(
-        !built.penalties.is_empty(),
+        !built.active_penalties.is_empty(),
         "the hybrid Duchon–Matérn basis must carry a primary penalty"
     );
-    let s = &built.penalties[0];
+    let s = &built
+        .active_penalties
+        .iter()
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+        .expect("hybrid Duchon–Matérn build must retain its primary roughness penalty")
+        .matrix;
     let eigs = jacobi_eigenvalues(s);
     let lambda_min = eigs.iter().cloned().fold(f64::INFINITY, f64::min);
     let lambda_max = eigs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
