@@ -5,7 +5,7 @@ use crate::survival::construction::{
 use crate::survival::location_scale::{
     ResidualDistribution, SurvivalCovariateTimeBasis, SurvivalLocationScaleTimeParameterization,
 };
-use crate::survival::lognormal_kernel::FrailtySpec;
+use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec};
 use crate::wiggle::{
     WigglePenaltyMetadata, canonical_wiggle_function_penalties,
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
@@ -4615,9 +4615,11 @@ impl FittedModel {
             match self.family_state.frailty() {
                 Some(FrailtySpec::None)
                 | Some(FrailtySpec::GaussianShift {
-                    sigma_fixed: Some(_),
+                    scale: FrailtyScale::Fixed { .. },
                 }) => {}
-                Some(FrailtySpec::GaussianShift { sigma_fixed: None }) => {
+                Some(FrailtySpec::GaussianShift {
+                    scale: FrailtyScale::Learned { .. },
+                }) => {
                     return Err(FittedModelError::IncompatibleConfig {
                         reason: "marginal-slope model requires a fixed GaussianShift sigma in family_state.frailty"
                             .to_string(),
@@ -4702,9 +4704,11 @@ impl FittedModel {
                 match frailty {
                     FrailtySpec::None
                     | FrailtySpec::GaussianShift {
-                        sigma_fixed: Some(_),
+                        scale: FrailtyScale::Fixed { .. },
                     } => {}
-                    FrailtySpec::GaussianShift { sigma_fixed: None } => {
+                    FrailtySpec::GaussianShift {
+                        scale: FrailtyScale::Learned { .. },
+                    } => {
                         return Err(FittedModelError::IncompatibleConfig {
                             reason: "survival marginal-slope model requires a fixed GaussianShift sigma in family_state.frailty"
                                 .to_string(),
@@ -4745,11 +4749,12 @@ impl FittedModel {
         if let FittedFamily::LatentSurvival { frailty } = &self.family_state {
             match frailty {
                 FrailtySpec::HazardMultiplier {
-                    sigma_fixed: Some(_),
+                    scale: FrailtyScale::Fixed { .. },
                     ..
                 } => {}
                 FrailtySpec::HazardMultiplier {
-                    sigma_fixed: None, ..
+                    scale: FrailtyScale::Learned { .. },
+                    ..
                 } => {
                     return Err(FittedModelError::IncompatibleConfig {
                         reason: "latent survival model requires a fixed HazardMultiplier sigma in family_state.frailty"
@@ -4773,11 +4778,12 @@ impl FittedModel {
         if let FittedFamily::LatentBinary { frailty } = &self.family_state {
             match frailty {
                 FrailtySpec::HazardMultiplier {
-                    sigma_fixed: Some(_),
+                    scale: FrailtyScale::Fixed { .. },
                     ..
                 } => {}
                 FrailtySpec::HazardMultiplier {
-                    sigma_fixed: None, ..
+                    scale: FrailtyScale::Learned { .. },
+                    ..
                 } => {
                     return Err(FittedModelError::IncompatibleConfig {
                         reason: "latent binary model requires a fixed HazardMultiplier sigma in family_state.frailty"
