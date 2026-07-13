@@ -5031,6 +5031,38 @@ fn checkpointing_objective_rejects_wrong_dim_on_decode() {
 }
 
 #[test]
+fn schema_two_iterate_is_rejected_after_hessian_provenance_break_2253() {
+    let obsolete = serde_json::json!({
+        "schema": 2,
+        "rho": [0.5],
+        "beta": [1.0],
+        "hessian": [4.0],
+        "hessian_dim": 1,
+        "cost": 2.0,
+        "eval_id": 7
+    });
+    let bytes = serde_json::to_vec(&obsolete).expect("serialize obsolete payload");
+    assert!(decode_iterate(&bytes, 1).is_none());
+}
+
+#[test]
+fn transferred_hessian_requires_current_analytic_capability_2253() {
+    let hessian = array![[2.0_f64, 0.0], [0.0, 3.0]];
+    assert!(
+        eligible_transferred_outer_hessian(
+            Some(&hessian),
+            DeclaredHessianForm::Unavailable,
+            2,
+        )
+        .is_none()
+    );
+    assert!(
+        eligible_transferred_outer_hessian(Some(&hessian), DeclaredHessianForm::Dense, 2)
+            .is_some()
+    );
+}
+
+#[test]
 fn iterate_payload_round_trips_beta() {
     // Every persisted entry that comes with an inner-β hint round-trips
     // (ρ, β) together — that pair lets a resume open inner PIRLS in the
