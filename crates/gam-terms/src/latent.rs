@@ -1755,10 +1755,10 @@ mod tests {
 
         // Each factor projected standalone at its own offset/width must match the
         // composite's corresponding block.
-        let circle_block =
-            circle.project_gradient_to_tangent(t.slice(s![0..1]), g.slice(s![0..1]));
-        let sphere_block =
-            sphere.project_gradient_to_tangent(t.slice(s![1..3]), g.slice(s![1..3]));
+        let circle_block = circle
+            .project_gradient_to_tangent(t.slice(ndarray::s![0..1]), g.slice(ndarray::s![0..1]));
+        let sphere_block = sphere
+            .project_gradient_to_tangent(t.slice(ndarray::s![1..3]), g.slice(ndarray::s![1..3]));
         assert_eq!(projected[0], circle_block[0], "d=1 circle factor block");
         for a in 0..2 {
             assert_eq!(projected[1 + a], sphere_block[a], "d=2 sphere factor block");
