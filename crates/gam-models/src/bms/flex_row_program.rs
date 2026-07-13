@@ -1208,5 +1208,122 @@ mod tests {
             BmsFlexRowOrder3FinalizerPhase::NegLogThird { direction: 0 },
         ]);
         assert_eq!(order3_finalizer_phases, expected_order3_phases);
+
+        let mut order3_two_directions = Vec::new();
+        BmsFlexRowProgram::try_for_each_order3_finalizer(
+            2,
+            2,
+            |node| -> Result<(), std::convert::Infallible> {
+                order3_two_directions.push(node);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut order4_finalizer = Vec::new();
+        BmsFlexRowProgram::try_for_each_order4_finalizer(
+            2,
+            2,
+            1,
+            |node| -> Result<(), std::convert::Infallible> {
+                order4_finalizer.push(node);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut expected_order4_finalizer = order3_two_directions
+            .iter()
+            .copied()
+            .map(BmsFlexRowOrder4FinalizerNode::Order3)
+            .collect::<Vec<_>>();
+        expected_order4_finalizer.extend([
+            BmsFlexRowOrder4FinalizerNode::DirectionPairStart { pair: 0 },
+            BmsFlexRowOrder4FinalizerNode::ImplicitMixedSecond {
+                pair: 0,
+                left: 0,
+                right: 0,
+            },
+            BmsFlexRowOrder4FinalizerNode::ImplicitMixedSecond {
+                pair: 0,
+                left: 0,
+                right: 1,
+            },
+            BmsFlexRowOrder4FinalizerNode::ImplicitMixedSecond {
+                pair: 0,
+                left: 1,
+                right: 1,
+            },
+            BmsFlexRowOrder4FinalizerNode::ObservedMixedFirst {
+                pair: 0,
+                primary: 0,
+            },
+            BmsFlexRowOrder4FinalizerNode::ObservedMixedFirst {
+                pair: 0,
+                primary: 1,
+            },
+            BmsFlexRowOrder4FinalizerNode::ObservedMixedSecond {
+                pair: 0,
+                left: 0,
+                right: 0,
+            },
+            BmsFlexRowOrder4FinalizerNode::ObservedMixedSecond {
+                pair: 0,
+                left: 0,
+                right: 1,
+            },
+            BmsFlexRowOrder4FinalizerNode::ObservedMixedSecond {
+                pair: 0,
+                left: 1,
+                right: 1,
+            },
+            BmsFlexRowOrder4FinalizerNode::NegLogFourth {
+                pair: 0,
+                left: 0,
+                right: 0,
+            },
+            BmsFlexRowOrder4FinalizerNode::NegLogFourth {
+                pair: 0,
+                left: 0,
+                right: 1,
+            },
+            BmsFlexRowOrder4FinalizerNode::NegLogFourth {
+                pair: 0,
+                left: 1,
+                right: 1,
+            },
+        ]);
+        assert_eq!(order4_finalizer, expected_order4_finalizer);
+
+        let mut order3_two_direction_phases = Vec::new();
+        BmsFlexRowProgram::try_for_each_order3_finalizer_phase(
+            2,
+            |phase| -> Result<(), std::convert::Infallible> {
+                order3_two_direction_phases.push(phase);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut order4_finalizer_phases = Vec::new();
+        BmsFlexRowProgram::try_for_each_order4_finalizer_phase(
+            2,
+            1,
+            |phase| -> Result<(), std::convert::Infallible> {
+                order4_finalizer_phases.push(phase);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut expected_order4_phases = order3_two_direction_phases
+            .iter()
+            .copied()
+            .map(BmsFlexRowOrder4FinalizerPhase::Order3)
+            .collect::<Vec<_>>();
+        expected_order4_phases.extend([
+            BmsFlexRowOrder4FinalizerPhase::DirectionPairStart { pair: 0 },
+            BmsFlexRowOrder4FinalizerPhase::ImplicitMixedSecond { pair: 0 },
+            BmsFlexRowOrder4FinalizerPhase::ObservedMixedFirst { pair: 0 },
+            BmsFlexRowOrder4FinalizerPhase::ObservedMixedSecond { pair: 0 },
+            BmsFlexRowOrder4FinalizerPhase::NegLogFourth { pair: 0 },
+        ]);
+        assert_eq!(order4_finalizer_phases, expected_order4_phases);
     }
 }
