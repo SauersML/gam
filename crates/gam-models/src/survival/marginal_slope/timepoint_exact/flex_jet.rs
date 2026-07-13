@@ -52,7 +52,7 @@
 //!   1. `moment_term` was a plain product → it double-counted the calibration's
 //!      shared η-motion by `(j+m)/j` per Leibniz split (lifted intercept Hessian
 //!      2× too large). Fixed to the distinguished-derivative projector (weight
-//!      `j/(j+m)=|A|/|I|`; see [`FlexJet::moment_term`]).
+//!      `j/(j+m)=|A|/|I|`; see [`MomentTerm::moment_term`]).
 //!   2. The intercept lift ran a hardcoded 2 iterations; the frozen-inverse chord
 //!      recovers exactly ONE Taylor degree per pass (`e_r∈m^{r+1}`), so `Jet3`
 //!      (order 3) / `Jet4` (order 4) directional channels were under-converged.
@@ -783,11 +783,7 @@ impl FlexJet for Jet1 {
     fn scale_homogeneous_orders(&self, factors: [f64; 5]) -> Self {
         Jet1 {
             v: factors[0] * self.v,
-            g: self
-                .g
-                .iter()
-                .map(|&channel| factors[1] * channel)
-                .collect(),
+            g: self.g.iter().map(|&channel| factors[1] * channel).collect(),
         }
     }
 }
@@ -969,9 +965,7 @@ impl FlexJet for ArenaJet3<'_> {
                 dimension,
                 self.arena,
                 |axis| factors[offset + 1] * channels.g[axis],
-                |row, column| {
-                    factors[offset + 2] * channels.h[row * dimension + column]
-                },
+                |row, column| factors[offset + 2] * channels.h[row * dimension + column],
             )
         };
         Self {
@@ -1071,8 +1065,7 @@ impl<const K: usize> FlexJet for FixedJet3<K> {
             }
             for row in 0..K {
                 for column in 0..K {
-                    scaled.h[row][column] =
-                        factors[offset + 2] * channels.0.h[row][column];
+                    scaled.h[row][column] = factors[offset + 2] * channels.0.h[row][column];
                 }
             }
             Order2(scaled)
@@ -1607,10 +1600,10 @@ impl SurvivalMarginalSlopeFamily {
 // recurrence, intercept lift, cell-coefficient / chi-poly / moving-edge jets, and
 // the observed / calibration input bridges) live here at module scope, consumed by
 // the `compute_survival_timepoint_exact_jet` Jet2 wrapper below. The `#[test]`
-// oracle gates + the `flex_timepoint_inputs_jet2_impl` cross-check path + the
-// `MomentTerm` impls for the higher-order `Jet3`/`Jet4` channels remain in
-// `#[cfg(test)] mod moment_engine_tests`, pinning these against the scalar-FD
-// oracle of the real intercept solve and the hand timepoint packs.
+// oracle gates + the `flex_timepoint_inputs_jet2_impl` cross-check path remain
+// in `#[cfg(test)] mod moment_engine_tests`, pinning the one generic projector
+// against the scalar-FD oracle of the real intercept solve and the historical
+// hand timepoint packs.
 
 // #932: the `recip`/`exp`/`add_const` jet helpers (formerly `FlexJet` default
 // methods) live here as free generic fns — only the relocated moment-engine /
@@ -1673,16 +1666,14 @@ fn add_const<J: FlexJet>(x: &J, c: f64) -> J {
 /// Along a scalar path the law collapses to the closed form
 /// `P_n = Σ_j C(n,j)·(j/n)·C^(j)M^(n−j) = Σ_j C(n−1,j−1) C^(j)M^(n−j)
 ///      = d^(n−1)/dt^(n−1) (C′M)` — i.e. `½/⅔,⅓/¾,½,¼` are not empirical
-/// fudge factors but `binom(n−1,j−1)/binom(n,j)`. Verified channel-for-channel
-/// against the true `R_ij…` integrals (gam#932; the design recommendation is to
-/// generate the weights from `block-size/total-order`, retiring hand tables).
+/// fudge factors but `binom(n−1,j−1)/binom(n,j)`. The implementation below
+/// generates them for every channel as `E⁻¹((E C)M)`; no order-specific table
+/// remains. It is verified channel-for-channel against the true `R_ij…`
+/// integrals (gam#932).
 ///
 /// `moment_term` was formerly a `FlexJet` trait method, but the production
-/// single-source NLL assembles its residual directly — only the moment-engine
-/// cross-checks below consume this oracle, so (like `recip`/`exp`/`add_const`
-/// above) it lives here as a private extension trait with its two
-/// contracted-channel helpers, avoiding the orphaned-`dead_code` gate while
-/// preserving the exact derivations.
+/// single-source NLL assembles its residual directly. The private extension
+/// trait expresses the projector once for every production and oracle algebra.
 trait MomentTerm: FlexJet {
     fn moment_term(&self, moment: &Self) -> Self {
         // Let E be the Euler operator that multiplies every homogeneous
@@ -2726,11 +2717,9 @@ impl SurvivalMarginalSlopeFamily {
     }
 }
 
-// #932-2 increment 2: the higher-order `MomentTerm` channels (Jet3 directional /
-// Jet4 mixed-second-directional) + their `jet2_moment_eps`/`jet2_moment_eps_del`
-// order-3/4 `j/(j+m)` Leibniz projectors. Production once the contracted
-// directional/bidirectional path (`row_flex_{third,fourth}_contract_from_base`)
-// drives `flex_timepoint_inputs_generic` at `Jet3`/`Jet4`.
+// #932-2 increment 2: Jet3 directional and Jet4 mixed-second-directional
+// channels instantiate the same Euler-generated `j/(j+m)` projector as the
+// order-one/two and nested-dual algebras.
 
 impl SurvivalMarginalSlopeFamily {
     /// #932-2 PRODUCTION cutover (increment 2): the directional timepoint
