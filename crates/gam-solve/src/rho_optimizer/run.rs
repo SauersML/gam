@@ -691,13 +691,17 @@ impl OuterProblem {
                     // matches this fit's full-θ dimension; a dimension drift
                     // (structural change the cache key did not capture) falls
                     // back to the scalar warm metric in run_plan.
-                    config.warm_start_outer_hessian = hessian.and_then(|(dim, flat)| {
-                        if dim == self.n_params && flat.len() == dim * dim {
-                            Array2::from_shape_vec((dim, dim), flat).ok()
-                        } else {
-                            None
-                        }
-                    });
+                    config.warm_start_outer_hessian = if self.hessian.is_analytic() {
+                        hessian.and_then(|(dim, flat)| {
+                            if dim == self.n_params && flat.len() == dim * dim {
+                                Array2::from_shape_vec((dim, dim), flat).ok()
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
                     if config
                         .initial_rho
                         .as_ref()

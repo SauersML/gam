@@ -190,6 +190,25 @@ pub(crate) fn continuation_prewarm_step_budget(
     cost_scaled_prewarm_budget(base_budget, p_coefficients)
 }
 
+/// A transferred dense outer Hessian is eligible as a BFGS seed only when the
+/// current objective itself declares analytic second-order geometry. Shape and
+/// finiteness are necessary but cannot establish provenance: without this gate,
+/// a persistent checkpoint can inject curvature produced by an older objective
+/// implementation (including the deleted SAE finite-difference path) into a
+/// current Hessian-unavailable solve (#2253).
+pub(crate) fn eligible_transferred_outer_hessian<'a>(
+    hessian: Option<&'a Array2<f64>>,
+    declared: DeclaredHessianForm,
+    n_params: usize,
+) -> Option<&'a Array2<f64>> {
+    if !declared.is_analytic() {
+        return None;
+    }
+    hessian.filter(|h| {
+        h.nrows() == n_params && h.ncols() == n_params && h.iter().all(|v| v.is_finite())
+    })
+}
+
 /// A multistart candidate that has cleared the analytic outer certificate.
 ///
 /// Keeping the winner slot typed this way prevents a solver status bit from
@@ -1666,14 +1685,11 @@ pub(crate) fn run_outer_with_plan(
                         // way the converged
                         // optimum is unchanged: BFGS reaches ∇V=0 under any SPD
                         // initial metric, and the gradient/KKT tests are identical.
-                        let dense_metric = config
-                            .warm_start_outer_hessian
-                            .as_ref()
-                            .filter(|h| {
-                                h.nrows() == layout.n_params
-                                    && h.ncols() == layout.n_params
-                                    && h.iter().all(|v| v.is_finite())
-                            })
+                        let dense_metric = eligible_transferred_outer_hessian(
+                            config.warm_start_outer_hessian.as_ref(),
+                            cap.hessian,
+                            layout.n_params,
+                        )
                             .and_then(|h| {
                                 match gam_linalg::utils::certified_spd_inverse(
                                     h,

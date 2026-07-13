@@ -456,7 +456,11 @@ pub(crate) struct IteratePayload {
 /// Entries with a different schema id are rejected by `decode_iterate`
 /// so incompatible on-disk payloads fall through to cold start instead
 /// of seeding the inner solve with a malformed iterate.
-pub(crate) const ITERATE_PAYLOAD_SCHEMA: u32 = 2;
+/// Schema 3 invalidates every payload written before outer-Hessian provenance
+/// was tied to the objective's declared analytic capability. In particular,
+/// schema-2 SAE checkpoints may contain the now-deleted finite-difference
+/// curvature and must never influence a resumed quasi-Newton metric (#2253).
+pub(crate) const ITERATE_PAYLOAD_SCHEMA: u32 = 3;
 
 pub(crate) fn encode_iterate(
     rho: &Array1<f64>,
@@ -528,7 +532,7 @@ pub(crate) fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<It
 /// cold-start against a Hessian with condition number `≈ e^{2·rho_bound}`,
 /// and Newton degraded to O(1/k) descent that exhausted the cycle budget.
 ///
-/// The contract is now `(ρ, β)`: the schema-2 iterate payload carries
+/// The contract is now `(ρ, β)`: the current iterate payload carries
 /// both, and [`CheckpointingObjective`] refuses to persist a divergent
 /// inner state (non-finite cost or β). Boundary ρ — when written under
 /// the new invariant — is a *legitimate* finding (the smoothness wants
