@@ -29,32 +29,9 @@ thread_local! {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EmpiricalBmsFlexCostClass {
-    Rigid,
-    ScoreWarp,
-    LinkDeviation,
-    MixedDeviation,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EmpiricalBmsDerivativeOrder {
-    Third,
-    Fourth,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EmpiricalBmsJetSchedule {
     FixedWidthFromPlan,
     DynamicBatch { lanes: usize },
-}
-
-fn empirical_bms_flex_cost_class(primary: &PrimarySlices) -> EmpiricalBmsFlexCostClass {
-    match (primary.h.is_some(), primary.w.is_some()) {
-        (false, false) => EmpiricalBmsFlexCostClass::Rigid,
-        (true, false) => EmpiricalBmsFlexCostClass::ScoreWarp,
-        (false, true) => EmpiricalBmsFlexCostClass::LinkDeviation,
-        (true, true) => EmpiricalBmsFlexCostClass::MixedDeviation,
-    }
 }
 
 /// Bound the live directional jet work for widths without a fixed
@@ -76,21 +53,10 @@ fn empirical_bms_runtime_batch_lanes(r: usize) -> usize {
         .min(EMPIRICAL_BMS_BATCH_LANE_CAP)
 }
 
-fn empirical_bms_jet_schedule(
-    cost: EmpiricalBmsFlexCostClass,
-    order: EmpiricalBmsDerivativeOrder,
-    r: usize,
-) -> EmpiricalBmsJetSchedule {
-    match (cost, order, r) {
-        (
-            EmpiricalBmsFlexCostClass::Rigid
-            | EmpiricalBmsFlexCostClass::ScoreWarp
-            | EmpiricalBmsFlexCostClass::LinkDeviation
-            | EmpiricalBmsFlexCostClass::MixedDeviation,
-            EmpiricalBmsDerivativeOrder::Third | EmpiricalBmsDerivativeOrder::Fourth,
-            4 | 8 | 12 | 18,
-        ) => EmpiricalBmsJetSchedule::FixedWidthFromPlan,
-        (_, _, runtime_width) => EmpiricalBmsJetSchedule::DynamicBatch {
+fn empirical_bms_jet_schedule(r: usize) -> EmpiricalBmsJetSchedule {
+    match r {
+        4 | 8 | 12 | 18 => EmpiricalBmsJetSchedule::FixedWidthFromPlan,
+        runtime_width => EmpiricalBmsJetSchedule::DynamicBatch {
             lanes: empirical_bms_runtime_batch_lanes(runtime_width),
         },
     }
@@ -1273,11 +1239,7 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        match empirical_bms_jet_schedule(
-            empirical_bms_flex_cost_class(primary),
-            EmpiricalBmsDerivativeOrder::Third,
-            r,
-        ) {
+        match empirical_bms_jet_schedule(r) {
             EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_third_many_dispatch(&plan, &point, row_dirs, r)
             }
@@ -1350,11 +1312,7 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        match empirical_bms_jet_schedule(
-            empirical_bms_flex_cost_class(primary),
-            EmpiricalBmsDerivativeOrder::Third,
-            r,
-        ) {
+        match empirical_bms_jet_schedule(r) {
             EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_third_trace_dispatch(&plan, &point, gram, r)
             }
@@ -1518,11 +1476,7 @@ impl BernoulliMarginalSlopeFamily {
         primary: &PrimarySlices,
     ) -> Result<Vec<Array2<f64>>, String> {
         let r = primary.total;
-        match empirical_bms_jet_schedule(
-            empirical_bms_flex_cost_class(primary),
-            EmpiricalBmsDerivativeOrder::Fourth,
-            r,
-        ) {
+        match empirical_bms_jet_schedule(r) {
             EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_fourth_many_dispatch(plan, point, direction_pairs, r)
             }
@@ -4124,37 +4078,22 @@ mod empirical_flex_jet_oracle_tests {
     }
 
     #[test]
-    fn empirical_bms_schedule_maps_all_common_costs_and_orders_to_fixed_plan_932() {
-        let costs = [
-            EmpiricalBmsFlexCostClass::Rigid,
-            EmpiricalBmsFlexCostClass::ScoreWarp,
-            EmpiricalBmsFlexCostClass::LinkDeviation,
-            EmpiricalBmsFlexCostClass::MixedDeviation,
-        ];
-        let orders = [
-            EmpiricalBmsDerivativeOrder::Third,
-            EmpiricalBmsDerivativeOrder::Fourth,
-        ];
-
-        for cost in costs {
-            for order in orders {
-                for r in [4, 8, 12, 18] {
-                    assert_eq!(
-                        empirical_bms_jet_schedule(cost, order, r),
-                        EmpiricalBmsJetSchedule::FixedWidthFromPlan,
-                        "cost={cost:?} order={order:?} r={r} must reuse one fixed-width plan",
-                    );
-                }
-                for r in [1, 2, 3, 5, 7, 9, 16, 19, 32, 128] {
-                    assert_eq!(
-                        empirical_bms_jet_schedule(cost, order, r),
-                        EmpiricalBmsJetSchedule::DynamicBatch {
-                            lanes: empirical_bms_runtime_batch_lanes(r),
-                        },
-                        "cost={cost:?} order={order:?} r={r} must use the bounded runtime schedule",
-                    );
-                }
-            }
+    fn empirical_bms_schedule_maps_common_widths_to_one_fixed_plan_932() {
+        for r in [4, 8, 12, 18] {
+            assert_eq!(
+                empirical_bms_jet_schedule(r),
+                EmpiricalBmsJetSchedule::FixedWidthFromPlan,
+                "r={r} must reuse one fixed-width plan",
+            );
+        }
+        for r in [1, 2, 3, 5, 7, 9, 16, 19, 32, 128] {
+            assert_eq!(
+                empirical_bms_jet_schedule(r),
+                EmpiricalBmsJetSchedule::DynamicBatch {
+                    lanes: empirical_bms_runtime_batch_lanes(r),
+                },
+                "r={r} must use the bounded runtime schedule",
+            );
         }
     }
 
