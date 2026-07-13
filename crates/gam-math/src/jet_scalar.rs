@@ -344,8 +344,11 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
     ) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         assert_eq!(inputs.len(), coefficients.dimension());
-        // `FixedRuntimeJet` is `repr(transparent)` over `S`, so a slice has the
-        // same element layout, alignment, length, and provenance.
+        // SAFETY: `FixedRuntimeJet<S, K>` is `repr(transparent)` with exactly one
+        // non-zero-sized field of type `S`. Therefore each element has the same
+        // layout and alignment as `S`; the cast preserves the allocation,
+        // provenance, element count, and shared lifetime of `inputs`, and no
+        // mutable reference is created while the original slice is borrowed.
         let inner =
             unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
         Self {
