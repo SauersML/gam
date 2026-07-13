@@ -675,7 +675,7 @@ fn top_factor_birth_decoder(
     // factor-selection behavior on non-circle residuals is unchanged. The circle
     // detection + its noise floor are derived from the SAME residual, no new constant.
     if let Some(circle) = residual_principal_birth_candidate(term, residual) {
-        if circle.circle_coords.is_some() {
+        if circle.circle().is_some() {
             return Some(circle);
         }
     }
@@ -1293,21 +1293,16 @@ pub fn fit_stagewise(
         // parameterizes the born circle with the TEMPLATE's coordinate (the wrong
         // phase for a fresh disjoint circle). The rank-1 / shared-factor fallback
         // keeps the historical DC-row seed + race.
-        let born_move = match &seed.circle_coords {
-            Some(coords) => crate::structure_harvest::born_circle_atom(
+        let born_move = match &seed.kind {
+            BirthSeedKind::Circle(circle) => crate::structure_harvest::born_circle_atom(
                 &term,
                 &rho,
-                template_circle_geometry(&term)
-                    .cloned()
-                    .ok_or_else(|| {
-                        "fit_stagewise: circle seed requires the template atom's persisted periodic geometry plan"
-                            .to_string()
-                    })?,
+                circle.geometry.clone(),
                 seed.decoder.clone(),
-                coords.clone(),
-                seed.circle_gate.clone().unwrap_or_else(|| vec![0.0; n]),
+                circle.coords.clone(),
+                circle.gate.clone(),
             ),
-            None => apply_structure_move(
+            BirthSeedKind::ResidualFactor => apply_structure_move(
                 &term,
                 &rho,
                 &StructureMove::Birth { candidate: 0 },
@@ -1940,21 +1935,16 @@ fn race_birth_seed(
     let faer_seq_race_guard = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
     let k = term.k_atoms();
     let n = term.assignment.logits.nrows();
-    let born_move = match &seed.circle_coords {
-        Some(coords) => crate::structure_harvest::born_circle_atom(
+    let born_move = match &seed.kind {
+        BirthSeedKind::Circle(circle) => crate::structure_harvest::born_circle_atom(
             term,
             rho,
-            template_circle_geometry(term)
-                .cloned()
-                .ok_or_else(|| {
-                    "race_birth_seed: circle seed requires the template atom's persisted periodic geometry plan"
-                        .to_string()
-                })?,
+            circle.geometry.clone(),
             seed.decoder.clone(),
-            coords.clone(),
-            seed.circle_gate.clone().unwrap_or_else(|| vec![0.0; n]),
+            circle.coords.clone(),
+            circle.gate.clone(),
         ),
-        None => apply_structure_move(
+        BirthSeedKind::ResidualFactor => apply_structure_move(
             term,
             rho,
             &StructureMove::Birth { candidate: 0 },
@@ -1977,9 +1967,11 @@ fn race_birth_seed(
     // Support: a circle seed's own-presence gate marks the rows it can fire on
     // (finite gate); a shared-factor DC seed is global (all rows), which forces a
     // singleton accept (batched round == serial round on non-circle residuals).
-    let support: Vec<usize> = match &seed.circle_gate {
-        Some(g) => (0..n).filter(|&i| g[i].is_finite()).collect(),
-        None => (0..n).collect(),
+    let support: Vec<usize> = match &seed.kind {
+        BirthSeedKind::Circle(circle) => {
+            (0..n).filter(|&row| circle.gate[row].is_finite()).collect()
+        }
+        BirthSeedKind::ResidualFactor => (0..n).collect(),
     };
     // Output-dim support: the columns the born decoder actually writes. A circle in
     // an orthogonal ambient plane occupies only its 2 (cos/sin) output dims, so a
@@ -2198,7 +2190,7 @@ pub fn fit_stagewise_batched(
             .planes
             .iter()
             .map(|c| plane_to_birth_seed(&term, c))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         if seeds.is_empty() {
             let Some(fallback) = top_factor_birth_decoder(&term, &model, residual.view())
                 .or_else(|| residual_principal_birth_candidate(&term, residual.view()))
@@ -2404,9 +2396,7 @@ pub fn terminal_joint_assembly(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifold::{
-        AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
-    };
+    use crate::manifold::{AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom};
 
     /// Unscreened pooled-residual covariance oracle: `Σ` fit on the full
     /// `R = target − fitted` with no stratum-local floor screen. Production
@@ -2788,15 +2778,15 @@ mod tests {
             "disjoint block-diagonal residual must yield a fallback candidate \
              (structure above the derived MP noise floor)",
         );
+        assert!(
+            seed.circle().is_none(),
+            "unequal independent signals must NOT be seeded as a circle"
+        );
         let (decoder, energy) = (seed.decoder, seed.energy);
         assert!(energy > 0.0 && energy.is_finite());
         // Two UNEQUAL independent signals (var 4 vs 2.25) are NOT a circle — the
         // eigenvalue-degeneracy gate rejects the 2-plane, so this exercises the
         // rank-1 row-0 fallback (circle_coords None, direction on the constant row).
-        assert!(
-            seed.circle_coords.is_none(),
-            "unequal independent signals must NOT be seeded as a circle"
-        );
         // The chosen direction must be a real signal direction (mass on channels 0-3),
         // not a noise channel.
         let sig_mass: f64 = (0..4).map(|j| decoder[[0, j]].powi(2)).sum();
@@ -2854,10 +2844,11 @@ mod tests {
         }
         let seed = residual_principal_birth_candidate(&term, residual.view())
             .expect("a real circle residual must yield a birth candidate");
-        let born_coords = seed.circle_coords.clone().expect(
-            "a circle residual must be seeded as a rank-2 CIRCLE (circle_coords Some), \
-             not a DC direction",
-        );
+        let born_coords = seed
+            .circle()
+            .expect("a circle residual must be seeded as a rank-2 circle, not a DC direction")
+            .coords
+            .clone();
 
         // Harmonic (cos/sin) rows carry the mass; the DC row-0 is ~0.
         let dc: f64 = (0..p)
@@ -2964,7 +2955,7 @@ mod tests {
         let clean_seed = residual_principal_birth_candidate(&term, clean.view())
             .expect("clean circle must yield a birth candidate");
         assert!(
-            clean_seed.circle_coords.is_some(),
+            clean_seed.circle().is_some(),
             "positive control: a clean single circle must be seeded as a rank-2 circle"
         );
 
@@ -2983,7 +2974,7 @@ mod tests {
         let blend_seed = residual_principal_birth_candidate(&term, blend.view())
             .expect("blend residual still yields a (rank-1) birth candidate");
         assert!(
-            blend_seed.circle_coords.is_none(),
+            blend_seed.circle().is_none(),
             "κ-null certificate must REJECT the two-circle blend (κ≈1.5 > analytic-anchor \
              gate) and fall through to the rank-1 seed, not born it as a clean circle"
         );
@@ -3029,10 +3020,10 @@ mod tests {
 
         let seed = residual_principal_birth_candidate(&term, residual.view())
             .expect("dense torus must yield a birth candidate");
-        let dec =
-            seed.circle_coords.as_ref().map(|_| &seed.decoder).expect(
-                "dense torus must be seeded as a CLEAN rank-2 circle (κ-deflation), not DC",
-            );
+        let dec = seed
+            .circle()
+            .map(|_| &seed.decoder)
+            .expect("dense torus must be seeded as a CLEAN rank-2 circle (κ-deflation), not DC");
 
         // Per-circle energy fraction of the born 2-plane (cos/sin rows on channels 2c,2c+1).
         let total: f64 = (0..p)
@@ -3121,14 +3112,12 @@ mod tests {
         // The disjoint principal path seeds the circle with the OWN-presence gate.
         let seed = residual_principal_birth_candidate(&term, residual.view())
             .expect("an incumbent-sparse circle must still yield a birth candidate");
-        let born_coords = seed
-            .circle_coords
-            .clone()
+        let circle = seed
+            .circle()
             .expect("residual must be seeded as a rank-2 circle");
-        let gate = seed
-            .circle_gate
-            .clone()
-            .expect("a circle seed must carry the own-presence gate");
+        let born_geometry = circle.geometry.clone();
+        let born_coords = circle.coords.clone();
+        let gate = circle.gate.clone();
         // Presence is detected on the circle's rows [h,n) (finite gate), not [0,h).
         let present_on_circle = (h..n).filter(|&i| gate[i].is_finite()).count();
         let present_off_circle = (0..h).filter(|&i| gate[i].is_finite()).count();
@@ -3143,13 +3132,7 @@ mod tests {
         let (child, mut child_rho) = crate::structure_harvest::born_circle_atom(
             &term,
             &rho,
-            SaeAtomGeometryPlan::new(
-                SaeAtomBasisKind::Periodic,
-                1,
-                SaeBasisResolution::PeriodicHarmonics { order: 1 },
-                SaeReferenceMetricPlan::UnitCircle,
-            )
-            .unwrap(),
+            born_geometry,
             seed.decoder.clone(),
             born_coords,
             gate,
@@ -3275,14 +3258,14 @@ mod tests {
             .expect("the entangled path must yield a birth seed");
         // MIRROR: the entangled path now seeds a rank-2 CIRCLE, not a DC row.
         assert!(
-            seed.circle_coords.is_some(),
+            seed.circle().is_some(),
             "top_factor_birth_decoder must MIRROR the #2101 circle seed on a degenerate \
              2-plane residual (circle_coords Some), not the flat DC seed"
         );
-        let gate = seed
-            .circle_gate
-            .clone()
-            .expect("the mirrored circle seed must carry the own-presence gate");
+        let gate = &seed
+            .circle()
+            .expect("the mirrored circle seed must carry typed circle state")
+            .gate;
         assert!(
             gate.iter().filter(|g| g.is_finite()).count() > n / 2,
             "the mirrored circle must mark its present rows with a finite own-presence gate"
@@ -3470,8 +3453,17 @@ mod tests {
         BirthSeed {
             decoder,
             energy: 1.0,
-            circle_coords: Some(phases),
-            circle_gate: Some(gate),
+            kind: BirthSeedKind::Circle(CircleBirthSeed {
+                geometry: SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Periodic,
+                    1,
+                    SaeBasisResolution::PeriodicHarmonics { order: 1 },
+                    SaeReferenceMetricPlan::UnitCircle,
+                )
+                .unwrap(),
+                coords: phases,
+                gate,
+            }),
         }
     }
 

@@ -335,6 +335,9 @@ pub(crate) struct GlsWiggleSecondDirCoeffs {
 }
 
 pub(crate) struct GlsWiggleFirstDirCoeffs {
+    pub(crate) coeff_mm_base: Array1<f64>,
+    pub(crate) coeff_ml_base: Array1<f64>,
+    pub(crate) coeff_ll_base: Array1<f64>,
     pub(crate) coeff_mm_u: Array1<f64>,
     pub(crate) coeff_ml_u: Array1<f64>,
     pub(crate) coeff_ll_u: Array1<f64>,
@@ -343,6 +346,8 @@ pub(crate) struct GlsWiggleFirstDirCoeffs {
     pub(crate) scale_wiggle_u: Array1<f64>,
     pub(crate) mean_wiggle_base: Array1<f64>,
     pub(crate) gradient_mu_base: Array1<f64>,
+    pub(crate) gradient_ls_base: Array1<f64>,
+    pub(crate) gradient_ls_u: Array1<f64>,
     pub(crate) scale_wiggle_base: Array1<f64>,
     pub(crate) hessian_mm_base: Array1<f64>,
     pub(crate) hessian_mm_u: Array1<f64>,
@@ -360,6 +365,10 @@ pub(crate) fn gls_wiggle_first_directional_coeffs(
     let base = &tower.base;
     let first = &tower.first;
     let d = &geom.dq_dq0;
+    let coeff_mm_base = &base.hessian_mm * &d.mapv(|value| value * value)
+        + &base.gradient_mu * &geom.d2q_dq02;
+    let coeff_ml_base = &base.hessian_ml * d;
+    let coeff_ll_base = base.hessian_ll.clone();
     let coeff_mm_u = &first.hessian_mm * &d.mapv(|value| value * value)
         + &(2.0 * &base.hessian_mm * d * s1_u)
         + &(&first.gradient_mu * &geom.d2q_dq02)
@@ -371,6 +380,9 @@ pub(crate) fn gls_wiggle_first_directional_coeffs(
     let scale_wiggle_u = first.hessian_ml.clone();
     let mean_wiggle_base = &base.hessian_mm * d;
     GlsWiggleFirstDirCoeffs {
+        coeff_mm_base,
+        coeff_ml_base,
+        coeff_ll_base,
         coeff_mm_u,
         coeff_ml_u,
         coeff_ll_u,
@@ -379,6 +391,8 @@ pub(crate) fn gls_wiggle_first_directional_coeffs(
         scale_wiggle_u,
         mean_wiggle_base,
         gradient_mu_base: base.gradient_mu.clone(),
+        gradient_ls_base: base.gradient_ls.clone(),
+        gradient_ls_u: first.gradient_ls.clone(),
         scale_wiggle_base: base.hessian_ml.clone(),
         hessian_mm_base: base.hessian_mm.clone(),
         hessian_mm_u: first.hessian_mm.clone(),
@@ -711,6 +725,7 @@ impl GaussianLocationScaleWiggleFamily {
             scale_wiggle_base,
             hessian_mm_base,
             hessian_mm_u,
+            ..
         } = gls_wiggle_first_directional_coeffs(&rows, &geom, &q_u, &zeta, &s1_u, &g2_u);
 
         let h_mm = xt_diag_x_dense(xmu, &coeff_mm_u)?;
@@ -784,6 +799,7 @@ impl GaussianLocationScaleWiggleFamily {
             scale_wiggle_base,
             hessian_mm_base,
             hessian_mm_u,
+            ..
         } = gls_wiggle_first_directional_coeffs(&rows, &geom, &q_u, &zeta, &s1_u, &g2_u);
 
         // Pair-coefficient bundles. For (0=X_mu, 3=B'): combine

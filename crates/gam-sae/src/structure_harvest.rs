@@ -81,19 +81,15 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
 use crate::atom_codes::SparseAtomCodes;
-use crate::basis::{
-    CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
-    MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SaeBasisSecondJet, SphereChartEvaluator,
-    TorusHarmonicEvaluator,
-};
+use crate::basis::SaeBasisSecondJet;
 use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
 use crate::frames::GrassmannFrame;
 use crate::manifold::{
     AssignmentMode, AtlasSeamKind, GraphStructureSelection, LearnedGraphAtom, OccupancyLaw,
     SAE_MAX_PERIODIC_HARMONICS, SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisResolution,
     SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SaeReferenceMetricPlan,
-    SphereChartTransition, UnitSpeedChartTransition,
-    amplitude_concentration_certificate, classify_occupancy_interval,
+    SphereChartTransition, UnitSpeedChartTransition, amplitude_concentration_certificate,
+    classify_occupancy_interval,
 };
 use crate::migration_ledger::SaeMigrationLedger;
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
@@ -3471,9 +3467,7 @@ fn race_birth_topology(
     // flexible flat/patch fit override that true topology. Only a flat verdict — the
     // least-bad chart for a folded plane — can be a fold worth unrolling.
     let template_is_sheet = matches!(
-        template_winner
-            .as_ref()
-            .map(|(fit, _)| fit.geometry.kind()),
+        template_winner.as_ref().map(|(fit, _)| fit.geometry.kind()),
         Some(SaeAtomBasisKind::EuclideanPatch)
     );
     let intrinsic_winner = if template_is_sheet {
@@ -4190,17 +4184,10 @@ fn build_intrinsic_primary_specs(
     Ok(Some(specs))
 }
 
-/// Duchon nullspace order `m` for the raced 2-D thin-plate sheet (#2240) —
-/// DERIVED (identity with the seed builder): mirrors the FFI seed path's
-/// `sae_duchon_atom_m(dim) = dim/2 + 2`, i.e. `m = 3` (degree-2 polynomial
-/// nullspace) at `dim = 2`, so the race scores the same function space the
-/// winning seed will build.
-const DUCHON_SHEET_M: usize = 3;
-
-/// Polynomial-nullspace dimension of the `DUCHON_SHEET_M` thin-plate sheet in
-/// 2-D — DERIVED: monomials of total degree ≤ 2 in two variables, `C(2+2, 2) =
-/// 6`. The center count must clear this for the kernel block to have positive
-/// rank.
+/// Polynomial-nullspace dimension of the plan-declared 2-D thin-plate sheet.
+/// The geometry authority derives `m = d/2 + 2 = 3`, so the nullspace contains
+/// the six monomials of total degree at most two. The center count must clear
+/// this dimension for the kernel block to have positive rank.
 const DUCHON_SHEET_NULLSPACE_DIM: usize = 6;
 
 /// Race-time center budget for the 2-D Duchon-sheet candidate (#2240) —
@@ -8131,10 +8118,7 @@ mod tests {
         assert!(
             has_cylinder,
             "the d=2 topology-race candidate set MUST include the Cylinder kind; got {:?}",
-            specs
-                .iter()
-                .map(|s| s.geometry.kind())
-                .collect::<Vec<_>>()
+            specs.iter().map(|s| s.geometry.kind()).collect::<Vec<_>>()
         );
         let has_torus = specs
             .iter()
@@ -8668,8 +8652,7 @@ mod tests {
     fn curl_killer_demo_planted_circle_wins_race() {
         let (term, _rho) = shattered_plane_term(false);
         let residuals = residuals_of(&term);
-        let cands =
-            curl_candidates(&term, residuals.view(), &CurlConfig::default()).unwrap();
+        let cands = curl_candidates(&term, residuals.view(), &CurlConfig::default()).unwrap();
         assert!(
             !cands.is_empty(),
             "curl must recover the shattered circle before the race"

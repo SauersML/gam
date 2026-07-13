@@ -294,6 +294,136 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         }
         Ok(rows)
     }
+
+    fn first_directional_rows(
+        &self,
+        d_eta_t: &Array1<f64>,
+        d_eta_ls: &Array1<f64>,
+        u_w: ArrayView1<'_, f64>,
+    ) -> Result<BinomialWiggleFirstDirectionalRows, String> {
+        use gam_math::jet_scalar::OneSeed;
+
+        let n = self.family.y.len();
+        assert_eq!(d_eta_t.len(), n);
+        assert_eq!(d_eta_ls.len(), n);
+        let mut rows = BinomialWiggleFirstDirectionalRows::zeros(n);
+        let probe_terms = [
+            (3, [1.0, 0.0, 0.0, 0.0, 0.0]),
+            (4, [0.0, 1.0, 0.0, 0.0, 0.0]),
+            (5, [0.0, 0.0, 1.0, 0.0, 0.0]),
+        ];
+        for row in 0..n {
+            let values = [self.eta_t[row], self.eta_ls[row], 0.0, 0.0, 0.0, 0.0];
+            let direction = [d_eta_t[row], d_eta_ls[row], 1.0, 0.0, 0.0, 0.0];
+            let primaries: [OneSeed<6>; 6] = std::array::from_fn(|axis| {
+                OneSeed::seed_direction(values[axis], axis, direction[axis])
+            });
+            let warp = self.linear_basis_stack(row, self.beta_w.view(), Some(self.etaw[row]));
+            let direction_stack = self.linear_basis_stack(row, u_w, None);
+            let mut terms = [(0, [0.0; 5]); 4];
+            terms[0] = (2, direction_stack);
+            terms[1..].copy_from_slice(&probe_terms);
+            let h = self
+                .eval_fixed(row, &primaries, warp, &terms, 3)?
+                .contracted_third();
+            rows.coeff_tt[row] = h[0][0];
+            rows.coeff_tl[row] = h[0][1];
+            rows.coeff_ll[row] = h[1][1];
+            rows.coeff_tw_b[row] = h[0][3];
+            rows.coeff_tw_d[row] = h[0][4];
+            rows.coeff_tw_dd[row] = h[0][5];
+            rows.coeff_lw_b[row] = h[1][3];
+            rows.coeff_lw_d[row] = h[1][4];
+            rows.coeff_lw_dd[row] = h[1][5];
+            rows.coeff_ww_bb[row] = h[3][3];
+            rows.coeff_ww_bd[row] = h[3][4];
+        }
+        Ok(rows)
+    }
+
+    fn second_directional_rows(
+        &self,
+        d_eta_t_u: &Array1<f64>,
+        d_eta_ls_u: &Array1<f64>,
+        u_w: ArrayView1<'_, f64>,
+        d_eta_t_v: &Array1<f64>,
+        d_eta_ls_v: &Array1<f64>,
+        v_w: ArrayView1<'_, f64>,
+    ) -> Result<BinomialWiggleSecondDirectionalRows, String> {
+        use gam_math::jet_scalar::TwoSeed;
+
+        let n = self.family.y.len();
+        assert_eq!(d_eta_t_u.len(), n);
+        assert_eq!(d_eta_ls_u.len(), n);
+        assert_eq!(d_eta_t_v.len(), n);
+        assert_eq!(d_eta_ls_v.len(), n);
+        let mut rows = BinomialWiggleSecondDirectionalRows::zeros(n);
+        let probe_terms = [
+            (4, [1.0, 0.0, 0.0, 0.0, 0.0]),
+            (5, [0.0, 1.0, 0.0, 0.0, 0.0]),
+            (6, [0.0, 0.0, 1.0, 0.0, 0.0]),
+            (7, [0.0, 0.0, 0.0, 1.0, 0.0]),
+        ];
+        for row in 0..n {
+            let values = [
+                self.eta_t[row],
+                self.eta_ls[row],
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ];
+            let direction_u = [
+                d_eta_t_u[row],
+                d_eta_ls_u[row],
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ];
+            let direction_v = [
+                d_eta_t_v[row],
+                d_eta_ls_v[row],
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ];
+            let primaries: [TwoSeed<8>; 8] = std::array::from_fn(|axis| {
+                TwoSeed::seed(values[axis], axis, direction_u[axis], direction_v[axis])
+            });
+            let warp = self.linear_basis_stack(row, self.beta_w.view(), Some(self.etaw[row]));
+            let mut terms = [(0, [0.0; 5]); 6];
+            terms[0] = (2, self.linear_basis_stack(row, u_w, None));
+            terms[1] = (3, self.linear_basis_stack(row, v_w, None));
+            terms[2..].copy_from_slice(&probe_terms);
+            let h = self
+                .eval_fixed(row, &primaries, warp, &terms, 4)?
+                .contracted_fourth();
+            rows.coeff_tt[row] = h[0][0];
+            rows.coeff_tl[row] = h[0][1];
+            rows.coeff_ll[row] = h[1][1];
+            rows.coeff_tw_b[row] = h[0][4];
+            rows.coeff_tw_d[row] = h[0][5];
+            rows.coeff_tw_dd[row] = h[0][6];
+            rows.coeff_tw_d3[row] = h[0][7];
+            rows.coeff_lw_b[row] = h[1][4];
+            rows.coeff_lw_d[row] = h[1][5];
+            rows.coeff_lw_dd[row] = h[1][6];
+            rows.coeff_lw_d3[row] = h[1][7];
+            rows.coeff_ww_bb[row] = h[4][4];
+            rows.coeff_ww_bd[row] = h[4][5];
+            rows.coeff_ww_bdd[row] = h[4][6];
+            rows.coeff_ww_dd[row] = h[5][5];
+        }
+        Ok(rows)
+    }
 }
 
 #[derive(Clone)]
@@ -2934,10 +3064,8 @@ impl BinomialWiggleOrder2Rows {
     }
 }
 
-/// Per-row coefficient arrays for the BLS Wiggle joint first-directional
-/// Hessian derivative `D_β H_L[u]`, shared by the dense `_directional_derivative`
-/// assembly and the matrix-free `bls_wiggle_directional_operator`.
-pub(crate) struct BinomialWiggleDhRowCoeffs {
+/// Typed-probe lowering of `D H[u]` from the canonical wiggle row program.
+pub(crate) struct BinomialWiggleFirstDirectionalRows {
     pub(crate) coeff_tt: Array1<f64>,
     pub(crate) coeff_tl: Array1<f64>,
     pub(crate) coeff_ll: Array1<f64>,
@@ -2947,141 +3075,70 @@ pub(crate) struct BinomialWiggleDhRowCoeffs {
     pub(crate) coeff_lw_b: Array1<f64>,
     pub(crate) coeff_lw_d: Array1<f64>,
     pub(crate) coeff_lw_dd: Array1<f64>,
-    pub(crate) coeffww_bb: Array1<f64>,
-    pub(crate) coeffww_db: Array1<f64>,
+    pub(crate) coeff_ww_bb: Array1<f64>,
+    pub(crate) coeff_ww_bd: Array1<f64>,
 }
 
-/// All references needed to evaluate [`BinomialWiggleDhRowCoeffs`].
-pub(crate) struct BinomialWiggleDhRowInputs<'a> {
-    pub(crate) core0: &'a BinomialLocationScaleCore,
-    pub(crate) eta_t: &'a Array1<f64>,
-    pub(crate) etaw: &'a Array1<f64>,
-    pub(crate) sigma: &'a Array1<f64>,
-    pub(crate) m: &'a Array1<f64>,
-    pub(crate) g2: &'a Array1<f64>,
-    pub(crate) g3: &'a Array1<f64>,
-    pub(crate) b0: &'a Array2<f64>,
-    pub(crate) d0: &'a Array2<f64>,
-    pub(crate) dd0: &'a Array2<f64>,
-    pub(crate) uw: &'a Array1<f64>,
-    pub(crate) d_eta_t: &'a Array1<f64>,
-    pub(crate) d_eta_ls: &'a Array1<f64>,
+impl BinomialWiggleFirstDirectionalRows {
+    fn zeros(n: usize) -> Self {
+        Self {
+            coeff_tt: Array1::zeros(n),
+            coeff_tl: Array1::zeros(n),
+            coeff_ll: Array1::zeros(n),
+            coeff_tw_b: Array1::zeros(n),
+            coeff_tw_d: Array1::zeros(n),
+            coeff_tw_dd: Array1::zeros(n),
+            coeff_lw_b: Array1::zeros(n),
+            coeff_lw_d: Array1::zeros(n),
+            coeff_lw_dd: Array1::zeros(n),
+            coeff_ww_bb: Array1::zeros(n),
+            coeff_ww_bd: Array1::zeros(n),
+        }
+    }
+}
+
+/// Typed-probe lowering of `D² H[u,v]` from the canonical wiggle row program.
+pub(crate) struct BinomialWiggleSecondDirectionalRows {
+    pub(crate) coeff_tt: Array1<f64>,
+    pub(crate) coeff_tl: Array1<f64>,
+    pub(crate) coeff_ll: Array1<f64>,
+    pub(crate) coeff_tw_b: Array1<f64>,
+    pub(crate) coeff_tw_d: Array1<f64>,
+    pub(crate) coeff_tw_dd: Array1<f64>,
+    pub(crate) coeff_tw_d3: Array1<f64>,
+    pub(crate) coeff_lw_b: Array1<f64>,
+    pub(crate) coeff_lw_d: Array1<f64>,
+    pub(crate) coeff_lw_dd: Array1<f64>,
+    pub(crate) coeff_lw_d3: Array1<f64>,
+    pub(crate) coeff_ww_bb: Array1<f64>,
+    pub(crate) coeff_ww_bd: Array1<f64>,
+    pub(crate) coeff_ww_bdd: Array1<f64>,
+    pub(crate) coeff_ww_dd: Array1<f64>,
+}
+
+impl BinomialWiggleSecondDirectionalRows {
+    fn zeros(n: usize) -> Self {
+        Self {
+            coeff_tt: Array1::zeros(n),
+            coeff_tl: Array1::zeros(n),
+            coeff_ll: Array1::zeros(n),
+            coeff_tw_b: Array1::zeros(n),
+            coeff_tw_d: Array1::zeros(n),
+            coeff_tw_dd: Array1::zeros(n),
+            coeff_tw_d3: Array1::zeros(n),
+            coeff_lw_b: Array1::zeros(n),
+            coeff_lw_d: Array1::zeros(n),
+            coeff_lw_dd: Array1::zeros(n),
+            coeff_lw_d3: Array1::zeros(n),
+            coeff_ww_bb: Array1::zeros(n),
+            coeff_ww_bd: Array1::zeros(n),
+            coeff_ww_bdd: Array1::zeros(n),
+            coeff_ww_dd: Array1::zeros(n),
+        }
+    }
 }
 
 impl BinomialLocationScaleWiggleFamily {
-    /// Per-row coefficient loop for the joint first-directional Hessian
-    /// derivative. The dense and operator paths build the identical 11
-    /// coefficient arrays from the same canonical directional-q formulas.
-    pub(crate) fn binomial_wiggle_dh_row_coeffs(
-        &self,
-        n: usize,
-        inputs: &BinomialWiggleDhRowInputs<'_>,
-    ) -> BinomialWiggleDhRowCoeffs {
-        let BinomialWiggleDhRowInputs {
-            core0,
-            eta_t,
-            etaw,
-            sigma,
-            m,
-            g2,
-            g3,
-            b0,
-            d0,
-            dd0,
-            uw,
-            d_eta_t,
-            d_eta_ls,
-        } = *inputs;
-
-        let mut coeff_tt = Array1::<f64>::zeros(n);
-        let mut coeff_tl = Array1::<f64>::zeros(n);
-        let mut coeff_ll = Array1::<f64>::zeros(n);
-        let mut coeff_tw_b = Array1::<f64>::zeros(n);
-        let mut coeff_tw_d = Array1::<f64>::zeros(n);
-        let mut coeff_tw_dd = Array1::<f64>::zeros(n);
-        let mut coeff_lw_b = Array1::<f64>::zeros(n);
-        let mut coeff_lw_d = Array1::<f64>::zeros(n);
-        let mut coeff_lw_dd = Array1::<f64>::zeros(n);
-        let mut coeffww_bb = Array1::<f64>::zeros(n);
-        let mut coeffww_db = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let q_i = core0.q0[i] + etaw[i];
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                q_i,
-                core0.mu[i],
-                core0.dmu_dq[i],
-                core0.d2mu_dq2[i],
-                core0.d3mu_dq3[i],
-                &self.link_kind,
-            );
-            let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i]);
-            let dq0 = nonwiggle_q_directional(q0, d_eta_t[i], d_eta_ls[i]);
-
-            let br = b0.row(i);
-            let dr = d0.row(i);
-            let ddr = dd0.row(i);
-            let duw_i = dr.dot(uw);
-            let dduw_i = ddr.dot(uw);
-
-            let delta_m = g2[i] * dq0.delta_q + duw_i;
-            let delta_g2 = g3[i] * dq0.delta_q + dduw_i;
-
-            let q_t = m[i] * q0.q_t;
-            let q_ls = m[i] * q0.q_ls;
-            let q_tt = g2[i] * q0.q_t * q0.q_t;
-            let q_tl = g2[i] * q0.q_t * q0.q_ls + m[i] * q0.q_tl;
-            let q_ll = g2[i] * q0.q_ls * q0.q_ls + m[i] * q0.q_ll;
-
-            let delta_q_t = delta_m * q0.q_t + m[i] * dq0.delta_q_t;
-            let delta_q_ls = delta_m * q0.q_ls + m[i] * dq0.delta_q_ls;
-            let delta_q_tt = delta_g2 * q0.q_t * q0.q_t + g2[i] * 2.0 * q0.q_t * dq0.delta_q_t;
-            let delta_q_tl = delta_g2 * q0.q_t * q0.q_ls
-                + g2[i] * (dq0.delta_q_t * q0.q_ls + q0.q_t * dq0.delta_q_ls)
-                + delta_m * q0.q_tl
-                + m[i] * dq0.delta_q_tl;
-            let delta_q_ll = delta_g2 * q0.q_ls * q0.q_ls
-                + g2[i] * 2.0 * q0.q_ls * dq0.delta_q_ls
-                + delta_m * q0.q_ll
-                + m[i] * dq0.delta_q_ll;
-
-            let delta_q = m[i] * dq0.delta_q + br.dot(uw);
-
-            coeff_tt[i] = directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, delta_q, q_t, q_t, q_tt, delta_q_t, delta_q_t, delta_q_tt,
-            );
-            coeff_tl[i] = directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, delta_q, q_t, q_ls, q_tl, delta_q_t, delta_q_ls, delta_q_tl,
-            );
-            coeff_ll[i] = directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, delta_q, q_ls, q_ls, q_ll, delta_q_ls, delta_q_ls, delta_q_ll,
-            );
-            coeff_tw_b[i] = m3 * delta_q * q_t + m2 * delta_q_t;
-            coeff_tw_d[i] = m2 * (q_t * dq0.delta_q + delta_q * q0.q_t) + m1 * dq0.delta_q_t;
-            coeff_tw_dd[i] = m1 * dq0.delta_q * q0.q_t;
-            coeff_lw_b[i] = m3 * delta_q * q_ls + m2 * delta_q_ls;
-            coeff_lw_d[i] = m2 * (q_ls * dq0.delta_q + delta_q * q0.q_ls) + m1 * dq0.delta_q_ls;
-            coeff_lw_dd[i] = m1 * dq0.delta_q * q0.q_ls;
-            coeffww_bb[i] = m3 * delta_q;
-            coeffww_db[i] = m2 * dq0.delta_q;
-        }
-
-        BinomialWiggleDhRowCoeffs {
-            coeff_tt,
-            coeff_tl,
-            coeff_ll,
-            coeff_tw_b,
-            coeff_tw_d,
-            coeff_tw_dd,
-            coeff_lw_b,
-            coeff_lw_d,
-            coeff_lw_dd,
-            coeffww_bb,
-            coeffww_db,
-        }
-    }
-
     /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
     ///
     /// The two-output map is (η_threshold, η_log_sigma).

@@ -2468,8 +2468,10 @@ pub fn sas_inverse_link_jetwith_param_partials(
     let eta = finite_inverse_link_eta("SAS inverse link", eta)?;
     let asinh = asinh_jet5(eta);
     let (ld_eff, dld_eff_draw) = sas_effective_log_delta(log_delta);
+    let d2ld_eff_draw2 = tanh_bound_d2(log_delta, SAS_LOG_DELTA_BOUND);
     let delta = ld_eff.exp();
     let ddelta_draw = delta * dld_eff_draw;
+    let d2delta_draw2 = delta * (dld_eff_draw * dld_eff_draw + d2ld_eff_draw2);
     let u_raw = delta * asinh.value + epsilon;
     let u = tanh_bound(u_raw, SAS_U_CLAMP);
     let g1 = tanh_bound_d1(u_raw, SAS_U_CLAMP);
@@ -2556,10 +2558,56 @@ pub fn sas_inverse_link_jetwith_param_partials(
         + g1 * r3t_ld;
     let djet_dlog_delta = param_partials(u_ld, u1_ld, u2_ld, u3_ld);
 
+    // Exact parameter Hessians needed by the profiled likelihood. Only `mu`
+    // and `d1` enter the scalar log-survival/log-density terms, so carry the
+    // two-variable chain to second parameter order without constructing unused
+    // Hessians for d2/d3. Parameter order is `(epsilon, raw_log_delta)`.
+    let r_t = [rt_eps, rt_ld];
+    let r1_t = [r1t_eps, r1t_ld];
+    let r_tt = [[0.0, 0.0], [0.0, d2delta_draw2 * asinh.value]];
+    let r1_tt = [[0.0, 0.0], [0.0, d2delta_draw2 * a1]];
+    let u_t = [u_eps, u_ld];
+    let u1_t = [u1_eps, u1_ld];
+    let z_t = [c * u_t[0], c * u_t[1]];
+    let z1_t = [
+        s * u_t[0] * u1 + c * u1_t[0],
+        s * u_t[1] * u1 + c * u1_t[1],
+    ];
+    let mut d2mu_dparams2 = Array2::<f64>::zeros((2, 2));
+    let mut d2d1_dparams2 = Array2::<f64>::zeros((2, 2));
+    for j in 0..2 {
+        for k in j..2 {
+            let u_jk = g2 * r_t[j] * r_t[k] + g1 * r_tt[j][k];
+            let u1_jk = g3 * r_t[j] * r_t[k] * r1
+                + g2 * r_tt[j][k] * r1
+                + g2 * r_t[j] * r1_t[k]
+                + g2 * r_t[k] * r1_t[j]
+                + g1 * r1_tt[j][k];
+            let z_jk = s * u_t[j] * u_t[k] + c * u_jk;
+            let z1_jk = c * u_t[j] * u_t[k] * u1
+                + s * u_jk * u1
+                + s * u_t[j] * u1_t[k]
+                + s * u_t[k] * u1_t[j]
+                + c * u1_jk;
+            let mu_jk = base.d2 * z_t[j] * z_t[k] + base.d1 * z_jk;
+            let d1_jk = base.d3 * z_t[j] * z_t[k] * z1
+                + base.d2 * z_jk * z1
+                + base.d2 * z_t[j] * z1_t[k]
+                + base.d2 * z_t[k] * z1_t[j]
+                + base.d1 * z1_jk;
+            d2mu_dparams2[[j, k]] = mu_jk;
+            d2mu_dparams2[[k, j]] = mu_jk;
+            d2d1_dparams2[[j, k]] = d1_jk;
+            d2d1_dparams2[[k, j]] = d1_jk;
+        }
+    }
+
     Ok(SasJetWithParamPartials {
         jet,
         djet_depsilon,
         djet_dlog_delta,
+        d2mu_dparams2,
+        d2d1_dparams2,
     })
 }
 

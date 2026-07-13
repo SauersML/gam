@@ -4216,7 +4216,9 @@ pub(crate) fn owned_mode_outer_finalizer_rejects_certified_objective_mismatch() 
 #[test]
 pub(crate) fn owned_mode_outer_finalizer_preserves_active_jeffreys_profile_without_replay() {
     #[derive(Clone)]
-    struct ActiveJeffreysQuadraticFamily;
+    struct ActiveJeffreysQuadraticFamily {
+        evaluations: Arc<AtomicUsize>,
+    }
 
     impl CustomFamily for ActiveJeffreysQuadraticFamily {
         fn joint_jeffreys_term_required(&self) -> bool {
@@ -4227,6 +4229,7 @@ pub(crate) fn owned_mode_outer_finalizer_preserves_active_jeffreys_profile_witho
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
+            self.evaluations.fetch_add(1, Ordering::Relaxed);
             let beta = block_states[0].beta[0];
             Ok(FamilyEvaluation {
                 log_likelihood: -0.25 * beta * beta,
@@ -4257,7 +4260,9 @@ pub(crate) fn owned_mode_outer_finalizer_preserves_active_jeffreys_profile_witho
         }
     }
 
-    let family = ActiveJeffreysQuadraticFamily;
+    let family = ActiveJeffreysQuadraticFamily {
+        evaluations: Arc::new(AtomicUsize::new(0)),
+    };
     let specs = vec![ParameterBlockSpec {
         name: "active_jeffreys".to_string(),
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
@@ -4306,6 +4311,7 @@ pub(crate) fn owned_mode_outer_finalizer_preserves_active_jeffreys_profile_witho
     .expect("Jeffreys profile probe")
     .expect("absolute curvature below one must arm the Jeffreys profile");
     assert_ne!(phi.to_bits(), 0.0_f64.to_bits());
+    let evaluations_before_finalization = family.evaluations.load(Ordering::Relaxed);
 
     let certified_outer = certified_test_outer(rho.clone(), profiled.result.objective);
     let fit = fit_custom_family_fixed_log_lambdas_from_owned_mode(
@@ -4321,6 +4327,11 @@ pub(crate) fn owned_mode_outer_finalizer_preserves_active_jeffreys_profile_witho
     assert_eq!(
         fit.penalized_objective.to_bits(),
         certified_outer.final_value().to_bits()
+    );
+    assert_eq!(
+        family.evaluations.load(Ordering::Relaxed),
+        evaluations_before_finalization,
+        "owned-mode finalization must not call the family evaluator again",
     );
     assert!(
         fit.convergence_evidence()
