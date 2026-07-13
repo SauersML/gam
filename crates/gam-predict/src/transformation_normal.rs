@@ -66,7 +66,7 @@ impl PredictionTransform for TransformationNormalPredictor {
             mean: h,
             eta_se: None,
             mean_se: None,
-            covariance_corrected_used: false,
+            covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
 
@@ -166,6 +166,8 @@ impl PredictableModel for TransformationNormalPredictor {
             mean_upper: None,
             observation_lower: None,
             observation_upper: None,
+            point_covariance_source: InferenceCovarianceMode::Conditional,
+            uncertainty_covariance_source: None,
         };
         if options.include_observation_interval
             && let Some(level) = options.confidence_level

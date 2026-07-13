@@ -8106,7 +8106,7 @@ fn predict_columns(
             // (#812). The posterior-mean *point* stays conditional regardless of
             // mode (issue #398); only the reported uncertainty responds.
             let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
-                .unwrap_or(gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred);
+                .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected);
             let posterior_options = gam_predict::PosteriorMeanOptions {
                 confidence_level: Some(confidence_level),
                 covariance_mode,
@@ -8166,7 +8166,7 @@ fn predict_columns(
             // user-selectable, mirroring `gam predict --covariance-mode` and the
             // engine's `includeobservation_interval` switch.
             let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
-                .unwrap_or(gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred);
+                .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected);
             let includeobservation_interval = options.observation_interval.unwrap_or(false);
             let uncertainty_options = gam_predict::PredictUncertaintyOptions {
                 confidence_level,
@@ -8341,7 +8341,7 @@ fn predict_columns_conformal(
     let family = model_likelihood_spec(model);
 
     let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
-        .unwrap_or(gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred);
+        .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected);
     let uncertainty_options = gam_predict::PredictUncertaintyOptions {
         confidence_level: level,
         covariance_mode,

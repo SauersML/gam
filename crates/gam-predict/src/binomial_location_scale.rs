@@ -187,7 +187,7 @@ impl BinomialLocationScalePredictor {
             mean: with_se.mean,
             eta_se: with_se.mean_se.clone(),
             mean_se: with_se.mean_se,
-            covariance_corrected_used: false,
+            covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
 
@@ -428,7 +428,7 @@ impl BinomialLocationScalePredictor {
             mean,
             eta_se: Some(eta_se.clone()),
             mean_se: Some(eta_se),
-            covariance_corrected_used: false,
+            covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
 }
@@ -455,7 +455,7 @@ impl PredictionTransform for BinomialLocationScalePredictor {
                 let p_total = self.beta_threshold.len()
                     + self.beta_noise.len()
                     + self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
-                let (backend, covariance_corrected_used) = fit.select_uncertainty_backend(
+                let (backend, covariance_source) = fit.select_uncertainty_backend(
                     p_total,
                     covariance_mode,
                     "binomial location-scale",
@@ -468,7 +468,7 @@ impl PredictionTransform for BinomialLocationScalePredictor {
                     mean: prob,
                     eta_se: Some(response_se.clone()),
                     mean_se: Some(response_se),
-                    covariance_corrected_used,
+                    covariance_source,
                 })
             }
             PredictPass::PosteriorMean => self.posterior_mean_state(input, fit),

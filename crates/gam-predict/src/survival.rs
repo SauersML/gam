@@ -190,7 +190,7 @@ impl SurvivalPredictor {
 
     /// Survival point + η/mean standard errors from an explicit covariance
     /// `backend` (so the caller can select conditional vs. smoothing-corrected
-    /// covariance). The `covariance_corrected_used` flag is left `false`; the
+    /// covariance). The provenance source is conditional; the
     /// caller overrides it according to the backend it selected.
     fn state_from_backend(
         &self,
@@ -222,7 +222,7 @@ impl SurvivalPredictor {
             mean: survival_prob,
             eta_se: Some(eta_se),
             mean_se: Some(mean_se_vec),
-            covariance_corrected_used: false,
+            covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
 
@@ -244,7 +244,7 @@ impl SurvivalPredictor {
                 mean: survival_prob,
                 eta_se: None,
                 mean_se: None,
-                covariance_corrected_used: false,
+                covariance_source: InferenceCovarianceMode::Conditional,
             })
         }
     }
@@ -267,10 +267,10 @@ impl PredictionTransform for SurvivalPredictor {
                 // Select the covariance the caller requested and report which
                 // was used, instead of always using the conditional covariance.
                 let p_total = self.beta_threshold.len() + self.beta_log_sigma.len();
-                let (backend, covariance_corrected_used) =
+                let (backend, covariance_source) =
                     fit.select_uncertainty_backend(p_total, covariance_mode, "survival")?;
                 let mut state = self.state_from_backend(input, &backend)?;
-                state.covariance_corrected_used = covariance_corrected_used;
+                state.covariance_source = covariance_source;
                 Ok(state)
             }
             PredictPass::PosteriorMean => {
@@ -347,7 +347,7 @@ impl PredictionTransform for SurvivalPredictor {
                     mean,
                     eta_se: Some(eta_se),
                     mean_se: Some(mean_se),
-                    covariance_corrected_used: false,
+                    covariance_source: InferenceCovarianceMode::Conditional,
                 })
             }
         }

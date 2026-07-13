@@ -389,7 +389,7 @@ pub(crate) fn prediction_backend_from_model<'a>(
 pub(crate) fn infer_covariance_mode(mode: CovarianceModeArg) -> InferenceCovarianceMode {
     match mode {
         CovarianceModeArg::Conditional => InferenceCovarianceMode::Conditional,
-        CovarianceModeArg::Corrected => InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        CovarianceModeArg::Corrected => InferenceCovarianceMode::SmoothingCorrected,
     }
 }
 

@@ -309,12 +309,11 @@ pub enum ObservationInterval<'a> {
 
 /// Static metadata threaded into every [`PredictUncertaintyResult`].
 ///
-/// These fields are pure provenance — the requested covariance mode and whether
-/// a smoothing-corrected covariance was actually used — and are copied verbatim
-/// into the result so the engine, not each predictor, owns the struct shape.
+/// This field is pure provenance: the exact covariance definition consumed by
+/// the uncertainty calculation. It is copied verbatim into the result so the
+/// engine, not each predictor, owns the struct shape.
 pub struct UncertaintyProvenance {
-    pub covariance_mode_requested: InferenceCovarianceMode,
-    pub covariance_corrected_used: bool,
+    pub covariance_source: InferenceCovarianceMode,
 }
 
 /// Assemble a [`PredictUncertaintyResult`] from a predictor's already-computed
@@ -384,8 +383,7 @@ pub fn assemble_uncertainty_result(
         mean_upper,
         observation_lower,
         observation_upper,
-        covariance_mode_requested: provenance.covariance_mode_requested,
-        covariance_corrected_used: provenance.covariance_corrected_used,
+        covariance_source: provenance.covariance_source,
     })
 }
 
@@ -480,14 +478,10 @@ pub struct LinearState {
     /// Standard error of μ (delta-method, response scale). `None` when no
     /// covariance.
     pub mean_se: Option<Array1<f64>>,
-    /// Whether the standard errors in this state were derived from the
-    /// smoothing-corrected covariance (`true`) rather than the conditional
-    /// covariance (`false`). The full-uncertainty driver propagates this to the
-    /// result's `covariance_corrected_used` provenance flag, so it must reflect
-    /// the covariance actually consumed by `eta_se`/`mean_se` — not merely what
-    /// the caller requested. Point-state (fit-free) construction always reports
-    /// `false`.
-    pub covariance_corrected_used: bool,
+    /// Exact covariance definition consumed by `eta_se` / `mean_se`. The
+    /// full-uncertainty driver propagates it into the public result. Point-state
+    /// and posterior-mean construction use conditional covariance.
+    pub covariance_source: InferenceCovarianceMode,
 }
 
 /// Family-specific supplier for the shared predict pipeline.
@@ -528,8 +522,8 @@ pub trait PredictionTransform {
     /// carries the posterior covariance / penalized Hessian some predictors
     /// need, and `covariance_mode` selects which covariance (conditional vs.
     /// smoothing-corrected) the full-uncertainty SEs are built from. The
-    /// returned [`LinearState::covariance_corrected_used`] records which
-    /// covariance was actually consumed.
+    /// returned [`LinearState::covariance_source`] records which covariance was
+    /// actually consumed.
     ///
     /// The default services the full-uncertainty pass from the fit-free
     /// [`point_state`](PredictionTransform::point_state); predictors whose
@@ -679,7 +673,7 @@ pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
         )?;
         state.mean = posterior_state.mean;
     }
-    let covariance_corrected_used = state.covariance_corrected_used;
+    let covariance_source = state.covariance_source;
     let eta_se = state.eta_se.ok_or_else(|| {
         EstimationError::InvalidInput(
             "full uncertainty requires covariance (eta_se unavailable)".to_string(),
@@ -760,8 +754,7 @@ pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
         mean_bound_method_for(transform, &policy, &response_map, &mean_se),
         observation_interval,
         UncertaintyProvenance {
-            covariance_mode_requested: options.covariance_mode,
-            covariance_corrected_used,
+            covariance_source,
         },
     )
 }
@@ -821,6 +814,8 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
         mean_upper: None,
         observation_lower: None,
         observation_upper: None,
+        point_covariance_source: InferenceCovarianceMode::Conditional,
+        uncertainty_covariance_source: None,
     };
 
     let Some(level) = options.confidence_level else {
@@ -832,39 +827,38 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
     // conditional covariance). The posterior-mean *point* above stays
     // conditional; only the uncertainty responds.
     //
-    // `Conditional` keeps the posterior pass's own SE (no extra work, bitwise
-    // identical to prior behaviour). For the smoothing modes:
-    //   * when the fit carries a smoothing-corrected covariance, re-derive the
-    //     SEs from the full-uncertainty pass (which selects the corrected
-    //     backend);
-    //   * `…Required` with no correction available must error, exactly as the
-    //     full-uncertainty path's `select_uncertainty_backend` does — silently
-    //     downgrading to conditional would make the mode meaningless;
-    //   * `…Preferred` with no correction falls back to the conditional SEs.
+    // `Conditional` keeps the posterior pass's own SE. `SmoothingCorrected`
+    // re-derives the SEs from the full-uncertainty pass and errors if the fit
+    // cannot supply that exact covariance definition.
     let (eta_se, mean_se) = match options.covariance_mode {
         InferenceCovarianceMode::Conditional => (cond_eta_se, cond_mean_se),
-        mode if fit.beta_covariance_corrected().is_some() => {
-            match transform.linear_state(input, fit, PredictPass::FullUncertainty, mode) {
-                Ok(unc) => (
-                    unc.eta_se.unwrap_or(cond_eta_se),
-                    unc.mean_se.unwrap_or(cond_mean_se),
-                ),
-                Err(err) => match mode {
-                    InferenceCovarianceMode::ConditionalPlusSmoothingRequired => return Err(err),
-                    _ => (cond_eta_se, cond_mean_se),
-                },
+        InferenceCovarianceMode::SmoothingCorrected => {
+            let unc = transform.linear_state(
+                input,
+                fit,
+                PredictPass::FullUncertainty,
+                InferenceCovarianceMode::SmoothingCorrected,
+            )?;
+            let eta_se = unc.eta_se.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "smoothing-corrected posterior-mean uncertainty requires eta SE".to_string(),
+                )
+            })?;
+            let mean_se = unc.mean_se.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "smoothing-corrected posterior-mean uncertainty requires mean SE".to_string(),
+                )
+            })?;
+            if unc.covariance_source != InferenceCovarianceMode::SmoothingCorrected {
+                return Err(EstimationError::InvalidInput(
+                    "smoothing-corrected posterior-mean uncertainty resolved a conditional covariance"
+                        .to_string(),
+                ));
             }
+            (eta_se, mean_se)
         }
-        InferenceCovarianceMode::ConditionalPlusSmoothingRequired => {
-            return Err(EstimationError::InvalidInput(
-                "posterior-mean prediction: covariance_mode='required' but the fit does not \
-                 contain a smoothing-corrected covariance"
-                    .to_string(),
-            ));
-        }
-        // `…Preferred` with no correction available: fall back to conditional.
-        _ => (cond_eta_se, cond_mean_se),
     };
+    result.uncertainty_covariance_source = Some(options.covariance_mode);
     result.eta_standard_error = eta_se;
     // Record the response-scale SE used to build the credible band so the FFI/CLI
     // predict tables can report it as `std_error` instead of the link-scale σ_η
@@ -1042,8 +1036,7 @@ mod parity_tests {
             },
             None,
             UncertaintyProvenance {
-                covariance_mode_requested: InferenceCovarianceMode::Conditional,
-                covariance_corrected_used: false,
+                covariance_source: InferenceCovarianceMode::Conditional,
             },
         )
         .expect("engine assembly");
@@ -1058,7 +1051,10 @@ mod parity_tests {
         assert_close(&out.mean_upper, &ref_mean_upper, "mean upper");
         assert!(out.observation_lower.is_none());
         assert!(out.observation_upper.is_none());
-        assert!(!out.covariance_corrected_used);
+        assert_eq!(
+            out.covariance_source,
+            InferenceCovarianceMode::Conditional
+        );
     }
 
     /// BernoulliMarginalSlopePredictor shape: symmetric η interval, response
@@ -1094,8 +1090,7 @@ mod parity_tests {
             },
             None,
             UncertaintyProvenance {
-                covariance_mode_requested: InferenceCovarianceMode::Conditional,
-                covariance_corrected_used: false,
+                covariance_source: InferenceCovarianceMode::Conditional,
             },
         )
         .expect("engine assembly");
@@ -1162,8 +1157,7 @@ mod parity_tests {
                 bounds: ResponseBounds::UNBOUNDED,
             }),
             UncertaintyProvenance {
-                covariance_mode_requested: InferenceCovarianceMode::Conditional,
-                covariance_corrected_used: false,
+                covariance_source: InferenceCovarianceMode::Conditional,
             },
         )
         .expect("engine assembly");
@@ -1213,8 +1207,7 @@ mod parity_tests {
             },
             None,
             UncertaintyProvenance {
-                covariance_mode_requested: InferenceCovarianceMode::Conditional,
-                covariance_corrected_used: false,
+                covariance_source: InferenceCovarianceMode::Conditional,
             },
         )
         .expect("engine assembly");
@@ -1248,6 +1241,8 @@ mod parity_tests {
             mean_upper: None,
             observation_lower: None,
             observation_upper: None,
+            point_covariance_source: InferenceCovarianceMode::Conditional,
+            uncertainty_covariance_source: None,
         };
         assemble_posterior_mean_bounds(
             &mut none_result,
@@ -1277,6 +1272,8 @@ mod parity_tests {
             mean_upper: None,
             observation_lower: None,
             observation_upper: None,
+            point_covariance_source: InferenceCovarianceMode::Conditional,
+            uncertainty_covariance_source: None,
         };
         assemble_posterior_mean_bounds(
             &mut some_result,
@@ -1327,8 +1324,7 @@ mod parity_tests {
             },
             None,
             UncertaintyProvenance {
-                covariance_mode_requested: InferenceCovarianceMode::Conditional,
-                covariance_corrected_used: false,
+                covariance_source: InferenceCovarianceMode::Conditional,
             },
         )
         .expect("engine assembly");
@@ -1374,8 +1370,7 @@ mod parity_tests {
             },
             None,
             UncertaintyProvenance {
-                covariance_mode_requested: InferenceCovarianceMode::Conditional,
-                covariance_corrected_used: false,
+                covariance_source: InferenceCovarianceMode::Conditional,
             },
         )
         .expect("engine assembly");

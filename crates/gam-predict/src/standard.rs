@@ -205,7 +205,7 @@ impl StandardPredictor {
             eta_se: Some(eta_se),
             mean_se: Some(mean_se),
             // Posterior-mean integration always uses the conditional posterior.
-            covariance_corrected_used: false,
+            covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
 }
@@ -226,7 +226,7 @@ impl PredictionTransform for StandardPredictor {
             mean_se: with_se.mean_se,
             // Point state is built from the predictor's stored conditional
             // covariance.
-            covariance_corrected_used: false,
+            covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
 
@@ -253,7 +253,7 @@ impl PredictionTransform for StandardPredictor {
                     )
                 })?;
                 let p_total = self.beta.len() + runtime.beta.len();
-                let (backend, covariance_corrected_used) = fit.select_uncertainty_backend(
+                let (backend, covariance_source) = fit.select_uncertainty_backend(
                     p_total,
                     covariance_mode,
                     "standard link-wiggle",
@@ -265,7 +265,7 @@ impl PredictionTransform for StandardPredictor {
                     mean,
                     eta_se: Some(eta_se),
                     mean_se: Some(mean_se),
-                    covariance_corrected_used,
+                    covariance_source,
                 })
             }
             PredictPass::PosteriorMean => self.wiggle_posterior_mean_state(input, fit),

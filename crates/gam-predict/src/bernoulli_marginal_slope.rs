@@ -53,7 +53,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
             mean,
             eta_se,
             mean_se,
-            covariance_corrected_used: false,
+            covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
 
@@ -70,7 +70,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                 // Select the covariance the caller requested (conditional vs.
                 // smoothing-corrected) instead of always using the conditional
                 // backend, and report which was used.
-                let (backend, covariance_corrected_used) = fit.select_uncertainty_backend(
+                let (backend, covariance_source) = fit.select_uncertainty_backend(
                     self.theta().len(),
                     covariance_mode,
                     "bernoulli marginal-slope",
@@ -83,7 +83,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                     mean,
                     eta_se: Some(eta_se),
                     mean_se: Some(mean_se),
-                    covariance_corrected_used,
+                    covariance_source,
                 })
             }
             PredictPass::PosteriorMean => {
@@ -112,7 +112,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                     mean,
                     eta_se: Some(eta_se),
                     mean_se: Some(mean_se),
-                    covariance_corrected_used: false,
+                    covariance_source: InferenceCovarianceMode::Conditional,
                 })
             }
         }

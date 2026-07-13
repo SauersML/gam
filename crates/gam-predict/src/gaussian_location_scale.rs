@@ -212,7 +212,7 @@ impl PredictionTransform for GaussianLocationScalePredictor {
             mean,
             eta_se,
             mean_se,
-            covariance_corrected_used: false,
+            covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
 
@@ -232,7 +232,7 @@ impl PredictionTransform for GaussianLocationScalePredictor {
         let p_total = p_mu + p_sigma + p_w;
         // Full uncertainty honors the requested covariance mode; posterior-mean
         // integration uses the conditional posterior.
-        let (backend, covariance_corrected_used) = match pass {
+        let (backend, covariance_source) = match pass {
             PredictPass::FullUncertainty => {
                 fit.select_uncertainty_backend(p_total, covariance_mode, "gaussian location-scale")?
             }
@@ -243,7 +243,7 @@ impl PredictionTransform for GaussianLocationScalePredictor {
                     p_total,
                     "gaussian location-scale posterior mean",
                 )?,
-                false,
+                InferenceCovarianceMode::Conditional,
             ),
         };
         let eta_se =
@@ -254,7 +254,7 @@ impl PredictionTransform for GaussianLocationScalePredictor {
             mean,
             eta_se: Some(eta_se.clone()),
             mean_se: Some(eta_se),
-            covariance_corrected_used,
+            covariance_source,
         })
     }
 

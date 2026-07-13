@@ -88,10 +88,9 @@ struct PyPredictOptions {
     interval: Option<f64>,
     time_grid: Option<Vec<f64>>,
     /// Posterior covariance source for eta/mean intervals. One of
-    /// `"conditional"` (H⁻¹ only), `"smoothing"` (first-order smoothing
-    /// correction `H⁻¹ + J Var(ρ̂) Jᵀ` when available, else falls back to
-    /// conditional), or `"required"` (the smoothing correction, erroring if it
-    /// is unavailable). `None` keeps the engine default (`"smoothing"`). This
+    /// `"conditional"` (H⁻¹ only) or `"smoothing"` (first-order smoothing
+    /// correction `H⁻¹ + J Var(ρ̂) Jᵀ`, erroring if it is unavailable).
+    /// `None` keeps the engine default (`"smoothing"`). This
     /// is the Python/CLI parity surface for `--covariance-mode`; it is read on
     /// the delta-method (effectively-linear + interval) predict branch where
     /// `PredictUncertaintyOptions` governs the covariance, mirroring the CLI's
@@ -117,7 +116,7 @@ struct PyPredictOptions {
 }
 
 /// Parse the public `covariance_mode` string into the engine enum. `None`
-/// keeps the engine default (smoothing-preferred); unknown strings are a hard
+/// keeps the engine default (required smoothing-corrected); unknown strings are a hard
 /// error so a typo never silently degrades to the default covariance.
 fn parse_covariance_mode(
     raw: Option<&str>,
@@ -127,14 +126,9 @@ fn parse_covariance_mode(
     };
     match text.trim().to_ascii_lowercase().as_str() {
         "conditional" => Ok(Some(gam_predict::InferenceCovarianceMode::Conditional)),
-        "smoothing" => Ok(Some(
-            gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
-        )),
-        "required" => Ok(Some(
-            gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingRequired,
-        )),
+        "smoothing" => Ok(Some(gam_predict::InferenceCovarianceMode::SmoothingCorrected)),
         other => Err(format!(
-            "covariance_mode must be one of \"conditional\", \"smoothing\", or \"required\"; \
+            "covariance_mode must be one of \"conditional\" or \"smoothing\"; \
              got \"{other}\""
         )),
     }

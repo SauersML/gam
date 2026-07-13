@@ -233,7 +233,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
             mean,
             eta_se,
             mean_se,
-            covariance_corrected_used: false,
+            covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
 
@@ -245,7 +245,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         covariance_mode: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
         let p_total = self.beta_mu.len() + self.beta_noise.len();
-        let (backend, covariance_corrected_used) = match pass {
+        let (backend, covariance_source) = match pass {
             PredictPass::FullUncertainty => fit.select_uncertainty_backend(
                 p_total,
                 covariance_mode,
@@ -258,7 +258,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
                     p_total,
                     "dispersion location-scale posterior mean",
                 )?,
-                false,
+                InferenceCovarianceMode::Conditional,
             ),
         };
         let (eta, plugin_mean, eta_se, mean_se) = self.state_from_backend(input, &backend)?;
@@ -283,7 +283,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
             mean,
             eta_se: Some(eta_se),
             mean_se: Some(mean_se),
-            covariance_corrected_used,
+            covariance_source,
         })
     }
 
