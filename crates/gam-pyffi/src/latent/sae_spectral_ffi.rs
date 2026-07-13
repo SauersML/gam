@@ -1516,7 +1516,7 @@ fn atlas_nerve_diagram<'py>(
             &route,
             activation_threshold,
             blocks.as_deref(),
-            observations.as_ref().map(ndarray::Array2::view),
+            observations.as_ref().map(|array| array.view()),
             familywise_alpha,
         )
     })?;

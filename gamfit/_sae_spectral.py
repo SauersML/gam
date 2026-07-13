@@ -867,6 +867,8 @@ def atlas_nerve_diagram(
     *,
     activation_threshold: float = 1.0e-6,
     blocks: Any | None = None,
+    observations: Any | None = None,
+    familywise_alpha: float | None = None,
 ) -> AtlasNerveDiagram:
     """Build an atlas nerve from fixed-width sparse block routing.
 
@@ -874,9 +876,25 @@ def atlas_nerve_diagram(
     with ``indices`` shaped ``N x s`` and values shaped
     ``N x s x block_size``. ``n_units`` preserves charts with no observed
     firing; the logical ``N x K`` code matrix is never materialized.
+
+    Supplying ``observations`` (the ambient activation rows the charts were read
+    from, one row per route row) together with ``familywise_alpha`` runs the
+    cross-fitted Gaussian-PCA holonomy producer and threads a real finite-sample
+    certificate through the diagram. Both must be given together, since a
+    topology promotion must state the error probability it spends; omitting both
+    keeps the pure combinatorial nerve.
     """
+    if (observations is None) != (familywise_alpha is None):
+        raise ValueError(
+            "atlas_nerve_diagram requires observations and familywise_alpha together"
+        )
     indices, values = _sparse_route_arrays(route, "route", int(block_size))
     block_list = None if blocks is None else [int(b) for b in blocks]
+    ambient = (
+        None
+        if observations is None
+        else np.ascontiguousarray(np.asarray(observations, dtype=np.float64))
+    )
     payload = rust_module().atlas_nerve_diagram(
         indices,
         values,
@@ -884,6 +902,8 @@ def atlas_nerve_diagram(
         int(block_size),
         float(activation_threshold),
         block_list,
+        ambient,
+        None if familywise_alpha is None else float(familywise_alpha),
     )
     if not bool(payload["computed"]):
         return AtlasNerveDiagram(computed=False, reason=str(payload["reason"]))
