@@ -751,6 +751,118 @@ mod structured_pass_request_tests {
     }
 }
 
+#[cfg(test)]
+mod vanished_stage_tests {
+    use super::*;
+    use crate::manifold::{
+        AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
+    };
+    use gam_terms::latent::LatentManifold;
+    use ndarray::Array3;
+
+    fn fixed_boundary_term(k: usize, live_first: bool) -> (SaeManifoldTerm, SaeManifoldRho) {
+        let n = 8usize;
+        let p = 2usize;
+        let mut atoms = Vec::with_capacity(k);
+        for atom in 0..k {
+            let mut decoder = Array2::<f64>::zeros((1, p));
+            if atom == 0 && live_first {
+                decoder[[0, 0]] = 1.0;
+            }
+            atoms.push(
+                SaeManifoldAtom::new_with_provided_function_gram(
+                    format!("atom{atom}"),
+                    SaeAtomBasisKind::EuclideanPatch,
+                    1,
+                    Array2::<f64>::ones((n, 1)),
+                    Array3::<f64>::zeros((n, 1, 1)),
+                    decoder,
+                    Array2::<f64>::eye(1),
+                )
+                .unwrap(),
+            );
+        }
+        let mut logits = Array2::<f64>::zeros((n, k));
+        if k > 1 {
+            logits.column_mut(1).fill(-40.0);
+        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![Array2::<f64>::zeros((n, 1)); k],
+            vec![LatentManifold::Euclidean; k],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
+        (term, rho)
+    }
+
+    #[test]
+    fn committed_k2_boundary_compacts_and_fixed_rho_restart_certifies_k1() {
+        let (term, rho) = fixed_boundary_term(2, true);
+        let mut target = Array2::<f64>::zeros((8, 2));
+        target.column_mut(0).fill(1.0);
+        let registry = AnalyticPenaltyRegistry::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stage = fit_outer_stage_to_boundary(
+            term,
+            &target,
+            &registry,
+            rho,
+            0,
+            1.0,
+            1.0e-6,
+            1.0e-6,
+            false,
+            SaeFitStage::Primary,
+            &cancel,
+            "Euclidean",
+        )
+        .expect("proper vanished subset must restart on the compacted stratum");
+        let SaeStageFit::Certified(objective) = stage else {
+            panic!("one live atom must not collapse to the Tier-0 null");
+        };
+        let fitted = objective
+            .into_fitted()
+            .expect("reduced fixed-rho state must carry an inner certificate");
+        assert_eq!(fitted.term.k_atoms(), 1);
+        assert_eq!(fitted.rho.log_lambda_smooth.len(), 1);
+        assert_eq!(fitted.rho.log_ard.len(), 1);
+        assert!(fitted.penalized_quasi_laplace_criterion.is_finite());
+    }
+
+    #[test]
+    fn committed_k1_boundary_returns_exact_tier0_null_not_manifold_fit() {
+        let (term, rho) = fixed_boundary_term(1, false);
+        let target = Array2::<f64>::ones((8, 2));
+        let registry = AnalyticPenaltyRegistry::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stage = fit_outer_stage_to_boundary(
+            term,
+            &target,
+            &registry,
+            rho,
+            0,
+            1.0,
+            1.0e-6,
+            1.0e-6,
+            false,
+            SaeFitStage::Primary,
+            &cancel,
+            "Euclidean",
+        )
+        .expect("all-vanished state must be an exact structural result");
+        let SaeStageFit::Null(report) = stage else {
+            panic!("K=1 vanished boundary must not mint a manifold fit");
+        };
+        assert_eq!(report.vanished_atoms.iter().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(report.tier0.mean, Array1::<f64>::zeros(2));
+        assert!(report.residual_sum_squares.is_finite());
+        assert_eq!(report.fitted, Array2::<f64>::zeros((8, 2)));
+    }
+}
+
 /// Lift an `N×p` reconstruction produced against the standardized de-meaned
 /// target back to raw-target space: `x̂ ← μ + σ ⊙ x̂`. Mirrors
 /// [`SaeManifoldTerm::add_tier0_mean_inplace`] for the report's standalone

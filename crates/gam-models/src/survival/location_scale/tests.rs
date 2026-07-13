@@ -8060,3 +8060,153 @@ fn reduced_parametric_aft_stopping_criterion_is_weight_scale_invariant() {
         "log-sigma must be weight-scale invariant: w=1 -> {ls1:.9}, w=500 -> {ls500:.9}"
     );
 }
+
+/// Temporary #932 release measurement. The retired bespoke link-wiggle
+/// assembler is not a valid baseline (and no longer exists), so this reports
+/// the complete live runtime-width H/t3/t4 operation without inventing a hand
+/// comparator. Removed immediately after the exact-SHA MSI result is captured.
+#[test]
+fn release_measure_survival_ls_link_wiggle_runtime_width_932() {
+    use super::row_kernel::{
+        survival_ls_wiggle_directional_derivative_dense,
+        survival_ls_wiggle_joint_hessian_dense,
+        survival_ls_wiggle_second_directional_derivative_dense,
+    };
+    use crate::row_kernel::RowSet;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn best_ns<T, F: FnMut() -> T>(iterations: usize, mut evaluate: F) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(evaluate());
+            }
+            best = best.min(start.elapsed().as_nanos() as f64 / iterations as f64);
+        }
+        best
+    }
+
+    fn measure_case(label: &str, knots: Array1<f64>) {
+        let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+            [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+            [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+            [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+            [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+        ];
+        let event = [1.0, 1.0, 1.0, 1.0];
+        let weight = [1.0, 0.8, 1.2, 1.1];
+        let q0_exit = Array1::from_shape_fn(primaries.len(), |row| {
+            primaries[row][1] - primaries[row][3] * (-primaries[row][6]).exp()
+        });
+        let degree = 3usize;
+        let xwiggle = survival_wiggle_basis_with_options(
+            q0_exit.view(),
+            &knots,
+            degree,
+            BasisOptions::value(),
+        )
+        .expect("wiggle design");
+        let pw = xwiggle.ncols();
+        let inverse_link = residual_distribution_inverse_link(ResidualDistribution::Gaussian);
+        let mut family =
+            survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+        family.x_link_wiggle = Some(DesignMatrix::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(xwiggle.clone()),
+        ));
+        family.wiggle_knots = Some(knots);
+        family.wiggle_degree = Some(degree);
+
+        let mut states = survival_ls_joint_oracle_states(&primaries);
+        let betaw = Array1::<f64>::zeros(pw);
+        states.push(ParameterBlockState {
+            eta: xwiggle.dot(&betaw),
+            beta: betaw,
+        });
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("wiggle dynamic geometry");
+        let n_coefficients: usize = states.iter().map(|state| state.beta.len()).sum();
+        let direction_u: Vec<f64> = (0..n_coefficients)
+            .map(|axis| 0.01 * (axis as f64 + 1.0))
+            .collect();
+        let direction_v: Vec<f64> = (0..n_coefficients)
+            .map(|axis| -0.007 * (axis as f64 + 0.5))
+            .collect();
+
+        let hessian = survival_ls_wiggle_joint_hessian_dense(&family, &dynamic, 0.0)
+            .expect("warm wiggle Hessian");
+        let third = survival_ls_wiggle_directional_derivative_dense(
+            &family,
+            &dynamic,
+            0.0,
+            &RowSet::All,
+            &direction_u,
+        )
+        .expect("warm wiggle third");
+        let fourth = survival_ls_wiggle_second_directional_derivative_dense(
+            &family,
+            &dynamic,
+            0.0,
+            &RowSet::All,
+            &direction_u,
+            &direction_v,
+        )
+        .expect("warm wiggle fourth");
+        for matrix in [&hessian, &third, &fourth] {
+            assert_eq!(matrix.dim(), (n_coefficients, n_coefficients));
+            assert!(matrix.iter().all(|value| value.is_finite()));
+        }
+
+        let hessian_ns = best_ns(30, || {
+            survival_ls_wiggle_joint_hessian_dense(&family, &dynamic, 0.0)
+                .expect("timed wiggle Hessian")
+        });
+        let third_ns = best_ns(20, || {
+            survival_ls_wiggle_directional_derivative_dense(
+                &family,
+                &dynamic,
+                0.0,
+                &RowSet::All,
+                &direction_u,
+            )
+            .expect("timed wiggle third")
+        });
+        let fourth_ns = best_ns(10, || {
+            survival_ls_wiggle_second_directional_derivative_dense(
+                &family,
+                &dynamic,
+                0.0,
+                &RowSet::All,
+                &direction_u,
+                &direction_v,
+            )
+            .expect("timed wiggle fourth")
+        });
+        let n_rows = primaries.len() as f64;
+        eprintln!(
+            "G932_SLS_WIGGLE_RELEASE label={label} rows={} pw={pw} kw={} \
+             baseline=none_retired_invalid hessian_ns={hessian_ns:.3} \
+             hessian_ns_per_row={:.3} t3_ns={third_ns:.3} t3_ns_per_row={:.3} \
+             t4_ns={fourth_ns:.3} t4_ns_per_row={:.3}",
+            primaries.len(),
+            SLS_ROW_K + pw,
+            hessian_ns / n_rows,
+            third_ns / n_rows,
+            fourth_ns / n_rows,
+        );
+    }
+
+    measure_case(
+        "pw3",
+        array![-2.5, -2.5, -2.5, -2.5, 3.2, 3.2, 3.2, 3.2],
+    );
+    measure_case(
+        "pw13",
+        Array1::from_vec(vec![
+            -2.5, -2.5, -2.5, -2.5, -2.3, -2.0, -1.4, -0.8, -0.2, 0.4, 1.0, 1.6, 2.2,
+            2.7, 3.0, 3.2, 3.2, 3.2, 3.2,
+        ]),
+    );
+}

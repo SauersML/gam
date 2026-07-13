@@ -9305,3 +9305,162 @@ fn survival_sparse_tower4_full_t4_matches_dense_oracle_979() {
         "[979 isolation] full t4 max_abs_gap={max_abs_gap:e} max_rel_gap={max_rel_gap:e} over {n} rows"
     );
 }
+
+/// Temporary #932 release measurement. Removed immediately after the exact-SHA
+/// MSI result is captured.
+#[test]
+fn release_measure_flex_jet_orders_vs_retained_oracles_932() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn best_ns<T, F: FnMut() -> T>(iterations: usize, mut evaluate: F) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(evaluate());
+            }
+            best = best.min(start.elapsed().as_nanos() as f64 / iterations as f64);
+        }
+        best
+    }
+
+    fn matrix_gap(production: &Array2<f64>, retained: &[f64]) -> (f64, f64) {
+        assert_eq!(production.len(), retained.len());
+        production
+            .iter()
+            .zip(retained)
+            .fold((0.0_f64, 0.0_f64), |(max_abs, max_rel), (&got, &want)| {
+                let abs = (got - want).abs();
+                (max_abs.max(abs), max_rel.max(abs / want.abs().max(1.0)))
+            })
+    }
+
+    let fixture = B10_PARITY_FIXTURES[0];
+    let (family, block_states) = b10_flex_family_for_parity(fixture);
+    let primary = flex_primary_slices(&family);
+    let directions = b10_direction_set(primary.total);
+    let dir_u = &directions[0].1;
+    let dir_v = &directions[1].1;
+
+    let production_third = family
+        .row_flex_primary_third_contracted_exact(0, &block_states, dir_u)
+        .expect("production Jet3 third");
+    let retained_third = b10_third_oracle_from_family(&family, &block_states, dir_u);
+    let (third_max_abs, third_max_rel) = matrix_gap(&production_third, &retained_third);
+    assert!(
+        third_max_abs <= 5e-8 || third_max_rel <= 5e-7,
+        "valid retained third oracle disagrees: abs={third_max_abs:e} rel={third_max_rel:e}"
+    );
+
+    let production_fourth = family
+        .row_flex_primary_fourth_contracted_exact(0, &block_states, dir_u, dir_v)
+        .expect("production Jet4 fourth");
+    let retained_fourth = b10_fourth_oracle_from_family(&family, &block_states, dir_u, dir_v);
+    let (fourth_max_abs, fourth_max_rel) = matrix_gap(&production_fourth, &retained_fourth);
+
+    let q_geometry = family
+        .row_dynamic_q_geometry(0, &block_states)
+        .expect("row q geometry");
+    let g = block_states[2].eta[0];
+    let beta_h = family.flex_score_beta(&block_states).expect("score beta");
+    let beta_w = family.flex_link_beta(&block_states).expect("link beta");
+    let o_infl = family
+        .influence_index_offset(0, &block_states)
+        .expect("influence offset");
+    let jet1 = family
+        .compute_row_flex_primary_gradient_from_parts(
+            0,
+            q_geometry.q0,
+            q_geometry.q1,
+            q_geometry.qd1,
+            g,
+            beta_h,
+            beta_w,
+            o_infl,
+            &primary,
+        )
+        .expect("production Jet1 value/gradient");
+    let jet2 = family
+        .compute_row_flex_primary_gradient_hessian_from_parts(
+            0,
+            q_geometry.q0,
+            q_geometry.q1,
+            q_geometry.qd1,
+            g,
+            beta_h,
+            beta_w,
+            o_infl,
+            &primary,
+        )
+        .expect("production Jet2 value/gradient/Hessian");
+    assert_eq!(jet1.0.to_bits(), jet2.0.to_bits(), "Jet1/Jet2 value drift");
+    for (axis, (&first, &second)) in jet1.1.iter().zip(jet2.1.iter()).enumerate() {
+        assert_eq!(
+            first.to_bits(),
+            second.to_bits(),
+            "Jet1/Jet2 gradient drift at axis {axis}"
+        );
+    }
+
+    let jet1_ns = best_ns(200, || {
+        family
+            .compute_row_flex_primary_gradient_from_parts(
+                0,
+                q_geometry.q0,
+                q_geometry.q1,
+                q_geometry.qd1,
+                g,
+                beta_h,
+                beta_w,
+                o_infl,
+                &primary,
+            )
+            .expect("timed Jet1")
+    });
+    let jet2_ns = best_ns(200, || {
+        family
+            .compute_row_flex_primary_gradient_hessian_from_parts(
+                0,
+                q_geometry.q0,
+                q_geometry.q1,
+                q_geometry.qd1,
+                g,
+                beta_h,
+                beta_w,
+                o_infl,
+                &primary,
+            )
+            .expect("timed Jet2")
+    });
+    let hand_third_ns = best_ns(80, || {
+        b10_third_oracle_from_family(&family, &block_states, dir_u)
+    });
+    let jet3_ns = best_ns(80, || {
+        family
+            .row_flex_primary_third_contracted_exact(0, &block_states, dir_u)
+            .expect("timed production Jet3")
+    });
+    let invalid_hand_fourth_ns = best_ns(30, || {
+        b10_fourth_oracle_from_family(&family, &block_states, dir_u, dir_v)
+    });
+    let jet4_ns = best_ns(30, || {
+        family
+            .row_flex_primary_fourth_contracted_exact(0, &block_states, dir_u, dir_v)
+            .expect("timed production Jet4")
+    });
+
+    eprintln!(
+        "G932_FLEX_RELEASE fixture={} p={} jet1_ns={jet1_ns:.3} jet2_ns={jet2_ns:.3} \
+         jet2_over_jet1={:.6} hand_t3_ns={hand_third_ns:.3} jet3_ns={jet3_ns:.3} \
+         hand_over_jet3={:.6} t3_max_abs={third_max_abs:.6e} t3_max_rel={third_max_rel:.6e} \
+         invalid_hand_t4_ns={invalid_hand_fourth_ns:.3} jet4_ns={jet4_ns:.3} \
+         invalid_hand_over_jet4={:.6} invalid_t4_max_abs={fourth_max_abs:.6e} \
+         invalid_t4_max_rel={fourth_max_rel:.6e}",
+        fixture.label,
+        primary.total,
+        jet2_ns / jet1_ns,
+        hand_third_ns / jet3_ns,
+        invalid_hand_fourth_ns / jet4_ns,
+    );
+}

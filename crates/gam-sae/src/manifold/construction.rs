@@ -89,7 +89,7 @@ pub(crate) const RANK_VANISHED_REL: f64 = 1.0e-9;
 pub struct VanishedAtoms(Box<[usize]>);
 
 impl VanishedAtoms {
-    fn from_slots(slots: impl IntoIterator<Item = usize>) -> Option<Self> {
+    pub(crate) fn from_slots(slots: impl IntoIterator<Item = usize>) -> Option<Self> {
         let mut slots: Vec<usize> = slots.into_iter().collect();
         slots.sort_unstable();
         slots.dedup();
