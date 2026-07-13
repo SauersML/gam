@@ -11,7 +11,7 @@ use gam_models::inference::model::{
     gaussian_location_scale_mean_beta, location_scale_noise_beta,
 };
 use gam_models::quadrature::QuadratureContext;
-use gam_models::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
+use gam_models::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
 use gam_models::survival::{
     CauseSpecificSurvivalAloRowInput, LatentBinaryAloRowInput, LatentSurvivalAloRowInput,
     LatentSurvivalAloSigma, SurvivalLikelihoodMode, SurvivalLocationScaleAloRowInput,
@@ -1984,7 +1984,7 @@ fn saved_latent_hazard_multiplier(
     };
     match frailty {
         FrailtySpec::HazardMultiplier {
-            sigma_fixed: Some(sigma),
+            scale: FrailtyScale::Fixed { sigma },
             loading,
         } if sigma.is_finite() && *sigma >= 0.0 => Ok((*sigma, *loading)),
         other => Err(invalid(format!(
@@ -2863,7 +2863,7 @@ fn compute_saved_marginal_slope_survival_alo(
     let gaussian_frailty_sd = match payload.family_state.frailty() {
         Some(gam_models::survival::lognormal_kernel::FrailtySpec::None) => None,
         Some(gam_models::survival::lognormal_kernel::FrailtySpec::GaussianShift {
-            sigma_fixed: Some(sigma),
+            scale: FrailtyScale::Fixed { sigma },
         }) => Some(*sigma),
         Some(frailty) => {
             return Err(invalid(format!(
