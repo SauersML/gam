@@ -2550,21 +2550,15 @@ pub(crate) fn cross_row_preconditioner_build_honors_pd_floor_1795() {
     // spectral floor unit-deflates the collapsed direction relative to λ_max=3.
     sys.hbb = array![[1.0_f64, 2.0], [2.0, 1.0]];
 
-    let unfloored = ArrowBlockDiagInverse::build(&sys, 0.0, 0.0, None, false, &backend);
+    let unfloored = ArrowBlockDiagInverse::build(&sys, 0.0, 0.0, None, &backend);
     assert!(
         matches!(unfloored, Err(ArrowSchurError::SchurFactorFailed { .. })),
         "un-floored cross-row preconditioner must surface the non-PD Schur"
     );
 
-    let floored = ArrowBlockDiagInverse::build(
-        &sys,
-        0.0,
-        0.0,
-        Some(SPECTRAL_DEFLATION_REL_FLOOR),
-        false,
-        &backend,
-    )
-    .expect("cross-row preconditioner must honor the spectral PD-floor");
+    let floored =
+        ArrowBlockDiagInverse::build(&sys, 0.0, 0.0, Some(SPECTRAL_DEFLATION_REL_FLOOR), &backend)
+            .expect("cross-row preconditioner must honor the spectral PD-floor");
 
     let rhs_t = Array1::<f64>::zeros(sys.row_offsets[sys.rows.len()]);
     let rhs_beta = array![0.25_f64, -0.5];
@@ -3083,7 +3077,7 @@ pub(crate) fn parallel_block_diag_inverse_apply_deterministic_and_solves() {
     let backend = CpuBatchedBlockSolver;
     let ridge_t = 1e-4;
     let ridge_beta = 1e-5;
-    let precond = ArrowBlockDiagInverse::build(&sys, ridge_t, ridge_beta, None, false, &backend)
+    let precond = ArrowBlockDiagInverse::build(&sys, ridge_t, ridge_beta, None, &backend)
         .expect("block-diagonal inverse must build");
     let total_dt = sys.row_offsets[n];
     let r_t = Array1::from_iter((0..total_dt).map(|i| 0.15 * (i as f64).sin() + 0.02));
