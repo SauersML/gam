@@ -1601,55 +1601,24 @@ fn sphere_linear_block(atom: &SaeManifoldAtom) -> Option<Array2<f64>> {
     Some(decoder.slice(ndarray::s![1..4, ..]).to_owned())
 }
 
-/// Exact inverse of a `3×3` matrix (Cramer). `None` if singular.
-fn inverse_3x3(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
-    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    if !det.is_finite() || det.abs() < 1e-12 {
-        return None;
-    }
-    let inv_det = 1.0 / det;
-    let mut inv = [[0.0; 3]; 3];
-    inv[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det;
-    inv[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det;
-    inv[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det;
-    inv[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det;
-    inv[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det;
-    inv[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det;
-    inv[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det;
-    inv[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det;
-    inv[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det;
-    Some(inv)
-}
-
 /// Nearest orthogonal matrix to `m` (the orthogonal polar factor `U Vᵀ` of its
-/// SVD) via Higham's polar iteration `Q ← ½(Q + Q⁻ᵀ)`.  This is the orthogonal
-/// Procrustes solution `argmin_{QᵀQ=I} ‖Q − M‖_F`; convergence is quadratic once
-/// near the factor, so a few dozen iterations reach machine precision.  `None`
-/// if any iterate is singular (a degenerate, non-invertible frame product).
+/// SVD). This is the orthogonal Procrustes solution
+/// `argmin_{QᵀQ=I} ‖Q − M‖_F`. Using the decomposition directly makes singular
+/// values, rather than iteration counts or numeric cutoffs, govern the result.
 fn nearest_orthogonal_3x3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
-    let mut q = m;
-    for _ in 0..128 {
-        let inv = inverse_3x3(&q)?;
-        let mut next = [[0.0; 3]; 3];
-        let mut diff = 0.0;
-        for i in 0..3 {
-            for j in 0..3 {
-                // inv transpose: (Q⁻ᵀ)[i][j] = inv[j][i].
-                next[i][j] = 0.5 * (q[i][j] + inv[j][i]);
-                diff += (next[i][j] - q[i][j]).abs();
-            }
-        }
-        q = next;
-        if diff < 1e-15 {
-            break;
-        }
-    }
-    if q.iter().flatten().any(|x| !x.is_finite()) {
+    let matrix = Array2::from_shape_fn((3, 3), |(row, column)| m[row][column]);
+    let (left, _, right_t) = matrix.svd(true, true).ok()?;
+    let orthogonal = left?.dot(&right_t?);
+    if orthogonal.iter().any(|value| !value.is_finite()) {
         return None;
     }
-    Some(q)
+    let mut result = [[0.0; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            result[row][column] = orthogonal[[row, column]];
+        }
+    }
+    Some(result)
 }
 
 /// Decode a sphere chart's `(7, p)` decoder at explicit intrinsic unit vectors
@@ -1779,7 +1748,14 @@ fn fit_sphere_seam_transition(
     }
     // B's north pole u_b = [0,0,1] into A's coordinate; A's north pole into B's.
     let b_pole_in_a = lat_of(rotate_unit(&rotation, [0.0, 0.0, 1.0]));
-    let inv_rotation = inverse_3x3(&rotation)?;
+    // The polar factor is orthogonal by construction, so its exact algebraic
+    // inverse is its transpose; no determinant cutoff or second solve exists.
+    let mut inv_rotation = [[0.0; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            inv_rotation[row][column] = rotation[column][row];
+        }
+    }
     let a_pole_in_b = lat_of(rotate_unit(&inv_rotation, [0.0, 0.0, 1.0]));
     let b_pole_interior_to_a = b_pole_in_a > a_lat_lo && b_pole_in_a < a_lat_hi;
     let a_pole_interior_to_b = a_pole_in_b > b_lat_lo && a_pole_in_b < b_lat_hi;

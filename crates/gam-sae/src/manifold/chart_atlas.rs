@@ -188,12 +188,6 @@ pub struct SphereChartTransition {
 }
 
 impl SphereChartTransition {
-    /// Largest tolerated departure from orthonormality (`‖RᵀR − I‖_∞`) and from a
-    /// unit determinant magnitude.  A fitted Procrustes rotation is orthogonal to
-    /// machine precision; this is a loud guard against a mis-supplied matrix, not
-    /// a modelling knob.
-    const ORTHONORMAL_TOL: f64 = 1e-6;
-
     #[must_use = "transition validation errors must be handled"]
     pub fn new(
         from_chart: usize,
@@ -207,24 +201,26 @@ impl SphereChartTransition {
         if rotation.iter().flatten().any(|x| !x.is_finite()) {
             return Err("sphere chart transition rotation must be finite".to_string());
         }
-        // `RᵀR = I`: the rows are an orthonormal ambient frame.
+        // `RᵀR = I`: accept precisely the backward error of a three-term dot
+        // product at this matrix's scale. There is no statistical or fitted
+        // tolerance here: a non-orthogonal fitted map belongs in the noisy
+        // holonomy certificate, not this exact-transition type.
+        let frame_scale: f64 = rotation.iter().flatten().map(|value| value * value).sum();
+        let backward_error = f64::EPSILON * 3.0 * frame_scale.max(1.0);
         for i in 0..3 {
             for j in 0..3 {
                 let dot: f64 = (0..3).map(|k| rotation[k][i] * rotation[k][j]).sum();
                 let target = if i == j { 1.0 } else { 0.0 };
-                if (dot - target).abs() > Self::ORTHONORMAL_TOL {
+                if (dot - target).abs() > backward_error {
                     return Err(format!(
-                        "sphere chart transition rotation is not orthonormal: (RᵀR)[{i},{j}] = {dot}"
+                        "sphere chart transition rotation is not orthonormal: (RᵀR)[{i},{j}] = {dot}, machine backward-error bound={backward_error}"
                     ));
                 }
             }
         }
-        let det = Self::determinant_of(&rotation);
-        if (det.abs() - 1.0).abs() > Self::ORTHONORMAL_TOL {
-            return Err(format!(
-                "sphere chart transition rotation must have |det| = 1, got det = {det}"
-            ));
-        }
+        // A square orthogonal matrix is nonsingular and has determinant ±1;
+        // re-testing that theorem with an independent numeric band would only
+        // reintroduce a second, potentially contradictory threshold.
         Ok(Self {
             from_chart,
             to_chart,
@@ -960,5 +956,30 @@ mod tests {
         assert_eq!(left.charts(), &[0, 1, 2, 3]);
         assert_eq!(left.transitions().len(), 3);
         assert_eq!(left.orientability(), AtlasOrientability::Orientable);
+    }
+
+    #[test]
+    fn sphere_transition_exact_type_rejects_fitted_near_orthogonality() {
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let reflection = [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert_eq!(
+            SphereChartTransition::new(0, 1, identity, AtlasSeamKind::Pole)
+                .unwrap()
+                .sign(),
+            1
+        );
+        assert_eq!(
+            SphereChartTransition::new(0, 1, reflection, AtlasSeamKind::Pole)
+                .unwrap()
+                .sign(),
+            -1
+        );
+
+        let mut fitted_but_not_exact = identity;
+        fitted_but_not_exact[0][0] += 1.0e-8;
+        assert!(
+            SphereChartTransition::new(0, 1, fitted_but_not_exact, AtlasSeamKind::Pole).is_err(),
+            "a fitted approximate rotation must use the statistical certificate path"
+        );
     }
 }
