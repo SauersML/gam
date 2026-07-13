@@ -326,9 +326,12 @@ pub(crate) struct GlsWiggleSecondDirCoeffs {
     pub(crate) l_u: Array1<f64>,
     pub(crate) l_v: Array1<f64>,
     pub(crate) l_uv: Array1<f64>,
-    pub(crate) dw_u: Array1<f64>,
-    pub(crate) dw_v: Array1<f64>,
-    pub(crate) dw_uv: Array1<f64>,
+    pub(crate) hessian_mm_base: Array1<f64>,
+    pub(crate) gradient_mu_base: Array1<f64>,
+    pub(crate) hessian_ml_base: Array1<f64>,
+    pub(crate) hessian_mm_u: Array1<f64>,
+    pub(crate) hessian_mm_v: Array1<f64>,
+    pub(crate) hessian_mm_uv: Array1<f64>,
 }
 
 pub(crate) struct GlsWiggleFirstDirCoeffs {
@@ -453,9 +456,6 @@ pub(crate) fn gls_wiggle_second_directional_coeffs(
     let l_u = first_u.hessian_ml.clone();
     let l_v = first_v.hessian_ml.clone();
     let l_uv = second_uv.hessian_ml.clone();
-    let dw_u = first_u.hessian_mm.clone();
-    let dw_v = first_v.hessian_mm.clone();
-    let dw_uv = second_uv.hessian_mm.clone();
 
     GlsWiggleSecondDirCoeffs {
         coeff_mm_uv,
@@ -470,9 +470,12 @@ pub(crate) fn gls_wiggle_second_directional_coeffs(
         l_u,
         l_v,
         l_uv,
-        dw_u,
-        dw_v,
-        dw_uv,
+        hessian_mm_base: base.hessian_mm.clone(),
+        gradient_mu_base: base.gradient_mu.clone(),
+        hessian_ml_base: base.hessian_ml.clone(),
+        hessian_mm_u: first_u.hessian_mm.clone(),
+        hessian_mm_v: first_v.hessian_mm.clone(),
+        hessian_mm_uv: second_uv.hessian_mm.clone(),
     }
 }
 
@@ -919,9 +922,12 @@ impl GaussianLocationScaleWiggleFamily {
             l_u,
             l_v,
             l_uv,
-            dw_u,
-            dw_v,
-            dw_uv,
+            hessian_mm_base,
+            gradient_mu_base,
+            hessian_ml_base,
+            hessian_mm_u,
+            hessian_mm_v,
+            hessian_mm_uv,
         } = gls_wiggle_second_directional_coeffs(
             &rows,
             &geom,
@@ -943,20 +949,21 @@ impl GaussianLocationScaleWiggleFamily {
         // Pair-coefficient bundles. Cross-block (mu, B'/B'') absorb basis_u/v/uv row scaling.
         let xi_u_xi_v = &xi_u * &xi_v;
         let coeff_m_b1 = &(&a_u * &xi_v) + &(&a_v * &xi_u) + &c_uv;
-        let coeff_m_b2 = &(&rows.w * &geom.dq_dq0 * &xi_u_xi_v) + &(&c_u * &xi_v) + &(&c_v * &xi_u);
-        let coeff_m_b3 = -(&rows.m * &xi_u_xi_v);
+        let coeff_m_b2 =
+            &(&hessian_mm_base * &geom.dq_dq0 * &xi_u_xi_v) + &(&c_u * &xi_v) + &(&c_v * &xi_u);
+        let coeff_m_b3 = &gradient_mu_base * &xi_u_xi_v;
         // OBSERVED ls↔wiggle cross 2κm (#1561). B' channel = single-drift cross
         // l_u·ξ_v + l_v·ξ_u (basis_{u,v} = diag(ξ)·B'); B'' channel = value coeff
         // 2κm on the second basis drift basis_uv = diag(ξ_uξ_v)·B''.
         let coeff_ls_b1 = &(&l_u * &xi_v) + &(&l_v * &xi_u);
-        let coeff_ls_b2 = 2.0 * &rows.kappa * &rows.m * &xi_u_xi_v;
+        let coeff_ls_b2 = &hessian_ml_base * &xi_u_xi_v;
         // Wiggle-wiggle from a_ab + a_ab^T + a_ij + a_ij^T + a_iwj + a_iwj^T + a_jwi + a_jwi^T:
         //   a_ab = B''^T diag(w·ξ_uξ_v) B    → pair (B, B'', w·ξ_uξ_v)
         //   a_ij = B'^T diag(w·ξ_uξ_v) B'   → pair (B', B', 2·w·ξ_uξ_v)  (a_ij + a_ij^T)
         //   a_iwj+a_jwi = B'^T diag(dw_v·ξ_u + dw_u·ξ_v) B → pair (B, B', sum)
-        let coeff_b_b1 = &(&dw_u * &xi_v) + &(&dw_v * &xi_u);
-        let coeff_b_b2 = &rows.w * &xi_u_xi_v;
-        let coeff_b1_b1 = 2.0 * &(&rows.w * &xi_u_xi_v);
+        let coeff_b_b1 = &(&hessian_mm_u * &xi_v) + &(&hessian_mm_v * &xi_u);
+        let coeff_b_b2 = &hessian_mm_base * &xi_u_xi_v;
+        let coeff_b1_b1 = 2.0 * &(&hessian_mm_base * &xi_u_xi_v);
 
         let basis: Arc<Array2<f64>> = Arc::new(geom.basis.clone());
         let basis_d1: Arc<Array2<f64>> = Arc::new(geom.basis_d1.clone());
@@ -1004,7 +1011,7 @@ impl GaussianLocationScaleWiggleFamily {
                 // (X_ls, B'') ← observed ls↔wiggle basis 2nd drift 2κm·ξ_uξ_v
                 (1, 4, coeff_ls_b2),
                 // (B, B) ← `xt_diag_x_dense(&geom.basis, &dw_uv)`
-                (2, 2, dw_uv),
+                (2, 2, hessian_mm_uv),
                 // (B, B') ← combined `a_iwj + a_iwj^T + a_jwi + a_jwi^T` =
                 // B^T diag(dw_u·ξ_v + dw_v·ξ_u) B' + B'^T diag(...) B
                 (2, 3, coeff_b_b1),
@@ -1109,9 +1116,12 @@ impl GaussianLocationScaleWiggleFamily {
             l_u,
             l_v,
             l_uv,
-            dw_u,
-            dw_v,
-            dw_uv,
+            hessian_mm_base,
+            gradient_mu_base,
+            hessian_ml_base,
+            hessian_mm_u,
+            hessian_mm_v,
+            hessian_mm_uv,
         } = gls_wiggle_second_directional_coeffs(
             &rows,
             &geom,
@@ -1136,23 +1146,19 @@ impl GaussianLocationScaleWiggleFamily {
         let h_mw = xt_diag_y_dense(xmu, &a_uv, &geom.basis)?
             + &xt_diag_y_dense(xmu, &a_u, &basis_v)?
             + &xt_diag_y_dense(xmu, &a_v, &basis_u)?
-            + &xt_diag_y_dense(xmu, &(&rows.w * &geom.dq_dq0), &basis_uv)?
+            + &xt_diag_y_dense(xmu, &(&hessian_mm_base * &geom.dq_dq0), &basis_uv)?
             + &xt_diag_y_dense(xmu, &c_uv, &geom.basis_d1)?
             + &xt_diag_y_dense(xmu, &c_u, &basis1_v)?
             + &xt_diag_y_dense(xmu, &c_v, &basis1_u)?
-            + &xt_diag_y_dense(xmu, &(-&rows.m), &basis1_uv)?;
-        // OBSERVED ls↔wiggle cross 2κm (#1561): D²[X_ls^T diag(2κm) B] over the
-        // coeff (l_uv), the single-drift cross terms (l_u·δ_v B + l_v·δ_u B), and
-        // the value coeff on the second basis drift δ²B = basis_uv.
-        let coeff_lw_b = 2.0 * &rows.kappa * &rows.m;
+            + &xt_diag_y_dense(xmu, &gradient_mu_base, &basis1_uv)?;
         let h_lw = xt_diag_y_dense(x_ls, &l_uv, &geom.basis)?
             + &xt_diag_y_dense(x_ls, &l_u, &basis_v)?
             + &xt_diag_y_dense(x_ls, &l_v, &basis_u)?
-            + &xt_diag_y_dense(x_ls, &coeff_lw_b, &basis_uv)?;
-        let a_ab = xt_diag_y_dense(&basis_uv, &rows.w, &geom.basis)?;
-        let a_ij = xt_diag_y_dense(&basis_u, &rows.w, &basis_v)?;
-        let a_iwj = xt_diag_y_dense(&basis_u, &dw_v, &geom.basis)?;
-        let a_jwi = xt_diag_y_dense(&basis_v, &dw_u, &geom.basis)?;
+            + &xt_diag_y_dense(x_ls, &hessian_ml_base, &basis_uv)?;
+        let a_ab = xt_diag_y_dense(&basis_uv, &hessian_mm_base, &geom.basis)?;
+        let a_ij = xt_diag_y_dense(&basis_u, &hessian_mm_base, &basis_v)?;
+        let a_iwj = xt_diag_y_dense(&basis_u, &hessian_mm_v, &geom.basis)?;
+        let a_jwi = xt_diag_y_dense(&basis_v, &hessian_mm_u, &geom.basis)?;
         let h_ww = &a_ab
             + &a_ab.t()
             + &a_ij
@@ -1161,7 +1167,7 @@ impl GaussianLocationScaleWiggleFamily {
             + a_iwj.t()
             + &a_jwi
             + a_jwi.t()
-            + &xt_diag_x_dense(&geom.basis, &dw_uv)?;
+            + &xt_diag_x_dense(&geom.basis, &hessian_mm_uv)?;
         Ok(Some(gaussian_pack_wiggle_joint_symmetrichessian(
             &h_mm, &h_ml, &h_mw, &h_ll, &h_lw, &h_ww,
         )))
