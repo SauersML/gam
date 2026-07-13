@@ -257,6 +257,7 @@ impl SurvivalMarginalSlopePsiWorkspace {
         hyper_layout: crate::custom_family::CustomFamilyHyperLayout,
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
+        family.family_hyper.validate_layout(&hyper_layout)?;
         let cache = if family.flex_active() {
             None
         } else {
@@ -278,8 +279,8 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         &self,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        match self.hyper_layout.axis(psi_index) {
-            Some(crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. }) => {
+        match self.family.family_hyper_role(&self.hyper_layout, psi_index)? {
+            None => {
                 self.family.psi_terms_inner_with_options(
                     &self.block_states,
                     self.hyper_layout.design_derivative_blocks(),
@@ -288,21 +289,15 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                     &self.options,
                 )
             }
-            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 }) => {
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => {
                 self.family.sigma_exact_joint_psi_terms_with_options(
                     &self.block_states,
                     &self.specs,
                     &self.options,
                 )
             }
-            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }) => {
-                Err(format!(
-                    "SurvivalMarginalSlopeFamily does not declare family hyper axis {family_axis}"
-                ))
-            }
-            None => Err(format!(
-                "SurvivalMarginalSlopeFamily hyper axis {psi_index} is out of range for {} axes",
-                self.hyper_layout.len()
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => Err(format!(
+                "survival marginal-slope baseline family axis {axis} has no installed exact first-order row calculus"
             )),
         }
     }
@@ -356,23 +351,10 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let axis_i = self.hyper_layout.axis(psi_i).ok_or_else(|| {
-            format!(
-                "SurvivalMarginalSlopeFamily hyper axis {psi_i} is out of range for {} axes",
-                self.hyper_layout.len()
-            )
-        })?;
-        let axis_j = self.hyper_layout.axis(psi_j).ok_or_else(|| {
-            format!(
-                "SurvivalMarginalSlopeFamily hyper axis {psi_j} is out of range for {} axes",
-                self.hyper_layout.len()
-            )
-        })?;
+        let axis_i = self.family.family_hyper_role(&self.hyper_layout, psi_i)?;
+        let axis_j = self.family.family_hyper_role(&self.hyper_layout, psi_j)?;
         match (axis_i, axis_j) {
-            (
-                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
-                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
-            ) => self.family.psi_second_order_terms_inner_with_options(
+            (None, None) => self.family.psi_second_order_terms_inner_with_options(
                 &self.block_states,
                 self.hyper_layout.design_derivative_blocks(),
                 psi_i,
@@ -381,28 +363,17 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                 &self.options,
             ),
             (
-                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
-                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma),
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma),
             ) => self
                 .family
                 .sigma_exact_joint_psisecond_order_terms_with_options(
                     &self.block_states,
                     &self.options,
                 ),
-            (
-                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
-                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
-            )
-            | (
-                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
-                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
-            ) => Ok(None),
-            (crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }, _)
-            | (_, crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }) => {
-                Err(format!(
-                    "SurvivalMarginalSlopeFamily does not declare family hyper axis {family_axis}"
-                ))
-            }
+            _ => Err(format!(
+                "survival marginal-slope family-touching pair ({psi_i}, {psi_j}) has no installed exact second-order row calculus"
+            )),
         }
     }
 
@@ -411,8 +382,8 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<gam_problem::DriftDerivResult>, String> {
-        match self.hyper_layout.axis(psi_index) {
-            Some(crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. }) => self
+        match self.family.family_hyper_role(&self.hyper_layout, psi_index)? {
+            None => self
                 .family
                 .psi_hessian_directional_derivative_operator_with_options(
                     &self.block_states,
@@ -422,7 +393,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                     &self.options,
                 )
                 .map(|result| result.map(gam_problem::DriftDerivResult::Operator)),
-            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 }) => self
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => self
                 .family
                 .sigma_exact_joint_psihessian_directional_derivative_with_options(
                     &self.block_states,
@@ -430,14 +401,8 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                     &self.options,
                 )
                 .map(|result| result.map(gam_problem::DriftDerivResult::Dense)),
-            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }) => {
-                Err(format!(
-                    "SurvivalMarginalSlopeFamily does not declare family hyper axis {family_axis}"
-                ))
-            }
-            None => Err(format!(
-                "SurvivalMarginalSlopeFamily hyper axis {psi_index} is out of range for {} axes",
-                self.hyper_layout.len()
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => Err(format!(
+                "survival marginal-slope baseline family axis {axis} has no installed exact beta-Hessian drift calculus"
             )),
         }
     }

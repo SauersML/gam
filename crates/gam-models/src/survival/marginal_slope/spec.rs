@@ -124,6 +124,9 @@ pub struct SurvivalMarginalSlopeFitResult {
     pub marginal_design: TermCollectionDesign,
     /// Learned or fixed Gaussian-shift frailty SD.  `None` = no frailty.
     pub gaussian_frailty_sd: Option<f64>,
+    /// Certified nonlinear baseline selected by the joint LAML solve. Linear
+    /// baselines have no family-owned coordinates and therefore return `None`.
+    pub baseline_config: Option<crate::survival::construction::SurvivalBaselineConfig>,
     pub logslope_design: TermCollectionDesign,
     pub baseline_slope: f64,
     pub baseline_offset_residuals: OffsetChannelResiduals,

@@ -47,14 +47,18 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let score_covariance = marginal_slope_covariance_from_scores(spec.z.view(), &spec.weights)?;
     let z_primary = spec.z.column(0).to_owned();
     let n = spec.age_entry.len();
-    let (initial_sigma, learned_sigma_initial) = match &spec.frailty {
+    let (initial_sigma, learned_sigma_initial, learned_log_sigma_coordinate) = match &spec.frailty {
         FrailtySpec::GaussianShift {
             scale: FrailtyScale::Fixed { sigma },
-        } => (Some(*sigma), None),
+        } => (Some(*sigma), None, None),
         FrailtySpec::GaussianShift {
-            scale: FrailtyScale::Learned { initial_sigma },
-        } => (Some(*initial_sigma), Some(*initial_sigma)),
-        FrailtySpec::None => (None, None),
+            scale @ FrailtyScale::Learned { initial_sigma },
+        } => (
+            Some(*initial_sigma),
+            Some(*initial_sigma),
+            scale.learned_log_sigma_coordinate(),
+        ),
+        FrailtySpec::None => (None, None, None),
         FrailtySpec::HazardMultiplier { .. } => {
             return Err(SurvivalMarginalSlopeError::InvalidInput {
                 reason:
@@ -64,6 +68,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             .into());
         }
     };
+    let (baseline_initial_theta, baseline_lower_theta, baseline_upper_theta) =
+        match &spec.baseline_hyper {
+            SurvivalMarginalSlopeBaselineHyperSpec::Linear => {
+                (Vec::new(), Vec::new(), Vec::new())
+            }
+            SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear { chart } => {
+                let (lower, upper) = chart.theta_bounds();
+                (chart.initial_theta().to_vec(), lower.to_vec(), upper.to_vec())
+            }
+        };
     let probit_scale = probit_frailty_scale(initial_sigma);
     let baseline_started = std::time::Instant::now();
     let baseline_slope = pooled_survival_baseline(
@@ -745,7 +759,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         logslope_design.penalties.len(),
         &core_rho0_seed,
         &extra_rho0,
-        learned_sigma_initial,
+        &baseline_initial_theta,
+        &baseline_lower_theta,
+        &baseline_upper_theta,
+        learned_log_sigma_coordinate,
         kappa_options_effective,
     );
 
@@ -1631,6 +1648,60 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     };
 
     let intercept_warm_starts = new_intercept_warm_start_cache(n);
+    let initial_hyper_theta = setup.theta0();
+    let family_coordinate_start = setup.rho_dim() + setup.log_kappa_dim();
+    let baseline_axis_count = baseline_initial_theta.len();
+    let sigma_coordinate = learned_sigma_initial
+        .is_some()
+        .then_some(family_coordinate_start + baseline_axis_count);
+    let sigma_from_theta = |theta: &Array1<f64>| -> Result<Option<f64>, String> {
+        match sigma_coordinate {
+            Some(axis) => theta
+                .get(axis)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "survival marginal-slope theta has {} coordinates, missing learned log-sigma axis {axis}",
+                        theta.len()
+                    )
+                })
+                .map(|log_sigma| Some(log_sigma.exp())),
+            None => Ok(initial_sigma),
+        }
+    };
+    let family_hyper_from_theta =
+        |theta: &Array1<f64>| -> Result<SurvivalMarginalSlopeFamilyHyperState, String> {
+            let baseline_end = family_coordinate_start + baseline_axis_count;
+            if theta.len() < baseline_end {
+                return Err(format!(
+                    "survival marginal-slope theta has {} coordinates, expected at least {baseline_end} to realize the baseline chart",
+                    theta.len()
+                ));
+            }
+            let baseline_geometry = match &spec.baseline_hyper {
+                SurvivalMarginalSlopeBaselineHyperSpec::Linear => None,
+                SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear { chart } => {
+                    let baseline_theta = theta
+                        .slice(s![family_coordinate_start..baseline_end])
+                        .to_owned();
+                    Some(Arc::new(chart.evaluate(&baseline_theta)?))
+                }
+            };
+            let learned_log_sigma = sigma_coordinate
+                .map(|axis| {
+                    theta.get(axis).copied().ok_or_else(|| {
+                        format!(
+                            "survival marginal-slope theta has {} coordinates, missing learned log-sigma axis {axis}",
+                            theta.len()
+                        )
+                    })
+                })
+                .transpose()?;
+            SurvivalMarginalSlopeFamilyHyperState::new(
+                baseline_geometry,
+                learned_log_sigma,
+            )
+        };
     // FlexActivation::OffForRigidPilot forces the rigid warm-start to construct
     // a family with no score_warp / link_dev runtimes and no flex blocks. That
     // is the only way to guarantee the pilot does not enter the survival flex
@@ -1639,10 +1710,25 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // call site.
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign,
-                       sigma: Option<f64>,
+                       theta: &Array1<f64>,
                        flex: FlexActivation,
                        coords: BlockDesignCoords|
      -> Result<SurvivalMarginalSlopeFamily, String> {
+        let family_hyper = family_hyper_from_theta(theta)?;
+        let sigma = sigma_from_theta(theta)?;
+        let (family_offset_entry, family_offset_exit, family_derivative_offset_exit) =
+            match family_hyper.baseline_geometry.as_ref() {
+                Some(geometry) => (
+                    Arc::new(geometry.offset_entry.clone()),
+                    Arc::new(geometry.offset_exit.clone()),
+                    Arc::new(geometry.derivative_offset_exit.clone()),
+                ),
+                None => (
+                    Arc::clone(&offset_entry),
+                    Arc::clone(&offset_exit),
+                    Arc::clone(&derivative_offset_exit),
+                ),
+            };
         let (score_warp_active, link_dev_active) = match flex {
             FlexActivation::OffForRigidPilot => (None, None),
             FlexActivation::On => (score_warp_runtime.clone(), link_dev_runtime.clone()),
@@ -1668,13 +1754,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             z: Arc::clone(&z),
             score_covariance: score_covariance.clone(),
             gaussian_frailty_sd: sigma,
+            family_hyper,
             derivative_guard,
             design_entry: design_entry.clone(),
             design_exit: design_exit.clone(),
             design_derivative_exit: design_derivative_exit.clone(),
-            offset_entry: Arc::clone(&offset_entry),
-            offset_exit: Arc::clone(&offset_exit),
-            derivative_offset_exit: Arc::clone(&derivative_offset_exit),
+            offset_entry: family_offset_entry,
+            offset_exit: family_offset_exit,
+            derivative_offset_exit: family_derivative_offset_exit,
             marginal_design: marginal_design.design.clone(),
             logslope_layout,
             score_warp: score_warp_active,
@@ -2040,7 +2127,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let rigid_family = make_family(
             &marginal_design,
             &logslope_design,
-            initial_sigma,
+            &initial_hyper_theta,
             FlexActivation::OffForRigidPilot,
             BlockDesignCoords::PostCutover,
         )?;
@@ -2184,7 +2271,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let initial_family = make_family(
         &marginal_design,
         &logslope_design,
-        initial_sigma,
+        &initial_hyper_theta,
         FlexActivation::On,
         BlockDesignCoords::PostCutover,
     )?;
@@ -2218,13 +2305,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 .iter()
                 .zip(right.iter())
                 .all(|(lhs, rhs)| lhs.to_bits() == rhs.to_bits())
-    };
-    let sigma_from_theta = |theta: &Array1<f64>| -> Option<f64> {
-        if learned_sigma_initial.is_some() {
-            Some(theta[setup.rho_dim() + setup.log_kappa_dim()].exp())
-        } else {
-            initial_sigma
-        }
     };
     let get_hyper_layout = |theta: &Array1<f64>,
                             specs: &[TermCollectionSpec],
@@ -2268,11 +2348,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         if link_dev_runtime.is_some() {
             derivative_blocks.push(Vec::new());
         }
-        let family_axes = if learned_sigma_initial.is_some() {
-            vec![0]
-        } else {
-            Vec::new()
-        };
+        let family_axis_count =
+            baseline_axis_count + usize::from(learned_sigma_initial.is_some());
+        let family_axes = (0..family_axis_count).collect();
         let hyper_values = theta.slice(s![setup.rho_dim()..]).to_owned();
         let layout = Arc::new(crate::custom_family::CustomFamilyHyperLayout::new(
             derivative_blocks,
@@ -2333,11 +2411,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 FlexActivation::On,
                 BlockDesignCoords::RematerializedRaw,
             )?;
-            let sigma = sigma_from_theta(theta);
             let family = make_family(
                 &designs[0],
                 &designs[1],
-                sigma,
+                theta,
                 FlexActivation::On,
                 BlockDesignCoords::RematerializedRaw,
             )?;
@@ -2417,7 +2494,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     }
                 }
             }
-            let sigma = sigma_from_theta(theta);
             // Preserve ValueOnly probes and request the Hessian exactly when
             // this realized family advertised analytic joint second-order
             // support.
@@ -2430,7 +2506,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             let family = make_family(
                 &designs[0],
                 &designs[1],
-                sigma,
+                theta,
                 FlexActivation::On,
                 BlockDesignCoords::RematerializedRaw,
             )?;
@@ -2518,11 +2594,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     }
                 }
             }
-            let sigma = sigma_from_theta(theta);
             let family = make_family(
                 &designs[0],
                 &designs[1],
-                sigma,
+                theta,
                 FlexActivation::On,
                 BlockDesignCoords::RematerializedRaw,
             )?;
@@ -2788,16 +2863,23 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 .to_string()
         })?
         .rho();
-    let final_sigma = sigma_from_theta(certified_theta);
-    let (baseline_offset_residuals, baseline_offset_curvatures) = {
+    let final_sigma = sigma_from_theta(certified_theta)?;
+    let (baseline_offset_residuals, baseline_offset_curvatures, final_baseline_config) = {
         let final_family = make_family(
             &solved.designs[0],
             &solved.designs[1],
-            final_sigma,
+            certified_theta,
             FlexActivation::On,
             BlockDesignCoords::RematerializedRaw,
         )?;
-        final_family.offset_channel_geometry(&solved.fit.block_states)?
+        let selected_baseline = final_family
+            .family_hyper
+            .baseline_geometry
+            .as_ref()
+            .map(|geometry| geometry.baseline_config.clone());
+        let (residuals, curvatures) =
+            final_family.offset_channel_geometry(&solved.fit.block_states)?;
+        (residuals, curvatures, selected_baseline)
     };
 
     // Phase-4b V+M-exact result-time lift. When the active cutover
@@ -2913,6 +2995,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         marginal_design: designs[0].clone(),
         logslope_design: designs[1].clone(),
         gaussian_frailty_sd: final_sigma,
+        baseline_config: final_baseline_config,
         baseline_slope,
         baseline_offset_residuals,
         baseline_offset_curvatures,

@@ -3468,6 +3468,8 @@ pub struct SurvivalMarginalSlopeFrozenOffsetChart {
     age_exit: Array1<f64>,
     target: SurvivalBaselineTarget,
     initial_theta: Array1<f64>,
+    lower_theta: Array1<f64>,
+    upper_theta: Array1<f64>,
     fixed_offset_entry: Array1<f64>,
     fixed_offset_exit: Array1<f64>,
     fixed_derivative_offset_exit: Array1<f64>,
@@ -3514,11 +3516,15 @@ impl SurvivalMarginalSlopeFrozenOffsetChart {
                     "survival marginal-slope frozen offset chart requires a nonlinear baseline",
                 )
             })?;
+        let lower_theta = initial_geometry.theta.mapv(|value| value - 6.0);
+        let upper_theta = initial_geometry.theta.mapv(|value| value + 6.0);
         Ok(Self {
             age_entry: age_entry.clone(),
             age_exit: age_exit.clone(),
             target: initial_config.target,
             initial_theta: initial_geometry.theta,
+            lower_theta,
+            upper_theta,
             fixed_offset_entry: prepared_offset_entry - &initial_geometry.offset_entry,
             fixed_offset_exit: prepared_offset_exit - &initial_geometry.offset_exit,
             fixed_derivative_offset_exit: prepared_derivative_offset_exit
@@ -3532,6 +3538,14 @@ impl SurvivalMarginalSlopeFrozenOffsetChart {
 
     pub fn initial_theta(&self) -> &Array1<f64> {
         &self.initial_theta
+    }
+
+    /// Declared finite domain of this frozen nonlinear chart. These are the
+    /// same coordinate bounds used by the legacy standalone baseline solver,
+    /// now owned by the chart so a joint solver and its terminal certificate
+    /// cannot silently choose a different domain.
+    pub fn theta_bounds(&self) -> (&Array1<f64>, &Array1<f64>) {
+        (&self.lower_theta, &self.upper_theta)
     }
 
     pub fn fixed_offsets(&self) -> (&Array1<f64>, &Array1<f64>, &Array1<f64>) {

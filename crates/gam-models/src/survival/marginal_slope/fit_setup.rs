@@ -369,7 +369,10 @@ pub(crate) fn joint_setup(
     logslope_penalties: usize,
     core_rho0_seed: &[f64],
     extra_rho0: &[f64],
-    learned_sigma_initial: Option<f64>,
+    baseline_initial_theta: &[f64],
+    baseline_lower_theta: &[f64],
+    baseline_upper_theta: &[f64],
+    learned_log_sigma_coordinate: Option<(f64, f64, f64)>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
     let (marginal_terms, logslope_terms) = if kappa_options.enabled {
@@ -471,11 +474,29 @@ pub(crate) fn joint_setup(
         log_kappa_lower,
         log_kappa_upper,
     );
-    if let Some(sigma) = learned_sigma_initial {
+    assert_eq!(
+        baseline_initial_theta.len(),
+        baseline_lower_theta.len(),
+        "baseline lower bound length mismatch"
+    );
+    assert_eq!(
+        baseline_initial_theta.len(),
+        baseline_upper_theta.len(),
+        "baseline upper bound length mismatch"
+    );
+    let mut auxiliary0 = baseline_initial_theta.to_vec();
+    let mut lower = baseline_lower_theta.to_vec();
+    let mut upper = baseline_upper_theta.to_vec();
+    if let Some((log_sigma, log_sigma_lower, log_sigma_upper)) = learned_log_sigma_coordinate {
+        auxiliary0.push(log_sigma);
+        lower.push(log_sigma_lower);
+        upper.push(log_sigma_upper);
+    }
+    if !auxiliary0.is_empty() {
         setup.with_auxiliary(
-            Array1::from_vec(vec![sigma.ln()]),
-            Array1::from_vec(vec![-12.0]),
-            Array1::from_vec(vec![6.0]),
+            Array1::from_vec(auxiliary0),
+            Array1::from_vec(lower),
+            Array1::from_vec(upper),
         )
     } else {
         setup

@@ -95,6 +95,15 @@ impl FrailtyScale {
             }),
         }
     }
+
+    /// Exact log-sigma coordinate and declared finite chart domain for a
+    /// learned scale. Fixed scales have no optimizer coordinate.
+    pub(crate) fn learned_log_sigma_coordinate(self) -> Option<(f64, f64, f64)> {
+        match self {
+            Self::Fixed { .. } => None,
+            Self::Learned { initial_sigma } => Some((initial_sigma.ln(), -12.0, 6.0)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

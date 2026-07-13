@@ -18,17 +18,51 @@ pub(crate) enum SurvivalMarginalSlopeFamilyHyperAxis {
 /// realized family so callbacks never infer semantics from empty derivative
 /// matrices or floating-point values.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct SurvivalMarginalSlopeFamilyHyperAxes {
+pub(crate) struct SurvivalMarginalSlopeFamilyHyperState {
     baseline_axis_count: usize,
     log_sigma_axis: Option<usize>,
+    /// Exact family-coordinate values used to realize this family instance.
+    /// Kept bitwise aligned with the family tail of `CustomFamilyHyperLayout`
+    /// so a workspace cannot accidentally reuse row geometry from a
+    /// neighbouring outer probe.
+    family_values: Array1<f64>,
+    pub(crate) baseline_geometry:
+        Option<Arc<crate::survival::construction::SurvivalMarginalSlopeOffsetGeometry>>,
 }
 
-impl SurvivalMarginalSlopeFamilyHyperAxes {
-    pub(crate) fn new(baseline_axis_count: usize, learned_sigma: bool) -> Self {
-        Self {
-            baseline_axis_count,
-            log_sigma_axis: learned_sigma.then_some(baseline_axis_count),
+impl SurvivalMarginalSlopeFamilyHyperState {
+    pub(crate) fn new(
+        baseline_geometry: Option<
+            Arc<crate::survival::construction::SurvivalMarginalSlopeOffsetGeometry>,
+        >,
+        learned_log_sigma: Option<f64>,
+    ) -> Result<Self, String> {
+        let baseline_axis_count = baseline_geometry
+            .as_ref()
+            .map_or(0, |geometry| geometry.theta.len());
+        let mut family_values = baseline_geometry
+            .as_ref()
+            .map_or_else(Vec::new, |geometry| geometry.theta.to_vec());
+        if let Some(log_sigma) = learned_log_sigma {
+            if !log_sigma.is_finite() {
+                return Err(
+                    "survival marginal-slope learned log-sigma coordinate must be finite"
+                        .to_string(),
+                );
+            }
+            family_values.push(log_sigma);
         }
+        if family_values.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "survival marginal-slope baseline family coordinates must be finite".to_string(),
+            );
+        }
+        Ok(Self {
+            baseline_axis_count,
+            log_sigma_axis: learned_log_sigma.map(|_| baseline_axis_count),
+            family_values: Array1::from_vec(family_values),
+            baseline_geometry,
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -49,6 +83,34 @@ impl SurvivalMarginalSlopeFamilyHyperAxes {
             None
         }
     }
+
+    pub(crate) fn validate_layout(
+        &self,
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+    ) -> Result<(), String> {
+        if hyper_layout.family_axis_count() != self.len() {
+            return Err(format!(
+                "SurvivalMarginalSlopeFamily declares {} family hyper axes, manifest carries {}",
+                self.len(),
+                hyper_layout.family_axis_count(),
+            ));
+        }
+        let manifest_family_values = hyper_layout
+            .values()
+            .slice(s![hyper_layout.design_axis_count()..]);
+        if manifest_family_values.len() != self.family_values.len()
+            || manifest_family_values
+                .iter()
+                .zip(self.family_values.iter())
+                .any(|(manifest, realized)| manifest.to_bits() != realized.to_bits())
+        {
+            return Err(
+                "SurvivalMarginalSlopeFamily row geometry does not bitwise match the family-coordinate manifest"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// The time block has one beta vector but THREE design matrices (entry, exit,
@@ -66,7 +128,7 @@ pub(crate) struct SurvivalMarginalSlopeFamily {
     pub(crate) z: Arc<Array2<f64>>,
     pub(crate) score_covariance: MarginalSlopeCovariance,
     pub(crate) gaussian_frailty_sd: Option<f64>,
-    pub(crate) family_hyper_axes: SurvivalMarginalSlopeFamilyHyperAxes,
+    pub(crate) family_hyper: SurvivalMarginalSlopeFamilyHyperState,
     pub(crate) derivative_guard: f64,
     /// Time block: 3 designs sharing one beta vector.
     /// Stored as DesignMatrix to support sparse local-support bases at
@@ -146,17 +208,11 @@ impl SurvivalMarginalSlopeFamily {
         hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         global_axis: usize,
     ) -> Result<Option<SurvivalMarginalSlopeFamilyHyperAxis>, String> {
-        if hyper_layout.family_axis_count() != self.family_hyper_axes.len() {
-            return Err(format!(
-                "SurvivalMarginalSlopeFamily declares {} family hyper axes, manifest carries {}",
-                self.family_hyper_axes.len(),
-                hyper_layout.family_axis_count(),
-            ));
-        }
+        self.family_hyper.validate_layout(hyper_layout)?;
         match hyper_layout.axis(global_axis) {
             Some(crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. }) => Ok(None),
             Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }) => self
-                .family_hyper_axes
+                .family_hyper
                 .role(family_axis)
                 .map(Some)
                 .ok_or_else(|| {
