@@ -843,7 +843,7 @@ impl MarginalSlopeCovariance {
             }
             let root = value.sqrt();
             square_root[axis] = root;
-            ones_quadratic_form += root * root;
+            ones_quadratic_form += value;
         }
         if !ones_quadratic_form.is_finite() {
             return Err("marginal-slope diagonal covariance geometry overflowed".to_string());
