@@ -1161,11 +1161,44 @@ impl CertifiedOuterResult {
         self.result.final_grad_norm
     }
 
+    /// Exact analytic gradient re-measured by the optimizer-owned terminal
+    /// certificate. Downstream selected-profile finalizers use this to prove
+    /// that a retained objective payload is the one certified at `rho()`.
+    pub fn final_gradient(&self) -> Option<&Array1<f64>> {
+        self.result.final_gradient.as_ref()
+    }
+
     pub fn criterion_certificate(&self) -> &OuterCriterionCertificate {
         self.result
             .criterion_certificate
             .as_ref()
             .expect("CertifiedOuterResult always owns a validated certificate")
+    }
+}
+
+#[cfg(test)]
+mod certified_outer_result_tests {
+    use super::*;
+
+    #[test]
+    fn caller_boolean_and_zero_gradient_cannot_mint_outer_authority() {
+        let mut fabricated = OuterResult::new(
+            Array1::from_vec(vec![0.0]),
+            1.0,
+            3,
+            true,
+            OuterPlan {
+                solver: Solver::Bfgs,
+                hessian_source: HessianSource::BfgsApprox,
+            },
+        );
+        fabricated.final_grad_norm = Some(0.0);
+        fabricated.final_gradient = Some(Array1::from_vec(vec![0.0]));
+        fabricated.converged_via = Some(OuterConvergedVia::GradientStationary);
+
+        let reason = CertifiedOuterResult::from_optimizer_result(fabricated)
+            .expect_err("caller-written status and gradient must not mint a certificate");
+        assert!(reason.contains("no analytic certificate"), "{reason}");
     }
 }
 
