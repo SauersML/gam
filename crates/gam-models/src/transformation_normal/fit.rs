@@ -910,7 +910,13 @@ mod owned_mode_slot_tests {
             &theta,
             &geometry_key,
             &gam_problem::outer_subsample::RowSet::Subsample {
-                rows: Arc::new(vec![0]),
+                rows: Arc::new(vec![
+                    gam_problem::outer_subsample::WeightedOuterRow {
+                        index: 0,
+                        weight: 2.0,
+                        stratum: 0,
+                    },
+                ]),
                 n_full: 2,
             },
             gam_problem::EvalMode::ValueGradientHessian,
