@@ -464,6 +464,7 @@ fn sae_eq4_description_length<'py>(
     let out = PyDict::new(py);
     out.set_item("support_bits", dl.support_bits)?;
     out.set_item("achieved_block_l0", dl.achieved_block_l0)?;
+    out.set_item("dictionary_bits", dl.dictionary_bits)?;
     for row in &dl.per_target {
         let suffix = format_g(row.target);
         out.set_item(format!("bits_at_r2_{suffix}"), row.bits)?;

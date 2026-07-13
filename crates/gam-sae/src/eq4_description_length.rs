@@ -80,6 +80,9 @@ pub struct Eq4DescriptionLength {
     /// Achieved mean per-token support cardinality `L0` (mean active atoms per
     /// row), the un-rounded value that the support cardinality rounds.
     pub achieved_block_l0: f64,
+    /// Amortised BIC dictionary charge
+    /// `0.5 * dictionary_params / N * log2(N)`, shared by every target.
+    pub dictionary_bits: f64,
     /// One entry per R² target, in the order the targets were supplied.
     pub per_target: Vec<Eq4TargetBits>,
     /// The featurizer's own native bits/token, echoed through when supplied.
@@ -319,6 +322,7 @@ where
     Ok(Eq4DescriptionLength {
         support_bits,
         achieved_block_l0: l0,
+        dictionary_bits,
         per_target,
         native_bits_per_token,
     })
@@ -370,6 +374,7 @@ mod tests {
         assert_eq!(result.per_target.len(), 1);
         let target = result.per_target[0];
         let dictionary_bits = 0.5 * 4.0 / 6.0 * 6.0_f64.log2();
+        assert_eq!(result.dictionary_bits, dictionary_bits);
         assert!(
             (target.bits
                 - (result.support_bits + target.code_bits + target.resid_bits + dictionary_bits))
