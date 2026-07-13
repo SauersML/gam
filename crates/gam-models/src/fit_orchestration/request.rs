@@ -332,6 +332,19 @@ pub struct SurvivalLocationScaleFitResult {
     pub inverse_link: InverseLink,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
+    /// Distinct proof for outer inverse-link profiling. The nested unified fit
+    /// retains its own smoothing/spatial certificate; optimized-link results
+    /// retain this sealed carrier instead of overwriting or dropping either
+    /// optimization layer's evidence. `None` means the inverse link was fixed.
+    pub(crate) inverse_link_outer: Option<gam_solve::rho_optimizer::CertifiedOuterResult>,
+}
+
+impl SurvivalLocationScaleFitResult {
+    pub fn inverse_link_outer(
+        &self,
+    ) -> Option<&gam_solve::rho_optimizer::CertifiedOuterResult> {
+        self.inverse_link_outer.as_ref()
+    }
 }
 
 pub struct SurvivalTransformationFitResult {

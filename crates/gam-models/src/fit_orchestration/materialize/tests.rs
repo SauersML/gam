@@ -1,7 +1,6 @@
 use super::*;
 use gam_data::load_dataset_projected;
 use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam_solve::rho_optimizer::{HessianSource, OuterPlan, OuterResult, Solver};
 use gam_terms::basis::{
     DuchonNullspaceOrder, center_strategy_is_auto, minimum_duchon_power_for_operator_penalties,
     starting_num_centers,
@@ -1054,21 +1053,6 @@ fn surv_interval_degenerate_bracket_dataset() -> Dataset {
     }
 }
 
-fn workflow_test_outer_result(converged: bool, rho: Array1<f64>) -> OuterResult {
-    let mut result = OuterResult::new(
-        rho,
-        1.25,
-        7,
-        converged,
-        OuterPlan {
-            solver: Solver::Bfgs,
-            hessian_source: HessianSource::BfgsApprox,
-        },
-    );
-    result.final_grad_norm = Some(0.5);
-    result
-}
-
 fn duchon_workflow_dataset() -> Dataset {
     let n = 72usize;
     let mut values = Array2::<f64>::zeros((n, 3));
@@ -2113,34 +2097,6 @@ fn survival_location_scale_wiggle_rejects_unsupported_inverse_link() {
 
     assert!(err.contains("survival link wiggle"));
     assert!(err.contains("does not support"));
-}
-
-#[test]
-fn survival_inverse_link_result_requires_convergence() {
-    let err = recover_converged_survival_inverse_link(
-        workflow_test_outer_result(false, Array1::from_vec(vec![0.1, -0.2])),
-        "survival inverse-link optimization (SAS, dim=2)",
-        |_| Some(InverseLink::Standard(StandardLink::Logit)),
-    )
-    .err()
-    .expect("non-converged inverse-link search should fail");
-
-    assert!(err.contains("did not converge"));
-    assert!(err.contains("final_objective"));
-}
-
-#[test]
-fn survival_inverse_link_result_requires_recoverable_state() {
-    let err = recover_converged_survival_inverse_link(
-        workflow_test_outer_result(true, Array1::from_vec(vec![9.0, 8.0])),
-        "survival inverse-link optimization (mixture, dim=2)",
-        |_| None,
-    )
-    .err()
-    .expect("unrecoverable inverse-link state should fail");
-
-    assert!(err.contains("produced an invalid inverse-link state"));
-    assert!(err.contains("9.0"));
 }
 
 // #371: survival-only / binomial-only DSL controls must be *rejected* in a
