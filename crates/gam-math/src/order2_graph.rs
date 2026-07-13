@@ -13,6 +13,7 @@
 //! this module owns the compiled lowering schedule.
 
 use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 
 use crate::jet_scalar::{Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients};
 
@@ -55,6 +56,68 @@ const EMPTY_NODE: GraphNode = GraphNode {
     support: 0,
 };
 const EMPTY_ATOM: CurvatureAtom = CurvatureAtom::Empty;
+
+/// Fixed-capacity scalar scratch with only its logical prefix initialized.
+///
+/// The graph's active atom count and quadratic arity are usually far below the
+/// hard node capacity. Keeping the inactive suffix uninitialized prevents a
+/// full 32-scalar memset in every primitive while retaining allocation-free,
+/// checked storage for the general graph contract.
+struct InlineScalars {
+    slots: [MaybeUninit<f64>; MAX_GRAPH_NODES],
+    len: usize,
+}
+
+impl InlineScalars {
+    #[inline(always)]
+    fn zeros(len: usize) -> Self {
+        assert!(len <= MAX_GRAPH_NODES, "inline scalar capacity exceeded");
+        let mut values = Self {
+            slots: [MaybeUninit::uninit(); MAX_GRAPH_NODES],
+            len,
+        };
+        for slot in &mut values.slots[..len] {
+            slot.write(0.0);
+        }
+        values
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    fn push(&mut self, value: f64) {
+        assert!(self.len < MAX_GRAPH_NODES, "inline scalar capacity exceeded");
+        self.slots[self.len].write(value);
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    fn add(&mut self, index: usize, value: f64) {
+        debug_assert!(index < self.len);
+        // SAFETY: `zeros` initializes the entire logical prefix, `push`
+        // initializes one slot before extending it, and callers only address
+        // indices below `len`.
+        unsafe {
+            *self.slots.get_unchecked_mut(index).assume_init_mut() += value;
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[f64] {
+        // SAFETY: exactly the prefix `0..len` is initialized by `zeros`/`push`;
+        // `MaybeUninit<f64>` has the same layout and alignment as `f64`.
+        unsafe { std::slice::from_raw_parts(self.slots.as_ptr().cast::<f64>(), self.len) }
+    }
+
+    #[inline(always)]
+    fn as_mut_slice(&mut self) -> &mut [f64] {
+        // SAFETY: the logical prefix is initialized and uniquely borrowed.
+        unsafe { std::slice::from_raw_parts_mut(self.slots.as_mut_ptr().cast::<f64>(), self.len) }
+    }
+}
 
 #[derive(Debug)]
 struct GraphTape {
@@ -163,9 +226,14 @@ impl Order2GraphWorkspace {
         value: f64,
         support: u128,
         gradient: [f64; K],
-        hessian_weights: [f64; MAX_CURVATURE_ATOMS],
+        hessian_weights: &InlineScalars,
     ) -> usize {
         assert_eq!(tape.dimension, K, "compiled graph dimension mismatch");
+        assert_eq!(
+            hessian_weights.len(),
+            tape.atom_len,
+            "compiled graph curvature dimension mismatch"
+        );
         assert!(
             tape.node_len < MAX_GRAPH_NODES,
             "compiled graph node capacity exceeded"
@@ -173,8 +241,9 @@ impl Order2GraphWorkspace {
         let node = tape.node_len;
         tape.nodes[node] = GraphNode { value, support };
         tape.gradients[node * K..(node + 1) * K].copy_from_slice(&gradient);
-        tape.hessian_weights[node * MAX_CURVATURE_ATOMS..(node + 1) * MAX_CURVATURE_ATOMS]
-            .copy_from_slice(&hessian_weights);
+        let weight_start = node * MAX_CURVATURE_ATOMS;
+        tape.hessian_weights[weight_start..weight_start + tape.atom_len]
+            .copy_from_slice(hessian_weights.as_slice());
         tape.node_len += 1;
         node
     }
@@ -182,12 +251,16 @@ impl Order2GraphWorkspace {
     #[inline(always)]
     fn inherit_hessian(
         tape: &GraphTape,
-        output: &mut [f64; MAX_CURVATURE_ATOMS],
+        output: &mut InlineScalars,
         input: usize,
         scale: f64,
     ) {
+        debug_assert_eq!(output.len(), tape.atom_len);
         for atom in 0..tape.atom_len {
-            output[atom] += scale * tape.hessian_weights[input * MAX_CURVATURE_ATOMS + atom];
+            output.add(
+                atom,
+                scale * tape.hessian_weights[input * MAX_CURVATURE_ATOMS + atom],
+            );
         }
     }
 
@@ -198,6 +271,9 @@ impl Order2GraphWorkspace {
             "compiled graph curvature capacity exceeded"
         );
         let index = tape.atom_len;
+        for node in 0..tape.node_len {
+            tape.hessian_weights[node * MAX_CURVATURE_ATOMS + index] = 0.0;
+        }
         tape.atoms[index] = atom;
         tape.atom_len += 1;
         index
