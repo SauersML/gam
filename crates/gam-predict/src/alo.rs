@@ -1,10 +1,9 @@
 use std::ops::Range;
 
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam_model_kernels::sigma_link::survival_q0_from_eta;
 use gam_models::gamlss::{
-    DispersionFamilyKind, binomial_location_scale_alo_row_geometry,
-    dispersion_alo_row_geometry, gaussian_location_scale_alo_row_geometry,
+    DispersionFamilyKind, binomial_location_scale_alo_row_geometry, dispersion_alo_row_geometry,
+    gaussian_location_scale_alo_row_geometry,
 };
 use gam_models::inference::model::{
     FittedModel, PredictModelClass, binomial_location_scale_threshold_beta,
@@ -51,9 +50,7 @@ fn require_location_scale_inputs<'a>(
             class.name()
         )));
     }
-    if observations.prior_weights.len() != n
-        || input.design.nrows() != n
-        || input.offset.len() != n
+    if observations.prior_weights.len() != n || input.design.nrows() != n || input.offset.len() != n
     {
         return Err(invalid(format!(
             "saved {} ALO row mismatch: response={n}, weights={}, primary_design={}, primary_offset={}",
@@ -100,11 +97,7 @@ fn require_location_scale_inputs<'a>(
     Ok(noise_design)
 }
 
-fn secondary_eta(
-    input: &PredictInput,
-    design: &DesignMatrix,
-    beta: &Array1<f64>,
-) -> Array1<f64> {
+fn secondary_eta(input: &PredictInput, design: &DesignMatrix, beta: &Array1<f64>) -> Array1<f64> {
     let mut eta = design.dot(beta);
     if let Some(offset) = input.offset_noise.as_ref() {
         eta += offset;
@@ -155,17 +148,12 @@ fn require_saved_hessian<'a>(
     class: PredictModelClass,
     parameter_dimension: usize,
 ) -> Result<&'a Array2<f64>, EstimationError> {
-    let fit = model
-        .payload()
-        .fit_result
-        .as_ref()
-        .or_else(|| model.unified())
-        .ok_or_else(|| {
-            invalid(format!(
-                "saved {} ALO requires a canonical fitted coefficient state",
-                class.name()
-            ))
-        })?;
+    let fit = model.payload().fit_result.as_ref().ok_or_else(|| {
+        invalid(format!(
+            "saved {} ALO requires a canonical fitted coefficient state",
+            class.name()
+        ))
+    })?;
     let hessian = fit.penalized_hessian().ok_or_else(|| {
         invalid(format!(
             "saved {} ALO requires the exact unscaled penalized Hessian",
@@ -219,23 +207,23 @@ fn compute_gaussian_location_scale_alo(
 ) -> Result<SavedModelAloDiagnostics, EstimationError> {
     let class = PredictModelClass::GaussianLocationScale;
     let secondary_design = require_location_scale_inputs(class, input, observations)?;
-    let fit = model.payload().fit_result.as_ref().or_else(|| model.unified()).ok_or_else(|| {
+    let fit = model.payload().fit_result.as_ref().ok_or_else(|| {
         invalid("saved Gaussian location-scale ALO requires a canonical fit result")
     })?;
     let beta_mean = gaussian_location_scale_mean_beta(fit)
         .ok_or_else(|| invalid("saved Gaussian location-scale ALO is missing the mean block"))?;
-    let beta_scale = location_scale_noise_beta(fit).or_else(|| {
-        model
-            .payload()
-            .beta_noise
-            .clone()
-            .map(Array1::from_vec)
-    }).ok_or_else(|| invalid("saved Gaussian location-scale ALO is missing the log-scale block"))?;
-    let runtime = model
-        .saved_prediction_runtime()
-        .map_err(|error| invalid(format!("saved Gaussian location-scale ALO runtime: {error}")))?;
+    let beta_scale = location_scale_noise_beta(fit).ok_or_else(|| {
+        invalid("saved Gaussian location-scale ALO is missing the log-scale block")
+    })?;
+    let runtime = model.saved_prediction_runtime().map_err(|error| {
+        invalid(format!(
+            "saved Gaussian location-scale ALO runtime: {error}"
+        ))
+    })?;
     let wiggle = runtime.link_wiggle;
-    let wiggle_beta = wiggle.as_ref().map_or(&[][..], |runtime| runtime.beta.as_slice());
+    let wiggle_beta = wiggle
+        .as_ref()
+        .map_or(&[][..], |runtime| runtime.beta.as_slice());
     let parameter_dimension = beta_mean.len() + beta_scale.len() + wiggle_beta.len();
     let hessian = require_saved_hessian(model, class, parameter_dimension)?;
     let base_mean = input.design.dot(&beta_mean) + &input.offset;
@@ -258,12 +246,15 @@ fn compute_gaussian_location_scale_alo(
             Ok(Array2::zeros((n, 0))),
         ),
     };
-    let basis = basis.map_err(|error| invalid(format!("saved Gaussian ALO warp basis: {error}")))?;
+    let basis =
+        basis.map_err(|error| invalid(format!("saved Gaussian ALO warp basis: {error}")))?;
     let basis_d1 =
         basis_d1.map_err(|error| invalid(format!("saved Gaussian ALO warp d1: {error}")))?;
     let basis_d2 =
         basis_d2.map_err(|error| invalid(format!("saved Gaussian ALO warp d2: {error}")))?;
-    let response_scale = model.payload().gaussian_response_scale.unwrap_or(1.0);
+    let response_scale = model.payload().gaussian_response_scale.ok_or_else(|| {
+        invalid("saved Gaussian location-scale ALO is missing its response standardization scale")
+    })?;
 
     let mut observed_hessians = Vec::with_capacity(n);
     let mut scores = Vec::with_capacity(n);
@@ -326,32 +317,37 @@ fn compute_binomial_location_scale_alo(
 ) -> Result<SavedModelAloDiagnostics, EstimationError> {
     let class = PredictModelClass::BinomialLocationScale;
     let secondary_design = require_location_scale_inputs(class, input, observations)?;
-    let fit = model.payload().fit_result.as_ref().or_else(|| model.unified()).ok_or_else(|| {
+    let fit = model.payload().fit_result.as_ref().ok_or_else(|| {
         invalid("saved binomial location-scale ALO requires a canonical fit result")
     })?;
-    let beta_threshold = binomial_location_scale_threshold_beta(fit)
-        .ok_or_else(|| invalid("saved binomial location-scale ALO is missing the threshold block"))?;
-    let beta_scale = location_scale_noise_beta(fit).or_else(|| {
-        model
-            .payload()
-            .beta_noise
-            .clone()
-            .map(Array1::from_vec)
-    }).ok_or_else(|| invalid("saved binomial location-scale ALO is missing the log-scale block"))?;
-    let runtime = model
-        .saved_prediction_runtime()
-        .map_err(|error| invalid(format!("saved binomial location-scale ALO runtime: {error}")))?;
+    let beta_threshold = binomial_location_scale_threshold_beta(fit).ok_or_else(|| {
+        invalid("saved binomial location-scale ALO is missing the threshold block")
+    })?;
+    let beta_scale = location_scale_noise_beta(fit).ok_or_else(|| {
+        invalid("saved binomial location-scale ALO is missing the log-scale block")
+    })?;
+    let runtime = model.saved_prediction_runtime().map_err(|error| {
+        invalid(format!(
+            "saved binomial location-scale ALO runtime: {error}"
+        ))
+    })?;
     let inverse_link = runtime.inverse_link.ok_or_else(|| {
         invalid("saved binomial location-scale ALO is missing its resolved inverse link")
     })?;
     let wiggle = runtime.link_wiggle;
-    let wiggle_beta = wiggle.as_ref().map_or(&[][..], |runtime| runtime.beta.as_slice());
+    let wiggle_beta = wiggle
+        .as_ref()
+        .map_or(&[][..], |runtime| runtime.beta.as_slice());
     let parameter_dimension = beta_threshold.len() + beta_scale.len() + wiggle_beta.len();
     let hessian = require_saved_hessian(model, class, parameter_dimension)?;
     let threshold_eta = input.design.dot(&beta_threshold) + &input.offset;
     let eta_scale = secondary_eta(input, secondary_design, &beta_scale);
+    // Replay the fitted binomial map exactly. This deliberately does not use
+    // the survival prediction saturation helper: a non-representable q0 is a
+    // factual saved-row geometry failure here, not a value to replace before
+    // evaluating the fitted warp basis.
     let q0 = Array1::from_shape_fn(threshold_eta.len(), |row| {
-        survival_q0_from_eta(threshold_eta[row], eta_scale[row])
+        -threshold_eta[row] * (-eta_scale[row]).exp()
     });
     let n = observations.response.len();
     let (basis, basis_d1, basis_d2) = match wiggle.as_ref() {
@@ -371,7 +367,8 @@ fn compute_binomial_location_scale_alo(
             Ok(Array2::zeros((n, 0))),
         ),
     };
-    let basis = basis.map_err(|error| invalid(format!("saved binomial ALO warp basis: {error}")))?;
+    let basis =
+        basis.map_err(|error| invalid(format!("saved binomial ALO warp basis: {error}")))?;
     let basis_d1 =
         basis_d1.map_err(|error| invalid(format!("saved binomial ALO warp d1: {error}")))?;
     let basis_d2 =
@@ -449,18 +446,14 @@ fn compute_dispersion_location_scale_alo(
 ) -> Result<SavedModelAloDiagnostics, EstimationError> {
     let class = PredictModelClass::DispersionLocationScale;
     let secondary_design = require_location_scale_inputs(class, input, observations)?;
-    let fit = model.payload().fit_result.as_ref().or_else(|| model.unified()).ok_or_else(|| {
+    let fit = model.payload().fit_result.as_ref().ok_or_else(|| {
         invalid("saved dispersion location-scale ALO requires a canonical fit result")
     })?;
     let beta_mean = gaussian_location_scale_mean_beta(fit)
         .ok_or_else(|| invalid("saved dispersion location-scale ALO is missing the mean block"))?;
-    let beta_dispersion = location_scale_noise_beta(fit).or_else(|| {
-        model
-            .payload()
-            .beta_noise
-            .clone()
-            .map(Array1::from_vec)
-    }).ok_or_else(|| invalid("saved dispersion location-scale ALO is missing the precision block"))?;
+    let beta_dispersion = location_scale_noise_beta(fit).ok_or_else(|| {
+        invalid("saved dispersion location-scale ALO is missing the precision block")
+    })?;
     let parameter_dimension = beta_mean.len() + beta_dispersion.len();
     let hessian = require_saved_hessian(model, class, parameter_dimension)?;
     let eta_mean = input.design.dot(&beta_mean) + &input.offset;
