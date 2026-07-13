@@ -4856,6 +4856,20 @@ pub(crate) fn born_circle_atom(
             phase_coords.dim()
         ));
     }
+    if circle_gate.len() != n {
+        return Err(format!(
+            "born_circle_atom: circle gate must have one entry per row ({n}); got {}",
+            circle_gate.len()
+        ));
+    }
+    if circle_gate
+        .iter()
+        .any(|gate| !gate.is_finite() && *gate != f64::NEG_INFINITY)
+    {
+        return Err(
+            "born_circle_atom: circle gate entries must be finite or negative infinity".to_string(),
+        );
+    }
     // The plan is the sole authority for the basis, its analytic jets, and the
     // declared unit-circle function Gram. The decoder is only a coefficient
     // realization and cannot redefine any of those geometry fields.
@@ -4899,7 +4913,7 @@ pub(crate) fn born_circle_atom(
         // (absent rows, `circle_gate` = −∞) keep the conservative birth default. Both
         // scales are derived — the dictionary's own logits and the ρ_i/λ₊ ratio — no
         // new constant.
-        let own_gate = circle_gate.get(row).copied().unwrap_or(f64::NEG_INFINITY);
+        let own_gate = circle_gate[row];
         let inc_max = (0..k)
             .map(|c| term.assignment.logits[[row, c]])
             .fold(f64::NEG_INFINITY, f64::max);
@@ -8527,6 +8541,26 @@ mod tests {
         assert!(
             cand.net_evidence > 0.0,
             "net evidence must favour the circle"
+        );
+
+        // The typed seed is an atomic row-level contract. A truncated gate is
+        // schema corruption, not evidence that the omitted rows are absent.
+        let mut malformed_seed = cand.seed.clone();
+        let BirthSeed::Circle { gate, .. } = &mut malformed_seed else {
+            panic!("curl candidate must carry typed circle state");
+        };
+        gate.pop();
+        let malformed_error = apply_structure_move_seeded(
+            &term,
+            &rho,
+            &StructureMove::Birth { candidate: 0 },
+            &[malformed_seed],
+        )
+        .err()
+        .expect("a truncated circle gate must be rejected");
+        assert!(
+            malformed_error.contains("one entry per row"),
+            "unexpected truncated-gate error: {malformed_error}"
         );
 
         // Born through the existing birth plumbing → a Periodic circle atom.
