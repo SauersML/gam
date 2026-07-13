@@ -201,11 +201,7 @@ impl<'row> MultinomialLogitRowProgram<'row> {
     /// tails. The identity uses `sum(response) = 1`:
     ///
     /// `NLL/w = log(D) - sum_active y_a(eta_a-shift) + y_ref*shift`.
-    fn eval_expression<S: JetField>(
-        &self,
-        primaries: &[S],
-        constant: impl Fn(f64) -> S,
-    ) -> S {
+    fn eval_expression<S: JetField>(&self, primaries: &[S], constant: impl Fn(f64) -> S) -> S {
         assert_eq!(primaries.len(), self.eta.len());
         let shift = self.stable_shift();
         let mut denominator = constant((-shift).exp());
@@ -273,11 +269,7 @@ impl<'row> MultinomialLogitRowProgram<'row> {
 
     /// Diagonal-only structure-compiled Hessian lowering. This preserves the
     /// O(M) preconditioner path without reintroducing a second softmax formula.
-    pub(crate) fn hessian_diagonal_into(
-        &self,
-        probabilities: &mut [f64],
-        diagonal: &mut [f64],
-    ) {
+    pub(crate) fn hessian_diagonal_into(&self, probabilities: &mut [f64], diagonal: &mut [f64]) {
         let active_classes = self.eta.len();
         assert_eq!(diagonal.len(), active_classes);
         self.probabilities_into(probabilities);
@@ -1129,14 +1121,9 @@ impl MultinomialFamily {
     /// downstream assembly (gradient, dense Hessian, directional derivative)
     /// reads from the same source.
     fn evaluate_row_kernels(&self, eta: ArrayView2<'_, f64>) -> (f64, Array3<f64>, Array2<f64>) {
-        let log_lik = self.likelihood.log_lik(eta, self.y_one_hot.view());
-        // hess_block returns w_n · (δ_ab p_a − p_a p_b) (i.e. the canonical
-        // observed = Fisher information block under the logit link).
-        let fisher = self.likelihood.hess_block(eta, self.y_one_hot.view());
-        // grad_eta returns w_n · (y_a − p_a); the *negative-loglik* gradient
-        // we hand to the joint Newton step is its negation. We return the
-        // raw log-likelihood gradient and let assembly handle the sign.
-        let grad_eta_logl = self.likelihood.grad_eta(eta, self.y_one_hot.view());
+        let (log_lik, grad_eta_logl, fisher) = self
+            .likelihood
+            .value_gradient_hessian(eta, self.y_one_hot.view());
         (log_lik, fisher, grad_eta_logl)
     }
 
@@ -1234,15 +1221,18 @@ impl MultinomialFamily {
     /// Joint log-likelihood and stacked gradient evaluated from cached softmax
     /// probabilities, without re-collecting η or re-running the row kernels.
     ///
-    /// `probs_full` is the `(N, K)` softmax matrix at the workspace's frozen β.
-    /// The weighted multinomial log-likelihood is `Σ_n w_n Σ_k y_{n,k} log p_{n,k}`
-    /// and the gradient of `log L` wrt the active blocks is
+    /// `eta` and `probs_full` are the frozen row program's logits and `(N, K)`
+    /// normalized masses. The value is re-evaluated through the canonical stable
+    /// row expression (probabilities can underflow to exact zero, so taking their
+    /// logarithm is not a valid tail representation); the gradient reuses the
+    /// cached normalized masses. The gradient of `log L` wrt the active blocks is
     /// `∂log L/∂β_a = X^T (w ⊙ (y − p))_a`, laid out output-major to match
     /// [`Self::assemble_joint_hessian`]. Reused by the frozen-β workspace so the
     /// inner joint-Newton gradient load and line-search log-likelihood reads
     /// share the same cached probabilities as the matrix-free `H·v` contraction.
     fn joint_loglik_and_gradient_from_probs(
         &self,
+        eta: ArrayView2<'_, f64>,
         probs_full: ArrayView2<'_, f64>,
     ) -> (f64, Array1<f64>) {
         let n = self.weights.len();
@@ -1250,22 +1240,25 @@ impl MultinomialFamily {
         let m = self.active_classes();
         let k = self.total_classes;
         let design_view = self.design.view();
+        assert_eq!(eta.dim(), (n, m));
+        assert_eq!(probs_full.dim(), (n, k));
         let mut log_lik = 0.0_f64;
+        let mut eta_row = vec![0.0_f64; m];
+        let mut response_row = vec![0.0_f64; k];
         for row in 0..n {
             let w = self.weights[row];
             if w == 0.0 {
                 continue;
             }
-            for c in 0..k {
-                let y = self.y_one_hot[[row, c]];
-                if y != 0.0 {
-                    // Mirror `MultinomialLogitLikelihood::log_lik`: clamp the
-                    // probability away from zero by 1e-300 to guard log(0) on
-                    // underflow (the residual still drives the gradient).
-                    let pc = probs_full[[row, c]].max(1.0e-300);
-                    log_lik += w * y * pc.ln();
-                }
+            for axis in 0..m {
+                eta_row[axis] = eta[[row, axis]];
             }
+            for class in 0..k {
+                response_row[class] = self.y_one_hot[[row, class]];
+            }
+            let program = MultinomialLogitRowProgram::new(&eta_row, &response_row, w)
+                .unwrap_or_else(|error| panic!("invalid frozen multinomial row {row}: {error}"));
+            log_lik -= program.negative_log_likelihood();
         }
         let mut grad = Array1::<f64>::zeros(m * p);
         for a in 0..m {
@@ -2086,8 +2079,9 @@ impl CustomFamily for MultinomialFamily {
         _: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         let eta = self.collect_eta_matrix(block_states)?;
-        let log_lik = self.likelihood.log_lik(eta.view(), self.y_one_hot.view());
-        let grad_eta_logl = self.likelihood.grad_eta(eta.view(), self.y_one_hot.view());
+        let (log_lik, grad_eta_logl) = self
+            .likelihood
+            .value_gradient(eta.view(), self.y_one_hot.view());
         let gradient = self.assemble_joint_gradient(&grad_eta_logl);
         Ok(Some(ExactNewtonJointGradientEvaluation {
             log_likelihood: log_lik,
@@ -2110,6 +2104,7 @@ impl CustomFamily for MultinomialFamily {
         Ok(Some(Arc::new(MultinomialHessianWorkspace {
             family: self.clone(),
             block_states: block_states.to_vec(),
+            eta,
             probs,
         })))
     }
@@ -2246,6 +2241,10 @@ impl CustomFamily for MultinomialFamily {
 struct MultinomialHessianWorkspace {
     family: MultinomialFamily,
     block_states: Vec<ParameterBlockState>,
+    /// Frozen active logits. Values cannot be reconstructed from probabilities
+    /// after tail underflow, so the canonical row expression retains them for
+    /// exact value/gradient workspace queries.
+    eta: Array2<f64>,
     /// Per-row softmax probabilities `(N, K)` (including the reference column
     /// at index `K − 1`), frozen at the construction `β`. The Fisher block is
     /// a function of these alone, so the matrix-free `H·v` contraction reuses
@@ -2282,7 +2281,7 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
         let (log_lik, _) = self
             .family
-            .joint_loglik_and_gradient_from_probs(self.probs.view());
+            .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view());
         Ok(Some(log_lik))
     }
 
@@ -2291,7 +2290,7 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         let (log_likelihood, gradient) = self
             .family
-            .joint_loglik_and_gradient_from_probs(self.probs.view());
+            .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view());
         Ok(Some(ExactNewtonJointGradientEvaluation {
             log_likelihood,
             gradient,
@@ -2618,6 +2617,20 @@ mod tests {
             .expect("single-row multinomial family")
         }
 
+        fn single_row_family_response(response: &[f64], w: f64) -> MultinomialFamily {
+            let y = Array2::from_shape_vec((1, response.len()), response.to_vec())
+                .expect("single-row simplex response");
+            MultinomialFamily::new(
+                y,
+                array![w],
+                response.len(),
+                Arc::new(array![[1.0_f64]]),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+            )
+            .expect("single-row multinomial family with simplex response")
+        }
+
         /// Deterministic LCG (NO `rand`, NO clock seeding — #932 rules).
         struct Lcg(u64);
         impl Lcg {
@@ -2711,8 +2724,11 @@ mod tests {
                 let obs = trial % (M + 1);
                 let w = rng.uniform(0.25, 2.5);
                 let family = single_row_family(obs, w, M + 1);
-                let prog = crate::multinomial_reml::MultinomialLogitRowProgram::new(eta, obs, w)
-                    .expect("valid multinomial row program");
+                let mut response = vec![0.0; M + 1];
+                response[obs] = 1.0;
+                let prog =
+                    crate::multinomial_reml::MultinomialLogitRowProgram::new(&eta, &response, w)
+                        .expect("valid multinomial row program");
 
                 // ── Jet ORACLE vs LIVE production (≤1e-9) ──────────────────────
                 let (jet_v, jet_g, jet_h) = program_row_kernel(&prog, 0).expect("jet row kernel");
@@ -2720,7 +2736,9 @@ mod tests {
                 // Value + gradient from the live log-lik assembler (NLL = −log_lik,
                 // ∇NLL = −∇log_lik).
                 let probs = active_probs(&family, &eta);
-                let (log_lik, grad_ll) = family.joint_loglik_and_gradient_from_probs(probs.view());
+                let eta_matrix = Array2::from_shape_vec((1, M), eta.to_vec()).expect("eta matrix");
+                let (log_lik, grad_ll) =
+                    family.joint_loglik_and_gradient_from_probs(eta_matrix.view(), probs.view());
                 close(
                     jet_v,
                     -log_lik,
@@ -2826,6 +2844,112 @@ mod tests {
             run_parity::<3>(0x0bad_c0de_0710_2020);
         }
 
+        /// Saturated active/reference classes and label-smoothed targets all use
+        /// the same centered semantic expression. This catches the former
+        /// probability-clamp split: values remain exact after a probability has
+        /// underflowed to zero, while V/G/H/t3/t4 stay finite and agree with the
+        /// production structure-compiled schedules.
+        #[test]
+        fn multinomial_extreme_tails_share_one_stable_row_program_932() {
+            const M: usize = 3;
+            let cases = [
+                ([1_000.0, -1_000.0, -750.0], [0.0, 0.0, 0.0, 1.0], 1.25),
+                ([-1_000.0, -900.0, -800.0], [0.0, 0.0, 1.0, 0.0], 0.75),
+                ([1_000.0, 1_000.0, -1_000.0], [0.2, 0.3, 0.1, 0.4], 2.0),
+            ];
+            let direction = [0.7, -0.4, 1.1];
+            let direction_u = [-0.3, 0.9, 0.2];
+
+            for (case, (eta, response, weight)) in cases.into_iter().enumerate() {
+                let program = MultinomialLogitRowProgram::new(&eta, &response, weight)
+                    .expect("valid extreme-tail row program");
+                let (canonical_value, canonical_gradient, canonical_hessian) =
+                    program_row_kernel(&program, 0).expect("canonical extreme-tail V/G/H");
+                let canonical_third = program_third_contracted(&program, 0, &direction)
+                    .expect("canonical extreme-tail third");
+                let canonical_fourth =
+                    program_fourth_contracted(&program, 0, &direction_u, &direction)
+                        .expect("canonical extreme-tail fourth");
+
+                assert!(canonical_value.is_finite(), "case {case} value");
+                assert!(
+                    canonical_gradient.iter().all(|value| value.is_finite()),
+                    "case {case} gradient"
+                );
+                assert!(
+                    canonical_hessian
+                        .iter()
+                        .flatten()
+                        .all(|value| value.is_finite()),
+                    "case {case} Hessian"
+                );
+                assert!(
+                    canonical_third
+                        .iter()
+                        .flatten()
+                        .all(|value| value.is_finite()),
+                    "case {case} third"
+                );
+                assert!(
+                    canonical_fourth
+                        .iter()
+                        .flatten()
+                        .all(|value| value.is_finite()),
+                    "case {case} fourth"
+                );
+
+                let family = single_row_family_response(&response, weight);
+                let eta_matrix =
+                    Array2::from_shape_vec((1, M), eta.to_vec()).expect("tail eta matrix");
+                let response_matrix = Array2::from_shape_vec((1, M + 1), response.to_vec())
+                    .expect("tail response matrix");
+                let (live_log_likelihood, live_gradient, live_hessian) = family
+                    .likelihood
+                    .value_gradient_hessian(eta_matrix.view(), response_matrix.view());
+                close(
+                    canonical_value,
+                    -live_log_likelihood,
+                    1.0e-12,
+                    &format!("tail case {case} value"),
+                );
+                for row in 0..M {
+                    close(
+                        canonical_gradient[row],
+                        -live_gradient[[0, row]],
+                        1.0e-12,
+                        &format!("tail case {case} gradient[{row}]"),
+                    );
+                    for column in 0..M {
+                        close(
+                            canonical_hessian[row][column],
+                            live_hessian[[0, row, column]],
+                            1.0e-12,
+                            &format!("tail case {case} Hessian[{row}][{column}]"),
+                        );
+                    }
+                }
+
+                let live_third = prod_third(&family, &eta, &direction);
+                let live_fourth = prod_fourth(&family, &eta, &direction_u, &direction);
+                for row in 0..M {
+                    for column in 0..M {
+                        close(
+                            canonical_third[row][column],
+                            live_third[row][column],
+                            1.0e-12,
+                            &format!("tail case {case} third[{row}][{column}]"),
+                        );
+                        close(
+                            canonical_fourth[row][column],
+                            live_fourth[row][column],
+                            1.0e-12,
+                            &format!("tail case {case} fourth[{row}][{column}]"),
+                        );
+                    }
+                }
+            }
+        }
+
         /// The target-shaped M=32 storage schedules must remain an exact lowering
         /// of the canonical multinomial row program. This invokes the live
         /// `directional_fisher_jet_rows` and `second_directional_fisher_jet_rows`
@@ -2866,7 +2990,9 @@ mod tests {
                 let observed_class = if trial % 2 == 0 { trial } else { M };
                 let weight = 0.8 + 0.3 * trial as f64;
                 let family = single_row_family(observed_class, weight, M + 1);
-                let program = MultinomialLogitRowProgram::new(eta, observed_class, weight)
+                let mut response = vec![0.0; M + 1];
+                response[observed_class] = 1.0;
+                let program = MultinomialLogitRowProgram::new(&eta, &response, weight)
                     .expect("valid M=32 multinomial row program");
 
                 let production_first = prod_third(&family, &eta, &direction);

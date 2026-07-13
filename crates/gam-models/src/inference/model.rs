@@ -959,9 +959,10 @@ pub struct SavedLinkWiggleRuntime {
     /// Frozen-index mean-coordinate shift `s` (#2141). When present the predict
     /// layer evaluates the warp basis at the frozen index
     /// `η̂ = base + X·s` rather than at the de-aliased base predictor `base`, so
-    /// predict reproduces the exact `q` (and deviance) the fit computed. `None`
-    /// for warp paths that never de-aliased (location-scale / dynamic-basis),
-    /// where the base predictor already is the warp index.
+    /// predict reproduces the exact `q` (and deviance) the fit computed. This is
+    /// mandatory for standard link-wiggle fits and `None` only for other model
+    /// classes whose warp path never de-aliased, where the base predictor is
+    /// already the warp index.
     pub index_shift: Option<Vec<f64>>,
 }
 
@@ -3246,17 +3247,16 @@ impl FittedModel {
                 reason: joint_wiggle_unsupported_link_message("link wiggle"),
             });
         }
-        let beta = match self.predict_model_class() {
-            // #1596: the frozen-basis de-aliased standard link-warp is fit in a
-            // reduced, identifiable coordinate `γ` and the fit_result LinkWiggle
-            // block stores `γ` (its true free parameters). The full-width
-            // standard-basis lift `β_w = Z·γ`, the coefficients the predict-time
-            // I-spline basis multiplies, is persisted in `payload.beta_link_wiggle`
-            // — prefer it when present. Without it (the dynamic-basis path) the
-            // block coefficients ARE the standard-basis warp, read directly.
-            PredictModelClass::Standard if payload.beta_link_wiggle.is_some() => {
-                payload.beta_link_wiggle.clone().expect("checked is_some")
-            }
+        let model_class = self.predict_model_class();
+        let beta = match model_class {
+            // The current frozen-basis fit residualizes `B` in observation
+            // space without changing the wiggle coefficient width. Saved-frame
+            // finalization then moves the complete fit, including every
+            // covariance, into `[Mean, LinkWiggle]` prediction coordinates.
+            // The payload copy is retained as replay metadata but must agree
+            // bit-for-bit with that canonical fitted block; accepting either
+            // source independently would let point prediction and uncertainty
+            // describe different models.
             PredictModelClass::Standard => {
                 let fit = payload.fit_result.as_ref().ok_or_else(|| {
                     FittedModelError::MissingField {
@@ -3275,14 +3275,46 @@ impl FittedModel {
                                 .to_string(),
                     });
                 }
-                fit.block_by_role(BlockRole::LinkWiggle)
-                    .ok_or_else(|| FittedModelError::MissingField {
+                let block = fit.block_by_role(BlockRole::LinkWiggle).ok_or_else(|| {
+                    FittedModelError::MissingField {
                         reason:
                             "standard link-wiggle model is missing LinkWiggle coefficient block"
                                 .to_string(),
-                    })?
-                    .beta
-                    .to_vec()
+                    }
+                })?;
+                let payload_beta = payload.beta_link_wiggle.as_ref().ok_or_else(|| {
+                    FittedModelError::MissingField {
+                        reason: "standard link-wiggle model is missing its exact saved prediction coefficients; refit"
+                            .to_string(),
+                    }
+                })?;
+                if payload_beta.len() != block.beta.len()
+                    || payload_beta
+                        .iter()
+                        .zip(block.beta.iter())
+                        .any(|(saved, fitted)| saved.to_bits() != fitted.to_bits())
+                {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: "standard link-wiggle payload coefficients disagree with the fitted LinkWiggle block"
+                            .to_string(),
+                    });
+                }
+                let shift = payload.link_wiggle_index_shift.as_ref().ok_or_else(|| {
+                    FittedModelError::MissingField {
+                        reason: "standard link-wiggle model is missing its frozen-index shift; refit"
+                            .to_string(),
+                    }
+                })?;
+                if shift.len() != fit.blocks[0].beta.len() {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "standard link-wiggle frozen-index shift has {} entries but the Mean block has {} coefficients",
+                            shift.len(),
+                            fit.blocks[0].beta.len(),
+                        ),
+                    });
+                }
+                block.beta.to_vec()
             }
             _ => payload
                 .beta_link_wiggle
@@ -3314,9 +3346,9 @@ impl FittedModel {
             }
         }
         // #2141: the frozen-index shift lets predict evaluate the warp basis at
-        // the index `η̂` the fit pinned `B` at (`base + X·s`). `None` for
-        // pre-#2141 saves and for non-de-aliased warp paths, where the base
-        // predictor already is the warp index.
+        // the index `η̂` the fit pinned `B` at (`base + X·s`). Standard models
+        // were required to carry a complete shift above. Other model classes
+        // may omit it only when their base predictor already is the warp index.
         let index_shift = payload.link_wiggle_index_shift.clone();
         Ok(Some(SavedLinkWiggleRuntime {
             knots,

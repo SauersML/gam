@@ -17,7 +17,10 @@ fn require_row_program<const K: usize, P: RowProgram<K>>() {}
 
 #[test]
 fn canonical_row_programs_are_production_artifacts() {
-    require_row_program::<2, MultinomialLogitRowProgram<2>>();
+    fn require_multinomial<'a>() {
+        require_row_program::<2, MultinomialLogitRowProgram<'a>>();
+    }
+    require_multinomial();
     require_row_program::<3, CauseSpecificRowProgram>();
 
     fn require_gaussian<'a>() {

@@ -8903,6 +8903,9 @@ struct DenseAffineDesign {
     coefficient_frame: &'static str,
     coefficient_start: usize,
     coefficient_stop: usize,
+    covariance_conditional: Option<Array2<f64>>,
+    covariance_smoothing_corrected: Option<Array2<f64>>,
+    covariance_frequentist: Option<Array2<f64>>,
 }
 
 fn affine_design_for_dataset(
@@ -8952,6 +8955,9 @@ fn affine_design_for_dataset(
         coefficient_frame: affine.coefficient_frame.name(),
         coefficient_start: affine.coefficient_range.start,
         coefficient_stop: affine.coefficient_range.end,
+        covariance_conditional: affine.covariances.conditional,
+        covariance_smoothing_corrected: affine.covariances.smoothing_corrected,
+        covariance_frequentist: affine.covariances.frequentist,
     })
 }
 

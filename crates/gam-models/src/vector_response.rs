@@ -18,9 +18,7 @@
 //! what the arrow Schur elimination in `solver/arrow_schur.rs` consumes.
 
 use crate::model_types::EstimationError;
-use crate::multinomial_reml::{
-    MultinomialLogitRowProgram, multinomial_logit_probabilities_into,
-};
+use crate::multinomial_reml::{MultinomialLogitRowProgram, multinomial_logit_probabilities_into};
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 
 /// Per-output noise model for a vector response.
@@ -652,11 +650,7 @@ impl MultinomialLogitLikelihood {
                 }
             }
         }
-        (
-            -negative_log_likelihood,
-            gradient_log_likelihood,
-            hessian,
-        )
+        (-negative_log_likelihood, gradient_log_likelihood, hessian)
     }
 
     /// Fused value/gradient entry for callers that do not consume curvature.
@@ -700,53 +694,26 @@ impl VectorLikelihood for MultinomialLogitLikelihood {
         let m = self.active_classes;
         let k = self.total_classes();
         assert_eq!(eta.ncols(), m, "η must have K-1 columns");
-        assert_eq!(y.dim(), (n, k), "y must be (N, K) one-hot encoded");
-        let mut acc = 0.0_f64;
+        assert_eq!(y.dim(), (n, k), "y must be (N, K) simplex encoded");
         let mut eta_row = vec![0.0_f64; m];
-        let mut probs_row = vec![0.0_f64; k];
+        let mut response_row = vec![0.0_f64; k];
+        let mut negative_log_likelihood = 0.0_f64;
         for row in 0..n {
-            let w = self.row_weight(row);
-            for j in 0..m {
-                eta_row[j] = eta[[row, j]];
+            for axis in 0..m {
+                eta_row[axis] = eta[[row, axis]];
             }
-            Self::softmax_with_baseline(&eta_row, &mut probs_row);
-            let mut row_acc = 0.0_f64;
-            for c in 0..k {
-                let yc = y[[row, c]];
-                if yc != 0.0 {
-                    // Guard against log(0) when p underflows; clamp the
-                    // probability away from zero by 1e-300 — outside the
-                    // representable range, the residual still drives the
-                    // gradient correctly.
-                    let p = probs_row[c].max(1.0e-300);
-                    row_acc += yc * p.ln();
-                }
+            for class in 0..k {
+                response_row[class] = y[[row, class]];
             }
-            acc += w * row_acc;
+            negative_log_likelihood += self
+                .row_program(row, &eta_row, &response_row)
+                .negative_log_likelihood();
         }
-        acc
+        -negative_log_likelihood
     }
 
     fn grad_eta(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
-        let n = eta.nrows();
-        let m = self.active_classes;
-        let k = self.total_classes();
-        assert_eq!(eta.ncols(), m, "η must have K-1 columns");
-        assert_eq!(y.dim(), (n, k), "y must be (N, K) one-hot encoded");
-        let mut out = Array2::<f64>::zeros((n, m));
-        let mut eta_row = vec![0.0_f64; m];
-        let mut probs_row = vec![0.0_f64; k];
-        for row in 0..n {
-            let w = self.row_weight(row);
-            for j in 0..m {
-                eta_row[j] = eta[[row, j]];
-            }
-            Self::softmax_with_baseline(&eta_row, &mut probs_row);
-            for j in 0..m {
-                out[[row, j]] = w * (y[[row, j]] - probs_row[j]);
-            }
-        }
-        out
+        self.value_gradient(eta, y).1
     }
 
     fn hess_diag(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
@@ -758,52 +725,30 @@ impl VectorLikelihood for MultinomialLogitLikelihood {
         let m = self.active_classes;
         let k = self.total_classes();
         assert_eq!(eta.ncols(), m, "η must have K-1 columns");
-        assert_eq!(y.dim(), (n, k), "y must be (N, K) one-hot encoded");
+        assert_eq!(y.dim(), (n, k), "y must be (N, K) simplex encoded");
         let mut out = Array2::<f64>::zeros((n, m));
         let mut eta_row = vec![0.0_f64; m];
-        let mut probs_row = vec![0.0_f64; k];
+        let mut response_row = vec![0.0_f64; k];
+        let mut probabilities = vec![0.0_f64; k];
+        let mut diagonal = vec![0.0_f64; m];
         for row in 0..n {
-            let w = self.row_weight(row);
-            for j in 0..m {
-                eta_row[j] = eta[[row, j]];
+            for axis in 0..m {
+                eta_row[axis] = eta[[row, axis]];
             }
-            Self::softmax_with_baseline(&eta_row, &mut probs_row);
-            for j in 0..m {
-                let p = probs_row[j];
-                out[[row, j]] = w * p * (1.0 - p);
+            for class in 0..k {
+                response_row[class] = y[[row, class]];
+            }
+            self.row_program(row, &eta_row, &response_row)
+                .hessian_diagonal_into(&mut probabilities, &mut diagonal);
+            for axis in 0..m {
+                out[[row, axis]] = diagonal[axis];
             }
         }
         out
     }
 
     fn hess_block(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array3<f64> {
-        // Per-row dense (M, M) Fisher / observed-information block:
-        //     H_{n,a,b} = w_n · ( p_{n,a} · δ_{ab} − p_{n,a} · p_{n,b} )
-        let n = eta.nrows();
-        let m = self.active_classes;
-        let k = self.total_classes();
-        assert_eq!(eta.ncols(), m, "η must have K-1 columns");
-        assert_eq!(y.dim(), (n, k), "y must be (N, K) one-hot encoded");
-        let mut out = Array3::<f64>::zeros((n, m, m));
-        let mut eta_row = vec![0.0_f64; m];
-        let mut probs_row = vec![0.0_f64; k];
-        for row in 0..n {
-            let w = self.row_weight(row);
-            for j in 0..m {
-                eta_row[j] = eta[[row, j]];
-            }
-            Self::softmax_with_baseline(&eta_row, &mut probs_row);
-            for a in 0..m {
-                let pa = probs_row[a];
-                out[[row, a, a]] = w * pa * (1.0 - pa);
-                for b in (a + 1)..m {
-                    let off = -w * pa * probs_row[b];
-                    out[[row, a, b]] = off;
-                    out[[row, b, a]] = off;
-                }
-            }
-        }
-        out
+        self.value_gradient_hessian(eta, y).2
     }
 }
 

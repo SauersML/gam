@@ -180,17 +180,44 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         let mut q0 = Vec::with_capacity(self.n);
         let mut q1 = Vec::with_capacity(self.n);
         let mut qd1 = Vec::with_capacity(self.n);
-        for row in 0..self.n {
-            let values = self.row_dynamic_q_values(row, block_states)?;
-            q0.push(values.q0);
-            q1.push(values.q1);
-            qd1.push(values.qd1);
-        }
+        let timewiggle_primary_rows = if self.flex_timewiggle_active() {
+            let p_time = block_states[0].beta.len();
+            let p_marginal = block_states[1].beta.len();
+            let mut time_rows = Array2::<f64>::zeros((3 * self.n, p_time));
+            let mut marginal_rows = Array2::<f64>::zeros((3 * self.n, p_marginal));
+            for row in 0..self.n {
+                let values = self.row_dynamic_q_gradient(row, block_states)?;
+                q0.push(values.q0);
+                q1.push(values.q1);
+                qd1.push(values.qd1);
+                for column in 0..p_time {
+                    time_rows[[row, column]] = values.dq0_time[column];
+                    time_rows[[self.n + row, column]] = values.dq1_time[column];
+                    time_rows[[2 * self.n + row, column]] = values.dqd1_time[column];
+                }
+                for column in 0..p_marginal {
+                    marginal_rows[[row, column]] = values.dq0_marginal[column];
+                    marginal_rows[[self.n + row, column]] = values.dq1_marginal[column];
+                    marginal_rows[[2 * self.n + row, column]] =
+                        values.dqd1_marginal[column];
+                }
+            }
+            Some((time_rows, marginal_rows))
+        } else {
+            for row in 0..self.n {
+                let values = self.row_dynamic_q_values(row, block_states)?;
+                q0.push(values.q0);
+                q1.push(values.q1);
+                qd1.push(values.qd1);
+            }
+            None
+        };
         let scalars = SurvivalMarginalSlopeFamilyScalars::new(
             q0,
             q1,
             qd1,
             slopes,
+            timewiggle_primary_rows,
             self.probit_frailty_scale(),
             &self.score_covariance,
         )?;

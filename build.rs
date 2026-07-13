@@ -4675,15 +4675,17 @@ const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
         kind: DerivativeSpecializationKind::Bespoke,
         production_path: "crates/gam-models/src/multinomial_reml.rs",
         production_anchors: &[
-            "pub struct MultinomialLogitRowProgram<const M: usize>",
-            "impl<const M: usize> gam_math::jet_tower::RowProgram<M> for MultinomialLogitRowProgram<M>",
+            "pub struct MultinomialLogitRowProgram<'row>",
+            "impl<const M: usize> gam_math::jet_tower::RowProgram<M> for MultinomialLogitRowProgram<'_>",
+            "fn eval_expression<S: JetField>",
+            "pub(crate) fn value_gradient_hessian_into",
             "fn softmax_fisher_perturbation<S: FisherPerturbation>",
         ],
         discovery_anchor: "fn softmax_fisher_perturbation<S: FisherPerturbation>",
         pin_path: "crates/gam-models/src/multinomial_reml.rs",
         pin_anchors: &[
             "fn multinomial_live_tower_matches_jet_and_fd()",
-            "crate::multinomial_reml::MultinomialLogitRowProgram::new(eta, obs, w)",
+            "fn multinomial_extreme_tails_share_one_stable_row_program_932()",
         ],
     },
     DerivativeSpecialization {
