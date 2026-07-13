@@ -1973,7 +1973,13 @@ fn compute_saved_location_scale_survival_alo(
             wiggle.constrained_basis(&q_base_entry, BasisOptions::value()),
             wiggle.constrained_basis(&q_base_entry, BasisOptions::first_derivative()),
             wiggle.constrained_basis(&q_base_entry, BasisOptions::second_derivative()),
-            wiggle.constrained_basis(&q_base_entry, BasisOptions::third_derivative()),
+            wiggle.constrained_basis(
+                &q_base_entry,
+                BasisOptions {
+                    derivative_order: 3,
+                    ..BasisOptions::value()
+                },
+            ),
         ),
         None => (
             Ok(Array2::zeros((n, 0))),
@@ -1993,7 +1999,13 @@ fn compute_saved_location_scale_survival_alo(
                 wiggle.constrained_basis(&q_base_exit, BasisOptions::value()),
                 wiggle.constrained_basis(&q_base_exit, BasisOptions::first_derivative()),
                 wiggle.constrained_basis(&q_base_exit, BasisOptions::second_derivative()),
-                wiggle.constrained_basis(&q_base_exit, BasisOptions::third_derivative()),
+                wiggle.constrained_basis(
+                    &q_base_exit,
+                    BasisOptions {
+                        derivative_order: 3,
+                        ..BasisOptions::value()
+                    },
+                ),
             )
         }
         None => (
