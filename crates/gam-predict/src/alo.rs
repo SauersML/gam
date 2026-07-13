@@ -7,22 +7,27 @@ use gam_models::gamlss::{
     gaussian_location_scale_alo_row_geometry,
 };
 use gam_models::inference::model::{
-    FittedModel, PredictModelClass, binomial_location_scale_threshold_beta,
+    FittedFamily, FittedModel, PredictModelClass, binomial_location_scale_threshold_beta,
     gaussian_location_scale_mean_beta, location_scale_noise_beta,
 };
 use gam_models::survival::{
-    CauseSpecificSurvivalAloRowInput, SurvivalLikelihoodMode, SurvivalLocationScaleAloRowInput,
+    CauseSpecificSurvivalAloRowInput, LatentBinaryAloRowInput, LatentSurvivalAloRowInput,
+    LatentSurvivalAloSigma, SurvivalLikelihoodMode, SurvivalLocationScaleAloRowInput,
     SurvivalLocationScaleAloTimeWiggleInput, SurvivalLocationScaleAloWiggleInput,
     SurvivalMarginalSlopeSavedAloReplayInput, cause_specific_survival_alo_row_geometry,
+    latent_binary_alo_row_geometry, latent_survival_alo_row_geometry,
     replay_saved_survival_marginal_slope_alo, require_saved_survival_likelihood_mode,
     survival_event_code_from_value, survival_location_scale_alo_row_geometry,
     survival_location_scale_time_wiggle_basis_authority,
 };
+use gam_models::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
+use gam_models::quadrature::QuadratureContext;
 use gam_models::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalAloRowInput,
     transformation_normal_alo_row_geometry,
 };
 use gam_problem::{BlockRole, EstimationError, Gauge, ResponseFamily};
+use gam_solve::model_types::UnifiedFitResult;
 use gam_solve::inference::alo::{
     AloInput, MultiBlockAloDiagnostics, MultiBlockAloInput, compute_alo_from_input,
     compute_multiblock_alo,
@@ -189,6 +194,150 @@ pub struct SavedLocationScaleSurvivalAloInput {
     time_base: SavedSurvivalAffineBlockAloInput,
     threshold: SavedSurvivalAffineBlockAloInput,
     log_sigma: SavedSurvivalAffineBlockAloInput,
+}
+
+/// Shared affine rows for the two saved latent hazard-window likelihoods.
+///
+/// Current saved latent models persist an entry/exit window with binary event
+/// codes. Interval-censored fitting has a separate upper-bound channel that is
+/// not part of this on-disk model contract, so this carrier rejects the interval
+/// sentinel instead of inventing a right-bound design.
+struct SavedLatentWindowAloRows {
+    event: Array1<u8>,
+    time: SavedSurvivalAffineBlockAloInput,
+    mean_design: DesignMatrix,
+    mean_offset: Array1<f64>,
+    unloaded_mass_entry: Array1<f64>,
+    unloaded_mass_exit: Array1<f64>,
+    unloaded_hazard_exit: Option<Array1<f64>>,
+}
+
+/// Exact saved-row carrier for the latent-survival likelihood.
+pub struct SavedLatentSurvivalAloInput {
+    rows: SavedLatentWindowAloRows,
+}
+
+/// Exact saved-row carrier for the latent-binary likelihood.
+pub struct SavedLatentBinaryAloInput {
+    rows: SavedLatentWindowAloRows,
+}
+
+impl SavedLatentWindowAloRows {
+    fn new(
+        context: &str,
+        event: Array1<u8>,
+        time: SavedSurvivalAffineBlockAloInput,
+        mean_design: DesignMatrix,
+        mean_offset: Array1<f64>,
+        unloaded_mass_entry: Array1<f64>,
+        unloaded_mass_exit: Array1<f64>,
+        unloaded_hazard_exit: Option<Array1<f64>>,
+    ) -> Result<Self, String> {
+        let n = event.len();
+        let hazard_len = unloaded_hazard_exit.as_ref().map_or(n, Array1::len);
+        if n == 0
+            || time.design_exit.nrows() != n
+            || mean_design.nrows() != n
+            || mean_offset.len() != n
+            || unloaded_mass_entry.len() != n
+            || unloaded_mass_exit.len() != n
+            || hazard_len != n
+        {
+            return Err(format!(
+                "saved {context} ALO row mismatch: event={n}, time={}, mean={}/{}, unloaded={}/{}, hazard={hazard_len}",
+                time.design_exit.nrows(),
+                mean_design.nrows(),
+                mean_offset.len(),
+                unloaded_mass_entry.len(),
+                unloaded_mass_exit.len(),
+            ));
+        }
+        if time.design_exit.ncols() == 0 || mean_design.ncols() == 0 {
+            return Err(format!(
+                "saved {context} ALO requires non-empty time and mean designs; got {}/{} columns",
+                time.design_exit.ncols(),
+                mean_design.ncols(),
+            ));
+        }
+        if let Some((row, code)) = event
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, code)| *code > 1)
+        {
+            return Err(format!(
+                "saved {context} ALO event[{row}] must be exactly 0 or 1, got {code}"
+            ));
+        }
+        if let Some((row, value)) = mean_offset
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "saved {context} ALO mean offset[{row}] must be finite, got {value}"
+            ));
+        }
+        Ok(Self {
+            event,
+            time,
+            mean_design,
+            mean_offset,
+            unloaded_mass_entry,
+            unloaded_mass_exit,
+            unloaded_hazard_exit,
+        })
+    }
+}
+
+impl SavedLatentSurvivalAloInput {
+    pub fn new(
+        event: Array1<u8>,
+        time: SavedSurvivalAffineBlockAloInput,
+        mean_design: DesignMatrix,
+        mean_offset: Array1<f64>,
+        unloaded_mass_entry: Array1<f64>,
+        unloaded_mass_exit: Array1<f64>,
+        unloaded_hazard_exit: Array1<f64>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            rows: SavedLatentWindowAloRows::new(
+                "latent-survival",
+                event,
+                time,
+                mean_design,
+                mean_offset,
+                unloaded_mass_entry,
+                unloaded_mass_exit,
+                Some(unloaded_hazard_exit),
+            )?,
+        })
+    }
+}
+
+impl SavedLatentBinaryAloInput {
+    pub fn new(
+        event: Array1<u8>,
+        time: SavedSurvivalAffineBlockAloInput,
+        mean_design: DesignMatrix,
+        mean_offset: Array1<f64>,
+        unloaded_mass_entry: Array1<f64>,
+        unloaded_mass_exit: Array1<f64>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            rows: SavedLatentWindowAloRows::new(
+                "latent-binary",
+                event,
+                time,
+                mean_design,
+                mean_offset,
+                unloaded_mass_entry,
+                unloaded_mass_exit,
+                None,
+            )?,
+        })
+    }
 }
 
 impl SavedLocationScaleSurvivalAloInput {
@@ -391,6 +540,8 @@ impl SavedCauseSpecificSurvivalAloInput {
 /// Typed survival row carriers accepted by saved-model ALO.
 pub enum SavedSurvivalAloInput {
     CauseSpecific(SavedCauseSpecificSurvivalAloInput),
+    Latent(SavedLatentSurvivalAloInput),
+    LatentBinary(SavedLatentBinaryAloInput),
     LocationScale(SavedLocationScaleSurvivalAloInput),
     MarginalSlope(SavedMarginalSlopeSurvivalAloInput),
 }
@@ -1758,6 +1909,359 @@ fn compute_saved_cause_specific_survival_alo(
     )
 }
 
+struct SavedLatentBlockRanges {
+    time: Range<usize>,
+    mean: Range<usize>,
+    scale: Option<Range<usize>>,
+}
+
+fn saved_latent_block_ranges(
+    fit: &UnifiedFitResult,
+    context: &str,
+) -> Result<SavedLatentBlockRanges, EstimationError> {
+    let mut cursor = 0usize;
+    let mut time = None;
+    let mut mean = None;
+    let mut scale = None;
+    for block in &fit.blocks {
+        let next = cursor.checked_add(block.beta.len()).ok_or_else(|| {
+            invalid(format!(
+                "saved {context} ALO coefficient layout overflows usize"
+            ))
+        })?;
+        if block.beta.is_empty() {
+            return Err(invalid(format!(
+                "saved {context} ALO has an empty {} block",
+                block.role.name()
+            )));
+        }
+        let target = match block.role {
+            BlockRole::Time => &mut time,
+            BlockRole::Mean => &mut mean,
+            BlockRole::Scale => &mut scale,
+            role => {
+                return Err(invalid(format!(
+                    "saved {context} ALO cannot map unexpected {} block",
+                    role.name()
+                )));
+            }
+        };
+        if target.replace(cursor..next).is_some() {
+            return Err(invalid(format!(
+                "saved {context} ALO has duplicate {} blocks",
+                block.role.name()
+            )));
+        }
+        cursor = next;
+    }
+    if cursor != fit.beta.len() {
+        return Err(invalid(format!(
+            "saved {context} ALO block widths sum to {cursor}; fitted beta has {} entries",
+            fit.beta.len()
+        )));
+    }
+    Ok(SavedLatentBlockRanges {
+        time: time.ok_or_else(|| invalid(format!("saved {context} ALO is missing its time block")))?,
+        mean: mean.ok_or_else(|| invalid(format!("saved {context} ALO is missing its mean block")))?,
+        scale,
+    })
+}
+
+fn saved_latent_hazard_multiplier(
+    model: &FittedModel,
+    mode: SurvivalLikelihoodMode,
+) -> Result<(f64, HazardLoading), EstimationError> {
+    let frailty = match (&model.payload().family_state, mode) {
+        (FittedFamily::LatentSurvival { frailty }, SurvivalLikelihoodMode::Latent)
+        | (FittedFamily::LatentBinary { frailty }, SurvivalLikelihoodMode::LatentBinary) => frailty,
+        (family, _) => {
+            return Err(invalid(format!(
+                "saved {mode:?} ALO family metadata is incompatible: {family:?}"
+            )));
+        }
+    };
+    match frailty {
+        FrailtySpec::HazardMultiplier {
+            sigma_fixed: Some(sigma),
+            loading,
+        } if sigma.is_finite() && *sigma >= 0.0 => Ok((*sigma, *loading)),
+        other => Err(invalid(format!(
+            "saved {mode:?} ALO requires a fixed finite non-negative HazardMultiplier frailty, got {other:?}"
+        ))),
+    }
+}
+
+fn validate_saved_latent_observations(
+    context: &str,
+    event: &Array1<u8>,
+    observations: &SavedAloObservations<'_>,
+) -> Result<(), EstimationError> {
+    let n = event.len();
+    if observations.response.len() != n || observations.prior_weights.len() != n {
+        return Err(invalid(format!(
+            "saved {context} ALO row mismatch: carrier={n}, response={}, weights={}",
+            observations.response.len(),
+            observations.prior_weights.len(),
+        )));
+    }
+    for row in 0..n {
+        let response_code = survival_event_code_from_value(observations.response[row], row)
+            .map_err(|reason| invalid(format!("saved {context} ALO response: {reason}")))?;
+        if response_code > 1 {
+            return Err(invalid(format!(
+                "saved {context} ALO response[{row}] must be exactly 0 or 1, got {response_code}"
+            )));
+        }
+        if response_code != event[row] {
+            return Err(invalid(format!(
+                "saved {context} ALO event mismatch at row {row}: carrier={}, observations={response_code}",
+                event[row]
+            )));
+        }
+        let weight = observations.prior_weights[row];
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(invalid(format!(
+                "saved {context} ALO prior weight[{row}] must be finite and non-negative, got {weight}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn compute_saved_latent_survival_alo(
+    model: &FittedModel,
+    input: &SavedLatentSurvivalAloInput,
+    observations: SavedAloObservations<'_>,
+) -> Result<SavedModelAloDiagnostics, EstimationError> {
+    let class = PredictModelClass::Survival;
+    let mode = require_saved_survival_likelihood_mode(model)
+        .map_err(|error| invalid(format!("saved survival ALO likelihood mode: {error}")))?;
+    if mode != SurvivalLikelihoodMode::Latent {
+        return Err(invalid(format!(
+            "saved latent-survival ALO row geometry cannot replay {mode:?}"
+        )));
+    }
+    validate_saved_latent_observations("latent-survival", &input.rows.event, &observations)?;
+    let fit = model.payload().fit_result.as_ref().ok_or_else(|| {
+        invalid("saved latent-survival ALO requires a canonical fitted coefficient state")
+    })?;
+    let ranges = saved_latent_block_ranges(fit, "latent-survival")?;
+    if fit.blocks.len() != 2 + usize::from(ranges.scale.is_some()) {
+        return Err(invalid(format!(
+            "saved latent-survival ALO expects time, mean, and optional learned-scale blocks; got {} blocks",
+            fit.blocks.len()
+        )));
+    }
+    if ranges.time.len() != input.rows.time.design_exit.ncols()
+        || ranges.mean.len() != input.rows.mean_design.ncols()
+    {
+        return Err(invalid(format!(
+            "saved latent-survival ALO fitted/design mismatch: time={}/{}, mean={}/{}",
+            ranges.time.len(),
+            input.rows.time.design_exit.ncols(),
+            ranges.mean.len(),
+            input.rows.mean_design.ncols(),
+        )));
+    }
+    let (persisted_sigma, loading) = saved_latent_hazard_multiplier(model, mode)?;
+    let learned_scale = ranges.scale.is_some();
+    let sigma = match ranges.scale.as_ref() {
+        Some(range) => {
+            if range.len() != 1 {
+                return Err(invalid(format!(
+                    "saved latent-survival ALO learned scale block has {} coefficients; expected one",
+                    range.len()
+                )));
+            }
+            let log_sigma = fit.beta[range.start];
+            let fitted_sigma = log_sigma.exp();
+            if !log_sigma.is_finite()
+                || !fitted_sigma.is_finite()
+                || fitted_sigma <= 0.0
+                || fitted_sigma != persisted_sigma
+            {
+                return Err(invalid(format!(
+                    "saved latent-survival ALO learned scale disagrees with family metadata: log_sigma={log_sigma:?}, fitted_sigma={fitted_sigma:?}, persisted_sigma={persisted_sigma:?}"
+                )));
+            }
+            LatentSurvivalAloSigma::LearnedLogScale(log_sigma)
+        }
+        None => LatentSurvivalAloSigma::Fixed(persisted_sigma),
+    };
+    let beta_time = fit.beta.slice(s![ranges.time.clone()]).to_owned();
+    let (q_entry, q_exit, qdot_exit) = input
+        .rows
+        .time
+        .evaluate(&beta_time, "latent-survival time")?;
+    let beta_mean = fit.beta.slice(s![ranges.mean.clone()]).to_owned();
+    let mu = input.rows.mean_design.dot(&beta_mean) + &input.rows.mean_offset;
+    let geometry = require_saved_geometry(model, class, fit.beta.len())?;
+    let quadrature = QuadratureContext::new();
+    let unloaded_hazard_exit = input
+        .rows
+        .unloaded_hazard_exit
+        .as_ref()
+        .expect("latent-survival constructor installs the hazard channel");
+    let n = input.rows.event.len();
+    let mut observed_hessians = Vec::with_capacity(n);
+    let mut scores = Vec::with_capacity(n);
+    let mut coordinate_values = Vec::with_capacity(n);
+    let live_primary_indices = if learned_scale {
+        vec![0, 1, 2, 4, 5]
+    } else {
+        vec![0, 1, 2, 4]
+    };
+    for row in 0..n {
+        let row_geometry = latent_survival_alo_row_geometry(LatentSurvivalAloRowInput {
+            quadrature: &quadrature,
+            hazard_loading: loading,
+            event_code: input.rows.event[row],
+            prior_weight: observations.prior_weights[row],
+            q_entry: q_entry[row],
+            q_exit: q_exit[row],
+            qdot_exit: qdot_exit[row],
+            // Saved latent-window rows are exactly non-interval. `q_right` is
+            // inactive in their fitted row program, so its affine value and
+            // design equal the exit boundary by contract.
+            q_right: q_exit[row],
+            mu: mu[row],
+            sigma,
+            unloaded_mass_entry: input.rows.unloaded_mass_entry[row],
+            unloaded_mass_exit: input.rows.unloaded_mass_exit[row],
+            unloaded_mass_right: 0.0,
+            unloaded_hazard_exit: unloaded_hazard_exit[row],
+        })
+        .map_err(|reason| invalid(format!("saved latent-survival ALO row {row}: {reason}")))?;
+        let live_dimension = live_primary_indices.len();
+        observed_hessians.push(Array2::from_shape_fn(
+            (live_dimension, live_dimension),
+            |(left, right)| {
+                row_geometry.observed_hessian
+                    [[live_primary_indices[left], live_primary_indices[right]]]
+            },
+        ));
+        scores.push(Array1::from_shape_fn(live_dimension, |axis| {
+            row_geometry.nll_score[live_primary_indices[axis]]
+        }));
+        coordinate_values.push(Array1::from_shape_fn(live_dimension, |axis| {
+            row_geometry.coordinate_values[live_primary_indices[axis]]
+        }));
+    }
+    let mut coordinate_designs = vec![
+        input.rows.time.design_entry.clone(),
+        input.rows.time.design_exit.clone(),
+        input.rows.time.design_derivative_exit.clone(),
+        input.rows.mean_design.clone(),
+    ];
+    let mut coordinate_ranges = vec![
+        ranges.time.clone(),
+        ranges.time.clone(),
+        ranges.time,
+        ranges.mean,
+    ];
+    let mut coordinate_names = vec![
+        "q-entry".to_string(),
+        "q-exit".to_string(),
+        "qdot-exit".to_string(),
+        "mu".to_string(),
+    ];
+    if let Some(range) = ranges.scale {
+        coordinate_designs.push(constant_scalar_design(n));
+        coordinate_ranges.push(range);
+        coordinate_names.push("log-sigma".to_string());
+    }
+    compute_saved_multicoordinate_core(
+        class,
+        coordinate_names,
+        coordinate_designs,
+        coordinate_ranges,
+        geometry,
+        observed_hessians,
+        scores,
+        coordinate_values,
+    )
+}
+
+fn compute_saved_latent_binary_alo(
+    model: &FittedModel,
+    input: &SavedLatentBinaryAloInput,
+    observations: SavedAloObservations<'_>,
+) -> Result<SavedModelAloDiagnostics, EstimationError> {
+    let class = PredictModelClass::Survival;
+    let mode = require_saved_survival_likelihood_mode(model)
+        .map_err(|error| invalid(format!("saved survival ALO likelihood mode: {error}")))?;
+    if mode != SurvivalLikelihoodMode::LatentBinary {
+        return Err(invalid(format!(
+            "saved latent-binary ALO row geometry cannot replay {mode:?}"
+        )));
+    }
+    validate_saved_latent_observations("latent-binary", &input.rows.event, &observations)?;
+    let fit = model.payload().fit_result.as_ref().ok_or_else(|| {
+        invalid("saved latent-binary ALO requires a canonical fitted coefficient state")
+    })?;
+    let ranges = saved_latent_block_ranges(fit, "latent-binary")?;
+    if ranges.scale.is_some() || fit.blocks.len() != 2 {
+        return Err(invalid(format!(
+            "saved latent-binary ALO requires exactly time and mean blocks; got {} blocks",
+            fit.blocks.len()
+        )));
+    }
+    if ranges.time.len() != input.rows.time.design_exit.ncols()
+        || ranges.mean.len() != input.rows.mean_design.ncols()
+    {
+        return Err(invalid(format!(
+            "saved latent-binary ALO fitted/design mismatch: time={}/{}, mean={}/{}",
+            ranges.time.len(),
+            input.rows.time.design_exit.ncols(),
+            ranges.mean.len(),
+            input.rows.mean_design.ncols(),
+        )));
+    }
+    let (sigma, loading) = saved_latent_hazard_multiplier(model, mode)?;
+    let beta_time = fit.beta.slice(s![ranges.time.clone()]).to_owned();
+    let (q_entry, q_exit, _) = input.rows.time.evaluate(&beta_time, "latent-binary time")?;
+    let beta_mean = fit.beta.slice(s![ranges.mean.clone()]).to_owned();
+    let mu = input.rows.mean_design.dot(&beta_mean) + &input.rows.mean_offset;
+    let geometry = require_saved_geometry(model, class, fit.beta.len())?;
+    let quadrature = QuadratureContext::new();
+    let n = input.rows.event.len();
+    let mut observed_hessians = Vec::with_capacity(n);
+    let mut scores = Vec::with_capacity(n);
+    let mut coordinate_values = Vec::with_capacity(n);
+    for row in 0..n {
+        let row_geometry = latent_binary_alo_row_geometry(LatentBinaryAloRowInput {
+            quadrature: &quadrature,
+            hazard_loading: loading,
+            event: input.rows.event[row],
+            prior_weight: observations.prior_weights[row],
+            q_entry: q_entry[row],
+            q_exit: q_exit[row],
+            mu: mu[row],
+            sigma,
+            unloaded_mass_entry: input.rows.unloaded_mass_entry[row],
+            unloaded_mass_exit: input.rows.unloaded_mass_exit[row],
+        })
+        .map_err(|reason| invalid(format!("saved latent-binary ALO row {row}: {reason}")))?;
+        observed_hessians.push(row_geometry.observed_hessian);
+        scores.push(row_geometry.nll_score);
+        coordinate_values.push(row_geometry.coordinate_values);
+    }
+    compute_saved_multicoordinate_core(
+        class,
+        vec!["q-entry".to_string(), "q-exit".to_string(), "mu".to_string()],
+        vec![
+            input.rows.time.design_entry.clone(),
+            input.rows.time.design_exit.clone(),
+            input.rows.mean_design.clone(),
+        ],
+        vec![ranges.time.clone(), ranges.time, ranges.mean],
+        geometry,
+        observed_hessians,
+        scores,
+        coordinate_values,
+    )
+}
+
 fn compute_saved_location_scale_survival_alo(
     model: &FittedModel,
     input: &SavedLocationScaleSurvivalAloInput,
@@ -2553,6 +3057,12 @@ pub fn compute_saved_model_alo(
         PredictModelClass::Survival => match input {
             SavedModelAloInput::Survival(SavedSurvivalAloInput::CauseSpecific(input)) => {
                 compute_saved_cause_specific_survival_alo(model, input, observations)
+            }
+            SavedModelAloInput::Survival(SavedSurvivalAloInput::Latent(input)) => {
+                compute_saved_latent_survival_alo(model, input, observations)
+            }
+            SavedModelAloInput::Survival(SavedSurvivalAloInput::LatentBinary(input)) => {
+                compute_saved_latent_binary_alo(model, input, observations)
             }
             SavedModelAloInput::Survival(SavedSurvivalAloInput::LocationScale(input)) => {
                 compute_saved_location_scale_survival_alo(model, input, observations)
