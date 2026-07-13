@@ -584,10 +584,10 @@ fn topology_records_from_codes(
 /// (`‖A·G − G·A‖_F`) by [`certify_square_transfer`], and validity is the
 /// library's own gate ([`AtlasTransferGate::from_square_transfer`]). Any other
 /// block width, fewer than two co-firing rows, a singular coordinate Gram, or a
-/// non-finite operator exposes no certifiable transfer at this boundary, so the
-/// gate is UNCERTIFIED (`valid = false`, unknown/`inf` defects) — never
-/// fabricated valid. `block_a`/`block_b` index the dictionary blocks the two
-/// charts read; `chart_a`/`chart_b` are the nerve-vertex labels.
+/// non-finite operator exposes no transfer gate at this boundary; the nerve
+/// records the observed overlap as rejected because no certificate exists.
+/// `block_a`/`block_b` index the dictionary blocks the two charts read;
+/// `chart_a`/`chart_b` are the nerve-vertex labels.
 fn chart_transfer_gate_sparse(
     route: &AuditSparseRoute,
     support_a: &gam::terms::sae::inference::atlas_nerve::AtlasChart,
@@ -596,17 +596,12 @@ fn chart_transfer_gate_sparse(
     block_b: usize,
     chart_a: usize,
     chart_b: usize,
-) -> gam::terms::sae::inference::atlas_nerve::AtlasTransferGate {
+) -> Result<Option<gam::terms::sae::inference::atlas_nerve::AtlasTransferGate>, String> {
+    use gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyEdgeId;
     use gam::terms::sae::inference::atlas_nerve::AtlasTransferGate;
-    let uncertified = || AtlasTransferGate {
-        a: chart_a,
-        b: chart_b,
-        valid: false,
-        transport_defect: f64::INFINITY,
-        equivariance_defect: f64::INFINITY,
-    };
+    let edge = AtlasHolonomyEdgeId::new(chart_a, chart_b, 0)?;
     if route.block_size != 2 {
-        return uncertified();
+        return Ok(None);
     }
     let mut xa: Vec<f64> = Vec::new();
     let mut xb: Vec<f64> = Vec::new();
@@ -651,20 +646,18 @@ fn chart_transfer_gate_sparse(
     }
     let n_co = xa.len() / 2;
     if n_co < 2 {
-        return uncertified();
+        return Ok(None);
     }
-    let (Ok(x_a), Ok(x_b)) = (
-        ndarray::Array2::from_shape_vec((n_co, 2), xa),
-        ndarray::Array2::from_shape_vec((n_co, 2), xb),
-    ) else {
-        return uncertified();
-    };
+    let x_a = ndarray::Array2::from_shape_vec((n_co, 2), xa)
+        .map_err(|error| format!("chart {chart_a} overlap coordinates are malformed: {error}"))?;
+    let x_b = ndarray::Array2::from_shape_vec((n_co, 2), xb)
+        .map_err(|error| format!("chart {chart_b} overlap coordinates are malformed: {error}"))?;
     // Empirical chart-to-chart transfer operator `A = (X_aᵀX_a)⁻¹ X_aᵀX_b`
     // solving `X_a A ≈ X_b` over the co-firing rows.
     let Ok(operator) =
         gam::terms::sae::chart_transfer::pulled_back_operator(x_a.view(), x_b.view())
     else {
-        return uncertified();
+        return Ok(None);
     };
     // Both charts are circles, so the shared infinitesimal-rotation generator is
     // the SO(2) generator `[[0,−1],[1,0]]`.
@@ -674,8 +667,8 @@ fn chart_transfer_gate_sparse(
         generator.view(),
         generator.view(),
     ) {
-        Ok(cert) => AtlasTransferGate::from_square_transfer(chart_a, chart_b, cert, 2),
-        Err(_) => uncertified(),
+        Ok(cert) => Ok(Some(AtlasTransferGate::from_square_transfer(edge, cert, 2))),
+        Err(_) => Ok(None),
     }
 }
 
@@ -744,7 +737,7 @@ fn atlas_nerve_from_sparse_route(
     }
     let mut gates = Vec::with_capacity(coactive_pairs.len());
     for (a, b) in coactive_pairs {
-        gates.push(chart_transfer_gate_sparse(
+        if let Some(gate) = chart_transfer_gate_sparse(
             route,
             &charts[a],
             &charts[b],
@@ -752,7 +745,9 @@ fn atlas_nerve_from_sparse_route(
             chart_blocks[b],
             a,
             b,
-        ));
+        )? {
+            gates.push(gate);
+        }
     }
     let diagram =
         gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(
@@ -788,7 +783,7 @@ fn atlas_nerve_dict<'py>(
     out.set_item("good_cover_certified", diagram.good_cover_certified)?;
     out.set_item(
         "orientation_holonomy",
-        match diagram.orientation_holonomy {
+        match diagram.certified_orientability() {
             Some(gam::terms::sae::manifold::AtlasOrientability::Orientable) => "orientable",
             Some(gam::terms::sae::manifold::AtlasOrientability::NonOrientable) => {
                 "non_orientable"
