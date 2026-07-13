@@ -5784,7 +5784,7 @@ mod empirical_flex_jet_oracle_tests {
         const SAMPLES: usize = 9;
 
         for is_score_warp in [true, false] {
-            for r in [8_usize, 12, 18] {
+            for r in [4_usize, 8, 12, 18] {
                 let mut fixture = make_dimension_fixture(is_score_warp, r);
                 fixture.grid = scheduled_benchmark_grid();
                 fixture.family.latent_measure = LatentMeasureKind::GlobalEmpirical {
@@ -5888,42 +5888,46 @@ mod empirical_flex_jet_oracle_tests {
                     third_speedup,
                     third_repeated,
                     third_scheduled,
-                ) = scheduled_paired_medians(SAMPLES, || {
-                    directions
-                        .iter()
-                        .map(|direction| {
-                            fixture
-                                .family
-                                .empirical_flex_row_third_contracted(
-                                    0,
-                                    &fixture.primary,
-                                    q,
-                                    slope,
-                                    beta_h,
-                                    beta_w,
-                                    &row_ctx,
-                                    direction,
-                                    &fixture.grid,
-                                )
-                                .expect("repeated fixed-width third contraction")
-                        })
-                        .collect::<Vec<_>>()
-                }, || {
-                    fixture
-                        .family
-                        .empirical_flex_row_third_contracted_many(
-                            0,
-                            &fixture.primary,
-                            q,
-                            slope,
-                            beta_h,
-                            beta_w,
-                            &row_ctx,
-                            &directions,
-                            &fixture.grid,
-                        )
-                        .expect("scheduled third contractions")
-                });
+                ) = scheduled_paired_medians(
+                    SAMPLES,
+                    || {
+                        directions
+                            .iter()
+                            .map(|direction| {
+                                fixture
+                                    .family
+                                    .empirical_flex_row_third_contracted(
+                                        0,
+                                        &fixture.primary,
+                                        q,
+                                        slope,
+                                        beta_h,
+                                        beta_w,
+                                        &row_ctx,
+                                        direction,
+                                        &fixture.grid,
+                                    )
+                                    .expect("repeated fixed-width third contraction")
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                    || {
+                        fixture
+                            .family
+                            .empirical_flex_row_third_contracted_many(
+                                0,
+                                &fixture.primary,
+                                q,
+                                slope,
+                                beta_h,
+                                beta_w,
+                                &row_ctx,
+                                &directions,
+                                &fixture.grid,
+                            )
+                            .expect("scheduled third contractions")
+                    },
+                );
                 for lane in 0..r {
                     assert_matrix_close(
                         "final scheduled third",
@@ -5938,14 +5942,38 @@ mod empirical_flex_jet_oracle_tests {
                     trace_speedup,
                     trace_repeated,
                     trace_scheduled,
-                ) = scheduled_paired_medians(SAMPLES, || {
-                    let mut gradient = Array1::<f64>::zeros(r);
-                    for axis in 0..r {
-                        let mut basis = Array1::<f64>::zeros(r);
-                        basis[axis] = 1.0;
-                        let third = fixture
+                ) = scheduled_paired_medians(
+                    SAMPLES,
+                    || {
+                        let mut gradient = Array1::<f64>::zeros(r);
+                        for axis in 0..r {
+                            let mut basis = Array1::<f64>::zeros(r);
+                            basis[axis] = 1.0;
+                            let third = fixture
+                                .family
+                                .empirical_flex_row_third_contracted(
+                                    0,
+                                    &fixture.primary,
+                                    q,
+                                    slope,
+                                    beta_h,
+                                    beta_w,
+                                    &row_ctx,
+                                    &basis,
+                                    &fixture.grid,
+                                )
+                                .expect("repeated fixed-width trace contraction");
+                            gradient[axis] =
+                                BernoulliMarginalSlopeFamily::row_primary_trace_contract(
+                                    &third, &gram,
+                                );
+                        }
+                        gradient
+                    },
+                    || {
+                        fixture
                             .family
-                            .empirical_flex_row_third_contracted(
+                            .empirical_flex_row_third_trace_gradient(
                                 0,
                                 &fixture.primary,
                                 q,
@@ -5953,30 +5981,12 @@ mod empirical_flex_jet_oracle_tests {
                                 beta_h,
                                 beta_w,
                                 &row_ctx,
-                                &basis,
+                                &gram,
                                 &fixture.grid,
                             )
-                            .expect("repeated fixed-width trace contraction");
-                        gradient[axis] =
-                            BernoulliMarginalSlopeFamily::row_primary_trace_contract(&third, &gram);
-                    }
-                    gradient
-                }, || {
-                    fixture
-                        .family
-                        .empirical_flex_row_third_trace_gradient(
-                            0,
-                            &fixture.primary,
-                            q,
-                            slope,
-                            beta_h,
-                            beta_w,
-                            &row_ctx,
-                            &gram,
-                            &fixture.grid,
-                        )
-                        .expect("scheduled trace gradient")
-                });
+                            .expect("scheduled trace gradient")
+                    },
+                );
                 for axis in 0..r {
                     let expected = trace_repeated[axis];
                     let actual = trace_scheduled[axis];
@@ -5986,44 +5996,53 @@ mod empirical_flex_jet_oracle_tests {
                     );
                 }
 
-                let (fourth_repeated_ns, fourth_repeated) = scheduled_median(SAMPLES, || {
-                    ordered_pairs
-                        .iter()
-                        .map(|(direction_u, direction_v)| {
-                            fixture
-                                .family
-                                .empirical_flex_row_fourth_contracted(
-                                    0,
-                                    &fixture.primary,
-                                    q,
-                                    slope,
-                                    beta_h,
-                                    beta_w,
-                                    &row_ctx,
-                                    direction_u,
-                                    direction_v,
-                                    &fixture.grid,
-                                )
-                                .expect("repeated fixed-width fourth contraction")
-                        })
-                        .collect::<Vec<_>>()
-                });
-                let (fourth_scheduled_ns, fourth_scheduled) = scheduled_median(SAMPLES, || {
-                    fixture
-                        .family
-                        .empirical_flex_row_fourth_contracted_many_ordered(
-                            0,
-                            &fixture.primary,
-                            q,
-                            slope,
-                            beta_h,
-                            beta_w,
-                            &row_ctx,
-                            &ordered_pairs,
-                            &fixture.grid,
-                        )
-                        .expect("scheduled fourth contractions")
-                });
+                let (
+                    fourth_repeated_ns,
+                    fourth_scheduled_ns,
+                    fourth_speedup,
+                    fourth_repeated,
+                    fourth_scheduled,
+                ) = scheduled_paired_medians(
+                    SAMPLES,
+                    || {
+                        ordered_pairs
+                            .iter()
+                            .map(|(direction_u, direction_v)| {
+                                fixture
+                                    .family
+                                    .empirical_flex_row_fourth_contracted(
+                                        0,
+                                        &fixture.primary,
+                                        q,
+                                        slope,
+                                        beta_h,
+                                        beta_w,
+                                        &row_ctx,
+                                        direction_u,
+                                        direction_v,
+                                        &fixture.grid,
+                                    )
+                                    .expect("repeated fixed-width fourth contraction")
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                    || {
+                        fixture
+                            .family
+                            .empirical_flex_row_fourth_contracted_many_ordered(
+                                0,
+                                &fixture.primary,
+                                q,
+                                slope,
+                                beta_h,
+                                beta_w,
+                                &row_ctx,
+                                &ordered_pairs,
+                                &fixture.grid,
+                            )
+                            .expect("scheduled fourth contractions")
+                    },
+                );
                 for lane in 0..ordered_pairs.len() {
                     assert_matrix_close(
                         "final scheduled fourth",
@@ -6044,16 +6063,16 @@ mod empirical_flex_jet_oracle_tests {
                 );
                 let kind = if is_score_warp { "score" } else { "link" };
                 eprintln!(
-                    "BMS932_FINAL kind={kind} r={r} channel=t3-many repeated_ns={third_repeated_ns} scheduled_ns={third_scheduled_ns} speedup={:.3} arena_bytes={third_stable}",
-                    third_repeated_ns as f64 / third_scheduled_ns as f64,
+                    "BMS932_FINAL kind={kind} r={r} channel=t3-many repeated_median_ns={third_repeated_ns} scheduled_median_ns={third_scheduled_ns} paired_speedup={:.3} arena_bytes={third_stable}",
+                    third_speedup,
                 );
                 eprintln!(
-                    "BMS932_FINAL kind={kind} r={r} channel=t3-trace repeated_ns={trace_repeated_ns} scheduled_ns={trace_scheduled_ns} speedup={:.3} arena_bytes={third_stable}",
-                    trace_repeated_ns as f64 / trace_scheduled_ns as f64,
+                    "BMS932_FINAL kind={kind} r={r} channel=t3-trace repeated_median_ns={trace_repeated_ns} scheduled_median_ns={trace_scheduled_ns} paired_speedup={:.3} arena_bytes={third_stable}",
+                    trace_speedup,
                 );
                 eprintln!(
-                    "BMS932_FINAL kind={kind} r={r} channel=t4-many repeated_ns={fourth_repeated_ns} scheduled_ns={fourth_scheduled_ns} speedup={:.3} arena_bytes={fourth_stable}",
-                    fourth_repeated_ns as f64 / fourth_scheduled_ns as f64,
+                    "BMS932_FINAL kind={kind} r={r} channel=t4-many repeated_median_ns={fourth_repeated_ns} scheduled_median_ns={fourth_scheduled_ns} paired_speedup={:.3} arena_bytes={fourth_stable}",
+                    fourth_speedup,
                 );
             }
         }
