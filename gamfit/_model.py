@@ -115,14 +115,13 @@ class Model:
             or ``interval="full_conformal"``
             (e.g. ``0.95`` for a 95% interval). Ignored when ``interval`` is a
             float or ``None``.
-        covariance_mode : {"conditional", "smoothing", "required"}, optional
+        covariance_mode : {"conditional", "smoothing"}, optional
             Posterior covariance source for the interval (CLI<->Python parity
             with ``gam predict --covariance-mode``). ``"conditional"`` uses the
             conditional posterior ``H^{-1}`` only; ``"smoothing"`` (the
-            default when ``None``) prefers the first-order smoothing-corrected
-            covariance ``H^{-1} + J Var(rho_hat) J^T`` and falls back to
-            conditional when it is unavailable; ``"required"`` demands the
-            smoothing correction and errors if it cannot be formed. Read
+            default when ``None``) requires the first-order smoothing-corrected
+            covariance ``H^{-1} + J Var(rho_hat) J^T`` and errors if it cannot
+            be formed. Read
             whenever ``interval`` is set, for every family — including the
             curved-inverse-link families (binomial / Bernoulli) whose default
             point is the posterior mean: the mode shapes the reported SE and the
@@ -397,7 +396,7 @@ class Model:
             held-out fold is already independent of the fitted model.
         conformal_level : float
             Target marginal coverage in ``(0, 1)`` (e.g. ``0.9``).
-        covariance_mode : {"conditional", "smoothing", "required"}, optional
+        covariance_mode : {"conditional", "smoothing"}, optional
             Covariance source for the per-point scale ``s(x)``; see
             :meth:`predict`.
         observation_interval : bool, default False

@@ -7227,9 +7227,51 @@ impl SigmaEffMode {
 }
 
 #[cfg(test)]
-mod survival_payload_nonfinite_tests {
-    use super::{SurvivalPredictionJsonPayload, SurvivalPredictionPayload};
+mod prediction_payload_tests {
+    use super::{
+        parse_covariance_mode, PredictionPayload, SurvivalPredictionJsonPayload,
+        SurvivalPredictionPayload,
+    };
+    use gam_predict::{InferenceCovarianceMode, PredictUncertaintyOptions};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn public_covariance_modes_are_exact_and_default_to_required_smoothing() {
+        assert_eq!(
+            PredictUncertaintyOptions::default().covariance_mode,
+            InferenceCovarianceMode::SmoothingCorrected
+        );
+        assert_eq!(parse_covariance_mode(None).expect("default mode"), None);
+        assert_eq!(
+            parse_covariance_mode(Some("conditional")).expect("conditional mode"),
+            Some(InferenceCovarianceMode::Conditional)
+        );
+        assert_eq!(
+            parse_covariance_mode(Some("smoothing")).expect("smoothing mode"),
+            Some(InferenceCovarianceMode::SmoothingCorrected)
+        );
+        assert!(
+            parse_covariance_mode(Some("required")).is_err(),
+            "the removed compatibility spelling must not remain as a dead mode"
+        );
+    }
+
+    #[test]
+    fn model_based_prediction_payload_exposes_exact_covariance_source() {
+        let payload = PredictionPayload {
+            columns: BTreeMap::from([("mean".to_string(), vec![1.0])]),
+            model_class: "standard".to_string(),
+            family: "identity".to_string(),
+            interval_method: None,
+            covariance_source: Some("smoothing-corrected".to_string()),
+        };
+
+        let value = serde_json::to_value(payload).expect("serialize prediction payload");
+        assert_eq!(
+            value.get("covariance_source").and_then(|item| item.as_str()),
+            Some("smoothing-corrected")
+        );
+    }
 
     /// #1564 (bug 1): the REAL survival prediction payload structs must round-trip
     /// the non-finite values a saturated Royston-Parmar tail legitimately carries.

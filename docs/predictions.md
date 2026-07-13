@@ -24,7 +24,7 @@ model.predict(
 | `data` | required | Table-like input matching the training schema. |
 | `interval` | `None` | Single uncertainty knob. `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. `"conformal"` requests exact jackknife+ intervals for eligible Gaussian-identity fits; `"full_conformal"` requests the exact full-conformal set. On standard GLMs / location-scale this populates `std_error`, `mean_lower`, `mean_upper`. On survival location-scale it populates `survival_se` and `eta_se` on the returned `SurvivalPrediction`. Other survival likelihoods and competing-risks reject non-`None` interval requests at the Rust boundary. |
 | `conformal_level` | `0.9` | Marginal coverage for `interval="conformal"` or `"full_conformal"`. Ignored for numeric Wald intervals. |
-| `covariance_mode` | `None` | Python accepts `"conditional"`, `"smoothing"`, or `"required"` for interval covariance. `None` prefers smoothing-corrected covariance when available. The CLI uses the equivalent `--covariance-mode conditional|corrected` names. |
+| `covariance_mode` | `None` | Python accepts `"conditional"` or `"smoothing"` for interval covariance. `None` requires smoothing-corrected covariance and errors when the fit cannot supply it. The CLI uses the equivalent `--covariance-mode conditional|corrected` names. |
 | `observation_interval` | `False` | When `True` and `interval` is numeric, adds response-scale prediction interval columns for families with an observation variance. |
 | `return_type` | `None` | One of `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"` for table-shaped outputs. Defaults to the input table kind, falling back to the training table kind. |
 | `id_column` | `None` | Name of a column in `data` whose stringified values are carried through into table outputs and `SurvivalPrediction`. |
@@ -36,6 +36,10 @@ it also exposes prediction columns as attributes such as `pred.mean`,
 `pred.std_error`, `pred.mean_lower`, and `pred.mean_upper`. For convenience,
 `pred.lower`, `pred.upper`, and `pred.se_mean` alias the interval columns
 `mean_lower`, `mean_upper`, and `std_error`.
+For model-based intervals, a dict-shaped result also carries the scalar
+`covariance_source` provenance field (`"conditional"` or
+`"smoothing-corrected"`); pandas results expose the same value in
+`result.attrs["covariance_source"]`.
 
 ## Return value by model class
 

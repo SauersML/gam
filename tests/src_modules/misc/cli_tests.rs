@@ -2674,7 +2674,15 @@ fn standard_fixed_link_wiggle_prediction_runs() {
         auxiliary_matrix: None,
     };
     let out = predictor
-        .predict_posterior_mean(&input, &fit, &super::PosteriorMeanOptions::with_level(0.95))
+        .predict_posterior_mean(
+            &input,
+            &fit,
+            &super::PosteriorMeanOptions {
+                confidence_level: Some(0.95),
+                covariance_mode: super::InferenceCovarianceMode::Conditional,
+                include_observation_interval: false,
+            },
+        )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "predict standard binomial wiggle", e));
     assert_eq!(out.eta.len(), 3);
     assert_eq!(

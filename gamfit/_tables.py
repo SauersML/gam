@@ -10,13 +10,15 @@ from typing import Any, cast
 SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow"}
 
 
-class PredictionResult(dict[str, list[Any]]):
+class PredictionResult(dict[str, Any]):
     """Dict-shaped prediction table with attribute access to columns.
 
     ``Model.predict(..., return_type="dict")`` and dict-shaped tabular
     defaults return this class. It behaves like a normal ``dict`` for
     subscription and iteration, while also allowing field access such as
     ``pred.mean``, ``pred.std_error``, and ``pred.mean_lower``.
+    Model-based interval results also carry the scalar metadata field
+    ``pred.covariance_source`` / ``pred["covariance_source"]``.
     """
 
     _ALIASES = {
@@ -25,7 +27,7 @@ class PredictionResult(dict[str, list[Any]]):
         "se_mean": "std_error",
     }
 
-    def __getattr__(self, name: str) -> list[Any]:
+    def __getattr__(self, name: str) -> Any:
         key = self._ALIASES.get(name, name)
         try:
             return self[key]

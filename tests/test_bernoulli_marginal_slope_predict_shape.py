@@ -62,14 +62,42 @@ def _dispatch(
     )
 
 
-def _payload(model_class: str, family: str, columns: dict[str, list[float]]) -> str:
-    return json.dumps(
+def _payload(
+    model_class: str,
+    family: str,
+    columns: dict[str, list[float]],
+    *,
+    covariance_source: str | None = None,
+) -> str:
+    payload: dict[str, Any] = {
+        "model_class": model_class,
+        "family": family,
+        "columns": columns,
+    }
+    if covariance_source is not None:
+        payload["covariance_source"] = covariance_source
+    return json.dumps(payload)
+
+
+def test_interval_dict_exposes_exact_covariance_provenance(monkeypatch: Any) -> None:
+    raw = _payload(
+        "standard",
+        "identity",
         {
-            "model_class": model_class,
-            "family": family,
-            "columns": columns,
-        }
+            "linear_predictor": [1.0, 2.0],
+            "mean": [1.0, 2.0],
+            "std_error": [0.1, 0.2],
+            "mean_lower": [0.8, 1.6],
+            "mean_upper": [1.2, 2.4],
+        },
+        covariance_source="smoothing-corrected",
     )
+
+    out = _dispatch(monkeypatch, raw, interval=0.95, return_type="dict")
+
+    assert isinstance(out, PredictionResult)
+    assert out["covariance_source"] == "smoothing-corrected"
+    assert out.covariance_source == "smoothing-corrected"
 
 
 def test_bernoulli_marginal_slope_saved_kind_returns_1d_probabilities(

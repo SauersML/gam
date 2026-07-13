@@ -9,8 +9,8 @@ model (it is the only standard family whose default point is the posterior mean
 * ``observation_interval=True`` produced no ``observation_lower`` /
   ``observation_upper`` columns (#811), even though the engine implements the
   Bernoulli observation band ``p·(1−p)``; and
-* ``covariance_mode`` was inert (#812): ``"conditional"`` / ``"smoothing"`` /
-  ``"required"`` all returned bitwise-identical SEs, so the smoothing-parameter
+* ``covariance_mode`` was inert (#812): ``"conditional"`` and ``"smoothing"``
+  returned bitwise-identical SEs, so the smoothing-parameter
   correction ``J·Var(ρ̂)·Jᵀ`` that every other family includes by default was
   never applied and binomial intervals systematically under-covered.
 
@@ -23,8 +23,8 @@ of the root cause is caught even if those exact assertions drift:
 * the *point* estimate is invariant to ``covariance_mode`` /
   ``observation_interval`` (issue #398 generalised — the fix must add columns,
   never move ``mean`` / ``linear_predictor``);
-* ``covariance_mode="required"`` actually succeeds and agrees with
-  ``"smoothing"`` (the correction is genuinely formed, not a silent fallback);
+* ``covariance_mode="smoothing"`` genuinely forms the corrected covariance
+  instead of silently substituting the conditional covariance;
 * the response-scale *credible band* — not merely ``std_error`` — widens under
   smoothing (the bounds consume the covariance-mode SE);
 * the rare-event Bernoulli observation band is genuinely informative
@@ -70,7 +70,7 @@ def test_point_invariant_to_covariance_mode_and_observation() -> None:
         model.predict(grid, return_type="dict")["linear_predictor"], dtype=float
     )
 
-    for cm in ("conditional", "smoothing", "required"):
+    for cm in ("conditional", "smoothing"):
         for obs in (False, True):
             out = model.predict(
                 grid, interval=0.95, covariance_mode=cm, observation_interval=obs
@@ -91,11 +91,11 @@ def test_point_invariant_to_covariance_mode_and_observation() -> None:
             )
 
 
-def test_required_covariance_mode_succeeds_and_matches_smoothing() -> None:
-    # `covariance_mode="required"` must actually form the smoothing-corrected
-    # covariance for a REML-selected smooth (not silently fall back), and must
-    # agree with the `"smoothing"` request. The conditional SE must be strictly
-    # smaller somewhere, proving the correction is non-trivial.
+def test_smoothing_covariance_mode_is_nontrivial() -> None:
+    # `covariance_mode="smoothing"` must form the smoothing-corrected covariance
+    # for a REML-selected smooth, never silently substitute the conditional
+    # covariance. The conditional SE must be strictly smaller somewhere,
+    # proving the correction is non-trivial.
     model = _fit_binomial(seed=2)
     grid = _grid(12)
 
@@ -105,8 +105,7 @@ def test_required_covariance_mode_succeeds_and_matches_smoothing() -> None:
             dtype=float,
         )
 
-    cond, smooth, req = se("conditional"), se("smoothing"), se("required")
-    np.testing.assert_allclose(req, smooth, rtol=1e-9, atol=1e-12)
+    cond, smooth = se("conditional"), se("smoothing")
     assert np.all(smooth >= cond - 1e-12)
     assert np.any(smooth > cond + 1e-9), (
         "smoothing correction added no variance anywhere — covariance_mode is inert"

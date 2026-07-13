@@ -137,7 +137,7 @@ def shape_predict_response(
     # (`_shape_point_payload`) owns the identical "return the vector, or restore
     # a one-column table" tail that the three forked shapers used to duplicate.
     point, table_columns = _point_payload_spec(model_class, family, columns)
-    return _shape_point_payload(
+    shaped = _shape_point_payload(
         point,
         table_columns,
         table_requested=table_requested,
@@ -148,6 +148,28 @@ def shape_predict_response(
         training_table_kind=training_table_kind,
         restore=restore,
     )
+    return _attach_covariance_provenance(shaped, parsed.get("covariance_source"))
+
+
+def _attach_covariance_provenance(result: Any, source: Any) -> Any:
+    """Expose the Rust interval covariance source on public Python results.
+
+    The source is prediction metadata, not a row-valued numeric column. Dict
+    results therefore receive a scalar key, while pandas stores it in the
+    container's metadata mapping so numeric prediction columns keep their
+    dtype. Other table implementations still retain the source in the raw FFI
+    payload instead of fabricating an in-band numeric encoding.
+    """
+    if source is None:
+        return result
+    covariance_source = str(source)
+    if isinstance(result, dict):
+        result["covariance_source"] = covariance_source
+        return result
+    attrs = getattr(result, "attrs", None)
+    if isinstance(attrs, dict):
+        attrs["covariance_source"] = covariance_source
+    return result
 
 
 def _point_payload_spec(

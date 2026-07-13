@@ -5,18 +5,17 @@ interval, so binomial credible intervals are the bare conditional ones.
 ``Model.predict``'s ``covariance_mode`` selects the covariance source for the
 response-scale SE: ``"conditional"`` = ``H^{-1}`` only; ``"smoothing"`` /
 ``None`` (the default required ``SmoothingCorrected`` mode) adds the
-first-order smoothing correction ``J·Var(rho_hat)·J^T``; ``"required"`` demands
-that correction and errors if it cannot be formed (``gamfit/_model.py:84-95``).
+first-order smoothing correction ``J·Var(rho_hat)·J^T`` and errors if it cannot
+be formed (``gamfit/_model.py:84-95``).
 For a smooth model with REML-selected ``rho``, the correction is non-trivial, so
 the modes must produce *different* standard errors — and they do for Poisson,
 Gamma and Gaussian.
 
-For binomial the three modes return **bitwise-identical** standard errors: the
+For binomial the two modes return **bitwise-identical** standard errors: the
 correction is simply not applied. As a result a binomial ``s(x)`` model's
 default credible intervals omit the smoothing uncertainty that every other
 family includes by default, so they are systematically too narrow, and
-``covariance_mode`` is a no-op (in particular ``"required"`` does not error even
-when one would expect it to mean something).
+``covariance_mode`` is a no-op.
 
 Root cause (read, no patch): same dispatch as the sibling observation-interval
 defect. ``crates/gam-pyffi/src/lib.rs`` ``predict_columns`` branches on

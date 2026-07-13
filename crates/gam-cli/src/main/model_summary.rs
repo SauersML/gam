@@ -327,11 +327,13 @@ pub(crate) fn covariance_from_model(
         .fit_result
         .as_ref()
         .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())?;
-    let cov = match mode {
-        CovarianceModeArg::Corrected => fit.beta_covariance_corrected().or(fit.beta_covariance()),
-        CovarianceModeArg::Conditional => fit.beta_covariance(),
-    };
-    if let Some(cov) = cov {
+    if mode == CovarianceModeArg::Corrected {
+        return fit.beta_covariance_corrected().cloned().ok_or_else(|| {
+            "saved model does not contain smoothing-corrected covariance; refit before requesting --covariance-mode corrected"
+                .to_string()
+        });
+    }
+    if let Some(cov) = fit.beta_covariance() {
         return Ok(cov.clone());
     }
     if let Some(hessian) = fit.penalized_hessian() {
@@ -362,11 +364,14 @@ pub(crate) fn prediction_backend_from_model<'a>(
         .fit_result
         .as_ref()
         .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())?;
-    let covariance = match mode {
-        CovarianceModeArg::Corrected => fit.beta_covariance_corrected().or(fit.beta_covariance()),
-        CovarianceModeArg::Conditional => fit.beta_covariance(),
-    };
-    if let Some(covariance) = covariance {
+    if mode == CovarianceModeArg::Corrected {
+        let covariance = fit.beta_covariance_corrected().ok_or_else(|| {
+            "saved model does not contain smoothing-corrected covariance; refit before requesting --covariance-mode corrected"
+                .to_string()
+        })?;
+        return Ok(PredictionCovarianceBackend::from_dense(covariance.view()));
+    }
+    if let Some(covariance) = fit.beta_covariance() {
         return Ok(PredictionCovarianceBackend::from_dense(covariance.view()));
     }
     if let Some(hessian) = fit.penalized_hessian() {
