@@ -182,23 +182,6 @@ pub(crate) struct LogslopeLayout {
 }
 
 impl LogslopeLayout {
-    /// Shared-channel constructor. Production paths use
-    /// [`LogslopeTopology::materialize_identity`] so topology validation stays
-    /// at the construction boundary.
-    #[cfg(test)]
-    pub(crate) fn shared(coefficient_design: DesignMatrix, offset: Array1<f64>) -> Self {
-        let nrows = coefficient_design.nrows();
-        let current_width = coefficient_design.ncols();
-        Self {
-            coefficient_design,
-            nrows,
-            current_width,
-            channels: LogslopeChannels::Shared {
-                offset: Arc::new(offset),
-            },
-        }
-    }
-
     #[inline]
     pub(crate) fn is_per_score(&self) -> bool {
         matches!(self.channels, LogslopeChannels::PerScore { .. })
@@ -214,17 +197,6 @@ impl LogslopeLayout {
     #[inline]
     pub(crate) fn coefficient_design(&self) -> &DesignMatrix {
         &self.coefficient_design
-    }
-
-    #[cfg(test)]
-    pub(crate) fn replace_coefficient_design(&mut self, design: DesignMatrix) {
-        assert_eq!(
-            design.nrows(),
-            self.nrows,
-            "test replacement must preserve logslope layout row count"
-        );
-        self.current_width = design.ncols();
-        self.coefficient_design = design;
     }
 
     pub(crate) fn validate_for(&self, score_dim: usize) -> Result<(), String> {
@@ -391,14 +363,6 @@ impl LogslopeLayout {
     }
 }
 
-#[cfg(test)]
-impl From<DesignMatrix> for LogslopeLayout {
-    fn from(design: DesignMatrix) -> Self {
-        let nrows = design.nrows();
-        Self::shared(design, Array1::<f64>::zeros(nrows))
-    }
-}
-
 pub(crate) struct LogslopeRowWorkspace {
     raw_row: Array2<f64>,
     channel_rows: Array2<f64>,
@@ -489,6 +453,41 @@ fn certify_channel_nonzero(
 mod tests {
     use super::*;
     use ndarray::array;
+
+    impl LogslopeLayout {
+        /// Test-only shared-channel constructor. Production paths use
+        /// [`LogslopeTopology::materialize_identity`] so topology validation
+        /// stays at the construction boundary.
+        pub(crate) fn shared(coefficient_design: DesignMatrix, offset: Array1<f64>) -> Self {
+            let nrows = coefficient_design.nrows();
+            let current_width = coefficient_design.ncols();
+            Self {
+                coefficient_design,
+                nrows,
+                current_width,
+                channels: LogslopeChannels::Shared {
+                    offset: Arc::new(offset),
+                },
+            }
+        }
+
+        pub(crate) fn replace_coefficient_design(&mut self, design: DesignMatrix) {
+            assert_eq!(
+                design.nrows(),
+                self.nrows,
+                "test replacement must preserve logslope layout row count"
+            );
+            self.current_width = design.ncols();
+            self.coefficient_design = design;
+        }
+    }
+
+    impl From<DesignMatrix> for LogslopeLayout {
+        fn from(design: DesignMatrix) -> Self {
+            let nrows = design.nrows();
+            Self::shared(design, Array1::<f64>::zeros(nrows))
+        }
+    }
 
     fn assert_close(left: &Array2<f64>, right: &Array2<f64>) {
         assert_eq!(left.dim(), right.dim());
