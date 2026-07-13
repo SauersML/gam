@@ -145,11 +145,8 @@ pub fn ispline_function_penalties(
         });
     }
 
-    let bspline_roughness = bspline_derivative_penalty_matrix(
-        knot_vector,
-        value_degree,
-        derivative_order,
-    )?;
+    let bspline_roughness =
+        bspline_derivative_penalty_matrix(knot_vector, value_degree, derivative_order)?;
     let num_bspline_basis = bspline_roughness.nrows();
     let num_ispline_basis = num_bspline_basis.checked_sub(1).ok_or_else(|| {
         BasisError::InvalidKnotVector(
@@ -166,16 +163,11 @@ pub fn ispline_function_penalties(
     for column in 0..num_ispline_basis {
         cumulative.slice_mut(s![column + 1.., column]).fill(1.0);
     }
-    let mut roughness = cumulative
-        .t()
-        .dot(&bspline_roughness)
-        .dot(&cumulative);
+    let mut roughness = cumulative.t().dot(&bspline_roughness).dot(&cumulative);
     symmetrize_in_place(&mut roughness);
 
     let roughness_nullspace_dim = derivative_order - 1;
-    let nullspace_shrinkage = if include_nullspace_shrinkage
-        && roughness_nullspace_dim > 0
-    {
+    let nullspace_shrinkage = if include_nullspace_shrinkage && roughness_nullspace_dim > 0 {
         let function_gram = ispline_function_gram(knot_vector, ispline_degree)?;
         Some(
             function_space_nullspace_shrinkage(&roughness, &function_gram)?.ok_or_else(|| {
@@ -224,19 +216,15 @@ pub fn ispline_function_gram(
             breaks.push(knot);
         }
     }
-    piecewise_polynomial_function_gram(
-        &breaks,
-        value_degree + 1,
-        &mut |points| {
-            let (basis, _) = create_basis::<Dense>(
-                points,
-                KnotSource::Provided(knot_vector),
-                ispline_degree,
-                BasisOptions::i_spline(),
-            )?;
-            Ok((*basis).clone())
-        },
-    )
+    piecewise_polynomial_function_gram(&breaks, value_degree + 1, &mut |points| {
+        let (basis, _) = create_basis::<Dense>(
+            points,
+            KnotSource::Provided(knot_vector),
+            ispline_degree,
+            BasisOptions::i_spline(),
+        )?;
+        Ok((*basis).clone())
+    })
 }
 
 /// Exact cyclic (periodic) B-spline roughness penalty over one full period:
@@ -711,13 +699,11 @@ mod tests {
                 let expected = if polynomial_degree < order {
                     0.0
                 } else {
-                    let derivative_factor =
-                        ((polynomial_degree - order + 1)..=polynomial_degree)
-                            .map(|factor| factor as f64)
-                            .product::<f64>();
+                    let derivative_factor = ((polynomial_degree - order + 1)..=polynomial_degree)
+                        .map(|factor| factor as f64)
+                        .product::<f64>();
                     let residual_degree = polynomial_degree - order;
-                    derivative_factor.powi(2)
-                        * width.powi((2 * residual_degree + 1) as i32)
+                    derivative_factor.powi(2) * width.powi((2 * residual_degree + 1) as i32)
                         / (2 * residual_degree + 1) as f64
                 };
                 let relative_error = (observed - expected).abs() / expected.abs().max(1.0);
@@ -739,8 +725,7 @@ mod tests {
         let ispline_degree = value_degree - 1;
         let order = 3usize;
         let knots = clamped_knots(&[0.04, 0.19, 0.2, 0.61, 0.91], value_degree, 0.0, 1.0);
-        let built =
-            ispline_function_penalties(knots.view(), ispline_degree, order, false).unwrap();
+        let built = ispline_function_penalties(knots.view(), ispline_degree, order, false).unwrap();
         let alpha = Array1::from_iter(
             (0..built.roughness.nrows()).map(|index| (0.37 + 1.91 * index as f64).sin()),
         );
@@ -791,8 +776,7 @@ mod tests {
         let order = 2usize;
         let coarse_knots = clamped_knots(&[0.16, 0.53, 0.88], value_degree, 0.0, 1.0);
         let coarse_b = array![0.0, 0.7, -0.4, 1.6, 0.2, 1.1, -0.3];
-        let (fine_knots, fine_b) =
-            insert_knot_once(&coarse_knots, &coarse_b, value_degree, 0.37);
+        let (fine_knots, fine_b) = insert_knot_once(&coarse_knots, &coarse_b, value_degree, 0.37);
         let coarse_alpha = anchored_bspline_to_ispline_coefficients(&coarse_b);
         let fine_alpha = anchored_bspline_to_ispline_coefficients(&fine_b);
 
@@ -814,7 +798,10 @@ mod tests {
         let value_error = (&coarse_basis.dot(&coarse_alpha) - &fine_basis.dot(&fine_alpha))
             .iter()
             .fold(0.0_f64, |error, value| error.max(value.abs()));
-        assert!(value_error < 2e-12, "knot insertion changed f by {value_error}");
+        assert!(
+            value_error < 2e-12,
+            "knot insertion changed f by {value_error}"
+        );
 
         let coarse =
             ispline_function_penalties(coarse_knots.view(), ispline_degree, order, false).unwrap();
@@ -822,8 +809,7 @@ mod tests {
             ispline_function_penalties(fine_knots.view(), ispline_degree, order, false).unwrap();
         let coarse_energy = coarse_alpha.dot(&coarse.roughness.dot(&coarse_alpha));
         let fine_energy = fine_alpha.dot(&fine.roughness.dot(&fine_alpha));
-        let relative_error =
-            (coarse_energy - fine_energy).abs() / coarse_energy.abs().max(1.0);
+        let relative_error = (coarse_energy - fine_energy).abs() / coarse_energy.abs().max(1.0);
         assert!(
             relative_error < 2e-12,
             "knot insertion changed roughness: coarse={coarse_energy}, fine={fine_energy}, relative error {relative_error}"
@@ -838,8 +824,7 @@ mod tests {
         let value_degree = 3usize;
         let ispline_degree = value_degree - 1;
         let knots = clamped_knots(&[0.08, 0.31, 0.73, 0.95], value_degree, 0.0, 1.0);
-        let built =
-            ispline_function_penalties(knots.view(), ispline_degree, 2, true).unwrap();
+        let built = ispline_function_penalties(knots.view(), ispline_degree, 2, true).unwrap();
         let ridge = built
             .nullspace_shrinkage
             .as_ref()
@@ -867,9 +852,8 @@ mod tests {
             "ridge must equal the exact L2 norm on null(S): ridge={null_ridge_energy}, L2={null_function_energy}"
         );
 
-        let mut range = Array1::from_iter(
-            (0..linear.len()).map(|index| (0.2 + index as f64 * 1.7).cos()),
-        );
+        let mut range =
+            Array1::from_iter((0..linear.len()).map(|index| (0.2 + index as f64 * 1.7).cos()));
         let projection = linear.dot(&gram.dot(&range)) / null_function_energy;
         range -= &(projection * &linear);
         let range_ridge_energy = range.dot(&ridge.dot(&range));

@@ -54,13 +54,9 @@ pub fn buildwiggle_block_input_from_knots(
         return Err("wiggle basis has no free monotone columns".to_string());
     }
     let internal_degree = monotone_wiggle_internal_degree(degree)?;
-    let function_penalties = ispline_function_penalties(
-        knots.view(),
-        internal_degree,
-        penalty_order,
-        double_penalty,
-    )
-    .map_err(|error| error.to_string())?;
+    let function_penalties =
+        ispline_function_penalties(knots.view(), internal_degree, penalty_order, double_penalty)
+            .map_err(|error| error.to_string())?;
     if function_penalties.roughness.dim() != (p, p) {
         return Err(format!(
             "I-spline function penalty is {}x{} but wiggle design has {p} columns",
@@ -73,9 +69,7 @@ pub fn buildwiggle_block_input_from_knots(
     )];
     let mut nullspace_dims = vec![function_penalties.roughness_nullspace_dim];
     if let Some(nullspace_shrinkage) = function_penalties.nullspace_shrinkage {
-        penalties.push(crate::model_types::PenaltySpec::Dense(
-            nullspace_shrinkage,
-        ));
+        penalties.push(crate::model_types::PenaltySpec::Dense(nullspace_shrinkage));
         nullspace_dims.push(0);
     }
     Ok(ParameterBlockInput {
@@ -253,11 +247,9 @@ pub fn append_selected_wiggle_function_penalties(
                 function_penalty.roughness.ncols(),
             ));
         }
-        block
-            .penalties
-            .push(crate::model_types::PenaltySpec::Dense(
-                function_penalty.roughness,
-            ));
+        block.penalties.push(crate::model_types::PenaltySpec::Dense(
+            function_penalty.roughness,
+        ));
         block
             .nullspace_dims
             .push(function_penalty.roughness_nullspace_dim);

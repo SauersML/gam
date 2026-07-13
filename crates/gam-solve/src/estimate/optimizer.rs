@@ -981,7 +981,7 @@ where
                 //      per-block "exact" cyclic closed form. The candidate is
                 //      admitted only after the true coupled REML cost scores it.
                 let summed_diagonal = reml_state
-                    .analytic_gaussian_profiled_diagonal_rho((lo, hi))
+                    .analytic_gaussian_profiled_diagonal_rho((lo, hi))?
                     .map(|rho_blocks| {
                         let mut seed = base.clone();
                         for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
@@ -996,10 +996,7 @@ where
                 // Keep the strictly-cheapest certified/scored candidate.
                 let mut refined = base.clone();
                 let mut best_cost = base_cost;
-                for candidate in [initial_sp, summed_diagonal]
-                    .into_iter()
-                    .flatten()
-                {
+                for candidate in [initial_sp, summed_diagonal].into_iter().flatten() {
                     let candidate_cost = reml_state
                         .compute_cost(&candidate)
                         .ok()
@@ -2040,10 +2037,8 @@ where
         }
         _ => None,
     };
-    let dispersion = dispersion_from_likelihood(
-        &pirls_res.likelihood,
-        profiled_gaussian_standard_deviation,
-    )?;
+    let dispersion =
+        dispersion_from_likelihood(&pirls_res.likelihood, profiled_gaussian_standard_deviation)?;
     // Persist the square root of the resolved response dispersion for every
     // scalar-scale family. It is never an overloaded Gamma shape or an inert
     // unit placeholder; family-specific inference consumes the typed metadata.
@@ -2388,8 +2383,8 @@ where
                 // reservation covers this buffer and its `solvemulti` output
                 // jointly, so it is bound to whichever one outlives the other
                 // (both are dropped together at the end of this iteration).
-                let rhs =
-                    chunk_reservation.bind(qs.t().slice(ndarray::s![.., col_start..col_end]).to_owned());
+                let rhs = chunk_reservation
+                    .bind(qs.t().slice(ndarray::s![.., col_start..col_end]).to_owned());
                 let z_chunk = factor_t.solvemulti(&rhs).map_err(|reason| {
                     EstimationError::RemlOptimizationFailed(format!(
                         "exact coefficient-SE solve failed at columns {col_start}..{col_end}: {reason}"

@@ -3917,8 +3917,8 @@ impl<'a> RemlState<'a> {
     /// Certified finite-window single-λ Gaussian-identity REML optimum, mapped
     /// to a uniform per-block ρ seed. Setting every block's λ equal makes the effective
     /// penalty `λ·Σ_j S_j`, so the profiled Gaussian REML criterion collapses to
-    /// the one-dimensional closed form on the summed penalty, whose global
-    /// minimizer is selected by stationary-bracket certification
+    /// the one-dimensional closed form on the summed penalty, whose
+    /// finite-window minimizer is selected by stationary-bracket certification
     /// (`gaussian_reml_closed_form`) rather than descent. The diagonal is the
     /// best candidate on this explicit one-dimensional restriction of the
     /// multi-λ problem; it is not represented as a coordinate-wise solution of
@@ -3929,31 +3929,34 @@ impl<'a> RemlState<'a> {
     pub(crate) fn analytic_gaussian_profiled_diagonal_rho(
         &self,
         bounds: (f64, f64),
-    ) -> Option<Array1<f64>> {
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
         if !reml_is_gaussian_identity(&self.config.likelihood) {
-            return None;
+            return Ok(None);
         }
         if self.linear_constraints.is_some()
             || self.coefficient_lower_bounds.is_some()
             || self.runtime_mixture_link_state.is_some()
             || self.runtime_sas_link_state.is_some()
         {
-            return None;
+            return Ok(None);
         }
         let k = self.canonical_penalties.len();
         if k == 0 {
-            return None;
+            return Ok(None);
         }
         if !matches!(self.x, DesignMatrix::Dense(_)) {
-            return None;
+            return Ok(None);
         }
         let x_dense = self
             .x
             .try_to_dense_by_chunks("gaussian_summed_diagonal_seed")
-            .ok()?;
+            .map_err(EstimationError::RemlOptimizationFailed)?;
         let p = self.p;
         if x_dense.ncols() != p {
-            return None;
+            return Err(EstimationError::InvalidInput(format!(
+                "Gaussian profiled diagonal seed design has {} columns, expected {p}",
+                x_dense.ncols()
+            )));
         }
         // Sum the canonical penalties into a single p×p `S = Σ_j S_j` — the
         // effective penalty when every λ_j is equal.
@@ -3977,17 +3980,18 @@ impl<'a> RemlState<'a> {
             s.view(),
             Some(weights.view()),
             None,
-        )
-        .ok()?;
+        )?;
         if !result.rho.is_finite() {
-            return None;
+            return Err(EstimationError::RemlOptimizationFailed(
+                "Gaussian profiled diagonal seed returned a non-finite rho".to_string(),
+            ));
         }
         let (lo, hi) = if bounds.0 <= bounds.1 {
             bounds
         } else {
             (bounds.1, bounds.0)
         };
-        Some(Array1::from_elem(k, result.rho.clamp(lo, hi)))
+        Ok(Some(Array1::from_elem(k, result.rho.clamp(lo, hi))))
     }
 
     /// Returns the effective Hessian and the ridge value used (if any).
@@ -4376,8 +4380,7 @@ impl<'a> RemlState<'a> {
         // same identity hole for any bundle retained within a screening call.
         super::rho_key::sanitized_eval_state_key(
             rho,
-            self.screening_max_inner_iterations
-                .load(Ordering::Relaxed),
+            self.screening_max_inner_iterations.load(Ordering::Relaxed),
             self.outer_inner_cap.load(Ordering::Relaxed),
         )
     }

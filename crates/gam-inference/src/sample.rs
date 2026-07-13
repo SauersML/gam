@@ -1399,7 +1399,7 @@ fn sample_survival(
             wiggle_degree,
             &extra_orders,
         )
-            .map_err(|e| format!("baseline-timewiggle penalty reconstruction failed: {e}"))?;
+        .map_err(|e| format!("baseline-timewiggle penalty reconstruction failed: {e}"))?;
         for (widx, s) in block.penalties.iter().enumerate() {
             let s = match s {
                 gam_solve::estimate::PenaltySpec::Block { local, .. } => local,

@@ -3452,8 +3452,8 @@ fn conservative_interval(lo: f64, hi: f64, magnitude: f64, operations: usize) ->
     if n_eps >= 1.0 {
         return Interval::entire();
     }
-    let pad = (n_eps / (1.0 - n_eps))
-        * magnitude.max(lo.abs()).max(hi.abs()).max(f64::MIN_POSITIVE);
+    let pad =
+        (n_eps / (1.0 - n_eps)) * magnitude.max(lo.abs()).max(hi.abs()).max(f64::MIN_POSITIVE);
     Interval {
         lo: round_down(lo - pad),
         hi: round_up(hi + pad),
@@ -3668,9 +3668,7 @@ fn reml_deriv_enclosure_profile(
                 .saturating_mul(ywy.len().max(1)),
         ),
     );
-    let vp_magnitude = g1_lo.abs()
-        + g1_hi.abs()
-        + half_nu.abs() * (g2_lo.abs() + g2_hi.abs());
+    let vp_magnitude = g1_lo.abs() + g1_hi.abs() + half_nu.abs() * (g2_lo.abs() + g2_hi.abs());
     let vpp_magnitude = half_d.abs() * (sum_w_lo.abs() + sum_w_hi.abs())
         + half_nu.abs() * (vpp_disp_lo.abs() + vpp_disp_hi.abs());
     (
@@ -3817,7 +3815,9 @@ fn refine_stationary_rho_core(
             return Err(profile_search_refusal(
                 eval,
                 midpoint,
-                format!("stationary refinement could not represent an interior point on [{lo}, {hi}]"),
+                format!(
+                    "stationary refinement could not represent an interior point on [{lo}, {hi}]"
+                ),
             ));
         }
         let current = eval(candidate);
@@ -3906,17 +3906,10 @@ fn enumerate_and_select_rho_with_controls(
         }
 
         if monotone {
-            let crosses = (ea.grad <= 0.0 && eb.grad >= 0.0)
-                || (ea.grad >= 0.0 && eb.grad <= 0.0);
+            let crosses = (ea.grad <= 0.0 && eb.grad >= 0.0) || (ea.grad >= 0.0 && eb.grad <= 0.0);
             if crosses {
                 let hint = init_rho.filter(|rho| rho.is_finite() && *rho >= a && *rho <= b);
-                let root = refine_stationary_rho_core(
-                    &eval,
-                    a,
-                    b,
-                    controls.resolution,
-                    hint,
-                )?;
+                let root = refine_stationary_rho_core(&eval, a, b, controls.resolution, hint)?;
                 let duplicate = last_root.is_some_and(|previous| {
                     root.rho.to_bits() == previous.rho.to_bits()
                         || (root.bracket[0] <= previous.bracket[1]
@@ -4129,12 +4122,7 @@ fn optimize_rho_no_alloc(
     n_outputs: usize,
     init_rho: Option<f64>,
 ) -> Result<f64, EstimationError> {
-    validate_reml_profile_residuals(
-        cache,
-        ywy.view(),
-        projected_rhs_squared.view(),
-        RHO_LOWER,
-    )?;
+    validate_reml_profile_residuals(cache, ywy.view(), projected_rhs_squared.view(), RHO_LOWER)?;
     if cache.penalty_rank == 0 {
         return Ok(init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER));
     }
@@ -5457,34 +5445,18 @@ mod tests {
         let ywy = array![q + irreducible_residual];
         let projected = array![[q]];
         let eval = |rho: f64| {
-            evaluate_reml_parts(
-                &cache,
-                ywy.view(),
-                projected.view(),
-                n_effective,
-                1,
-                rho,
-            )
+            evaluate_reml_parts(&cache, ywy.view(), projected.view(), n_effective, 1, rho)
         };
         let enclose = |a: f64, b: f64| {
-            reml_deriv_enclosure(
-                &cache,
-                ywy.view(),
-                projected.view(),
-                n_effective,
-                1,
-                a,
-                b,
-            )
+            reml_deriv_enclosure(&cache, ywy.view(), projected.view(), n_effective, 1, a, b)
         };
-        let expected_t = irreducible_residual
-            / (((n_effective - 1) as f64) * q - irreducible_residual);
+        let expected_t =
+            irreducible_residual / (((n_effective - 1) as f64) * q - irreducible_residual);
         let expected_rho = (expected_t / delta).ln();
         let mut roots = Vec::new();
-        let selection = enumerate_and_select_rho(&eval, &enclose, Some(-20.0), |root, _| {
-            roots.push(root)
-        })
-        .expect("profile certificate");
+        let selection =
+            enumerate_and_select_rho(&eval, &enclose, Some(-20.0), |root, _| roots.push(root))
+                .expect("profile certificate");
 
         assert_eq!(roots.len(), 1, "unexpected stationary set");
         assert!(
@@ -5529,10 +5501,7 @@ mod tests {
             |_root, _eval| {},
         )
         .expect_err("ambiguous stationary structure must refuse");
-        assert!(matches!(
-            error,
-            EstimationError::RemlDidNotConverge { .. }
-        ));
+        assert!(matches!(error, EstimationError::RemlDidNotConverge { .. }));
     }
 
     #[test]
@@ -5724,8 +5693,7 @@ mod tests {
             reml_deriv_enclosure(&cache, ywy.view(), prs.view(), n_eff, n_out, a, b)
         };
         let mut roots = Vec::new();
-        enumerate_and_select_rho(&eval, &enclose, None, |root, _| roots.push(root.rho))
-            .unwrap();
+        enumerate_and_select_rho(&eval, &enclose, None, |root, _| roots.push(root.rho)).unwrap();
         assert!(
             roots.iter().any(|&r| (r - r0).abs() < 1.0e-2),
             "root near {r0:.6} (gap {:.4} < grid cell) missing from {roots:?}",
@@ -5777,7 +5745,6 @@ mod tests {
             }
             assert!(selected_cost <= eval(RHO_LOWER).cost + tol);
             assert!(selected_cost <= eval(RHO_UPPER).cost + tol);
-
         }
     }
 
