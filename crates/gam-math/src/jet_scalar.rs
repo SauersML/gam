@@ -5891,13 +5891,18 @@ mod tests {
                 stacks[term],
             ))
         });
-        let wrapped_lefts = std::array::from_fn(|term| FixedRuntimeJet::from_inner(lefts[term]));
-        let wrapped_rights = std::array::from_fn(|term| FixedRuntimeJet::from_inner(rights[term]));
-        let wrapped_addends =
+        let wrapped_lefts: [FixedRuntimeJet<Tower4<K>, K>; N] =
+            std::array::from_fn(|term| FixedRuntimeJet::from_inner(lefts[term]));
+        let wrapped_rights: [FixedRuntimeJet<Tower4<K>, K>; N] =
+            std::array::from_fn(|term| FixedRuntimeJet::from_inner(rights[term]));
+        let wrapped_addends: [FixedRuntimeJet<Tower4<K>, K>; N] =
             std::array::from_fn(|term| FixedRuntimeJet::from_inner(addends[term]));
-        let wrapped_left_refs = std::array::from_fn(|term| &wrapped_lefts[term]);
-        let wrapped_right_refs = std::array::from_fn(|term| &wrapped_rights[term]);
-        let wrapped_addend_refs = std::array::from_fn(|term| &wrapped_addends[term]);
+        let wrapped_left_refs: [&FixedRuntimeJet<Tower4<K>, K>; N] =
+            std::array::from_fn(|term| &wrapped_lefts[term]);
+        let wrapped_right_refs: [&FixedRuntimeJet<Tower4<K>, K>; N] =
+            std::array::from_fn(|term| &wrapped_rights[term]);
+        let wrapped_addend_refs: [&FixedRuntimeJet<Tower4<K>, K>; N] =
+            std::array::from_fn(|term| &wrapped_addends[term]);
         let actual = FixedRuntimeJet::<Tower4<K>, K>::scaled_multiply_add_affine_composed_sum(
             &wrapped_left_refs,
             &wrapped_right_refs,
