@@ -1678,7 +1678,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             "live dynamic fused addends must share dimension and arena"
         );
         let (representatives, term_sources, source_count) =
-            canonical_shared_source_schedule(|term, representative| {
+            canonical_shared_source_schedule::<N>(|term, representative| {
                 std::ptr::eq(lefts[term], lefts[representative])
                     && addend_scales[term] == addend_scales[representative]
             });
@@ -3389,7 +3389,7 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
         derivative_stacks: &[[f64; 5]; N],
     ) -> Self {
         let (representatives, term_sources, source_count) =
-            canonical_shared_source_schedule(|term, representative| {
+            canonical_shared_source_schedule::<N>(|term, representative| {
                 std::ptr::eq(lefts[term], lefts[representative])
                     && addend_scales[term] == addend_scales[representative]
             });
