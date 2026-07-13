@@ -1167,18 +1167,21 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     // ρ-ψ pair callback
     let rho_ext = {
         let per_block_lambdas = Arc::clone(&per_block_lambdas);
-        let derivative_blocks = Arc::clone(&derivative_blocks);
+        let hyper_layout = Arc::clone(&hyper_layout);
         let beta_arc = Arc::clone(&beta_arc);
         let psi_penalty_cache = Arc::clone(&psi_penalty_cache);
         let rho_penalty_cache = Arc::clone(&rho_penalty_cache);
         let s_logdet_block_cache = Arc::clone(&s_logdet_block_cache);
 
         Box::new(move |rho_k: usize, psi_j: usize| -> HyperCoordPair {
-            if rho_k >= rho_penalty_cache.len() || psi_j >= psi_penalty_cache.len() {
-                return HyperCoordPair::zero();
-            }
+            assert!(
+                rho_k < rho_penalty_cache.len() && psi_j < hyper_layout.len(),
+                "rho×typed-hyper pair index out of bounds: ({rho_k}, {psi_j}) for {} rho and {} non-rho axes",
+                rho_penalty_cache.len(),
+                hyper_layout.len()
+            );
             let rho_cache = &rho_penalty_cache[rho_k];
-            let psi_cache = &psi_penalty_cache[psi_j];
+            let psi_cache = psi_penalty_cache[psi_j].as_ref();
             let mut a = 0.0;
             let mut g = Array1::<f64>::zeros(total);
             let mut b_mat = Array2::<f64>::zeros((total, total));
@@ -1186,9 +1189,12 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             // S_{ρ_k, ψ_j} = λ_k ∂S_k/∂ψ_j.
             // Only nonzero when both coordinates share the same block and the
             // ψ derivative touches the k-th penalty.
-            let ld_s = if rho_cache.block_idx == psi_cache.block_idx {
+            let ld_s = if let Some(psi_cache) = psi_cache
+                && rho_cache.block_idx == psi_cache.block_idx
+            {
                 let p_block = rho_cache.end - rho_cache.start;
-                let deriv = &derivative_blocks[psi_cache.block_idx][psi_cache.local_idx];
+                let deriv = &hyper_layout.design_derivative_blocks()[psi_cache.block_idx]
+                    [psi_cache.local_idx];
                 let lambda_k = per_block_lambdas[rho_cache.block_idx][rho_cache.penalty_idx];
                 let local = if let Some(ref components) = deriv.s_psi_penalty_components {
                     let mut m = Array2::<f64>::zeros((p_block, p_block));
