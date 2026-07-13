@@ -2343,7 +2343,8 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     drop(d_tau);
     drop(d_ruv);
 
-    let bytes = ((n + n * r
+    let bytes = ((n
+        + n * r
         + n * r * r
         + marginal_design_row_major.len()
         + logslope_design_row_major.len())
@@ -2400,11 +2401,12 @@ pub(crate) fn launch_bms_flex_row_joint_gradient(
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex_row joint gradient alloc partial: {err}"),
             })?;
-    let mut d_out = stream
-        .alloc_zeros::<f64>(output_width)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row joint gradient alloc output: {err}"),
-        })?;
+    let mut d_out =
+        stream
+            .alloc_zeros::<f64>(output_width)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row joint gradient alloc output: {err}"),
+            })?;
     let partial_func = backend
         .module
         .load_function("bms_flex_row_joint_gradient_partial")
@@ -2418,8 +2420,15 @@ pub(crate) fn launch_bms_flex_row_joint_gradient(
             reason: format!("bms_flex_row joint gradient load reduce: {err}"),
         })?;
 
+    let num_chunks_u32 =
+        u32::try_from(args.num_chunks).map_err(|_| GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row joint gradient: num_chunks={} exceeds u32 range",
+                args.num_chunks
+            ),
+        })?;
     let cfg_partial = LaunchConfig {
-        grid_dim: (args.num_chunks as u32, 1, 1),
+        grid_dim: (num_chunks_u32, 1, 1),
         block_dim: (HVP_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -2448,15 +2457,24 @@ pub(crate) fn launch_bms_flex_row_joint_gradient(
         reason: format!("bms_flex_row joint gradient partial launch: {err}"),
     })?;
 
-    let output_width_i32 = i32::try_from(output_width).map_err(|_| {
-        GpuError::DriverCallFailed {
-            reason: format!(
-                "bms_flex_row joint gradient: output_width={output_width} exceeds i32 range"
-            ),
-        }
+    let output_width_i32 = i32::try_from(output_width).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!(
+            "bms_flex_row joint gradient: output_width={output_width} exceeds i32 range"
+        ),
     })?;
-    let num_chunks_i32 = args.num_chunks as i32;
-    let reduce_blocks = (output_width as u32).div_ceil(REDUCTION_THREADS);
+    let num_chunks_i32 =
+        i32::try_from(args.num_chunks).map_err(|_| GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row joint gradient: num_chunks={} exceeds i32 range",
+                args.num_chunks
+            ),
+        })?;
+    let output_width_u32 = u32::try_from(output_width).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!(
+            "bms_flex_row joint gradient: output_width={output_width} exceeds u32 range"
+        ),
+    })?;
+    let reduce_blocks = output_width_u32.div_ceil(REDUCTION_THREADS);
     let cfg_reduce = LaunchConfig {
         grid_dim: (reduce_blocks, 1, 1),
         block_dim: (REDUCTION_THREADS, 1, 1),
@@ -4083,6 +4101,85 @@ mod tests {
         out
     }
 
+    pub(crate) fn cpu_oracle_bms_flex_row_joint_gradient(
+        row_neglog: &[f64],
+        row_grad: &[f64],
+        marginal_design: &[f64],
+        logslope_design: &[f64],
+        block: &BmsFlexBlockLayout,
+        primary: &BmsFlexPrimaryLayout,
+        n: usize,
+    ) -> (f64, Vec<f64>) {
+        let r = primary.r;
+        assert_eq!(row_neglog.len(), n);
+        assert_eq!(row_grad.len(), n * r);
+        assert_eq!(marginal_design.len(), n * block.p_m);
+        assert_eq!(logslope_design.len(), n * block.p_g);
+        let mut log_likelihood = 0.0_f64;
+        let mut gradient = vec![0.0_f64; block.p_total];
+        for row in 0..n {
+            log_likelihood -= row_neglog[row];
+            let grow = &row_grad[row * r..(row + 1) * r];
+            for j in 0..block.p_m {
+                gradient[j] -= grow[0] * marginal_design[row * block.p_m + j];
+            }
+            for j in 0..block.p_g {
+                gradient[block.p_m + j] -= grow[1] * logslope_design[row * block.p_g + j];
+            }
+            if let (Some(primary_h), Some(block_h)) = (primary.h.as_ref(), block.h.as_ref()) {
+                for (offset, primary_idx) in primary_h.clone().enumerate() {
+                    gradient[block_h.start + offset] -= grow[primary_idx];
+                }
+            }
+            if let (Some(primary_w), Some(block_w)) = (primary.w.as_ref(), block.w.as_ref()) {
+                for (offset, primary_idx) in primary_w.clone().enumerate() {
+                    gradient[block_w.start + offset] -= grow[primary_idx];
+                }
+            }
+        }
+        (log_likelihood, gradient)
+    }
+
+    #[test]
+    fn cpu_joint_gradient_oracle_pins_score_sign_and_active_hw_pullback() {
+        let n = 2_usize;
+        let r = 5_usize;
+        let block = BmsFlexBlockLayout {
+            p_m: 2,
+            p_g: 1,
+            h: Some(3..5),
+            w: Some(5..6),
+            p_total: 6,
+        };
+        let primary = BmsFlexPrimaryLayout {
+            h: Some(2..4),
+            w: Some(4..5),
+            r,
+        };
+        let row_neglog = [1.25, 0.75];
+        let row_grad = [
+            2.0, -3.0, 5.0, -7.0, 11.0, // row 0
+            -13.0, 17.0, -19.0, 23.0, -29.0, // row 1
+        ];
+        let marginal = [1.0, 2.0, -0.5, 3.0];
+        let logslope = [4.0, -2.0];
+        let (log_likelihood, gradient) = cpu_oracle_bms_flex_row_joint_gradient(
+            &row_neglog,
+            &row_grad,
+            &marginal,
+            &logslope,
+            &block,
+            &primary,
+            n,
+        );
+        assert_eq!(log_likelihood, -2.0);
+        assert_eq!(
+            gradient,
+            vec![-8.5, 35.0, 46.0, 14.0, -16.0, 18.0],
+            "joint output must be the score/log-likelihood sign, with h/w direct slots"
+        );
+    }
+
     /// Hand-construct a small symmetric per-row Hessian + small designs and
     /// verify the CPU oracle satisfies the expected algebra. Platform-
     /// independent (runs on macOS / Linux without CUDA).
@@ -4323,6 +4420,25 @@ mod tests {
                 &primary,
                 n,
             );
+            let row_neglog = (0..n)
+                .map(|row| 0.25 + 0.125 * row as f64)
+                .collect::<Vec<_>>();
+            let row_grad = (0..n * r)
+                .map(|index| {
+                    let row = index / r;
+                    let primary_idx = index % r;
+                    (row as f64 + 0.75) * (primary_idx as f64 - 1.25)
+                })
+                .collect::<Vec<_>>();
+            let (cpu_log_likelihood, cpu_gradient) = cpu_oracle_bms_flex_row_joint_gradient(
+                &row_neglog,
+                &row_grad,
+                &marginal,
+                &logslope,
+                &block,
+                &primary,
+                n,
+            );
 
             // Allocate a DeviceResidentRowHess by hand using the HVP backend's
             // stream + module so we don't need to drive the full BMS row kernel.
@@ -4344,11 +4460,11 @@ mod tests {
                 .expect("[bms_flex_row hvp parity] upload logslope must succeed on CUDA host");
             let storage = DeviceResidentRowHess {
                 neglog: stream
-                    .alloc_zeros::<f64>(n)
-                    .expect("[bms_flex_row hvp parity] alloc neglog"),
+                    .clone_htod(&row_neglog)
+                    .expect("[bms_flex_row hvp parity] upload neglog"),
                 grad: stream
-                    .alloc_zeros::<f64>(n * r)
-                    .expect("[bms_flex_row hvp parity] alloc grad"),
+                    .clone_htod(&row_grad)
+                    .expect("[bms_flex_row hvp parity] upload grad"),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,
@@ -4357,15 +4473,24 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
-                    * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>())
+                    as u64,
             };
             let gpu_hvp =
                 launch_bms_flex_row_hvp(&storage, &v).expect("HVP kernel must launch on CUDA host");
             let gpu_diag = launch_bms_flex_row_diagonal(&storage)
                 .expect("diagonal kernel must launch on CUDA host");
+            let gpu_joint = launch_bms_flex_row_joint_gradient(&storage)
+                .expect("joint-gradient kernel must launch on CUDA host");
             assert_eq!(gpu_hvp.len(), cpu_hvp.len());
             assert_eq!(gpu_diag.len(), cpu_diag.len());
+            assert_eq!(gpu_joint.gradient.len(), cpu_gradient.len());
+            assert!(
+                (gpu_joint.log_likelihood - cpu_log_likelihood).abs() <= 1e-12,
+                "loglik: cpu={} gpu={}",
+                cpu_log_likelihood,
+                gpu_joint.log_likelihood
+            );
             for i in 0..p_total {
                 let diff = (cpu_hvp[i] - gpu_hvp[i]).abs();
                 assert!(
@@ -4380,6 +4505,13 @@ mod tests {
                     "diag[{i}]: cpu={} gpu={} |Δ|={ddiff:.3e}",
                     cpu_diag[i],
                     gpu_diag[i]
+                );
+                let gdiff = (cpu_gradient[i] - gpu_joint.gradient[i]).abs();
+                assert!(
+                    gdiff <= 1e-10,
+                    "joint gradient[{i}]: cpu={} gpu={} |Δ|={gdiff:.3e}",
+                    cpu_gradient[i],
+                    gpu_joint.gradient[i]
                 );
             }
         }
@@ -4495,8 +4627,8 @@ mod tests {
             block: block.clone(),
             primary: primary.clone(),
 
-            bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
-                * std::mem::size_of::<f64>()) as u64,
+            bytes: ((n + n * r + n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>())
+                as u64,
         };
         let scratch = bms_flex_row_hvp_multi_scratch_bytes_for_shape(n, p_total, rhs_count)
             .expect("storage scratch budget");
@@ -4647,8 +4779,8 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
-                    * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>())
+                    as u64,
             };
 
             // Host-out adapter (allocates its own d_out, syncs + downloads).
@@ -4868,8 +5000,8 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
-                    * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>())
+                    as u64,
             };
             let gpu_hvp = launch_bms_flex_row_hvp(&storage, &v)
                 .expect("HVP kernel must launch on CUDA host at n64/r20/p44");
@@ -5050,8 +5182,8 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
-                    * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>())
+                    as u64,
             };
             let h_gpu = launch_bms_flex_row_dense_block(&storage)
                 .expect("dense_block kernel must launch on CUDA host");
@@ -5148,8 +5280,8 @@ mod tests {
             r,
             block,
             primary,
-            bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
-                * std::mem::size_of::<f64>()) as u64,
+            bytes: ((n + n * r + n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>())
+                as u64,
         };
         let actual = launch_bms_flex_row_dense(&storage)
             .expect("wide dense HVP materialization must stay on CUDA");
@@ -5304,8 +5436,8 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
-                    * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>())
+                    as u64,
             };
             let warmup: usize = 3;
             let iters: usize = 15;
@@ -5524,8 +5656,8 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
-                    * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>())
+                    as u64,
             };
             // Warmup + 5-iter median (dense build is heavier than HVP).
             let warmup: usize = 2;

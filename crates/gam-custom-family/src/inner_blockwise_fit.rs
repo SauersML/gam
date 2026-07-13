@@ -3954,6 +3954,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // than spinning. Falling through to blockwise (the old `break`)
                 // would switch the coupled exact-Hessian problem onto a
                 // principal-block surrogate (the ridge-drift mode this path avoids).
+                if joint_workspace_requested {
+                    cached_joint_hessian_source = Some(joint_hessian_source);
+                }
                 continue;
             }
 

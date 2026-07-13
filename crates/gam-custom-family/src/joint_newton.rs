@@ -4138,10 +4138,15 @@ pub(crate) fn load_joint_gradient_evaluation<F: CustomFamily + Clone + Send + Sy
         ),
         None => None,
     };
-    if family.inner_joint_workspace_gradient_available(specs)
-        && let Some(workspace_ref) = workspace.as_ref()
-        && let Some(joint_eval) = workspace_ref.joint_gradient_evaluation()?
-    {
+    if family.inner_joint_workspace_gradient_available(specs) {
+        let workspace_ref = workspace.as_ref().ok_or_else(|| {
+            "family advertises inner joint workspace gradients, but no workspace was retained"
+                .to_string()
+        })?;
+        let joint_eval = workspace_ref.joint_gradient_evaluation()?.ok_or_else(|| {
+            "family advertises inner joint workspace gradients, but its workspace returned none"
+                .to_string()
+        })?;
         return Ok((
             joint_eval.log_likelihood,
             Some(joint_eval.gradient),

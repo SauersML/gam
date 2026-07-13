@@ -266,8 +266,7 @@ fn gaussian_loc_scale_jet_tower_matches_hand_derived_via_universal_oracle() {
 
     for (row, fixture) in rows.iter().enumerate() {
         // The mechanically jet-derived dense tower (every channel in one pass).
-        let tower: Box<Tower4<2>> =
-            program_full_tower(&program, row).expect("gaussian jet tower");
+        let tower: Box<Tower4<2>> = program_full_tower(&program, row).expect("gaussian jet tower");
 
         // The INDEPENDENT hand-derived channels a hand kernel would claim.
         let claims = gaussian_closed_form_channels(fixture, &third_dirs, &fourth_pairs);

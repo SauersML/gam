@@ -269,8 +269,7 @@ fn gamma_dispersion_jet_tower_matches_independent_fd_oracle() {
     };
 
     for (row, fixture) in rows.iter().enumerate() {
-        let tower: Box<Tower4<2>> =
-            program_full_tower(&program, row).expect("gamma jet tower");
+        let tower: Box<Tower4<2>> = program_full_tower(&program, row).expect("gamma jet tower");
 
         // Value.
         close(

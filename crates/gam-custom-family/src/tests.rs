@@ -1648,6 +1648,10 @@ impl ExactNewtonJointHessianWorkspace for InnerPreludeCountingWorkspace {
         self.dense_calls.fetch_add(1, Ordering::Relaxed);
         Ok(Some(array![[1.0]]))
     }
+
+    fn directional_derivative(&self, _: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
@@ -1656,6 +1660,7 @@ pub(crate) struct InnerPreludeWorkspaceFamily {
     pub(crate) workspace_builds: Arc<AtomicUsize>,
     pub(crate) dense_calls: Arc<AtomicUsize>,
     pub(crate) provide_workspace: bool,
+    pub(crate) advertise_workspace_gradient: bool,
 }
 
 impl CustomFamily for InnerPreludeWorkspaceFamily {
@@ -1699,6 +1704,10 @@ impl CustomFamily for InnerPreludeWorkspaceFamily {
         true
     }
 
+    fn inner_joint_workspace_gradient_available(&self, _: &[ParameterBlockSpec]) -> bool {
+        self.advertise_workspace_gradient
+    }
+
     fn joint_trust_metric_block_floor(
         &self,
         _: &[ParameterBlockState],
@@ -1718,6 +1727,7 @@ pub(crate) fn inner_workspace_prevalidation_reuses_cycle0_hessian_without_family
         workspace_builds: Arc::clone(&workspace_builds),
         dense_calls: Arc::clone(&dense_calls),
         provide_workspace: true,
+        advertise_workspace_gradient: false,
     };
     let spec = ParameterBlockSpec {
         name: "workspace".to_string(),
@@ -1768,6 +1778,7 @@ pub(crate) fn advertised_inner_workspace_missing_fails_closed_without_family_fal
         workspace_builds: Arc::clone(&workspace_builds),
         dense_calls: Arc::new(AtomicUsize::new(0)),
         provide_workspace: false,
+        advertise_workspace_gradient: false,
     };
     let spec = ParameterBlockSpec {
         name: "missing-workspace".to_string(),
