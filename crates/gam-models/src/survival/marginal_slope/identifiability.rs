@@ -1258,6 +1258,54 @@ pub fn apply_compiled_map_to_designs(
         ));
     }
 
+    let time_raw = map.raw_block_ranges[0].clone();
+    let marg_raw = map.raw_block_ranges[1].clone();
+    let log_raw = map.raw_block_ranges[2].clone();
+    let time_compiled = map.compiled_block_ranges[0].clone();
+    let marg_compiled = map.compiled_block_ranges[1].clone();
+    let log_compiled = map.compiled_block_ranges[2].clone();
+
+    let t = &map.raw_from_compiled;
+    let raw_total = t.nrows();
+    let compiled_total = t.ncols();
+    let expected_raw_total = log_raw.end;
+    if raw_total != expected_raw_total {
+        return Err(format!(
+            "apply_compiled_map_to_designs: T has {raw_total} raw rows but block ranges sum to \
+             {expected_raw_total}"
+        ));
+    }
+    let expected_compiled_total = log_compiled.end;
+    if compiled_total != expected_compiled_total {
+        return Err(format!(
+            "apply_compiled_map_to_designs: T has {compiled_total} compiled cols but block ranges \
+             sum to {expected_compiled_total}"
+        ));
+    }
+    let validate_partition =
+        |ranges: &[std::ops::Range<usize>], total: usize, coordinate: &str| -> Result<(), String> {
+            let mut expected_start = 0usize;
+            for (block_idx, range) in ranges.iter().enumerate() {
+                if range.start != expected_start || range.end < range.start || range.end > total {
+                    return Err(format!(
+                        "apply_compiled_map_to_designs: malformed {coordinate} block range \
+                     {block_idx}={range:?}; expected a contiguous range starting at \
+                     {expected_start} within 0..{total}"
+                    ));
+                }
+                expected_start = range.end;
+            }
+            if expected_start != total {
+                return Err(format!(
+                    "apply_compiled_map_to_designs: {coordinate} block ranges end at \
+                 {expected_start}, expected total {total}"
+                ));
+            }
+            Ok(())
+        };
+    validate_partition(&map.raw_block_ranges, raw_total, "raw")?;
+    validate_partition(&map.compiled_block_ranges, compiled_total, "compiled")?;
+
     // The current survival runtime represents time, marginal, and logslope as
     // three semantically distinct coefficient blocks.  It can therefore apply
     // an independent coefficient-side transform inside each block, but it
@@ -1291,30 +1339,6 @@ pub fn apply_compiled_map_to_designs(
                 }
             }
         }
-    }
-    let time_raw = map.raw_block_ranges[0].clone();
-    let marg_raw = map.raw_block_ranges[1].clone();
-    let log_raw = map.raw_block_ranges[2].clone();
-    let time_compiled = map.compiled_block_ranges[0].clone();
-    let marg_compiled = map.compiled_block_ranges[1].clone();
-    let log_compiled = map.compiled_block_ranges[2].clone();
-
-    let t = &map.raw_from_compiled;
-    let raw_total = t.nrows();
-    let compiled_total = t.ncols();
-    let expected_raw_total = log_raw.end;
-    if raw_total != expected_raw_total {
-        return Err(format!(
-            "apply_compiled_map_to_designs: T has {raw_total} raw rows but block ranges sum to \
-             {expected_raw_total}"
-        ));
-    }
-    let expected_compiled_total = log_compiled.end;
-    if compiled_total != expected_compiled_total {
-        return Err(format!(
-            "apply_compiled_map_to_designs: T has {compiled_total} compiled cols but block ranges \
-             sum to {expected_compiled_total}"
-        ));
     }
 
     let v_time = t
@@ -1855,6 +1879,31 @@ mod tests {
         )
         .expect_err("a triangular map cannot be represented by split blocks");
         assert!(error.contains("unsupported cross-block lift"), "{error}");
+    }
+
+    #[test]
+    fn compiled_map_with_malformed_ranges_is_rejected_without_indexing() {
+        use gam_identifiability::families::compiler::CompiledMap;
+
+        let map = CompiledMap {
+            raw_from_compiled: Array2::<f64>::eye(3),
+            raw_block_ranges: vec![0..1, 2..2, 2..3],
+            compiled_block_ranges: vec![0..1, 1..2, 2..3],
+        };
+        let design = || DesignMatrix::from(Array2::<f64>::ones((2, 1)));
+        let error = apply_compiled_map_to_designs(
+            &map,
+            design(),
+            design(),
+            design(),
+            design(),
+            design(),
+            &[],
+            &[],
+            &[],
+        )
+        .expect_err("a non-contiguous raw partition must be rejected");
+        assert!(error.contains("malformed raw block range"), "{error}");
     }
 
     /// Top-level Phase-4b API test for the SMGS parametric path:
