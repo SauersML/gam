@@ -17,7 +17,16 @@
 //! * **residual** bits — the same joint water level applied to the residual
 //!   covariance spectrum (its own weight-1 component);
 //! * **dictionary** bits — the amortised `½·(dictionary_params / N)·log₂(N)` BIC
-//!   charge for storing the decoder.
+//!   charge for storing the decoder, where `N` is the DECLARED
+//!   `amortization_horizon` (the message/deployment horizon or declared
+//!   training-observation count), NOT the number of rows sampled to estimate the
+//!   score. The estimation subsample size (`estimation_rows = test_x.nrows()`)
+//!   controls ONLY the Monte-Carlo variance of the support / code / residual
+//!   expectations; it must never leak into the dictionary code (#2283 / audit
+//!   §21). Conflating the two made the authoritative bits-at-R² row meaningless
+//!   (the same fitted flat model priced radically different dictionary bits at
+//!   256 vs 8192 estimation rows), so the two `N`s are now passed separately and
+//!   the dictionary term depends on the horizon alone.
 //!
 //! Unlike the per-featurizer [`crate::description_length::score`] surface (which
 //! water-fills a single unweighted spectrum), the Eq. 4 scorer water-fills a
@@ -81,8 +90,20 @@ pub struct Eq4DescriptionLength {
     /// row), the un-rounded value that the support cardinality rounds.
     pub achieved_block_l0: f64,
     /// Amortised BIC dictionary charge
-    /// `0.5 * dictionary_params / N * log2(N)`, shared by every target.
+    /// `0.5 * dictionary_params / amortization_horizon * log2(amortization_horizon)`,
+    /// shared by every target. Depends ONLY on the declared `amortization_horizon`,
+    /// never on `estimation_rows` (#2283): re-estimating the score on a different
+    /// row subsample leaves this term bitwise identical.
     pub dictionary_bits: f64,
+    /// The number of rows actually used to estimate the code / residual / support
+    /// expectations (`test_x.nrows()`). This is the Monte-Carlo estimator size; it
+    /// affects only estimator variance and is reported for provenance. It is NOT
+    /// the dictionary amortisation horizon (see [`Self::amortization_horizon`]).
+    pub estimation_rows: i64,
+    /// The declared amortisation horizon `N` charged in the dictionary code (the
+    /// message/deployment horizon or declared training-observation count). Echoed
+    /// through so a reader can confirm the dictionary term is sample-invariant.
+    pub amortization_horizon: i64,
     /// One entry per R² target, in the order the targets were supplied.
     pub per_target: Vec<Eq4TargetBits>,
     /// The featurizer's own native bits/token, echoed through when supplied.
@@ -160,7 +181,19 @@ fn atom_code_spectrum(contribution: ArrayView2<f64>, code_dim: usize) -> Result<
 /// * `code_dims` — the coded-coordinate dimension `d_g` of each of the `G`
 ///   atoms (length `G`, nonnegative).
 /// * `dictionary_params` — the decoder scalar count charged the BIC dictionary
-///   term.
+///   term. This is a STORAGE-CODE scalar count (the number of decoder scalars a
+///   receiver must be handed to reconstruct: `K_flat·P + K_curved·b·P`), NOT a
+///   BIC free-identifiable/effective dimension. The two coincide only for a
+///   full-rank unpenalised decoder; the scorer declares the storage-code reading
+///   explicitly so a future edit cannot silently relabel it as EDF (#2283 / audit
+///   §21).
+/// * `amortization_horizon` — the DECLARED `N` charged in the dictionary code
+///   `0.5·dictionary_params/N·log₂(N)`: the message/deployment horizon or the
+///   declared training-observation count. It is passed SEPARATELY from the
+///   estimation subsample (`test_x.nrows()`), and must be at least `2` (an
+///   `Err` is returned otherwise — the horizon is never silently defaulted to the
+///   estimation subsample, so the #2283 confound cannot recur). The dictionary
+///   term depends on this value ALONE.
 /// * `r2_targets` — the fixed-distortion R² operating points, each finite and in
 ///   `[0, 1)`; must be nonempty.
 /// * `native_bits_per_token` — echoed onto the report when present.
@@ -168,15 +201,19 @@ fn atom_code_spectrum(contribution: ArrayView2<f64>, code_dim: usize) -> Result<
 ///   matrix of atom `g` restricted to the supplied firing-row indices `take`.
 ///   Invoked only for atoms that clear the skip rule, one atom at a time.
 ///
-/// The firing-row selection, the `4096`-row subsampling cap, the skip rule for
-/// atoms firing on fewer than `max(d_g + 1, 4)` rows, and every numerical term
-/// live here; the callback only materialises rows.
+/// The number of rows of `test_x` / `recon` / `gate` is the `estimation_rows`
+/// Monte-Carlo estimator size: it drives ONLY the variance of the support / code
+/// / residual expectations, never the dictionary code. The firing-row selection,
+/// the `4096`-row subsampling cap, the skip rule for atoms firing on fewer than
+/// `max(d_g + 1, 4)` rows, and every numerical term live here; the callback only
+/// materialises rows.
 pub fn eq4_fixed_distortion_description_length<F>(
     test_x: ArrayView2<f64>,
     recon: ArrayView2<f64>,
     gate: ArrayView2<f64>,
     code_dims: &[i64],
     dictionary_params: i64,
+    amortization_horizon: i64,
     r2_targets: &[f64],
     native_bits_per_token: Option<f64>,
     mut fetch_contribution: F,
@@ -215,6 +252,18 @@ where
     }
     if dictionary_params < 0 {
         return Err("dictionary_params must be nonnegative".to_string());
+    }
+    // The amortisation horizon is a DECLARED quantity, passed separately from the
+    // estimation subsample and never inferred from it (#2283). Requiring it to be
+    // at least 2 keeps `log₂(N)` non-negative and well-posed and forces every
+    // caller to state the horizon explicitly rather than let the score silently
+    // adopt the Monte-Carlo subsample size.
+    if amortization_horizon < 2 {
+        return Err(format!(
+            "amortization_horizon must be at least 2 (the declared message/deployment \
+             or training-observation N); it is passed separately from the {n}-row \
+             estimation subsample and is never defaulted to it, got {amortization_horizon}"
+        ));
     }
     if !test_x.iter().all(|v| v.is_finite()) || !recon.iter().all(|v| v.is_finite()) {
         return Err("test_x and recon must contain only finite values".to_string());
@@ -296,8 +345,11 @@ where
         code_spectra.push(atom_code_spectrum(contribution.view(), code_dim)?);
     }
 
-    // Dictionary bits are the same at every target.
-    let dictionary_bits = 0.5 * dictionary_params as f64 / n as f64 * (n.max(2) as f64).log2();
+    // Dictionary bits are the same at every target AND independent of the
+    // estimation subsample: the charge is `0.5·params/N·log₂(N)` in the DECLARED
+    // amortization horizon `N`, never the `n`-row Monte-Carlo subsample (#2283).
+    let horizon = amortization_horizon as f64;
+    let dictionary_bits = 0.5 * dictionary_params as f64 / horizon * horizon.log2();
 
     let mut per_target = Vec::with_capacity(r2_targets.len());
     for &target in r2_targets {
@@ -323,6 +375,8 @@ where
         support_bits,
         achieved_block_l0: l0,
         dictionary_bits,
+        estimation_rows: n as i64,
+        amortization_horizon,
         per_target,
         native_bits_per_token,
     })
@@ -332,6 +386,10 @@ where
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// The declared amortisation horizon used by the fixtures — distinct from the
+    /// 6-row estimation subsample so the two `N`s can never be confused.
+    const FIXTURE_HORIZON: i64 = 4096;
 
     fn fixture(code_dims: &[i64], dictionary_params: i64) -> Result<Eq4DescriptionLength, String> {
         let test_x = array![
@@ -351,6 +409,7 @@ mod tests {
             gate.view(),
             code_dims,
             dictionary_params,
+            FIXTURE_HORIZON,
             &[0.9],
             Some(1.25),
             move |_atom, take| {
@@ -372,8 +431,12 @@ mod tests {
         assert_eq!(result.achieved_block_l0, 1.0);
         assert_eq!(result.native_bits_per_token, Some(1.25));
         assert_eq!(result.per_target.len(), 1);
+        assert_eq!(result.estimation_rows, 6);
+        assert_eq!(result.amortization_horizon, FIXTURE_HORIZON);
         let target = result.per_target[0];
-        let dictionary_bits = 0.5 * 4.0 / 6.0 * 6.0_f64.log2();
+        // The dictionary charge uses the DECLARED horizon, not the 6-row subsample.
+        let horizon = FIXTURE_HORIZON as f64;
+        let dictionary_bits = 0.5 * 4.0 / horizon * horizon.log2();
         assert_eq!(result.dictionary_bits, dictionary_bits);
         assert!(
             (target.bits

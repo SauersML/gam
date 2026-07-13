@@ -1804,7 +1804,10 @@ pub fn build_measure_jet_basis(
             penalty_normalization_scales.push(c_l);
             raw_penalty_normalization_scales.push(c_l / scale_weight);
             candidates.push(PenaltyCandidate {
-                matrix: s_norm,
+                matrix: ConstructiveQuadratic::try_from_dense_psd(
+                    s_norm,
+                    "measure-jet scale penalty",
+                )?,
                 source: PenaltySource::Other(format!("measure_jet_scale_{level}")),
                 normalization_scale: c_l,
                 kronecker_factors: None,
@@ -1828,7 +1831,10 @@ pub fn build_measure_jet_basis(
         let (penalty_norm, c_primary) = normalize_penalty(&penalty);
         fused_penalty_normalization_scale = Some(c_primary);
         candidates.push(PenaltyCandidate {
-            matrix: penalty_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                penalty_norm,
+                "measure-jet primary penalty",
+            )?,
             source: PenaltySource::Primary,
             normalization_scale: c_primary,
             kronecker_factors: None,
@@ -1844,7 +1850,10 @@ pub fn build_measure_jet_basis(
         let null_penalty = affine_function_nullspace_penalty(&kz, centers.view(), masses.view())?;
         let (null_penalty_norm, c_null) = normalize_penalty(&null_penalty);
         candidates.push(PenaltyCandidate {
-            matrix: null_penalty_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                null_penalty_norm,
+                "measure-jet null-function penalty",
+            )?,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: c_null,
             kronecker_factors: None,

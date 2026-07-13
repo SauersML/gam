@@ -81,6 +81,15 @@ impl CgroupMemoryProbeFailure {
     pub fn detail(&self) -> &str {
         &self.detail
     }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        kind: CgroupMemoryProbeFailureKind,
+        path: impl Into<Box<str>>,
+        detail: impl Into<Box<str>>,
+    ) -> Self {
+        Self::new(kind, path, detail)
+    }
 }
 
 impl fmt::Display for CgroupMemoryProbeFailure {
@@ -111,6 +120,43 @@ pub struct CgroupMemoryAvailability {
 }
 
 impl CgroupMemoryAvailability {
+    fn from_consistent_counters(
+        binding_path: impl Into<Box<str>>,
+        limit_bytes: u64,
+        current_bytes: u64,
+        inactive_file_bytes: u64,
+        inspected_levels: usize,
+    ) -> Option<Self> {
+        let working_set_bytes = current_bytes.checked_sub(inactive_file_bytes)?;
+        Some(Self {
+            binding_path: binding_path.into(),
+            limit_bytes,
+            current_bytes,
+            inactive_file_bytes,
+            working_set_bytes,
+            available_bytes: limit_bytes.saturating_sub(working_set_bytes),
+            inspected_levels,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        binding_path: impl Into<Box<str>>,
+        limit_bytes: u64,
+        current_bytes: u64,
+        inactive_file_bytes: u64,
+        inspected_levels: usize,
+    ) -> Self {
+        Self::from_consistent_counters(
+            binding_path,
+            limit_bytes,
+            current_bytes,
+            inactive_file_bytes,
+            inspected_levels,
+        )
+        .expect("cgroup test fixture counters must be internally consistent")
+    }
+
     pub fn binding_path(&self) -> &str {
         &self.binding_path
     }
@@ -140,6 +186,22 @@ impl CgroupMemoryAvailability {
     }
 }
 
+impl fmt::Display for CgroupMemoryAvailability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "finite cgroup-v2 ceiling at {} (limit={}, current={}, inactive_file={}, working_set={}, available={}, visible_levels={})",
+            self.binding_path,
+            self.limit_bytes,
+            self.current_bytes,
+            self.inactive_file_bytes,
+            self.working_set_bytes,
+            self.available_bytes,
+            self.inspected_levels,
+        )
+    }
+}
+
 /// The process' typed cgroup memory provenance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CgroupMemoryObservation {
@@ -157,6 +219,23 @@ pub enum CgroupMemoryObservation {
     /// A memory controller appears active but its semantics could not be read
     /// exactly. Admission must fail closed rather than inherit host memory.
     ProbeFailed(CgroupMemoryProbeFailure),
+}
+
+impl fmt::Display for CgroupMemoryObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotPresent => formatter.write_str("no active cgroup memory controller"),
+            Self::V2Unbounded {
+                cgroup_path,
+                inspected_levels,
+            } => write!(
+                formatter,
+                "unbounded cgroup-v2 hierarchy at {cgroup_path} ({inspected_levels} memory.max levels)"
+            ),
+            Self::V2Limited(observation) => observation.fmt(formatter),
+            Self::ProbeFailed(failure) => write!(formatter, "cgroup probe failed: {failure}"),
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -255,11 +334,11 @@ mod linux {
                 unified = Some(path);
             }
         }
-        if unified.is_none() && legacy_memory {
+        if legacy_memory {
             return Err(failure(
                 CgroupMemoryProbeFailureKind::UnsupportedCgroupV1,
                 source,
-                "an active cgroup-v1 memory controller has no exact v2 limit semantics",
+                "an active cgroup-v1 memory controller has no cgroup-v2 limit semantics",
             ));
         }
         Ok(unified)
@@ -311,6 +390,17 @@ mod linux {
             }
             let root = decode_mountinfo_path(before_fields[3], source)?;
             let mount_point = decode_mountinfo_path(before_fields[4], source)?;
+            if !root.is_absolute() || !mount_point.is_absolute() {
+                return Err(failure(
+                    CgroupMemoryProbeFailureKind::MalformedMountInfo,
+                    source,
+                    format!(
+                        "cgroup2 mount paths must be absolute (root={}, mount_point={})",
+                        root.display(),
+                        mount_point.display()
+                    ),
+                ));
+            }
             if membership.strip_prefix(&root).is_err() {
                 continue;
             }
@@ -348,23 +438,24 @@ mod linux {
                 index += 1;
                 continue;
             }
-            if index + 3 >= bytes.len()
-                || !(bytes[index + 1] as char).is_ascii_digit()
-                || !(bytes[index + 2] as char).is_ascii_digit()
-                || !(bytes[index + 3] as char).is_ascii_digit()
-            {
+            let octal = bytes
+                .get(index + 1..index + 4)
+                .filter(|digits| digits.iter().all(|digit| (b'0'..=b'7').contains(digit)));
+            let Some(octal) = octal else {
                 return Err(failure(
                     CgroupMemoryProbeFailureKind::MalformedMountInfo,
                     source,
                     format!("invalid mountinfo path escape in {raw:?}"),
                 ));
-            }
-            let octal = &raw[index + 1..index + 4];
-            let value = u8::from_str_radix(octal, 8).map_err(|_| {
+            };
+            let value = u16::from(octal[0] - b'0') * 64
+                + u16::from(octal[1] - b'0') * 8
+                + u16::from(octal[2] - b'0');
+            let value = u8::try_from(value).map_err(|_| {
                 failure(
                     CgroupMemoryProbeFailureKind::MalformedMountInfo,
                     source,
-                    format!("invalid mountinfo octal escape \\{octal}"),
+                    format!("mountinfo path escape exceeds one byte in {raw:?}"),
                 )
             })?;
             decoded.push(value);
@@ -384,6 +475,14 @@ mod linux {
                 format!("leaf is outside mount point {}", mount_point.display()),
             ));
         }
+        let leaf_metadata = fs::metadata(leaf).map_err(|error| io_failure(leaf, error))?;
+        if !leaf_metadata.is_dir() {
+            return Err(failure(
+                CgroupMemoryProbeFailureKind::MissingUnifiedMount,
+                leaf,
+                "resolved process cgroup is not a directory",
+            ));
+        }
         let mut directory = leaf.to_path_buf();
         let mut inspected_levels = 0usize;
         let mut binding: Option<CgroupMemoryAvailability> = None;
@@ -397,14 +496,16 @@ mod linux {
                     match parse_limit(&raw_limit, &max_path)? {
                         CgroupMemoryLimit::Unlimited => {}
                         CgroupMemoryLimit::Finite(limit_bytes) => {
-                            let current_raw = read_optional(&current_path)?.ok_or_else(|| {
-                                failure(
-                                    CgroupMemoryProbeFailureKind::MissingCounter,
-                                    &current_path,
-                                    "finite memory.max requires memory.current",
-                                )
-                            })?;
-                            let current_bytes = parse_counter(&current_raw, &current_path)?;
+                            let current_before_raw =
+                                read_optional(&current_path)?.ok_or_else(|| {
+                                    failure(
+                                        CgroupMemoryProbeFailureKind::MissingCounter,
+                                        &current_path,
+                                        "finite memory.max requires memory.current",
+                                    )
+                                })?;
+                            let current_before =
+                                parse_counter(&current_before_raw, &current_path)?;
                             let stat_raw = read_optional(&stat_path)?.ok_or_else(|| {
                                 failure(
                                     CgroupMemoryProbeFailureKind::MissingCounter,
@@ -414,6 +515,22 @@ mod linux {
                             })?;
                             let inactive_file_bytes =
                                 parse_stat_counter(&stat_raw, "inactive_file", &stat_path)?;
+                            // `memory.current` and `memory.stat` are live files,
+                            // not an atomic snapshot. Bracket the stat read and
+                            // use the larger current value: this is conservative
+                            // for admission and prevents an ordinary concurrent
+                            // charge/uncharge from looking like malformed data.
+                            let current_after_raw =
+                                read_optional(&current_path)?.ok_or_else(|| {
+                                    failure(
+                                        CgroupMemoryProbeFailureKind::MissingCounter,
+                                        &current_path,
+                                        "memory.current disappeared during cgroup probe",
+                                    )
+                                })?;
+                            let current_after =
+                                parse_counter(&current_after_raw, &current_path)?;
+                            let current_bytes = current_before.max(current_after);
                             if inactive_file_bytes > current_bytes {
                                 return Err(failure(
                                     CgroupMemoryProbeFailureKind::InconsistentCounters,
@@ -423,24 +540,22 @@ mod linux {
                                     ),
                                 ));
                             }
-                            let working_set_bytes =
-                                current_bytes.saturating_sub(inactive_file_bytes);
-                            let available_bytes =
-                                limit_bytes.saturating_sub(working_set_bytes);
-                            let candidate = CgroupMemoryAvailability {
-                                binding_path: directory
-                                    .display()
-                                    .to_string()
-                                    .into_boxed_str(),
+                            let candidate = CgroupMemoryAvailability::from_consistent_counters(
+                                directory.display().to_string().into_boxed_str(),
                                 limit_bytes,
                                 current_bytes,
                                 inactive_file_bytes,
-                                working_set_bytes,
-                                available_bytes,
-                                inspected_levels: 0,
-                            };
-                            if binding.as_ref().is_none_or(|current| {
-                                candidate.available_bytes < current.available_bytes
+                                0,
+                            )
+                            .ok_or_else(|| {
+                                failure(
+                                    CgroupMemoryProbeFailureKind::InconsistentCounters,
+                                    &stat_path,
+                                    "memory counters became inconsistent during construction",
+                                )
+                            })?;
+                            if binding.as_ref().map_or(true, |current| {
+                                candidate.available_bytes() < current.available_bytes()
                             }) {
                                 binding = Some(candidate);
                             }
@@ -450,7 +565,12 @@ mod linux {
                 None => {
                     let has_current = read_optional(&current_path)?.is_some();
                     let has_stat = read_optional(&stat_path)?.is_some();
-                    if has_current || has_stat {
+                    // The cgroup-v2 root is exempt from resource control and
+                    // therefore has accounting files but no `memory.max`.
+                    // Every non-root level with controller accounting must
+                    // expose its hard-limit file; otherwise the observation is
+                    // incomplete and cannot safely inherit host capacity.
+                    if directory != mount_point && (has_current || has_stat) {
                         return Err(failure(
                             CgroupMemoryProbeFailureKind::MissingCounter,
                             &max_path,

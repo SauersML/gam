@@ -605,8 +605,8 @@ pub(crate) fn scale_hypercoord_pair(mut pair: HyperCoordPair, scale: f64) -> Hyp
     pair.g *= scale;
     pair.b_mat *= scale;
     if let Some(operator) = pair.b_operator.take() {
-        pair.b_operator = Some(Box::new(ScaledHyperOperator {
-            inner: Arc::from(operator),
+        pair.b_operator = Some(Arc::new(ScaledHyperOperator {
+            inner: operator,
             scale,
         }));
     }

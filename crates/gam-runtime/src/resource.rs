@@ -1,3 +1,9 @@
+use crate::cgroup_memory::detect_cgroup_memory;
+pub use crate::cgroup_memory::{
+    CgroupMemoryAvailability, CgroupMemoryLimit, CgroupMemoryObservation,
+    CgroupMemoryProbeFailure, CgroupMemoryProbeFailureKind,
+};
+
 /// The library-default streamed row-chunk target (8 MiB), shared as a `const`
 /// so compile-time consumers (e.g. device tile geometry) stay in lockstep with
 /// [`ResourcePolicy::default_library`] without a runtime policy query.
@@ -39,6 +45,8 @@ const GOVERNOR_BUDGET_DENOMINATOR: u128 = 4;
 pub enum MemoryAvailabilitySource {
     Host,
     Cgroup,
+    HostAndCgroup,
+    CgroupProbeFailure,
 }
 
 impl std::fmt::Display for MemoryAvailabilitySource {
@@ -46,44 +54,23 @@ impl std::fmt::Display for MemoryAvailabilitySource {
         match self {
             Self::Host => formatter.write_str("host"),
             Self::Cgroup => formatter.write_str("cgroup"),
+            Self::HostAndCgroup => formatter.write_str("host and cgroup equally"),
+            Self::CgroupProbeFailure => formatter.write_str("cgroup probe failure"),
         }
-    }
-}
-
-/// The current process' cgroup memory observation.
-///
-/// `available_bytes == 0` is an authoritative exhaustion signal. The detector
-/// never fabricates a cgroup zero when the OS reports no controller ceiling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CgroupMemoryAvailability {
-    total_bytes: u64,
-    available_bytes: u64,
-    resident_bytes: u64,
-}
-
-impl CgroupMemoryAvailability {
-    pub const fn total_bytes(self) -> u64 {
-        self.total_bytes
-    }
-
-    pub const fn available_bytes(self) -> u64 {
-        self.available_bytes
-    }
-
-    pub const fn resident_bytes(self) -> u64 {
-        self.resident_bytes
     }
 }
 
 /// Provenance-preserving memory availability for the current process.
 ///
-/// The admitted value is exactly `min(host, cgroup)` when a cgroup observation
-/// exists, otherwise the host value. In particular, a genuine cgroup zero is
-/// preserved and can never turn into a positive host allowance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A finite cgroup-v2 ceiling admits exactly `min(host available, reclaim-aware
+/// cgroup available)`. A literal `memory.max = max` remains typed as unbounded
+/// and therefore defers to the host. If an active controller cannot be parsed
+/// exactly, admission fails closed with zero bytes while retaining the typed
+/// probe failure; it never silently inherits host capacity.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryAvailability {
     host_available_bytes: u64,
-    cgroup: Option<CgroupMemoryAvailability>,
+    cgroup: CgroupMemoryObservation,
     available_bytes: u64,
     limiting_source: MemoryAvailabilitySource,
 }
@@ -91,14 +78,33 @@ pub struct MemoryAvailability {
 impl MemoryAvailability {
     fn from_observation(
         host_available_bytes: u64,
-        cgroup: Option<CgroupMemoryAvailability>,
+        cgroup: CgroupMemoryObservation,
     ) -> Self {
-        let (available_bytes, limiting_source) = match cgroup {
-            Some(observation) if observation.available_bytes <= host_available_bytes => (
-                observation.available_bytes,
-                MemoryAvailabilitySource::Cgroup,
-            ),
-            _ => (host_available_bytes, MemoryAvailabilitySource::Host),
+        use std::cmp::Ordering;
+
+        let (available_bytes, limiting_source) = match &cgroup {
+            CgroupMemoryObservation::NotPresent
+            | CgroupMemoryObservation::V2Unbounded { .. } => {
+                (host_available_bytes, MemoryAvailabilitySource::Host)
+            }
+            CgroupMemoryObservation::V2Limited(observation) => {
+                match observation.available_bytes().cmp(&host_available_bytes) {
+                    Ordering::Less => (
+                        observation.available_bytes(),
+                        MemoryAvailabilitySource::Cgroup,
+                    ),
+                    Ordering::Equal => (
+                        host_available_bytes,
+                        MemoryAvailabilitySource::HostAndCgroup,
+                    ),
+                    Ordering::Greater => {
+                        (host_available_bytes, MemoryAvailabilitySource::Host)
+                    }
+                }
+            }
+            CgroupMemoryObservation::ProbeFailed(_) => {
+                (0, MemoryAvailabilitySource::CgroupProbeFailure)
+            }
         };
         Self {
             host_available_bytes,
@@ -108,77 +114,42 @@ impl MemoryAvailability {
         }
     }
 
-    pub const fn host_available_bytes(self) -> u64 {
+    pub const fn host_available_bytes(&self) -> u64 {
         self.host_available_bytes
     }
 
-    pub const fn cgroup(self) -> Option<CgroupMemoryAvailability> {
-        self.cgroup
+    pub const fn cgroup(&self) -> &CgroupMemoryObservation {
+        &self.cgroup
     }
 
-    pub const fn available_bytes(self) -> u64 {
+    pub const fn available_bytes(&self) -> u64 {
         self.available_bytes
     }
 
-    pub fn available_bytes_usize(self) -> usize {
+    pub fn available_bytes_usize(&self) -> usize {
         usize::try_from(self.available_bytes).unwrap_or(usize::MAX)
     }
 
-    pub const fn limiting_source(self) -> MemoryAvailabilitySource {
+    pub const fn limiting_source(&self) -> MemoryAvailabilitySource {
         self.limiting_source
     }
 }
 
 impl std::fmt::Display for MemoryAvailability {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.cgroup {
-            Some(cgroup) => write!(
+        match &self.cgroup {
+            CgroupMemoryObservation::ProbeFailed(failure) => write!(
                 formatter,
-                "{} bytes limited by {} (host_available={}, cgroup_available={}, cgroup_total={}, cgroup_resident={})",
-                self.available_bytes,
-                self.limiting_source,
-                self.host_available_bytes,
-                cgroup.available_bytes,
-                cgroup.total_bytes,
-                cgroup.resident_bytes,
+                "0 bytes admitted because the active cgroup probe failed closed (host_available={}, failure={})",
+                self.host_available_bytes, failure,
             ),
-            None => write!(
+            observation => write!(
                 formatter,
-                "{} bytes limited by host (no cgroup ceiling observation)",
-                self.available_bytes,
+                "{} bytes limited by {} (host_available={}, {})",
+                self.available_bytes, self.limiting_source, self.host_available_bytes, observation,
             ),
         }
     }
-}
-
-/// Admit a cgroup observation only when it is a *real ceiling below the host*.
-///
-/// A cgroup binds this process' memory only if its controller ceiling sits below
-/// the host total. sysinfo reports cgroup v2 `memory.max = max` (no limit) as
-/// `total_memory = min(u64::MAX, host_total) = host_total`, and it derives
-/// `free_memory = total_memory - memory.current` where `memory.current` counts
-/// *reclaimable page cache* as used. So an unlimited cgroup on a healthy host
-/// reads `free ≈ 0` even though the host's `MemAvailable` (which excludes
-/// reclaimable cache) is ample — the exact #2317 failure, where the min of the
-/// two collapsed the governor budget to ~0 and refused every dense fit.
-///
-/// When `total >= host_total` the cgroup imposes no ceiling tighter than the
-/// host, so its cache-conflating `free` reading is discarded in favour of the
-/// host observation. A genuine sub-host ceiling (`total < host_total`) is
-/// preserved verbatim, including a real exhausted `free = 0` and a literal
-/// `memory.max = 0` hard-zero ceiling.
-fn admissible_cgroup_ceiling(
-    limits: &sysinfo::CGroupLimits,
-    host_total_bytes: u64,
-) -> Option<CgroupMemoryAvailability> {
-    if limits.total_memory >= host_total_bytes {
-        return None;
-    }
-    Some(CgroupMemoryAvailability {
-        total_bytes: limits.total_memory,
-        available_bytes: limits.free_memory,
-        resident_bytes: limits.rss,
-    })
 }
 
 /// Refresh and return the OS and cgroup observations that govern process
@@ -189,17 +160,14 @@ pub fn detect_memory_availability() -> MemoryAvailability {
     let system = SYSTEM.get_or_init(|| Mutex::new(sysinfo::System::new()));
     let mut system = system.lock().expect("sysinfo system mutex poisoned");
     system.refresh_memory();
-    let host_total_bytes = system.total_memory();
-    let cgroup = system
-        .cgroup_limits()
-        .and_then(|limits| admissible_cgroup_ceiling(&limits, host_total_bytes));
+    let cgroup = detect_cgroup_memory();
     MemoryAvailability::from_observation(system.available_memory(), cgroup)
 }
 
 /// Convert one provenance-preserving availability observation to the process
 /// budget. Zero is an authoritative exhausted-memory signal and deliberately
 /// yields a zero budget.
-fn governor_budget_from_availability(availability: MemoryAvailability) -> usize {
+fn governor_budget_from_availability(availability: &MemoryAvailability) -> usize {
     let scaled = u128::from(availability.available_bytes()) * GOVERNOR_BUDGET_NUMERATOR
         / GOVERNOR_BUDGET_DENOMINATOR;
     usize::try_from(scaled).unwrap_or(usize::MAX)
@@ -275,9 +243,10 @@ impl MemoryGovernor {
     }
 
     fn with_detected_availability(availability: MemoryAvailability) -> Self {
+        let budget_bytes = governor_budget_from_availability(&availability);
         Self {
             ledger: Arc::new(GovernorLedger {
-                budget_bytes: governor_budget_from_availability(availability),
+                budget_bytes,
                 availability,
                 reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
             }),
@@ -289,7 +258,7 @@ impl MemoryGovernor {
     }
 
     pub fn availability(&self) -> MemoryAvailability {
-        self.ledger.availability
+        self.ledger.availability.clone()
     }
 
     pub fn reserved_bytes(&self) -> usize {
@@ -333,7 +302,7 @@ impl MemoryGovernor {
                         requested_bytes: bytes,
                         reserved_bytes: current,
                         budget_bytes: self.ledger.budget_bytes,
-                        availability: self.ledger.availability,
+                        availability: self.ledger.availability.clone(),
                     });
                 }
             };
@@ -1060,7 +1029,7 @@ mod resource_policy_tests {
             .div_ceil(GOVERNOR_BUDGET_NUMERATOR);
         let availability = MemoryAvailability::from_observation(
             u64::try_from(available_bytes).expect("test budget has a representable observation"),
-            None,
+            CgroupMemoryObservation::NotPresent,
         );
         let governor = MemoryGovernor::with_detected_availability(availability);
         assert_eq!(governor.budget_bytes(), budget_bytes);
@@ -1321,54 +1290,64 @@ mod resource_policy_tests {
 
     #[test]
     fn memory_availability_distinguishes_host_cgroup_and_exhaustion() {
-        let host_only = MemoryAvailability::from_observation(1_000, None);
+        let host_only = MemoryAvailability::from_observation(
+            1_000,
+            CgroupMemoryObservation::NotPresent,
+        );
         assert_eq!(host_only.available_bytes(), 1_000);
         assert_eq!(host_only.limiting_source(), MemoryAvailabilitySource::Host);
-        assert_eq!(governor_budget_from_availability(host_only), 750);
+        assert_eq!(governor_budget_from_availability(&host_only), 750);
 
-        let exhausted_host = MemoryAvailability::from_observation(0, None);
+        let exhausted_host =
+            MemoryAvailability::from_observation(0, CgroupMemoryObservation::NotPresent);
         assert_eq!(exhausted_host.available_bytes(), 0);
-        assert_eq!(governor_budget_from_availability(exhausted_host), 0);
+        assert_eq!(governor_budget_from_availability(&exhausted_host), 0);
 
         let finite_cgroup = MemoryAvailability::from_observation(
             1_000,
-            Some(CgroupMemoryAvailability {
-                total_bytes: 600,
-                available_bytes: 400,
-                resident_bytes: 200,
-            }),
+            CgroupMemoryObservation::V2Limited(CgroupMemoryAvailability::fixture(
+                "/fixture/leaf",
+                600,
+                200,
+                0,
+                1,
+            )),
         );
         assert_eq!(finite_cgroup.available_bytes(), 400);
         assert_eq!(
             finite_cgroup.limiting_source(),
             MemoryAvailabilitySource::Cgroup
         );
-        assert_eq!(governor_budget_from_availability(finite_cgroup), 300);
+        assert_eq!(governor_budget_from_availability(&finite_cgroup), 300);
 
         let exhausted_cgroup = MemoryAvailability::from_observation(
             1_000,
-            Some(CgroupMemoryAvailability {
-                total_bytes: 600,
-                available_bytes: 0,
-                resident_bytes: 600,
-            }),
+            CgroupMemoryObservation::V2Limited(CgroupMemoryAvailability::fixture(
+                "/fixture/leaf",
+                600,
+                600,
+                0,
+                1,
+            )),
         );
         assert_eq!(exhausted_cgroup.available_bytes(), 0);
         assert_eq!(
             exhausted_cgroup.limiting_source(),
             MemoryAvailabilitySource::Cgroup
         );
-        assert_eq!(governor_budget_from_availability(exhausted_cgroup), 0);
+        assert_eq!(governor_budget_from_availability(&exhausted_cgroup), 0);
 
-        // An absent/unlimited cgroup is either `None` or a host-clamped
-        // observation. Neither is allowed to manufacture a zero.
+        // A finite cgroup with more headroom than the host remains visible as
+        // provenance, but the host is the binding observation.
         let host_is_tighter = MemoryAvailability::from_observation(
             1_000,
-            Some(CgroupMemoryAvailability {
-                total_bytes: 8_000,
-                available_bytes: 6_000,
-                resident_bytes: 2_000,
-            }),
+            CgroupMemoryObservation::V2Limited(CgroupMemoryAvailability::fixture(
+                "/fixture/leaf",
+                8_000,
+                2_000,
+                0,
+                1,
+            )),
         );
         assert_eq!(host_is_tighter.available_bytes(), 1_000);
         assert_eq!(
@@ -1378,100 +1357,92 @@ mod resource_policy_tests {
 
         let equal_cgroup_ceiling = MemoryAvailability::from_observation(
             1_000,
-            Some(CgroupMemoryAvailability {
-                total_bytes: 1_200,
-                available_bytes: 1_000,
-                resident_bytes: 200,
-            }),
+            CgroupMemoryObservation::V2Limited(CgroupMemoryAvailability::fixture(
+                "/fixture/leaf",
+                1_200,
+                200,
+                0,
+                1,
+            )),
         );
         assert_eq!(equal_cgroup_ceiling.available_bytes(), 1_000);
         assert_eq!(
             equal_cgroup_ceiling.limiting_source(),
-            MemoryAvailabilitySource::Cgroup
+            MemoryAvailabilitySource::HostAndCgroup
         );
 
         let both_exhausted = MemoryAvailability::from_observation(
             0,
-            Some(CgroupMemoryAvailability {
-                total_bytes: 600,
-                available_bytes: 0,
-                resident_bytes: 600,
-            }),
+            CgroupMemoryObservation::V2Limited(CgroupMemoryAvailability::fixture(
+                "/fixture/leaf",
+                600,
+                600,
+                0,
+                1,
+            )),
         );
         assert_eq!(
             both_exhausted.limiting_source(),
-            MemoryAvailabilitySource::Cgroup
+            MemoryAvailabilitySource::HostAndCgroup
         );
 
-        // A literal cgroup-v2 `memory.max = 0` is a valid hard zero ceiling.
-        // sysinfo represents the unlimited `max` token as `u64::MAX` and clamps it
-        // to positive host total, so a zero-total observation must remain
-        // authoritative rather than being reinterpreted as an absent controller.
+        // A numeric cgroup-v2 `memory.max = 0` is distinct from the literal
+        // `max` token and remains an authoritative hard-zero ceiling.
         let zero_ceiling = MemoryAvailability::from_observation(
             8_000,
-            Some(CgroupMemoryAvailability {
-                total_bytes: 0,
-                available_bytes: 0,
-                resident_bytes: 0,
-            }),
+            CgroupMemoryObservation::V2Limited(CgroupMemoryAvailability::fixture(
+                "/fixture/leaf",
+                0,
+                0,
+                0,
+                1,
+            )),
         );
         assert_eq!(zero_ceiling.available_bytes(), 0);
         assert_eq!(
             zero_ceiling.limiting_source(),
             MemoryAvailabilitySource::Cgroup
         );
-        assert_eq!(governor_budget_from_availability(zero_ceiling), 0);
+        assert_eq!(governor_budget_from_availability(&zero_ceiling), 0);
     }
 
     #[test]
-    fn unlimited_cgroup_defers_to_host_available_memory_2317() {
-        const HOST_TOTAL: u64 = 64 * 1024 * 1024 * 1024;
-
-        // #2317: cgroup v2 `memory.max = max`. sysinfo clamps `total` to the host
-        // total and derives `free = total - memory.current`, where memory.current
-        // counts reclaimable page cache — so a healthy host reads ~0 free. This is
-        // NOT a ceiling below the host: it must be dropped so host MemAvailable
-        // governs, otherwise every dense fit is refused on a box with free memory.
-        let unlimited = sysinfo::CGroupLimits {
-            total_memory: HOST_TOTAL,
-            free_memory: 12_000, // cache-inflated memory.current drives this near zero
-            rss: HOST_TOTAL - 12_000,
-            ..Default::default()
-        };
-        assert_eq!(admissible_cgroup_ceiling(&unlimited, HOST_TOTAL), None);
-
-        // A cgroup whose total sits *below* the host total is a real ceiling and is
-        // admitted verbatim — including a genuinely exhausted `free = 0` (the RSS
-        // has consumed the whole real limit, not merely reclaimable cache).
-        let real_ceiling = sysinfo::CGroupLimits {
-            total_memory: 4 * 1024 * 1024 * 1024,
-            free_memory: 0,
-            rss: 4 * 1024 * 1024 * 1024,
-            ..Default::default()
-        };
-        let admitted = admissible_cgroup_ceiling(&real_ceiling, HOST_TOTAL)
-            .expect("a sub-host ceiling is a real, binding observation");
-        assert_eq!(admitted.available_bytes(), 0);
-        assert_eq!(admitted.total_bytes(), 4 * 1024 * 1024 * 1024);
-
-        // A literal `memory.max = 0` (total 0 < host total) stays a hard-zero
-        // ceiling — the exhaustion contract the sibling test pins end-to-end.
-        let hard_zero = sysinfo::CGroupLimits {
-            total_memory: 0,
-            free_memory: 0,
-            rss: 0,
-            ..Default::default()
-        };
-        let admitted_zero = admissible_cgroup_ceiling(&hard_zero, HOST_TOTAL)
-            .expect("a zero-total ceiling below host is still a real observation");
-        assert_eq!(admitted_zero.available_bytes(), 0);
-        assert_eq!(
-            governor_budget_from_availability(MemoryAvailability::from_observation(
-                HOST_TOTAL,
-                Some(admitted_zero),
-            )),
-            0
+    fn literal_unlimited_cgroup_defers_to_host_available_memory_2317() {
+        let unlimited = MemoryAvailability::from_observation(
+            2_430_926_848,
+            CgroupMemoryObservation::V2Unbounded {
+                cgroup_path: "/fixture/leaf".into(),
+                inspected_levels: 3,
+            },
         );
+        assert_eq!(unlimited.available_bytes(), 2_430_926_848);
+        assert_eq!(unlimited.limiting_source(), MemoryAvailabilitySource::Host);
+        assert_eq!(
+            governor_budget_from_availability(&unlimited),
+            1_823_195_136
+        );
+        assert!(format!("{unlimited}").contains("unbounded cgroup-v2"));
+    }
+
+    #[test]
+    fn malformed_active_cgroup_fails_closed_with_typed_evidence() {
+        let availability = MemoryAvailability::from_observation(
+            8_000,
+            CgroupMemoryObservation::ProbeFailed(CgroupMemoryProbeFailure::fixture(
+                CgroupMemoryProbeFailureKind::InvalidCounter,
+                "/fixture/leaf/memory.current",
+                "expected an unsigned byte count",
+            )),
+        );
+        assert_eq!(availability.available_bytes(), 0);
+        assert_eq!(
+            availability.limiting_source(),
+            MemoryAvailabilitySource::CgroupProbeFailure
+        );
+        assert_eq!(governor_budget_from_availability(&availability), 0);
+        let evidence = format!("{availability}");
+        assert!(evidence.contains("failed closed"));
+        assert!(evidence.contains("invalid-counter"));
     }
 
     #[test]
@@ -1482,10 +1453,13 @@ mod resource_policy_tests {
         // (active + inactive + free) * page_size.
         let xnu_available = (75_514_u64 + 69_056 + 3_802) * 16_384;
         assert_eq!(xnu_available, 2_430_926_848);
-        let availability = MemoryAvailability::from_observation(xnu_available, None);
+        let availability = MemoryAvailability::from_observation(
+            xnu_available,
+            CgroupMemoryObservation::NotPresent,
+        );
         assert_eq!(availability.available_bytes(), xnu_available);
         assert_eq!(
-            governor_budget_from_availability(availability),
+            governor_budget_from_availability(&availability),
             1_823_195_136
         );
     }

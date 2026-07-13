@@ -251,7 +251,10 @@ pub fn build_thin_plate_basiswithworkspace(
         )?;
         let (penalty_bending_norm, c_bending) = normalize_penalty(&penalty_bending);
         let mut candidates = vec![PenaltyCandidate {
-            matrix: penalty_bending_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                penalty_bending_norm,
+                "thin-plate bending penalty",
+            )?,
             source: PenaltySource::Primary,
             normalization_scale: c_bending,
             kronecker_factors: None,
@@ -260,7 +263,10 @@ pub fn build_thin_plate_basiswithworkspace(
         if let Some(penalty_ridge) = penalty_ridge {
             let (penalty_ridge_norm, c_ridge) = normalize_penalty(&penalty_ridge);
             candidates.push(PenaltyCandidate {
-                matrix: penalty_ridge_norm,
+                matrix: ConstructiveQuadratic::try_from_dense_psd(
+                    penalty_ridge_norm,
+                    "thin-plate null-function ridge",
+                )?,
                 source: PenaltySource::DoublePenaltyNullspace,
                 normalization_scale: c_ridge,
                 kronecker_factors: None,
@@ -301,7 +307,10 @@ pub fn build_thin_plate_basiswithworkspace(
         };
         let (penalty_bending_norm, c_bending) = normalize_penalty(&tps.penalty_bending);
         let mut candidates = vec![PenaltyCandidate {
-            matrix: penalty_bending_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                penalty_bending_norm,
+                "thin-plate bending penalty",
+            )?,
             source: PenaltySource::Primary,
             normalization_scale: c_bending,
             kronecker_factors: None,
@@ -310,7 +319,10 @@ pub fn build_thin_plate_basiswithworkspace(
         if spec.double_penalty {
             let (penalty_ridge_norm, c_ridge) = normalize_penalty(&tps.penalty_ridge);
             candidates.push(PenaltyCandidate {
-                matrix: penalty_ridge_norm,
+                matrix: ConstructiveQuadratic::try_from_dense_psd(
+                    penalty_ridge_norm,
+                    "thin-plate null-function ridge",
+                )?,
                 source: PenaltySource::DoublePenaltyNullspace,
                 normalization_scale: c_ridge,
                 kronecker_factors: None,
@@ -332,7 +344,9 @@ pub fn build_thin_plate_basiswithworkspace(
         candidates = candidates
             .into_iter()
             .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                let matrix = gauge.restrict_penalty(&candidate.matrix);
+                let matrix = candidate
+                    .matrix
+                    .restricted(&gauge, "thin-plate identifiability restriction")?;
                 Ok(PenaltyCandidate {
                     matrix,
                     source: candidate.source,
@@ -366,8 +380,11 @@ pub fn build_thin_plate_basiswithworkspace(
                     if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
                         match &rebuilt {
                             Some(ridge) => {
-                                let (matrix, scale) = normalize_penalty(ridge);
-                                candidate.matrix = matrix;
+                                let (_, scale) = normalize_penalty(ridge.dense());
+                                candidate.matrix = ridge.scaled(
+                                    1.0 / scale,
+                                    "normalized thin-plate null ridge",
+                                )?;
                                 candidate.normalization_scale = scale;
                                 candidate.kronecker_factors = None;
                                 candidate.op = None;
@@ -375,7 +392,7 @@ pub fn build_thin_plate_basiswithworkspace(
                             // Constrained bending penalty is full rank: no null
                             // space to shrink. Zero the block; the filter drops it.
                             None => {
-                                candidate.matrix = Array2::<f64>::zeros((p, p));
+                                candidate.matrix = ConstructiveQuadratic::zero(p);
                                 candidate.normalization_scale = 1.0;
                                 candidate.kronecker_factors = None;
                                 candidate.op = None;
@@ -451,7 +468,10 @@ pub fn thin_plate_penalties_at_length_scale(
     )?;
     let (penalty_bending_norm, c_bending) = normalize_penalty(&penalty_bending);
     let mut candidates = vec![PenaltyCandidate {
-        matrix: penalty_bending_norm,
+        matrix: ConstructiveQuadratic::try_from_dense_psd(
+            penalty_bending_norm,
+            "re-keyed thin-plate bending penalty",
+        )?,
         source: PenaltySource::Primary,
         normalization_scale: c_bending,
         kronecker_factors: None,
@@ -460,7 +480,10 @@ pub fn thin_plate_penalties_at_length_scale(
     if let Some(penalty_ridge) = penalty_ridge {
         let (penalty_ridge_norm, c_ridge) = normalize_penalty(&penalty_ridge);
         candidates.push(PenaltyCandidate {
-            matrix: penalty_ridge_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                penalty_ridge_norm,
+                "re-keyed thin-plate null-function ridge",
+            )?,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: c_ridge,
             kronecker_factors: None,
@@ -473,7 +496,9 @@ pub fn thin_plate_penalties_at_length_scale(
         candidates = candidates
             .into_iter()
             .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                let matrix = gauge.restrict_penalty(&candidate.matrix);
+                let matrix = candidate
+                    .matrix
+                    .restricted(&gauge, "re-keyed thin-plate identifiability")?;
                 Ok(PenaltyCandidate {
                     matrix,
                     source: candidate.source,
@@ -505,14 +530,17 @@ pub fn thin_plate_penalties_at_length_scale(
                     if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
                         match &rebuilt {
                             Some(ridge) => {
-                                let (matrix, scale) = normalize_penalty(ridge);
-                                candidate.matrix = matrix;
+                                let (_, scale) = normalize_penalty(ridge.dense());
+                                candidate.matrix = ridge.scaled(
+                                    1.0 / scale,
+                                    "normalized re-keyed thin-plate null ridge",
+                                )?;
                                 candidate.normalization_scale = scale;
                                 candidate.kronecker_factors = None;
                                 candidate.op = None;
                             }
                             None => {
-                                candidate.matrix = Array2::<f64>::zeros((p, p));
+                                candidate.matrix = ConstructiveQuadratic::zero(p);
                                 candidate.normalization_scale = 1.0;
                                 candidate.kronecker_factors = None;
                                 candidate.op = None;
@@ -1568,21 +1596,30 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
 
     let candidates = vec![
         PenaltyCandidate {
-            matrix: s0_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s0_norm,
+                "Matérn anisotropic mass penalty",
+            )?,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
             op: None,
         },
         PenaltyCandidate {
-            matrix: s1_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s1_norm,
+                "Matérn anisotropic tension penalty",
+            )?,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
             op: None,
         },
         PenaltyCandidate {
-            matrix: s2_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s2_norm,
+                "Matérn anisotropic stiffness penalty",
+            )?,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
@@ -2660,7 +2697,7 @@ pub fn operator_penalty_candidates_closed_form(
     kernel_nullspace: Option<&Array2<f64>>,
     polynomial_block_cols: usize,
     outer_identifiability: Option<&Array2<f64>>,
-) -> Vec<PenaltyCandidate> {
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let kappa = 1.0 / length_scale.max(1e-300);
 
     // Per-q Duchon convergence regime: closed-form Lebesgue kernel matrix is
@@ -2721,7 +2758,10 @@ pub fn operator_penalty_candidates_closed_form(
     if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
         let (s0, c0) = normalize_penalty(&symmetrize(&centered_design_gram(d0)));
         out.push(PenaltyCandidate {
-            matrix: s0,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s0,
+                "closed-form operator mass penalty",
+            )?,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
@@ -2748,7 +2788,10 @@ pub fn operator_penalty_candidates_closed_form(
         let (s1, c1) = normalize_penalty(&s1_raw);
         let op = make_op(1, c1);
         out.push(PenaltyCandidate {
-            matrix: s1,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s1,
+                "closed-form operator tension penalty",
+            )?,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
@@ -2775,14 +2818,17 @@ pub fn operator_penalty_candidates_closed_form(
         let (s2, c2) = normalize_penalty(&s2_raw);
         let op = make_op(2, c2);
         out.push(PenaltyCandidate {
-            matrix: s2,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s2,
+                "closed-form operator stiffness penalty",
+            )?,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
             op,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Threshold above which the closed-form factory emits an operator-form `op`
@@ -2878,7 +2924,7 @@ pub fn operator_penalty_candidates_closed_form_pure(
     kernel_nullspace: Option<&Array2<f64>>,
     polynomial_block_cols: usize,
     outer_identifiability: Option<&Array2<f64>>,
-) -> Vec<PenaltyCandidate> {
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
     // q=0 mass is the *centered* collocation Gram — the data-density-weighted
     // spring penalty on deviations from the function's mean over the
     // collocation sites. Centering each design column by its mean across rows
@@ -2919,7 +2965,10 @@ pub fn operator_penalty_candidates_closed_form_pure(
         // the penalty null space (intercept genuinely unpenalized).
         let (s0, c0) = normalize_penalty(&symmetrize(&centered_design_gram(d0)));
         out.push(PenaltyCandidate {
-            matrix: s0,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s0,
+                "pure-Duchon operator mass penalty",
+            )?,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
@@ -2943,7 +2992,10 @@ pub fn operator_penalty_candidates_closed_form_pure(
         };
         let (s1, c1) = normalize_penalty(&s1_raw);
         out.push(PenaltyCandidate {
-            matrix: s1,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s1,
+                "pure-Duchon operator tension penalty",
+            )?,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
@@ -2967,14 +3019,17 @@ pub fn operator_penalty_candidates_closed_form_pure(
         };
         let (s2, c2) = normalize_penalty(&s2_raw);
         out.push(PenaltyCandidate {
-            matrix: s2,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s2,
+                "pure-Duchon operator stiffness penalty",
+            )?,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
             op: None,
         });
     }
-    out
+    Ok(out)
 }
 
 pub(crate) fn operator_penalty_candidates_from_collocation(
@@ -2982,7 +3037,7 @@ pub(crate) fn operator_penalty_candidates_from_collocation(
     d1: &Array2<f64>,
     d2: &Array2<f64>,
     spec: &DuchonOperatorPenaltySpec,
-) -> Vec<PenaltyCandidate> {
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let s0_raw = symmetrize(&fast_ata(d0));
     let (s0, c0) = normalize_penalty(&s0_raw);
     let (s1, c1) = normalize_penalty(&symmetrize(&fast_ata(d1)));
@@ -2990,7 +3045,10 @@ pub(crate) fn operator_penalty_candidates_from_collocation(
     let mut out = Vec::new();
     if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
         out.push(PenaltyCandidate {
-            matrix: s0,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s0,
+                "collocation operator mass penalty",
+            )?,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
@@ -2999,7 +3057,10 @@ pub(crate) fn operator_penalty_candidates_from_collocation(
     }
     if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
         out.push(PenaltyCandidate {
-            matrix: s1,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s1,
+                "collocation operator tension penalty",
+            )?,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
@@ -3008,14 +3069,17 @@ pub(crate) fn operator_penalty_candidates_from_collocation(
     }
     if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
         out.push(PenaltyCandidate {
-            matrix: s2,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s2,
+                "collocation operator stiffness penalty",
+            )?,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
             op: None,
         });
     }
-    out
+    Ok(out)
 }
 
 pub(crate) fn active_operator_penalty_derivatives(
@@ -3510,19 +3574,22 @@ pub(crate) fn project_penalty_matrix(
 pub(crate) fn normalize_penalty_candidate(
     matrix: Array2<f64>,
     source: PenaltySource,
-) -> PenaltyCandidate {
+) -> Result<PenaltyCandidate, BasisError> {
     let (matrix, normalization_scale) = if matrix.iter().all(|v| v.abs() <= 1e-12) {
         (matrix, 1.0)
     } else {
         normalize_penalty(&matrix)
     };
-    PenaltyCandidate {
-        matrix,
+    Ok(PenaltyCandidate {
+        matrix: ConstructiveQuadratic::try_from_dense_psd(
+            matrix,
+            "normalized function penalty candidate",
+        )?,
         source,
         normalization_scale,
         kronecker_factors: None,
         op: None,
-    }
+    })
 }
 
 pub fn build_matern_collocation_operator_matrices(

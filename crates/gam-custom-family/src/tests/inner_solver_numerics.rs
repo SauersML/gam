@@ -1739,6 +1739,7 @@ pub(crate) fn exact_newton_joint_psi_hook_can_supply_fixed_beta_termswithout_qua
         implicit_axis: 0,
         implicit_group_id: None,
     };
+    let hyper_layout = test_design_hyper_layout(vec![vec![deriv]]);
     let result = evaluate_custom_family_joint_hyper(
         &OneBlockExactPsiHookFamily,
         &[spec],
@@ -1748,7 +1749,7 @@ pub(crate) fn exact_newton_joint_psi_hook_can_supply_fixed_beta_termswithout_qua
             ..BlockwiseFitOptions::default()
         },
         &Array1::zeros(0),
-        &[vec![deriv]],
+        &hyper_layout,
         None,
         EvalMode::ValueAndGradient,
     )
@@ -2000,13 +2001,17 @@ pub(crate) fn rho_only_outer_objective_matches_joint_hyper_when_psi_is_empty() {
             EvalMode::ValueGradientHessian,
         )
         .expect("rho-only outer objective");
-    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
+    let hyper_layout = test_design_hyper_layout(
+        (0..specs.len())
+            .map(|_| Vec::<CustomFamilyBlockPsiDerivative>::new())
+            .collect(),
+    );
     let joint_result = evaluate_custom_family_joint_hyper(
         &family,
         &specs,
         &options,
         &rho,
-        &derivative_blocks,
+        &hyper_layout,
         None,
         EvalMode::ValueGradientHessian,
     )

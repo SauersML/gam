@@ -1841,14 +1841,18 @@ pub(crate) fn outerobjectivegradienthessian_internal<
     rho_prior: gam_problem::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, String> {
-    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
+    let hyper_layout = CustomFamilyHyperLayout::new(
+        vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()],
+        Vec::new(),
+        Array1::zeros(0),
+    )?;
     evaluate_custom_family_hyper_internal(
         family,
         specs,
         options,
         penalty_counts,
         rho,
-        &derivative_blocks,
+        &hyper_layout,
         warm_start,
         rho_prior,
         eval_mode,

@@ -708,7 +708,14 @@ pub fn build_constant_curvature_basis(
         }
     };
     let gauge = gam_problem::Gauge::from_block_transforms(&[z.clone()]);
-    let penalty = gauge.restrict_penalty(&raw_penalty);
+    let raw_penalty = ConstructiveQuadratic::try_from_dense_psd(
+        (&raw_penalty + &raw_penalty.t()) * 0.5,
+        "constant-curvature raw RKHS penalty",
+    )?;
+    let penalty = raw_penalty.restricted(
+        &gauge,
+        "constant-curvature identifiability restriction",
+    )?;
     let raw_design = constant_curvature_kernel_matrix(data, centers.view(), spec.kappa, ell_eff)?;
     let design = gam_linalg::matrix::DesignMatrix::Dense(
         gam_linalg::matrix::DenseDesignMatrix::from(gauge.restrict_design(&raw_design)),
@@ -732,9 +739,8 @@ pub fn build_constant_curvature_basis(
     // raising recovery toward the unconstrained RKHS ceiling. The penalty stays
     // exactly proportional to zᵀKz, so the constrained-kernel-Gram contract is
     // unchanged.
-    let penalty_sym = (&penalty + &penalty.t()) * 0.5;
     let mut candidates = vec![PenaltyCandidate {
-        matrix: penalty_sym,
+        matrix: penalty,
         source: PenaltySource::Primary,
         normalization_scale: 1.0,
         kronecker_factors: None,
@@ -751,7 +757,10 @@ pub fn build_constant_curvature_basis(
         let ridge = Array2::<f64>::eye(design.ncols());
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
-            matrix: ridge_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                ridge_norm,
+                "constant-curvature whole-function ridge",
+            )?,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: c_ridge,
             kronecker_factors: None,

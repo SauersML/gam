@@ -266,7 +266,7 @@ pub fn build_bspline_basis_1d(
             rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
         let filtered = filter_penalty_candidates(renormalize_constrained_penalty_candidates(
             transformed_candidates,
-        ))?;
+        )?)?;
         return Ok(BasisBuildResult {
             design,
             affine_offset: None,
@@ -372,7 +372,7 @@ pub fn build_bspline_basis_1d(
             rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
         let filtered = filter_penalty_candidates(renormalize_constrained_penalty_candidates(
             transformed_candidates,
-        ))?;
+        )?)?;
         return Ok(BasisBuildResult {
             design,
             affine_offset: None,
@@ -680,7 +680,7 @@ pub fn build_bspline_basis_1d(
         rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
     let filtered = filter_penalty_candidates(renormalize_constrained_penalty_candidates(
         transformed_candidates,
-    ))?;
+    )?)?;
     // Non-zero endpoint anchor (#2297): the constrained design above spans the
     // zero-anchor nullspace `Z`; the anchor value is carried by the raw-basis
     // particular solution `β_p` as an affine offset function `B_raw · β_p`. This
@@ -819,7 +819,7 @@ pub fn build_cubic_regression_basis_1d(
         rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
     let filtered = filter_penalty_candidates(renormalize_constrained_penalty_candidates(
         transformed_candidates,
-    ))?;
+    )?)?;
 
     Ok(BasisBuildResult {
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design_c)),
@@ -1955,21 +1955,29 @@ mod atomic_penalty_record_tests {
 
         let filtered = filter_penalty_candidates(vec![
             PenaltyCandidate {
-                matrix: Array2::zeros((3, 3)),
+                matrix: ConstructiveQuadratic::zero(3),
                 source: PenaltySource::Other("dropped-before-active".to_string()),
                 normalization_scale: 11.0,
                 kronecker_factors: None,
                 op: None,
             },
             PenaltyCandidate {
-                matrix: primary_matrix.clone(),
+                matrix: ConstructiveQuadratic::try_from_dense_psd(
+                    primary_matrix.clone(),
+                    "atomic primary test penalty",
+                )
+                .expect("constructive primary"),
                 source: PenaltySource::Primary,
                 normalization_scale: 13.0,
                 kronecker_factors: None,
                 op: Some(Arc::clone(&primary_op)),
             },
             PenaltyCandidate {
-                matrix: secondary_matrix.clone(),
+                matrix: ConstructiveQuadratic::try_from_dense_psd(
+                    secondary_matrix.clone(),
+                    "atomic secondary test penalty",
+                )
+                .expect("constructive secondary"),
                 source: PenaltySource::DoublePenaltyNullspace,
                 normalization_scale: 17.0,
                 kronecker_factors: None,
@@ -2048,15 +2056,52 @@ mod atomic_penalty_record_tests {
 /// active; the `> 1e-12` guard only avoids dividing a numerically-zero block.
 fn renormalize_constrained_penalty_candidates(
     mut candidates: Vec<PenaltyCandidate>,
-) -> Vec<PenaltyCandidate> {
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
     for candidate in &mut candidates {
         let frob = candidate.matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
         if frob.is_finite() && frob > 1e-12 {
-            candidate.matrix.mapv_inplace(|v| v / frob);
+            candidate.matrix = candidate
+                .matrix
+                .scaled(1.0 / frob, "constrained penalty normalization")?;
             candidate.normalization_scale *= frob;
         }
     }
+    Ok(candidates)
+}
+
+/// Restrict a complete candidate set through one composed coefficient chart.
+///
+/// The transform is applied to each authoritative energy factor (`A → A M`),
+/// never to a rounded dense Gram. This makes PSD and the structural null space
+/// invariant under the fold-specific chart by construction (#2318).
+fn restrict_penalty_candidates(
+    candidates: Vec<PenaltyCandidate>,
+    transform: Option<&Array2<f64>>,
+    context: &str,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let Some(transform) = transform else {
+        return Ok(candidates);
+    };
+    let gauge = gam_problem::Gauge::from_block_transforms(&[transform.clone()]);
     candidates
+        .into_iter()
+        .map(|candidate| {
+            let PenaltyCandidate {
+                matrix,
+                source,
+                normalization_scale,
+                kronecker_factors: _,
+                op: _,
+            } = candidate;
+            Ok(PenaltyCandidate {
+                matrix: matrix.restricted(&gauge, context)?,
+                source,
+                normalization_scale,
+                kronecker_factors: None,
+                op: None,
+            })
+        })
+        .collect()
 }
 
 /// Rebuild the double-penalty null-space shrinkage ridge in the FINAL
@@ -2097,28 +2142,39 @@ fn rebuild_double_penalty_nullspace_in_constrained_chart(
     // could then mis-pick it and rebuild the projector from the wrong null space.
     // Deriving the ridge from `null(S_c)` only makes sense for the genuine
     // wiggliness penalty, so we pin that selection here.
-    let primary_constrained = candidates
+    let primary_candidate = candidates
         .iter()
         .find(|c| matches!(c.source, PenaltySource::Primary))
-        .map(|c| c.matrix.mapv(|value| value * c.normalization_scale));
-    let Some(s_c) = primary_constrained else {
+        .ok_or_else(|| {
+            BasisError::InvalidInput(
+                "double-penalty B-spline has a null-space shrinkage ridge but no primary wiggliness penalty to derive its constrained null space from".to_string(),
+            )
+        })?;
+    let primary_constrained = primary_candidate.matrix.scaled(
+        primary_candidate.normalization_scale,
+        "physical constrained B-spline roughness",
+    )?;
+    if primary_constrained.nrows() == 0 {
         crate::bail_invalid_basis!(
-            "double-penalty B-spline has a null-space shrinkage ridge but no primary \
-             wiggliness penalty to derive its constrained null space from"
+            "double-penalty B-spline primary roughness has an empty coefficient chart"
         );
-    };
-    let p = s_c.nrows();
+    }
+    let p = primary_constrained.nrows();
     for candidate in &mut candidates {
         if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
             // Undo the raw-chart Frobenius normalizations before rebuilding.
             // The two physical congruence transforms are covariant under any
             // basis change; their independently normalized working matrices
             // are not.
-            let ridge_constrained = candidate
-                .matrix
-                .mapv(|value| value * candidate.normalization_scale);
-            candidate.matrix = rebuild_metric_consistent_ridge(&s_c, &ridge_constrained)?
-                .unwrap_or_else(|| Array2::<f64>::zeros((p, p)));
+            let ridge_constrained = candidate.matrix.scaled(
+                candidate.normalization_scale,
+                "physical constrained B-spline null ridge",
+            )?;
+            candidate.matrix = rebuild_metric_consistent_ridge(
+                &primary_constrained,
+                &ridge_constrained,
+            )?
+            .unwrap_or_else(|| ConstructiveQuadratic::zero(p));
             candidate.normalization_scale = 1.0;
             candidate.op = None;
         }
@@ -2519,6 +2575,55 @@ fn ridge_from_null_metric_action(
     Ok(fast_abt(&gz, &gz))
 }
 
+/// Construct the same metric ridge while retaining its energy factor.
+fn constructive_ridge_from_null_metric_action(
+    n: &Array2<f64>,
+    w: &Array2<f64>,
+    context: &str,
+) -> Result<ConstructiveQuadratic, BasisError> {
+    let c_raw = n.t().dot(w);
+    let (c_sym, evals, evecs) = spectral_summary(&c_raw)?;
+    let tol = generalized_spectral_tolerance(&evals, &c_sym);
+    if let Some(&invalid) = evals.iter().find(|&&value| value <= tol) {
+        crate::bail_invalid_basis!(
+            "{context}: null-function metric is not strictly positive definite; eigenvalue {invalid:.6e} is at or below tolerance {tol:.6e}"
+        );
+    }
+    let mut metric_columns = w.dot(&evecs);
+    for (mut column, &eigenvalue) in metric_columns
+        .axis_iter_mut(Axis(1))
+        .zip(evals.iter())
+    {
+        column /= eigenvalue.sqrt();
+    }
+    ConstructiveQuadratic::from_energy_factor(metric_columns.t().to_owned(), context)
+}
+
+/// Structural null space of a constructive quadratic.
+///
+/// Rank revelation acts on `A`, not on `AᵀA`: this avoids squaring the
+/// condition number and, critically, there is no negative-eigenvalue class to
+/// adjudicate because PSD is encoded by the type.
+fn constructive_nullspace_basis(
+    quadratic: &ConstructiveQuadratic,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    let coefficient_dim = quadratic.factor().ncols();
+    if coefficient_dim == 0 {
+        return Ok(None);
+    }
+    if quadratic.factor().nrows() == 0 {
+        return Ok(Some(Array2::eye(coefficient_dim)));
+    }
+    let factor_transpose = quadratic.factor().t().to_owned();
+    let (null, rank) = rrqr_nullspace_basis(&factor_transpose, default_rrqr_rank_alpha())
+        .map_err(BasisError::LinalgError)?;
+    if rank >= coefficient_dim || null.ncols() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(null))
+    }
+}
+
 /// Function-space ridge for an explicitly identified coefficient subspace.
 ///
 /// `frame` may be any full-column-rank frame for the target function subspace;
@@ -2715,9 +2820,9 @@ pub fn function_space_nullspace_shrinkage(
 /// ordinary eigenvalue cutoff during a later chart change. Returns `Ok(None)`
 /// when the constrained primary has no null space.
 pub(crate) fn rebuild_metric_consistent_ridge(
-    primary_constrained: &Array2<f64>,
-    ridge_constrained: &Array2<f64>,
-) -> Result<Option<Array2<f64>>, BasisError> {
+    primary_constrained: &ConstructiveQuadratic,
+    ridge_constrained: &ConstructiveQuadratic,
+) -> Result<Option<ConstructiveQuadratic>, BasisError> {
     if primary_constrained.dim() != ridge_constrained.dim()
         || primary_constrained.nrows() != primary_constrained.ncols()
     {
@@ -2732,17 +2837,15 @@ pub(crate) fn rebuild_metric_consistent_ridge(
     if primary_constrained.nrows() == 0 {
         return Ok(None);
     }
-    let metric = primary_constrained + ridge_constrained;
-    let Some(n) = generalized_nullspace_basis(
-        primary_constrained,
-        &metric,
-        "metric-consistent ridge rebuild generalized eigenproblem",
-    )?
-    else {
+    let Some(n) = constructive_nullspace_basis(primary_constrained)? else {
         return Ok(None);
     };
-    let w = ridge_constrained.dot(&n);
-    Ok(Some(ridge_from_null_metric_action(&n, &w)?))
+    let w = ridge_constrained.dense().dot(&n);
+    Ok(Some(constructive_ridge_from_null_metric_action(
+        &n,
+        &w,
+        "metric-consistent ridge rebuild",
+    )?))
 }
 
 pub(crate) fn default_internal_knot_count_for_data(n: usize, degree: usize) -> usize {

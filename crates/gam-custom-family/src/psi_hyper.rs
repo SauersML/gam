@@ -1111,20 +1111,12 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                         total_dim: total,
                     });
                     b_operator = Some(match b_operator.take() {
-                        Some(existing) => {
-                            let existing_arc: Arc<dyn HyperOperator> = Arc::from(existing);
-                            Box::new(CompositeHyperOperator {
-                                dense: None,
-                                operators: vec![existing_arc, block_drift],
-                                dim_hint: total,
-                            }) as Box<dyn HyperOperator>
-                        }
-                        None => Box::new(BlockLocalDrift {
-                            local: s_local.clone(),
-                            start: cache_i.start,
-                            end: cache_i.end,
-                            total_dim: total,
-                        }) as Box<dyn HyperOperator>,
+                        Some(existing) => Arc::new(CompositeHyperOperator {
+                            dense: None,
+                            operators: vec![existing, block_drift],
+                            dim_hint: total,
+                        }) as Arc<dyn HyperOperator>,
+                        None => block_drift,
                     });
                 }
 

@@ -3,6 +3,18 @@
 
 use super::*;
 
+pub(crate) fn test_design_hyper_layout(
+    design_derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+) -> CustomFamilyHyperLayout {
+    let axis_count: usize = design_derivative_blocks.iter().map(Vec::len).sum();
+    CustomFamilyHyperLayout::new(
+        design_derivative_blocks,
+        Vec::new(),
+        Array1::zeros(axis_count),
+    )
+    .expect("test design-hyper layout must satisfy the typed axis contract")
+}
+
 #[derive(Clone)]
 pub(crate) struct BatchedOuterHessianTestFamily {
     pub(crate) matrix: Array2<f64>,
@@ -2806,14 +2818,14 @@ pub(crate) fn default_custom_family_exact_hessian_hooks_drive_profiled_outer_hes
         inner_max_cycles: 1,
         ..BlockwiseFitOptions::default()
     };
-    let penalty_derivatives = [vec![]];
+    let hyper_layout = test_design_hyper_layout(vec![vec![]]);
     let rho = array![0.0];
     let result = evaluate_custom_family_joint_hyper(
         &DefaultDiagonalExactHookFamily,
         &specs,
         &options,
         &rho,
-        &penalty_derivatives,
+        &hyper_layout,
         None,
         EvalMode::ValueGradientHessian,
     )
@@ -2835,7 +2847,7 @@ pub(crate) fn default_custom_family_exact_hessian_hooks_drive_profiled_outer_hes
             &specs,
             &options,
             &array![rho_value],
-            &penalty_derivatives,
+            &hyper_layout,
             None,
             EvalMode::ValueAndGradient,
         )
@@ -2852,6 +2864,7 @@ pub(crate) fn default_custom_family_exact_hessian_hooks_drive_profiled_outer_hes
 #[test]
 pub(crate) fn nonconverged_inner_refuses_profile_derivatives() {
     let spec = default_diagonal_exact_hook_spec();
+    let hyper_layout = test_design_hyper_layout(vec![vec![]]);
     let result = evaluate_custom_family_joint_hyper(
         &DefaultDiagonalExactHookFamily,
         &[spec],
@@ -2863,7 +2876,7 @@ pub(crate) fn nonconverged_inner_refuses_profile_derivatives() {
             ..BlockwiseFitOptions::default()
         },
         &array![0.0],
-        &[vec![]],
+        &hyper_layout,
         None,
         EvalMode::ValueGradientHessian,
     );
@@ -3088,6 +3101,7 @@ pub(crate) fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
     };
     let penalty_counts = vec![1];
     let rho = array![0.0];
+    let hyper_layout = test_design_hyper_layout(vec![vec![]]);
 
     let with_d2 = evaluate_custom_family_hyper_internal(
         &OneBlockQuarticExactFamily {
@@ -3099,7 +3113,7 @@ pub(crate) fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
         &options,
         &penalty_counts,
         &rho,
-        &[vec![]],
+        &hyper_layout,
         None,
         gam_problem::RhoPrior::Flat,
         EvalMode::ValueGradientHessian,
@@ -3115,7 +3129,7 @@ pub(crate) fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
         &options,
         &penalty_counts,
         &rho,
-        &[vec![]],
+        &hyper_layout,
         None,
         gam_problem::RhoPrior::Flat,
         EvalMode::ValueGradientHessian,
@@ -4201,12 +4215,13 @@ pub(crate) fn owned_mode_outer_finalizer_rejects_certified_objective_mismatch() 
         ..BlockwiseFitOptions::default()
     };
     let selected_theta = array![0.0];
+    let hyper_layout = test_design_hyper_layout(vec![vec![]]);
     let owned = evaluate_custom_family_joint_hyper_owned(
         &OneBlockIdentityFamily,
         &specs,
         &options,
         &selected_theta,
-        &[vec![]],
+        &hyper_layout,
         None,
         EvalMode::ValueOnly,
     )
@@ -4252,12 +4267,13 @@ pub(crate) fn terminal_mode_binding_rejects_gradient_substitution() {
         ..BlockwiseFitOptions::default()
     };
     let theta = array![0.0];
+    let hyper_layout = test_design_hyper_layout(vec![vec![]]);
     let owned = evaluate_custom_family_joint_hyper_owned(
         &OneBlockIdentityFamily,
         &specs,
         &options,
         &theta,
-        &[vec![]],
+        &hyper_layout,
         None,
         EvalMode::ValueOnly,
     )
@@ -4694,6 +4710,7 @@ pub(crate) fn failed_terminal_probe_clears_stale_owned_mode() {
         stacked_offset: None,
     }];
     let theta = array![0.0];
+    let hyper_layout = test_design_hyper_layout(vec![vec![]]);
     let evaluated = evaluate_custom_family_joint_hyper_owned(
         &OneBlockIdentityFamily,
         &specs,
@@ -4703,7 +4720,7 @@ pub(crate) fn failed_terminal_probe_clears_stale_owned_mode() {
             ..BlockwiseFitOptions::default()
         },
         &theta,
-        &[vec![]],
+        &hyper_layout,
         None,
         EvalMode::ValueOnly,
     )

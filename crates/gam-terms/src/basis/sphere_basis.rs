@@ -85,7 +85,11 @@ pub fn build_spherical_spline_basis(
         SphericalSplineIdentifiability::CenterSumToZero => Array2::<f64>::eye(raw_width),
     };
     let gauge = gam_problem::Gauge::from_block_transforms(&[z.clone()]);
-    let penalty = gauge.restrict_penalty(&raw_penalty);
+    let raw_penalty = ConstructiveQuadratic::try_from_dense_psd(
+        symmetrize_penalty(&raw_penalty),
+        "Wahba sphere raw roughness",
+    )?;
+    let penalty = raw_penalty.restricted(&gauge, "Wahba sphere identifiability")?;
     // The selected sphere centers are the compact domain quadrature carried by
     // this finite-rank Wahba representation. Evaluate the exact decomposed
     // chart `[K_CC Z - H C | H]` on those centers, then apply the FINAL active
@@ -103,7 +107,8 @@ pub fn build_spherical_spline_basis(
     let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
         gauge.restrict_design(&raw_design),
     ));
-    let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
+    let (_, c_primary) = normalize_penalty(penalty.dense());
+    let penalty_norm = penalty.scaled(1.0 / c_primary, "normalized Wahba roughness")?;
     let mut candidates = vec![PenaltyCandidate {
         matrix: penalty_norm,
         source: PenaltySource::Primary,
@@ -112,10 +117,15 @@ pub fn build_spherical_spline_basis(
         op: None,
     }];
     if spec.double_penalty {
-        if let Some(ridge) = function_space_nullspace_shrinkage(&penalty, &function_gram)? {
+        if let Some(ridge) =
+            function_space_nullspace_shrinkage(penalty.dense(), &function_gram)?
+        {
             let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
             candidates.push(PenaltyCandidate {
-                matrix: ridge_norm,
+                matrix: ConstructiveQuadratic::try_from_dense_psd(
+                    ridge_norm,
+                    "Wahba sphere null-function ridge",
+                )?,
                 source: PenaltySource::DoublePenaltyNullspace,
                 normalization_scale: c_ridge,
                 kronecker_factors: None,
@@ -679,8 +689,16 @@ pub(crate) fn build_spherical_harmonic_basis(
     };
     let gauge = gam_problem::Gauge::from_block_transforms(&[transform.clone()]);
     let design = gauge.restrict_design(&design);
-    let penalty = gauge.restrict_penalty(&penalty);
-    let ridge = gauge.restrict_penalty(&ridge);
+    let penalty = ConstructiveQuadratic::try_from_dense_psd(
+        symmetrize_penalty(&penalty),
+        "spherical-harmonic raw roughness",
+    )?
+    .restricted(&gauge, "spherical-harmonic identifiability")?;
+    let ridge = ConstructiveQuadratic::try_from_dense_psd(
+        symmetrize_penalty(&ridge),
+        "spherical-harmonic raw null ridge",
+    )?
+    .restricted(&gauge, "spherical-harmonic ridge identifiability")?;
 
     let mut candidates = vec![PenaltyCandidate {
         matrix: penalty,
@@ -690,7 +708,11 @@ pub(crate) fn build_spherical_harmonic_basis(
         op: None,
     }];
     if spec.double_penalty {
-        let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
+        let (_, c_ridge) = normalize_penalty(ridge.dense());
+        let ridge_norm = ridge.scaled(
+            1.0 / c_ridge,
+            "normalized spherical-harmonic null ridge",
+        )?;
         candidates.push(PenaltyCandidate {
             matrix: ridge_norm,
             source: PenaltySource::DoublePenaltyNullspace,
@@ -1577,7 +1599,10 @@ pub fn build_matern_operator_penalty_psi_derivatives(
             continue;
         }
         candidates.push(PenaltyCandidate {
-            matrix,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                matrix,
+                "spherical operator penalty",
+            )?,
             source,
             normalization_scale,
             kronecker_factors: None,
@@ -2015,21 +2040,30 @@ pub fn build_duchon_operator_penalty_psi_derivatives(
 
     let candidates = vec![
         PenaltyCandidate {
-            matrix: s0_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s0_norm,
+                "spherical operator mass penalty",
+            )?,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
             op: None,
         },
         PenaltyCandidate {
-            matrix: s1_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s1_norm,
+                "spherical operator tension penalty",
+            )?,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
             op: None,
         },
         PenaltyCandidate {
-            matrix: s2_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s2_norm,
+                "spherical operator stiffness penalty",
+            )?,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
@@ -2574,7 +2608,10 @@ pub(crate) fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
             &symmetrize(&penalty_psi_psi),
         );
     let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
-        matrix: penalty_norm,
+        matrix: ConstructiveQuadratic::try_from_dense_psd(
+            penalty_norm,
+            "spherical learned-kernel primary penalty",
+        )?,
         source: PenaltySource::Primary,
         normalization_scale,
         kronecker_factors: None,

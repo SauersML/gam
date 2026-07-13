@@ -350,12 +350,12 @@ pub(crate) fn build_matern_operator_penalty_candidates(
     // (e.g. ν=1/2) is not over-smoothed by a higher-order roughness penalty its
     // own RKHS norm does not control (#707).
     let matern_spec = DuchonOperatorPenaltySpec::matern_for_smoothness(nu, centers.ncols());
-    Ok(operator_penalty_candidates_from_collocation(
+    operator_penalty_candidates_from_collocation(
         &ops.d0,
         &ops.d1,
         &ops.d2,
         &matern_spec,
-    ))
+    )
 }
 
 /// True when every entry of `m` is finite.
@@ -424,7 +424,7 @@ pub(crate) fn matern_double_penalty_candidates(
     let mut candidates = vec![normalize_penalty_candidate(
         primary.clone(),
         PenaltySource::Primary,
-    )];
+    )?];
     // K_CC is strictly positive definite after center rank reduction. The ONLY
     // structural null direction is the explicitly appended intercept. Kernel
     // eigenvalues near a floating-point tolerance remain range directions; they
@@ -438,7 +438,7 @@ pub(crate) fn matern_double_penalty_candidates(
         candidates.push(normalize_penalty_candidate(
             shrinkage,
             PenaltySource::DoublePenaltyNullspace,
-        ));
+        )?);
     }
     Ok(candidates)
 }
