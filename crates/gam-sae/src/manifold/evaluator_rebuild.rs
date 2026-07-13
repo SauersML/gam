@@ -50,17 +50,11 @@ pub fn sae_duchon_atom_m(dim: usize) -> usize {
 /// quadratic patch.)
 pub const SAE_EUCLIDEAN_PATCH_MAX_DEGREE: usize = 2;
 
-/// Upper bound for RECOVERING a EuclideanPatch atom's monomial degree from its
-/// trained decoder width (`sae_euclidean_degree_for_basis_size`). The seed patch
-/// is degree 2 ([`SAE_EUCLIDEAN_PATCH_MAX_DEGREE`]), but a structure-search BIRTH
-/// races a `d=1` line candidate at degree 3 (`gam::terms::sae::structure_harvest`
-/// `topology_candidates_for_dim`: `EuclideanPatchEvaluator::new(1, 3)`, width
-/// `M = 4`). The OOS rebuild and the inner-Newton basis refresh must recover that
-/// born degree from the trained width, so the recovery search reaches degree 3
-/// even though no SEED atom is built past degree 2. The per-`d` monomial widths
-/// are strictly increasing in the degree (`d=1`: 1,2,3,4; `d=2`: 1,3,6,10), so a
-/// width maps back to a unique degree with no collision.
-pub const SAE_EUCLIDEAN_PATCH_RECOVERY_MAX_DEGREE: usize = 3;
+/// Largest explicitly selectable Euclidean-patch degree in the topology race.
+/// Seed patches use degree 2 ([`SAE_EUCLIDEAN_PATCH_MAX_DEGREE`]); a structure
+/// birth may explicitly persist the degree-3 line candidate. The degree lives
+/// in [`SaeBasisResolution::Polynomial`], never inferred from decoder width.
+pub const SAE_EUCLIDEAN_PATCH_RACE_MAX_DEGREE: usize = 3;
 
 /// Flat-line polynomial degree of a Cylinder `S¹ × ℝ` atom's line axis (axis 1).
 /// Mirrors the Euclidean-patch degree so the cylinder's flat factor matches the

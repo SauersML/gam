@@ -157,7 +157,7 @@ impl SaeAtomGeometryPlan {
                 _,
                 SaeBasisResolution::Polynomial { degree },
                 SaeReferenceMetricPlan::EuclideanPolynomial,
-            ) => (SAE_EUCLIDEAN_PATCH_MAX_DEGREE..=SAE_EUCLIDEAN_PATCH_RECOVERY_MAX_DEGREE)
+            ) => (SAE_EUCLIDEAN_PATCH_MAX_DEGREE..=SAE_EUCLIDEAN_PATCH_RACE_MAX_DEGREE)
                 .contains(degree),
             (
                 SaeAtomBasisKind::Poincare,
