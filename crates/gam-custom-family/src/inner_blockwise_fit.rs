@@ -373,7 +373,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             )?;
             let mut cached_mode_acceptable = true;
             let mut certified_workspace = cached.joint_workspace.clone();
-            if joint_constraints.is_none() && !family.joint_jeffreys_term_required() {
+            if has_joint_exacthessian
+                && joint_constraints.is_none()
+                && !family.joint_jeffreys_term_required()
+            {
                 let certificate = exact_joint_mode_curvature_certificate(
                     family,
                     &states,
