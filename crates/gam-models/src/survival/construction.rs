@@ -12,7 +12,7 @@
 use crate::probability::{normal_pdf, standard_normal_quantile};
 use crate::survival::location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, ResidualDistribution,
-    SurvivalCovariateTermBlockTemplate,
+    SurvivalCovariateTermBlockTemplate, SurvivalCovariateTimeBasis,
 };
 use crate::survival::lognormal_kernel::HazardLoading;
 use crate::survival::marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD;
@@ -3695,6 +3695,10 @@ pub fn build_time_varying_survival_covariate_template(
         .collect();
 
     Ok(SurvivalCovariateTermBlockTemplate::TimeVarying {
+        time_basis: SurvivalCovariateTimeBasis {
+            degree: time_degree,
+            knots: knots.to_vec(),
+        },
         time_basis_entry: time_design_entry,
         time_basis_exit: time_design_exit,
         time_basis_derivative_exit: time_design_derivative_exit,

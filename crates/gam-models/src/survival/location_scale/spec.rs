@@ -1,4 +1,25 @@
 use super::*;
+use serde::{Deserialize, Serialize};
+
+/// Exact time-axis parameterization selected by the fitted location-scale
+/// model. Saved replay must dispatch on this structural fit result, never on
+/// coefficient values (an all-zero fitted warp is data, not a type tag).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurvivalLocationScaleTimeParameterization {
+    /// The ordinary monotone time-warp channel `h(t)` is present.
+    MonotoneWarp,
+    /// The warp was removed and `-log(t)` is carried by the location channel.
+    ReducedParametricAft,
+}
+
+/// Resolved B-spline authority for a time-varying threshold or log-scale
+/// covariate margin. Knots are fit-time values, not prediction-time estimates.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SurvivalCovariateTimeBasis {
+    pub degree: usize,
+    pub knots: Vec<f64>,
+}
 
 /// How a time block's parameterization enforces the derivative-guard
 /// monotonicity `q'(t) ≥ guard`.
@@ -157,11 +178,21 @@ pub(crate) struct SurvivalLocationScaleSpec {
 pub enum SurvivalCovariateTermBlockTemplate {
     Static,
     TimeVarying {
+        time_basis: SurvivalCovariateTimeBasis,
         time_basis_entry: Array2<f64>,
         time_basis_exit: Array2<f64>,
         time_basis_derivative_exit: Array2<f64>,
         time_penalties: Vec<Array2<f64>>,
     },
+}
+
+impl SurvivalCovariateTermBlockTemplate {
+    pub fn resolved_time_basis(&self) -> Option<&SurvivalCovariateTimeBasis> {
+        match self {
+            Self::Static => None,
+            Self::TimeVarying { time_basis, .. } => Some(time_basis),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -206,6 +237,9 @@ pub const DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD: f64 = 1e-6;
 
 pub struct SurvivalLocationScaleTermFitResult {
     pub fit: UnifiedFitResult,
+    pub time_parameterization: SurvivalLocationScaleTimeParameterization,
+    pub threshold_time_basis: Option<SurvivalCovariateTimeBasis>,
+    pub log_sigma_time_basis: Option<SurvivalCovariateTimeBasis>,
     pub resolved_thresholdspec: TermCollectionSpec,
     pub resolved_log_sigmaspec: TermCollectionSpec,
     pub threshold_design: TermCollectionDesign,

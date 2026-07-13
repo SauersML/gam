@@ -122,6 +122,7 @@ pub(crate) use std::sync::atomic::AtomicUsize;
 pub(crate) use std::sync::{Arc, Mutex};
 
 mod accumulate;
+mod alo_replay;
 mod block_jacobians;
 mod block_layout;
 mod calibration;
@@ -158,6 +159,7 @@ mod timepoint_exact;
 mod timewiggle_geometry;
 
 pub use block_jacobians::*;
+pub use alo_replay::*;
 pub(crate) use block_layout::*;
 pub use error::*;
 pub(crate) use family::*;
