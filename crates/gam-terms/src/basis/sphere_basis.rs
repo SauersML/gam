@@ -872,8 +872,15 @@ pub(crate) fn build_matern_basis_seeded(
                 aniso.as_deref(),
             )?;
             let primary = project_penalty_matrix(&penalty_kernel, full_transform.as_ref());
+            let function_gram = matern_center_function_gram(
+                &penalty_kernel,
+                spec.include_intercept,
+                full_transform.as_ref(),
+            )?;
             let (candidates, survived) = matern_double_penalty_candidates_with_decision(
                 &primary,
+                &function_gram,
+                spec.include_intercept,
                 frozen_nullspace_shrinkage_survived,
             )?;
             realized_nullspace_shrinkage_survived = survived;
@@ -956,8 +963,15 @@ pub(crate) fn build_matern_basis_seeded(
                 aniso.as_deref(),
             )?;
             let primary = project_penalty_matrix(&penalty_kernel, full_transform.as_ref());
+            let function_gram = matern_center_function_gram(
+                &penalty_kernel,
+                spec.include_intercept,
+                full_transform.as_ref(),
+            )?;
             let (candidates, survived) = matern_double_penalty_candidates_with_decision(
                 &primary,
+                &function_gram,
+                spec.include_intercept,
                 frozen_nullspace_shrinkage_survived,
             )?;
             realized_nullspace_shrinkage_survived = survived;
