@@ -1560,7 +1560,7 @@ pub(super) struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
     pub(super) family: BernoulliMarginalSlopeFamily,
     pub(super) block_states: Vec<ParameterBlockState>,
     pub(super) specs: Vec<ParameterBlockSpec>,
-    pub(super) derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+    pub(super) hyper_layout: crate::custom_family::CustomFamilyHyperLayout,
     pub(super) cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
     /// Outer-only ψ-calculus options. The `outer_score_subsample` field is
     /// the row mask threaded through `sigma_exact_joint_psi_terms_with_options`
