@@ -1244,6 +1244,101 @@ mod tests {
         }
     }
 
+    /// #932 runtime-width cutover gate. The production row program derives the
+    /// complete V/G/H tower in one `DynamicOrder2` pass; this compares every
+    /// channel with the retired strongest-hand schedule for correlated full and
+    /// low-rank score covariance. The explicit score-score assertions pin the
+    /// mixed blocks that a scalar or block-diagonal check would miss.
+    #[test]
+    fn runtime_vector_row_program_matches_strongest_hand_mixed_score_vgh_932() {
+        let full = MarginalSlopeCovariance::Full(
+            Array2::from_shape_vec(
+                (3, 3),
+                vec![1.2, 0.18, -0.11, 0.18, 0.9, 0.24, -0.11, 0.24, 0.7],
+            )
+            .expect("3x3 full covariance"),
+        );
+        let low_rank = MarginalSlopeCovariance::LowRank(
+            Array2::from_shape_vec((3, 2), vec![0.8, -0.1, 0.25, 0.7, -0.45, 0.35])
+                .expect("3x2 covariance factor"),
+        );
+        let cases = [
+            (&full, 0.0, -0.6, 0.45, 0.85, 0.72),
+            (&full, 1.0, 0.3, -0.75, 1.25, 1.0),
+            (&low_rank, 0.35, -1.1, 0.8, 0.55, 0.63),
+            (&low_rank, 1.0, 0.9, -0.2, 1.6, 0.91),
+        ];
+        let slopes = [0.55, -0.8, 0.35];
+        let scores = [-1.2, 0.65, 1.4];
+        let mut arena = DynamicJetArena::new();
+        let close = |label: &str, actual: f64, expected: f64| {
+            let tolerance = 5.0e-11 * actual.abs().max(expected.abs()).max(1.0);
+            assert!(
+                actual.is_finite()
+                    && expected.is_finite()
+                    && (actual - expected).abs() <= tolerance,
+                "{label}: runtime={actual:+.16e}, hand={expected:+.16e}, tolerance={tolerance:.3e}",
+            );
+        };
+
+        for (case, &(covariance, event, q0, q1, qd1, probit_scale))
+            in cases.iter().enumerate()
+        {
+            let runtime = row_primary_closed_form_vector(
+                q0,
+                q1,
+                qd1,
+                &slopes,
+                &scores,
+                covariance,
+                1.3,
+                event,
+                1.0e-8,
+                probit_scale,
+                &mut arena,
+            )
+            .expect("runtime vector row program");
+            let hand = vector_hand_oracle::row_primary_closed_form_vector_hand_reference(
+                q0,
+                q1,
+                qd1,
+                &slopes,
+                &scores,
+                covariance,
+                1.3,
+                event,
+                1.0e-8,
+                probit_scale,
+            )
+            .expect("strongest-hand vector row");
+
+            close(&format!("case {case} value"), runtime.0, hand.0);
+            for axis_a in 0..runtime.1.len() {
+                close(
+                    &format!("case {case} gradient[{axis_a}]"),
+                    runtime.1[axis_a],
+                    hand.1[axis_a],
+                );
+                for axis_b in 0..runtime.1.len() {
+                    close(
+                        &format!("case {case} Hessian[{axis_a},{axis_b}]"),
+                        runtime.2[[axis_a, axis_b]],
+                        hand.2[[axis_a, axis_b]],
+                    );
+                }
+            }
+
+            let mixed_score_mass = runtime.2[[3, 4]]
+                .abs()
+                .max(runtime.2[[3, 5]].abs())
+                .max(runtime.2[[4, 5]].abs());
+            assert!(
+                mixed_score_mass > 1.0e-6,
+                "case {case}: fixture must exercise a nonzero cross-score Hessian block"
+            );
+        }
+    }
+
     /// #932 cutover gate: every live K=1 scalar caller now uses the packed
     /// lowering of `rigid_row_nll`. Pin every returned channel against the
     /// retired strongest hand schedule over both event branches, ordinary
