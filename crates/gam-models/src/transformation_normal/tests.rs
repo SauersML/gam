@@ -443,7 +443,10 @@ fn toy_family_and_derivatives_with_penalty_mode(
         beta,
         eta: Array1::zeros(h_prime.len()),
     };
-    let spec = family.block_spec();
+    let rho0 = family
+        .penalty_scale_log_lambdas()
+        .expect("toy smoothing seed");
+    let spec = family.block_spec(&rho0).expect("toy coefficient block");
     (family, derivative_blocks, state, spec)
 }
 
@@ -761,7 +764,7 @@ pub(crate) fn kronecker_dense_fast_paths_match_dense_materialization() {
         [0.7, 0.1, 0.6],
         [-0.2, 0.9, 0.5],
     ];
-    let weights = array![0.7, 1.4, 0.9, 1.2];
+    let weights = array![0.7, 0.0, 0.9, 1.2];
     let v = array![0.6, -0.3, 0.5, 0.8];
     let kron = KroneckerDesign::new_khatri_rao(
         &left,
@@ -777,6 +780,10 @@ pub(crate) fn kronecker_dense_fast_paths_match_dense_materialization() {
     let got_gram = kron
         .weighted_gram(&weights, &ResourcePolicy::default_library())
         .unwrap();
+    let got_diagonal_mean = kron
+        .weighted_gram_diagonal_mean(&weights, &ResourcePolicy::default_library())
+        .unwrap();
+    let expected_diagonal_mean = matrix_diag_mean_abs(&expected_gram);
 
     let transpose_err = (&got_transpose - &expected_transpose)
         .iter()
@@ -791,6 +798,10 @@ pub(crate) fn kronecker_dense_fast_paths_match_dense_materialization() {
     assert!(
         gram_err < 1e-10,
         "Kronecker weighted Gram fast path mismatch: max_abs={gram_err}"
+    );
+    assert!(
+        (got_diagonal_mean - expected_diagonal_mean).abs() < 1e-12,
+        "Kronecker weighted Gram diagonal mean mismatch: got={got_diagonal_mean}, expected={expected_diagonal_mean}"
     );
 }
 

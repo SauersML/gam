@@ -215,15 +215,9 @@ impl KroneckerDesign {
         weights: &Array1<f64>,
         policy: &ResourcePolicy,
     ) -> Result<f64, String> {
-        FiniteSignedWeightsView::try_new(weights.view()).map_err(|reason| {
+        PsdWeightsView::try_from_array(weights).map_err(|reason| {
             format!("KroneckerDesign::weighted_gram_diagonal_mean: {reason}")
         })?;
-        if weights.iter().any(|weight| *weight < 0.0) {
-            return Err(TransformationNormalError::InvalidInput {
-                reason: "KroneckerDesign diagonal-mean weights must be non-negative".to_string(),
-            }
-            .into());
-        }
         match self {
             KroneckerDesign::KhatriRao { left, right } => {
                 let n = left.nrows();
