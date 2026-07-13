@@ -845,7 +845,7 @@ fn survival_ls_default_guard_unit_family() -> SurvivalLocationScaleFamily {
 #[test]
 fn survival_ls_monotonicity_floors_near_cancellation_negative_velocity() {
     let family = survival_ls_default_guard_unit_family();
-    let guard = family.time_derivative_lower_bound();
+    let guard = family.derivative_guard;
 
     // A near-cancellation that lands g just barely negative: d_raw and qdot are
     // O(1) and opposite-signed, differing only at the ~1e-7 level — exactly the

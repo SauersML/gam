@@ -2620,16 +2620,6 @@ impl SurvivalLocationScaleFamily {
         p_total - p_w..p_total
     }
 
-    #[inline]
-    pub(crate) fn time_derivative_lower_bound(&self) -> f64 {
-        assert!(
-            self.derivative_guard.is_finite() && self.derivative_guard > 0.0,
-            "survival location-scale derivative guard must be finite and positive: derivative_guard={}",
-            self.derivative_guard
-        );
-        self.derivative_guard
-    }
-
     pub(crate) fn max_feasible_time_step(
         &self,
         beta: &Array1<f64>,
