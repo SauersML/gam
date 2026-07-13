@@ -1450,12 +1450,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 warm_ref,
                 rho_prior.clone(),
             ) {
-                Ok((eval, warm, true)) => {
+                Ok((eval, warm, true, _inner)) => {
                     outer.warm_cache = Some(warm);
                     outer.last_error = None;
                     Ok(eval)
                 }
-                Ok((_eval, warm, false)) => {
+                Ok((_eval, warm, false, _inner)) => {
                     outer.warm_cache = Some(warm);
                     outer.last_error =
                         Some("custom-family EFS inner solve did not converge".to_string());
@@ -2011,21 +2011,29 @@ pub fn fit_custom_family_fixed_log_lambdas_from_outer<
     )
 }
 
-/// Assemble a fixed-hyperparameter fit from the exact coefficient mode that
-/// won atomic nonconvex profiling.
+#[derive(Clone, Copy)]
+enum OwnedModeCurvatureRequirement {
+    CertifiedStationaryPoint,
+    CertifiedLocalMinimum,
+}
+
+/// Assemble a fixed-hyperparameter fit from the exact coefficient mode owned
+/// by the terminal outer evaluation.
 ///
 /// This consuming boundary deliberately performs no canonicalization, warm
-/// restart, or inner solve. The selected mode, its objective, and its returned-
-/// beta Hessian workspace are one identity; changing any one of them would
-/// silently switch the Laplace branch after outer optimization.
-fn fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance<
+/// restart, objective replay, or inner solve. The mode, its objective, its
+/// smoothing prefix, and its returned-beta Hessian workspace are one identity;
+/// changing any one of them would silently switch the Laplace branch after
+/// outer optimization.
+fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-    selection: CustomFamilyJointHyperModeSelection,
+    mode: CustomFamilyOwnedMode,
     provenance: FixedLogLambdaProvenance<'_>,
+    curvature_requirement: OwnedModeCurvatureRequirement,
 ) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
     let (outer_iterations, outer_gradient_norm, criterion_certificate, certified_theta) =
         match provenance {
@@ -2034,10 +2042,14 @@ fn fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance<
                 selected_theta,
                 outer,
             } => {
-                if outer.criterion_certificate().hessian_psd != Some(true) {
+                if matches!(
+                    curvature_requirement,
+                    OwnedModeCurvatureRequirement::CertifiedLocalMinimum
+                ) && outer.criterion_certificate().hessian_psd != Some(true)
+                {
                     return Err(CustomFamilyError::Optimization {
                         context:
-                            "fit_custom_family_fixed_log_lambdas_from_mode_selection outer curvature",
+                            "fit_custom_family_fixed_log_lambdas_from_owned_mode outer curvature",
                         reason: "a profiled nonconvex coefficient mode requires a positive-semidefinite analytic outer Hessian certificate"
                             .to_string(),
                     });
@@ -2052,7 +2064,7 @@ fn fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance<
                 {
                     return Err(CustomFamilyError::InvalidInput {
                         context:
-                            "fit_custom_family_fixed_log_lambdas_from_mode_selection outer identity",
+                            "fit_custom_family_fixed_log_lambdas_from_owned_mode outer identity",
                         reason: "the selected full hyperparameter vector does not bitwise match the certified outer optimum"
                             .to_string(),
                     });
@@ -2066,71 +2078,30 @@ fn fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance<
             }
         };
 
-    let CustomFamilyJointHyperModeSelection {
-        result,
-        selected_candidate,
-        screened_objectives,
-        selected_inner: inner,
-        ..
-    } = selection;
-    if !result.inner_converged || !inner.converged {
+    let CustomFamilyOwnedMode {
+        objective: selected_objective,
+        rho,
+        inner,
+    } = mode;
+    if !inner.converged {
         return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection",
+            context: "fit_custom_family_fixed_log_lambdas_from_owned_mode",
             reason: "the selected coefficient branch was not converged; no fit was assembled"
                 .to_string(),
         });
     }
 
-    let selected_objective = result.objective;
-    let screened_objective = screened_objectives
-        .get(selected_candidate)
-        .and_then(|objective| *objective)
-        .ok_or_else(|| CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection objective identity",
-            reason: "the selected candidate has no finite screened profile objective".to_string(),
-        })?;
-    if screened_objective.to_bits() != selected_objective.to_bits() {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection objective identity",
-            reason: format!(
-                "selected profile objective changed after screening: screened={screened_objective:.17e}, selected={selected_objective:.17e}"
-            ),
-        });
-    }
     if let Some((_, certified_objective)) = certified_theta
         && selected_objective.to_bits() != certified_objective.to_bits()
     {
         return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection objective identity",
+            context: "fit_custom_family_fixed_log_lambdas_from_owned_mode objective identity",
             reason: format!(
                 "selected profile objective does not belong to the certified outer optimum: selected={selected_objective:.17e}, certified={certified_objective:.17e}",
             ),
         });
     }
 
-    let selected_warm_start = result.warm_start.inner;
-    let beta_matches = selected_warm_start.block_beta.len() == inner.block_states.len()
-        && selected_warm_start
-            .block_beta
-            .iter()
-            .zip(inner.block_states.iter())
-            .all(|(carried, state)| {
-                carried.len() == state.beta.len()
-                    && carried
-                        .iter()
-                        .zip(state.beta.iter())
-                        .all(|(left, right)| left.to_bits() == right.to_bits())
-            });
-    if !beta_matches {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection coefficient identity",
-            reason:
-                "the selected result carrier and owned inner mode have different coefficient bits"
-                    .to_string(),
-        });
-    }
-
-    let rho = selected_warm_start.rho;
     if let Some((certified_theta, _)) = certified_theta
         && (certified_theta.len() < rho.len()
             || certified_theta
@@ -2139,7 +2110,7 @@ fn fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance<
                 .any(|(certified, selected)| certified.to_bits() != selected.to_bits()))
     {
         return Err(CustomFamilyError::InvalidInput {
-            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection smoothing identity",
+            context: "fit_custom_family_fixed_log_lambdas_from_owned_mode smoothing identity",
             reason: "the selected smoothing coordinates do not bitwise match the certified outer optimum prefix"
                 .to_string(),
         });
@@ -2152,7 +2123,7 @@ fn fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance<
             .any(|(selected, configured)| selected.to_bits() != configured.to_bits())
     {
         return Err(CustomFamilyError::InvalidInput {
-            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection",
+            context: "fit_custom_family_fixed_log_lambdas_from_owned_mode",
             reason: "selected smoothing coordinates do not bitwise match the supplied coefficient-mode geometry"
                 .to_string(),
         });
@@ -2163,7 +2134,7 @@ fn fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance<
     let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
     let workspace = inner.joint_workspace.as_ref().ok_or_else(|| {
         CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection curvature identity",
+            context: "fit_custom_family_fixed_log_lambdas_from_owned_mode curvature identity",
             reason:
                 "the selected mode did not retain its certified returned-beta Hessian workspace"
                     .to_string(),
@@ -2176,7 +2147,7 @@ fn fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance<
         "selected-mode final Hessian",
     )?
     .ok_or_else(|| CustomFamilyError::Optimization {
-        context: "fit_custom_family_fixed_log_lambdas_from_mode_selection curvature identity",
+        context: "fit_custom_family_fixed_log_lambdas_from_owned_mode curvature identity",
         reason: "the selected mode workspace did not expose its exact returned-beta Hessian"
             .to_string(),
     })?;
@@ -2195,7 +2166,7 @@ fn fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance<
         Some(&hessian),
     )
     .map_err(|error| CustomFamilyError::Optimization {
-        context: "fit_custom_family_fixed_log_lambdas_from_mode_selection covariance",
+        context: "fit_custom_family_fixed_log_lambdas_from_owned_mode covariance",
         reason: error.to_string(),
     })?;
     let geometry = compute_joint_geometry(
@@ -2207,7 +2178,7 @@ fn fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance<
         Some(&hessian),
     )
     .map_err(|reason| CustomFamilyError::Optimization {
-        context: "fit_custom_family_fixed_log_lambdas_from_mode_selection geometry",
+        context: "fit_custom_family_fixed_log_lambdas_from_owned_mode geometry",
         reason,
     })?;
 
@@ -2229,6 +2200,69 @@ fn fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance<
     )
 }
 
+fn owned_mode_from_selection(
+    selection: CustomFamilyJointHyperModeSelection,
+) -> Result<CustomFamilyOwnedMode, CustomFamilyError> {
+    let CustomFamilyJointHyperModeSelection {
+        result,
+        selected_candidate,
+        screened_objectives,
+        mode,
+        ..
+    } = selection;
+    if !result.inner_converged || !mode.inner.converged {
+        return Err(CustomFamilyError::Optimization {
+            context: "owned coefficient-mode selection",
+            reason: "the selected coefficient branch was not converged".to_string(),
+        });
+    }
+    let screened_objective = screened_objectives
+        .get(selected_candidate)
+        .and_then(|objective| *objective)
+        .ok_or_else(|| CustomFamilyError::Optimization {
+            context: "owned coefficient-mode selection objective identity",
+            reason: "the selected candidate has no finite screened profile objective".to_string(),
+        })?;
+    if screened_objective.to_bits() != result.objective.to_bits()
+        || result.objective.to_bits() != mode.objective.to_bits()
+    {
+        return Err(CustomFamilyError::Optimization {
+            context: "owned coefficient-mode selection objective identity",
+            reason: format!(
+                "selected profile objective changed across screening/result/mode ownership: screened={screened_objective:.17e}, result={:.17e}, mode={:.17e}",
+                result.objective, mode.objective,
+            ),
+        });
+    }
+    let carried = &result.warm_start.inner;
+    let rho_matches = carried.rho.len() == mode.rho.len()
+        && carried
+            .rho
+            .iter()
+            .zip(mode.rho.iter())
+            .all(|(left, right)| left.to_bits() == right.to_bits());
+    let beta_matches = carried.block_beta.len() == mode.inner.block_states.len()
+        && carried
+            .block_beta
+            .iter()
+            .zip(mode.inner.block_states.iter())
+            .all(|(left, state)| {
+                left.len() == state.beta.len()
+                    && left
+                        .iter()
+                        .zip(state.beta.iter())
+                        .all(|(left, right)| left.to_bits() == right.to_bits())
+            });
+    if !rho_matches || !beta_matches {
+        return Err(CustomFamilyError::Optimization {
+            context: "owned coefficient-mode selection state identity",
+            reason: "the selected public result and owned inner mode have different rho or coefficient bits"
+                .to_string(),
+        });
+    }
+    Ok(mode)
+}
+
 /// Assemble a caller-fixed coefficient mode. No outer coordinate was
 /// optimized, so the resulting fit deliberately carries no outer certificate.
 pub fn fit_custom_family_user_fixed_log_lambdas_from_mode_selection<
@@ -2239,12 +2273,14 @@ pub fn fit_custom_family_user_fixed_log_lambdas_from_mode_selection<
     options: &BlockwiseFitOptions,
     selection: CustomFamilyJointHyperModeSelection,
 ) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
-    fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance(
+    let mode = owned_mode_from_selection(selection)?;
+    fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance(
         family,
         specs,
         options,
-        selection,
+        mode,
         FixedLogLambdaProvenance::UserFixed,
+        OwnedModeCurvatureRequirement::CertifiedLocalMinimum,
     )
 }
 
@@ -2260,15 +2296,43 @@ pub fn fit_custom_family_fixed_log_lambdas_from_mode_selection<
     selected_theta: &Array1<f64>,
     outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
 ) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
-    fit_custom_family_fixed_log_lambdas_from_mode_selection_with_provenance(
+    let mode = owned_mode_from_selection(selection)?;
+    fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance(
         family,
         specs,
         options,
-        selection,
+        mode,
         FixedLogLambdaProvenance::CertifiedOuter {
             selected_theta,
             outer,
         },
+        OwnedModeCurvatureRequirement::CertifiedLocalMinimum,
+    )
+}
+
+/// Assemble the exact coefficient mode installed by the outer optimizer's
+/// terminal full-data evaluation. No optimizer, objective replay, or inner
+/// coefficient solve is entered at this boundary.
+pub fn fit_custom_family_fixed_log_lambdas_from_owned_mode<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    mode: CustomFamilyOwnedMode,
+    selected_theta: &Array1<f64>,
+    outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
+) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
+    fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance(
+        family,
+        specs,
+        options,
+        mode,
+        FixedLogLambdaProvenance::CertifiedOuter {
+            selected_theta,
+            outer,
+        },
+        OwnedModeCurvatureRequirement::CertifiedStationaryPoint,
     )
 }
 

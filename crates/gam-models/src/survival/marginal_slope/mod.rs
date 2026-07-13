@@ -25,9 +25,10 @@ pub(crate) use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace, FamilyEvaluation,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, custom_family_outer_derivatives,
-    evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
-    fit_custom_family, fit_custom_family_fixed_log_lambda_warm_start,
-    fit_custom_family_fixed_log_lambdas_from_outer,
+    evaluate_custom_family_joint_hyper_efs_owned_shared,
+    evaluate_custom_family_joint_hyper_owned_shared, fit_custom_family,
+    fit_custom_family_fixed_log_lambda_warm_start,
+    fit_custom_family_fixed_log_lambdas_from_owned_mode,
     joint_hyper_options_for_outer_tolerance,
 };
 pub(crate) use gam_problem::{
@@ -97,8 +98,9 @@ pub(crate) use gam_solve::pirls::LinearInequalityConstraints;
 pub(crate) use crate::probability::signed_probit_logcdf_and_mills_ratio;
 
 pub(crate) use crate::fit_orchestration::drivers::{
-    ExactJointHyperSetup, SpatialFitProvenance, build_term_collection_designs_and_freeze_joint,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    ExactJointEfsEvaluation, ExactJointEvaluation, ExactJointHyperSetup, SpatialFitProvenance,
+    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
 };
 pub(crate) use gam_terms::smooth::{
     BlockwisePenalty, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,

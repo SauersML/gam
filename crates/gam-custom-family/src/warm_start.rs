@@ -1010,12 +1010,39 @@ pub struct CustomFamilyJointHyperResult {
     pub inner_converged: bool,
 }
 
+/// Opaque ownership token for the exact coefficient mode that produced one
+/// profiled outer-objective value.
+///
+/// A warm start is only a seed and cannot prove mode identity for a nonconvex
+/// coefficient problem.  This carrier instead owns the complete converged
+/// inner result, the exact profiled-objective bits, and the smoothing prefix
+/// used to produce them.  Spatial optimization retains this token alongside
+/// its terminal evaluation and fit assembly consumes it without another inner
+/// solve.
+pub struct CustomFamilyOwnedMode {
+    pub(crate) objective: f64,
+    pub(crate) rho: Array1<f64>,
+    pub(crate) inner: BlockwiseInnerResult,
+}
+
+/// Analytic joint-hyper result together with its exact owned coefficient mode.
+pub struct CustomFamilyJointHyperOwnedResult {
+    pub result: CustomFamilyJointHyperResult,
+    pub mode: CustomFamilyOwnedMode,
+}
+
 pub struct CustomFamilyJointHyperEfsResult {
     pub efs_eval: gam_problem::EfsEval,
     pub warm_start: CustomFamilyWarmStart,
     /// See [`CustomFamilyJointHyperResult::inner_converged`]. EFS gradients
     /// also assume a stationary inner solve.
     pub inner_converged: bool,
+}
+
+/// EFS joint-hyper result together with its exact owned coefficient mode.
+pub struct CustomFamilyJointHyperEfsOwnedResult {
+    pub result: CustomFamilyJointHyperEfsResult,
+    pub mode: CustomFamilyOwnedMode,
 }
 
 pub(crate) struct OuterObjectiveEvalResult {
@@ -1036,12 +1063,12 @@ pub(crate) struct OuterObjectiveEvalResult {
 pub(crate) fn outer_eval_result_to_joint_hyper_result(
     result: OuterObjectiveEvalResult,
 ) -> CustomFamilyJointHyperResult {
-    outer_eval_result_into_joint_hyper_result_and_inner(result).0
+    outer_eval_result_into_joint_hyper_owned_result(result).result
 }
 
-pub(crate) fn outer_eval_result_into_joint_hyper_result_and_inner(
+pub(crate) fn outer_eval_result_into_joint_hyper_owned_result(
     result: OuterObjectiveEvalResult,
-) -> (CustomFamilyJointHyperResult, BlockwiseInnerResult) {
+) -> CustomFamilyJointHyperOwnedResult {
     let OuterObjectiveEvalResult {
         objective,
         gradient,
@@ -1050,16 +1077,21 @@ pub(crate) fn outer_eval_result_into_joint_hyper_result_and_inner(
         inner_converged,
         inner,
     } = result;
-    (
-        CustomFamilyJointHyperResult {
+    let rho = warm_start.rho.clone();
+    CustomFamilyJointHyperOwnedResult {
+        result: CustomFamilyJointHyperResult {
             objective,
             gradient,
             outer_hessian,
             warm_start: CustomFamilyWarmStart { inner: warm_start },
             inner_converged,
         },
-        inner,
-    )
+        mode: CustomFamilyOwnedMode {
+            objective,
+            rho,
+            inner,
+        },
+    }
 }
 
 pub(crate) struct OwnedDenseHessianOperator {

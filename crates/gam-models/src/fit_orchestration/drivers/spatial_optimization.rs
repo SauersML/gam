@@ -4928,8 +4928,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         // reconstruct a second global offset from term specs or coefficient
         // blocks: unpenalized fixed/random effects own columns but emit no
         // penalty, and multi-penalty smooths own more than one coordinate.
-        let (smooth_penalty_ranges, full_penalty_ranges) =
-            emitted_smooth_penalty_ranges(&design)?;
+        let (smooth_penalty_ranges, full_penalty_ranges) = emitted_smooth_penalty_ranges(&design)?;
         let fixed_blocks = build_term_collection_fixed_blocks(data, &spec)
             .map_err(|e| format!("failed to cache fixed term-collection blocks: {e}"))?;
 
@@ -5187,15 +5186,15 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 // topology desync #1270 hard-errored on. Sharing the builder
                 // makes the block count ψ-stable by construction.
                 let filtered = matern_operator_penalty_triplet_at_length_scale(
-                        centers.view(),
-                        periodic.as_deref(),
-                        identifiability_transform.as_ref(),
-                        *nu,
-                        *include_intercept,
-                        aniso_for_penalty,
-                        effective_ls,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    centers.view(),
+                    periodic.as_deref(),
+                    identifiability_transform.as_ref(),
+                    *nu,
+                    *include_intercept,
+                    aniso_for_penalty,
+                    effective_ls,
+                )
+                .map_err(|e| e.to_string())?;
                 let locals = filtered
                     .active
                     .iter()
@@ -5853,10 +5852,33 @@ pub struct SpatialLengthScaleOptimizationResult<FitOut> {
     pub timing: Option<SpatialLengthScaleOptimizationTiming>,
 }
 
-#[derive(Clone, Copy)]
-pub enum SpatialFitProvenance<'a> {
+/// One exact outer-objective evaluation together with the owned coefficient
+/// mode that produced it.
+///
+/// `mode` is deliberately generic and move-only.  The spatial driver never
+/// interprets or clones it; it retains the carrier that belongs to the latest
+/// successful evaluation and transfers that exact ownership into final fit
+/// assembly after the outer certificate has been issued.
+pub struct ExactJointEvaluation<M> {
+    pub objective: f64,
+    pub gradient: Array1<f64>,
+    pub hessian: gam_problem::HessianValue,
+    pub mode: M,
+}
+
+/// One exact fixed-point evaluation and the owned coefficient mode that
+/// produced its value and update equations.
+pub struct ExactJointEfsEvaluation<M> {
+    pub evaluation: gam_problem::EfsEval,
+    pub mode: M,
+}
+
+pub enum SpatialFitProvenance<'a, M> {
     NoOuterOptimization,
-    Certified(&'a gam_solve::rho_optimizer::CertifiedOuterResult),
+    Certified {
+        outer: &'a gam_solve::rho_optimizer::CertifiedOuterResult,
+        mode: M,
+    },
 }
 
 /// Exact-joint hyper-parameter setup for N-block spatial length-scale optimization.
@@ -6478,7 +6500,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     Ok(problem)
 }
 
-pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEfsFn, SeedFn>(
+pub fn optimize_spatial_length_scale_exact_joint<FitOut, Mode, FitFn, ExactFn, ExactEfsFn, SeedFn>(
     data: ArrayView2<'_, f64>,
     block_specs: &[TermCollectionSpec],
     block_term_indices: &[Vec<usize>],
@@ -6496,12 +6518,11 @@ pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEf
     mut seed_inner_beta_fn: SeedFn,
 ) -> Result<SpatialLengthScaleOptimizationResult<FitOut>, String>
 where
-    FitOut: Clone,
     FitFn: FnMut(
         &Array1<f64>,
         &[TermCollectionSpec],
         &[TermCollectionDesign],
-        SpatialFitProvenance<'_>,
+        SpatialFitProvenance<'_, Mode>,
     ) -> Result<FitOut, String>,
     ExactFn: FnMut(
         &Array1<f64>,
@@ -6509,13 +6530,13 @@ where
         &[TermCollectionDesign],
         gam_solve::estimate::reml::reml_outer_engine::EvalMode,
         &gam_problem::outer_subsample::RowSet,
-    ) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), String>,
+    ) -> Result<ExactJointEvaluation<Mode>, String>,
     ExactEfsFn: FnMut(
         &Array1<f64>,
         &[TermCollectionSpec],
         &[TermCollectionDesign],
         &gam_problem::outer_subsample::RowSet,
-    ) -> Result<gam_problem::EfsEval, String>,
+    ) -> Result<ExactJointEfsEvaluation<Mode>, String>,
     SeedFn: FnMut(&Array1<f64>) -> Result<gam_solve::rho_optimizer::SeedOutcome, EstimationError>,
 {
     let n_blocks = block_specs.len();
@@ -6631,16 +6652,36 @@ where
         .map(|((spec, design), terms)| (spec.clone(), design.clone(), terms.clone()))
         .collect();
 
-    struct NBlockExactJointState<'d> {
+    struct NBlockExactJointState<'d, M> {
         cache: ExactJointDesignCache<'d>,
         row_set: gam_problem::outer_subsample::RowSet,
         staged_pilot_active: bool,
+        terminal_mode: Option<(Array1<f64>, f64, M)>,
+    }
+
+    impl<M> NBlockExactJointState<'_, M> {
+        fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
+            let theta_changed = !self
+                .cache
+                .current_theta
+                .as_ref()
+                .is_some_and(|current| theta_values_match(current, theta));
+            if theta_changed {
+                self.terminal_mode = None;
+            }
+            self.cache.ensure_theta(theta)
+        }
+
+        fn install_terminal_mode(&mut self, theta: &Array1<f64>, objective: f64, mode: M) {
+            self.terminal_mode = Some((theta.clone(), objective, mode));
+        }
     }
 
     let mut state = NBlockExactJointState {
         cache: ExactJointDesignCache::new(data, cache_blocks, rho_dim, all_dims.clone())?,
         row_set: gam_problem::outer_subsample::RowSet::All,
         staged_pilot_active: false,
+        terminal_mode: None,
     };
 
     // ── P7: staged-κ schedule ────────────────────────────────────────────
@@ -6837,7 +6878,7 @@ where
     }
 
     let result = {
-        let eval_outer = |ctx: &mut &mut NBlockExactJointState<'_>,
+        let eval_outer = |ctx: &mut &mut NBlockExactJointState<'_, Mode>,
                           theta: &Array1<f64>,
                           order: OuterEvalOrder|
          -> Result<OuterEval, EstimationError> {
@@ -6876,7 +6917,7 @@ where
                     });
                 }
             }
-            if let Err(err) = ctx.cache.ensure_theta(theta) {
+            if let Err(err) = ctx.ensure_theta(theta) {
                 log::warn!(
                     "[OUTER] n-block exact-joint spatial: ensure_theta failed during gradient evaluation: {err}"
                 );
@@ -6904,13 +6945,8 @@ where
                 gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient
             };
             let t0 = std::time::Instant::now();
-            let result = (*exact_fn_cell.borrow_mut())(
-                theta,
-                &specs,
-                &designs,
-                eval_mode,
-                &ctx.row_set,
-            );
+            let result =
+                (*exact_fn_cell.borrow_mut())(theta, &specs, &designs, eval_mode, &ctx.row_set);
             let elapsed_s = t0.elapsed().as_secs_f64();
             kphase_eval_calls.set(kphase_eval_calls.get() + 1);
             kphase_eval_total_s.set(kphase_eval_total_s.get() + elapsed_s);
@@ -6925,7 +6961,13 @@ where
                 elapsed_s,
             );
             match result {
-                Ok((cost, grad, hess)) => {
+                Ok(ExactJointEvaluation {
+                    objective: cost,
+                    gradient: grad,
+                    hessian: hess,
+                    mode,
+                }) => {
+                    ctx.install_terminal_mode(theta, cost, mode);
                     if value_only {
                         ctx.cache.store_cost_only(theta, cost);
                     } else {
@@ -6967,11 +7009,11 @@ where
 
         let obj = problem.build_objective_with_eval_order(
             &mut state,
-            |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
+            |ctx: &mut &mut NBlockExactJointState<'_, Mode>, theta: &Array1<f64>| {
                 if let Some(cost) = ctx.cache.memoized_cost(theta) {
                     return Ok(cost);
                 }
-                if let Err(err) = ctx.cache.ensure_theta(theta) {
+                if let Err(err) = ctx.ensure_theta(theta) {
                     log::warn!(
                         "[OUTER] n-block exact-joint spatial: ensure_theta failed during cost evaluation: {err}"
                     );
@@ -7007,7 +7049,12 @@ where
                     elapsed_s,
                 );
                 match result {
-                    Ok((cost, _grad, _hess)) => {
+                    Ok(ExactJointEvaluation {
+                        objective: cost,
+                        mode,
+                        ..
+                    }) => {
+                        ctx.install_terminal_mode(theta, cost, mode);
                         // Don't `store_eval`: that path is only valid when the
                         // closure produced a real gradient. The next outer-eval
                         // call will recompute (V, ∇V) at this θ if needed; the
@@ -7024,7 +7071,7 @@ where
                     }
                 }
             },
-            |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
+            |ctx: &mut &mut NBlockExactJointState<'_, Mode>, theta: &Array1<f64>| {
                 eval_outer(
                     ctx,
                     theta,
@@ -7035,13 +7082,13 @@ where
                     },
                 )
             },
-            |ctx: &mut &mut NBlockExactJointState<'_>,
+            |ctx: &mut &mut NBlockExactJointState<'_, Mode>,
              theta: &Array1<f64>,
              order: OuterEvalOrder| { eval_outer(ctx, theta, order) },
-            None::<fn(&mut &mut NBlockExactJointState<'_>)>,
+            None::<fn(&mut &mut NBlockExactJointState<'_, Mode>)>,
             Some(
-                |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
-                    ctx.cache
+                |ctx: &mut &mut NBlockExactJointState<'_, Mode>, theta: &Array1<f64>| {
+                    ctx
                         .ensure_theta(theta)
                         .map_err(EstimationError::InvalidInput)?;
                     let design_revision = Some(ctx.cache.design_revision());
@@ -7066,18 +7113,20 @@ where
                         log_kappa_norm,
                         elapsed_s,
                     );
-                    let eval = eval_result.map_err(EstimationError::RemlOptimizationFailed)?;
-                    Ok(eval)
+                    let ExactJointEfsEvaluation { evaluation, mode } =
+                        eval_result.map_err(EstimationError::RemlOptimizationFailed)?;
+                    ctx.install_terminal_mode(theta, evaluation.cost, mode);
+                    Ok(evaluation)
                 },
             ),
         );
         let mut obj = obj
             .with_seed_inner_state(
-                move |_ctx: &mut &mut NBlockExactJointState<'_>, beta: &Array1<f64>| {
+                move |_ctx: &mut &mut NBlockExactJointState<'_, Mode>, beta: &Array1<f64>| {
                     (seed_inner_beta_fn)(beta)
                 },
             )
-            .with_exact_polish(|ctx: &mut &mut NBlockExactJointState<'_>| {
+            .with_exact_polish(|ctx: &mut &mut NBlockExactJointState<'_, Mode>| {
                 if !ctx.staged_pilot_active {
                     return false;
                 }
@@ -7086,6 +7135,7 @@ where
                 // Keep the realized design and warm coefficient state: only the
                 // score measure changes here.
                 ctx.cache.invalidate_objective_memo();
+                ctx.terminal_mode = None;
                 ctx.row_set = gam_problem::outer_subsample::RowSet::All;
                 ctx.staged_pilot_active = false;
                 true
@@ -7149,7 +7199,23 @@ where
     // The returned theta and certificate now belong to the exact full-data
     // continuation. No separate probe may mutate that certified identity before
     // the final coefficient fit.
-    state.cache.ensure_theta(&theta_star)?;
+    state.ensure_theta(&theta_star)?;
+    let (mode_theta, mode_objective, mode) = state.terminal_mode.take().ok_or_else(|| {
+        "n-block exact-joint spatial optimization produced a certificate without retaining the owned terminal coefficient mode"
+            .to_string()
+    })?;
+    if !theta_values_match(&mode_theta, &theta_star) {
+        return Err(
+            "n-block exact-joint spatial terminal coefficient mode does not bitwise match the certified hyperparameter vector"
+                .to_string(),
+        );
+    }
+    if mode_objective.to_bits() != certified_outer.final_value().to_bits() {
+        return Err(format!(
+            "n-block exact-joint spatial terminal coefficient mode objective does not bitwise match the certified objective: mode={mode_objective:.17e}, certified={:.17e}",
+            certified_outer.final_value(),
+        ));
+    }
 
     let resolved_specs: Vec<TermCollectionSpec> = collect_specs(&state.cache);
     let designs: Vec<TermCollectionDesign> = collect_designs(&state.cache);
@@ -7158,7 +7224,10 @@ where
         &theta_star,
         &resolved_specs,
         &designs,
-        SpatialFitProvenance::Certified(&certified_outer),
+        SpatialFitProvenance::Certified {
+            outer: &certified_outer,
+            mode,
+        },
     )?;
 
     for spec in &resolved_specs {

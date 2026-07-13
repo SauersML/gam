@@ -39,9 +39,10 @@ use crate::custom_family::{
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonOuterCurvature, FamilyChannelHessian, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState, PenaltyMatrix, PsiDesignMap, build_rowwise_kronecker_psi_operator,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
-    first_psi_linear_map, fit_custom_family, fit_custom_family_fixed_log_lambdas_from_outer,
-    resolve_custom_family_x_psi_map, shared_dense_arc, weighted_crossprod_psi_maps,
+    evaluate_custom_family_joint_hyper_efs_owned, evaluate_custom_family_joint_hyper_owned,
+    first_psi_linear_map, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas_from_owned_mode, resolve_custom_family_x_psi_map,
+    shared_dense_arc, weighted_crossprod_psi_maps,
 };
 
 use gam_problem::{
@@ -92,8 +93,9 @@ use gam_solve::mixture_link::{
 use gam_solve::pirls::LinearInequalityConstraints;
 
 use crate::fit_orchestration::drivers::{
-    ExactJointHyperSetup, SpatialFitProvenance, freeze_term_collection_from_design,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    ExactJointEfsEvaluation, ExactJointEvaluation, ExactJointHyperSetup, SpatialFitProvenance,
+    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
 };
 use gam_terms::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,

@@ -1863,7 +1863,15 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
     rho_prior: gam_problem::RhoPrior,
-) -> Result<(gam_problem::EfsEval, ConstrainedWarmStart, bool), String> {
+) -> Result<
+    (
+        gam_problem::EfsEval,
+        ConstrainedWarmStart,
+        bool,
+        BlockwiseInnerResult,
+    ),
+    String,
+> {
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
@@ -1876,14 +1884,15 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
             inner.cycles,
             rho.len(),
         );
-        return nonconverged_outer_efs_result(
+        let (eval, warm, converged) = nonconverged_outer_efs_result(
             &inner,
             rho,
             rho.len(),
             include_logdet_h,
             include_logdet_s,
             "custom-family EFS non-converged inner solve",
-        );
+        )?;
+        return Ok((eval, warm, converged, inner));
     }
     let ridge = effective_solverridge(options.ridge_floor);
     let moderidge = if options.ridge_policy.accounts_for_objective() {
@@ -2252,7 +2261,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
         cached_inner: Some(cached_inner_mode_from_result(&inner)),
     };
 
-    Ok((efs_eval, warm, inner.converged))
+    Ok((efs_eval, warm, inner.converged, inner))
 }
 
 pub(crate) fn normalize_outer_eval_error_detail(error: &str) -> &str {

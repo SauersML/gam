@@ -2539,6 +2539,31 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
     warm_start: Option<&CustomFamilyWarmStart>,
     eval_mode: EvalMode,
 ) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
+    Ok(evaluate_custom_family_joint_hyper_owned(
+        family,
+        specs,
+        options,
+        rho_current,
+        derivative_blocks,
+        warm_start,
+        eval_mode,
+    )?
+    .result)
+}
+
+/// Evaluate a joint hyperparameter point and retain the exact coefficient mode
+/// that produced its objective and derivative payload.
+pub fn evaluate_custom_family_joint_hyper_owned<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_current: &Array1<f64>,
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    warm_start: Option<&CustomFamilyWarmStart>,
+    eval_mode: EvalMode,
+) -> Result<CustomFamilyJointHyperOwnedResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     let has_psi_derivatives = derivative_blocks.iter().any(|block| !block.is_empty());
     let (eval_options, strict_warm_start) =
@@ -2557,7 +2582,9 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
         gam_problem::RhoPrior::Flat,
         eval_mode,
     )?;
-    Ok(outer_eval_result_to_joint_hyper_result(eval_result))
+    Ok(outer_eval_result_into_joint_hyper_owned_result(
+        eval_result,
+    ))
 }
 
 pub fn evaluate_custom_family_joint_hyper_shared<
@@ -2571,6 +2598,31 @@ pub fn evaluate_custom_family_joint_hyper_shared<
     warm_start: Option<&CustomFamilyWarmStart>,
     eval_mode: EvalMode,
 ) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
+    Ok(evaluate_custom_family_joint_hyper_owned_shared(
+        family,
+        specs,
+        options,
+        rho_current,
+        derivative_blocks,
+        warm_start,
+        eval_mode,
+    )?
+    .result)
+}
+
+/// Shared-derivative-block variant of
+/// [`evaluate_custom_family_joint_hyper_owned`].
+pub fn evaluate_custom_family_joint_hyper_owned_shared<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_current: &Array1<f64>,
+    derivative_blocks: SharedDerivativeBlocks,
+    warm_start: Option<&CustomFamilyWarmStart>,
+    eval_mode: EvalMode,
+) -> Result<CustomFamilyJointHyperOwnedResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     let has_psi_derivatives = derivative_blocks.iter().any(|block| !block.is_empty());
     let (eval_options, strict_warm_start) =
@@ -2591,7 +2643,9 @@ pub fn evaluate_custom_family_joint_hyper_shared<
         eval_mode,
         None,
     )?;
-    Ok(outer_eval_result_to_joint_hyper_result(eval_result))
+    Ok(outer_eval_result_into_joint_hyper_owned_result(
+        eval_result,
+    ))
 }
 
 pub struct CustomFamilyJointHyperModeSelection {
@@ -2603,7 +2657,7 @@ pub struct CustomFamilyJointHyperModeSelection {
     ///
     /// Crate-internal finalization consumes this directly so a fixed-hyper fit
     /// cannot re-enter the nonconvex inner solver and silently change basins.
-    pub(crate) selected_inner: BlockwiseInnerResult,
+    pub(crate) mode: CustomFamilyOwnedMode,
 }
 
 /// Profile a nonconvex coefficient mode without assembling expensive outer
@@ -2716,17 +2770,17 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
 
     if matches!(eval_mode, EvalMode::ValueOnly) {
         let selected_candidate = ranked_candidates[0];
-        let (result, selected_inner) = outer_eval_result_into_joint_hyper_result_and_inner(
+        let owned = outer_eval_result_into_joint_hyper_owned_result(
             screened_results[selected_candidate]
                 .take()
                 .expect("ranked candidate retains its screened result"),
         );
         return Ok(CustomFamilyJointHyperModeSelection {
-            result,
+            result: owned.result,
             selected_candidate,
             screened_objectives,
             rejected_candidates,
-            selected_inner,
+            mode: owned.mode,
         });
     }
 
@@ -2769,14 +2823,13 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         rho_current.len() + derivative_blocks.iter().map(Vec::len).sum::<usize>(),
         selected_candidate,
     )?;
-    let (result, selected_inner) =
-        outer_eval_result_into_joint_hyper_result_and_inner(derivative_eval);
+    let owned = outer_eval_result_into_joint_hyper_owned_result(derivative_eval);
     Ok(CustomFamilyJointHyperModeSelection {
-        result,
+        result: owned.result,
         selected_candidate,
         screened_objectives,
         rejected_candidates,
-        selected_inner,
+        mode: owned.mode,
     })
 }
 
@@ -2907,7 +2960,15 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     rho_current: &Array1<f64>,
     derivative_blocks: SharedDerivativeBlocks,
     warm_start: Option<&ConstrainedWarmStart>,
-) -> Result<(gam_problem::EfsEval, ConstrainedWarmStart, bool), CustomFamilyError> {
+) -> Result<
+    (
+        gam_problem::EfsEval,
+        ConstrainedWarmStart,
+        bool,
+        BlockwiseInnerResult,
+    ),
+    CustomFamilyError,
+> {
     if derivative_blocks.len() != specs.len() {
         crate::bail_dim_custom!(
             "joint hyper derivative block count mismatch: got {}, expected {}",
@@ -2962,7 +3023,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
             rho_dim,
             psi_dim,
         );
-        return nonconverged_outer_efs_result(
+        let (eval, warm, converged) = nonconverged_outer_efs_result(
             &inner,
             rho_current,
             theta_dim,
@@ -2970,7 +3031,8 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
             include_logdet_s,
             "custom-family joint-hyper EFS non-converged inner solve",
         )
-        .map_err(CustomFamilyError::from);
+        .map_err(CustomFamilyError::from)?;
+        return Ok((eval, warm, converged, inner));
     }
     let ridge = effective_solverridge(options.ridge_floor);
     let moderidge = if options.ridge_policy.accounts_for_objective() {
@@ -3243,7 +3305,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         cached_inner: Some(cached_inner_mode_from_result(&inner)),
     };
 
-    Ok((efs_eval, warm, inner.converged))
+    Ok((efs_eval, warm, inner.converged, inner))
 }
 
 /// Evaluate the joint custom-family hyper-surface in fixed-point form for the
@@ -3256,11 +3318,30 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     warm_start: Option<&CustomFamilyWarmStart>,
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
-    // Borrowed entry point: lift the `&[Vec<…>]` derivative blocks into a
-    // `SharedDerivativeBlocks` (`Arc<Vec<Vec<…>>>`) and delegate to the single
-    // source of truth. All validation, the empty-block fast path, and the
-    // internal evaluator dispatch live in `…_efs_shared`.
-    evaluate_custom_family_joint_hyper_efs_shared(
+    Ok(evaluate_custom_family_joint_hyper_efs_owned(
+        family,
+        specs,
+        options,
+        rho_current,
+        derivative_blocks,
+        warm_start,
+    )?
+    .result)
+}
+
+/// Evaluate the EFS joint hyperparameter map and retain the exact coefficient
+/// mode that produced it.
+pub fn evaluate_custom_family_joint_hyper_efs_owned<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_current: &Array1<f64>,
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    warm_start: Option<&CustomFamilyWarmStart>,
+) -> Result<CustomFamilyJointHyperEfsOwnedResult, CustomFamilyError> {
+    evaluate_custom_family_joint_hyper_efs_owned_shared(
         family,
         specs,
         options,
@@ -3280,6 +3361,29 @@ pub fn evaluate_custom_family_joint_hyper_efs_shared<
     derivative_blocks: SharedDerivativeBlocks,
     warm_start: Option<&CustomFamilyWarmStart>,
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
+    Ok(evaluate_custom_family_joint_hyper_efs_owned_shared(
+        family,
+        specs,
+        options,
+        rho_current,
+        derivative_blocks,
+        warm_start,
+    )?
+    .result)
+}
+
+/// Shared-derivative-block variant of
+/// [`evaluate_custom_family_joint_hyper_efs_owned`].
+pub fn evaluate_custom_family_joint_hyper_efs_owned_shared<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_current: &Array1<f64>,
+    derivative_blocks: SharedDerivativeBlocks,
+    warm_start: Option<&CustomFamilyWarmStart>,
+) -> Result<CustomFamilyJointHyperEfsOwnedResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     if derivative_blocks.len() != specs.len() {
         crate::bail_dim_custom!(
@@ -3288,31 +3392,40 @@ pub fn evaluate_custom_family_joint_hyper_efs_shared<
             specs.len()
         );
     }
-    let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
-        outerobjectiveefs(
-            family,
-            specs,
-            options,
-            &penalty_counts,
-            rho_current,
-            warm_start.map(|w| &w.inner),
-            gam_problem::RhoPrior::Flat,
-        )
-        .map_err(CustomFamilyError::from)?
-    } else {
-        evaluate_custom_family_joint_hyper_efs_internal_shared(
-            family,
-            specs,
-            options,
-            &penalty_counts,
-            rho_current,
-            derivative_blocks,
-            warm_start.map(|w| &w.inner),
-        )?
+    let (efs_eval, warm_start, inner_converged, inner) =
+        if derivative_blocks.iter().all(Vec::is_empty) {
+            outerobjectiveefs(
+                family,
+                specs,
+                options,
+                &penalty_counts,
+                rho_current,
+                warm_start.map(|w| &w.inner),
+                gam_problem::RhoPrior::Flat,
+            )
+            .map_err(CustomFamilyError::from)?
+        } else {
+            evaluate_custom_family_joint_hyper_efs_internal_shared(
+                family,
+                specs,
+                options,
+                &penalty_counts,
+                rho_current,
+                derivative_blocks,
+                warm_start.map(|w| &w.inner),
+            )?
+        };
+    let mode = CustomFamilyOwnedMode {
+        objective: efs_eval.cost,
+        rho: warm_start.rho.clone(),
+        inner,
     };
-    Ok(outer_efs_result_to_joint_hyper_efs_result(
-        efs_eval,
-        warm_start,
-        inner_converged,
-    ))
+    Ok(CustomFamilyJointHyperEfsOwnedResult {
+        result: outer_efs_result_to_joint_hyper_efs_result(
+            efs_eval,
+            warm_start,
+            inner_converged,
+        ),
+        mode,
+    })
 }
