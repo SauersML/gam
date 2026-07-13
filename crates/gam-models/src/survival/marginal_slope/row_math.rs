@@ -500,6 +500,7 @@ mod vector_hand_oracle_tests {
 
     impl ReusableHandVectorRowWorkspace {
         pub(super) fn new(covariance: &MarginalSlopeCovariance) -> Result<Self, String> {
+            covariance.validate("reusable hand survival marginal-slope row workspace")?;
             let score_dimension = covariance.dim();
             let dimension = score_dimension.checked_add(3).ok_or_else(|| {
                 SurvivalMarginalSlopeError::IncompatibleDimensions {
@@ -564,7 +565,6 @@ mod vector_hand_oracle_tests {
         output: &mut [f64],
         low_rank_projection: &mut [f64],
     ) -> Result<(), String> {
-        covariance.validate("survival marginal-slope covariance matvec")?;
         if vector.len() != covariance.dim() || output.len() != covariance.dim() {
             return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
                 reason: format!(
