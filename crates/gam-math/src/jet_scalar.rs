@@ -635,13 +635,19 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
     #[inline(always)]
     fn add(&self, o: &Self) -> Self {
         self.assert_compatible(o);
-        let g = self.arena.zeros(self.dimension());
+        let dimension = self.dimension();
+        let g = self.arena.zeros(dimension);
         let h = self.arena.zeros(self.h.len());
         for i in 0..g.len() {
             g[i] = self.g[i] + o.g[i];
         }
-        for i in 0..h.len() {
-            h[i] = self.h[i] + o.h[i];
+        for row in 0..dimension {
+            for column in row..dimension {
+                let index = row * dimension + column;
+                let channel = self.h[index] + o.h[index];
+                h[index] = channel;
+                h[column * dimension + row] = channel;
+            }
         }
         Self {
             arena: self.arena,
@@ -654,13 +660,19 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
     #[inline(always)]
     fn sub(&self, o: &Self) -> Self {
         self.assert_compatible(o);
-        let g = self.arena.zeros(self.dimension());
+        let dimension = self.dimension();
+        let g = self.arena.zeros(dimension);
         let h = self.arena.zeros(self.h.len());
         for i in 0..g.len() {
             g[i] = self.g[i] - o.g[i];
         }
-        for i in 0..h.len() {
-            h[i] = self.h[i] - o.h[i];
+        for row in 0..dimension {
+            for column in row..dimension {
+                let index = row * dimension + column;
+                let channel = self.h[index] - o.h[index];
+                h[index] = channel;
+                h[column * dimension + row] = channel;
+            }
         }
         Self {
             arena: self.arena,
@@ -703,13 +715,19 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
 
     #[inline(always)]
     fn scale(&self, s: f64) -> Self {
-        let g = self.arena.zeros(self.dimension());
+        let dimension = self.dimension();
+        let g = self.arena.zeros(dimension);
         let h = self.arena.zeros(self.h.len());
         for i in 0..g.len() {
             g[i] = self.g[i] * s;
         }
-        for i in 0..h.len() {
-            h[i] = self.h[i] * s;
+        for row in 0..dimension {
+            for column in row..dimension {
+                let index = row * dimension + column;
+                let channel = self.h[index] * s;
+                h[index] = channel;
+                h[column * dimension + row] = channel;
+            }
         }
         Self {
             arena: self.arena,
@@ -728,9 +746,11 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             g[i] = d[1] * self.g[i];
         }
         for i in 0..n {
-            for j in 0..n {
+            for j in i..n {
                 let ij = i * n + j;
-                h[ij] = d[1] * self.h[ij] + d[2] * self.g[i] * self.g[j];
+                let channel = d[1] * self.h[ij] + d[2] * self.g[i] * self.g[j];
+                h[ij] = channel;
+                h[j * n + i] = channel;
             }
         }
         Self {

@@ -6936,7 +6936,9 @@ impl ManifoldSaeCore {
             let boxed: Box<gam::inference::steering::AppliedDoseProbe<'_>> =
                 Box::new(move |plan: &gam::inference::steering::SteerPlan| {
                     Python::attach(|py| {
-                        let plan_dict = steer_plan_to_pydict(py, plan.clone())?;
+                        let plan_dict = steer_plan_to_pydict(py, plan.clone()).map_err(|error| {
+                            format!("steer_to_target could not serialize probe plan: {error}")
+                        })?;
                         let result = obj
                             .call1(py, (plan_dict,))
                             .map_err(|error| format!("steer_to_target probe raised: {error}"))?;
