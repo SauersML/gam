@@ -3106,6 +3106,44 @@ mod trust_region_subproblem_tests {
         );
     }
 
+    /// The convergence-rank cutoff may be many orders of magnitude wider than
+    /// a resolvable negative eigenvalue when an unrelated penalty mode sets the
+    /// spectrum scale. The hard-case witness must still be the true minimum
+    /// eigenvector, not a nearby positive mode that happens to fall inside that
+    /// broad rank band.
+    #[test]
+    pub(crate) fn weak_negative_hard_case_uses_true_minimum_mode() {
+        let h = array![
+            [-1.0e-3, 0.0, 0.0],
+            [0.0, 2.0e-3, 0.0],
+            [0.0, 0.0, 1.0e8]
+        ];
+        let rhs = array![0.0, 0.0, 0.0];
+        let d = array![1.0, 1.0, 1.0];
+        let spec = WhitenedHessianSpectrum::decompose(&h, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();
+        assert!(spec.has_resolvable_negative_curvature());
+
+        let radius = 0.5;
+        let step = spec.trust_region_step(radius);
+        let norm = metric_norm(&step.delta, &d);
+        assert!((norm - radius).abs() < 1e-10, "hard-case step norm {norm}");
+        assert!(
+            step.delta[0].abs() > radius * (1.0 - 1e-10),
+            "hard case must use the true negative mode, got {:?}",
+            step.delta
+        );
+        assert!(
+            step.delta[1].abs() < 1e-12 && step.delta[2].abs() < 1e-12,
+            "positive modes must not receive the hard-case witness, got {:?}",
+            step.delta
+        );
+        let predicted_reduction = rhs.dot(&step.delta) - 0.5 * step.delta.dot(&h.dot(&step.delta));
+        assert!(
+            predicted_reduction > 0.0,
+            "true-minimum hard-case step must lower the quadratic model"
+        );
+    }
+
     /// Self-vanishing: as rhs → 0 the step → 0 regardless of the radius, so the
     /// converged β and the KKT fixed point are unchanged by the globalization.
     #[test]
