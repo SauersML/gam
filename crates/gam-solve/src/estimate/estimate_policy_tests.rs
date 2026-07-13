@@ -765,7 +765,10 @@ fn unified_fit_accepts_inference_hessian_in_rectangular_active_geometry_frame() 
             .reduced_total(),
         1
     );
-    assert_eq!(fit.penalized_hessian().expect("active Hessian").dim(), (1, 1));
+    assert_eq!(
+        fit.penalized_hessian().expect("active Hessian").dim(),
+        (1, 1)
+    );
 }
 
 #[test]
@@ -897,6 +900,19 @@ fn resolve_external_family_accepts_supported_nonlogit_firth_request() {
     )
     .expect("CLogLog has a Fisher-weight jet");
     assert!(firth);
+}
+
+#[test]
+fn fit_geometry_wire_schema_requires_explicit_coefficient_gauge() {
+    let fit = decode_invariant_test_fit();
+    let mut payload = serde_json::to_value(&fit).expect("serialize fit");
+    payload["geometry"]
+        .as_object_mut()
+        .expect("serialized geometry object")
+        .remove("coefficient_gauge");
+    let error = serde_json::from_value::<UnifiedFitResult>(payload)
+        .expect_err("an old geometry payload must not guess an identity gauge");
+    assert!(error.to_string().contains("missing field `coefficient_gauge`"));
 }
 
 #[test]
