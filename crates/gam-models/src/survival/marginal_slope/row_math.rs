@@ -701,6 +701,30 @@ mod vector_hand_oracle_tests {
 /// and Hessian channel then flows through the same stable probit/log-density
 /// leaf stacks as [`rigid_row_nll`]. There is no separately maintained chain
 /// rule for score cross-blocks.
+enum VectorSupport {
+    Zero,
+    Singleton { axis: usize, value: f64 },
+    Multiple,
+}
+
+#[inline(always)]
+fn vector_support(input: &[f64]) -> VectorSupport {
+    let mut singleton = None;
+    for (axis, &value) in input.iter().enumerate() {
+        if value == 0.0 {
+            continue;
+        }
+        if singleton.is_some() {
+            return VectorSupport::Multiple;
+        }
+        singleton = Some((axis, value));
+    }
+    match singleton {
+        None => VectorSupport::Zero,
+        Some((axis, value)) => VectorSupport::Singleton { axis, value },
+    }
+}
+
 impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
     fn dimension(&self) -> usize {
         self.dim()
@@ -716,6 +740,19 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
                 }
             }
             Self::Full(matrix) => {
+                match vector_support(input) {
+                    VectorSupport::Zero => {
+                        output.fill(0.0);
+                        return;
+                    }
+                    VectorSupport::Singleton { axis, value } => {
+                        for row in 0..input.len() {
+                            output[row] = matrix[[row, axis]] * value;
+                        }
+                        return;
+                    }
+                    VectorSupport::Multiple => {}
+                }
                 for row in 0..input.len() {
                     let mut value = 0.0;
                     for column in 0..input.len() {
@@ -726,6 +763,19 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
             }
             Self::LowRank(factor) => {
                 output.fill(0.0);
+                match vector_support(input) {
+                    VectorSupport::Zero => return,
+                    VectorSupport::Singleton { axis, value } => {
+                        for rank in 0..factor.ncols() {
+                            let projection = factor[[axis, rank]] * value;
+                            for row in 0..input.len() {
+                                output[row] += factor[[row, rank]] * projection;
+                            }
+                        }
+                        return;
+                    }
+                    VectorSupport::Multiple => {}
+                }
                 for rank in 0..factor.ncols() {
                     let mut projection = 0.0;
                     for row in 0..input.len() {
