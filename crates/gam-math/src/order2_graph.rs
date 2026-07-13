@@ -14,7 +14,8 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 
 use crate::jet_scalar::{
-    Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients, canonical_shared_source_schedule,
+    Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients, aggregate_shared_source_derivatives,
+    canonical_shared_source_schedule,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -912,10 +913,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 lefts[term].node == lefts[representative].node
                     && addend_scales[term] == addend_scales[representative]
             });
+        let (value, source_derivatives) =
+            aggregate_shared_source_derivatives(&term_sources, input_scales, derivative_stacks);
         let mut source_gradients = [[0.0; K]; N];
-        let mut source_firsts = [0.0; N];
-        let mut source_seconds = [0.0; N];
-        let mut value = 0.0;
         let mut gradient = [0.0; K];
         let mut support = 0_u16;
         let mut right_first = 0.0;
@@ -926,20 +926,12 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         if addend_live {
             support |= tape.nodes[addend_node].support;
         }
-        for term in 0..N {
-            let first = derivative_stacks[term][1] * input_scales[term];
-            let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
-            let source = term_sources[term];
-            source_firsts[source] += first;
-            source_seconds[source] += second;
-            value += derivative_stacks[term][0];
-        }
         for source in 0..source_count {
             let term = representatives[source];
             let left = lefts[term].node;
             let left_value = tape.nodes[left].value;
             let right_value = tape.nodes[right_node].value;
-            let first = source_firsts[source];
+            let first = source_derivatives[source][1];
             support |= tape.nodes[left].support;
             right_first += first * left_value;
             addend_first += first * addend_scales[term];
@@ -986,8 +978,8 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 let cross = tape.gradients[left * K + primary]
                     * tape.gradients[right_node * K + other]
                     + tape.gradients[left * K + other] * tape.gradients[right_node * K + primary];
-                channel += source_firsts[source] * cross
-                    + source_seconds[source]
+                channel += source_derivatives[source][1] * cross
+                    + source_derivatives[source][2]
                         * source_gradients[source][primary]
                         * source_gradients[source][other];
             }
@@ -1004,7 +996,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         for source in 0..source_count {
             let term = representatives[source];
             let left = lefts[term].node;
-            let left_first = source_firsts[source] * tape.nodes[right_node].value;
+            let left_first = source_derivatives[source][1] * tape.nodes[right_node].value;
             Order2GraphWorkspace::push_edge(tape, left, left_first);
         }
         if N != 0 {
@@ -1246,6 +1238,7 @@ mod tests {
             NO_PRIMARY_AXIS,
             "derived quadratic inputs must select the unrestricted Jacobian projection",
         );
+        let graph_linear = Order2Graph::linear_combination(&[x, xy], &[0.3, -0.8], 2, &workspace);
         let coefficients = MatrixFreeDense3 {
             matrix: [[1.2, -0.3, 0.25], [-0.3, 0.8, 0.17], [0.25, 0.17, 1.4]],
             workspace: &workspace,
@@ -1258,6 +1251,8 @@ mod tests {
         let eager_x = DynamicOrder2::variable(0.4, 0, 2, &arena);
         let eager_y = DynamicOrder2::variable(-0.7, 1, 2, &arena);
         let eager_xy = eager_x.product(&eager_y);
+        let eager_linear =
+            DynamicOrder2::linear_combination(&[eager_x, eager_xy], &[0.3, -0.8], 2, &arena);
         let eager = DynamicOrder2::symmetric_quadratic_form(
             &[eager_x, eager_y, eager_xy],
             &coefficients,
@@ -1269,12 +1264,19 @@ mod tests {
             let tolerance = 2.0e-13 * actual.abs().max(expected.abs()).max(1.0);
             assert!((actual - expected).abs() <= tolerance);
         };
+        let graph_linear = graph_linear.into_order2();
+        close(graph_linear.value(), eager_linear.v);
         close(graph.value(), eager.v);
         for primary in 0..2 {
+            close(graph_linear.g()[primary], eager_linear.g()[primary]);
             close(graph.g()[primary], eager.g()[primary]);
         }
         for row in 0..2 {
             for column in 0..2 {
+                close(
+                    graph_linear.h()[row][column],
+                    eager_linear.h_at(row, column),
+                );
                 close(graph.h()[row][column], eager.h_at(row, column));
             }
         }
@@ -1286,13 +1288,8 @@ mod tests {
         workspace.reset(4);
         let x = Order2Graph::<4>::variable(0.4, 0, 4, &workspace);
         let z = Order2Graph::<4>::variable(1.1, 2, 4, &workspace);
-        let linear = Order2Graph::linear_combination(
-            &[z, x, z],
-            &[0.3, -0.7, 1.1],
-            4,
-            &workspace,
-        )
-        .into_order2();
+        let linear = Order2Graph::linear_combination(&[z, x, z], &[0.3, -0.7, 1.1], 4, &workspace)
+            .into_order2();
         assert!((linear.value() - 1.26).abs() <= 2.0e-13);
         assert_eq!(linear.g(), [-0.7, 0.0, 1.4, 0.0]);
         assert!(linear.h().iter().flatten().all(|&channel| channel == 0.0));

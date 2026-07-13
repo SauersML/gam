@@ -2077,6 +2077,12 @@ fn build_formula_design_for_multinomial(
     let design = build_term_collection_design(data.values.view(), &spec).map_err(|err| {
         EstimationError::InvalidInput(format!("multinomial fit: build design: {err}"))
     })?;
+    if design.affine_offset.iter().any(|value| *value != 0.0) {
+        crate::bail_invalid_estim!(
+            "multinomial fit does not support non-zero smooth anchors: the reference-coded \
+             softmax requires an explicit affine offset for every non-reference class"
+        );
+    }
     Ok((spec, design, y_col, parsed.response, y_kind))
 }
 
@@ -3112,6 +3118,12 @@ fn build_multinomial_predict_design(
             "multinomial predict: rebuild design from saved termspec: {err}"
         ))
     })?;
+    if design.affine_offset.iter().any(|value| *value != 0.0) {
+        crate::bail_invalid_estim!(
+            "multinomial predict does not support non-zero smooth anchors: the saved \
+             reference-coded softmax has no per-class affine offset channel"
+        );
+    }
     let x_dense = design
         .design
         .try_to_dense_by_chunks("multinomial predict design")

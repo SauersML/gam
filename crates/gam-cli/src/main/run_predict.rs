@@ -1105,6 +1105,9 @@ pub(crate) fn run_predict_survival(
             noise_offset.len()
         ));
     }
+    let effective_primary_offset = cov_design
+        .compose_offset(primary_offset.view(), "survival CLI covariate block")
+        .map_err(|error| error.to_string())?;
     let p_cov = cov_design.design.ncols();
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
@@ -1215,14 +1218,14 @@ pub(crate) fn run_predict_survival(
                 model,
                 &cov_design.design,
                 &prepared,
-                primary_offset,
+                &effective_primary_offset,
             ),
             SurvivalLikelihoodMode::LatentBinary => run_predict_saved_latent_binary(
                 args,
                 model,
                 &cov_design.design,
                 &prepared,
-                primary_offset,
+                &effective_primary_offset,
             ),
             SurvivalLikelihoodMode::Transformation
             | SurvivalLikelihoodMode::Weibull
@@ -1287,6 +1290,9 @@ pub(crate) fn run_predict_survival(
         )?;
         let raw_sigma_design = build_term_collection_design(threshold_input, &log_sigmaspec)
             .map_err(|e| format!("failed to build survival log-sigma design: {e}"))?;
+        let effective_noise_offset = raw_sigma_design
+            .compose_offset(noise_offset.view(), "survival CLI log-sigma block")
+            .map_err(|error| error.to_string())?;
         let survival_noise_transform = scale_transform_from_payload(
             &model.survival_noise_projection,
             &model.survival_noise_center,
@@ -1334,9 +1340,9 @@ pub(crate) fn run_predict_survival(
                 .as_ref()
                 .map_or(0, |w| w.beta.len()),
             x_threshold: threshold_design.design.clone(),
-            eta_threshold_offset: primary_offset.clone(),
+            eta_threshold_offset: effective_primary_offset.clone(),
             x_log_sigma: prepared_sigma_design,
-            eta_log_sigma_offset: noise_offset.clone(),
+            eta_log_sigma_offset: effective_noise_offset,
             x_link_wiggle: None,
             link_wiggle_knots: link_wiggle_knots.clone(),
             link_wiggle_degree,
@@ -1433,6 +1439,9 @@ pub(crate) fn run_predict_survival(
         let logslope_input = logslope_clipped.as_ref().map_or(data, |arr| arr.view());
         let logslope_design = build_term_collection_design(logslope_input, &logslopespec)
             .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
+        let effective_noise_offset = logslope_design
+            .compose_offset(noise_offset.view(), "survival CLI marginal-slope logslope block")
+            .map_err(|error| error.to_string())?;
         let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
         let (predictor, pred_input, predictor_fit) = build_saved_survival_marginal_slope_predictor(
             model,
@@ -1445,8 +1454,8 @@ pub(crate) fn run_predict_survival(
             &eta_offset_entry,
             &eta_offset_exit,
             &derivative_offset_exit,
-            primary_offset,
-            noise_offset,
+            &effective_primary_offset,
+            &effective_noise_offset,
         )?;
 
         let (eta, mean, eta_se_opt, mean_lo, mean_hi): (
@@ -1590,8 +1599,8 @@ pub(crate) fn run_predict_survival(
                 .to_string(),
         );
     }
-    eta_offset_entry += primary_offset;
-    eta_offset_exit += primary_offset;
+    eta_offset_entry += &effective_primary_offset;
+    eta_offset_exit += &effective_primary_offset;
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     let beta = fit_saved.beta.clone();
     if beta.len() != p {

@@ -1349,6 +1349,9 @@ pub fn predict_survival(
             ),
         });
     }
+    let effective_primary_offset = cov_design
+        .compose_offset(primary_offset.view(), "survival prediction covariate block")
+        .map_err(|error| error.to_string())?;
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
@@ -1391,7 +1394,7 @@ pub fn predict_survival(
             &age_entry,
             &age_exit,
             &cov_design,
-            primary_offset,
+            &effective_primary_offset,
             noise_offset,
             training_headers,
             col_map,
@@ -1536,7 +1539,7 @@ pub fn predict_survival(
             col_map,
             training_headers,
             &cov_design.design,
-            primary_offset,
+            &effective_primary_offset,
             noise_offset,
             &time_build,
             &eta_offset_entry,
@@ -1620,7 +1623,7 @@ pub fn predict_survival(
                             &row_time,
                             &r_eta_exit,
                             &r_deriv_exit,
-                            primary_offset[i],
+                            effective_primary_offset[i],
                         )
                     }
                     SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
@@ -1634,7 +1637,7 @@ pub fn predict_survival(
                             cov_row,
                             r_eta_exit[0],
                             r_deriv_exit[0],
-                            primary_offset[i],
+                            effective_primary_offset[i],
                         )
                     }
                     SurvivalLikelihoodMode::Latent
@@ -1798,6 +1801,12 @@ pub fn predict_competing_risks_survival(
             ),
         });
     }
+    let effective_primary_offset = cov_design
+        .compose_offset(
+            primary_offset.view(),
+            "competing-risks prediction covariate block",
+        )
+        .map_err(|error| error.to_string())?;
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
@@ -2020,7 +2029,7 @@ pub fn predict_competing_risks_survival(
                     &cov_rows[i],
                     r_eta_exit,
                     r_deriv_exit,
-                    primary_offset[i],
+                    effective_primary_offset[i],
                 )
             };
 
@@ -2342,6 +2351,9 @@ fn build_marginal_slope_predict_context(
     let logslope_input = logslope_clipped.as_ref().map_or(data, |arr| arr.view());
     let logslope_design = build_term_collection_design(logslope_input, &logslopespec)
         .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
+    let effective_noise_offset = logslope_design
+        .compose_offset(noise_offset.view(), "survival marginal-slope logslope block")
+        .map_err(|error| error.to_string())?;
 
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     let (predictor, _pred_input, _predictor_fit) = build_saved_survival_marginal_slope_predictor(
@@ -2356,7 +2368,7 @@ fn build_marginal_slope_predict_context(
         eta_offset_exit,
         derivative_offset_exit,
         primary_offset,
-        noise_offset,
+        &effective_noise_offset,
     )?;
 
     let blocks = &fit_saved.blocks;
@@ -2386,7 +2398,7 @@ fn build_marginal_slope_predict_context(
         logslope_design: logslope_design.design.clone(),
         cov_eta,
         z_raw,
-        noise_offset: noise_offset.clone(),
+        noise_offset: effective_noise_offset,
     })
 }
 
@@ -3018,6 +3030,9 @@ fn predict_survival_location_scale_batch(
     let raw_sigma_design =
         gam_terms::smooth::build_term_collection_design(sigma_input, &log_sigmaspec)
             .map_err(|err| format!("failed to build survival log-sigma design: {err}"))?;
+    let effective_noise_offset = raw_sigma_design
+        .compose_offset(noise_offset.view(), "survival location-scale log-sigma block")
+        .map_err(|error| error.to_string())?;
     let survival_noise_transform = scale_transform_from_payload(
         &model.survival_noise_projection,
         &model.survival_noise_center,
@@ -3132,7 +3147,7 @@ fn predict_survival_location_scale_batch(
         x_threshold: threshold_matrix,
         eta_threshold_offset,
         x_log_sigma: prepared_sigma_design,
-        eta_log_sigma_offset: expand_vector(noise_offset),
+        eta_log_sigma_offset: expand_vector(&effective_noise_offset),
         x_link_wiggle: None,
         link_wiggle_knots: link_wiggle_knots.clone(),
         link_wiggle_degree,

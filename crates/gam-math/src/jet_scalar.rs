@@ -244,7 +244,15 @@ fn shared_multiply_add_affine_composed_sum_default<T, const N: usize>(
     multiply_add: impl Fn(&T, &T, &T) -> T,
     affine_compose: impl Fn(&T, f64, f64, [f64; 5]) -> T,
 ) -> T {
-    (0..N).fold(constant(0.0), |sum, term| {
+    let (representatives, term_sources, source_count) =
+        canonical_shared_source_schedule(|term, representative| {
+            std::ptr::eq(lefts[term], lefts[representative])
+                && addend_scales[term] == addend_scales[representative]
+        });
+    let (value, source_derivatives) =
+        aggregate_shared_source_derivatives(&term_sources, input_scales, derivative_stacks);
+    (0..source_count).fold(constant(value), |sum, source| {
+        let term = representatives[source];
         let inner = if addend_scales[term] == 0.0 {
             mul(lefts[term], right)
         } else if addend_scales[term] == 1.0 {
@@ -252,7 +260,7 @@ fn shared_multiply_add_affine_composed_sum_default<T, const N: usize>(
         } else {
             multiply_add(lefts[term], right, &scale(addend, addend_scales[term]))
         };
-        let composed = affine_compose(&inner, input_scales[term], 0.0, derivative_stacks[term]);
+        let composed = affine_compose(&inner, 1.0, 0.0, source_derivatives[source]);
         add(&sum, &composed)
     })
 }
@@ -283,6 +291,32 @@ pub(crate) fn canonical_shared_source_schedule<const N: usize>(
         term_sources[term] = source;
     }
     (representatives, term_sources, source_count)
+}
+
+/// Sum each source's affine-scaled derivative stack through fourth order.
+///
+/// For a term `f(s*x)`, derivative order `r` contributes `f^(r) * s^r`.
+/// The primal value is accumulated once in original term order, while source
+/// stacks deliberately keep a zero value channel so adding their composed jets
+/// cannot perturb that authoritative primal sum.
+#[inline(always)]
+pub(crate) fn aggregate_shared_source_derivatives<const N: usize>(
+    term_sources: &[usize; N],
+    input_scales: &[f64; N],
+    derivative_stacks: &[[f64; 5]; N],
+) -> (f64, [[f64; 5]; N]) {
+    let mut value = 0.0;
+    let mut source_derivatives = [[0.0; 5]; N];
+    for term in 0..N {
+        value += derivative_stacks[term][0];
+        let source = term_sources[term];
+        let mut scale_power = input_scales[term];
+        for order in 1..5 {
+            source_derivatives[source][order] += derivative_stacks[term][order] * scale_power;
+            scale_power *= input_scales[term];
+        }
+    }
+    (value, source_derivatives)
 }
 
 /// A truncated-Taylor scalar carrying derivatives in `K` primaries.
@@ -1648,25 +1682,16 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
                 std::ptr::eq(lefts[term], lefts[representative])
                     && addend_scales[term] == addend_scales[representative]
             });
+        let (value, source_derivatives) =
+            aggregate_shared_source_derivatives(&term_sources, input_scales, derivative_stacks);
         let source_gradients = arena.zeros(source_count * dimension);
-        let mut source_firsts = [0.0; N];
-        let mut source_seconds = [0.0; N];
         let gradient = arena.zeros(dimension);
         let hessian = arena.zeros(dimension * dimension);
-        let mut value = 0.0;
         let mut right_first = 0.0;
         let mut addend_first = 0.0;
-        for term in 0..N {
-            let first = derivative_stacks[term][1] * input_scales[term];
-            let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
-            let source = term_sources[term];
-            source_firsts[source] += first;
-            source_seconds[source] += second;
-            value += derivative_stacks[term][0];
-        }
         for source in 0..source_count {
             let term = representatives[source];
-            let first = source_firsts[source];
+            let first = source_derivatives[source][1];
             right_first += first * lefts[term].v;
             addend_first += first * addend_scales[term];
             for primary in 0..dimension {
@@ -1709,8 +1734,8 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
                     let local_product_hessian = lefts[term].g[primary] * right.g[other]
                         + lefts[term].g[other] * right.g[primary]
                         + lefts[term].h[index] * right.v;
-                    channel += source_firsts[source] * local_product_hessian
-                        + source_seconds[source]
+                    channel += source_derivatives[source][1] * local_product_hessian
+                        + source_derivatives[source][2]
                             * source_gradients[source * dimension + primary]
                             * source_gradients[source * dimension + other];
                 }
@@ -3358,23 +3383,16 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
                 std::ptr::eq(lefts[term], lefts[representative])
                     && addend_scales[term] == addend_scales[representative]
             });
+        let (value, source_derivatives) =
+            aggregate_shared_source_derivatives(&term_sources, input_scales, derivative_stacks);
         let mut source_gradients = [[0.0; K]; N];
-        let mut source_firsts = [0.0; N];
-        let mut source_seconds = [0.0; N];
         let mut out = crate::jet_tower::Tower2::zero();
+        out.v = value;
         let mut right_first = 0.0;
         let mut addend_first = 0.0;
-        for term in 0..N {
-            let first = derivative_stacks[term][1] * input_scales[term];
-            let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
-            let source = term_sources[term];
-            source_firsts[source] += first;
-            source_seconds[source] += second;
-            out.v += derivative_stacks[term][0];
-        }
         for source in 0..source_count {
             let term = representatives[source];
-            let first = source_firsts[source];
+            let first = source_derivatives[source][1];
             right_first += first * lefts[term].0.v;
             addend_first += first * addend_scales[term];
             for primary in 0..K {
@@ -3417,8 +3435,8 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
                     let local_product_hessian = lefts[term].0.g[primary] * right.0.g[other]
                         + lefts[term].0.g[other] * right.0.g[primary]
                         + lefts[term].0.h[primary][other] * right.0.v;
-                    channel += source_firsts[source] * local_product_hessian
-                        + source_seconds[source]
+                    channel += source_derivatives[source][1] * local_product_hessian
+                        + source_derivatives[source][2]
                             * source_gradients[source][primary]
                             * source_gradients[source][other];
                 }
@@ -5937,11 +5955,16 @@ mod tests {
             vars[1].mul(&vars[1]).add(&vars[0].scale(0.3)),
             vars[0].mul(&vars[0]).sub(&vars[1].scale(-0.2)),
         ];
-        let lefts: [Tower4<K>; N] = std::array::from_fn(|term| upstream[term % upstream.len()]);
+        let mut lefts: [Tower4<K>; N] = std::array::from_fn(|term| upstream[term % upstream.len()]);
+        lefts[4] = lefts[0];
+        lefts[5] = lefts[0];
         let right = upstream[1];
         let addend = upstream[2];
         let addend_scales: [f64; N] = std::array::from_fn(|term| [-0.0, 1.0, -0.7, 0.25][term % 4]);
-        let input_scales: [f64; N] = std::array::from_fn(|term| [0.0, -1.3, 0.45, 1.1][term % 4]);
+        let mut input_scales: [f64; N] =
+            std::array::from_fn(|term| [0.0, -1.3, 0.45, 1.1][term % 4]);
+        input_scales[0] = -1.1;
+        input_scales[4] = 1.1;
         let stacks: [[f64; 5]; N] = std::array::from_fn(|term| {
             let t = term as f64 + 1.0;
             [0.17 * t, -0.11 * t, 0.07 * t, -0.03 * t, 0.013 * t]
@@ -5966,8 +5989,10 @@ mod tests {
             std::array::from_fn(|term| FixedRuntimeJet::from_inner(lefts[term]));
         let wrapped_right = FixedRuntimeJet::from_inner(right);
         let wrapped_addend = FixedRuntimeJet::from_inner(addend);
-        let wrapped_left_refs: [&FixedRuntimeJet<Tower4<K>, K>; N] =
+        let mut wrapped_left_refs: [&FixedRuntimeJet<Tower4<K>, K>; N] =
             std::array::from_fn(|term| &wrapped_lefts[term]);
+        wrapped_left_refs[4] = &wrapped_lefts[0];
+        wrapped_left_refs[5] = &wrapped_lefts[0];
         let actual = FixedRuntimeJet::<Tower4<K>, K>::shared_multiply_add_affine_composed_sum(
             &wrapped_left_refs,
             &wrapped_right,
@@ -5981,10 +6006,10 @@ mod tests {
         .into_inner();
 
         let same = |label: &str, got: f64, want: f64| {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "{label}: got={got:+.17e}, want={want:+.17e}"
+            let tolerance = 2.0e-13 * got.abs().max(want.abs()).max(1.0);
+            assert!(
+                (got - want).abs() <= tolerance,
+                "{label}: got={got:+.17e}, want={want:+.17e}, tolerance={tolerance:.3e}"
             );
         };
         same("value", actual.v, expected.v);
