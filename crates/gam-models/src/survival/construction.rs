@@ -3617,7 +3617,6 @@ pub fn build_time_varying_survival_covariate_template(
     }
     let num_internal_knots = time_k - (time_degree + 1);
 
-    let log_entry = age_entry.mapv(|t| t.max(1e-12).ln());
     let log_exit = age_exit.mapv(|t| t.max(1e-12).ln());
 
     let time_spec = BSplineBasisSpec {
@@ -3646,6 +3645,82 @@ pub fn build_time_varying_survival_covariate_template(
         }
     };
 
+    let time_penalties = time_build
+        .active_penalties
+        .into_iter()
+        .map(|penalty| penalty.matrix)
+        .collect();
+
+    finish_time_varying_survival_covariate_template(
+        age_entry,
+        age_exit,
+        time_degree,
+        knots,
+        time_design_exit,
+        time_penalties,
+        block_name,
+    )
+}
+
+/// Replay a fit-time threshold/log-scale time margin from its resolved knots.
+/// Prediction and saved ALO use this path so the prediction sample can never
+/// move the spline basis by re-estimating quantile knots.
+pub fn replay_time_varying_survival_covariate_template(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    time_basis: &SurvivalCovariateTimeBasis,
+    block_name: &str,
+) -> Result<SurvivalCovariateTermBlockTemplate, String> {
+    let log_exit = age_exit.mapv(|t| t.max(1e-12).ln());
+    let knots = Array1::from_vec(time_basis.knots.clone());
+    let time_build = build_bspline_basis_1d(
+        log_exit.view(),
+        &BSplineBasisSpec {
+            degree: time_basis.degree,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Provided(knots.clone()),
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
+        },
+    )
+    .map_err(|e| format!("failed to replay {block_name} time-margin B-spline basis: {e}"))?;
+    let time_design_exit = time_build.design.to_dense();
+    let time_penalties = time_build
+        .active_penalties
+        .into_iter()
+        .map(|penalty| penalty.matrix)
+        .collect();
+    finish_time_varying_survival_covariate_template(
+        age_entry,
+        age_exit,
+        time_basis.degree,
+        knots,
+        time_design_exit,
+        time_penalties,
+        block_name,
+    )
+}
+
+fn finish_time_varying_survival_covariate_template(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    time_degree: usize,
+    knots: Array1<f64>,
+    time_design_exit: Array2<f64>,
+    time_penalties: Vec<Array2<f64>>,
+    block_name: &str,
+) -> Result<SurvivalCovariateTermBlockTemplate, String> {
+    if age_entry.len() != age_exit.len() {
+        return Err(format!(
+            "{block_name} time-margin entry/exit row mismatch: {} versus {}",
+            age_entry.len(),
+            age_exit.len()
+        ));
+    }
+    let log_entry = age_entry.mapv(|t| t.max(1e-12).ln());
+    let log_exit = age_exit.mapv(|t| t.max(1e-12).ln());
     let time_build_entry = build_bspline_basis_1d(
         log_entry.view(),
         &BSplineBasisSpec {
@@ -3661,10 +3736,12 @@ pub fn build_time_varying_survival_covariate_template(
     .map_err(|e| format!("failed to evaluate {block_name} time-margin basis at entry: {e}"))?;
     let time_design_entry = time_build_entry.design.to_dense();
     let p_time = time_design_exit.ncols();
+    if p_time == 0 {
+        return Err(format!(
+            "{block_name} time-margin basis resolved to zero columns"
+        ));
+    }
     let mut time_design_derivative_exit = Array2::<f64>::zeros((age_exit.len(), p_time));
-    // Per-row derivative-basis evaluation is independent; each row owns its
-    // own small `deriv_buf`. par_chunks_mut over the (n × p_time) output rows
-    // hands disjoint mutable row-slices to rayon workers.
     time_design_derivative_exit
         .as_slice_mut()
         .expect("zeros are contiguous")
@@ -3687,12 +3764,6 @@ pub fn build_time_varying_survival_covariate_template(
             }
             Ok(())
         })?;
-
-    let time_penalties = time_build
-        .active_penalties
-        .into_iter()
-        .map(|penalty| penalty.matrix)
-        .collect();
 
     Ok(SurvivalCovariateTermBlockTemplate::TimeVarying {
         time_basis: SurvivalCovariateTimeBasis {

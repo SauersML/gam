@@ -25,14 +25,15 @@ use crate::fit_orchestration::{FitConfig, StandardFitResult};
 use crate::inference::model::{
     FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind, SavedAnchorComponent,
     SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization, SavedResidualCascade,
-    SavedSplineScan, TransformationScoreCalibration,
+    SavedSplineScan, SavedSurvivalLocationScaleStructure, TransformationScoreCalibration,
 };
 use crate::scale_design::ScaleDeviationTransform;
 use crate::survival::construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, survival_baseline_targetname,
 };
 use crate::survival::location_scale::{
-    ResidualDistribution, residual_distribution_from_inverse_link,
+    ResidualDistribution, SurvivalCovariateTimeBasis,
+    SurvivalLocationScaleTimeParameterization, residual_distribution_from_inverse_link,
 };
 use crate::transformation_normal::TransformationNormalFamily;
 use faer::Side;
@@ -974,6 +975,7 @@ pub struct SurvivalMarginalSlopeInputs<'a> {
     /// block in the saved block count.
     pub influence_absorber_width: Option<usize>,
     pub influence_absorber_design: Option<&'a Array2<f64>>,
+    pub score_covariance: &'a Array2<f64>,
 }
 
 /// Construct a Royston-Parmar survival [`FittedModelPayload`] through the
@@ -1073,6 +1075,14 @@ pub fn assemble_survival_marginal_slope_payload(
             .map(|row| row.to_vec())
             .collect()
     });
+    payload.survival_marginal_slope_score_covariance = Some(
+        inputs
+            .score_covariance
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect(),
+    );
     source.apply_to(&mut payload);
     payload
 }
@@ -1183,8 +1193,8 @@ pub fn assemble_survival_transformation_payload(
 /// Source-agnostic semantic content of a survival location-scale
 /// (Royston-Parmar with a learned residual link) saved model. Centralizing
 /// fixes the drift where CLI and FFI disagreed on `formula_noise`,
-/// `baseline_timewiggle_*`, and `survival_noise_projection_ridge_alpha`.
-pub struct SurvivalLocationScaleInputs<'a> {
+/// `baseline_timewiggle_*`, and exact location-scale replay topology.
+pub struct SurvivalLocationScaleInputs {
     pub formula: String,
     pub data_schema: DataSchema,
     /// Fit result with the fitted inverse-link state and link-wiggle artifacts
@@ -1205,11 +1215,13 @@ pub struct SurvivalLocationScaleInputs<'a> {
     pub time_basis: SavedSurvivalTimeBasis,
     pub ridge_lambda: f64,
     pub survival_likelihood_label: String,
+    pub time_parameterization: SurvivalLocationScaleTimeParameterization,
+    pub threshold_time_basis: Option<SurvivalCovariateTimeBasis>,
+    pub log_sigma_time_basis: Option<SurvivalCovariateTimeBasis>,
     pub formula_noise: Option<String>,
     pub survival_beta_time: Vec<f64>,
     pub survival_beta_threshold: Vec<f64>,
     pub survival_beta_log_sigma: Vec<f64>,
-    pub noise_transform: &'a ScaleDeviationTransform,
     pub resolved_thresholdspec: TermCollectionSpec,
     pub resolved_log_sigmaspec: TermCollectionSpec,
 }
@@ -1217,7 +1229,7 @@ pub struct SurvivalLocationScaleInputs<'a> {
 /// Assemble the canonical survival location-scale payload (the single source of
 /// truth for that on-disk contract).
 pub fn assemble_survival_location_scale_payload(
-    inputs: SurvivalLocationScaleInputs<'_>,
+    inputs: SurvivalLocationScaleInputs,
     source: SavedModelSourceMetadata,
 ) -> FittedModelPayload {
     let survival_distribution =
@@ -1254,24 +1266,15 @@ pub fn assemble_survival_location_scale_payload(
     payload.apply_survival_time_basis(&inputs.time_basis);
     payload.survivalridge_lambda = Some(inputs.ridge_lambda);
     payload.survival_likelihood = Some(inputs.survival_likelihood_label);
+    payload.survival_location_scale_structure = Some(SavedSurvivalLocationScaleStructure {
+        time_parameterization: inputs.time_parameterization,
+        threshold_time_basis: inputs.threshold_time_basis,
+        log_sigma_time_basis: inputs.log_sigma_time_basis,
+    });
     payload.formula_noise = inputs.formula_noise;
     payload.survival_beta_time = Some(inputs.survival_beta_time);
     payload.survival_beta_threshold = Some(inputs.survival_beta_threshold);
     payload.survival_beta_log_sigma = Some(inputs.survival_beta_log_sigma);
-    payload.survival_noise_projection = Some(
-        inputs
-            .noise_transform
-            .projection_coef
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
-    );
-    payload.survival_noise_center = Some(inputs.noise_transform.weighted_column_mean.to_vec());
-    payload.survival_noise_scale = Some(inputs.noise_transform.rescale.to_vec());
-    payload.survival_noise_non_intercept_start = Some(inputs.noise_transform.non_intercept_start);
-    payload.survival_noise_projection_ridge_alpha =
-        Some(inputs.noise_transform.projection_ridge_alpha);
     payload.survival_distribution = survival_distribution;
     payload.resolved_termspec = Some(inputs.resolved_thresholdspec);
     payload.resolved_termspec_noise = Some(inputs.resolved_log_sigmaspec);

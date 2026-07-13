@@ -2,7 +2,10 @@ use crate::bms::{LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIn
 use crate::survival::construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
 };
-use crate::survival::location_scale::ResidualDistribution;
+use crate::survival::location_scale::{
+    ResidualDistribution, SurvivalCovariateTimeBasis,
+    SurvivalLocationScaleTimeParameterization,
+};
 use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::wiggle::{
     WigglePenaltyMetadata, canonical_wiggle_function_penalties,
@@ -56,7 +59,17 @@ use std::path::Path;
 /// Do NOT bump for purely additive `Option<T>` fields that the save-time
 /// invariant (`validate_for_persistence`) does not yet require. Those are
 /// forward-compatible.
-pub const MODEL_PAYLOAD_VERSION: u32 = 10;
+pub const MODEL_PAYLOAD_VERSION: u32 = 11;
+
+/// Exact topology required to replay a saved survival location-scale fit.
+/// This is a required v11 payload field: `None` is explicit for every other
+/// family, while location-scale persistence requires `Some`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedSurvivalLocationScaleStructure {
+    pub time_parameterization: SurvivalLocationScaleTimeParameterization,
+    pub threshold_time_basis: Option<SurvivalCovariateTimeBasis>,
+    pub log_sigma_time_basis: Option<SurvivalCovariateTimeBasis>,
+}
 
 /// Schema-free saved-model metadata keyed by stable group id.
 ///
@@ -387,10 +400,13 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub influence_absorber_width: Option<usize>,
     /// Exact residualized training-row design paired with the trailing
-    /// survival marginal-slope influence block.  Mandatory in the v10 schema:
+    /// survival marginal-slope influence block. Mandatory in the v11 schema:
     /// `None` is the explicit no-absorber state, while an absent JSON field is
     /// rejected rather than interpreted as an old-model fallback.
     pub influence_absorber_design: Option<Vec<Vec<f64>>>,
+    /// Exact latent-score covariance used by the fitted survival
+    /// marginal-slope preservation map. Mandatory in the current schema.
+    pub survival_marginal_slope_score_covariance: Option<Vec<Vec<f64>>>,
     #[serde(default)]
     pub survival_entry: Option<String>,
     #[serde(default)]
@@ -429,24 +445,16 @@ pub struct FittedModelPayload {
     pub survivalridge_lambda: Option<f64>,
     #[serde(default)]
     pub survival_likelihood: Option<String>,
+    /// Exact location-scale topology. This field intentionally has no serde
+    /// default: every v11 artifact must state `null` for non-location-scale
+    /// families or carry the complete structure for location-scale replay.
+    pub survival_location_scale_structure: Option<SavedSurvivalLocationScaleStructure>,
     #[serde(default)]
     pub survival_beta_time: Option<Vec<f64>>,
     #[serde(default)]
     pub survival_beta_threshold: Option<Vec<f64>>,
     #[serde(default)]
     pub survival_beta_log_sigma: Option<Vec<f64>>,
-    #[serde(default)]
-    pub survival_noise_projection: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
-    pub survival_noise_center: Option<Vec<f64>>,
-    #[serde(default)]
-    pub survival_noise_scale: Option<Vec<f64>>,
-    #[serde(default)]
-    pub survival_noise_non_intercept_start: Option<usize>,
-    /// Survival analog of `noise_projection_ridge_alpha`: the Tikhonov ridge
-    /// used when fitting the survival log-sigma projection.
-    #[serde(default)]
-    pub survival_noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
     pub survival_distribution: Option<ResidualDistribution>,
     #[serde(default)]
@@ -739,6 +747,7 @@ impl FittedModelPayload {
             link_deviation_runtime: None,
             influence_absorber_width: None,
             influence_absorber_design: None,
+            survival_marginal_slope_score_covariance: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -758,14 +767,10 @@ impl FittedModelPayload {
             survival_time_anchor: None,
             survivalridge_lambda: None,
             survival_likelihood: None,
+            survival_location_scale_structure: None,
             survival_beta_time: None,
             survival_beta_threshold: None,
             survival_beta_log_sigma: None,
-            survival_noise_projection: None,
-            survival_noise_center: None,
-            survival_noise_scale: None,
-            survival_noise_non_intercept_start: None,
-            survival_noise_projection_ridge_alpha: None,
             survival_distribution: None,
             training_headers: None,
             training_table_kind: "unknown".to_string(),
@@ -1171,10 +1176,47 @@ fn validate_survival_saved_block_matches_payload(
     Ok(block.beta.len())
 }
 
+fn validate_survival_covariate_time_basis(
+    basis: &SurvivalCovariateTimeBasis,
+    label: &str,
+) -> Result<usize, FittedModelError> {
+    let minimum_knots = basis.degree.checked_add(2).ok_or_else(|| {
+        FittedModelError::SchemaMismatch {
+            reason: format!("location-scale survival saved {label} degree overflows"),
+        }
+    })?;
+    if basis.knots.len() < minimum_knots {
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "location-scale survival saved {label} knot vector has length {}, but degree {} requires at least {minimum_knots}",
+                basis.knots.len(),
+                basis.degree
+            ),
+        });
+    }
+    if basis.knots.iter().any(|value| !value.is_finite())
+        || basis.knots.windows(2).any(|pair| pair[1] < pair[0])
+        || basis.knots.first() == basis.knots.last()
+    {
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "location-scale survival saved {label} knots must be finite, nondecreasing, and span a nonzero interval"
+            ),
+        });
+    }
+    Ok(basis.knots.len() - basis.degree - 1)
+}
+
 fn validate_survival_location_scale_saved_fit(
     payload: &FittedModelPayload,
     link_wiggle: Option<&SavedLinkWiggleRuntime>,
 ) -> Result<(), FittedModelError> {
+    let structure = payload
+        .survival_location_scale_structure
+        .as_ref()
+        .ok_or_else(|| FittedModelError::MissingField {
+            reason: "location-scale survival model is missing exact replay structure".to_string(),
+        })?;
     let fit = payload
         .fit_result
         .as_ref()
@@ -1200,6 +1242,26 @@ fn validate_survival_location_scale_saved_fit(
         payload.survival_beta_log_sigma.as_ref(),
         "log-sigma",
     )?;
+    if let Some(basis) = structure.threshold_time_basis.as_ref() {
+        let width = validate_survival_covariate_time_basis(basis, "threshold time basis")?;
+        if p_threshold % width != 0 {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "location-scale survival threshold width {p_threshold} is not divisible by its saved time-basis width {width}"
+                ),
+            });
+        }
+    }
+    if let Some(basis) = structure.log_sigma_time_basis.as_ref() {
+        let width = validate_survival_covariate_time_basis(basis, "log-sigma time basis")?;
+        if p_log_sigma % width != 0 {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "location-scale survival log-sigma width {p_log_sigma} is not divisible by its saved time-basis width {width}"
+                ),
+            });
+        }
+    }
     let p_wiggle = match link_wiggle {
         Some(runtime) => {
             let block = fit.block_by_role(BlockRole::LinkWiggle).ok_or_else(|| {
@@ -1229,6 +1291,44 @@ fn validate_survival_location_scale_saved_fit(
         }
     };
     let expected = p_time + p_threshold + p_log_sigma + p_wiggle;
+
+    match structure.time_parameterization {
+        SurvivalLocationScaleTimeParameterization::MonotoneWarp => {}
+        SurvivalLocationScaleTimeParameterization::ReducedParametricAft => {
+            if payload.beta_baseline_timewiggle.is_some() || link_wiggle.is_some() {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "reduced parametric-AFT location-scale survival cannot carry a time or link wiggle"
+                        .to_string(),
+                });
+            }
+            let time = fit
+                .block_by_role(BlockRole::Time)
+                .expect("time block was validated above");
+            if time.beta.iter().any(|value| *value != 0.0) {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "reduced parametric-AFT location-scale survival time block must be the exact zero affine lift"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    if let Some(timewiggle_beta) = payload.beta_baseline_timewiggle.as_ref() {
+        let time = fit
+            .block_by_role(BlockRole::Time)
+            .expect("time block was validated above");
+        if timewiggle_beta.len() > time.beta.len()
+            || time
+                .beta
+                .slice(ndarray::s![time.beta.len() - timewiggle_beta.len()..])
+                .to_vec()
+                != *timewiggle_beta
+        {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: "location-scale survival baseline-timewiggle coefficients must equal the protected tail of the time block"
+                    .to_string(),
+            });
+        }
+    }
 
     if let Some(cov) = fit.beta_covariance()
         && (cov.nrows() != expected || cov.ncols() != expected)
@@ -4631,6 +4731,17 @@ impl FittedModel {
                     .to_string(),
             });
         }
+        let is_survival_location_scale = matches!(self.family_state, FittedFamily::Survival { .. })
+            && self
+                .survival_likelihood
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("location-scale"));
+        if !is_survival_location_scale && self.survival_location_scale_structure.is_some() {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: "non-location-scale model carries location-scale replay structure"
+                    .to_string(),
+            });
+        }
         let has_any_saved_link_wiggle = self.linkwiggle_knots.is_some()
             || self.linkwiggle_degree.is_some()
             || self.linkwiggle_penalty_metadata.is_some()
@@ -4685,11 +4796,7 @@ impl FittedModel {
                 });
             }
         }
-        if self
-            .survival_likelihood
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("location-scale"))
-        {
+        if is_survival_location_scale {
             validate_survival_location_scale_saved_fit(self.payload(), saved_link_wiggle.as_ref())?;
         }
 
@@ -4854,33 +4961,6 @@ impl FittedModel {
         }
         if let Some(v) = self.survival_beta_log_sigma.as_ref() {
             validate_all_finite("survival_beta_log_sigma", v.iter().copied()).map_err(corrupt)?;
-        }
-        if let Some(v) = self.survival_noise_projection.as_ref() {
-            validate_all_finite("survival_noise_projection", v.iter().flatten().copied())
-                .map_err(corrupt)?;
-            if self.survival_noise_projection_ridge_alpha.is_none() {
-                return Err(FittedModelError::MissingField {
-                    reason:
-                        "model has survival_noise_projection but is missing survival_noise_projection_ridge_alpha; refit"
-                            .to_string(),
-                });
-            }
-        }
-        if let Some(v) = self.survival_noise_center.as_ref() {
-            validate_all_finite("survival_noise_center", v.iter().copied()).map_err(corrupt)?;
-        }
-        if let Some(v) = self.survival_noise_projection_ridge_alpha {
-            ensure_finite_scalar("survival_noise_projection_ridge_alpha", v).map_err(corrupt)?;
-            if v < 0.0 {
-                return Err(FittedModelError::InvalidInput {
-                    reason: format!(
-                        "survival_noise_projection_ridge_alpha must be non-negative, got {v}"
-                    ),
-                });
-            }
-        }
-        if let Some(v) = self.survival_noise_scale.as_ref() {
-            validate_all_finite("survival_noise_scale", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.mixture_link_param_covariance.as_ref() {
             validate_all_finite("mixture_link_param_covariance", v.iter().flatten().copied())

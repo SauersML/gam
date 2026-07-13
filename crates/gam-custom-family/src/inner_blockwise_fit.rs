@@ -7,6 +7,111 @@ use super::blockwise_solve::BlockWorkingSetUpdaterExt;
 use super::*;
 use gam_solve::row_measure::RowSubsampleMaskExt;
 
+pub(crate) struct ExactJointModeCurvatureCertificate {
+    pub(crate) workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    pub(crate) minimum_whitened_eigenvalue: f64,
+    pub(crate) numerical_floor: f64,
+}
+
+impl ExactJointModeCurvatureCertificate {
+    pub(crate) fn has_resolvable_negative_curvature(&self) -> bool {
+        self.minimum_whitened_eigenvalue < -self.numerical_floor
+    }
+}
+
+/// Rebuild the exact penalized coefficient Hessian at the coefficient vector
+/// that an inner solve is about to return.
+///
+/// A first-order/stall exit inside the Newton cycle is only tentative for a
+/// nonconvex family: the cycle's spectrum belongs to its head β, while an
+/// accepted step changes β before several later exits can fire. This fresh
+/// certificate uses the same structural dense materialization required by the
+/// Laplace log-determinant, adds only penalties that belong to the objective,
+/// and tests inertia in the scale-aware trust metric. Solver stabilization,
+/// reflected curvature, and trace-only ridge are deliberately excluded.
+pub(crate) fn exact_joint_mode_curvature_certificate<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    joint_mode_diagonal_ridge: f64,
+    joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
+    total_p: usize,
+) -> Result<ExactJointModeCurvatureCertificate, String> {
+    let workspace = family
+        .exact_newton_joint_hessian_workspace_with_options(states, specs, options)?;
+    let source = match workspace.as_ref() {
+        Some(workspace) => exact_newton_joint_hessian_source_from_workspace(
+            workspace,
+            total_p,
+            MaterializationIntent::LogdetFactorization,
+            "fresh exact joint-mode curvature certificate",
+        )?,
+        None => None,
+    };
+    let mut hessian = match source {
+        Some(source) => materialize_joint_hessian_source(
+            &source,
+            total_p,
+            "fresh exact joint-mode curvature certificate",
+        )?,
+        None => exact_newton_joint_hessian_symmetrized(
+            family,
+            states,
+            specs,
+            total_p,
+            "fresh exact joint-mode curvature certificate",
+        )?
+        .ok_or_else(|| {
+            "fresh exact joint-mode curvature certificate requires a joint Hessian".to_string()
+        })?,
+    };
+    let mut metric = joint_penalty_preconditioner_diag(
+        &hessian.diag().to_owned(),
+        ranges,
+        s_lambdas,
+        joint_mode_diagonal_ridge,
+        joint_bundle,
+    );
+    if let Some(floor) = family.joint_trust_metric_block_floor(states, specs)?
+        && floor.len() == metric.len()
+    {
+        for (value, floor_value) in metric.iter_mut().zip(floor.iter()) {
+            if floor_value.is_finite() && *floor_value > *value {
+                *value = *floor_value;
+            }
+        }
+    }
+    add_joint_penalty_to_matrix(
+        &mut hessian,
+        ranges,
+        s_lambdas,
+        joint_mode_diagonal_ridge,
+        joint_bundle,
+    );
+    let zero_rhs = Array1::<f64>::zeros(total_p);
+    let spectrum = whitened_spectrum::WhitenedHessianSpectrum::decompose(
+        &hessian,
+        &zero_rhs,
+        &metric,
+        KKT_REFUSAL_RANK_TOL,
+    )?;
+    let minimum_whitened_eigenvalue = spectrum
+        .gamma
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    Ok(ExactJointModeCurvatureCertificate {
+        workspace,
+        minimum_whitened_eigenvalue,
+        numerical_floor: spectrum.numerical_floor,
+    })
+}
+
 pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -253,26 +358,65 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             }
             cached_active_sets = seed.active_sets.clone();
             refresh_all_block_etas(family, specs, &mut states)?;
-            log::info!(
-                "[PIRLS/joint-Newton warm-start] reused cached same-rho inner mode | cycles={} logdet_h={:.6e} logdet_s={:.6e}",
-                cached.cycles,
-                cached.block_logdet_h,
-                cached.block_logdet_s,
-            );
-            return Ok(BlockwiseInnerResult {
-                block_states: states,
-                active_sets: normalize_active_sets(cached_active_sets),
-                log_likelihood: cached.log_likelihood,
-                penalty_value: cached.penalty_value,
-                cycles: cached.cycles,
-                converged: cached.converged,
-                block_logdet_h: cached.block_logdet_h,
-                block_logdet_s: cached.block_logdet_s,
-                s_lambdas,
-                joint_workspace: cached.joint_workspace.clone(),
-                kkt_residual: cached.kkt_residual.clone(),
-                active_constraints: cached.active_constraints.clone(),
-            });
+            let local_ranges = block_param_ranges(specs);
+            let local_joint_mode_diagonal_ridge =
+                if ridge > 0.0 && options.ridge_policy.accounts_for_objective() {
+                    ridge
+                } else {
+                    0.0
+                };
+            let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+            let joint_constraints = assemble_joint_linear_constraints(
+                &block_constraints,
+                &local_ranges,
+                total_joint_p,
+            )?;
+            let mut cached_mode_acceptable = true;
+            let mut certified_workspace = cached.joint_workspace.clone();
+            if joint_constraints.is_none() && !family.joint_jeffreys_term_required() {
+                let certificate = exact_joint_mode_curvature_certificate(
+                    family,
+                    &states,
+                    specs,
+                    options,
+                    &local_ranges,
+                    &s_lambdas,
+                    local_joint_mode_diagonal_ridge,
+                    joint_bundle,
+                    total_joint_p,
+                )?;
+                cached_mode_acceptable = !certificate.has_resolvable_negative_curvature();
+                certified_workspace = certificate.workspace;
+                if !cached_mode_acceptable {
+                    log::warn!(
+                        "[PIRLS/joint-Newton warm-start] refused cached same-rho inner mode: fresh returned-mode curvature lambda_min={:.6e} < -floor={:.6e}; retaining beta only as an uncertified solver seed",
+                        certificate.minimum_whitened_eigenvalue,
+                        certificate.numerical_floor,
+                    );
+                }
+            }
+            if cached_mode_acceptable {
+                log::info!(
+                    "[PIRLS/joint-Newton warm-start] reused cached same-rho inner mode | cycles={} logdet_h={:.6e} logdet_s={:.6e}",
+                    cached.cycles,
+                    cached.block_logdet_h,
+                    cached.block_logdet_s,
+                );
+                return Ok(BlockwiseInnerResult {
+                    block_states: states,
+                    active_sets: normalize_active_sets(cached_active_sets),
+                    log_likelihood: cached.log_likelihood,
+                    penalty_value: cached.penalty_value,
+                    cycles: cached.cycles,
+                    converged: cached.converged,
+                    block_logdet_h: cached.block_logdet_h,
+                    block_logdet_s: cached.block_logdet_s,
+                    s_lambdas,
+                    joint_workspace: certified_workspace,
+                    kkt_residual: cached.kkt_residual.clone(),
+                    active_constraints: cached.active_constraints.clone(),
+                });
+            }
         }
         // Cold-start path: copy prior β where dimensions match
         // (best-effort; mismatched blocks keep the freshly-built
@@ -5555,6 +5699,46 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // scale-aware tolerances); whether convergence is *reachable within
             // the cycle budget* is judged by the deterministic descent-rate
             // guard alongside the residual-stall detector above.
+        }
+
+        if converged {
+            let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+            let joint_constraints =
+                assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
+            // A full-space PSD test is exact for the unconstrained CTN mode.
+            // Constrained and Jeffreys-augmented families require their own
+            // critical-cone / augmented-objective certificate and retain the
+            // existing first-order contract here.
+            if joint_constraints.is_none() && joint_jeffreys_subspace.is_none() {
+                let certificate = exact_joint_mode_curvature_certificate(
+                    family,
+                    &states,
+                    specs,
+                    options,
+                    &ranges,
+                    &s_lambdas,
+                    joint_mode_diagonal_ridge,
+                    joint_bundle,
+                    total_p,
+                )?;
+                let has_negative_curvature = certificate.has_resolvable_negative_curvature();
+                let minimum_whitened_eigenvalue = certificate.minimum_whitened_eigenvalue;
+                let numerical_floor = certificate.numerical_floor;
+                cached_joint_workspace = certificate.workspace;
+                if has_negative_curvature {
+                    return Err(format!(
+                        "joint Newton tentative convergence rejected by fresh exact returned-mode curvature: lambda_min={:.6e} < -floor={:.6e}; an indefinite coefficient point cannot define a Laplace mode",
+                        minimum_whitened_eigenvalue,
+                        numerical_floor,
+                    ));
+                } else {
+                    log::info!(
+                        "[PIRLS/joint-Newton mode certificate] returned beta certified from fresh exact curvature: lambda_min={:.6e}, floor={:.6e}",
+                        minimum_whitened_eigenvalue,
+                        numerical_floor,
+                    );
+                }
+            }
         }
 
         // Explicit terminal verdict for the joint-Newton inner solve.

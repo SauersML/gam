@@ -700,7 +700,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             effective_timewiggle.as_ref(),
             None,
         )?;
-        let time_design_exit = prepared.time_design_exit.clone();
         let phase_start = std::time::Instant::now();
         log::info!(
             "[PHASE] survival-location-scale fit start n={}",
@@ -754,10 +753,9 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             fit_result.artifacts.survival_link_wiggle_knots = fit.wiggle_knots.clone();
             fit_result.artifacts.survival_link_wiggle_degree = fit.wiggle_degree;
             // Source-specific work: extract the baseline-timewiggle block (from
-            // the first block-state beta), re-encode the survival noise
-            // scale-deviation transform, and freeze the threshold / log-sigma
-            // term specs. The shared core then assembles the canonical payload
-            // exactly as the FFI does.
+            // the first block-state beta) and freeze the threshold / log-sigma
+            // term specs. The fit uses the raw log-scale design by construction;
+            // no independent prediction-time transform is persisted.
             let baseline_timewiggle = prepared.timewiggle_build.as_ref().map(|w| {
                 let p_base = time_build.x_exit_time.ncols();
                 let beta = fit
@@ -777,17 +775,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     beta: SurvivalTimewiggleBeta::Single(beta),
                 }
             });
-            let survival_primary_design = DesignMatrix::hstack(vec![
-                time_design_exit.clone(),
-                fit.fit.threshold_design.design.clone(),
-            ])?;
-            let survival_noise_transform = build_scale_deviation_transform_design(
-                &survival_primary_design,
-                &fit.fit.log_sigma_design.design,
-                &weights,
-                infer_non_intercept_start_design(&fit.fit.log_sigma_design.design, &weights)?,
-            )
-            .map_err(|e| format!("failed to encode survival noise transform: {e}"))?;
             let resolved_thresholdspec = freeze_term_collection_from_design(
                 &fit.fit.resolved_thresholdspec,
                 &fit.fit.threshold_design,
@@ -817,13 +804,15 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     ridge_lambda: effective_config.ridge_lambda,
                     survival_likelihood_label: survival_likelihood_modename(likelihood_mode)
                         .to_string(),
+                    time_parameterization: fit.fit.time_parameterization,
+                    threshold_time_basis: fit.fit.threshold_time_basis.clone(),
+                    log_sigma_time_basis: fit.fit.log_sigma_time_basis.clone(),
                     formula_noise: predict_noise_formula
                         .as_ref()
                         .map(|(noise_formula, _)| noise_formula.clone()),
                     survival_beta_time: fit.fit.fit.beta_time().to_vec(),
                     survival_beta_threshold: fit.fit.fit.beta_threshold().to_vec(),
                     survival_beta_log_sigma: fit.fit.fit.beta_log_sigma().to_vec(),
-                    noise_transform: &survival_noise_transform,
                     resolved_thresholdspec,
                     resolved_log_sigmaspec,
                 },

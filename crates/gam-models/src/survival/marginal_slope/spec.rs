@@ -106,6 +106,7 @@ pub struct SurvivalMarginalSlopeFitResult {
     pub baseline_offset_residuals: OffsetChannelResiduals,
     pub baseline_offset_curvatures: OffsetChannelCurvatures,
     pub z_normalization: LatentZNormalization,
+    pub score_covariance: Array2<f64>,
     pub time_block_penalties_len: usize,
     pub time_wiggle_knots: Option<Array1<f64>>,
     pub time_wiggle_degree: Option<usize>,

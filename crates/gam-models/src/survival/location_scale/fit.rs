@@ -351,6 +351,19 @@ pub(crate) fn fit_survival_location_scale_terms(
         },
         wiggle_rho0.len(),
     );
+    // This is the same structural predicate consumed by
+    // `PreparedSurvivalLocationScaleModel::is_reduced_parametric_aft`: every
+    // smoothing coordinate is absent, and neither time nor link wiggles exist.
+    // Persist the result while the fit topology is still available; saved
+    // replay must not attempt to recover it from fitted coefficient values.
+    let time_parameterization = if layout.total() == 0
+        && protected_timewiggle_cols == 0
+        && spec.linkwiggle_block.is_none()
+    {
+        SurvivalLocationScaleTimeParameterization::ReducedParametricAft
+    } else {
+        SurvivalLocationScaleTimeParameterization::MonotoneWarp
+    };
     let mut rho0 = Array1::<f64>::zeros(layout.total());
     if layout.k_time > 0 {
         if time_rho0.len() != layout.k_time {
@@ -913,6 +926,9 @@ pub(crate) fn fit_survival_location_scale_terms(
         };
     Ok(SurvivalLocationScaleTermFitResult {
         fit: solved.fit,
+        time_parameterization,
+        threshold_time_basis: spec.threshold_template.resolved_time_basis().cloned(),
+        log_sigma_time_basis: spec.log_sigma_template.resolved_time_basis().cloned(),
         resolved_thresholdspec: resolved_specs.remove(0),
         resolved_log_sigmaspec: resolved_specs.remove(0),
         threshold_design: designs.remove(0),

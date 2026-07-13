@@ -12,7 +12,9 @@ use gam_models::inference::model::{
 };
 use gam_models::survival::{
     CauseSpecificSurvivalAloRowInput, SurvivalLikelihoodMode,
+    SurvivalMarginalSlopeSavedAloReplayInput,
     cause_specific_survival_alo_row_geometry, require_saved_survival_likelihood_mode,
+    replay_saved_survival_marginal_slope_alo,
     survival_event_code_from_value,
 };
 use gam_models::transformation_normal::{
@@ -53,6 +55,101 @@ pub struct SavedCauseSpecificSurvivalAloInput {
     coordinate_offsets: Vec<Array1<f64>>,
     coordinate_ranges: Vec<Range<usize>>,
     cause_count: usize,
+}
+
+/// Exact row channels needed to reconstruct a fitted survival
+/// marginal-slope likelihood.  The three time designs deliberately share the
+/// same coefficient block; their time-wiggle tail is the fit-time zero
+/// placeholder because the nonlinear basis evaluation is replayed by the
+/// family row program itself.
+pub struct SavedMarginalSlopeSurvivalAloInput {
+    event: Array1<f64>,
+    latent_z: Array1<f64>,
+    design_entry: DesignMatrix,
+    design_exit: DesignMatrix,
+    design_derivative_exit: DesignMatrix,
+    offset_entry: Array1<f64>,
+    offset_exit: Array1<f64>,
+    derivative_offset_exit: Array1<f64>,
+    marginal_design: DesignMatrix,
+    marginal_offset: Array1<f64>,
+    logslope_design: DesignMatrix,
+    logslope_offset: Array1<f64>,
+}
+
+impl SavedMarginalSlopeSurvivalAloInput {
+    pub fn new(
+        event: Array1<f64>,
+        latent_z: Array1<f64>,
+        design_entry: DesignMatrix,
+        design_exit: DesignMatrix,
+        design_derivative_exit: DesignMatrix,
+        offset_entry: Array1<f64>,
+        offset_exit: Array1<f64>,
+        derivative_offset_exit: Array1<f64>,
+        marginal_design: DesignMatrix,
+        marginal_offset: Array1<f64>,
+        logslope_design: DesignMatrix,
+        logslope_offset: Array1<f64>,
+    ) -> Result<Self, String> {
+        let n = event.len();
+        if n == 0
+            || latent_z.len() != n
+            || offset_entry.len() != n
+            || offset_exit.len() != n
+            || derivative_offset_exit.len() != n
+            || marginal_offset.len() != n
+            || logslope_offset.len() != n
+            || design_entry.nrows() != n
+            || design_exit.nrows() != n
+            || design_derivative_exit.nrows() != n
+            || marginal_design.nrows() != n
+            || logslope_design.nrows() != n
+        {
+            return Err(
+                "saved survival marginal-slope ALO row channels are not aligned".to_string(),
+            );
+        }
+        if design_entry.ncols() == 0
+            || design_entry.ncols() != design_exit.ncols()
+            || design_entry.ncols() != design_derivative_exit.ncols()
+            || marginal_design.ncols() == 0
+            || logslope_design.ncols() == 0
+        {
+            return Err(format!(
+                "saved survival marginal-slope ALO design topology is invalid: time entry/exit/derivative={}/{}/{}, marginal={}, logslope={}",
+                design_entry.ncols(),
+                design_exit.ncols(),
+                design_derivative_exit.ncols(),
+                marginal_design.ncols(),
+                logslope_design.ncols(),
+            ));
+        }
+        if let Some((row, value)) = event
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| *value != 0.0 && *value != 1.0)
+        {
+            return Err(format!(
+                "saved survival marginal-slope ALO event[{row}] must be exactly 0 or 1, got {value}"
+            ));
+        }
+        Ok(Self {
+            event,
+            latent_z,
+            design_entry,
+            design_exit,
+            design_derivative_exit,
+            offset_entry,
+            offset_exit,
+            derivative_offset_exit,
+            marginal_design,
+            marginal_offset,
+            logslope_design,
+            logslope_offset,
+        })
+    }
 }
 
 impl SavedCauseSpecificSurvivalAloInput {
@@ -134,6 +231,7 @@ impl SavedCauseSpecificSurvivalAloInput {
 /// Typed survival row carriers accepted by saved-model ALO.
 pub enum SavedSurvivalAloInput {
     CauseSpecific(SavedCauseSpecificSurvivalAloInput),
+    MarginalSlope(SavedMarginalSlopeSurvivalAloInput),
 }
 
 /// Class-aware saved-model ALO input.
@@ -1468,6 +1566,247 @@ fn compute_saved_cause_specific_survival_alo(
     )
 }
 
+fn compute_saved_marginal_slope_survival_alo(
+    model: &FittedModel,
+    input: &SavedMarginalSlopeSurvivalAloInput,
+    observations: SavedAloObservations<'_>,
+) -> Result<SavedModelAloDiagnostics, EstimationError> {
+    let class = PredictModelClass::Survival;
+    let likelihood_mode = require_saved_survival_likelihood_mode(model)
+        .map_err(|error| invalid(format!("saved survival ALO likelihood mode: {error}")))?;
+    if likelihood_mode != SurvivalLikelihoodMode::MarginalSlope {
+        return Err(invalid(format!(
+            "saved marginal-slope survival ALO row geometry cannot replay {likelihood_mode:?}"
+        )));
+    }
+    let n = input.event.len();
+    if observations.response.len() != n || observations.prior_weights.len() != n {
+        return Err(invalid(format!(
+            "saved survival marginal-slope ALO row mismatch: carrier={n}, response={}, weights={}",
+            observations.response.len(),
+            observations.prior_weights.len(),
+        )));
+    }
+    for row in 0..n {
+        if observations.response[row] != input.event[row] {
+            return Err(invalid(format!(
+                "saved survival marginal-slope ALO event mismatch at row {row}: carrier={}, observations={}",
+                input.event[row], observations.response[row],
+            )));
+        }
+    }
+
+    let payload = model.payload();
+    let fit = payload.fit_result.as_ref().ok_or_else(|| {
+        invalid("saved survival marginal-slope ALO requires a canonical fitted coefficient state")
+    })?;
+    let runtime = model.saved_prediction_runtime().map_err(|error| {
+        invalid(format!(
+            "saved survival marginal-slope ALO runtime: {error}"
+        ))
+    })?;
+    let expected_blocks = 3
+        + usize::from(runtime.score_warp.is_some())
+        + usize::from(runtime.link_deviation.is_some())
+        + usize::from(payload.influence_absorber_width.is_some());
+    if fit.blocks.len() != expected_blocks {
+        return Err(invalid(format!(
+            "saved survival marginal-slope ALO expects {expected_blocks} coefficient blocks, got {}",
+            fit.blocks.len(),
+        )));
+    }
+    let time_beta = &fit.blocks[0].beta;
+    let marginal_beta = &fit.blocks[1].beta;
+    let logslope_beta = &fit.blocks[2].beta;
+    if input.design_entry.ncols() != time_beta.len()
+        || input.marginal_design.ncols() != marginal_beta.len()
+        || input.logslope_design.ncols() != logslope_beta.len()
+    {
+        return Err(invalid(format!(
+            "saved survival marginal-slope ALO raw design/beta mismatch: time={}/{}, marginal={}/{}, logslope={}/{}",
+            input.design_entry.ncols(),
+            time_beta.len(),
+            input.marginal_design.ncols(),
+            marginal_beta.len(),
+            input.logslope_design.ncols(),
+            logslope_beta.len(),
+        )));
+    }
+    let mut cursor = 3usize;
+    let score_warp_beta = runtime.score_warp.as_ref().map(|_| {
+        let beta = &fit.blocks[cursor].beta;
+        cursor += 1;
+        beta
+    });
+    let link_deviation_beta = runtime.link_deviation.as_ref().map(|_| {
+        let beta = &fit.blocks[cursor].beta;
+        cursor += 1;
+        beta
+    });
+    let influence_beta = payload.influence_absorber_width.map(|_| {
+        let beta = &fit.blocks[cursor].beta;
+        cursor += 1;
+        beta
+    });
+    if cursor != fit.blocks.len() {
+        return Err(invalid(
+            "saved survival marginal-slope ALO coefficient topology did not consume every fitted block",
+        ));
+    }
+
+    let normalized_z = payload
+        .latent_z_normalization
+        .ok_or_else(|| {
+            invalid("saved survival marginal-slope ALO is missing latent-z normalization")
+        })?
+        .apply(&input.latent_z, "saved survival marginal-slope ALO")
+        .map_err(|error| invalid(error.to_string()))?;
+    let time_wiggle_knots = payload
+        .baseline_timewiggle_knots
+        .as_ref()
+        .map(|knots| Array1::from_vec(knots.clone()));
+    let time_wiggle_ncols = payload
+        .beta_baseline_timewiggle
+        .as_ref()
+        .map_or(0, Vec::len);
+    let influence_design = match payload.influence_absorber_design.as_ref() {
+        None => None,
+        Some(rows) => {
+            let width = payload.influence_absorber_width.ok_or_else(|| {
+                invalid(
+                    "saved survival marginal-slope ALO influence design has no persisted width",
+                )
+            })?;
+            if rows.len() != n || rows.iter().any(|row| row.len() != width) {
+                return Err(invalid(format!(
+                    "saved survival marginal-slope ALO influence design is not {n}x{width}"
+                )));
+            }
+            Some(
+                Array2::from_shape_vec(
+                    (n, width),
+                    rows.iter().flat_map(|row| row.iter().copied()).collect(),
+                )
+                .map_err(|error| invalid(format!("saved influence design shape: {error}")))?,
+            )
+        }
+    };
+    let gaussian_frailty_sd = match payload.family_state.frailty() {
+        Some(gam_models::survival::lognormal_kernel::FrailtySpec::None) => None,
+        Some(
+            gam_models::survival::lognormal_kernel::FrailtySpec::GaussianShift {
+                sigma_fixed: Some(sigma),
+            },
+        ) => Some(*sigma),
+        Some(frailty) => {
+            return Err(invalid(format!(
+                "saved survival marginal-slope ALO has unsupported fitted frailty state {frailty:?}"
+            )));
+        }
+        None => {
+            return Err(invalid(
+                "saved survival marginal-slope ALO is missing its fitted frailty state",
+            ));
+        }
+    };
+
+    let replay = replay_saved_survival_marginal_slope_alo(
+        SurvivalMarginalSlopeSavedAloReplayInput {
+            design_entry: &input.design_entry,
+            design_exit: &input.design_exit,
+            design_derivative_exit: &input.design_derivative_exit,
+            offset_entry: &input.offset_entry,
+            offset_exit: &input.offset_exit,
+            derivative_offset_exit: &input.derivative_offset_exit,
+            marginal_design: &input.marginal_design,
+            marginal_offset: &input.marginal_offset,
+            logslope_design: &input.logslope_design,
+            logslope_offset: &input.logslope_offset,
+            latent_z: &normalized_z,
+            event: &input.event,
+            prior_weights: observations.prior_weights,
+            derivative_guard: gam_models::survival::survival_derivative_guard_for_likelihood(
+                likelihood_mode,
+            ),
+            time_wiggle_knots: time_wiggle_knots.as_ref(),
+            time_wiggle_degree: payload.baseline_timewiggle_degree,
+            time_wiggle_ncols,
+            time_beta,
+            marginal_beta,
+            logslope_beta,
+            score_warp_beta,
+            link_deviation_beta,
+            influence_beta,
+            score_warp_runtime: runtime.score_warp.as_ref(),
+            link_deviation_runtime: runtime.link_deviation.as_ref(),
+            influence_design: influence_design.as_ref(),
+            gaussian_frailty_sd,
+        },
+    )
+    .map_err(|reason| invalid(format!("saved survival marginal-slope ALO replay: {reason}")))?;
+    let parameter_dimension = fit.beta.len();
+    let geometry = require_saved_geometry(model, class, parameter_dimension)?;
+    if replay.block_dimensions.iter().sum::<usize>() != parameter_dimension {
+        return Err(invalid(format!(
+            "saved survival marginal-slope ALO row program has {} raw coefficients; fit has {parameter_dimension}",
+            replay.block_dimensions.iter().sum::<usize>(),
+        )));
+    }
+    let coordinate_names = replay
+        .block_dimensions
+        .iter()
+        .enumerate()
+        .flat_map(|(block, &width)| {
+            let label = match block {
+                0 => "time",
+                1 => "marginal",
+                2 => "logslope",
+                _ if runtime.score_warp.is_some() && block == 3 => "score-warp",
+                _ if runtime.link_deviation.is_some()
+                    && block == 3 + usize::from(runtime.score_warp.is_some()) =>
+                {
+                    "link-deviation"
+                }
+                _ => "influence-absorber",
+            };
+            (0..width)
+                .map(move |coefficient| format!("{label}[{coefficient}]"))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let coordinate_designs = (0..parameter_dimension)
+        .map(|_| constant_scalar_design(n))
+        .collect::<Vec<_>>();
+    let coordinate_ranges = (0..parameter_dimension)
+        .map(|coefficient| coefficient..coefficient + 1)
+        .collect::<Vec<_>>();
+    let observed_hessians = replay
+        .rows
+        .iter()
+        .map(|row| row.observed_hessian.clone())
+        .collect::<Vec<_>>();
+    let scores = replay
+        .rows
+        .iter()
+        .map(|row| row.nll_score.clone())
+        .collect::<Vec<_>>();
+    let coordinate_values = replay
+        .rows
+        .into_iter()
+        .map(|row| row.coordinate_values)
+        .collect::<Vec<_>>();
+    compute_saved_multicoordinate_core(
+        class,
+        coordinate_names,
+        coordinate_designs,
+        coordinate_ranges,
+        geometry,
+        observed_hessians,
+        scores,
+        coordinate_values,
+    )
+}
+
 /// Replay exact ALO from one saved-model authority for every fitted class.
 ///
 /// The dispatcher never refits, substitutes a simpler model, or reconstructs
@@ -1520,6 +1859,9 @@ pub fn compute_saved_model_alo(
         PredictModelClass::Survival => match input {
             SavedModelAloInput::Survival(SavedSurvivalAloInput::CauseSpecific(input)) => {
                 compute_saved_cause_specific_survival_alo(model, input, observations)
+            }
+            SavedModelAloInput::Survival(SavedSurvivalAloInput::MarginalSlope(input)) => {
+                compute_saved_marginal_slope_survival_alo(model, input, observations)
             }
             SavedModelAloInput::Affine(_) => Err(invalid(
                 "saved survival ALO requires typed entry/exit/derivative row geometry",

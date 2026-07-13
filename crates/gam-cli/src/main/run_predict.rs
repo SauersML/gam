@@ -346,6 +346,204 @@ fn build_saved_cause_specific_survival_alo_input(
     ))
 }
 
+fn build_saved_marginal_slope_survival_alo_input(
+    model: &SavedModel,
+    data: ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    primary_offset: &Array1<f64>,
+    noise_offset: &Array1<f64>,
+) -> Result<gam_predict::SavedModelAloInput, String> {
+    let likelihood_mode = require_saved_survival_likelihood_mode(model)?;
+    if likelihood_mode != SurvivalLikelihoodMode::MarginalSlope {
+        return Err(format!(
+            "saved marginal-slope ALO carrier cannot rebuild {likelihood_mode:?} survival"
+        ));
+    }
+    let n = data.nrows();
+    if n == 0 || primary_offset.len() != n || noise_offset.len() != n {
+        return Err(format!(
+            "saved survival marginal-slope ALO row mismatch: data={n}, primary_offset={}, noise_offset={}",
+            primary_offset.len(),
+            noise_offset.len(),
+        ));
+    }
+    let event_name = model.survival_event.as_ref().ok_or_else(|| {
+        "saved survival marginal-slope ALO model is missing its event column".to_string()
+    })?;
+    let event_col = resolve_role_col(col_map, event_name, "survival event")?;
+    let event = Array1::from_vec(
+        data.column(event_col)
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(row, value)| {
+                let code = survival_event_code_from_value(value, row)?;
+                if code > 1 {
+                    return Err(format!(
+                        "saved survival marginal-slope ALO event[{row}] must be binary, got cause code {code}"
+                    ));
+                }
+                Ok(f64::from(code))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    );
+    let z_name = model.z_column.as_ref().ok_or_else(|| {
+        "saved survival marginal-slope ALO model is missing its latent z column".to_string()
+    })?;
+    let z_col = resolve_role_col(col_map, z_name, "z")?;
+    let latent_z = data.column(z_col).to_owned();
+
+    let time_columns = resolve_saved_survival_time_columns(model, col_map)?;
+    let mut age_entry = Array1::<f64>::zeros(n);
+    let mut age_exit = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let (entry, exit) = normalize_survival_time_pair(
+            time_columns.row_entry_time(data, row),
+            data[[row, time_columns.exit_col]],
+            row,
+        )?;
+        age_entry[row] = entry;
+        age_exit[row] = exit;
+    }
+
+    let termspec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )?;
+    let clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let design_input = clipped.as_ref().map_or(data, |values| values.view());
+    let marginal_build = build_term_collection_design(design_input, &termspec)
+        .map_err(|error| format!("failed to build saved marginal-slope design: {error}"))?;
+    let marginal_offset = marginal_build
+        .compose_offset(
+            primary_offset.view(),
+            "saved survival marginal-slope ALO marginal block",
+        )
+        .map_err(|error| error.to_string())?;
+    let logslopespec = resolve_termspec_for_prediction(
+        &model.resolved_termspec_logslope.as_ref().cloned(),
+        training_headers,
+        col_map,
+        "resolved_termspec_logslope",
+    )?;
+    let logslope_build = build_term_collection_design(design_input, &logslopespec)
+        .map_err(|error| format!("failed to build saved marginal-slope logslope design: {error}"))?;
+    let mut logslope_offset = logslope_build
+        .compose_offset(
+            noise_offset.view(),
+            "saved survival marginal-slope ALO logslope block",
+        )
+        .map_err(|error| error.to_string())?;
+    logslope_offset += model.logslope_baseline.ok_or_else(|| {
+        "saved survival marginal-slope ALO model is missing its fitted logslope baseline"
+            .to_string()
+    })?;
+
+    let time_config = load_survival_time_basis_config_from_model(model)?;
+    let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_config, None)?;
+    let anchor = model.survival_time_anchor.ok_or_else(|| {
+        "saved survival marginal-slope ALO model is missing survival_time_anchor".to_string()
+    })?;
+    let resolved_time_config = resolved_survival_time_basis_config_from_build(
+        &time_build.basisname,
+        time_build.degree,
+        time_build.knots.as_ref(),
+        time_build.keep_cols.as_ref(),
+        time_build.smooth_lambda,
+    )?;
+    let anchor_row = evaluate_survival_time_basis_row(anchor, &resolved_time_config)?;
+    center_survival_time_designs_at_anchor(
+        &mut time_build.x_entry_time,
+        &mut time_build.x_exit_time,
+        &anchor_row,
+    )?;
+    let baseline_config = saved_survival_runtime_baseline_config(model)?;
+    let (mut offset_entry, mut offset_exit, mut derivative_offset_exit) =
+        build_survival_time_offsets_for_likelihood(
+            &age_entry,
+            &age_exit,
+            &baseline_config,
+            likelihood_mode,
+            None,
+        )?;
+    add_survival_time_derivative_guard_offset(
+        &age_entry,
+        &age_exit,
+        anchor,
+        survival_derivative_guard_for_likelihood(likelihood_mode),
+        &mut offset_entry,
+        &mut offset_exit,
+        &mut derivative_offset_exit,
+    )?;
+
+    let p_timewiggle = model
+        .beta_baseline_timewiggle
+        .as_ref()
+        .map_or(0, Vec::len);
+    match (
+        model.baseline_timewiggle_knots.as_ref(),
+        model.baseline_timewiggle_degree,
+        p_timewiggle,
+    ) {
+        (None, None, 0) => {}
+        (Some(_), Some(_), width) if width > 0 => {}
+        _ => {
+            return Err(
+                "saved survival marginal-slope ALO has incomplete baseline-timewiggle authority"
+                    .to_string(),
+            );
+        }
+    }
+    if p_timewiggle > 0 {
+        let zeros = DesignMatrix::from(Array2::<f64>::zeros((n, p_timewiggle)));
+        time_build.x_entry_time = DesignMatrix::hstack(vec![
+            time_build.x_entry_time,
+            zeros.clone(),
+        ])?;
+        time_build.x_exit_time =
+            DesignMatrix::hstack(vec![time_build.x_exit_time, zeros.clone()])?;
+        time_build.x_derivative_time =
+            DesignMatrix::hstack(vec![time_build.x_derivative_time, zeros])?;
+    }
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    if fit.blocks.len() < 3
+        || fit.blocks[0].beta.len() != time_build.x_exit_time.ncols()
+        || fit.blocks[1].beta.len() != marginal_build.design.ncols()
+        || fit.blocks[2].beta.len() != logslope_build.design.ncols()
+    {
+        return Err(format!(
+            "saved survival marginal-slope ALO fitted/design topology mismatch: blocks={}, time={}/{}, marginal={}/{}, logslope={}/{}",
+            fit.blocks.len(),
+            fit.blocks.first().map_or(0, |block| block.beta.len()),
+            time_build.x_exit_time.ncols(),
+            fit.blocks.get(1).map_or(0, |block| block.beta.len()),
+            marginal_build.design.ncols(),
+            fit.blocks.get(2).map_or(0, |block| block.beta.len()),
+            logslope_build.design.ncols(),
+        ));
+    }
+    let input = gam_predict::SavedMarginalSlopeSurvivalAloInput::new(
+        event,
+        latent_z,
+        time_build.x_entry_time,
+        time_build.x_exit_time,
+        time_build.x_derivative_time,
+        offset_entry,
+        offset_exit,
+        derivative_offset_exit,
+        marginal_build.design,
+        marginal_offset,
+        logslope_build.design,
+        logslope_offset,
+    )?;
+    Ok(gam_predict::SavedModelAloInput::survival(
+        gam_predict::SavedSurvivalAloInput::MarginalSlope(input),
+    ))
+}
+
 pub(crate) fn build_saved_alo_predict_input(
     model: &SavedModel,
     data: ArrayView2<'_, f64>,
@@ -356,14 +554,31 @@ pub(crate) fn build_saved_alo_predict_input(
     noise_offset_supplied: bool,
 ) -> Result<gam_predict::SavedModelAloInput, String> {
     if model.predict_model_class() == PredictModelClass::Survival {
-        return build_saved_cause_specific_survival_alo_input(
-            model,
-            data,
-            col_map,
-            training_headers,
-            offset,
-            noise_offset_supplied,
-        );
+        return match require_saved_survival_likelihood_mode(model)? {
+            SurvivalLikelihoodMode::MarginalSlope => {
+                build_saved_marginal_slope_survival_alo_input(
+                    model,
+                    data,
+                    col_map,
+                    training_headers,
+                    offset,
+                    noise_offset,
+                )
+            }
+            SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
+                build_saved_cause_specific_survival_alo_input(
+                    model,
+                    data,
+                    col_map,
+                    training_headers,
+                    offset,
+                    noise_offset_supplied,
+                )
+            }
+            other => Err(format!(
+                "saved {other:?} survival ALO requires its typed fitted row geometry"
+            )),
+        };
     }
     if model.predict_model_class() != PredictModelClass::TransformationNormal {
         return build_predict_input_for_model(

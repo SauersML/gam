@@ -511,6 +511,7 @@ pub(crate) fn build_survival_covariate_block_from_design(
             time_basis_exit,
             time_basis_derivative_exit,
             time_penalties,
+            ..
         } => {
             if cov_design.affine_offset.iter().any(|value| *value != 0.0) {
                 return Err(

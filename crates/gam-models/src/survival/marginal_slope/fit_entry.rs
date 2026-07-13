@@ -2886,6 +2886,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         baseline_offset_residuals,
         baseline_offset_curvatures,
         z_normalization,
+        score_covariance: score_covariance.to_dense(),
         time_block_penalties_len: time_penalties_len,
         time_wiggle_knots: spec.timewiggle_block.as_ref().map(|wiggle| wiggle.knots.clone()),
         time_wiggle_degree: spec.timewiggle_block.as_ref().map(|wiggle| wiggle.degree),

@@ -66,6 +66,7 @@ fn flex_anchor_rows(
     saved: &SavedCompiledFlexBlock,
     parametric_rows: &Array2<f64>,
     score_warp: Option<&DeviationRuntime>,
+    score_argument: &Array1<f64>,
     label: &str,
 ) -> Result<Option<Array2<f64>>, String> {
     if saved.anchor_correction.is_none() {
@@ -80,9 +81,9 @@ fn flex_anchor_rows(
     let mut flex_width = None;
     let mut saw_flex = false;
     for (component, saved_component) in saved.anchor_components.iter().enumerate() {
-        match saved_component.kind {
+        match &saved_component.kind {
             SavedAnchorKind::Parametric { ncols, .. } if !saw_flex => {
-                parametric_width = parametric_width.checked_add(ncols).ok_or_else(|| {
+                parametric_width = parametric_width.checked_add(*ncols).ok_or_else(|| {
                     format!("saved survival marginal-slope {label} anchor width overflows usize")
                 })?;
             }
@@ -93,7 +94,7 @@ fn flex_anchor_rows(
             }
             SavedAnchorKind::FlexEvaluation { ncols } if !saw_flex => {
                 saw_flex = true;
-                flex_width = Some(ncols);
+                flex_width = Some(*ncols);
             }
             SavedAnchorKind::FlexEvaluation { .. } => {
                 return Err(format!(
@@ -116,9 +117,7 @@ fn flex_anchor_rows(
             "saved survival marginal-slope {label} needs a score-warp flex anchor, but no score-warp runtime exists"
         )
     })?;
-    let score_rows = score_warp.design_at_training_with_residual(
-        &Array1::zeros(parametric_rows.nrows()),
-    )?;
+    let score_rows = score_warp.design_at_training_with_residual(score_argument)?;
     if score_rows.ncols() != flex_width {
         return Err(format!(
             "saved survival marginal-slope {label} flex anchor width is {flex_width}; score-warp runtime emits {}",
@@ -233,6 +232,31 @@ fn validate_replay_input(input: &SurvivalMarginalSlopeSavedAloReplayInput<'_>) -
             );
         }
     }
+    for (label, runtime, beta) in [
+        ("score-warp", input.score_warp_runtime, input.score_warp_beta),
+        (
+            "link-deviation",
+            input.link_deviation_runtime,
+            input.link_deviation_beta,
+        ),
+    ] {
+        match (runtime, beta) {
+            (None, None) => {}
+            (Some(runtime), Some(beta)) if runtime.basis_dim == beta.len() => {}
+            (Some(runtime), Some(beta)) => {
+                return Err(format!(
+                    "saved survival marginal-slope ALO {label} runtime width is {}; beta has {} entries",
+                    runtime.basis_dim,
+                    beta.len(),
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "saved survival marginal-slope ALO {label} runtime and coefficient block must be present together"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -262,7 +286,15 @@ pub fn replay_saved_survival_marginal_slope_alo(
 
     let score_anchor = input
         .score_warp_runtime
-        .map(|saved| flex_anchor_rows(saved, &parametric_anchor, None, "score-warp"))
+        .map(|saved| {
+            flex_anchor_rows(
+                saved,
+                &parametric_anchor,
+                None,
+                input.latent_z,
+                "score-warp",
+            )
+        })
         .transpose()?
         .flatten();
     let score_warp = input
@@ -271,7 +303,15 @@ pub fn replay_saved_survival_marginal_slope_alo(
         .transpose()?;
     let link_anchor = input
         .link_deviation_runtime
-        .map(|saved| flex_anchor_rows(saved, &parametric_anchor, score_warp.as_ref(), "link-deviation"))
+        .map(|saved| {
+            flex_anchor_rows(
+                saved,
+                &parametric_anchor,
+                score_warp.as_ref(),
+                input.latent_z,
+                "link-deviation",
+            )
+        })
         .transpose()?
         .flatten();
     let link_dev = input
@@ -426,21 +466,37 @@ mod tests {
         let time_beta = Array1::from_vec(vec![q0, q1, qd]);
         let marginal_beta = Array1::zeros(1);
         let logslope_beta = Array1::from_vec(vec![g]);
+        let n = 3;
+        let time_entry = dense(Array2::from_shape_fn((n, 3), |(_, column)| {
+            if column == 0 { 1.0 } else { 0.0 }
+        }));
+        let time_exit = dense(Array2::from_shape_fn((n, 3), |(_, column)| {
+            if column == 1 { 1.0 } else { 0.0 }
+        }));
+        let time_derivative = dense(Array2::from_shape_fn((n, 3), |(_, column)| {
+            if column == 2 { 1.0 } else { 0.0 }
+        }));
+        let marginal_design = dense(Array2::zeros((n, 1)));
+        let logslope_design = dense(Array2::ones((n, 1)));
+        let zero = Array1::zeros(n);
+        let latent_z = Array1::from_vec(vec![-1.5_f64.sqrt(), 0.0, 1.5_f64.sqrt()]);
+        let events = Array1::from_elem(n, event);
+        let weights = Array1::from_elem(n, weight);
         let replay = replay_saved_survival_marginal_slope_alo(
             SurvivalMarginalSlopeSavedAloReplayInput {
-                design_entry: &dense(ndarray::array![[1.0, 0.0, 0.0]]),
-                design_exit: &dense(ndarray::array![[0.0, 1.0, 0.0]]),
-                design_derivative_exit: &dense(ndarray::array![[0.0, 0.0, 1.0]]),
-                offset_entry: &Array1::zeros(1),
-                offset_exit: &Array1::zeros(1),
-                derivative_offset_exit: &Array1::zeros(1),
-                marginal_design: &dense(Array2::zeros((1, 1))),
-                marginal_offset: &Array1::zeros(1),
-                logslope_design: &dense(Array2::ones((1, 1))),
-                logslope_offset: &Array1::zeros(1),
-                latent_z: &Array1::zeros(1),
-                event: &Array1::from_vec(vec![event]),
-                prior_weights: &Array1::from_vec(vec![weight]),
+                design_entry: &time_entry,
+                design_exit: &time_exit,
+                design_derivative_exit: &time_derivative,
+                offset_entry: &zero,
+                offset_exit: &zero,
+                derivative_offset_exit: &zero,
+                marginal_design: &marginal_design,
+                marginal_offset: &zero,
+                logslope_design: &logslope_design,
+                logslope_offset: &zero,
+                latent_z: &latent_z,
+                event: &events,
+                prior_weights: &weights,
                 derivative_guard: 1.0e-6,
                 time_wiggle_knots: None,
                 time_wiggle_degree: None,
@@ -458,7 +514,7 @@ mod tests {
             },
         )
         .expect("rigid saved survival row replays");
-        let row = &replay.rows[0];
+        let row = &replay.rows[1];
         let mills0 = normal_pdf(-q0) / normal_cdf(-q0);
         let mills1 = normal_pdf(-q1) / normal_cdf(-q1);
         let score0 = -weight * mills0;

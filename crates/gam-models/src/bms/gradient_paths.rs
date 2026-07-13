@@ -801,6 +801,14 @@ pub enum MarginalSlopeCovariance {
 pub(crate) const COVARIANCE_QUADRATIC_FORM_PSD_TOL: f64 = -1e-10;
 
 impl MarginalSlopeCovariance {
+    pub fn to_dense(&self) -> Array2<f64> {
+        match self {
+            Self::Diagonal(diagonal) => Array2::from_diag(diagonal),
+            Self::Full(covariance) => covariance.clone(),
+            Self::LowRank(factor) => factor.dot(&factor.t()),
+        }
+    }
+
     pub fn shape(&self) -> MarginalSlopeCovarianceShape {
         match self {
             Self::Diagonal(_) => MarginalSlopeCovarianceShape::Diagonal,

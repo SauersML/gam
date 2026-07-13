@@ -5402,39 +5402,6 @@ fn build_survival_location_scale_ffi_payload(
     fit_result.artifacts.survival_link_wiggle_knots = ls_result.wiggle_knots.clone();
     fit_result.artifacts.survival_link_wiggle_degree = ls_result.wiggle_degree;
 
-    // Reconstruct survival_noise_projection / center / scale by replaying the
-    // CLI's build_scale_deviation_transform on the time + threshold + log_sigma
-    // designs. Required for predict_survival_location_scale to recover the
-    // saved scale-deviation transform.
-    let dense_threshold = ls_result
-        .fit
-        .threshold_design
-        .design
-        .try_to_dense_by_chunks("survival location-scale threshold design")?;
-    let dense_log_sigma = ls_result
-        .fit
-        .log_sigma_design
-        .design
-        .try_to_dense_by_chunks("survival location-scale log_sigma design")?;
-    let dense_time_exit = time_build
-        .x_exit_time
-        .try_to_dense_by_chunks("survival location-scale time-exit design")?;
-    let mut survival_primary_design =
-        Array2::<f64>::zeros((n, dense_time_exit.ncols() + dense_threshold.ncols()));
-    survival_primary_design
-        .slice_mut(s![.., 0..dense_time_exit.ncols()])
-        .assign(&dense_time_exit);
-    survival_primary_design
-        .slice_mut(s![.., dense_time_exit.ncols()..])
-        .assign(&dense_threshold);
-    let survival_noise_transform = build_scale_deviation_transform(
-        &survival_primary_design,
-        &dense_log_sigma,
-        weights,
-        infer_non_intercept_start(&dense_log_sigma, weights),
-    )
-    .map_err(|err| format!("failed to encode survival noise transform: {err}"))?;
-
     let resolved_thresholdspec = freeze_term_collection_from_design(
         &ls_result.fit.resolved_thresholdspec,
         &ls_result.fit.threshold_design,
@@ -5447,9 +5414,9 @@ fn build_survival_location_scale_ffi_payload(
     .map_err(|err| err.to_string())?;
 
     // Thin adapter over the shared core assembler. The FFI's source-specific
-    // work above re-derives the survival metadata, compacts the fit result with
-    // the fitted link state, and re-encodes the noise scale-deviation transform;
-    // the canonical payload is assembled by the same path the CLI uses.
+    // work above re-derives the survival metadata and compacts the fit result
+    // with the fitted link state; the canonical payload is assembled by the
+    // same path the CLI uses.
     Ok(assemble_survival_location_scale_payload(
         SurvivalLocationScaleInputs {
             formula,
@@ -5473,11 +5440,13 @@ fn build_survival_location_scale_ffi_payload(
             time_basis: SavedSurvivalTimeBasis::from_build(&time_build, time_anchor),
             ridge_lambda: fit_config.ridge_lambda,
             survival_likelihood_label: survival_likelihood_modename(likelihood_mode).to_string(),
+            time_parameterization: ls_result.fit.time_parameterization,
+            threshold_time_basis: ls_result.fit.threshold_time_basis.clone(),
+            log_sigma_time_basis: ls_result.fit.log_sigma_time_basis.clone(),
             formula_noise: None,
             survival_beta_time: ls_result.fit.fit.beta_time().to_vec(),
             survival_beta_threshold: ls_result.fit.fit.beta_threshold().to_vec(),
             survival_beta_log_sigma: ls_result.fit.fit.beta_log_sigma().to_vec(),
-            noise_transform: &survival_noise_transform,
             resolved_thresholdspec,
             resolved_log_sigmaspec,
         },
