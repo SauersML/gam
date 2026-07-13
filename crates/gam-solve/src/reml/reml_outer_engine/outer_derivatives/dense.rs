@@ -721,7 +721,7 @@ pub(crate) fn compute_outer_hessian(
                         &beta_ext,
                         solution.fixed_drift_deriv.as_ref(),
                         subspace,
-                    );
+                    )?;
 
                     let correction = compute_ift_correction_trace(
                         hop,
@@ -839,7 +839,7 @@ pub(crate) fn compute_outer_hessian(
                         &beta_j,
                         solution.fixed_drift_deriv.as_ref(),
                         subspace,
-                    );
+                    )?;
 
                     let correction = compute_ift_correction_trace(
                         hop,
