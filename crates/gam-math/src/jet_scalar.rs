@@ -187,11 +187,9 @@ fn affine_composed_sum_default<T>(
 ) -> T {
     assert_eq!(inputs.len(), input_scales.len());
     assert_eq!(inputs.len(), derivative_stacks.len());
-    inputs
-        .iter()
-        .zip(input_scales)
-        .zip(derivative_stacks)
-        .fold(constant(0.0), |sum, ((input, &input_scale), &stack)| {
+    inputs.iter().zip(input_scales).zip(derivative_stacks).fold(
+        constant(0.0),
+        |sum, ((input, &input_scale), &stack)| {
             add(
                 &sum,
                 &affine_compose_default(
@@ -204,7 +202,8 @@ fn affine_composed_sum_default<T>(
                     &compose,
                 ),
             )
-        })
+        },
+    )
 }
 
 /// A truncated-Taylor scalar carrying derivatives in `K` primaries.
@@ -1179,8 +1178,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             gradient[primary] = first * self.g[primary];
             for other in primary..dimension {
                 let index = primary * dimension + other;
-                let channel =
-                    first * self.h[index] + second * self.g[primary] * self.g[other];
+                let channel = first * self.h[index] + second * self.g[primary] * self.g[other];
                 hessian[index] = channel;
                 hessian[other * dimension + primary] = channel;
             }
@@ -1212,10 +1210,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         let gradient = arena.zeros(dimension);
         let hessian = arena.zeros(dimension * dimension);
         let mut value = 0.0;
-        for ((input, &input_scale), stack) in inputs
-            .iter()
-            .zip(input_scales)
-            .zip(derivative_stacks)
+        for ((input, &input_scale), stack) in inputs.iter().zip(input_scales).zip(derivative_stacks)
         {
             let first = stack[1] * input_scale;
             let second = stack[2] * input_scale * input_scale;
@@ -1224,8 +1219,8 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
                 gradient[primary] += first * input.g[primary];
                 for other in primary..dimension {
                     let index = primary * dimension + other;
-                    hessian[index] += first * input.h[index]
-                        + second * input.g[primary] * input.g[other];
+                    hessian[index] +=
+                        first * input.h[index] + second * input.g[primary] * input.g[other];
                 }
             }
         }
@@ -2783,6 +2778,77 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
                     + addend.0.h[primary][other];
                 out.h[primary][other] = channel;
                 out.h[other][primary] = channel;
+            }
+        }
+        Order2(out)
+    }
+
+    #[inline(always)]
+    fn product(&self, right: &Self) -> Self {
+        let mut out = crate::jet_tower::Tower2::zero();
+        out.v = self.0.v * right.0.v;
+        for primary in 0..K {
+            out.g[primary] = self.0.v * right.0.g[primary] + self.0.g[primary] * right.0.v;
+            for other in primary..K {
+                let channel = self.0.v * right.0.h[primary][other]
+                    + self.0.g[primary] * right.0.g[other]
+                    + self.0.g[other] * right.0.g[primary]
+                    + self.0.h[primary][other] * right.0.v;
+                out.h[primary][other] = channel;
+                out.h[other][primary] = channel;
+            }
+        }
+        Order2(out)
+    }
+
+    #[inline(always)]
+    fn affine_compose(
+        &self,
+        input_scale: f64,
+        _input_shift: f64,
+        derivative_stack: [f64; 5],
+    ) -> Self {
+        let first = derivative_stack[1] * input_scale;
+        let second = derivative_stack[2] * input_scale * input_scale;
+        let mut out = crate::jet_tower::Tower2::zero();
+        out.v = derivative_stack[0];
+        for primary in 0..K {
+            out.g[primary] = first * self.0.g[primary];
+            for other in primary..K {
+                let channel =
+                    first * self.0.h[primary][other] + second * self.0.g[primary] * self.0.g[other];
+                out.h[primary][other] = channel;
+                out.h[other][primary] = channel;
+            }
+        }
+        Order2(out)
+    }
+
+    #[inline(always)]
+    fn affine_composed_sum(
+        inputs: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+    ) -> Self {
+        assert_eq!(inputs.len(), input_scales.len());
+        assert_eq!(inputs.len(), derivative_stacks.len());
+        let mut out = crate::jet_tower::Tower2::zero();
+        for ((input, &input_scale), stack) in inputs.iter().zip(input_scales).zip(derivative_stacks)
+        {
+            let first = stack[1] * input_scale;
+            let second = stack[2] * input_scale * input_scale;
+            out.v += stack[0];
+            for primary in 0..K {
+                out.g[primary] += first * input.0.g[primary];
+                for other in primary..K {
+                    out.h[primary][other] += first * input.0.h[primary][other]
+                        + second * input.0.g[primary] * input.0.g[other];
+                }
+            }
+        }
+        for primary in 0..K {
+            for other in primary + 1..K {
+                out.h[other][primary] = out.h[primary][other];
             }
         }
         Order2(out)
@@ -4877,6 +4943,233 @@ mod tests {
                             <= tolerance * actual.abs().max(expected.abs()).max(1.0),
                         "{label}[{primary_a},{primary_b}]: direct={actual:+.16e}, scalar={expected:+.16e}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_product_and_affine_nodes_match_scalar_program_randomized() {
+        const K: usize = 4;
+        const TERMS: usize = 4;
+
+        fn sample(state: &mut u64) -> f64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            let unit = (*state >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64));
+            2.0 * unit - 1.0
+        }
+
+        fn arbitrary_order2<const K: usize>(state: &mut u64) -> Order2<K> {
+            let mut tower = crate::jet_tower::Tower2::zero();
+            tower.v = sample(state);
+            for primary in 0..K {
+                tower.g[primary] = sample(state);
+                for other in primary..K {
+                    let channel = sample(state);
+                    tower.h[primary][other] = channel;
+                    tower.h[other][primary] = channel;
+                }
+            }
+            Order2(tower)
+        }
+
+        fn close(actual: f64, expected: f64, case: usize, label: &str) {
+            let tolerance = 2.0e-12 * actual.abs().max(expected.abs()).max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "case {case} {label}: direct={actual:+.16e}, scalar={expected:+.16e}, tolerance={tolerance:.3e}"
+            );
+        }
+
+        let mut state = 0x932a_ff1e_c0de_5eed_u64;
+        for case in 0..256 {
+            // Arbitrary value, gradient, and symmetric-Hessian inputs model the
+            // complete local state of nonlinear upstream expressions. This is
+            // stronger than testing only independently seeded variables.
+            let fixed_inputs: [Order2<K>; TERMS] =
+                std::array::from_fn(|_| arbitrary_order2(&mut state));
+            let input_scales: [f64; TERMS] = std::array::from_fn(|_| sample(&mut state));
+            let derivative_stacks: [[f64; 5]; TERMS] =
+                std::array::from_fn(|_| std::array::from_fn(|_| sample(&mut state)));
+            let input_shift = sample(&mut state);
+
+            let fixed_product_direct = fixed_inputs[0].product(&fixed_inputs[1]);
+            let fixed_product_scalar = fixed_inputs[0].mul(&fixed_inputs[1]);
+            let fixed_affine_direct =
+                fixed_inputs[2].affine_compose(input_scales[2], input_shift, derivative_stacks[2]);
+            let fixed_affine_scalar = affine_compose_default(
+                &fixed_inputs[2],
+                input_scales[2],
+                input_shift,
+                derivative_stacks[2],
+                JetField::scale,
+                Order2::add_constant,
+                JetField::compose_unary,
+            );
+            let fixed_sum_direct =
+                Order2::affine_composed_sum(&fixed_inputs, &input_scales, &derivative_stacks);
+            let fixed_sum_scalar = affine_composed_sum_default(
+                &fixed_inputs,
+                &input_scales,
+                &derivative_stacks,
+                Order2::constant,
+                JetField::add,
+                JetField::scale,
+                Order2::add_constant,
+                JetField::compose_unary,
+            );
+
+            let arena = DynamicJetArena::new();
+            let dynamic_inputs: [DynamicOrder2<'_>; TERMS] = std::array::from_fn(|term| {
+                DynamicOrder2::from_channel_functions(
+                    fixed_inputs[term].value(),
+                    K,
+                    &arena,
+                    |primary| fixed_inputs[term].g()[primary],
+                    |primary, other| fixed_inputs[term].h()[primary][other],
+                )
+            });
+            let dynamic_product_direct = dynamic_inputs[0].product(&dynamic_inputs[1]);
+            let dynamic_product_scalar = dynamic_inputs[0].mul(&dynamic_inputs[1]);
+            let dynamic_affine_direct = dynamic_inputs[2].affine_compose(
+                input_scales[2],
+                input_shift,
+                derivative_stacks[2],
+                &arena,
+            );
+            let dynamic_affine_scalar = affine_compose_default(
+                &dynamic_inputs[2],
+                input_scales[2],
+                input_shift,
+                derivative_stacks[2],
+                RuntimeJetScalar::scale,
+                |input, constant| input.add_constant(constant, &arena),
+                RuntimeJetScalar::compose_unary,
+            );
+            let dynamic_sum_direct = DynamicOrder2::affine_composed_sum(
+                &dynamic_inputs,
+                &input_scales,
+                &derivative_stacks,
+                K,
+                &arena,
+            );
+            let dynamic_sum_scalar = affine_composed_sum_default(
+                &dynamic_inputs,
+                &input_scales,
+                &derivative_stacks,
+                |value| DynamicOrder2::constant(value, K, &arena),
+                RuntimeJetScalar::add,
+                RuntimeJetScalar::scale,
+                |input, constant| input.add_constant(constant, &arena),
+                RuntimeJetScalar::compose_unary,
+            );
+
+            for (label, actual, expected) in [
+                (
+                    "fixed product value",
+                    fixed_product_direct.value(),
+                    fixed_product_scalar.value(),
+                ),
+                (
+                    "fixed affine value",
+                    fixed_affine_direct.value(),
+                    fixed_affine_scalar.value(),
+                ),
+                (
+                    "fixed affine sum value",
+                    fixed_sum_direct.value(),
+                    fixed_sum_scalar.value(),
+                ),
+                (
+                    "dynamic product value",
+                    dynamic_product_direct.value(),
+                    dynamic_product_scalar.value(),
+                ),
+                (
+                    "dynamic affine value",
+                    dynamic_affine_direct.value(),
+                    dynamic_affine_scalar.value(),
+                ),
+                (
+                    "dynamic affine sum value",
+                    dynamic_sum_direct.value(),
+                    dynamic_sum_scalar.value(),
+                ),
+            ] {
+                close(actual, expected, case, label);
+            }
+            for primary in 0..K {
+                for (label, actual, expected) in [
+                    (
+                        "fixed product gradient",
+                        fixed_product_direct.g()[primary],
+                        fixed_product_scalar.g()[primary],
+                    ),
+                    (
+                        "fixed affine gradient",
+                        fixed_affine_direct.g()[primary],
+                        fixed_affine_scalar.g()[primary],
+                    ),
+                    (
+                        "fixed affine sum gradient",
+                        fixed_sum_direct.g()[primary],
+                        fixed_sum_scalar.g()[primary],
+                    ),
+                    (
+                        "dynamic product gradient",
+                        dynamic_product_direct.g()[primary],
+                        dynamic_product_scalar.g()[primary],
+                    ),
+                    (
+                        "dynamic affine gradient",
+                        dynamic_affine_direct.g()[primary],
+                        dynamic_affine_scalar.g()[primary],
+                    ),
+                    (
+                        "dynamic affine sum gradient",
+                        dynamic_sum_direct.g()[primary],
+                        dynamic_sum_scalar.g()[primary],
+                    ),
+                ] {
+                    close(actual, expected, case, label);
+                }
+                for other in 0..K {
+                    for (label, actual, expected) in [
+                        (
+                            "fixed product Hessian",
+                            fixed_product_direct.h()[primary][other],
+                            fixed_product_scalar.h()[primary][other],
+                        ),
+                        (
+                            "fixed affine Hessian",
+                            fixed_affine_direct.h()[primary][other],
+                            fixed_affine_scalar.h()[primary][other],
+                        ),
+                        (
+                            "fixed affine sum Hessian",
+                            fixed_sum_direct.h()[primary][other],
+                            fixed_sum_scalar.h()[primary][other],
+                        ),
+                        (
+                            "dynamic product Hessian",
+                            dynamic_product_direct.h_at(primary, other),
+                            dynamic_product_scalar.h_at(primary, other),
+                        ),
+                        (
+                            "dynamic affine Hessian",
+                            dynamic_affine_direct.h_at(primary, other),
+                            dynamic_affine_scalar.h_at(primary, other),
+                        ),
+                        (
+                            "dynamic affine sum Hessian",
+                            dynamic_sum_direct.h_at(primary, other),
+                            dynamic_sum_scalar.h_at(primary, other),
+                        ),
+                    ] {
+                        close(actual, expected, case, label);
+                    }
                 }
             }
         }
