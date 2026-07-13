@@ -1801,6 +1801,73 @@ pub trait RowProgram<const K: usize>: Send + Sync {
     -> Result<S, String>;
 }
 
+/// Maximum aggregate size of a canonical row program's seeded primary jets
+/// kept on the call stack. Small fixed-width programs stay allocation-free;
+/// wider derivative representations use one exact-length heap array instead
+/// of making the thread stack scale as `K * size_of::<S>()`.
+///
+/// This is a storage-policy boundary, not a calculus fallback: both branches
+/// invoke the same [`RowProgram::eval`] expression with the same scalar type.
+const PROGRAM_PRIMARY_JET_STACK_BUDGET_BYTES: usize = 64 * 1024;
+
+#[inline]
+fn program_primary_jets_fit_stack<S, const K: usize>() -> bool {
+    std::mem::size_of::<S>()
+        .checked_mul(K)
+        .is_some_and(|bytes| bytes <= PROGRAM_PRIMARY_JET_STACK_BUDGET_BYTES)
+}
+
+fn evaluate_program_with_stack_primaries<const K: usize, P, S>(
+    prog: &P,
+    row: usize,
+    mut seed: impl FnMut(usize) -> S,
+) -> Result<S, String>
+where
+    P: RowProgram<K> + ?Sized,
+    S: crate::jet_scalar::JetScalar<K>,
+{
+    let vars: [S; K] = std::array::from_fn(&mut seed);
+    prog.eval(row, &vars)
+}
+
+#[inline(never)]
+fn evaluate_program_with_heap_primaries<const K: usize, P, S>(
+    prog: &P,
+    row: usize,
+    seed: impl FnMut(usize) -> S,
+) -> Result<S, String>
+where
+    P: RowProgram<K> + ?Sized,
+    S: crate::jet_scalar::JetScalar<K>,
+{
+    // The exact-size range builds precisely K initialized Copy scalars in
+    // heap-backed storage. Converting the boxed slice to a boxed array changes
+    // only its type; it never materializes `[S; K]` on the stack.
+    let vars: Box<[S]> = (0..K).map(seed).collect();
+    let vars: Box<[S; K]> = match vars.try_into() {
+        Ok(vars) => vars,
+        Err(_) => unreachable!("exact-size primary jet iterator changed length"),
+    };
+    prog.eval(row, &vars)
+}
+
+#[inline]
+fn evaluate_program_with_seeded_primaries<const K: usize, P, S>(
+    prog: &P,
+    row: usize,
+    seed: impl FnMut(usize) -> S,
+) -> Result<S, String>
+where
+    P: RowProgram<K> + ?Sized,
+    S: crate::jet_scalar::JetScalar<K>,
+{
+    if program_primary_jets_fit_stack::<S, K>() {
+        evaluate_program_with_stack_primaries(prog, row, seed)
+    } else {
+        evaluate_program_with_heap_primaries(prog, row, seed)
+    }
+}
+
 /// Derive the `row_kernel` channel `(nll, ∇, H)` from a [`RowProgram`] at the
 /// value/gradient/Hessian scalar [`crate::jet_scalar::Order2`], WITHOUT
 /// materialising any third / fourth tensor.
@@ -1809,10 +1876,9 @@ pub fn program_row_kernel<const K: usize, P: RowProgram<K> + ?Sized>(
     row: usize,
 ) -> Result<(f64, [f64; K], [[f64; K]; K]), String> {
     let base = prog.primaries(row)?;
-    let vars: [crate::jet_scalar::Order2<K>; K] = std::array::from_fn(|a| {
+    let s = evaluate_program_with_seeded_primaries(prog, row, |a| {
         <crate::jet_scalar::Order2<K> as crate::jet_scalar::JetScalar<K>>::variable(base[a], a)
-    });
-    let s = prog.eval(row, &vars)?;
+    })?;
     Ok(s.into_channels())
 }
 
@@ -1825,9 +1891,9 @@ pub fn program_third_contracted<const K: usize, P: RowProgram<K> + ?Sized>(
     dir: &[f64; K],
 ) -> Result<[[f64; K]; K], String> {
     let base = prog.primaries(row)?;
-    let vars: [crate::jet_scalar::OneSeed<K>; K] =
-        std::array::from_fn(|a| crate::jet_scalar::OneSeed::seed_direction(base[a], a, dir[a]));
-    let s = prog.eval(row, &vars)?;
+    let s = evaluate_program_with_seeded_primaries(prog, row, |a| {
+        crate::jet_scalar::OneSeed::seed_direction(base[a], a, dir[a])
+    })?;
     Ok(s.contracted_third())
 }
 
@@ -1841,9 +1907,9 @@ pub fn program_fourth_contracted<const K: usize, P: RowProgram<K> + ?Sized>(
     dir_v: &[f64; K],
 ) -> Result<[[f64; K]; K], String> {
     let base = prog.primaries(row)?;
-    let vars: [crate::jet_scalar::TwoSeed<K>; K] =
-        std::array::from_fn(|a| crate::jet_scalar::TwoSeed::seed(base[a], a, dir_u[a], dir_v[a]));
-    let s = prog.eval(row, &vars)?;
+    let s = evaluate_program_with_seeded_primaries(prog, row, |a| {
+        crate::jet_scalar::TwoSeed::seed(base[a], a, dir_u[a], dir_v[a])
+    })?;
     Ok(s.contracted_fourth())
 }
 
@@ -1854,8 +1920,7 @@ pub fn program_full_tower<const K: usize, P: RowProgram<K> + ?Sized>(
     row: usize,
 ) -> Result<Tower4<K>, String> {
     let base = prog.primaries(row)?;
-    let vars: [Tower4<K>; K] = std::array::from_fn(|a| Tower4::variable(base[a], a));
-    prog.eval(row, &vars)
+    evaluate_program_with_seeded_primaries(prog, row, |a| Tower4::variable(base[a], a))
 }
 
 // ── The oracle ───────────────────────────────────────────────────────

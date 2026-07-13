@@ -3009,70 +3009,95 @@ mod tests {
         /// `directional_fisher_jet_rows` and `second_directional_fisher_jet_rows`
         /// production entries, so x86-64-v3 exercises the contiguous first-order
         /// schedule while AVX-512-native builds exercise the symmetric static
-        /// schedule. Mixed-second output is symmetric on both targets.
+        /// schedule. Mixed-second output is symmetric on both targets. The
+        /// worker's 1 MiB stack is deliberately smaller than the 1,082,368-byte
+        /// `TwoSeed<32>` primary array: passing proves the canonical evaluator
+        /// selected its bounded heap storage rather than relying on test-runner
+        /// stack configuration.
         #[test]
         fn multinomial_m32_production_directional_routes_match_canonical_jet_932() {
-            const M: usize = 32;
-            let first_schedule = fisher_output_schedule::<OneSeed<0>>(M);
-            let expected_first = if AVX2_WITHOUT_AVX512 {
-                FisherOutputSchedule::ContiguousFull
-            } else {
-                FisherOutputSchedule::SymmetricTriangle
-            };
-            assert!(
-                first_schedule == expected_first,
-                "M=32 first-directional Fisher schedule does not match the target ISA"
-            );
-            assert!(
-                fisher_output_schedule::<TwoSeed<0>>(M) == FisherOutputSchedule::SymmetricTriangle,
-                "M=32 second-directional Fisher schedule must retain symmetric output"
-            );
+            const REGRESSION_STACK_BYTES: usize = 1024 * 1024;
+            let worker = std::thread::Builder::new()
+                .name("multinomial-m32-canonical-stack-bound".to_string())
+                .stack_size(REGRESSION_STACK_BYTES)
+                .spawn(|| {
+                    const M: usize = 32;
+                    assert_eq!(
+                        M * std::mem::size_of::<gam_math::jet_scalar::TwoSeed<M>>(),
+                        1_082_368,
+                        "M=32 canonical fourth-order seed footprint changed"
+                    );
+                    let first_schedule = fisher_output_schedule::<OneSeed<0>>(M);
+                    let expected_first = if AVX2_WITHOUT_AVX512 {
+                        FisherOutputSchedule::ContiguousFull
+                    } else {
+                        FisherOutputSchedule::SymmetricTriangle
+                    };
+                    assert!(
+                        first_schedule == expected_first,
+                        "M=32 first-directional Fisher schedule does not match the target ISA"
+                    );
+                    assert!(
+                        fisher_output_schedule::<TwoSeed<0>>(M)
+                            == FisherOutputSchedule::SymmetricTriangle,
+                        "M=32 second-directional Fisher schedule must retain symmetric output"
+                    );
 
-            for trial in 0..4 {
-                let eta: [f64; M] = std::array::from_fn(|axis| {
-                    0.9 * ((axis * 7 + trial * 3 + 1) as f64 * 0.17).sin()
-                        - 0.35 * ((axis + trial + 2) as f64 * 0.11).cos()
-                });
-                let direction: [f64; M] = std::array::from_fn(|axis| {
-                    0.7 * ((axis * 5 + trial + 3) as f64 * 0.13).cos()
-                        - 0.2 * ((axis + 2 * trial + 1) as f64 * 0.19).sin()
-                });
-                let direction_u: [f64; M] = std::array::from_fn(|axis| {
-                    -0.6 * ((axis * 3 + trial + 4) as f64 * 0.09).sin()
-                        + 0.25 * ((axis + trial + 5) as f64 * 0.23).cos()
-                });
-                let observed_class = if trial % 2 == 0 { trial } else { M };
-                let weight = 0.8 + 0.3 * trial as f64;
-                let family = single_row_family(observed_class, weight, M + 1);
-                let mut response = vec![0.0; M + 1];
-                response[observed_class] = 1.0;
-                let program = MultinomialLogitRowProgram::new(&eta, &response, weight)
-                    .expect("valid M=32 multinomial row program");
+                    for trial in 0..4 {
+                        let eta: [f64; M] = std::array::from_fn(|axis| {
+                            0.9 * ((axis * 7 + trial * 3 + 1) as f64 * 0.17).sin()
+                                - 0.35 * ((axis + trial + 2) as f64 * 0.11).cos()
+                        });
+                        let direction: [f64; M] = std::array::from_fn(|axis| {
+                            0.7 * ((axis * 5 + trial + 3) as f64 * 0.13).cos()
+                                - 0.2 * ((axis + 2 * trial + 1) as f64 * 0.19).sin()
+                        });
+                        let direction_u: [f64; M] = std::array::from_fn(|axis| {
+                            -0.6 * ((axis * 3 + trial + 4) as f64 * 0.09).sin()
+                                + 0.25 * ((axis + trial + 5) as f64 * 0.23).cos()
+                        });
+                        let observed_class = if trial % 2 == 0 { trial } else { M };
+                        let weight = 0.8 + 0.3 * trial as f64;
+                        let family = single_row_family(observed_class, weight, M + 1);
+                        let mut response = vec![0.0; M + 1];
+                        response[observed_class] = 1.0;
+                        let program = MultinomialLogitRowProgram::new(&eta, &response, weight)
+                            .expect("valid M=32 multinomial row program");
 
-                let production_first = prod_third(&family, &eta, &direction);
-                let canonical_first = program_third_contracted(&program, 0, &direction)
-                    .expect("canonical M=32 first-directional Fisher contraction");
-                let production_second = prod_fourth(&family, &eta, &direction_u, &direction);
-                let canonical_second =
-                    program_fourth_contracted(&program, 0, &direction_u, &direction)
-                        .expect("canonical M=32 second-directional Fisher contraction");
+                        let production_first = prod_third(&family, &eta, &direction);
+                        let canonical_first = program_third_contracted(&program, 0, &direction)
+                            .expect("canonical M=32 first-directional Fisher contraction");
+                        let production_second =
+                            prod_fourth(&family, &eta, &direction_u, &direction);
+                        let canonical_second =
+                            program_fourth_contracted(&program, 0, &direction_u, &direction)
+                                .expect("canonical M=32 second-directional Fisher contraction");
 
-                for row in 0..M {
-                    for column in 0..M {
-                        close(
-                            production_first[row][column],
-                            canonical_first[row][column],
-                            JET_TOL,
-                            &format!("M=32 trial {trial} first-directional[{row}][{column}]"),
-                        );
-                        close(
-                            production_second[row][column],
-                            canonical_second[row][column],
-                            JET_TOL,
-                            &format!("M=32 trial {trial} second-directional[{row}][{column}]"),
-                        );
+                        for row in 0..M {
+                            for column in 0..M {
+                                close(
+                                    production_first[row][column],
+                                    canonical_first[row][column],
+                                    JET_TOL,
+                                    &format!(
+                                        "M=32 trial {trial} first-directional[{row}][{column}]"
+                                    ),
+                                );
+                                close(
+                                    production_second[row][column],
+                                    canonical_second[row][column],
+                                    JET_TOL,
+                                    &format!(
+                                        "M=32 trial {trial} second-directional[{row}][{column}]"
+                                    ),
+                                );
+                            }
+                        }
                     }
-                }
+                })
+                .expect("spawn bounded-stack M=32 parity worker");
+            if let Err(payload) = worker.join() {
+                std::panic::resume_unwind(payload);
             }
         }
     }
