@@ -482,6 +482,22 @@ fn code_anchor_line_indices_in_tokens(source_tokens: &[RustCodeToken], anchor: &
         return Vec::new();
     }
 
+    if anchor_tokens.iter().any(|token| token.lexeme == "fn") {
+        let mut lines = Vec::new();
+        for start in 0..source_tokens.len() {
+            if source_tokens[start].lexeme != anchor_tokens[0].lexeme
+                || !function_anchor_matches_at(&source_tokens[start..], &anchor_tokens)
+            {
+                continue;
+            }
+            let line_index = source_tokens[start].line_index;
+            if lines.last() != Some(&line_index) {
+                lines.push(line_index);
+            }
+        }
+        return lines;
+    }
+
     let mut lines = Vec::new();
     for window in source_tokens.windows(anchor_tokens.len()) {
         if window
@@ -496,6 +512,83 @@ fn code_anchor_line_indices_in_tokens(source_tokens: &[RustCodeToken], anchor: &
         }
     }
     lines
+}
+
+fn function_anchor_matches_at(source: &[RustCodeToken], anchor: &[RustCodeToken]) -> bool {
+    let mut source_index = 0usize;
+    let mut anchor_index = 0usize;
+    let mut source_saw_fn = false;
+    let mut anchor_saw_fn = false;
+    let mut source_parameter_depth = None::<usize>;
+    let mut anchor_parameter_depth = None::<usize>;
+    let mut source_parameters_finished = false;
+    let mut anchor_parameters_finished = false;
+
+    while anchor_index < anchor.len() {
+        if source_index >= source.len() {
+            return false;
+        }
+
+        let source_has_optional_trailing_comma = source_parameter_depth == Some(1)
+            && source[source_index].lexeme == ","
+            && source
+                .get(source_index + 1)
+                .is_some_and(|token| token.lexeme == ")")
+            && anchor[anchor_index].lexeme == ")";
+        if source_has_optional_trailing_comma {
+            source_index += 1;
+            continue;
+        }
+
+        let anchor_has_optional_trailing_comma = anchor_parameter_depth == Some(1)
+            && anchor[anchor_index].lexeme == ","
+            && anchor
+                .get(anchor_index + 1)
+                .is_some_and(|token| token.lexeme == ")")
+            && source[source_index].lexeme == ")";
+        if anchor_has_optional_trailing_comma {
+            anchor_index += 1;
+            continue;
+        }
+
+        if source[source_index].lexeme != anchor[anchor_index].lexeme {
+            return false;
+        }
+
+        let lexeme = source[source_index].lexeme.as_str();
+        if lexeme == "fn" {
+            source_saw_fn = true;
+            anchor_saw_fn = true;
+        } else if lexeme == "(" {
+            if source_saw_fn && !source_parameters_finished {
+                source_parameter_depth = Some(source_parameter_depth.map_or(1, |depth| depth + 1));
+            }
+            if anchor_saw_fn && !anchor_parameters_finished {
+                anchor_parameter_depth = Some(anchor_parameter_depth.map_or(1, |depth| depth + 1));
+            }
+        } else if lexeme == ")" {
+            if let Some(depth) = source_parameter_depth {
+                if depth == 1 {
+                    source_parameter_depth = None;
+                    source_parameters_finished = true;
+                } else {
+                    source_parameter_depth = Some(depth - 1);
+                }
+            }
+            if let Some(depth) = anchor_parameter_depth {
+                if depth == 1 {
+                    anchor_parameter_depth = None;
+                    anchor_parameters_finished = true;
+                } else {
+                    anchor_parameter_depth = Some(depth - 1);
+                }
+            }
+        }
+
+        source_index += 1;
+        anchor_index += 1;
+    }
+    true
 }
 
 fn code_identifier_line_indices(source: &str, identifier: &str) -> Vec<usize> {
@@ -733,6 +826,12 @@ fn enforce_derivative_policy_negative_probes() {
         code_anchor_line_indices(multiline_gaussian_order2, gaussian_order2_anchor),
         vec![1],
         "#932 policy self-test: rustfmt line wrapping changed a production anchor's identity"
+    );
+    let tuple_parameter_anchor = "fn tuple_parameter(value: (usize))";
+    let tuple_parameter_source = "fn tuple_parameter(value: (usize,)) {}";
+    assert!(
+        code_anchor_line_indices(tuple_parameter_source, tuple_parameter_anchor).is_empty(),
+        "#932 policy self-test: optional parameter punctuation erased a tuple's identity"
     );
 
     let cfg_test_gaussian_order2 = format!("#[cfg(test)]\n{multiline_gaussian_order2}");
