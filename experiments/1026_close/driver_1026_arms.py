@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fcntl
 import hashlib
 import json
 import os
@@ -35,6 +36,7 @@ import numpy as np
 
 
 PAIR_SCHEMA = "gam.issue2283.eq4-pair.v1"
+FLAT_CHECKPOINT_SCHEMA = "gam.issue2283.flat-checkpoint.v1"
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 HEX_GIT_SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -60,6 +62,84 @@ def _array_sha256(values: np.ndarray) -> str:
     digest.update(b"\0")
     digest.update(memoryview(array).cast("B"))
     return digest.hexdigest()
+
+
+def _bits_selection(n_test: int, bits_max_rows: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed + 7)
+    take = min(int(bits_max_rows), int(n_test))
+    return np.sort(rng.choice(n_test, take, replace=False)).astype(np.int64, copy=False)
+
+
+def _array_manifest(values: np.ndarray) -> dict:
+    array = np.ascontiguousarray(values)
+    return {
+        "shape": list(array.shape),
+        "dtype": array.dtype.str,
+        "sha256": _array_sha256(array),
+    }
+
+
+def _write_flat_checkpoint(path: str, arrays: dict[str, np.ndarray], metadata: dict) -> str:
+    destination = Path(path).resolve()
+    if destination.suffix != ".npz":
+        raise ValueError("--flat-checkpoint must end in .npz")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    contiguous = {name: np.ascontiguousarray(values) for name, values in arrays.items()}
+    payload = dict(metadata)
+    payload["schema"] = FLAT_CHECKPOINT_SCHEMA
+    payload["arrays"] = {name: _array_manifest(values) for name, values in contiguous.items()}
+    encoded = np.frombuffer(_canonical_json(payload).encode("utf-8"), dtype=np.uint8)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp.npz")
+    try:
+        np.savez(temporary, metadata_json=encoded, **contiguous)
+        with open(temporary, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return _file_sha256(destination)
+
+
+def _read_flat_checkpoint(path: str, expected_pair_identity: dict, expected_config: dict):
+    source = Path(path).resolve()
+    if source.suffix != ".npz":
+        raise ValueError("--flat-checkpoint must end in .npz")
+    with np.load(source, allow_pickle=False) as payload:
+        names = set(payload.files)
+        if "metadata_json" not in names:
+            raise ValueError("flat checkpoint is missing metadata_json")
+        metadata = json.loads(payload["metadata_json"].tobytes().decode("utf-8"))
+        expected_names = set(metadata.get("arrays", {})) | {"metadata_json"}
+        if names != expected_names:
+            raise ValueError(
+                f"flat checkpoint arrays {sorted(names)} do not match manifest {sorted(expected_names)}"
+            )
+        arrays = {
+            name: np.ascontiguousarray(payload[name])
+            for name in sorted(names - {"metadata_json"})
+        }
+    if metadata.get("schema") != FLAT_CHECKPOINT_SCHEMA:
+        raise ValueError(f"unsupported flat checkpoint schema {metadata.get('schema')!r}")
+    if metadata.get("pair_identity") != expected_pair_identity:
+        raise ValueError("flat checkpoint pair identity does not match this run")
+    if metadata.get("flat_config") != expected_config:
+        raise ValueError("flat checkpoint configuration does not match this run")
+    for name, values in arrays.items():
+        if _array_manifest(values) != metadata["arrays"][name]:
+            raise ValueError(f"flat checkpoint array {name!r} failed its manifest")
+    return arrays, metadata, _file_sha256(source)
+
+
+def _append_jsonl(path: str, record: dict) -> None:
+    destination = Path(path).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with open(destination, "a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.write(_canonical_json(record) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def _validate_measurement_identity(run_id: str, code_revision: str, wheel_sha256: str) -> None:
@@ -91,6 +171,44 @@ def _source_provenance(code_revision: str, wheel_sha256: str) -> dict:
         "wheel_sha256": wheel_sha256,
         "gamfit_version": str(gamfit.__version__),
         "source_sha256": {name: _file_sha256(path) for name, path in paths.items()},
+    }
+
+
+def _pair_identity(
+    args,
+    *,
+    n: int,
+    p: int,
+    data_manifest: dict,
+    sampled_row_ids: np.ndarray,
+    train_row_ids: np.ndarray,
+    test_row_ids: np.ndarray,
+    bits_idx: np.ndarray,
+    source_provenance: dict,
+) -> dict:
+    return {
+        "schema": PAIR_SCHEMA,
+        "run_id": args.run_id,
+        "source": source_provenance,
+        "data": {
+            "manifest_sha256": data_manifest["sha256"],
+            "sampled_row_ids_sha256": _array_sha256(sampled_row_ids),
+            "train_row_ids_sha256": _array_sha256(train_row_ids),
+            "test_row_ids_sha256": _array_sha256(test_row_ids),
+            "bits_test_positions_sha256": _array_sha256(bits_idx),
+            "bits_row_ids_sha256": _array_sha256(test_row_ids[bits_idx]),
+        },
+        "config": {
+            "max_rows": args.max_rows,
+            "test_frac": args.test_frac,
+            "seed": args.seed,
+            "N": n,
+            "p": p,
+            "K": args.K,
+            "top_k": args.top_k,
+            "bits_max_rows": args.bits_max_rows,
+            "bits_rows": int(bits_idx.size),
+        },
     }
 
 
