@@ -1814,6 +1814,53 @@ pub(crate) fn advertised_inner_workspace_missing_fails_closed_without_family_fal
     );
 }
 
+#[test]
+pub(crate) fn advertised_workspace_gradient_missing_fails_before_row_measure_fallback() {
+    let evaluations = Arc::new(AtomicUsize::new(0));
+    let workspace_builds = Arc::new(AtomicUsize::new(0));
+    let family = InnerPreludeWorkspaceFamily {
+        evaluations: Arc::clone(&evaluations),
+        workspace_builds: Arc::clone(&workspace_builds),
+        dense_calls: Arc::new(AtomicUsize::new(0)),
+        provide_workspace: true,
+        advertise_workspace_gradient: true,
+    };
+    let spec = ParameterBlockSpec {
+        name: "missing-workspace-gradient".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+
+    let error = inner_blockwise_fit(
+        &family,
+        &[spec],
+        &[Array1::zeros(0)],
+        &BlockwiseFitOptions::default(),
+        None,
+    )
+    .expect_err("an advertised workspace gradient must not fall back to a different row measure");
+    assert!(
+        error.contains(
+            "advertises inner joint workspace gradients, but its workspace returned none"
+        ),
+        "unexpected missing-workspace-gradient error: {error}",
+    );
+    assert_eq!(workspace_builds.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        evaluations.load(Ordering::Relaxed),
+        0,
+        "missing workspace-gradient authority must fail before family.evaluate can mix row measures",
+    );
+}
+
 /// A workspace that exposes both a dense build and a matrix-free HVP and
 /// refines its representation per intent (#738): matrix-free for the inner
 /// solve, dense for logdet factorization. Mirrors CTN's contract.
