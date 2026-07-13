@@ -92,7 +92,7 @@ def _write_flat_checkpoint(path: str, arrays: dict[str, np.ndarray], metadata: d
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp.npz")
     try:
         np.savez(temporary, metadata_json=encoded, **contiguous)
-        with open(temporary, "rb") as handle:
+        with open(temporary, "rb+") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
     finally:
