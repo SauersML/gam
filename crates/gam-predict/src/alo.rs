@@ -46,7 +46,6 @@ pub struct SavedAloObservations<'a> {
 /// carries its own parameter-aligned design and coefficient range; the three
 /// ranges for one cause intentionally overlap because all three predictors are
 /// affine functions of the same fitted endpoint block.
-#[derive(Clone)]
 pub struct SavedCauseSpecificSurvivalAloInput {
     event_codes: Array1<u8>,
     entry_active: Vec<bool>,
@@ -133,7 +132,6 @@ impl SavedCauseSpecificSurvivalAloInput {
 }
 
 /// Typed survival row carriers accepted by saved-model ALO.
-#[derive(Clone)]
 pub enum SavedSurvivalAloInput {
     CauseSpecific(SavedCauseSpecificSurvivalAloInput),
 }
@@ -143,7 +141,6 @@ pub enum SavedSurvivalAloInput {
 /// The affine predictor carrier cannot represent survival's entry/exit/time
 /// derivative row map. Making that distinction explicit prevents a survival
 /// model from being silently forced through a simpler prediction surface.
-#[derive(Clone)]
 pub enum SavedModelAloInput {
     Affine(PredictInput),
     Survival(SavedSurvivalAloInput),

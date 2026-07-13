@@ -1871,7 +1871,7 @@ mod tests {
         let marg_pens = vec![BlockwisePenalty::new(0..3, s_marg.clone())];
         let log_pens = vec![BlockwisePenalty::new(0..2, s_log.clone())];
 
-        let error = apply_compiled_map_to_designs(
+        let error = match apply_compiled_map_to_designs(
             &map,
             raw_time_entry,
             raw_time_exit,
@@ -1881,8 +1881,10 @@ mod tests {
             &time_pens,
             &marg_pens,
             &log_pens,
-        )
-        .expect_err("a triangular map cannot be represented by split blocks");
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a triangular map cannot be represented by split blocks"),
+        };
         assert!(error.contains("unsupported cross-block lift"), "{error}");
     }
 
@@ -1896,7 +1898,7 @@ mod tests {
             compiled_block_ranges: vec![0..1, 1..2, 2..3],
         };
         let design = || DesignMatrix::from(Array2::<f64>::ones((2, 1)));
-        let error = apply_compiled_map_to_designs(
+        let error = match apply_compiled_map_to_designs(
             &map,
             design(),
             design(),
@@ -1906,8 +1908,10 @@ mod tests {
             &[],
             &[],
             &[],
-        )
-        .expect_err("a non-contiguous raw partition must be rejected");
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a non-contiguous raw partition must be rejected"),
+        };
         assert!(error.contains("malformed raw block range"), "{error}");
     }
 
