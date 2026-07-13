@@ -518,6 +518,34 @@ pub struct DynamicOrder2<'arena> {
 }
 
 impl DynamicOrder2<'_> {
+    /// Construct an arena-backed second-order scalar from channel functions.
+    ///
+    /// This is the allocation-free extension seam for exact projected products
+    /// whose channel law is not ordinary scalar multiplication. Each channel is
+    /// written directly into the row arena, so downstream runtime-jet programs
+    /// can keep their specialized algebra without materializing temporary
+    /// `Vec`s or exposing the arena pointer stored by [`DynamicOrder2`].
+    #[inline]
+    #[must_use]
+    pub fn from_channel_functions<'arena>(
+        value: f64,
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+        mut gradient: impl FnMut(usize) -> f64,
+        mut hessian: impl FnMut(usize, usize) -> f64,
+    ) -> DynamicOrder2<'arena> {
+        let g = arena.alloc_slice_fill_with(dimension, |axis| gradient(axis));
+        let h = arena.alloc_slice_fill_with(dimension * dimension, |index| {
+            hessian(index / dimension, index % dimension)
+        });
+        DynamicOrder2 {
+            arena,
+            v: value,
+            g,
+            h,
+        }
+    }
+
     /// Gradient channel.
     #[inline]
     #[must_use]
