@@ -2780,7 +2780,8 @@ mod tests {
                         .expect("valid multinomial row program");
 
                 // ── Jet ORACLE vs LIVE production (≤1e-9) ──────────────────────
-                let (jet_v, jet_g, jet_h) = program_row_kernel(&prog, 0).expect("jet row kernel");
+                let (jet_v, jet_g, jet_h) =
+                    program_row_kernel::<M, _>(&prog, 0).expect("jet row kernel");
 
                 // Value + gradient from the live log-lik assembler (NLL = −log_lik,
                 // ∇NLL = −∇log_lik).
@@ -2916,7 +2917,7 @@ mod tests {
                 let program = MultinomialLogitRowProgram::new(&eta, &response, weight)
                     .expect("valid extreme-tail row program");
                 let (canonical_value, canonical_gradient, canonical_hessian) =
-                    program_row_kernel(&program, 0).expect("canonical extreme-tail V/G/H");
+                    program_row_kernel::<3, _>(&program, 0).expect("canonical extreme-tail V/G/H");
                 let canonical_third = program_third_contracted(&program, 0, &direction)
                     .expect("canonical extreme-tail third");
                 let canonical_fourth =
