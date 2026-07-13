@@ -10,9 +10,9 @@ pub(crate) use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8
 pub(crate) use csv::WriterBuilder;
 
 pub(crate) use gam::estimate::{
-    BlockRole, ContinuousSmoothnessOrderStatus, FitOptions, FittedLinkState, ModelSummary,
+    BlockRole, ContinuousSmoothnessOrderStatus, FittedLinkState, ModelSummary,
     ParametricTermSummary, SmoothTermSummary, UnifiedFitResult,
-    compute_continuous_smoothness_order, fit_gam,
+    compute_continuous_smoothness_order,
 };
 
 pub(crate) use gam::families::bms::{
@@ -93,7 +93,7 @@ pub(crate) use gam::report;
 pub(crate) use gam::probability::{normal_cdf, standard_normal_quantile};
 
 pub(crate) use gam::families::fit_orchestration::drivers::{
-    fit_term_collection_forspec, freeze_term_collection_from_design,
+    freeze_term_collection_from_design,
 };
 pub(crate) use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
