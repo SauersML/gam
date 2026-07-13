@@ -21,11 +21,12 @@ use crate::bms::{
 };
 use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
 use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
-use crate::fit_orchestration::{FitConfig, StandardFitResult};
+use crate::fit_orchestration::{FitConfig, StandardFitResult, expectile_tau_for_config};
 use crate::inference::model::{
-    FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind, SavedAnchorComponent,
-    SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization, SavedResidualCascade,
-    SavedSplineScan, SavedSurvivalLocationScaleStructure, TransformationScoreCalibration,
+    FittedEstimator, FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
+    SavedResidualCascade, SavedSplineScan, SavedSurvivalLocationScaleStructure,
+    TransformationScoreCalibration,
 };
 use crate::scale_design::ScaleDeviationTransform;
 use crate::survival::construction::{
@@ -342,6 +343,15 @@ pub fn assemble_standard_payload(
         .likelihood_family
         .clone()
         .unwrap_or_else(LikelihoodSpec::gaussian_identity);
+    let estimator = expectile_tau_for_config(fit_config)
+        .map_err(|error| format!("failed to persist estimator metadata: {error}"))?
+        .map_or(FittedEstimator::Likelihood, |tau| {
+            FittedEstimator::Expectile { tau }
+        });
+    let family_label = match estimator {
+        FittedEstimator::Likelihood => family.name().to_string(),
+        FittedEstimator::Expectile { tau } => format!("expectile({tau})"),
+    };
     let (gaussian_jackknife_plus, full_conformal) =
         standard_conformal_substrates(&formula, dataset, fit_config, &family, &fit, &design);
     let latent_cloglog_state = if family.is_latent_cloglog() {
@@ -362,8 +372,9 @@ pub fn assemble_standard_payload(
             mixture_state: saved_mixture_state_from_fit(&fit),
             sas_state: saved_sas_state_from_fit(&fit),
         },
-        family.name().to_string(),
+        family_label,
     );
+    payload.estimator = estimator;
     payload.unified = Some(fit.clone());
     payload.fit_result = Some(fit.clone());
     payload.data_schema = Some(dataset.schema.clone());

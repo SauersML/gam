@@ -33,7 +33,7 @@ fn multi_z_k1_diagonal_matches_scalar_rigid_eta_bitwise() {
     let slope = 0.42;
     let z = 1.25;
     let probit_scale = 0.8;
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0]).unwrap();
 
     let eta_multi =
         marginal_slope_probit_eta(q, &[z], &[slope], &covariance, probit_scale).expect("eta");
@@ -51,7 +51,7 @@ fn multi_z_k4_diagonal_covariance_preserves_marginal_identity() {
     let probit_scale = 0.9;
     let z = [0.4, -1.2, 0.7, 2.1];
     let slopes = [0.20, -0.15, 0.35, 0.05];
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 0.5, 2.0, 0.25]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0, 0.5, 2.0, 0.25]).unwrap();
 
     let eta = marginal_slope_probit_eta(q, &z, &slopes, &covariance, probit_scale).expect("eta");
     assert!(eta.is_finite());
@@ -65,7 +65,7 @@ fn multi_z_k2_full_covariance_preserves_marginal_identity() {
     let probit_scale = 1.15;
     let z = [1.1, -0.3];
     let slopes = [0.45, -0.25];
-    let covariance = MarginalSlopeCovariance::Full(array![[1.4, 0.35], [0.35, 0.8]]);
+    let covariance = MarginalSlopeCovariance::full(array![[1.4, 0.35], [0.35, 0.8]]).unwrap();
 
     let eta = marginal_slope_probit_eta(q, &z, &slopes, &covariance, probit_scale).expect("eta");
     assert!(eta.is_finite());
@@ -80,7 +80,7 @@ fn multi_z_k4_low_rank_covariance_preserves_marginal_identity() {
     let z = [-0.2, 0.9, 1.4, -1.1];
     let slopes = [0.30, -0.40, 0.10, 0.25];
     let factor = array![[1.0, 0.0], [0.5, 0.2], [-0.3, 0.7], [0.1, -0.4]];
-    let covariance = MarginalSlopeCovariance::LowRank(factor);
+    let covariance = MarginalSlopeCovariance::low_rank(factor).unwrap();
 
     let eta = marginal_slope_probit_eta(q, &z, &slopes, &covariance, probit_scale).expect("eta");
     assert!(eta.is_finite());
@@ -104,12 +104,7 @@ fn multi_z_covariance_shape_auto_derives_from_score_geometry() {
         .expect("diagonal covariance");
     assert_eq!(diagonal.shape(), MarginalSlopeCovarianceShape::Diagonal);
 
-    // Full case: construct two columns whose sample off-diagonal is far above
-    // the 4σ statistical floor used by the classifier.  Mixing the two
-    // harmonics cos(2π·3t) and cos(2π·5t) gives orthogonal basis functions
-    // with var ≈ 1/2 each; col2 = 0.7·col1 + 0.4·col1_other_harmonic injects
-    // a cov[0,1] ≈ 0.35 ≈ 7·SE_offdiag at N=64.  Both eigenvalues stay well
-    // above rank_tol, so the classifier falls through to Full (not LowRank).
+    // Every nonzero off-diagonal is exact geometry and therefore remains Full.
     const N_FULL: usize = 64;
     let mut full_scores = ndarray::Array2::<f64>::zeros((N_FULL, 2));
     for i in 0..N_FULL {
@@ -132,7 +127,7 @@ fn multi_z_covariance_shape_auto_derives_from_score_geometry() {
         [2.0, 4.0, -1.0, -3.0],
         [3.0, 6.0, -1.5, -4.5],
     ];
-    let low_rank = marginal_slope_covariance_from_scores(low_rank_scores.view(), &weights)
-        .expect("low-rank covariance");
-    assert_eq!(low_rank.shape(), MarginalSlopeCovarianceShape::LowRank);
+    let collinear = marginal_slope_covariance_from_scores(low_rank_scores.view(), &weights)
+        .expect("collinear covariance");
+    assert_eq!(collinear.shape(), MarginalSlopeCovarianceShape::Full);
 }

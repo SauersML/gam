@@ -172,7 +172,7 @@ pub(crate) fn marginal_slope_hints(config: &FitConfig) -> gam_runtime::resource:
 /// only when both are present and disagree is rejected as a contradiction; when
 /// neither pins `τ`, the median expectile `τ = 0.5` (the ordinary mean fit) is
 /// the default.
-fn expectile_tau_for_config(config: &FitConfig) -> Result<Option<f64>, WorkflowError> {
+pub fn expectile_tau_for_config(config: &FitConfig) -> Result<Option<f64>, WorkflowError> {
     let Some(raw) = config.family.as_deref() else {
         return Ok(None);
     };

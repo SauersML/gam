@@ -1931,18 +1931,20 @@ mod tests {
             vars[2].mul(&vars[4]).sub(&vars[0]),
         ];
         let covariances = [
-            MarginalSlopeCovariance::Diagonal(Array1::from_vec(vec![1.2, 0.8, 1.5])),
-            MarginalSlopeCovariance::Full(
+            MarginalSlopeCovariance::diagonal(Array1::from_vec(vec![1.2, 0.8, 1.5])).unwrap(),
+            MarginalSlopeCovariance::full(
                 Array2::from_shape_vec(
                     (3, 3),
                     vec![1.2, 0.3, -0.2, 0.3, 0.8, 0.15, -0.2, 0.15, 1.5],
                 )
                 .expect("3x3 covariance"),
-            ),
-            MarginalSlopeCovariance::LowRank(
+            )
+            .unwrap(),
+            MarginalSlopeCovariance::low_rank(
                 Array2::from_shape_vec((3, 2), vec![0.8, -0.1, 0.25, 0.7, -0.45, 0.35])
                     .expect("3x2 factor"),
-            ),
+            )
+            .unwrap(),
         ];
 
         for covariance in &covariances {
@@ -1989,18 +1991,21 @@ mod tests {
     /// oracles and the strongest-hand schedule for every covariance form.
     #[test]
     fn runtime_vector_row_program_matches_strongest_hand_mixed_score_vgh_932() {
-        let diagonal = MarginalSlopeCovariance::Diagonal(Array1::from_vec(vec![1.2, 0.9, 0.7]));
-        let full = MarginalSlopeCovariance::Full(
+        let diagonal =
+            MarginalSlopeCovariance::diagonal(Array1::from_vec(vec![1.2, 0.9, 0.7])).unwrap();
+        let full = MarginalSlopeCovariance::full(
             Array2::from_shape_vec(
                 (3, 3),
                 vec![1.2, 0.18, -0.11, 0.18, 0.9, 0.24, -0.11, 0.24, 0.7],
             )
             .expect("3x3 full covariance"),
-        );
-        let low_rank = MarginalSlopeCovariance::LowRank(
+        )
+        .unwrap();
+        let low_rank = MarginalSlopeCovariance::low_rank(
             Array2::from_shape_vec((3, 2), vec![0.8, -0.1, 0.25, 0.7, -0.45, 0.35])
                 .expect("3x2 covariance factor"),
-        );
+        )
+        .unwrap();
         let cases = [
             (&diagonal, 0.0, -0.4, 0.65, 0.95, 0.8),
             (&diagonal, 1.0, 0.15, -0.55, 1.35, 0.94),
@@ -2154,25 +2159,31 @@ mod tests {
             let scores: Vec<f64> = (0..k)
                 .map(|axis| -0.9 + 1.8 * (axis + 1) as f64 / (k + 1) as f64)
                 .collect();
-            let diagonal = MarginalSlopeCovariance::Diagonal(Array1::from_shape_fn(k, |axis| {
-                0.75 + 0.08 * axis as f64
-            }));
-            let full =
-                MarginalSlopeCovariance::Full(Array2::from_shape_fn((k, k), |(row, col)| {
+            let diagonal =
+                MarginalSlopeCovariance::diagonal(Array1::from_shape_fn(k, |axis| {
+                    0.75 + 0.08 * axis as f64
+                }))
+                .unwrap();
+            let full = MarginalSlopeCovariance::full(Array2::from_shape_fn(
+                (k, k),
+                |(row, col)| {
                     if row == col {
                         1.0 + 0.06 * row as f64
                     } else {
                         0.025 / (1.0 + row.abs_diff(col) as f64)
                     }
-                }));
+                },
+            ))
+            .unwrap();
             let rank = k.min(3);
-            let low_rank = MarginalSlopeCovariance::LowRank(Array2::from_shape_fn(
+            let low_rank = MarginalSlopeCovariance::low_rank(Array2::from_shape_fn(
                 (k, rank),
                 |(row, column)| {
                     let sign = if (row + column) % 2 == 0 { 1.0 } else { -1.0 };
                     sign * (0.18 + 0.03 * row as f64 + 0.05 * column as f64)
                 },
-            ));
+            ))
+            .unwrap();
             let covariances = [diagonal, full, low_rank];
             let q0 = -0.55 + 0.035 * k as f64;
             let q1 = 0.72 - 0.025 * k as f64;
@@ -2193,8 +2204,7 @@ mod tests {
             for (shape_index, covariance) in covariances.iter().enumerate() {
                 let mut production_workspace =
                     RigidVectorRowWorkspace::new(covariance).expect("production width workspace");
-                let value_workspace =
-                    RigidVectorValueWorkspace::new(covariance).expect("value-only width workspace");
+                let value_workspace = RigidVectorValueWorkspace::new(covariance);
                 for event in [0.0, 0.35, 1.0] {
                     let production_value = row_primary_closed_form_vector_into(
                         q0,
@@ -2364,21 +2374,29 @@ mod tests {
         let scores: Vec<f64> = (0..K)
             .map(|axis| -1.1 + 2.2 * (axis + 1) as f64 / (K + 1) as f64)
             .collect();
-        let diagonal = MarginalSlopeCovariance::Diagonal(Array1::from_shape_fn(K, |axis| {
+        let diagonal = MarginalSlopeCovariance::diagonal(Array1::from_shape_fn(K, |axis| {
             0.8 + 0.055 * axis as f64
-        }));
-        let full = MarginalSlopeCovariance::Full(Array2::from_shape_fn((K, K), |(row, col)| {
-            if row == col {
-                1.0 + 0.04 * row as f64
-            } else {
-                0.018 / (1.0 + row.abs_diff(col) as f64)
-            }
-        }));
-        let low_rank =
-            MarginalSlopeCovariance::LowRank(Array2::from_shape_fn((K, 3), |(row, column)| {
+        }))
+        .unwrap();
+        let full = MarginalSlopeCovariance::full(Array2::from_shape_fn(
+            (K, K),
+            |(row, col)| {
+                if row == col {
+                    1.0 + 0.04 * row as f64
+                } else {
+                    0.018 / (1.0 + row.abs_diff(col) as f64)
+                }
+            },
+        ))
+        .unwrap();
+        let low_rank = MarginalSlopeCovariance::low_rank(Array2::from_shape_fn(
+            (K, 3),
+            |(row, column)| {
                 let sign = if (row + column) % 2 == 0 { 1.0 } else { -1.0 };
                 sign * (0.14 + 0.018 * row as f64 + 0.035 * column as f64)
-            }));
+            },
+        ))
+        .unwrap();
         let covariances = [diagonal, full, low_rank];
         let mut dynamic_arena = DynamicJetArena::new();
 
@@ -2395,8 +2413,7 @@ mod tests {
         for (shape, covariance) in covariances.iter().enumerate() {
             let mut production_workspace =
                 RigidVectorRowWorkspace::new(covariance).expect("k=14 production workspace");
-            let value_workspace =
-                RigidVectorValueWorkspace::new(covariance).expect("k=14 value-only workspace");
+            let value_workspace = RigidVectorValueWorkspace::new(covariance);
             for event in [0.0, 0.35, 1.0] {
                 let production_value = row_primary_closed_form_vector_into(
                     -0.31,
@@ -2496,9 +2513,8 @@ mod tests {
         assert!(checked_vector_workspace_layout(0).is_err());
         assert!(checked_vector_workspace_layout(usize::MAX).is_err());
 
-        let empty_covariance = MarginalSlopeCovariance::Diagonal(Array1::zeros(0));
-        assert!(RigidVectorRowWorkspace::new(&empty_covariance).is_err());
-        let covariance = MarginalSlopeCovariance::Diagonal(Array1::ones(3));
+        assert!(MarginalSlopeCovariance::diagonal(Array1::zeros(0)).is_err());
+        let covariance = MarginalSlopeCovariance::diagonal(Array1::ones(3)).unwrap();
         let mut workspace = RigidVectorRowWorkspace::new(&covariance).expect("k=3 workspace");
         let error = row_primary_closed_form_vector_into(
             -0.2,
@@ -2547,25 +2563,32 @@ mod tests {
                 let scores: Vec<f64> = (0..$k)
                     .map(|axis| -1.25 + 2.5 * (axis + 1) as f64 / ($k + 1) as f64)
                     .collect();
-                let diagonal =
-                    MarginalSlopeCovariance::Diagonal(Array1::from_shape_fn($k, |axis| {
+                let diagonal = MarginalSlopeCovariance::diagonal(Array1::from_shape_fn(
+                    $k,
+                    |axis| {
                         0.8 + 0.07 * axis as f64
-                    }));
-                let full =
-                    MarginalSlopeCovariance::Full(Array2::from_shape_fn(($k, $k), |(row, col)| {
+                    },
+                ))
+                .unwrap();
+                let full = MarginalSlopeCovariance::full(Array2::from_shape_fn(
+                    ($k, $k),
+                    |(row, col)| {
                         if row == col {
                             1.0 + 0.05 * row as f64
                         } else {
                             0.02 / (1.0 + row.abs_diff(col) as f64)
                         }
-                    }));
-                let low_rank = MarginalSlopeCovariance::LowRank(Array2::from_shape_fn(
+                    },
+                ))
+                .unwrap();
+                let low_rank = MarginalSlopeCovariance::low_rank(Array2::from_shape_fn(
                     ($k, $k.min(3)),
                     |(row, column)| {
                         let sign = if (row + column) % 2 == 0 { 1.0 } else { -1.0 };
                         sign * (0.17 + 0.025 * row as f64 + 0.04 * column as f64)
                     },
-                ));
+                ))
+                .unwrap();
                 let cases = [
                     ("diagonal", &diagonal),
                     ("full", &full),

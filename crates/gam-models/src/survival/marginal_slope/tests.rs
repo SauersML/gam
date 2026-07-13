@@ -274,6 +274,14 @@ fn make_closed_form_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
     }
 }
 
+#[test]
+fn k1_shared_logslope_uses_cached_arbitrary_variance_932() {
+    let mut family = make_closed_form_test_family(3);
+    family.score_covariance = MarginalSlopeCovariance::diagonal(array![3.75]).unwrap();
+    assert_eq!(family.score_covariance.ones_quadratic_form(), 3.75);
+    assert_eq!(family.shared_logslope_covariance_scale(), 3.75);
+}
+
 fn closed_form_block_states(
     family: &SurvivalMarginalSlopeFamily,
     g: f64,

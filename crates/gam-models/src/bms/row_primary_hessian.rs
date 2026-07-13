@@ -1302,7 +1302,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
-        let scale = program.scale();
+        let scale = self.probit_frailty_scale();
         let n = self.y.len();
         let score_runtime = self.score_warp.as_ref();
         let link_runtime = self.link_dev.as_ref();

@@ -140,7 +140,7 @@ fn survival_k1_eta_bitwise_scalar_identity_200_fixtures() {
         let slope = [rng.range(-1.5, 1.5)];
         // Keep probit_scale strictly positive but otherwise free.
         let probit_scale = rng.range(0.05, 2.5);
-        let covariance = MarginalSlopeCovariance::Diagonal(Array1::from(vec![1.0]));
+        let covariance = MarginalSlopeCovariance::diagonal(Array1::from(vec![1.0])).unwrap();
         let r = probit_scale * slope[0];
         let scalar = q * (1.0 + r * r).sqrt() + r * z[0];
         let got = survival_marginal_slope_vector_eta(q, &z, &slope, &covariance, probit_scale)
@@ -164,7 +164,7 @@ fn bernoulli_k1_eta_bitwise_scalar_identity_200_fixtures() {
         let z = [rng.normal()];
         let slope = [rng.range(-1.5, 1.5)];
         let probit_scale = rng.range(0.05, 2.5);
-        let covariance = MarginalSlopeCovariance::Diagonal(Array1::from(vec![1.0]));
+        let covariance = MarginalSlopeCovariance::diagonal(Array1::from(vec![1.0])).unwrap();
         let r = probit_scale * slope[0];
         let scalar = q * (1.0 + r * r).sqrt() + r * z[0];
         let got = marginal_slope_probit_eta(q, &z, &slope, &covariance, probit_scale)
@@ -195,10 +195,11 @@ fn bernoulli_survival_eta_agreement_k_up_to_6_all_shapes() {
 
             // Shape A: Full
             let sigma_full = make_full_cov(&mut rng, k);
-            let cov_full = MarginalSlopeCovariance::Full(sigma_full.clone());
+            let cov_full = MarginalSlopeCovariance::full(sigma_full.clone()).unwrap();
 
             // Shape B: Diagonal (just the diagonal of sigma_full)
-            let cov_diag = MarginalSlopeCovariance::Diagonal(sigma_full.diag().to_owned());
+            let cov_diag =
+                MarginalSlopeCovariance::diagonal(sigma_full.diag().to_owned()).unwrap();
 
             // Shape C: LowRank: random factor of width = min(k, rng-pick)
             let rank = rng.usize_in(1, k);
@@ -208,7 +209,7 @@ fn bernoulli_survival_eta_agreement_k_up_to_6_all_shapes() {
                     factor[[i, j]] = rng.normal();
                 }
             }
-            let cov_low = MarginalSlopeCovariance::LowRank(factor);
+            let cov_low = MarginalSlopeCovariance::low_rank(factor).unwrap();
 
             for cov in [&cov_full, &cov_diag, &cov_low] {
                 let eb = marginal_slope_probit_eta(q, &z, &slopes, cov, probit_scale)
@@ -265,8 +266,8 @@ fn block_diagonal_independence_with_zero_slopes_in_block_b() {
         let probit_scale = rng.range(0.2, 1.7);
         let q = rng.range(-2.0, 2.0);
 
-        let cov_full = MarginalSlopeCovariance::Full(sigma);
-        let cov_a = MarginalSlopeCovariance::Full(sigma_a);
+        let cov_full = MarginalSlopeCovariance::full(sigma).unwrap();
+        let cov_a = MarginalSlopeCovariance::full(sigma_a).unwrap();
 
         let scale_full =
             marginal_slope_preserving_scale(&slopes, &cov_full, probit_scale).expect("scale full");
@@ -322,8 +323,8 @@ fn zero_slope_extra_column_does_not_change_eta_or_scale() {
         let mut z_ext = z.clone();
         z_ext.push(rng.normal()); // arbitrary; coefficient is zero so must not affect output
 
-        let cov = MarginalSlopeCovariance::Full(sigma);
-        let cov_ext = MarginalSlopeCovariance::Full(sigma_ext);
+        let cov = MarginalSlopeCovariance::full(sigma).unwrap();
+        let cov_ext = MarginalSlopeCovariance::full(sigma_ext).unwrap();
 
         let s_base = marginal_slope_preserving_scale(&slopes, &cov, probit_scale).expect("s base");
         let s_ext =
@@ -354,7 +355,7 @@ fn lowrank_matches_full_of_outer_product() {
     let tol = 1e-13;
     for trial in 0..100 {
         let k = rng.usize_in(2, 6);
-        let rank = rng.usize_in(1, k);
+        let rank = k;
         let mut factor = Array2::<f64>::zeros((k, rank));
         for i in 0..k {
             for j in 0..rank {
@@ -362,8 +363,8 @@ fn lowrank_matches_full_of_outer_product() {
             }
         }
         let sigma_full = factor_to_full(&factor);
-        let cov_low = MarginalSlopeCovariance::LowRank(factor);
-        let cov_full = MarginalSlopeCovariance::Full(sigma_full);
+        let cov_low = MarginalSlopeCovariance::low_rank(factor).unwrap();
+        let cov_full = MarginalSlopeCovariance::full(sigma_full).unwrap();
 
         let slopes: Vec<f64> = (0..k).map(|_| rng.range(-1.2, 1.2)).collect();
         let z: Vec<f64> = (0..k).map(|_| rng.normal()).collect();
@@ -404,8 +405,8 @@ fn diagonal_matches_full_of_diag() {
         for i in 0..k {
             sigma_full[[i, i]] = diag[i];
         }
-        let cov_diag = MarginalSlopeCovariance::Diagonal(Array1::from(diag.clone()));
-        let cov_full = MarginalSlopeCovariance::Full(sigma_full);
+        let cov_diag = MarginalSlopeCovariance::diagonal(Array1::from(diag.clone())).unwrap();
+        let cov_full = MarginalSlopeCovariance::full(sigma_full).unwrap();
 
         let slopes: Vec<f64> = (0..k).map(|_| rng.range(-1.3, 1.3)).collect();
         let z: Vec<f64> = (0..k).map(|_| rng.normal()).collect();
@@ -434,13 +435,13 @@ fn diagonal_matches_full_of_diag() {
 
 // ------------------------------------------------------------------
 // Test 8: marginal_slope_covariance_from_scores reductions:
-//   (a) two columns with col2 = alpha * col1 exactly -> LowRank (rank 1)
+//   (a) two columns with col2 = alpha * col1 exactly -> Full, retaining coupling
 //   (b) three exactly-orthogonal scaled columns      -> Diagonal
 // We check `.shape()` only (numerical content tested by other tests).
 // ------------------------------------------------------------------
 #[test]
 fn auto_derivation_shape_reductions() {
-    // (a) Perfect collinearity -> LowRank
+    // (a) Perfect collinearity has a nonzero off-diagonal, so it remains Full.
     let n = 64;
     let mut col1 = Array1::<f64>::zeros(n);
     let mut rng = SplitMix64::new(0x5C0F_E5_u64);
@@ -458,20 +459,11 @@ fn auto_derivation_shape_reductions() {
         .expect("from_scores collinear");
     assert_eq!(
         cov_collinear.shape(),
-        MarginalSlopeCovarianceShape::LowRank,
-        "collinear K=2 case should auto-detect LowRank (rank-1), got {:?}",
+        MarginalSlopeCovarianceShape::Full,
+        "collinear K=2 case must retain exact coupling as Full, got {:?}",
         cov_collinear.shape()
     );
-    if let MarginalSlopeCovariance::LowRank(factor) = &cov_collinear {
-        assert_eq!(
-            factor.ncols(),
-            1,
-            "rank-1 collinear case should produce a single-column factor, got {} cols",
-            factor.ncols()
-        );
-    } else {
-        panic!("unreachable: shape check passed but enum variant did not");
-    }
+    assert_ne!(cov_collinear.to_dense()[[0, 1]], 0.0);
 
     // (b) Orthogonal scaled indicator columns -> Diagonal.
     // Take three "scaled selector" columns whose row supports do not overlap;
@@ -524,7 +516,7 @@ fn survival_neglog_k1_matches_closed_form_20_fixtures() {
         // Event indicator: alternate between 0 and 1 deterministically.
         let event = if trial % 2 == 0 { 0.0 } else { 1.0 };
         let probit_scale = rng.range(0.1, 2.0);
-        let cov = MarginalSlopeCovariance::Diagonal(Array1::from(vec![1.0]));
+        let cov = MarginalSlopeCovariance::diagonal(Array1::from(vec![1.0])).unwrap();
         let derivative_guard = 1e-12;
 
         let got = survival_marginal_slope_vector_neglog(

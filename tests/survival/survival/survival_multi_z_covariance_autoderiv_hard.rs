@@ -392,66 +392,33 @@ fn t05_weights_select_correlated_half() {
 }
 
 // ====================================================================
-// Test 6: N < K and N == K degenerate
+// Test 6: N < K and N == K singular dense geometry
 // ====================================================================
 #[test]
-fn t06a_n_less_than_k_must_err_or_lowrank() {
+fn t06a_n_less_than_k_retains_nonzero_coupling_as_full() {
     let n = 3;
     let k = 4;
     let mut state = 0x1357_9BDFu64;
     let scores = make_iid_normal_scores(n, k, &mut state);
     let w = ones_weights(n);
     let result = marginal_slope_covariance_from_scores(scores.view(), &w);
-    match result {
-        Err(_) => {} // OK
-        Ok(cov) => match cov {
-            MarginalSlopeCovariance::Diagonal(_) => {
-                // Diagonal is technically rank ≤ K, but with N=3 < K=4 and
-                // generic scores it's vanishingly unlikely off-diagonals are
-                // ≤ 1e-10. Allow but warn.
-                println!("t06a: N=3 K=4 returned Diagonal (acceptable but surprising)");
-            }
-            MarginalSlopeCovariance::Full(_) => {
-                panic!("N=3 < K=4 must NOT return Full (would be rank-deficient)");
-            }
-            MarginalSlopeCovariance::LowRank(factor) => {
-                assert!(
-                    factor.ncols() <= n,
-                    "LowRank factor with N=3 must have rank ≤ 3, got {}",
-                    factor.ncols()
-                );
-            }
-        },
+    if let Ok(covariance) = result {
+        assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
+        assert_eq!(covariance.dim(), k);
     }
 }
 
 #[test]
-fn t06b_n_equal_k_must_err_or_lowrank() {
+fn t06b_n_equal_k_retains_nonzero_coupling_as_full() {
     let n = 4;
     let k = 4;
     let mut state = 0x2468_ACE0u64;
     let scores = make_iid_normal_scores(n, k, &mut state);
     let w = ones_weights(n);
     let result = marginal_slope_covariance_from_scores(scores.view(), &w);
-    match result {
-        Err(_) => {} // OK
-        Ok(cov) => match cov {
-            MarginalSlopeCovariance::Diagonal(_) => {
-                println!("t06b: N=K=4 returned Diagonal (acceptable but surprising)");
-            }
-            MarginalSlopeCovariance::Full(_) => {
-                panic!(
-                    "N=K=4 must NOT return full-rank Full: sample covariance has rank ≤ N-1 = 3"
-                );
-            }
-            MarginalSlopeCovariance::LowRank(factor) => {
-                assert!(
-                    factor.ncols() < k,
-                    "LowRank factor with N=K=4 must have rank < 4, got {}",
-                    factor.ncols()
-                );
-            }
-        },
+    if let Ok(covariance) = result {
+        assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
+        assert_eq!(covariance.dim(), k);
     }
 }
 
@@ -611,20 +578,14 @@ fn t10_k_eq_1_always_diagonal_or_err() {
         let w = ones_weights(n);
         let result = marginal_slope_covariance_from_scores(col.view(), &w);
         match result {
-            Ok(cov) => match cov {
-                MarginalSlopeCovariance::Diagonal(diag) => {
-                    assert_eq!(
-                        diag.len(),
-                        1,
-                        "case {case}: Diagonal must have length 1, got {}",
-                        diag.len()
-                    );
-                }
-                other => panic!(
-                    "case {case}: K=1 must return Diagonal, got {:?}",
-                    other.shape()
-                ),
-            },
+            Ok(covariance) => {
+                assert_eq!(
+                    covariance.shape(),
+                    MarginalSlopeCovarianceShape::Diagonal,
+                    "case {case}: K=1 must return Diagonal"
+                );
+                assert_eq!(covariance.dim(), 1);
+            }
             Err(_) => {
                 // Err is also acceptable (e.g. degenerate zero variance).
             }

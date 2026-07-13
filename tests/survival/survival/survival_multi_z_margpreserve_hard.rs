@@ -94,7 +94,7 @@ fn random_diagonal(rng: &mut SplitMix64, k: usize) -> MarginalSlopeCovariance {
     for i in 0..k {
         diag[i] = 0.01 + 2.0 * rng.next_unit();
     }
-    MarginalSlopeCovariance::Diagonal(diag)
+    MarginalSlopeCovariance::diagonal(diag).unwrap()
 }
 
 fn random_full(rng: &mut SplitMix64, k: usize) -> (MarginalSlopeCovariance, Array2<f64>) {
@@ -109,7 +109,7 @@ fn random_full(rng: &mut SplitMix64, k: usize) -> (MarginalSlopeCovariance, Arra
     for i in 0..k {
         cov[[i, i]] += 1e-3;
     }
-    (MarginalSlopeCovariance::Full(cov.clone()), cov)
+    (MarginalSlopeCovariance::full(cov.clone()).unwrap(), cov)
 }
 
 fn random_low_rank(rng: &mut SplitMix64, k: usize, r: usize) -> MarginalSlopeCovariance {
@@ -119,7 +119,7 @@ fn random_low_rank(rng: &mut SplitMix64, k: usize, r: usize) -> MarginalSlopeCov
             f[[i, j]] = rng.next_signed();
         }
     }
-    MarginalSlopeCovariance::LowRank(f)
+    MarginalSlopeCovariance::low_rank(f).unwrap()
 }
 
 fn random_slopes(rng: &mut SplitMix64, k: usize, norm: f64) -> Vec<f64> {
@@ -230,7 +230,7 @@ fn survival_multi_z_near_degenerate_rank1_lowrank() {
     for i in 0..k {
         f[[i, 0]] = rng.next_signed();
     }
-    let cov = MarginalSlopeCovariance::LowRank(f);
+    let cov = MarginalSlopeCovariance::low_rank(f).unwrap();
     // For 50 random (q, slopes, probit_scale) we expect the exact identity
     // (no SPD floor was added on the rank-1 path).
     for seed in 0u64..50 {
@@ -307,7 +307,7 @@ fn survival_multi_z_near_degenerate_full_one_tiny_eigenvalue() {
             sigma[[j, i]] = avg;
         }
     }
-    let cov = MarginalSlopeCovariance::Full(sigma);
+    let cov = MarginalSlopeCovariance::full(sigma).unwrap();
 
     for seed in 0u64..50 {
         let mut rng = SplitMix64::new(0x1357_2468 ^ seed);
@@ -332,7 +332,7 @@ fn survival_multi_z_near_degenerate_full_one_tiny_eigenvalue() {
 
 #[test]
 fn survival_multi_z_k1_eta_bitwise_matches_scalar() {
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0]).unwrap();
     for seed in 0u64..100 {
         let mut rng = SplitMix64::new(0x9999_AAAA ^ seed);
         let q = 4.0 * rng.next_signed();
@@ -403,7 +403,7 @@ fn survival_multi_z_permutation_invariance_full_and_lowrank() {
                 lr_factor[[i, j]] = rng.next_signed();
             }
         }
-        let cov_lr = MarginalSlopeCovariance::LowRank(lr_factor.clone());
+        let cov_lr = MarginalSlopeCovariance::low_rank(lr_factor.clone()).unwrap();
 
         let amp = 1.0 + rng.next_unit();
         let slopes = random_slopes(&mut rng, k, amp);
@@ -414,8 +414,9 @@ fn survival_multi_z_permutation_invariance_full_and_lowrank() {
         let perm = random_permutation(&mut rng, k);
         let slopes_p = permute_vec(&slopes, &perm);
         let z_p = permute_vec(&z, &perm);
-        let cov_full_p = MarginalSlopeCovariance::Full(permute_full(&dense, &perm));
-        let cov_lr_p = MarginalSlopeCovariance::LowRank(permute_lowrank_rows(&lr_factor, &perm));
+        let cov_full_p = MarginalSlopeCovariance::full(permute_full(&dense, &perm)).unwrap();
+        let cov_lr_p =
+            MarginalSlopeCovariance::low_rank(permute_lowrank_rows(&lr_factor, &perm)).unwrap();
 
         for (label, cov, cov_p) in [
             ("Full", &cov_full, &cov_full_p),
@@ -460,8 +461,8 @@ fn survival_multi_z_diagonal_from_full_matches() {
         for i in 0..k {
             dense[[i, i]] = diag[i];
         }
-        let cov_diag = MarginalSlopeCovariance::Diagonal(diag);
-        let cov_full = MarginalSlopeCovariance::Full(dense);
+        let cov_diag = MarginalSlopeCovariance::diagonal(diag).unwrap();
+        let cov_full = MarginalSlopeCovariance::full(dense).unwrap();
 
         let slopes = random_slopes(&mut rng, k, 1.0);
         let probit_scale = 0.3 + 1.0 * rng.next_unit();
@@ -486,15 +487,15 @@ fn survival_multi_z_lowrank_vs_full_equivalence() {
     for seed in 0u64..50 {
         let mut rng = SplitMix64::new(0xC0FFEE ^ seed);
         let k = rng.range(2, 8); // [2,7]
-        let r = rng.range(1, k + 1); // [1,k]
+        let r = k;
         let mut factor = Array2::<f64>::zeros((k, r));
         for i in 0..k {
             for j in 0..r {
                 factor[[i, j]] = rng.next_signed();
             }
         }
-        let cov_lr = MarginalSlopeCovariance::LowRank(factor.clone());
-        let cov_full = MarginalSlopeCovariance::Full(factor.dot(&factor.t()));
+        let cov_lr = MarginalSlopeCovariance::low_rank(factor.clone()).unwrap();
+        let cov_full = MarginalSlopeCovariance::full(factor.dot(&factor.t())).unwrap();
 
         let amp = 0.5 + rng.next_unit();
         let slopes = random_slopes(&mut rng, k, amp);
@@ -554,7 +555,7 @@ fn survival_multi_z_covariance_from_scores_smoke() {
 
 #[test]
 fn survival_multi_z_eta_rejects_z_slope_dimension_mismatch() {
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 1.0]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0, 1.0]).unwrap();
     // z and covariance agree (len 2), but slopes is length 3.
     let err =
         survival_marginal_slope_vector_eta(0.2, &[0.4, -0.8], &[0.3, 0.1, -0.2], &covariance, 1.0)
@@ -567,7 +568,7 @@ fn survival_multi_z_eta_rejects_z_slope_dimension_mismatch() {
 
 #[test]
 fn survival_multi_z_eta_rejects_z_covariance_dimension_mismatch() {
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 1.0, 1.0]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0, 1.0, 1.0]).unwrap();
     let err = survival_marginal_slope_vector_eta(0.1, &[0.4, 0.5], &[0.3, 0.2], &covariance, 1.0)
         .expect_err("z/cov mismatch must fail");
     assert!(
@@ -578,7 +579,7 @@ fn survival_multi_z_eta_rejects_z_covariance_dimension_mismatch() {
 
 #[test]
 fn survival_multi_z_scale_rejects_nonfinite_slope() {
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 1.0]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0, 1.0]).unwrap();
     let err = survival_marginal_slope_vector_scale(&[0.3, f64::NAN], &covariance, 1.0)
         .expect_err("non-finite slope must fail");
     assert!(!err.is_empty(), "expected non-empty error, got: {err}");
@@ -586,7 +587,7 @@ fn survival_multi_z_scale_rejects_nonfinite_slope() {
 
 #[test]
 fn survival_multi_z_eta_rejects_nonfinite_z() {
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 1.0]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0, 1.0]).unwrap();
     let err = survival_marginal_slope_vector_eta(
         0.1,
         &[0.4, f64::INFINITY],

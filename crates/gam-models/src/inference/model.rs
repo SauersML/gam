@@ -58,7 +58,7 @@ use std::path::Path;
 /// Do NOT bump for purely additive `Option<T>` fields that the save-time
 /// invariant (`validate_for_persistence`) does not yet require. Those are
 /// forward-compatible.
-pub const MODEL_PAYLOAD_VERSION: u32 = 11;
+pub const MODEL_PAYLOAD_VERSION: u32 = 12;
 
 /// Exact topology required to replay a saved survival location-scale fit.
 /// This is a required v11 payload field: `None` is explicit for every other
@@ -248,6 +248,13 @@ pub struct FittedModelPayload {
     pub model_kind: ModelKind,
     pub family_state: FittedFamily,
     pub family: String,
+    /// Statistical criterion that produced the saved response surface.
+    ///
+    /// This is a required v12 field. In particular, an expectile fit uses a
+    /// Gaussian-identity inner solver but does not thereby acquire a Gaussian
+    /// observation law. Persisting the estimator separately prevents
+    /// generative consumers from manufacturing one after save/load.
+    pub estimator: FittedEstimator,
     /// Human-readable advisories produced while materializing this model —
     /// e.g. an mgcv-style "k was reduced to the data support" note when a
     /// cubic-regression marginal is capped, or a basis-degradation note. These
@@ -698,6 +705,7 @@ impl FittedModelPayload {
             model_kind,
             family_state,
             family,
+            estimator: FittedEstimator::Likelihood,
             inference_notes: Vec::new(),
             used_device: false,
             fit_result: None,
@@ -872,6 +880,18 @@ pub enum ModelKind {
     MarginalSlope,
     Survival,
     TransformationNormal,
+}
+
+/// Statistical criterion represented by a saved fitted surface.
+///
+/// `Likelihood` means the persisted [`LikelihoodSpec`] is also the fitted
+/// observation law. `Expectile` records the asymmetric least-squares target;
+/// it intentionally defines no observation sampler on its own.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "estimator_kind", rename_all = "kebab-case")]
+pub enum FittedEstimator {
+    Likelihood,
+    Expectile { tau: f64 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3038,6 +3058,11 @@ impl FittedModel {
         self.payload().family_state.likelihood()
     }
 
+    #[inline]
+    pub fn estimator(&self) -> FittedEstimator {
+        self.payload().estimator
+    }
+
     /// Columns this model consumes from a prediction frame — its *input
     /// contract*.
     ///
@@ -4367,6 +4392,45 @@ impl FittedModel {
         // MODEL_PAYLOAD_VERSION constant — every payload must round-trip
         // identically between writers and readers running the same schema.
         self.validate_payload_version()?;
+        let expectile_family_tag = {
+            let family = self.family.trim().to_ascii_lowercase();
+            family == "expectile" || family.starts_with("expectile(")
+        };
+        match self.estimator {
+            FittedEstimator::Likelihood if expectile_family_tag => {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "saved family is tagged expectile but estimator metadata says likelihood"
+                        .to_string(),
+                });
+            }
+            FittedEstimator::Likelihood => {}
+            FittedEstimator::Expectile { tau } => {
+                if !tau.is_finite() || tau <= 0.0 || tau >= 1.0 {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved expectile estimator requires finite tau strictly in (0, 1), got {tau}"
+                        ),
+                    });
+                }
+                let gaussian_identity_standard = self.model_kind == ModelKind::Standard
+                    && matches!(
+                        &self.family_state,
+                        FittedFamily::Standard { likelihood, .. }
+                            if *likelihood == LikelihoodSpec::gaussian_identity()
+                    );
+                if !gaussian_identity_standard || !expectile_family_tag {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved expectile estimator requires an expectile-tagged standard \
+                             Gaussian-identity fit; got model_kind={:?}, family={:?}, likelihood={:?}",
+                            self.model_kind,
+                            self.family,
+                            self.family_state.likelihood(),
+                        ),
+                    });
+                }
+            }
+        }
         if self.training_table_kind.trim().is_empty() {
             return Err(FittedModelError::MissingField {
                 reason: "saved model training_table_kind must be non-empty".to_string(),

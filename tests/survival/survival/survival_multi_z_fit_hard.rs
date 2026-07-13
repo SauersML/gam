@@ -202,7 +202,7 @@ fn survival_multi_z_fit_truth_neglog_minimised_at_true_slopes_30_seeds() {
     // Use the population covariance (identity) for both event simulation
     // and likelihood evaluation, so the truth is the exact population
     // optimum (no model mismatch between generating and evaluating Σ).
-    let covariance = MarginalSlopeCovariance::Diagonal(Array1::<f64>::ones(K));
+    let covariance = MarginalSlopeCovariance::diagonal(Array1::<f64>::ones(K)).unwrap();
 
     const SEEDS: u64 = 30;
     let mut sum_truth = 0.0_f64;

@@ -2289,6 +2289,54 @@ mod covariance_admission_tests {
         MarginalSlopeCovariance::full(array![[1.0, 0.0], [0.0, 0.0]])
             .expect("an exact singular PSD covariance is admissible");
     }
+
+    #[test]
+    fn full_covariance_admission_accepts_coupled_singular_psd_932() {
+        let covariance = MarginalSlopeCovariance::full(array![[1.0, 1.0], [1.0, 1.0]])
+            .expect("a coupled singular PSD covariance is admissible");
+        assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
+        assert_eq!(covariance.to_dense(), array![[1.0, 1.0], [1.0, 1.0]]);
+    }
+
+    #[test]
+    fn exact_nonzero_offdiagonal_classifier_retains_full_geometry_932() {
+        let epsilon = 1.0e-14;
+        let scores = array![[-1.0, -epsilon], [1.0, epsilon], [0.0, -1.0], [0.0, 1.0]];
+        let covariance =
+            marginal_slope_covariance_from_scores(scores.view(), &Array1::ones(4)).unwrap();
+        let dense = covariance.to_dense();
+        assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
+        assert_ne!(dense[[0, 1]], 0.0);
+        assert_eq!(dense[[0, 1]], dense[[1, 0]]);
+        let direction = [0.75, -1.25];
+        let expected = direction[0]
+            * (dense[[0, 0]] * direction[0] + dense[[0, 1]] * direction[1])
+            + direction[1]
+                * (dense[[1, 0]] * direction[0] + dense[[1, 1]] * direction[1]);
+        let actual = covariance.quadratic_form(&direction).unwrap();
+        assert!((actual - expected).abs() <= 2.0e-15);
+    }
+
+    #[test]
+    fn equal_dense_covariance_quadratic_forms_match_all_representations_932() {
+        let diagonal = MarginalSlopeCovariance::diagonal(array![1.2, 0.7]).unwrap();
+        let full = MarginalSlopeCovariance::full(array![[1.2, 0.0], [0.0, 0.7]]).unwrap();
+        let low_rank = MarginalSlopeCovariance::low_rank(array![
+            [1.2_f64.sqrt(), 0.0],
+            [0.0, 0.7_f64.sqrt()]
+        ])
+        .unwrap();
+        let direction = [0.35, -0.8];
+        let expected = diagonal.quadratic_form(&direction).unwrap();
+        for covariance in [&full, &low_rank] {
+            let actual = covariance.quadratic_form(&direction).unwrap();
+            assert!((actual - expected).abs() <= 2.0e-15);
+            assert!(
+                (covariance.ones_quadratic_form() - diagonal.ones_quadratic_form()).abs()
+                    <= 2.0e-15
+            );
+        }
+    }
 }
 
 #[cfg(test)]

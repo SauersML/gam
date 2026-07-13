@@ -28,7 +28,7 @@ fn survival_multi_z_k1_diagonal_matches_scalar_eta_bitwise() {
     let z = [1.3];
     let slope = [0.27];
     let probit_scale = 0.8;
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0]).unwrap();
     let eta =
         survival_marginal_slope_vector_eta(q, &z, &slope, &covariance, probit_scale).expect("eta");
     let observed = probit_scale * slope[0];
@@ -42,7 +42,7 @@ fn survival_multi_z_k1_diagonal_matches_scalar_eta_bitwise() {
 fn survival_multi_z_k1_scale_reduces_to_original_scalar_unit_variance() {
     let slope = [0.31];
     let probit_scale: f64 = 0.75;
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0]).unwrap();
     let observed: f64 = probit_scale * slope[0];
     let expected = (1.0 + observed * observed).sqrt();
     let actual =
@@ -55,7 +55,7 @@ fn survival_multi_z_k2_full_covariance_preserves_identity() {
     let q = -0.22;
     let z = [0.6, -1.1];
     let slopes = [0.35, -0.2];
-    let covariance = MarginalSlopeCovariance::Full(array![[1.3, 0.4], [0.4, 0.7]]);
+    let covariance = MarginalSlopeCovariance::full(array![[1.3, 0.4], [0.4, 0.7]]).unwrap();
     let eta = survival_marginal_slope_vector_eta(q, &z, &slopes, &covariance, 1.1).expect("eta");
     assert!(eta.is_finite());
     assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
@@ -69,7 +69,7 @@ fn survival_multi_z_shared_slope_neglog_uses_row_sum_and_covariance_quadratic() 
     let qd1 = 0.9;
     let shared_slope = -0.22;
     let z = [0.6, -1.1];
-    let covariance = MarginalSlopeCovariance::Full(array![[1.3, 0.4], [0.4, 0.7]]);
+    let covariance = MarginalSlopeCovariance::full(array![[1.3, 0.4], [0.4, 0.7]]).unwrap();
     let probit_scale = 0.85;
     let weight = 1.3;
     let event = 1.0;
@@ -110,8 +110,13 @@ fn survival_multi_z_k4_low_rank_covariance_preserves_identity() {
     let q = 0.19;
     let z = [-0.4, 0.8, 1.2, -1.5];
     let slopes = [0.25, -0.32, 0.08, 0.21];
-    let covariance =
-        MarginalSlopeCovariance::LowRank(array![[1.0, 0.0], [0.2, 0.4], [-0.3, 0.5], [0.7, -0.1]]);
+    let covariance = MarginalSlopeCovariance::low_rank(array![
+        [1.0, 0.0],
+        [0.2, 0.4],
+        [-0.3, 0.5],
+        [0.7, -0.1]
+    ])
+    .unwrap();
     let eta = survival_marginal_slope_vector_eta(q, &z, &slopes, &covariance, 0.9).expect("eta");
     assert!(eta.is_finite());
     assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::LowRank);
@@ -123,7 +128,7 @@ fn survival_multi_z_low_rank_scale_matches_matrix_determinant_lemma() {
     let slopes = [0.25, -0.32, 0.08, 0.21];
     let probit_scale = 0.9;
     let factor = array![[1.0, 0.0], [0.2, 0.4], [-0.3, 0.5], [0.7, -0.1]];
-    let covariance = MarginalSlopeCovariance::LowRank(factor.clone());
+    let covariance = MarginalSlopeCovariance::low_rank(factor.clone()).unwrap();
     let observed: Vec<f64> = slopes.iter().map(|&slope| probit_scale * slope).collect();
 
     let mut projected_norm2 = 0.0;
@@ -142,7 +147,7 @@ fn survival_multi_z_low_rank_scale_matches_matrix_determinant_lemma() {
         "low_rank_scale={low_rank_scale:.17e} determinant_lemma_scale={determinant_lemma_scale:.17e}"
     );
 
-    let dense_covariance = MarginalSlopeCovariance::Full(factor.dot(&factor.t()));
+    let dense_covariance = MarginalSlopeCovariance::full(factor.dot(&factor.t())).unwrap();
     let dense_scale =
         survival_marginal_slope_vector_scale(&slopes, &dense_covariance, probit_scale)
             .expect("dense scale");
@@ -154,7 +159,7 @@ fn survival_multi_z_low_rank_scale_matches_matrix_determinant_lemma() {
 
 #[test]
 fn survival_multi_z_eta_rejects_score_slope_dimension_mismatch() {
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 1.0]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0, 1.0]).unwrap();
     let err = survival_marginal_slope_vector_eta(0.2, &[0.4, -0.8], &[0.3], &covariance, 1.0)
         .expect_err("dimension mismatch must fail");
     assert!(err.contains("dimension mismatch"));
@@ -167,7 +172,7 @@ fn survival_multi_z_k1_neglog_matches_scalar_identity_fixture() {
     let qd1 = 0.8;
     let slope = [0.31];
     let z = [0.45];
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0]).unwrap();
     let probit_scale: f64 = 0.75;
     let observed: f64 = probit_scale * slope[0];
     let c = (1.0 + observed * observed).sqrt();
@@ -199,7 +204,7 @@ fn survival_multi_z_k1_neglog_matches_scalar_identity_fixture() {
 
 #[test]
 fn survival_multi_z_neglog_rejects_derivative_guard_violation() {
-    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 1.0]);
+    let covariance = MarginalSlopeCovariance::diagonal(array![1.0, 1.0]).unwrap();
     let err = survival_marginal_slope_vector_neglog(
         0.0,
         0.2,

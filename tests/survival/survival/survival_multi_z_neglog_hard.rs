@@ -112,7 +112,7 @@ fn make_full_psd(rng: &mut SplitMix64, k: usize) -> MarginalSlopeCovariance {
             sigma[[j, i]] = avg;
         }
     }
-    MarginalSlopeCovariance::Full(sigma)
+    MarginalSlopeCovariance::full(sigma).unwrap()
 }
 
 fn make_diagonal(rng: &mut SplitMix64, k: usize) -> MarginalSlopeCovariance {
@@ -120,7 +120,7 @@ fn make_diagonal(rng: &mut SplitMix64, k: usize) -> MarginalSlopeCovariance {
     for i in 0..k {
         diag[i] = rng.uniform(0.05, 2.0);
     }
-    MarginalSlopeCovariance::Diagonal(diag)
+    MarginalSlopeCovariance::diagonal(diag).unwrap()
 }
 
 fn make_low_rank(rng: &mut SplitMix64, k: usize, rank: usize) -> MarginalSlopeCovariance {
@@ -131,7 +131,7 @@ fn make_low_rank(rng: &mut SplitMix64, k: usize, rank: usize) -> MarginalSlopeCo
             factor[[i, j]] = rng.uniform(-0.7, 0.7);
         }
     }
-    MarginalSlopeCovariance::LowRank(factor)
+    MarginalSlopeCovariance::low_rank(factor).unwrap()
 }
 
 fn random_slopes(rng: &mut SplitMix64, k: usize) -> Vec<f64> {
@@ -214,11 +214,12 @@ fn neglog_matches_closed_form_across_dims_shapes_events() {
 fn neglog_event_zero_is_bitwise_invariant_under_qd1() {
     let slopes = [0.31, -0.18, 0.05];
     let z = [0.7, -1.2, 0.4];
-    let covariance = MarginalSlopeCovariance::Full(ndarray::array![
+    let covariance = MarginalSlopeCovariance::full(ndarray::array![
         [1.2, 0.3, -0.1],
         [0.3, 0.9, 0.2],
         [-0.1, 0.2, 1.1],
-    ]);
+    ])
+    .unwrap();
     let probit_scale = 0.85;
     let weight = 1.4;
     let q0 = 0.21;
@@ -290,7 +291,8 @@ fn neglog_errors_when_derivative_guard_is_violated() {
 
 #[test]
 fn neglog_finite_and_continuous_just_above_guard() {
-    let covariance = MarginalSlopeCovariance::Full(ndarray::array![[1.0, 0.3], [0.3, 0.8]]);
+    let covariance =
+        MarginalSlopeCovariance::full(ndarray::array![[1.0, 0.3], [0.3, 0.8]]).unwrap();
     let slopes = [0.21, -0.14];
     let z = [0.5, -0.7];
     let probit_scale = 0.9;
@@ -340,7 +342,7 @@ fn neglog_finite_and_continuous_just_above_guard() {
 
 #[test]
 fn neglog_is_linear_in_weight_and_zero_for_zero_weight() {
-    let covariance = MarginalSlopeCovariance::Diagonal(ndarray::array![1.2, 0.7, 0.5]);
+    let covariance = MarginalSlopeCovariance::diagonal(ndarray::array![1.2, 0.7, 0.5]).unwrap();
     let slopes = [0.18, -0.22, 0.1];
     let z = [0.6, -0.4, 0.9];
     let probit_scale = 0.8;
@@ -472,7 +474,8 @@ fn neglog_invariant_under_joint_negation_of_z_and_slopes() {
 
 #[test]
 fn neglog_lone_sign_flip_changes_value() {
-    let covariance = MarginalSlopeCovariance::Full(ndarray::array![[1.0, 0.25], [0.25, 0.7],]);
+    let covariance =
+        MarginalSlopeCovariance::full(ndarray::array![[1.0, 0.25], [0.25, 0.7],]).unwrap();
     let slopes = [0.31, -0.22];
     let z = [0.8, -0.5];
     let probit_scale = 0.95;
@@ -538,11 +541,12 @@ fn neglog_lone_sign_flip_changes_value() {
 
 #[test]
 fn neglog_invariant_under_probit_scale_slope_rescale() {
-    let covariance = MarginalSlopeCovariance::Full(ndarray::array![
+    let covariance = MarginalSlopeCovariance::full(ndarray::array![
         [1.1, 0.2, -0.05],
         [0.2, 0.9, 0.15],
         [-0.05, 0.15, 1.3],
-    ]);
+    ])
+    .unwrap();
     let slopes = [0.22, -0.31, 0.17];
     let z = [0.7, -0.4, 1.1];
     let weight = 1.1;
@@ -594,7 +598,8 @@ fn neglog_invariant_under_probit_scale_slope_rescale() {
 
 #[test]
 fn neglog_errors_on_dimension_mismatch() {
-    let covariance = MarginalSlopeCovariance::Full(ndarray::array![[1.0, 0.2], [0.2, 0.8]]);
+    let covariance =
+        MarginalSlopeCovariance::full(ndarray::array![[1.0, 0.2], [0.2, 0.8]]).unwrap();
     let slopes_ok = [0.3, -0.2];
     let z_ok = [0.5, -0.4];
 
@@ -651,7 +656,7 @@ fn neglog_errors_on_dimension_mismatch() {
 
 #[test]
 fn neglog_nonfinite_inputs_yield_error_or_nonfinite() {
-    let covariance = MarginalSlopeCovariance::Diagonal(ndarray::array![1.0, 0.5]);
+    let covariance = MarginalSlopeCovariance::diagonal(ndarray::array![1.0, 0.5]).unwrap();
     let good_slopes = [0.21, -0.13];
     let good_z = [0.5, -0.3];
     let probit_scale = 0.9;
