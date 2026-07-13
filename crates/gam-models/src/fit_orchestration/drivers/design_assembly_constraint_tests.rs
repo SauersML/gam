@@ -389,10 +389,7 @@ fn bspline_nonzero_anchor_has_fixed_affine_lift_and_homogeneous_chart() {
     let beta_p = anchor_offset_coeffs
         .as_ref()
         .expect("non-zero anchor records its raw-basis particular solution");
-    let realized_offset = design
-        .affine_offset
-        .as_ref()
-        .expect("non-zero anchor realizes an affine row function");
+    let realized_offset = &design.affine_offset;
     assert!(
         (realized_offset[0] - 2.0).abs() < 1e-10,
         "realized left endpoint must equal the requested anchor, got {}",

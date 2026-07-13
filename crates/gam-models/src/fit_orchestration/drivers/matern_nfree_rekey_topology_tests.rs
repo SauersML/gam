@@ -231,9 +231,18 @@ mod matern_nfree_rekey_topology_tests {
             let trial_design = build_term_collection_design(data.view(), &trial_spec)
                 .expect("slow-path trial design");
             let truth_metadata = &trial_design.smooth.terms[0].metadata;
-            let (truth_locals, truth_nulldims, _info) =
-                matern_operator_penalty_triplet_from_metadata(truth_metadata)
-                    .expect("slow-path operator triplet");
+            let truth_penalties = matern_operator_penalty_triplet_from_metadata(truth_metadata)
+                .expect("slow-path operator triplet");
+            let truth_locals: Vec<Array2<f64>> = truth_penalties
+                .active
+                .iter()
+                .map(|penalty| penalty.matrix.clone())
+                .collect();
+            let truth_nulldims: Vec<usize> = truth_penalties
+                .active
+                .iter()
+                .map(|penalty| penalty.nullity)
+                .collect();
 
             // Fast path: the n-free re-key at the same ψ.
             let (rekey, rekey_nulldims) = realizer
@@ -392,9 +401,18 @@ mod matern_nfree_rekey_topology_tests {
         let trial_design = build_term_collection_design(data.view(), &trial_spec)
             .expect("slow-path trial design");
         let truth_metadata = &trial_design.smooth.terms[0].metadata;
-        let (truth_locals, truth_nulldims, _info) =
-            matern_operator_penalty_triplet_from_metadata(truth_metadata)
-                .expect("slow-path operator triplet");
+        let truth_penalties = matern_operator_penalty_triplet_from_metadata(truth_metadata)
+            .expect("slow-path operator triplet");
+        let truth_locals: Vec<Array2<f64>> = truth_penalties
+            .active
+            .iter()
+            .map(|penalty| penalty.matrix.clone())
+            .collect();
+        let truth_nulldims: Vec<usize> = truth_penalties
+            .active
+            .iter()
+            .map(|penalty| penalty.nullity)
+            .collect();
 
         let psi_trial = -trial_length_scale.ln();
         let (rekey, rekey_nulldims) = realizer

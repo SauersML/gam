@@ -2012,8 +2012,8 @@ mod tests {
     #[test]
     fn saved_alo_gamma_row_geometry_matches_closed_form_and_keeps_meat_distinct() {
         let y = 4.0;
-        let mu = 2.0;
-        let nu = 3.0;
+        let mu: f64 = 2.0;
+        let nu: f64 = 3.0;
         let weight = 1.7;
         let geometry = dispersion_alo_row_geometry(
             DispersionFamilyKind::Gamma,
