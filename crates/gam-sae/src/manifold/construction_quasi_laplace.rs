@@ -2979,8 +2979,27 @@ impl SaeManifoldTerm {
                 |rhs| Ok(solver.solve(zero_t.view(), rhs)?.beta),
             );
         }
+        // #2253/#2228 λ→0 boundary: route the β-only columns through the ONE
+        // deflated spectral pseudo-inverse (see
+        // `decoder_smoothness_effective_dof_per_atom`) so a doubly-null decoder
+        // direction contributes 0 dof instead of `Inf`/`NaN`. With a zero
+        // t-RHS the full arrow solve's β component IS the β-Schur selected
+        // inverse (`solve(0, m).beta = S_β⁻¹ m`), so the deflated applier is
+        // the exact drop-in — but ONLY on the plain bordered arrow. When a
+        // gauge Woodbury deflation is installed (`!plain_selected_inverse_
+        // available`) the solve carries a rank-R gauge correction the β-Schur
+        // applier omits; there the known nulls are already stiffened by
+        // `κQQᵀ`, so the plain per-column solve stays (finite by
+        // construction of the gauge stiffness).
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
         let mut m_col = Array1::<f64>::zeros(k);
+        let deflated_apply = if solver.plain_selected_inverse_available() {
+            Some(cache.schur_deflated_applier().map_err(|e| {
+                format!("decoder_smoothness_effective_dof_with_solver_per_atom: {e:?}")
+            })?)
+        } else {
+            None
+        };
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let s = &atom.smooth_penalty;
             let m = atom.basis_size();
@@ -2997,7 +3016,10 @@ impl SaeManifoldTerm {
                         let s_nu_mu = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
                         m_col[off + nu * r + oc] = lambda * s_nu_mu;
                     }
-                    let z = solver.solve(zero_t.view(), m_col.view())?.beta;
+                    let z = match deflated_apply.as_ref() {
+                        Some(apply) => apply(m_col.view()),
+                        None => solver.solve(zero_t.view(), m_col.view())?.beta,
+                    };
                     trace += z[col];
                 }
             }

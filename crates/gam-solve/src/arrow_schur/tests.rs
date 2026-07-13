@@ -1900,6 +1900,167 @@ pub(crate) fn schur_inverse_beta_block_matches_dense() {
     assert!(cache.schur_inverse_block(0..(k + 1)).is_err());
 }
 
+/// #2253/#2228 λ→0 gate: the deflated β-Schur pseudo-inverse must (a) match
+/// the plain selected inverse to round-off in the INTERIOR (no direction near
+/// the rank floor ⇒ nothing deflates ⇒ no silent bias), and (b) stay FINITE at
+/// the ρ lower face where a doubly-null (data-null ∧ penalty-null) decoder
+/// direction gives the β-Schur factor a ~zero pivot and the plain
+/// back-substitution returns `Inf`/`NaN`. The reusable one-eigh applier
+/// (`schur_deflated_applier`) must be bit-identical to the per-call form.
+#[test]
+pub(crate) fn schur_inverse_deflated_finite_at_boundary_matches_plain_interior() {
+    // ---- Interior: same SPD fixture as the dense-oracle test above. ----
+    let n = 3usize;
+    let d = 2usize;
+    let k = 2usize;
+    let mut sys = ArrowSchurSystem::new(n, d, k);
+    sys.rows[0].htt = array![[4.0_f64, 0.5], [0.5, 3.0]];
+    sys.rows[0].htbeta = array![[1.0_f64, 0.2], [-0.3, 0.7]];
+    sys.rows[1].htt = array![[5.0_f64, -0.4], [-0.4, 2.5]];
+    sys.rows[1].htbeta = array![[0.6_f64, -0.1], [0.4, 0.9]];
+    sys.rows[2].htt = array![[3.5_f64, 0.2], [0.2, 4.5]];
+    sys.rows[2].htbeta = array![[-0.2_f64, 0.5], [0.8, -0.6]];
+    for row in sys.rows.iter_mut() {
+        row.gt = array![0.0_f64, 0.0];
+    }
+    sys.hbb = array![[12.0_f64, 0.7], [0.7, 10.0]];
+    sys.gb = array![0.0_f64, 0.0];
+    let options = ArrowSolveOptions::direct();
+    let (_dt, _db, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+        .expect("direct arrow solve should factor this SPD system");
+
+    let applier = cache
+        .schur_deflated_applier()
+        .expect("interior cache must support the deflated applier");
+    for col in 0..k {
+        let mut e = Array1::<f64>::zeros(k);
+        e[col] = 1.0;
+        let plain = cache.schur_inverse_apply(e.view()).expect("plain apply");
+        let deflated = cache
+            .schur_inverse_apply_deflated(e.view())
+            .expect("deflated apply");
+        let reused = applier(e.view());
+        for r in 0..k {
+            assert!(
+                (plain[r] - deflated[r]).abs() < 1e-9,
+                "interior: deflated[{r}] {} vs plain {} (col {col}) — nothing may deflate",
+                deflated[r],
+                plain[r]
+            );
+            assert_eq!(
+                deflated[r], reused[r],
+                "one-eigh applier must be bit-identical to the per-call deflated apply"
+            );
+        }
+    }
+    let plain_block = cache.schur_inverse_block(0..k).expect("plain block");
+    let deflated_block = cache
+        .schur_inverse_block_deflated(0..k)
+        .expect("deflated block");
+    for r in 0..k {
+        for c in 0..k {
+            assert!(
+                (plain_block[[r, c]] - deflated_block[[r, c]]).abs() < 1e-9,
+                "interior block[{r},{c}]: deflated {} vs plain {}",
+                deflated_block[[r, c]],
+                plain_block[[r, c]]
+            );
+        }
+    }
+
+    // ---- Boundary: β-Schur factor with an exactly-null third pivot, the
+    // doubly-null decoder direction at the ρ lower face. ----
+    let kb = 3usize;
+    let mut boundary = cache.clone();
+    boundary.k = kb;
+    boundary.schur_factor = Some(array![
+        [2.0_f64, 0.0, 0.0],
+        [0.3, 1.5, 0.0],
+        [0.0, 0.0, 0.0]
+    ]);
+    // The htbeta coupling is irrelevant to the β-Schur back-substitution under
+    // test; drop it so the cloned d=2 row blocks (built for k=2) cannot be
+    // consulted with a k=3 RHS.
+    boundary.htbeta = ArrowHtbetaCache::Dense {
+        blocks: std::sync::Arc::from(
+            vec![
+                Array2::<f64>::zeros((d, kb)),
+                Array2::<f64>::zeros((d, kb)),
+                Array2::<f64>::zeros((d, kb)),
+            ]
+            .into_boxed_slice(),
+        ),
+        estimated_bytes: 0,
+    };
+
+    // Plain path: the zero pivot divides to a non-finite entry.
+    let mut e_null = Array1::<f64>::zeros(kb);
+    e_null[2] = 1.0;
+    let plain_null = boundary
+        .schur_inverse_apply(e_null.view())
+        .expect("plain apply runs (and blows up numerically) at the boundary");
+    assert!(
+        plain_null.iter().any(|v| !v.is_finite()),
+        "boundary pin: the plain back-substitution must go non-finite on the \
+         doubly-null direction — if this stops failing the fixture no longer \
+         exercises the divergence"
+    );
+
+    // Deflated path: finite by construction; the null direction contributes 0.
+    let deflated_null = boundary
+        .schur_inverse_apply_deflated(e_null.view())
+        .expect("deflated apply at the boundary");
+    assert!(
+        deflated_null.iter().all(|v| v.is_finite()),
+        "deflated apply must be finite at the boundary"
+    );
+    assert!(
+        deflated_null.iter().all(|v| v.abs() < 1e-9),
+        "the doubly-null direction is unidentifiable and must contribute 0"
+    );
+
+    // Kept subspace: the deflated inverse must agree with the dense inverse of
+    // the leading 2×2 SPD block M = L₂L₂ᵀ (the survivors), i.e. deflation only
+    // removes the null direction, never distorts the kept one.
+    let l2 = array![[2.0_f64, 0.0], [0.3, 1.5]];
+    let m2 = l2.dot(&l2.t());
+    let det = m2[[0, 0]] * m2[[1, 1]] - m2[[0, 1]] * m2[[1, 0]];
+    let m2_inv = array![
+        [m2[[1, 1]] / det, -m2[[0, 1]] / det],
+        [-m2[[1, 0]] / det, m2[[0, 0]] / det]
+    ];
+    for col in 0..2 {
+        let mut e = Array1::<f64>::zeros(kb);
+        e[col] = 1.0;
+        let z = boundary
+            .schur_inverse_apply_deflated(e.view())
+            .expect("deflated apply on kept direction");
+        for r in 0..2 {
+            assert!(
+                (z[r] - m2_inv[[r, col]]).abs() < 1e-9,
+                "kept-subspace entry [{r},{col}]: deflated {} vs dense M₂⁻¹ {}",
+                z[r],
+                m2_inv[[r, col]]
+            );
+        }
+        assert!(
+            z[2].abs() < 1e-9,
+            "kept columns must not leak into the deflated null direction"
+        );
+    }
+
+    // The EDF-style trace contraction (what the SAE per-atom smoothness dof
+    // computes) is finite through the deflated block even with the null pivot.
+    let block = boundary
+        .schur_inverse_block_deflated(0..kb)
+        .expect("deflated block at the boundary");
+    let trace: f64 = (0..kb).map(|j| block[[j, j]]).sum();
+    assert!(
+        trace.is_finite(),
+        "boundary EDF trace must be finite; got {trace}"
+    );
+}
+
 /// Evidence/log-det mode: a per-row `H_tt` that is PD but ill-conditioned
 /// (κ above the safe-Schur ceiling) is handled differently by the two
 /// solve paths. The default `direct()` path conditions each row to the
