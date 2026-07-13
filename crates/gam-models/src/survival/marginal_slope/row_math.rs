@@ -1738,7 +1738,7 @@ mod tests {
             let mut production_workspace = RigidVectorRowWorkspace::new();
             let mut graph_workspace = Order2GraphWorkspace::new();
             let mut dynamic_arena = DynamicJetArena::new();
-            let initial_graph_bytes = production_workspace.graph.retained_bytes();
+            let initial_graph_nodes = production_workspace.graph.node_count();
             let initial_dynamic_bytes = production_workspace.dynamic.allocated_bytes();
             for (shape_index, covariance) in covariances.iter().enumerate() {
                 for event in [0.0, 0.35, 1.0] {
@@ -1759,7 +1759,7 @@ mod tests {
                     if shape_index == 0 && event == 0.0 {
                         if k <= 8 {
                             assert!(
-                                production_workspace.graph.retained_bytes() > initial_graph_bytes,
+                                production_workspace.graph.node_count() > initial_graph_nodes,
                                 "k={k}: scheduled production graph did not record a row"
                             );
                             assert_eq!(
@@ -1769,8 +1769,8 @@ mod tests {
                             );
                         } else {
                             assert_eq!(
-                                production_workspace.graph.retained_bytes(),
-                                initial_graph_bytes,
+                                production_workspace.graph.node_count(),
+                                initial_graph_nodes,
                                 "k={k}: dynamic boundary unexpectedly recorded a graph"
                             );
                             assert!(
