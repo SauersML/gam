@@ -357,7 +357,7 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
     // (`DEVICE_LOOP_MIN_P`, the matvec offload floors) — never a calibrated
     // policy field — so evaluating it on the pre-probe default policy is
     // IDENTICAL to evaluating it on the probed runtime's policy. A shape it
-    // rejects therefore skips `GpuRuntime::global()` (whose first call creates
+    // rejects therefore skips runtime availability resolution (whose first call creates
     // a CUDA primary context on every GPU); an admitted shape probes exactly as
     // before.
     let cg_iters = options
@@ -374,7 +374,8 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
     }
     // Require a live device before assembling the GPU matvec backend; the
     // runtime handle itself is not needed here, only its presence.
-    gam_gpu::device_runtime::GpuRuntime::global()?;
+    gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .unwrap_or_else(|error| panic!("Arrow-Schur GPU runtime resolution failed: {error}"))?;
     let matvec =
         crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta).ok()?;
     let mut device_options = options.clone();
@@ -438,7 +439,7 @@ pub(crate) fn try_device_arrow_direct(
     // policy's dense-reduction flop floor, which no reachable policy can
     // calibrate below `MIN_CALIBRATABLE_GEMM_FLOPS`. A shape failing this
     // most-permissive bound is refused by EVERY policy, so it returns to the
-    // CPU dense path without `GpuRuntime::global()` (whose first call creates a
+    // CPU dense path without runtime availability resolution (whose first call creates a
     // CUDA primary context on every GPU). Shapes clearing it probe and face the
     // runtime's real (possibly calibrated) gate exactly as before.
     let n_rows = sys.rows.len();
@@ -449,7 +450,8 @@ pub(crate) fn try_device_arrow_direct(
     {
         return None;
     }
-    let runtime = gam_gpu::device_runtime::GpuRuntime::global()?;
+    let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .unwrap_or_else(|error| panic!("Arrow-Schur direct runtime resolution failed: {error}"))?;
     let admitted = runtime
         .policy()
         .dense_hessian_work_target_is_gpu(sys.rows.len(), sys.k);
@@ -585,7 +587,7 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
     // Evaluated BEFORE the device probe (startup-tax ordering fix): the
     // predicate reads only associated constants — never a calibrated policy
     // field — so the pre-probe default policy decides identically to the probed
-    // runtime's policy, and a rejected shape skips `GpuRuntime::global()`
+    // runtime's policy, and a rejected shape skips availability resolution
     // (whose first call creates a CUDA primary context on every GPU) entirely.
     let cg_iters = options
         .pcg
@@ -606,8 +608,11 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
         );
         return None;
     }
-    if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-        trace_decline!("no GpuRuntime::global() (CPU-only host or probe failed)");
+    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .unwrap_or_else(|error| panic!("SAE direct GPU runtime resolution failed: {error}"))
+        .is_none()
+    {
+        trace_decline!("typed CUDA absence under the configured policy");
         return None;
     }
     log::debug!(
@@ -875,7 +880,7 @@ fn build_resident_base_frame_if_admitted(
     if matches!(gam_gpu::global_policy(), gam_gpu::GpuPolicy::Off) {
         return None;
     }
-    // Same size gate as `try_device_arrow_direct`, BEFORE `GpuRuntime::global()`,
+    // Same size gate as `try_device_arrow_direct`, BEFORE runtime resolution,
     // so a below-threshold shape never creates a CUDA primary context.
     let n_rows = sys.rows.len();
     let dense_work = 2u128 * (n_rows as u128) * (sys.k as u128) * (sys.k as u128);
@@ -885,7 +890,8 @@ fn build_resident_base_frame_if_admitted(
     {
         return None;
     }
-    let runtime = gam_gpu::device_runtime::GpuRuntime::global()?;
+    let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .unwrap_or_else(|error| panic!("Arrow-Schur diagnostic runtime resolution failed: {error}"))?;
     if !runtime
         .policy()
         .dense_hessian_work_target_is_gpu(sys.rows.len(), sys.k)

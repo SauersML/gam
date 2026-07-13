@@ -69,7 +69,7 @@ pub(crate) fn try_factor_blocks_batched(
     // admission is `SmallDenseBatchedPotrf { p: d, batch }` or
     // `Potrf { p: d, batch }`. When NO reachable dispatch policy could admit
     // either op, the shim is guaranteed to decline, so return to the exact
-    // per-row CPU path without calling `is_available()` — whose first call
+    // per-row CPU path without resolving availability — whose first call
     // probes the driver and creates a CUDA primary context on every GPU.
     // Admissible shapes probe and dispatch exactly as before.
     let batch = rows.len();
@@ -81,7 +81,10 @@ pub(crate) fn try_factor_blocks_batched(
         return None;
     }
     // No device → let the CPU path own the work (it is the exact fallback).
-    if !gam_gpu::device_runtime::GpuRuntime::is_available() {
+    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .unwrap_or_else(|error| panic!("batched Arrow-Schur GPU probe failed: {error}"))
+        .is_none()
+    {
         return None;
     }
 

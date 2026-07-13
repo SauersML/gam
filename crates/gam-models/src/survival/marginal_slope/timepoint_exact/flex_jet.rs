@@ -1978,6 +1978,8 @@ fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> O
 ///
 /// The caller pre-seeds `b_jet` (the slope `g` primary), `du[u]` (the unit
 /// per-primary jets), `template` (a zero jet shaped at the right order/`p`), and
+/// `q_jet` (the complete time-quantile jet, including both coefficient and
+/// family-owned directions), and
 /// supplies the OBSERVED-channel jets `rho_jet`/`tau_jet` (the `h`/`w`/`infl`
 /// linear channels added to `eta`/`chi`; pass zero jets for a pure `g` model,
 /// where the full `(a,b)` observed-coeff pack already carries every `g` order).
@@ -1994,8 +1996,7 @@ fn flex_timepoint_inputs_generic<J: FlexJet + MomentTerm>(
     d_check: f64,
     primary_g: usize,
     infl: Option<usize>,
-    q_index: usize,
-    q: f64,
+    q_jet: &J,
     z_obs: f64,
     o_infl: f64,
     obs_coeff: [f64; 4],
@@ -2017,7 +2018,7 @@ fn flex_timepoint_inputs_generic<J: FlexJet + MomentTerm>(
     // one third of the Jet3 lift work and half of the Jet2 lift work. (A
     // hardcoded 2 left the Jet3/Jet4 mixed intercept derivatives one iteration
     // short — `eta_uv` converged but `eta_uv_dir` did not; gam#932.)
-    let residual = |a: &J| calibration_residual_jet(a, b_jet, primary_g, du, q_index, q, cells);
+    let residual = |a: &J| calibration_residual_jet(a, b_jet, primary_g, du, q_jet, cells);
     let a_jet = lift_intercept_flex(template, a0, 1.0 / d_check, J::ORDER, residual);
 
     // Observed eta/chi: the OBSERVED cell coefficient `c_k(a, {θ_u})` and its
@@ -2157,8 +2158,9 @@ fn lift_intercept_flex<J: FlexJet>(
 
 /// The per-row calibration residual jet `R(A)` for [`lift_intercept_flex`],
 /// summed over a timepoint's cells: `Σ_cells INV_TWO_PI·Σ_k tangent(c_posₖ(A))·
-/// Mₖ(A)` plus the q-marginal self-term `−φ(q)` on the `q_index` primary (the
-/// `f_u[q_index] += φ(q)` boundary term of the calibration). The cells are
+/// Mₖ(A)` plus the q-marginal self-term carried by the complete generic `q_jet`
+/// (the
+/// historical `f_u[q] += φ(q)` boundary term of the calibration). The cells are
 /// supplied as `(base_pos_coeffs, fixed, edges, finiteness, numeric_moments)` so
 /// the coefficient jets and moment jets are rebuilt at the current iterate `A`.
 fn calibration_residual_jet<J: FlexJet + MomentTerm>(
@@ -2166,8 +2168,7 @@ fn calibration_residual_jet<J: FlexJet + MomentTerm>(
     b_jet: &J,
     g_axis: usize,
     du: &[J],
-    q_index: usize,
-    q: f64,
+    q_jet: &J,
     cells: &[CalibrationCellJetInputs<'_>],
 ) -> J {
     let da = tangent_jet(a_jet);
@@ -2209,17 +2210,15 @@ fn calibration_residual_jet<J: FlexJet + MomentTerm>(
     // drives R≈0) reproduces every order: grad[q]=−φ(q), Hess[q,q]=q·φ(q), and the
     // ε/εδ channels carry the directional `(q²−1)φ` / `(q³−3q)φ` q-self terms the
     // FLAT `−φ(q)·δq` form dropped (the bug the Jet3/Jet4 gates pin).
-    if q_index < du.len() {
-        let phi_q = crate::probability::normal_pdf(q);
-        let g0 = crate::probability::normal_cdf(-q);
-        let g1 = -phi_q;
-        let g2 = q * phi_q;
-        let g3 = (1.0 - q * q) * phi_q;
-        let g4 = (q * q * q - 3.0 * q) * phi_q;
-        let q_jet = add_const(&du[q_index], q);
-        let q_self = add_const(&q_jet.compose_unary([g0, g1, g2, g3, g4]), -g0);
-        r = r.add(&q_self);
-    }
+    let q = q_jet.value();
+    let phi_q = crate::probability::normal_pdf(q);
+    let g0 = crate::probability::normal_cdf(-q);
+    let g1 = -phi_q;
+    let g2 = q * phi_q;
+    let g3 = (1.0 - q * q) * phi_q;
+    let g4 = (q * q * q - 3.0 * q) * phi_q;
+    let q_self = add_const(&q_jet.compose_unary([g0, g1, g2, g3, g4]), -g0);
+    r = r.add(&q_self);
     r
 }
 
@@ -2643,6 +2642,7 @@ impl SurvivalMarginalSlopeFamily {
         let template = Jet2::primary(0.0, usize::MAX, p);
         let b_jet = Jet2::primary(b, primary.g, p);
         let du: Vec<Jet2> = (0..p).map(|u| Jet2::primary(0.0, u, p)).collect();
+        let q_jet = add_const(&du[q_index], q);
         let (eta, chi, d) = flex_timepoint_inputs_generic(
             &template,
             &b_jet,
@@ -2651,8 +2651,7 @@ impl SurvivalMarginalSlopeFamily {
             d_check,
             primary.g,
             primary.infl,
-            q_index,
-            q,
+            &q_jet,
             z_obs,
             o_infl,
             obs_coeff,
@@ -2711,6 +2710,7 @@ impl SurvivalMarginalSlopeFamily {
         let template = Jet1::primary(0.0, usize::MAX, p);
         let b_jet = Jet1::primary(b, primary.g, p);
         let du: Vec<Jet1> = (0..p).map(|u| Jet1::primary(0.0, u, p)).collect();
+        let q_jet = add_const(&du[q_index], q);
         let (eta, chi, d) = flex_timepoint_inputs_generic(
             &template,
             &b_jet,
@@ -2719,8 +2719,7 @@ impl SurvivalMarginalSlopeFamily {
             d_check,
             primary.g,
             primary.infl,
-            q_index,
-            q,
+            &q_jet,
             z_obs,
             o_infl,
             obs_coeff,
@@ -2778,6 +2777,7 @@ impl SurvivalMarginalSlopeFamily {
                 let template = $template;
                 let b_jet = $b_jet;
                 let du = $du;
+                let q_jet = add_const(&du[q_index], q);
                 let (eta, chi, d) = flex_timepoint_inputs_generic(
                     &template,
                     &b_jet,
@@ -2786,8 +2786,7 @@ impl SurvivalMarginalSlopeFamily {
                     d_check,
                     primary.g,
                     primary.infl,
-                    q_index,
-                    q,
+                    &q_jet,
                     z_obs,
                     o_infl,
                     obs_coeff,
@@ -2847,6 +2846,7 @@ impl SurvivalMarginalSlopeFamily {
         let du: Vec<Jet4> = (0..p)
             .map(|u| Jet4::primary(0.0, u, p, dir1[u], dir2[u]))
             .collect();
+        let q_jet = add_const(&du[q_index], q);
         let (eta, chi, d) = flex_timepoint_inputs_generic(
             &template,
             &b_jet,
@@ -2855,8 +2855,7 @@ impl SurvivalMarginalSlopeFamily {
             d_check,
             primary.g,
             primary.infl,
-            q_index,
-            q,
+            &q_jet,
             z_obs,
             0.0,
             obs_coeff,
@@ -2938,6 +2937,48 @@ mod moment_engine_tests {
                 factors[total_orders[channel]] * original_channels[channel]
             );
         }
+    }
+
+    #[test]
+    fn generic_q_jet_carries_exact_beta_family_calibration_channels() {
+        let q = 0.37;
+        let zero = Jet2::from_parts(0.0, &[0.0], &[]);
+        let template = Dual2 {
+            v: zero.clone(),
+            g: zero.clone(),
+            h: zero.clone(),
+        };
+        // q = q0 + beta + theta: independent unit inner-beta and outer-family
+        // directions, with no curvature in the input chart itself.
+        let q_jet = Dual2 {
+            v: Jet2::primary(q, 0, 1),
+            g: Jet2::from_parts(1.0, &[0.0], &[]),
+            h: zero,
+        };
+        let residual = calibration_residual_jet(&template, &template, 0, &[], &q_jet, &[]);
+        let phi = crate::probability::normal_pdf(q);
+        let expected = [
+            -phi,
+            q * phi,
+            (1.0 - q * q) * phi,
+            (q * q * q - 3.0 * q) * phi,
+        ];
+        let check = |actual: f64, wanted: f64, channel: &str| {
+            let tolerance = 256.0 * f64::EPSILON * (1.0 + actual.abs().max(wanted.abs()));
+            assert!(
+                (actual - wanted).abs() <= tolerance,
+                "{channel}: actual={actual:.17e}, wanted={wanted:.17e}, tolerance={tolerance:.3e}"
+            );
+        };
+        check(residual.v.v, 0.0, "value");
+        check(residual.v.g[0], expected[0], "beta first");
+        check(residual.v.h[0], expected[1], "beta second");
+        check(residual.g.v, expected[0], "family first");
+        check(residual.g.g[0], expected[1], "family-beta");
+        check(residual.g.h[0], expected[2], "family-beta-beta");
+        check(residual.h.v, expected[1], "family second");
+        check(residual.h.g[0], expected[2], "family-family-beta");
+        check(residual.h.h[0], expected[3], "family-family-beta-beta");
     }
 
     /// Test-only execution policy that runs the historical order-four moment
@@ -4388,6 +4429,7 @@ mod moment_engine_tests {
             let du4: Vec<Jet4> = (0..p)
                 .map(|u| Jet4::primary(0.0, u, p, d2[u], d2[u]))
                 .collect();
+            let q4 = add_const(&du4[primary.q1], q1);
             let (eta4, chi4, d4) = flex_timepoint_inputs_generic(
                 &tpl4,
                 &b4,
@@ -4396,8 +4438,7 @@ mod moment_engine_tests {
                 d_check,
                 primary.g,
                 primary.infl,
-                primary.q1,
-                q1,
+                &q4,
                 z_obs,
                 o_infl,
                 obs_coeff,
@@ -4424,6 +4465,7 @@ mod moment_engine_tests {
             let du2: Vec<Dual22> = (0..p)
                 .map(|u| Dual22::seed_directional(0.0, d1[u], d2[u]))
                 .collect();
+            let q2 = add_const(&du2[primary.q1], q1);
             let (eta2, chi2, d2n) = flex_timepoint_inputs_generic(
                 &tpl2,
                 &b2,
@@ -4432,8 +4474,7 @@ mod moment_engine_tests {
                 d_check,
                 primary.g,
                 primary.infl,
-                primary.q1,
-                q1,
+                &q2,
                 z_obs,
                 o_infl,
                 obs_coeff,
@@ -4667,9 +4708,9 @@ mod moment_engine_tests {
             let du4: Vec<Jet4> = (0..p)
                 .map(|u| Jet4::primary(0.0, u, p, dir1[u], dir2[u]))
                 .collect();
-            let residual_probe = |a: &Jet4| {
-                calibration_residual_jet(a, &b_jet4, primary.g, &du4, primary.q1, q1, &cells)
-            };
+            let q_jet4 = add_const(&du4[primary.q1], q1);
+            let residual_probe =
+                |a: &Jet4| calibration_residual_jet(a, &b_jet4, primary.g, &du4, &q_jet4, &cells);
             let a_jet_probe = lift_intercept_flex(&template4, a1, 1.0 / d_check, 4, residual_probe);
             let jet_a_uvuv = a_jet_probe.eps_del.h[primary.q1 * p + primary.q1];
 
@@ -4715,6 +4756,7 @@ mod moment_engine_tests {
         let du4: Vec<Jet4> = (0..p)
             .map(|u| Jet4::primary(0.0, u, p, dir1[u], dir2[u]))
             .collect();
+        let q_jet4 = add_const(&du4[primary.q1], q1);
         let (eta4, chi4, d4) = flex_timepoint_inputs_generic(
             &template4,
             &b_jet4,
@@ -4723,8 +4765,7 @@ mod moment_engine_tests {
             d_check,
             primary.g,
             primary.infl,
-            primary.q1,
-            q1,
+            &q_jet4,
             z_obs,
             o_infl,
             obs_coeff,

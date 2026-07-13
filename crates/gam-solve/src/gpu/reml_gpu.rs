@@ -44,7 +44,10 @@ pub fn evidence_derivatives_gpu(input: RemlGpuInput<'_>) -> Result<RemlGpuEviden
 
     #[cfg(target_os = "linux")]
     {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
+        if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
             return linux_cuda::evidence_derivatives(input);
         }
     }

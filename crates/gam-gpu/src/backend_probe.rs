@@ -5,9 +5,9 @@
 //! `survival_flex`, `cubic_bspline_moments`, `cubic_cell`, `pirls_row`,
 //! `sphere`, ...) carried its own near-identical `probe_linux` prologue:
 //!
-//!   1. Fetch the process-wide [`GpuRuntime`] or fail with a
-//!      `DriverLibraryUnavailable { reason: "<module> backend: no CUDA
-//!      runtime available" }`.
+//!   1. Resolve the process-wide [`GpuRuntime`] losslessly. Typed hardware
+//!      absence becomes a labelled `DriverLibraryUnavailable`; probe faults
+//!      keep their original [`GpuError`] variant.
 //!   2. Read the runtime's selected device ordinal.
 //!   3. Create (or reuse) the per-ordinal [`CudaContext`] or fail with a
 //!      `DriverCallFailed { reason: "<module> backend: failed to create
@@ -39,7 +39,7 @@ pub use linux::{
 mod linux {
     use crate::device::GpuCapability;
     use crate::device_cache::{DeviceArena, PtxModuleCache};
-    use crate::device_runtime::{GpuRuntime, cuda_context_for};
+    use crate::device_runtime::{GpuAvailabilityRef, GpuRuntime, cuda_context_for};
     use crate::gpu_error::GpuError;
     use cudarc::driver::{CudaContext, CudaStream};
     use std::sync::{Arc, Mutex};
@@ -65,9 +65,14 @@ mod linux {
     /// into both failure messages so the uniform contract still attributes
     /// errors to their originating backend.
     pub fn probe_cuda_backend(label: &'static str) -> Result<CudaBackendParts, GpuError> {
-        let runtime = GpuRuntime::global().ok_or_else(|| GpuError::DriverLibraryUnavailable {
-            reason: format!("{label} backend: no CUDA runtime available"),
-        })?;
+        let runtime = match GpuRuntime::availability()? {
+            GpuAvailabilityRef::Available(runtime) => runtime,
+            GpuAvailabilityRef::Absent(reason) => {
+                return Err(GpuError::DriverLibraryUnavailable {
+                    reason: format!("{label} backend: {reason}"),
+                });
+            }
+        };
         let ordinal = runtime.selected_device().ordinal;
         let ctx = cuda_context_for(ordinal).ok_or_else(|| {
             gpu_err!("{label} backend: failed to create CUDA context for device {ordinal}")
@@ -136,7 +141,7 @@ mod linux {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::probe_cuda_backend;
-    use crate::device_runtime::GpuRuntime;
+    use crate::device_runtime::{GpuAvailabilityRef, GpuRuntime};
     use crate::gpu_error::GpuError;
 
     /// Parity: every backend's probe must agree with the shared contract on
@@ -151,14 +156,15 @@ mod tests {
     /// through one prologue instead of drifting copies.
     #[test]
     fn shared_probe_matches_runtime_device_and_labels_errors() {
-        match GpuRuntime::global() {
-            None => {
+        match GpuRuntime::availability() {
+            Ok(GpuAvailabilityRef::Absent(absence)) => {
                 // No runtime: the shared probe must fail uniformly and
                 // attribute the failure to the supplied label.
                 match probe_cuda_backend("bms_flex") {
                     Err(GpuError::DriverLibraryUnavailable { reason }) => {
                         assert_eq!(
-                            reason, "bms_flex backend: no CUDA runtime available",
+                            reason,
+                            format!("bms_flex backend: {absence}"),
                             "shared probe must emit the uniform no-runtime message"
                         );
                     }
@@ -168,7 +174,7 @@ mod tests {
                     ),
                 }
             }
-            Some(runtime) => {
+            Ok(GpuAvailabilityRef::Available(runtime)) => {
                 // Runtime present: every label resolves the same selected
                 // device and the same compute capability the runtime
                 // advertises, and the context binds to that ordinal.
@@ -199,6 +205,7 @@ mod tests {
                         .unwrap_or_else(|err| panic!("{label}: default stream must sync: {err:?}"));
                 }
             }
+            Err(error) => panic!("GPU probe fault must fail this backend contract test: {error}"),
         }
     }
 }

@@ -7,6 +7,14 @@ use super::blockwise_solve::BlockWorkingSetUpdaterExt;
 use super::*;
 use gam_solve::row_measure::RowSubsampleMaskExt;
 
+pub(crate) fn beta_cache_keys_match_bitwise(lhs: &Array1<f64>, rhs: &Array1<f64>) -> bool {
+    lhs.len() == rhs.len()
+        && lhs
+            .iter()
+            .zip(rhs.iter())
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
 pub(crate) struct ExactJointModeCurvatureCertificate {
     pub(crate) workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     pub(crate) minimum_whitened_eigenvalue: f64,
@@ -1354,7 +1362,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     None
                 } else if let Some((_, grad_phi, hphi)) = jeffreys_triple_cache
                     .as_ref()
-                    .filter(|(key, _, _)| *key == head_beta_key)
+                    .filter(|(key, _, _)| beta_cache_keys_match_bitwise(key, &head_beta_key))
                 {
                     // Cross-cycle cache hit: the previous cycle's post-step KKT
                     // residual already computed the exact triple at this β. Reuse.
@@ -5964,6 +5972,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
 
         // If joint Newton converged, skip the blockwise loop entirely.
         if converged {
+            // The accepted-step cache is keyed by the exact coefficient bits.
+            // Nothing between the accepted step and this terminal branch mutates
+            // beta, so a hit is the authoritative Jeffreys derivative artifact at
+            // the returned mode. A miss deliberately falls through to the normal
+            // computation; approximate/stale reuse is never allowed here.
+            let final_beta_key = flatten_state_betas(&states, specs);
+            let final_jeffreys_cache = jeffreys_triple_cache.as_ref().filter(|(beta_key, _, _)| {
+                beta_cache_keys_match_bitwise(beta_key, &final_beta_key)
+            });
             let penalty_value = total_quadratic_penalty(
                 &states,
                 &s_lambdas,
@@ -5979,6 +5996,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 block_log_lambdas,
                 options,
                 cached_joint_workspace.clone(),
+                final_jeffreys_cache.map(|(_, _, hphi)| hphi),
             )?;
             // The IFT/outer KKT residual must be the AUGMENTED stationarity
             // `∇L − Sβ + ∇Φ` the inner Newton actually drove to zero — NOT the bare
@@ -5992,21 +6010,25 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // residual the genuinely-near-zero augmented stationarity the inner
             // certified, so the gate passes. No-op when the term is
             // condition-gated/unavailable (∇Φ=0).
-            let augmented_joint_gradient: Option<Array1<f64>> = match (
-                cached_joint_gradient.as_ref(),
-                joint_jeffreys_subspace.as_ref(),
-            ) {
-                (Some(gradient), Some(z_joint)) => {
-                    match custom_family_joint_jeffreys_term(
-                        family, &states, specs, &ranges, z_joint,
-                    )? {
-                        Some((_phi, grad_phi, _hphi)) if grad_phi.len() == gradient.len() => {
-                            Some(gradient + &grad_phi)
-                        }
-                        _ => None,
+            let augmented_joint_gradient: Option<Array1<f64>> = match cached_joint_gradient.as_ref()
+            {
+                Some(gradient) => match final_jeffreys_cache {
+                    Some((_, grad_phi, _)) if grad_phi.len() == gradient.len() => {
+                        Some(gradient + grad_phi)
                     }
-                }
-                _ => None,
+                    _ => match joint_jeffreys_subspace.as_ref() {
+                        Some(z_joint) => match custom_family_joint_jeffreys_term(
+                            family, &states, specs, &ranges, z_joint,
+                        )? {
+                            Some((_phi, grad_phi, _hphi)) if grad_phi.len() == gradient.len() => {
+                                Some(gradient + &grad_phi)
+                            }
+                            _ => None,
+                        },
+                        None => None,
+                    },
+                },
+                None => None,
             };
             let ift_gradient = augmented_joint_gradient
                 .as_ref()
@@ -6230,6 +6252,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 block_log_lambdas,
                 options,
                 cached_joint_workspace.clone(),
+                None,
             )?;
             let active_constraints = {
                 let local_ranges = block_param_ranges(specs);
@@ -6293,6 +6316,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 block_log_lambdas,
                 options,
                 cached_joint_workspace.clone(),
+                None,
             )?;
             let active_constraints = {
                 let local_ranges = block_param_ranges(specs);
@@ -7312,6 +7336,7 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
         block_log_lambdas,
         options,
         certified_workspace.clone(),
+        None,
     )?;
     let kkt_residual = if converged {
         match exact_newton_joint_gradient_from_eval(cached_eval, specs, &states)? {

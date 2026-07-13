@@ -3,6 +3,153 @@
 //! marginal psi-row lift through the time-wiggle deformation.
 
 use super::*;
+use gam_math::nested_dual::JetField;
+
+/// One row of each time-wiggle basis derivative from `B` through `B'''''`.
+///
+/// Keeping the six rows separate avoids allocating a per-row array of stacks
+/// in the hot path. The generic scalar constructor consumes `[B..B'''']` for
+/// `q` and the shifted `[B'..B''''']` stack for `dq/dh`.
+pub(crate) struct TimewiggleBasisDerivativeRows<'a> {
+    basis: ArrayView1<'a, f64>,
+    basis_d1: ArrayView1<'a, f64>,
+    basis_d2: ArrayView1<'a, f64>,
+    basis_d3: ArrayView1<'a, f64>,
+    basis_d4: ArrayView1<'a, f64>,
+    basis_d5: ArrayView1<'a, f64>,
+}
+
+impl<'a> TimewiggleBasisDerivativeRows<'a> {
+    fn from_geometry(
+        geometry: &'a SurvivalTimeWiggleGeometry,
+        basis_d5: &'a Array2<f64>,
+        row: usize,
+    ) -> Self {
+        Self {
+            basis: geometry.basis.row(row),
+            basis_d1: geometry.basis_d1.row(row),
+            basis_d2: geometry.basis_d2.row(row),
+            basis_d3: geometry.basis_d3.row(row),
+            basis_d4: geometry.basis_d4.row(row),
+            basis_d5: basis_d5.row(row),
+        }
+    }
+
+    fn validate_width(&self, width: usize, endpoint: &str) -> Result<(), String> {
+        let widths = [
+            self.basis.len(),
+            self.basis_d1.len(),
+            self.basis_d2.len(),
+            self.basis_d3.len(),
+            self.basis_d4.len(),
+            self.basis_d5.len(),
+        ];
+        if widths.iter().any(|&actual| actual != width) {
+            return Err(format!(
+                "survival marginal-slope {endpoint} timewiggle B..B5 widths {widths:?} must all equal scalar coefficient width {width}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn basis_stack(&self, coefficient: usize) -> [f64; 5] {
+        [
+            self.basis[coefficient],
+            self.basis_d1[coefficient],
+            self.basis_d2[coefficient],
+            self.basis_d3[coefficient],
+            self.basis_d4[coefficient],
+        ]
+    }
+
+    #[inline]
+    fn derivative_stack(&self, coefficient: usize) -> [f64; 5] {
+        [
+            self.basis_d1[coefficient],
+            self.basis_d2[coefficient],
+            self.basis_d3[coefficient],
+            self.basis_d4[coefficient],
+            self.basis_d5[coefficient],
+        ]
+    }
+}
+
+/// Bitwise current values anchoring the generic time-wiggle scalar program.
+/// Centering every nonconstant term at its own value preserves the existing
+/// f64 dot-product result exactly while leaving all derivative channels intact.
+#[derive(Clone, Copy)]
+pub(crate) struct TimewiggleQBaseValues {
+    pub(crate) q0: f64,
+    pub(crate) q1: f64,
+    pub(crate) dq1_dh1: f64,
+}
+
+/// Generic time-wiggle row coordinates.
+pub(crate) struct TimewiggleScalarQ<J> {
+    pub(crate) q0: J,
+    pub(crate) q1: J,
+    pub(crate) qd1: J,
+}
+
+#[inline]
+fn constant_like<J: JetField>(anchor: &J, value: f64) -> J {
+    anchor.compose_unary([value, 0.0, 0.0, 0.0, 0.0])
+}
+
+#[inline]
+fn centered<J: JetField>(value: &J) -> J {
+    value.sub(&constant_like(value, value.value()))
+}
+
+fn timewiggle_q_at_endpoint<J: JetField>(
+    h: &J,
+    beta_w: &[J],
+    basis: &TimewiggleBasisDerivativeRows<'_>,
+    base_value: f64,
+) -> J {
+    let mut q = constant_like(h, base_value).add(&centered(h));
+    for (coefficient, beta) in beta_w.iter().enumerate() {
+        let basis_value = h.compose_unary(basis.basis_stack(coefficient));
+        q = q.add(&centered(&beta.mul(&basis_value)));
+    }
+    q
+}
+
+/// Evaluate `q0 = h0 + B(h0) beta_w`, `q1 = h1 + B(h1) beta_w`, and
+/// `qd1 = (1 + B'(h1) beta_w) d_raw` over one scalar algebra.
+///
+/// `h0`, `h1`, `d_raw`, and every wiggle coefficient share the same scalar, so
+/// `Dual2<Order2<_>>` and `Dual2<OneSeed<_>>` carry baseline-family directions
+/// and beta-wiggle primary channels through the identical program. The supplied
+/// base values are the current f64 path's already-computed results; centering
+/// makes those values bit-identical without changing any derivative.
+pub(crate) fn timewiggle_q_from_basis_derivative_rows<J: JetField>(
+    h0: &J,
+    h1: &J,
+    d_raw: &J,
+    beta_w: &[J],
+    entry_basis: &TimewiggleBasisDerivativeRows<'_>,
+    exit_basis: &TimewiggleBasisDerivativeRows<'_>,
+    base_values: TimewiggleQBaseValues,
+) -> Result<TimewiggleScalarQ<J>, String> {
+    entry_basis.validate_width(beta_w.len(), "entry")?;
+    exit_basis.validate_width(beta_w.len(), "exit")?;
+
+    let q0 = timewiggle_q_at_endpoint(h0, beta_w, entry_basis, base_values.q0);
+    let q1 = timewiggle_q_at_endpoint(h1, beta_w, exit_basis, base_values.q1);
+    let mut dq1_dh1 = constant_like(h1, base_values.dq1_dh1);
+    for (coefficient, beta) in beta_w.iter().enumerate() {
+        let basis_derivative = h1.compose_unary(exit_basis.derivative_stack(coefficient));
+        dq1_dh1 = dq1_dh1.add(&centered(&beta.mul(&basis_derivative)));
+    }
+
+    Ok(TimewiggleScalarQ {
+        q0,
+        q1,
+        qd1: dq1_dh1.mul(d_raw),
+    })
+}
 
 impl SurvivalMarginalSlopeFamily {
     pub(crate) fn flex_timewiggle_active(&self) -> bool {
@@ -59,6 +206,19 @@ impl SurvivalMarginalSlopeFamily {
         h0: ndarray::ArrayView1<'_, f64>,
         beta_w: ndarray::ArrayView1<'_, f64>,
     ) -> Result<Option<SurvivalTimeWiggleGeometry>, String> {
+        Ok(self
+            .time_wiggle_geometry_with_basis_d5(h0, beta_w)?
+            .map(|(geometry, _basis_d5)| geometry))
+    }
+
+    /// Full geometry plus the per-coefficient fifth basis derivative retained
+    /// for the generic scalar q program. The public current-geometry wrapper
+    /// discards `basis_d5` after aggregating it, preserving its existing type.
+    fn time_wiggle_geometry_with_basis_d5(
+        &self,
+        h0: ndarray::ArrayView1<'_, f64>,
+        beta_w: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Option<(SurvivalTimeWiggleGeometry, Array2<f64>)>, String> {
         let first = self.time_wiggle_first_order_geometry(h0, beta_w)?;
         let Some(first) = first else {
             return Ok(None);
@@ -89,18 +249,21 @@ impl SurvivalMarginalSlopeFamily {
         let d3q_dq03 = fast_av(&basis_d3, &beta_w);
         let d4q_dq04 = fast_av(&basis_d4, &beta_w);
         let d5q_dq05 = fast_av(&basis_d5, &beta_w);
-        Ok(Some(SurvivalTimeWiggleGeometry {
-            basis: first.basis,
-            basis_d1: first.basis_d1,
-            basis_d2: first.basis_d2,
-            basis_d3,
-            basis_d4,
-            dq_dq0: first.dq_dq0,
-            d2q_dq02: first.d2q_dq02,
-            d3q_dq03,
-            d4q_dq04,
-            d5q_dq05,
-        }))
+        Ok(Some((
+            SurvivalTimeWiggleGeometry {
+                basis: first.basis,
+                basis_d1: first.basis_d1,
+                basis_d2: first.basis_d2,
+                basis_d3,
+                basis_d4,
+                dq_dq0: first.dq_dq0,
+                d2q_dq02: first.d2q_dq02,
+                d3q_dq03,
+                d4q_dq04,
+                d5q_dq05,
+            },
+            basis_d5,
+        )))
     }
 
     pub(crate) fn row_dynamic_q_values(

@@ -113,7 +113,7 @@ mod linux {
             if let Some(existing) = self.module.get() {
                 return Ok(existing);
             }
-            let ptx = compile_ptx_with_opts(source, nvrtc_compile_options())
+            let ptx = compile_ptx_with_opts(source, nvrtc_compile_options()?)
                 .map_err(|err| {
                     // The historical silent-CPU class: an NVRTC failure here is
                     // swallowed by callers' `.ok()?`; count it so telemetry can
@@ -143,11 +143,11 @@ mod linux {
     /// this instead when their kernel uses double atomics, or the device path
     /// silently falls back to the CPU.
     pub fn compile_ptx_arch<S: AsRef<str>>(source: S) -> Result<cudarc::nvrtc::Ptx, GpuError> {
-        compile_ptx_with_opts(source.as_ref(), nvrtc_compile_options())
+        compile_ptx_with_opts(source.as_ref(), nvrtc_compile_options()?)
             .gpu_ctx_with(|err| std::format!("NVRTC compile failed: {err}"))
     }
 
-    fn nvrtc_compile_options() -> CompileOptions {
+    fn nvrtc_compile_options() -> Result<CompileOptions, GpuError> {
         let mut opts = CompileOptions::default();
         opts.include_paths = nvrtc_include_paths();
         // GPU↔CPU PARITY: disable FMA contraction. NVRTC's default is
@@ -172,10 +172,10 @@ mod linux {
         // the device path silently falls back to the CPU (SAE ran at 0% GPU).
         // `arch` is `Option<&'static str>`; `nvrtc_arch()` returns a static
         // `compute_NN` for the device's real capability.
-        if let Some(runtime) = crate::device_runtime::GpuRuntime::global() {
+        if let Some(runtime) = crate::device_runtime::GpuRuntime::resolve(crate::global_policy())? {
             opts.arch = Some(runtime.selected_device().capability.nvrtc_arch());
         }
-        opts
+        Ok(opts)
     }
 
     fn nvrtc_include_paths() -> Vec<String> {

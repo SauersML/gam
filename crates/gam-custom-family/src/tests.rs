@@ -3320,6 +3320,47 @@ fn value_only_outer_jeffreys_skips_completion_and_drift_construction() {
     );
 }
 
+#[test]
+fn beta_cache_identity_is_bitwise_exact() {
+    let key = array![0.0, 1.25, -3.0];
+    assert!(beta_cache_keys_match_bitwise(&key, &key.clone()));
+    assert!(
+        !beta_cache_keys_match_bitwise(&key, &array![-0.0, 1.25, -3.0]),
+        "numeric equality is insufficient for an authoritative derivative cache key",
+    );
+    assert!(!beta_cache_keys_match_bitwise(&key, &array![0.0, 1.25]));
+}
+
+#[test]
+fn blockwise_logdet_reuses_cached_jeffreys_hphi_without_rebuilding_axes() {
+    let information_calls = Arc::new(AtomicUsize::new(0));
+    let axis_batch_calls = Arc::new(AtomicUsize::new(0));
+    let completion_calls = Arc::new(AtomicUsize::new(0));
+    let family = OuterJeffreysModeCountingFamily {
+        information_calls: Arc::clone(&information_calls),
+        axis_batch_calls: Arc::clone(&axis_batch_calls),
+        completion_calls: Arc::clone(&completion_calls),
+    };
+    let specs = vec![jeffreys_seam_spec(1)];
+    let mut states = vec![jeffreys_seam_state(array![0.0])];
+    let cached_hphi = array![[0.25]];
+    let (logdet_h, _) = blockwise_logdet_terms_with_workspace(
+        &family,
+        &specs,
+        &mut states,
+        &[Array1::zeros(0)],
+        &BlockwiseFitOptions::default(),
+        None,
+        Some(&cached_hphi),
+    )
+    .expect("cached Jeffreys H_phi should feed the terminal logdet");
+
+    assert!((logdet_h - 1.25_f64.ln()).abs() < 1e-12);
+    assert_eq!(information_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(axis_batch_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(completion_calls.load(Ordering::Relaxed), 0);
+}
+
 /// Observed-default family for the gam#1020 seam contract: implements only
 /// the observed joint Newton Hessian (and its directional derivatives) and
 /// relies on the trait defaults for the Jeffreys information hooks.

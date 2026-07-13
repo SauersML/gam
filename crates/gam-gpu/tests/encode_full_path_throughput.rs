@@ -302,18 +302,18 @@ fn full_exact_encode_throughput_and_correctness() {
     // is false; separately, the fail-closed contract must hold — on a CPU-only
     // host `GpuPolicy::Required` surfaces a structured error (never a silent CPU
     // pass dressed as a device run), and on a real device it succeeds.
-    let required = GpuRuntime::global_or_fail(GpuPolicy::Required);
-    if GpuRuntime::is_available() {
-        assert!(
-            required.is_ok(),
+    let required = GpuRuntime::resolve(GpuPolicy::Required);
+    match GpuRuntime::availability() {
+        Ok(gam_gpu::GpuAvailabilityRef::Available(_)) => assert!(
+            matches!(required, Ok(Some(_))),
             "GpuPolicy::Required must succeed when a device is present"
-        );
-    } else {
-        assert!(
-            matches!(required, Err(GpuError::DriverLibraryUnavailable { .. })),
+        ),
+        Ok(gam_gpu::GpuAvailabilityRef::Absent(_)) => assert!(
+            matches!(required, Err(GpuError::RequiredDeviceUnavailable { .. })),
             "GpuPolicy::Required must fail closed when the device is absent, got {required:?}"
-        );
+        ),
+        Err(error) => panic!("GPU probe fault must fail this plumbing test: {error}"),
     }
     // GpuPolicy::Off always refuses, regardless of hardware.
-    assert!(GpuRuntime::global_or_fail(GpuPolicy::Off).is_err());
+    assert!(matches!(GpuRuntime::resolve(GpuPolicy::Off), Ok(None)));
 }

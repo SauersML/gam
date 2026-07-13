@@ -76,8 +76,8 @@ fn cpu_reference_k1(
 /// AGGREGATE active-row mass and mean border width (CG budget 1: a K=1 Direct
 /// solve is a single factor, not a CG loop — see `BATCHED_K1_DESIGN.md` §5).
 /// Returns `None` to decline the whole class to the CPU reference. Off Linux
-/// there is no CUDA path: `GpuRuntime::global()` is `None` and the class
-/// declines through the same admission flow.
+/// there is no CUDA path: Auto resolves typed absence and the class declines
+/// through the same admission flow. Probe faults fail rather than declining.
 ///
 /// The batched per-atom device kernel is not yet attached, so an admitted class
 /// still declines to the CPU reference rather than fabricate a step: this function
@@ -89,7 +89,8 @@ fn try_device_batched_k1(
     if systems.is_empty() {
         return None;
     }
-    let runtime = gam_gpu::device_runtime::GpuRuntime::global()?;
+    let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .unwrap_or_else(|error| panic!("batched K=1 GPU runtime resolution failed: {error}"))?;
     let total_rows: usize = systems.iter().map(|s| s.rows.len()).sum();
     let mean_k = systems.iter().map(|s| s.k).sum::<usize>() / systems.len();
     let max_d = systems.iter().map(|s| s.d).max().unwrap_or(0);

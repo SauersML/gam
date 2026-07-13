@@ -403,7 +403,10 @@ pub fn evidence_derivatives_hutchinson_gpu(
 
     #[cfg(target_os = "linux")]
     {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
+        if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
             match linux_cuda::evidence_derivatives(&input) {
                 Ok(evidence) => return Ok(evidence),
                 Err(GpuError::NoDeviceKernel { .. }) => {
@@ -2131,8 +2134,10 @@ mod tests {
     fn block_2_8_hill_climb_adaptive_vs_exact_at_p2000_d8() {
         // Smaller dimensions on CPU CI to keep the test under a minute;
         // V100 runs the full p=2000, d=8 specified in the charter.
-        let on_v100 =
-            cfg!(target_os = "linux") && gam_gpu::device_runtime::GpuRuntime::global().is_some();
+        let on_v100 = cfg!(target_os = "linux")
+            && gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+                .unwrap_or_else(|error| panic!("GPU probe fault in hill-climb gate: {error}"))
+                .is_some();
         let (p, d): (usize, usize) = if on_v100 { (2000, 8) } else { (256, 4) };
 
         let mut h = Array2::<f64>::zeros((p, p));

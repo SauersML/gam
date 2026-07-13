@@ -123,14 +123,18 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     // can carry. Such a shape would only inherit the tile split's inter-tile
     // reassociation (the documented, tolerance-bounded departure) while doing
     // 100% CPU work, so route it to the serial/rayon reference path below
-    // WITHOUT calling `GpuRuntime::global()` (whose first call creates a CUDA
+    // WITHOUT resolving GPU availability (whose first call creates a CUDA
     // primary context on every GPU). Shapes clearing the floor probe and tile
     // exactly as before.
     let assembly_work = 2u128 * (n as u128) * (sys.d as u128) * (k as u128) * (k as u128);
     let tiles = if assembly_work < gam_gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS {
         None
     } else {
-        gam_gpu::device_runtime::GpuRuntime::global().and_then(|rt| {
+        gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+            .map_err(|error| ArrowSchurError::SchurFactorFailed {
+                reason: format!("GPU runtime resolution failed during Schur reduction: {error}"),
+            })?
+            .and_then(|rt| {
             let tiles = gam_gpu::pool::balanced_partition(rt, n);
             // Engage the device stacked-GEMM reduction when a MULTI-GPU pool can
             // overlap tiles, OR — the single-GPU gap this closes — when the one
@@ -1032,7 +1036,12 @@ pub fn solve_streaming_reduced_beta(
         // CPU `solve_dense_reduced_system`, which then drives the same proximal
         // ridge escalation. A genuine device PD failure is non-recoverable for
         // this attempt's `schur`, so we let the CPU path re-confirm and escalate.
-        if gam_gpu::device_runtime::GpuRuntime::is_available() {
+        if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+            .map_err(|error| ArrowSchurError::SchurFactorFailed {
+                reason: format!("GPU runtime resolution failed before reduced solve: {error}"),
+            })?
+            .is_some()
+        {
             match crate::gpu_kernels::arrow_schur::solve_reduced_beta_pcg(
                 &schur,
                 rhs_beta,
@@ -1749,7 +1758,7 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
     }
     // Size gate BEFORE the device probe (startup-tax ordering): the predicate
     // reads only associated constants, so a shape it rejects skips
-    // `GpuRuntime::global()` (whose first call creates a CUDA primary context on
+    // runtime availability resolution (whose first call creates a CUDA primary context on
     // every GPU); an admitted shape probes exactly as the PCG seam does.
     if !gam_gpu::GpuDispatchPolicy::default().reduced_schur_matvec_should_offload(
         sys.rows.len(),
@@ -1759,7 +1768,8 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
     ) {
         return None;
     }
-    gam_gpu::device_runtime::GpuRuntime::global()?;
+    gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .unwrap_or_else(|error| panic!("evidence GPU runtime resolution failed: {error}"))?;
     // #1017: framed matrix-free system with resident device operands — prefer the
     // device-resident DETERMINISTIC reduced-Schur apply (upload operands once,
     // cross only x/out per apply, atomics-free so the SLQ log|S| determinism
@@ -5502,7 +5512,7 @@ pub(crate) fn cholesky_lower(a: &Array2<f64>) -> Result<Array2<f64>, String> {
     // former unconditional `k×k` clone (≈32 MB at the SAE border) was pure waste
     // on the CPU path that now dominates. `cuda_selected()` is a cheap policy +
     // runtime-presence probe.
-    if gam_gpu::cuda_selected() {
+    if gam_gpu::cuda_selected().map_err(|error| error.to_string())? {
         let mut maybe_device = a.clone();
         if gam_gpu::try_cholesky_lower_inplace(&mut maybe_device).is_some() {
             return Ok(maybe_device);

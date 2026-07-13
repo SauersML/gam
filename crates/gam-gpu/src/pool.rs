@@ -213,7 +213,7 @@ pub fn scatter_batched<T: Send>(
 /// This must exist on every target, not just Linux: not every caller is inside
 /// `#[cfg(target_os = "linux")]` — the SAE manifold per-atom Gram/smoothness
 /// scatters (`src/terms/sae/manifold/mod.rs`) call it from platform-independent
-/// code. At runtime off Linux `GpuRuntime::global()` returns `None`, so the
+/// code. At runtime off Linux Auto resolution returns typed absence, so the
 /// `Some(rt)` branch that reaches here is never taken; the body only needs to
 /// compile and honour the contract. `balanced_partition` yields no tiles when
 /// the runtime has no devices, so this reports `None` and the caller runs its

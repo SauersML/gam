@@ -1207,6 +1207,7 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
     block_log_lambdas: &[Array1<f64>],
     options: &BlockwiseFitOptions,
     preferred_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    cached_jeffreys_hphi: Option<&Array2<f64>>,
 ) -> Result<(f64, f64), String> {
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
@@ -1238,7 +1239,8 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
     // information with the expected Fisher information the certificate does
     // not transfer (observed grows on saturated rows where expected decays),
     // so the pre-check is bypassed and the exact gate always runs.
-    let outer_precheck_eligible = include_logdet_h
+    let outer_precheck_eligible = cached_jeffreys_hphi.is_none()
+        && include_logdet_h
         && total > 0
         && family.joint_jeffreys_information_matches_observed_hessian();
     let outer_jeffreys_precheck_skips = match preferred_workspace.as_ref() {
@@ -1295,27 +1297,38 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
         }
         _ => false,
     };
-    let logdet_jeffreys_hphi: Option<Array2<f64>> = if include_logdet_h
-        && !outer_jeffreys_precheck_skips
-        && !options.seed_screening
-        && family.joint_jeffreys_term_required()
-    {
-        // Skipped during seed screening: this per-axis Jeffreys curvature
-        // (O(p · per-axis-Hdot)) augments the outer LAML logdet `½ log|H+Sλ+H_Φ|`,
-        // a refinement the screening SCORE does not need. Screening ranks seeds by
-        // the un-augmented `½ log|H+Sλ|` plus the value-only Firth penalty already
-        // in `penalty_value`; the load-bearing H_Φ is restored for the real fit
-        // (gam#729/#808).
-        match build_joint_jeffreys_subspace(specs, &ranges)? {
-            Some(z_joint) => {
-                custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
-                    .map(|(_phi, _grad, hphi)| hphi)
+    let logdet_jeffreys_hphi: Option<Array2<f64>> =
+        if !include_logdet_h || options.seed_screening || !family.joint_jeffreys_term_required() {
+            None
+        } else if let Some(hphi) = cached_jeffreys_hphi {
+            if hphi.dim() != (total, total) {
+                return Err(format!(
+                    "cached joint Jeffreys H_phi has shape {:?}, expected ({total}, {total})",
+                    hphi.dim()
+                ));
             }
-            None => None,
-        }
-    } else {
-        None
-    };
+            // The caller supplies this only after an exact, bitwise beta-key match.
+            // Reusing the already-authoritative H_phi keeps the outer logdet on the
+            // same augmented Hessian as the converged Newton step without paying a
+            // second all-axis Jeffreys sweep at that identical coefficient point.
+            Some(hphi.clone())
+        } else if !outer_jeffreys_precheck_skips {
+            // Skipped during seed screening: this per-axis Jeffreys curvature
+            // (O(p · per-axis-Hdot)) augments the outer LAML logdet `½ log|H+Sλ+H_Φ|`,
+            // a refinement the screening SCORE does not need. Screening ranks seeds by
+            // the un-augmented `½ log|H+Sλ|` plus the value-only Firth penalty already
+            // in `penalty_value`; the load-bearing H_Φ is restored for the real fit
+            // (gam#729/#808).
+            match build_joint_jeffreys_subspace(specs, &ranges)? {
+                Some(z_joint) => {
+                    custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
+                        .map(|(_phi, _grad, hphi)| hphi)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
     let compute_block_logdet_term = |b: usize| -> Result<(Array2<f64>, f64), String> {
         let spec = &specs[b];
         let (start, end) = ranges[b];

@@ -5,8 +5,8 @@
 //! routine, and returns the host result. The cudarc-backed implementations
 //! always compile (cudarc dynamically loads `libcuda` at runtime via the
 //! `fallback-dynamic-loading` feature), and dispatch is gated at runtime on
-//! `super::device_runtime::GpuRuntime::global()` — when no device is probed the
-//! status enum advertises `CudaUnavailable` and callers fall back to CPU.
+//! `super::device_runtime::GpuRuntime::resolve()` — typed hardware absence
+//! advertises `CudaUnavailable`, while probe faults remain errors.
 //!
 //! The implementations route through `super::device_runtime::cuda_context_for` and
 //! the cudarc 0.19 cuBLAS API. Any transient backend failure (OOM, launch
@@ -14,7 +14,7 @@
 //! `super::linalg` falls back to the CPU fast path without disturbing
 //! numerics.
 
-pub fn blas_backend_status() -> super::CudaBackendStatus {
+pub fn blas_backend_status() -> Result<super::CudaBackendStatus, super::GpuError> {
     super::cuda_backend_status()
 }
 

@@ -172,7 +172,8 @@ pub(crate) type SigmaPointResult = (Array2<f64>, Array1<f64>);
 /// properties that determine correctness.
 #[inline]
 pub(crate) fn device_pirls_stage3_ready() -> bool {
-    gam_gpu::cuda_selected() && gam_gpu::device_runtime::GpuRuntime::global().is_some()
+    gam_gpu::cuda_selected()
+        .unwrap_or_else(|error| panic!("GPU runtime resolution failed for Stage 3: {error}"))
 }
 
 /// Sigma-cubature executor dispatch — the swap site between the CPU Rayon
@@ -266,7 +267,7 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
     let Some(admission) = admission_for(&likelihood_spec.spec, n, p) else {
         return Ok(None);
     };
-    let Some(runtime) = GpuRuntime::global() else {
+    let Some(runtime) = GpuRuntime::resolve(gam_gpu::global_policy())? else {
         return Ok(None);
     };
     if !runtime.policy().should_use_gpu_pirls_loop(admission) {

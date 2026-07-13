@@ -5,15 +5,15 @@
 //! the kernel to a device is fully automatic and never requires a user-facing
 //! flag — it depends only on:
 //!
-//!   1. `GpuRuntime::global()` returning `Some(_)` (a device was probed at
-//!      process startup).
+//!   1. Lossless runtime resolution returning an available device.
 //!   2. The kernel being large enough to amortize launch/PCIe overhead, per
 //!      the thresholds in `policy::GpuDispatchPolicy`.
 //!   3. cudarc successfully dynamically loading `libcuda` at process startup
 //!      via its `fallback-dynamic-loading` feature. When the loader fails
-//!      (no driver, no toolkit installed), `GpuRuntime::probe()` returns
-//!      `Ok(None)` and every `try_*` returns `None` so the caller falls
-//!      through to the existing faer CPU kernel.
+//!      (no driver, no toolkit installed), Auto receives typed absence and
+//!      every `try_*` returns `None` so the caller falls through to the
+//!      existing faer CPU kernel. Probe faults fail loudly instead of being
+//!      reclassified as absence.
 //!
 //! The wiring lives here so `solver/pirls.rs` and the family Hessian
 //! assemblers can stay backend-agnostic: they call `gam_linalg::faer_ndarray::fast_*`
@@ -72,7 +72,7 @@ impl gam_linalg::gpu_hook::GpuGemmDispatch for CudaGemmDispatch {
     }
 
     fn device_count(&self) -> usize {
-        GpuRuntime::global().map_or(0, |rt| rt.device_count())
+        runtime_for_dispatch().map_or(0, GpuRuntime::device_count)
     }
 
     fn try_fast_ab_broadcast_b_batched(
@@ -116,6 +116,20 @@ pub enum DispatchOp {
     JointHessian2x2 { n: usize, pa: usize, pb: usize },
 }
 
+/// Resolve the runtime at the infallible `gam-linalg` optimization-hook
+/// boundary. Typed Auto/Off absence declines the optional acceleration;
+/// faults and Required absence cannot be represented by the hook's `Option`
+/// return type, so they fail loudly rather than silently executing a CPU path.
+#[inline]
+fn runtime_for_dispatch() -> Option<&'static GpuRuntime> {
+    GpuRuntime::resolve(super::global_policy()).unwrap_or_else(|error| {
+        panic!(
+            "GPU runtime resolution failed under policy '{}': {error}",
+            super::global_policy()
+        )
+    })
+}
+
 impl DispatchOp {
     /// Conservative flop estimate used for the generic `gemm_min_flops` gate.
     #[inline]
@@ -148,7 +162,7 @@ impl DispatchOp {
     /// small-dense-batched-POTRF fields, which `calibration::calibrate_device`
     /// never adjusts. A `false` here means EVERY reachable policy's
     /// [`route_through_gpu`] admission would also refuse, so the caller may
-    /// return to the CPU path WITHOUT touching `GpuRuntime::global()` — i.e.
+    /// return to the CPU path WITHOUT resolving GPU availability — i.e.
     /// without triggering the device probe and its per-GPU
     /// `cuDevicePrimaryCtxRetain` context creation. A `true` decides nothing:
     /// the probed runtime's real policy still gates the op exactly as before.
@@ -197,14 +211,14 @@ impl DispatchOp {
 #[must_use]
 pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
     // Size gate BEFORE the device probe (startup-tax ordering fix): an op no
-    // reachable policy could admit must not pay `GpuRuntime::global()` — the
-    // first call of which creates a CUDA primary context on every GPU. Ops that
+    // reachable policy could admit must not resolve availability — the first
+    // call creates a CUDA primary context on every GPU. Ops that
     // clear this most-permissive bound fall through to the probed runtime's
     // real policy admission below, bit-for-bit as before.
     if !op.admissible_under_any_policy() {
         return None;
     }
-    let runtime = GpuRuntime::global()?;
+    let runtime = runtime_for_dispatch()?;
     let policy = &runtime.policy;
     let admit = match op {
         DispatchOp::Gemm { m, n, k } => {
@@ -253,7 +267,8 @@ const MULTI_GPU_BATCH_FLOOR: usize = 64;
 #[cfg(target_os = "linux")]
 #[inline]
 fn should_split_batch(batch: usize) -> bool {
-    GpuRuntime::global().is_some_and(|rt| rt.device_count() > 1) && batch >= MULTI_GPU_BATCH_FLOOR
+    runtime_for_dispatch().is_some_and(|rt| rt.device_count() > 1)
+        && batch >= MULTI_GPU_BATCH_FLOOR
 }
 
 #[inline]
@@ -952,10 +967,10 @@ pub fn try_solve_upper_triangular_matrix(
 mod pre_probe_gate_tests {
     //! Pins the CUDA startup-tax ordering fix at the dispatch chokepoint: an op
     //! no reachable policy could admit must be refused by `route_through_gpu`
-    //! WITHOUT calling `GpuRuntime::global()` — i.e. without triggering the
+    //! WITHOUT resolving GPU availability — i.e. without triggering the
     //! device probe and its per-GPU `cuDevicePrimaryCtxRetain` context
     //! creation. Observable on any host (CUDA or not) through the process-wide
-    //! `global_call_count` counter; nextest gives each test its own process.
+    //! `resolution_call_count` counter; nextest gives each test its own process.
     use super::{DispatchOp, GpuDispatchPolicy, route_through_gpu};
     use crate::device_runtime::GpuRuntime;
 
@@ -984,7 +999,7 @@ mod pre_probe_gate_tests {
                 pb: 8,
             },
         ];
-        let before = GpuRuntime::global_call_count();
+        let before = GpuRuntime::resolution_call_count();
         for op in tiny_ops {
             assert!(
                 !op.admissible_under_any_policy(),
@@ -996,9 +1011,9 @@ mod pre_probe_gate_tests {
             );
         }
         assert_eq!(
-            GpuRuntime::global_call_count(),
+            GpuRuntime::resolution_call_count(),
             before,
-            "route_through_gpu must refuse CPU-sized ops BEFORE GpuRuntime::global(), \
+            "route_through_gpu must refuse CPU-sized ops BEFORE runtime resolution, \
              so no CUDA context is ever created for them"
         );
     }
@@ -1013,15 +1028,15 @@ mod pre_probe_gate_tests {
             k: 2_048,
         };
         assert!(big.admissible_under_any_policy());
-        let before = GpuRuntime::global_call_count();
+        let before = GpuRuntime::resolution_call_count();
         let routed = route_through_gpu(big);
         assert!(
             routed.is_none_or(|runtime| !runtime.devices.is_empty()),
             "a routed operation must receive a runtime with at least one usable device"
         );
         assert!(
-            GpuRuntime::global_call_count() > before,
-            "an admissible op must fall through to GpuRuntime::global()"
+            GpuRuntime::resolution_call_count() > before,
+            "an admissible op must fall through to runtime resolution"
         );
     }
 
@@ -1126,11 +1141,19 @@ mod pre_probe_gate_tests {
 #[cfg(test)]
 mod tests {
     use super::{DispatchOp, route_through_gpu, try_fast_ab};
+    use crate::GpuPolicy;
     use crate::device_runtime::GpuRuntime;
+
+    fn available_runtime_or_skip(label: &str) -> Option<&'static GpuRuntime> {
+        match GpuRuntime::resolve(GpuPolicy::Auto) {
+            Ok(runtime) => runtime,
+            Err(error) => panic!("[{label}] GPU probe fault: {error}"),
+        }
+    }
 
     #[test]
     fn sae_shape_dispatch_ops_route_when_cuda_runtime_is_present() {
-        let Some(runtime) = GpuRuntime::global() else {
+        let Some(runtime) = available_runtime_or_skip("sae dispatch gate") else {
             eprintln!("[sae dispatch gate] no CUDA runtime - skipping branch-admission check");
             return;
         };
@@ -1174,7 +1197,7 @@ mod tests {
         );
     }
 
-    /// Touching `GpuRuntime::global()` must install the dense-GEMM dispatch
+    /// Resolving an available runtime must install the dense-GEMM dispatch
     /// hook into `gam_linalg`, so a profitable `fast_ab` call routes through
     /// the device — and the device result must match the CPU oracle within
     /// IEEE reduction tolerance. This is the regression guard for the bug
@@ -1184,14 +1207,14 @@ mod tests {
     fn global_runtime_installs_fast_ab_hook_and_matches_cpu() {
         use ndarray::Array2;
 
-        let Some(_runtime) = GpuRuntime::global() else {
+        let Some(_runtime) = available_runtime_or_skip("fast_ab hook") else {
             eprintln!("[fast_ab hook] no CUDA runtime - skipping engagement check");
             return;
         };
-        // After `global()` returned `Some`, the hook MUST be installed.
+        // After resolution returned an available device, the hook MUST be installed.
         assert!(
             gam_linalg::gpu_hook::gpu_dispatch().is_some(),
-            "GpuRuntime::global() returned a device but did not register the \
+            "GpuRuntime::resolve(Auto) returned a device but did not register the \
              dense-GEMM dispatch hook — fast_ab would silently stay on the CPU"
         );
 
@@ -1252,7 +1275,7 @@ mod tests {
         use crate::blas::gemm_cuda;
         use ndarray::Array2;
 
-        let Some(runtime) = GpuRuntime::global() else {
+        let Some(runtime) = available_runtime_or_skip("gemm transpose-free") else {
             eprintln!("[gemm transpose-free] no CUDA runtime - skipping");
             return;
         };

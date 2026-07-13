@@ -41,7 +41,7 @@ pub mod kernels;
 
 pub use cpu_traits::MatrixLocation;
 pub use device::GpuDeviceInfo;
-pub use device_runtime::GpuRuntime;
+pub use device_runtime::{GpuAbsence, GpuAvailability, GpuAvailabilityRef, GpuRuntime};
 pub use dictionary_score::{
     DEFAULT_DICTIONARY_SCORE_MIN_ELEMS, DEFAULT_DICTIONARY_SCORE_TILE_ELEMS,
     DictionaryScoreRoutePlan,
@@ -75,12 +75,12 @@ pub enum CudaBackendStatus {
 }
 
 #[inline]
-pub(crate) fn cuda_backend_status() -> CudaBackendStatus {
-    if device_runtime::GpuRuntime::global().is_some() {
+pub(crate) fn cuda_backend_status() -> Result<CudaBackendStatus, GpuError> {
+    Ok(if device_runtime::GpuRuntime::resolve(global_policy())?.is_some() {
         CudaBackendStatus::CudaReady
     } else {
         CudaBackendStatus::CudaUnavailable
-    }
+    })
 }
 
 /// User-facing GPU backend policy.
@@ -198,11 +198,12 @@ pub fn configure_global_policy(policy: GpuPolicy) {
 /// runtime/backend support becomes an explicit error at the callee instead of
 /// an implicit CPU route.
 #[inline]
-pub fn cuda_selected() -> bool {
+pub fn cuda_selected() -> Result<bool, GpuError> {
     match global_policy() {
-        GpuPolicy::Auto => device_runtime::GpuRuntime::is_available(),
-        GpuPolicy::Off => false,
-        GpuPolicy::Required => true,
+        GpuPolicy::Off => Ok(false),
+        policy @ (GpuPolicy::Auto | GpuPolicy::Required) => {
+            Ok(device_runtime::GpuRuntime::resolve(policy)?.is_some())
+        }
     }
 }
 
@@ -244,14 +245,17 @@ impl GpuEligibility {
 /// Decide whether a GPU kernel may run. This is deliberately conservative:
 /// with no compiled vendor backend, `auto` returns CPU fallback and `required`
 /// returns an error at the call site through [`GpuDecision::require_supported`].
-pub fn decide(kernel: GpuKernel, eligibility: GpuEligibility) -> GpuDecision {
+pub fn decide(
+    kernel: GpuKernel,
+    eligibility: GpuEligibility,
+) -> Result<GpuDecision, GpuError> {
     let policy = global_policy();
     // Auto must consult the actual probed runtime, not only the
     // compile-time eligibility.  Without this, `decide()` would claim
-    // GPU when the kernel is "compiled in" even though `GpuRuntime::global()`
-    // observed no device — silently producing CPU work via failed dispatch
-    // and hiding the cpu_reason from callers wanting to log fallback cause.
-    let runtime_available = device_runtime::GpuRuntime::is_available();
+    // GPU when the kernel is "compiled in" even though lossless resolution
+    // observed typed absence. Probe faults are returned rather than being
+    // hidden behind the CPU route.
+    let runtime_available = device_runtime::GpuRuntime::resolve(policy)?.is_some();
     let (use_gpu, reason) = match (policy, eligibility) {
         (GpuPolicy::Off, _) => (false, "cpu-gpu-policy-off"),
         (GpuPolicy::Auto, GpuEligibility::BackendNotCompiled) => {
@@ -273,12 +277,12 @@ pub fn decide(kernel: GpuKernel, eligibility: GpuEligibility) -> GpuDecision {
         (GpuPolicy::Required, GpuEligibility::WorkloadBelowThreshold)
         | (GpuPolicy::Required, GpuEligibility::Eligible) => (true, "gpu-required-supported"),
     };
-    GpuDecision {
+    Ok(GpuDecision {
         policy,
         kernel,
         use_gpu,
         reason,
-    }
+    })
 }
 
 impl GpuDecision {
@@ -420,28 +424,30 @@ mod policy_tests {
 
     #[test]
     fn gpu_mode_required_fails_closed_when_device_absent() {
-        use crate::device_runtime::GpuRuntime;
+        use crate::device_runtime::{GpuAvailabilityRef, GpuRuntime};
         // Off always refuses, regardless of hardware.
-        assert!(matches!(
-            GpuRuntime::global_or_fail(GpuPolicy::Off),
-            Err(GpuError::DriverLibraryUnavailable { .. })
-        ));
+        assert!(GpuRuntime::resolve(GpuPolicy::Off).unwrap().is_none());
 
-        if GpuRuntime::is_available() {
-            // On a GPU host both Auto and Required must succeed.
-            assert!(GpuRuntime::global_or_fail(GpuPolicy::Required).is_ok());
-            assert!(GpuRuntime::global_or_fail(GpuPolicy::Auto).is_ok());
-        } else {
-            // Fail-closed: Required surfaces a STRUCTURED error rather than a
-            // silent CPU fallback. Auto also reports unavailable (callers there
-            // swallow it and fall back), but the variant is what lets Required
-            // propagate it as fatal.
-            let required = GpuRuntime::global_or_fail(GpuPolicy::Required);
-            assert!(
-                matches!(required, Err(GpuError::DriverLibraryUnavailable { .. })),
-                "GpuPolicy::Required must fail closed when the device is absent, got {required:?}"
-            );
-            assert!(GpuRuntime::global_or_fail(GpuPolicy::Auto).is_err());
+        match GpuRuntime::availability() {
+            Ok(GpuAvailabilityRef::Available(_)) => {
+                // On a GPU host both Auto and Required must succeed.
+                assert!(matches!(
+                    GpuRuntime::resolve(GpuPolicy::Required),
+                    Ok(Some(_))
+                ));
+                assert!(matches!(GpuRuntime::resolve(GpuPolicy::Auto), Ok(Some(_))));
+            }
+            Ok(GpuAvailabilityRef::Absent(_)) => {
+                // Fail-closed: Required surfaces a structured error rather than
+                // a silent CPU fallback. Auto alone maps typed absence to None.
+                let required = GpuRuntime::resolve(GpuPolicy::Required);
+                assert!(
+                    matches!(required, Err(GpuError::RequiredDeviceUnavailable { .. })),
+                    "GpuPolicy::Required must fail closed when the device is absent, got {required:?}"
+                );
+                assert!(matches!(GpuRuntime::resolve(GpuPolicy::Auto), Ok(None)));
+            }
+            Err(error) => panic!("GPU probe fault must fail this contract test: {error}"),
         }
     }
 

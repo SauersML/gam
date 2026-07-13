@@ -70,11 +70,13 @@ pub fn pirls_loop_curvature_for(family: PirlsLoopFamilyKind) -> PirlsLoopCurvatu
     }
 }
 
-/// Detect whether the CUDA runtime is initialised on this host. The probe
-/// underneath returns `None` on every non-Linux target, so the function works
-/// unconditionally.
+/// Detect whether CUDA is available under Auto semantics. Typed absence is
+/// `false`; a probe fault fails loudly because this legacy boolean admission
+/// boundary cannot represent an error without misclassifying it as absence.
 pub fn gpu_runtime_available() -> bool {
-    gam_gpu::device_runtime::GpuRuntime::is_available()
+    gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("PIRLS GPU runtime probe failed: {error}"))
+        .is_some()
 }
 
 /// Strict admission shape for the Stage 3.3 PIRLS loop, computed from the
@@ -220,13 +222,17 @@ mod linux_impl {
         n: usize,
         p: usize,
     ) -> bool {
-        if !cuda_selected() {
+        if !cuda_selected()
+            .unwrap_or_else(|error| panic!("PIRLS admission runtime resolution failed: {error}"))
+        {
             return false;
         }
         let Some(admission) = admission_for(&likelihood.spec, n, p) else {
             return false;
         };
-        let Some(runtime) = GpuRuntime::global() else {
+        let Some(runtime) = GpuRuntime::resolve(gam_gpu::global_policy())
+            .unwrap_or_else(|error| panic!("PIRLS admission runtime resolution failed: {error}"))
+        else {
             return false;
         };
         runtime.policy().should_use_gpu_pirls_loop(admission)
@@ -240,8 +246,14 @@ mod linux_impl {
     ) -> Option<Result<(PirlsResult, WorkingModelPirlsResult), EstimationError>> {
         // Honor the documented GPU policy: never route to the GPU loop when
         // the caller has explicitly selected CPU execution.
-        if !cuda_selected() {
-            return None;
+        match cuda_selected() {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                return Some(Err(EstimationError::InvalidInput(format!(
+                    "PIRLS GPU runtime resolution failed: {error}"
+                ))));
+            }
         }
         // Gaussian-identity fits have an exact GPU PLS path (issue #272) and
         // must NOT be routed through the row-kernel PIRLS loop on device.
@@ -257,7 +269,15 @@ mod linux_impl {
         let p = input.x_original.ncols();
         // Engine-level admission: shape + family + curvature + runtime probe.
         let admission = admission_for(&input.likelihood.spec, n, p)?;
-        let runtime = GpuRuntime::global()?;
+        let runtime = match GpuRuntime::resolve(gam_gpu::global_policy()) {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => return None,
+            Err(error) => {
+                return Some(Err(EstimationError::InvalidInput(format!(
+                    "PIRLS GPU runtime resolution failed: {error}"
+                ))));
+            }
+        };
         if !runtime.policy().should_use_gpu_pirls_loop(admission) {
             return None;
         }
@@ -744,10 +764,17 @@ mod linux_impl {
     /// Returns `true` iff cuda_selected(), runtime available, and the likelihood
     /// is Gaussian-identity.
     pub fn try_gpu_gaussian_pls_admit(likelihood: &gam_problem::GlmLikelihoodSpec) -> bool {
-        if !gam_gpu::cuda_selected() {
+        if !gam_gpu::cuda_selected().unwrap_or_else(|error| {
+            panic!("Gaussian PLS admission runtime resolution failed: {error}")
+        }) {
             return false;
         }
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+        if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+            .unwrap_or_else(|error| {
+                panic!("Gaussian PLS admission runtime resolution failed: {error}")
+            })
+            .is_none()
+        {
             return false;
         }
         likelihood.spec.is_gaussian_identity()

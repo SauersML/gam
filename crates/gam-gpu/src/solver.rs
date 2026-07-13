@@ -6,7 +6,7 @@
 
 use ndarray::{Array2, ArrayView2};
 
-pub fn solver_backend_status() -> super::CudaBackendStatus {
+pub fn solver_backend_status() -> Result<super::CudaBackendStatus, super::GpuError> {
     super::cuda_backend_status()
 }
 
@@ -681,8 +681,8 @@ mod cuda {
         // `CudaContext::new(0)` here would fragment driver state across
         // distinct contexts, defeat memory-pool sharing, and pin work to
         // ordinal 0 even when the runtime probe chose a different device.
-        let runtime = super::super::device_runtime::GpuRuntime::global()
-            .ok_or_else(|| "cuda runtime unavailable".to_string())?;
+        let runtime = super::super::device_runtime::GpuRuntime::require()
+            .map_err(|error| format!("cuda runtime unavailable: {error}"))?;
         context_and_stream_for(runtime.selected_device().ordinal)
     }
 
@@ -944,10 +944,10 @@ pub fn iterative_refinement_cholesky_solve(
 
     #[cfg(target_os = "linux")]
     {
-        let runtime = super::device_runtime::GpuRuntime::global().ok_or_else(|| {
+        let runtime = super::device_runtime::GpuRuntime::require().map_err(|error| {
             let (rows, cols) = hessian.dim();
             format!(
-                "CUDA runtime unavailable; hessian={rows}x{cols}, rhs={}x{}",
+                "CUDA runtime unavailable; hessian={rows}x{cols}, rhs={}x{}: {error}",
                 rhs.nrows(),
                 rhs.ncols()
             )
@@ -1027,12 +1027,13 @@ pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, S
 
     #[cfg(target_os = "linux")]
     {
-        if super::device_runtime::GpuRuntime::global().is_none() {
+        super::device_runtime::GpuRuntime::require().map_err(|error| {
             let (rows, cols) = hessian.dim();
-            return Err(format!(
-                "CUDA runtime unavailable for Cholesky factorization; hessian={rows}x{cols}"
-            ));
-        }
+            format!(
+                "CUDA runtime unavailable for Cholesky factorization; \
+                 hessian={rows}x{cols}: {error}"
+            )
+        })?;
         cuda::cholesky_lower(hessian)
     }
 }

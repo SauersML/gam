@@ -807,7 +807,7 @@ pub struct PirlsLoopAdmission {
     /// is not admitted.
     pub curvature: PirlsLoopCurvatureKind,
     /// True when the CUDA runtime is initialised on this host (i.e.
-    /// `GpuRuntime::global().is_some()`).
+    /// lossless Auto resolution returned an available runtime).
     pub gpu_available: bool,
 }
 

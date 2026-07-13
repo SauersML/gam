@@ -3559,7 +3559,10 @@ pub fn weighted_crossprod_gpu(
 
     #[cfg(target_os = "linux")]
     {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+        if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
             return cpu_fallback::weighted_crossprod_cpu(x, weights);
         }
         cuda::weighted_crossprod(x, weights)
@@ -3574,7 +3577,10 @@ pub fn solve_pirls_step_gpu(input: PirlsGpuInput<'_>) -> Result<PirlsGpuStep, St
 
     #[cfg(target_os = "linux")]
     {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+        if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
             return cpu_fallback::solve_step_cpu(input);
         }
         cuda::solve_step(input)
@@ -3593,9 +3599,8 @@ pub fn upload_shared_pirls_gpu(
     prior_w: ndarray::ArrayView1<'_, f64>,
     offset: ndarray::ArrayView1<'_, f64>,
 ) -> Result<PirlsGpuSharedData, String> {
-    if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-        return Err("cuda runtime unavailable; cannot upload shared GPU PIRLS data".to_string());
-    }
+    gam_gpu::device_runtime::GpuRuntime::require()
+        .map_err(|error| format!("cannot upload shared GPU PIRLS data: {error}"))?;
     PirlsGpuSharedData::upload_impl(x, y, prior_w, offset)
 }
 
@@ -3896,9 +3901,15 @@ mod stream_device_parity_tests {
     use super::*;
     use ndarray::arr2;
 
+    fn device_available() -> bool {
+        gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+            .unwrap_or_else(|error| panic!("GPU probe fault in PIRLS device test: {error}"))
+            .is_some()
+    }
+
     #[test]
     fn device_input_step_matches_host_input_step_on_v100() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+        if !device_available() {
             eprintln!("[stream_device_parity] no CUDA runtime — skipping");
             return;
         }
@@ -4014,7 +4025,7 @@ mod stream_device_parity_tests {
             CurvatureMode, PirlsRowFamily, RowInput, row_reweight_cpu,
         };
         use std::time::Instant;
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+        if !device_available() {
             eprintln!("[hill_climb] no CUDA runtime — skipping");
             return;
         }
@@ -4140,7 +4151,7 @@ mod stream_device_parity_tests {
     /// `(XᵀX + Sλ)⁻¹·Xᵀy` solution.
     #[test]
     fn pirls_loop_converges_to_ols_solution_on_gaussian_identity() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+        if !device_available() {
             eprintln!("[stage_3_3] no CUDA runtime — skipping");
             return;
         }
