@@ -1278,29 +1278,46 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
-            let mut workspace = workspace.borrow_mut();
-            let lane_limit = empirical_bms_directional_batch_lanes(r);
-            let mut contracted = Vec::with_capacity(row_dirs.len());
-            for directions in row_dirs.chunks(lane_limit) {
-                workspace.reset(directions.len());
-                let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                    DynamicOneSeedBatch::seed_directions(point[axis], axis, r, &workspace, |lane| {
-                        directions[lane][axis]
-                    })
-                });
-                let jet = plan.evaluate(vars, 3, &workspace)?;
-                for lane in 0..directions.len() {
-                    contracted.push(
-                        Array2::from_shape_vec((r, r), jet.contracted_third(lane).to_vec())
-                            .map_err(|error| {
-                                format!("empirical BMS third-contraction shape: {error}")
-                            })?,
-                    );
-                }
+        match empirical_bms_jet_schedule(
+            empirical_bms_flex_cost_class(primary),
+            EmpiricalBmsDerivativeOrder::Third,
+            r,
+        ) {
+            EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
+                Self::empirical_fixed_third_many_dispatch(&plan, &point, row_dirs, r)
             }
-            Ok(contracted)
-        })
+            EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
+                EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
+                    let mut workspace = workspace.borrow_mut();
+                    let mut contracted = Vec::with_capacity(row_dirs.len());
+                    for directions in row_dirs.chunks(lanes) {
+                        workspace.reset(directions.len());
+                        let vars = workspace.alloc_slice_fill_with(r, |axis| {
+                            DynamicOneSeedBatch::seed_directions(
+                                point[axis],
+                                axis,
+                                r,
+                                &workspace,
+                                |lane| directions[lane][axis],
+                            )
+                        });
+                        let jet = plan.evaluate(vars, 3, &workspace)?;
+                        for lane in 0..directions.len() {
+                            contracted.push(
+                                Array2::from_shape_vec(
+                                    (r, r),
+                                    jet.contracted_third(lane).to_vec(),
+                                )
+                                .map_err(|error| {
+                                    format!("empirical BMS third-contraction shape: {error}")
+                                })?,
+                            );
+                        }
+                    }
+                    Ok(contracted)
+                })
+            }
+        }
     }
 
     /// Trace-contract every Hessian index of the full third derivative in one
@@ -1341,30 +1358,46 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
-            let mut workspace = workspace.borrow_mut();
-            let lane_limit = empirical_bms_directional_batch_lanes(r);
-            let mut gradient = Array1::<f64>::zeros(r);
-            for axis_start in (0..r).step_by(lane_limit) {
-                let lanes = (r - axis_start).min(lane_limit);
-                workspace.reset(lanes);
-                let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                    DynamicOneSeedBatch::seed_directions(point[axis], axis, r, &workspace, |lane| {
-                        if axis_start + lane == axis { 1.0 } else { 0.0 }
-                    })
-                });
-                let jet = plan.evaluate(vars, 3, &workspace)?;
-                for lane in 0..lanes {
-                    gradient[axis_start + lane] = jet
-                        .contracted_third(lane)
-                        .iter()
-                        .zip(gram)
-                        .map(|(third, weight)| third * weight)
-                        .sum();
-                }
+        match empirical_bms_jet_schedule(
+            empirical_bms_flex_cost_class(primary),
+            EmpiricalBmsDerivativeOrder::Third,
+            r,
+        ) {
+            EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
+                Self::empirical_fixed_third_trace_dispatch(&plan, &point, gram, r)
             }
-            Ok(gradient)
-        })
+            EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
+                EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
+                    let mut workspace = workspace.borrow_mut();
+                    let mut gradient = Array1::<f64>::zeros(r);
+                    for axis_start in (0..r).step_by(lanes) {
+                        let active_lanes = (r - axis_start).min(lanes);
+                        workspace.reset(active_lanes);
+                        let vars = workspace.alloc_slice_fill_with(r, |axis| {
+                            DynamicOneSeedBatch::seed_directions(
+                                point[axis],
+                                axis,
+                                r,
+                                &workspace,
+                                |lane| {
+                                    if axis_start + lane == axis { 1.0 } else { 0.0 }
+                                },
+                            )
+                        });
+                        let jet = plan.evaluate(vars, 3, &workspace)?;
+                        for lane in 0..active_lanes {
+                            gradient[axis_start + lane] = jet
+                                .contracted_third(lane)
+                                .iter()
+                                .zip(gram)
+                                .map(|(third, weight)| third * weight)
+                                .sum();
+                        }
+                    }
+                    Ok(gradient)
+                })
+            }
+        }
     }
 
     pub(super) fn empirical_flex_row_fourth_contracted(
