@@ -1430,11 +1430,11 @@ impl<const K: usize> O2x4<K> {
         }
         self.compose([e, e, e])
     }
-    /// `1/self`, per-lane stack `[1/u, -1/u², 2/u³]` — the DIVISION-based stack
-    /// of the [`recip`] free fn the scalar reconstruction path uses (NOT the
-    /// reciprocal-multiply `[r,-r²,2r³]` of
-    /// [`gam_math::jet_scalar::JetScalar::recip`]; those differ by a
-    /// ULP and would break `to_bits` parity). Caller guarantees nonzero.
+    /// `1/self`, per-lane stack `[r, -r², 2r³]`, `r = 1/u`, matching
+    /// [`RuntimeJetScalar::recip`] exactly. Computing `-1/u²` and `2/u³`
+    /// directly is mathematically equivalent but can differ by a few ULPs,
+    /// which would violate lane-to-scalar bit identity. Caller guarantees
+    /// nonzero.
     #[inline]
     fn recip(&self) -> Self {
         let mut d0 = [0.0; LANES];
@@ -1442,11 +1442,11 @@ impl<const K: usize> O2x4<K> {
         let mut d2 = [0.0; LANES];
         for i in 0..LANES {
             let u = self.v[i];
-            let u2 = u * u;
-            let u3 = u2 * u;
-            d0[i] = 1.0 / u;
-            d1[i] = -1.0 / u2;
-            d2[i] = 2.0 / u3;
+            let r = 1.0 / u;
+            let r2 = r * r;
+            d0[i] = r;
+            d1[i] = -r2;
+            d2[i] = 2.0 * r2 * r;
         }
         self.compose([d0, d1, d2])
     }
@@ -1544,15 +1544,15 @@ impl<const K: usize> O1x4<K> {
     }
     #[inline]
     fn recip(&self) -> Self {
-        // Division-based `[1/u, -1/u²]` matching the `recip` free fn (see
-        // `O2x4::recip`), so lane `i` is `to_bits`-identical to the scalar path.
+        // Reciprocal-multiply `[r, -r²]`, matching `RuntimeJetScalar::recip`
+        // (see `O2x4::recip`) so every lane is bit-identical to the scalar path.
         let mut d0 = [0.0; LANES];
         let mut d1 = [0.0; LANES];
         for i in 0..LANES {
             let u = self.v[i];
-            let u2 = u * u;
-            d0[i] = 1.0 / u;
-            d1[i] = -1.0 / u2;
+            let r = 1.0 / u;
+            d0[i] = r;
+            d1[i] = -(r * r);
         }
         self.compose([d0, d1])
     }
