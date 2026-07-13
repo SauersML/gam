@@ -28,6 +28,20 @@ pub(super) enum BmsFlexCalibrationOrder2Node {
     PrimaryPairSecond { left: usize, right: usize },
 }
 
+/// Backend lowering phases for the Order2 calibration schedule.
+///
+/// CPU moment consumers expand these phases into indexed nodes. Generated
+/// backends may preserve a phase as one runtime loop, avoiding max-width
+/// source unrolling while retaining the same semantic phase order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BmsFlexCalibrationOrder2Phase {
+    InterceptFirst,
+    InterceptSecond,
+    PrimaryFirst,
+    InterceptPrimarySecond,
+    PrimaryPairSecond,
+}
+
 /// Declarative directional derivative of the Order2 calibration schedule.
 ///
 /// `DirectionStart` lets an optimized backend compile the sparse coefficient
@@ -93,6 +107,20 @@ pub(super) enum BmsFlexRowOrder2FinalizerNode {
     ObservedScoreSensitivity { primary: usize },
     ObservedSecond { left: usize, right: usize },
     NegLogFirst { primary: usize },
+}
+
+/// Backend lowering phases for the dependency-ordered Order2 row finalizer.
+/// Indexed CPU visits and compact generated device loops are expansions of
+/// this one phase stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BmsFlexRowOrder2FinalizerPhase {
+    ImplicitFirst,
+    ImplicitFirstComplete,
+    ImplicitSecond,
+    ObservedFirst,
+    ObservedScoreSensitivity,
+    ObservedSecond,
+    NegLogFirst,
 }
 
 /// Borrowed scalar coordinates of the canonical BMS FLEX row program.
