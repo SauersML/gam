@@ -1029,8 +1029,7 @@ mod test_support {
         let phi_u1 = w * d * eta1;
         let phi_u2 = w * d;
         // Time derivative: -d·log(ad1).
-        let (nl_u1, nl_u2, _, _) =
-            super::vector_hand_oracle_tests::neglog_derivatives(ad1);
+        let (nl_u1, nl_u2, _, _) = super::vector_hand_oracle_tests::neglog_derivatives(ad1);
         let td_u1 = w * d * nl_u1;
         let td_u2 = w * d * nl_u2;
 
@@ -1321,6 +1320,101 @@ mod tests {
             assert!(
                 mixed_score_mass > 1.0e-6,
                 "case {case}: fixture must exercise a nonzero cross-score Hessian block"
+            );
+        }
+    }
+
+    /// Temporary #932 release measurement for the runtime-width row program.
+    /// Correctness remains pinned by
+    /// `runtime_vector_row_program_matches_strongest_hand_mixed_score_vgh_932`;
+    /// this records the production `DynamicOrder2` cost against the test-only
+    /// strongest-hand witness and proves a warmed arena stops growing.
+    #[test]
+    fn release_measure_runtime_vector_program_vs_strongest_hand_932() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn best_ns<T, F: FnMut() -> T>(iterations: usize, mut evaluate: F) -> f64 {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    black_box(evaluate());
+                }
+                best = best.min(start.elapsed().as_nanos() as f64 / iterations as f64);
+            }
+            best
+        }
+
+        let full = MarginalSlopeCovariance::Full(
+            Array2::from_shape_vec(
+                (3, 3),
+                vec![1.2, 0.18, -0.11, 0.18, 0.9, 0.24, -0.11, 0.24, 0.7],
+            )
+            .expect("3x3 full covariance"),
+        );
+        let low_rank = MarginalSlopeCovariance::LowRank(
+            Array2::from_shape_vec((3, 2), vec![0.8, -0.1, 0.25, 0.7, -0.45, 0.35])
+                .expect("3x2 covariance factor"),
+        );
+        let cases = [
+            ("full", &full, 1.0, 0.3, -0.75, 1.25, 1.0),
+            ("low_rank", &low_rank, 1.0, 0.9, -0.2, 1.6, 0.91),
+        ];
+        let slopes = [0.55, -0.8, 0.35];
+        let scores = [-1.2, 0.65, 1.4];
+
+        for &(label, covariance, event, q0, q1, qd1, probit_scale) in &cases {
+            let mut arena = DynamicJetArena::new();
+            let evaluate_runtime = |arena: &mut DynamicJetArena| {
+                row_primary_closed_form_vector(
+                    q0,
+                    q1,
+                    qd1,
+                    &slopes,
+                    &scores,
+                    covariance,
+                    1.3,
+                    event,
+                    1.0e-8,
+                    probit_scale,
+                    arena,
+                )
+                .expect("runtime vector row program")
+            };
+            black_box(evaluate_runtime(&mut arena));
+            let first_warm_bytes = arena.allocated_bytes();
+            black_box(evaluate_runtime(&mut arena));
+            let stable_warm_bytes = arena.allocated_bytes();
+            black_box(evaluate_runtime(&mut arena));
+            assert_eq!(
+                arena.allocated_bytes(),
+                stable_warm_bytes,
+                "{label}: equal-size warmed row must not grow its arena"
+            );
+
+            let runtime_ns = best_ns(20_000, || evaluate_runtime(&mut arena));
+            let hand_ns = best_ns(20_000, || {
+                vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
+                    q0,
+                    q1,
+                    qd1,
+                    &slopes,
+                    &scores,
+                    covariance,
+                    1.3,
+                    event,
+                    1.0e-8,
+                    probit_scale,
+                )
+                .expect("strongest-hand vector row")
+            });
+            eprintln!(
+                "G932_VECTOR_ORDER2_RELEASE covariance={label} k=3 event={event:.0} \
+                 runtime_ns={runtime_ns:.3} hand_ns={hand_ns:.3} \
+                 hand_over_runtime={:.6} first_warm_bytes={first_warm_bytes} \
+                 stable_warm_bytes={stable_warm_bytes}",
+                hand_ns / runtime_ns,
             );
         }
     }
