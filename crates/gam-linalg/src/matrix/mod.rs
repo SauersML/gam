@@ -1033,6 +1033,34 @@ impl SparseDesignMatrix {
         self.csr_cache.set(arc.clone()).ok();
         Some(arc)
     }
+
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "SparseDesignMatrix::row_chunk_into shape mismatch",
+            });
+        }
+        out.fill(0.0);
+        let csr = self
+            .to_csr_arc()
+            .ok_or(MatrixMaterializationError::MissingRowChunk {
+                context: "SparseDesignMatrix::row_chunk_into: failed to obtain CSR view",
+            })?;
+        let symbolic = csr.symbolic();
+        let row_ptr = symbolic.row_ptr();
+        let col_idx = symbolic.col_idx();
+        let values = csr.val();
+        for (local_row, row) in rows.enumerate() {
+            for ptr in row_ptr[row]..row_ptr[row + 1] {
+                out[[local_row, col_idx[ptr]]] = values[ptr];
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Deref for SparseDesignMatrix {
@@ -2411,6 +2439,27 @@ impl DesignBlock {
         }
     }
 
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "DesignBlock::row_chunk_into shape mismatch",
+            });
+        }
+        match self {
+            Self::Dense(d) => d.row_chunk_into(rows, out),
+            Self::Sparse(s) => s.row_chunk_into(rows, out),
+            Self::RandomEffect(op) => op.row_chunk_into(rows, out),
+            Self::Intercept(_) => {
+                out.fill(1.0);
+                Ok(())
+            }
+        }
+    }
+
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         certify_signed_weights("DesignBlock::diag_xtw_x", weights, self.nrows())?;
         match self {
@@ -3009,8 +3058,7 @@ impl DenseDesignOperator for BlockDesignOperator {
         for (idx, block) in self.blocks.iter().enumerate() {
             let cs = self.col_offsets[idx];
             let ce = self.col_offsets[idx + 1];
-            let block_chunk = block.try_row_chunk(rows.clone())?;
-            out.slice_mut(s![.., cs..ce]).assign(&block_chunk);
+            block.row_chunk_into(rows.clone(), out.slice_mut(s![.., cs..ce]))?;
         }
         Ok(())
     }
@@ -3203,9 +3251,10 @@ impl DenseDesignOperator for MultiChannelOperator {
             let ch_local_start = global % n;
             let ch_local_end = ((ch_idx + 1) * n).min(rows.end) - ch_idx * n;
             let segment_len = ch_local_end - ch_local_start;
-            let ch_chunk = self.channels[ch_idx].try_row_chunk(ch_local_start..ch_local_end)?;
-            out.slice_mut(s![local..local + segment_len, ..])
-                .assign(&ch_chunk);
+            self.channels[ch_idx].row_chunk_into(
+                ch_local_start..ch_local_end,
+                out.slice_mut(s![local..local + segment_len, ..]),
+            )?;
             local += segment_len;
             global += segment_len;
         }
@@ -4523,7 +4572,7 @@ impl DenseDesignOperator for DesignMatrix {
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
-        mut out: ArrayViewMut2<'_, f64>,
+        out: ArrayViewMut2<'_, f64>,
     ) -> Result<(), MatrixMaterializationError> {
         if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
             return Err(MatrixMaterializationError::MissingRowChunk {
@@ -4532,25 +4581,7 @@ impl DenseDesignOperator for DesignMatrix {
         }
         match self {
             Self::Dense(matrix) => matrix.row_chunk_into(rows, out),
-            Self::Sparse(matrix) => {
-                out.fill(0.0);
-                let csr =
-                    matrix
-                        .to_csr_arc()
-                        .ok_or(MatrixMaterializationError::MissingRowChunk {
-                            context: "DesignMatrix::row_chunk_into: failed to obtain CSR view",
-                        })?;
-                let sym = csr.symbolic();
-                let row_ptr = sym.row_ptr();
-                let col_idx = sym.col_idx();
-                let vals = csr.val();
-                for (local_row, row) in rows.enumerate() {
-                    for ptr in row_ptr[row]..row_ptr[row + 1] {
-                        out[[local_row, col_idx[ptr]]] = vals[ptr];
-                    }
-                }
-                Ok(())
-            }
+            Self::Sparse(matrix) => matrix.row_chunk_into(rows, out),
         }
     }
 
