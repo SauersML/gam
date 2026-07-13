@@ -5713,21 +5713,52 @@ mod empirical_flex_jet_oracle_tests {
         }
     }
 
-    fn scheduled_median<T>(samples: usize, mut evaluate: impl FnMut() -> T) -> (u128, T) {
+    fn scheduled_paired_medians<T>(
+        samples: usize,
+        mut repeated: impl FnMut() -> T,
+        mut scheduled: impl FnMut() -> T,
+    ) -> (u128, u128, f64, T, T) {
         assert!(samples > 0);
-        let mut timings = Vec::with_capacity(samples);
-        let mut output = None;
-        for _ in 0..samples {
-            let start = std::time::Instant::now();
-            let value = evaluate();
-            timings.push(start.elapsed().as_nanos());
-            std::hint::black_box(&value);
-            output = Some(value);
+        let mut repeated_timings = Vec::with_capacity(samples);
+        let mut scheduled_timings = Vec::with_capacity(samples);
+        let mut speedups = Vec::with_capacity(samples);
+        let mut repeated_output = None;
+        let mut scheduled_output = None;
+        for sample in 0..samples {
+            let (repeated_ns, repeated_value, scheduled_ns, scheduled_value) = if sample % 2 == 0 {
+                let start = std::time::Instant::now();
+                let repeated_value = repeated();
+                let repeated_ns = start.elapsed().as_nanos();
+                let start = std::time::Instant::now();
+                let scheduled_value = scheduled();
+                let scheduled_ns = start.elapsed().as_nanos();
+                (repeated_ns, repeated_value, scheduled_ns, scheduled_value)
+            } else {
+                let start = std::time::Instant::now();
+                let scheduled_value = scheduled();
+                let scheduled_ns = start.elapsed().as_nanos();
+                let start = std::time::Instant::now();
+                let repeated_value = repeated();
+                let repeated_ns = start.elapsed().as_nanos();
+                (repeated_ns, repeated_value, scheduled_ns, scheduled_value)
+            };
+            std::hint::black_box(&repeated_value);
+            std::hint::black_box(&scheduled_value);
+            repeated_timings.push(repeated_ns);
+            scheduled_timings.push(scheduled_ns);
+            speedups.push(repeated_ns as f64 / scheduled_ns as f64);
+            repeated_output = Some(repeated_value);
+            scheduled_output = Some(scheduled_value);
         }
-        timings.sort_unstable();
+        repeated_timings.sort_unstable();
+        scheduled_timings.sort_unstable();
+        speedups.sort_by(f64::total_cmp);
         (
-            timings[samples / 2],
-            output.expect("positive sample count produces output"),
+            repeated_timings[samples / 2],
+            scheduled_timings[samples / 2],
+            speedups[samples / 2],
+            repeated_output.expect("positive sample count produces repeated output"),
+            scheduled_output.expect("positive sample count produces scheduled output"),
         )
     }
 
@@ -5851,7 +5882,13 @@ mod empirical_flex_jet_oracle_tests {
                     "common-width fourth schedule retained an arena"
                 );
 
-                let (third_repeated_ns, third_repeated) = scheduled_median(SAMPLES, || {
+                let (
+                    third_repeated_ns,
+                    third_scheduled_ns,
+                    third_speedup,
+                    third_repeated,
+                    third_scheduled,
+                ) = scheduled_paired_medians(SAMPLES, || {
                     directions
                         .iter()
                         .map(|direction| {
@@ -5871,8 +5908,7 @@ mod empirical_flex_jet_oracle_tests {
                                 .expect("repeated fixed-width third contraction")
                         })
                         .collect::<Vec<_>>()
-                });
-                let (third_scheduled_ns, third_scheduled) = scheduled_median(SAMPLES, || {
+                }, || {
                     fixture
                         .family
                         .empirical_flex_row_third_contracted_many(
@@ -5896,7 +5932,13 @@ mod empirical_flex_jet_oracle_tests {
                     );
                 }
 
-                let (trace_repeated_ns, trace_repeated) = scheduled_median(SAMPLES, || {
+                let (
+                    trace_repeated_ns,
+                    trace_scheduled_ns,
+                    trace_speedup,
+                    trace_repeated,
+                    trace_scheduled,
+                ) = scheduled_paired_medians(SAMPLES, || {
                     let mut gradient = Array1::<f64>::zeros(r);
                     for axis in 0..r {
                         let mut basis = Array1::<f64>::zeros(r);
@@ -5919,8 +5961,7 @@ mod empirical_flex_jet_oracle_tests {
                             BernoulliMarginalSlopeFamily::row_primary_trace_contract(&third, &gram);
                     }
                     gradient
-                });
-                let (trace_scheduled_ns, trace_scheduled) = scheduled_median(SAMPLES, || {
+                }, || {
                     fixture
                         .family
                         .empirical_flex_row_third_trace_gradient(
