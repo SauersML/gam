@@ -7315,36 +7315,39 @@ mod tests {
 
     #[test]
     fn parse_bspline_boundary_conditions_and_side_selector() {
-        // Non-zero anchors are rejected at parse time; the diagnostic must
-        // name the side and value, which doubles as a check that the
-        // `side=left` filter routes the global `anchor=` value to the
-        // left endpoint (not the right).
+        // The `side=left` filter routes the global `anchor=` value to the left
+        // endpoint (not the right), preserving the non-zero value for the
+        // affine boundary lift.
         let mut opts = BTreeMap::new();
         opts.insert("boundary_conditions".to_string(), "anchored".to_string());
         opts.insert("side".to_string(), "left".to_string());
         opts.insert("anchor".to_string(), "2.5".to_string());
-        let err = parse_bspline_boundary_conditions(&opts)
-            .expect_err("non-zero left anchor must be rejected")
-            .to_string();
-        assert!(
-            err.contains("left") && err.contains("2.5"),
-            "rejection should name the affected side and value: {err}"
-        );
+        let parsed = parse_bspline_boundary_conditions(&opts).expect("left anchor parses");
+        assert!(matches!(
+            parsed.left,
+            BSplineEndpointBoundaryCondition::Anchored { value } if value == 2.5
+        ));
+        assert!(matches!(
+            parsed.right,
+            BSplineEndpointBoundaryCondition::Free
+        ));
 
         // Side-specific aliases (`start_bc`/`end_bc`) plus the side-specific
         // anchor key (`right_anchor`) must funnel the value onto the right
-        // endpoint — verified through the rejection diagnostic.
+        // endpoint.
         let mut opts = BTreeMap::new();
         opts.insert("start_bc".to_string(), "clamped".to_string());
         opts.insert("end_bc".to_string(), "zero".to_string());
         opts.insert("right_anchor".to_string(), "-1.0".to_string());
-        let err = parse_bspline_boundary_conditions(&opts)
-            .expect_err("non-zero right anchor must be rejected")
-            .to_string();
-        assert!(
-            err.contains("right") && err.contains("-1"),
-            "rejection should name the affected side and value: {err}"
-        );
+        let parsed = parse_bspline_boundary_conditions(&opts).expect("right anchor parses");
+        assert!(matches!(
+            parsed.left,
+            BSplineEndpointBoundaryCondition::Clamped
+        ));
+        assert!(matches!(
+            parsed.right,
+            BSplineEndpointBoundaryCondition::Anchored { value } if value == -1.0
+        ));
 
         // With anchors at zero the basis builder accepts the configuration,
         // so the same alias plumbing yields a clean `Anchored { value: 0.0 }`

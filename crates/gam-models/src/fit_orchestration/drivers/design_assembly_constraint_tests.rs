@@ -308,21 +308,14 @@ fn collect_feature_columns(spec: &TermCollectionSpec) -> Vec<usize> {
 }
 
 #[test]
-fn bspline_nonzero_anchor_rejected_homogeneous_pin_baked_structurally() {
-    // #1238 (commit 091830200) changed the B-spline endpoint-boundary contract:
-    // Anchored (Hermite C1: value+slope) and Clamped (slope) endpoints are now
-    // BAKED into the raw coefficient chart as a structural nullspace
-    // reparameterization (build the constraint rows, form their nullspace
-    // transform, apply it to design+penalties, compose it into the stored
-    // identifiability transform so the pinned functionals are structurally zero
-    // and the constrained columns are dropped) — they are no longer emitted as a
-    // `linear_constraints` equality block, and ONLY homogeneous (value≈0) anchors
-    // are representable. This fixture was authored against the pre-#1238 contract
-    // (boundaries → linear equality constraints, non-zero anchors allowed) and
-    // orphaned out of every test binary by #1601, so it silently encoded the dead
-    // contract. Re-homed here it pins the CURRENT contract: non-zero anchors
-    // REJECTED, homogeneous pins baked structurally (no linear constraints,
-    // columns dropped, endpoint functionals structurally zero in the chart).
+fn bspline_nonzero_anchor_has_fixed_affine_lift_and_homogeneous_chart() {
+    // The inhomogeneous endpoint equations are split canonically into a fixed
+    // particular solution plus the old homogeneous null-space chart:
+    //
+    //     f(x) = B_raw(x) beta_p + B_raw(x) Z gamma.
+    //
+    // Thus the constrained coefficient width and penalty geometry remain
+    // identical to a zero anchor, while beta_p alone owns the requested value.
     let x = Array1::linspace(0.0, 1.0, 25);
     let data = x.clone().insert_axis(Axis(1));
     let mk = |left, right| SmoothTermSpec {
@@ -346,24 +339,6 @@ fn bspline_nonzero_anchor_rejected_homogeneous_pin_baked_structurally() {
         joint_null_rotation: None,
     };
 
-    // A non-zero anchor is no longer representable as a homogeneous structural
-    // pin: the builder must reject it with the specific InvalidInput (#1238).
-    let err = build_smooth_design(
-        data.view(),
-        &[mk(
-            BSplineEndpointBoundaryCondition::Anchored { value: 2.0 },
-            BSplineEndpointBoundaryCondition::Clamped,
-        )],
-    )
-    .expect_err("non-zero anchor must be rejected post-#1238");
-    match err {
-        gam_terms::basis::BasisError::InvalidInput(msg) => assert!(
-            msg.contains("anchored B-spline boundary value must be zero"),
-            "unexpected rejection message: {msg}"
-        ),
-        other => panic!("expected InvalidInput for non-zero anchor, got {other:?}"),
-    }
-
     // Reference free basis fixes the raw column count (8 columns here).
     let free = build_smooth_design(
         data.view(),
@@ -376,18 +351,17 @@ fn bspline_nonzero_anchor_rejected_homogeneous_pin_baked_structurally() {
     let raw_cols = free.total_smooth_cols();
     assert_eq!(raw_cols, 8);
 
-    // Homogeneous Anchored{0.0} (Hermite value+slope) left + Clamped (slope)
-    // right is now BAKED into the coefficient chart. Three structural rows (left
-    // value, left slope, right slope) are dropped, so the design loses exactly
-    // three columns and carries NO linear constraints.
+    // Anchored (Hermite value+slope) left + Clamped (slope) right is baked into
+    // the homogeneous coefficient chart. Three structural rows are dropped,
+    // independently of the non-zero right-hand side.
     let design = build_smooth_design(
         data.view(),
         &[mk(
-            BSplineEndpointBoundaryCondition::Anchored { value: 0.0 },
+            BSplineEndpointBoundaryCondition::Anchored { value: 2.0 },
             BSplineEndpointBoundaryCondition::Clamped,
         )],
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "homogeneous anchored/clamped basis builds", e));
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "affine anchored/clamped basis builds", e));
     assert!(
         design.linear_constraints.is_none(),
         "boundary conditions are baked structurally, not emitted as linear constraints"
@@ -401,6 +375,7 @@ fn bspline_nonzero_anchor_rejected_homogeneous_pin_baked_structurally() {
     let BasisMetadata::BSpline1D {
         knots,
         identifiability_transform,
+        anchor_offset_coeffs,
         ..
     } = &design.terms[0].metadata
     else {
@@ -411,6 +386,18 @@ fn bspline_nonzero_anchor_rejected_homogeneous_pin_baked_structurally() {
         .unwrap_or_else(|| panic!("{} failed", "baked boundary transform recorded for replay"));
     assert_eq!(z.nrows(), raw_cols);
     assert_eq!(z.ncols(), design.total_smooth_cols());
+    let beta_p = anchor_offset_coeffs
+        .as_ref()
+        .expect("non-zero anchor records its raw-basis particular solution");
+    let realized_offset = design
+        .affine_offset
+        .as_ref()
+        .expect("non-zero anchor realizes an affine row function");
+    assert!(
+        (realized_offset[0] - 2.0).abs() < 1e-10,
+        "realized left endpoint must equal the requested anchor, got {}",
+        realized_offset[0]
+    );
 
     // PROVE the endpoint is structurally pinned in the constrained chart:
     // evaluate the RAW basis at each endpoint, push it through the stored
@@ -459,6 +446,12 @@ fn bspline_nonzero_anchor_rejected_homogeneous_pin_baked_structurally() {
         "right endpoint slope (Clamped) must be structurally pinned to zero, got {:e}",
         maxabs(&baked_right_slope)
     );
+    let affine_left_value = left_value.row(0).dot(beta_p);
+    let affine_left_slope = left_slope.row(0).dot(beta_p);
+    let affine_right_slope = right_slope.row(0).dot(beta_p);
+    assert!((affine_left_value - 2.0).abs() < 1e-10);
+    assert!(affine_left_slope.abs() < 1e-10);
+    assert!(affine_right_slope.abs() < 1e-10);
 }
 
 #[test]

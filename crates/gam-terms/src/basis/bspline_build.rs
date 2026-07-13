@@ -1812,14 +1812,6 @@ pub fn analyze_penalty_block_with_op(
     })
 }
 
-pub fn filter_active_penalty_candidates(
-    candidates: Vec<PenaltyCandidate>,
-) -> Result<(Vec<Array2<f64>>, Vec<usize>, Vec<PenaltyInfo>), BasisError> {
-    let (penalties, nullspace_dims, penaltyinfo, _null_eigenvectors, _ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
-    Ok((penalties, nullspace_dims, penaltyinfo))
-}
-
 /// Extract the orthonormal basis of `null(S)` from a `CanonicalPenaltyBlock`.
 ///
 /// Returns `Some(U_null)` with `U_null.ncols() == block.nullity` when the
@@ -1861,42 +1853,18 @@ pub(crate) fn nullspace_basis_from_block(block: &CanonicalPenaltyBlock) -> Optio
 /// when the local dimension is zero, or when the joint penalty is
 /// full-rank (joint nullity = 0). A non-trivial `joint_nullity` is the
 /// only state encoded as `Some`.
-/// Recompute per-block null-eigenvector matrices from a sequence of penalty
-/// matrices. Each output entry `null_eigenvectors[k]` is `Some(U_null)`
-/// (eigenvectors of `penalties[k]` at eigenvalues `|ev| ≤ spectral_tolerance`,
-/// the genuine null directions) when the block has a non-trivial null space,
-/// and `None` otherwise.
-///
-/// This is the inverse of "consumers update `penalties[k]` without
-/// refreshing `null_eigenvectors[k]`": whenever a code path rebuilds a
-/// penalty matrix in-place (e.g., the factor-sum-to-zero handler's
-/// Kronecker-style `S_big` reconstruction), the parallel `null_eigenvectors`
-/// vector becomes stale unless this helper is called. The invariant the
-/// pipeline relies on is `null_eigenvectors[k]` always mirrors
-/// `penalties[k]`'s spectral null space.
-pub fn recompute_null_eigenvectors(
-    penalties: &[Array2<f64>],
-) -> Result<Vec<Option<Array2<f64>>>, BasisError> {
-    penalties
-        .iter()
-        .map(|s| {
-            let block = analyze_penalty_block_with_op(s, None)?;
-            Ok(nullspace_basis_from_block(&block))
-        })
-        .collect()
-}
-
 pub fn compute_joint_null_rotation(
-    penalties: &[Array2<f64>],
+    penalties: &[ActivePenalty],
 ) -> Result<Option<JointNullRotation>, BasisError> {
     if penalties.is_empty() {
         return Ok(None);
     }
-    let p = penalties[0].nrows();
+    let p = penalties[0].matrix.nrows();
     if p == 0 {
         return Ok(None);
     }
-    for (k, s) in penalties.iter().enumerate() {
+    for (k, penalty) in penalties.iter().enumerate() {
+        let s = &penalty.matrix;
         if s.nrows() != p || s.ncols() != p {
             crate::bail_dim_basis!(
                 "compute_joint_null_rotation: penalty[{}] is {}×{}, expected {}×{}",
@@ -1909,8 +1877,8 @@ pub fn compute_joint_null_rotation(
         }
     }
     let mut s_sum = Array2::<f64>::zeros((p, p));
-    for s in penalties {
-        s_sum += s;
+    for penalty in penalties {
+        s_sum += &penalty.matrix;
     }
     let (sym, evals, evecs) = spectral_summary(&s_sum)?;
     let tol = spectral_tolerance(&sym, &evals);
@@ -1936,39 +1904,28 @@ pub fn compute_joint_null_rotation(
     }))
 }
 
-/// Same filtering pass as [`filter_active_penalty_candidates`] but also
-/// returns the per-active-penalty operator handles and null-space bases.
+/// Canonicalize candidate matrices and partition them into active penalty
+/// identities and separately typed dropped diagnostics.
 ///
-/// All three "side-channel" vectors (`nullspace_dims`, `null_eigenvectors`,
-/// `ops`) are parallel to `penalties` — same length, same order. `null_eigenvectors[k]`
-/// is `Some(U_null)` iff `nullspace_dims[k] > 0`; `ops[k]` is `Some(op)` iff
-/// the candidate carried an operator-form handle bit-equivalent to the dense
-/// matrix. Construction-side consumers use `null_eigenvectors` to absorb the
-/// smooth's penalty null space into the parametric block; PIRLS/REML
-/// consumers route through the `ops` `Some` entries for exact operator
-/// matvec without materializing the dense `p x p` Gram.
-pub fn filter_active_penalty_candidates_with_ops(
+/// A retained candidate is emitted as one [`ActivePenalty`], so its matrix,
+/// nullity, null basis, operator, semantic source, and normalization can never
+/// acquire different positional offsets. Rank-zero candidates exist only in
+/// `FilteredPenalties::dropped` and therefore cannot be indexed as matrices.
+pub fn filter_penalty_candidates(
     candidates: Vec<PenaltyCandidate>,
-) -> Result<
-    (
-        Vec<Array2<f64>>,
-        Vec<usize>,
-        Vec<PenaltyInfo>,
-        Vec<Option<Array2<f64>>>,
-        Vec<Option<std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>>>,
-    ),
-    BasisError,
-> {
-    let mut penalties = Vec::with_capacity(candidates.len());
-    let mut nullspace_dims = Vec::with_capacity(candidates.len());
-    let mut penaltyinfo = Vec::with_capacity(candidates.len());
-    let mut active_null_eigenvectors: Vec<Option<Array2<f64>>> =
-        Vec::with_capacity(candidates.len());
-    let mut active_ops: Vec<Option<std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>>> =
-        Vec::with_capacity(candidates.len());
+) -> Result<FilteredPenalties, BasisError> {
+    let mut active = Vec::with_capacity(candidates.len());
+    let mut dropped = Vec::new();
 
     for (original_index, candidate) in candidates.into_iter().enumerate() {
-        let analysis = analyze_penalty_block_with_op(&candidate.matrix, candidate.op.clone())?;
+        let PenaltyCandidate {
+            matrix,
+            source,
+            normalization_scale,
+            kronecker_factors,
+            op,
+        } = candidate;
+        let analysis = analyze_penalty_block_with_op(&matrix, op)?;
         let dropped_reason = if analysis.rank == 0 {
             Some(if analysis.iszero {
                 PenaltyDropReason::ZeroMatrix
@@ -1978,51 +1935,49 @@ pub fn filter_active_penalty_candidates_with_ops(
         } else {
             None
         };
-        let active = dropped_reason.is_none();
         let kronecker_factors =
-            validated_kronecker_factors(candidate.kronecker_factors, &analysis.sym_penalty);
-        if active {
+            validated_kronecker_factors(kronecker_factors, &analysis.sym_penalty);
+        if let Some(reason) = dropped_reason {
+            log::debug!(
+                "Dropped inactive penalty block source={:?} original_index={} reason={:?}",
+                source,
+                original_index,
+                reason
+            );
+            dropped.push(DroppedPenaltyInfo {
+                source,
+                original_index,
+                reason,
+                normalization_scale,
+            });
+        } else {
             let null_basis = nullspace_basis_from_block(&analysis);
             log::debug!(
                 "Retained penalty block source={:?} original_index={} rank={} nullspace_dim_hint={} has_op={} has_null_basis={}",
-                candidate.source,
+                source,
                 original_index,
                 analysis.rank,
                 analysis.nullity,
                 analysis.op.is_some(),
                 null_basis.is_some(),
             );
-            penalties.push(analysis.sym_penalty);
-            nullspace_dims.push(analysis.nullity);
-            active_null_eigenvectors.push(null_basis);
-            active_ops.push(analysis.op);
-        } else {
-            log::debug!(
-                "Dropped inactive penalty block source={:?} original_index={} reason={:?}",
-                candidate.source,
-                original_index,
-                dropped_reason
-            );
+            active.push(ActivePenalty {
+                matrix: analysis.sym_penalty,
+                nullity: analysis.nullity,
+                null_eigenvectors: null_basis,
+                op: analysis.op,
+                info: ActivePenaltyInfo {
+                    source,
+                    original_index,
+                    effective_rank: analysis.rank,
+                    normalization_scale,
+                    kronecker_factors,
+                },
+            });
         }
-        penaltyinfo.push(PenaltyInfo {
-            source: candidate.source,
-            original_index,
-            active,
-            effective_rank: analysis.rank,
-            dropped_reason,
-            nullspace_dim_hint: analysis.nullity,
-            normalization_scale: candidate.normalization_scale,
-            kronecker_factors,
-        });
     }
 
-    Ok((
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
-        active_null_eigenvectors,
-        active_ops,
-    ))
+    Ok(FilteredPenalties { active, dropped })
 }
 
 /// Re-normalize already-constrained 1-D B-spline penalty candidates to unit
@@ -2042,7 +1997,7 @@ pub fn filter_active_penalty_candidates_with_ops(
 ///
 /// Fit-invariant at the REML optimum: rescaling `S → S/c` only rescales the
 /// recorded `λ̂` by `c`. Scaling a block never changes its rank, so this cannot
-/// alter which penalties `filter_active_penalty_candidates_with_ops` keeps
+/// alter which penalties `filter_penalty_candidates` keeps
 /// active; the `> 1e-12` guard only avoids dividing a numerically-zero block.
 fn renormalize_constrained_penalty_candidates(
     mut candidates: Vec<PenaltyCandidate>,

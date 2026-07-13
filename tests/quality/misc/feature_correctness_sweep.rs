@@ -372,10 +372,23 @@ fn bc_bspline_columns_drop_by_constraint_count() {
 }
 
 #[test]
-fn bc_bspline_rejects_nonzero_anchor() {
+fn bc_bspline_realizes_nonzero_anchor_as_affine_lift() {
     use BSplineEndpointBoundaryCondition::{Anchored, Free};
-    let r = build_bc(20, 8, Anchored { value: 1.5 }, Free);
-    assert!(r.is_err(), "non-zero anchor should be rejected");
+    let built = build_bc(20, 8, Anchored { value: 1.5 }, Free)
+        .expect("non-zero anchor should build");
+    let affine = built
+        .affine_offset
+        .as_ref()
+        .expect("non-zero anchor should carry an affine row function");
+    assert!(
+        (affine[0] - 1.5).abs() < 1e-10,
+        "left endpoint affine value must equal the anchor, got {}",
+        affine[0]
+    );
+    assert!(
+        built.design.row(0).iter().all(|value| value.abs() < 1e-10),
+        "the estimated coefficient chart must remain homogeneously pinned"
+    );
 }
 
 // ----- SPHERE WAHBA: ~40 cases -----

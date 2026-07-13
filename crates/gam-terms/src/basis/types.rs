@@ -1485,34 +1485,19 @@ pub struct BasisBuildResult {
     /// channels and routes the result through the model's ordinary likelihood
     /// offset at fit and prediction time.
     pub affine_offset: Option<Array1<f64>>,
-    pub penalties: Vec<Array2<f64>>,
-    pub nullspace_dims: Vec<usize>,
-    pub penaltyinfo: Vec<PenaltyInfo>,
+    /// Canonical active penalties. Matrix, spectral metadata, operator form,
+    /// and semantic identity are one record so dropping an earlier candidate
+    /// cannot shift one channel without shifting all of them.
+    pub active_penalties: Vec<ActivePenalty>,
+    /// Candidate diagnostics excluded from the active smoothing-parameter
+    /// layout. Dropped candidates never share a positional container with
+    /// active matrices.
+    pub dropped_penalties: Vec<DroppedPenaltyInfo>,
     pub metadata: BasisMetadata,
     /// Optional factored rowwise-Kronecker representation for tensor-product
     /// bases. When present, downstream code can keep the design operator-backed
     /// instead of forcing a fully materialized `n x prod(q_j)` block.
     pub kronecker_factored: Option<KroneckerFactoredBasis>,
-    /// Per-active-penalty operator handles (parallel to `penalties`). Each
-    /// entry is `Some(op)` when the closed-form factory emitted an op-form
-    /// penalty bit-equivalent to the dense matrix, `None` for ordinary dense
-    /// penalties. Downstream consumers route through the `Some` entries to
-    /// avoid materializing dense `p x p` Grams in exact operator algebra.
-    pub ops: Vec<Option<std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>>>,
-    /// Per-active-penalty null-space eigenvector matrices (parallel to
-    /// `penalties`). Each entry is `Some(U_null)` with `U_null.ncols() ==
-    /// nullspace_dims[k]` when the active block has a non-trivial null space
-    /// (eigenvalues ≤ spectral tolerance), and `None` when the block is
-    /// already full-rank. The columns of `U_null` are the eigenvectors of
-    /// `sym_penalty` at the (near-)zero eigenvalues — i.e., an orthonormal
-    /// basis of `null(S_block)` in the block's own coordinate system.
-    ///
-    /// This is the raw spectral data that the construction pipeline uses to
-    /// absorb each smooth's penalty null space into the parametric block
-    /// (reparameterize-and-split). Without absorption the inner Newton solve
-    /// cannot converge on data whose unpenalized signal lies along a null
-    /// direction of `S` (phantom-multiplier refusal at the KKT certificate).
-    pub null_eigenvectors: Vec<Option<Array2<f64>>>,
     /// Joint-null absorption rotation for this basis, when the basis carries
     /// any penalties with a non-trivial joint null space.
     ///
@@ -1577,36 +1562,10 @@ impl std::fmt::Debug for BasisBuildResult {
                 "affine_offset_len",
                 &self.affine_offset.as_ref().map(|offset| offset.len()),
             )
-            .field("penalties", &self.penalties)
-            .field("nullspace_dims", &self.nullspace_dims)
-            .field("penaltyinfo", &self.penaltyinfo)
+            .field("active_penalties", &self.active_penalties)
+            .field("dropped_penalties", &self.dropped_penalties)
             .field("metadata", &self.metadata)
             .field("kronecker_factored", &self.kronecker_factored)
-            .field(
-                "ops",
-                &format_args!(
-                    "[{}]",
-                    self.ops
-                        .iter()
-                        .map(|o| if o.is_some() { "Some" } else { "None" })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )
-            .field(
-                "null_eigenvectors",
-                &format_args!(
-                    "[{}]",
-                    self.null_eigenvectors
-                        .iter()
-                        .map(|u| match u {
-                            Some(m) => format!("Some({}x{})", m.nrows(), m.ncols()),
-                            None => "None".to_string(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )
             .field("joint_null_rotation", &self.joint_null_rotation)
             .finish()
     }
@@ -1737,14 +1696,17 @@ fn default_normalization_scale() -> f64 {
     1.0
 }
 
+/// Metadata for one retained penalty coordinate.
+///
+/// This type is active-only by construction. In particular it has no
+/// `active` flag or optional drop reason: those fields allowed a metadata
+/// position to exist without a corresponding matrix and made positional
+/// indexing silently wrong after an earlier candidate was dropped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PenaltyInfo {
+pub struct ActivePenaltyInfo {
     pub source: PenaltySource,
     pub original_index: usize,
-    pub active: bool,
     pub effective_rank: usize,
-    pub dropped_reason: Option<PenaltyDropReason>,
-    pub nullspace_dim_hint: usize,
     #[serde(default = "default_normalization_scale")]
     pub normalization_scale: f64,
     /// Kronecker factors preserved from tensor penalty construction.
@@ -1753,10 +1715,62 @@ pub struct PenaltyInfo {
     pub kronecker_factors: Option<Vec<Array2<f64>>>,
 }
 
+/// Diagnostic for one penalty candidate excluded from the optimizer layout.
+/// It is intentionally a different type from [`ActivePenaltyInfo`] so a
+/// dropped record cannot be used as an active matrix index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DroppedPenaltyInfo {
+    pub source: PenaltySource,
+    pub original_index: usize,
+    pub reason: PenaltyDropReason,
+    #[serde(default = "default_normalization_scale")]
+    pub normalization_scale: f64,
+}
+
+/// One atomic active penalty identity.
+///
+/// Every field describes the same retained candidate. Consumers may reorder,
+/// transform, or remove a penalty only by moving the whole record, which makes
+/// matrix/role/nullity/operator skew unrepresentable.
+#[derive(Clone)]
+pub struct ActivePenalty {
+    pub matrix: Array2<f64>,
+    pub nullity: usize,
+    pub null_eigenvectors: Option<Array2<f64>>,
+    pub op: Option<std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>>,
+    pub info: ActivePenaltyInfo,
+}
+
+impl std::fmt::Debug for ActivePenalty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivePenalty")
+            .field(
+                "matrix",
+                &format_args!("{}×{}", self.matrix.nrows(), self.matrix.ncols()),
+            )
+            .field("nullity", &self.nullity)
+            .field(
+                "null_eigenvectors",
+                &self
+                    .null_eigenvectors
+                    .as_ref()
+                    .map(|basis| format!("{}×{}", basis.nrows(), basis.ncols())),
+            )
+            .field("op_dim", &self.op.as_ref().map(|op| op.dim()))
+            .field("info", &self.info)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FilteredPenalties {
+    pub active: Vec<ActivePenalty>,
+    pub dropped: Vec<DroppedPenaltyInfo>,
+}
+
 #[derive(Clone)]
 pub struct PenaltyCandidate {
     pub matrix: Array2<f64>,
-    pub nullspace_dim_hint: usize,
     pub source: PenaltySource,
     pub normalization_scale: f64,
     /// Optional Kronecker factors whose product equals `matrix`.
@@ -1778,7 +1792,6 @@ impl std::fmt::Debug for PenaltyCandidate {
                 "matrix",
                 &format_args!("{}×{}", self.matrix.nrows(), self.matrix.ncols()),
             )
-            .field("nullspace_dim_hint", &self.nullspace_dim_hint)
             .field("source", &self.source)
             .field("normalization_scale", &self.normalization_scale)
             .field(

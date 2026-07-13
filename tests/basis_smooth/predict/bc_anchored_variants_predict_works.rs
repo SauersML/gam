@@ -57,7 +57,10 @@ fn try_fit_and_predict(formula: &str) -> Result<Vec<f64>, String> {
     }
     let design = build_term_collection_design(new_data.view(), &fit.resolvedspec)
         .map_err(|e| format!("predict design failed: {e}"))?;
-    Ok(design.design.apply(&fit.fit.beta).to_vec())
+    design
+        .apply(fit.fit.beta.view())
+        .map(|prediction| prediction.to_vec())
+        .map_err(|e| format!("predict apply failed: {e}"))
 }
 
 #[test]
@@ -98,12 +101,8 @@ fn bc_variants_fit_and_predict_end_to_end() {
     );
 }
 
-/// Non-zero anchor values are not (yet) supported by the basis builder.
-/// The term builder should reject them upfront with an actionable message
-/// instead of letting the user see a deep generic "Matrix conditioning" /
-/// "basis function generation failed" error from inside the basis layer.
 #[test]
-fn bc_nonzero_anchor_rejected_with_clear_error_at_term_build() {
+fn bc_nonzero_anchor_fit_and_predict_end_to_end() {
     init_parallelism();
     let cases = &[
         "y ~ s(x, bc=anchored, anchor_left=1, anchor_right=-1)",
@@ -111,39 +110,19 @@ fn bc_nonzero_anchor_rejected_with_clear_error_at_term_build() {
         "y ~ s(x, bc_right=anchored, anchor_right=-1)",
         "y ~ s(x, bc_left=anchored, anchor_left=0.5)",
     ];
-    let mut bad = Vec::<String>::new();
+    let mut failures = Vec::<String>::new();
     for f in cases {
         match try_fit_and_predict(f) {
-            Ok(_) => {
-                // Fit succeeded → great, nonzero anchors are now supported.
-                eprintln!("[bc-nonzero] supported   {f}");
+            Ok(prediction) if prediction.iter().all(|value| value.is_finite()) => {
+                eprintln!("[bc-nonzero] supported {f}");
             }
-            Err(e) => {
-                // Failure must be a clear actionable message. The basis-builder
-                // wrapper produces "Underlying basis function generation
-                // failed: Invalid input: ..."; we want a focused term-builder
-                // error that names `anchor` and the unsupported `value`.
-                let lower = e.to_lowercase();
-                let mentions_anchor = lower.contains("anchor");
-                let mentions_remedy = lower.contains("value 0")
-                    || lower.contains("anchor value 0")
-                    || lower.contains("subtract")
-                    || lower.contains("offset");
-                if !mentions_anchor
-                    || !mentions_remedy
-                    || lower.contains("matrix conditioning")
-                    || lower.contains("basis function generation")
-                {
-                    bad.push(format!("`{f}`: opaque error: {e}"));
-                } else {
-                    eprintln!("[bc-nonzero] clear-error {f} -- {e}");
-                }
-            }
+            Ok(_) => failures.push(format!("`{f}`: non-finite predictions")),
+            Err(error) => failures.push(format!("`{f}`: {error}")),
         }
     }
     assert!(
-        bad.is_empty(),
-        "Non-zero anchor cases should either work or yield a clear actionable error:\n  - {}",
-        bad.join("\n  - "),
+        failures.is_empty(),
+        "non-zero anchor fit/predict failures:\n  - {}",
+        failures.join("\n  - "),
     );
 }
