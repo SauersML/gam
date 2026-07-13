@@ -347,7 +347,7 @@ fn production_objective_forced_streaming_value_gradient_matches_dense() {
         1.0e-6,
     );
     let mut streaming = SaeManifoldOuterObjective::new(
-        term,  target, None, seed_rho, 40, 1.0, 1.0e-6, 1.0e-6,
+        term, target, None, seed_rho, 40, 1.0, 1.0e-6, 1.0e-6,
     );
 
     // Construction binds the outer-coordinate layout to the assignment family.
@@ -361,7 +361,11 @@ fn production_objective_forced_streaming_value_gradient_matches_dense() {
         .baseline_rho
         .from_flat(rho_flat.view())
         .expect("dense and streaming objectives must own the same typed rho layout");
-    assert_eq!(rho_flat.len(), 2, "K=1 Softmax has no assignment-strength coordinate");
+    assert_eq!(
+        rho_flat.len(),
+        2,
+        "K=1 Softmax has no assignment-strength coordinate"
+    );
 
     let dense_eval = OuterObjective::eval(&mut dense, &rho_flat)
         .expect("dense production value+gradient");
