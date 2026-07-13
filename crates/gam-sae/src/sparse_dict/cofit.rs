@@ -47,9 +47,11 @@
 //!   fallback, so the round is monotone by construction either way.
 //!
 //! Each committed round therefore has `J[r] ≤ J[r-1]` up to numerical
-//! tolerance; the loop runs until the relative decrease of `J` satisfies its
-//! convergence criterion. The curved solver's internals are **untouched** — it
-//! is called through its existing public surface with an adjusted target.
+//! tolerance. Convergence requires an entire deterministic A/B replay to leave
+//! codes, chart ownership, and both reconstruction components bit-identical; an
+//! objective stall alone never mints a fit. The curved solver's internals are
+//! **untouched** — it is called through its existing public surface with an
+//! adjusted target.
 
 use std::collections::HashSet;
 
@@ -64,9 +66,10 @@ use super::coordinate::explained_variance_from_reconstruction;
 /// Configuration for [`cofit_block_and_curved`].
 #[derive(Clone, Debug)]
 pub struct CofitConfig {
-    /// Stop early once the relative decrease of the joint objective between two
-    /// consecutive rounds falls below this (a stalled descent).
-    pub rel_tol: f64,
+    /// Maximum number of complete deterministic A/B replays. Exhaustion is a
+    /// non-convergence error; a [`CofitReport`] is created only after one replay
+    /// leaves the complete fitted state bit-identical.
+    pub max_rounds: usize,
     /// Linear-tier ridge `λ_lin` on the per-row active-set least-squares codes.
     pub code_ridge: f32,
     /// Relative slack for the monotone-non-increase invariant. A round whose
@@ -83,7 +86,7 @@ pub struct CofitConfig {
 impl Default for CofitConfig {
     fn default() -> Self {
         Self {
-            rel_tol: 1.0e-4,
+            max_rounds: 256,
             code_ridge: 1.0e-6,
             monotone_slack: 1.0e-6,
             chart: BlockChartComposeConfig::default(),
@@ -191,8 +194,8 @@ pub fn cofit_block_and_curved(
             codes.shape()
         ));
     }
-    if !(config.rel_tol.is_finite() && config.rel_tol > 0.0) {
-        return Err("cofit: rel_tol must be finite and positive".to_string());
+    if config.max_rounds == 0 {
+        return Err("cofit: max_rounds must be positive".to_string());
     }
     let g_total = decoder.nrows() / b;
 
@@ -215,8 +218,6 @@ pub fn cofit_block_and_curved(
         .collect();
 
     let target_owned = target.to_owned();
-    let tss = frobenius_tss(target);
-
     let mut work = codes.to_owned();
 
     // ---- Round 0: the one-shot fit-curved-on-linear-residual baseline. ----
@@ -246,10 +247,16 @@ pub fn cofit_block_and_curved(
         },
     )?;
 
-    // ---- Rounds 1.. : alternate until the joint objective converges. ----
-    let mut round = 1usize;
-    loop {
+    // ---- Rounds 1.. : replay the complete deterministic A/B map until it is
+    //      idempotent. Objective stalls are not convergence certificates: a
+    //      small strict decrease still means the next re-entry changes the fit.
+    let mut converged = false;
+    for round in 1..=config.max_rounds {
         let prev_objective = objective;
+        let previous_codes = work.clone();
+        let previous_accepted = accepted.clone();
+        let previous_composed = composed.clone();
+        let previous_curved = curved.clone();
 
         // (A) Linear tier refit against the chart-adjusted target `target − C`,
         //     over the chart-*unowned* active slots only. Exact per-row block
@@ -286,8 +293,10 @@ pub fn cofit_block_and_curved(
         let cand_composed = candidate.reconstructed.clone();
         let objective_b = joint_objective(target.view(), &cand_composed, &work, config.code_ridge);
 
-        let slack = config.monotone_slack * (objective_a.abs() + 1.0);
-        let curved_committed = objective_b <= objective_a + slack;
+        // Commit only a strict objective improvement. `monotone_slack` diagnoses
+        // floating-point invariant breaches; it is never permission to install a
+        // worse candidate or to churn between equal-valued chart states.
+        let curved_committed = objective_b < objective_a;
         if curved_committed {
             accepted = cand_accepted;
             zero_owned_codes(&mut work, blocks, &accepted);
@@ -326,12 +335,24 @@ pub fn cofit_block_and_curved(
             "round",
         )?;
 
-        // Stall test on the relative objective decrease.
-        let denom = prev_objective.abs().max(tss).max(1.0);
-        if (prev_objective - objective) / denom < config.rel_tol {
+        // The transition just executed IS a full deterministic A/B replay from
+        // the previous state. Return only when every fitted component recurs
+        // bit-for-bit; otherwise the installed state is still moving, regardless
+        // of how small its objective decrease was.
+        if work == previous_codes
+            && accepted == previous_accepted
+            && composed == previous_composed
+            && curved == previous_curved
+        {
+            converged = true;
             break;
         }
-        round += 1;
+    }
+    if !converged {
+        return Err(format!(
+            "cofit: deterministic full A/B replay did not reach an idempotent fixed point after {} rounds (final objective {objective})",
+            config.max_rounds
+        ));
     }
 
     let linear_reconstruction =
@@ -544,28 +565,6 @@ fn frobenius_sse(target: ArrayView2<'_, f32>, recon: &Array2<f32>) -> f64 {
         }
     }
     sse
-}
-
-/// Total sum of squares of `target` about its per-column mean.
-fn frobenius_tss(target: ArrayView2<'_, f32>) -> f64 {
-    let (n, p) = target.dim();
-    let mut means = vec![0.0f64; p];
-    for i in 0..n {
-        for c in 0..p {
-            means[c] += target[[i, c]] as f64;
-        }
-    }
-    for m in &mut means {
-        *m /= n.max(1) as f64;
-    }
-    let mut tss = 0.0;
-    for i in 0..n {
-        for c in 0..p {
-            let d = target[[i, c]] as f64 - means[c];
-            tss += d * d;
-        }
-    }
-    tss
 }
 
 /// The linear-tier ridge energy `λ_lin · ‖codes‖²_F`.
@@ -842,6 +841,32 @@ mod cofit_tests {
                 "objective rose from {prev} to {cur}"
             );
         }
+    }
+
+    #[test]
+    fn insufficient_rounds_return_error_instead_of_an_open_cofit_2023() {
+        let decoder = planted_decoder();
+        let (x, _theta) = planted_data(240);
+        let (blocks, codes) = tied_routing(&x, &decoder, 2);
+        let config = CofitConfig {
+            max_rounds: 1,
+            chart: chart_cfg_small(),
+            ..CofitConfig::default()
+        };
+
+        let error = cofit_block_and_curved(
+            x.view(),
+            decoder.view(),
+            blocks.view(),
+            codes.view(),
+            1.0,
+            &config,
+        )
+        .expect_err("a still-moving A/B replay must not mint CofitReport");
+        assert!(
+            error.contains("did not reach an idempotent fixed point"),
+            "unexpected non-convergence error: {error}"
+        );
     }
 
     #[test]

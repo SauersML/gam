@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use gam_problem::RowMetric;
+use gam_problem::{FisherFactorKind, RowMetric};
 use ndarray::{Array2, ArrayView1, ArrayView3};
 
 /// Scientific provenance and likelihood role of a supplied output-Fisher
@@ -53,6 +53,7 @@ pub struct SaeFisherRowMetricRequest<'a> {
     expected_rows: usize,
     expected_output_dim: usize,
     provenance: SaeFisherMetricProvenance,
+    factor_kind: FisherFactorKind,
     mass_residual: Option<ArrayView1<'a, f64>>,
 }
 
@@ -65,6 +66,7 @@ impl<'a> SaeFisherRowMetricRequest<'a> {
         expected_rows: usize,
         expected_output_dim: usize,
         provenance: Option<&str>,
+        factor_kind: Option<&str>,
         mass_residual: Option<ArrayView1<'a, f64>>,
     ) -> Result<Self, String> {
         Ok(Self {
@@ -72,6 +74,9 @@ impl<'a> SaeFisherRowMetricRequest<'a> {
             expected_rows,
             expected_output_dim,
             provenance: SaeFisherMetricProvenance::from_tag(provenance)?,
+            factor_kind: FisherFactorKind::from_tag(factor_kind.ok_or_else(|| {
+                "fisher_factor_kind is required when fisher_factors are present".to_string()
+            })?)?,
             mass_residual,
         })
     }
@@ -144,10 +149,11 @@ pub fn build_sae_fisher_row_metric(
             RowMetric::behavioral_fisher(packed, request.expected_output_dim, rank)
         }
     }?;
-    match request.mass_residual {
+    let metric = match request.mass_residual {
         None => Ok(metric),
         Some(residual) => metric.with_truncation_mass_residual(Arc::new(residual.to_owned())),
-    }
+    }?;
+    metric.with_fisher_factor_kind(request.factor_kind)
 }
 
 #[cfg(test)]
@@ -167,6 +173,7 @@ mod tests {
             2,
             3,
             None,
+            Some("uncertified_approximation"),
             Some(mass_residual.view()),
         )
         .expect("typed request");
@@ -192,6 +199,7 @@ mod tests {
             2,
             3,
             Some("behavioral_fisher"),
+            Some("uncertified_approximation"),
             None,
         )
         .expect("behavioral request");
@@ -203,10 +211,27 @@ mod tests {
         assert!(metric.whitens_likelihood());
 
         let bad_tag =
-            SaeFisherRowMetricRequest::from_tag(factors.view(), 2, 3, Some("mystery"), None);
+            SaeFisherRowMetricRequest::from_tag(
+                factors.view(),
+                2,
+                3,
+                Some("mystery"),
+                Some("uncertified_approximation"),
+                None,
+            );
         assert!(bad_tag.is_err());
-        let bad_rows = SaeFisherRowMetricRequest::from_tag(factors.view(), 3, 3, None, None)
-            .expect("shape validation runs in entry");
+        assert!(
+            SaeFisherRowMetricRequest::from_tag(factors.view(), 2, 3, None, None, None).is_err()
+        );
+        let bad_rows = SaeFisherRowMetricRequest::from_tag(
+            factors.view(),
+            3,
+            3,
+            None,
+            Some("uncertified_approximation"),
+            None,
+        )
+        .expect("shape validation runs in entry");
         assert!(build_sae_fisher_row_metric(bad_rows).is_err());
     }
 }

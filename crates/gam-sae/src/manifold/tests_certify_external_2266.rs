@@ -107,7 +107,14 @@ mod tests {
                 },
             );
         let fisher_metric_request =
-            SaeFisherRowMetricRequest::from_tag(fisher_u3.view(), N_CIRCLE, p_out, None, None)
+            SaeFisherRowMetricRequest::from_tag(
+                fisher_u3.view(),
+                N_CIRCLE,
+                p_out,
+                None,
+                Some("uncertified_approximation"),
+                None,
+            )
                 .expect("rank-1 output-Fisher metric request");
 
         let registry = AnalyticPenaltyRegistry::new();

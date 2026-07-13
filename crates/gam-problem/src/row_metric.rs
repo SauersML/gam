@@ -257,6 +257,31 @@ pub enum FisherFactorKind {
     UncertifiedApproximation,
 }
 
+impl FisherFactorKind {
+    /// Stable artifact/FFI tag. Factor status is part of the scientific data,
+    /// not an inference a consumer may recreate from rank or trace metadata.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::ExactFull => "exact_full",
+            Self::CertifiedPsdLowerBound => "certified_psd_lower_bound",
+            Self::UncertifiedApproximation => "uncertified_approximation",
+        }
+    }
+
+    /// Parse the required public factor-status tag (#2249).
+    pub fn from_tag(tag: &str) -> Result<Self, String> {
+        match tag {
+            "exact_full" => Ok(Self::ExactFull),
+            "certified_psd_lower_bound" => Ok(Self::CertifiedPsdLowerBound),
+            "uncertified_approximation" => Ok(Self::UncertifiedApproximation),
+            other => Err(format!(
+                "fisher_factor_kind must be 'exact_full', 'certified_psd_lower_bound', or \
+                 'uncertified_approximation'; got {other:?}"
+            )),
+        }
+    }
+}
+
 /// The single per-row metric object. Holds one low-rank factor stack `U_n` (or
 /// none, for Euclidean) plus the validated PSD blocks, tagged with its
 /// [`MetricProvenance`].

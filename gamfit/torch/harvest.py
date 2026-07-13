@@ -74,6 +74,10 @@ __all__ = [
 _HARVEST_PROVENANCES = frozenset(
     {"output_fisher", "output_fisher_downstream", "behavioral_fisher"}
 )
+_HARVEST_SCHEMA = "gamfit.FisherHarvest/v1"
+_FISHER_FACTOR_KINDS = frozenset(
+    {"exact_full", "certified_psd_lower_bound", "uncertified_approximation"}
+)
 
 _ATTENTION_FORWARD_AD_MARKERS = (
     "scaled_dot_product",
@@ -119,7 +123,7 @@ def _jvp_with_attention_diagnostic(
 
 
 # ---------------------------------------------------------------------------
-# Shard container — the (X, U, mass_residual) contract
+# Shard container — factors plus explicit scientific status
 # ---------------------------------------------------------------------------
 
 
@@ -138,8 +142,8 @@ class HarvestShard:
         Flattened row-major this matches the gam layout
         ``u[n, i * r + k] = U[n, i, k]``.
     mass_residual
-        ``(n,)`` truncation diagnostic: ``trace(G_n) − Σ_{k≤r} λ_k ≥ 0``, the
-        output-Fisher mass off the captured top-r subspace.
+        Optional ``(n,)`` tail-trace diagnostic. It is not a certificate and is
+        absent for exact factors. A certified PSD lower bound must carry it.
     rank
         ``r``, the number of factors per row (``U.shape[2]``).
     provenance
@@ -153,18 +157,25 @@ class HarvestShard:
         across both; only the tag (and the science it certifies) differs, so the
         gauge/lens/enrichment machinery is provenance-generic and consumes either
         unchanged. Any other value is rejected.
+    factor_kind
+        Required operator status. It is never inferred from rank or from a
+        scalar tail estimate: randomized/Ritz and probe factors are
+        ``"uncertified_approximation"``; a complete factorization is
+        ``"exact_full"``; ``"certified_psd_lower_bound"`` is reserved for a
+        producer that proves the Loewner-order relation.
     """
 
     X: Any
     U: Any
     mass_residual: Any
     rank: int
+    factor_kind: str
     provenance: str = "output_fisher"
 
     def __post_init__(self) -> None:
         X = np.asarray(self.X)
         U = np.asarray(self.U)
-        mr = np.asarray(self.mass_residual)
+        mr = None if self.mass_residual is None else np.asarray(self.mass_residual)
         if X.ndim != 2:
             raise ValueError(f"X must be (n, p); got shape {X.shape}")
         n, p = X.shape
@@ -172,8 +183,20 @@ class HarvestShard:
             raise ValueError(
                 f"U must be (n, p, r) = ({n}, {p}, {self.rank}); got shape {U.shape}"
             )
-        if mr.shape != (n,):
+        if mr is not None and mr.shape != (n,):
             raise ValueError(f"mass_residual must be (n,) = ({n},); got shape {mr.shape}")
+        if self.factor_kind not in _FISHER_FACTOR_KINDS:
+            raise ValueError(
+                f"factor_kind must be one of {sorted(_FISHER_FACTOR_KINDS)}; "
+                f"got {self.factor_kind!r}"
+            )
+        if self.factor_kind == "exact_full" and (self.rank != p or mr is not None):
+            raise ValueError(
+                "exact_full requires rank == activation dimension and forbids "
+                "mass_residual"
+            )
+        if self.factor_kind == "certified_psd_lower_bound" and mr is None:
+            raise ValueError("certified_psd_lower_bound requires mass_residual")
         if self.provenance not in _HARVEST_PROVENANCES:
             raise ValueError(
                 f"provenance must be one of {sorted(_HARVEST_PROVENANCES)}; "
@@ -582,7 +605,14 @@ def harvest_output_fisher_factors(
         mass_residual[row] = max(residual, 0.0)
         U[row] = scaled.detach().to(torch.float32).cpu().numpy()
 
-    return HarvestShard(X=X, U=U, mass_residual=mass_residual, rank=rank)
+    factor_kind = "exact_full" if rank == p else "uncertified_approximation"
+    return HarvestShard(
+        X=X,
+        U=U,
+        mass_residual=None if factor_kind == "exact_full" else mass_residual,
+        rank=rank,
+        factor_kind=factor_kind,
+    )
 
 
 def harvest_behavioral_fisher_probes(
@@ -643,9 +673,6 @@ def harvest_behavioral_fisher_probes(
 
     U = np.empty((n, p, probes), dtype=np.float32)
     X = act_flat.to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
-    # Full-rank unbiased sketch ⇒ no truncated tail; mass_residual is identically 0.
-    mass_residual = np.zeros((n,), dtype=np.float32)
-
     for row in range(n):
         x_row = act_flat[row].to(work_dtype).detach().requires_grad_(False)
 
@@ -677,8 +704,9 @@ def harvest_behavioral_fisher_probes(
     return HarvestShard(
         X=X,
         U=U,
-        mass_residual=mass_residual,
+        mass_residual=None,
         rank=probes,
+        factor_kind="uncertified_approximation",
         provenance="behavioral_fisher",
     )
 
@@ -830,11 +858,13 @@ def harvest_downstream_output_fisher_factors(
         mass_residual[row] = max(residual, 0.0)
         U[row] = scaled.detach().to(torch.float32).cpu().numpy()
 
+    factor_kind = "exact_full" if rank == p else "uncertified_approximation"
     return HarvestShard(
         X=X,
         U=U,
-        mass_residual=mass_residual,
+        mass_residual=None if factor_kind == "exact_full" else mass_residual,
         rank=rank,
+        factor_kind=factor_kind,
         provenance="output_fisher_downstream",
     )
 
@@ -845,7 +875,7 @@ def harvest_downstream_output_fisher_factors(
 
 
 def save_harvest_shard(shard: HarvestShard, path: str | Path) -> str:
-    """Write ``shard`` to a ``.npz`` archive: ``X``, ``U``, ``mass_residual``.
+    """Write one strict, self-describing Fisher harvest artifact.
 
     Mirrors :mod:`gamfit._sampling`'s ``.npz`` suffix rule. Factors are stored
     f32 (their working precision); ``rank`` is recorded so the loader can assert
@@ -854,22 +884,28 @@ def save_harvest_shard(shard: HarvestShard, path: str | Path) -> str:
     out = Path(path)
     if out.suffix != ".npz":
         out = out.with_name(out.name + ".npz")
-    np.savez(
-        out,
-        X=np.ascontiguousarray(shard.X, dtype=np.float32),
-        U=np.ascontiguousarray(shard.U, dtype=np.float32),
-        mass_residual=np.ascontiguousarray(shard.mass_residual, dtype=np.float32),
-        rank=np.int64(shard.rank),
-        provenance=np.str_(shard.provenance),
-    )
+    fields = {
+        "schema": np.str_(_HARVEST_SCHEMA),
+        "X": np.ascontiguousarray(shard.X, dtype=np.float32),
+        "U": np.ascontiguousarray(shard.U, dtype=np.float32),
+        "rank": np.int64(shard.rank),
+        "provenance": np.str_(shard.provenance),
+        "factor_kind": np.str_(shard.factor_kind),
+    }
+    if shard.mass_residual is not None:
+        fields["mass_residual"] = np.ascontiguousarray(
+            shard.mass_residual, dtype=np.float32
+        )
+    np.savez(out, **fields)
     return str(out)
 
 
 def load_harvest_shard(path: str | Path) -> dict[str, Any]:
     """Load a harvest shard, promoting to f64 at the gam boundary.
 
-    Returns a dict with f64 ``X (n, p)``, ``U (n, p, r)``, ``mass_residual (n,)``
-    and the int ``rank``. The f32 → f64 promotion happens here: the torch side
+    Returns a dict carrying the required schema/provenance/factor-kind fields,
+    f64 ``X (n, p)``, ``U (n, p, r)``, an optional f64 tail diagnostic, and the
+    integer ``rank``. The f32 → f64 promotion happens here: the torch side
     keeps factors in their natural low precision; gam (which runs f64 CPU)
     consumes them promoted. The flattened ``U`` row-major layout
     ``u[n, i * r + k] = U[n, i, k]`` is exactly ``RowMetric::output_fisher``'s.
@@ -880,20 +916,43 @@ def load_harvest_shard(path: str | Path) -> dict[str, Any]:
         if suffixed.exists():
             target = suffixed
     npz = np.load(target)
-    # `provenance` is absent in pre-#980 shards on disk; default to the
-    # same-position metric so old shards load unchanged.
-    provenance = (
-        str(npz["provenance"].item()) if "provenance" in npz.files else "output_fisher"
-    )
+    required = {"schema", "X", "U", "rank", "provenance", "factor_kind"}
+    missing = required.difference(npz.files)
+    if missing:
+        raise ValueError(
+            f"harvest shard at {target} is missing required fields {sorted(missing)}"
+        )
+    schema = str(npz["schema"].item())
+    if schema != _HARVEST_SCHEMA:
+        raise ValueError(
+            f"harvest shard at {target} has unsupported schema {schema!r}; "
+            f"expected {_HARVEST_SCHEMA!r}"
+        )
+    provenance = str(npz["provenance"].item())
     if provenance not in _HARVEST_PROVENANCES:
         raise ValueError(
             f"harvest shard at {target} has unknown provenance {provenance!r}; "
             f"expected one of {sorted(_HARVEST_PROVENANCES)}"
         )
+    factor_kind = str(npz["factor_kind"].item())
+    mass_residual = (
+        np.asarray(npz["mass_residual"], dtype=np.float64)
+        if "mass_residual" in npz.files
+        else None
+    )
+    shard = HarvestShard(
+        X=np.asarray(npz["X"], dtype=np.float64),
+        U=np.asarray(npz["U"], dtype=np.float64),
+        mass_residual=mass_residual,
+        rank=int(npz["rank"].item()),
+        provenance=provenance,
+        factor_kind=factor_kind,
+    )
     return {
         "X": np.asarray(npz["X"], dtype=np.float64),
         "U": np.asarray(npz["U"], dtype=np.float64),
-        "mass_residual": np.asarray(npz["mass_residual"], dtype=np.float64),
-        "rank": int(npz["rank"].item()),
-        "provenance": provenance,
+        "mass_residual": mass_residual,
+        "rank": shard.rank,
+        "provenance": shard.provenance,
+        "factor_kind": shard.factor_kind,
     }

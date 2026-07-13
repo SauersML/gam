@@ -186,7 +186,14 @@ mod tests {
                 |(_, i, _)| if i == 0 { 1.0 } else { 0.0 },
             );
         let dummy_metric =
-            SaeFisherRowMetricRequest::from_tag(dummy_u.view(), N_CIRCLE, P_OUT, None, None)
+            SaeFisherRowMetricRequest::from_tag(
+                dummy_u.view(),
+                N_CIRCLE,
+                P_OUT,
+                None,
+                Some("uncertified_approximation"),
+                None,
+            )
                 .expect("placeholder metric request");
 
         let registry = AnalyticPenaltyRegistry::new();

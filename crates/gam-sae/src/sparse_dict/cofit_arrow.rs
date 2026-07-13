@@ -21,9 +21,10 @@
 //! the engine lane on #2023 — this module never touches the driver internals, it
 //! only CALLS `SaeManifoldTerm`.
 //!
-//! **#2275 certificate reconciliation.** The block lane's `certified` flag maps to
-//! the joint solver's `EvidenceJointFitOutcome.fixed_point`: the arrow-routed fit
-//! is `certified` iff the evidence policy certified an idempotent fixed point.
+//! **#2275 certificate reconciliation.** The joint solver's
+//! `EvidenceJointFitOutcome.fixed_point` is a construction gate, not report
+//! telemetry: `false` returns a non-convergence error, so every
+//! [`ArrowCofitReport`] necessarily came from an idempotent re-entry.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -48,10 +49,6 @@ pub struct ArrowCofitReport {
     /// Explained variance of `reconstructed` against the target (mean-baseline via
     /// the shared `explained_variance_from_reconstruction` helper cofit uses).
     pub explained_variance: f64,
-    /// #2275 certificate: `true` iff the joint solver certified an idempotent
-    /// fixed point (`EvidenceJointFitOutcome.fixed_point`); `false` is the typed
-    /// open certificate at `K ≫ rank`.
-    pub certified: bool,
     /// Number of curved (periodic) atoms folded into the joint solve — the count
     /// of blocks whose BIC-gated chart discovery ([`compose_block_coordinate_charts`])
     /// promoted them from a flat linear atom to a curved chart. `0` for the
@@ -65,9 +62,8 @@ pub struct ArrowCofitReport {
 }
 
 /// Tuning for the arrow-routed linear fit. `max_iter` must be generous enough for
-/// the evidence policy to settle: `run_joint_fit_arrow_schur_for_quasi_laplace`
-/// rejects a heuristic termination, so a too-small budget errors rather than
-/// returning an open certificate.
+/// the evidence policy to settle: a too-small iteration budget is a
+/// non-convergence error and can never produce an [`ArrowCofitReport`].
 #[derive(Clone, Debug)]
 pub struct ArrowCofitConfig {
     pub log_lambda_sparse: f64,
@@ -207,6 +203,11 @@ pub fn cofit_linear_via_arrow(
         config.ridge_ext_coord,
         config.ridge_beta,
     )?;
+    require_idempotent_fixed_point(
+        outcome.fixed_point,
+        "cofit_linear_via_arrow",
+        config.max_iter,
+    )?;
 
     let recon_f64 = term.try_fitted_for_rho(&rho)?;
     let reconstructed = recon_f64.mapv(|v| v as f32);
@@ -216,7 +217,6 @@ pub fn cofit_linear_via_arrow(
     Ok(ArrowCofitReport {
         reconstructed,
         explained_variance,
-        certified: outcome.fixed_point,
         n_curved_atoms: 0,
         curved_charge: 0.0,
     })
@@ -483,6 +483,11 @@ pub fn cofit_composed_via_arrow(
         config.ridge_ext_coord,
         config.ridge_beta,
     )?;
+    require_idempotent_fixed_point(
+        outcome.fixed_point,
+        "cofit_composed_via_arrow",
+        config.max_iter,
+    )?;
 
     let recon_f64 = term.try_fitted_for_rho(&rho)?;
     let reconstructed = recon_f64.mapv(|v| v as f32);
@@ -492,10 +497,23 @@ pub fn cofit_composed_via_arrow(
     Ok(ArrowCofitReport {
         reconstructed,
         explained_variance,
-        certified: outcome.fixed_point,
         n_curved_atoms,
         curved_charge,
     })
+}
+
+fn require_idempotent_fixed_point(
+    fixed_point: bool,
+    entry: &str,
+    max_iter: usize,
+) -> Result<(), String> {
+    if fixed_point {
+        Ok(())
+    } else {
+        Err(format!(
+            "{entry}: deterministic joint-solver re-entry did not reach an idempotent fixed point within {max_iter} iterations"
+        ))
+    }
 }
 
 /// The BIC-selected chart-owned block set (single blocks + both members of each
@@ -598,8 +616,8 @@ mod tests {
         .expect("arrow-routed linear cofit must run end to end");
 
         eprintln!(
-            "[#2023 5a] block_ev={:.6} arrow_ev={:.6} certified={}",
-            block_ev, arrow.explained_variance, arrow.certified
+            "[#2023 5a] block_ev={:.6} arrow_ev={:.6}",
+            block_ev, arrow.explained_variance
         );
         assert!(
             arrow.explained_variance.is_finite(),
@@ -694,6 +712,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn insufficient_iterations_return_error_instead_of_open_arrow_cofit_2023() {
+        let n = 120usize;
+        let b = 2usize;
+        let decoder = planted_decoder();
+        let x = planted_data(n);
+        let (blocks, codes) = tied_routing(&x, &decoder, b);
+        let config = ArrowCofitConfig {
+            max_iter: 0,
+            chart: parity_chart_cfg(),
+            ..ArrowCofitConfig::default()
+        };
+
+        let error = cofit_composed_via_arrow(
+            x.view(),
+            decoder.view(),
+            blocks.view(),
+            codes.view(),
+            1.0,
+            &config,
+        )
+        .expect_err("an open joint-solver re-entry must not mint ArrowCofitReport");
+        assert!(
+            error.contains("did not reach an idempotent fixed point"),
+            "unexpected non-convergence error: {error}"
+        );
+    }
+
     /// #2023 Increment 5 (the composed cutover): the unified arrow-Schur joint solve
     /// over a MIXED linear + curved atom set must MATCH-OR-BEAT the hand-rolled A/B
     /// coordinate-descent co-fit ([`super::super::cofit_block_and_curved`]) in
@@ -743,11 +789,10 @@ mod tests {
         .expect("composed arrow-Schur co-fit runs end to end");
 
         eprintln!(
-            "[#2023 5] cofit_ev={:.6} arrow_ev={:.6} n_curved={} certified={} charge={:.4}",
+            "[#2023 5] cofit_ev={:.6} arrow_ev={:.6} n_curved={} charge={:.4}",
             cofit.explained_variance,
             arrow.explained_variance,
             arrow.n_curved_atoms,
-            arrow.certified,
             arrow.curved_charge
         );
 
