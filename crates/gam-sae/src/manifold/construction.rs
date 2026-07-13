@@ -5636,6 +5636,7 @@ include!("construction_smoothness_dof.rs");
 // are mechanically split into a sibling `*_tests` file and inlined via
 // `include!` (the sanctioned cohesive-module decomposition — see build.rs
 // file_stem_is_exempt_test_module). Keeps this tracked file under the 10k limit.
+#[cfg(test)]
 include!("construction_tests.rs");
 
 /// Solve-invariant operands of `selected_inverse_row_blocks_or_solve` (#932

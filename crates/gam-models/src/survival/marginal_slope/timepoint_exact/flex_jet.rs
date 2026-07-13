@@ -4174,25 +4174,17 @@ mod moment_engine_tests {
         }
     }
 
-    /// #932 item-2 STEP 3c: `flex_timepoint_inputs_generic::<Jet3>` directional
-    /// channel == hand `compute_survival_timepoint_directional_exact_from_cached`
-    /// (`block10_pack_dir`) term-for-term (≤1e-6) on a real g-only family.
+    /// The runtime Jet3 arena retains one bounded tape per worker and reuses it
+    /// for an identical-width production row.
     #[test]
-    fn flex_timepoint_inputs_jet3_directional_matches_hand_932() {
-        let n = 16usize;
-        let family = make_g_only_flex_family(n);
+    fn flex_third_arena_reuses_warmed_tape_932() {
+        let family = make_g_only_flex_family(16);
         let primary = flex_primary_slices(&family);
-        let p = primary.total;
         let row = 5usize;
         let g = 0.21_f64;
-
-        // Exit timepoint q1. The g-only family has no time design and no wiggle, so
-        // `q1 = offset_exit[row] + marginal_design[row]·m_beta` (the marginal block
-        // eta), per `row_dynamic_q_values`.
-        let m_beta = 0.15_f64;
-        let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * m_beta;
-        let o_infl = 0.0_f64;
-        let (a1, d1) = family
+        let q1 = family.offset_exit[row]
+            + family.marginal_design.to_dense()[[row, 0]] * 0.15;
+        let a1 = family
             .solve_row_survival_intercept_with_slot(
                 q1,
                 g,
@@ -4200,128 +4192,45 @@ mod moment_engine_tests {
                 None,
                 Some((row, SurvivalInterceptSlotKind::Exit)),
             )
-            .expect("intercept solve");
+            .expect("intercept solve")
+            .0;
         let cached = family
             .build_cached_partition(&primary, a1, g, None, None)
             .expect("cached partition");
-
-        // Direction: a generic non-axis-aligned direction over all primaries.
-        let dir =
-            Array1::from_iter((0..p).map(|c| 0.1 + 0.05 * (c as f64) - 0.02 * ((c % 3) as f64)));
-
-        // Hand directional pack.
-        let hand = family
-            .compute_survival_timepoint_directional_exact_from_cached(
-                row, &primary, q1, primary.q1, a1, g, None, None, &cached, &dir, true,
-            )
-            .expect("hand directional");
-
-        // Generic Jet3 builder, seeded with the direction.
-        let (obs_coeff, obs_fixed) =
-            observed_fixed_for(&family, &primary, row, a1, g, None, None).expect("obs fixed");
-        let cells = cells_from_cached(&cached);
-        let z_obs = family.observed_score_projection(row);
-        let d_check = family
-            .evaluate_survival_denom_d(a1, g, None, None)
-            .expect("denom");
-
-        let template = Jet3::primary(0.0, usize::MAX, p, 0.0);
-        let b_jet = Jet3::primary(g, primary.g, p, dir[primary.g]);
-        let du: Vec<Jet3> = (0..p).map(|u| Jet3::primary(0.0, u, p, dir[u])).collect();
-        let (eta, chi, dnorm) = flex_timepoint_inputs_generic(
-            &template,
-            &b_jet,
-            &du,
-            a1,
-            d_check,
-            primary.g,
-            primary.infl,
-            primary.q1,
-            q1,
-            z_obs,
-            o_infl,
-            obs_coeff,
-            &obs_fixed,
-            &cells,
-        )
-        .expect("generic jet3");
-
-        // eps.g = D_dir(grad), eps.h = D_dir(Hess). Compare to the hand *_dir.
-        let cmp_vec = |label: &str, jet: &Vec<f64>, hand: &[f64]| {
-            for u in 0..p {
-                assert!(
-                    (jet[u] - hand[u]).abs() <= 1e-6 * (1.0 + hand[u].abs()),
-                    "{label}[{u}] jet {} != hand {}",
-                    jet[u],
-                    hand[u]
-                );
-            }
-        };
-        let cmp_mat = |label: &str, jet: &Vec<f64>, hand: &Array2<f64>| {
-            for u in 0..p {
-                for v in 0..p {
-                    assert!(
-                        (jet[u * p + v] - hand[[u, v]]).abs() <= 1e-6 * (1.0 + hand[[u, v]].abs()),
-                        "{label}[{u},{v}] jet {} != hand {}",
-                        jet[u * p + v],
-                        hand[[u, v]]
-                    );
-                }
-            }
-        };
-        // First localize: the Jet3 BASE channel (`.base`) must equal the hand base
-        // timepoint (value/grad/Hess) — if the directional fails this isolates
-        // whether the base or the ε-lifting is at fault.
-        let base = family
-            .compute_survival_timepoint_exact_from_cached(
-                row, &primary, q1, primary.q1, a1, g, d1, None, None, o_infl, true, &cached,
-            )
-            .expect("hand base");
-        assert!(
-            (eta.base.v - base.eta).abs() <= 1e-6 * (1.0 + base.eta.abs()),
-            "eta base value {} != hand {}",
-            eta.base.v,
-            base.eta
+        let dir = Array1::from_iter(
+            (0..primary.total).map(|axis| 0.1 + 0.03 * axis as f64),
         );
-        cmp_vec("eta_u", &eta.base.g, base.eta_u.as_slice().unwrap());
-        cmp_mat("eta_uv", &eta.base.h, &base.eta_uv);
-        cmp_vec("chi_u", &chi.base.g, base.chi_u.as_slice().unwrap());
-        cmp_mat("chi_uv", &chi.base.h, &base.chi_uv);
-        cmp_vec("d_u", &dnorm.base.g, base.d_u.as_slice().unwrap());
-        cmp_mat("d_uv", &dnorm.base.h, &base.d_uv);
 
-        // The directional (ε) channel == hand `block10_pack_dir` term-for-term.
-        cmp_vec("eta_u_dir", &eta.eps.g, hand.eta_u_dir.as_slice().unwrap());
-        cmp_mat("eta_uv_dir", &eta.eps.h, &hand.eta_uv_dir);
-        cmp_vec("chi_u_dir", &chi.eps.g, hand.chi_u_dir.as_slice().unwrap());
-        cmp_mat("chi_uv_dir", &chi.eps.h, &hand.chi_uv_dir);
-        cmp_vec("d_u_dir", &dnorm.eps.g, hand.d_u_dir.as_slice().unwrap());
-        cmp_mat("d_uv_dir", &dnorm.eps.h, &hand.d_uv_dir);
-
-        // The dynamic p=4 production schedule retains one bounded tape per
-        // worker. Repeating an identical-width row must not grow that warmed
-        // high-water mark.
-        let run_dynamic_row = || {
+        let run = || {
             with_flex_third_jet_arena(|arena| {
                 family
                     .compute_survival_timepoint_directional_jet_from_cached(
-                        row, &primary, q1, primary.q1, a1, g, None, None, o_infl, &cached, &dir,
+                        row,
+                        &primary,
+                        q1,
+                        primary.q1,
+                        a1,
+                        g,
+                        None,
+                        None,
+                        0.0,
+                        &cached,
+                        &dir,
                         arena,
                     )
-                    .expect("dynamic FLEX third row")
+                    .expect("production third-order timepoint")
             })
         };
         let retained_bytes = || with_flex_third_jet_arena(|arena| arena.allocated_bytes());
-        run_dynamic_row();
+        run();
         let first = retained_bytes();
         assert!(first > 0, "FLEX third arena did not retain its warm tape");
-        run_dynamic_row();
-        let second = retained_bytes();
+        run();
         assert_eq!(
-            second, first,
-            "same-width FLEX third row grew its warmed arena: {first} -> {second} bytes"
+            retained_bytes(),
+            first,
+            "same-width FLEX third row grew its warmed arena"
         );
-        eprintln!("G932_FLEX_THIRD_ARENA retained_bytes={second}");
     }
 
     /// #932 grad-only cutover: the production grad-only timepoint

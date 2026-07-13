@@ -314,15 +314,30 @@ impl GaussianLocationScaleWiggleFamily {
 /// `_from_designs` assemblies. Holds exactly the quantities both consumers
 /// read downstream of the (identical) coefficient computation.
 pub(crate) struct GlsWiggleSecondDirCoeffs {
+    pub(crate) objective_uv: Array1<f64>,
+    pub(crate) coeff_mm_base: Array1<f64>,
+    pub(crate) coeff_mm_u: Array1<f64>,
+    pub(crate) coeff_mm_v: Array1<f64>,
     pub(crate) coeff_mm_uv: Array1<f64>,
+    pub(crate) coeff_ml_base: Array1<f64>,
+    pub(crate) coeff_ml_u: Array1<f64>,
+    pub(crate) coeff_ml_v: Array1<f64>,
     pub(crate) coeff_ml_uv: Array1<f64>,
+    pub(crate) coeff_ll_base: Array1<f64>,
+    pub(crate) coeff_ll_u: Array1<f64>,
+    pub(crate) coeff_ll_v: Array1<f64>,
     pub(crate) coeff_ll_uv: Array1<f64>,
+    pub(crate) mean_wiggle_base: Array1<f64>,
     pub(crate) a_u: Array1<f64>,
     pub(crate) a_v: Array1<f64>,
     pub(crate) a_uv: Array1<f64>,
     pub(crate) c_u: Array1<f64>,
     pub(crate) c_v: Array1<f64>,
     pub(crate) c_uv: Array1<f64>,
+    pub(crate) gradient_ls_base: Array1<f64>,
+    pub(crate) gradient_ls_u: Array1<f64>,
+    pub(crate) gradient_ls_v: Array1<f64>,
+    pub(crate) gradient_ls_uv: Array1<f64>,
     pub(crate) l_u: Array1<f64>,
     pub(crate) l_v: Array1<f64>,
     pub(crate) l_uv: Array1<f64>,
@@ -405,6 +420,7 @@ pub(crate) fn gls_wiggle_first_directional_coeffs(
 pub(crate) struct GlsWiggleDirPieces<'a> {
     pub(crate) zeta_u: &'a Array1<f64>,
     pub(crate) zeta_v: &'a Array1<f64>,
+    pub(crate) zeta_uv: &'a Array1<f64>,
     pub(crate) q_u: &'a Array1<f64>,
     pub(crate) q_v: &'a Array1<f64>,
     pub(crate) q_uv: &'a Array1<f64>,
@@ -426,6 +442,7 @@ pub(crate) fn gls_wiggle_second_directional_coeffs(
     let GlsWiggleDirPieces {
         zeta_u,
         zeta_v,
+        zeta_uv,
         q_u,
         q_v,
         q_uv,
@@ -436,14 +453,28 @@ pub(crate) fn gls_wiggle_second_directional_coeffs(
         g2_v,
         g2_uv,
     } = *dir;
-    let zero_mixed_scale = Array1::zeros(rows.obs_weight.len());
-    let tower = gaussian_row_second_tower(rows, q_u, zeta_u, q_v, zeta_v, q_uv, &zero_mixed_scale);
+    let tower = gaussian_row_second_tower(rows, q_u, zeta_u, q_v, zeta_v, q_uv, zeta_uv);
     let base = &tower.base;
     let first_u = &tower.first_a;
     let first_v = &tower.first_b;
     let second_uv = &tower.second;
     let d = &geom.dq_dq0;
     let d2 = &geom.d2q_dq02;
+    let d_squared = d.mapv(|value| value * value);
+    let objective_uv = &base.hessian_mm * &(q_u * q_v)
+        + &base.hessian_ml * &(q_u * zeta_v + q_v * zeta_u)
+        + &base.hessian_ll * &(zeta_u * zeta_v)
+        + &base.gradient_mu * q_uv
+        + &base.gradient_ls * zeta_uv;
+    let coeff_mm_base = &base.hessian_mm * &d_squared + &base.gradient_mu * d2;
+    let coeff_mm_u = &first_u.hessian_mm * &d_squared
+        + &(2.0 * &base.hessian_mm * d * s1_u)
+        + &(&first_u.gradient_mu * d2)
+        + &(&base.gradient_mu * g2_u);
+    let coeff_mm_v = &first_v.hessian_mm * &d_squared
+        + &(2.0 * &base.hessian_mm * d * s1_v)
+        + &(&first_v.gradient_mu * d2)
+        + &(&base.gradient_mu * g2_v);
     let coeff_mm_uv = &(&second_uv.hessian_mm * &d.mapv(|value| value * value))
         + &(2.0 * &first_u.hessian_mm * d * s1_v)
         + &(2.0 * &first_v.hessian_mm * d * s1_u)
@@ -453,11 +484,18 @@ pub(crate) fn gls_wiggle_second_directional_coeffs(
         + &(&first_u.gradient_mu * g2_v)
         + &(&first_v.gradient_mu * g2_u)
         + &(&base.gradient_mu * g2_uv);
+    let coeff_ml_base = &base.hessian_ml * d;
+    let coeff_ml_u = &first_u.hessian_ml * d + &base.hessian_ml * s1_u;
+    let coeff_ml_v = &first_v.hessian_ml * d + &base.hessian_ml * s1_v;
     let coeff_ml_uv = &(&second_uv.hessian_ml * d)
         + &(&first_u.hessian_ml * s1_v)
         + &(&first_v.hessian_ml * s1_u)
         + &(&base.hessian_ml * s1_uv);
+    let coeff_ll_base = base.hessian_ll.clone();
+    let coeff_ll_u = first_u.hessian_ll.clone();
+    let coeff_ll_v = first_v.hessian_ll.clone();
     let coeff_ll_uv = second_uv.hessian_ll.clone();
+    let mean_wiggle_base = &base.hessian_mm * d;
     let a_u = &first_u.hessian_mm * d + &base.hessian_mm * s1_u;
     let a_v = &first_v.hessian_mm * d + &base.hessian_mm * s1_v;
     let a_uv = &second_uv.hessian_mm * d
@@ -472,15 +510,30 @@ pub(crate) fn gls_wiggle_second_directional_coeffs(
     let l_uv = second_uv.hessian_ml.clone();
 
     GlsWiggleSecondDirCoeffs {
+        objective_uv,
+        coeff_mm_base,
+        coeff_mm_u,
+        coeff_mm_v,
         coeff_mm_uv,
+        coeff_ml_base,
+        coeff_ml_u,
+        coeff_ml_v,
         coeff_ml_uv,
+        coeff_ll_base,
+        coeff_ll_u,
+        coeff_ll_v,
         coeff_ll_uv,
+        mean_wiggle_base,
         a_u,
         a_v,
         a_uv,
         c_u,
         c_v,
         c_uv,
+        gradient_ls_base: base.gradient_ls.clone(),
+        gradient_ls_u: first_u.gradient_ls.clone(),
+        gradient_ls_v: first_v.gradient_ls.clone(),
+        gradient_ls_uv: second_uv.gradient_ls.clone(),
         l_u,
         l_v,
         l_uv,
@@ -924,6 +977,7 @@ impl GaussianLocationScaleWiggleFamily {
         let q_uv = &(&geom.d2q_dq02 * &(&xi_u * &xi_v)) + &(&b1u * &xi_v) + &(&b1v * &xi_u);
         let s1_uv = &(&geom.d3q_dq03 * &(&xi_u * &xi_v)) + &(&b2u * &xi_v) + &(&b2v * &xi_u);
         let g2_uv = &(&geom.d4q_dq04 * &(&xi_u * &xi_v)) + &(&b3u * &xi_v) + &(&b3v * &xi_u);
+        let zeta_uv = Array1::zeros(zeta_u.len());
 
         let GlsWiggleSecondDirCoeffs {
             coeff_mm_uv,
@@ -944,12 +998,14 @@ impl GaussianLocationScaleWiggleFamily {
             hessian_mm_u,
             hessian_mm_v,
             hessian_mm_uv,
+            ..
         } = gls_wiggle_second_directional_coeffs(
             &rows,
             &geom,
             &GlsWiggleDirPieces {
                 zeta_u: &zeta_u,
                 zeta_v: &zeta_v,
+                zeta_uv: &zeta_uv,
                 q_u: &q_u,
                 q_v: &q_v,
                 q_uv: &q_uv,
@@ -1108,6 +1164,7 @@ impl GaussianLocationScaleWiggleFamily {
         let q_uv = &(&geom.d2q_dq02 * &(&xi_u * &xi_v)) + &(&b1u * &xi_v) + &(&b1v * &xi_u);
         let s1_uv = &(&geom.d3q_dq03 * &(&xi_u * &xi_v)) + &(&b2u * &xi_v) + &(&b2v * &xi_u);
         let g2_uv = &(&geom.d4q_dq04 * &(&xi_u * &xi_v)) + &(&b3u * &xi_v) + &(&b3v * &xi_u);
+        let zeta_uv = Array1::zeros(zeta_u.len());
 
         let basis_u = scale_matrix_rows(&geom.basis_d1, &xi_u)?;
         let basis_v = scale_matrix_rows(&geom.basis_d1, &xi_v)?;
@@ -1138,12 +1195,14 @@ impl GaussianLocationScaleWiggleFamily {
             hessian_mm_u,
             hessian_mm_v,
             hessian_mm_uv,
+            ..
         } = gls_wiggle_second_directional_coeffs(
             &rows,
             &geom,
             &GlsWiggleDirPieces {
                 zeta_u: &zeta_u,
                 zeta_v: &zeta_v,
+                zeta_uv: &zeta_uv,
                 q_u: &q_u,
                 q_v: &q_v,
                 q_uv: &q_uv,
