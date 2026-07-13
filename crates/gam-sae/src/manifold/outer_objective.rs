@@ -3519,6 +3519,14 @@ fn reactive_rho_domain_upper(
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         let streaming_plan = self.term.streaming_plan();
+        let gradient = sae_outer_gradient_capability(streaming_plan);
+        // SAE's Fellner--Schall/MacKay updates are useful simultaneous proposal
+        // directions, but their zeros omit the profiled criterion's state-
+        // response/third-order channels. They may drive a fixed-point solver
+        // only when the complete analytic gradient is available to certify the
+        // terminal KKT root. Matrix-free SAE currently lacks that proof surface
+        // and must refuse rather than mint a surrogate fixed point (#2253).
+        let exact_gradient_certificate = matches!(gradient, Derivative::Analytic);
         let assignment_gradient_dim =
             usize::from(assignment_strength_gradient_coordinate(&self.baseline_rho).is_some());
         OuterCapability {
@@ -3532,7 +3540,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             //    from analytic inverse traces in one pass. It explicitly declares
             //    the gradient UNAVAILABLE; the zero-gradient `eval` result in that
             //    regime is startup plumbing and can never certify a fit.
-            gradient: sae_outer_gradient_capability(streaming_plan),
+            gradient,
             // The profiled SAE criterion currently exposes an exact analytic
             // gradient but no exact second derivative. Never advertise curvature
             // manufactured by perturbing ρ and re-solving the inner problem: that
@@ -3546,7 +3554,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // scalable EFS updates still own smoothness/ARD while this coordinate
             // moves by its exact penalized quasi-Laplace gradient. Small dense fits still select the
             // ordinary full-gradient BFGS plan at the existing crossover.
-            psi_dim: assignment_gradient_dim,
+            psi_dim: if exact_gradient_certificate {
+                assignment_gradient_dim
+            } else {
+                0
+            },
             // The SAE path minimizes its explicitly named custom quasi-Laplace
             // criterion. The extended Fellner--Schall fixed point needs only the traces
             // tr(H⁻¹ S_c) (decoder_smoothness_effective_dof + ard_inverse_traces),
@@ -3562,10 +3574,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // bounded and `energy > 0`, so λ cannot rail to a mean-collapse).
             // Fitted-data collapse is recorded separately as a structure-search
             // verdict and never changes this fixed-point objective.
-            fixed_point_available: true,
+            fixed_point_available: exact_gradient_certificate,
             barrier_config: None,
             prefer_gradient_only: false,
-            disable_fixed_point: false,
+            disable_fixed_point: !exact_gradient_certificate,
         }
     }
 
@@ -4022,15 +4034,24 @@ impl OuterObjective for SaeManifoldOuterObjective {
         rho: &Array1<f64>,
     ) -> Result<FixedPointCertificateEval, EstimationError> {
         self.check_cancelled()?;
-        let (evaluation, coordinates) = self
-            .efs_step_with_certificate(rho.view())
-            .map_err(EstimationError::RemlOptimizationFailed)?;
-        let rho_state = self
-            .baseline_rho
-            .from_flat(rho.view())
-            .map_err(EstimationError::InvalidInput)?;
-        let cost = evaluation.cost + self.block_jacobian(&rho_state);
-        Ok(FixedPointCertificateEval { cost, coordinates })
+        // EFS/MacKay step zeros are not the stationarity equations of the full
+        // profiled quasi-Laplace objective: the exact gradient also contains
+        // logdet state response, the third-order correction, and rank-response
+        // channels. Re-evaluate the authoritative analytic sample and expose its
+        // negative gradient as the signed feasible-descent residual. The generic
+        // fixed-point certificate projects this vector at the rho box and applies
+        // the same tolerance as the first-order optimizer, so an EFS proposal can
+        // accelerate iteration but can never certify a different root (#2253).
+        let evaluation = self.eval(rho)?;
+        let coordinates = evaluation
+            .gradient
+            .iter()
+            .map(|&gradient| FixedPointCoordinateCertificate::covered(-gradient, 1.0))
+            .collect();
+        Ok(FixedPointCertificateEval {
+            cost: evaluation.cost,
+            coordinates,
+        })
     }
 
     fn reset(&mut self) {

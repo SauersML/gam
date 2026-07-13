@@ -359,10 +359,14 @@ fn fixed_point_certificate_covers_non_ordered_beta_bernoulli_exact_gradient() {
     let proof = proof_objective
         .eval_fixed_point_certificate(&proof_rho)
         .expect("fixed-point proof hook must evaluate");
+    let (mut exact_objective, exact_rho) = make_objective();
+    let exact = exact_objective
+        .eval(&exact_rho)
+        .expect("authoritative analytic gradient");
     assert_eq!(proof.coordinates.len(), proof_rho.len());
     match &proof.coordinates[0] {
         FixedPointCoordinateCertificate::Covered { update, scale } => {
-            assert_abs_diff_eq!(*update, iteration.steps[0], epsilon = 1.0e-12);
+            assert_abs_diff_eq!(*update, -exact.gradient[0], epsilon = 1.0e-12);
             assert_eq!(*scale, 1.0);
         }
         FixedPointCoordinateCertificate::Uncovered { reason } => panic!(
@@ -408,9 +412,13 @@ fn fixed_point_certificate_covers_ordered_beta_bernoulli_complete_gradient() {
     let proof = proof_objective
         .eval_fixed_point_certificate(&proof_rho)
         .expect("ordered Beta--Bernoulli fixed-point proof hook must evaluate");
+    let (mut exact_objective, exact_rho) = make_objective();
+    let exact = exact_objective
+        .eval(&exact_rho)
+        .expect("authoritative analytic gradient");
     match &proof.coordinates[0] {
         FixedPointCoordinateCertificate::Covered { update, scale } => {
-            assert_abs_diff_eq!(*update, iteration.steps[0], epsilon = 1.0e-12);
+            assert_abs_diff_eq!(*update, -exact.gradient[0], epsilon = 1.0e-12);
             assert_eq!(*scale, 1.0);
         }
         FixedPointCoordinateCertificate::Uncovered { reason } => panic!(
