@@ -6455,7 +6455,17 @@ impl SaeManifoldTerm {
                     target,
                     dictionary_rank,
                 );
-                if !(ev_now.is_finite() && ev_now > ev_floor) {
+                // The signal-free floor renders NO verdict when the dictionary is
+                // rank-saturated (reachable rank >= n): colspan(Φ) is all of Rⁿ, so
+                // every fit reconstructs the target and EV carries zero evidence
+                // about degeneracy — `absolute_degeneracy_ev_floor` returns NaN by
+                // that convention. The per-iteration detector already stands down on
+                // a NaN floor (its `ev <= ev_floor` guard is false on NaN); the
+                // exhaustion guard MUST too, or a high-EV fit on a small saturated
+                // fixture is falsely rejected as co-collapsed — `ev_now > NaN` is
+                // always false, so the bare `!(ev_now > ev_floor)` always fired.
+                // Only raise on a FINITE verdict that EV genuinely fails to clear.
+                if ev_floor.is_finite() && !(ev_now.is_finite() && ev_now > ev_floor) {
                     // Carry the collapse MEASUREMENTS in the message so a caller that
                     // deliberately drives co-collapse as a control (red-tree scaling
                     // experiments) can read the numbers off the exception instead of
