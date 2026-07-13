@@ -1793,6 +1793,7 @@ impl SurvivalMarginalSlopeFamily {
                 self.n,
                 |range| -> Result<_, String> {
                     let mut acc = make_per_z_acc();
+                    let mut row_jet_arena = gam_math::jet_scalar::DynamicJetArena::new();
                     for row in range {
                     let q0 = self.design_entry.dot_row(row, beta_time)
                         + self.offset_entry[row]
@@ -1815,6 +1816,7 @@ impl SurvivalMarginalSlopeFamily {
                         self.event[row],
                         self.derivative_guard,
                         probit_scale,
+                        &mut row_jet_arena,
                     )?;
                     acc.0 -= nll;
                     self.design_entry
@@ -1929,6 +1931,7 @@ impl SurvivalMarginalSlopeFamily {
                 self.n,
                 |range| -> Result<_, String> {
                     let mut acc = make_per_z_joint_acc();
+                    let mut row_jet_arena = gam_math::jet_scalar::DynamicJetArena::new();
                     for row in range {
                     let q0 = self.design_entry.dot_row(row, beta_time)
                         + self.offset_entry[row]
@@ -1951,6 +1954,7 @@ impl SurvivalMarginalSlopeFamily {
                         self.event[row],
                         self.derivative_guard,
                         probit_scale,
+                        &mut row_jet_arena,
                     )?;
                     acc.0 -= nll;
                     let mut j = Array2::<f64>::zeros((dim, total));

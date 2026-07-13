@@ -34,11 +34,10 @@ PROTOCOL (matches the real-data numbers posted to #1026):
 
 CPU PARTIAL: pass --cpu-partial to run K in {1,2,4,8}. It measures whether
 curved EV climbs and then starts flattening on the available banked slice, but
-it is NOT acceptance for the roadmap.
-
-GPU REQUIREMENT: the official Qwen 32K-reference comparison needs the full
-K in {8,32,128,512} ladder at token rate. K>=32 is gated on the device-resident
-solver (#1017) + memory work (#1009), so CPU evidence cannot close #1026.
+it is NOT acceptance for the roadmap. The full K in {8,32,128,512} ladder is
+also a supported CPU production path and is the authoritative timing contract
+for the committed 635-row fixture (#2267). A GPU can accelerate larger token-
+rate corpora, but it is not a validity requirement for this measurement.
 
 EXAMPLE (OLMo-3-32B base, layer 25, on a cluster compute node):
   python examples/sae_ev_vs_k_olmo.py \

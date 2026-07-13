@@ -4,6 +4,8 @@
 
 use super::*;
 
+use gam_math::jet_scalar::{DynamicJetArena, DynamicOrder2, RuntimeJetScalar};
+
 // ── Closed-form row kernel ─────────────────────────────────────────────
 //
 // The survival marginal-slope NLL for row i is:
@@ -484,7 +486,11 @@ pub fn survival_marginal_slope_vector_neglog(
             - event * ad1.ln()))
 }
 
-pub(crate) fn marginal_slope_covariance_matvec(
+#[cfg(test)]
+mod vector_hand_oracle {
+    use super::*;
+
+fn marginal_slope_covariance_matvec(
     covariance: &MarginalSlopeCovariance,
     vector: &[f64],
 ) -> Result<Vec<f64>, String> {
@@ -532,7 +538,7 @@ pub(crate) fn marginal_slope_covariance_matvec(
     })
 }
 
-pub(crate) fn row_primary_closed_form_vector(
+pub(super) fn row_primary_closed_form_vector_hand_reference(
     q0: f64,
     q1: f64,
     qd1: f64,
@@ -670,6 +676,213 @@ pub(crate) fn row_primary_closed_form_vector(
         }
     }
     Ok((nll, grad, hess))
+}
+
+}
+
+/// Runtime-width rigid row program for independent score slopes.
+///
+/// The first three primaries are `(q0, q1, qd1)` and the remaining primaries
+/// are the score-specific slopes. The covariance representation changes only
+/// how the exact quadratic form `r' Sigma r` is lowered; every value, gradient,
+/// and Hessian channel then flows through the same stable probit/log-density
+/// leaf stacks as [`rigid_row_nll`]. There is no separately maintained chain
+/// rule for score cross-blocks.
+fn rigid_vector_row_nll<'arena, S>(
+    vars: &[S],
+    z: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    inputs: &RigidRowInputs,
+    arena: &'arena DynamicJetArena,
+) -> Result<S, String>
+where
+    S: RuntimeJetScalar<'arena, Workspace = DynamicJetArena>,
+{
+    let dimension = vars.len();
+    let k = dimension.checked_sub(3).ok_or_else(|| {
+        SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope vector row needs three index primaries, got {dimension}"
+            ),
+        }
+        .to_string()
+    })?;
+    if z.len() != k || covariance.dim() != k {
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope vector row dimension mismatch: slopes={k}, z={}, covariance={}",
+                z.len(),
+                covariance.dim()
+            ),
+        }
+        .into());
+    }
+    covariance.validate("survival marginal-slope vector row program")?;
+    if !inputs.probit_scale.is_finite() {
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: format!(
+                "survival marginal-slope probit scale must be finite, got {}",
+                inputs.probit_scale
+            ),
+        }
+        .into());
+    }
+    if z.iter().any(|value| !value.is_finite())
+        || vars[3..].iter().any(|slope| !slope.value().is_finite())
+    {
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: "survival marginal-slope vector scores and slopes must be finite".to_string(),
+        }
+        .into());
+    }
+
+    let observed_slopes = arena.alloc_slice_fill_with(k, |axis| {
+        vars[3 + axis].scale(inputs.probit_scale)
+    });
+    let mut linear = S::constant(0.0, dimension, arena);
+    for axis in 0..k {
+        linear = linear.add(&observed_slopes[axis].scale(z[axis]));
+    }
+
+    // Preserve each covariance representation's canonical accumulation order.
+    // In particular, LowRank evaluates ||L' r||^2 without materializing Sigma.
+    let mut variance = S::constant(0.0, dimension, arena);
+    match covariance {
+        MarginalSlopeCovariance::Diagonal(diagonal) => {
+            for axis in 0..k {
+                variance = variance.add(
+                    &observed_slopes[axis]
+                        .mul(&observed_slopes[axis])
+                        .scale(diagonal[axis]),
+                );
+            }
+        }
+        MarginalSlopeCovariance::Full(matrix) => {
+            for row in 0..k {
+                let mut row_dot = S::constant(0.0, dimension, arena);
+                for column in 0..k {
+                    row_dot = row_dot.add(&observed_slopes[column].scale(matrix[[row, column]]));
+                }
+                variance = variance.add(&observed_slopes[row].mul(&row_dot));
+            }
+        }
+        MarginalSlopeCovariance::LowRank(factor) => {
+            for column in 0..factor.ncols() {
+                let mut projection = S::constant(0.0, dimension, arena);
+                for row in 0..k {
+                    projection =
+                        projection.add(&observed_slopes[row].scale(factor[[row, column]]));
+                }
+                variance = variance.add(&projection.mul(&projection));
+            }
+        }
+    }
+    let variance_value = variance.value();
+    if !(variance_value.is_finite()
+        && variance_value >= crate::bms::gradient_paths::COVARIANCE_QUADRATIC_FORM_PSD_TOL)
+    {
+        return Err(SurvivalMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "survival marginal-slope covariance quadratic form must be non-negative, got {variance_value}"
+            ),
+        }
+        .into());
+    }
+    // At a mathematical zero, floating accumulation may land a few ulps below
+    // zero. Shift only the primal constant; derivative channels are unchanged.
+    if variance_value < 0.0 {
+        variance = variance.add(&S::constant(-variance_value, dimension, arena));
+    }
+
+    let one_plus_variance = variance.add(&S::constant(1.0, dimension, arena));
+    let correction = one_plus_variance.compose_unary(unary_derivatives_sqrt(
+        one_plus_variance.value(),
+    ));
+    let eta0 = vars[0].mul(&correction).add(&linear);
+    let eta1 = vars[1].mul(&correction).add(&linear);
+    let adjusted_derivative = vars[2].mul(&correction);
+    let neg_eta0 = eta0.neg();
+    let neg_eta1 = eta1.neg();
+
+    validate_rigid_row_admission(
+        vars[2].value(),
+        inputs,
+        neg_eta0.value(),
+        neg_eta1.value(),
+        adjusted_derivative.value(),
+    )?;
+
+    let entry = neg_eta0
+        .compose_unary(unary_derivatives_neglog_phi(neg_eta0.value(), inputs.wi))
+        .scale(-1.0);
+    let exit = neg_eta1.compose_unary(unary_derivatives_neglog_phi(
+        neg_eta1.value(),
+        inputs.wi * (1.0 - inputs.di),
+    ));
+    let mut event_density = S::constant(0.0, dimension, arena);
+    let mut time_derivative = S::constant(0.0, dimension, arena);
+    if inputs.di > 0.0 {
+        event_density = eta1
+            .compose_unary(unary_derivatives_log_normal_pdf(eta1.value()))
+            .scale((-inputs.wi) * inputs.di);
+        time_derivative = adjusted_derivative
+            .compose_unary(unary_derivatives_log(adjusted_derivative.value()))
+            .scale((-inputs.wi) * inputs.di);
+    }
+    Ok(exit
+        .add(&entry)
+        .add(&event_density.add(&time_derivative)))
+}
+
+pub(crate) fn row_primary_closed_form_vector(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    slopes: &[f64],
+    z: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+    arena: &mut DynamicJetArena,
+) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    let k = slopes.len();
+    if z.len() != k || covariance.dim() != k {
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope vector row dimension mismatch: slopes={}, z={}, covariance={}",
+                k,
+                z.len(),
+                covariance.dim()
+            ),
+        }
+        .into());
+    }
+    let dim = 3 + k;
+    arena.reset();
+    let primary_values = arena.alloc_slice_fill_with(dim, |axis| match axis {
+        0 => q0,
+        1 => q1,
+        2 => qd1,
+        _ => slopes[axis - 3],
+    });
+    let vars = arena.alloc_slice_fill_with(dim, |axis| {
+        DynamicOrder2::variable(primary_values[axis], axis, dim, arena)
+    });
+    let inputs = RigidRowInputs {
+        row: 0,
+        wi: w,
+        di: d,
+        z_sum: 0.0,
+        covariance_ones: 0.0,
+        probit_scale,
+        qd1_lower: derivative_guard,
+    };
+    let row = rigid_vector_row_nll(vars, z, covariance, &inputs, arena)?;
+    let gradient = Array1::from_vec(row.g().to_vec());
+    let hessian = Array2::from_shape_fn((dim, dim), |(a, b)| row.h_at(a, b));
+    Ok((row.v, gradient, hessian))
 }
 
 pub(crate) fn standardize_latent_z_matrix_with_policy(

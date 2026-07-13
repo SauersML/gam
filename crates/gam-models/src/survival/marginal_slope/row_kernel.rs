@@ -1028,7 +1028,7 @@ pub(crate) fn rigid_row_nll<S: JetScalar<4>>(
 /// the already-admitted GPU gather. The three witnesses come from the same
 /// [`row_program!`] declaration: directly from the generic program on CPU and
 /// from its dependency-sliced scalar witness schedule during GPU admission.
-fn validate_rigid_row_admission(
+pub(super) fn validate_rigid_row_admission(
     qd1: f64,
     inputs: &RigidRowInputs,
     neg_eta0: f64,
