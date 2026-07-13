@@ -290,7 +290,6 @@ pub trait RuntimeJetScalar<'arena>: Clone {
         )
     }
 
-
     /// Evaluate `sum_i weights[i] * inputs[i]` in one semantic primitive.
     fn linear_combination(
         inputs: &[Self],
@@ -2245,21 +2244,47 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
             }
             out.g[primary] = 2.0 * channel;
         }
-        for primary_a in 0..K {
-            for primary_b in primary_a..K {
+        let mut input_gradient = [0.0; K];
+        let mut projected_gradient = [0.0; K];
+        for primary_b in 0..K {
+            for row in 0..input_dimension {
+                input_gradient[row] = inputs[row].0.g[primary_b];
+            }
+            coefficients.multiply(
+                &input_gradient[..input_dimension],
+                &mut projected_gradient[..input_dimension],
+            );
+            for primary_a in 0..=primary_b {
                 let mut inherited = 0.0;
                 let mut curvature = 0.0;
                 for row in 0..input_dimension {
                     inherited += projected[row] * inputs[row].0.h[primary_a][primary_b];
-                    for column in 0..input_dimension {
-                        curvature += coefficients.coefficient(row, column)
-                            * inputs[row].0.g[primary_a]
-                            * inputs[column].0.g[primary_b];
-                    }
+                    curvature += inputs[row].0.g[primary_a] * projected_gradient[row];
                 }
                 let channel = 2.0 * (inherited + curvature);
                 out.h[primary_a][primary_b] = channel;
                 out.h[primary_b][primary_a] = channel;
+            }
+        }
+        Order2(out)
+    }
+
+    #[inline(always)]
+    fn linear_combination(inputs: &[Self], weights: &[f64]) -> Self {
+        assert_eq!(inputs.len(), weights.len());
+        let mut out = crate::jet_tower::Tower2::zero();
+        for (input, &weight) in inputs.iter().zip(weights) {
+            out.v += input.0.v * weight;
+        }
+        for primary in 0..K {
+            for (input, &weight) in inputs.iter().zip(weights) {
+                out.g[primary] += input.0.g[primary] * weight;
+            }
+            for other in primary..K {
+                for (input, &weight) in inputs.iter().zip(weights) {
+                    out.h[primary][other] += input.0.h[primary][other] * weight;
+                }
+                out.h[other][primary] = out.h[primary][other];
             }
         }
         Order2(out)
@@ -3992,6 +4017,15 @@ mod tests {
             JetField::mul,
             JetField::scale,
         );
+        let weights = [0.7, -1.1, 0.35];
+        let fixed_linear_direct = Order2::linear_combination(&fixed_inputs, &weights);
+        let fixed_linear_scalar = linear_combination_default(
+            &fixed_inputs,
+            &weights,
+            Order2::constant,
+            JetField::add,
+            JetField::scale,
+        );
 
         let arena = DynamicJetArena::new();
         let dynamic_vars: [DynamicOrder2<'_>; K] =
@@ -4011,6 +4045,15 @@ mod tests {
             RuntimeJetScalar::mul,
             RuntimeJetScalar::scale,
         );
+        let dynamic_linear_direct =
+            DynamicOrder2::linear_combination(&dynamic_inputs, &weights, K, &arena);
+        let dynamic_linear_scalar = linear_combination_default(
+            &dynamic_inputs,
+            &weights,
+            |value| DynamicOrder2::constant(value, K, &arena),
+            RuntimeJetScalar::add,
+            RuntimeJetScalar::scale,
+        );
 
         let tolerance = 2.0e-13;
         for (label, actual, expected) in [
@@ -4019,6 +4062,16 @@ mod tests {
                 "dynamic value",
                 dynamic_direct.value(),
                 dynamic_scalar.value(),
+            ),
+            (
+                "fixed linear value",
+                fixed_linear_direct.value(),
+                fixed_linear_scalar.value(),
+            ),
+            (
+                "dynamic linear value",
+                dynamic_linear_direct.value(),
+                dynamic_linear_scalar.value(),
             ),
         ] {
             assert!(
@@ -4038,6 +4091,16 @@ mod tests {
                     dynamic_direct.g()[primary_a],
                     dynamic_scalar.g()[primary_a],
                 ),
+                (
+                    "fixed linear gradient",
+                    fixed_linear_direct.g()[primary_a],
+                    fixed_linear_scalar.g()[primary_a],
+                ),
+                (
+                    "dynamic linear gradient",
+                    dynamic_linear_direct.g()[primary_a],
+                    dynamic_linear_scalar.g()[primary_a],
+                ),
             ] {
                 assert!(
                     (actual - expected).abs()
@@ -4056,6 +4119,16 @@ mod tests {
                         "dynamic Hessian",
                         dynamic_direct.h_at(primary_a, primary_b),
                         dynamic_scalar.h_at(primary_a, primary_b),
+                    ),
+                    (
+                        "fixed linear Hessian",
+                        fixed_linear_direct.h()[primary_a][primary_b],
+                        fixed_linear_scalar.h()[primary_a][primary_b],
+                    ),
+                    (
+                        "dynamic linear Hessian",
+                        dynamic_linear_direct.h_at(primary_a, primary_b),
+                        dynamic_linear_scalar.h_at(primary_a, primary_b),
                     ),
                 ] {
                     assert!(
