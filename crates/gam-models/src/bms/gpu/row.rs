@@ -72,14 +72,14 @@
 //! ```
 //!
 //! Implementation choice (Stage 2): **one CUDA block per row**, with
-//! `blockDim.x = 32` threads. The block's `F_u`, `F_au`, `F_uv`, `bar_e_u`,
-//! `bar_e_uv` live in shared memory; threads in the block parallelise the
+//! `blockDim.x = 32` threads. The block's `F_u`, `F_au`, `F_uv`, and `bar_e_u`
+//! live in shared memory; threads in the block parallelise the
 //! per-cell sums, then a single thread of the block (`threadIdx.x == 0`) does
 //! the IFT solve, the observed-point assembly, the Mills evaluation, and the
 //! final gradient + Hessian write-out. With the `r ≤ MAX_R` cap (32) the
-//! shared-memory footprint per block is `r + r + r*r + r + r*r` doubles
-//! = `2r² + 3r` ≤ 2 144 doubles ≈ 17 KB, well below the V100 48 KB per-block
-//! limit. This keeps the implementation simple and avoids per-thread global
+//! shared-memory footprint, including two 32-wide reductions and two scalars,
+//! is `r² + 3r + 66` ≤ 1 186 doubles ≈ 9.3 KiB, well below the V100 48 KiB
+//! per-block limit. This keeps the implementation simple and avoids per-thread global
 //! scratch (a per-thread `r*r` scratch arena would be ~2 GB at n=195k, r=20).
 
 #[cfg(target_os = "linux")]
@@ -467,7 +467,6 @@ extern "C" __global__ void bms_flex_row_kernel(
     //   F_au     [r]
     //   F_uv     [r*r]
     //   bar_e_u  [r]
-    //   bar_e_uv [r*r]
     //   reduce_a [blockDim.x]
     //   reduce_b [blockDim.x]
     // Sized for the worst case (r = MAX_R = 32).
@@ -475,7 +474,6 @@ extern "C" __global__ void bms_flex_row_kernel(
     __shared__ double F_au[32];
     __shared__ double F_uv[32 * 32];
     __shared__ double bar_e_u[32];
-    __shared__ double bar_e_uv[32 * 32];
     __shared__ double reduce_a[32];
     __shared__ double reduce_b[32];
     __shared__ double F_a_shared;
@@ -643,6 +641,9 @@ fn build_generated_row_kernel_source() -> String {
     BmsFlexRowProgram::try_for_each_calibration_order2_phase(
         true,
         |phase| -> Result<(), std::convert::Infallible> {
+            source.push_str(&format!(
+                "        // canonical calibration phase: {phase:?}\n"
+            ));
             match phase {
                 BmsFlexCalibrationOrder2Phase::InterceptFirst => {
                     source.push_str("        local_Fa += D_OF(A_c);\n");
@@ -693,6 +694,7 @@ fn build_generated_row_kernel_source() -> String {
     BmsFlexRowProgram::try_for_each_order2_finalizer_phase(
         true,
         |phase| -> Result<(), std::convert::Infallible> {
+            source.push_str(&format!("    // canonical finalizer phase: {phase:?}\n"));
             match phase {
                 BmsFlexRowOrder2FinalizerPhase::ImplicitFirst => {
                     source.push_str(
@@ -743,8 +745,6 @@ fn build_generated_row_kernel_source() -> String {
                                    + tau[u] * a_u[v]
                                    + a_u[u] * tau[v]
                                    + ruv[u * r + v];
-            bar_e_uv[u * r + v] = observed_second;
-            bar_e_uv[v * r + u] = observed_second;
             double hessian_value =
                 B_i * bar_e_u[u] * bar_e_u[v] + A_i * observed_second;
             out_hess[row * r * r + u * r + v] = hessian_value;
@@ -780,9 +780,8 @@ pub(crate) fn generated_row_kernel_source() -> &'static str {
 // Force `s_f` to be considered used at the Rust level even though Stage 2 of
 // the kernel doesn't consume it on-device (the host has already baked the
 // probit frailty scale into the per-cell cubic coefficients). The dispatcher
-// wave that ports the rigid-branch fallback may want to apply `s_f` device-side
-// for log diagnostics; leaving the field on the input struct + reading it here
-// avoids a `let _` silencer the build.rs scanner would reject.
+// validates that the host-baked cubic coefficients came from a finite,
+// positive frailty scale; reading it here also avoids a `let _` silencer.
 #[inline]
 pub(crate) fn s_f_diagnostic_finite(inputs: &BmsFlexRowKernelInputs<'_>) -> bool {
     inputs.s_f.is_finite() && inputs.s_f > 0.0
@@ -3553,6 +3552,25 @@ mod tests {
         assert!(source.contains("for (int u = 1; u < r; ++u)"));
         assert!(source.contains("for (int v = u; v < r; ++v)"));
         assert!(source.contains("Canonical implicit-first stage complete"));
+        let mut cursor = 0usize;
+        for marker in [
+            "canonical calibration phase: InterceptFirst",
+            "canonical calibration phase: InterceptSecond",
+            "canonical calibration phase: PrimaryFirstAndInterceptSecond",
+            "canonical calibration phase: PrimaryPairSecond",
+            "canonical finalizer phase: ImplicitFirst",
+            "canonical finalizer phase: ImplicitFirstComplete",
+            "canonical finalizer phase: ImplicitSecond",
+            "canonical finalizer phase: ObservedFirst",
+            "canonical finalizer phase: ObservedScoreSensitivity",
+            "canonical finalizer phase: ObservedSecond",
+            "canonical finalizer phase: NegLogFirst",
+        ] {
+            let relative = source[cursor..]
+                .find(marker)
+                .unwrap_or_else(|| panic!("generated CUDA source omitted phase {marker}"));
+            cursor += relative + marker.len();
+        }
         assert!(
             source.len() < 40_000,
             "generated CUDA source unexpectedly bloated"

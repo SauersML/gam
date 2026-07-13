@@ -372,7 +372,7 @@ impl BmsFlexRowProgram {
 
     /// Visit the canonical Order2 calibration phases without choosing a
     /// backend index representation.
-    fn try_for_each_calibration_order2_phase<E>(
+    pub(super) fn try_for_each_calibration_order2_phase<E>(
         need_hessian: bool,
         mut visit: impl FnMut(BmsFlexCalibrationOrder2Phase) -> Result<(), E>,
     ) -> Result<(), E> {
@@ -535,7 +535,7 @@ impl BmsFlexRowProgram {
 
     /// Visit the canonical dependency phases without selecting an index
     /// representation for a backend.
-    fn try_for_each_order2_finalizer_phase<E>(
+    pub(super) fn try_for_each_order2_finalizer_phase<E>(
         need_hessian: bool,
         mut visit: impl FnMut(BmsFlexRowOrder2FinalizerPhase) -> Result<(), E>,
     ) -> Result<(), E> {
@@ -672,6 +672,25 @@ mod tests {
             ]
         );
 
+        let mut order2_phases = Vec::new();
+        BmsFlexRowProgram::try_for_each_calibration_order2_phase(
+            true,
+            |phase| -> Result<(), std::convert::Infallible> {
+                order2_phases.push(phase);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            order2_phases,
+            vec![
+                BmsFlexCalibrationOrder2Phase::InterceptFirst,
+                BmsFlexCalibrationOrder2Phase::InterceptSecond,
+                BmsFlexCalibrationOrder2Phase::PrimaryFirstAndInterceptSecond,
+                BmsFlexCalibrationOrder2Phase::PrimaryPairSecond,
+            ]
+        );
+
         let mut order3 = Vec::new();
         BmsFlexRowProgram::try_for_each_calibration_order3_indexed(
             active.len(),
@@ -798,6 +817,28 @@ mod tests {
                 BmsFlexRowOrder2FinalizerNode::ObservedSecond { left: 1, right: 1 },
                 BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary: 0 },
                 BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary: 1 },
+            ]
+        );
+
+        let mut finalizer_phases = Vec::new();
+        BmsFlexRowProgram::try_for_each_order2_finalizer_phase(
+            true,
+            |phase| -> Result<(), std::convert::Infallible> {
+                finalizer_phases.push(phase);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            finalizer_phases,
+            vec![
+                BmsFlexRowOrder2FinalizerPhase::ImplicitFirst,
+                BmsFlexRowOrder2FinalizerPhase::ImplicitFirstComplete,
+                BmsFlexRowOrder2FinalizerPhase::ImplicitSecond,
+                BmsFlexRowOrder2FinalizerPhase::ObservedFirst,
+                BmsFlexRowOrder2FinalizerPhase::ObservedScoreSensitivity,
+                BmsFlexRowOrder2FinalizerPhase::ObservedSecond,
+                BmsFlexRowOrder2FinalizerPhase::NegLogFirst,
             ]
         );
     }
