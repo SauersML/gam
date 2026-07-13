@@ -1010,6 +1010,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &per_block,
             options,
             None,
+            None,
+            None,
         )
         .map_err(|error| CustomFamilyError::Optimization {
             context: "fit_custom_family no-smoothing covariance factorization",
@@ -1749,6 +1751,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         &per_block,
         &final_options,
         Some(&hessian),
+        inner.terminal_working_sets.as_deref(),
+        inner.terminal_working_sets.as_deref(),
     )
     .map_err(|error| CustomFamilyError::Optimization {
         context: "fit_custom_family final covariance factorization",
@@ -1879,6 +1883,8 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
         &inner.block_states,
         &per_block,
         options,
+        None,
+        None,
         None,
     )
     .map_err(|error| CustomFamilyError::Optimization {
@@ -2104,6 +2110,8 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         &per_block,
         options,
         Some(&hessian),
+        inner.terminal_working_sets.as_deref(),
+        inner.terminal_working_sets.as_deref(),
     )
     .map_err(|error| CustomFamilyError::Optimization {
         context: "fit_custom_family_fixed_log_lambdas_from_owned_mode covariance",

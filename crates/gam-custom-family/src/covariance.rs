@@ -1333,6 +1333,7 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
     per_block_log_lambdas: &[Array1<f64>],
     options: &BlockwiseFitOptions,
     preferred_unpenalized_hessian: Option<&Array2<f64>>,
+    preferred_working_sets: Option<&[BlockWorkingSet]>,
 ) -> Result<Option<FitGeometry>, String> {
     if specs.len() != per_block_log_lambdas.len() {
         return Ok(None);
@@ -1367,16 +1368,24 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
                     hessian.ncols(),
                 ));
             }
-            (
-                hessian.clone(),
-                // An owned returned-beta Hessian is exact coefficient-space
-                // curvature, not an IRLS pseudo-observation measure. Empty
-                // vectors truthfully encode that no working-data evidence was
-                // retained; row-length zero weights would fabricate an ALO
-                // system with a different likelihood geometry.
-                Array1::zeros(0),
-                Array1::zeros(0),
-            )
+            match preferred_working_sets {
+                Some([
+                    BlockWorkingSet::Diagonal {
+                        working_response,
+                        working_weights,
+                    },
+                ]) => (
+                    hessian.clone(),
+                    working_weights.clone(),
+                    working_response.clone(),
+                ),
+                // Exact coefficient curvature is sufficient for covariance
+                // and EDF, but it does not imply an IRLS row measure. Never
+                // mint ALO geometry from empty or zero pseudo-data.
+                Some([BlockWorkingSet::ExactNewton { .. }]) => return Ok(None),
+                None => return Ok(None),
+                Some(_) => return Ok(None),
+            }
         } else {
             let eval = family.evaluate(states).ok();
             let Some(eval) = eval else {
@@ -1399,12 +1408,9 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
                     if h.nrows() != spec.design.ncols() || h.ncols() != spec.design.ncols() {
                         return Ok(None);
                     }
-                    // The exact-Newton block carries no IRLS pseudo-data; the
-                    // trace edf reads only the penalized Hessian, and the
-                    // downstream IRLS covariance path is unused for these
-                    // families (they report dispersion = 1). Match the joint
-                    // multi-block branch's zero-length convention.
-                    (h, Array1::zeros(0), Array1::zeros(0))
+                    // `FitGeometry` promises paired score-side IRLS row data;
+                    // exact coefficient curvature alone does not provide it.
+                    return Ok(None);
                 }
                 _ => return Ok(None),
             }
@@ -1440,93 +1446,13 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
         }));
     }
 
-    let requires_explicit_joint_hessian = specs.iter().enumerate().any(|(idx, spec)| {
-        custom_family_block_role(&spec.name, idx, specs.len()) == gam_problem::BlockRole::LinkWiggle
-    });
-    let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let mut h = if let Some(hessian) = preferred_unpenalized_hessian {
-        if hessian.dim() != (total_p, total_p) || hessian.iter().any(|value| !value.is_finite()) {
-            return Err(format!(
-                "preferred joint geometry Hessian must be finite with shape {total_p}x{total_p}, got {}x{}",
-                hessian.nrows(),
-                hessian.ncols(),
-            ));
-        }
-        hessian.clone()
-    } else {
-        let Some(hessian) = exact_newton_joint_hessian_symmetrized(
-            family,
-            states,
-            specs,
-            total_p,
-            "compute_joint_geometry",
-        )?
-        else {
-            if requires_explicit_joint_hessian {
-                return Err(
-                    "link-wiggle fits require an exact explicit joint Hessian for posterior sampling"
-                        .to_string(),
-                );
-            }
-            return Ok(None);
-        };
-        hessian
-    };
-    let ranges = block_param_ranges(specs);
-    for (block_idx, spec) in specs.iter().enumerate() {
-        let Some(block_log_lambdas) = per_block_log_lambdas.get(block_idx) else {
-            return Ok(None);
-        };
-        let lambdas = exact_lambdas_from_log_strengths(
-            block_log_lambdas,
-            &format!("joint geometry block {block_idx} log strength"),
-        )?;
-        if lambdas.len() != spec.penalties.len() {
-            return Ok(None);
-        }
-        let (start, end) = ranges[block_idx];
-        let block_dim = end - start;
-        for (penalty_idx, penalty) in spec.penalties.iter().enumerate() {
-            let scale = lambdas[penalty_idx];
-            if scale == 0.0 {
-                continue;
-            }
-            let dense = penalty.as_dense_cow();
-            if dense.nrows() == block_dim && dense.ncols() == block_dim {
-                h.slice_mut(ndarray::s![start..end, start..end])
-                    .scaled_add(scale, &*dense);
-            } else if dense.nrows() == total_p && dense.ncols() == total_p {
-                h.scaled_add(scale, &*dense);
-            } else {
-                return Ok(None);
-            }
-        }
-    }
-    // gam#1587/#561: add the full-width JOINT penalty `Σ_t exp(ρ_t) S_t` at the
-    // selected `ρ_t`. The multinomial centered metric carries ALL of a fit's
-    // smoothing here (its per-block penalty lists are empty), so without this the
-    // exported geometry is the unpenalized likelihood Hessian and the trace EDF
-    // reads as the full coefficient count (no smoothing spent). No-op for the
-    // per-block-only families (`joint_penalties` is `None`).
-    if let Some(bundle) = options.joint_penalties.as_deref()
-        && !bundle.is_empty()
-    {
-        bundle.add_to_matrix(&mut h);
-    }
-    Ok(Some(FitGeometry {
-        coefficient_gauge: gam_problem::gauge::Gauge::identity(
-            &specs
-                .iter()
-                .map(|spec| spec.design.ncols())
-                .collect::<Vec<_>>(),
-        ),
-        penalized_hessian: h.into(),
-        // Joint exact-Newton curvature carries no per-row IRLS pseudo-data.
-        // Empty is the explicit unavailable representation; n zeros would be
-        // a fabricated likelihood measure.
-        working_weights: Array1::zeros(0),
-        working_response: Array1::zeros(0),
-    }))
+    // `FitGeometry` owns one paired score-side row measure. Multiple parameter
+    // blocks may have different working responses/weights and therefore cannot
+    // be encoded truthfully in that type. Their owned joint Hessian still feeds
+    // covariance and EDF through separate coefficient-space channels; ALO
+    // geometry remains explicitly unavailable until it has a typed multi-block
+    // representation.
+    Ok(None)
 }
 
 pub(crate) fn joint_penalty_subspace_trace_parts(

@@ -65,6 +65,7 @@ pub struct CustomFamilyHyperLayout {
     design_derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     family_axes: Vec<usize>,
     design_axis_count: usize,
+    axis_count: usize,
 }
 
 impl CustomFamilyHyperLayout {
@@ -86,11 +87,22 @@ impl CustomFamilyHyperLayout {
                 ));
             }
         }
-        let design_axis_count = design_derivative_blocks.iter().map(Vec::len).sum();
+        let design_axis_count = design_derivative_blocks.iter().try_fold(
+            0usize,
+            |count, derivatives| {
+                count.checked_add(derivatives.len()).ok_or_else(|| {
+                    "custom-family hyper layout design-axis count exceeds usize".to_string()
+                })
+            },
+        )?;
+        let axis_count = design_axis_count
+            .checked_add(family_axes.len())
+            .ok_or_else(|| "custom-family hyper layout axis count exceeds usize".to_string())?;
         Ok(Self {
             design_derivative_blocks,
             family_axes,
             design_axis_count,
+            axis_count,
         })
     }
 
@@ -107,7 +119,7 @@ impl CustomFamilyHyperLayout {
     }
 
     pub fn len(&self) -> usize {
-        self.design_axis_count + self.family_axes.len()
+        self.axis_count
     }
 
     pub fn is_empty(&self) -> bool {
@@ -126,16 +138,21 @@ impl CustomFamilyHyperLayout {
     pub fn axis(&self, global_index: usize) -> Option<CustomFamilyHyperAxis> {
         if global_index < self.design_axis_count {
             let mut remaining = global_index;
-            for (block, derivatives) in self.design_derivative_blocks.iter().enumerate() {
-                if remaining < derivatives.len() {
-                    return Some(CustomFamilyHyperAxis::DesignPenalty {
-                        block,
-                        derivative_index: remaining,
-                    });
-                }
-                remaining -= derivatives.len();
-            }
-            unreachable!("validated design-axis count must resolve every design coordinate");
+            return self
+                .design_derivative_blocks
+                .iter()
+                .enumerate()
+                .find_map(|(block, derivatives)| {
+                    if remaining < derivatives.len() {
+                        Some(CustomFamilyHyperAxis::DesignPenalty {
+                            block,
+                            derivative_index: remaining,
+                        })
+                    } else {
+                        remaining -= derivatives.len();
+                        None
+                    }
+                });
         }
         let family_offset = global_index.checked_sub(self.design_axis_count)?;
         self.family_axes
@@ -147,15 +164,16 @@ impl CustomFamilyHyperLayout {
     pub fn design_derivative(
         &self,
         global_index: usize,
-    ) -> Option<(usize, &CustomFamilyBlockPsiDerivative)> {
+    ) -> Option<(usize, usize, &CustomFamilyBlockPsiDerivative)> {
         match self.axis(global_index)? {
             CustomFamilyHyperAxis::DesignPenalty {
                 block,
                 derivative_index,
-            } => Some((
-                block,
-                &self.design_derivative_blocks[block][derivative_index],
-            )),
+            } => self
+                .design_derivative_blocks
+                .get(block)?
+                .get(derivative_index)
+                .map(|derivative| (block, derivative_index, derivative)),
             CustomFamilyHyperAxis::Family { .. } => None,
         }
     }

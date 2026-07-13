@@ -5634,10 +5634,16 @@ include!("construction_smoothness_dof.rs");
 
 // [#780 line-count gate] The `#[cfg(test)]` modules below the production code
 // are mechanically split into a sibling `*_tests` file and inlined via
-// `include!` (the sanctioned cohesive-module decomposition — see build.rs
-// file_stem_is_exempt_test_module). Keeps this tracked file under the 10k limit.
+// `include!` inside a private test-only module (the sanctioned cohesive-module
+// decomposition — see build.rs file_stem_is_exempt_test_module). Keeps this
+// tracked file under the 10k limit without putting test imports/items in the
+// production module namespace.
 #[cfg(test)]
-include!("construction_tests.rs");
+mod construction_tests {
+    use super::*;
+
+    include!("construction_tests.rs");
+}
 
 /// Solve-invariant operands of `selected_inverse_row_blocks_or_solve` (#932
 /// FRONT C): everything fixed across the per-row sweep of one

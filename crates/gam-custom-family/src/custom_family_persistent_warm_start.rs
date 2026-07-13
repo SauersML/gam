@@ -469,6 +469,7 @@ pub(crate) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>
         // joint-Newton pass produces them.
         kkt_residual: None,
         active_constraints: None,
+        terminal_working_sets: None,
     });
     let inner_status = cached_inner.as_ref().map_or("missing", |inner| {
         if inner.converged {

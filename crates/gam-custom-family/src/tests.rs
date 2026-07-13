@@ -425,6 +425,7 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
             beta: beta.clone(),
             eta: Array1::zeros(1),
         }],
+        terminal_working_sets: None,
         active_sets: vec![None],
         log_likelihood: 0.0,
         penalty_value: 0.5 * beta.dot(&fast_av(&s_lambda, &beta)),
@@ -601,6 +602,7 @@ pub(crate) fn joint_outer_gradient_projected_trace_drops_joint_null() {
             beta: beta.clone(),
             eta: Array1::zeros(1),
         }],
+        terminal_working_sets: None,
         active_sets: vec![None],
         log_likelihood: 0.0,
         penalty_value: 0.5 * beta.dot(&fast_av(&s_lambda, &beta)),
@@ -739,6 +741,7 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
                 beta: beta.clone(),
                 eta: Array1::zeros(1),
             }],
+            terminal_working_sets: None,
             active_sets: vec![None],
             log_likelihood: 0.0,
             penalty_value: 0.5 * lam * beta.dot(&fast_av(&s_unit, &beta)),
@@ -1095,6 +1098,7 @@ pub(crate) fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_boun
                 eta: Array1::zeros(1),
             },
         ],
+        terminal_working_sets: None,
         active_sets: vec![None, None, None],
         log_likelihood: 0.0,
         penalty_value: 0.5
@@ -2017,9 +2021,9 @@ pub(crate) fn advertised_workspace_gradient_missing_fails_before_row_measure_fal
 /// A workspace that exposes both a dense build and a matrix-free HVP and
 /// refines its representation per intent (#738): matrix-free for the inner
 /// solve, dense for logdet factorization. Mirrors CTN's contract.
-pub(crate) struct IntentRefiningHessianWorkspace {
-    pub(crate) dense_calls: Arc<AtomicUsize>,
-    pub(crate) matvec_calls: Arc<AtomicUsize>,
+struct IntentRefiningHessianWorkspace {
+    dense_calls: Arc<AtomicUsize>,
+    matvec_calls: Arc<AtomicUsize>,
 }
 
 impl ExactNewtonJointHessianWorkspace for IntentRefiningHessianWorkspace {
@@ -2992,10 +2996,10 @@ pub(crate) fn custom_family_outer_derivatives_keeps_strict_second_order_geometry
 }
 
 #[derive(Clone)]
-pub(crate) struct OneBlockQuarticExactFamily {
-    pub(crate) linear: f64,
-    pub(crate) curvature: f64,
-    pub(crate) second_scale: f64,
+struct OneBlockQuarticExactFamily {
+    linear: f64,
+    curvature: f64,
+    second_scale: f64,
 }
 
 impl CustomFamily for OneBlockQuarticExactFamily {
@@ -3361,7 +3365,7 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
 /// back to the exact pairwise second-directional path, and must return
 /// `None` when the pairwise fallback is not allowed (width cap exceeded).
 #[derive(Clone)]
-pub(crate) struct PairwiseJeffreysSeamFamily;
+struct PairwiseJeffreysSeamFamily;
 
 impl CustomFamily for PairwiseJeffreysSeamFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -4467,23 +4471,18 @@ pub(crate) fn owned_joint_penalty_geometry_uses_terminal_workspace_without_famil
         &per_block,
         &assembly_options,
         Some(&hessian),
+        evaluated.inner.terminal_working_sets.as_deref(),
     )
-    .expect("joint terminal geometry")
-    .expect("joint terminal geometry present");
+    .expect("joint terminal geometry decision");
     assert_eq!(
         family.evaluations.load(Ordering::Relaxed),
         evaluations_before_assembly,
-        "terminal Hessian materialization, covariance, and geometry must not call family.evaluate",
+        "terminal Hessian materialization, covariance, and geometry decision must not call family.evaluate",
     );
-    let expected_precision = Array2::eye(2) * 3.0;
     let expected_covariance = Array2::eye(2) / 3.0;
     assert!(
-        geometry
-            .penalized_hessian
-            .as_array()
-            .iter()
-            .zip(expected_precision.iter())
-            .all(|(actual, expected)| (actual - expected).abs() <= 1.0e-12),
+        geometry.is_none(),
+        "exact joint coefficient curvature has no single truthful IRLS row measure",
     );
     assert!(
         covariance

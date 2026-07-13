@@ -2450,6 +2450,10 @@ pub(crate) fn assemble_block_local_s_psi_psi(
 #[derive(Clone)]
 pub struct BlockwiseInnerResult {
     pub block_states: Vec<ParameterBlockState>,
+    /// Exact working-set evidence evaluated at `block_states` by the inner
+    /// solve. `None` only when an owned exact-Hessian workspace was the sole
+    /// family evaluation source.
+    pub(crate) terminal_working_sets: Option<Vec<BlockWorkingSet>>,
     pub active_sets: Vec<Option<Vec<usize>>>,
     pub log_likelihood: f64,
     pub penalty_value: f64,
@@ -2477,6 +2481,10 @@ impl std::fmt::Debug for BlockwiseInnerResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockwiseInnerResult")
             .field("block_states", &self.block_states)
+            .field(
+                "terminal_working_sets",
+                &self.terminal_working_sets.as_ref().map(Vec::len),
+            )
             .field("active_sets", &self.active_sets)
             .field("log_likelihood", &self.log_likelihood)
             .field("penalty_value", &self.penalty_value)
@@ -2512,4 +2520,5 @@ pub(crate) struct CachedInnerMode {
     pub(crate) joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     pub(crate) kkt_residual: Option<ProjectedKktResidual>,
     pub(crate) active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
+    pub(crate) terminal_working_sets: Option<Vec<BlockWorkingSet>>,
 }

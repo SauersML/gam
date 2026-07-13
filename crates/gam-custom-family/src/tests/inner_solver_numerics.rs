@@ -302,8 +302,15 @@ impl CustomFamily for OneBlockNearlySymmetricPseudoLaplaceFamily {
 pub(crate) struct OneBlockAlwaysErrorFamily;
 
 impl CustomFamily for OneBlockAlwaysErrorFamily {
-    fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        Err("synthetic outer objective failure: block[0] evaluate()".to_string())
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let state = block_states
+            .first()
+            .ok_or_else(|| "synthetic outer objective failure: missing block[0]".to_string())?;
+        Err(format!(
+            "synthetic outer objective failure: block[0] evaluate() at beta_dim={} eta_dim={}",
+            state.beta.len(),
+            state.eta.len(),
+        ))
     }
 }
 
@@ -324,10 +331,25 @@ impl CustomFamily for OneBlockCovarianceErrorFamily {
 
     fn exact_newton_joint_hessian_with_specs(
         &self,
-        _: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
-        Err("synthetic covariance assembly failure".to_string())
+        let state = block_states
+            .first()
+            .ok_or_else(|| {
+                "synthetic covariance assembly failure: missing block state".to_string()
+            })?;
+        let spec = specs
+            .first()
+            .ok_or_else(|| {
+                "synthetic covariance assembly failure: missing block spec".to_string()
+            })?;
+        Err(format!(
+            "synthetic covariance assembly failure for block '{}' at beta_dim={} design_dim={}",
+            spec.name,
+            state.beta.len(),
+            spec.design.ncols(),
+        ))
     }
 }
 

@@ -805,10 +805,6 @@ impl GaussianPcaPatch {
         noise * (signal + noise) / (signal * signal * self.covariance_degrees_of_freedom() as f64)
     }
 
-    fn tangent_frame(&self) -> Array2<f64> {
-        self.projection_frame.dot(&self.tangent_coordinates)
-    }
-
     fn audit_summary(&self) -> GaussianPcaPatchSummary {
         GaussianPcaPatchSummary {
             chart: self.chart,
@@ -3400,7 +3396,10 @@ fn build_projected_edge(
             spec.a, spec.b, spec.overlap
         ));
     }
-    // Coordinates are mapped from chart a to chart b, hence M = U_b^T U_a.
+    // Coordinates are mapped from chart a to chart b, hence
+    // M = U_b^T U_a = T_b^T (W_b^T W_a) T_a. Evaluate the exact factorized
+    // identity in retained coordinates instead of materializing either ambient
+    // tangent frame U_i = W_i T_i for every edge.
     let cross = patch_b
         .tangent_coordinates
         .t()

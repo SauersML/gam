@@ -438,6 +438,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 );
                 return Ok(BlockwiseInnerResult {
                     block_states: states,
+                    terminal_working_sets: cached.terminal_working_sets.clone(),
                     active_sets: normalize_active_sets(cached_active_sets),
                     log_likelihood: cached.log_likelihood,
                     penalty_value: cached.penalty_value,
@@ -6053,6 +6054,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
+                terminal_working_sets: cached_eval
+                    .as_ref()
+                    .map(|eval| eval.blockworking_sets.clone()),
                 active_sets: normalize_active_sets(cached_active_sets),
                 log_likelihood: current_log_likelihood,
                 penalty_value,
@@ -6241,6 +6245,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
+                terminal_working_sets: cached_eval
+                    .as_ref()
+                    .map(|eval| eval.blockworking_sets.clone()),
                 active_sets: normalize_active_sets(cached_active_sets),
                 log_likelihood: current_log_likelihood,
                 penalty_value,
@@ -6301,6 +6308,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
+                terminal_working_sets: cached_eval
+                    .as_ref()
+                    .map(|eval| eval.blockworking_sets.clone()),
                 active_sets: normalize_active_sets(cached_active_sets),
                 log_likelihood: current_log_likelihood,
                 penalty_value,
@@ -7343,6 +7353,7 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
     };
     Ok(BlockwiseInnerResult {
         block_states: states,
+        terminal_working_sets: Some(cached_eval.blockworking_sets.clone()),
         active_sets: normalize_active_sets(cached_active_sets),
         log_likelihood: cached_eval.log_likelihood,
         penalty_value,
