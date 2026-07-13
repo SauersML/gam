@@ -1099,9 +1099,24 @@ mod tests {
     fn compiled_graph_projects_only_sparse_supported_primary_directions() {
         let mut workspace = Order2GraphWorkspace::new();
         workspace.reset(MAX_PRIMARY_DIMENSION);
-        let x = Order2Graph::variable(0.4, 0, MAX_PRIMARY_DIMENSION, &workspace);
-        let y = Order2Graph::variable(-0.7, 7, MAX_PRIMARY_DIMENSION, &workspace);
-        let z = Order2Graph::variable(1.1, 15, MAX_PRIMARY_DIMENSION, &workspace);
+        let x = Order2Graph::<MAX_PRIMARY_DIMENSION>::variable(
+            0.4,
+            0,
+            MAX_PRIMARY_DIMENSION,
+            &workspace,
+        );
+        let y = Order2Graph::<MAX_PRIMARY_DIMENSION>::variable(
+            -0.7,
+            7,
+            MAX_PRIMARY_DIMENSION,
+            &workspace,
+        );
+        let z = Order2Graph::<MAX_PRIMARY_DIMENSION>::variable(
+            1.1,
+            15,
+            MAX_PRIMARY_DIMENSION,
+            &workspace,
+        );
         let coefficients = CountingIdentity3 {
             workspace: &workspace,
             multiply_calls: Cell::new(0),
