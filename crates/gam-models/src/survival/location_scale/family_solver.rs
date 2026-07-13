@@ -1495,7 +1495,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             self.clone(),
             block_states.to_vec(),
             specs.to_vec(),
-            derivative_blocks.to_vec(),
+            hyper_layout.clone(),
         )?)))
     }
 
@@ -1527,7 +1527,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             self.clone(),
             block_states.to_vec(),
             specs.to_vec(),
-            derivative_blocks.to_vec(),
+            hyper_layout.clone(),
         )?;
         if let Some(subsample) = options.outer_score_subsample.as_ref() {
             workspace.apply_outer_subsample(subsample.rows.as_ref());
@@ -2500,7 +2500,7 @@ pub(crate) struct SurvivalExactNewtonJointPsiWorkspace {
     pub(crate) family: SurvivalLocationScaleFamily,
     pub(crate) block_states: Vec<ParameterBlockState>,
     pub(crate) specs: Vec<ParameterBlockSpec>,
-    pub(crate) derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    pub(crate) hyper_layout: CustomFamilyHyperLayout,
     pub(crate) row_mask: Option<Arc<Array1<f64>>>,
 }
 
@@ -2509,13 +2509,13 @@ impl SurvivalExactNewtonJointPsiWorkspace {
         family: SurvivalLocationScaleFamily,
         block_states: Vec<ParameterBlockState>,
         specs: Vec<ParameterBlockSpec>,
-        derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+        hyper_layout: CustomFamilyHyperLayout,
     ) -> Result<Self, String> {
         Ok(Self {
             family,
             block_states,
             specs,
-            derivative_blocks,
+            hyper_layout,
             row_mask: None,
         })
     }
@@ -2543,7 +2543,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         self.family.exact_newton_joint_psi_terms_masked(
             &self.block_states,
             &self.specs,
-            &self.derivative_blocks,
+            self.hyper_layout.design_derivative_blocks(),
             psi_index,
             self.row_mask.as_deref(),
         )
@@ -2554,7 +2554,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let psi_dim = self.derivative_blocks.iter().map(Vec::len).sum::<usize>();
+        let psi_dim = self.hyper_layout.design_axis_count();
         if psi_i >= psi_dim || psi_j >= psi_dim {
             return Ok(None);
         }
@@ -2580,7 +2580,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
             }
             .into());
         }
-        let psi_dim = self.derivative_blocks.iter().map(Vec::len).sum::<usize>();
+        let psi_dim = self.hyper_layout.design_axis_count();
         if psi_index >= psi_dim {
             return Ok(None);
         }
@@ -2589,7 +2589,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
             .exact_newton_joint_psihessian_directional_derivative(
                 &self.block_states,
                 &self.specs,
-                &self.derivative_blocks,
+                &self.hyper_layout,
                 psi_index,
                 d_beta_flat,
             )?
