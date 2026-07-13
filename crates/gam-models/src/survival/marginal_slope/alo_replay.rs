@@ -7,7 +7,7 @@
 //! optimizer, and returns one exact coefficient score/Hessian per row.
 
 use super::*;
-use crate::bms::alo_replay::exact_runtime_from_saved;
+use crate::bms::exact_runtime_from_saved;
 use crate::inference::model::{SavedAnchorKind, SavedCompiledFlexBlock};
 
 pub struct SurvivalMarginalSlopeSavedAloReplayInput<'a> {

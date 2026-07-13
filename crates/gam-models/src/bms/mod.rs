@@ -58,6 +58,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 mod alo_replay;
 pub mod deviation_runtime;
 pub mod gpu;
+pub(crate) use alo_replay::exact_runtime_from_saved;
 pub use alo_replay::{
     BernoulliMarginalSlopeAloRowGeometry, BernoulliMarginalSlopeAloRowInput,
     BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloRowGeometry,
