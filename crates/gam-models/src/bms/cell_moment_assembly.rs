@@ -28,13 +28,14 @@ thread_local! {
         std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
 }
 
-/// Bound the live directional Hessian channels in one runtime-jet pass.
+/// Bound the live directional jet work in one row-plan pass.
 ///
-/// Each lane carries `r²` order-two coefficients at every live tape node.
-/// Keeping that product bounded avoids the cache cliff and geometric arena
-/// growth of an all-directions pass while every chunk still evaluates the same
-/// frozen [`EmpiricalBmsRowJetPlan`].
-const EMPIRICAL_BMS_BATCH_HESSIAN_CHANNEL_BUDGET: usize = 576;
+/// Each lane carries `r²` order-two coefficients, while the basis-dependent
+/// row program contributes `O(r)` live tape nodes. Bounding `lanes·r³` tracks
+/// the leading working set that caused the measured cache cliff and geometric
+/// arena growth, while every chunk still evaluates the same frozen
+/// [`EmpiricalBmsRowJetPlan`].
+const EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET: usize = 4096;
 /// Preserve pairwise reuse even when two lanes exceed the cache budget: a
 /// one-lane chunk pays the batching traversal cost without sharing any work.
 const EMPIRICAL_BMS_BATCH_LANE_FLOOR: usize = 2;
@@ -42,8 +43,8 @@ const EMPIRICAL_BMS_BATCH_LANE_CAP: usize = 8;
 
 #[inline]
 fn empirical_bms_directional_batch_lanes(r: usize) -> usize {
-    let channels_per_lane = r.saturating_mul(r).max(1);
-    (EMPIRICAL_BMS_BATCH_HESSIAN_CHANNEL_BUDGET / channels_per_lane)
+    let tape_work_per_lane = r.saturating_mul(r).saturating_mul(r).max(1);
+    (EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET / tape_work_per_lane)
         .clamp(EMPIRICAL_BMS_BATCH_LANE_FLOOR, EMPIRICAL_BMS_BATCH_LANE_CAP)
 }
 
@@ -3946,7 +3947,7 @@ mod empirical_flex_jet_oracle_tests {
     fn empirical_bms_directional_batch_budget_is_dimension_bounded_932() {
         assert_eq!(empirical_bms_directional_batch_lanes(4), 8);
         assert_eq!(empirical_bms_directional_batch_lanes(8), 8);
-        assert_eq!(empirical_bms_directional_batch_lanes(12), 4);
+        assert_eq!(empirical_bms_directional_batch_lanes(12), 2);
         assert_eq!(empirical_bms_directional_batch_lanes(18), 2);
 
         for r in 1..=128 {
@@ -3954,11 +3955,11 @@ mod empirical_flex_jet_oracle_tests {
             assert!(
                 (EMPIRICAL_BMS_BATCH_LANE_FLOOR..=EMPIRICAL_BMS_BATCH_LANE_CAP).contains(&lanes)
             );
-            let channels = lanes.saturating_mul(r.saturating_mul(r));
+            let tape_work = lanes.saturating_mul(r.saturating_mul(r).saturating_mul(r));
             assert!(
-                channels <= EMPIRICAL_BMS_BATCH_HESSIAN_CHANNEL_BUDGET
+                tape_work <= EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET
                     || lanes == EMPIRICAL_BMS_BATCH_LANE_FLOOR,
-                "r={r} lanes={lanes} carries {channels} Hessian channels"
+                "r={r} lanes={lanes} carries {tape_work} dimension-weighted channels"
             );
         }
     }
