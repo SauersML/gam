@@ -2322,9 +2322,9 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
         lane: &mut SurrogateLaneState,
-    ) -> Result<StreamingOuterEvaluation, String> {
+    ) -> Result<StreamingOuterEvaluation, SaeCriterionError> {
         lane.request_inverse_probes();
-        let (cost, loss, cache, system) = self
+        let evaluated = self
             .penalized_quasi_laplace_criterion_streaming_exact_with_cache_lane_and_system(
                 target,
                 rho,
@@ -2333,15 +2333,26 @@ impl SaeManifoldTerm {
                 learning_rate,
                 ridge_ext_coord,
                 ridge_beta,
-                Some(lane),
-            )?;
+                Some(&mut *lane),
+            );
+        let (cost, loss, cache, system) = match evaluated {
+            Ok(evaluated) => evaluated,
+            Err(error) => {
+                let _ = lane.take_inverse_probes();
+                return Err(error);
+            }
+        };
         let system = system.ok_or_else(|| {
-            "streaming outer evaluation did not retain its matrix-free evidence system"
-                .to_string()
+            SaeCriterionError::Numerical(
+                "streaming outer evaluation did not retain its matrix-free evidence system"
+                    .to_string(),
+            )
         })?;
         let inverse_probe_bundle = lane.take_inverse_probes().ok_or_else(|| {
-            "streaming outer evaluation did not emit the requested selected-inverse probe bundle"
-                .to_string()
+            SaeCriterionError::Numerical(
+                "streaming outer evaluation did not emit the requested selected-inverse probe bundle"
+                    .to_string(),
+            )
         })?;
         if let Some((row, directions)) = cache
             .deflated_row_directions
@@ -2349,12 +2360,12 @@ impl SaeManifoldTerm {
             .enumerate()
             .find(|(_, directions)| !directions.is_empty())
         {
-            return Err(format!(
+            return Err(SaeCriterionError::Numerical(format!(
                 "streaming outer derivative is undefined for row {row} with {} spectral \
                  deflation direction(s): the selected-inverse bundle does not carry the \
                  Daleckii--Krein correction",
                 directions.len()
-            ));
+            )));
         }
         Ok(StreamingOuterEvaluation {
             cost,
@@ -2382,7 +2393,7 @@ impl SaeManifoldTerm {
             ArrowFactorCache,
             Option<ArrowSchurSystem>,
         ),
-        String,
+        SaeCriterionError,
     > {
         self.assignment.validate_rho_domain(rho)?;
         let mut rho_fixed = rho.clone();

@@ -359,6 +359,17 @@ pub struct SaeIntoFittedResult {
     pub termination: SaeOuterTermination,
 }
 
+/// A converged fixed-`rho` inner state that lies on the boundary of its
+/// fixed-`K` stratum.  It is intentionally not a fit: the stage orchestrator
+/// must either remove a proper subset and re-run the reduced outer problem to
+/// certification, or materialize the exact Tier-0 null when every atom
+/// vanished.
+pub(crate) struct SaeVanishedStageState {
+    pub term: SaeManifoldTerm,
+    pub rho: SaeManifoldRho,
+    pub atoms: VanishedAtoms,
+}
+
 impl SaeIntoFittedResult {
     pub fn invalidates_pre_final_shape_uncertainty(&self) -> bool {
         self.charts_canonicalized
@@ -763,6 +774,66 @@ fn sae_surrogate_lane_config() -> SurrogateLaneConfig {
 }
 
 impl SaeManifoldOuterObjective {
+    pub(crate) fn current_rho_flat(&self) -> Array1<f64> {
+        self.current_rho.to_flat()
+    }
+
+    /// Re-evaluate one committed terminal coordinate with the idempotent dense
+    /// or streaming criterion and return its typed vanished-atom boundary, if
+    /// any. Speculative line-search probes continue to see disappearance as an
+    /// infeasible trial; only this stage-owner call may turn the terminal
+    /// coordinate into a change of model dimension.
+    pub(crate) fn vanished_stage_state_at(
+        &self,
+        rho_flat: ArrayView1<'_, f64>,
+    ) -> Result<Option<SaeVanishedStageState>, String> {
+        let rho = self.baseline_rho.from_flat(rho_flat)?;
+        let mut term = self.term.clone();
+        let evaluated = if term.streaming_plan().direct_logdet_admitted() {
+            term.penalized_quasi_laplace_criterion_with_cache(
+                self.target.view(),
+                &rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            )
+        } else {
+            term.penalized_quasi_laplace_criterion_streaming_exact_with_cache(
+                self.target.view(),
+                &rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            )
+        };
+        let atoms = match evaluated {
+            Ok(_) => return Ok(None),
+            Err(SaeCriterionError::Numerical(message)) => return Err(message),
+            Err(SaeCriterionError::VanishedAtoms(atoms)) => atoms,
+        };
+
+        let vanished = atoms.as_btree_set();
+        for atlas in term.chart_atlases() {
+            let removed = atlas
+                .charts()
+                .iter()
+                .filter(|chart| vanished.contains(chart))
+                .count();
+            if removed > 0 && removed < atlas.charts().len() {
+                return Err(format!(
+                    "vanished-atom boundary would partially delete live atlas {:?}; \
+                     chart-atlas disappearance must be adjudicated at semantic-atlas granularity",
+                    atlas.charts()
+                ));
+            }
+        }
+        Ok(Some(SaeVanishedStageState { term, rho, atoms }))
+    }
+
     pub fn new(
         mut term: SaeManifoldTerm,
         target: Array2<f64>,
@@ -838,7 +909,7 @@ impl SaeManifoldOuterObjective {
         &mut self,
         rho: &SaeManifoldRho,
         direct_logdet_admitted: bool,
-    ) -> Result<OuterCriterionEvaluation, String> {
+    ) -> Result<OuterCriterionEvaluation, SaeCriterionError> {
         if direct_logdet_admitted {
             let (cost, loss, cache) = self.term.penalized_quasi_laplace_criterion_with_cache(
                 self.target.view(),
@@ -858,8 +929,10 @@ impl SaeManifoldOuterObjective {
         }
 
         let lane = self.surrogate_lane.as_mut().ok_or_else(|| {
-            "streaming outer evaluation requires the frozen rational-logdet surrogate lane"
-                .to_string()
+            SaeCriterionError::Numerical(
+                "streaming outer evaluation requires the frozen rational-logdet surrogate lane"
+                    .to_string(),
+            )
         })?;
         let evaluated = self
             .term
@@ -942,7 +1015,9 @@ impl SaeManifoldOuterObjective {
         &mut self,
         rho: &SaeManifoldRho,
     ) -> Result<OuterEval, String> {
-        let evaluated = self.evaluate_outer_criterion_route(rho, false)?;
+        let evaluated = self
+            .evaluate_outer_criterion_route(rho, false)
+            .map_err(|error| error.to_string())?;
         let gradient = self
             .analytic_gradient_for_outer_evaluation(rho, &evaluated)
             .map_err(|error| error.to_string())?;
@@ -3256,6 +3331,7 @@ impl SaeManifoldOuterObjective {
         }
 
         let beta_hat = self.term.flatten_beta();
+        self.last_loss = Some(evaluation.loss);
         let consecutive_restored_incumbents = self
             .term
             .best_fit_incumbent
@@ -3871,13 +3947,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
             self.record_warm_start(warm_start_outcome)
                 .map_err(EstimationError::RemlOptimizationFailed)?;
         }
-        // The analytic gradient lane (`eval`) reads the dense joint-Hessian cache.
-        // In the matrix-free regime that cache does not exist, but SAE never
-        // descends ρ with this gradient lane there: the outer plan routes to the
-        // Fellner–Schall fixed point (`Solver::Efs` → `eval_efs`/`efs_step`), which
-        // needs only the analytic traces `tr(H⁻¹ S_c)` — no gradient, and (per
-        // SPEC) no finite differences. So this dense-cache path is reached only
-        // when the dense criterion factor is admitted.
+        // Dense and streaming analytic samples use one route-selected authority.
+        // The streaming artifact retains the exact matrix-free system and frozen
+        // inverse-probe bundle that produced its rational-logdet value; no dense
+        // retry or independently reassembled operator is allowed.
         // #1782 — a RECOVERABLE inner-solve refusal (a probed ρ whose undamped
         // joint Hessian is non-PD / whose inner solve cannot converge at that ρ)
         // is an INFEASIBLE-ρ signal, NOT a fatal defect: the value-only lanes
@@ -3891,15 +3964,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // while ordered_beta_bernoulli (whose seed happens to stay PD) survived. Treat it the
         // same infeasible way here so the three lanes agree; a genuinely
         // non-recoverable error still propagates.
-        let (cost, loss, cache) = match self.term.penalized_quasi_laplace_criterion_with_cache(
-            self.target.view(),
-            &rho_state,
-            self.registry.as_ref(),
-            self.inner_max_iter,
-            self.learning_rate,
-            self.ridge_ext_coord,
-            self.ridge_beta,
-        ) {
+        let direct_logdet_admitted = self.term.streaming_plan().direct_logdet_admitted();
+        let evaluation = match self
+            .evaluate_outer_criterion_route(&rho_state, direct_logdet_admitted)
+        {
             Ok(evaluated) => evaluated,
             Err(SaeCriterionError::VanishedAtoms(atoms)) => {
                 log::debug!("SAE analytic evaluation reached fixed-K structural boundary: {atoms}");
@@ -3923,60 +3991,17 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 return Err(EstimationError::RemlOptimizationFailed(err));
             }
         };
+        let cost = evaluation.cost;
         self.record_fit_data_collapse_verdict(&rho_state)
             .map_err(EstimationError::RemlOptimizationFailed)?;
         if !cost.is_finite() {
             self.probe_telemetry.infeasible_criterion_evals += 1;
             return Ok(OuterEval::infeasible(rho.len()));
         }
-        // Exact implicit derivative through the converged inner state. The arrow
-        // solver first applies a rank-revealing projection of the closed-form
-        // chart gauge and penalty-aware decoder nulls, then solves the resulting
-        // implicit-function system. A system that remains singular or unreliable
-        // is a typed `OuterGradientError`: it is not a usable derivative and must
-        // terminate this evaluation instead of being hidden behind a plain inverse
-        // or a differenced value path.
-        let lambda_smooth = rho_state
-            .lambda_smooth_vec()
-            .map_err(EstimationError::RemlOptimizationFailed)?;
-        let grad_components = self
-            .term
-            .outer_gradient_arrow_solver(&cache, &lambda_smooth)
-            .and_then(|solver| {
-                self.term
-                    .analytic_outer_rho_gradient_components_with_bundle(
-                        self.target.view(),
-                        &rho_state,
-                        &loss,
-                    cache,
-                        &solver,
-                        None,
-                        None,
-                    )
-            })
+        let gradient = self
+            .analytic_gradient_for_outer_evaluation(&rho_state, &evaluation)
             .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?;
-        let mut gradient = grad_components.gradient();
-        // #2231 Inc-B (stage 2) — ADD the block-relevance tail's explicit data +
-        // change-of-variables channels `½·R̃_ℓ − n·p_ℓ/2`
-        // ([`Self::block_log_lambda_gradient`]) to the components assembler's
-        // tail, which now carries the block coordinate's `−½·Γᵀθ̂_ρ` Laplace
-        // adjoint (`crosscoder_block_ift_rhs` feeds the exact-stationarity solve
-        // the target-scaling RHS `−½·Jᵀ_M Z̃^{(ℓ)}`). Explicit + adjoint together
-        // are the COMPLETE `∂C/∂log λ_ℓ` of the priced criterion — overwriting
-        // here would re-truncate the gradient to a fictitious fixed-θ̂ criterion
-        // (#2087 desync class). No-op for a plain SAE (`None` ⇒ the tail stays
-        // empty and untouched).
-        if let Some(block_grad) = self
-            .block_log_lambda_gradient(&rho_state)
-            .map_err(EstimationError::RemlOptimizationFailed)?
-        {
-            let tail = gradient.len() - block_grad.len();
-            for (l, g_l) in block_grad.into_iter().enumerate() {
-                gradient[tail + l] += g_l;
-            }
-        }
         let beta_hat = self.term.flatten_beta();
-        self.last_loss = Some(evaluation.loss);
         // #1206 — the gradient lane (`OuterEvalOrder::ValueAndGradient`, consumed
         // by the outer BFGS Armijo line search) MUST return a cost whose gradient
         // is the gradient we return: the consistent pair `(f, ∇f)` for the pure
@@ -4002,7 +4027,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // `outer_gradient_arrow_solver`, not something to paper over with a
         // differenced value path.
         self.current_rho = rho_state;
-        self.last_loss = Some(loss);
+        self.last_loss = Some(evaluation.loss);
         if self.termination.record(cost) {
             self.bank_checkpoint(rho);
         }

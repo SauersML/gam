@@ -252,7 +252,7 @@ fn fit_structured_metric(n: usize, p: usize) -> gam_problem::RowMetric {
 /// the dense direct plan (routing the criterion to streaming) while ADMITTING the
 /// matrix-free plan — the exact regime the streaming route was built for.
 #[test]
-fn wide_border_routes_to_streaming_without_fake_gradient_certificate() {
+fn wide_border_routes_to_streaming_with_complete_analytic_gradient_certificate() {
     let (n, p, k, d_max) = (500usize, 128usize, 32usize, 1usize);
     let total_basis = 2 * k; // width-2 euclidean basis per atom.
     let border_dim = total_basis * p;
@@ -286,8 +286,8 @@ fn wide_border_routes_to_streaming_without_fake_gradient_certificate() {
     );
     assert_eq!(
         sae_outer_gradient_capability(plan),
-        Derivative::Unavailable,
-        "matrix-free SAE must not advertise the startup-only zero vector as an analytic gradient"
+        Derivative::Analytic,
+        "matrix-free SAE must advertise the complete rational-value/single-adjoint gradient"
     );
     let dense_plan = sae_streaming_plan_from_budget(
         n,
@@ -317,6 +317,76 @@ fn wide_border_routes_to_streaming_without_fake_gradient_certificate() {
     // hard error) precisely because the matrix-free lane is admitted.
     plan.admitted_or_error(n, border_dim, k)
         .expect("matrix-free-admitted plan must not hard-error at the admission gate");
+}
+
+/// Production-objective routing pin for #2080(A). Force the small, exactly
+/// checkable planted-circle objective through the same streaming artifact used
+/// when the memory planner rejects direct evidence, then compare its returned
+/// `(value, gradient)` with the ordinary dense production evaluation. At this
+/// tiny border the derived-rank surrogate captures the whole reduced space, so
+/// the comparison is an exact-route parity check rather than a stochastic error
+/// budget. Calling the objective helper (not the component assembler directly)
+/// prevents the production branch from regressing to a zero gradient while the
+/// lower-level parity test remains green.
+#[test]
+fn production_objective_forced_streaming_value_gradient_matches_dense() {
+    let target = planted_circle_embedded(32, 4, 0.02);
+    let mut term = planted_circle_seed_term(
+        target.view(),
+        PlantedCircleAssignmentMode::Softmax,
+    )
+    .0;
+    term.atoms[0].basis_second_jet = Some(Arc::new(
+        PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator"),
+    ));
+    let rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
+    let mut dense = SaeManifoldOuterObjective::new(
+        term.clone(),
+        target.clone(),
+        None,
+        rho.clone(),
+        40,
+        1.0,
+        1.0e-6,
+        1.0e-6,
+    );
+    let mut streaming = SaeManifoldOuterObjective::new(
+        term,
+        target,
+        None,
+        rho.clone(),
+        40,
+        1.0,
+        1.0e-6,
+        1.0e-6,
+    );
+
+    let dense_eval = OuterObjective::eval(&mut dense, &rho.to_flat())
+        .expect("dense production value+gradient");
+    let streaming_eval = streaming
+        .evaluate_forced_streaming_value_gradient(&rho)
+        .expect("forced streaming production value+gradient");
+
+    assert!(dense_eval.cost.is_finite() && streaming_eval.cost.is_finite());
+    assert_eq!(dense_eval.gradient.len(), streaming_eval.gradient.len());
+    let dense_norm_sq = dense_eval.gradient.dot(&dense_eval.gradient);
+    assert!(
+        dense_norm_sq.is_finite() && dense_norm_sq > 1.0e-12,
+        "route parity must exercise a nonzero analytic gradient; norm^2={dense_norm_sq}"
+    );
+    assert_abs_diff_eq!(streaming_eval.cost, dense_eval.cost, epsilon = 1.0e-7);
+    for (coordinate, (&streamed, &direct)) in streaming_eval
+        .gradient
+        .iter()
+        .zip(dense_eval.gradient.iter())
+        .enumerate()
+    {
+        assert_abs_diff_eq!(streamed, direct, epsilon = 1.0e-6);
+        assert!(
+            streamed.is_finite(),
+            "streaming gradient coordinate {coordinate} is non-finite"
+        );
+    }
 }
 
 /// Hybrid-EFS must replace the former held-zero non-ordered Beta--Bernoulli assignment coordinate

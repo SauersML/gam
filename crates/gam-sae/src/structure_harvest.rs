@@ -2348,7 +2348,7 @@ fn fold_atom_into(term: &mut SaeManifoldTerm, a: usize, b: usize) -> Result<(), 
 /// its folded partner's mass (call this AFTER the folds); any per-atom diagnostic
 /// caches are reset so the post-glue refit rebuilds them against the reduced
 /// dictionary rather than indexing a stale length-`K`.
-fn remove_atoms(
+pub(crate) fn remove_atoms(
     term: &mut SaeManifoldTerm,
     rho: &mut SaeManifoldRho,
     remove: &std::collections::BTreeSet<usize>,
