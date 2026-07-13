@@ -906,7 +906,7 @@ fn row_primary_closed_form_vector_fixed<const DIM: usize>(
 
 enum RigidVectorRowBackend {
     Fixed,
-    Graph(Box<Order2GraphWorkspace>),
+    Graph(Order2GraphWorkspace),
     Dynamic(DynamicJetArena),
 }
 
@@ -930,7 +930,7 @@ impl RigidVectorRowWorkspace {
                 .into());
             }
             1..=8 => RigidVectorRowBackend::Fixed,
-            9..=13 => RigidVectorRowBackend::Graph(Box::new(Order2GraphWorkspace::new())),
+            9..=13 => RigidVectorRowBackend::Graph(Order2GraphWorkspace::new()),
             14.. => RigidVectorRowBackend::Dynamic(DynamicJetArena::new()),
         };
         Ok(Self {
@@ -1068,11 +1068,11 @@ pub(crate) fn row_primary_closed_form_vector(
         (RigidVectorRowBackend::Fixed, 6) => fixed_row!(9),
         (RigidVectorRowBackend::Fixed, 7) => fixed_row!(10),
         (RigidVectorRowBackend::Fixed, 8) => fixed_row!(11),
-        (RigidVectorRowBackend::Graph(graph), 9) => graph_row!(12, graph.as_mut()),
-        (RigidVectorRowBackend::Graph(graph), 10) => graph_row!(13, graph.as_mut()),
-        (RigidVectorRowBackend::Graph(graph), 11) => graph_row!(14, graph.as_mut()),
-        (RigidVectorRowBackend::Graph(graph), 12) => graph_row!(15, graph.as_mut()),
-        (RigidVectorRowBackend::Graph(graph), 13) => graph_row!(16, graph.as_mut()),
+        (RigidVectorRowBackend::Graph(graph), 9) => graph_row!(12, graph),
+        (RigidVectorRowBackend::Graph(graph), 10) => graph_row!(13, graph),
+        (RigidVectorRowBackend::Graph(graph), 11) => graph_row!(14, graph),
+        (RigidVectorRowBackend::Graph(graph), 12) => graph_row!(15, graph),
+        (RigidVectorRowBackend::Graph(graph), 13) => graph_row!(16, graph),
         (RigidVectorRowBackend::Dynamic(arena), 14..) => row_primary_closed_form_vector_dynamic(
             q0,
             q1,
