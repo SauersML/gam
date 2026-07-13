@@ -133,6 +133,27 @@ pub(crate) fn transformation_spatial_geometry_key(
     Ok(key)
 }
 
+pub(crate) fn transformation_exact_outer_options(
+    options: &BlockwiseFitOptions,
+    row_set: &gam_problem::outer_subsample::RowSet,
+) -> BlockwiseFitOptions {
+    let mut effective = options.clone();
+    effective.auto_outer_subsample = false;
+    effective.outer_score_subsample = match row_set {
+        gam_problem::outer_subsample::RowSet::All => None,
+        gam_problem::outer_subsample::RowSet::Subsample { rows, n_full } => {
+            Some(Arc::new(
+                crate::outer_subsample::OuterScoreSubsample::from_weighted_rows(
+                    rows.as_ref().clone(),
+                    *n_full,
+                    0,
+                ),
+            ))
+        }
+    };
+    effective
+}
+
 // ---------------------------------------------------------------------------
 // Top-level fit function
 // ---------------------------------------------------------------------------
@@ -605,7 +626,7 @@ pub fn fit_transformation_normal(
          specs: &[TermCollectionSpec],
          designs: &[TermCollectionDesign],
          eval_mode,
-         _row_set| {
+         row_set| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             ensure_exact_geometry(&specs[0], &designs[0], &rho)?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
@@ -614,10 +635,14 @@ pub fn fit_transformation_normal(
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let warm_starts = exact_mode_candidates(eval_mode, &rho);
             let competing_modes = warm_starts.len() > 1;
+            // `row_set` is the outer driver's authoritative measure. Rebuild
+            // the family-facing option on every evaluation so a pilot mask
+            // cannot survive the driver's rotation back to full data.
+            let eval_options = transformation_exact_outer_options(&options, row_set);
             let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
                 &geometry.family,
                 &geometry.blocks,
-                &options,
+                &eval_options,
                 &rho,
                 Arc::clone(&geometry.derivative_blocks),
                 &warm_starts,
