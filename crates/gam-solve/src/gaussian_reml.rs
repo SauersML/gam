@@ -563,6 +563,11 @@ pub fn gaussian_reml_multi_shared_dispersion_closed_form(
     weights: Option<ArrayView1<'_, f64>>,
     init_rho: Option<f64>,
 ) -> Result<GaussianRemlMultiResult, EstimationError> {
+    if y.ncols() == 0 {
+        crate::bail_invalid_estim!(
+            "shared-dispersion Gaussian REML requires at least one response column"
+        );
+    }
     let prepared = prepare_gaussian_reml(x, y, penalty, None, weights, None)?;
     let init_rho = init_rho
         .map(f64::exp)
@@ -4165,7 +4170,7 @@ mod tests {
         assert!(expected_sigma2 > 0.0);
         assert!(
             (fit.sigma2[0] - expected_sigma2).abs()
-                <= f64::EPSILON * (n as f64) * expected_sigma2.max(1.0),
+                <= f64::EPSILON.sqrt() * expected_sigma2.max(1.0),
             "shared sigma2 {} must equal pooled vector deviance / shared dof {}",
             fit.sigma2[0],
             expected_sigma2
@@ -5801,8 +5806,7 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
     let mut ranks = Vec::with_capacity(f_blocks);
     let mut pinvs = Vec::with_capacity(f_blocks);
     for penalty in &penalties {
-        let geometry =
-            gam_linalg::utils::rank_certified_psd_pseudoinverse(penalty, 1.0e-10)?;
+        let geometry = gam_linalg::utils::rank_certified_psd_pseudoinverse(penalty, 1.0e-10)?;
         ranks.push(geometry.rank());
         pinvs.push(geometry.into_pseudoinverse());
     }

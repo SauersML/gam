@@ -3651,13 +3651,11 @@ pub struct PrimaryTopologyChoice {
     /// topology race scores with rather than the fixed `SAE_DEFAULT_TORUS_HARMONICS`
     /// budget. `None` for every other kind.
     pub n_torus_harmonics: Option<usize>,
-    /// The `(n, latent_dim)` seed chart to install for this atom when the
-    /// INTRINSIC-metric seed won the primary race (#2240/#2280). `Some` only when
-    /// the geodesic (Isomap) embedding beat the PCA chart on evidence: a
-    /// swiss-roll-class fold must be seeded UNFOLDED, so the winning intrinsic
-    /// coordinates ride out of the race rather than being re-creased by the linear
-    /// PCA seed downstream. `None` when the PCA seed won (the default seed path
-    /// already reproduces its chart) — every non-auto atom carries `None`.
+    /// The `(n, latent_dim)` coordinate realization on which this topology won
+    /// the primary race (#2240/#2280). Kind and coordinates are one atomic
+    /// evidence candidate: an intrinsic sheet carries its unfolded Isomap chart,
+    /// while every PCA/natural-chart winner carries the exact chart it was scored
+    /// on rather than asking the seed builder to reconstruct an approximation.
     pub coords: Array2<f64>,
 }
 
@@ -4511,11 +4509,10 @@ fn select_torus_resolution(
 /// `atom_basis`. `resolution_overrides[k]` is the per-atom basis-native
 /// resolution knob (`None` unless evidence-grown), interpreted per the resolved
 /// basis kind — Duchon center count for a flat/Duchon-sheet winner (#2240),
-/// per-axis harmonic order for a torus winner (#2243). `coord_overrides[k]` is the
-/// UNFOLDED geodesic seed chart to install when the intrinsic-metric seed won the
-/// primary race (#2280), `None` when the PCA seed won (the common path) — the
-/// caller overrides that atom's coordinate block with it so a folded factor is
-/// seeded unrolled rather than re-creased by the linear PCA seed.
+/// per-axis harmonic order for a torus winner (#2243). `coord_overrides[k]` is
+/// the exact coordinate realization of an auto winner (`None` only for an
+/// explicitly named, non-auto atom), so the caller installs the same kind+chart
+/// candidate that earned the evidence verdict.
 pub fn resolve_auto_primary_atoms(
     target: ArrayView2<'_, f64>,
     labels: &[usize],
