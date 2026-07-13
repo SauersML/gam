@@ -351,6 +351,9 @@ fn tweedie_profile_loglik(request: &StandardFitRequest<'_>, p: f64) -> Option<f6
     // μ = g⁻¹(Xβ̂ + offset); the Tweedie family is fixed to the log link by
     // `resolve_family`, so g⁻¹ = exp. `design.apply` reproduces the fitted
     // linear predictor exactly (same contract the expectile/predict paths use).
+    // `design.apply` already folds the design's fixed affine channel (non-zero
+    // B-spline endpoint anchor, #2297) into `Xβ̂`, so only the user offset is
+    // added here; adding `affine_offset` again would double-count the pin.
     let mut eta = fitted.design.apply(fitted.fit.beta.view()).ok()?;
     if eta.len() != request.y.len() {
         return None;

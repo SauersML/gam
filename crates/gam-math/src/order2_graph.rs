@@ -909,7 +909,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let right_node = right.node;
         let addend_node = addend.node;
         let (representatives, term_sources, source_count) =
-            canonical_shared_source_schedule(|term, representative| {
+            canonical_shared_source_schedule::<N>(|term, representative| {
                 lefts[term].node == lefts[representative].node
                     && addend_scales[term] == addend_scales[representative]
             });
