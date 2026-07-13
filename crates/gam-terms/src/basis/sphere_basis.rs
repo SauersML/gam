@@ -2606,15 +2606,15 @@ fn matern_center_design_chart(
         Some(transform) => fast_ab(kernel, transform),
         None => kernel.clone(),
     };
-    let mut design = Array2::<f64>::zeros((
-        k,
-        kernel_chart.ncols() + usize::from(include_intercept),
-    ));
+    let mut design =
+        Array2::<f64>::zeros((k, kernel_chart.ncols() + usize::from(include_intercept)));
     design
         .slice_mut(s![.., 0..kernel_chart.ncols()])
         .assign(&kernel_chart);
     if include_intercept {
-        design.column_mut(kernel_chart.ncols()).fill(intercept_value);
+        design
+            .column_mut(kernel_chart.ncols())
+            .fill(intercept_value);
     }
     design
 }
@@ -2638,12 +2638,8 @@ fn matern_center_function_metric_jet(
     let design_b = matern_center_design_chart(kernel_b, z_opt, include_intercept, 0.0);
     let design_ab = matern_center_design_chart(kernel_ab, z_opt, include_intercept, 0.0);
     let gram = symmetrize_penalty(&fast_ata(&design));
-    let gram_a = symmetrize_penalty(
-        &(fast_atb(&design_a, &design) + fast_atb(&design, &design_a)),
-    );
-    let gram_b = symmetrize_penalty(
-        &(fast_atb(&design_b, &design) + fast_atb(&design, &design_b)),
-    );
+    let gram_a = symmetrize_penalty(&(fast_atb(&design_a, &design) + fast_atb(&design, &design_a)));
+    let gram_b = symmetrize_penalty(&(fast_atb(&design_b, &design) + fast_atb(&design, &design_b)));
     let gram_ab = symmetrize_penalty(
         &(fast_atb(&design_ab, &design)
             + fast_atb(&design_a, &design_b)
@@ -2655,9 +2651,7 @@ fn matern_center_function_metric_jet(
     if include_intercept {
         frame[[p - 1, 0]] = 1.0;
     }
-    function_space_subspace_shrinkage_derivatives(
-        &frame, &gram, &gram_a, &gram_b, &gram_ab,
-    )
+    function_space_subspace_shrinkage_derivatives(&frame, &gram, &gram_a, &gram_b, &gram_ab)
 }
 
 /// Build the Matérn double-penalty **primary** block (the projected kernel
@@ -2753,9 +2747,8 @@ pub(crate) fn build_matern_double_penalty_primarywith_psi_derivatives(
     s_psi_psi
         .slice_mut(s![0..kernel_cols, 0..kernel_cols])
         .assign(&kernel_psi_psi);
-    let (s_norm, s_norm_psi, s_norm_psi_psi, c) =
+    let (s_norm, s_norm_psi, s_norm_psi_psi, _) =
         normalize_penaltywith_psi_derivatives(&s, &s_psi, &s_psi_psi);
-    let _ = c;
     Ok((
         s_norm,
         s_norm_psi,
@@ -2867,13 +2860,8 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
         aniso,
     )?;
     let (penalties_derivative, penaltiessecond_derivative) = if spec.double_penalty {
-        let (
-            _,
-            primary_derivative,
-            primarysecond_derivative,
-            shrinkage_first,
-            shrinkagesecond,
-        ) = build_matern_double_penalty_primarywith_psi_derivatives(
+        let (_, primary_derivative, primarysecond_derivative, shrinkage_first, shrinkagesecond) =
+            build_matern_double_penalty_primarywith_psi_derivatives(
                 centers.view(),
                 spec.length_scale,
                 spec.nu,
@@ -3144,26 +3132,22 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let coefficient_gauge = z_opt
             .as_ref()
             .map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
-        let (mut raw_first, mut raw_second_diag) =
-            build_matern_aniso_primary_raw_derivative_matrices(
-                centers.view(),
-                eta,
-                spec.length_scale,
-                spec.nu,
-            )?;
+        let (raw_first, raw_second_diag) = build_matern_aniso_primary_raw_derivative_matrices(
+            centers.view(),
+            eta,
+            spec.length_scale,
+            spec.nu,
+        )?;
         for a in 0..dim {
-            // raw_first[a] / raw_second_diag[a] are dropped after this loop.
-            // When there is no identifiability transform we previously cloned
-            // them just to slice into primary_*; move them instead.
             let projected_first = if let Some(gauge) = coefficient_gauge.as_ref() {
                 gauge.restrict_penalty(&raw_first[a])
             } else {
-                std::mem::take(&mut raw_first[a])
+                raw_first[a].clone()
             };
             let projected_second = if let Some(gauge) = coefficient_gauge.as_ref() {
                 gauge.restrict_penalty(&raw_second_diag[a])
             } else {
-                std::mem::take(&mut raw_second_diag[a])
+                raw_second_diag[a].clone()
             };
             primary_first_raw[a]
                 .slice_mut(s![0..kernel_cols, 0..kernel_cols])
@@ -3185,10 +3169,9 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let has_shrinkage = base.penaltyinfo.iter().any(|info| {
             info.active && matches!(info.source, PenaltySource::DoublePenaltyNullspace)
         });
-        // The value path emits the primary double-penalty block as
-        // `A / ||A||_F`. Differentiate that normalized block here too; the raw
-        // `A_a` / `A_aa` derivatives are still retained for the shrinkage
-        // projector, whose eigenspace is defined by the un-normalized `A`.
+        // The value path emits each block after Frobenius normalization. Keep
+        // the raw center kernel and its exact axis derivatives for both the
+        // primary RKHS block and the moving function-metric intercept ridge.
         let kernel = build_matern_kernel_penalty(
             centers.view(),
             spec.length_scale,
@@ -3217,27 +3200,27 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
             primary_first.push(first);
             primary_second_diag.push(second);
         }
-        let shrinkage_frame = if has_shrinkage {
-            ShrinkageProjectorFrame::build(&a_raw)?
-        } else {
-            None
-        };
-        let shrinkage_first: Vec<Array2<f64>> = (0..dim)
-            .map(|a| match &shrinkage_frame {
-                Some(frame) => frame.first(&primary_first_raw[a]),
-                None => Array2::<f64>::zeros((total_cols, total_cols)),
-            })
-            .collect();
-        let shrinkage_second_diag: Vec<Array2<f64>> = (0..dim)
-            .map(|a| match &shrinkage_frame {
-                Some(frame) => frame.second(
-                    &primary_first_raw[a],
-                    &primary_first_raw[a],
-                    &primary_second_diag_raw[a],
-                ),
-                None => Array2::<f64>::zeros((total_cols, total_cols)),
-            })
-            .collect();
+        let mut shrinkage_first = Vec::with_capacity(dim);
+        let mut shrinkage_second_diag = Vec::with_capacity(dim);
+        for a in 0..dim {
+            if has_shrinkage {
+                let jet = matern_center_function_metric_jet(
+                    &kernel.slice(s![0..k, 0..k]).to_owned(),
+                    &raw_first[a],
+                    &raw_first[a],
+                    &raw_second_diag[a],
+                    z_opt.as_ref(),
+                    spec.include_intercept,
+                )?;
+                let (_, first, second, _) =
+                    normalize_penaltywith_psi_derivatives(&jet.value, &jet.first_a, &jet.mixed);
+                shrinkage_first.push(first);
+                shrinkage_second_diag.push(second);
+            } else {
+                shrinkage_first.push(Array2::<f64>::zeros((total_cols, total_cols)));
+                shrinkage_second_diag.push(Array2::<f64>::zeros((total_cols, total_cols)));
+            }
+        }
         result.penalties_first = Vec::with_capacity(dim);
         result.penalties_second_diag = Vec::with_capacity(dim);
         for a in 0..dim {
@@ -3263,11 +3246,11 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let penaltyinfo = base.penaltyinfo.clone();
         let length_scale = spec.length_scale;
         let nu = spec.nu;
-        // Per-axis projected first derivatives ∂A/∂η_a (embedded), so the
-        // cross-pair shrinkage second derivative `∂²P/∂η_a∂η_b` can be formed
-        // exactly inside the provider (#1122).
         let primary_first_raw_owned = primary_first_raw.clone();
         let a_raw_owned = a_raw.clone();
+        let kernel_block_owned = kernel.slice(s![0..k, 0..k]).to_owned();
+        let kernel_first_owned = raw_first.clone();
+        let z_owned = z_opt.clone();
         let include_intercept = spec.include_intercept;
         result.penalties_cross_provider = Some(AnisoPenaltyCrossProvider::new(
             move |axis_a: usize, axis_b: usize| {
@@ -3287,6 +3270,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                     a,
                     b,
                 )?;
+                let raw_cross_for_metric = raw_cross.clone();
                 let projected: Array2<f64> = if let Some(gauge) = gauge_owned.as_ref() {
                     gauge.restrict_penalty(&raw_cross)
                 } else {
@@ -3303,37 +3287,27 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                     &padded,
                     trace_of_product(&a_raw_owned, &a_raw_owned).sqrt(),
                 );
-                // Exact cross second derivative of the shrinkage projector, if
-                // an active shrinkage block exists at this hyperparameter.
+                // Exact mixed derivative of the function-metric ridge. The
+                // structural intercept frame is fixed; only the compact center
+                // Gram moves with the two anisotropy axes.
                 let shrinkage_cross = if penaltyinfo.iter().any(|info| {
                     info.active && matches!(info.source, PenaltySource::DoublePenaltyNullspace)
                 }) {
-                    let kernel = build_matern_kernel_penalty(
-                        centers_owned.view(),
-                        length_scale,
-                        nu,
+                    let jet = matern_center_function_metric_jet(
+                        &kernel_block_owned,
+                        &kernel_first_owned[a],
+                        &kernel_first_owned[b],
+                        &raw_cross_for_metric,
+                        z_owned.as_ref(),
                         include_intercept,
-                        Some(&eta_owned),
                     )?;
-                    let k = centers_owned.nrows();
-                    let kblock = kernel.slice(s![0..k, 0..k]).to_owned();
-                    let projected_a = if let Some(gauge) = gauge_owned.as_ref() {
-                        gauge.restrict_penalty(&kblock)
-                    } else {
-                        kblock
-                    };
-                    let mut a_raw = Array2::<f64>::zeros((total_cols, total_cols));
-                    a_raw
-                        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-                        .assign(&projected_a);
-                    match ShrinkageProjectorFrame::build(&a_raw)? {
-                        Some(frame) => frame.second(
-                            &primary_first_raw_owned[a],
-                            &primary_first_raw_owned[b],
-                            &padded,
-                        ),
-                        None => Array2::<f64>::zeros((total_cols, total_cols)),
-                    }
+                    normalize_penalty_cross_psi_derivative(
+                        &jet.value,
+                        &jet.first_a,
+                        &jet.first_b,
+                        &jet.mixed,
+                        trace_of_product(&jet.value, &jet.value).sqrt(),
+                    )
                 } else {
                     Array2::<f64>::zeros((total_cols, total_cols))
                 };
