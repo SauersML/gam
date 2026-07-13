@@ -13,12 +13,18 @@ use gam_models::inference::model::{
     FittedModel, PredictModelClass, binomial_location_scale_threshold_beta,
     gaussian_location_scale_mean_beta, location_scale_noise_beta,
 };
+use gam_models::transformation_normal::{
+    TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalAloRowInput,
+    transformation_normal_alo_row_geometry,
+};
 use gam_problem::{EstimationError, ResponseFamily};
 use gam_solve::inference::alo::{
     MultiBlockAloDiagnostics, MultiBlockAloInput, compute_multiblock_alo,
 };
-use gam_terms::basis::BasisOptions;
-use ndarray::{Array1, Array2};
+use gam_terms::basis::{
+    BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
+};
+use ndarray::{Array1, Array2, s};
 
 use crate::{FittedModelPredictExt, PredictInput};
 
@@ -175,7 +181,7 @@ fn require_saved_hessian<'a>(
     Ok(hessian)
 }
 
-fn compute_location_scale_core(
+fn compute_saved_multicoordinate_core(
     class: PredictModelClass,
     coordinate_names: Vec<String>,
     coordinate_designs: Vec<DesignMatrix>,
@@ -303,7 +309,7 @@ fn compute_gaussian_location_scale_alo(
         "mean-base",
         "log-sigma",
     );
-    compute_location_scale_core(
+    compute_saved_multicoordinate_core(
         class,
         names,
         designs,
@@ -421,7 +427,7 @@ fn compute_binomial_location_scale_alo(
         "threshold",
         "log-sigma",
     );
-    compute_location_scale_core(
+    compute_saved_multicoordinate_core(
         class,
         names,
         designs,
@@ -498,7 +504,7 @@ fn compute_dispersion_location_scale_alo(
         "mean",
         "log-precision",
     );
-    compute_location_scale_core(
+    compute_saved_multicoordinate_core(
         class,
         names,
         designs,
@@ -620,9 +626,260 @@ pub fn compute_saved_bernoulli_marginal_slope_alo(
         0..predictor.beta_marginal.len(),
         predictor.beta_marginal.len()..parameter_dimension,
     ];
-    compute_location_scale_core(
+    compute_saved_multicoordinate_core(
         class,
         vec!["marginal-eta".to_string(), "slope".to_string()],
+        coordinate_designs,
+        coordinate_ranges,
+        hessian,
+        observed_hessians,
+        scores,
+        coordinate_values,
+    )
+}
+
+/// Replay exact saved-H ALO for a finite-support transformation-normal fit.
+pub fn compute_saved_transformation_normal_alo(
+    model: &FittedModel,
+    covariate_design: &DesignMatrix,
+    additive_offset: &Array1<f64>,
+    observations: SavedAloObservations<'_>,
+) -> Result<SavedModelAloDiagnostics, EstimationError> {
+    let class = PredictModelClass::TransformationNormal;
+    if model.predict_model_class() != class {
+        return Err(invalid(format!(
+            "saved transformation-normal ALO dispatcher received model class {}",
+            model.predict_model_class().name()
+        )));
+    }
+    let n = observations.response.len();
+    if n == 0
+        || observations.prior_weights.len() != n
+        || covariate_design.nrows() != n
+        || additive_offset.len() != n
+    {
+        return Err(invalid(format!(
+            "saved transformation-normal ALO row mismatch: response={n}, weights={}, design={}, offset={}",
+            observations.prior_weights.len(),
+            covariate_design.nrows(),
+            additive_offset.len(),
+        )));
+    }
+    let payload = model.payload();
+    let knots = payload
+        .transformation_response_knots
+        .as_ref()
+        .ok_or_else(|| invalid("saved transformation-normal ALO is missing response knots"))?;
+    let transform_rows = payload
+        .transformation_response_transform
+        .as_ref()
+        .ok_or_else(|| {
+            invalid("saved transformation-normal ALO is missing its response transform")
+        })?;
+    let degree = payload
+        .transformation_response_degree
+        .ok_or_else(|| invalid("saved transformation-normal ALO is missing its response degree"))?;
+    let response_median = payload
+        .transformation_response_median
+        .ok_or_else(|| invalid("saved transformation-normal ALO is missing its response median"))?;
+    if knots.is_empty() || transform_rows.is_empty() {
+        return Err(invalid(
+            "saved transformation-normal ALO response basis metadata is empty",
+        ));
+    }
+    let transform_columns = transform_rows[0].len();
+    if transform_columns == 0
+        || transform_rows
+            .iter()
+            .any(|row| row.len() != transform_columns)
+    {
+        return Err(invalid(
+            "saved transformation-normal ALO response transform is empty or ragged",
+        ));
+    }
+    let mut transform = Array2::<f64>::zeros((transform_rows.len(), transform_columns));
+    for (row_index, row) in transform_rows.iter().enumerate() {
+        for (column_index, &value) in row.iter().enumerate() {
+            transform[[row_index, column_index]] = value;
+        }
+    }
+    let knots = Array1::from_vec(knots.clone());
+    let (raw_value_basis, _) = create_basis::<Dense>(
+        observations.response.view(),
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::i_spline(),
+    )
+    .map_err(|error| {
+        invalid(format!(
+            "saved transformation-normal ALO value basis: {error}"
+        ))
+    })?;
+    let raw_value_basis = raw_value_basis.as_ref();
+    let raw_derivative_basis =
+        create_ispline_derivative_dense(observations.response.view(), &knots, degree, 1).map_err(
+            |error| {
+                invalid(format!(
+                    "saved transformation-normal ALO derivative basis: {error}"
+                ))
+            },
+        )?;
+    if raw_value_basis.ncols() != transform.nrows()
+        || raw_derivative_basis.dim() != raw_value_basis.dim()
+    {
+        return Err(invalid(format!(
+            "saved transformation-normal ALO raw basis/transform mismatch: value={}x{}, derivative={}x{}, transform={}x{}",
+            raw_value_basis.nrows(),
+            raw_value_basis.ncols(),
+            raw_derivative_basis.nrows(),
+            raw_derivative_basis.ncols(),
+            transform.nrows(),
+            transform.ncols(),
+        )));
+    }
+    let shape_value = raw_value_basis.dot(&transform);
+    let shape_derivative = raw_derivative_basis.dot(&transform);
+    let response_dimension = transform_columns + 1;
+    let mut response_value_basis = Array2::<f64>::zeros((n, response_dimension));
+    response_value_basis.column_mut(0).fill(1.0);
+    response_value_basis
+        .slice_mut(s![.., 1..])
+        .assign(&shape_value);
+    let mut response_derivative_basis = Array2::<f64>::zeros((n, response_dimension));
+    response_derivative_basis
+        .slice_mut(s![.., 1..])
+        .assign(&shape_derivative);
+
+    let lower_response = knots[0];
+    let upper_response = knots[knots.len() - 1];
+    if !(upper_response > lower_response) {
+        return Err(invalid(format!(
+            "saved transformation-normal ALO support is degenerate: lower={lower_response}, upper={upper_response}"
+        )));
+    }
+    let endpoints = Array1::from_vec(vec![lower_response, upper_response]);
+    let (raw_endpoint_basis, _) = create_basis::<Dense>(
+        endpoints.view(),
+        KnotSource::Provided(knots.view()),
+        degree,
+        BasisOptions::i_spline(),
+    )
+    .map_err(|error| {
+        invalid(format!(
+            "saved transformation-normal ALO endpoints: {error}"
+        ))
+    })?;
+    if raw_endpoint_basis.ncols() != transform.nrows() {
+        return Err(invalid(format!(
+            "saved transformation-normal ALO endpoint basis has {} columns; transform requires {}",
+            raw_endpoint_basis.ncols(),
+            transform.nrows(),
+        )));
+    }
+    let endpoint_shape = raw_endpoint_basis.as_ref().dot(&transform);
+    let mut lower_basis = Array1::<f64>::zeros(response_dimension);
+    let mut upper_basis = Array1::<f64>::zeros(response_dimension);
+    lower_basis[0] = 1.0;
+    upper_basis[0] = 1.0;
+    lower_basis
+        .slice_mut(s![1..])
+        .assign(&endpoint_shape.row(0));
+    upper_basis
+        .slice_mut(s![1..])
+        .assign(&endpoint_shape.row(1));
+
+    let fit = payload.fit_result.as_ref().ok_or_else(|| {
+        invalid("saved transformation-normal ALO requires a canonical fit result")
+    })?;
+    if fit.blocks.len() != 1 {
+        return Err(invalid(format!(
+            "saved transformation-normal ALO requires one coefficient block, got {}",
+            fit.blocks.len()
+        )));
+    }
+    let beta = &fit.blocks[0].beta;
+    let covariate_dimension = covariate_design.ncols();
+    let parameter_dimension = response_dimension * covariate_dimension;
+    if beta.len() != parameter_dimension {
+        return Err(invalid(format!(
+            "saved transformation-normal ALO beta has {} entries; response/covariate layout requires {parameter_dimension}",
+            beta.len()
+        )));
+    }
+    let hessian = require_saved_hessian(model, class, parameter_dimension)?;
+    let mut gamma = Array2::<f64>::zeros((n, response_dimension));
+    for component in 0..response_dimension {
+        let start = component * covariate_dimension;
+        let beta_component = beta
+            .slice(s![start..start + covariate_dimension])
+            .to_owned();
+        gamma
+            .column_mut(component)
+            .assign(&covariate_design.dot(&beta_component));
+    }
+
+    let lower_floor = TRANSFORMATION_MONOTONICITY_EPS * (lower_response - response_median);
+    let upper_floor = TRANSFORMATION_MONOTONICITY_EPS * (upper_response - response_median);
+    let lower_basis_slice = lower_basis
+        .as_slice()
+        .expect("owned lower basis contiguous");
+    let upper_basis_slice = upper_basis
+        .as_slice()
+        .expect("owned upper basis contiguous");
+    let mut observed_hessians = Vec::with_capacity(n);
+    let mut scores = Vec::with_capacity(n);
+    let mut coordinate_values = Vec::with_capacity(n);
+    for row in 0..n {
+        let response_value_row = response_value_basis.row(row);
+        let response_derivative_row = response_derivative_basis.row(row);
+        let gamma_row = gamma.row(row);
+        let geometry = transformation_normal_alo_row_geometry(TransformationNormalAloRowInput {
+            response_value_basis: response_value_row
+                .as_slice()
+                .expect("response value row contiguous"),
+            response_derivative_basis: response_derivative_row
+                .as_slice()
+                .expect("response derivative row contiguous"),
+            response_lower_basis: lower_basis_slice,
+            response_upper_basis: upper_basis_slice,
+            gamma: gamma_row.as_slice().expect("gamma row contiguous"),
+            additive_offset: additive_offset[row],
+            response_floor_offset: TRANSFORMATION_MONOTONICITY_EPS
+                * (observations.response[row] - response_median),
+            response_lower_floor_offset: lower_floor,
+            response_upper_floor_offset: upper_floor,
+            prior_weight: observations.prior_weights[row],
+        })
+        .map_err(|reason| {
+            invalid(format!(
+                "saved transformation-normal ALO row {row}: {reason}"
+            ))
+        })?;
+        observed_hessians.push(geometry.observed_hessian);
+        scores.push(geometry.nll_score);
+        coordinate_values.push(gamma_row.to_owned());
+    }
+    let coordinate_designs = (0..response_dimension)
+        .map(|_| covariate_design.clone())
+        .collect::<Vec<_>>();
+    let coordinate_ranges = (0..response_dimension)
+        .map(|component| {
+            let start = component * covariate_dimension;
+            start..start + covariate_dimension
+        })
+        .collect::<Vec<_>>();
+    let coordinate_names = (0..response_dimension)
+        .map(|component| {
+            if component == 0 {
+                "location-gamma".to_string()
+            } else {
+                format!("shape-gamma[{component}]")
+            }
+        })
+        .collect::<Vec<_>>();
+    compute_saved_multicoordinate_core(
+        class,
+        coordinate_names,
         coordinate_designs,
         coordinate_ranges,
         hessian,

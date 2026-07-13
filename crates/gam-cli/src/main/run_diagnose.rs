@@ -58,6 +58,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             | PredictModelClass::BinomialLocationScale
             | PredictModelClass::DispersionLocationScale
             | PredictModelClass::BernoulliMarginalSlope
+            | PredictModelClass::TransformationNormal
     ) {
         let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
         require_dataset_rows("diagnose", &args.data, ds.values.nrows())?;
@@ -68,28 +69,55 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             resolve_weight_column(&ds, &col_map, model.payload().weight_column.as_deref())
                 .map_err(|error| format!("failed to resolve saved diagnose weights: {error}"))?;
         let (offset, noise_offset) = report_offset_for(&model, &ds, &col_map)?;
-        let input = build_predict_input_for_model(
-            &model,
-            ds.values.view(),
-            &col_map,
-            model.training_headers.as_ref(),
-            &offset,
-            &noise_offset,
-            model.payload().noise_offset_column.is_some(),
-        )?;
         let observations = gam_predict::SavedAloObservations {
             response: &response,
             prior_weights: &prior_weights,
         };
         let alo = match model.predict_model_class() {
-            PredictModelClass::BernoulliMarginalSlope => {
-                gam_predict::compute_saved_bernoulli_marginal_slope_alo(
+            PredictModelClass::TransformationNormal => {
+                let spec = resolve_termspec_for_prediction(
+                    &model.resolved_termspec,
+                    model.training_headers.as_ref(),
+                    &col_map,
+                    "resolved_termspec",
+                )?;
+                let design =
+                    build_term_collection_design(ds.values.view(), &spec).map_err(|error| {
+                        format!("failed to build saved transformation-normal ALO design: {error}")
+                    })?;
+                let effective_offset = design
+                    .compose_offset(offset.view(), "saved transformation-normal ALO design")
+                    .map_err(|error| error.to_string())?;
+                gam_predict::compute_saved_transformation_normal_alo(
                     &model,
-                    &input,
+                    &design.design,
+                    &effective_offset,
                     observations,
                 )
             }
-            _ => gam_predict::compute_saved_location_scale_alo(&model, &input, observations),
+            class => {
+                let input = build_predict_input_for_model(
+                    &model,
+                    ds.values.view(),
+                    &col_map,
+                    model.training_headers.as_ref(),
+                    &offset,
+                    &noise_offset,
+                    model.payload().noise_offset_column.is_some(),
+                )?;
+                match class {
+                    PredictModelClass::BernoulliMarginalSlope => {
+                        gam_predict::compute_saved_bernoulli_marginal_slope_alo(
+                            &model,
+                            &input,
+                            observations,
+                        )
+                    }
+                    _ => {
+                        gam_predict::compute_saved_location_scale_alo(&model, &input, observations)
+                    }
+                }
+            }
         }
         .map_err(|error| format!("saved-model ALO failed: {error}"))?;
         print_multicoordinate_alo(&alo);
