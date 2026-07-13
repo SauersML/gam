@@ -929,6 +929,7 @@ mod tests {
     use super::*;
     use crate::jet_scalar::{DynamicJetArena, DynamicOrder2, FixedRuntimeJet, JetScalar};
     use crate::nested_dual::JetField;
+    use std::cell::Cell;
 
     struct DenseSymmetric3([[f64; 3]; 3]);
 
@@ -993,6 +994,27 @@ mod tests {
         }
     }
 
+    struct CountingIdentity3<'arena> {
+        workspace: &'arena Order2GraphWorkspace,
+        multiply_calls: Cell<usize>,
+    }
+
+    impl SymmetricQuadraticCoefficients for CountingIdentity3<'_> {
+        fn dimension(&self) -> usize {
+            3
+        }
+
+        fn multiply(&self, input: &[f64], output: &mut [f64]) {
+            assert!(self.workspace.node_count() != 0);
+            self.multiply_calls.set(self.multiply_calls.get() + 1);
+            output.copy_from_slice(input);
+        }
+
+        fn coefficient(&self, _row: usize, _column: usize) -> f64 {
+            panic!("compiled graph quadratic lowering must preserve matrix-free multiply")
+        }
+    }
+
     #[test]
     fn compiled_graph_quadratic_arity_is_independent_and_matrix_free() {
         let mut workspace = Order2GraphWorkspace::new();
@@ -1037,23 +1059,78 @@ mod tests {
     #[test]
     fn compiled_graph_accepts_maximum_quadratic_arity_plus_output_node() {
         let mut workspace = Order2GraphWorkspace::new();
-        workspace.reset(1);
+        workspace.reset(MAX_PRIMARY_DIMENSION);
         let values: [f64; MAX_QUADRATIC_ARITY] =
             std::array::from_fn(|axis| 0.01 * (axis + 1) as f64);
-        let vars: [Order2Graph<'_, 1>; MAX_QUADRATIC_ARITY] =
-            std::array::from_fn(|axis| Order2Graph::variable(values[axis], 0, 1, &workspace));
+        let vars: [Order2Graph<'_, MAX_PRIMARY_DIMENSION>; MAX_QUADRATIC_ARITY] =
+            std::array::from_fn(|axis| {
+                Order2Graph::variable(
+                    values[axis],
+                    axis % MAX_PRIMARY_DIMENSION,
+                    MAX_PRIMARY_DIMENSION,
+                    &workspace,
+                )
+            });
         let coefficients = MatrixFreeIdentity32 {
             workspace: &workspace,
         };
-        let graph = Order2Graph::symmetric_quadratic_form(&vars, &coefficients, 1, &workspace)
-            .into_order2();
+        let graph = Order2Graph::symmetric_quadratic_form(
+            &vars,
+            &coefficients,
+            MAX_PRIMARY_DIMENSION,
+            &workspace,
+        )
+        .into_order2();
 
         let expected_value = values.iter().map(|value| value * value).sum::<f64>();
-        let expected_gradient = 2.0 * values.iter().sum::<f64>();
         let tolerance = 2.0e-13;
         assert!((graph.value() - expected_value).abs() <= tolerance);
-        assert!((graph.g()[0] - expected_gradient).abs() <= tolerance);
-        assert!((graph.h()[0][0] - 2.0 * MAX_QUADRATIC_ARITY as f64).abs() <= tolerance);
+        for primary in 0..MAX_PRIMARY_DIMENSION {
+            let expected_gradient = 2.0 * (values[primary] + values[primary + 16]);
+            assert!((graph.g()[primary] - expected_gradient).abs() <= tolerance);
+            for other in 0..MAX_PRIMARY_DIMENSION {
+                let expected_hessian = if primary == other { 4.0 } else { 0.0 };
+                assert!((graph.h()[primary][other] - expected_hessian).abs() <= tolerance);
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_graph_projects_only_sparse_supported_primary_directions() {
+        let mut workspace = Order2GraphWorkspace::new();
+        workspace.reset(MAX_PRIMARY_DIMENSION);
+        let x = Order2Graph::variable(0.4, 0, MAX_PRIMARY_DIMENSION, &workspace);
+        let y = Order2Graph::variable(-0.7, 7, MAX_PRIMARY_DIMENSION, &workspace);
+        let z = Order2Graph::variable(1.1, 15, MAX_PRIMARY_DIMENSION, &workspace);
+        let coefficients = CountingIdentity3 {
+            workspace: &workspace,
+            multiply_calls: Cell::new(0),
+        };
+        let graph = Order2Graph::symmetric_quadratic_form(
+            &[x, y, z],
+            &coefficients,
+            MAX_PRIMARY_DIMENSION,
+            &workspace,
+        )
+        .into_order2();
+
+        assert_eq!(coefficients.multiply_calls.get(), 4);
+        for primary in 0..MAX_PRIMARY_DIMENSION {
+            let active = matches!(primary, 0 | 7 | 15);
+            let expected_gradient = match primary {
+                0 => 0.8,
+                7 => -1.4,
+                15 => 2.2,
+                _ => 0.0,
+            };
+            assert_eq!(graph.g()[primary], expected_gradient);
+            for other in 0..MAX_PRIMARY_DIMENSION {
+                assert_eq!(
+                    graph.h()[primary][other],
+                    if active && primary == other { 2.0 } else { 0.0 }
+                );
+            }
+        }
     }
 
     fn expression<'arena, S: RuntimeJetScalar<'arena>>(
