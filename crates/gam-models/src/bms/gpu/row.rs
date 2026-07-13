@@ -85,9 +85,6 @@
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
-#[cfg(target_os = "linux")]
-use std::fmt::Write as _;
-
 use gam_gpu::gpu_error::GpuError;
 
 #[cfg(target_os = "linux")]
@@ -98,7 +95,7 @@ use cudarc::driver::{CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernel
 
 #[cfg(target_os = "linux")]
 use super::super::flex_row_program::{
-    BmsFlexCalibrationOrder2Node, BmsFlexRowOrder2FinalizerNode, BmsFlexRowProgram,
+    BmsFlexCalibrationOrder2Phase, BmsFlexRowOrder2FinalizerPhase, BmsFlexRowProgram,
 };
 
 /// Hard ceiling on `r` (= 2 + p_h + p_w). Matches the shared-memory budget
@@ -640,187 +637,136 @@ fn build_generated_row_kernel_source() -> String {
     let (between, suffix) = remainder
         .split_once(FINALIZER_MARKER)
         .expect("CUDA row template must contain the finalizer marker");
-    let mut source = String::with_capacity(CUDA_ROW_KERNEL_TEMPLATE.len() + 240_000);
+    let mut source = String::with_capacity(CUDA_ROW_KERNEL_TEMPLATE.len() + 16_000);
     source.push_str(prefix);
 
-    BmsFlexRowProgram::try_for_each_calibration_order2_contiguous(
-        1..MAX_R,
+    BmsFlexRowProgram::try_for_each_calibration_order2_phase(
         true,
-        |node| -> std::fmt::Result {
-            match node {
-                BmsFlexCalibrationOrder2Node::InterceptFirst => {
-                    writeln!(source, "        local_Fa += D_OF(A_c);")?;
+        |phase| -> Result<(), std::convert::Infallible> {
+            match phase {
+                BmsFlexCalibrationOrder2Phase::InterceptFirst => {
+                    source.push_str("        local_Fa += D_OF(A_c);\n");
                 }
-                BmsFlexCalibrationOrder2Node::InterceptSecond => {
-                    writeln!(
-                        source,
-                        "        local_Faa += D_OF(AA_c) - Q_OF(A_c, A_c);"
-                    )?;
+                BmsFlexCalibrationOrder2Phase::InterceptSecond => {
+                    source.push_str("        local_Faa += D_OF(AA_c) - Q_OF(A_c, A_c);\n");
                 }
-                BmsFlexCalibrationOrder2Node::PrimaryFirst { primary } => {
-                    writeln!(source, "        if (r > {primary}) {{")?;
-                    writeln!(
-                        source,
-                        "            const double *R = cell_r + ((size_t)c * (size_t)(r - 1) + {offset}) * 4;",
-                        offset = primary - 1,
-                    )?;
-                    writeln!(source, "            atomic_add_f64(&F_u[{primary}], D_OF(R));")?;
-                    writeln!(source, "        }}")?;
+                BmsFlexCalibrationOrder2Phase::PrimaryFirstAndInterceptSecond => {
+                    source.push_str(
+                        r#"        for (int u = 1; u < r; ++u) {
+            const double *R_u = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
+            const double *AR_u = cell_ar + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
+            atomic_add_f64(&F_u[u], D_OF(R_u));
+            atomic_add_f64(&F_au[u], D_OF(AR_u) - Q_OF(A_c, R_u));
+        }
+"#,
+                    );
                 }
-                BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary } => {
-                    writeln!(source, "        if (r > {primary}) {{")?;
-                    writeln!(
-                        source,
-                        "            const double *R = cell_r + ((size_t)c * (size_t)(r - 1) + {offset}) * 4;",
-                        offset = primary - 1,
-                    )?;
-                    writeln!(
-                        source,
-                        "            const double *AR = cell_ar + ((size_t)c * (size_t)(r - 1) + {offset}) * 4;",
-                        offset = primary - 1,
-                    )?;
-                    writeln!(
-                        source,
-                        "            atomic_add_f64(&F_au[{primary}], D_OF(AR) - Q_OF(A_c, R));"
-                    )?;
-                    writeln!(source, "        }}")?;
+                BmsFlexCalibrationOrder2Phase::PrimaryPairSecond => {
+                    source.push_str(
+                        r#"        for (int u = 1; u < r; ++u) {
+            const double *R_u = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(u - 1)) * 4;
+            for (int v = u; v < r; ++v) {
+                const double *R_v = cell_r + ((size_t)c * (size_t)(r - 1) + (size_t)(v - 1)) * 4;
+                double explicit_second = 0.0;
+                if (u == 1 && v == 1) {
+                    explicit_second = D_OF(cell_sbb + (size_t)c * 4);
+                } else if (u == 1 && v < 2 + p_h) {
+                    int j = v - 2;
+                    explicit_second = D_OF(cell_sbh + ((size_t)c * (size_t)p_h + (size_t)j) * 4);
+                } else if (u == 1) {
+                    int l = v - (2 + p_h);
+                    explicit_second = D_OF(cell_sbw + ((size_t)c * (size_t)p_w + (size_t)l) * 4);
                 }
-                BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left, right } => {
-                    writeln!(source, "        if (r > {right}) {{")?;
-                    writeln!(
-                        source,
-                        "            const double *R_left = cell_r + ((size_t)c * (size_t)(r - 1) + {offset}) * 4;",
-                        offset = left - 1,
-                    )?;
-                    writeln!(
-                        source,
-                        "            const double *R_right = cell_r + ((size_t)c * (size_t)(r - 1) + {offset}) * 4;",
-                        offset = right - 1,
-                    )?;
-                    writeln!(source, "            double explicit_second = 0.0;")?;
-                    if left == 1 && right == 1 {
-                        writeln!(
-                            source,
-                            "            explicit_second = D_OF(cell_sbb + (size_t)c * 4);"
-                        )?;
-                    } else if left == 1 {
-                        writeln!(source, "            if ({right} < 2 + p_h) {{")?;
-                        writeln!(
-                            source,
-                            "                const double *S = cell_sbh + ((size_t)c * (size_t)p_h + {right} - 2) * 4;"
-                        )?;
-                        writeln!(source, "                explicit_second = D_OF(S);")?;
-                        writeln!(source, "            }} else {{")?;
-                        writeln!(
-                            source,
-                            "                const double *S = cell_sbw + ((size_t)c * (size_t)p_w + {right} - (2 + p_h)) * 4;"
-                        )?;
-                        writeln!(source, "                explicit_second = D_OF(S);")?;
-                        writeln!(source, "            }}")?;
-                    }
-                    writeln!(
-                        source,
-                        "            atomic_add_f64(&F_uv[{left} * r + {right}], explicit_second - Q_OF(R_left, R_right));"
-                    )?;
-                    writeln!(source, "        }}")?;
+                atomic_add_f64(&F_uv[u * r + v], explicit_second - Q_OF(R_u, R_v));
+            }
+        }
+"#,
+                    );
                 }
             }
             Ok(())
         },
     )
-    .expect("writing generated CUDA calibration source into String cannot fail");
+    .expect("the infallible calibration phase emitter cannot fail");
 
     source.push_str(between);
-    BmsFlexRowProgram::try_for_each_order2_finalizer(
-        MAX_R,
+    BmsFlexRowProgram::try_for_each_order2_finalizer_phase(
         true,
-        |node| -> std::fmt::Result {
-            match node {
-                BmsFlexRowOrder2FinalizerNode::ImplicitFirst { primary } => {
-                    writeln!(source, "    if (r > {primary}) {{")?;
-                    writeln!(
-                        source,
-                        "        a_u[{primary}] = -F_u[{primary}] * inv_Fa;"
-                    )?;
-                    writeln!(source, "    }}")?;
+        |phase| -> Result<(), std::convert::Infallible> {
+            match phase {
+                BmsFlexRowOrder2FinalizerPhase::ImplicitFirst => {
+                    source.push_str(
+                        r#"    for (int u = 0; u < r; ++u) {
+        a_u[u] = -F_u[u] * inv_Fa;
+    }
+"#,
+                    );
                 }
-                BmsFlexRowOrder2FinalizerNode::ImplicitFirstComplete => {
-                    writeln!(source, "    // Canonical implicit-first stage complete.")?;
+                BmsFlexRowOrder2FinalizerPhase::ImplicitFirstComplete => {
+                    source.push_str("    // Canonical implicit-first stage complete.\n");
                 }
-                BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left, right } => {
-                    writeln!(source, "    if (r > {right}) {{")?;
-                    writeln!(
-                        source,
-                        "        double term = F_uv[{left} * r + {right}] + F_au[{right}] * a_u[{left}] + F_au[{left}] * a_u[{right}] + F_aa * a_u[{left}] * a_u[{right}];"
-                    )?;
-                    writeln!(source, "        double value = -term * inv_Fa;")?;
-                    writeln!(source, "        a_uv[{left} * r + {right}] = value;")?;
-                    if left != right {
-                        writeln!(source, "        a_uv[{right} * r + {left}] = value;")?;
-                    }
-                    writeln!(source, "    }}")?;
+                BmsFlexRowOrder2FinalizerPhase::ImplicitSecond => {
+                    source.push_str(
+                        r#"    for (int u = 0; u < r; ++u) {
+        for (int v = u; v < r; ++v) {
+            double term = F_uv[u * r + v]
+                        + F_au[v] * a_u[u]
+                        + F_au[u] * a_u[v]
+                        + F_aa * a_u[u] * a_u[v];
+            double value = -term * inv_Fa;
+            a_uv[u * r + v] = value;
+            a_uv[v * r + u] = value;
+        }
+    }
+"#,
+                    );
                 }
-                BmsFlexRowOrder2FinalizerNode::ObservedFirst { primary } => {
-                    writeln!(source, "    if (r > {primary}) {{")?;
-                    writeln!(
-                        source,
-                        "        bar_e_u[{primary}] = chi * a_u[{primary}] + rho[{primary}];"
-                    )?;
-                    writeln!(source, "    }}")?;
+                BmsFlexRowOrder2FinalizerPhase::ObservedFirst => {
+                    source.push_str(
+                        r#"    for (int u = 0; u < r; ++u) {
+        bar_e_u[u] = chi * a_u[u] + rho[u];
+    }
+"#,
+                    );
                 }
-                BmsFlexRowOrder2FinalizerNode::ObservedScoreSensitivity { primary } => {
-                    if primary == 0 {
-                        writeln!(
-                            source,
-                            "    // Score-sensitivity nodes have no Stage-2 device output channel."
-                        )?;
-                    }
+                BmsFlexRowOrder2FinalizerPhase::ObservedScoreSensitivity => {
+                    source.push_str(
+                        "    // Score sensitivity has no Stage-2 device output channel.\n",
+                    );
                 }
-                BmsFlexRowOrder2FinalizerNode::ObservedSecond { left, right } => {
-                    writeln!(source, "    if (r > {right}) {{")?;
-                    writeln!(
-                        source,
-                        "        double observed_second = chi * a_uv[{left} * r + {right}] + xi * a_u[{left}] * a_u[{right}] + tau[{left}] * a_u[{right}] + a_u[{left}] * tau[{right}] + ruv[{left} * r + {right}];"
-                    )?;
-                    writeln!(
-                        source,
-                        "        bar_e_uv[{left} * r + {right}] = observed_second;"
-                    )?;
-                    if left != right {
-                        writeln!(
-                            source,
-                            "        bar_e_uv[{right} * r + {left}] = observed_second;"
-                        )?;
-                    }
-                    writeln!(
-                        source,
-                        "        double hessian_value = B_i * bar_e_u[{left}] * bar_e_u[{right}] + A_i * observed_second;"
-                    )?;
-                    writeln!(
-                        source,
-                        "        out_hess[row * r * r + {left} * r + {right}] = hessian_value;"
-                    )?;
-                    if left != right {
-                        writeln!(
-                            source,
-                            "        out_hess[row * r * r + {right} * r + {left}] = hessian_value;"
-                        )?;
-                    }
-                    writeln!(source, "    }}")?;
+                BmsFlexRowOrder2FinalizerPhase::ObservedSecond => {
+                    source.push_str(
+                        r#"    for (int u = 0; u < r; ++u) {
+        for (int v = u; v < r; ++v) {
+            double observed_second = chi * a_uv[u * r + v]
+                                   + xi * a_u[u] * a_u[v]
+                                   + tau[u] * a_u[v]
+                                   + a_u[u] * tau[v]
+                                   + ruv[u * r + v];
+            bar_e_uv[u * r + v] = observed_second;
+            bar_e_uv[v * r + u] = observed_second;
+            double hessian_value =
+                B_i * bar_e_u[u] * bar_e_u[v] + A_i * observed_second;
+            out_hess[row * r * r + u * r + v] = hessian_value;
+            out_hess[row * r * r + v * r + u] = hessian_value;
+        }
+    }
+"#,
+                    );
                 }
-                BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary } => {
-                    writeln!(source, "    if (r > {primary}) {{")?;
-                    writeln!(
-                        source,
-                        "        out_grad[row * r + {primary}] = A_i * bar_e_u[{primary}];"
-                    )?;
-                    writeln!(source, "    }}")?;
+                BmsFlexRowOrder2FinalizerPhase::NegLogFirst => {
+                    source.push_str(
+                        r#"    for (int u = 0; u < r; ++u) {
+        out_grad[row * r + u] = A_i * bar_e_u[u];
+    }
+"#,
+                    );
                 }
             }
             Ok(())
         },
     )
-    .expect("writing generated CUDA finalizer source into String cannot fail");
+    .expect("the infallible finalizer phase emitter cannot fail");
     source.push_str(suffix);
     source
 }
@@ -3033,7 +2979,6 @@ mod row_kernel_tests {
         gam_gpu::numerics_host::log_ndtr_mills_curvature(x)
     }
 
-
     // #415 parity lock: one fitted StandardNormal FLEX family supplies both
     // the production CPU lowering and the generated CUDA launch.
     mod parity_415 {
@@ -3136,24 +3081,19 @@ mod row_kernel_tests {
             (family, states)
         }
 
-        /// The non-vacuous #415 lock: pack once, run the host oracle for all
-        /// rows, run the CPU family per row, and assert value/gradient/Hessian
-        /// parity.
+        /// One real StandardNormal full-FLEX fit drives both the production CPU
+        /// lowering and the generated CUDA kernel. No mirrored host algebra is
+        /// involved.
         #[test]
-        fn cpu_oracle_matches_cpu_family_row_analytic_flex_415() {
+        fn generated_cuda_row_kernel_matches_canonical_cpu_lowering_415() {
             let n = 12usize;
             let (family, states) = make_flex_parity_family(n);
             let cache = family
                 .build_exact_eval_cache(&states)
                 .expect("flex exact eval cache");
-
-            // Preconditions that make the lock non-vacuous: the row-cell-moments
-            // bundle (which the oracle consumes) must actually be materialised,
-            // and the deviation blocks must both be present so p_h > 0 AND p_w > 0.
             assert!(
                 cache.row_cell_moments.is_some(),
-                "#415 fixture must materialise the row-cell-moments bundle; the pack \
-                 and both compared paths read it"
+                "#415 fixture must materialise production row-cell moments"
             );
             let primary = &cache.primary;
             let r = primary.total;
@@ -3161,61 +3101,19 @@ mod row_kernel_tests {
             let p_w = primary.w.as_ref().map(|range| range.len()).unwrap_or(0);
             assert!(
                 p_h > 0 && p_w > 0,
-                "#415 fixture must be full-flex: p_h={p_h} p_w={p_w}"
+                "fixture must activate both deviation blocks"
             );
-            assert_eq!(r, 2 + p_h + p_w, "#415 fixture primary layout");
+            assert_eq!(r, 2 + p_h + p_w);
 
-            // Pack the SAME fitted state the CPU family will consume, then run the
-            // GPU host oracle over every row.
             let owned = family
                 .pack_bms_flex_row_kernel_inputs(&states, &cache)
-                .expect("pack must not error")
-                .expect("pack must succeed for the StandardNormal full-flex fixture");
+                .expect("packing production CUDA inputs must not error")
+                .expect("StandardNormal full-FLEX fixture must admit the CUDA row kernel");
             let inputs = owned.as_borrowed();
-            let oracle = cpu_oracle_outputs(&inputs);
-            assert_eq!(oracle.neglog.len(), n);
-            assert_eq!(oracle.grad.len(), n * r);
-            assert_eq!(oracle.hess.len(), n * r * r);
-
-            // Non-vacuity guard for the original #415/BMS-FLEX failure mode:
-            // the Mills margin must be the packed observed predictor VALUE
-            // `e_obs`, not the q-axis first derivative `bar_e_u[0]`. The oracle
-            // does not expose `bar_e_u`, but its gradient obeys
-            // `grad[0] = A(e_obs) · bar_e_u[0]`; recover that derivative from
-            // the written output and prove this fixture separates it from
-            // `e_obs` on at least one row. Otherwise a kernel/oracle that
-            // accidentally substituted `bar_e_u[0]` for `e_obs` could pass a
-            // vacuous fixture where both scalars coincide.
-            let mut separates_observed_value_from_q_derivative = false;
-            for row in 0..n {
-                let y = inputs.y[row];
-                let w = inputs.w[row];
-                let s = 2.0 * y - 1.0;
-                let e_obs = inputs.e_obs[row];
-                let (_, lambda) = super::oracle_log_ndtr_and_mills(s * e_obs);
-                let a_i = -w * s * lambda;
-                if a_i.abs() > 1e-12 {
-                    let recovered_bar_e_q = oracle.grad[row * r] / a_i;
-                    if (recovered_bar_e_q - e_obs).abs() > 1e-8 {
-                        separates_observed_value_from_q_derivative = true;
-                        break;
-                    }
-                }
-            }
-            assert!(
-                separates_observed_value_from_q_derivative,
-                "#415 fixture must distinguish e_obs from bar_e_u[0]; otherwise \
-                 the observed-value Mills-margin regression is not exercised"
-            );
-
-            // Both sides are exact f64 CPU math over the SAME cached moments, so
-            // the only slack is FP summation ordering. Anything looser than this
-            // would hide a real algebraic drift.
-            let tol_abs = 1e-9_f64;
-            let tol_rel = 1e-10_f64;
-
+            let mut canonical_neglog = vec![0.0; n];
+            let mut canonical_grad = vec![0.0; n * r];
+            let mut canonical_hess = vec![0.0; n * r * r];
             let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
-            let mut max_rel = 0.0_f64;
             let mut checked_labels = [false, false];
 
             for row in 0..n {
@@ -3226,14 +3124,9 @@ mod row_kernel_tests {
                     .and_then(|bundle| bundle.row(row, 9));
                 assert!(
                     row_moments.is_some(),
-                    "row {row} must carry degree-9 cell moments (the oracle reads them)"
+                    "row {row} must carry degree-9 moments"
                 );
-                let label = family.y[row] as usize;
-                if label < 2 {
-                    checked_labels[label] = true;
-                }
-
-                let value = family
+                canonical_neglog[row] = family
                     .lower_bms_flex_row_order2_with_moments(
                         row,
                         &states,
@@ -3244,73 +3137,87 @@ mod row_kernel_tests {
                         true,
                         &mut scratch,
                     )
-                    .expect("cpu family row analytic flex");
-
-                // ── value ────────────────────────────────────────────────────
-                let o_val = oracle.neglog[row];
-                if o_val.is_nan() || value.is_nan() {
-                    assert!(
-                        o_val.is_nan() && value.is_nan(),
-                        "row {row}: NaN parity broke — oracle={o_val} family={value}"
-                    );
-                    continue;
-                }
-                let vd = (o_val - value).abs();
-                let vtol = tol_abs + tol_rel * o_val.abs();
-                max_rel = max_rel.max(vd / o_val.abs().max(1.0));
-                assert!(
-                    vd <= vtol,
-                    "row {row} value drift: oracle={o_val:.17e} family={value:.17e} \
-                     |Δ|={vd:.3e} > tol={vtol:.3e}"
-                );
-
-                // ── gradient ─────────────────────────────────────────────────
+                    .expect("canonical production CPU row lowering");
                 for u in 0..r {
-                    let o_g = oracle.grad[row * r + u];
-                    let f_g = scratch.grad[u];
-                    let gd = (o_g - f_g).abs();
-                    let gtol = tol_abs + tol_rel * o_g.abs();
-                    max_rel = max_rel.max(gd / o_g.abs().max(1.0));
-                    assert!(
-                        gd <= gtol,
-                        "row {row} grad[{u}] drift: oracle={o_g:.17e} family={f_g:.17e} \
-                         |Δ|={gd:.3e} > tol={gtol:.3e}"
-                    );
-                }
-
-                // ── full r×r Hessian ─────────────────────────────────────────
-                for u in 0..r {
+                    canonical_grad[row * r + u] = scratch.grad[u];
                     for v in 0..r {
-                        let o_h = oracle.hess[row * r * r + u * r + v];
-                        let f_h = scratch.hess[[u, v]];
-                        let hd = (o_h - f_h).abs();
-                        let htol = tol_abs + tol_rel * o_h.abs();
-                        max_rel = max_rel.max(hd / o_h.abs().max(1.0));
-                        assert!(
-                            hd <= htol,
-                            "row {row} hess[{u},{v}] drift: oracle={o_h:.17e} \
-                             family={f_h:.17e} |Δ|={hd:.3e} > tol={htol:.3e}"
+                        let value = scratch.hess[[u, v]];
+                        assert!(value.is_finite(), "row {row}: H[{u},{v}] is non-finite");
+                        assert_eq!(
+                            value.to_bits(),
+                            scratch.hess[[v, u]].to_bits(),
+                            "row {row}: canonical Hessian lost exact symmetry"
                         );
+                        canonical_hess[row * r * r + u * r + v] = value;
+                    }
+                }
+                checked_labels[family.y[row] as usize] = true;
+            }
+            assert!(checked_labels[0] && checked_labels[1]);
+
+            let mut separates_value_from_q_derivative = false;
+            for row in 0..n {
+                let sign = 2.0 * inputs.y[row] - 1.0;
+                let (_, lambda) = super::host_log_ndtr_and_mills(sign * inputs.e_obs[row]);
+                let scale = -inputs.w[row] * sign * lambda;
+                if scale.abs() > 1e-12 {
+                    let observed_q_derivative = canonical_grad[row * r] / scale;
+                    if (observed_q_derivative - inputs.e_obs[row]).abs() > 1e-8 {
+                        separates_value_from_q_derivative = true;
+                        break;
                     }
                 }
             }
-
-            // Edge coverage: both label branches must have been exercised (the
-            // q-row overrides F_q=-mu_1 / F_qq=-mu_2 and both Mills sign branches).
             assert!(
-                checked_labels[0] && checked_labels[1],
-                "#415 fixture must exercise both y=0 and y=1 rows: {checked_labels:?}"
+                separates_value_from_q_derivative,
+                "fixture must distinguish the observed value from its q derivative"
             );
-            eprintln!(
-                "#415 parity lock: n={n} r={r} p_h={p_h} p_w={p_w} max_rel(oracle−family)={max_rel:.3e}"
-            );
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("[bms_flex_row parity] generated CUDA check requires Linux");
+                return;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
+                    eprintln!("[bms_flex_row parity] no CUDA runtime");
+                    return;
+                };
+                let gpu = super::super::launch_bms_flex_row_kernel(owned.as_borrowed())
+                    .expect("CUDA-selected canonical parity launch must succeed");
+                let check = |channel: &str, index: usize, cpu: f64, device: f64| {
+                    let difference = (cpu - device).abs();
+                    let tolerance = 1e-8 + 1e-8 * cpu.abs();
+                    assert!(
+                        difference <= tolerance,
+                        "{channel}[{index}] CPU={cpu:.17e} CUDA={device:.17e} \
+                         difference={difference:.3e} tolerance={tolerance:.3e}"
+                    );
+                };
+                for (index, (&cpu, &device)) in
+                    canonical_neglog.iter().zip(gpu.neglog.iter()).enumerate()
+                {
+                    check("neglog", index, cpu, device);
+                }
+                for (index, (&cpu, &device)) in
+                    canonical_grad.iter().zip(gpu.grad.iter()).enumerate()
+                {
+                    check("gradient", index, cpu, device);
+                }
+                for (index, (&cpu, &device)) in
+                    canonical_hess.iter().zip(gpu.hess.iter()).enumerate()
+                {
+                    check("hessian", index, cpu, device);
+                }
+            }
         }
     }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::oracle_parity_tests::*;
+    use super::row_kernel_tests::*;
     use super::*;
 
     pub(crate) fn minimal_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
@@ -3539,188 +3446,11 @@ mod tests {
         }
     }
 
-    /// Build a non-trivial fixture: `n = 4` rows, `r = 5` (p_h = 2, p_w = 1),
-    /// 2–4 cells per row, distinct values so a structural bug in either path
-    /// can't be masked by accidental cancellation.
-    pub(crate) fn make_parity_buffers() -> TestBuffers {
-        let n = 4_usize;
-        let r = 5_usize;
-        let p_h = 2_usize;
-        let p_w = 1_usize;
-        // Per-row cell counts: 2, 3, 4, 2 → total 11 cells.
-        let row_cells: [u32; 4] = [2, 3, 4, 2];
-        let mut cell_offsets = vec![0_u32; n + 1];
-        for i in 0..n {
-            cell_offsets[i + 1] = cell_offsets[i] + row_cells[i];
-        }
-        let total_cells = cell_offsets[n] as usize;
-
-        // Deterministic but varied generators (LCG-ish so each slot is distinct).
-        let f = |seed: usize| -> f64 {
-            let x = ((seed.wrapping_mul(2_654_435_761)) & 0xFFFF) as f64 / 65_536.0;
-            0.1 + 0.4 * x
-        };
-
-        let q = (0..n).map(|i| 0.05 + 0.1 * (i as f64)).collect::<Vec<_>>();
-        let b = (0..n).map(|i| 0.6 + 0.05 * (i as f64)).collect::<Vec<_>>();
-        let mu_1 = (0..n).map(|i| 0.7 + 0.02 * (i as f64)).collect::<Vec<_>>();
-        let mu_2 = (0..n).map(|i| 0.15 + 0.01 * (i as f64)).collect::<Vec<_>>();
-        let z_obs = (0..n).map(|i| -0.2 + 0.1 * (i as f64)).collect::<Vec<_>>();
-        let y = [1.0, 0.0, 1.0, 0.0].to_vec();
-        let w = vec![1.0; n];
-        let e_obs = (0..n).map(|i| -0.3 + 0.2 * (i as f64)).collect::<Vec<_>>();
-
-        let cell_c0 = (0..total_cells).map(|c| f(c + 1001)).collect::<Vec<_>>();
-        let cell_c1 = (0..total_cells)
-            .map(|c| -f(c + 2002) * 0.5)
-            .collect::<Vec<_>>();
-        let cell_c2 = (0..total_cells).map(|c| f(c + 3003) * 0.2).collect();
-        let cell_c3 = (0..total_cells).map(|c| -f(c + 4004) * 0.1).collect();
-
-        let cell_a = (0..total_cells * 4)
-            .map(|i| f(i + 5005) * 0.3)
-            .collect::<Vec<_>>();
-        let cell_aa = (0..total_cells * 4)
-            .map(|i| f(i + 6006) * 0.1)
-            .collect::<Vec<_>>();
-        let cell_r = (0..total_cells * (r - 1) * 4)
-            .map(|i| f(i + 7007) * 0.2)
-            .collect::<Vec<_>>();
-        let cell_ar = (0..total_cells * (r - 1) * 4)
-            .map(|i| f(i + 8008) * 0.05)
-            .collect::<Vec<_>>();
-        let cell_sbb = (0..total_cells * 4)
-            .map(|i| f(i + 9009) * 0.08)
-            .collect::<Vec<_>>();
-        let cell_sbh = (0..total_cells * p_h * 4)
-            .map(|i| f(i + 10_010) * 0.07)
-            .collect::<Vec<_>>();
-        let cell_sbw = (0..total_cells * p_w * 4)
-            .map(|i| f(i + 11_011) * 0.06)
-            .collect::<Vec<_>>();
-        let cell_moments = (0..total_cells * MOMENT_STRIDE)
-            .map(|i| 0.4 + 0.1 * f(i + 12_012))
-            .collect::<Vec<_>>();
-
-        let chi_obs = (0..n).map(|i| 0.9 + 0.01 * (i as f64)).collect::<Vec<_>>();
-        let xi_obs = (0..n).map(|i| 0.2 + 0.01 * (i as f64)).collect::<Vec<_>>();
-        let rho_u = (0..n * r).map(|i| 0.03 * f(i + 13_013)).collect::<Vec<_>>();
-        let tau_u = (0..n * r).map(|i| 0.02 * f(i + 14_014)).collect::<Vec<_>>();
-        let r_uv = (0..n * r * r)
-            .map(|i| 0.04 * f(i + 15_015))
-            .collect::<Vec<_>>();
-
-        TestBuffers {
-            q,
-            b,
-            mu_1,
-            mu_2,
-            z_obs,
-            y,
-            w,
-            e_obs,
-            cell_offsets,
-            cell_c0,
-            cell_c1,
-            cell_c2,
-            cell_c3,
-            cell_a,
-            cell_aa,
-            cell_r,
-            cell_ar,
-            cell_sbb,
-            cell_sbh,
-            cell_sbw,
-            cell_moments,
-            chi_obs,
-            xi_obs,
-            rho_u,
-            tau_u,
-            r_uv,
-        }
-    }
-
-    pub(crate) fn parity_inputs<'a>(buffers: &'a TestBuffers) -> BmsFlexRowKernelInputs<'a> {
-        BmsFlexRowKernelInputs {
-            n_rows: 4,
-            r: 5,
-            p_h: 2,
-            p_w: 1,
-            q: &buffers.q,
-            b: &buffers.b,
-            mu_1: &buffers.mu_1,
-            mu_2: &buffers.mu_2,
-            z_obs: &buffers.z_obs,
-            y: &buffers.y,
-            w: &buffers.w,
-            e_obs: &buffers.e_obs,
-            s_f: 1.0,
-            cell_offsets: &buffers.cell_offsets,
-            cell_c0: &buffers.cell_c0,
-            cell_c1: &buffers.cell_c1,
-            cell_c2: &buffers.cell_c2,
-            cell_c3: &buffers.cell_c3,
-            cell_a: &buffers.cell_a,
-            cell_aa: &buffers.cell_aa,
-            cell_r: &buffers.cell_r,
-            cell_ar: &buffers.cell_ar,
-            cell_sbb: &buffers.cell_sbb,
-            cell_sbh: &buffers.cell_sbh,
-            cell_sbw: &buffers.cell_sbw,
-            cell_moments: CellMomentsSource::Host(&buffers.cell_moments),
-            chi_obs: &buffers.chi_obs,
-            xi_obs: &buffers.xi_obs,
-            rho_u: &buffers.rho_u,
-            tau_u: &buffers.tau_u,
-            r_uv: &buffers.r_uv,
-        }
-    }
-
-    /// Symmetry + finiteness of the CPU oracle. Runs on every host (Linux,
-    /// macOS, CPU CI) since the oracle is platform-independent. Guarantees the
-    /// reference path used by the GPU parity test is itself well-formed.
-    #[test]
-    pub(crate) fn cpu_oracle_produces_finite_symmetric_hessian() {
-        let buffers = make_parity_buffers();
-        let inputs = parity_inputs(&buffers);
-        inputs
-            .validate()
-            .expect("parity fixture must satisfy validate()");
-        let out = cpu_oracle_outputs(&inputs);
-        let n = inputs.n_rows;
-        let r = inputs.r;
-        assert_eq!(out.neglog.len(), n);
-        assert_eq!(out.grad.len(), n * r);
-        assert_eq!(out.hess.len(), n * r * r);
-        for row in 0..n {
-            assert!(
-                out.neglog[row].is_finite(),
-                "row {row}: neglog must be finite, got {}",
-                out.neglog[row]
-            );
-            for u in 0..r {
-                let g = out.grad[row * r + u];
-                assert!(g.is_finite(), "row {row}: grad[{u}] = {g}");
-                for v in 0..r {
-                    let huv = out.hess[row * r * r + u * r + v];
-                    let hvu = out.hess[row * r * r + v * r + u];
-                    assert!(huv.is_finite(), "row {row}: H[{u},{v}] = {huv}");
-                    assert_eq!(
-                        huv.to_bits(),
-                        hvu.to_bits(),
-                        "row {row}: H[{u},{v}] and H[{v},{u}] must be bit-identical"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Independent finite-difference correctness lock on the oracle's probit
+    /// Independent finite-difference correctness lock on the device probit
     /// Mills layer — the most optimizer-sensitive, drift-prone term in the
     /// whole row kernel (issue #415: "third/fourth-order derivative
     /// contractions drift silently … formulas are complex and
-    /// optimizer-sensitive"). The device kernel's `bms_flex_row_kernel` and
-    /// the host oracle's `cpu_oracle_outputs` both close out with the same
+    /// optimizer-sensitive"). The generated device kernel closes with this
     /// Mills algebra:
     ///
     /// ```text
@@ -3736,21 +3466,19 @@ mod tests {
     /// row neglog is a function of the observed predictor VALUE `e := e_obs`,
     /// not of the q-axis first derivative `bar_e_u[0]`; by the assembled
     /// formula `∂neglog/∂e = A` and `∂²neglog/∂e² = B`. This test reconstructs
-    /// `A`, `B`, and `neglog` exactly as the oracle does (same
-    /// `oracle_log_ndtr_and_mills`, same sign convention), then verifies the
+    /// `A`, `B`, and `neglog` through the canonical host numerics, then verifies the
     /// analytic `A`/`B` against high-order central differences of
     /// `e ↦ −w · log Φ(s·e)`. A drift in the kernel's Mills derivatives —
-    /// which the device-parity test cannot catch because it checks the kernel
-    /// *against the same (possibly-wrong) oracle* — fails here on every host,
-    /// CUDA or not. Bounds are the genuine fifth-order central-difference
+    /// fails independently of the CPU↔CUDA production parity check. Bounds are
+    /// the genuine fifth-order central-difference
     /// truncation floor; they are not weakened to pass.
     #[test]
-    pub(crate) fn cpu_oracle_mills_layer_matches_finite_differences() {
-        // Probit neglog as the oracle assembles it, as a function of the
+    pub(crate) fn device_mills_layer_matches_finite_differences() {
+        // Probit neglog as a function of the
         // observed scalar predictor `e` with weight `w` and label `y`.
         let neglog_of = |e: f64, y: f64, w: f64| -> f64 {
             let s = 2.0 * y - 1.0;
-            let (log_cdf, _) = oracle_log_ndtr_and_mills(s * e);
+            let (log_cdf, _) = host_log_ndtr_and_mills(s * e);
             -w * log_cdf
         };
         // Analytic first/second derivatives wrt `e` — the exact `A`/`B` the
@@ -3758,7 +3486,7 @@ mod tests {
         let ab_of = |e: f64, y: f64, w: f64| -> (f64, f64) {
             let s = 2.0 * y - 1.0;
             let m_arg = s * e;
-            let (_, lambda, probit_curvature) = oracle_log_ndtr_mills_curvature(m_arg);
+            let (_, lambda, probit_curvature) = host_log_ndtr_mills_curvature(m_arg);
             let a_i = -w * s * lambda;
             let b_i = w * probit_curvature;
             (a_i, b_i)
@@ -3817,109 +3545,18 @@ mod tests {
         }
     }
 
-    /// CPU↔GPU parity. Only runs end-to-end on a Linux host with a CUDA
-    /// runtime; skips with a clear `eprintln!` on every other host so the
-    /// always-on test suite stays green on the macOS dev box and CPU CI.
-    ///
-    /// On a CUDA host: drives the kernel through `launch_bms_flex_row_kernel`
-    /// and the same `BmsFlexRowKernelInputs` through `cpu_oracle_outputs`,
-    /// then asserts every element of `neglog`, `grad`, and `hess` agrees
-    /// within `|Δ| <= 1e-8 + 1e-8·|cpu|` (absolute-or-relative).
     #[test]
-    pub(crate) fn bms_flex_row_kernel_matches_cpu_oracle_when_cuda_available() {
-        #[cfg(not(target_os = "linux"))]
-        {
-            eprintln!(
-                "[bms_flex_row parity] non-Linux host — skipping CUDA parity \
-                 (CPU oracle exercised by sibling test)"
-            );
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-                eprintln!(
-                    "[bms_flex_row parity] no CUDA runtime — skipping device \
-                     parity (CPU oracle exercised by sibling test)"
-                );
-                return;
-            };
-            let buffers = make_parity_buffers();
-            let inputs_cpu = parity_inputs(&buffers);
-            inputs_cpu
-                .validate()
-                .expect("parity fixture must satisfy validate()");
-            let cpu_out = cpu_oracle_outputs(&inputs_cpu);
-
-            // Launch the device kernel against the same inputs.
-            let inputs_gpu = parity_inputs(&buffers);
-            let gpu_out = match launch_bms_flex_row_kernel(inputs_gpu) {
-                Ok(out) => out,
-                Err(err) => panic!(
-                    "[bms_flex_row parity] launch failed on CUDA-selected host; \
-                     device/oracle parity must fail loudly on GPU CI: {err}"
-                ),
-            };
-
-            let n = inputs_cpu.n_rows;
-            let r = inputs_cpu.r;
-            let tol_abs = 1e-8_f64;
-            let tol_rel = 1e-8_f64;
-            let check_close = |label: &str, idx: usize, cpu: f64, gpu: f64| {
-                if cpu.is_nan() || gpu.is_nan() {
-                    assert!(
-                        cpu.is_nan() && gpu.is_nan(),
-                        "{label}[{idx}]: NaN parity broke — cpu={cpu}, gpu={gpu}"
-                    );
-                    return;
-                }
-                let diff = (cpu - gpu).abs();
-                let tol = tol_abs + tol_rel * cpu.abs();
-                assert!(
-                    diff <= tol,
-                    "{label}[{idx}]: |cpu − gpu| = {diff:.3e} > tol = {tol:.3e}; \
-                     cpu={cpu:.17e}, gpu={gpu:.17e}"
-                );
-            };
-            assert_eq!(cpu_out.neglog.len(), gpu_out.neglog.len());
-            assert_eq!(cpu_out.grad.len(), gpu_out.grad.len());
-            assert_eq!(cpu_out.hess.len(), gpu_out.hess.len());
-            for (i, (&c, &g)) in cpu_out.neglog.iter().zip(gpu_out.neglog.iter()).enumerate() {
-                check_close("neglog", i, c, g);
-            }
-            for (i, (&c, &g)) in cpu_out.grad.iter().zip(gpu_out.grad.iter()).enumerate() {
-                check_close("grad", i, c, g);
-            }
-            for (i, (&c, &g)) in cpu_out.hess.iter().zip(gpu_out.hess.iter()).enumerate() {
-                check_close("hess", i, c, g);
-            }
-            // Spot-check exact symmetry on the GPU Hessian too.
-            for row in 0..n {
-                for u in 0..r {
-                    for v in 0..r {
-                        let a = gpu_out.hess[row * r * r + u * r + v];
-                        let bb = gpu_out.hess[row * r * r + v * r + u];
-                        assert_eq!(
-                            a.to_bits(),
-                            bb.to_bits(),
-                            "GPU row {row}: H[{u},{v}] ≠ H[{v},{u}] bit-for-bit"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    pub(crate) fn kernel_source_mentions_cpu_parity_reference() {
-        // Guarantee the maintainer-facing parity reference comment survives
-        // refactors of the NVRTC kernel source — the dispatcher wave that
-        // wires this to bms_flex.rs cross-checks parity against the CPU
-        // function named here.
-        #[cfg(target_os = "linux")]
-        assert!(ROW_KERNEL_BODY.contains("lower_bms_flex_row_order2_from_parts"));
-        #[cfg(target_os = "linux")]
-        assert!(ROW_KERNEL_BODY.contains("cell_first_derivative_from_moments"));
+    pub(crate) fn generated_source_interprets_compact_canonical_phase_streams() {
+        let source = generated_row_kernel_source();
+        assert!(!source.contains("__BMS_FLEX_CALIBRATION_ORDER2__"));
+        assert!(!source.contains("__BMS_FLEX_ORDER2_FINALIZER__"));
+        assert!(source.contains("for (int u = 1; u < r; ++u)"));
+        assert!(source.contains("for (int v = u; v < r; ++v)"));
+        assert!(source.contains("Canonical implicit-first stage complete"));
+        assert!(
+            source.len() < 40_000,
+            "generated CUDA source unexpectedly bloated"
+        );
     }
 
     // ── Phase-3 HVP / diagonal CPU oracles + GPU parity tests ────────────────

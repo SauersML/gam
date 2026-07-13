@@ -34,11 +34,10 @@ pub(super) enum BmsFlexCalibrationOrder2Node {
 /// backends may preserve a phase as one runtime loop, avoiding max-width
 /// source unrolling while retaining the same semantic phase order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum BmsFlexCalibrationOrder2Phase {
+enum BmsFlexCalibrationOrder2Phase {
     InterceptFirst,
     InterceptSecond,
-    PrimaryFirst,
-    InterceptPrimarySecond,
+    PrimaryFirstAndInterceptSecond,
     PrimaryPairSecond,
 }
 
@@ -113,7 +112,7 @@ pub(super) enum BmsFlexRowOrder2FinalizerNode {
 /// Indexed CPU visits and compact generated device loops are expansions of
 /// this one phase stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum BmsFlexRowOrder2FinalizerPhase {
+enum BmsFlexRowOrder2FinalizerPhase {
     ImplicitFirst,
     ImplicitFirstComplete,
     ImplicitSecond,
@@ -336,25 +335,54 @@ impl BmsFlexRowProgram {
         need_hessian: bool,
         mut visit: impl FnMut(BmsFlexCalibrationOrder2Node) -> Result<(), E>,
     ) -> Result<(), E> {
-        visit(BmsFlexCalibrationOrder2Node::InterceptFirst)?;
-        if need_hessian {
-            visit(BmsFlexCalibrationOrder2Node::InterceptSecond)?;
-        }
-        for position in 0..active_count {
-            let primary = active_at(position);
-            visit(BmsFlexCalibrationOrder2Node::PrimaryFirst { primary })?;
-            if need_hessian {
-                visit(BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary })?;
-            }
-        }
-        if need_hessian {
-            for left_position in 0..active_count {
-                let left = active_at(left_position);
-                for right_position in left_position..active_count {
-                    let right = active_at(right_position);
-                    visit(BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left, right })?;
+        Self::try_for_each_calibration_order2_phase(need_hessian, |phase| {
+            match phase {
+                BmsFlexCalibrationOrder2Phase::InterceptFirst => {
+                    visit(BmsFlexCalibrationOrder2Node::InterceptFirst)?;
+                }
+                BmsFlexCalibrationOrder2Phase::InterceptSecond => {
+                    visit(BmsFlexCalibrationOrder2Node::InterceptSecond)?;
+                }
+                BmsFlexCalibrationOrder2Phase::PrimaryFirstAndInterceptSecond => {
+                    for position in 0..active_count {
+                        let primary = active_at(position);
+                        visit(BmsFlexCalibrationOrder2Node::PrimaryFirst { primary })?;
+                        if need_hessian {
+                            visit(BmsFlexCalibrationOrder2Node::InterceptPrimarySecond {
+                                primary,
+                            })?;
+                        }
+                    }
+                }
+                BmsFlexCalibrationOrder2Phase::PrimaryPairSecond => {
+                    for left_position in 0..active_count {
+                        let left = active_at(left_position);
+                        for right_position in left_position..active_count {
+                            visit(BmsFlexCalibrationOrder2Node::PrimaryPairSecond {
+                                left,
+                                right: active_at(right_position),
+                            })?;
+                        }
+                    }
                 }
             }
+            Ok(())
+        })
+    }
+
+    /// Visit the canonical Order2 calibration phases without choosing a
+    /// backend index representation.
+    pub(super) fn try_for_each_calibration_order2_phase<E>(
+        need_hessian: bool,
+        mut visit: impl FnMut(BmsFlexCalibrationOrder2Phase) -> Result<(), E>,
+    ) -> Result<(), E> {
+        visit(BmsFlexCalibrationOrder2Phase::InterceptFirst)?;
+        if need_hessian {
+            visit(BmsFlexCalibrationOrder2Phase::InterceptSecond)?;
+        }
+        visit(BmsFlexCalibrationOrder2Phase::PrimaryFirstAndInterceptSecond)?;
+        if need_hessian {
+            visit(BmsFlexCalibrationOrder2Phase::PrimaryPairSecond)?;
         }
         Ok(())
     }
@@ -461,33 +489,67 @@ impl BmsFlexRowProgram {
         need_hessian: bool,
         mut visit: impl FnMut(BmsFlexRowOrder2FinalizerNode) -> Result<(), E>,
     ) -> Result<(), E> {
-        for primary in 0..primary_count {
-            visit(BmsFlexRowOrder2FinalizerNode::ImplicitFirst { primary })?;
-        }
-        visit(BmsFlexRowOrder2FinalizerNode::ImplicitFirstComplete)?;
-        if need_hessian {
-            for left in 0..primary_count {
-                for right in left..primary_count {
-                    visit(BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left, right })?;
+        Self::try_for_each_order2_finalizer_phase(need_hessian, |phase| {
+            match phase {
+                BmsFlexRowOrder2FinalizerPhase::ImplicitFirst => {
+                    for primary in 0..primary_count {
+                        visit(BmsFlexRowOrder2FinalizerNode::ImplicitFirst { primary })?;
+                    }
+                }
+                BmsFlexRowOrder2FinalizerPhase::ImplicitFirstComplete => {
+                    visit(BmsFlexRowOrder2FinalizerNode::ImplicitFirstComplete)?;
+                }
+                BmsFlexRowOrder2FinalizerPhase::ImplicitSecond => {
+                    for left in 0..primary_count {
+                        for right in left..primary_count {
+                            visit(BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left, right })?;
+                        }
+                    }
+                }
+                BmsFlexRowOrder2FinalizerPhase::ObservedFirst => {
+                    for primary in 0..primary_count {
+                        visit(BmsFlexRowOrder2FinalizerNode::ObservedFirst { primary })?;
+                    }
+                }
+                BmsFlexRowOrder2FinalizerPhase::ObservedScoreSensitivity => {
+                    for primary in 0..primary_count {
+                        visit(BmsFlexRowOrder2FinalizerNode::ObservedScoreSensitivity { primary })?;
+                    }
+                }
+                BmsFlexRowOrder2FinalizerPhase::ObservedSecond => {
+                    for left in 0..primary_count {
+                        for right in left..primary_count {
+                            visit(BmsFlexRowOrder2FinalizerNode::ObservedSecond { left, right })?;
+                        }
+                    }
+                }
+                BmsFlexRowOrder2FinalizerPhase::NegLogFirst => {
+                    for primary in 0..primary_count {
+                        visit(BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary })?;
+                    }
                 }
             }
-        }
-        for primary in 0..primary_count {
-            visit(BmsFlexRowOrder2FinalizerNode::ObservedFirst { primary })?;
-        }
-        for primary in 0..primary_count {
-            visit(BmsFlexRowOrder2FinalizerNode::ObservedScoreSensitivity { primary })?;
-        }
+            Ok(())
+        })
+    }
+
+    /// Visit the canonical dependency phases without selecting an index
+    /// representation for a backend.
+    pub(super) fn try_for_each_order2_finalizer_phase<E>(
+        need_hessian: bool,
+        mut visit: impl FnMut(BmsFlexRowOrder2FinalizerPhase) -> Result<(), E>,
+    ) -> Result<(), E> {
+        visit(BmsFlexRowOrder2FinalizerPhase::ImplicitFirst)?;
+        visit(BmsFlexRowOrder2FinalizerPhase::ImplicitFirstComplete)?;
         if need_hessian {
-            for left in 0..primary_count {
-                for right in left..primary_count {
-                    visit(BmsFlexRowOrder2FinalizerNode::ObservedSecond { left, right })?;
-                }
-            }
+            visit(BmsFlexRowOrder2FinalizerPhase::ImplicitSecond)?;
         }
-        for primary in 0..primary_count {
-            visit(BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary })?;
+        visit(BmsFlexRowOrder2FinalizerPhase::ObservedFirst)?;
+        visit(BmsFlexRowOrder2FinalizerPhase::ObservedScoreSensitivity)?;
+        if need_hessian {
+            visit(BmsFlexRowOrder2FinalizerPhase::ObservedSecond)?;
         }
+        visit(BmsFlexRowOrder2FinalizerPhase::NegLogFirst)?;
         Ok(())
     }
 
