@@ -1055,7 +1055,7 @@ mod tests {
         let weights = array![2.0, -3.0, 0.25, -1.5];
         let expected = noise
             .t()
-            .dot(&(noise * weights.view().insert_axis(ndarray::Axis(1))));
+            .dot(&(&noise * weights.view().insert_axis(ndarray::Axis(1))));
         let got = design.diag_xtw_x(&weights).unwrap();
         assert_matrix_close(&got, &expected, 1e-12, "signed scale-deviation Gram");
 

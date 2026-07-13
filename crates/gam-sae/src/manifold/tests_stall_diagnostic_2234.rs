@@ -80,7 +80,8 @@ fn logdet_audit_point(
         0.05,
         1.0e-6,
         1.0e-6,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let raw_smoothness_sum: f64 = term
         .decoder_smoothness_value_per_atom(&rho.lambda_smooth_vec().unwrap())
         .iter()
@@ -100,7 +101,8 @@ fn logdet_audit_point(
     let log_det_tt = super::construction::coordinate_block_log_det(&cache)?;
     let quasi_laplace_complexity = super::construction::rank_adjusted_quasi_laplace_complexity(
         log_det, log_det_tt, &d_eff, &n_eff,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let occam = term.reml_occam_term(rho)?;
     let extra_penalty_energy = term
         .reml_extra_penalty_value_total(registry)

@@ -110,6 +110,7 @@ fn checkpoint_banks_resumes_and_discards_across_objectives() {
         resumed_decoder, fitted_decoder,
         "resume must install the banked decoder exactly (value-for-value)"
     );
+    let resumed_rho = ndarray::Array1::from_vec(resumed_rho);
     let resumed = second
         .eval(&resumed_rho)
         .expect("resumed authoritative criterion and gradient must evaluate");

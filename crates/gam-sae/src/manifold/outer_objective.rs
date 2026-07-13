@@ -577,6 +577,18 @@ struct ReactiveWaypointCheckpoint {
     crosscoder_blocks: Option<CrosscoderBlockPricing>,
 }
 
+struct MatrixFreeOuterArtifacts {
+    system: ArrowSchurSystem,
+    inverse_probe_bundle: (Vec<Array1<f64>>, Vec<Array1<f64>>),
+}
+
+struct OuterCriterionEvaluation {
+    cost: f64,
+    loss: SaeManifoldLoss,
+    cache: ArrowFactorCache,
+    matrix_free: Option<MatrixFreeOuterArtifacts>,
+}
+
 pub struct SaeManifoldOuterObjective {
     pub(crate) term: SaeManifoldTerm,
     /// Pristine term to restore from on `reset` (multi-start baseline).
@@ -706,15 +718,12 @@ fn basin_bundle_member_capacity(term: &SaeManifoldTerm) -> usize {
     host_budget.saturating_sub(plan.estimated_direct_peak_bytes) / bytes_per_saved_state
 }
 
-/// The dense route exposes the exact joint-Hessian IFT gradient. The matrix-
-/// free route has only analytic EFS equations; its `eval()` zero vector exists
-/// for legacy startup plumbing and is never a derivative capability or proof.
-pub(crate) fn sae_outer_gradient_capability(plan: SaeStreamingPlan) -> Derivative {
-    if plan.direct_logdet_admitted() {
-        Derivative::Analytic
-    } else {
-        Derivative::Unavailable
-    }
+/// Both admitted evidence routes expose the complete analytic joint-Hessian IFT
+/// gradient. The streaming route uses the frozen rational-logdet probe bundle
+/// and one matrix-free adjoint solve; it never manufactures a zero derivative or
+/// retries through the dense factorization.
+pub(crate) fn sae_outer_gradient_capability(_plan: SaeStreamingPlan) -> Derivative {
+    Derivative::Analytic
 }
 
 /// The assignment-strength coordinate handled by Hybrid-EFS's full analytic
@@ -819,6 +828,130 @@ impl SaeManifoldOuterObjective {
             crosscoder_blocks: None,
             reactive_waypoint_checkpoint: None,
         }
+    }
+
+    /// Evaluate one converged outer sample through the selected storage route.
+    /// The streaming variant returns the exact matrix-free operator and frozen
+    /// selected-inverse bundle that produced the value; callers must consume
+    /// them together or reject the sample.
+    fn evaluate_outer_criterion_route(
+        &mut self,
+        rho: &SaeManifoldRho,
+        direct_logdet_admitted: bool,
+    ) -> Result<OuterCriterionEvaluation, String> {
+        if direct_logdet_admitted {
+            let (cost, loss, cache) = self.term.penalized_quasi_laplace_criterion_with_cache(
+                self.target.view(),
+                rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            )?;
+            return Ok(OuterCriterionEvaluation {
+                cost,
+                loss,
+                cache,
+                matrix_free: None,
+            });
+        }
+
+        let lane = self.surrogate_lane.as_mut().ok_or_else(|| {
+            "streaming outer evaluation requires the frozen rational-logdet surrogate lane"
+                .to_string()
+        })?;
+        let evaluated = self
+            .term
+            .penalized_quasi_laplace_streaming_outer_evaluation(
+                self.target.view(),
+                rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+                lane,
+            )?;
+        Ok(OuterCriterionEvaluation {
+            cost: evaluated.cost,
+            loss: evaluated.loss,
+            cache: evaluated.cache,
+            matrix_free: Some(MatrixFreeOuterArtifacts {
+                system: evaluated.system,
+                inverse_probe_bundle: evaluated.inverse_probe_bundle,
+            }),
+        })
+    }
+
+    /// Complete analytic derivative of the exact value represented by
+    /// `evaluation`. Dense and streaming storage differ only in their inverse
+    /// action; all explicit, trace, Occam, rank-response, and single-adjoint IFT
+    /// channels are assembled by the same authority.
+    fn analytic_gradient_for_outer_evaluation(
+        &self,
+        rho: &SaeManifoldRho,
+        evaluation: &OuterCriterionEvaluation,
+    ) -> Result<Array1<f64>, OuterGradientError> {
+        let components = if let Some(matrix_free) = evaluation.matrix_free.as_ref() {
+            let (probes, inverse_probes) = &matrix_free.inverse_probe_bundle;
+            let solver = DeflatedArrowSolver::plain(&evaluation.cache);
+            self.term
+                .analytic_outer_rho_gradient_components_with_bundle(
+                    self.target.view(),
+                    rho,
+                    &evaluation.loss,
+                    &evaluation.cache,
+                    &solver,
+                    Some((probes, inverse_probes)),
+                    Some(&matrix_free.system),
+                )?
+        } else {
+            let lambda_smooth = rho
+                .lambda_smooth_vec()
+                .map_err(OuterGradientError::internal)?;
+            let solver = self
+                .term
+                .outer_gradient_arrow_solver(&evaluation.cache, &lambda_smooth)?;
+            self.term
+                .analytic_outer_rho_gradient_components_with_bundle(
+                    self.target.view(),
+                    rho,
+                    &evaluation.loss,
+                    &evaluation.cache,
+                    &solver,
+                    None,
+                    None,
+                )?
+        };
+        let mut gradient = components.gradient();
+        if let Some(block_grad) = self
+            .block_log_lambda_gradient(rho)
+            .map_err(OuterGradientError::internal)?
+        {
+            let tail = gradient.len() - block_grad.len();
+            for (block, value) in block_grad.into_iter().enumerate() {
+                gradient[tail + block] += value;
+            }
+        }
+        Ok(gradient)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evaluate_forced_streaming_value_gradient(
+        &mut self,
+        rho: &SaeManifoldRho,
+    ) -> Result<OuterEval, String> {
+        let evaluated = self.evaluate_outer_criterion_route(rho, false)?;
+        let gradient = self
+            .analytic_gradient_for_outer_evaluation(rho, &evaluated)
+            .map_err(|error| error.to_string())?;
+        Ok(OuterEval {
+            cost: evaluated.cost,
+            gradient,
+            hessian: HessianValue::Unavailable,
+            inner_beta_hint: Some(self.term.flatten_beta()),
+        })
     }
 
     /// #2231 Inc-B (stage 1) — enable crosscoder block-relevance PRICING.
@@ -1489,7 +1622,7 @@ impl SaeManifoldOuterObjective {
             Ok(evaluated) => evaluated,
             Err(err) => {
                 self.term = saved_term;
-                return Err(err);
+                return Err(err.to_string());
             }
         };
         let residual = self
@@ -2050,7 +2183,8 @@ impl SaeManifoldOuterObjective {
             self.learning_rate,
             self.ridge_ext_coord,
             self.ridge_beta,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         self.last_loss = Some(loss.clone());
         Ok((loss, cache))
     }
@@ -2265,7 +2399,7 @@ impl SaeManifoldOuterObjective {
                 .warm_start_latents_from_amortized_encoder(self.target.view(), &rho);
             self.record_warm_start(warm_start_outcome)?;
         }
-        let (penalized_quasi_laplace_cost, loss) = match drive {
+        let criterion = match drive {
             ProbeInnerDrive::Criterion {
                 refine_progress_extension,
             } => self
@@ -2280,7 +2414,23 @@ impl SaeManifoldOuterObjective {
                     self.ridge_beta,
                     refine_progress_extension,
                     self.surrogate_lane.as_mut(),
-                )?,
+                ),
+        };
+        let (penalized_quasi_laplace_cost, loss) = match criterion {
+            Ok(evaluated) => evaluated,
+            Err(SaeCriterionError::VanishedAtoms(atoms)) => {
+                log::debug!(
+                    "SAE criterion reached fixed-K structural boundary at rho={:?}: {atoms}",
+                    rho.to_flat()
+                );
+                let loss = self.term.loss(self.target.view(), &rho)?;
+                let beta_hat = self.term.flatten_beta();
+                self.current_rho = rho;
+                self.last_loss = Some(loss);
+                self.probe_telemetry.infeasible_criterion_evals += 1;
+                return Ok((f64::INFINITY, beta_hat));
+            }
+            Err(SaeCriterionError::Numerical(message)) => return Err(message),
         };
         let beta_hat = self.term.flatten_beta();
         // ONE criterion everywhere. Every outer lane — BFGS/ARC descent, the
@@ -2696,38 +2846,13 @@ impl SaeManifoldOuterObjective {
         // arrow cache, which the streaming criterion produces (and now returns).
         // Route through it so the Fellner–Schall step runs matrix-free at large K;
         // dense-admitted fits keep the byte-for-byte dense path.
-        // #2080: ask the surrogate lane to emit the shared (probes, S⁻¹·probes)
-        // bundle during this criterion's matrix-free evidence eval, so the
-        // smoothness EDF below is the matrix-free tr(S⁻¹·M_k) off that bundle
-        // instead of the dense `beta_inv`. The direct-admitted path ignores it
-        // (no lane threaded); `take_inverse_probes` after the call clears the flag
-        // either way, so a dense eval never hands back stale solves.
-        if let Some(lane) = self.surrogate_lane.as_mut() {
-            lane.request_inverse_probes();
-        }
-        let criterion = if self.term.streaming_plan().direct_logdet_admitted() {
-            self.term.penalized_quasi_laplace_criterion_with_cache(
-                self.target.view(),
-                &rho,
-                self.registry.as_ref(),
-                self.inner_max_iter,
-                self.learning_rate,
-                self.ridge_ext_coord,
-                self.ridge_beta,
-            )
-        } else {
-            self.term
-                .penalized_quasi_laplace_criterion_streaming_exact_with_cache_and_lane(
-                    self.target.view(),
-                    &rho,
-                    self.registry.as_ref(),
-                    self.inner_max_iter,
-                    self.learning_rate,
-                    self.ridge_ext_coord,
-                    self.ridge_beta,
-                    self.surrogate_lane.as_mut(),
-                )
-        };
+        // #2080: the streaming criterion emits one indivisible value/gradient
+        // artifact: factor cache, exact matrix-free operator, and the frozen
+        // `(probes, S^-1 probes)` bundle. Reassembling the operator after the
+        // value would both duplicate the dominant pass and risk differentiating
+        // a different functional.
+        let direct_logdet_admitted = self.term.streaming_plan().direct_logdet_admitted();
+        let criterion = self.evaluate_outer_criterion_route(&rho, direct_logdet_admitted);
         let infeasible_evaluation = |reason: &str| {
             (
                 EfsEval {
@@ -2749,8 +2874,14 @@ impl SaeManifoldOuterObjective {
                     .collect(),
             )
         };
-        let (cost, loss, cache) = match criterion {
+        let evaluation = match criterion {
             Ok(evaluated) => evaluated,
+            Err(SaeCriterionError::VanishedAtoms(atoms)) => {
+                log::debug!("SAE EFS probe reached fixed-K structural boundary: {atoms}");
+                self.probe_telemetry.infeasible_criterion_evals += 1;
+                self.current_rho = rho;
+                return Ok(infeasible_evaluation("vanished-atom structural boundary"));
+            }
             // #1782 — the EFS lane IS the SAE seed-startup-VALIDATION lane
             // (`run_fixed_point_outer_solver` → `eval_step(seed)` → `eval_efs` →
             // `efs_step`). At a seed ρ a K>1 threshold-gate/softmax (or rank-deficient
@@ -2764,7 +2895,9 @@ impl SaeManifoldOuterObjective {
             // pseudo-objective with zero updates. Returning `+inf` and uncovered
             // coordinates lets the fixed-point runner reject/backtrack without
             // ever certifying the point. Genuine defects still propagate.
-            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+            Err(SaeCriterionError::Numerical(err))
+                if Self::is_recoverable_value_probe_refusal(&err) =>
+            {
                 self.probe_telemetry.record_refusal_kind(&err);
                 log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
                 self.probe_telemetry.infeasible_criterion_evals += 1;
@@ -2773,11 +2906,11 @@ impl SaeManifoldOuterObjective {
                     "infeasible penalized quasi-Laplace score",
                 ));
             }
-            Err(err) => return Err(err),
+            Err(SaeCriterionError::Numerical(err)) => return Err(err),
         };
+        let cost = evaluation.cost;
         self.record_fit_data_collapse_verdict(&rho)?;
         self.current_rho = rho.clone();
-        self.last_loss = Some(loss);
         if !cost.is_finite() {
             self.probe_telemetry.infeasible_criterion_evals += 1;
             return Ok(infeasible_evaluation(
@@ -2790,26 +2923,32 @@ impl SaeManifoldOuterObjective {
         // coordinate sum of squares in the denominator.
         let n_eff = self.term.n_obs() as f64;
         let sumsq = self.term.ard_coord_sumsq();
-        // #2080: take the surrogate lane's shared (probes, S⁻¹·probes) bundle from
-        // this eval's matrix-free evidence branch (if it ran) ONCE — both the ARD
-        // posterior-variance trace here and the smoothness EDF below consume it, so
-        // taking it twice would starve the second consumer. When present, the ARD
-        // denominator's `tr(H⁻¹)_tt` is the matrix-free selected-inverse trace off
-        // that bundle (no dense Schur `S⁻¹`); otherwise (dense-admitted, or no lane)
-        // the dense `full_inverse_apply` / selected-inverse diagonal path stands.
-        let inverse_probe_bundle = self
-            .surrogate_lane
-            .as_mut()
-            .and_then(|l| l.take_inverse_probes());
+        // The assignment-strength ψ coordinate has no EFS equation. Its one
+        // exact gradient component comes from the complete all-coordinate
+        // assembler; single-adjoint form makes this the same one solve the old
+        // coordinate-specialized forward response paid.
+        let complete_gradient = if rho.sparse_flat_index().is_some() {
+            Some(
+                self.analytic_gradient_for_outer_evaluation(&rho, &evaluation)
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+        let cache = &evaluation.cache;
+        let inverse_probe_bundle = evaluation
+            .matrix_free
+            .as_ref()
+            .map(|artifacts| &artifacts.inverse_probe_bundle);
         let traces = if let Some((probes, sinv)) = inverse_probe_bundle.as_ref() {
             self.term
-                .ard_inverse_traces_from_probes(&cache, probes, sinv)
+                .ard_inverse_traces_from_probes(cache, probes, sinv)
                 .map_err(|e| {
                     format!("SaeManifoldOuterObjective::efs_step: ARD traces (matrix-free): {e}")
                 })?
         } else {
             self.term
-                .ard_inverse_traces(&cache)
+                .ard_inverse_traces(cache)
                 .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: ARD traces: {e}"))?
         };
 
@@ -2838,52 +2977,10 @@ impl SaeManifoldOuterObjective {
                 assignment_strength_gradient_coordinate(&rho),
                 Some(sparse_index)
             );
-            let gradient = if let Some((probes, inverse_probes)) = inverse_probe_bundle.as_ref() {
-                let system = self.term.assemble_full_matrix_free_evidence_system(
-                    self.target.view(),
-                    &rho,
-                    self.registry.as_ref(),
-                    None,
-                )?;
-                self.term
-                    .analytic_assignment_strength_gradient_matrix_free(
-                        self.target.view(),
-                        &rho,
-                        &cache,
-                        &system,
-                        probes,
-                        inverse_probes,
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "SaeManifoldOuterObjective::efs_step: matrix-free \
-                                 assignment-strength gradient: {error}"
-                        )
-                    })?
-            } else {
-                let solver = self
-                    .term
-                    .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec()?)
-                    .map_err(|error| {
-                        format!(
-                            "SaeManifoldOuterObjective::efs_step: dense assignment-strength \
-                                 solver: {error}"
-                        )
-                    })?;
-                self.term
-                    .analytic_assignment_strength_gradient_dense(
-                        self.target.view(),
-                        &rho,
-                        &cache,
-                        &solver,
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "SaeManifoldOuterObjective::efs_step: dense assignment-strength \
-                                 gradient: {error}"
-                        )
-                    })?
-            };
+            let gradient = complete_gradient
+                .as_ref()
+                .expect("sparse rho coordinate requested its complete analytic gradient")
+                [sparse_index];
             // A normalized negative gradient is a bounded feasible-descent
             // update whose zero is exactly the full criterion root.
             let gradient_scale = gradient.abs().max(1.0);
@@ -3804,18 +3901,27 @@ impl OuterObjective for SaeManifoldOuterObjective {
             self.ridge_beta,
         ) {
             Ok(evaluated) => evaluated,
+            Err(SaeCriterionError::VanishedAtoms(atoms)) => {
+                log::debug!("SAE analytic evaluation reached fixed-K structural boundary: {atoms}");
+                self.probe_telemetry.infeasible_criterion_evals += 1;
+                return Ok(OuterEval::infeasible(rho.len()));
+            }
             // A non-PD per-row/cross-row/Schur factor has no defined Laplace
             // evidence at this ρ. Return the objective contract's typed
             // infeasible evaluation so the optimizer rejects/backtracks. A
             // finite sentinel here would be a different objective. Genuine
             // evaluation defects still hard-error below.
-            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+            Err(SaeCriterionError::Numerical(err))
+                if Self::is_recoverable_value_probe_refusal(&err) =>
+            {
                 self.probe_telemetry.record_refusal_kind(&err);
                 log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 return Ok(OuterEval::infeasible(rho.len()));
             }
-            Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
+            Err(SaeCriterionError::Numerical(err)) => {
+                return Err(EstimationError::RemlOptimizationFailed(err));
+            }
         };
         self.record_fit_data_collapse_verdict(&rho_state)
             .map_err(EstimationError::RemlOptimizationFailed)?;
@@ -3842,7 +3948,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                         self.target.view(),
                         &rho_state,
                         &loss,
-                        &cache,
+                    cache,
                         &solver,
                         None,
                         None,
@@ -3870,6 +3976,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             }
         }
         let beta_hat = self.term.flatten_beta();
+        self.last_loss = Some(evaluation.loss);
         // #1206 — the gradient lane (`OuterEvalOrder::ValueAndGradient`, consumed
         // by the outer BFGS Armijo line search) MUST return a cost whose gradient
         // is the gradient we return: the consistent pair `(f, ∇f)` for the pure
