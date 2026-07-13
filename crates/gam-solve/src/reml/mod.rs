@@ -5243,6 +5243,7 @@ impl EvalCacheManager {
     /// Creates a sanitized cache key from rho values.
     /// Returns None if any component is NaN, in which case caching is skipped.
     /// Maps -0.0 to 0.0 to ensure key stability.
+    #[cfg(test)]
     pub(crate) fn sanitized_rhokey(rho: &Array1<f64>) -> Option<Vec<u64>> {
         self::rho_key::sanitized_rhokey(rho)
     }
