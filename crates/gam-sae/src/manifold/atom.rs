@@ -716,9 +716,17 @@ impl SaeManifoldAtom {
     }
 
     /// Attach the exact geometry plan used to build this atom. The plan's kind,
-    /// latent dimension, and derived full width must agree; there is no width or
-    /// harmonic-order inference from the realized arrays.
+    /// latent dimension, derived full width, and reference-function Gram must
+    /// agree. Attachment is one-shot: replacing a plan could otherwise change
+    /// the declared metric independently of the frozen Gram. There is no width
+    /// or harmonic-order inference from the realized arrays.
     pub fn with_geometry_plan(mut self, plan: SaeAtomGeometryPlan) -> Result<Self, String> {
+        if self.geometry_plan.is_some() {
+            return Err(
+                "SaeManifoldAtom::with_geometry_plan: geometry plan is already installed; replacement is forbidden"
+                    .to_string(),
+            );
+        }
         if plan.kind() != &self.basis_kind || plan.latent_dim() != self.latent_dim {
             return Err(format!(
                 "SaeManifoldAtom::with_geometry_plan: plan ({:?}, dim={}) disagrees with atom ({:?}, dim={})",
@@ -733,6 +741,29 @@ impl SaeManifoldAtom {
             return Err(format!(
                 "SaeManifoldAtom::with_geometry_plan: plan width {planned_width} disagrees with atom full width {}",
                 self.full_basis_size()
+            ));
+        }
+        let planned_penalty = plan.build_reference_penalty()?;
+        if planned_penalty.dim() != self.smooth_penalty.dim() {
+            return Err(format!(
+                "SaeManifoldAtom::with_geometry_plan: plan reference Gram shape {:?} disagrees with atom Gram shape {:?}",
+                planned_penalty.dim(),
+                self.smooth_penalty.dim()
+            ));
+        }
+        let scale = planned_penalty
+            .iter()
+            .chain(self.smooth_penalty.iter())
+            .fold(1.0_f64, |current, value| current.max(value.abs()));
+        let tolerance = f64::EPSILON.sqrt() * scale * planned_width.max(1) as f64;
+        let max_difference = planned_penalty
+            .iter()
+            .zip(self.smooth_penalty.iter())
+            .map(|(planned, installed)| (planned - installed).abs())
+            .fold(0.0_f64, f64::max);
+        if max_difference > tolerance {
+            return Err(format!(
+                "SaeManifoldAtom::with_geometry_plan: installed reference Gram differs from plan by {max_difference}, tolerance {tolerance}"
             ));
         }
         self.geometry_plan = Some(plan);

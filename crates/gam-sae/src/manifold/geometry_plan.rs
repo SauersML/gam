@@ -336,6 +336,14 @@ impl SaeAtomGeometryPlan {
         Ok(evaluator)
     }
 
+    /// Materialize the declared reference-function Gram without evaluating a
+    /// caller coordinate block. Used when a plan is attached to an atom so the
+    /// persisted metric and the atom's already-installed Gram cannot disagree.
+    pub(crate) fn build_reference_penalty(&self) -> Result<Array2<f64>, String> {
+        let evaluator = self.build_evaluator()?;
+        self.reference_penalty(evaluator.as_ref())
+    }
+
     /// Evaluate the plan's analytic basis and materialize the one declared
     /// reference-function Gram. This is the sole seed/rebuild/OOS authority:
     /// callers only validate and copy these arrays, never reconstruct a

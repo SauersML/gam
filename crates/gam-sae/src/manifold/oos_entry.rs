@@ -1197,6 +1197,33 @@ mod tests {
     }
 
     #[test]
+    fn geometry_plan_attachment_is_one_shot_and_gram_checked() {
+        let geometry = SaeAtomGeometryPlan::projective_plane(1).unwrap();
+        let coords = Array2::from_shape_vec((1, 2), vec![0.2, 0.3]).unwrap();
+        let width = geometry.basis_size().unwrap();
+        let spec = SaeOosAtomSpec::new(geometry.clone(), Array2::zeros((width, 1))).unwrap();
+        let atom = build_oos_atom(0, &spec, coords.view(), 1).unwrap();
+        assert!(atom.with_geometry_plan(geometry.clone()).is_err());
+
+        let bundle = geometry.evaluate_bundle(coords.view()).unwrap();
+        let mut wrong_penalty = bundle.reference_penalty;
+        wrong_penalty[[1, 1]] += 1.0;
+        let mismatched = SaeManifoldAtom::new_with_provided_function_gram(
+            "mismatched",
+            geometry.kind().clone(),
+            geometry.latent_dim(),
+            bundle.basis_values,
+            bundle.basis_jacobian,
+            Array2::zeros((width, 1)),
+            wrong_penalty,
+        )
+        .unwrap()
+        .with_basis_second_jet(bundle.evaluator)
+        .with_geometry_plan(geometry);
+        assert!(mismatched.is_err());
+    }
+
+    #[test]
     fn typed_oos_entry_reconstructs_frozen_periodic_dictionary() {
         let request = periodic_request();
         let expected = request.target.clone();
