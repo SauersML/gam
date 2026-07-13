@@ -541,11 +541,12 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
     fn affine_compose(
         &self,
         input_scale: f64,
-        _input_shift: f64,
+        input_shift: f64,
         derivative_stack: [f64; 5],
         workspace: &'arena Self::Workspace,
     ) -> Self {
         assert!(std::ptr::eq(self.workspace, workspace));
+        assert!(input_shift.is_finite(), "affine input shift must be finite");
         self.unary(
             derivative_stack[0],
             derivative_stack[1] * input_scale,

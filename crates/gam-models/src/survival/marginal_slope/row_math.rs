@@ -950,11 +950,6 @@ impl RigidVectorRowWorkspace {
             dynamic: DynamicJetArena::new(),
         }
     }
-
-    #[cfg(test)]
-    fn retained_bytes(&self) -> usize {
-        self.graph.retained_bytes() + self.dynamic.allocated_bytes()
-    }
 }
 
 fn row_primary_closed_form_vector_graph<const DIM: usize>(
