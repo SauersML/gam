@@ -977,11 +977,12 @@ pub struct HyperCoord {
     pub tk_x_fixed: Option<Array2<f64>>,
 }
 
+#[derive(Clone)]
 pub struct HyperCoordPair {
     pub a: f64,
     pub g: Array1<f64>,
     pub b_mat: Array2<f64>,
-    pub b_operator: Option<Box<dyn HyperOperator>>,
+    pub b_operator: Option<Arc<dyn HyperOperator>>,
     pub ld_s: f64,
 }
 
