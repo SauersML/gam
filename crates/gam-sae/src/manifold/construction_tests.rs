@@ -61,6 +61,17 @@ mod amortized_encoder_tests {
             .outer_explicit_smoothness_ard_hessian(&rho, frozen_smoothness)
             .expect("explicit smoothness/ARD Hessian block assembles");
 
+        // The sparse explicit channel must be LIVE on this softmax fixture, else its
+        // Hessian row is a vacuous ~0-vs-~0 comparison.
+        let sparse_index = rho
+            .sparse_flat_index()
+            .expect("softmax fixture must carry a sparse log-strength coordinate");
+        assert!(
+            analytic[[sparse_index, sparse_index]].abs() > 1.0e-6,
+            "sparse explicit ∂² must be non-trivial (λ_sparse·E): {}",
+            analytic[[sparse_index, sparse_index]]
+        );
+
         let base = rho.to_flat();
         let eps = 1.0e-6;
         for j in 0..n_params {
@@ -87,6 +98,16 @@ mod amortized_encoder_tests {
                         v[r.ard_flat_index(atom, axis)] += ard[atom][axis];
                     }
                 }
+                // Sparse (softmax log-strength) explicit gradient, the channel CH6
+                // adds to the Hessian: the assignment prior value = λ_sparse·E.
+                if let Some(si) = r.sparse_flat_index() {
+                    v[si] = crate::assignment::assignment_prior_log_strength_derivative_weighted(
+                        &term.assignment,
+                        &r,
+                        term.row_loss_weights.as_deref(),
+                    )
+                    .unwrap();
+                }
                 v
             };
             let fd_col = (gradient(1.0) - gradient(-1.0)) / (2.0 * eps);
@@ -95,7 +116,7 @@ mod amortized_encoder_tests {
                 let fd_ij = fd_col[i];
                 assert!(
                     (analytic_ij - fd_ij).abs() < 1.0e-6 + 1.0e-5 * analytic_ij.abs(),
-                    "explicit smoothness/ARD Hessian [{i},{j}] mismatch: \
+                    "explicit smoothness/ARD/sparse Hessian [{i},{j}] mismatch: \
                      analytic={analytic_ij}, fd={fd_ij}"
                 );
             }
@@ -183,7 +204,25 @@ mod amortized_encoder_tests {
         // floor, as the sibling logdet-adjoint gates do). The evaluation ρ below
         // must NOT be used for the fit: at λ_smooth/α that large this 10-row, m=3
         // decoder is driven into total co-collapse by the inner solve.
-        let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+        let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
+        // #item1: EXCITE the sparse (softmax log-strength) logdet channel. On the
+        // pristine on-manifold target the converged fit has ~zero residual and the
+        // free logit is ~decoupled from β, so the joint and coordinate-block traces
+        // cancel to ~2e-12 and the sparse logdet row is inert (a ~0-vs-~0 FD, which
+        // validates nothing). Perturbing the target off the model manifold (the same
+        // recipe `converged_state_with_residual` uses) gives a real residual and real
+        // logit–β coupling, so the sparse joint − coordinate back-substitution term
+        // is materially nonzero and the sparse row is genuinely validated below.
+        {
+            let (n, p) = (target.nrows(), target.ncols());
+            for row in 0..n {
+                for col in 0..p {
+                    let phase = (row as f64 + 0.35) / n as f64;
+                    let theta = std::f64::consts::TAU * phase;
+                    target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
+                }
+            }
+        }
         rho.log_lambda_sparse = 0.5;
         term.penalized_quasi_laplace_criterion_with_cache(
             target.view(),
@@ -334,22 +373,24 @@ mod amortized_encoder_tests {
             }
             v
         };
-        // HONEST SCOPE LIMIT: the sparse (softmax log-strength) logdet leg is INERT on
-        // this fixture. The PRODUCTION gradient's own `logdet_trace[sparse]` measures
-        // ~2e-12 here — the joint and coordinate-block traces cancel to 12 digits,
-        // because the logit slot carries no beta back-substitution correction on this
-        // zero-residual fixture. (Slot indexing is confirmed correct: `coord_offsets`
-        // starts the coords at `assignment_coord_dim`, so row slot 0 IS the logit.)
-        // The sparse row is therefore assembled and CHECKED against FD below, but the
-        // check is ~0 vs ~0 — it guards against regression, it does NOT validate the
-        // sparse operator. A fixture that genuinely excites the sparse logdet channel
-        // is still owed before the capability flip.
+        // #item1 verdict: with the off-manifold target excitation above, the sparse
+        // logdet channel is LIVE (the free logit now carries real β back-substitution),
+        // so its row of the FD comparison below is a genuine validation, not a
+        // ~0-vs-~0 regression guard. Assert liveness so the excitation cannot silently
+        // regress back to the inert (~2e-12) state that would make this row vacuous.
         let base_trace = logdet_trace_at(0.0, sparse_index);
         eprintln!(
-            "CH4 sparse leg (INERT on this fixture, not validated): \
-             logdet_trace[sparse]={:.6e}, H[sparse,sparse]={:.6e}",
+            "CH4 sparse logdet leg (item1, excited): logdet_trace[sparse]={:.6e}, \
+             H[sparse,sparse]={:.6e}",
             base_trace[sparse_index],
             analytic[[sparse_index, sparse_index]]
+        );
+        assert!(
+            base_trace[sparse_index].abs() > 1.0e-6,
+            "the off-manifold excitation must make the sparse logdet channel live, else its \
+             row of this gate is vacuous: logdet_trace[sparse]={} (inert ⇒ characterize why \
+             and let the explicit/third-order channels carry the sparse row)",
+            base_trace[sparse_index]
         );
 
         for &j in &coord_indices {

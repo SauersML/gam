@@ -1110,6 +1110,37 @@ impl SaeManifoldTerm {
             }
         }
 
+        // Sparse (assignment log-strength). For softmax the gradient's
+        // `explicit[sparse]` is `assignment_prior_log_strength_derivative_weighted`
+        // = the prior VALUE = `λ_sparse · E(logits)` (assignment.rs:1690), which is
+        // degree-one in `λ_sparse = e^ρ_sparse` (the concentration multiplies the
+        // logit penalty linearly). So `∂²/∂ρ_sparse² = ∂/∂ρ_sparse(λ_sparse·E) =
+        // λ_sparse·E` — the SAME scalar the gradient reports — and there is no cross
+        // term (it depends only on `λ_sparse` and the frozen logits, not on
+        // smooth/ARD). K=1 softmax and frozen routing return 0, so the diagonal is
+        // correctly zero there.
+        if let Some(sparse_index) = rho.sparse_flat_index() {
+            match self.assignment.mode {
+                AssignmentMode::Softmax { .. } => {
+                    hessian[[sparse_index, sparse_index]] +=
+                        crate::assignment::assignment_prior_log_strength_derivative_weighted(
+                            &self.assignment,
+                            rho,
+                            self.row_loss_weights.as_deref(),
+                        )?;
+                }
+                _ => {
+                    return Err(
+                        "outer_explicit_smoothness_ard_hessian: rho carries a sparse \
+                         log-strength coordinate under a non-softmax assignment prior, whose \
+                         explicit second derivative this channel does not yet model; refusing \
+                         to assemble a Hessian with a silently-zero sparse explicit term"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         Ok(hessian)
     }
 
@@ -1462,6 +1493,20 @@ impl SaeManifoldTerm {
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
     ) -> Result<Array2<f64>, String> {
+        // #2231 crosscoder block relevances (`log_lambda_block`, the trailing flat
+        // coordinates): the gradient prices them (`crosscoder_block_ift_rhs`), but no
+        // Hessian channel writes their rows/columns yet. Emitting a Dense Hessian with
+        // those rows identically zero while their gradient is live would hand ARC a
+        // singular system — strictly worse than declaring the curvature unavailable.
+        // Refuse until a block channel lands. (Empty on the circle-mint route.)
+        if !rho.log_lambda_block.is_empty() {
+            return Err(format!(
+                "exact_fixed_stratum_outer_hessian: rho carries {} crosscoder block \
+                 relevance coordinate(s) that no Hessian channel models; refusing to \
+                 advertise a curvature block with unmodelled (zero) rows",
+                rho.log_lambda_block.len()
+            ));
+        }
         let mut hessian = self.outer_explicit_smoothness_ard_hessian(rho, loss.smoothness)?;
         hessian += &self.rank_charge_direct_rho_hessian(target, rho, loss, cache)?;
         hessian += &self.logdet_daleckii_krein_hessian(rho, cache)?;
