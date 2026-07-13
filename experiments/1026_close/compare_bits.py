@@ -1,103 +1,155 @@
 #!/usr/bin/env python3
-"""Print bits(flat) - bits(hybrid) per distortion target from a #1026 run.
+"""Strict paired Eq-4 comparison for GitHub #2283.
 
-The driver runs ONE arm per process (each a short schedulable job), so the
-cross-arm Eq-4 comparison the #1026 close reports — the MDL margin gam#2233
-predicts curved atoms win by — is assembled here from the results jsonl after
-the arms land. Lower bits is better; a POSITIVE bits(flat) - bits(hybrid) means
-the hybrid dictionary describes the same held-out cloud in fewer bits.
-
-    python3 compare_bits.py results_1026.jsonl [--seed 0] [--tag ...]
-
-For each (flat arm, hybrid arm) pair at the matched seed/tag it prints the
-per-target delta and the support/code/residual breakdown that localizes WHERE
-the win comes from (the theorem: circles win support+residual, not code).
+The input must contain exactly one authoritative ``external_topk`` result and one
+authoritative resumed ``hybrid_rust`` result for ``--run-id``. Both rows must carry
+the same canonical pair identity: code/wheel/scorer hashes, shard manifest, exact
+sample/split/bits row hashes, and the shared measurement configuration. Duplicate,
+stale, or mismatched rows are errors rather than freshness heuristics.
 """
+
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-from collections import defaultdict
+import math
 
-FLAT_ARMS = ("gam_flat", "external_topk")
-HYBRID_ARMS = ("hybrid_rust", "hybrid")
+
+PAIR_SCHEMA = "gam.issue2283.eq4-pair.v1"
+ARMS = ("external_topk", "hybrid_rust")
 TARGETS = ("0.99", "0.95", "0.9", "0.8")
+HISTORICAL_BAR_R2_099 = 56_322.0
+
+
+def _canonical_json(payload) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _payload_sha256(payload) -> str:
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 def load(path):
-    recs = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                recs.append(json.loads(line))
-    return recs
-
-
-def latest_by_arm(recs, seed, tag):
-    """Last record per arm matching seed (and tag if given) — the freshest run."""
-    by_arm = {}
-    for r in recs:
-        if seed is not None and r.get("seed") != seed:
-            continue
-        if tag is not None and r.get("tag") != tag:
-            continue
-        if f"bits_bits_at_r2_{TARGETS[0]}" not in r and "bits_bits_at_r2_0.99" not in r:
-            # accept any record carrying bits fields
-            if not any(k.startswith("bits_bits_at_r2_") for k in r):
+    records = []
+    with open(path, encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
                 continue
-        by_arm[r["arm"]] = r
-    return by_arm
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{path}:{line_number}: invalid JSON: {error}") from error
+    return records
 
 
-def bits_at(rec, target):
-    return rec.get(f"bits_bits_at_r2_{target}")
+def _authoritative_pair(records, run_id):
+    selected = {
+        arm: [
+            record
+            for record in records
+            if record.get("record_type") == "result"
+            and record.get("run_id") == run_id
+            and record.get("arm") == arm
+        ]
+        for arm in ARMS
+    }
+    for arm, rows in selected.items():
+        if len(rows) != 1:
+            raise ValueError(
+                f"run_id={run_id!r} requires exactly one {arm!r} result; found {len(rows)}"
+            )
+    external, hybrid = (selected[arm][0] for arm in ARMS)
+    for record in (external, hybrid):
+        if record.get("issue") != 2283:
+            raise ValueError(f"{record['arm']} row is not an issue-2283 result")
+        identity = record.get("pair_identity")
+        if not isinstance(identity, dict) or identity.get("schema") != PAIR_SCHEMA:
+            raise ValueError(f"{record['arm']} row has no canonical pair identity")
+        if identity.get("run_id") != run_id:
+            raise ValueError(f"{record['arm']} pair identity has the wrong run ID")
+        digest = _payload_sha256(identity)
+        if record.get("pair_identity_sha256") != digest:
+            raise ValueError(f"{record['arm']} pair identity digest is invalid")
+        data = identity["data"]
+        if record.get("data_manifest", {}).get("sha256") != data["manifest_sha256"]:
+            raise ValueError(f"{record['arm']} shard manifest does not match its pair identity")
+        if record.get("bits_test_positions_sha256") != data["bits_test_positions_sha256"]:
+            raise ValueError(f"{record['arm']} bit positions do not match its pair identity")
+        if record.get("bits_row_ids_sha256") != data["bits_row_ids_sha256"]:
+            raise ValueError(f"{record['arm']} bit rows do not match its pair identity")
+        if record.get("bits_dict_params_faithful") is not True:
+            raise ValueError(f"{record['arm']} row is not dictionary-parameter faithful")
+    if external["pair_identity"] != hybrid["pair_identity"]:
+        raise ValueError("external and hybrid rows have different config/provenance identities")
+    if hybrid.get("hybrid_phase") != "curved-resume":
+        raise ValueError("hybrid result was not produced by the curved-resume phase")
+    if not hybrid.get("flat_checkpoint_sha256"):
+        raise ValueError("hybrid result has no flat checkpoint digest")
+    return external, hybrid
 
 
-def breakdown(rec, target):
-    return (
-        rec.get("bits_support_bits"),
-        rec.get(f"bits_code_bits_at_r2_{target}"),
-        rec.get(f"bits_resid_bits_at_r2_{target}"),
-    )
+def _components(record, target):
+    components = {
+        "support": record[f"bits_support_bits"],
+        "code": record[f"bits_code_bits_at_r2_{target}"],
+        "residual": record[f"bits_resid_bits_at_r2_{target}"],
+        "dictionary": record["bits_dictionary_bits"],
+    }
+    total = record[f"bits_bits_at_r2_{target}"]
+    if not math.isclose(total, sum(components.values()), rel_tol=1.0e-12, abs_tol=1.0e-9):
+        raise ValueError(
+            f"{record['arm']} R2={target} total does not reconcile with its four components"
+        )
+    return total, components
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("results", help="results_1026.jsonl written by the driver")
-    ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--tag", default=None)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("results")
+    parser.add_argument("--run-id", required=True)
+    args = parser.parse_args()
 
-    recs = load(args.results)
-    by_arm = latest_by_arm(recs, args.seed, args.tag)
-    flats = [a for a in FLAT_ARMS if a in by_arm]
-    hybrids = [a for a in HYBRID_ARMS if a in by_arm]
-    if not flats or not hybrids:
-        print(f"[compare_bits] need >=1 flat {FLAT_ARMS} and >=1 hybrid "
-              f"{HYBRID_ARMS} arm with bits fields; found flats={flats} "
-              f"hybrids={hybrids}")
-        return 1
+    external, hybrid = _authoritative_pair(load(args.results), args.run_id)
+    print(
+        f"=== issue #2283 paired Eq-4 run {args.run_id} "
+        f"identity={external['pair_identity_sha256']} ==="
+    )
+    print(f"EV external={external['ev']:.6f} hybrid={hybrid['ev']:.6f}")
+    print(
+        f"{'target R2':>10} {'external':>12} {'hybrid':>12} {'delta':>12}  "
+        "(support/code/residual/dictionary)"
+    )
+    for target in TARGETS:
+        external_total, external_parts = _components(external, target)
+        hybrid_total, hybrid_parts = _components(hybrid, target)
+        delta = {
+            name: external_parts[name] - hybrid_parts[name]
+            for name in external_parts
+        }
+        print(
+            f"{target:>10} {external_total:>12.1f} {hybrid_total:>12.1f} "
+            f"{external_total-hybrid_total:>+12.1f}  "
+            f"({delta['support']:+.1f}/{delta['code']:+.1f}/"
+            f"{delta['residual']:+.1f}/{delta['dictionary']:+.1f})"
+        )
 
-    for flat in flats:
-        for hyb in hybrids:
-            fr, hr = by_arm[flat], by_arm[hyb]
-            print(f"\n=== bits({flat}) - bits({hyb})  "
-                  f"[seed={fr.get('seed')} K={fr.get('K')} top_k={fr.get('top_k')}] ===")
-            print(f"  EV: {flat}={fr.get('ev'):.5f}  {hyb}={hr.get('ev'):.5f}")
-            print(f"  {'target R2':>10} {'bits(flat)':>12} {'bits(hyb)':>12} "
-                  f"{'Δ=flat-hyb':>12}  (Δsupport/Δcode/Δresid)")
-            for t in TARGETS:
-                bf, bh = bits_at(fr, t), bits_at(hr, t)
-                if bf is None or bh is None:
-                    continue
-                fs, fc, frd = breakdown(fr, t)
-                hs, hc, hrd = breakdown(hr, t)
-                dsup = (fs - hs) if (fs is not None and hs is not None) else float("nan")
-                dcode = (fc - hc) if (fc is not None and hc is not None) else float("nan")
-                dres = (frd - hrd) if (frd is not None and hrd is not None) else float("nan")
-                print(f"  {t:>10} {bf:>12.1f} {bh:>12.1f} {bf - bh:>12.1f}"
-                      f"   ({dsup:+.1f}/{dcode:+.1f}/{dres:+.1f})")
+    external_099, _ = _components(external, "0.99")
+    hybrid_099, _ = _components(hybrid, "0.99")
+    if hybrid_099 >= external_099:
+        raise ValueError(
+            f"#2283 failed: hybrid {hybrid_099:.6f} does not beat paired external "
+            f"{external_099:.6f}"
+        )
+    if hybrid_099 >= HISTORICAL_BAR_R2_099:
+        raise ValueError(
+            f"#2283 failed: hybrid {hybrid_099:.6f} does not beat historical bar "
+            f"{HISTORICAL_BAR_R2_099:.0f}"
+        )
+    print(
+        f"PASS R2=0.99: hybrid={hybrid_099:.6f} < paired={external_099:.6f} "
+        f"and < historical={HISTORICAL_BAR_R2_099:.0f}"
+    )
     return 0
 
 
