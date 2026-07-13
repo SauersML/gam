@@ -137,7 +137,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         // axis. Family axes have no fabricated block owner and therefore carry
         // exactly zero S_i.
         let penalty_motion = hyper_layout.design_derivative(psi_global).map(
-            |(block_idx, deriv)| {
+            |(block_idx, _, deriv)| {
                 let (start, end) = ranges[block_idx];
                 let p_block = end - start;
                 let s_psi_local = assemble_block_local_s_psi(
@@ -432,13 +432,7 @@ pub fn build_contracted_psi_hook(
     }
     let mut axes: Vec<Option<DesignPsiAxis>> = Vec::with_capacity(hyper_layout.len());
     for axis_idx in 0..hyper_layout.len() {
-        if let Some((block_idx, deriv)) = hyper_layout.design_derivative(axis_idx) {
-            let local_idx = match hyper_layout.axis(axis_idx) {
-                Some(CustomFamilyHyperAxis::DesignPenalty {
-                    derivative_index, ..
-                }) => derivative_index,
-                _ => unreachable!("design derivative must have a design axis identity"),
-            };
+        if let Some((block_idx, local_idx, deriv)) = hyper_layout.design_derivative(axis_idx) {
             let (start, end) = ranges_arc[block_idx];
             let p_block = end - start;
             let s_psi_local =
@@ -795,13 +789,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     let mut psi_penalty_cache: Vec<Option<PsiPenaltyCacheEntry>> =
         Vec::with_capacity(hyper_layout.len());
     for axis_idx in 0..hyper_layout.len() {
-        if let Some((block_idx, deriv)) = hyper_layout.design_derivative(axis_idx) {
-            let local_idx = match hyper_layout.axis(axis_idx) {
-                Some(CustomFamilyHyperAxis::DesignPenalty {
-                    derivative_index, ..
-                }) => derivative_index,
-                _ => unreachable!("design derivative must have a design axis identity"),
-            };
+        if let Some((block_idx, local_idx, deriv)) = hyper_layout.design_derivative(axis_idx) {
             let (start, end) = ranges_arc[block_idx];
             let p_block = end - start;
             let s_local = assemble_block_local_s_psi(deriv, &per_block_lambdas[block_idx], p_block);
@@ -3042,7 +3030,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     options: &BlockwiseFitOptions,
     penalty_counts: &[usize],
     rho_current: &Array1<f64>,
-    derivative_blocks: SharedDerivativeBlocks,
+    hyper_layout: SharedCustomFamilyHyperLayout,
     warm_start: Option<&ConstrainedWarmStart>,
 ) -> Result<
     (
@@ -3053,10 +3041,10 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     ),
     CustomFamilyError,
 > {
-    if derivative_blocks.len() != specs.len() {
+    if hyper_layout.block_count() != specs.len() {
         crate::bail_dim_custom!(
-            "joint hyper derivative block count mismatch: got {}, expected {}",
-            derivative_blocks.len(),
+            "joint hyper layout block count mismatch: got {}, expected {}",
+            hyper_layout.block_count(),
             specs.len()
         );
     }
@@ -3069,7 +3057,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     }
 
     let rho_dim = penalty_counts.iter().sum::<usize>();
-    let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
+    let psi_dim = hyper_layout.len();
     if psi_dim == 0 {
         return Err(CustomFamilyError::InvalidInput {
             context: "evaluate_custom_family_joint_hyper_efs",
@@ -3240,7 +3228,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         family.exact_newton_joint_psi_workspace_with_options(
             synced_joint_states.as_ref(),
             specs,
-            derivative_blocks.as_ref(),
+            hyper_layout.as_ref(),
             options,
         )?
     } else {
@@ -3253,7 +3241,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         family,
         synced_joint_states.as_ref(),
         specs,
-        derivative_blocks.as_ref(),
+        hyper_layout.as_ref(),
         &beta_flat,
         rho_slice,
         penalty_counts,
