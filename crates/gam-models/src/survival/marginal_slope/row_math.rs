@@ -1329,6 +1329,12 @@ pub(crate) struct EvalCache {
 mod tests {
     use super::*;
 
+    impl RigidVectorRowWorkspace {
+        fn retained_bytes(&self) -> usize {
+            self.graph.retained_bytes() + self.dynamic.allocated_bytes()
+        }
+    }
+
     fn row_primary_closed_form_vector_fixed<const DIM: usize>(
         q0: f64,
         q1: f64,
