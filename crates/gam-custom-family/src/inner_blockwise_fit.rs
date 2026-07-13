@@ -93,6 +93,12 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
         joint_mode_diagonal_ridge,
         joint_bundle,
     );
+    if hessian.iter().any(|value| !value.is_finite()) {
+        return Err(
+            "fresh exact joint-mode curvature certificate found a non-finite penalized Hessian"
+                .to_string(),
+        );
+    }
     let zero_rhs = Array1::<f64>::zeros(total_p);
     let spectrum = whitened_spectrum::WhitenedHessianSpectrum::decompose(
         &hessian,
@@ -6820,6 +6826,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         converged,
         cycles_done,
         last_residual_tol,
+        has_joint_exacthessian,
     )
 }
 
@@ -7117,7 +7124,53 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
     converged: bool,
     cycles_done: usize,
     last_residual_tol: f64,
+    exact_joint_curvature_available: bool,
 ) -> Result<BlockwiseInnerResult, String> {
+    let local_ranges = block_param_ranges(specs);
+    let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
+    let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+    let joint_constraints =
+        assemble_joint_linear_constraints(&block_constraints, &local_ranges, local_total_p)?;
+    let joint_mode_diagonal_ridge =
+        if ridge > 0.0 && options.ridge_policy.accounts_for_objective() {
+            ridge
+        } else {
+            0.0
+        };
+    let mut certified_workspace = None;
+    if converged
+        && exact_joint_curvature_available
+        && joint_constraints.is_none()
+        && !family.joint_jeffreys_term_required()
+    {
+        let certificate = exact_joint_mode_curvature_certificate(
+            family,
+            &states,
+            specs,
+            options,
+            &local_ranges,
+            &s_lambdas,
+            joint_mode_diagonal_ridge,
+            joint_bundle,
+            local_total_p,
+        )?;
+        let has_negative_curvature = certificate.has_resolvable_negative_curvature();
+        let minimum_whitened_eigenvalue = certificate.minimum_whitened_eigenvalue;
+        let numerical_floor = certificate.numerical_floor;
+        certified_workspace = certificate.workspace;
+        if has_negative_curvature {
+            return Err(format!(
+                "blockwise/joint-polish tentative convergence rejected by fresh exact returned-mode curvature: lambda_min={:.6e} < -floor={:.6e}; an indefinite coefficient point cannot define a Laplace mode",
+                minimum_whitened_eigenvalue, numerical_floor,
+            ));
+        }
+        log::info!(
+            "[PIRLS/blockwise mode certificate] returned beta certified from fresh exact curvature: lambda_min={:.6e}, floor={:.6e}",
+            minimum_whitened_eigenvalue,
+            numerical_floor,
+        );
+    }
+
     // Reuse cached evaluation from the last cycle's end (or the initial eval if 0 cycles ran).
     let penalty_value = total_quadratic_penalty(
         &states,
@@ -7128,13 +7181,17 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
         Some(specs),
     );
 
-    let (block_logdet_h, block_logdet_s) =
-        blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
+    let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
+        family,
+        specs,
+        &mut states,
+        block_log_lambdas,
+        options,
+        certified_workspace.clone(),
+    )?;
     let kkt_residual = if converged {
         match exact_newton_joint_gradient_from_eval(cached_eval, specs, &states)? {
             Some(gradient) => {
-                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
-                let local_total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
                 let active_set_rows_total: usize = cached_active_sets
                     .iter()
                     .map(|maybe| maybe.as_ref().map(|v| v.len()).unwrap_or(0))
@@ -7162,9 +7219,6 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
     };
 
     let active_constraints = {
-        let local_ranges = block_param_ranges(specs);
-        let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
-        let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
         assemble_active_constraint_block(
             &block_constraints,
             &cached_active_sets,
@@ -7183,7 +7237,7 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
         block_logdet_h,
         block_logdet_s,
         s_lambdas,
-        joint_workspace: None,
+        joint_workspace: certified_workspace,
         kkt_residual,
         active_constraints,
     })
