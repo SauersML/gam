@@ -440,6 +440,54 @@ fn rust_expression(expression: &ProgramExpr, leaves: &[Leaf]) -> TokenStream2 {
     }
 }
 
+fn rust_runtime_expression(expression: &ProgramExpr, leaves: &[Leaf]) -> TokenStream2 {
+    match expression {
+        ProgramExpr::Path(ident) => quote!(#ident.clone()),
+        ProgramExpr::Zero => quote!(S::constant(
+            0.0,
+            __row_program_dimension,
+            __row_program_workspace,
+        )),
+        ProgramExpr::Neg(value) => {
+            let value = rust_runtime_expression(value, leaves);
+            quote!({ let value = #value; value.neg() })
+        }
+        ProgramExpr::Scale(value, scalar) => {
+            let value = rust_runtime_expression(value, leaves);
+            quote!({ let value = #value; value.scale(#scalar) })
+        }
+        ProgramExpr::AddConstant(value, scalar) => {
+            let value = rust_runtime_expression(value, leaves);
+            quote!({
+                let value = #value;
+                value.add_constant(#scalar, __row_program_workspace)
+            })
+        }
+        ProgramExpr::Add(left, right) => {
+            let left = rust_runtime_expression(left, leaves);
+            let right = rust_runtime_expression(right, leaves);
+            quote!({ let left = #left; let right = #right; left.add(&right) })
+        }
+        ProgramExpr::Mul(left, right) => {
+            let left = rust_runtime_expression(left, leaves);
+            let right = rust_runtime_expression(right, leaves);
+            quote!({ let left = #left; let right = #right; left.mul(&right) })
+        }
+        ProgramExpr::Compose {
+            leaf,
+            value,
+            arguments,
+        } => {
+            let value_ident = value;
+            let rust_leaf = &leaves[*leaf].rust;
+            quote!({
+                let value = #value_ident.clone();
+                value.compose_unary(#rust_leaf(value.value(), #(#arguments),*))
+            })
+        }
+    }
+}
+
 fn rust_scalar_expression(expression: &ProgramExpr, leaves: &[Leaf]) -> TokenStream2 {
     match expression {
         ProgramExpr::Path(ident) => quote!(#ident),
@@ -1608,6 +1656,35 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
     });
     let rust_result = rust_expression(&result, &leaves);
     let witness_values = witnesses.iter().map(|witness| quote!(#witness.value()));
+    let runtime_primary_bindings = primaries
+        .iter()
+        .map(|primary| quote!(let #primary = (*#primary).clone();));
+    let runtime_statements = statements.iter().map(|statement| match statement {
+        Statement::Local {
+            name,
+            mutable,
+            value,
+        } => {
+            let value = rust_runtime_expression(value, &leaves);
+            if *mutable {
+                quote!(let mut #name = #value;)
+            } else {
+                quote!(let #name = #value;)
+            }
+        }
+        Statement::If {
+            condition,
+            assignments,
+        } => {
+            let assignments = assignments.iter().map(|(target, value)| {
+                let value = rust_runtime_expression(value, &leaves);
+                quote!(#target = #value;)
+            });
+            quote!(if #condition { #(#assignments)* })
+        }
+    });
+    let runtime_result = rust_runtime_expression(&result, &leaves);
+    let runtime_witness_values = witnesses.iter().map(|witness| quote!(#witness.value()));
     let witness_count = witnesses.len();
     let scalar_witness_dependencies = witness_dependencies(&statements, &witnesses);
     let scalar_witness_scalar_dependencies =
@@ -1664,6 +1741,7 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
         }
     };
     let dimension = primaries.len();
+    let runtime_name = format_ident!("{}_runtime", name);
     let order2_name = format_ident!("{}_order2", name);
     let order2_body = rust_order2_body(
         &primaries,
@@ -1693,6 +1771,19 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
             #(#rust_statements)*
             let emitted_row_program_value = #rust_result;
             (emitted_row_program_value, [#(#witness_values),*])
+        }
+
+        #[inline(always)]
+        #visibility fn #runtime_name<'arena, S: ::gam_math::jet_scalar::RuntimeJetScalar<'arena>>(
+            #(#primaries: &S,)*
+            #(#constants: f64,)*
+            __row_program_dimension: usize,
+            __row_program_workspace: &'arena S::Workspace,
+        ) -> (S, [f64; #witness_count]) {
+            #(#runtime_primary_bindings)*
+            #(#runtime_statements)*
+            let emitted_row_program_value = #runtime_result;
+            (emitted_row_program_value, [#(#runtime_witness_values),*])
         }
 
         #[inline(always)]
@@ -1777,6 +1868,8 @@ mod tests {
         .expect("parse row program");
         let expanded = expand(input).expect("expand row program").to_string();
         assert!(expanded.contains("JetScalar < 2usize >"));
+        assert!(expanded.contains("RuntimeJetScalar"));
+        assert!(expanded.contains("fn sample_runtime"));
         assert!(expanded.contains("fn sample_order2"));
         assert!(expanded.contains("sqrt_stack"));
         assert!(expanded.contains("log_stack"));
@@ -1786,6 +1879,42 @@ mod tests {
         assert!(expanded.contains("d_log(adjusted_v"));
         assert!(!expanded.contains("J2"));
         assert!(!expanded.contains("j2_"));
+    }
+
+    #[test]
+    fn runtime_rust_schedule_clones_reusable_bindings_and_uses_runtime_workspace() {
+        let rust = emitted_function(
+            quote! {
+                fn runtime_formula(x, y; take, shift)
+                leaves { curve => curve_stack => d_curve }
+                witnesses [curved];
+                {
+                    let sum = add(x, y);
+                    let shifted = add_constant(sum, shift);
+                    let curved = compose(curve, shifted);
+                    let mut out = zero();
+                    if (take > 0.0) { out = add(curved, x); }
+                    return add(out, curved);
+                }
+            },
+            "runtime_formula_runtime",
+        )
+        .replace(' ', "");
+
+        for formula in [
+            "S:::gam_math::jet_scalar::RuntimeJetScalar<'arena>",
+            "letx=(*x).clone();",
+            "lety=(*y).clone();",
+            "value.add_constant(shift,__row_program_workspace)",
+            "S::constant(0.0,__row_program_dimension,__row_program_workspace)",
+            "letvalue=shifted.clone();",
+            "[curved.value()]",
+        ] {
+            assert!(
+                rust.contains(formula),
+                "missing generated runtime formula: {formula}\n{rust}"
+            );
+        }
     }
 
     #[test]

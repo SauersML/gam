@@ -50,38 +50,26 @@ pub(crate) fn lift_fit_geometry_to_raw(
     geometry: Option<FitGeometry>,
 ) -> Result<(Option<Array2<f64>>, Option<FitGeometry>), CustomFamilyError> {
     let lifted_cov = covariance_conditional.map(|c| canonical.gauge.lift_covariance(&c));
-    let lifted_geom = geometry
+    let lifted_geom = lift_fit_geometry_through_gauge(&canonical.gauge, geometry)?;
+    Ok((lifted_cov, lifted_geom))
+}
+
+pub(crate) fn lift_fit_geometry_through_gauge(
+    raw_from_geometry: &Gauge,
+    geometry: Option<FitGeometry>,
+) -> Result<Option<FitGeometry>, CustomFamilyError> {
+    geometry
         .map(|mut geometry| {
             geometry.coefficient_gauge = geometry
                 .coefficient_gauge
-                .left_compose(&canonical.gauge)
+                .left_compose(raw_from_geometry)
                 .map_err(|reason| CustomFamilyError::InvalidInput {
-                    context: "lift_fit_geometry_to_raw",
+                    context: "lift_fit_geometry_through_gauge",
                     reason,
                 })?;
             Ok::<_, CustomFamilyError>(geometry)
         })
-        .transpose()?;
-    Ok((lifted_cov, lifted_geom))
-}
-
-fn gauge_is_identity(gauge: &gam_solve::gauge::Gauge) -> bool {
-    if gauge.raw_total() != gauge.reduced_total() {
-        return false;
-    }
-    let (nrows, ncols) = gauge.t_full.dim();
-    if nrows != ncols {
-        return false;
-    }
-    for i in 0..nrows {
-        for j in 0..ncols {
-            let expected = if i == j { 1.0 } else { 0.0 };
-            if (gauge.t_full[[i, j]] - expected).abs() > 1e-12 {
-                return false;
-            }
-        }
-    }
-    true
+        .transpose()
 }
 
 fn fixed_lambda_warm_start_for_reduced_specs<'a>(
@@ -89,7 +77,7 @@ fn fixed_lambda_warm_start_for_reduced_specs<'a>(
     canonical: &gam_identifiability::canonical::CanonicalSpecs,
 ) -> Option<&'a ConstrainedWarmStart> {
     let warm = warm_start?;
-    if !gauge_is_identity(&canonical.gauge) {
+    if !canonical.gauge.is_identity() {
         return None;
     }
     if warm.inner.block_beta.len() != canonical.reduced_specs.len()

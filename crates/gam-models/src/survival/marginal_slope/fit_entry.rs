@@ -2825,45 +2825,49 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         }
         solved.fit.beta = flat;
 
-        // Lift the joint covariance / Hessian geometry with the SAME T
-        // the β lift used (#741 cov-lift gap, #933 one-lift-convention):
-        // raw-width β paired with compiled-width Σ would make predict-time
-        // standard errors index the wrong coordinates. The joint matrices
-        // span compiled parametric blocks followed by raw flex blocks, so
-        // the gauge is extended with identity over the flex widths.
+        // Push coefficient covariance into the raw reporting frame and retain
+        // precision in the active frame with the SAME affine gauge used for
+        // beta (#741, #933, #2301). A rectangular T has no raw-space precision:
+        // T H T' would be a singular covariance-style congruence, not the
+        // optimizer's quadratic form. Saved ALO instead uses J_raw T against
+        // the unchanged active H. The joint matrices span compiled parametric
+        // blocks followed by raw flex blocks, so the gauge is extended with
+        // identity over the flex widths.
         let joint_gauge = lift.extend_with_identity(&flex_widths);
-        let lift_joint = |name: &str, m: Array2<f64>| -> Array2<f64> {
-            if m.nrows() == joint_gauge.reduced_total() {
-                joint_gauge.lift_covariance(&m)
-            } else {
-                log::warn!(
-                    "[smgs phase-4b result lift] {name} has dim {} but the compiled+flex \
-                     reduced width is {} (raw {}); leaving it unlifted — this indicates a \
-                     width bug upstream",
-                    m.nrows(),
-                    joint_gauge.reduced_total(),
+        let lift_joint_covariance = |name: &str, matrix: Array2<f64>| -> Result<Array2<f64>, String> {
+            let active = joint_gauge.reduced_total();
+            if matrix.dim() != (active, active) {
+                return Err(format!(
+                    "survival marginal-slope {name} is {}x{}; exact result gauge requires {active}x{active} active coordinates before its {}-coefficient raw lift",
+                    matrix.nrows(),
+                    matrix.ncols(),
                     joint_gauge.raw_total(),
-                );
-                m
+                ));
             }
+            Ok(joint_gauge.lift_covariance(&matrix))
         };
         solved.fit.covariance_conditional = solved
             .fit
             .covariance_conditional
             .take()
-            .map(|c| lift_joint("covariance_conditional", c));
+            .map(|covariance| lift_joint_covariance("covariance_conditional", covariance))
+            .transpose()?;
         solved.fit.covariance_corrected = solved
             .fit
             .covariance_corrected
             .take()
-            .map(|c| lift_joint("covariance_corrected", c));
-        if let Some(geometry) = solved.fit.geometry.take() {
-            let h_red = geometry.penalized_hessian.into_array();
-            solved.fit.geometry = Some(crate::model_types::FitGeometry {
-                penalized_hessian: lift_joint("penalized_hessian", h_red).into(),
-                working_weights: geometry.working_weights,
-                working_response: geometry.working_response,
-            });
+            .map(|covariance| lift_joint_covariance("covariance_corrected", covariance))
+            .transpose()?;
+        if let Some(mut geometry) = solved.fit.geometry.take() {
+            geometry.coefficient_gauge = geometry
+                .coefficient_gauge
+                .left_compose(&joint_gauge)
+                .map_err(|reason| {
+                    format!(
+                        "survival marginal-slope active geometry cannot compose with its exact raw result gauge: {reason}"
+                    )
+                })?;
+            solved.fit.geometry = Some(geometry);
         }
     }
 

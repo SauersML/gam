@@ -110,6 +110,33 @@ pub(crate) fn blockwise_fit_from_parts_accepts_stacked_solver_eta_with_canonical
 }
 
 #[test]
+pub(crate) fn custom_family_geometry_keeps_active_precision_under_rectangular_raw_lift() {
+    let active_hessian = array![[5.0, 1.5], [1.5, 3.0]];
+    let outer = Gauge {
+        t_full: array![[1.0, 0.0], [0.5, 2.0], [-1.0, 3.0]],
+        affine_shift: array![4.0, -2.0, 1.0],
+        block_starts_raw: vec![0, 3],
+        block_starts_reduced: vec![0, 2],
+    };
+    let geometry = FitGeometry {
+        coefficient_gauge: Gauge::identity(&[2]),
+        penalized_hessian: active_hessian.clone().into(),
+        working_weights: array![1.0],
+        working_response: array![0.0],
+    };
+
+    let lifted = lift_fit_geometry_through_gauge(&outer, Some(geometry))
+        .expect("rectangular raw lift")
+        .expect("geometry remains available");
+
+    assert_eq!(lifted.penalized_hessian.as_array(), &active_hessian);
+    assert_eq!(lifted.coefficient_gauge.t_full, outer.t_full);
+    assert_eq!(lifted.coefficient_gauge.affine_shift, outer.affine_shift);
+    assert_eq!(lifted.coefficient_gauge.raw_widths(), vec![3]);
+    assert_eq!(lifted.coefficient_gauge.reduced_widths(), vec![2]);
+}
+
+#[test]
 pub(crate) fn batched_outer_hessian_terms_materialize_to_exact_small_matrix() {
     let exact = array![[4.0, -1.0], [-1.0, 3.0]];
     let family = BatchedOuterHessianTestFamily {

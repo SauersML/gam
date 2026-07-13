@@ -56,7 +56,7 @@ use std::path::Path;
 /// Do NOT bump for purely additive `Option<T>` fields that the save-time
 /// invariant (`validate_for_persistence`) does not yet require. Those are
 /// forward-compatible.
-pub const MODEL_PAYLOAD_VERSION: u32 = 9;
+pub const MODEL_PAYLOAD_VERSION: u32 = 10;
 
 /// Schema-free saved-model metadata keyed by stable group id.
 ///

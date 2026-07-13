@@ -635,7 +635,7 @@ pub fn blockwise_fit_from_parts(
                 raw_block_starts
                     .last()
                     .copied()
-                    .unwrap_or(0)
+                    .expect("raw block starts contain the initial zero")
                     .checked_add(state.beta.len())
                     .ok_or_else(|| CustomFamilyError::DimensionMismatch {
                         reason: "blockwise_fit raw coefficient partition overflows usize"

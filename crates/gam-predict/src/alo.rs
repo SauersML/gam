@@ -427,9 +427,7 @@ fn pullback_saved_coordinate_designs(
             }
             None => 0..1,
         };
-        let transform = raw_to_active
-            .slice(s![.., active_range.clone()])
-            .to_owned();
+        let transform = raw_to_active.slice(s![.., active_range.clone()]).to_owned();
         if exact_identity(&transform) {
             active_designs.push(design);
         } else {
@@ -520,7 +518,7 @@ fn compute_saved_standard_alo(
             beta.len()
         )));
     }
-    let hessian = require_saved_hessian(model, class, beta.len())?;
+    let geometry = require_saved_geometry(model, class, beta.len())?;
     let eta = input.design.dot(beta) + &input.offset;
     let likelihood =
         GlmLikelihoodSpec::try_new(model.likelihood(), fit.likelihood_scale.clone())
@@ -538,9 +536,23 @@ fn compute_saved_standard_alo(
         &mut working_response,
     )?;
     let phi = standard_alo_dispersion(fit.standard_deviation, likelihood.spec.link_function())?;
-    let dense_design = input.design.to_dense();
+    let (mut active_designs, active_ranges) = pullback_saved_coordinate_designs(
+        class,
+        geometry.gauge,
+        vec![input.design.clone()],
+        vec![0..beta.len()],
+    )?;
+    if active_ranges.len() != 1 || active_ranges[0] != (0..geometry.gauge.reduced_total()) {
+        return Err(invalid(
+            "saved standard ALO gauge does not expose every active coordinate to its sole fitted block",
+        ));
+    }
+    let dense_design = active_designs
+        .pop()
+        .expect("one standard ALO design was constructed")
+        .to_dense();
     let scalar = compute_alo_from_input(&AloInput::from_penalized_hessian_with_working_state(
-        hessian,
+        geometry.penalized_hessian,
         &dense_design,
         &eta,
         &input.offset,
@@ -589,18 +601,24 @@ fn compute_saved_multicoordinate_core(
     coordinate_names: Vec<String>,
     coordinate_designs: Vec<DesignMatrix>,
     coordinate_ranges: Vec<Range<usize>>,
-    penalized_hessian: &Array2<f64>,
+    geometry: SavedAloGeometry<'_>,
     observed_hessians: Vec<Array2<f64>>,
     scores: Vec<Array1<f64>>,
     coordinate_values: Vec<Array1<f64>>,
 ) -> Result<SavedModelAloDiagnostics, EstimationError> {
+    let (active_designs, active_ranges) = pullback_saved_coordinate_designs(
+        class,
+        geometry.gauge,
+        coordinate_designs,
+        coordinate_ranges,
+    )?;
     let score_covariances = scores.iter().map(score_outer_product).collect::<Vec<_>>();
     let diagnostics = compute_multiblock_alo(&MultiBlockAloInput {
         n_obs: scores.len(),
         n_coordinates: coordinate_names.len(),
-        coordinate_designs: &coordinate_designs,
-        coordinate_coefficient_ranges: &coordinate_ranges,
-        penalized_hessian,
+        coordinate_designs: &active_designs,
+        coordinate_coefficient_ranges: &active_ranges,
+        penalized_hessian: geometry.penalized_hessian,
         observed_hessians: &observed_hessians,
         score_covariances: &score_covariances,
         scores: &scores,
@@ -638,7 +656,7 @@ fn compute_gaussian_location_scale_alo(
         .as_ref()
         .map_or(&[][..], |runtime| runtime.beta.as_slice());
     let parameter_dimension = beta_mean.len() + beta_scale.len() + wiggle_beta.len();
-    let hessian = require_saved_hessian(model, class, parameter_dimension)?;
+    let geometry = require_saved_geometry(model, class, parameter_dimension)?;
     let base_mean = input.design.dot(&beta_mean) + &input.offset;
     let eta_scale = secondary_eta(input, secondary_design, &beta_scale);
     let n = observations.response.len();
@@ -717,7 +735,7 @@ fn compute_gaussian_location_scale_alo(
         names,
         designs,
         ranges,
-        hessian,
+        geometry,
         observed_hessians,
         scores,
         coordinate_values,
@@ -753,7 +771,7 @@ fn compute_binomial_location_scale_alo(
         .as_ref()
         .map_or(&[][..], |runtime| runtime.beta.as_slice());
     let parameter_dimension = beta_threshold.len() + beta_scale.len() + wiggle_beta.len();
-    let hessian = require_saved_hessian(model, class, parameter_dimension)?;
+    let geometry = require_saved_geometry(model, class, parameter_dimension)?;
     let threshold_eta = input.design.dot(&beta_threshold) + &input.offset;
     let eta_scale = secondary_eta(input, secondary_design, &beta_scale);
     // Replay the fitted binomial map exactly. This deliberately does not use
@@ -835,7 +853,7 @@ fn compute_binomial_location_scale_alo(
         names,
         designs,
         ranges,
-        hessian,
+        geometry,
         observed_hessians,
         scores,
         coordinate_values,
@@ -870,7 +888,7 @@ fn compute_dispersion_location_scale_alo(
         invalid("saved dispersion location-scale ALO is missing the precision block")
     })?;
     let parameter_dimension = beta_mean.len() + beta_dispersion.len();
-    let hessian = require_saved_hessian(model, class, parameter_dimension)?;
+    let geometry = require_saved_geometry(model, class, parameter_dimension)?;
     let eta_mean = input.design.dot(&beta_mean) + &input.offset;
     let eta_dispersion = secondary_eta(input, secondary_design, &beta_dispersion);
     let kind = dispersion_kind(&model.payload().family_state.likelihood().response)?;
@@ -912,7 +930,7 @@ fn compute_dispersion_location_scale_alo(
         names,
         designs,
         ranges,
-        hessian,
+        geometry,
         observed_hessians,
         scores,
         coordinate_values,
@@ -997,7 +1015,7 @@ fn compute_saved_bernoulli_marginal_slope_alo(
         + logslope_dimension
         + replay.score_warp_dimension
         + replay.link_deviation_dimension;
-    let hessian = require_saved_hessian(model, class, parameter_dimension)?;
+    let geometry = require_saved_geometry(model, class, parameter_dimension)?;
     let mut observed_hessians = Vec::with_capacity(n);
     let mut scores = Vec::with_capacity(n);
     let mut coordinate_values = Vec::with_capacity(n);
@@ -1049,7 +1067,7 @@ fn compute_saved_bernoulli_marginal_slope_alo(
         coordinate_names,
         coordinate_designs,
         coordinate_ranges,
-        hessian,
+        geometry,
         observed_hessians,
         scores,
         coordinate_values,
@@ -1224,7 +1242,7 @@ fn compute_saved_transformation_normal_alo(
             beta.len()
         )));
     }
-    let hessian = require_saved_hessian(model, class, parameter_dimension)?;
+    let geometry = require_saved_geometry(model, class, parameter_dimension)?;
     let mut gamma = Array2::<f64>::zeros((n, response_dimension));
     for component in 0..response_dimension {
         let start = component * covariate_dimension;
@@ -1300,7 +1318,7 @@ fn compute_saved_transformation_normal_alo(
         coordinate_names,
         coordinate_designs,
         coordinate_ranges,
-        hessian,
+        geometry,
         observed_hessians,
         scores,
         coordinate_values,
@@ -1352,7 +1370,7 @@ fn compute_saved_cause_specific_survival_alo(
         invalid("saved survival ALO requires a canonical fitted coefficient state")
     })?;
     let parameter_dimension = fit.beta.len();
-    let hessian = require_saved_hessian(model, class, parameter_dimension)?;
+    let geometry = require_saved_geometry(model, class, parameter_dimension)?;
     let fitted_cause_count = model
         .payload()
         .survival_cause_count
@@ -1443,7 +1461,7 @@ fn compute_saved_cause_specific_survival_alo(
         coordinate_names,
         input.coordinate_designs.clone(),
         input.coordinate_ranges.clone(),
-        hessian,
+        geometry,
         observed_hessians,
         scores,
         coordinate_values,
@@ -1507,5 +1525,39 @@ pub fn compute_saved_model_alo(
                 "saved survival ALO requires typed entry/exit/derivative row geometry",
             )),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_alo_pulls_raw_rows_through_rectangular_gauge() {
+        // beta_raw = T theta_active + a with three reported coefficients but
+        // only two fitted directions.  The local coordinate touches raw rows
+        // 1..3, so its active Jacobian must be X_local * T[1..3, :].
+        let gauge = Gauge {
+            t_full: Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 0.5, 2.0, -1.0, 3.0])
+                .expect("3x2 gauge"),
+            affine_shift: Array1::from_vec(vec![4.0, -2.0, 1.0]),
+            block_starts_raw: vec![0, 3],
+            block_starts_reduced: vec![0, 2],
+        };
+        gauge.validate().expect("rectangular gauge is valid");
+        let raw_design =
+            Array2::from_shape_vec((2, 2), vec![2.0, 4.0, -1.0, 3.0]).expect("2x2 raw row design");
+        let expected = raw_design.dot(&gauge.t_full.slice(s![1..3, ..]));
+
+        let (active_designs, active_ranges) = pullback_saved_coordinate_designs(
+            PredictModelClass::Standard,
+            &gauge,
+            vec![DesignMatrix::from(raw_design)],
+            vec![1..3],
+        )
+        .expect("exact active-row pullback");
+
+        assert_eq!(active_ranges, vec![0..2]);
+        assert_eq!(active_designs[0].to_dense(), expected);
     }
 }
