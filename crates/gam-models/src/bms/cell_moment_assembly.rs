@@ -986,6 +986,28 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
+    fn empirical_fixed_fourth_contracted_arrays<const K: usize>(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64; K],
+        direction_u: &[f64; K],
+        direction_v: &[f64; K],
+    ) -> Result<Array2<f64>, String> {
+        let vars: [FixedRuntimeJet<TwoSeed<K>, K>; K] = std::array::from_fn(|axis| {
+            FixedRuntimeJet::from_inner(TwoSeed::seed(
+                point[axis],
+                axis,
+                direction_u[axis],
+                direction_v[axis],
+            ))
+        });
+        let contracted = plan
+            .evaluate(&vars, 4, &())?
+            .into_inner()
+            .contracted_fourth();
+        Ok(Array2::from_shape_fn((K, K), |(a, b)| contracted[a][b]))
+    }
+
+    #[inline]
     fn empirical_fixed_fourth_contracted<const K: usize>(
         plan: &EmpiricalBmsRowJetPlan,
         point: &[f64],
@@ -1016,25 +1038,7 @@ impl BernoulliMarginalSlopeFamily {
                     direction_v.len()
                 )
             })?;
-        let vars: [FixedRuntimeJet<TwoSeed<K>, K>; K] = std::array::from_fn(|axis| {
-            FixedRuntimeJet::from_inner(TwoSeed::seed(
-                point[axis],
-                axis,
-                direction_u[axis],
-                direction_v[axis],
-            ))
-        });
-        let contracted = plan
-            .evaluate(&vars, 4, &())?
-            .into_inner()
-            .contracted_fourth();
-        let mut out = Array2::<f64>::zeros((K, K));
-        for a in 0..K {
-            for b in 0..K {
-                out[[a, b]] = contracted[a][b];
-            }
-        }
-        Ok(out)
+        Self::empirical_fixed_fourth_contracted_arrays(plan, point, direction_u, direction_v)
     }
 
     fn empirical_fixed_third_many_from_plan<const K: usize>(
@@ -1042,9 +1046,26 @@ impl BernoulliMarginalSlopeFamily {
         point: &[f64],
         directions: &[Array1<f64>],
     ) -> Result<Vec<Array2<f64>>, String> {
+        let point: &[f64; K] = point.try_into().map_err(|_| {
+            format!(
+                "fixed empirical BMS point length {} != specialization width {K}",
+                point.len()
+            )
+        })?;
         directions
             .iter()
-            .map(|direction| Self::empirical_fixed_third_contracted::<K>(plan, point, direction))
+            .map(|direction| {
+                let direction: &[f64; K] = direction
+                    .as_slice()
+                    .and_then(|values| values.try_into().ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "fixed empirical BMS third direction length {} != specialization width {K}",
+                            direction.len()
+                        )
+                    })?;
+                Self::empirical_fixed_third_contracted_arrays(plan, point, direction)
+            })
             .collect()
     }
 
@@ -1070,12 +1091,38 @@ impl BernoulliMarginalSlopeFamily {
         point: &[f64],
         gram: &[f64],
     ) -> Result<Array1<f64>, String> {
+        let point: &[f64; K] = point.try_into().map_err(|_| {
+            format!(
+                "fixed empirical BMS point length {} != specialization width {K}",
+                point.len()
+            )
+        })?;
+        if gram.len() != K * K {
+            return Err(format!(
+                "fixed empirical BMS trace gram length {} != {}",
+                gram.len(),
+                K * K
+            ));
+        }
         let mut gradient = Array1::<f64>::zeros(K);
-        for axis in 0..K {
-            let mut basis = Array1::<f64>::zeros(K);
-            basis[axis] = 1.0;
-            let third = Self::empirical_fixed_third_contracted::<K>(plan, point, &basis)?;
-            gradient[axis] = Self::row_primary_trace_contract(&third, gram);
+        for direction_axis in 0..K {
+            let vars: [FixedRuntimeJet<OneSeed<K>, K>; K] = std::array::from_fn(|axis| {
+                FixedRuntimeJet::from_inner(OneSeed::seed_direction(
+                    point[axis],
+                    axis,
+                    f64::from(axis == direction_axis),
+                ))
+            });
+            let contracted = plan
+                .evaluate(&vars, 3, &())?
+                .into_inner()
+                .contracted_third();
+            gradient[direction_axis] = contracted
+                .iter()
+                .flatten()
+                .zip(gram)
+                .map(|(third, weight)| third * weight)
+                .sum();
         }
         Ok(gradient)
     }
@@ -1102,10 +1149,39 @@ impl BernoulliMarginalSlopeFamily {
         point: &[f64],
         direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
     ) -> Result<Vec<Array2<f64>>, String> {
+        let point: &[f64; K] = point.try_into().map_err(|_| {
+            format!(
+                "fixed empirical BMS point length {} != specialization width {K}",
+                point.len()
+            )
+        })?;
         direction_pairs
             .iter()
             .map(|(direction_u, direction_v)| {
-                Self::empirical_fixed_fourth_contracted::<K>(plan, point, direction_u, direction_v)
+                let direction_u: &[f64; K] = direction_u
+                    .as_slice()
+                    .and_then(|values| values.try_into().ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "fixed empirical BMS fourth first-direction length {} != specialization width {K}",
+                            direction_u.len()
+                        )
+                    })?;
+                let direction_v: &[f64; K] = direction_v
+                    .as_slice()
+                    .and_then(|values| values.try_into().ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "fixed empirical BMS fourth second-direction length {} != specialization width {K}",
+                            direction_v.len()
+                        )
+                    })?;
+                Self::empirical_fixed_fourth_contracted_arrays(
+                    plan,
+                    point,
+                    direction_u,
+                    direction_v,
+                )
             })
             .collect()
     }
