@@ -31,7 +31,144 @@ pub struct CustomFamilyBlockPsiDerivative {
     pub implicit_group_id: Option<usize>,
 }
 
-pub type SharedDerivativeBlocks = Arc<Vec<Vec<CustomFamilyBlockPsiDerivative>>>;
+/// Identity of one coordinate in the custom-family hyperparameter surface.
+///
+/// The global coordinate order is deliberately structural rather than inferred
+/// from empty derivative matrices:
+///
+/// 1. design/penalty coordinates, grouped in block order; then
+/// 2. family-owned coordinates, in family-local axis order.
+///
+/// `derivative_index` addresses the derivative within `block` in the layout's
+/// [`CustomFamilyHyperLayout::design_derivative_blocks`] storage.  A family
+/// coordinate has no fictitious block owner and therefore cannot accidentally
+/// participate in generic `X_psi`/`S_psi` assembly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustomFamilyHyperAxis {
+    DesignPenalty {
+        block: usize,
+        derivative_index: usize,
+    },
+    Family {
+        family_axis: usize,
+    },
+}
+
+/// Validated global layout for exact custom-family hyperparameter calculus.
+///
+/// Family-owned axes are represented explicitly.  In particular, an empty
+/// `X_psi`/`S_psi` pair is still a design/penalty axis; it is never interpreted
+/// as an auxiliary family parameter.  This makes first-order, pairwise, and
+/// mixed-beta dispatch use the same coordinate identity.
+#[derive(Clone)]
+pub struct CustomFamilyHyperLayout {
+    design_derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    family_axes: Vec<usize>,
+    design_axis_count: usize,
+}
+
+impl CustomFamilyHyperLayout {
+    /// Construct a layout with an explicit list of family-local axes.
+    ///
+    /// `family_axes` must be exactly `0..family_axes.len()`.  Requiring the
+    /// caller to provide that list makes adding a family parameter an explicit
+    /// breaking change at the evaluation site, while the validation prevents
+    /// duplicate, missing, or reordered family identities.
+    pub fn new(
+        design_derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+        family_axes: Vec<usize>,
+    ) -> Result<Self, String> {
+        for (expected, &actual) in family_axes.iter().enumerate() {
+            if actual != expected {
+                return Err(format!(
+                    "custom-family hyper layout family axes must be contiguous and ordered: \
+                     position {expected} carries family axis {actual}"
+                ));
+            }
+        }
+        let design_axis_count = design_derivative_blocks.iter().map(Vec::len).sum();
+        Ok(Self {
+            design_derivative_blocks,
+            family_axes,
+            design_axis_count,
+        })
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.design_derivative_blocks.len()
+    }
+
+    pub fn design_axis_count(&self) -> usize {
+        self.design_axis_count
+    }
+
+    pub fn family_axis_count(&self) -> usize {
+        self.family_axes.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.design_axis_count + self.family_axes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn design_derivative_blocks(&self) -> &[Vec<CustomFamilyBlockPsiDerivative>] {
+        &self.design_derivative_blocks
+    }
+
+    pub fn family_axes(&self) -> &[usize] {
+        &self.family_axes
+    }
+
+    /// Resolve a global hyperparameter coordinate to its typed identity.
+    pub fn axis(&self, global_index: usize) -> Option<CustomFamilyHyperAxis> {
+        if global_index < self.design_axis_count {
+            let mut remaining = global_index;
+            for (block, derivatives) in self.design_derivative_blocks.iter().enumerate() {
+                if remaining < derivatives.len() {
+                    return Some(CustomFamilyHyperAxis::DesignPenalty {
+                        block,
+                        derivative_index: remaining,
+                    });
+                }
+                remaining -= derivatives.len();
+            }
+            unreachable!("validated design-axis count must resolve every design coordinate");
+        }
+        let family_offset = global_index.checked_sub(self.design_axis_count)?;
+        self.family_axes
+            .get(family_offset)
+            .copied()
+            .map(|family_axis| CustomFamilyHyperAxis::Family { family_axis })
+    }
+
+    pub fn design_derivative(
+        &self,
+        global_index: usize,
+    ) -> Option<(usize, &CustomFamilyBlockPsiDerivative)> {
+        match self.axis(global_index)? {
+            CustomFamilyHyperAxis::DesignPenalty {
+                block,
+                derivative_index,
+            } => Some((
+                block,
+                &self.design_derivative_blocks[block][derivative_index],
+            )),
+            CustomFamilyHyperAxis::Family { .. } => None,
+        }
+    }
+
+    pub fn family_axis(&self, global_index: usize) -> Option<usize> {
+        match self.axis(global_index)? {
+            CustomFamilyHyperAxis::Family { family_axis } => Some(family_axis),
+            CustomFamilyHyperAxis::DesignPenalty { .. } => None,
+        }
+    }
+}
+
+pub type SharedCustomFamilyHyperLayout = Arc<CustomFamilyHyperLayout>;
 
 impl CustomFamilyBlockPsiDerivative {
     /// Public constructor for use in tests and external consumers.
