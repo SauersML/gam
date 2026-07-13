@@ -405,153 +405,23 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        // Exact directional derivative dH[u] for the same 3-block model.
-        //
-        // Direction:
-        //   u = (u_t, u_l, uw),
-        //   d_eta_t = X_t u_t, d_eta_l = X_l u_l.
-        //
-        // Canonical objective identity for scalar-q composition:
-        //   dH_ab[u] =
-        //      m3 * dq * q_a q_b
-        //    + m2 * (dq_a q_b + q_a dq_b + dq q_ab)
-        //    + m1 * dq_ab
-        // where (m1,m2,m3) are derivatives of F wrt q.
-        //
-        // Log-likelihood derivative relation used in code:
-        //   s = d ell/dq, c = d² ell/dq², t = d³ ell/dq³
-        //   m1 = -s, m2 = -c, m3 = -t.
-        //
-        // Required analytic chain terms:
-        //
-        // 1) Wiggle scalars:
-        //   m  = 1 + betaw^T B'(q0)
-        //   g2 = betaw^T B''(q0)
-        //   g3 = betaw^T B'''(q0)
-        //
-        // 2) Directional wiggle scalars:
-        //   dm  = (B'·uw)  + g2*dq0
-        //   dg2 = (B''·uw) + g3*dq0
-        //
-        // 3) Directional q pieces:
-        //   dq   = m*dq0 + B·uw
-        //   dq_t = dm*q0_t + m*dq0_t
-        //   dq_l = dm*q0_l + m*dq0_l
-        //
-        // 4) Directional second q pieces:
-        //   dq_tt = dg2*q0_t*q0_t + g2*(2*q0_t*dq0_t)
-        //   dq_tl = dg2*q0_t*q0_l + g2*(dq0_t*q0_l + q0_t*dq0_l)
-        //           + dm*q0_tl + m*dq0_tl
-        //   dq_ll = dg2*q0_l*q0_l + g2*(2*q0_l*dq0_l)
-        //           + dm*q0_ll + m*dq0_ll
-        //
-        // 5) Mixed w-block directional terms:
-        //   qw   = B,         dqw   = B' dq0
-        //   q_tw  = q0_t B',   dq_tw  = dq0_t B' + dq0 q0_t B''
-        //   q_lw  = q0_l B',   dq_lw  = dq0_l B' + dq0 q0_l B''
-        //   qww  = 0,         dqww  = 0
-        //
-        // Implementation below follows these formulas exactly block-by-block.
-        let (n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
-
         let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
             return Ok(None);
         };
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
-        let betaw0 = block_states[Self::BLOCK_WIGGLE].beta.clone();
-        let core0 = binomial_location_scale_core(
-            &self.y,
-            &self.weights,
-            eta_t,
-            eta_ls,
-            Some(etaw),
-            &self.link_kind,
-        )?;
-        let b0 = self.wiggle_design(core0.q0.view())?;
-        let pw = b0.ncols();
+        let program = BinomialLocationScaleWiggleRowProgram::new(self, block_states, 3)?;
+        let pw = program.beta_w.len();
         let beta_layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
-        let total = beta_layout.total();
         let (u_t, u_ls, uw) = beta_layout.split_three(d_beta_flat, "wiggle joint d_beta")?;
         let d_eta_t = fast_av(&x_t, &u_t);
         let d_eta_ls = fast_av(&x_ls, &u_ls);
-
-        let d0 =
-            self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::first_derivative())?;
-        let dd0 =
-            self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::second_derivative())?;
-        let d3q = self.wiggle_d3q_dq03(core0.q0.view(), betaw0.view())?;
-        if d0.ncols() != betaw0.len() || dd0.ncols() != betaw0.len() {
-            return Err(GamlssError::DimensionMismatch {
-                reason: format!(
-                    "wiggle derivative/beta mismatch in exact joint dH: B'={} B''={} betaw={}",
-                    d0.ncols(),
-                    dd0.ncols(),
-                    betaw0.len()
-                ),
-            }
-            .into());
-        }
-        let m = d0.dot(&betaw0) + 1.0;
-        let g2 = dd0.dot(&betaw0);
-        let g3 = d3q;
-        let (sigma, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
-
-        let BinomialWiggleDhRowCoeffs {
-            coeff_tt,
-            coeff_tl,
-            coeff_ll,
-            coeff_tw_b,
-            coeff_tw_d,
-            coeff_tw_dd,
-            coeff_lw_b,
-            coeff_lw_d,
-            coeff_lw_dd,
-            coeffww_bb,
-            coeffww_db,
-        } = self.binomial_wiggle_dh_row_coeffs(
-            n,
-            &BinomialWiggleDhRowInputs {
-                core0: &core0,
-                eta_t,
-                etaw,
-                sigma: &sigma,
-                m: &m,
-                g2: &g2,
-                g3: &g3,
-                b0: &b0,
-                d0: &d0,
-                dd0: &dd0,
-                uw: &uw,
-                d_eta_t: &d_eta_t,
-                d_eta_ls: &d_eta_ls,
-            },
-        );
-        let d_h_tt = xt_diag_x_dense(&x_t, &coeff_tt)?;
-        let d_h_tl = xt_diag_y_dense(&x_t, &coeff_tl, &x_ls)?;
-        let d_h_ll = xt_diag_x_dense(&x_ls, &coeff_ll)?;
-        let d_h_tw = xt_diag_y_dense(&x_t, &coeff_tw_b, &b0)?
-            + &xt_diag_y_dense(&x_t, &coeff_tw_d, &d0)?
-            + &xt_diag_y_dense(&x_t, &coeff_tw_dd, &dd0)?;
-        let d_h_lw = xt_diag_y_dense(&x_ls, &coeff_lw_b, &b0)?
-            + &xt_diag_y_dense(&x_ls, &coeff_lw_d, &d0)?
-            + &xt_diag_y_dense(&x_ls, &coeff_lw_dd, &dd0)?;
-        let mut d_hww = xt_diag_x_dense(&b0, &coeffww_bb)?;
-        d_hww += &xt_diag_y_dense(&d0, &coeffww_db, &b0)?;
-        d_hww += &xt_diag_y_dense(&b0, &coeffww_db, &d0)?;
-
-        let mut d_h = Array2::<f64>::zeros((total, total));
-        d_h.slice_mut(s![0..pt, 0..pt]).assign(&d_h_tt);
-        d_h.slice_mut(s![0..pt, pt..pt + pls]).assign(&d_h_tl);
-        d_h.slice_mut(s![pt..pt + pls, pt..pt + pls])
-            .assign(&d_h_ll);
-        d_h.slice_mut(s![0..pt, pt + pls..total]).assign(&d_h_tw);
-        d_h.slice_mut(s![pt..pt + pls, pt + pls..total])
-            .assign(&d_h_lw);
-        d_h.slice_mut(s![pt + pls..total, pt + pls..total])
-            .assign(&d_hww);
-        mirror_upper_to_lower(&mut d_h);
-        Ok(Some(d_h))
+        let rows = program.first_directional_rows(&d_eta_t, &d_eta_ls, uw.view())?;
+        Ok(Some(rows.assemble_dense(
+            x_t.as_ref(),
+            x_ls.as_ref(),
+            &program.basis_derivatives,
+        )?))
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative(

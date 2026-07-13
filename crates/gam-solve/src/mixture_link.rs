@@ -3062,6 +3062,24 @@ mod tests {
     }
 
     #[test]
+    fn mixture_second_partials_obey_equal_weight_two_component_identity() {
+        let state = state_fromspec(&MixtureLinkSpec {
+            components: vec![LinkComponent::Probit, LinkComponent::Logit],
+            initial_rho: Array1::from_vec(vec![0.0]),
+        })
+        .expect("valid two-component mixture");
+        let out = mixture_inverse_link_jetwith_rho_partials(&state, 0.37);
+        // For two components, f''(rho)=pi(1-pi)(1-2pi)(f0-f1), so both
+        // response channels have exactly zero curvature at the equal-weight
+        // coordinate rho=0. This checks the analytic softmax Hessian without
+        // using a finite-difference oracle.
+        assert_eq!(out.d2mu_drho2.dim(), (1, 1));
+        assert_eq!(out.d2d1_drho2.dim(), (1, 1));
+        assert_eq!(out.d2mu_drho2[[0, 0]], 0.0);
+        assert_eq!(out.d2d1_drho2[[0, 0]], 0.0);
+    }
+
+    #[test]
     fn sas_param_partials_matchfd() {
         let eta = 0.37;
         let epsilon = -0.12;
@@ -3103,6 +3121,19 @@ mod tests {
         assert!((out.djet_dlog_delta.d1 - fd_ld.d1).abs() < 5e-5);
         assert!((out.djet_dlog_delta.d2 - fd_ld.d2).abs() < 5e-5);
         assert!((out.djet_dlog_delta.d3 - fd_ld.d3).abs() < 5e-4);
+    }
+
+    #[test]
+    fn sas_second_partials_have_exact_center_identities() {
+        let out = sas_inverse_link_jetwith_param_partials(0.0, 0.0, 0.0)
+            .expect("finite SAS center");
+        let phi0 = normal_pdf(0.0);
+        let expected_epsilon_d1 = -2.0 * phi0 / (SAS_U_CLAMP * SAS_U_CLAMP);
+        assert_eq!(out.d2mu_dparams2, Array2::zeros((2, 2)));
+        assert_eq!(out.d2d1_dparams2[[0, 1]], out.d2d1_dparams2[[1, 0]]);
+        assert!((out.d2d1_dparams2[[0, 0]] - expected_epsilon_d1).abs() < 1.0e-15);
+        assert!((out.d2d1_dparams2[[1, 1]] - phi0).abs() < 1.0e-15);
+        assert_eq!(out.d2d1_dparams2[[0, 1]], 0.0);
     }
 
     /// #1876 closability isolation gate. The SAS-link binomial FAMILY score at
@@ -3554,6 +3585,20 @@ mod tests {
         assert!((out.djet_depsilon.d1 - fd_epsilon.d1).abs() < 5e-5);
         assert!((out.djet_depsilon.d2 - fd_epsilon.d2).abs() < 1.2e-4);
         assert!((out.djet_depsilon.d3 - fd_epsilon.d3).abs() < 4e-4);
+    }
+
+    #[test]
+    fn beta_logistic_second_partials_obey_center_symmetry() {
+        let out = beta_logistic_inverse_link_jetwith_param_partials(0.0, 0.37, 0.0);
+        // At eta=0 and epsilon=0, a=b for every log-shape center, hence
+        // I_{1/2}(a,a)=1/2 identically. Its pure epsilon and pure log-shape
+        // second derivatives vanish by complement symmetry, while the density
+        // is even in epsilon and therefore has zero mixed derivative there.
+        assert_eq!(out.d2mu_dparams2[[0, 1]], out.d2mu_dparams2[[1, 0]]);
+        assert_eq!(out.d2d1_dparams2[[0, 1]], out.d2d1_dparams2[[1, 0]]);
+        assert!(out.d2mu_dparams2[[0, 0]].abs() < 1.0e-12);
+        assert!(out.d2mu_dparams2[[1, 1]].abs() < 1.0e-12);
+        assert!(out.d2d1_dparams2[[0, 1]].abs() < 1.0e-12);
     }
 
     #[test]

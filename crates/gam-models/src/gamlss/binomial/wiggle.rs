@@ -3095,6 +3095,41 @@ impl BinomialWiggleFirstDirectionalRows {
             coeff_ww_bd: Array1::zeros(n),
         }
     }
+
+    fn assemble_dense(
+        &self,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        basis: &[Array2<f64>],
+    ) -> Result<Array2<f64>, String> {
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let pw = basis[0].ncols();
+        let total = pt + pls + pw;
+        let mut out = Array2::zeros((total, total));
+        out.slice_mut(s![0..pt, 0..pt])
+            .assign(&xt_diag_x_dense(x_t, &self.coeff_tt)?);
+        out.slice_mut(s![0..pt, pt..pt + pls])
+            .assign(&xt_diag_y_dense(x_t, &self.coeff_tl, x_ls)?);
+        out.slice_mut(s![pt..pt + pls, pt..pt + pls])
+            .assign(&xt_diag_x_dense(x_ls, &self.coeff_ll)?);
+        let h_tw = xt_diag_y_dense(x_t, &self.coeff_tw_b, &basis[0])?
+            + xt_diag_y_dense(x_t, &self.coeff_tw_d, &basis[1])?
+            + xt_diag_y_dense(x_t, &self.coeff_tw_dd, &basis[2])?;
+        let h_lw = xt_diag_y_dense(x_ls, &self.coeff_lw_b, &basis[0])?
+            + xt_diag_y_dense(x_ls, &self.coeff_lw_d, &basis[1])?
+            + xt_diag_y_dense(x_ls, &self.coeff_lw_dd, &basis[2])?;
+        let h_ww = xt_diag_x_dense(&basis[0], &self.coeff_ww_bb)?
+            + xt_diag_y_dense(&basis[0], &self.coeff_ww_bd, &basis[1])?
+            + xt_diag_y_dense(&basis[1], &self.coeff_ww_bd, &basis[0])?;
+        out.slice_mut(s![0..pt, pt + pls..]).assign(&h_tw);
+        out.slice_mut(s![pt..pt + pls, pt + pls..])
+            .assign(&h_lw);
+        out.slice_mut(s![pt + pls.., pt + pls..])
+            .assign(&h_ww);
+        mirror_upper_to_lower(&mut out);
+        Ok(out)
+    }
 }
 
 /// Typed-probe lowering of `D² H[u,v]` from the canonical wiggle row program.
@@ -3135,6 +3170,46 @@ impl BinomialWiggleSecondDirectionalRows {
             coeff_ww_bdd: Array1::zeros(n),
             coeff_ww_dd: Array1::zeros(n),
         }
+    }
+
+    fn assemble_dense(
+        &self,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        basis: &[Array2<f64>],
+    ) -> Result<Array2<f64>, String> {
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let pw = basis[0].ncols();
+        let total = pt + pls + pw;
+        let mut out = Array2::zeros((total, total));
+        out.slice_mut(s![0..pt, 0..pt])
+            .assign(&xt_diag_x_dense(x_t, &self.coeff_tt)?);
+        out.slice_mut(s![0..pt, pt..pt + pls])
+            .assign(&xt_diag_y_dense(x_t, &self.coeff_tl, x_ls)?);
+        out.slice_mut(s![pt..pt + pls, pt..pt + pls])
+            .assign(&xt_diag_x_dense(x_ls, &self.coeff_ll)?);
+        let h_tw = xt_diag_y_dense(x_t, &self.coeff_tw_b, &basis[0])?
+            + xt_diag_y_dense(x_t, &self.coeff_tw_d, &basis[1])?
+            + xt_diag_y_dense(x_t, &self.coeff_tw_dd, &basis[2])?
+            + xt_diag_y_dense(x_t, &self.coeff_tw_d3, &basis[3])?;
+        let h_lw = xt_diag_y_dense(x_ls, &self.coeff_lw_b, &basis[0])?
+            + xt_diag_y_dense(x_ls, &self.coeff_lw_d, &basis[1])?
+            + xt_diag_y_dense(x_ls, &self.coeff_lw_dd, &basis[2])?
+            + xt_diag_y_dense(x_ls, &self.coeff_lw_d3, &basis[3])?;
+        let h_ww = xt_diag_x_dense(&basis[0], &self.coeff_ww_bb)?
+            + xt_diag_y_dense(&basis[0], &self.coeff_ww_bd, &basis[1])?
+            + xt_diag_y_dense(&basis[1], &self.coeff_ww_bd, &basis[0])?
+            + xt_diag_y_dense(&basis[0], &self.coeff_ww_bdd, &basis[2])?
+            + xt_diag_y_dense(&basis[2], &self.coeff_ww_bdd, &basis[0])?
+            + xt_diag_x_dense(&basis[1], &self.coeff_ww_dd)?;
+        out.slice_mut(s![0..pt, pt + pls..]).assign(&h_tw);
+        out.slice_mut(s![pt..pt + pls, pt + pls..])
+            .assign(&h_lw);
+        out.slice_mut(s![pt + pls.., pt + pls..])
+            .assign(&h_ww);
+        mirror_upper_to_lower(&mut out);
+        Ok(out)
     }
 }
 

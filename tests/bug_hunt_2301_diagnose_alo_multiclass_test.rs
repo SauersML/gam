@@ -15,11 +15,20 @@
 //! 2. a survival fit (`Surv(...) ~ x`) — must also succeed through its typed
 //!    entry/exit/derivative replay and print the same ALO diagnostics contract.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
+use csv::StringRecord;
+use gam::encode_recordswith_inferred_schema;
 use gam::gam_binary;
+use gam::inference::model::FittedModel;
+use gam::predict::input::build_predict_input_for_model;
+use gam::predict::{
+    SavedAloObservations, SavedModelAloDiagnostics, SavedModelAloInput, compute_saved_model_alo,
+};
 use gam::test_support::cli_harness::run_or_panic;
+use ndarray::{Array1, Array2};
 
 fn write_csv(path: &Path, header: &[&str], rows: &[Vec<f64>]) {
     let mut writer = csv::Writer::from_path(path).expect("create csv");
