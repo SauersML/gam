@@ -437,8 +437,8 @@ pub struct PirlsResult {
     /// which equals `Sβ − ∇ℓ` because `Xᵀ(η−z)·w = −∇ℓ`). Storing the vector —
     /// not just its norm — lets the outer REML/LAML evaluator engage the
     /// inner-KKT envelope correction `Ṽ = V − ½·rᵀH⁻¹r` on the flexible-link
-    /// (SAS/mixture) path, where the outer optimizer accepts β̂ at a first-order
-    /// inner cap (`outer_inner_cap`) short of exact stationarity. The correction
+    /// and ψ/anisotropy paths, where the outer optimizer may accept β̂ at a
+    /// first-order inner cap short of exact stationarity. The correction
     /// and its θ-gradient vanish as `r → 0`, so a fully-converged fit is
     /// unchanged. See [`crate::model_types::ProjectedKktResidual`].
     pub penalized_gradient_transformed: Array1<f64>,

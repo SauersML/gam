@@ -109,8 +109,8 @@ pub enum SurvivalPredictError {
     IncompatibleSchema { reason: String },
     /// The requested combination of saved-model mode and predict-time
     /// options is not implemented in this library entry point yet (e.g.
-    /// uncertainty for non-location-scale, latent window prediction,
-    /// competing-risks with `with_uncertainty`).
+    /// uncertainty for a plug-in non-location-scale prediction or latent
+    /// window prediction).
     UnsupportedConfiguration { reason: String },
     /// Posterior-mean prediction requires the fitted joint coefficient
     /// covariance in exactly the same block-concatenated coordinate system as
@@ -213,11 +213,11 @@ pub struct SurvivalPredictRequest<'a> {
     /// If `None`, every row is evaluated at its own `age_exit`. If
     /// `Some(grid)`, every row is evaluated at every time in the grid.
     pub time_grid: Option<&'a [f64]>,
-    /// When true, the result also carries delta-method standard errors
-    /// for the survival surface (response scale) and the linear
-    /// predictor.  Currently honored for `LocationScale` only; other
-    /// likelihood modes return `Err` rather than silently dropping
-    /// the request.
+    /// When true, the result also carries posterior standard errors for the
+    /// reported surfaces and linear predictors. Posterior-mean prediction uses
+    /// the same joint coefficient quadrature as the point estimand; explicit
+    /// plug-in single-event prediction retains its model-specific uncertainty
+    /// implementation.
     pub with_uncertainty: bool,
     /// Response-scale estimand. [`SurvivalPredictEstimand::PosteriorMean`] is
     /// the default; plug-in prediction is available only as an explicit opt-in.
@@ -475,6 +475,134 @@ where
     Ok(())
 }
 
+fn posterior_standard_error_matrix(
+    mean: &Array2<f64>,
+    second_moment: &Array2<f64>,
+    label: &str,
+) -> Result<Array2<f64>, SurvivalPredictError> {
+    if second_moment.dim() != mean.dim() {
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "posterior {label} moment shape mismatch: mean={:?}, second={:?}",
+                mean.dim(),
+                second_moment.dim(),
+            ),
+        });
+    }
+    let mut standard_error = Array2::<f64>::zeros(mean.raw_dim());
+    for ((row, column), slot) in standard_error.indexed_iter_mut() {
+        let first = mean[[row, column]];
+        let second = second_moment[[row, column]];
+        if !(first.is_finite() && second.is_finite()) {
+            return Err(SurvivalPredictError::NumericalFailure {
+                reason: format!(
+                    "posterior {label} moments must be finite at row {row}, time column {column}: mean={first}, second={second}"
+                ),
+            });
+        }
+        let variance = second - first * first;
+        let roundoff_tolerance = 128.0
+            * f64::EPSILON
+            * second.abs().max((first * first).abs()).max(1.0);
+        if variance < -roundoff_tolerance {
+            return Err(SurvivalPredictError::NumericalFailure {
+                reason: format!(
+                    "posterior {label} variance is negative beyond roundoff at row {row}, time column {column}: {variance}"
+                ),
+            });
+        }
+        *slot = variance.max(0.0).sqrt();
+    }
+    Ok(standard_error)
+}
+
+fn posterior_standard_error_vector(
+    mean: &Array1<f64>,
+    second_moment: &Array1<f64>,
+    label: &str,
+) -> Result<Array1<f64>, SurvivalPredictError> {
+    if second_moment.len() != mean.len() {
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "posterior {label} moment length mismatch: mean={}, second={}",
+                mean.len(),
+                second_moment.len(),
+            ),
+        });
+    }
+    let mut standard_error = Array1::<f64>::zeros(mean.len());
+    for row in 0..mean.len() {
+        let first = mean[row];
+        let second = second_moment[row];
+        if !(first.is_finite() && second.is_finite()) {
+            return Err(SurvivalPredictError::NumericalFailure {
+                reason: format!(
+                    "posterior {label} moments must be finite at row {row}: mean={first}, second={second}"
+                ),
+            });
+        }
+        let variance = second - first * first;
+        let roundoff_tolerance = 128.0
+            * f64::EPSILON
+            * second.abs().max((first * first).abs()).max(1.0);
+        if variance < -roundoff_tolerance {
+            return Err(SurvivalPredictError::NumericalFailure {
+                reason: format!(
+                    "posterior {label} variance is negative beyond roundoff at row {row}: {variance}"
+                ),
+            });
+        }
+        standard_error[row] = variance.max(0.0).sqrt();
+    }
+    Ok(standard_error)
+}
+
+fn posterior_standard_error_surfaces(
+    mean: &[Array2<f64>],
+    second_moment: &[Array2<f64>],
+    label: &str,
+) -> Result<Vec<Array2<f64>>, SurvivalPredictError> {
+    if second_moment.len() != mean.len() {
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "posterior {label} cause count mismatch: mean={}, second={}",
+                mean.len(),
+                second_moment.len(),
+            ),
+        });
+    }
+    mean.iter()
+        .zip(second_moment)
+        .enumerate()
+        .map(|(cause, (first, second))| {
+            posterior_standard_error_matrix(first, second, &format!("{label} cause {}", cause + 1))
+        })
+        .collect()
+}
+
+fn posterior_standard_error_vectors(
+    mean: &[Array1<f64>],
+    second_moment: &[Array1<f64>],
+    label: &str,
+) -> Result<Vec<Array1<f64>>, SurvivalPredictError> {
+    if second_moment.len() != mean.len() {
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "posterior {label} cause count mismatch: mean={}, second={}",
+                mean.len(),
+                second_moment.len(),
+            ),
+        });
+    }
+    mean.iter()
+        .zip(second_moment)
+        .enumerate()
+        .map(|(cause, (first, second))| {
+            posterior_standard_error_vector(first, second, &format!("{label} cause {}", cause + 1))
+        })
+        .collect()
+}
+
 fn predict_survival_posterior_mean(
     req: SurvivalPredictRequest<'_>,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
@@ -583,15 +711,10 @@ fn predict_survival_posterior_mean(
     Ok(result)
 }
 
-fn predict_competing_risks_posterior_mean(
+fn predict_competing_risks_with_posterior(
     req: SurvivalPredictRequest<'_>,
 ) -> Result<CompetingRisksPredictResult, SurvivalPredictError> {
-    if req.with_uncertainty {
-        return Err(SurvivalPredictError::UnsupportedConfiguration {
-            reason: "competing-risks survival prediction does not yet expose posterior surface standard errors"
-                .to_string(),
-        });
-    }
+    let posterior_mean_estimand = req.estimand == SurvivalPredictEstimand::PosteriorMean;
     let (posterior_mean, active_covariance) = survival_prediction_posterior_factor(req.model)?;
     let mut result = predict_competing_risks_survival(SurvivalPredictRequest {
         model: req.model,
@@ -609,16 +732,35 @@ fn predict_competing_risks_posterior_mean(
     let mut survival_mean = (0..cause_count)
         .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
         .collect::<Vec<_>>();
-    let mut density_mean = (0..cause_count)
+    let mut survival_second = (0..cause_count)
         .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
         .collect::<Vec<_>>();
     let mut hazard_mean = (0..cause_count)
         .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
         .collect::<Vec<_>>();
+    let mut hazard_second = (0..cause_count)
+        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
+        .collect::<Vec<_>>();
+    let mut cumulative_hazard_mean = (0..cause_count)
+        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
+        .collect::<Vec<_>>();
+    let mut cumulative_hazard_second = (0..cause_count)
+        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
+        .collect::<Vec<_>>();
     let mut cif_mean = (0..cause_count)
         .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
         .collect::<Vec<_>>();
+    let mut cif_second = (0..cause_count)
+        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
+        .collect::<Vec<_>>();
     let mut overall_mean = Array2::<f64>::zeros((n_rows, n_times));
+    let mut overall_second = Array2::<f64>::zeros((n_rows, n_times));
+    let mut eta_mean = (0..cause_count)
+        .map(|_| Array1::<f64>::zeros(n_rows))
+        .collect::<Vec<_>>();
+    let mut eta_second = (0..cause_count)
+        .map(|_| Array1::<f64>::zeros(n_rows))
+        .collect::<Vec<_>>();
 
     for_each_survival_posterior_node(&posterior_mean, &active_covariance, |node, weight| {
         let draw_model = saved_model_with_survival_coefficients(req.model, node)?;
@@ -637,6 +779,7 @@ fn predict_competing_risks_posterior_mean(
             || draw.survival.len() != cause_count
             || draw.hazard.len() != cause_count
             || draw.cumulative_hazard.len() != cause_count
+            || draw.linear_predictor.len() != cause_count
             || draw.overall_survival.dim() != (n_rows, n_times)
             || draw.times != result.times
             || draw.endpoint_names != result.endpoint_names
@@ -652,6 +795,7 @@ fn predict_competing_risks_posterior_mean(
                 || draw.hazard[cause].dim() != (n_rows, n_times)
                 || draw.cumulative_hazard[cause].dim() != (n_rows, n_times)
                 || draw.cif[cause].dim() != (n_rows, n_times)
+                || draw.linear_predictor[cause].len() != n_rows
             {
                 return Err(SurvivalPredictError::IncompatibleSchema {
                     reason: format!(
@@ -661,56 +805,95 @@ fn predict_competing_risks_posterior_mean(
                 });
             }
             for row in 0..n_rows {
+                let eta = draw.linear_predictor[cause][row];
+                eta_mean[cause][row] += weight * eta;
+                eta_second[cause][row] += weight * eta * eta;
                 for time in 0..n_times {
                     let survival = draw.survival[cause][[row, time]];
                     let hazard = draw.hazard[cause][[row, time]];
-                    let density = conditional_event_density(
-                        survival,
-                        draw.cumulative_hazard[cause][[row, time]],
-                        hazard,
-                    )?;
+                    let cumulative_hazard = draw.cumulative_hazard[cause][[row, time]];
+                    let cif = draw.cif[cause][[row, time]];
                     survival_mean[cause][[row, time]] += weight * survival;
-                    density_mean[cause][[row, time]] += weight * density;
+                    survival_second[cause][[row, time]] += weight * survival * survival;
                     hazard_mean[cause][[row, time]] += weight * hazard;
-                    cif_mean[cause][[row, time]] += weight * draw.cif[cause][[row, time]];
+                    hazard_second[cause][[row, time]] += weight * hazard * hazard;
+                    cumulative_hazard_mean[cause][[row, time]] +=
+                        weight * cumulative_hazard;
+                    cumulative_hazard_second[cause][[row, time]] +=
+                        weight * cumulative_hazard * cumulative_hazard;
+                    cif_mean[cause][[row, time]] += weight * cif;
+                    cif_second[cause][[row, time]] += weight * cif * cif;
                 }
             }
         }
         for row in 0..n_rows {
             for time in 0..n_times {
-                overall_mean[[row, time]] += weight * draw.overall_survival[[row, time]];
+                let overall_survival = draw.overall_survival[[row, time]];
+                overall_mean[[row, time]] += weight * overall_survival;
+                overall_second[[row, time]] += weight * overall_survival * overall_survival;
             }
         }
         Ok(())
     })?;
 
-    for cause in 0..cause_count {
-        for row in 0..n_rows {
-            for time in 0..n_times {
-                let survival = survival_mean[cause][[row, time]].clamp(0.0, 1.0);
-                let density = density_mean[cause][[row, time]];
-                if !(density.is_finite() && density >= 0.0) {
-                    return Err(SurvivalPredictError::NumericalFailure {
-                        reason: format!(
-                            "posterior competing-risks density is invalid for cause {}, row {row}, time column {time}: {density}",
-                            cause + 1
-                        ),
-                    });
-                }
-                result.survival[cause][[row, time]] = survival;
-                result.cumulative_hazard[cause][[row, time]] = -survival.ln();
-                result.hazard[cause][[row, time]] = if survival > 0.0 {
-                    density / survival
-                } else if hazard_mean[cause][[row, time]] == 0.0 {
-                    0.0
-                } else {
-                    f64::INFINITY
-                };
-                result.cif[cause][[row, time]] = cif_mean[cause][[row, time]].clamp(0.0, 1.0);
-            }
-        }
+    let (hazard_se, survival_se, cumulative_hazard_se, cif_se, overall_survival_se, eta_se) =
+        if req.with_uncertainty {
+            (
+                Some(posterior_standard_error_surfaces(
+                    &hazard_mean,
+                    &hazard_second,
+                    "competing-risks hazard",
+                )?),
+                Some(posterior_standard_error_surfaces(
+                    &survival_mean,
+                    &survival_second,
+                    "competing-risks survival",
+                )?),
+                Some(posterior_standard_error_surfaces(
+                    &cumulative_hazard_mean,
+                    &cumulative_hazard_second,
+                    "competing-risks cumulative hazard",
+                )?),
+                Some(posterior_standard_error_surfaces(
+                    &cif_mean,
+                    &cif_second,
+                    "competing-risks cumulative incidence",
+                )?),
+                Some(posterior_standard_error_matrix(
+                    &overall_mean,
+                    &overall_second,
+                    "competing-risks overall survival",
+                )?),
+                Some(posterior_standard_error_vectors(
+                    &eta_mean,
+                    &eta_second,
+                    "competing-risks linear predictor",
+                )?),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
+
+    if posterior_mean_estimand {
+        result.hazard = hazard_mean;
+        result.survival = survival_mean
+            .into_iter()
+            .map(|surface| surface.mapv(|value| value.clamp(0.0, 1.0)))
+            .collect();
+        result.cumulative_hazard = cumulative_hazard_mean;
+        result.cif = cif_mean
+            .into_iter()
+            .map(|surface| surface.mapv(|value| value.clamp(0.0, 1.0)))
+            .collect();
+        result.overall_survival = overall_mean.mapv(|value| value.clamp(0.0, 1.0));
+        result.linear_predictor = eta_mean;
     }
-    result.overall_survival = overall_mean.mapv(|value| value.clamp(0.0, 1.0));
+    result.hazard_se = hazard_se;
+    result.survival_se = survival_se;
+    result.cumulative_hazard_se = cumulative_hazard_se;
+    result.cif_se = cif_se;
+    result.overall_survival_se = overall_survival_se;
+    result.eta_se = eta_se;
     Ok(result)
 }
 
@@ -1092,6 +1275,18 @@ pub struct CompetingRisksPredictResult {
     /// Per-endpoint linear predictor at each row's own exit time, endpoint x row.
     pub linear_predictor: Vec<Array1<f64>>,
     pub likelihood_mode: SurvivalLikelihoodMode,
+    /// Posterior standard deviation of each cause-specific hazard surface.
+    pub hazard_se: Option<Vec<Array2<f64>>>,
+    /// Posterior standard deviation of each endpoint-specific survival surface.
+    pub survival_se: Option<Vec<Array2<f64>>>,
+    /// Posterior standard deviation of each cause-specific cumulative hazard.
+    pub cumulative_hazard_se: Option<Vec<Array2<f64>>>,
+    /// Posterior standard deviation of each cause-specific cumulative incidence.
+    pub cif_se: Option<Vec<Array2<f64>>>,
+    /// Posterior standard deviation of the all-cause survival surface.
+    pub overall_survival_se: Option<Array2<f64>>,
+    /// Posterior standard deviation of each cause-specific linear predictor.
+    pub eta_se: Option<Vec<Array1<f64>>>,
 }
 
 /// Run the survival prediction pipeline.
@@ -1515,8 +1710,8 @@ pub fn predict_survival(
 pub fn predict_competing_risks_survival(
     req: SurvivalPredictRequest<'_>,
 ) -> Result<CompetingRisksPredictResult, SurvivalPredictError> {
-    if req.estimand == SurvivalPredictEstimand::PosteriorMean {
-        return predict_competing_risks_posterior_mean(req);
+    if req.estimand == SurvivalPredictEstimand::PosteriorMean || req.with_uncertainty {
+        return predict_competing_risks_with_posterior(req);
     }
     let SurvivalPredictRequest {
         model,
@@ -1526,16 +1721,9 @@ pub fn predict_competing_risks_survival(
         primary_offset,
         noise_offset,
         time_grid,
-        with_uncertainty,
+        with_uncertainty: _,
         estimand: _,
     } = req;
-
-    if with_uncertainty {
-        return Err(SurvivalPredictError::UnsupportedConfiguration {
-            reason: "competing-risks survival prediction does not yet support with_uncertainty"
-                .to_string(),
-        });
-    }
 
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
     if !matches!(
@@ -2007,6 +2195,12 @@ pub fn predict_competing_risks_survival(
         overall_survival,
         linear_predictor,
         likelihood_mode: saved_likelihood_mode,
+        hazard_se: None,
+        survival_se: None,
+        cumulative_hazard_se: None,
+        cif_se: None,
+        overall_survival_se: None,
+        eta_se: None,
     })
 }
 
