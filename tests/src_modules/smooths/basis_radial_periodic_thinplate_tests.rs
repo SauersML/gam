@@ -4821,7 +4821,8 @@ fn test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_reg
         None,
         0,
         None,
-    );
+    )
+    .expect("pure Duchon candidate construction");
     assert_eq!(
         candidates.len(),
         3,
@@ -4901,7 +4902,8 @@ fn test_hybrid_duchon_candidate_factory_admits_log_riesz_closed_form() {
         None,
         0,
         None,
-    );
+    )
+    .expect("hybrid Duchon candidate construction");
     assert_eq!(candidates.len(), 1);
     assert!(matches!(
         candidates[0].source,
@@ -5470,7 +5472,11 @@ fn filter_penalty_candidates_preserves_matching_kronecker_factors() {
     let identity = Array2::<f64>::eye(2);
     let kron = crate::construction::kronecker_product(&s, &identity);
     let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
-        matrix: kron,
+        matrix: ConstructiveQuadratic::try_from_dense_psd(
+            kron,
+            "matching Kronecker test penalty",
+        )
+        .expect("PSD Kronecker penalty"),
         source: PenaltySource::TensorMarginal { dim: 0 },
         normalization_scale: 1.0,
         kronecker_factors: Some(vec![s.clone(), identity.clone()]),
@@ -5499,7 +5505,12 @@ fn filter_penalty_candidates_drops_stale_kronecker_factors_after_projection() {
         [0.0, 0.0, 1.0],
         [1.0, 1.0, 1.0]
     ];
-    let projected = z.t().dot(&kron).dot(&z);
+    let raw = ConstructiveQuadratic::try_from_dense_psd(kron, "raw Kronecker test penalty")
+        .expect("PSD Kronecker penalty");
+    let gauge = gam_problem::Gauge::from_block_transforms(&[z]);
+    let projected = raw
+        .restricted(&gauge, "projected Kronecker test penalty")
+        .expect("constructive projection");
     let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
         matrix: projected,
         source: PenaltySource::TensorMarginal { dim: 0 },

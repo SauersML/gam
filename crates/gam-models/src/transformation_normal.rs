@@ -73,8 +73,8 @@ pub(crate) use gam_problem::{
 pub(crate) use gam_solve::pirls::LinearInequalityConstraints;
 pub(crate) use gam_terms::basis::initializewiggle_knots_from_seed;
 pub(crate) use gam_terms::basis::{
-    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
-    create_ispline_derivative_dense,
+    BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
+    ispline_function_penalties,
 };
 pub(crate) use gam_terms::smooth::{
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,

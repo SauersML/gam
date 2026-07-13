@@ -2119,8 +2119,9 @@ fn restrict_penalty_candidates(
 /// restricts both physical penalties by congruence, `S_c=MᵀSM` and
 /// `R_c=MᵀRM`. If `M` removes part of `null(S)`, merely retaining `R_c`
 /// also retains metric coupling to the removed direction. Rebuilding from the
-/// surviving generalized null space gives the L² norm of exactly the null
-/// component that remains representable in the final chart.
+/// surviving structural null space of the retained energy factor gives the L²
+/// norm of exactly the null component that remains representable in the final
+/// chart.
 ///
 /// The rebuild is METRIC-CONSISTENT (`rebuild_metric_consistent_ridge`): the
 /// raw ridge is the function-space block `G Z (ZᵀGZ)⁻¹ ZᵀG` (penalizing

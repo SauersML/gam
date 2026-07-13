@@ -1324,10 +1324,11 @@ fn apply_global_smooth_identifiability(
                         ))
                     })?;
                 let ((plo, phi), s_full) = owner;
-                // Rebuild from the physical Primary and ridge submatrices. The
-                // generalized `(S, S+R)` null solve preserves the function metric
-                // through this global congruence instead of replacing it by a
-                // coefficient-space projector.
+                // Rebuild from the physical Primary and ridge submatrices. Rank
+                // revelation on the Primary's retained energy factor preserves
+                // the structural null space through this global chart, while the
+                // restricted ridge supplies the function-metric action. No signed
+                // spectrum of a rounded dense congruence is classified (#2318).
                 let block = ConstructiveQuadratic::from_energy_factor(
                     s_full.factor().slice(s![.., *plo..*phi]).to_owned(),
                     "owned global smooth primary block",
