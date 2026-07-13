@@ -2066,7 +2066,7 @@ pub(crate) fn validated_kronecker_factors(
 /// Duchon / constant-curvature / tensor-B-spline paths already normalize their
 /// own primary + `DoublePenaltyNullspace` blocks. This normalization is what
 /// makes the second smoothing parameter `λ_nullspace` *identifiable*: an
-/// un-normalized `Z Zᵀ` (largest eigenvalue 1) sits on a wildly different scale
+/// an un-normalized null-function ridge can sit on a wildly different scale
 /// from the raw bending penalty, leaving the outer REML objective nearly flat
 /// along the `λ_nullspace` coordinate. Under that flat coordinate REML weakened
 /// the wiggliness penalty instead of shrinking the term out, which *inflated*
@@ -2636,45 +2636,6 @@ pub(crate) fn rebuild_metric_consistent_ridge(
     };
     let w = ridge_constrained.dot(&n);
     Ok(Some(ridge_from_null_metric_action(&n, &w)?))
-}
-
-/// Build the double-penalty ridge from the structural null space of a PSD penalty.
-pub fn build_nullspace_shrinkage_penalty(
-    penalty: &Array2<f64>,
-) -> Result<Option<CanonicalPenaltyBlock>, BasisError> {
-    if penalty.nrows() != penalty.ncols() {
-        crate::bail_dim_basis!(
-            "penalty matrix must be square when building nullspace shrinkage penalty"
-        );
-    }
-    if penalty.nrows() == 0 {
-        return Ok(None);
-    }
-
-    let (sym, evals, evecs) = spectral_summary(penalty)?;
-    let tol = spectral_tolerance(&sym, &evals);
-
-    let zero_idx: Vec<usize> = evals
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &ev)| (ev.abs() <= tol).then_some(i))
-        .collect();
-    if zero_idx.is_empty() {
-        return Ok(None);
-    }
-    let z = evecs.select(Axis(1), &zero_idx);
-    let shrink = fast_abt(&z, &z);
-    Ok(Some(CanonicalPenaltyBlock {
-        sym_penalty: shrink,
-        eigenvalues: evals,
-        eigenvectors: evecs,
-        rank: zero_idx.len(),
-        nullity: 0,
-        negative_dim: 0,
-        tol,
-        iszero: false,
-        op: None,
-    }))
 }
 
 pub(crate) fn default_internal_knot_count_for_data(n: usize, degree: usize) -> usize {

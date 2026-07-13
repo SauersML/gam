@@ -116,11 +116,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // in this optimization. The spatial optimizer's own bootstrap inside
     // `optimize_spatial_length_scale_exact_joint` and every subsequent
     // kappa-driven rebuild feed the basis builder the captured
-    // `FrozenTransform` identifiability. Applying that captured transform to
-    // the same kernel can land the structural null-space block on the other
-    // side of `build_nullspace_shrinkage_penalty`'s spectral tolerance, so
-    // the raw and frozen builds disagree on whether the trend ridge survives
-    // as an active penalty candidate. Without this rebuild, the probe's
+    // `FrozenTransform` identifiability. Applying that captured transform
+    // changes the coefficient chart in which every penalty is represented.
+    // Without this rebuild, the probe's
     // penalty count overshoots every subsequent evaluator's measurement of
     // the frozen build, and `evaluate_custom_family_joint_hyper` refuses with
     // a "joint hyper rho dimension mismatch". Mirrors the CTN- and BMS-side

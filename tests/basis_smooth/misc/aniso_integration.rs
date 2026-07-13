@@ -68,7 +68,6 @@ fn aniso_matern_recovers_signal_axis() {
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     // Sentinel zeros: will be replaced by knot-cloud initialization.
                     aniso_log_scales: Some(vec![0.0, 0.0]),
-                    nullspace_shrinkage_survived: None,
                 },
                 input_scales: None,
             },

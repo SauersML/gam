@@ -8913,8 +8913,8 @@ fn affine_design_for_dataset(
     if let Some(scan) = scan_introspection(model)? {
         return Err(format!(
             "{} is fit by the exact O(n) state-space spline scan, which does not \
-             have a finite coefficient-frame design; design_matrix() is unavailable. \
-             Refit with double_penalty=true if you need an explicit affine design.",
+             have a finite coefficient-frame design; design_matrix() is unavailable \
+             for this fitted model.",
             scan_smooth_label(&scan)
         ));
     }
@@ -9168,9 +9168,8 @@ fn standard_mean_design_dense(
     if let Some(scan) = scan_introspection(model)? {
         return Err(format!(
             "{} is fit by the exact O(n) state-space spline scan, which does not \
-             build a dense design matrix; design_matrix() is unavailable for it. \
-             Refit with double_penalty=true if you need the explicit B-spline \
-             model matrix.",
+             build a finite coefficient-frame design; term-design diagnostics \
+             are unavailable for this fitted model.",
             scan_smooth_label(&scan)
         ));
     }

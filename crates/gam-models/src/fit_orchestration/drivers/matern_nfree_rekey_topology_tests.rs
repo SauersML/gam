@@ -86,7 +86,6 @@ mod matern_nfree_rekey_topology_tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                        nullspace_shrinkage_survived: None,
                     },
                     input_scales: None,
                 },

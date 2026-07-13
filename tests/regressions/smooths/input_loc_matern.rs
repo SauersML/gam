@@ -111,7 +111,6 @@ fn matern_gradient_dkappa_matches_finite_difference() {
         double_penalty: false,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let analytic = build_matern_basis_log_kappa_derivative(data.view(), &spec)
         .expect("analytic derivative should build");

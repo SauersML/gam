@@ -295,7 +295,6 @@ fn test_matern_public_second_derivative_matchesfd_of_public_first_derivative() {
         double_penalty: false,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let analytic = build_matern_basis_log_kappasecond_derivative(data.view(), &spec)
         .expect("analytic Matérn second derivative should build");
@@ -355,7 +354,6 @@ fn test_matern_aniso_operator_penalties_use_cross_provider() {
         double_penalty: false,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: Some(vec![0.1, -0.1]),
-        nullspace_shrinkage_survived: None,
     };
 
     let basis = build_matern_basis(data.view(), &spec).expect("aniso Matérn basis");

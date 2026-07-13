@@ -127,8 +127,8 @@ table = model.predict_array(X, interval=0.95)    # adds std_error / mean_lower /
 `observation_interval` (same semantics as `predict`); it does not take
 `return_type` or `id_column`. It is rejected for models fitted from a named
 table — call `predict` with a `dict` / DataFrame there so columns match by
-name. The companion `model.design_matrix_array(X)` returns the materialised
-design matrix for a numeric feature matrix.
+name. The companion `model.design_matrix_array(X)` returns the same typed
+[`AffineDesign`](#fitted-affine-design) contract as `design_matrix`.
 
 ## Carrying an identifier column
 
@@ -258,21 +258,49 @@ joint_survival = cif.overall_survival # (n_rows, 4)
 Endpoint names are taken from the mapping keys, or supplied via
 `endpoint_names=` when passing a sequence.
 
-## Raw design matrix
+## Fitted affine design
 
-For standard non-link-wiggle GAMs, `Model.design_matrix(data)` returns
-the `(n_rows, n_coeffs)` matrix the engine uses for the linear
-predictor:
+`Model.design_matrix(data)` returns a typed `AffineDesign` for every standard
+GAM that has a finite coefficient-frame representation. Its defining identity
+is:
 
 ```python
-X = model.design_matrix(test_df)        # (n_rows, n_coeffs)
-posterior = model.sample(train_df)
-custom_eta = posterior.samples @ X.T    # (n_draws, n_rows)
+affine = model.design_matrix(test_df)
+fitted_eta = affine.offset + affine.matrix @ affine.coefficients
 ```
 
-Use this to compose your own posterior quantity that
-isn't a straightforward `predict()` call. Restricted to standard
-non-link-wiggle GAMs.
+The object has six explicit fields:
+
+- `offset`: one value per row;
+- `matrix`: the materialised matrix in the named coefficient frame;
+- `coefficients`: the exact fitted vector multiplied by `matrix`;
+- `coefficient_frame`: `"full"` or `"link_wiggle"`;
+- `coefficient_start` / `coefficient_stop`: the represented half-open slice in
+  that frame (`coefficient_slice` exposes the corresponding Python `slice`).
+
+For an ordinary GAM, `offset` is the model offset, `matrix` is the full saved
+design (including deployment extensions), and the coefficient frame is
+`"full"`. Posterior draws use that same frame, so custom fitted-linear-predictor
+draws are:
+
+```python
+affine = model.design_matrix(test_df)
+posterior = model.sample(train_df)
+eta_draws = affine.offset + posterior.samples @ affine.matrix.T
+```
+
+For a link-wiggle fit, the final predictor at the fitted state is
+`base + B(warp_index) @ beta_w`. Accordingly, `offset` is the saved fitted base
+predictor, `matrix` is `B` evaluated at the exact saved warp index (including
+the frozen-index shift used by the fit), and `coefficient_frame` is
+`"link_wiggle"`. The returned `coefficients` are the exact saved
+standard-basis prediction coordinates. They can be a lift of the identifiable
+reduced coordinates used by the joint optimizer, so do not slice a joint
+posterior sample vector by shape and treat it as this frame.
+
+Exact scan smoothers and coupled multi-surface model classes do not possess one
+finite affine coefficient frame; `design_matrix` rejects them with a typed,
+actionable error instead of fabricating a matrix.
 
 ## Difference-smooth contrasts
 

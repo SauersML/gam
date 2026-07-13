@@ -101,20 +101,14 @@ fn frozen_frame_design_derivative_max_error(
         double_penalty,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let cold_build = build_matern_basis(xs.view(), &cold).expect("cold build");
-    let (centers, transform, shrinkage) = match &cold_build.metadata {
+    let (centers, transform) = match &cold_build.metadata {
         BasisMetadata::Matern {
             centers,
             identifiability_transform,
-            nullspace_shrinkage_survived,
             ..
-        } => (
-            centers.clone(),
-            identifiability_transform.clone(),
-            *nullspace_shrinkage_survived,
-        ),
+        } => (centers.clone(), identifiability_transform.clone()),
         other => panic!(
             "expected Matérn metadata, got {:?}",
             std::mem::discriminant(other)
@@ -122,17 +116,14 @@ fn frozen_frame_design_derivative_max_error(
     };
 
     // 3) Freeze EXACTLY as `freeze_geometry_from_metadata`: pin the reduced
-    //    centers as `UserProvided` and the transform + shrinkage decision as a
-    //    `FrozenTransform`. This is the spec the optimizer's per-trial value
+    //    centers as `UserProvided` and the transform as a `FrozenTransform`.
+    //    This is the spec the optimizer's per-trial value
     //    rebuild AND the analytic ψ-derivative arm both consume.
     let reduced_centers = centers.nrows();
     let mut frozen = cold.clone();
     frozen.center_strategy = CenterStrategy::UserProvided(centers);
     if let Some(z) = transform {
-        frozen.identifiability = MaternIdentifiability::FrozenTransform {
-            transform: z,
-            nullspace_shrinkage_survived: Some(shrinkage),
-        };
+        frozen.identifiability = MaternIdentifiability::FrozenTransform { transform: z };
     }
     // The optimizer has moved κ to the EVAL point; the frozen spec carries the
     // eval-κ length-scale while keeping the κ₀-frozen centers/transform.

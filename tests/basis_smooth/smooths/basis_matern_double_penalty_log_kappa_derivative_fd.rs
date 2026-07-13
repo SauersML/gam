@@ -8,19 +8,18 @@
 //! two normalized blocks:
 //!   * `Primary`               — the Frobenius-normalized projected kernel Gram
 //!     `Zᵀ K Z`, and
-//!   * `DoublePenaltyNullspace` — the Frobenius-normalized spectral projector
-//!     onto the near-null eigenspace of that Gram.
+//!   * `DoublePenaltyNullspace` — the Frobenius-normalized center-function-
+//!     metric penalty on the explicit intercept function.
 //!
 //! The bug fixed in #1122: the `DoublePenaltyNullspace` block's log-κ
-//! ψ-derivative was hard-coded to zero, but the projector rotates with κ (the
-//! Gram `Zᵀ K Z` it diagonalizes is κ-dependent). That objective↔gradient
+//! ψ-derivative was hard-coded to zero, but the function metric moves with κ.
+//! That objective↔gradient
 //! desync stalled the isotropic-κ joint REML at its iteration cap with a large
 //! residual gradient. This test FD-checks EACH active block's first and second
 //! log-κ derivative against a central difference of the forward (normalized)
-//! penalty, under `double_penalty: true`, on a configuration with a few
-//! near-duplicate centers that put a STABLE near-null eigenspace in the projected
-//! Gram — so the shrinkage block is reliably ACTIVE (with a κ-moving eigenvector)
-//! and the previously-omitted derivative is genuinely exercised.
+//! penalty under `double_penalty: true` with an explicit intercept, so the
+//! structural shrinkage block is reliably active and the previously omitted
+//! derivative is genuinely exercised.
 
 use gam::terms::basis::{
     CenterStrategy, MaternBasisSpec, MaternNu, build_matern_basis,
@@ -99,11 +98,10 @@ fn spec_at(rho: f64, nu: MaternNu) -> MaternBasisSpec {
         periodic: None,
         length_scale: (-rho).exp(),
         nu,
-        include_intercept: false,
+        include_intercept: true,
         double_penalty: true,
         identifiability: Default::default(),
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     }
 }
 
@@ -118,10 +116,7 @@ fn max_abs(a: &Array2<f64>) -> f64 {
     a.iter().fold(0.0_f64, |m, &v| m.max(v.abs()))
 }
 
-/// Moderate κ (ℓ = 1). The near-duplicate centers — not the length scale —
-/// supply the stable near-null eigenspace, so a moderate κ keeps the bulk
-/// spectrum well-conditioned and the rank-3 null's spectral gap large (no rank
-/// flicker across `ρ ± h`).
+/// Moderate κ (ℓ = 1), away from radial underflow and overflow.
 const RHO: f64 = 0.0;
 
 #[test]
@@ -137,7 +132,7 @@ fn matern_double_penalty_shrinkage_block_is_active_and_count_aligned() {
         assert!(
             n_blocks >= 2,
             "nu={nu:?}: expected an active DoublePenaltyNullspace block (>=2 penalties) \
-             at rho={RHO}; got {n_blocks}. If the spectral tolerance changed, retune RHO."
+             at rho={RHO}; got {n_blocks}. The explicit intercept must define this topology."
         );
         let spec = spec_at(RHO, nu);
         let deriv_blocks = build_matern_basis_log_kappa_derivatives(data.view(), &spec)

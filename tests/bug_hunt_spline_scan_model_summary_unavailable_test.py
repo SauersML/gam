@@ -135,14 +135,15 @@ def test_scan_summary_matches_dense_double_penalty_reference():
 
 def test_scan_design_matrix_gives_actionable_error():
     """A scan model retains no dense design, so design_matrix() must fail with a
-    precise, actionable message (not the cryptic missing-resolved_termspec one)."""
+    precise structural message (not a model-swapping fallback recommendation)."""
     df = _dataset()
     model = _fit_scan(df, degree=3, penalty_order=2)
     with pytest.raises(Exception) as exc:
         model.design_matrix(df)
     msg = str(exc.value).lower()
     assert "spline scan" in msg
-    assert "double_penalty" in msg
+    assert "finite coefficient-frame design" in msg
+    assert "double_penalty" not in msg
 
 
 def test_scan_predict_conformal_gives_actionable_error():

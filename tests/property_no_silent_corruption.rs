@@ -98,7 +98,6 @@ fn matern_spec() -> MaternBasisSpec {
         double_penalty: false,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     }
 }
 

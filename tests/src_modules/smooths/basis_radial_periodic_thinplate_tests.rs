@@ -5800,7 +5800,6 @@ fn test_matern_center_sum_tozero_produces_kernel_transform() {
         double_penalty: false,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let out = build_matern_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     assert_eq!(out.design.nrows(), data.nrows());
@@ -5836,7 +5835,6 @@ fn test_matern_operator_penalties_follow_rkhs_smoothness() {
             double_penalty: false,
             identifiability: MaternIdentifiability::None,
             aniso_log_scales: None,
-            nullspace_shrinkage_survived: None,
         };
         build_matern_basis(data.view(), &spec)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e))
@@ -6027,7 +6025,6 @@ fn test_matern_overspecified_centers_yield_full_rank_basis() {
         double_penalty: false,
         identifiability: MaternIdentifiability::None,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let out = build_matern_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     let dense = out.design.to_dense();
@@ -6063,7 +6060,6 @@ fn test_matern_include_intercept_keeps_single_unpenalized_dimension() {
         double_penalty: false,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let out = build_matern_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     // (k-1) constrained kernel cols + explicit intercept.
@@ -6085,7 +6081,6 @@ fn test_matern_double_penalty_drops_inactive_nullspace_blockwithout_intercept() 
         double_penalty: true,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let out = build_matern_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     assert_eq!(out.penalties.len(), 1);
@@ -6108,7 +6103,6 @@ fn test_matern_double_penalty_keeps_intercept_shrinkage_block() {
         double_penalty: true,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let out = build_matern_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     assert_eq!(out.penalties.len(), 2);
@@ -6120,63 +6114,6 @@ fn test_matern_double_penalty_keeps_intercept_shrinkage_block() {
         out.penaltyinfo[1].source,
         PenaltySource::DoublePenaltyNullspace
     ));
-}
-
-/// gam#787/#860: a frozen `nullspace_shrinkage_survived` decision overrides
-/// the κ-dependent spectral test so the κ-optimizer's per-trial rebuilds keep
-/// the learned-penalty count INVARIANT. The intercept config above emits 2
-/// penalties under the spectral test (`None`); freezing the decision to
-/// `Some(false)` must drop the shrinkage candidate (count → 1) and freezing
-/// to `Some(true)` must keep it (count → 2), regardless of length-scale.
-#[test]
-fn matern_frozen_nullspace_decision_overrides_spectral_test() {
-    let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.7]];
-    let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
-    // Reuse the surviving-shrinkage center sum-to-zero transform as a frozen
-    // transform so we exercise the FrozenTransform path with a pinned decision.
-    let z =
-        matern_identifiability_transform(centers.view(), &MaternIdentifiability::CenterSumToZero)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "transform builds", e))
-            .expect("center sum-to-zero yields a transform");
-    let base = |survived: Option<bool>| MaternBasisSpec {
-        periodic: None,
-        center_strategy: CenterStrategy::UserProvided(centers.clone()),
-        length_scale: 1.1,
-        nu: MaternNu::ThreeHalves,
-        include_intercept: true,
-        double_penalty: true,
-        identifiability: MaternIdentifiability::FrozenTransform {
-            transform: z.clone(),
-            nullspace_shrinkage_survived: survived,
-        },
-        aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
-    };
-    // Frozen OFF → only the primary kernel penalty survives.
-    let off = build_matern_basis(data.view(), &base(Some(false)))
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build with frozen-off shrinkage", e));
-    assert_eq!(
-        off.penalties.len(),
-        1,
-        "frozen Some(false) must suppress the DoublePenaltyNullspace candidate"
-    );
-    assert!(matches!(off.penaltyinfo[0].source, PenaltySource::Primary));
-    // Frozen ON → the shrinkage block is kept, INVARIANT across length-scale.
-    for length_scale in [0.6_f64, 1.1, 3.0] {
-        let mut spec_on = base(Some(true));
-        spec_on.length_scale = length_scale;
-        let on = build_matern_basis(data.view(), &spec_on)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build with frozen-on shrinkage", e));
-        assert_eq!(
-            on.penalties.len(),
-            2,
-            "frozen Some(true) must keep the shrinkage block at length_scale={length_scale}"
-        );
-        assert!(matches!(
-            on.penaltyinfo[1].source,
-            PenaltySource::DoublePenaltyNullspace
-        ));
-    }
 }
 
 /// #1090: a FrozenTransform Matérn build replays a fit whose centers and
@@ -6210,10 +6147,8 @@ fn matern_frozen_transform_skips_rank_reduction_on_degenerate_cloud() {
         double_penalty: false,
         identifiability: MaternIdentifiability::FrozenTransform {
             transform: z.clone(),
-            nullspace_shrinkage_survived: Some(false),
         },
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     // Degenerate replay cloud: many rows packed into a near-singleton point
     // at a length_scale that, under the cold RRQR reduction, would collapse
@@ -6274,7 +6209,6 @@ fn matern_cold_zero_rank_cloud_fails_loudly() {
         double_penalty: false,
         identifiability: MaternIdentifiability::None,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let err = build_matern_basis(data.view(), &spec)
         .expect_err("rank-0 Matérn cloud must fail loudly, not emit a degenerate basis");
@@ -6298,7 +6232,6 @@ fn test_matern_log_kappa_derivative_matchesfd() {
         double_penalty: false,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Matérn derivative should build", e));
@@ -6369,7 +6302,6 @@ fn test_matern_double_penalty_log_kappa_derivative_matchesfd() {
         double_penalty: true,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Matérn double-penalty derivative should build", e));

@@ -742,21 +742,13 @@ pub fn build_constant_curvature_basis(
         op: None,
     }];
     if spec.double_penalty {
-        // #1531: identity ridge is CORRECT here, NOT the nullspace-shrinkage ridge
-        // the sibling bases (sphere_basis / matern_kernel / duchon_thinplate) use.
-        // The Marra & Wood double penalty shrinks the NULL SPACE of the primary
-        // penalty so REML can drive an unsupported term to EDF→0. But the primary
-        // here is the RKHS kernel Gram zᵀKz, which is strictly PD / full-rank on
-        // distinct centers (see the `double_penalty: false` default note above): it
-        // has NO null space. `build_nullspace_shrinkage_penalty(&primary)` returns
-        // `Ok(None)` for a full-rank input, so matching the sibling pattern would
-        // make an explicit `double_penalty = true` a silent no-op. The full identity
-        // is the only second shrinkage coordinate that is actually selectable on a
-        // null-space-free primary, so it is what an explicit double penalty must use.
+        // #1531: the primary here is the RKHS kernel Gram zᵀKz, which is
+        // strictly PD / full-rank on distinct centers. It has no unpenalized
+        // function subspace, so an explicit second shrinkage coordinate must
+        // target the whole coefficient chart. The full identity is therefore
+        // intentional for this basis rather than a null-space penalty.
         // The regression test `constant_curvature_gram_is_full_rank_so_identity_is_the_only_double_penalty`
-        // locks the full-rank fact that justifies this; if a future basis change
-        // gives the Gram a genuine null space, that test fails and this branch must
-        // be revisited (switch to `build_nullspace_shrinkage_penalty`).
+        // locks the full-rank fact that justifies this branch.
         let ridge = Array2::<f64>::eye(design.ncols());
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
@@ -1857,12 +1849,8 @@ mod tests {
     /// #1531 regression: the constant-curvature RKHS primary penalty (the
     /// gauge-restricted kernel Gram `zᵀKz`) is strictly PD / full-rank, so it has
     /// NO null space. This is the fact that makes the `double_penalty` identity
-    /// ridge at the top of `build_constant_curvature_basis` correct rather than a
-    /// "ridge in the wrong chart": the sibling-basis nullspace-shrinkage path
-    /// (`build_nullspace_shrinkage_penalty`) returns `None` on a full-rank primary,
-    /// which would turn an explicit `double_penalty = true` into a silent no-op.
-    /// If a future basis change gives the primary a genuine null space, this test
-    /// fails and the identity-vs-nullspace decision at line ~724 must be revisited.
+    /// ridge at the top of `build_constant_curvature_basis` a deliberate
+    /// whole-chart shrinkage coordinate rather than a null-space penalty.
     #[test]
     fn constant_curvature_gram_is_full_rank_so_identity_is_the_only_double_penalty() {
         // Centers inside every κ chart, several curvatures spanning sign.
@@ -1899,18 +1887,6 @@ mod tests {
                 max > 0.0 && min > max * 1e-9,
                 "constant-curvature Gram must be full-rank PD at κ={kappa}: \
                  min eig {min:e}, max eig {max:e}"
-            );
-
-            // (b) Consequently the sibling nullspace-shrinkage builder yields
-            // nothing: matching that pattern would make `double_penalty` a no-op,
-            // confirming the identity ridge is the only selectable double penalty.
-            let null_shrink =
-                crate::basis::bspline_build::build_nullspace_shrinkage_penalty(&raw).unwrap();
-            assert!(
-                null_shrink.is_none(),
-                "build_nullspace_shrinkage_penalty must return None on the full-rank \
-                 constant-curvature primary at κ={kappa} (else the double penalty would be \
-                 a silent no-op and identity would be wrong)"
             );
         }
     }

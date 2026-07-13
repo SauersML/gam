@@ -106,7 +106,6 @@ fn aniso_matern_design_psi_derivative_matches_fd_and_is_not_sum_zero() {
         double_penalty: false,
         identifiability: Default::default(),
         aniso_log_scales: Some(eta0.clone()),
-        nullspace_shrinkage_survived: None,
     };
 
     let deriv = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();
@@ -212,7 +211,6 @@ fn aniso_matern_full_outer_loop_recovers_planted_signal_r2() {
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: Some(vec![0.0, 0.0]),
-                    nullspace_shrinkage_survived: None,
                 },
                 input_scales: None,
             },
@@ -351,7 +349,6 @@ fn fit_aniso_recovery(double_penalty: bool, num_centers: usize) -> AnisoRecovery
                     double_penalty,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: Some(vec![0.0, 0.0]),
-                    nullspace_shrinkage_survived: None,
                 },
                 input_scales: None,
             },

@@ -4531,7 +4531,6 @@ fn freeze_geometry_from_metadata(
                 centers,
                 input_scales: meta_scales,
                 identifiability_transform,
-                nullspace_shrinkage_survived,
                 ..
             },
         ) => {
@@ -4541,28 +4540,11 @@ fn freeze_geometry_from_metadata(
             {
                 *spec_scales = Some(s);
             }
-            // Pin BOTH the cold-build identifiability transform `Z` AND the
-            // double-penalty nullspace-shrinkage decision into a
-            // `FrozenTransform` (gam#787/#860, #1122). Without this, the
-            // κ-optimizer's per-trial value rebuild re-runs the κ-DEPENDENT
-            // spectral test (`build_nullspace_shrinkage_penalty`), whose
-            // tolerance scales with `λ_max(A(κ))`: as κ moves, near-null
-            // eigenvalues of the projected kernel Gram `A` cross the threshold,
-            // so the `DoublePenaltyNullspace` block `P/√r` (and its null
-            // dimension `r`) JUMP discontinuously between line-search trials.
-            // The analytic ψ-gradient — assembled in a fixed frozen eigenbasis
-            // — cannot follow those discrete jumps, so the joint REML objective
-            // V(κ) is piecewise-discontinuous while the gradient is smooth: an
-            // objective↔gradient desync that stalls the isotropic-κ optimizer
-            // with a large residual gradient at the iteration cap. Freezing the
-            // decision (and the transform that `A` is built from) makes the
-            // per-trial value rebuild and the analytic gradient share one fixed
-            // `Z` and one fixed `r`, restoring a smooth, differentiable V(κ).
+            // Freeze the cold-build coefficient chart. Double-penalty topology
+            // is structural (the explicit intercept only), so no numerical
+            // nullspace decision needs to be carried across κ trials.
             if let Some(transform) = identifiability_transform.clone() {
-                spec.identifiability = MaternIdentifiability::FrozenTransform {
-                    transform,
-                    nullspace_shrinkage_survived: Some(*nullspace_shrinkage_survived),
-                };
+                spec.identifiability = MaternIdentifiability::FrozenTransform { transform };
             }
             Some(frozen)
         }

@@ -2944,7 +2944,6 @@ pub fn build_smooth_basis(
                     // the double-penalty nullspace shrinkage survives; the freeze
                     // step then pins that decision into the FrozenTransform so the
                     // κ-optimizer's rebuilds keep the count invariant (gam#787/#860).
-                    nullspace_shrinkage_survived: None,
                 },
                 input_scales: None,
             })

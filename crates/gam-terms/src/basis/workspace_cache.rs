@@ -463,8 +463,8 @@ pub(crate) fn build_matern_double_penalty_candidates(
 ///
 /// The default kernel penalty is `alpha' S alpha` with `S_jl = k(||c_j - c_l||)`, embedded
 /// in the full coefficient space. With intercept included, that column is unpenalized by
-/// `penalty_kernel`; optional `penalty_ridge` is a nullspace projector used for
-/// double-penalty shrinkage of previously unpenalized directions.
+/// `penalty_kernel`; optional `penalty_ridge` is the center-function-metric
+/// penalty for double-penalty shrinkage of the explicit intercept direction.
 ///
 /// NOTE: This follows the RKHS Gram construction S = K_CC (not K_CC^{-1}) in
 /// coefficient space, with global scaling absorbed by the smoothing parameter λ.
@@ -1244,10 +1244,8 @@ mod matern_function_metric_tests {
         embedded.slice_mut(s![0..3, 0..3]).assign(&center_kernel);
         let gram =
             matern_center_function_gram(&embedded, true, None).expect("raw center function Gram");
-        let (base, survived) =
-            matern_double_penalty_candidates_with_decision(&embedded, &gram, true, None)
-                .expect("raw candidates");
-        assert!(survived);
+        let base = matern_double_penalty_candidates(&embedded, &gram, true)
+            .expect("raw candidates");
         assert_eq!(base.len(), 2);
         let raw_ridge = &base[1].matrix * base[1].normalization_scale;
 
@@ -1274,10 +1272,8 @@ mod matern_function_metric_tests {
         let primary_t = fast_atb(&transform, &fast_ab(&embedded, &transform));
         let gram_t = matern_center_function_gram(&embedded, true, Some(&transform))
             .expect("transformed center function Gram");
-        let (transformed, transformed_survived) =
-            matern_double_penalty_candidates_with_decision(&primary_t, &gram_t, true, None)
-                .expect("transformed candidates");
-        assert!(transformed_survived);
+        let transformed = matern_double_penalty_candidates(&primary_t, &gram_t, true)
+            .expect("transformed candidates");
         let ridge_t = &transformed[1].matrix * transformed[1].normalization_scale;
         let expected = fast_atb(&transform, &fast_ab(&raw_ridge, &transform));
         let covariance_error = (&ridge_t - &expected)
@@ -1295,17 +1291,15 @@ mod matern_function_metric_tests {
             Some(&transform.slice(s![0..3, 0..3]).to_owned()),
         )
         .expect("kernel-only Gram");
-        let (kernel_only, kernel_null) = matern_double_penalty_candidates_with_decision(
+        let kernel_only = matern_double_penalty_candidates(
             &fast_atb(
                 &transform.slice(s![0..3, 0..3]).to_owned(),
                 &fast_ab(&center_kernel, &transform.slice(s![0..3, 0..3]).to_owned()),
             ),
             &no_intercept_gram,
             false,
-            None,
         )
         .expect("kernel-only candidates");
-        assert!(!kernel_null);
         assert_eq!(kernel_only.len(), 1, "an SPD kernel has no null ridge");
     }
 }

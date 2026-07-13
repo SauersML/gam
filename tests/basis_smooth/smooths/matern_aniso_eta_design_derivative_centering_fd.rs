@@ -89,7 +89,6 @@ fn aniso_design_raw_psi_first_derivative_matches_single_axis_fd() {
         double_penalty: false,
         identifiability: Default::default(),
         aniso_log_scales: Some(eta0.clone()),
-        nullspace_shrinkage_survived: None,
     };
 
     let deriv = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();
@@ -157,7 +156,6 @@ fn aniso_design_raw_psi_second_diagonal_matches_single_axis_fd() {
         double_penalty: false,
         identifiability: Default::default(),
         aniso_log_scales: Some(eta0.clone()),
-        nullspace_shrinkage_survived: None,
     };
 
     let deriv = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();

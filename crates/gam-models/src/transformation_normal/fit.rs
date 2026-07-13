@@ -301,11 +301,9 @@ pub fn fit_transformation_normal(
     // both feed the basis builder a frozen `FrozenTransform` identifiability,
     // while `boot_design` was built from the raw `covariate_spec` with
     // identifiability computed from scratch. Applying the captured
-    // `FrozenTransform` to the same Duchon kernel can land the structural
-    // null-space block on either side of `build_nullspace_shrinkage_penalty`'s
-    // spectral tolerance, so the raw and frozen builds disagree on whether
-    // the trend ridge survives as an active penalty candidate. Without this
-    // rebuild, `n_penalties` is taken from the raw build but every subsequent
+    // `FrozenTransform` changes the exact coefficient chart of the penalty
+    // blocks. Without this rebuild, `n_penalties` is taken from the raw build
+    // but every subsequent
     // evaluator measures the frozen build, and `evaluate_custom_family_joint_hyper`
     // refuses with a `joint hyper rho dimension mismatch`.
     let probe_design = build_term_collection_design(covariate_data, &boot_spec)

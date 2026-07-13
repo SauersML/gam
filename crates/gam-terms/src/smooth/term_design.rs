@@ -1932,7 +1932,6 @@ fn with_identifiability_transform(
             identifiability_transform,
             input_scales,
             aniso_log_scales,
-            nullspace_shrinkage_survived,
         } => Ok(BasisMetadata::Matern {
             centers: centers.clone(),
             length_scale: *length_scale,
@@ -1945,7 +1944,6 @@ fn with_identifiability_transform(
             )?,
             input_scales: input_scales.clone(),
             aniso_log_scales: aniso_log_scales.clone(),
-            nullspace_shrinkage_survived: *nullspace_shrinkage_survived,
         }),
         BasisMetadata::Duchon {
             centers,

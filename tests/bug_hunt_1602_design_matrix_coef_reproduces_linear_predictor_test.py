@@ -1,16 +1,16 @@
-"""Bug hunt #1602: ``design_matrix(data) @ coef`` must reproduce the engine's
+"""Bug hunt #1602: the fitted affine design must reproduce the engine's
 ``linear_predictor`` for every family — not only the Gaussian identity link.
 
 Root cause (see ``scratchpad/issue_1602_coef_predictor.md``): the exported
 coefficients (``summary().coefficients``) are the penalized MLE / posterior mode
-``β̂``, so ``design_matrix(data) @ coef == X @ β̂ == η̂`` exactly and linearly.
+``β̂``, so ``offset + matrix @ coefficients == η̂`` exactly and linearly.
 But for curved inverse links (``prediction_uses_posterior_mean() == true``) the
 wiggle-free posterior-mean predict path reported a **bias-corrected** linear
 predictor ``η̂_BC = X @ (β̂ + b̂)`` with ``b̂ = H⁻¹S(β̂−μ)`` the O(1/n)
 frequentist bias-correction vector (``crates/gam-predict/src/standard.rs`` →
 ``predict_gam_posterior_mean_from_backendwith_bc``). That broke the documented
-``docs/predictions.md`` "Raw design matrix" contract — ``design_matrix(data) @
-coef == linear_predictor`` and the ``posterior.samples @ X.T`` recipe — by
+``docs/predictions.md`` affine-design contract and the
+``offset + posterior.samples @ X.T`` recipe — by
 exactly ``X @ b̂`` (1.5–4 % of the lp range) for Poisson/Gamma ``log`` and
 binomial ``logit``/``probit``, while staying exact for the identity link (whose
 plug-in path deliberately sets ``apply_bias_correction: false``).
@@ -91,15 +91,20 @@ def test_design_matrix_coef_reproduces_linear_predictor_all_links() -> None:
     for family, link in CASES:
         df = _make(family, link)
         model = _fit(df, family, link)
-        x_design = np.asarray(model.design_matrix(df), dtype=float)
+        affine = model.design_matrix(df)
+        x_design = np.asarray(affine.matrix, dtype=float)
         coef = _coef(model)
         eta_engine = _engine_eta(model, df)
 
+        assert isinstance(affine, gamfit.AffineDesign)
+        assert affine.coefficient_frame == "full"
+        assert affine.coefficient_slice == slice(0, coef.shape[0])
         assert x_design.shape[1] == coef.shape[0], (
             f"{family}/{link}: design has {x_design.shape[1]} cols but "
             f"{coef.shape[0]} coefficients"
         )
-        eta_from_coef = x_design @ coef
+        np.testing.assert_allclose(affine.coefficients, coef, rtol=0.0, atol=0.0)
+        eta_from_coef = affine.offset + x_design @ affine.coefficients
         lp_range = float(np.ptp(eta_engine))
         max_abs = float(np.max(np.abs(eta_from_coef - eta_engine)))
         rel = max_abs / lp_range if lp_range > 0 else max_abs
@@ -117,12 +122,13 @@ def test_posterior_samples_recipe_centered_on_linear_predictor() -> None:
     reported ``linear_predictor`` (same point estimate), for a curved link."""
     df = _make("poisson", None)
     model = _fit(df, "poisson", None)
-    x_design = np.asarray(model.design_matrix(df), dtype=float)
+    affine = model.design_matrix(df)
+    x_design = np.asarray(affine.matrix, dtype=float)
     eta_engine = _engine_eta(model, df)
 
     posterior = model.sample(df, samples=4000, seed=11)
     samples = np.asarray(posterior.samples, dtype=float)  # (n_draws, n_coef)
-    eta_draws = samples @ x_design.T                       # (n_draws, n_rows)
+    eta_draws = affine.offset + samples @ x_design.T       # (n_draws, n_rows)
     eta_mean = eta_draws.mean(axis=0)
 
     lp_range = float(np.ptp(eta_engine))

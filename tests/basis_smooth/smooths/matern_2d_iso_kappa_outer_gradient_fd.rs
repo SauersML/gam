@@ -13,17 +13,12 @@
 //! objective↔gradient DESYNC: the optimizer follows a gradient inconsistent with
 //! the objective it is minimizing.
 //!
-//! The root cause was the double-penalty nullspace-shrinkage decision (and the
-//! identifiability transform `Z`) NOT being frozen across the κ-optimizer's
-//! per-trial value rebuilds: the κ-DEPENDENT spectral test
-//! (`build_nullspace_shrinkage_penalty`, tolerance ∝ λ_max(A(κ))) flips the
-//! shrinkage block `P/√r` discontinuously as κ moves, so V(κ) is
-//! piecewise-discontinuous while the analytic gradient (assembled in a fixed
-//! frozen eigenbasis) is smooth. The fix freezes BOTH `Z` and the
-//! shrinkage decision into a `FrozenTransform` at the first per-trial rebuild,
-//! and mirrors that freeze onto the collection spec the analytic ψ-gradient
-//! reads, so value and gradient share one fixed `Z` and one fixed null
-//! dimension `r` at every trial.
+//! The original root cause was κ-dependent numerical null classification
+//! combined with an identifiability chart `Z` that was not frozen across
+//! per-trial rebuilds. Matérn topology is now structural (only an explicitly
+//! appended intercept is a null direction), and `Z` is frozen at the first
+//! rebuild and mirrored onto the spec read by the analytic ψ-gradient. Value
+//! and gradient therefore share one fixed chart and topology at every trial.
 //!
 //! The outer driver (`spatial-exact-joint`) runs
 //! `solver::outer_strategy::outer_gradient_fd_audit` automatically at θ₀,
@@ -289,7 +284,6 @@ fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: Some(vec![0.0, 0.0]),
-                    nullspace_shrinkage_survived: None,
                 },
                 input_scales: None,
             },

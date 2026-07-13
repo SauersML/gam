@@ -154,7 +154,6 @@ fn exact_spatial_adaptive_joint_hypergradient_matches_finite_difference() {
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
-                    nullspace_shrinkage_survived: None,
                 },
                 input_scales: None,
             },

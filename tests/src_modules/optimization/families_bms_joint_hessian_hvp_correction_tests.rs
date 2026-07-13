@@ -1858,7 +1858,6 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
                     // Isotropic (single length-scale, no aniso group) — the exact
                     // configuration whose `∂²X/∂ψ²` diagonal was gated to zero.
                     aniso_log_scales: None,
-                    nullspace_shrinkage_survived: None,
                 },
                 input_scales: None,
             },
@@ -2088,7 +2087,6 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
                     double_penalty: false,
                     identifiability: Default::default(),
                     aniso_log_scales: None,
-                    nullspace_shrinkage_survived: None,
                 },
                 input_scales: None,
             },

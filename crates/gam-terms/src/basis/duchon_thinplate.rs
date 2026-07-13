@@ -1601,7 +1601,7 @@ pub(crate) fn thin_plate_kernel_psi_triplet_from_distance(
 /// - `basis`: `n x (k_c + M)` matrix (`[K_c | P]`) where `M` is the TPS
 ///   polynomial null-space dimension for the selected ambient dimension
 /// - `penalty_bending`: constrained TPS curvature penalty
-/// - `penalty_ridge`: identity penalty for null-space shrinkage
+/// - `penalty_ridge`: center-metric penalty for null-function shrinkage
 pub fn create_thin_plate_spline_basis(
     data: ArrayView2<f64>,
     knots: ArrayView2<f64>,

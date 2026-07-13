@@ -76,7 +76,6 @@ fn matern_basis_cols(data: &Array2<f64>, k: usize) -> usize {
         double_penalty: false,
         identifiability: MaternIdentifiability::CenterSumToZero,
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let basis = build_matern_basis(x.view(), &spec)
         .unwrap_or_else(|e| panic!("matern basis build failed for k={k}: {e:?}"));

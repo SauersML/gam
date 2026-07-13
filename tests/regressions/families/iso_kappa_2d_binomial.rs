@@ -80,7 +80,6 @@ fn matern_2d_spec(num_centers: usize) -> TermCollectionSpec {
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     // Isotropic κ path (the #1066 subject): aniso_log_scales = None.
                     aniso_log_scales: None,
-                    nullspace_shrinkage_survived: None,
                 },
                 input_scales: None,
             },

@@ -21,7 +21,6 @@ fn matern_log_kappa_second_derivative_matches_finite_difference() {
         double_penalty: false,
         identifiability: Default::default(),
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     };
     let analytic = build_matern_basis_log_kappasecond_derivative(data.view(), &spec)
         .unwrap()

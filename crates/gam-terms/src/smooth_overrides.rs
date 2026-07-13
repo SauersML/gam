@@ -1202,7 +1202,6 @@ mod tests {
             double_penalty: false,
             identifiability: Default::default(),
             aniso_log_scales: None,
-            nullspace_shrinkage_survived: None,
         }
     }
 

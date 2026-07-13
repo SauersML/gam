@@ -1949,10 +1949,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // logslopespec_boot])` inside `optimize_spatial_length_scale_exact_joint`)
     // and every subsequent kappa-driven rebuild feed the basis builder the
     // captured `FrozenTransform` identifiability. Applying that captured
-    // transform to the same kernel can land the structural null-space block on
-    // the other side of `build_nullspace_shrinkage_penalty`'s spectral
-    // tolerance, so the raw and frozen builds disagree on whether the trend
-    // ridge survives as an active penalty candidate. Without this rebuild,
+    // transform changes the exact coefficient chart of the penalty blocks.
+    // Without this rebuild,
     // `marginal_penalty_count` / `logslope_design.penalties.len()` are taken
     // from the raw build but every subsequent evaluator measures the frozen
     // build, and `evaluate_custom_family_joint_hyper` refuses with a

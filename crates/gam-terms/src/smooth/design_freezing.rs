@@ -333,25 +333,15 @@ fn freeze_smooth_basis_from_metadata(
                 identifiability_transform,
                 input_scales: meta_scales,
                 aniso_log_scales: meta_aniso,
-                nullspace_shrinkage_survived: meta_nullspace_survived,
             },
         ) => {
             s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
             s.length_scale = *length_scale;
             s.nu = *nu;
             s.include_intercept = *include_intercept;
-            // Pin the bootstrap-κ double-penalty nullspace-shrinkage decision into
-            // the frozen transform so the κ-optimizer's per-trial design rebuilds
-            // reproduce the SAME learned-penalty count (gam#787/#860); without
-            // this the κ-dependent spectral test in `build_nullspace_shrinkage_penalty`
-            // flips the count 6↔7 and the rebuilt ρ dimension disagrees with the
-            // frozen joint setup ("joint hyper rho dimension mismatch"). When there
-            // is no transform to freeze we keep `None` (unconstrained kernel needs
-            // no replayed survival decision).
             s.identifiability = match identifiability_transform {
                 Some(z) => MaternIdentifiability::FrozenTransform {
                     transform: z.clone(),
-                    nullspace_shrinkage_survived: Some(*meta_nullspace_survived),
                 },
                 None => MaternIdentifiability::None,
             };

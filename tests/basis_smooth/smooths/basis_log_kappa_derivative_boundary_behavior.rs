@@ -17,7 +17,6 @@ fn log_kappa_derivatives_stay_finite_at_extreme_scales() {
             double_penalty: false,
             identifiability: Default::default(),
             aniso_log_scales: None,
-            nullspace_shrinkage_survived: None,
         };
         let bundle = build_matern_basis_log_kappa_derivatives(data.view(), &spec).unwrap();
         for (name, m) in [

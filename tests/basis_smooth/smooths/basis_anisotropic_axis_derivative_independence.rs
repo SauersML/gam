@@ -23,7 +23,6 @@ fn anisotropic_axis_derivatives_are_independent() {
         double_penalty: false,
         identifiability: Default::default(),
         aniso_log_scales: Some(vec![0.3, -0.2, -0.1]),
-        nullspace_shrinkage_survived: None,
     };
     let d = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();
     assert_eq!(
@@ -58,7 +57,6 @@ fn anisotropic_penalty_contrast_derivative_matches_finite_difference() {
         double_penalty: false,
         identifiability: Default::default(),
         aniso_log_scales: Some(vec![0.0, 0.0]),
-        nullspace_shrinkage_survived: None,
     };
     let deriv = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();
     assert_eq!(deriv.penalties_first.len(), 2);

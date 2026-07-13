@@ -151,7 +151,6 @@ fn iso_kappa_fd_variant_driver(
                 double_penalty: label.contains("_dp"),
                 identifiability: MaternIdentifiability::CenterSumToZero,
                 aniso_log_scales: None,
-                nullspace_shrinkage_survived: None,
             },
             input_scales: None,
         }
@@ -513,7 +512,6 @@ fn iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic() {
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
-                    nullspace_shrinkage_survived: None,
                 },
                 input_scales: None,
             },
@@ -584,8 +582,8 @@ fn iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic() {
                         spec.length_scale,
                         spec.double_penalty,
                         match &spec.identifiability {
-                            MaternIdentifiability::FrozenTransform { transform, nullspace_shrinkage_survived } =>
-                                format!("FrozenTransform{{z_dims={:?}, survived={:?}}}", transform.dim(), nullspace_shrinkage_survived),
+                            MaternIdentifiability::FrozenTransform { transform } =>
+                                format!("FrozenTransform{{z_dims={:?}}}", transform.dim()),
                             other => format!("{other:?}"),
                         },
                         spec.aniso_log_scales,

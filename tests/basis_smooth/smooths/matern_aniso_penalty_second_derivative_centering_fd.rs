@@ -68,7 +68,6 @@ fn aniso_penalty_raw_psi_second_derivative_matches_single_axis_fd() {
         double_penalty: true,
         identifiability: Default::default(),
         aniso_log_scales: Some(eta0.clone()),
-        nullspace_shrinkage_survived: None,
     };
 
     let deriv = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();

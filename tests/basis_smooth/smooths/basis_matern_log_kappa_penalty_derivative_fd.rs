@@ -39,7 +39,6 @@ fn spec_at(data: &Array2<f64>, rho: f64, nu: MaternNu) -> MaternBasisSpec {
         double_penalty: false,
         identifiability: Default::default(),
         aniso_log_scales: None,
-        nullspace_shrinkage_survived: None,
     }
 }
 

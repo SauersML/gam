@@ -3266,7 +3266,6 @@ fn does_notwarn_for_singlemultivariate_matern_spatial_term() {
                     include_intercept: false,
                     identifiability: gam::basis::MaternIdentifiability::default(),
                     aniso_log_scales: None,
-                    nullspace_shrinkage_survived: None,
                     periodic: None,
                 },
                 input_scales: None,
