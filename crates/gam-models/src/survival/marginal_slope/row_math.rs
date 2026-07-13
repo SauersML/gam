@@ -724,16 +724,15 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
                 }
             }
             Self::LowRank(factor) => {
-                for row in 0..input.len() {
-                    let mut value = 0.0;
-                    for column in 0..input.len() {
-                        let mut coefficient = 0.0;
-                        for rank in 0..factor.ncols() {
-                            coefficient += factor[[row, rank]] * factor[[column, rank]];
-                        }
-                        value += coefficient * input[column];
+                output.fill(0.0);
+                for rank in 0..factor.ncols() {
+                    let mut projection = 0.0;
+                    for row in 0..input.len() {
+                        projection += factor[[row, rank]] * input[row];
                     }
-                    output[row] = value;
+                    for row in 0..input.len() {
+                        output[row] += factor[[row, rank]] * projection;
+                    }
                 }
             }
         }
@@ -808,10 +807,8 @@ where
         .into());
     }
 
-    let mut linear = S::constant(0.0, dimension, workspace);
-    for axis in 0..k {
-        linear = linear.add(&vars[3 + axis].scale(inputs.probit_scale * z[axis]));
-    }
+    let linear =
+        S::linear_combination(&vars[3..], z, dimension, workspace).scale(inputs.probit_scale);
 
     // One semantic primitive owns the mechanically derived V/G/H channels for
     // `g' Sigma g`; representation-specific multiplication stays matrix free.
