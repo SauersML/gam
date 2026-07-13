@@ -455,12 +455,8 @@ pub fn term_collection_has_nonzero_anchor(spec: &TermCollectionSpec) -> bool {
 fn smooth_basis_has_nonzero_anchor(basis: &SmoothBasisSpec) -> bool {
     match basis {
         SmoothBasisSpec::ByVariable { inner, .. }
-        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
-            smooth_basis_has_nonzero_anchor(inner)
-        }
-        SmoothBasisSpec::BSpline1D { spec, .. } => {
-            spec.boundary_conditions.has_nonzero_anchor()
-        }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => smooth_basis_has_nonzero_anchor(inner),
+        SmoothBasisSpec::BSpline1D { spec, .. } => spec.boundary_conditions.has_nonzero_anchor(),
         SmoothBasisSpec::BySmooth { smooth, .. } => smooth_basis_has_nonzero_anchor(smooth),
         SmoothBasisSpec::TensorBSpline { spec, .. } => spec
             .marginalspecs

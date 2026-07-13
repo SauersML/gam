@@ -68,7 +68,7 @@ use gam_geometry::constant_curvature::{ConstantCurvature, distance_kappa_jet};
 use super::{
     BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeBundle,
     BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy, PenaltyCandidate,
-    PenaltyInfo, PenaltySource, filter_active_penalty_candidates_with_ops, normalize_penalty,
+    ActivePenaltyInfo, PenaltySource, filter_penalty_candidates, normalize_penalty,
     select_centers_by_strategy, weighted_coefficient_sum_to_zero_transform,
 };
 
@@ -735,7 +735,6 @@ pub fn build_constant_curvature_basis(
     let penalty_sym = (&penalty + &penalty.t()) * 0.5;
     let mut candidates = vec![PenaltyCandidate {
         matrix: penalty_sym,
-        nullspace_dim_hint: 0,
         source: PenaltySource::Primary,
         normalization_scale: 1.0,
         kronecker_factors: None,
@@ -753,21 +752,18 @@ pub fn build_constant_curvature_basis(
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
             matrix: ridge_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: c_ridge,
             kronecker_factors: None,
             op: None,
         });
     }
-    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
         affine_offset: None,
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
+        active_penalties: filtered.active,
+        dropped_penalties: filtered.dropped,
         metadata: BasisMetadata::ConstantCurvature {
             centers,
             kappa: spec.kappa,
@@ -775,8 +771,6 @@ pub fn build_constant_curvature_basis(
             constraint_transform: Some(z),
         },
         kronecker_factored: None,
-        ops,
-        null_eigenvectors,
         joint_null_rotation: None,
     })
 }
@@ -1125,13 +1119,12 @@ pub(crate) fn symmetrize(m: &Array2<f64>) -> Array2<f64> {
 /// zero. Any other source would mean the basis grew a penalty whose κ-movement
 /// is unaccounted for, so we refuse loudly rather than silently drop a term.
 pub(crate) fn active_constant_curvature_penalty_derivatives(
-    penaltyinfo: &[PenaltyInfo],
+    penalties: &[ActivePenalty],
     primary_derivative: &Array2<f64>,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
-    penaltyinfo
+    penalties
         .iter()
-        .filter(|info| info.active)
-        .map(|info| match &info.source {
+        .map(|penalty| match &penalty.info.source {
             PenaltySource::Primary => Ok(primary_derivative.clone()),
             PenaltySource::DoublePenaltyNullspace => {
                 Ok(Array2::<f64>::zeros(primary_derivative.raw_dim()))
@@ -1267,9 +1260,9 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
     // κ-independent). Rebuild the realized basis once to read `penaltyinfo`.
     let base = build_constant_curvature_basis(data, spec)?;
     let penalties_derivative =
-        active_constant_curvature_penalty_derivatives(&base.penaltyinfo, &s_first)?;
+        active_constant_curvature_penalty_derivatives(&base.active_penalties, &s_first)?;
     let penaltiessecond_derivative =
-        active_constant_curvature_penalty_derivatives(&base.penaltyinfo, &s_second)?;
+        active_constant_curvature_penalty_derivatives(&base.active_penalties, &s_second)?;
 
     Ok(BasisPsiDerivativeBundle {
         first: BasisPsiDerivativeResult {

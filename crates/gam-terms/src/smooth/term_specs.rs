@@ -798,9 +798,10 @@ pub struct SmoothTerm {
     pub name: String,
     pub coeff_range: Range<usize>,
     pub shape: ShapeConstraint,
-    pub penalties_local: Vec<Array2<f64>>,
-    pub nullspace_dims: Vec<usize>,
-    pub penaltyinfo_local: Vec<PenaltyInfo>,
+    /// Active local penalty identities. Numerical and semantic channels are
+    /// inseparable, including after a preceding candidate is dropped.
+    pub active_penalties: Vec<ActivePenalty>,
+    pub dropped_penalties: Vec<DroppedPenaltyInfo>,
     pub metadata: BasisMetadata,
     /// Optional term-local lower bounds for constrained coefficients.
     /// `-inf` means unconstrained.
@@ -908,8 +909,7 @@ impl SmoothTerm {
     pub fn wald_unpenalized_dim(&self) -> usize {
         joint_unpenalized_dim(
             self.coeff_range.len(),
-            &self.penalties_local,
-            &self.nullspace_dims,
+            &self.active_penalties,
         )
     }
 }
@@ -920,14 +920,13 @@ impl SmoothTerm {
 /// full `p_local × p_local` matrix (e.g. a Kronecker tensor factor).
 pub fn joint_unpenalized_dim(
     p_local: usize,
-    penalties_local: &[Array2<f64>],
-    nullspace_dims: &[usize],
+    active_penalties: &[ActivePenalty],
 ) -> usize {
     use gam_linalg::faer_ndarray::FaerEigh;
     if p_local == 0 {
         return 0;
     }
-    if penalties_local.is_empty() {
+    if active_penalties.is_empty() {
         // No penalty ⇒ a wholly unpenalized (fixed-effect) block.
         return p_local;
     }
@@ -937,13 +936,14 @@ pub fn joint_unpenalized_dim(
     // so the rank is computed in the right metric.
     let mut s_total = Array2::<f64>::zeros((p_local, p_local));
     let mut materialized = 0usize;
-    for s in penalties_local {
+    for penalty in active_penalties {
+        let s = &penalty.matrix;
         if s.nrows() == p_local && s.ncols() == p_local {
             s_total += s;
             materialized += 1;
         }
     }
-    if materialized == penalties_local.len() {
+    if materialized == active_penalties.len() {
         let symmetric = {
             let transpose = s_total.t().to_owned();
             (&s_total + &transpose) * 0.5
@@ -963,12 +963,12 @@ pub fn joint_unpenalized_dim(
     // (e.g. a Kronecker tensor factor): with ≥2 active penalties the joint
     // null space is almost always empty (the only over-rejecting direction);
     // with a single penalty it is exactly that penalty's own null space.
-    if penalties_local.len() >= 2 {
+    if active_penalties.len() >= 2 {
         0
     } else {
-        nullspace_dims
+        active_penalties
             .iter()
-            .copied()
+            .map(|penalty| penalty.nullity)
             .min()
             .unwrap_or(0)
             .min(p_local)
@@ -979,13 +979,13 @@ pub fn joint_unpenalized_dim(
 pub struct PenaltyBlockInfo {
     pub global_index: usize,
     pub termname: Option<String>,
-    pub penalty: PenaltyInfo,
+    pub penalty: ActivePenaltyInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DroppedPenaltyBlockInfo {
     pub termname: Option<String>,
-    pub penalty: PenaltyInfo,
+    pub penalty: DroppedPenaltyInfo,
 }
 
 #[derive(Debug, Clone)]
@@ -2455,7 +2455,7 @@ impl TermCollectionDesign {
         let Some(term) = self.smooth.terms.get(term_idx) else {
             return Ok(None);
         };
-        if term.penalties_local.is_empty() {
+        if term.active_penalties.is_empty() {
             return Ok(None);
         }
 
@@ -2464,7 +2464,7 @@ impl TermCollectionDesign {
             .smooth
             .terms
             .iter()
-            .map(|smooth| smooth.penalties_local.len())
+            .map(|smooth| smooth.active_penalties.len())
             .sum::<usize>();
         let expected = leading
             .checked_add(smooth_count)
@@ -2484,13 +2484,13 @@ impl TermCollectionDesign {
             .terms
             .iter()
             .take(term_idx)
-            .map(|smooth| smooth.penalties_local.len())
+            .map(|smooth| smooth.active_penalties.len())
             .sum::<usize>();
         let start = leading
             .checked_add(local_offset)
             .ok_or_else(|| "smooth penalty offset overflow".to_string())?;
         let end = start
-            .checked_add(term.penalties_local.len())
+            .checked_add(term.active_penalties.len())
             .ok_or_else(|| "smooth penalty range overflow".to_string())?;
         Ok(Some(start..end))
     }
@@ -5429,7 +5429,6 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
         let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym);
         candidates.push(PenaltyCandidate {
             matrix,
-            nullspace_dim_hint: 0,
             source,
             normalization_scale,
             kronecker_factors: None,
@@ -5897,7 +5896,6 @@ pub fn build_tensor_bspline_basis(
                 }
                 candidates.push(PenaltyCandidate {
                     matrix: s_dim,
-                    nullspace_dim_hint: 0,
                     source: PenaltySource::TensorMarginal { dim },
                     normalization_scale: normalized_marginal_penalties[dim].1,
                     kronecker_factors: Some(factors),
@@ -5913,7 +5911,6 @@ pub fn build_tensor_bspline_basis(
                 let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&shrink);
                 candidates.push(PenaltyCandidate {
                     matrix,
-                    nullspace_dim_hint: 0,
                     source: PenaltySource::TensorGlobalRidge,
                     normalization_scale,
                     kronecker_factors: None,
@@ -5948,7 +5945,6 @@ pub fn build_tensor_bspline_basis(
                 let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&matrix);
                 candidates.push(PenaltyCandidate {
                     matrix,
-                    nullspace_dim_hint: 0,
                     source: PenaltySource::TensorSeparable { penalized_margins },
                     normalization_scale,
                     kronecker_factors: Some(factors),
@@ -5964,7 +5960,6 @@ pub fn build_tensor_bspline_basis(
                 let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&matrix);
                 candidates.push(PenaltyCandidate {
                     matrix,
-                    nullspace_dim_hint: 0,
                     source: PenaltySource::TensorGlobalRidge,
                     normalization_scale,
                     kronecker_factors: None,
@@ -6056,7 +6051,6 @@ pub fn build_tensor_bspline_basis(
                 // unit-scale constrained penalties for every tensor margin.
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
                 Ok(PenaltyCandidate {
-                    nullspace_dim_hint: candidate.nullspace_dim_hint,
                     matrix,
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale * c_new,
@@ -6709,17 +6703,7 @@ pub struct LocalSmoothTermBuild {
     pub design: DesignMatrix,
     /// Fixed row-wise term contribution for an affine basis chart.
     pub affine_offset: Option<Array1<f64>>,
-    pub penalties: Vec<Array2<f64>>,
-    pub ops: Vec<Option<std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>>>,
-    pub nullspaces: Vec<usize>,
-    /// Per-active-penalty null-space eigenvector matrices, parallel to
-    /// `penalties` / `ops` / `nullspaces`. `Some(U_null)` when
-    /// `nullspaces[k] > 0`, with `U_null` orthonormal columns spanning
-    /// `null(penalties[k])` in this smooth's local coordinate system; `None`
-    /// when the active block is full-rank. Stage 1 plumbing; Stage 2
-    /// consumes this to absorb the smooth's null space into the parametric
-    /// block at `TermCollectionDesign` construction.
-    pub null_eigenvectors: Vec<Option<Array2<f64>>>,
+    pub active_penalties: Vec<ActivePenalty>,
     /// Joint-null absorption rotation for this smooth. `Some(rotation)`
     /// records `Q = [U_range | U_null]` spanning `null(Σ_k penalties[k])`,
     /// the joint null across all active penalty blocks on this smooth.
@@ -6727,8 +6711,7 @@ pub struct LocalSmoothTermBuild {
     /// there are no penalties. Stage-2 commit A: plumbing only — populated
     /// by commit B, applied by commit D.
     pub joint_null_rotation: Option<crate::basis::JointNullRotation>,
-    pub penaltyinfo: Vec<PenaltyInfo>,
-    pub pre_dropped_penaltyinfo: Vec<PenaltyInfo>,
+    pub dropped_penalties: Vec<DroppedPenaltyInfo>,
     pub metadata: BasisMetadata,
     pub linear_constraints: Option<LinearInequalityConstraints>,
     pub box_reparam: bool,
@@ -7178,7 +7161,6 @@ pub fn build_pca_smooth_basis(
         let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
             filter_active_penalty_candidates_with_ops(vec![PenaltyCandidate {
                 matrix: penalty,
-                nullspace_dim_hint: 0,
                 source: PenaltySource::OperatorMass,
                 normalization_scale: 1.0,
                 kronecker_factors: None,
@@ -7232,7 +7214,6 @@ pub fn build_pca_smooth_basis(
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(vec![PenaltyCandidate {
             matrix: penalty,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: 1.0,
             kronecker_factors: None,
@@ -7699,7 +7680,6 @@ pub fn build_by_smooth_local(
                     let (s_big, scale) = normalize_penalty_in_constrained_space(&s_big);
                     candidates.push(PenaltyCandidate {
                         matrix: s_big,
-                        nullspace_dim_hint: q.saturating_sub(base_info.effective_rank),
                         source: base_info.source.clone(),
                         normalization_scale: base_info.normalization_scale * scale,
                         kronecker_factors: None,
@@ -8012,7 +7992,6 @@ pub fn build_factor_smooth(
                 active: true,
                 effective_rank: 1,
                 dropped_reason: None,
-                nullspace_dim_hint: p.saturating_sub(1),
                 normalization_scale: 1.0,
                 kronecker_factors: None,
             })
@@ -8123,7 +8102,6 @@ pub fn build_factor_smooth(
                     active: true,
                     effective_rank: null_block.rank,
                     dropped_reason: None,
-                    nullspace_dim_hint: null_block.nullity,
                     normalization_scale: null_scale,
                     kronecker_factors: None,
                 });
@@ -8539,7 +8517,6 @@ pub fn build_single_local_smooth_term(
                             active: true,
                             effective_rank: null_block.rank,
                             dropped_reason: None,
-                            nullspace_dim_hint: null_block.nullity,
                             normalization_scale: null_scale,
                             kronecker_factors: None,
                         }));
@@ -9206,7 +9183,6 @@ pub fn build_single_local_smooth_term(
                     factors
                 });
                 Ok(PenaltyCandidate {
-                    nullspace_dim_hint: info.nullspace_dim_hint,
                     matrix,
                     source: info.source,
                     normalization_scale,

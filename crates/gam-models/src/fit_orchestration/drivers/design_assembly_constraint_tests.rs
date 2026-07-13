@@ -452,6 +452,30 @@ fn bspline_nonzero_anchor_has_fixed_affine_lift_and_homogeneous_chart() {
     assert!((affine_left_value - 2.0).abs() < 1e-10);
     assert!(affine_left_slope.abs() < 1e-10);
     assert!(affine_right_slope.abs() < 1e-10);
+
+    // Freeze/replay must reconstruct both halves of the affine realization,
+    // not merely the homogeneous coefficient chart.
+    let collection_spec = TermCollectionSpec {
+        linear_terms: Vec::new(),
+        random_effect_terms: Vec::new(),
+        smooth_terms: vec![mk(
+            BSplineEndpointBoundaryCondition::Anchored { value: 2.0 },
+            BSplineEndpointBoundaryCondition::Clamped,
+        )],
+    };
+    let fit_design = build_term_collection_design(data.view(), &collection_spec)
+        .expect("fit-time affine term collection");
+    let frozen = freeze_term_collection_from_design(&collection_spec, &fit_design)
+        .expect("freeze affine term collection");
+    let replay = build_term_collection_design(data.view(), &frozen)
+        .expect("replay affine term collection");
+    assert_eq!(
+        fit_design.affine_offset, replay.affine_offset,
+        "frozen replay must reproduce the fixed row function exactly"
+    );
+    let fit_linear = fit_design.design.to_dense();
+    let replay_linear = replay.design.to_dense();
+    assert_eq!(fit_linear, replay_linear);
 }
 
 #[test]

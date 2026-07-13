@@ -604,16 +604,12 @@ fn build_duchon_basis_uncached(
             workspace,
         )?);
     }
-    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
         affine_offset: None,
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
-        ops,
-        null_eigenvectors,
+        active_penalties: filtered.active,
+        dropped_penalties: filtered.dropped,
         joint_null_rotation: None,
         metadata: BasisMetadata::Duchon {
             centers,
@@ -650,7 +646,7 @@ fn build_duchon_basis_uncached(
 ///
 /// Returns the per-block penalty matrices (term-local frame, same order/count
 /// the cold build emits) and the active per-block nullspace dims — exactly the
-/// objects the cold build feeds into `filter_active_penalty_candidates_with_ops`.
+/// objects the cold build feeds into `filter_penalty_candidates`.
 pub fn duchon_penalties_at_length_scale(
     centers: ArrayView2<'_, f64>,
     identifiability_transform: Option<&Array2<f64>>,
@@ -706,9 +702,19 @@ pub fn duchon_penalties_at_length_scale(
             workspace,
         )?);
     }
-    let (penalties, nullspace_dims, _info, _eig, _ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
-    Ok((penalties, nullspace_dims))
+    let filtered = filter_penalty_candidates(candidates)?;
+    Ok((
+        filtered
+            .active
+            .iter()
+            .map(|penalty| penalty.matrix.clone())
+            .collect(),
+        filtered
+            .active
+            .iter()
+            .map(|penalty| penalty.nullity)
+            .collect(),
+    ))
 }
 
 /// Materialise the polynomial null-space block for a Duchon basis.
@@ -1841,14 +1847,13 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
 }
 
 pub(crate) fn active_thin_plate_penalty_derivatives(
-    penaltyinfo: &[PenaltyInfo],
+    penalties: &[ActivePenalty],
     primary_derivative: &Array2<f64>,
     nullspace_derivative: &Array2<f64>,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
-    penaltyinfo
+    penalties
         .iter()
-        .filter(|info| info.active)
-        .map(|info| match &info.source {
+        .map(|penalty| match &penalty.info.source {
             PenaltySource::Primary => Ok(primary_derivative.clone()),
             PenaltySource::DoublePenaltyNullspace => Ok(nullspace_derivative.clone()),
             other => Err(BasisError::InvalidInput(format!(
@@ -2306,12 +2311,12 @@ pub fn build_thin_plate_basis_log_kappa_derivativeswithworkspace(
     let nullspace_derivative = nullspace_derivative_opt;
     let nullspacesecond_derivative = nullspacesecond_derivative_opt;
     let penalties_derivative = active_thin_plate_penalty_derivatives(
-        &base.penaltyinfo,
+        &base.active_penalties,
         &primary_derivative,
         &nullspace_derivative,
     )?;
     let penaltiessecond_derivative = active_thin_plate_penalty_derivatives(
-        &base.penaltyinfo,
+        &base.active_penalties,
         &primarysecond_derivative,
         &nullspacesecond_derivative,
     )?;

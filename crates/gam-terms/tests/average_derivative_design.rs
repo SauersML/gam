@@ -6,8 +6,8 @@
 //! the crate library rather than the in-crate unit-test harness.
 
 use gam_terms::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata,
-    OneDimensionalBoundary,
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
+    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, OneDimensionalBoundary,
 };
 use gam_terms::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
@@ -155,4 +155,56 @@ fn analytic_average_derivative_matches_central_difference() {
         "analytic average-derivative design disagrees with reference: \
          max abs error {max_abs_err:.3e} (tol 1e-6)"
     );
+}
+
+#[test]
+fn nonzero_anchor_derivative_carries_exact_affine_slope() {
+    let data = ndarray::Array1::linspace(0.0, 1.0, 41).insert_axis(ndarray::Axis(1));
+    let anchor = 1.75;
+    let spec = TermCollectionSpec {
+        linear_terms: Vec::new(),
+        random_effect_terms: Vec::new(),
+        smooth_terms: vec![SmoothTermSpec {
+            name: "anchored s(x)".to_string(),
+            basis: SmoothBasisSpec::BSpline1D {
+                feature_col: 0,
+                spec: BSplineBasisSpec {
+                    degree: 3,
+                    penalty_order: 2,
+                    knotspec: BSplineKnotSpec::Generate {
+                        data_range: (0.0, 1.0),
+                        num_internal_knots: 7,
+                    },
+                    double_penalty: false,
+                    identifiability: BSplineIdentifiability::None,
+                    boundary: OneDimensionalBoundary::Open,
+                    boundary_conditions: BSplineBoundaryConditions {
+                        left: BSplineEndpointBoundaryCondition::Anchored { value: anchor },
+                        right: BSplineEndpointBoundaryCondition::Free,
+                    },
+                },
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+
+    let value = build_term_collection_design(data.view(), &spec).expect("anchored value design");
+    let derivative = build_term_collection_derivative_design(data.view(), &spec, 0)
+        .expect("anchored derivative design");
+    let beta = ndarray::Array1::<f64>::zeros(value.design.ncols());
+    let fitted_value = value
+        .apply(beta.view())
+        .expect("apply anchored value design");
+    let fitted_slope = derivative
+        .apply(beta.view())
+        .expect("apply anchored derivative design");
+
+    assert!((fitted_value[0] - anchor).abs() < 1e-10);
+    assert!(
+        fitted_slope[0].abs() < 1e-10,
+        "Hermite anchor requires zero endpoint slope, got {}",
+        fitted_slope[0]
+    );
+    assert!(derivative.affine_offset[0].abs() < 1e-10);
 }

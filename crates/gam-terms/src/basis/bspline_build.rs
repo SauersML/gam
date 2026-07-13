@@ -205,7 +205,6 @@ pub fn build_bspline_basis_1d(
         let (s_bend_norm, s_bend_scale) = normalize_penalty(&s_bend_raw);
         let penalties_raw = vec![PenaltyCandidate {
             matrix: s_bend_norm,
-            nullspace_dim_hint: 1,
             source: PenaltySource::Primary,
             normalization_scale: s_bend_scale,
             kronecker_factors: None,
@@ -249,7 +248,6 @@ pub fn build_bspline_basis_1d(
                     .into_iter()
                     .zip(penalties_raw)
                     .map(|(matrix, candidate)| PenaltyCandidate {
-                        nullspace_dim_hint: candidate.nullspace_dim_hint,
                         matrix,
                         source: candidate.source,
                         normalization_scale: candidate.normalization_scale,
@@ -265,16 +263,14 @@ pub fn build_bspline_basis_1d(
             };
         let transformed_candidates =
             rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
-        let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-            filter_active_penalty_candidates_with_ops(renormalize_constrained_penalty_candidates(
-                transformed_candidates,
-            ))?;
+        let filtered = filter_penalty_candidates(renormalize_constrained_penalty_candidates(
+            transformed_candidates,
+        ))?;
         return Ok(BasisBuildResult {
             design,
             affine_offset: None,
-            penalties,
-            nullspace_dims,
-            penaltyinfo,
+            active_penalties: filtered.active,
+            dropped_penalties: filtered.dropped,
             metadata: BasisMetadata::BSpline1D {
                 knots,
                 identifiability_transform,
@@ -285,8 +281,6 @@ pub fn build_bspline_basis_1d(
                 anchor_offset_coeffs: None,
             },
             kronecker_factored: None,
-            ops,
-            null_eigenvectors,
             joint_null_rotation: None,
         });
     }
@@ -375,16 +369,14 @@ pub fn build_bspline_basis_1d(
             )?;
         let transformed_candidates =
             rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
-        let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-            filter_active_penalty_candidates_with_ops(renormalize_constrained_penalty_candidates(
-                transformed_candidates,
-            ))?;
+        let filtered = filter_penalty_candidates(renormalize_constrained_penalty_candidates(
+            transformed_candidates,
+        ))?;
         return Ok(BasisBuildResult {
             design,
             affine_offset: None,
-            penalties,
-            nullspace_dims,
-            penaltyinfo,
+            active_penalties: filtered.active,
+            dropped_penalties: filtered.dropped,
             metadata: BasisMetadata::BSpline1D {
                 knots,
                 identifiability_transform,
@@ -396,8 +388,6 @@ pub fn build_bspline_basis_1d(
                 anchor_offset_coeffs: None,
             },
             kronecker_factored: None,
-            ops,
-            null_eigenvectors,
             joint_null_rotation: None,
         });
     }
@@ -580,7 +570,6 @@ pub fn build_bspline_basis_1d(
                     .into_iter()
                     .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
                         Ok(PenaltyCandidate {
-                            nullspace_dim_hint: candidate.nullspace_dim_hint,
                             matrix: candidate.matrix,
                             source: candidate.source,
                             normalization_scale: candidate.normalization_scale,
@@ -607,7 +596,6 @@ pub fn build_bspline_basis_1d(
                     .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
                         let matrix = gauge.restrict_penalty(&candidate.matrix);
                         Ok(PenaltyCandidate {
-                            nullspace_dim_hint: candidate.nullspace_dim_hint,
                             matrix,
                             source: candidate.source,
                             normalization_scale: candidate.normalization_scale,
@@ -690,7 +678,6 @@ pub fn build_bspline_basis_1d(
             .map(
                 |(matrix, candidate)| -> Result<PenaltyCandidate, BasisError> {
                     Ok(PenaltyCandidate {
-                        nullspace_dim_hint: candidate.nullspace_dim_hint,
                         matrix,
                         source: candidate.source,
                         normalization_scale: candidate.normalization_scale,
@@ -708,10 +695,9 @@ pub fn build_bspline_basis_1d(
     };
     let transformed_candidates =
         rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
-    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(renormalize_constrained_penalty_candidates(
-            transformed_candidates,
-        ))?;
+    let filtered = filter_penalty_candidates(renormalize_constrained_penalty_candidates(
+        transformed_candidates,
+    ))?;
     // Non-zero endpoint anchor (#2297): the constrained design above spans the
     // zero-anchor nullspace `Z`; the anchor value is carried by the raw-basis
     // particular solution `β_p` as an affine offset function `B_raw · β_p`. This
@@ -721,9 +707,8 @@ pub fn build_bspline_basis_1d(
     Ok(BasisBuildResult {
         design,
         affine_offset,
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
+        active_penalties: filtered.active,
+        dropped_penalties: filtered.dropped,
         metadata: BasisMetadata::BSpline1D {
             knots,
             identifiability_transform,
@@ -733,8 +718,6 @@ pub fn build_bspline_basis_1d(
             anchor_offset_coeffs,
         },
         kronecker_factored: None,
-        ops,
-        null_eigenvectors,
         joint_null_rotation: None,
     })
 }
@@ -790,7 +773,6 @@ pub fn build_cubic_regression_basis_1d(
     let (bend_norm, bend_scale) = normalize_penalty(&s_bend_raw);
     let mut penalties_raw = vec![PenaltyCandidate {
         matrix: bend_norm,
-        nullspace_dim_hint: 2,
         source: PenaltySource::Primary,
         normalization_scale: bend_scale,
         kronecker_factors: None,
@@ -808,7 +790,6 @@ pub fn build_cubic_regression_basis_1d(
         let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage);
         penalties_raw.push(PenaltyCandidate {
             matrix: ridge_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: ridge_scale,
             kronecker_factors: None,
@@ -839,7 +820,6 @@ pub fn build_cubic_regression_basis_1d(
         .into_iter()
         .zip(penalties_raw)
         .map(|(matrix, candidate)| PenaltyCandidate {
-            nullspace_dim_hint: candidate.nullspace_dim_hint,
             matrix,
             source: candidate.source,
             normalization_scale: candidate.normalization_scale,
@@ -853,24 +833,20 @@ pub fn build_cubic_regression_basis_1d(
     // unit Frobenius norm, exactly as the 1-D B-spline path does.
     let transformed_candidates =
         rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
-    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(renormalize_constrained_penalty_candidates(
-            transformed_candidates,
-        ))?;
+    let filtered = filter_penalty_candidates(renormalize_constrained_penalty_candidates(
+        transformed_candidates,
+    ))?;
 
     Ok(BasisBuildResult {
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design_c)),
         affine_offset: None,
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
+        active_penalties: filtered.active,
+        dropped_penalties: filtered.dropped,
         metadata: BasisMetadata::CubicRegression1D {
             knots: knots.clone(),
             identifiability_transform,
         },
         kronecker_factored: None,
-        ops,
-        null_eigenvectors,
         joint_null_rotation: None,
     })
 }
@@ -1376,7 +1352,6 @@ pub(crate) fn build_streaming_bspline_design_and_candidates(
         .into_iter()
         .zip(penalties_raw)
         .map(|(matrix, candidate)| PenaltyCandidate {
-            nullspace_dim_hint: candidate.nullspace_dim_hint,
             matrix,
             source: candidate.source,
             normalization_scale: candidate.normalization_scale,
@@ -2168,7 +2143,6 @@ fn bspline_penalty_candidates(
         let (bend_norm, bend_scale) = normalize_penalty(s_bend_raw);
         return Ok(vec![PenaltyCandidate {
             matrix: bend_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::Primary,
             normalization_scale: bend_scale,
             kronecker_factors: None,
@@ -2181,7 +2155,6 @@ fn bspline_penalty_candidates(
     Ok(vec![
         PenaltyCandidate {
             matrix: bend_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::Primary,
             normalization_scale: bend_scale,
             kronecker_factors: None,
@@ -2189,7 +2162,6 @@ fn bspline_penalty_candidates(
         },
         PenaltyCandidate {
             matrix: ridge_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: ridge_scale,
             kronecker_factors: None,

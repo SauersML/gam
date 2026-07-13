@@ -910,19 +910,14 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     };
     let candidates = vec![normalize_penalty_candidate(
         primary,
-        1,
         PenaltySource::Primary,
     )];
-    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
         affine_offset: None,
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
-        ops,
-        null_eigenvectors,
+        active_penalties: filtered.active,
+        dropped_penalties: filtered.dropped,
         joint_null_rotation: None,
         metadata: BasisMetadata::Duchon {
             centers,
@@ -1135,19 +1130,14 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
     };
     let candidates = vec![normalize_penalty_candidate(
         primary,
-        1,
         PenaltySource::Primary,
     )];
-    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
         affine_offset: None,
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
-        ops,
-        null_eigenvectors,
+        active_penalties: filtered.active,
+        dropped_penalties: filtered.dropped,
         joint_null_rotation: None,
         metadata: BasisMetadata::Duchon {
             centers: centers_owned,
@@ -1569,13 +1559,11 @@ pub(crate) fn duchon_native_penalty_candidates(
     let mut out = Vec::new();
     out.push(normalize_penalty_candidate(
         primary,
-        0,
         PenaltySource::Primary,
     ));
     if let Some(shrink) = shrink {
         out.push(normalize_penalty_candidate(
             shrink,
-            0,
             PenaltySource::DoublePenaltyNullspace,
         ));
     }
@@ -1746,7 +1734,6 @@ pub(crate) fn duchon_operator_penalty_candidates(
             let d1_axis = ops.d1.slice(s![axis..; dim, ..]).to_owned();
             candidates.push(normalize_penalty_candidate(
                 symmetrize(&fast_ata(&d1_axis)),
-                0,
                 PenaltySource::OperatorRelevance { axis },
             ));
         }

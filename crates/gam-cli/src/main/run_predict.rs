@@ -1440,7 +1440,10 @@ pub(crate) fn run_predict_survival(
         let logslope_design = build_term_collection_design(logslope_input, &logslopespec)
             .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
         let effective_noise_offset = logslope_design
-            .compose_offset(noise_offset.view(), "survival CLI marginal-slope logslope block")
+            .compose_offset(
+                noise_offset.view(),
+                "survival CLI marginal-slope logslope block",
+            )
             .map_err(|error| error.to_string())?;
         let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
         let (predictor, pred_input, predictor_fit) = build_saved_survival_marginal_slope_predictor(

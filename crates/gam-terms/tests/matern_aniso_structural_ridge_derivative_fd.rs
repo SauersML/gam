@@ -2,13 +2,12 @@
 //! double penalty must differentiate the represented FUNCTION metric, including
 //! first, diagonal-second, and mixed optimizer-coordinate derivatives.
 //!
-//! The irregular center cloud makes `[K_CC | 1]` nonorthogonal, and the explicit
-//! anisotropy makes all three ridge derivatives materially nonzero.  Every
-//! analytic matrix is compared with an independent central difference of the
-//! realized, normalized value penalty; no derivative helper participates in
-//! the reference path.
+//! This test belongs to `gam-terms`, whose public Matérn construction contract
+//! it exercises. Keeping it out of the top-level `gam` integration binary avoids
+//! compiling and linking every model, CLI, prediction, and Python dependency to
+//! validate one basis-level invariant.
 
-use gam::terms::basis::{
+use gam_terms::basis::{
     BasisWorkspace, CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu,
     PenaltySource, build_matern_basis_log_kappa_aniso_derivatives, build_matern_basiswithworkspace,
 };

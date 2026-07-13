@@ -488,7 +488,10 @@ fn transformation_normal_observed_scores(
         });
     }
     let offset = design
-        .compose_offset(offset.view(), "transformation-normal observed-score prediction")
+        .compose_offset(
+            offset.view(),
+            "transformation-normal observed-score prediction",
+        )
         .map_err(|error| PredictInputError::InvalidInput {
             reason: error.to_string(),
         })?;

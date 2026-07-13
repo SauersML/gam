@@ -68,7 +68,9 @@ fn boundary_conditioned_saved_spec_rebuilds_for_prediction() {
     }
     let design = build_term_collection_design(new_data.view(), &fit.resolvedspec)
         .expect("frozen boundary-conditioned spec should rebuild for prediction");
-    let pred = design.design.apply(&fit.fit.beta);
+    let pred = design
+        .apply(fit.fit.beta.view())
+        .expect("apply frozen boundary-conditioned design");
     assert!(pred.iter().all(|v| v.is_finite()));
 }
 
@@ -133,7 +135,9 @@ fn one_sided_anchored_bspline_is_predictable_after_freeze() {
             "prediction design column count must match fitted beta for `{formula}` \
              (the #1265 spurious-intercept regression)"
         );
-        let pred = design.design.apply(&fit.fit.beta);
+        let pred = design
+            .apply(fit.fit.beta.view())
+            .unwrap_or_else(|e| panic!("apply frozen design `{formula}`: {e:?}"));
         assert!(
             pred.iter().all(|v| v.is_finite()),
             "predictions must be finite for `{formula}`"
@@ -147,6 +151,89 @@ fn one_sided_anchored_bspline_is_predictable_after_freeze() {
         assert!(
             anchored_pred.abs() < 1e-6,
             "anchored endpoint must evaluate to the anchor value 0 for `{formula}`, got {anchored_pred:.3e}"
+        );
+    }
+}
+
+#[test]
+fn nonzero_anchors_sum_once_and_survive_multi_term_frozen_replay() {
+    init_parallelism();
+    let headers = ["x", "z", "y"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let rows = (0..48)
+        .map(|i| {
+            let x = i as f64 / 47.0;
+            let z = 1.0 - x;
+            let y = 0.5 + 0.6 * x * x + 0.4 * (1.0 - z) * (1.0 - z);
+            StringRecord::from(vec![x.to_string(), z.to_string(), y.to_string()])
+        })
+        .collect::<Vec<_>>();
+    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode affine dataset");
+    let config = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "y ~ s(x, bc_left=anchored, anchor_left=1.25, k=8) + \
+         s(z, bc_right=anchored, anchor_right=-0.75, k=8)",
+        &data,
+        &config,
+    )
+    .expect("multi-term non-zero-anchor fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard Gaussian fit");
+    };
+
+    // Rebuilding the training design from the frozen specification must be an
+    // exact replay, including the particular solutions that are not encoded in
+    // the homogeneous coefficient vector.
+    let replay = build_term_collection_design(data.values.view(), &fit.resolvedspec)
+        .expect("replay frozen multi-term design");
+    assert_eq!(fit.design.affine_offset, replay.affine_offset);
+    assert_eq!(fit.design.design.to_dense(), replay.design.to_dense());
+
+    let mut probe = Array2::<f64>::zeros((3, 3));
+    probe[[0, 0]] = 0.0;
+    probe[[0, 1]] = 1.0;
+    probe[[1, 0]] = 0.3;
+    probe[[1, 1]] = 0.8;
+    probe[[2, 0]] = 1.0;
+    probe[[2, 1]] = 0.0;
+    let joint = build_term_collection_design(probe.view(), &fit.resolvedspec)
+        .expect("joint frozen prediction design");
+
+    let mut left_spec = fit.resolvedspec.clone();
+    left_spec.smooth_terms = vec![fit.resolvedspec.smooth_terms[0].clone()];
+    let left = build_term_collection_design(probe.view(), &left_spec)
+        .expect("left-anchor frozen prediction design");
+    let mut right_spec = fit.resolvedspec.clone();
+    right_spec.smooth_terms = vec![fit.resolvedspec.smooth_terms[1].clone()];
+    let right = build_term_collection_design(probe.view(), &right_spec)
+        .expect("right-anchor frozen prediction design");
+
+    for row in 0..probe.nrows() {
+        let expected = left.affine_offset[row] + right.affine_offset[row];
+        assert!(
+            (joint.affine_offset[row] - expected).abs() < 1e-12,
+            "row {row}: multi-term affine channel must be the exact sum of its terms"
+        );
+    }
+    assert!(
+        (joint.affine_offset[0] - 0.5).abs() < 1e-10,
+        "the two endpoint anchors must contribute 1.25 + (-0.75) exactly once"
+    );
+
+    let prediction = joint
+        .apply(fit.fit.beta.view())
+        .expect("apply multi-term affine prediction design");
+    let linear = joint.design.apply(&fit.fit.beta);
+    for row in 0..probe.nrows() {
+        assert!(prediction[row].is_finite());
+        assert!(
+            (prediction[row] - linear[row] - joint.affine_offset[row]).abs() < 1e-12,
+            "row {row}: prediction must equal X beta plus exactly one affine lift"
         );
     }
 }

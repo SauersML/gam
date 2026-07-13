@@ -770,8 +770,8 @@ fn sample_standard(
         weighted_blockwise_penalty_sum(&design.penalties, fit.lambdas.as_slice().unwrap(), p);
 
     let saved_offset_vec = saved_offset(model, data, col_map)?;
-    let base_offset = saved_offset_vec
-        .unwrap_or_else(|| Array1::<f64>::zeros(design.design.nrows()));
+    let base_offset =
+        saved_offset_vec.unwrap_or_else(|| Array1::<f64>::zeros(design.design.nrows()));
     let offset_vec = design
         .compose_offset(base_offset.view(), "saved standard model sampling")
         .map_err(|error| error.to_string())?;
@@ -1094,8 +1094,8 @@ fn sample_standard_link_wiggle(
     // evaluation.
     let weights = saved_prior_weights(model, data, col_map)?;
     let saved_offset_vec = saved_offset(model, data, col_map)?;
-    let base_offset = saved_offset_vec
-        .unwrap_or_else(|| Array1::<f64>::zeros(design.design.nrows()));
+    let base_offset =
+        saved_offset_vec.unwrap_or_else(|| Array1::<f64>::zeros(design.design.nrows()));
     let offset_vec = design
         .compose_offset(base_offset.view(), "saved link-wiggle model sampling")
         .map_err(|error| error.to_string())?;

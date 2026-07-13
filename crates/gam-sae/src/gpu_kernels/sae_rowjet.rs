@@ -1667,27 +1667,48 @@ mod tests {
         if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
             return;
         }
-        let rows = complete_fixture(37);
+        // A 37-row smoke fixture launches each kernel for too little time to
+        // establish that the admitted production path actually occupies the
+        // device. Keep a complete, memory-bounded workload large enough for
+        // external utilization/profiler sampling, warm the NVRTC/module path
+        // once, then require every measured pass to match the one CPU oracle.
+        const ROW_COUNT: usize = 1 << 17;
+        const MEASURED_PASSES: usize = 8;
+        let rows = complete_fixture(ROW_COUNT);
         let cpu = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Cpu).expect("CPU oracle");
-        let device = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Device)
-            .expect("admitted device must execute without a host retry");
-        let max_error = cpu
-            .first
-            .iter()
-            .chain(&cpu.second)
-            .chain(&cpu.beta)
-            .chain(&cpu.beta_mixed)
-            .zip(
-                device
-                    .first
-                    .iter()
-                    .chain(&device.second)
-                    .chain(&device.beta)
-                    .chain(&device.beta_mixed),
-            )
-            .fold(0.0_f64, |maximum, (left, right)| {
-                maximum.max((left - right).abs())
-            });
+
+        execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Device)
+            .expect("admitted device warm-up must execute without a host retry");
+
+        let mut max_error = 0.0_f64;
+        for pass in 0..MEASURED_PASSES {
+            let device = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Device)
+                .unwrap_or_else(|error| {
+                    panic!("admitted device pass {pass} must execute without a host retry: {error}")
+                });
+            max_error = cpu
+                .first
+                .iter()
+                .chain(&cpu.second)
+                .chain(&cpu.beta)
+                .chain(&cpu.beta_mixed)
+                .zip(
+                    device
+                        .first
+                        .iter()
+                        .chain(&device.second)
+                        .chain(&device.beta)
+                        .chain(&device.beta_mixed),
+                )
+                .fold(max_error, |maximum, (left, right)| {
+                    maximum.max((left - right).abs())
+                });
+        }
+        let outputs_per_pass =
+            cpu.first.len() + cpu.second.len() + cpu.beta.len() + cpu.beta_mixed.len();
+        eprintln!(
+            "SAE_ROWJET_GPU_ACCEPT rows={ROW_COUNT} measured_passes={MEASURED_PASSES} outputs_per_pass={outputs_per_pass} max_abs_error={max_error:.17e}"
+        );
         assert!(
             max_error <= 1.0e-12,
             "complete SAE device/CPU row-jet error {max_error:e} exceeds 1e-12"

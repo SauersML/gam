@@ -121,10 +121,9 @@ use gam_linalg::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, rrqr_nullspace
 
 use super::{
     AnisoBasisPsiDerivatives, AnisoPenaltyCrossProvider, BasisBuildResult, BasisError,
-    BasisMetadata, CenterStrategy, PenaltyCandidate, PenaltySource,
-    filter_active_penalty_candidates_with_ops, normalize_penalty,
-    normalize_penalty_cross_psi_derivative, normalize_penaltywith_psi_derivatives,
-    select_centers_by_strategy, trace_of_product,
+    BasisMetadata, CenterStrategy, PenaltyCandidate, PenaltySource, filter_penalty_candidates,
+    normalize_penalty, normalize_penalty_cross_psi_derivative,
+    normalize_penaltywith_psi_derivatives, select_centers_by_strategy, trace_of_product,
 };
 
 /// Truncation radius of the Gaussian profile in units of the scale ε: weights
@@ -1806,7 +1805,6 @@ pub fn build_measure_jet_basis(
             raw_penalty_normalization_scales.push(c_l / scale_weight);
             candidates.push(PenaltyCandidate {
                 matrix: s_norm,
-                nullspace_dim_hint: 0,
                 source: PenaltySource::Other(format!("measure_jet_scale_{level}")),
                 normalization_scale: c_l,
                 kronecker_factors: None,
@@ -1831,7 +1829,6 @@ pub fn build_measure_jet_basis(
         fused_penalty_normalization_scale = Some(c_primary);
         candidates.push(PenaltyCandidate {
             matrix: penalty_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::Primary,
             normalization_scale: c_primary,
             kronecker_factors: None,
@@ -1848,24 +1845,21 @@ pub fn build_measure_jet_basis(
         let (null_penalty_norm, c_null) = normalize_penalty(&null_penalty);
         candidates.push(PenaltyCandidate {
             matrix: null_penalty_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: c_null,
             kronecker_factors: None,
             op: None,
         });
     }
-    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
     // #2225: compute the errors-in-variables input-noise scale while `centers`
     // is still owned; it is moved into the metadata `centers` field below.
     let sigma_coord = measure_jet_input_noise_scale(data, centers.view())?;
     Ok(BasisBuildResult {
         design,
         affine_offset: None,
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
+        active_penalties: filtered.active,
+        dropped_penalties: filtered.dropped,
         metadata: BasisMetadata::MeasureJet {
             centers,
             input_scales: None,
@@ -1889,8 +1883,6 @@ pub fn build_measure_jet_basis(
             sigma_coord,
         },
         kronecker_factored: None,
-        ops,
-        null_eigenvectors,
         joint_null_rotation: None,
     })
 }

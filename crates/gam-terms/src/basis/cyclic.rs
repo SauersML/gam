@@ -240,7 +240,6 @@ mod closure_tests {
         }
     }
 
-
     /// The periodic cardinal basis is a function of phase `(x-start)/period`,
     /// not the physical units used to express that phase. Include exact seam
     /// points and wrapped points one period outside the declared interval.
@@ -251,14 +250,9 @@ mod closure_tests {
         let start = -0.4_f64;
         let end = 1.6_f64;
         let points = Array1::from(vec![-2.4, -0.4, -0.13, 0.2, 1.1, 1.6, 3.6]);
-        let (reference, reference_knots) = create_cyclic_bspline_basis_dense(
-            points.view(),
-            start,
-            end,
-            degree,
-            num_basis,
-        )
-        .unwrap();
+        let (reference, reference_knots) =
+            create_cyclic_bspline_basis_dense(points.view(), start, end, degree, num_basis)
+                .unwrap();
         assert!(
             reference.iter().any(|value| value > &0.5),
             "cardinal fixture must contain a dominant local basis weight"

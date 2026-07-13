@@ -252,7 +252,6 @@ pub fn build_thin_plate_basiswithworkspace(
         let (penalty_bending_norm, c_bending) = normalize_penalty(&penalty_bending);
         let mut candidates = vec![PenaltyCandidate {
             matrix: penalty_bending_norm,
-            nullspace_dim_hint: poly_cols,
             source: PenaltySource::Primary,
             normalization_scale: c_bending,
             kronecker_factors: None,
@@ -262,7 +261,6 @@ pub fn build_thin_plate_basiswithworkspace(
             let (penalty_ridge_norm, c_ridge) = normalize_penalty(&penalty_ridge);
             candidates.push(PenaltyCandidate {
                 matrix: penalty_ridge_norm,
-                nullspace_dim_hint: 0,
                 source: PenaltySource::DoublePenaltyNullspace,
                 normalization_scale: c_ridge,
                 kronecker_factors: None,
@@ -304,7 +302,6 @@ pub fn build_thin_plate_basiswithworkspace(
         let (penalty_bending_norm, c_bending) = normalize_penalty(&tps.penalty_bending);
         let mut candidates = vec![PenaltyCandidate {
             matrix: penalty_bending_norm,
-            nullspace_dim_hint: tps.num_polynomial_basis,
             source: PenaltySource::Primary,
             normalization_scale: c_bending,
             kronecker_factors: None,
@@ -314,7 +311,6 @@ pub fn build_thin_plate_basiswithworkspace(
             let (penalty_ridge_norm, c_ridge) = normalize_penalty(&tps.penalty_ridge);
             candidates.push(PenaltyCandidate {
                 matrix: penalty_ridge_norm,
-                nullspace_dim_hint: 0,
                 source: PenaltySource::DoublePenaltyNullspace,
                 normalization_scale: c_ridge,
                 kronecker_factors: None,
@@ -338,7 +334,6 @@ pub fn build_thin_plate_basiswithworkspace(
             .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
                 let matrix = gauge.restrict_penalty(&candidate.matrix);
                 Ok(PenaltyCandidate {
-                    nullspace_dim_hint: candidate.nullspace_dim_hint,
                     matrix,
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale,
@@ -391,16 +386,12 @@ pub fn build_thin_plate_basiswithworkspace(
             }
         }
     }
-    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
         affine_offset: None,
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
-        ops,
-        null_eigenvectors,
+        active_penalties: filtered.active,
+        dropped_penalties: filtered.dropped,
         joint_null_rotation: None,
         metadata: BasisMetadata::ThinPlate {
             centers: original_centers,
@@ -462,7 +453,6 @@ pub fn thin_plate_penalties_at_length_scale(
     let (penalty_bending_norm, c_bending) = normalize_penalty(&penalty_bending);
     let mut candidates = vec![PenaltyCandidate {
         matrix: penalty_bending_norm,
-        nullspace_dim_hint: poly_cols,
         source: PenaltySource::Primary,
         normalization_scale: c_bending,
         kronecker_factors: None,
@@ -472,7 +462,6 @@ pub fn thin_plate_penalties_at_length_scale(
         let (penalty_ridge_norm, c_ridge) = normalize_penalty(&penalty_ridge);
         candidates.push(PenaltyCandidate {
             matrix: penalty_ridge_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: c_ridge,
             kronecker_factors: None,
@@ -487,7 +476,6 @@ pub fn thin_plate_penalties_at_length_scale(
             .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
                 let matrix = gauge.restrict_penalty(&candidate.matrix);
                 Ok(PenaltyCandidate {
-                    nullspace_dim_hint: candidate.nullspace_dim_hint,
                     matrix,
                     source: candidate.source,
                     normalization_scale: candidate.normalization_scale,
@@ -536,9 +524,19 @@ pub fn thin_plate_penalties_at_length_scale(
             }
         }
     }
-    let (penalties, nullspace_dims, _info, _eig, _ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
-    Ok((penalties, nullspace_dims))
+    let filtered = filter_penalty_candidates(candidates)?;
+    Ok((
+        filtered
+            .active
+            .iter()
+            .map(|penalty| penalty.matrix.clone())
+            .collect(),
+        filtered
+            .active
+            .iter()
+            .map(|penalty| penalty.nullity)
+            .collect(),
+    ))
 }
 
 /// Canonical domain guard for Matérn kernel evaluations: distance `r` must be
@@ -1572,7 +1570,6 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
     let candidates = vec![
         PenaltyCandidate {
             matrix: s0_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
@@ -1580,7 +1577,6 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
         },
         PenaltyCandidate {
             matrix: s1_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
@@ -1588,20 +1584,19 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
         },
         PenaltyCandidate {
             matrix: s2_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
             op: None,
         },
     ];
-    let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
 
     // Build per-axis results.
     let mut per_axis_results = Vec::with_capacity(dim);
     for a in 0..dim {
         let pen_first = active_operator_penalty_derivatives(
-            &penaltyinfo,
+            &filtered.active,
             &[
                 op0_info.s_first[a].clone(),
                 op1_info.s_first[a].clone(),
@@ -1610,7 +1605,7 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
             "Matérn-aniso",
         )?;
         let pen_second = active_operator_penalty_derivatives(
-            &penaltyinfo,
+            &filtered.active,
             &[
                 op0_info.s_second[a].clone(),
                 op1_info.s_second[a].clone(),
@@ -2728,7 +2723,6 @@ pub fn operator_penalty_candidates_closed_form(
         let (s0, c0) = normalize_penalty(&symmetrize(&centered_design_gram(d0)));
         out.push(PenaltyCandidate {
             matrix: s0,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
@@ -2756,7 +2750,6 @@ pub fn operator_penalty_candidates_closed_form(
         let op = make_op(1, c1);
         out.push(PenaltyCandidate {
             matrix: s1,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
@@ -2784,7 +2777,6 @@ pub fn operator_penalty_candidates_closed_form(
         let op = make_op(2, c2);
         out.push(PenaltyCandidate {
             matrix: s2,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
@@ -2929,7 +2921,6 @@ pub fn operator_penalty_candidates_closed_form_pure(
         let (s0, c0) = normalize_penalty(&symmetrize(&centered_design_gram(d0)));
         out.push(PenaltyCandidate {
             matrix: s0,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
@@ -2954,7 +2945,6 @@ pub fn operator_penalty_candidates_closed_form_pure(
         let (s1, c1) = normalize_penalty(&s1_raw);
         out.push(PenaltyCandidate {
             matrix: s1,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
@@ -2979,7 +2969,6 @@ pub fn operator_penalty_candidates_closed_form_pure(
         let (s2, c2) = normalize_penalty(&s2_raw);
         out.push(PenaltyCandidate {
             matrix: s2,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
@@ -3003,7 +2992,6 @@ pub(crate) fn operator_penalty_candidates_from_collocation(
     if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
         out.push(PenaltyCandidate {
             matrix: s0,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
@@ -3013,7 +3001,6 @@ pub(crate) fn operator_penalty_candidates_from_collocation(
     if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
         out.push(PenaltyCandidate {
             matrix: s1,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
@@ -3023,7 +3010,6 @@ pub(crate) fn operator_penalty_candidates_from_collocation(
     if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
         out.push(PenaltyCandidate {
             matrix: s2,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
@@ -3034,7 +3020,7 @@ pub(crate) fn operator_penalty_candidates_from_collocation(
 }
 
 pub(crate) fn active_operator_penalty_derivatives(
-    penaltyinfo: &[PenaltyInfo],
+    penalties: &[ActivePenalty],
     operator_derivatives: &[Array2<f64>],
     label: &str,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
@@ -3045,10 +3031,9 @@ pub(crate) fn active_operator_penalty_derivatives(
         );
     }
 
-    penaltyinfo
+    penalties
         .iter()
-        .filter(|info| info.active)
-        .map(|info| match &info.source {
+        .map(|penalty| match &penalty.info.source {
             PenaltySource::OperatorMass => Ok(operator_derivatives[0].clone()),
             PenaltySource::OperatorTension => Ok(operator_derivatives[1].clone()),
             PenaltySource::OperatorStiffness => Ok(operator_derivatives[2].clone()),
@@ -3525,7 +3510,6 @@ pub(crate) fn project_penalty_matrix(
 
 pub(crate) fn normalize_penalty_candidate(
     matrix: Array2<f64>,
-    nullspace_dim_hint: usize,
     source: PenaltySource,
 ) -> PenaltyCandidate {
     let (matrix, normalization_scale) = if matrix.iter().all(|v| v.abs() <= 1e-12) {
@@ -3535,7 +3519,6 @@ pub(crate) fn normalize_penalty_candidate(
     };
     PenaltyCandidate {
         matrix,
-        nullspace_dim_hint,
         source,
         normalization_scale,
         kronecker_factors: None,

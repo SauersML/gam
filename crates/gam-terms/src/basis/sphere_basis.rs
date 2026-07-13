@@ -106,7 +106,6 @@ pub fn build_spherical_spline_basis(
     let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
     let mut candidates = vec![PenaltyCandidate {
         matrix: penalty_norm,
-        nullspace_dim_hint: 0,
         source: PenaltySource::Primary,
         normalization_scale: c_primary,
         kronecker_factors: None,
@@ -117,7 +116,6 @@ pub fn build_spherical_spline_basis(
             let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
             candidates.push(PenaltyCandidate {
                 matrix: ridge_norm,
-                nullspace_dim_hint: 0,
                 source: PenaltySource::DoublePenaltyNullspace,
                 normalization_scale: c_ridge,
                 kronecker_factors: None,
@@ -125,14 +123,12 @@ pub fn build_spherical_spline_basis(
             });
         }
     }
-    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
         affine_offset: None,
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
+        active_penalties: filtered.active,
+        dropped_penalties: filtered.dropped,
         metadata: BasisMetadata::Sphere {
             centers,
             penalty_order: spec.penalty_order,
@@ -142,8 +138,6 @@ pub fn build_spherical_spline_basis(
             constraint_transform: Some(z),
         },
         kronecker_factored: None,
-        ops,
-        null_eigenvectors,
         joint_null_rotation: None,
     })
 }
@@ -690,7 +684,6 @@ pub(crate) fn build_spherical_harmonic_basis(
 
     let mut candidates = vec![PenaltyCandidate {
         matrix: penalty,
-        nullspace_dim_hint: 0,
         source: PenaltySource::Primary,
         normalization_scale: 1.0,
         kronecker_factors: None,
@@ -700,21 +693,18 @@ pub(crate) fn build_spherical_harmonic_basis(
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
             matrix: ridge_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: c_ridge,
             kronecker_factors: None,
             op: None,
         });
     }
-    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design)),
         affine_offset: None,
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
+        active_penalties: filtered.active,
+        dropped_penalties: filtered.dropped,
         metadata: BasisMetadata::Sphere {
             centers: Array2::<f64>::zeros((0, 2)),
             penalty_order: spec.penalty_order,
@@ -724,8 +714,6 @@ pub(crate) fn build_spherical_harmonic_basis(
             constraint_transform: Some(transform),
         },
         kronecker_factored: None,
-        ops,
-        null_eigenvectors,
         joint_null_rotation: None,
     })
 }
@@ -864,11 +852,7 @@ pub(crate) fn build_matern_basis_seeded(
                 spec.include_intercept,
                 full_transform.as_ref(),
             )?;
-            matern_double_penalty_candidates(
-                &primary,
-                &function_gram,
-                spec.include_intercept,
-            )?
+            matern_double_penalty_candidates(&primary, &function_gram, spec.include_intercept)?
         } else {
             build_matern_operator_penalty_candidates(
                 centers.view(),
@@ -952,11 +936,7 @@ pub(crate) fn build_matern_basis_seeded(
                 spec.include_intercept,
                 full_transform.as_ref(),
             )?;
-            matern_double_penalty_candidates(
-                &primary,
-                &function_gram,
-                spec.include_intercept,
-            )?
+            matern_double_penalty_candidates(&primary, &function_gram, spec.include_intercept)?
         } else {
             build_matern_operator_penalty_candidates(
                 centers.view(),
@@ -999,14 +979,12 @@ pub(crate) fn build_matern_basis_seeded(
         };
         (design, candidates)
     };
-    let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
         affine_offset: None,
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
+        active_penalties: filtered.active,
+        dropped_penalties: filtered.dropped,
         metadata: BasisMetadata::Matern {
             centers: original_centers,
             length_scale: spec.length_scale,
@@ -1018,8 +996,6 @@ pub(crate) fn build_matern_basis_seeded(
             aniso_log_scales: aniso,
         },
         kronecker_factored: None,
-        ops,
-        null_eigenvectors,
         joint_null_rotation: None,
     })
 }
@@ -1602,7 +1578,6 @@ pub fn build_matern_operator_penalty_psi_derivatives(
         }
         candidates.push(PenaltyCandidate {
             matrix,
-            nullspace_dim_hint: 0,
             source,
             normalization_scale,
             kronecker_factors: None,
@@ -1614,14 +1589,14 @@ pub fn build_matern_operator_penalty_psi_derivatives(
     // `[mass, tension, stiffness]` triple, so a gated-out (or rank-0-dropped)
     // operator is simply never requested and the returned derivative list stays
     // index-aligned with the forward penalty list.
-    let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
     let penalties_derivative = active_operator_penalty_derivatives(
-        &penaltyinfo,
+        &filtered.active,
         &[s0_norm_psi, s1_norm_psi, s2_norm_psi],
         "Matérn",
     )?;
     let penaltiessecond_derivative = active_operator_penalty_derivatives(
-        &penaltyinfo,
+        &filtered.active,
         &[s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi],
         "Matérn",
     )?;
@@ -2041,7 +2016,6 @@ pub fn build_duchon_operator_penalty_psi_derivatives(
     let candidates = vec![
         PenaltyCandidate {
             matrix: s0_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorMass,
             normalization_scale: c0,
             kronecker_factors: None,
@@ -2049,7 +2023,6 @@ pub fn build_duchon_operator_penalty_psi_derivatives(
         },
         PenaltyCandidate {
             matrix: s1_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorTension,
             normalization_scale: c1,
             kronecker_factors: None,
@@ -2057,7 +2030,6 @@ pub fn build_duchon_operator_penalty_psi_derivatives(
         },
         PenaltyCandidate {
             matrix: s2_norm,
-            nullspace_dim_hint: 0,
             source: PenaltySource::OperatorStiffness,
             normalization_scale: c2,
             kronecker_factors: None,
@@ -2072,16 +2044,16 @@ pub fn build_duchon_operator_penalty_psi_derivatives(
     let first_derivs = vec![s0_norm_psi, s1_norm_psi, s2_norm_psi];
     let second_derivs = vec![s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi];
 
-    let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
-    let active_sources = penaltyinfo
+    let filtered = filter_penalty_candidates(candidates)?;
+    let active_sources = filtered
+        .active
         .iter()
-        .filter(|info| info.active)
-        .map(|info| info.source.clone())
+        .map(|penalty| penalty.info.source.clone())
         .collect::<Vec<_>>();
     let penalties_derivative =
-        active_operator_penalty_derivatives(&penaltyinfo, &first_derivs, "Duchon")?;
+        active_operator_penalty_derivatives(&filtered.active, &first_derivs, "Duchon")?;
     let penaltiessecond_derivative =
-        active_operator_penalty_derivatives(&penaltyinfo, &second_derivs, "Duchon")?;
+        active_operator_penalty_derivatives(&filtered.active, &second_derivs, "Duchon")?;
     Ok((
         active_sources,
         penalties_derivative,
@@ -2304,13 +2276,13 @@ pub fn build_duchon_native_penalty_psi_derivatives(
         &z,
         identifiability_transform,
     )?;
-    let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+    let filtered = filter_penalty_candidates(candidates)?;
     let mut sources = Vec::new();
     let mut first = Vec::new();
     let mut second = Vec::new();
-    for info in penaltyinfo.iter().filter(|info| info.active) {
-        sources.push(info.source.clone());
-        match info.source {
+    for penalty in &filtered.active {
+        sources.push(penalty.info.source.clone());
+        match penalty.info.source {
             PenaltySource::Primary => {
                 first.push(primary_psi_norm.clone());
                 second.push(primary_psi_psi_norm.clone());
@@ -2601,9 +2573,8 @@ pub(crate) fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
             &symmetrize(&penalty_psi),
             &symmetrize(&penalty_psi_psi),
         );
-    let (_, _, penaltyinfo) = filter_active_penalty_candidates(vec![PenaltyCandidate {
+    let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
         matrix: penalty_norm,
-        nullspace_dim_hint: 1,
         source: PenaltySource::Primary,
         normalization_scale,
         kronecker_factors: None,
@@ -2611,8 +2582,8 @@ pub(crate) fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
     }])?;
     let mut penalties_derivative = Vec::new();
     let mut penaltiessecond_derivative = Vec::new();
-    for info in penaltyinfo.iter().filter(|info| info.active) {
-        match info.source {
+    for penalty in &filtered.active {
+        match penalty.info.source {
             PenaltySource::Primary => {
                 penalties_derivative.push(penalty_norm_psi.clone());
                 penaltiessecond_derivative.push(penalty_norm_psi_psi.clone());
@@ -2833,14 +2804,13 @@ pub(crate) fn build_matern_double_penalty_primarywith_psi_derivatives(
 /// the projected-kernel-Gram derivative; the `DoublePenaltyNullspace` block
 /// uses the exact spectral-projector derivative (#1122) supplied per block.
 pub(crate) fn active_matern_double_penalty_derivatives(
-    penaltyinfo: &[PenaltyInfo],
+    penalties: &[ActivePenalty],
     primary_derivative: &Array2<f64>,
     shrinkage_derivative: &Array2<f64>,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
-    penaltyinfo
+    penalties
         .iter()
-        .filter(|info| info.active)
-        .map(|info| match &info.source {
+        .map(|penalty| match &penalty.info.source {
             PenaltySource::Primary => Ok(primary_derivative.clone()),
             PenaltySource::DoublePenaltyNullspace => Ok(shrinkage_derivative.clone()),
             other => Err(BasisError::InvalidInput(format!(
@@ -2941,12 +2911,12 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
             )?;
         (
             active_matern_double_penalty_derivatives(
-                &base.penaltyinfo,
+                &base.active_penalties,
                 &primary_derivative,
                 &shrinkage_first,
             )?,
             active_matern_double_penalty_derivatives(
-                &base.penaltyinfo,
+                &base.active_penalties,
                 &primarysecond_derivative,
                 &shrinkagesecond,
             )?,
@@ -3236,8 +3206,11 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         // Reuse the value build already constructed at the top of this function
         // (its metadata seeded the realized geometry) — `base.penaltyinfo` is the
         // active-block mask sized to the realized (reduced) basis.
-        let has_shrinkage = base.penaltyinfo.iter().any(|info| {
-            info.active && matches!(info.source, PenaltySource::DoublePenaltyNullspace)
+        let has_shrinkage = base.active_penalties.iter().any(|penalty| {
+            matches!(
+                penalty.info.source,
+                PenaltySource::DoublePenaltyNullspace
+            )
         });
         // The value path emits each block after Frobenius normalization. Keep
         // the raw center kernel and its exact axis derivatives for both the
@@ -3295,12 +3268,12 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         result.penalties_second_diag = Vec::with_capacity(dim);
         for a in 0..dim {
             let pf = active_matern_double_penalty_derivatives(
-                &base.penaltyinfo,
+                &base.active_penalties,
                 &primary_first[a],
                 &shrinkage_first[a],
             )?;
             let ps = active_matern_double_penalty_derivatives(
-                &base.penaltyinfo,
+                &base.active_penalties,
                 &primary_second_diag[a],
                 &shrinkage_second_diag[a],
             )?;
@@ -3313,7 +3286,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let gauge_owned = z_opt
             .as_ref()
             .map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
-        let penaltyinfo = base.penaltyinfo.clone();
+        let active_penalties = base.active_penalties.clone();
         let length_scale = spec.length_scale;
         let nu = spec.nu;
         let primary_first_raw_owned = primary_first_raw.clone();
@@ -3360,8 +3333,11 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                 // Exact mixed derivative of the function-metric ridge. The
                 // structural intercept frame is fixed; only the compact center
                 // Gram moves with the two anisotropy axes.
-                let shrinkage_cross = if penaltyinfo.iter().any(|info| {
-                    info.active && matches!(info.source, PenaltySource::DoublePenaltyNullspace)
+                let shrinkage_cross = if active_penalties.iter().any(|penalty| {
+                    matches!(
+                        penalty.info.source,
+                        PenaltySource::DoublePenaltyNullspace
+                    )
                 }) {
                     let jet = matern_center_function_metric_jet(
                         &kernel_block_owned,
@@ -3382,7 +3358,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                     Array2::<f64>::zeros((total_cols, total_cols))
                 };
                 active_matern_double_penalty_derivatives(
-                    &penaltyinfo,
+                    &active_penalties,
                     &primary_cross,
                     &shrinkage_cross,
                 )

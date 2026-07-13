@@ -1424,9 +1424,9 @@ mod tests {
             NutsFamily::GammaLog => {
                 LikelihoodScaleMetadata::EstimatedGammaShape { shape: parameter }
             }
-            NutsFamily::BinomialLogit
-            | NutsFamily::BinomialProbit
-            | NutsFamily::PoissonLog => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            NutsFamily::BinomialLogit | NutsFamily::BinomialProbit | NutsFamily::PoissonLog => {
+                LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
+            }
         };
         GlmLikelihoodSpec { spec, scale }
     }

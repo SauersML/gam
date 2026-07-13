@@ -374,8 +374,8 @@ fn bc_bspline_columns_drop_by_constraint_count() {
 #[test]
 fn bc_bspline_realizes_nonzero_anchor_as_affine_lift() {
     use BSplineEndpointBoundaryCondition::{Anchored, Free};
-    let built = build_bc(20, 8, Anchored { value: 1.5 }, Free)
-        .expect("non-zero anchor should build");
+    let built =
+        build_bc(20, 8, Anchored { value: 1.5 }, Free).expect("non-zero anchor should build");
     let affine = built
         .affine_offset
         .as_ref()

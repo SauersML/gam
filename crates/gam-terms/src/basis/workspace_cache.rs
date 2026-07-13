@@ -423,7 +423,6 @@ pub(crate) fn matern_double_penalty_candidates(
     }
     let mut candidates = vec![normalize_penalty_candidate(
         primary.clone(),
-        0,
         PenaltySource::Primary,
     )];
     // K_CC is strictly positive definite after center rank reduction. The ONLY
@@ -438,7 +437,6 @@ pub(crate) fn matern_double_penalty_candidates(
         let shrinkage = function_space_subspace_shrinkage(&intercept_frame, function_gram)?;
         candidates.push(normalize_penalty_candidate(
             shrinkage,
-            0,
             PenaltySource::DoublePenaltyNullspace,
         ));
     }
@@ -1244,8 +1242,8 @@ mod matern_function_metric_tests {
         embedded.slice_mut(s![0..3, 0..3]).assign(&center_kernel);
         let gram =
             matern_center_function_gram(&embedded, true, None).expect("raw center function Gram");
-        let base = matern_double_penalty_candidates(&embedded, &gram, true)
-            .expect("raw candidates");
+        let base =
+            matern_double_penalty_candidates(&embedded, &gram, true).expect("raw candidates");
         assert_eq!(base.len(), 2);
         let raw_ridge = &base[1].matrix * base[1].normalization_scale;
 

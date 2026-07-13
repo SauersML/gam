@@ -1290,8 +1290,14 @@ mod tests {
         let z = Order2Graph::<4>::variable(1.1, 2, 4, &workspace);
         let linear = Order2Graph::linear_combination(&[z, x, z], &[0.3, -0.7, 1.1], 4, &workspace)
             .into_order2();
+        let close = |actual: f64, expected: f64| {
+            let tolerance = 2.0e-13 * actual.abs().max(expected.abs()).max(1.0);
+            assert!((actual - expected).abs() <= tolerance);
+        };
         assert!((linear.value() - 1.26).abs() <= 2.0e-13);
-        assert_eq!(linear.g(), &[-0.7, 0.0, 1.4, 0.0]);
+        for (actual, expected) in linear.g().iter().zip([-0.7, 0.0, 1.4, 0.0]) {
+            close(*actual, expected);
+        }
         assert!(linear.h().iter().flatten().all(|&channel| channel == 0.0));
         let coefficients = MatrixFreeDense3 {
             matrix: [[1.2, -0.3, 0.25], [-0.3, 0.8, 0.17], [0.25, 0.17, 1.4]],
@@ -1311,10 +1317,6 @@ mod tests {
             &arena,
         );
 
-        let close = |actual: f64, expected: f64| {
-            let tolerance = 2.0e-13 * actual.abs().max(expected.abs()).max(1.0);
-            assert!((actual - expected).abs() <= tolerance);
-        };
         close(graph.value(), eager.v);
         for primary in 0..4 {
             close(graph.g()[primary], eager.g()[primary]);

@@ -1795,11 +1795,9 @@ mod tests {
                                 + 8.0 * q_to_f64(fp1).abs()
                                 + q_to_f64(fp2).abs())
                                 / (12.0 * h);
-                            let fd_roundoff_allowance =
-                                64.0 * Quad::EPSILON.0 * stencil_condition;
-                            let fd_allowance = 2.0e-12 * condition
-                                + fd_roundoff_allowance
-                                + 1.0e-300;
+                            let fd_roundoff_allowance = 64.0 * Quad::EPSILON.0 * stencil_condition;
+                            let fd_allowance =
+                                2.0e-12 * condition + fd_roundoff_allowance + 1.0e-300;
                             max_fd_conditioned_error =
                                 max_fd_conditioned_error.max(fd_error / fd_allowance);
                             assert!(

@@ -477,13 +477,7 @@ mod knot_scale_invariance_tests {
     fn full_basis_vector_at(x: f64, knots: ArrayView1<f64>, degree: usize) -> Vec<f64> {
         let mut values = vec![0.0; knots.len() - degree - 1];
         let mut scratch = BsplineScratch::new(degree);
-        evaluate_splines_at_point_full_support_into(
-            x,
-            degree,
-            knots,
-            &mut values,
-            &mut scratch,
-        );
+        evaluate_splines_at_point_full_support_into(x, degree, knots, &mut values, &mut scratch);
         values
     }
 
@@ -539,8 +533,7 @@ mod knot_scale_invariance_tests {
             );
             for scale in [1e-9_f64, 1.0, 1e9] {
                 let scaled_knots = clamped_cubic_knots(scale);
-                let scaled =
-                    full_basis_vector_at(frac * scale, scaled_knots.view(), degree);
+                let scaled = full_basis_vector_at(frac * scale, scaled_knots.view(), degree);
                 for (basis_idx, (&actual, &expected)) in
                     scaled.iter().zip(reference.iter()).enumerate()
                 {
@@ -563,8 +556,7 @@ mod knot_scale_invariance_tests {
             let mut d1 = vec![0.0; num_basis];
             let mut d2 = vec![0.0; num_basis];
             evaluate_bspline_derivative_scalar(frac, knots.view(), degree, &mut d1).unwrap();
-            evaluate_bsplinesecond_derivative_scalar(frac, knots.view(), degree, &mut d2)
-                .unwrap();
+            evaluate_bsplinesecond_derivative_scalar(frac, knots.view(), degree, &mut d2).unwrap();
             assert!(d1.iter().any(|value| value.abs() > 0.1));
             assert!(d2.iter().any(|value| value.abs() > 0.1));
 

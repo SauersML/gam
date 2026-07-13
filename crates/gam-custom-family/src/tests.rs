@@ -9094,16 +9094,8 @@ pub(crate) fn per_penalty_edf_uses_realized_penalty_rank_2288() {
             design: DesignMatrix::from(Array2::<f64>::zeros((2, 3))),
             offset: Array1::zeros(2),
             penalties: vec![
-                PenaltyMatrix::Dense(array![
-                    [1.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0],
-                ]),
-                PenaltyMatrix::Dense(array![
-                    [0.0, 0.0, 0.0],
-                    [0.0, 2.0, 0.0],
-                    [0.0, 0.0, 3.0],
-                ]),
+                PenaltyMatrix::Dense(array![[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],]),
+                PenaltyMatrix::Dense(array![[0.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0],]),
             ],
             // Empty is deliberate: canonicalization clears pre-transform
             // nullities, so rank must come from the realized roots.
@@ -9120,16 +9112,8 @@ pub(crate) fn per_penalty_edf_uses_realized_penalty_rank_2288() {
             design: DesignMatrix::from(Array2::<f64>::zeros((2, 3))),
             offset: Array1::zeros(2),
             penalties: vec![
-                PenaltyMatrix::Dense(array![
-                    [4.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0],
-                ]),
-                PenaltyMatrix::Dense(array![
-                    [0.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0],
-                    [0.0, 0.0, 2.0],
-                ]),
+                PenaltyMatrix::Dense(array![[4.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],]),
+                PenaltyMatrix::Dense(array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0],]),
             ],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.25_f64.ln(), 2.0_f64.ln()],
