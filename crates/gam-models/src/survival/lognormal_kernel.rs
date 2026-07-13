@@ -67,6 +67,36 @@ pub enum HazardLoading {
 ///    K_{k,m}(μ, σ) kernel terms.
 ///
 /// These are mathematically distinct families.  Do not mix them.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "scale_kind", rename_all = "kebab-case")]
+pub enum FrailtyScale {
+    Fixed { sigma: f64 },
+    Learned { initial_sigma: f64 },
+}
+
+impl FrailtyScale {
+    fn validate(self, kind: &str) -> Result<(), LognormalKernelError> {
+        match self {
+            Self::Fixed { sigma } if sigma.is_finite() && sigma >= 0.0 => Ok(()),
+            Self::Fixed { sigma } => Err(LognormalKernelError::InvalidSpec {
+                reason: format!(
+                    "{kind} frailty Fixed scale requires finite sigma >= 0, got {sigma}"
+                ),
+            }),
+            Self::Learned { initial_sigma }
+                if initial_sigma.is_finite() && initial_sigma > 0.0 =>
+            {
+                Ok(())
+            }
+            Self::Learned { initial_sigma } => Err(LognormalKernelError::InvalidSpec {
+                reason: format!(
+                    "{kind} frailty Learned scale requires finite initial_sigma > 0, got {initial_sigma}"
+                ),
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "frailty_kind", rename_all = "kebab-case")]
 pub enum FrailtySpec {
@@ -77,14 +107,12 @@ pub enum FrailtySpec {
     /// Exact for probit: E[Φ(η + U)] = Φ(η / √(1+σ²)).
     /// The existing sextic microcell kernel is preserved.
     GaussianShift {
-        /// Fixed σ, or None if learnable.
-        sigma_fixed: Option<f64>,
+        scale: FrailtyScale,
     },
     /// Lognormal hazard multiplier: conditional hazard h(t|U) involves exp(U).
     /// Exact for PH/cloglog/survival via K_{k,m} kernel.
     HazardMultiplier {
-        /// Fixed σ, or None if learnable.
-        sigma_fixed: Option<f64>,
+        scale: FrailtyScale,
         /// How the multiplier loads onto hazard components.
         loading: HazardLoading,
     },
@@ -103,51 +131,12 @@ impl FrailtySpec {
 
     /// Validate the frailty scale domain independently of a model family.
     pub fn validate(&self) -> Result<(), LognormalKernelError> {
-        let (kind, sigma) = match self {
+        let (kind, scale) = match self {
             Self::None => return Ok(()),
-            Self::GaussianShift { sigma_fixed } => ("GaussianShift", sigma_fixed),
-            Self::HazardMultiplier { sigma_fixed, .. } => ("HazardMultiplier", sigma_fixed),
+            Self::GaussianShift { scale } => ("GaussianShift", *scale),
+            Self::HazardMultiplier { scale, .. } => ("HazardMultiplier", *scale),
         };
-        if let Some(sigma) = sigma
-            && (!sigma.is_finite() || *sigma < 0.0)
-        {
-            return Err(LognormalKernelError::InvalidSpec {
-                reason: format!("{kind} frailty requires a finite fixed sigma >= 0, got {sigma}"),
-            });
-        }
-        Ok(())
-    }
-
-    /// Resolve the exact frailty subset supported by Gaussian-shift
-    /// marginal-slope models.
-    ///
-    /// These models admit either no frailty or a Gaussian shift with a fixed
-    /// standard deviation. A learnable Gaussian-shift scale and the
-    /// structurally different hazard-multiplier frailty require other fitting
-    /// machinery and are rejected here at the type that owns those states.
-    pub fn resolve_fixed_gaussian_shift(
-        &self,
-        context: &str,
-    ) -> Result<Self, LognormalKernelError> {
-        self.validate()?;
-        match self {
-            Self::None => Ok(Self::None),
-            Self::GaussianShift {
-                sigma_fixed: Some(sigma),
-            } => Ok(Self::GaussianShift {
-                sigma_fixed: Some(*sigma),
-            }),
-            Self::GaussianShift { sigma_fixed: None } => Err(LognormalKernelError::InvalidSpec {
-                reason: format!(
-                    "{context} requires a fixed GaussianShift sigma; learnable GaussianShift sigma is not supported"
-                ),
-            }),
-            Self::HazardMultiplier { .. } => Err(LognormalKernelError::InvalidSpec {
-                reason: format!(
-                    "{context} requires GaussianShift frailty or no frailty; HazardMultiplier is a distinct hazard-scale model"
-                ),
-            }),
-        }
+        scale.validate(kind)
     }
 
     /// Validate that this frailty spec is compatible with score_warp/linkwiggle
@@ -1238,47 +1227,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_gaussian_shift_resolution_accepts_only_exact_fixed_states() {
-        assert_eq!(
-            FrailtySpec::None
-                .resolve_fixed_gaussian_shift("marginal-slope")
-                .unwrap(),
-            FrailtySpec::None
-        );
-        let fixed = FrailtySpec::GaussianShift {
-            sigma_fixed: Some(0.75),
-        };
-        assert_eq!(
-            fixed
-                .resolve_fixed_gaussian_shift("marginal-slope")
-                .unwrap(),
-            fixed
-        );
+    fn frailty_scale_validation_distinguishes_fixed_and_learned_domains() {
+        assert!(FrailtySpec::None.validate().is_ok());
         assert!(
-            FrailtySpec::GaussianShift { sigma_fixed: None }
-                .resolve_fixed_gaussian_shift("marginal-slope")
-                .is_err()
+            FrailtySpec::GaussianShift {
+                scale: FrailtyScale::Fixed { sigma: 0.75 },
+            }
+            .validate()
+            .is_ok()
         );
         assert!(
             FrailtySpec::HazardMultiplier {
-                sigma_fixed: Some(0.75),
+                scale: FrailtyScale::Learned { initial_sigma: 0.5 },
                 loading: HazardLoading::Full,
             }
-            .resolve_fixed_gaussian_shift("marginal-slope")
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            FrailtySpec::GaussianShift {
+                scale: FrailtyScale::Fixed { sigma: -0.1 },
+            }
+            .validate()
             .is_err()
         );
         assert!(
             FrailtySpec::GaussianShift {
-                sigma_fixed: Some(-0.1),
+                scale: FrailtyScale::Fixed { sigma: f64::NAN },
             }
-            .resolve_fixed_gaussian_shift("marginal-slope")
+            .validate()
             .is_err()
         );
         assert!(
             FrailtySpec::GaussianShift {
-                sigma_fixed: Some(f64::NAN),
+                scale: FrailtyScale::Learned { initial_sigma: 0.0 },
             }
-            .resolve_fixed_gaussian_shift("marginal-slope")
+            .validate()
+            .is_err()
+        );
+        assert!(
+            FrailtySpec::GaussianShift {
+                scale: FrailtyScale::Learned {
+                    initial_sigma: f64::INFINITY,
+                },
+            }
+            .validate()
             .is_err()
         );
     }
