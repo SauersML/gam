@@ -2830,6 +2830,123 @@ mod tests {
         }
     }
 
+    /// Compare an analytic derivative against its finite-difference oracle with a
+    /// tolerance that is robust when an individual order is near zero. Central-FD
+    /// truncation error is O(h²·‖higher derivative‖), so the absolute floor is
+    /// tied to `block_scale` (the largest magnitude in the derivative ladder)
+    /// rather than to the single order under test, which may legitimately vanish.
+    fn assert_fd_matches(analytic: f64, fd: f64, rel_tol: f64, block_scale: f64) {
+        let tol = rel_tol * fd.abs().max(analytic.abs()) + rel_tol * block_scale;
+        assert!(
+            (analytic - fd).abs() <= tol,
+            "analytic={analytic} fd={fd} diff={} tol={tol} block_scale={block_scale}",
+            (analytic - fd).abs()
+        );
+    }
+
+    fn block_scale(values: &[f64]) -> f64 {
+        values
+            .iter()
+            .fold(0.0_f64, |largest, value| largest.max(value.abs()))
+            .max(1.0)
+    }
+
+    /// #2315 Gap 3: the analytic Matérn radial-derivative ladder must match a
+    /// central finite difference of the adjacent lower order in `r`. `out[k]` is
+    /// `dᵏf/drᵏ`, so `out[k]` is the honest derivative of `out[k-1]`; a
+    /// wrong-exponent or dropped-chain-rule branch (the #2287–#2292 class) fails
+    /// here even when the value `out[0]` looks plausible. The lower order is the
+    /// exact analytic value, so the only residual is the O(h²) FD truncation.
+    #[test]
+    pub(crate) fn matern_block_radial_derivative_ladder_matches_finite_difference_2315() {
+        for (d, ell) in [(1usize, 1usize), (2, 2), (3, 2), (2, 3)] {
+            for kappa in [0.6_f64, 1.4] {
+                for r in [0.7_f64, 1.9] {
+                    let max_order = 3usize;
+                    let f = super::matern_block_radial_derivatives(d, ell, kappa, r, max_order);
+                    let scale = block_scale(&f);
+                    let h = 1e-4;
+                    let f_plus =
+                        super::matern_block_radial_derivatives(d, ell, kappa, r + h, max_order);
+                    let f_minus =
+                        super::matern_block_radial_derivatives(d, ell, kappa, r - h, max_order);
+                    for k in 1..=max_order {
+                        let fd = (f_plus[k - 1] - f_minus[k - 1]) / (2.0 * h);
+                        assert_fd_matches(f[k], fd, 1e-5, scale);
+                    }
+                }
+            }
+        }
+    }
+
+    /// #2315 Gap 3: the Riesz radial-derivative ladder must match a central
+    /// finite difference of the adjacent lower order in `r`, on the smooth
+    /// (non-log) branch. Fractional `j` keeps `2j − d` away from the even-integer
+    /// log dispatch so the whole ladder is analytic in `r`.
+    #[test]
+    pub(crate) fn riesz_block_radial_derivative_ladder_matches_finite_difference_2315() {
+        for d in [1usize, 2, 3] {
+            for j in [1.3_f64, 2.7] {
+                for r in [0.7_f64, 1.9] {
+                    let max_order = 3usize;
+                    let f = super::riesz_block_radial_derivatives(d, j, r, max_order);
+                    let h = 1e-4;
+                    let f_plus = super::riesz_block_radial_derivatives(d, j, r + h, max_order);
+                    let f_minus = super::riesz_block_radial_derivatives(d, j, r - h, max_order);
+                    for k in 1..=max_order {
+                        let fd = (f_plus[k - 1] - f_minus[k - 1]) / (2.0 * h);
+                        assert_relative_close(f[k], fd, 1e-5);
+                    }
+                }
+            }
+        }
+    }
+
+    /// #2315 Gap 3: the isotropic-Duchon κ-partial ladders must match finite
+    /// differences *in κ* of the base radial-derivative ladder, order by order.
+    /// The κ-partial is a per-block power law in κ (see the derivation above the
+    /// production fn), so a wrong `A_j'`/`B_ℓ'` coefficient or a dropped
+    /// `−2ℓκ·M_{ℓ+1}` Matérn-shift term is exactly the silent-derivative class
+    /// #2315 targets. Base order `k` is analytically exact, so the residual is
+    /// the O(h²) central-difference truncation for `_kappa_partial` and O(h²)
+    /// for the second-difference `_kappa_partial2`.
+    #[test]
+    pub(crate) fn isotropic_duchon_kappa_partials_match_finite_difference_2315() {
+        for (d, m, s) in [(1usize, 1usize, 1usize), (2, 2, 1), (3, 2, 2)] {
+            for kappa in [0.8_f64, 1.6] {
+                for r in [0.9_f64, 1.7] {
+                    let max_order = 3usize;
+                    let d1 = super::radial_derivatives_of_isotropic_duchon_kappa_partial(
+                        d, m, s, kappa, r, max_order,
+                    );
+                    let d2 = super::radial_derivatives_of_isotropic_duchon_kappa_partial2(
+                        d, m, s, kappa, r, max_order,
+                    );
+                    let h = 1e-4 * kappa;
+                    let base = |k_shift: f64| {
+                        super::radial_derivatives_of_isotropic_duchon(
+                            d,
+                            m,
+                            s as f64,
+                            kappa + k_shift,
+                            r,
+                            max_order,
+                        )
+                    };
+                    let base_0 = base(0.0);
+                    let base_plus = base(h);
+                    let base_minus = base(-h);
+                    for k in 0..=max_order {
+                        let fd1 = (base_plus[k] - base_minus[k]) / (2.0 * h);
+                        let fd2 = (base_plus[k] - 2.0 * base_0[k] + base_minus[k]) / (h * h);
+                        assert_relative_close(d1[k], fd1, 1e-5);
+                        assert_relative_close(d2[k], fd2, 1e-3);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     pub(crate) fn bessel_i_k_wronskian_holds_for_small_x() {
         for nu in [0.0, 0.3, 1.7, 6.2] {
