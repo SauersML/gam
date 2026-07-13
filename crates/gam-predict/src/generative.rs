@@ -18,6 +18,19 @@ use ndarray::{Array1, ArrayView2};
 use crate::FittedModelPredictExt;
 use crate::input::{build_predict_input_for_model, build_transformation_normal_quantile_grid};
 
+/// Borrowed row inputs for saved-model observation generation.
+pub struct SavedGenerativeInput<'a> {
+    pub data: ArrayView2<'a, f64>,
+    pub col_map: &'a HashMap<String, usize>,
+    pub training_headers: Option<&'a Vec<String>>,
+    pub offset: &'a Array1<f64>,
+    pub offset_noise: &'a Array1<f64>,
+    pub noise_offset_supplied: bool,
+    /// `None` for an unweighted saved model. A weighted saved model requires
+    /// the exact requested-row values from its persisted weight column.
+    pub prior_weights: Option<&'a Array1<f64>>,
+}
+
 /// Typed failures from [`generative_spec_for_saved_model`].
 #[derive(Debug)]
 pub enum SavedGenerativeError {
@@ -161,76 +174,56 @@ fn spline_scan_generative_spec(
 /// command and Python `Model.sample_replicates`.  It never refits, materializes
 /// a scan model as a dense spline, substitutes unit weights, or keeps a second
 /// response-family allowlist at an API boundary.
-#[allow(clippy::too_many_arguments)]
 pub fn generative_spec_for_saved_model(
     model: &FittedModel,
-    data: ArrayView2<'_, f64>,
-    col_map: &HashMap<String, usize>,
-    training_headers: Option<&Vec<String>>,
-    offset: &Array1<f64>,
-    offset_noise: &Array1<f64>,
-    noise_offset_supplied: bool,
-    prior_weights: Option<&Array1<f64>>,
+    request: SavedGenerativeInput<'_>,
 ) -> Result<GenerativeSpec, SavedGenerativeError> {
-    if let Some(spec) = spline_scan_generative_spec(model, data, col_map, prior_weights)? {
-        return Ok(spec);
-    }
-
-    let model_class = model.predict_model_class();
-    if model_class == PredictModelClass::Survival {
-        return Err(SavedGenerativeError::UnsupportedSampler {
-            model_class,
-            family: model.likelihood().pretty_name().to_string(),
-        });
-    }
-    let weights = validated_prior_weights(model, data.nrows(), prior_weights)?;
-    let input = build_predict_input_for_model(
-        model,
+    let SavedGenerativeInput {
         data,
         col_map,
         training_headers,
         offset,
         offset_noise,
         noise_offset_supplied,
-    )
-    .map_err(|reason| SavedGenerativeError::Evaluation {
-        reason: format!("prediction input: {reason}"),
-    })?;
+        prior_weights,
+    } = request;
+    if let Some(spec) = spline_scan_generative_spec(model, data.view(), col_map, prior_weights)? {
+        return Ok(spec);
+    }
 
-    if model_class == PredictModelClass::TransformationNormal {
-        let grid = build_transformation_normal_quantile_grid(
+    let model_class = model.predict_model_class();
+    let weights = validated_prior_weights(model, data.nrows(), prior_weights)?;
+    let predictor_response = || {
+        let input = build_predict_input_for_model(
             model,
-            data,
+            data.view(),
             col_map,
             training_headers,
             offset,
+            offset_noise,
+            noise_offset_supplied,
         )
         .map_err(|reason| SavedGenerativeError::Evaluation {
-            reason: format!("transformation-normal quantile grid: {reason}"),
+            reason: format!("prediction input: {reason}"),
         })?;
-        return Ok(GenerativeSpec {
-            mean: grid.conditional_mean,
-            noise: NoiseModel::TransformationNormalQuantile {
-                grid_y: grid.grid_y,
-                h_grid: grid.h_grid,
-            },
-        });
-    }
-
-    let predictor = model
-        .predictor()
-        .ok_or_else(|| SavedGenerativeError::MissingSavedState {
-            model_class,
-            reason: "canonical predictor could not be reconstructed".to_string(),
+        let predictor =
+            model
+                .predictor()
+                .ok_or_else(|| SavedGenerativeError::MissingSavedState {
+                    model_class,
+                    reason: "canonical predictor could not be reconstructed".to_string(),
+                })?;
+        let prediction = predictor.predict_plugin_response(&input).map_err(|error| {
+            SavedGenerativeError::Evaluation {
+                reason: format!("plug-in response prediction: {error}"),
+            }
         })?;
-    let prediction = predictor.predict_plugin_response(&input).map_err(|error| {
-        SavedGenerativeError::Evaluation {
-            reason: format!("plug-in response prediction: {error}"),
-        }
-    })?;
+        Ok::<_, SavedGenerativeError>((input, predictor, prediction))
+    };
 
     match model_class {
         PredictModelClass::GaussianLocationScale => {
+            let (input, predictor, prediction) = predictor_response()?;
             let sigma = predictor
                 .predict_noise_scale(&input)
                 .map_err(|error| SavedGenerativeError::Evaluation {
@@ -255,6 +248,7 @@ pub fn generative_spec_for_saved_model(
             })
         }
         PredictModelClass::DispersionLocationScale => {
+            let (input, predictor, prediction) = predictor_response()?;
             let dispersion = predictor
                 .predict_dispersion_scale(&input)
                 .map_err(|error| SavedGenerativeError::Evaluation {
@@ -277,6 +271,7 @@ pub fn generative_spec_for_saved_model(
             })
         }
         PredictModelClass::Standard => {
+            let (_, _, prediction) = predictor_response()?;
             let fit = model
                 .fit_result
                 .as_ref()
@@ -298,6 +293,7 @@ pub fn generative_spec_for_saved_model(
             )
         }
         PredictModelClass::BinomialLocationScale | PredictModelClass::BernoulliMarginalSlope => {
+            let (_, _, prediction) = predictor_response()?;
             let noise =
                 NoiseModel::from_likelihood(&model.likelihood(), prediction.mean.len(), None)
                     .map_err(|error| SavedGenerativeError::InvalidState {
@@ -308,8 +304,28 @@ pub fn generative_spec_for_saved_model(
                 noise,
             })
         }
-        PredictModelClass::TransformationNormal | PredictModelClass::Survival => unreachable!(
-            "transformation-normal and survival capabilities return before predictor dispatch"
-        ),
+        PredictModelClass::TransformationNormal => {
+            let grid = build_transformation_normal_quantile_grid(
+                model,
+                data,
+                col_map,
+                training_headers,
+                offset,
+            )
+            .map_err(|reason| SavedGenerativeError::Evaluation {
+                reason: format!("transformation-normal quantile grid: {reason}"),
+            })?;
+            Ok(GenerativeSpec {
+                mean: grid.conditional_mean,
+                noise: NoiseModel::TransformationNormalQuantile {
+                    grid_y: grid.grid_y,
+                    h_grid: grid.h_grid,
+                },
+            })
+        }
+        PredictModelClass::Survival => Err(SavedGenerativeError::UnsupportedSampler {
+            model_class,
+            family: model.likelihood().pretty_name().to_string(),
+        }),
     }
 }
