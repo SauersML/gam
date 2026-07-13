@@ -683,7 +683,7 @@ pub enum TargetDoseError {
     InvalidRequest(String),
     Steering(String),
     Probe(String),
-    FactorNeedsPatchedForward {
+    FactorNeedsAppliedDoseProbe {
         kind: FisherDoseKind,
     },
     UnreachableTarget {
@@ -705,9 +705,9 @@ impl std::fmt::Display for TargetDoseError {
             Self::InvalidRequest(message) | Self::Steering(message) | Self::Probe(message) => {
                 f.write_str(message)
             }
-            Self::FactorNeedsPatchedForward { kind } => write!(
+            Self::FactorNeedsAppliedDoseProbe { kind } => write!(
                 f,
-                "steer_to_target_nats: factor kind {} cannot solve a full-KL target without a patched-forward probe",
+                "steer_to_target_nats: factor kind {} cannot solve a full-KL target without an applied-dose probe",
                 kind.as_str()
             ),
             Self::UnreachableTarget {
@@ -853,7 +853,7 @@ pub fn steer_to_target_nats(
         )));
     }
     if probe.is_none() && unit.predicted_nats_kind != FisherDoseKind::ExactFull {
-        return Err(TargetDoseError::FactorNeedsPatchedForward {
+        return Err(TargetDoseError::FactorNeedsAppliedDoseProbe {
             kind: unit.predicted_nats_kind,
         });
     }

@@ -443,7 +443,7 @@ fn predicted_nats_survive_tier0_frame_rescale_2249() {
 /// `rank = p`, so `predicted_nats(a) = ½‖a·dg‖²` is exactly quadratic in `a`;
 /// the seed identity `½ a0² dgᵀM dg = q*` therefore holds to machine precision at
 /// every dose (and a-fortiori at infinitesimal dose). This is the pure math +
-/// plumbing surface; `measured_nats=None` makes its quadratic-only validation
+/// plumbing surface; `applied_probe=None` makes its quadratic-only validation
 /// explicit while the returned `steer` carries the exact delta to apply.
 #[test]
 fn target_dose_closed_form_seed_hits_dose_exactly() {

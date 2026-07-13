@@ -453,7 +453,7 @@ mod tests {
         .expect_err("an uncertified factor cannot solve a full-KL target without a probe");
         assert!(matches!(
             error,
-            crate::inference::steering::TargetDoseError::FactorNeedsPatchedForward {
+            crate::inference::steering::TargetDoseError::FactorNeedsAppliedDoseProbe {
                 kind: crate::inference::steering::FisherDoseKind::UncertifiedApproximation
             }
         ));
@@ -490,7 +490,6 @@ mod tests {
 
         // Model-in-the-loop probe: exact categorical KL of the applied chord.
         let z_from_probe = z_from.clone();
-        let dg_probe = dg_raw.clone();
         let p_from_probe = p_from.clone();
         let mut probe = move |plan: &SteerPlan| -> Result<AppliedDoseObservation, String> {
             let z_to: Vec<f64> = z_from_probe
