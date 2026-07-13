@@ -2036,13 +2036,17 @@ pub fn fit_bernoulli_marginal_slope_terms(
     spec.z = z_standardized;
     let sigma_learnable = matches!(
         &spec.frailty,
-        FrailtySpec::GaussianShift { sigma_fixed: None }
+        FrailtySpec::GaussianShift {
+            scale: FrailtyScale::Learned { .. }
+        }
     );
     let initial_sigma = match &spec.frailty {
         FrailtySpec::GaussianShift {
-            sigma_fixed: Some(s),
-        } => Some(*s),
-        FrailtySpec::GaussianShift { sigma_fixed: None } => Some(0.5),
+            scale: FrailtyScale::Fixed { sigma },
+        } => Some(*sigma),
+        FrailtySpec::GaussianShift {
+            scale: FrailtyScale::Learned { initial_sigma },
+        } => Some(*initial_sigma),
         FrailtySpec::None => None,
         FrailtySpec::HazardMultiplier { .. } => {
             return Err(
