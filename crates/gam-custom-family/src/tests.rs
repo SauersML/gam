@@ -3519,9 +3519,18 @@ impl OneStepReturnedSaddleFamily {
     }
 
     pub(crate) fn hessian(&self, x: f64, y: f64) -> Array2<f64> {
+        let displacement = x - self.target;
+        let target_squared = self.target * self.target;
+        let shape = -1.0 + 2.0 * displacement * displacement / target_squared;
         array![
-            [1.0, -2.0 * y / self.target],
-            [-2.0 * y / self.target, 1.0 - 2.0 * x / self.target],
+            [
+                1.0 + 2.0 * y * y / target_squared,
+                4.0 * displacement * y / target_squared
+            ],
+            [
+                4.0 * displacement * y / target_squared,
+                shape + 3.0 * y * y
+            ],
         ]
     }
 }
@@ -3529,20 +3538,24 @@ impl OneStepReturnedSaddleFamily {
 impl CustomFamily for OneStepReturnedSaddleFamily {
     fn evaluate(&self, states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let (x, y) = self.coordinates(states)?;
-        let y_curvature = 1.0 - 2.0 * x / self.target;
-        let score_x = self.target - x + y * y / self.target;
-        let score_y = -y_curvature * y;
-        let negative_log_likelihood = 0.5 * (x - self.target).powi(2) + 0.5 * y_curvature * y * y;
+        let displacement = x - self.target;
+        let target_squared = self.target * self.target;
+        let shape = -1.0 + 2.0 * displacement * displacement / target_squared;
+        let score_x = -displacement * (1.0 + 2.0 * y * y / target_squared);
+        let score_y = -(shape * y + y.powi(3));
+        let negative_log_likelihood =
+            0.5 * displacement * displacement + 0.5 * shape * y * y + 0.25 * y.powi(4);
+        let hessian = self.hessian(x, y);
         Ok(FamilyEvaluation {
             log_likelihood: -negative_log_likelihood,
             blockworking_sets: vec![
                 BlockWorkingSet::ExactNewton {
                     gradient: array![score_x],
-                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                    hessian: SymmetricMatrix::Dense(array![[hessian[(0, 0)]]]),
                 },
                 BlockWorkingSet::ExactNewton {
                     gradient: array![score_y],
-                    hessian: SymmetricMatrix::Dense(array![[y_curvature]]),
+                    hessian: SymmetricMatrix::Dense(array![[hessian[(1, 1)]]]),
                 },
             ],
         })
@@ -3668,6 +3681,47 @@ pub(crate) fn joint_newton_rejects_one_step_stationary_strict_saddle_at_returned
         error.contains("fresh exact returned-mode curvature"),
         "unexpected returned-mode rejection: {error}",
     );
+}
+
+#[test]
+pub(crate) fn joint_newton_recovers_from_returned_strict_saddle_with_remaining_cycle() {
+    let family = OneStepReturnedSaddleFamily { target: 0.125 };
+    let specs = one_step_returned_saddle_specs();
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 2,
+        use_remlobjective: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let result = inner_blockwise_fit(
+        &family,
+        &specs,
+        &[Array1::zeros(0), Array1::zeros(0)],
+        &options,
+        None,
+    )
+    .expect("fresh negative curvature should drive the existing hard-case escape");
+
+    assert!(result.converged);
+    assert_eq!(result.cycles, 2);
+    let (x, y) = family
+        .coordinates(&result.block_states)
+        .expect("recovered mode should retain both coordinates");
+    assert!((x - family.target).abs() <= 1.0e-12, "x={x}");
+    assert!((y.abs() - 1.0).abs() <= 1.0e-12, "y={y}");
+
+    let certificate = exact_joint_mode_curvature_certificate(
+        &family,
+        &result.block_states,
+        &specs,
+        &options,
+        &block_param_ranges(&specs),
+        &result.s_lambdas,
+        0.0,
+        None,
+        2,
+    )
+    .expect("recovered local minimum should have certifiable exact curvature");
+    assert!(!certificate.has_resolvable_negative_curvature());
 }
 
 /// gam#1088 fixture. A coupled two-block family whose joint Hessian carries
