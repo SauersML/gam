@@ -386,17 +386,18 @@ impl AtlasNerveDiagram {
             self.betti.b0,
             self.betti.b1,
             self.betti.b2,
+            self.euler_characteristic,
             self.orientation_holonomy,
         ) {
-            (1, 2, Some(1), Some(AtlasOrientability::Orientable)) => {
+            (1, 2, Some(1), 0, Some(AtlasOrientability::Orientable)) => {
                 Some((GraphCompressionKind::Torus, "torus", 2.0 * log_vertices))
             }
-            (1, 1, Some(0), Some(AtlasOrientability::Orientable)) => Some((
+            (1, 1, Some(0), 0, Some(AtlasOrientability::Orientable)) => Some((
                 GraphCompressionKind::Cylinder,
                 "cylinder",
                 2.0 * log_vertices,
             )),
-            (1, 0, Some(1), _) => Some((GraphCompressionKind::Sphere, "sphere", log_vertices)),
+            (1, 0, Some(1), 2, _) => Some((GraphCompressionKind::Sphere, "sphere", log_vertices)),
             _ => None,
         };
         if let Some((kind, name, named_bits)) = named {
