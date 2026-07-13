@@ -4292,7 +4292,9 @@ fn sturm_sign_changes_at(chain: &[Vec<Interval>], x: f64) -> Option<usize> {
     Some(changes)
 }
 
-/// Certified count of sign changes of the chain as `λ → +∞` (leading signs).
+/// Test-only whole-half-line oracle. Production certifies the declared finite
+/// smoothing domain with [`sturm_root_count_in`].
+#[cfg(test)]
 fn sturm_sign_changes_at_pos_inf(chain: &[Vec<Interval>]) -> Option<usize> {
     let mut prev = 0i32;
     let mut changes = 0usize;
@@ -4308,9 +4310,9 @@ fn sturm_sign_changes_at_pos_inf(chain: &[Vec<Interval>]) -> Option<usize> {
     Some(changes)
 }
 
-/// Certified number of distinct real roots of `P` on the OPEN interval
-/// `(lo, +∞)` (`lo ≥ 0`). `None` when the chain sign structure is undecidable in
-/// interval arithmetic.
+/// Test-only count of distinct real roots on `(lo, +∞)`, used by the pinned
+/// polynomial oracle below rather than by the finite-domain optimizer.
+#[cfg(test)]
 fn sturm_root_count_above(p: &[Interval], lo: f64) -> Option<usize> {
     let chain = build_sturm_chain(p)?;
     if chain.len() == 1 && chain[0].len() <= 1 {
