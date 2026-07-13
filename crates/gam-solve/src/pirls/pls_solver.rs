@@ -45,8 +45,9 @@ use std::sync::Arc;
 /// ndarray whose `.clone()` is O(1)) lets each trial's `PirlsResult` reuse the
 /// same rows with zero per-callback row work, so the κ outer loop touches only
 /// k×k objects per trial — the #1033 architectural invariant. The two cached
-/// scalars (`log_likelihood` at `μ=offset`, `max_abs_eta = ‖offset‖∞`) are the
-/// only other length-`n` reductions the synthesis performed per trial.
+/// scalars (the P-IRLS data log-kernel at `μ=offset`,
+/// `max_abs_eta = ‖offset‖∞`) are the only other length-`n` reductions the
+/// synthesis performed per trial.
 #[derive(Debug, Clone)]
 pub struct GaussianFrozenRows {
     /// `η ≡ μ ≡ offset` (identity link, stale rows) — shared by the
@@ -67,7 +68,9 @@ pub struct GaussianFrozenRows {
     pub solve_c_array: ArcArray1<f64>,
     /// `d²W_H/dη²` at `η=offset`.
     pub solve_d_array: ArcArray1<f64>,
-    /// `log L(y; μ=offset)` — the trial-invariant zero-iteration log-likelihood.
+    /// Trial-invariant zero-iteration P-IRLS data log-kernel. For a profiled
+    /// Gaussian this is exactly negative one half of the raw weighted RSS, not
+    /// a physical unit-dispersion likelihood.
     pub log_likelihood: f64,
     /// `‖offset‖∞` — the trial-invariant `max_abs_eta`.
     pub max_abs_eta: f64,
@@ -85,7 +88,7 @@ impl GaussianFrozenRows {
     /// Gaussian-identity, so the row predictions are stale placeholders), the
     /// working-weight derivatives are `computeworkingweight_derivatives_from_eta`
     /// at `η=offset` (constant `(1,0,0,0,0)` for Gaussian-identity), and the two
-    /// scalars are the zero-iteration `log L(y; μ=offset)` and `‖offset‖∞`.
+    /// scalars are the zero-iteration P-IRLS data log-kernel and `‖offset‖∞`.
     pub(crate) fn build(
         offset: ArrayView1<'_, f64>,
         y: ArrayView1<'_, f64>,
@@ -480,9 +483,7 @@ pub(super) fn solve_penalized_least_squares_implicit(
     // exactly; fall back to the Tikhonov nugget only when the bare factorization
     // actually fails. The augmented RHS `r + δμ` keeps the fallback a Tikhonov
     // regularization centered at the prior-mean target.
-    let bare_factor = StableSolver::new()
-        .factorize(&penalized_hessian)
-        .ok();
+    let bare_factor = StableSolver::new().factorize(&penalized_hessian).ok();
     let (factor, ridge_used) = if let Some(factor) = bare_factor {
         (factor, 0.0)
     } else {

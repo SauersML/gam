@@ -104,8 +104,8 @@ mod linux_impl {
     use crate::pirls::{
         ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind, PirlsCoordinateFrame,
         PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState,
-        calculate_loglikelihood_omitting_constants_from_eta,
         compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta,
+        pirls_data_log_kernel_from_eta,
     };
     use gam_gpu::cuda_selected;
     use gam_gpu::device_runtime::GpuRuntime;
@@ -586,12 +586,13 @@ mod linux_impl {
             eta: LinearPredictor::new(final_eta.clone()),
             gradient: gradient_total.clone(),
             hessian: penalized_hessian_sym.clone(),
-            log_likelihood: calculate_loglikelihood_omitting_constants_from_eta(
+            log_likelihood: pirls_data_log_kernel_from_eta(
                 input.y,
                 &final_eta,
                 input.likelihood,
                 input.inverse_link,
                 input.priorweights,
+                deviance,
             )?,
             deviance,
             penalty_term,
@@ -873,14 +874,15 @@ mod linux_impl {
             input.priorweights,
         )
         .map_err(|error| format!("GPU Gaussian deviance evaluation failed: {error}"))?;
-        let log_likelihood = calculate_loglikelihood_omitting_constants_from_eta(
+        let log_likelihood = pirls_data_log_kernel_from_eta(
             input.y,
             &eta,
             input.likelihood,
             input.inverse_link,
             input.priorweights,
+            deviance,
         )
-        .map_err(|error| format!("GPU Gaussian log-likelihood evaluation failed: {error}"))?;
+        .map_err(|error| format!("GPU Gaussian P-IRLS data-kernel evaluation failed: {error}"))?;
 
         // Stabilised Hessian = penalized_hessian + ridge_used·I.
         let mut stab = penalized_hessian.clone();

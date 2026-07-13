@@ -29,13 +29,7 @@ fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
 /// kernel's `−w·d/φ` term exactly; this only restores the `−½ln(2πφᵢ y^p)`
 /// prefactor. Homogeneous so `elpd(c·y) − elpd(y) = −n ln c` still holds.
 #[inline]
-fn tweedie_saddlepoint_loglik_approximation(
-    yi: f64,
-    mui: f64,
-    w: f64,
-    p: f64,
-    phi: f64,
-) -> f64 {
+fn tweedie_saddlepoint_loglik_approximation(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
     if w <= 0.0 {
         // Zero prior weight excludes the observation (the y>0 prefactor's
         // −ln wᵢ would otherwise diverge).
@@ -107,12 +101,12 @@ mod tests {
         compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale,
         deviance_eta_rows_with_log_measure_scale, evaluate_full_log_likelihood_from_eta,
         fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical,
-        select_active_set_release, should_log_pirls_decision_summary,
-        should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
-        solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, update_glmvectors,
-        variance_jet_for_weight_family, write_gamma_log_working_state,
-        write_negative_binomial_log_working_state, write_poisson_log_working_state,
-        write_tweedie_log_working_state,
+        pirls_data_log_kernel_from_eta, select_active_set_release,
+        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
+        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
+        stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family,
+        write_gamma_log_working_state, write_negative_binomial_log_working_state,
+        write_poisson_log_working_state, write_tweedie_log_working_state,
     };
     use crate::active_set;
     use crate::estimate::EstimationError;
@@ -122,8 +116,9 @@ mod tests {
     use gam_linalg::matrix::DesignMatrix;
     use gam_math::probability::standard_normal_quantile;
     use gam_problem::{
-        Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkComponent, LinkFunction,
-        LogSmoothingParamsView, MixtureLinkSpec, ResponseFamily, StandardLink,
+        Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
+        LinkComponent, LinkFunction, LogSmoothingParamsView, MixtureLinkSpec, ResponseFamily,
+        StandardLink,
     };
 
     // Test-only zero-log-measure-scale wrapper over the production single-row
@@ -2190,6 +2185,89 @@ mod tests {
                 .expect("representable final sum"),
             f64::MAX
         );
+    }
+
+    #[test]
+    fn profiled_gaussian_pirls_data_kernel_is_exactly_negative_half_raw_deviance_2305() {
+        let y = array![2.0, -1.0, 4.0];
+        let eta = array![1.0, 0.5, 3.0];
+        let weights = array![2.0, 0.5, 1.5];
+        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ));
+        assert!(matches!(
+            likelihood.scale,
+            LikelihoodScaleMetadata::ProfiledGaussian
+        ));
+
+        let deviance = calculate_deviance_from_eta(
+            y.view(),
+            &eta,
+            &likelihood,
+            &likelihood.spec.link,
+            weights.view(),
+        )
+        .expect("profiled-Gaussian conventional deviance");
+        let raw_weighted_rss = 4.625_f64;
+        assert_eq!(deviance, raw_weighted_rss);
+
+        let data_kernel = pirls_data_log_kernel_from_eta(
+            y.view(),
+            &eta,
+            &likelihood,
+            &likelihood.spec.link,
+            weights.view(),
+            deviance,
+        )
+        .expect("profiled-Gaussian P-IRLS data kernel");
+        assert_eq!(data_kernel, -0.5 * deviance);
+    }
+
+    #[test]
+    fn fixed_gaussian_pirls_keeps_raw_deviance_but_scales_likelihood_kernel_2305() {
+        let y = array![2.0, -1.0, 4.0];
+        let eta = array![1.0, 0.5, 3.0];
+        let weights = array![2.0, 0.5, 1.5];
+        let phi = 4.0_f64;
+        let likelihood = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(StandardLink::Identity),
+            ),
+            scale: LikelihoodScaleMetadata::FixedDispersion { phi },
+        };
+
+        let deviance = calculate_deviance_from_eta(
+            y.view(),
+            &eta,
+            &likelihood,
+            &likelihood.spec.link,
+            weights.view(),
+        )
+        .expect("fixed-Gaussian conventional deviance");
+        let raw_weighted_rss = 4.625_f64;
+        assert_eq!(deviance, raw_weighted_rss);
+
+        let data_kernel = pirls_data_log_kernel_from_eta(
+            y.view(),
+            &eta,
+            &likelihood,
+            &likelihood.spec.link,
+            weights.view(),
+            deviance,
+        )
+        .expect("fixed-Gaussian P-IRLS data kernel");
+        let strict_kernel = calculate_loglikelihood_omitting_constants_from_eta(
+            y.view(),
+            &eta,
+            &likelihood,
+            &likelihood.spec.link,
+            weights.view(),
+        )
+        .expect("fixed-Gaussian strict eta likelihood");
+        assert_eq!(data_kernel, strict_kernel);
+        assert_eq!(data_kernel, -0.5 * raw_weighted_rss / phi);
     }
 
     /// Regression for issue #2126: `calculate_deviance` for a Gamma family must
@@ -4588,7 +4666,8 @@ mod root_cause_tests {
 #[cfg(test)]
 mod reporting_loglikelihood_tests {
     use super::super::{
-        calculate_loglikelihood_omitting_constants_from_eta, evaluate_full_log_likelihood_from_eta,
+        calculate_loglikelihood_omitting_constants_from_eta,
+        eta_log_likelihood_value_and_score_into, evaluate_full_log_likelihood_from_eta,
     };
     use gam_problem::{
         GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily,
@@ -4762,6 +4841,33 @@ mod reporting_loglikelihood_tests {
         let error = evaluate_full_log_likelihood_from_eta(y.view(), eta.view(), &glm, w.view())
             .expect_err("unresolved profiled Gaussian scale must fail");
         assert!(error.to_string().contains("explicit positive dispersion"));
+
+        let error = calculate_loglikelihood_omitting_constants_from_eta(
+            y.view(),
+            &eta,
+            &glm,
+            &glm.spec.link,
+            w.view(),
+        )
+        .expect_err("strict eta likelihood must not invent a profiled Gaussian dispersion");
+        assert!(error.to_string().contains("explicit positive dispersion"));
+
+        let original_score = array![7.0, 8.0, 9.0];
+        let mut score = original_score.clone();
+        let error = eta_log_likelihood_value_and_score_into(
+            y.view(),
+            &eta,
+            &glm,
+            &glm.spec.link,
+            w.view(),
+            &mut score,
+        )
+        .expect_err("HMC eta likelihood must not invent a profiled Gaussian dispersion");
+        assert!(error.to_string().contains("explicit positive dispersion"));
+        assert_eq!(
+            score, original_score,
+            "strict eta likelihood failure must leave the caller's score untouched"
+        );
     }
 
     // Gaussian prior weights act as inverse-variance scaling (Var = φ/wᵢ): the

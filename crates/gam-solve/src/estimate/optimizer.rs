@@ -2839,7 +2839,8 @@ mod reported_loglikelihood_normalization_tests {
     use super::optimize_external_design;
     use crate::estimate::external_options::ExternalOptimOptions;
     use gam_problem::{
-        InverseLink, LikelihoodSpec, LogLikelihoodNormalization, ResponseFamily, StandardLink,
+        InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization,
+        ResponseFamily, StandardLink,
     };
     use gam_terms::smooth::BlockwisePenalty;
     use ndarray::{Array1, Array2};
@@ -2968,6 +2969,10 @@ mod reported_loglikelihood_normalization_tests {
         )
         .expect("Gaussian solve on clean near-linear data must converge");
 
+        assert!(matches!(
+            result.likelihood_scale,
+            LikelihoodScaleMetadata::ProfiledGaussian
+        ));
         assert!(
             result.log_likelihood.is_finite(),
             "reported Gaussian log-likelihood must be finite (the profiled σ̂² \

@@ -87,6 +87,9 @@ pub struct WorkingState {
     pub eta: LinearPredictor,
     pub gradient: Array1<f64>,
     pub hessian: gam_linalg::matrix::SymmetricMatrix,
+    /// Inner data log-kernel. A profiled Gaussian stores exactly `-D/2` for
+    /// conventional deviance `D`; likelihoods with a resolved physical scale
+    /// store the strict eta-space log-likelihood omitting response constants.
     pub log_likelihood: f64,
     pub deviance: f64,
     pub penalty_term: f64,

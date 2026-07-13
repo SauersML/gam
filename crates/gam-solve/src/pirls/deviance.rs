@@ -1023,8 +1023,7 @@ pub(crate) fn deviance_eta_row_with_log_measure_scale(
             let half_unit = if eta_difference == 0.0 {
                 0.0
             } else if eta_difference.abs() <= 1.0e-6 {
-                let (saturated_mu, saturated_one_minus_mu) =
-                    logit_probability_pair(saturated_eta);
+                let (saturated_mu, saturated_one_minus_mu) = logit_probability_pair(saturated_eta);
                 let saturated_a = saturated_mu * *phi;
                 let saturated_b = saturated_one_minus_mu * *phi;
                 let saturated_c = *phi * saturated_mu * saturated_one_minus_mu;
@@ -1562,14 +1561,13 @@ fn eta_log_measure_scale(likelihood: &GlmLikelihoodSpec) -> Result<f64, Estimati
     // non-unit Poisson/Binomial metadata before any parallel output exists.
     let scale = likelihood.resolved_scale().map_err(scale_error)?;
     match &likelihood.spec.response {
-        ResponseFamily::Gaussian => scale
-            .gaussian_log_phi()
-            .map(|log_phi| -log_phi)
-            .map_err(|error| {
+        ResponseFamily::Gaussian => scale.gaussian_log_phi().map(|log_phi| -log_phi).map_err(
+            |error| {
                 EstimationError::InvalidInput(format!(
                     "Gaussian eta log-likelihood requires an explicit positive dispersion: {error}"
                 ))
-            }),
+            },
+        ),
         ResponseFamily::Gamma => scale.gamma_log_shape().map_err(scale_error),
         ResponseFamily::Tweedie { .. } => scale
             .tweedie_log_phi()
@@ -1870,7 +1868,6 @@ pub(crate) fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
         - log_gamma_stirling_correction(b)
 }
 
-
 /// `ln(2π)` — the per-observation Gaussian / saddlepoint normalizer constant.
 pub(crate) const LN_2PI: f64 = 1.837_877_066_409_345_5;
 
@@ -2157,7 +2154,6 @@ pub fn evaluate_full_log_likelihood_from_eta(
     Ok(FullLogLikelihoodEvaluation { pointwise, total })
 }
 
-
 /// Exact compound-Poisson–gamma density in log-mean coordinates. A finite work
 /// certificate is part of the contract: an observation whose dominant series
 /// index cannot be enumerated exactly in f64, or whose roundoff-negligible tail
@@ -2360,8 +2356,6 @@ pub(crate) fn tweedie_exact_series_loglik_from_eta(
         ))
     }
 }
-
-
 
 /// Total exact Tweedie log-likelihood over all observations. This is the
 /// objective a maximum-likelihood profile of the variance power `p` optimizes
