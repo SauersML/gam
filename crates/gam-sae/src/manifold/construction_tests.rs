@@ -179,23 +179,12 @@ mod amortized_encoder_tests {
         use crate::manifold::arrow_solver::DeflatedArrowSolver;
         use crate::manifold::tests::gamma_fd_tiny_fixture;
         use ndarray::{array, Array1};
-        // gamma_fd_tiny sits at a ρ = −6 floor with no interior PD minimum (the
-        // sibling rank-charge gate documents the same). Lift ρ_sparse into the PD
-        // basin AND lift ρ_smooth / ρ_ard off the floor so the decoder-smoothness
-        // EDF (λ_smooth ≈ 1.35) and the periodic-ARD log-precision Hessian traces
-        // (α ≈ 0.9, 1.1) carry a non-trivial curvature signal. A ρ perturbation
-        // scales only α, never the frozen circle coordinate t, so the max(·,0)
-        // majorizer active set is invariant — no subgradient ambiguity at the FD.
+        // Converge θ̂ in the fixture's OWN PD basin (ρ_sparse lifted off the −6
+        // floor, as the sibling logdet-adjoint gates do). The evaluation ρ below
+        // must NOT be used for the fit: at λ_smooth/α that large this 10-row, m=3
+        // decoder is driven into total co-collapse by the inner solve.
         let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
         rho.log_lambda_sparse = 0.5;
-        for v in rho.log_lambda_smooth.iter_mut() {
-            *v = 0.3;
-        }
-        rho.log_ard = vec![array![-0.1_f64], array![0.1_f64]];
-        // Converge to a well-conditioned PD stationary state (mutates `term` to the
-        // fitted θ̂), then re-derive the fixed-θ̂ cache with a zero inner budget:
-        // H(ρ) = H_data(θ̂) + penalty(ρ) with θ̂ frozen — the fixed stratum the
-        // analytic Hessian differentiates.
         term.penalized_quasi_laplace_criterion_with_cache(
             target.view(),
             &rho,
@@ -205,7 +194,24 @@ mod amortized_encoder_tests {
             1.0e-6,
             1.0e-6,
         )
-        .expect("converged PD stationary cache");
+        .expect("converged PD stationary theta-hat");
+
+        // Evaluation ρ: lift ρ_smooth / ρ_ard off the −6 floor so the Daleckii–Krein
+        // CROSS terms — which scale as O(λ²) and O(α²) — sit well above FD noise. At
+        // the floor (λ = α ≈ 2.5e-3) the cross term is ~6e-6, under the FD tolerance,
+        // and the gate would pass on the δ self-term alone while the D-K machinery
+        // went entirely unchecked. The fixed-stratum Hessian is exact at ANY frozen
+        // θ̂ — it does not require θ̂ to be stationary for this ρ — and a ZERO inner
+        // budget assembles H(ρ) = H_data(θ̂) + penalty(ρ) without re-running the fit,
+        // so no co-collapse guard is tripped. Extra penalty only makes H more PD.
+        // A ρ perturbation scales only α, never the frozen circle coordinate t, so
+        // the max(·,0) majorizer active set is invariant — no subgradient ambiguity.
+        let mut rho_eval = rho.clone();
+        for v in rho_eval.log_lambda_smooth.iter_mut() {
+            *v = -2.0;
+        }
+        rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
+        let rho = rho_eval;
         let (_value, _loss, cache) = term
             .penalized_quasi_laplace_criterion_with_cache(
                 target.view(),
@@ -250,6 +256,22 @@ mod amortized_encoder_tests {
             analytic[[ard0, ard0]].abs() > 1.0e-6,
             "ARD logdet curvature must be non-trivial: {}",
             analytic[[ard0, ard0]]
+        );
+        // Non-vacuity of the Daleckii–Krein term SPECIFICALLY. An OFF-diagonal entry
+        // has no δ self-term, so it is pure `−½(tr(G Cᵢ G C_j) − tr(H_bd⁻¹ Cᵢ H_bd⁻¹ C_j))`
+        // — the selected-inverse curvature this channel exists to compute. It must
+        // exceed the FD tolerance by a real margin, else the gate would be satisfied
+        // by the self-term alone and the D-K math would ride through unvalidated.
+        let max_off_diagonal = coord_indices
+            .iter()
+            .flat_map(|&i| coord_indices.iter().map(move |&j| (i, j)))
+            .filter(|(i, j)| i != j)
+            .map(|(i, j)| analytic[[i, j]].abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_off_diagonal > 1.0e-4,
+            "the Daleckii-Krein cross term must be materially exercised (off-diagonal \
+             entries carry no delta self-term); max |off-diagonal| = {max_off_diagonal}"
         );
 
         // The production `logdet_trace` channel in ISOLATION, reproduced exactly as
