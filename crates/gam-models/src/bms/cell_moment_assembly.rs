@@ -29,8 +29,16 @@ thread_local! {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EmpiricalBmsJetSchedule {
+pub(super) enum EmpiricalBmsJetChannel {
+    ThirdMany,
+    ThirdTrace,
+    FourthMany,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EmpiricalBmsJetSchedule {
     FixedWidthFromPlan,
+    RepeatedFixedWidth,
     DynamicBatch { lanes: usize },
 }
 
@@ -53,10 +61,22 @@ fn empirical_bms_runtime_batch_lanes(r: usize) -> usize {
         .min(EMPIRICAL_BMS_BATCH_LANE_CAP)
 }
 
-fn empirical_bms_jet_schedule(r: usize) -> EmpiricalBmsJetSchedule {
-    match r {
-        4 | 8 | 12 | 18 => EmpiricalBmsJetSchedule::FixedWidthFromPlan,
-        runtime_width => EmpiricalBmsJetSchedule::DynamicBatch {
+pub(super) fn empirical_bms_jet_schedule(
+    channel: EmpiricalBmsJetChannel,
+    r: usize,
+) -> EmpiricalBmsJetSchedule {
+    match (channel, r) {
+        (
+            EmpiricalBmsJetChannel::ThirdMany | EmpiricalBmsJetChannel::ThirdTrace,
+            4 | 8 | 12 | 18,
+        )
+        | (EmpiricalBmsJetChannel::FourthMany, 4) => {
+            EmpiricalBmsJetSchedule::FixedWidthFromPlan
+        }
+        (EmpiricalBmsJetChannel::FourthMany, 8 | 12 | 18) => {
+            EmpiricalBmsJetSchedule::RepeatedFixedWidth
+        }
+        (_, runtime_width) => EmpiricalBmsJetSchedule::DynamicBatch {
             lanes: empirical_bms_runtime_batch_lanes(runtime_width),
         },
     }
@@ -1144,7 +1164,7 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn empirical_fixed_fourth_many_from_plan<const K: usize>(
+    pub(super) fn empirical_fixed_fourth_many_from_plan<const K: usize>(
         plan: &EmpiricalBmsRowJetPlan,
         point: &[f64],
         direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
@@ -1184,23 +1204,6 @@ impl BernoulliMarginalSlopeFamily {
                 )
             })
             .collect()
-    }
-
-    fn empirical_fixed_fourth_many_dispatch(
-        plan: &EmpiricalBmsRowJetPlan,
-        point: &[f64],
-        direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
-        r: usize,
-    ) -> Result<Vec<Array2<f64>>, String> {
-        match r {
-            4 => Self::empirical_fixed_fourth_many_from_plan::<4>(plan, point, direction_pairs),
-            8 => Self::empirical_fixed_fourth_many_from_plan::<8>(plan, point, direction_pairs),
-            12 => Self::empirical_fixed_fourth_many_from_plan::<12>(plan, point, direction_pairs),
-            18 => Self::empirical_fixed_fourth_many_from_plan::<18>(plan, point, direction_pairs),
-            _ => Err(format!(
-                "unsupported fixed empirical BMS fourth-many specialization width {r}"
-            )),
-        }
     }
 
     pub(super) fn empirical_flex_row_third_contracted(
@@ -1318,10 +1321,13 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        match empirical_bms_jet_schedule(r) {
+        match empirical_bms_jet_schedule(EmpiricalBmsJetChannel::ThirdMany, r) {
             EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_third_many_dispatch(&plan, &point, row_dirs, r)
             }
+            EmpiricalBmsJetSchedule::RepeatedFixedWidth => unreachable!(
+                "third-many schedule cannot select repeated fixed-width evaluation"
+            ),
             EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
                 EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
                     let mut workspace = workspace.borrow_mut();
@@ -1391,10 +1397,13 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        match empirical_bms_jet_schedule(r) {
+        match empirical_bms_jet_schedule(EmpiricalBmsJetChannel::ThirdTrace, r) {
             EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_third_trace_dispatch(&plan, &point, gram, r)
             }
+            EmpiricalBmsJetSchedule::RepeatedFixedWidth => unreachable!(
+                "third-trace schedule cannot select repeated fixed-width evaluation"
+            ),
             EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
                 EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
                     let mut workspace = workspace.borrow_mut();
@@ -1531,6 +1540,26 @@ impl BernoulliMarginalSlopeFamily {
         if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
             return Err("non-finite empirical flexible row context in fourth contraction".into());
         }
+        let schedule = empirical_bms_jet_schedule(EmpiricalBmsJetChannel::FourthMany, r);
+        if schedule == EmpiricalBmsJetSchedule::RepeatedFixedWidth {
+            return direction_pairs
+                .iter()
+                .map(|(direction_u, direction_v)| {
+                    self.empirical_flex_row_fourth_contracted(
+                        row,
+                        primary,
+                        q,
+                        b,
+                        beta_h,
+                        beta_w,
+                        row_ctx,
+                        direction_u,
+                        direction_v,
+                        grid,
+                    )
+                })
+                .collect();
+        }
         let plan = self.empirical_bms_row_jet_plan(
             row,
             primary,
@@ -1542,60 +1571,73 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        Self::empirical_bms_fourth_batch_from_plan(&plan, &point, direction_pairs, primary)
+        match schedule {
+            EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
+                Self::empirical_fixed_fourth_many_from_plan::<4>(
+                    &plan,
+                    &point,
+                    direction_pairs,
+                )
+            }
+            EmpiricalBmsJetSchedule::RepeatedFixedWidth => {
+                unreachable!("repeated fixed-width fourth schedule returned above")
+            }
+            EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
+                Self::empirical_dynamic_fourth_batch_from_plan(
+                    &plan,
+                    &point,
+                    direction_pairs,
+                    primary,
+                    lanes,
+                )
+            }
+        }
     }
 
-    /// Execute ordered two-seed contractions from one already-frozen row plan.
-    /// Common widths use the fixed specialization; other runtime widths use
-    /// bounded dynamic arena chunks without repeating grid/basis preprocessing.
-    pub(super) fn empirical_bms_fourth_batch_from_plan(
+    /// Execute ordered two-seed contractions in bounded runtime-sized chunks
+    /// from one already-frozen row plan.
+    pub(super) fn empirical_dynamic_fourth_batch_from_plan(
         plan: &EmpiricalBmsRowJetPlan,
         point: &[f64],
         direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
         primary: &PrimarySlices,
+        lanes: usize,
     ) -> Result<Vec<Array2<f64>>, String> {
         let r = primary.total;
-        match empirical_bms_jet_schedule(r) {
-            EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
-                Self::empirical_fixed_fourth_many_dispatch(plan, point, direction_pairs, r)
-            }
-            EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
-                let is_zero = |direction: &Array1<f64>| direction.iter().all(|value| *value == 0.0);
-                EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|workspace| {
-                    let mut workspace = workspace.borrow_mut();
-                    let mut contracted = Vec::with_capacity(direction_pairs.len());
-                    for pairs in direction_pairs.chunks(lanes) {
-                        workspace.reset(pairs.len());
-                        let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                            DynamicTwoSeedBatch::seed_direction_pairs(
-                                point[axis],
-                                axis,
-                                r,
-                                &workspace,
-                                |lane| (pairs[lane].0[axis], pairs[lane].1[axis]),
+        let is_zero = |direction: &Array1<f64>| direction.iter().all(|value| *value == 0.0);
+        EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|workspace| {
+            let mut workspace = workspace.borrow_mut();
+            let mut contracted = Vec::with_capacity(direction_pairs.len());
+            for pairs in direction_pairs.chunks(lanes) {
+                workspace.reset(pairs.len());
+                let vars = workspace.alloc_slice_fill_with(r, |axis| {
+                    DynamicTwoSeedBatch::seed_direction_pairs(
+                        point[axis],
+                        axis,
+                        r,
+                        &workspace,
+                        |lane| (pairs[lane].0[axis], pairs[lane].1[axis]),
+                    )
+                });
+                let jet = plan.evaluate(vars, 4, &workspace)?;
+                for (lane, (direction_u, direction_v)) in pairs.iter().enumerate() {
+                    if is_zero(direction_u) || is_zero(direction_v) {
+                        contracted.push(Array2::<f64>::zeros((r, r)));
+                    } else {
+                        contracted.push(
+                            Array2::from_shape_vec(
+                                (r, r),
+                                jet.contracted_fourth(lane).to_vec(),
                             )
-                        });
-                        let jet = plan.evaluate(vars, 4, &workspace)?;
-                        for (lane, (direction_u, direction_v)) in pairs.iter().enumerate() {
-                            if is_zero(direction_u) || is_zero(direction_v) {
-                                contracted.push(Array2::<f64>::zeros((r, r)));
-                            } else {
-                                contracted.push(
-                                    Array2::from_shape_vec(
-                                        (r, r),
-                                        jet.contracted_fourth(lane).to_vec(),
-                                    )
-                                    .map_err(|error| {
-                                        format!("empirical BMS fourth-contraction shape: {error}")
-                                    })?,
-                                );
-                            }
-                        }
+                            .map_err(|error| {
+                                format!("empirical BMS fourth-contraction shape: {error}")
+                            })?,
+                        );
                     }
-                    Ok(contracted)
-                })
+                }
             }
-        }
+            Ok(contracted)
+        })
     }
 
     pub(super) fn rigid_row_kernel_eval(

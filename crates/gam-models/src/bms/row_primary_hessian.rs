@@ -1,5 +1,6 @@
 use super::cell_moment_assembly::{
-    BernoulliInterceptSolveStats, fill_link_basis_cell_coeff_gradient,
+    BernoulliInterceptSolveStats, EmpiricalBmsJetChannel, EmpiricalBmsJetSchedule,
+    empirical_bms_jet_schedule, fill_link_basis_cell_coeff_gradient,
     fill_link_basis_cell_coeff_jet, fill_score_basis_cell_coeff_jet,
 };
 use super::exact_eval_cache::*;
@@ -6991,6 +6992,24 @@ impl BernoulliMarginalSlopeFamily {
                 .collect();
         }
 
+        let fourth_schedule =
+            empirical_bms_jet_schedule(EmpiricalBmsJetChannel::FourthMany, expected);
+        if fourth_schedule == EmpiricalBmsJetSchedule::RepeatedFixedWidth {
+            return direction_pairs
+                .iter()
+                .map(|(direction_u, direction_v)| {
+                    self.row_primary_fourth_contracted(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        direction_u,
+                        direction_v,
+                    )
+                })
+                .collect();
+        }
+
         let primary = &cache.primary;
         let point = self.primary_point_from_block_states(row, block_states, primary)?;
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
@@ -7013,12 +7032,27 @@ impl BernoulliMarginalSlopeFamily {
                 ordered_pairs.push((direction_u, direction_v));
                 ordered_pairs.push((direction_v, direction_u));
             }
-            let ordered = Self::empirical_bms_fourth_batch_from_plan(
-                &plan,
-                &primary_point,
-                &ordered_pairs,
-                primary,
-            )?;
+            let ordered = match fourth_schedule {
+                EmpiricalBmsJetSchedule::FixedWidthFromPlan => {
+                    Self::empirical_fixed_fourth_many_from_plan::<4>(
+                        &plan,
+                        &primary_point,
+                        &ordered_pairs,
+                    )
+                }
+                EmpiricalBmsJetSchedule::RepeatedFixedWidth => {
+                    unreachable!("repeated fixed-width fourth schedule returned above")
+                }
+                EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
+                    Self::empirical_dynamic_fourth_batch_from_plan(
+                        &plan,
+                        &primary_point,
+                        &ordered_pairs,
+                        primary,
+                        lanes,
+                    )
+                }
+            }?;
             let mut orientations = ordered.into_iter();
             while let Some(mut ordered) = orientations.next() {
                 let swapped = orientations

@@ -1581,9 +1581,6 @@ pub struct SaeCertifyRequest {
     /// state. This is explicit opt-in: evaluation-only certification preserves
     /// the dictionary the external trainer supplied unless asked to search.
     pub run_structure_search: bool,
-    /// No outer search and no inner solve run on this path, so nothing polls
-    /// this flag; kept only for typed symmetry with [`SaeFitRequest::cancel`].
-    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 /// Zero-optimization certification entry (#2263). Installs an externally
@@ -1614,7 +1611,6 @@ pub fn run_sae_manifold_certify(
         isometry_pin_active,
         metric_provenance,
         run_structure_search,
-        cancel: _cancel,
     } = request;
     let (n_obs, p_out) = z.dim();
     let mut term = base_term;

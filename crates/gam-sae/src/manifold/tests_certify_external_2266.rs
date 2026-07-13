@@ -184,7 +184,6 @@ mod tests {
             isometry_pin_active,
             metric_provenance,
             run_structure_search: false,
-            cancel: None,
         }
     }
 

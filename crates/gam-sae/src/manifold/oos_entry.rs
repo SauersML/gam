@@ -1445,7 +1445,6 @@ pub fn run_sae_manifold_certify_external(
         isometry_pin_active,
         metric_provenance,
         run_structure_search,
-        cancel: None,
     })?;
     let mut report = match outcome {
         super::SaeExternalCertificationOutcome::Certified(report) => report,
