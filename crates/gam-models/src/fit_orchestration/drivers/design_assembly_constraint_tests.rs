@@ -3521,8 +3521,17 @@ fn staged_exact_joint_outer_reoptimizes_and_certifies_the_full_row_measure() {
     let theta_dim = joint_setup.theta0().len();
     assert!(theta_dim > 0, "fixture must expose spatial outer coordinates");
 
+    struct TerminalEvidence {
+        serial: usize,
+        theta_bits: Vec<u64>,
+        objective_bits: u64,
+        full_rows: bool,
+    }
+
     let pilot_evals = std::cell::Cell::new(0usize);
     let exact_evals = std::cell::Cell::new(0usize);
+    let evaluation_serial = std::cell::Cell::new(0usize);
+    let fit_entry_serial = std::cell::Cell::new(None::<usize>);
     let policy = gam_model_api::families::custom_family::OuterDerivativePolicy {
         capability: gam_problem::ExactOuterDerivativeOrder::Second,
         predicted_hessian_work: u128::MAX,
@@ -3550,25 +3559,47 @@ fn staged_exact_joint_outer_reoptimizes_and_certifies_the_full_row_measure() {
         |theta, specs, designs, provenance| {
             assert_eq!(specs.len(), 2);
             assert_eq!(designs.len(), 2);
-            let SpatialFitProvenance::Certified { outer, mode: () } = provenance else {
+            let SpatialFitProvenance::Certified { outer, mode } = provenance else {
                 panic!("staged spatial fit must receive certified outer provenance");
             };
             assert_eq!(outer.rho(), theta);
             assert!(outer.criterion_certificate().certifies());
+            assert!(
+                mode.full_rows,
+                "the pilot coefficient mode must be revoked before final fit assembly",
+            );
+            assert_eq!(
+                mode.theta_bits,
+                theta.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "the moved coefficient mode must belong to the certified full theta",
+            );
+            assert_eq!(
+                mode.objective_bits,
+                outer.final_value().to_bits(),
+                "the moved coefficient mode must have produced the certified objective",
+            );
+            assert_eq!(
+                mode.serial,
+                evaluation_serial.get(),
+                "fit assembly must receive the latest exact evaluation's move-only carrier",
+            );
+            fit_entry_serial.set(Some(evaluation_serial.get()));
             Ok(theta.clone())
         },
         |theta, specs, designs, eval_mode, row_set| {
             assert_eq!(theta.len(), theta_dim);
             assert_eq!(specs.len(), 2);
             assert_eq!(designs.len(), 2);
-            let center = match row_set {
+            let serial = evaluation_serial.get() + 1;
+            evaluation_serial.set(serial);
+            let (center, full_rows) = match row_set {
                 gam_problem::outer_subsample::RowSet::Subsample { .. } => {
                     pilot_evals.set(pilot_evals.get() + 1);
-                    2.0
+                    (2.0, false)
                 }
                 gam_problem::outer_subsample::RowSet::All => {
                     exact_evals.set(exact_evals.get() + 1);
-                    -1.0
+                    (-1.0, true)
                 }
             };
             let gradient = theta.mapv(|value| value - center);
@@ -3587,7 +3618,12 @@ fn staged_exact_joint_outer_reoptimizes_and_certifies_the_full_row_measure() {
                 objective: cost,
                 gradient,
                 hessian,
-                mode: (),
+                mode: TerminalEvidence {
+                    serial,
+                    theta_bits: theta.iter().map(|value| value.to_bits()).collect(),
+                    objective_bits: cost.to_bits(),
+                    full_rows,
+                },
             })
         },
         |_theta, _specs, _designs, _row_set| {
@@ -3599,6 +3635,11 @@ fn staged_exact_joint_outer_reoptimizes_and_certifies_the_full_row_measure() {
 
     assert!(pilot_evals.get() > 0, "pilot objective was never evaluated");
     assert!(exact_evals.get() > 0, "exact objective was never evaluated");
+    assert_eq!(
+        fit_entry_serial.get(),
+        Some(evaluation_serial.get()),
+        "no exact profile evaluation may replay during or after owned-mode fit assembly",
+    );
     assert!(
         solved.fit.iter().all(|value| (*value + 1.0).abs() <= 1.0e-6),
         "returned pilot optimum instead of exact optimum: {:?}",
