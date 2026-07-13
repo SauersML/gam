@@ -1316,6 +1316,8 @@ mod device {
                 .arg(&p_i32)
                 .arg(&total)
                 .arg(&mut first_dev);
+            // SAFETY: the loaded kernel's argument ABI matches this builder, and
+            // `grid(first_len)` covers only the `first_len` allocated outputs.
             unsafe { launch.launch(grid(first_len)?) }.gpu_ctx("SAE row-jet first launch")?;
         }
         if second_len != 0 {
@@ -1341,6 +1343,8 @@ mod device {
                 .arg(&p_i32)
                 .arg(&total)
                 .arg(&mut second_dev);
+            // SAFETY: the loaded kernel's argument ABI matches this builder, and
+            // `grid(second_len)` covers only the `second_len` allocated outputs.
             unsafe { launch.launch(grid(second_len)?) }.gpu_ctx("SAE row-jet second launch")?;
         }
         if beta_len != 0 {
@@ -1363,6 +1367,8 @@ mod device {
                 .arg(&nb_i32)
                 .arg(&total)
                 .arg(&mut beta_dev);
+            // SAFETY: the loaded kernel's argument ABI matches this builder, and
+            // `grid(beta_len)` covers only the `beta_len` allocated outputs.
             unsafe { launch.launch(grid(beta_len)?) }.gpu_ctx("SAE row-jet beta launch")?;
         }
         if mixed_len != 0 {
@@ -1390,6 +1396,8 @@ mod device {
                 .arg(&nb_i32)
                 .arg(&total)
                 .arg(&mut mixed_dev);
+            // SAFETY: the loaded kernel's argument ABI matches this builder, and
+            // `grid(mixed_len)` covers only the `mixed_len` allocated outputs.
             unsafe { launch.launch(grid(mixed_len)?) }.gpu_ctx("SAE row-jet beta mixed launch")?;
         }
 
