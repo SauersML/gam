@@ -4249,7 +4249,6 @@ pub(crate) fn terminal_mode_binding_rejects_gradient_substitution() {
     let substituted = CustomFamilyTerminalMode {
         theta,
         objective,
-        fit_objective: objective,
         // The certified fixture owns an exact zero terminal gradient. Keeping
         // theta/objective/mode identical while substituting only this vector
         // must still fail closed.
@@ -4257,11 +4256,7 @@ pub(crate) fn terminal_mode_binding_rejects_gradient_substitution() {
         mode: owned.mode,
     };
 
-    let error = match bind_certified_custom_family_terminal_mode(
-        substituted,
-        &certified_outer,
-        &gam_problem::RhoPrior::Flat,
-    ) {
+    let error = match bind_certified_custom_family_terminal_mode(substituted, &certified_outer) {
         Ok(_) => panic!("a different terminal gradient cannot inherit the outer certificate"),
         Err(error) => error,
     };
@@ -4331,7 +4326,7 @@ pub(crate) fn labeled_terminal_mode_keeps_one_outer_rho_for_two_physical_penalti
         inner: eval.inner,
     };
     let mut state = CustomOuterState::new(None);
-    state.install_terminal_mode(&theta, objective, objective, &gradient, mode);
+    state.install_terminal_mode(&theta, objective, &gradient, mode);
     let terminal = state
         .terminal_mode
         .take()
@@ -4622,18 +4617,21 @@ pub(crate) fn owned_mode_finalizer_preserves_prior_and_active_jeffreys_without_r
     let evaluations_before_finalization = family.evaluations.load(Ordering::Relaxed);
 
     let objective = profiled.objective;
-    let fit_objective = inner_penalized_objective(
+    let inner_recomposition = inner_penalized_objective(
         &profiled.inner,
         include_exact_newton_logdet_h(&family, &options),
         include_exact_newton_logdet_s(&family, &options),
         "prior-bearing terminal test mode",
     )
-    .expect("owned-inner fit objective");
-    assert_eq!(fit_objective.to_bits(), flat.objective.to_bits());
+    .expect("owned-inner objective probe");
+    assert_ne!(
+        inner_recomposition.to_bits(),
+        flat.objective.to_bits(),
+        "active evaluator-side Jeffreys/Firth augmentation must not be recoverable by reconstructing from inner summary fields",
+    );
     let terminal = CustomFamilyTerminalMode {
         theta: rho.clone(),
         objective,
-        fit_objective,
         gradient: profiled.gradient,
         mode: CustomFamilyOwnedMode {
             objective,
@@ -4642,17 +4640,13 @@ pub(crate) fn owned_mode_finalizer_preserves_prior_and_active_jeffreys_without_r
         },
     };
     let certified_outer = certified_test_outer(rho, objective);
-    let (_mode, bound_fit_objective) = bind_certified_custom_family_terminal_mode(
-        terminal,
-        &certified_outer,
-        &prior,
-    )
-    .expect("the prior-bearing terminal identity must bind without replay");
+    let bound_mode = bind_certified_custom_family_terminal_mode(terminal, &certified_outer)
+        .expect("the prior-bearing terminal identity must bind without replay");
 
     assert_eq!(
-        bound_fit_objective.to_bits(),
-        flat.objective.to_bits(),
-        "the public fit objective must exclude the labeled rho prior",
+        bound_mode.objective.to_bits(),
+        certified_outer.final_value().to_bits(),
+        "the public fit objective must be the complete certified REML/LAML objective",
     );
     assert_eq!(
         certified_outer.final_value().to_bits(),
@@ -4703,7 +4697,7 @@ pub(crate) fn failed_terminal_probe_clears_stale_owned_mode() {
         inner: evaluated.mode.inner,
     };
     let mut state = CustomOuterState::new(None);
-    state.install_terminal_mode(&theta, objective, objective, &array![0.0], mode);
+    state.install_terminal_mode(&theta, objective, &array![0.0], mode);
     assert!(state.terminal_mode.is_some());
 
     // This is the transaction boundary used immediately before every

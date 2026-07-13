@@ -991,14 +991,12 @@ impl CustomOuterState {
         &mut self,
         theta: &Array1<f64>,
         objective: f64,
-        fit_objective: f64,
         gradient: &Array1<f64>,
         mode: CustomFamilyOwnedMode,
     ) {
         self.terminal_mode = Some(CustomFamilyTerminalMode {
             theta: theta.clone(),
             objective,
-            fit_objective,
             gradient: gradient.clone(),
             mode,
         });
@@ -1040,11 +1038,7 @@ impl CustomOuterState {
 /// exact evaluator state before fit assembly consumes it.
 pub(crate) struct CustomFamilyTerminalMode {
     pub(crate) theta: Array1<f64>,
-    /// Certified outer objective, including the labeled rho prior.
     pub(crate) objective: f64,
-    /// Same-evaluation profile objective reported on the public fit, excluding
-    /// the rho prior by API contract.
-    pub(crate) fit_objective: f64,
     pub(crate) gradient: Array1<f64>,
     pub(crate) mode: CustomFamilyOwnedMode,
 }
