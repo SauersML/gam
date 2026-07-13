@@ -39,7 +39,8 @@ const RANK_REVEAL_EPS_SLACK: f64 = 64.0;
 /// independent of `β` and equals the transposed row of the block's effective
 /// design matrix lifted into `R^K`.
 pub trait RowJacobianOperator: Send + Sync {
-    /// Dimension of the row primary state (survival: 4, Bernoulli: 1).
+    /// Dimension of the row primary state (survival marginal-slope: `3 + K`
+    /// for `K` score coordinates; Bernoulli: 1).
     fn k(&self) -> usize;
 
     /// Number of coefficients in this block (= width of `J_i`).
