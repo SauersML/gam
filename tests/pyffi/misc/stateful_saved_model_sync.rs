@@ -21,17 +21,17 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::tempdir;
 
-const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 8;
+const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 9;
 const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
-// FittedModelPayload has 96 serialized fields in schema version 8. These pin
+// FittedModelPayload has 97 serialized fields in schema version 9. These pin
 // fixtures leave `group_metadata=None` and `deployment_extensions=[]`; those are
 // the only two fields guarded by `skip_serializing_if`, so their JSON payloads
-// contain exactly 94 keys. Version 8 made `training_table_kind` a required
-// serialized String, while the typed `spline_scan` and `residual_cascade`
-// representation channels remain present (as null for these dense fixtures).
+// contain exactly 95 keys. Version 9 adds the canonical standard-link-wiggle
+// function-penalty metadata required to replay its posterior target without
+// inferring penalty order from lambda position; it is null for these fixtures.
 // Any payload-field or skip-rule change requires a fresh enumeration before
 // changing this pin.
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 94;
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 95;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {

@@ -54,7 +54,7 @@ use crate::transformation_normal::{
     fit_transformation_normal,
 };
 
-use crate::wiggle::WiggleBlockConfig;
+use crate::wiggle::{WiggleBlockConfig, WigglePenaltyMetadata};
 
 use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
 

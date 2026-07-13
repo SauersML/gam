@@ -741,6 +741,7 @@ fn constant_gaussian_standard_fit(
         saved_link_state: gam_solve::estimate::FittedLinkState::Standard(None),
         wiggle_knots: None,
         wiggle_degree: None,
+        wiggle_penalty_metadata: None,
         wiggle_saved_warp_beta: None,
         wiggle_saved_index_shift: None,
     })
@@ -1032,9 +1033,10 @@ fn adaptive_spatial_candidates(
                 .max(current_centers);
             let global_range = (smooth_offset + realized.coeff_range.start)
                 ..(smooth_offset + realized.coeff_range.end);
-            let edf = result
-                .fit
-                .per_term_edf(global_range, penalty_range.start, penalty_range.len());
+            let edf =
+                result
+                    .fit
+                    .per_term_edf(global_range, penalty_range.start, penalty_range.len());
             let nullspace_dim = realized.wald_unpenalized_dim();
             match adaptive_center_decision(
                 current_centers,

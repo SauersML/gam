@@ -235,6 +235,9 @@ pub struct StandardFitResult {
     pub saved_link_state: FittedLinkState,
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
+    /// Exact canonical function-penalty semantics and smoothing-parameter
+    /// order used by the fitted link-wiggle block.
+    pub wiggle_penalty_metadata: Option<WigglePenaltyMetadata>,
     /// Standard-basis link-warp coefficients `β_w = Z·γ` for the saved-model
     /// predict runtime when the frozen-basis de-aliasing engaged (#1596). The
     /// fit's coefficients stay in the reduced `γ` coordinate; this lift is

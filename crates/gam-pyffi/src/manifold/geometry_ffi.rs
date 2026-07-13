@@ -6844,6 +6844,7 @@ fn fit_dataset_impl(
             expectile_result.adaptive_diagnostics,
             expectile_result.wiggle_knots.map(|knots| knots.to_vec()),
             expectile_result.wiggle_degree,
+            expectile_result.wiggle_penalty_metadata,
             expectile_result.wiggle_saved_warp_beta,
             // Expectile LAWS is Gaussian-identity; it never engages the binomial
             // frozen-basis de-aliasing, so there is no frozen-index shift (#2141).
@@ -6914,6 +6915,7 @@ fn fit_dataset_impl(
                         standard_result.adaptive_diagnostics,
                         standard_result.wiggle_knots.map(|knots| knots.to_vec()),
                         standard_result.wiggle_degree,
+                        standard_result.wiggle_penalty_metadata,
                         standard_result.wiggle_saved_warp_beta,
                         standard_result.wiggle_saved_index_shift,
                     )?

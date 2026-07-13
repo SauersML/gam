@@ -809,10 +809,10 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
     }
 
     #[inline(always)]
-    fn scaled_multiply_add_affine_composed_sum<const N: usize>(
+    fn shared_multiply_add_affine_composed_sum<const N: usize>(
         lefts: &[&Self; N],
-        rights: &[&Self; N],
-        addends: &[&Self; N],
+        right: &Self,
+        addend: &Self,
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
@@ -823,52 +823,68 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         assert!(
             lefts
                 .iter()
-                .chain(rights)
-                .all(|input| std::ptr::eq(input.workspace, workspace)),
+                .all(|input| std::ptr::eq(input.workspace, workspace))
+                && (N == 0 || std::ptr::eq(right.workspace, workspace)),
             "compiled fused product-composition inputs belong to different workspaces"
         );
+        let addend_live = addend_scales.iter().any(|&scale| scale != 0.0);
         assert!(
-            addends
-                .iter()
-                .zip(addend_scales)
-                .all(|(input, &scale)| scale == 0.0 || std::ptr::eq(input.workspace, workspace)),
+            !addend_live || std::ptr::eq(addend.workspace, workspace),
             "live compiled fused addends belong to different workspaces"
         );
 
         let tape = workspace.tape_mut();
+        let right_node = right.node;
+        let addend_node = addend.node;
         let mut term_gradients = [[0.0; K]; N];
         let mut firsts = [0.0; N];
         let mut seconds = [0.0; N];
         let mut value = 0.0;
         let mut gradient = [0.0; K];
         let mut support = 0_u16;
+        let mut right_first = 0.0;
+        let mut addend_first = 0.0;
+        if N != 0 {
+            support |= tape.nodes[right_node].support;
+        }
+        if addend_live {
+            support |= tape.nodes[addend_node].support;
+        }
         for term in 0..N {
             let left = lefts[term].node;
-            let right = rights[term].node;
-            let addend = addends[term].node;
             let left_value = tape.nodes[left].value;
-            let right_value = tape.nodes[right].value;
+            let right_value = tape.nodes[right_node].value;
             let first = derivative_stacks[term][1] * input_scales[term];
             let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
             firsts[term] = first;
             seconds[term] = second;
             value += derivative_stacks[term][0];
-            support |= tape.nodes[left].support | tape.nodes[right].support;
-            if addend_scales[term] != 0.0 {
-                support |= tape.nodes[addend].support;
-            }
+            support |= tape.nodes[left].support;
+            right_first += first * left_value;
+            addend_first += first * addend_scales[term];
             for primary in 0..K {
-                let product_gradient = left_value * tape.gradients[right * K + primary]
+                let product_gradient = left_value * tape.gradients[right_node * K + primary]
                     + tape.gradients[left * K + primary] * right_value;
                 let inner_gradient = if addend_scales[term] == 0.0 {
                     product_gradient
                 } else if addend_scales[term] == 1.0 {
-                    product_gradient + tape.gradients[addend * K + primary]
+                    product_gradient + tape.gradients[addend_node * K + primary]
                 } else {
-                    product_gradient + addend_scales[term] * tape.gradients[addend * K + primary]
+                    product_gradient
+                        + addend_scales[term] * tape.gradients[addend_node * K + primary]
                 };
                 term_gradients[term][primary] = inner_gradient;
-                gradient[primary] += first * inner_gradient;
+                gradient[primary] += first * tape.gradients[left * K + primary] * right_value;
+            }
+        }
+        if N != 0 {
+            for primary in 0..K {
+                gradient[primary] += right_first * tape.gradients[right_node * K + primary];
+            }
+        }
+        if addend_live {
+            for primary in 0..K {
+                gradient[primary] += addend_first * tape.gradients[addend_node * K + primary];
             }
         }
 
@@ -885,9 +901,10 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             let mut channel = 0.0;
             for term in 0..N {
                 let left = lefts[term].node;
-                let right = rights[term].node;
-                let cross = tape.gradients[left * K + primary] * tape.gradients[right * K + other]
-                    + tape.gradients[left * K + other] * tape.gradients[right * K + primary];
+                let cross = tape.gradients[left * K + primary]
+                    * tape.gradients[right_node * K + other]
+                    + tape.gradients[left * K + other]
+                        * tape.gradients[right_node * K + primary];
                 channel += firsts[term] * cross
                     + seconds[term] * term_gradients[term][primary] * term_gradients[term][other];
             }
@@ -903,15 +920,14 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let edge_start = tape.edge_len;
         for term in 0..N {
             let left = lefts[term].node;
-            let right = rights[term].node;
-            let addend = addends[term].node;
-            let left_first = firsts[term] * tape.nodes[right].value;
-            let right_first = firsts[term] * tape.nodes[left].value;
+            let left_first = firsts[term] * tape.nodes[right_node].value;
             Order2GraphWorkspace::push_edge(tape, left, left_first);
-            Order2GraphWorkspace::push_edge(tape, right, right_first);
-            if addend_scales[term] != 0.0 {
-                Order2GraphWorkspace::push_edge(tape, addend, firsts[term] * addend_scales[term]);
-            }
+        }
+        if N != 0 {
+            Order2GraphWorkspace::push_edge(tape, right_node, right_first);
+        }
+        if addend_live {
+            Order2GraphWorkspace::push_edge(tape, addend_node, addend_first);
         }
         Order2GraphWorkspace::push_event(
             tape,

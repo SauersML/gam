@@ -230,10 +230,10 @@ fn affine_composed_sum_default<T>(
     )
 }
 
-fn scaled_multiply_add_affine_composed_sum_default<T, const N: usize>(
+fn shared_multiply_add_affine_composed_sum_default<T, const N: usize>(
     lefts: &[&T; N],
-    rights: &[&T; N],
-    addends: &[&T; N],
+    right: &T,
+    addend: &T,
     addend_scales: &[f64; N],
     input_scales: &[f64; N],
     derivative_stacks: &[[f64; 5]; N],
@@ -246,14 +246,14 @@ fn scaled_multiply_add_affine_composed_sum_default<T, const N: usize>(
 ) -> T {
     (0..N).fold(constant(0.0), |sum, term| {
         let inner = if addend_scales[term] == 0.0 {
-            mul(lefts[term], rights[term])
+            mul(lefts[term], right)
         } else if addend_scales[term] == 1.0 {
-            multiply_add(lefts[term], rights[term], addends[term])
+            multiply_add(lefts[term], right, addend)
         } else {
             multiply_add(
                 lefts[term],
-                rights[term],
-                &scale(addends[term], addend_scales[term]),
+                right,
+                &scale(addend, addend_scales[term]),
             )
         };
         let composed = affine_compose(&inner, input_scales[term], 0.0, derivative_stacks[term]);
@@ -383,18 +383,18 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
     /// borrowed so the call never copies a full derivative tower. An exact-zero
     /// addend scale (either sign of IEEE zero) removes that addend from the
     /// algebra entirely.
-    fn scaled_multiply_add_affine_composed_sum<const N: usize>(
+    fn shared_multiply_add_affine_composed_sum<const N: usize>(
         lefts: &[&Self; N],
-        rights: &[&Self; N],
-        addends: &[&Self; N],
+        right: &Self,
+        addend: &Self,
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
     ) -> Self {
-        scaled_multiply_add_affine_composed_sum_default(
+        shared_multiply_add_affine_composed_sum_default(
             lefts,
-            rights,
-            addends,
+            right,
+            addend,
             addend_scales,
             input_scales,
             derivative_stacks,
@@ -614,20 +614,20 @@ pub trait RuntimeJetScalar<'arena>: Clone {
     /// implementation-specific term cap; an exact-zero addend scale (including
     /// `-0.0`) means that addend has no dimension, workspace, or
     /// derivative-channel obligations.
-    fn scaled_multiply_add_affine_composed_sum<const N: usize>(
+    fn shared_multiply_add_affine_composed_sum<const N: usize>(
         lefts: &[&Self; N],
-        rights: &[&Self; N],
-        addends: &[&Self; N],
+        right: &Self,
+        addend: &Self,
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
         dimension: usize,
         workspace: &'arena Self::Workspace,
     ) -> Self {
-        scaled_multiply_add_affine_composed_sum_default(
+        shared_multiply_add_affine_composed_sum_default(
             lefts,
-            rights,
-            addends,
+            right,
+            addend,
             addend_scales,
             input_scales,
             derivative_stacks,
@@ -1036,10 +1036,10 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
     }
 
     #[inline(always)]
-    fn scaled_multiply_add_affine_composed_sum<const N: usize>(
+    fn shared_multiply_add_affine_composed_sum<const N: usize>(
         lefts: &[&Self; N],
-        rights: &[&Self; N],
-        addends: &[&Self; N],
+        right: &Self,
+        addend: &Self,
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
@@ -1048,13 +1048,11 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
     ) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         let left_inner: [&S; N] = std::array::from_fn(|term| &lefts[term].inner);
-        let right_inner: [&S; N] = std::array::from_fn(|term| &rights[term].inner);
-        let addend_inner: [&S; N] = std::array::from_fn(|term| &addends[term].inner);
         Self {
-            inner: S::scaled_multiply_add_affine_composed_sum(
+            inner: S::shared_multiply_add_affine_composed_sum(
                 &left_inner,
-                &right_inner,
-                &addend_inner,
+                &right.inner,
+                &addend.inner,
                 addend_scales,
                 input_scales,
                 derivative_stacks,
@@ -1599,10 +1597,10 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
     }
 
     #[inline(always)]
-    fn scaled_multiply_add_affine_composed_sum<const N: usize>(
+    fn shared_multiply_add_affine_composed_sum<const N: usize>(
         lefts: &[&Self; N],
-        rights: &[&Self; N],
-        addends: &[&Self; N],
+        right: &Self,
+        addend: &Self,
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
@@ -1610,15 +1608,16 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         arena: &'arena DynamicJetArena,
     ) -> Self {
         assert!(
-            lefts.iter().chain(rights).all(|input| {
+            lefts.iter().all(|input| {
                 input.dimension() == dimension && std::ptr::eq(input.arena, arena)
-            }),
+            }) && (N == 0
+                || (right.dimension() == dimension && std::ptr::eq(right.arena, arena))),
             "dynamic fused product-composition jets must share dimension and arena"
         );
+        let addend_live = addend_scales.iter().any(|&scale| scale != 0.0);
         assert!(
-            addends.iter().zip(addend_scales).all(|(input, &scale)| {
-                scale == 0.0 || (input.dimension() == dimension && std::ptr::eq(input.arena, arena))
-            }),
+            !addend_live
+                || (addend.dimension() == dimension && std::ptr::eq(addend.arena, arena)),
             "live dynamic fused addends must share dimension and arena"
         );
         let term_gradients = arena.zeros(N * dimension);
@@ -1627,43 +1626,56 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         let gradient = arena.zeros(dimension);
         let hessian = arena.zeros(dimension * dimension);
         let mut value = 0.0;
+        let mut right_first = 0.0;
+        let mut addend_first = 0.0;
         for term in 0..N {
             let first = derivative_stacks[term][1] * input_scales[term];
             let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
             firsts[term] = first;
             seconds[term] = second;
             value += derivative_stacks[term][0];
+            right_first += first * lefts[term].v;
+            addend_first += first * addend_scales[term];
             for primary in 0..dimension {
-                let product_gradient = lefts[term].v * rights[term].g[primary]
-                    + lefts[term].g[primary] * rights[term].v;
+                let product_gradient = lefts[term].v * right.g[primary]
+                    + lefts[term].g[primary] * right.v;
                 let inner_gradient = if addend_scales[term] == 0.0 {
                     product_gradient
                 } else if addend_scales[term] == 1.0 {
-                    product_gradient + addends[term].g[primary]
+                    product_gradient + addend.g[primary]
                 } else {
-                    product_gradient + addend_scales[term] * addends[term].g[primary]
+                    product_gradient + addend_scales[term] * addend.g[primary]
                 };
                 term_gradients[term * dimension + primary] = inner_gradient;
-                gradient[primary] += first * inner_gradient;
+                gradient[primary] += first * lefts[term].g[primary] * right.v;
+            }
+        }
+        if N != 0 {
+            for primary in 0..dimension {
+                gradient[primary] += right_first * right.g[primary];
+            }
+        }
+        if addend_live {
+            for primary in 0..dimension {
+                gradient[primary] += addend_first * addend.g[primary];
             }
         }
         for primary in 0..dimension {
             for other in primary..dimension {
                 let index = primary * dimension + other;
-                let mut channel = 0.0;
+                let mut channel = if N == 0 {
+                    0.0
+                } else {
+                    right_first * right.h[index]
+                };
+                if addend_live {
+                    channel += addend_first * addend.h[index];
+                }
                 for term in 0..N {
-                    let product_hessian = lefts[term].v * rights[term].h[index]
-                        + lefts[term].g[primary] * rights[term].g[other]
-                        + lefts[term].g[other] * rights[term].g[primary]
-                        + lefts[term].h[index] * rights[term].v;
-                    let inner_hessian = if addend_scales[term] == 0.0 {
-                        product_hessian
-                    } else if addend_scales[term] == 1.0 {
-                        product_hessian + addends[term].h[index]
-                    } else {
-                        product_hessian + addend_scales[term] * addends[term].h[index]
-                    };
-                    channel += firsts[term] * inner_hessian
+                    let local_product_hessian = lefts[term].g[primary] * right.g[other]
+                        + lefts[term].g[other] * right.g[primary]
+                        + lefts[term].h[index] * right.v;
+                    channel += firsts[term] * local_product_hessian
                         + seconds[term]
                             * term_gradients[term * dimension + primary]
                             * term_gradients[term * dimension + other];
@@ -3299,10 +3311,10 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
     }
 
     #[inline(always)]
-    fn scaled_multiply_add_affine_composed_sum<const N: usize>(
+    fn shared_multiply_add_affine_composed_sum<const N: usize>(
         lefts: &[&Self; N],
-        rights: &[&Self; N],
-        addends: &[&Self; N],
+        right: &Self,
+        addend: &Self,
         addend_scales: &[f64; N],
         input_scales: &[f64; N],
         derivative_stacks: &[[f64; 5]; N],
@@ -3311,42 +3323,56 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
         let mut firsts = [0.0; N];
         let mut seconds = [0.0; N];
         let mut out = crate::jet_tower::Tower2::zero();
+        let mut right_first = 0.0;
+        let mut addend_first = 0.0;
         for term in 0..N {
             let first = derivative_stacks[term][1] * input_scales[term];
             let second = derivative_stacks[term][2] * input_scales[term] * input_scales[term];
             firsts[term] = first;
             seconds[term] = second;
             out.v += derivative_stacks[term][0];
+            right_first += first * lefts[term].0.v;
+            addend_first += first * addend_scales[term];
             for primary in 0..K {
-                let product_gradient = lefts[term].0.v * rights[term].0.g[primary]
-                    + lefts[term].0.g[primary] * rights[term].0.v;
+                let product_gradient = lefts[term].0.v * right.0.g[primary]
+                    + lefts[term].0.g[primary] * right.0.v;
                 let inner_gradient = if addend_scales[term] == 0.0 {
                     product_gradient
                 } else if addend_scales[term] == 1.0 {
-                    product_gradient + addends[term].0.g[primary]
+                    product_gradient + addend.0.g[primary]
                 } else {
-                    product_gradient + addend_scales[term] * addends[term].0.g[primary]
+                    product_gradient + addend_scales[term] * addend.0.g[primary]
                 };
                 term_gradients[term][primary] = inner_gradient;
-                out.g[primary] += first * inner_gradient;
+                out.g[primary] += first * lefts[term].0.g[primary] * right.0.v;
+            }
+        }
+        if N != 0 {
+            for primary in 0..K {
+                out.g[primary] += right_first * right.0.g[primary];
+            }
+        }
+        let addend_live = addend_scales.iter().any(|&scale| scale != 0.0);
+        if addend_live {
+            for primary in 0..K {
+                out.g[primary] += addend_first * addend.0.g[primary];
             }
         }
         for primary in 0..K {
             for other in primary..K {
-                let mut channel = 0.0;
+                let mut channel = if N == 0 {
+                    0.0
+                } else {
+                    right_first * right.0.h[primary][other]
+                };
+                if addend_live {
+                    channel += addend_first * addend.0.h[primary][other];
+                }
                 for term in 0..N {
-                    let product_hessian = lefts[term].0.v * rights[term].0.h[primary][other]
-                        + lefts[term].0.g[primary] * rights[term].0.g[other]
-                        + lefts[term].0.g[other] * rights[term].0.g[primary]
-                        + lefts[term].0.h[primary][other] * rights[term].0.v;
-                    let inner_hessian = if addend_scales[term] == 0.0 {
-                        product_hessian
-                    } else if addend_scales[term] == 1.0 {
-                        product_hessian + addends[term].0.h[primary][other]
-                    } else {
-                        product_hessian + addend_scales[term] * addends[term].0.h[primary][other]
-                    };
-                    channel += firsts[term] * inner_hessian
+                    let local_product_hessian = lefts[term].0.g[primary] * right.0.g[other]
+                        + lefts[term].0.g[other] * right.0.g[primary]
+                        + lefts[term].0.h[primary][other] * right.0.v;
+                    channel += firsts[term] * local_product_hessian
                         + seconds[term]
                             * term_gradients[term][primary]
                             * term_gradients[term][other];

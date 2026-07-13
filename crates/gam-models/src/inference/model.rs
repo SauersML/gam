@@ -5,6 +5,7 @@ use crate::survival::construction::{
 use crate::survival::location_scale::ResidualDistribution;
 use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::wiggle::{
+    WigglePenaltyMetadata, canonical_wiggle_function_penalties,
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
 use gam_linalg::faer_ndarray::array2_to_nested_vec;
@@ -55,7 +56,7 @@ use std::path::Path;
 /// Do NOT bump for purely additive `Option<T>` fields that the save-time
 /// invariant (`validate_for_persistence`) does not yet require. Those are
 /// forward-compatible.
-pub const MODEL_PAYLOAD_VERSION: u32 = 8;
+pub const MODEL_PAYLOAD_VERSION: u32 = 9;
 
 /// Schema-free saved-model metadata keyed by stable group id.
 ///
@@ -312,6 +313,12 @@ pub struct FittedModelPayload {
     pub linkwiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
     pub linkwiggle_degree: Option<usize>,
+    /// Exact fit-time I-spline function-penalty semantics and ordered block
+    /// topology for a standard link-wiggle. Required for posterior sampling;
+    /// the sampler rebuilds these blocks through the canonical function-space
+    /// constructor and rejects any topology or lambda-count mismatch.
+    #[serde(default)]
+    pub linkwiggle_penalty_metadata: Option<WigglePenaltyMetadata>,
     #[serde(default)]
     pub beta_link_wiggle: Option<Vec<f64>>,
     /// Frozen-index mean-coordinate shift `s` for the standard binomial-mean
@@ -704,6 +711,7 @@ impl FittedModelPayload {
             gaussian_response_scale: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
+            linkwiggle_penalty_metadata: None,
             beta_link_wiggle: None,
             link_wiggle_index_shift: None,
             baseline_timewiggle_knots: None,
@@ -933,6 +941,10 @@ impl PredictModelClass {
 pub struct SavedLinkWiggleRuntime {
     pub knots: Vec<f64>,
     pub degree: usize,
+    /// Canonical penalty metadata is mandatory for standard fitted
+    /// link-wiggles, whose posterior sampler consumes it. Other model classes
+    /// do not expose the standard joint-wiggle sampling target.
+    pub penalty_metadata: Option<WigglePenaltyMetadata>,
     pub beta: Vec<f64>,
     /// Frozen-index mean-coordinate shift `s` (#2141). When present the predict
     /// layer evaluates the warp basis at the frozen index
@@ -3052,6 +3064,26 @@ impl FittedModel {
                             .to_string(),
                 })?,
         };
+        let penalty_metadata = payload.linkwiggle_penalty_metadata.clone();
+        if let Some(metadata) = penalty_metadata.as_ref() {
+            let canonical = canonical_wiggle_function_penalties(
+                &Array1::from_vec(knots.clone()),
+                degree,
+                &metadata.derivative_orders,
+                metadata.double_penalty,
+            )
+            .map_err(|reason| FittedModelError::PayloadCorrupt {
+                reason: format!("saved link-wiggle penalty metadata is invalid: {reason}"),
+            })?;
+            if canonical.metadata != *metadata {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "saved link-wiggle penalty topology {:?} disagrees with canonical topology {:?}",
+                        metadata.blocks, canonical.metadata.blocks,
+                    ),
+                });
+            }
+        }
         // #2141: the frozen-index shift lets predict evaluate the warp basis at
         // the index `η̂` the fit pinned `B` at (`base + X·s`). `None` for
         // pre-#2141 saves and for non-de-aliased warp paths, where the base
@@ -3060,6 +3092,7 @@ impl FittedModel {
         Ok(Some(SavedLinkWiggleRuntime {
             knots,
             degree,
+            penalty_metadata,
             beta,
             index_shift,
         }))
@@ -4495,6 +4528,7 @@ impl FittedModel {
         }
         let has_any_saved_link_wiggle = self.linkwiggle_knots.is_some()
             || self.linkwiggle_degree.is_some()
+            || self.linkwiggle_penalty_metadata.is_some()
             || self.beta_link_wiggle.is_some()
             || self
                 .fit_result
@@ -4505,6 +4539,15 @@ impl FittedModel {
         if has_any_saved_link_wiggle && saved_link_wiggle.is_none() {
             return Err(FittedModelError::SchemaMismatch {
                 reason: "saved model has incomplete link-wiggle state; expected metadata and coefficients"
+                    .to_string(),
+            });
+        }
+        if matches!(self.family_state, FittedFamily::Standard { .. })
+            && saved_link_wiggle.is_some()
+            && self.linkwiggle_penalty_metadata.is_none()
+        {
+            return Err(FittedModelError::MissingField {
+                reason: "standard link-wiggle model is missing canonical penalty metadata; refit"
                     .to_string(),
             });
         }
@@ -5653,6 +5696,7 @@ mod tests {
         let runtime = SavedLinkWiggleRuntime {
             knots: vec![],
             degree: 0,
+            penalty_metadata: None,
             beta: vec![],
             index_shift: Some(vec![0.25, -0.5]),
         };
@@ -5669,6 +5713,7 @@ mod tests {
         let runtime = SavedLinkWiggleRuntime {
             knots: vec![],
             degree: 0,
+            penalty_metadata: None,
             beta: vec![],
             index_shift: Some(vec![0.25]),
         };

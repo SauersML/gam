@@ -6,6 +6,7 @@ use gam_terms::basis::{
     ispline_function_penalties,
 };
 use ndarray::{Array1, Array2, ArrayView1};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
 pub struct WiggleBlockConfig {
@@ -15,11 +16,47 @@ pub struct WiggleBlockConfig {
     pub double_penalty: bool,
 }
 
+/// Semantic identity of one canonical I-spline penalty block.
+///
+/// The order of these values is the smoothing-parameter order. Persisting the
+/// topology prevents inference code from guessing a derivative order from a
+/// lambda index or inventing a zero block when the guess is invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum WigglePenaltyBlockKind {
+    Roughness { derivative_order: usize },
+    NullspaceShrinkage { derivative_order: usize },
+}
+
+/// Complete semantic description of a realized monotone-wiggle penalty list.
+///
+/// `derivative_orders` is already canonicalized into the exact roughness-block
+/// order used by fitting: primary first, followed by deduplicated additional
+/// orders. `blocks` additionally records whether the primary roughness emitted
+/// a function-metric nullspace shrinkage coordinate. For example, an order-one
+/// anchored I-spline roughness is full rank, so `double_penalty=true` emits no
+/// synthetic ridge block.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WigglePenaltyMetadata {
+    pub derivative_orders: Vec<usize>,
+    pub double_penalty: bool,
+    pub blocks: Vec<WigglePenaltyBlockKind>,
+}
+
+/// Exact matrices and nullities accompanying [`WigglePenaltyMetadata`].
+#[derive(Clone, Debug)]
+pub struct CanonicalWigglePenaltySet {
+    pub metadata: WigglePenaltyMetadata,
+    pub matrices: Vec<Array2<f64>>,
+    pub nullspace_dims: Vec<usize>,
+}
+
 #[derive(Clone)]
 pub(crate) struct SelectedWiggleBasis {
     pub knots: Array1<f64>,
     pub degree: usize,
     pub block: ParameterBlockInput,
+    pub penalty_metadata: WigglePenaltyMetadata,
 }
 
 // #1521: relocated DOWN into `gam_terms::basis` (was a gamlss/wiggle helper).
@@ -41,6 +78,109 @@ pub(crate) fn monotone_wiggle_internal_degree(degree: usize) -> Result<usize, St
         .ok_or_else(|| "monotone wiggle degree must be >= 2".to_string())
 }
 
+/// Build the exact ordered function-space penalty set for an anchored
+/// I-spline monotone wiggle.
+///
+/// `derivative_orders` must already be in the fitting order and contain no
+/// duplicates. The first order is the primary roughness; only its structural
+/// null space is eligible for the separate double-penalty coordinate. Every
+/// matrix comes from the canonical `C^T S_B C` function Gram, never a
+/// coefficient difference or identity metric.
+pub fn canonical_wiggle_function_penalties(
+    knots: &Array1<f64>,
+    degree: usize,
+    derivative_orders: &[usize],
+    double_penalty: bool,
+) -> Result<CanonicalWigglePenaltySet, String> {
+    if derivative_orders.is_empty() {
+        return Err("wiggle penalty metadata requires at least one derivative order".to_string());
+    }
+    if derivative_orders.contains(&0) {
+        return Err("wiggle penalty derivative orders must all be positive".to_string());
+    }
+    for (index, &order) in derivative_orders.iter().enumerate() {
+        if derivative_orders[..index].contains(&order) {
+            return Err(format!(
+                "wiggle penalty derivative order {order} is duplicated in canonical metadata"
+            ));
+        }
+    }
+
+    let internal_degree = monotone_wiggle_internal_degree(degree)?;
+    let mut blocks = Vec::new();
+    let mut matrices = Vec::new();
+    let mut nullspace_dims = Vec::new();
+    for (index, &derivative_order) in derivative_orders.iter().enumerate() {
+        let penalties = ispline_function_penalties(
+            knots.view(),
+            internal_degree,
+            derivative_order,
+            index == 0 && double_penalty,
+        )
+        .map_err(|error| error.to_string())?;
+        blocks.push(WigglePenaltyBlockKind::Roughness { derivative_order });
+        matrices.push(penalties.roughness);
+        nullspace_dims.push(penalties.roughness_nullspace_dim);
+        if let Some(nullspace_shrinkage) = penalties.nullspace_shrinkage {
+            blocks.push(WigglePenaltyBlockKind::NullspaceShrinkage { derivative_order });
+            matrices.push(nullspace_shrinkage);
+            nullspace_dims.push(0);
+        }
+    }
+
+    Ok(CanonicalWigglePenaltySet {
+        metadata: WigglePenaltyMetadata {
+            derivative_orders: derivative_orders.to_vec(),
+            double_penalty,
+            blocks,
+        },
+        matrices,
+        nullspace_dims,
+    })
+}
+
+fn buildwiggle_block_input_from_canonical_penalties(
+    seed: ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    canonical: &CanonicalWigglePenaltySet,
+) -> Result<ParameterBlockInput, String> {
+    let design = monotone_wiggle_basis_from_knots(seed, knots, degree)?;
+    let p = design.ncols();
+    if p == 0 {
+        return Err("wiggle basis has no free monotone columns".to_string());
+    }
+    if canonical.matrices.len() != canonical.nullspace_dims.len()
+        || canonical.matrices.len() != canonical.metadata.blocks.len()
+    {
+        return Err(
+            "canonical wiggle penalty matrices, nullities, and topology disagree".to_string(),
+        );
+    }
+    for (index, matrix) in canonical.matrices.iter().enumerate() {
+        if matrix.dim() != (p, p) {
+            return Err(format!(
+                "canonical I-spline penalty block {index} is {}x{} but wiggle design has {p} columns",
+                matrix.nrows(),
+                matrix.ncols(),
+            ));
+        }
+    }
+    Ok(ParameterBlockInput {
+        design: DesignMatrix::Dense(DenseDesignMatrix::from(design)),
+        offset: Array1::zeros(seed.len()),
+        penalties: canonical
+            .matrices
+            .iter()
+            .cloned()
+            .map(crate::model_types::PenaltySpec::Dense)
+            .collect(),
+        nullspace_dims: canonical.nullspace_dims.clone(),
+        initial_log_lambdas: None,
+        initial_beta: Some(Array1::zeros(p)),
+    })
+}
+
 pub fn buildwiggle_block_input_from_knots(
     seed: ArrayView1<'_, f64>,
     knots: &Array1<f64>,
@@ -48,38 +188,9 @@ pub fn buildwiggle_block_input_from_knots(
     penalty_order: usize,
     double_penalty: bool,
 ) -> Result<ParameterBlockInput, String> {
-    let design = monotone_wiggle_basis_from_knots(seed, knots, degree)?;
-    let p = design.ncols();
-    if p == 0 {
-        return Err("wiggle basis has no free monotone columns".to_string());
-    }
-    let internal_degree = monotone_wiggle_internal_degree(degree)?;
-    let function_penalties =
-        ispline_function_penalties(knots.view(), internal_degree, penalty_order, double_penalty)
-            .map_err(|error| error.to_string())?;
-    if function_penalties.roughness.dim() != (p, p) {
-        return Err(format!(
-            "I-spline function penalty is {}x{} but wiggle design has {p} columns",
-            function_penalties.roughness.nrows(),
-            function_penalties.roughness.ncols(),
-        ));
-    }
-    let mut penalties = vec![crate::model_types::PenaltySpec::Dense(
-        function_penalties.roughness,
-    )];
-    let mut nullspace_dims = vec![function_penalties.roughness_nullspace_dim];
-    if let Some(nullspace_shrinkage) = function_penalties.nullspace_shrinkage {
-        penalties.push(crate::model_types::PenaltySpec::Dense(nullspace_shrinkage));
-        nullspace_dims.push(0);
-    }
-    Ok(ParameterBlockInput {
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(design)),
-        offset: Array1::zeros(seed.len()),
-        penalties,
-        nullspace_dims,
-        initial_log_lambdas: None,
-        initial_beta: Some(Array1::zeros(p)),
-    })
+    let canonical =
+        canonical_wiggle_function_penalties(knots, degree, &[penalty_order], double_penalty)?;
+    buildwiggle_block_input_from_canonical_penalties(seed, knots, degree, &canonical)
 }
 
 pub fn buildwiggle_block_input_from_seed(
@@ -264,18 +375,23 @@ pub(crate) fn select_wiggle_basis_from_seed(
 ) -> Result<SelectedWiggleBasis, String> {
     let (primary_order, extra_orders) =
         split_wiggle_penalty_orders(cfg.penalty_order, penalty_orders)?;
-    let effective_cfg = WiggleBlockConfig {
-        degree: cfg.degree,
-        num_internal_knots: cfg.num_internal_knots,
-        penalty_order: primary_order,
-        double_penalty: cfg.double_penalty,
-    };
-    let (mut block, knots) = buildwiggle_block_input_from_seed(seed, &effective_cfg)?;
-    append_selected_wiggle_function_penalties(&mut block, &knots, cfg.degree, &extra_orders)?;
+    let mut derivative_orders = Vec::with_capacity(1 + extra_orders.len());
+    derivative_orders.push(primary_order);
+    derivative_orders.extend(extra_orders);
+    let knots = initializewiggle_knots_from_seed(seed, cfg.degree, cfg.num_internal_knots)?;
+    let canonical = canonical_wiggle_function_penalties(
+        &knots,
+        cfg.degree,
+        &derivative_orders,
+        cfg.double_penalty,
+    )?;
+    let block =
+        buildwiggle_block_input_from_canonical_penalties(seed, &knots, cfg.degree, &canonical)?;
     Ok(SelectedWiggleBasis {
         knots,
         degree: cfg.degree,
         block,
+        penalty_metadata: canonical.metadata,
     })
 }
 

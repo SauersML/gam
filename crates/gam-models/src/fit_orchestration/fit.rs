@@ -569,6 +569,7 @@ pub(crate) fn fit_standard_model(
         kappa_timing: fitted.kappa_timing,
         wiggle_knots: None,
         wiggle_degree: None,
+        wiggle_penalty_metadata: None,
         wiggle_saved_warp_beta: None,
         wiggle_saved_index_shift: None,
     };
@@ -593,6 +594,7 @@ pub(crate) fn fit_standard_model(
         },
         &wiggle.wiggle.penalty_orders,
     )?;
+    let wiggle_penalty_metadata = selected_wiggle_basis.penalty_metadata.clone();
 
     // A penalized, monotone-constrained link-offset spline shrinks to zero at
     // large smoothing, so the no-wiggle pilot fit (`result`) is the *exact*
@@ -665,6 +667,7 @@ pub(crate) fn fit_standard_model(
         kappa_timing: result.kappa_timing,
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),
+        wiggle_penalty_metadata: Some(wiggle_penalty_metadata),
         wiggle_saved_warp_beta: solved.saved_warp_beta,
         wiggle_saved_index_shift: solved.saved_index_shift,
     })

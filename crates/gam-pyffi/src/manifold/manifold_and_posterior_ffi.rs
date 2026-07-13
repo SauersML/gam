@@ -4555,6 +4555,7 @@ fn build_standard_payload(
     >,
     wiggle_knots: Option<Vec<f64>>,
     wiggle_degree: Option<usize>,
+    wiggle_penalty_metadata: Option<gam::families::wiggle::WigglePenaltyMetadata>,
     wiggle_saved_warp_beta: Option<Vec<f64>>,
     wiggle_saved_index_shift: Option<Vec<f64>>,
 ) -> Result<FittedModelPayload, String> {
@@ -4606,6 +4607,7 @@ fn build_standard_payload(
     payload.link = Some(family_inverse_link);
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
+    payload.linkwiggle_penalty_metadata = wiggle_penalty_metadata;
     // #1596: the standard link-wiggle warp is fit in a reduced, identifiable
     // coordinate `γ` (`β_w = Z·γ`); the saved fit_result block carries `γ`, so
     // persist the full-width standard-basis lift `β_w` here for the predict
@@ -5974,23 +5976,16 @@ fn serialize_competing_risks_prediction_payload(
             f64::INFINITY,
             "hazard",
         )?;
-        let (survival_lower, survival_upper) = competing_risks_surface_bounds(
-            &result.survival,
-            survival_se,
+        let (survival_lower, survival_upper) =
+            competing_risks_surface_bounds(&result.survival, survival_se, z, 0.0, 1.0, "survival")?;
+        let (cumulative_hazard_lower, cumulative_hazard_upper) = competing_risks_surface_bounds(
+            &result.cumulative_hazard,
+            cumulative_hazard_se,
             z,
             0.0,
-            1.0,
-            "survival",
+            f64::INFINITY,
+            "cumulative hazard",
         )?;
-        let (cumulative_hazard_lower, cumulative_hazard_upper) =
-            competing_risks_surface_bounds(
-                &result.cumulative_hazard,
-                cumulative_hazard_se,
-                z,
-                0.0,
-                f64::INFINITY,
-                "cumulative hazard",
-            )?;
         let (cif_lower, cif_upper) = competing_risks_surface_bounds(
             &result.cif,
             cif_se,
@@ -5999,15 +5994,14 @@ fn serialize_competing_risks_prediction_payload(
             1.0,
             "cumulative incidence",
         )?;
-        let (overall_survival_lower, overall_survival_upper) =
-            competing_risks_matrix_bounds(
-                &result.overall_survival,
-                overall_survival_se,
-                z,
-                0.0,
-                1.0,
-                "overall survival",
-            )?;
+        let (overall_survival_lower, overall_survival_upper) = competing_risks_matrix_bounds(
+            &result.overall_survival,
+            overall_survival_se,
+            z,
+            0.0,
+            1.0,
+            "overall survival",
+        )?;
         let (eta_lower, eta_upper) =
             competing_risks_vector_bounds(&result.linear_predictor, eta_se, z, "eta")?;
         (
@@ -6033,8 +6027,7 @@ fn serialize_competing_risks_prediction_payload(
             || result.eta_se.is_some()
         {
             return Err(
-                "competing-risks posterior SEs were produced without an interval level"
-                    .to_string(),
+                "competing-risks posterior SEs were produced without an interval level".to_string(),
             );
         }
         (

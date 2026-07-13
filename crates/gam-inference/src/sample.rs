@@ -22,7 +22,8 @@ use super::hmc_io::{
 pub use super::hmc_io::{NutsConfig, NutsResult};
 use crate::formula_dsl::{LinkWiggleFormulaSpec, parse_formula};
 use crate::model::{
-    FittedModel as SavedModel, PredictModelClass, load_survival_time_basis_config_from_model,
+    FittedModel as SavedModel, PredictModelClass, SavedLinkWiggleRuntime,
+    load_survival_time_basis_config_from_model,
 };
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
@@ -43,12 +44,11 @@ use gam_models::survival::{
 };
 use gam_models::wiggle::{
     append_selected_wiggle_function_penalties, buildwiggle_block_input_from_knots,
-    split_wiggle_penalty_orders,
+    canonical_wiggle_function_penalties, split_wiggle_penalty_orders,
 };
 use gam_problem::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam_runtime::resource::{MemoryGovernor, ResourcePolicy, rows_for_target_bytes};
 use gam_solve::estimate::{BlockRole, validate_all_finite};
-use gam_terms::basis::create_difference_penalty_matrix;
 use gam_terms::smooth::build_term_collection_design;
 use gam_terms::smooth::{LinearCoefficientGeometry, weighted_blockwise_penalty_sum};
 use gam_terms::term_builder::resolve_role_col;
@@ -176,6 +176,51 @@ fn weighted_penalty_matrix(
         out += &(s * lam);
     }
     Ok(out)
+}
+
+/// Rebuild the standard link-wiggle penalty from the exact semantic metadata
+/// persisted by fitting. The canonical constructor is shared with fit-time
+/// block assembly, and every count, shape, and ordered block kind is checked
+/// before lambdas are applied. There is intentionally no inferred order,
+/// skipped block, or zero-matrix completion path.
+fn saved_link_wiggle_penalty_matrix(
+    runtime: &SavedLinkWiggleRuntime,
+    lambdas: ArrayView1<'_, f64>,
+    expected_dimension: usize,
+) -> Result<Array2<f64>, String> {
+    let metadata = runtime.penalty_metadata.as_ref().ok_or_else(|| {
+        "standard link-wiggle sampling requires saved canonical penalty metadata; refit".to_string()
+    })?;
+    let canonical = canonical_wiggle_function_penalties(
+        &Array1::from_vec(runtime.knots.clone()),
+        runtime.degree,
+        &metadata.derivative_orders,
+        metadata.double_penalty,
+    )
+    .map_err(|error| format!("saved link-wiggle penalty reconstruction failed: {error}"))?;
+    if canonical.metadata != *metadata {
+        return Err(format!(
+            "saved link-wiggle penalty topology {:?} disagrees with canonical topology {:?}",
+            metadata.blocks, canonical.metadata.blocks,
+        ));
+    }
+    if canonical.matrices.len() != lambdas.len() {
+        return Err(format!(
+            "saved link-wiggle penalty/lambda mismatch: canonical topology has {} blocks but fit stores {} lambdas",
+            canonical.matrices.len(),
+            lambdas.len(),
+        ));
+    }
+    for (index, matrix) in canonical.matrices.iter().enumerate() {
+        if matrix.dim() != (expected_dimension, expected_dimension) {
+            return Err(format!(
+                "saved link-wiggle penalty block {index} is {}x{} but fitted LinkWiggle coordinate has dimension {expected_dimension}",
+                matrix.nrows(),
+                matrix.ncols(),
+            ));
+        }
+    }
+    weighted_penalty_matrix(&canonical.matrices, lambdas)
 }
 
 fn validate_explicit_link_wiggle_joint_hessian(
@@ -1036,27 +1081,7 @@ fn sample_standard_link_wiggle(
     let degree = wiggle_runtime.degree;
     let knot_arr = Array1::from_vec(wiggle_runtime.knots.clone());
 
-    let mut wiggle_penalties = Vec::new();
-    let default_orders = [2usize];
-    let n_wiggle_lambdas = wiggle_lambdas.len();
-    for k in 0..n_wiggle_lambdas {
-        let order = if k < default_orders.len() {
-            default_orders[k]
-        } else {
-            k + 1
-        };
-        if order >= p_wiggle {
-            continue;
-        }
-        let penalty = create_difference_penalty_matrix(p_wiggle, order, None)
-            .map_err(|e| format!("wiggle difference penalty failed: {e}"))?;
-        wiggle_penalties.push(penalty);
-    }
-    while wiggle_penalties.len() < n_wiggle_lambdas {
-        wiggle_penalties.push(Array2::zeros((p_wiggle, p_wiggle)));
-    }
-
-    let penalty_link = weighted_penalty_matrix(&wiggle_penalties, wiggle_lambdas)?;
+    let penalty_link = saved_link_wiggle_penalty_matrix(&wiggle_runtime, wiggle_lambdas, p_wiggle)?;
 
     // Fitted prior weights and offset, so the sampled target is exactly the
     // fitted model's posterior (#2245 finding 16). The offset also enters the
@@ -1561,7 +1586,97 @@ fn sample_survival(
 mod tests {
     use super::*;
     use gam_linalg::matrix::{DenseDesignMatrix, DenseDesignOperator, LinearOperator};
+    use gam_models::wiggle::WigglePenaltyBlockKind;
     use gam_problem::types::LikelihoodScaleMetadata;
+
+    /// #2306: fit and sampling must consume the same exact function-space
+    /// penalty, including order and lambda topology. The highly nonuniform knot
+    /// vector makes an unweighted coefficient-difference reconstruction
+    /// observably different. With primary order one the anchored I-spline
+    /// roughness is full rank, so `double_penalty=true` must not invent a ridge.
+    #[test]
+    fn standard_link_wiggle_sampling_penalty_matches_fit_value_gradient_hessian_2306() {
+        let a = -1.3_f64;
+        let b = 2.6_f64;
+        let width = b - a;
+        let mut knot_values = vec![a; 4];
+        knot_values.extend([
+            a + 0.03 * width,
+            a + 0.21 * width,
+            a + 0.22 * width,
+            a + 0.68 * width,
+            a + 0.94 * width,
+        ]);
+        knot_values.extend(vec![b; 4]);
+        let knots = Array1::from_vec(knot_values);
+        let derivative_orders = [1usize, 2, 3];
+        let fit_penalties =
+            canonical_wiggle_function_penalties(&knots, 3, &derivative_orders, true)
+                .expect("fit-time canonical penalties");
+        assert_eq!(
+            fit_penalties.metadata.blocks,
+            vec![
+                WigglePenaltyBlockKind::Roughness {
+                    derivative_order: 1,
+                },
+                WigglePenaltyBlockKind::Roughness {
+                    derivative_order: 2,
+                },
+                WigglePenaltyBlockKind::Roughness {
+                    derivative_order: 3,
+                },
+            ],
+            "order-one primary roughness has no null space, so double penalty emits no fake ridge",
+        );
+        let p = fit_penalties.matrices[0].nrows();
+        let runtime = SavedLinkWiggleRuntime {
+            knots: knots.to_vec(),
+            degree: 3,
+            penalty_metadata: Some(fit_penalties.metadata.clone()),
+            beta: vec![0.0; p],
+            index_shift: None,
+        };
+        let lambdas = Array1::from_vec(vec![0.7, 1.3, 2.1]);
+        let sampled_hessian = saved_link_wiggle_penalty_matrix(&runtime, lambdas.view(), p)
+            .expect("sampling rebuilds the fit topology");
+        let mut fitted_hessian = Array2::<f64>::zeros((p, p));
+        for (matrix, &lambda) in fit_penalties.matrices.iter().zip(lambdas.iter()) {
+            fitted_hessian.scaled_add(lambda, matrix);
+        }
+
+        let theta = Array1::from_shape_fn(p, |index| 0.15 + 0.07 * index as f64);
+        let fitted_gradient = fitted_hessian.dot(&theta);
+        let sampled_gradient = sampled_hessian.dot(&theta);
+        let fitted_value = 0.5 * theta.dot(&fitted_gradient);
+        let sampled_value = 0.5 * theta.dot(&sampled_gradient);
+        let max_hessian_error = sampled_hessian
+            .iter()
+            .zip(fitted_hessian.iter())
+            .map(|(sampled, fitted)| (sampled - fitted).abs())
+            .fold(0.0_f64, f64::max);
+        let max_gradient_error = sampled_gradient
+            .iter()
+            .zip(fitted_gradient.iter())
+            .map(|(sampled, fitted)| (sampled - fitted).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_hessian_error < 1.0e-12,
+            "penalty Hessian drift: {max_hessian_error}"
+        );
+        assert!(
+            max_gradient_error < 1.0e-12,
+            "penalty gradient drift: {max_gradient_error}"
+        );
+        assert!(
+            (sampled_value - fitted_value).abs() < 1.0e-12,
+            "penalty target drift"
+        );
+
+        let mismatch_lambdas = Array1::from_vec(vec![0.7, 1.3]);
+        let mismatch = saved_link_wiggle_penalty_matrix(&runtime, mismatch_lambdas.view(), p)
+            .expect_err("lambda count mismatch must be rejected, never padded");
+        assert!(mismatch.contains("3 blocks but fit stores 2 lambdas"));
+    }
 
     struct ChunkOnlySampleDesign {
         values: Array2<f64>,

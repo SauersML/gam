@@ -325,6 +325,7 @@ pub fn assemble_standard_payload(
         saved_link_state,
         wiggle_knots,
         wiggle_degree,
+        wiggle_penalty_metadata,
         wiggle_saved_warp_beta,
         wiggle_saved_index_shift,
         ..
@@ -367,6 +368,7 @@ pub fn assemble_standard_payload(
     payload.link = fitted_inverse_link(&fit.fitted_link).or_else(|| Some(family.link.clone()));
     payload.linkwiggle_knots = wiggle_knots.map(|knots| knots.to_vec());
     payload.linkwiggle_degree = wiggle_degree;
+    payload.linkwiggle_penalty_metadata = wiggle_penalty_metadata;
     payload.beta_link_wiggle = wiggle_saved_warp_beta;
     payload.link_wiggle_index_shift = wiggle_saved_index_shift;
     match &fit.fitted_link {
