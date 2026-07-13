@@ -1115,7 +1115,7 @@ pub(crate) struct MaternCrossPenaltyContext {
     pub(crate) length_scale: f64,
     pub(crate) nu: MaternNu,
     pub(crate) coefficient_gauge: Option<gam_problem::Gauge>,
-    pub(crate) penaltyinfo: Vec<PenaltyInfo>,
+    pub(crate) active_penalties: Vec<ActivePenalty>,
     pub(crate) d0: Array2<f64>,
     pub(crate) d1: Array2<f64>,
     pub(crate) d2: Array2<f64>,
@@ -1247,7 +1247,7 @@ impl MaternCrossPenaltyContext {
         );
 
         active_operator_penalty_derivatives(
-            &self.penaltyinfo,
+            &self.active_penalties,
             &[s0_cross, s1_cross, s2_cross],
             "Matérn-aniso-cross",
         )
@@ -1622,7 +1622,7 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
         length_scale,
         nu,
         coefficient_gauge: z_opt.map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()])),
-        penaltyinfo,
+        active_penalties: filtered.active,
         d0,
         d1,
         d2,

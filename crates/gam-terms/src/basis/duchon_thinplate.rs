@@ -43,9 +43,14 @@ impl gam_runtime::resource::ResidentBytes for CachedDuchonBasis {
             .saturating_mul(std::mem::size_of::<f64>());
         let penalty_bytes: usize = self
             .0
-            .penalties
+            .active_penalties
             .iter()
-            .map(|s| s.len().saturating_mul(std::mem::size_of::<f64>()))
+            .map(|penalty| {
+                penalty
+                    .matrix
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f64>())
+            })
             .sum();
         design_bytes
             .saturating_add(penalty_bytes)

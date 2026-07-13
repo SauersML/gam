@@ -2281,15 +2281,8 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         let mut ll = 0.0;
         for i in 0..self.y.len() {
             let q = eta_mu[i] + etaw[i];
-            ll += gaussian_diagonal_row_kernel(
-                i,
-                self.y[i],
-                q,
-                eta_ls[i],
-                self.weights[i],
-                ln2pi,
-            )?
-            .log_likelihood;
+            ll += gaussian_diagonal_row_kernel(i, self.y[i], q, eta_ls[i], self.weights[i], ln2pi)?
+                .log_likelihood;
             if !ll.is_finite() {
                 return Err(GamlssError::RowGeometryUnrepresentable {
                     row: i,
@@ -2341,15 +2334,9 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         for sampled in subsample.rows.iter() {
             let i = sampled.index;
             let q = eta_mu[i] + etaw[i];
-            let row_ll = gaussian_diagonal_row_kernel(
-                i,
-                self.y[i],
-                q,
-                eta_ls[i],
-                self.weights[i],
-                ln2pi,
-            )?
-            .log_likelihood;
+            let row_ll =
+                gaussian_diagonal_row_kernel(i, self.y[i], q, eta_ls[i], self.weights[i], ln2pi)?
+                    .log_likelihood;
             let contribution = scaled_signed_product3(sampled.weight, row_ll, 1.0);
             ll += contribution;
             if !contribution.is_finite() || !ll.is_finite() {
@@ -2357,7 +2344,11 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
                     row: i,
                     quantity: "Gaussian wiggle subsampled log likelihood",
                     eta: eta_ls[i],
-                    value: if contribution.is_finite() { ll } else { contribution },
+                    value: if contribution.is_finite() {
+                        ll
+                    } else {
+                        contribution
+                    },
                 }
                 .into());
             }

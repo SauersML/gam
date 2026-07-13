@@ -1075,6 +1075,10 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw(
     use gam_problem::BlockRole;
 
     let s = response_scale;
+    assert!(
+        s.is_finite() && s > 0.0,
+        "Gaussian location-scale response rescale must be finite and positive, got {s}"
+    );
     let ln_s = s.ln();
     // Intercept columns of the log-σ (Scale) design, expressed as offsets into
     // the Scale block's coefficient vector (the block β is laid out in noise
@@ -1152,10 +1156,15 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw(
         };
         row_factors.extend(std::iter::repeat_n(f, block.beta.len()));
     }
+    let parameter_dimension = row_factors.len();
     let rescale_cov = |cov: &mut Array2<f64>| {
-        let m = cov.nrows().min(cov.ncols()).min(row_factors.len());
-        for i in 0..m {
-            for j in 0..m {
+        assert_eq!(
+            cov.dim(),
+            (parameter_dimension, parameter_dimension),
+            "Gaussian location-scale covariance must align with the remapped coefficient vector"
+        );
+        for i in 0..parameter_dimension {
+            for j in 0..parameter_dimension {
                 cov[[i, j]] *= row_factors[i] * row_factors[j];
             }
         }
@@ -1165,6 +1174,37 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw(
     }
     if let Some(cov) = result.fit.fit.covariance_corrected.as_mut() {
         rescale_cov(cov);
+    }
+
+    // Precision transforms contravariantly to covariance. If
+    // β_raw = D β_internal + shift, then
+    //
+    //   H_raw = D^{-T} H_internal D^{-1}.
+    //
+    // The old remap transformed β and Cov(β) but left the saved penalized
+    // Hessian in the internal coordinate system. Any saved-model operation
+    // that solved that H against raw-coordinate design rows (notably ALO case
+    // deletion) therefore mixed parameter systems. Transform every persisted
+    // precision copy at the producer boundary so the saved model has one
+    // coordinate convention.
+    let rescale_precision =
+        |precision: &mut gam_problem::dispersion_cov::UnscaledPrecision| {
+            assert_eq!(
+                precision.dim(),
+                (parameter_dimension, parameter_dimension),
+                "Gaussian location-scale precision must align with the remapped coefficient vector"
+            );
+            for i in 0..parameter_dimension {
+                for j in 0..parameter_dimension {
+                    precision[[i, j]] /= row_factors[i] * row_factors[j];
+                }
+            }
+        };
+    if let Some(geometry) = result.fit.fit.geometry.as_mut() {
+        rescale_precision(&mut geometry.penalized_hessian);
+    }
+    if let Some(inference) = result.fit.fit.inference.as_mut() {
+        rescale_precision(&mut inference.penalized_hessian);
     }
 
     // The residual-scale summary `standard_deviation` is a response-units

@@ -2859,7 +2859,7 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
     // #755), periodic-expands it, and resolves the anisotropy/identifiability
     // transform over the surviving centers. Re-deriving the centers here from
     // `select_centers_by_strategy` (un-reduced) produced a derivative penalty
-    // sized to the FULL center set while `base.penaltyinfo` (the active-block
+    // sized to the FULL center set while `base.active_penalties` (the active-block
     // mask + the forward penalty list) is sized to the REDUCED set — an
     // index/shape desync that crashed the double-penalty ψ-derivative assembly
     // with an IncompatibleShape matmul and left the FD audit comparing
@@ -3105,7 +3105,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
     // (`build_matern_basiswithworkspace`) rank-REDUCES an over-specified center
     // set over this data cloud (`matern_rank_reduce_centers`) and periodic-EXPANDS
     // it; re-selecting raw centers here produced a derivative sized to the FULL
-    // center set while `base.penaltyinfo` / the realized design columns are sized
+    // center set while `base.active_penalties` / the realized design columns are sized
     // to the REDUCED+expanded set — a shape desync that the κ-gradient consumer
     // (`design_construction.rs` aniso entry) silently drops on a column-count
     // mismatch, disabling the analytic aniso κ-gradient for any rank-reduced or
@@ -3204,7 +3204,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         }
 
         // Reuse the value build already constructed at the top of this function
-        // (its metadata seeded the realized geometry) — `base.penaltyinfo` is the
+        // (its metadata seeded the realized geometry) — `base.active_penalties` is the
         // active-block mask sized to the realized (reduced) basis.
         let has_shrinkage = base.active_penalties.iter().any(|penalty| {
             matches!(
@@ -3453,7 +3453,7 @@ mod wahba_penalty_invariants_tests {
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
         };
         let built = build_spherical_spline_basis(data.view(), &spec).expect("Wahba basis");
-        assert_eq!(built.penalties.len(), 1);
+        assert_eq!(built.active_penalties.len(), 1);
         let BasisMetadata::Sphere { centers, .. } = &built.metadata else {
             panic!("Wahba builder must return spherical metadata");
         };
@@ -3472,7 +3472,7 @@ mod wahba_penalty_invariants_tests {
         let exact_raw = build_wahba_decomposed_penalty(center_kernel.view(), &decomposition);
         let (expected, _) = normalize_penalty(&exact_raw);
 
-        let observed = &built.penalties[0];
+        let observed = &built.active_penalties[0].matrix;
         assert_eq!(observed.dim(), expected.dim());
         let error = observed
             .iter()
@@ -3758,9 +3758,9 @@ mod harmonic_penalty_invariants_tests {
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
         };
         let built = build_spherical_harmonic_basis(data.view(), &spec).expect("harmonic basis");
-        assert_eq!(built.penalties.len(), 2);
-        let primary = &built.penalties[0];
-        let shrink = &built.penalties[1];
+        assert_eq!(built.active_penalties.len(), 2);
+        let primary = &built.active_penalties[0].matrix;
+        let shrink = &built.active_penalties[1].matrix;
 
         // The CURRENT harmonic builder (see build_spherical_harmonic_basis) uses
         // a FULL-RANK Laplace–Beltrami curvature penalty: the harmonic basis

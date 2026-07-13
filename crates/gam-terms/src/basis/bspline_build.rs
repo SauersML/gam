@@ -3186,14 +3186,15 @@ mod function_space_null_shrinkage_tests {
         let built = build_bspline_basis_1d(data.view(), &spec)
             .expect("one-sided clamped double-penalty basis");
         assert_eq!(
-            built.penalties.len(),
+            built.active_penalties.len(),
             2,
             "the slope constraint removes the linear null direction but the constant direction must remain shrinkable"
         );
-        assert!(built.penaltyinfo.iter().any(|info| {
-            info.active
-                && matches!(info.source, PenaltySource::DoublePenaltyNullspace)
-                && info.effective_rank == 1
+        assert!(built.active_penalties.iter().any(|penalty| {
+            matches!(
+                penalty.info.source,
+                PenaltySource::DoublePenaltyNullspace
+            ) && penalty.info.effective_rank == 1
         }));
     }
 

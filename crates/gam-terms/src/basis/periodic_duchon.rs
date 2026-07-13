@@ -1793,12 +1793,12 @@ mod mixed_periodicity_psd_tests {
             None,
         )
         .expect("cylinder mixed-periodicity basis must build");
-        let idx = built
-            .penaltyinfo
+        let penalty = built
+            .active_penalties
             .iter()
-            .position(|info| matches!(info.source, PenaltySource::Primary))
+            .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
             .expect("cylinder build must emit a Primary penalty");
-        (built.penalties[idx].clone(), centers.nrows())
+        (penalty.matrix.clone(), centers.nrows())
     }
 
     #[test]
@@ -1954,12 +1954,12 @@ mod mixed_periodicity_psd_tests {
             None,
         )
         .expect("torus mixed-periodicity basis must build");
-        let idx = built
-            .penaltyinfo
+        let penalty = built
+            .active_penalties
             .iter()
-            .position(|info| matches!(info.source, PenaltySource::Primary))
+            .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
             .expect("torus build must emit a Primary penalty");
-        let sym = symmetrize(&built.penalties[idx]);
+        let sym = symmetrize(&penalty.matrix);
         let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
         let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
         assert!(
