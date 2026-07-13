@@ -6316,7 +6316,7 @@ fn flex_production_fourth_contraction_matches_scalar_fd_witness() {
                         (fine[[u, v]] - coarse[[u, v]]).abs() > 2e-2 * scale + 1e-5;
                     if fd_unconverged {
                         eprintln!(
-                            "#932 b10 fourth[{u},{v}] {}/{u_label}->{v_label}: FD witness \
+                            "#932 flex fourth[{u},{v}] {}/{u_label}->{v_label}: FD witness \
                              unconverged (coarse {:+.4e}, fine {:+.4e}); skipping — production \
                              {got:+.4e}",
                             fixture.label,
@@ -6334,27 +6334,6 @@ fn flex_production_fourth_contraction_matches_scalar_fd_witness() {
                 }
             }
 
-            // The hand `cpu_oracle_fourth_contraction` (`b10_fourth_ordered`) stays
-            // EXERCISED as a deprecated cross-check (kept alive, not dead code), but is
-            // NOT asserted bit- or envelope-equal to production: its 4th-order g/h/w
-            // cross-channel quotient terms carry the #1454 moving-boundary
-            // incompleteness the single-source jet eliminated, so its divergence from
-            // the (FD-correct) production path IS the known bug itself — bounding that
-            // divergence is meaningless and fixture-fragile (it varies per fixture and
-            // direction). We assert only that the hand path stays FINITE (no crash /
-            // NaN). The production-vs-scalar-FD gate above is the real correctness check.
-            let hand = b10_fourth_oracle_from_family(&family, &block_states, dir_u, &dir_v);
-            assert_eq!(hand.len(), p * p);
-            for u in 0..p {
-                for v in 0..p {
-                    let h = hand[u * p + v];
-                    assert!(
-                        h.is_finite(),
-                        "{} / {u_label}->{v_label} hand fourth[{u},{v}] non-finite: {h:+.6e}",
-                        fixture.label
-                    );
-                }
-            }
         }
     }
 }
