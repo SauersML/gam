@@ -1537,14 +1537,127 @@ mod tests {
 
     #[test]
     fn memory_ledger_counts_coordinate_and_mixed_tensors_2304() {
-        let ledger = SaeRowJetMemoryLedger::for_shape(3, 6, 2, 3).expect("ledger");
-        assert!(ledger.fixed_device_bytes > 0);
-        assert!(ledger.device_bytes_per_row > ledger.fixed_device_bytes);
-        assert!(ledger.host_bytes_per_row > ledger.cpu_host_bytes_per_row);
-        assert!(ledger.host_bytes_per_row > ledger.device_bytes_per_row);
+        fn assert_exact_ledger(
+            k: usize,
+            q: usize,
+            p: usize,
+            n_beta: usize,
+            staging_is_host_peak: bool,
+        ) -> SaeRowJetMemoryLedger {
+            let f64_bytes = std::mem::size_of::<f64>();
+            let i32_bytes = std::mem::size_of::<i32>();
+
+            // Reconstruct every resident allocation independently of
+            // `SaeRowJetMemoryLedger::for_shape`. In particular, the complete
+            // coordinate Hessian is resident on both sides of the kernel and
+            // the single beta-mixed wire channel becomes two scheduled arrays.
+            let gate_bytes = k * f64_bytes;
+            let sqrt_weight_bytes = f64_bytes;
+            let decoded_bytes = k * p * f64_bytes;
+            let decoded_first_bytes = q * p * f64_bytes;
+            let decoded_second_bytes = q * q * p * f64_bytes;
+            let beta_basis_bytes = n_beta * f64_bytes;
+            let beta_basis_first_bytes = q * n_beta * f64_bytes;
+            let input_f64_bytes = gate_bytes
+                + sqrt_weight_bytes
+                + decoded_bytes
+                + decoded_first_bytes
+                + decoded_second_bytes
+                + beta_basis_bytes
+                + beta_basis_first_bytes;
+            let input_i32_bytes = (k + q + q) * i32_bytes;
+
+            let first_output_bytes = q * p * f64_bytes;
+            let second_output_bytes = q * q * p * f64_bytes;
+            let beta_output_bytes = n_beta * p * f64_bytes;
+            let beta_mixed_wire_bytes = q * n_beta * p * f64_bytes;
+            let flat_output_bytes = first_output_bytes
+                + second_output_bytes
+                + beta_output_bytes
+                + beta_mixed_wire_bytes;
+
+            assert_eq!(decoded_second_bytes, second_output_bytes);
+            let expected_device_bytes_per_row =
+                input_f64_bytes + input_i32_bytes + flat_output_bytes;
+            let expected_fixed_device_bytes = beta_output_bytes + n_beta * i32_bytes;
+
+            let semantic_input_bytes = input_f64_bytes
+                + beta_output_bytes
+                + k * std::mem::size_of::<bool>()
+                + q * std::mem::size_of::<SaeRowJetPrimary>()
+                + q * std::mem::size_of::<SaeCoordinateSlot>()
+                + n_beta * std::mem::size_of::<usize>()
+                + std::mem::size_of::<SaeSoftmaxRowJetInput>();
+            let production_layout_bytes = q * std::mem::size_of::<SaeRowJetPrimary>()
+                + std::mem::size_of::<Vec<SaeRowJetPrimary>>();
+            let staging_input_bytes = input_f64_bytes + input_i32_bytes;
+            let scheduled_output_bytes = first_output_bytes
+                + second_output_bytes
+                + beta_output_bytes
+                + 2 * beta_mixed_wire_bytes
+                + std::mem::size_of::<SaeScheduledRowJets>();
+            assert_eq!(
+                scheduled_output_bytes,
+                flat_output_bytes
+                    + beta_mixed_wire_bytes
+                    + std::mem::size_of::<SaeScheduledRowJets>()
+            );
+            let shared_host_bytes =
+                semantic_input_bytes + production_layout_bytes + flat_output_bytes;
+            let expected_cpu_host_bytes_per_row = shared_host_bytes + scheduled_output_bytes;
+            let expected_host_bytes_per_row =
+                shared_host_bytes + staging_input_bytes.max(scheduled_output_bytes);
+            let expected_fixed_host_bytes = gate_bytes
+                + beta_output_bytes
+                + n_beta * std::mem::size_of::<usize>()
+                + n_beta * i32_bytes
+                + std::mem::size_of::<SaeRowJetChannels>()
+                + 4 * std::mem::size_of::<Vec<()>>();
+
+            let expected = SaeRowJetMemoryLedger {
+                fixed_device_bytes: expected_fixed_device_bytes,
+                device_bytes_per_row: expected_device_bytes_per_row,
+                fixed_host_bytes: expected_fixed_host_bytes,
+                cpu_host_bytes_per_row: expected_cpu_host_bytes_per_row,
+                host_bytes_per_row: expected_host_bytes_per_row,
+            };
+            let actual = SaeRowJetMemoryLedger::for_shape(k, q, p, n_beta).expect("memory ledger");
+            assert_eq!(actual, expected, "shape K={k}, q={q}, p={p}, beta={n_beta}");
+
+            if staging_is_host_peak {
+                assert!(staging_input_bytes > scheduled_output_bytes);
+                assert_eq!(
+                    actual.host_bytes_per_row,
+                    shared_host_bytes + staging_input_bytes
+                );
+                assert!(actual.host_bytes_per_row > actual.cpu_host_bytes_per_row);
+            } else {
+                assert!(scheduled_output_bytes > staging_input_bytes);
+                assert_eq!(
+                    actual.host_bytes_per_row,
+                    shared_host_bytes + scheduled_output_bytes
+                );
+                assert_eq!(actual.host_bytes_per_row, actual.cpu_host_bytes_per_row);
+            }
+            actual
+        }
+
+        // The complete production fixture has a q^2 coordinate channel and a
+        // large scheduled expansion, so production expansion is the host peak.
+        let ledger = assert_exact_ledger(3, 6, 2, 3, false);
+        // A wide atom input with one primary makes CUDA staging the host peak.
+        assert_exact_ledger(64, 1, 2, 1, true);
+
         assert_eq!(
             ledger.maximum_rows(ledger.fixed_device_bytes, usize::MAX),
             0
+        );
+        assert_eq!(
+            ledger.maximum_rows(
+                ledger.fixed_device_bytes + ledger.device_bytes_per_row,
+                ledger.fixed_host_bytes + ledger.host_bytes_per_row
+            ),
+            1
         );
     }
 
