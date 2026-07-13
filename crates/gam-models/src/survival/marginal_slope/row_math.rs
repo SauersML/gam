@@ -487,7 +487,7 @@ pub fn survival_marginal_slope_vector_neglog(
 }
 
 #[cfg(test)]
-mod vector_hand_oracle {
+mod vector_hand_oracle_tests {
     use super::*;
 
     /// Derivatives of neglog(x) = -log(x): [-1/x, 1/x², -2/x³, 6/x⁴].
@@ -1029,7 +1029,8 @@ mod test_support {
         let phi_u1 = w * d * eta1;
         let phi_u2 = w * d;
         // Time derivative: -d·log(ad1).
-        let (nl_u1, nl_u2, _, _) = super::vector_hand_oracle::neglog_derivatives(ad1);
+        let (nl_u1, nl_u2, _, _) =
+            super::vector_hand_oracle_tests::neglog_derivatives(ad1);
         let td_u1 = w * d * nl_u1;
         let td_u2 = w * d * nl_u2;
 
@@ -1283,7 +1284,7 @@ mod tests {
                 &mut arena,
             )
             .expect("runtime vector row program");
-            let hand = vector_hand_oracle::row_primary_closed_form_vector_hand_reference(
+            let hand = vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
                 q0,
                 q1,
                 qd1,
