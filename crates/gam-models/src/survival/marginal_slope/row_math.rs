@@ -813,8 +813,8 @@ where
     // One semantic primitive owns the mechanically derived V/G/H channels for
     // `g' Sigma g`; representation-specific multiplication stays matrix free.
     let mut variance = S::symmetric_quadratic_form(&vars[3..], covariance, dimension, workspace);
-    variance = variance.scale(inputs.probit_scale * inputs.probit_scale);
-    let variance_value = variance.value();
+    let probit_variance_scale = inputs.probit_scale * inputs.probit_scale;
+    let variance_value = variance.value() * probit_variance_scale;
     if !(variance_value.is_finite()
         && variance_value >= crate::bms::gradient_paths::COVARIANCE_QUADRATIC_FORM_PSD_TOL)
     {
@@ -828,31 +828,35 @@ where
     // At a mathematical zero, floating accumulation may land a few ulps below
     // zero. Shift only the primal constant; derivative channels are unchanged.
     if variance_value < 0.0 {
-        variance = variance.add(&S::constant(-variance_value, dimension, workspace));
+        variance = variance.add_constant(-variance.value(), workspace);
     }
 
-    let one_plus_variance = variance.add_constant(1.0, workspace);
-    let correction =
-        one_plus_variance.compose_unary(unary_derivatives_sqrt(one_plus_variance.value()));
+    let correction_argument = 1.0 + probit_variance_scale * variance.value();
+    let correction = variance.affine_compose(
+        probit_variance_scale,
+        1.0,
+        unary_derivatives_sqrt(correction_argument),
+        workspace,
+    );
     let eta0 = vars[0].multiply_add(&correction, &linear);
     let eta1 = vars[1].multiply_add(&correction, &linear);
-    let adjusted_derivative = vars[2].mul(&correction);
-    let neg_eta0 = eta0.neg();
-    let neg_eta1 = eta1.neg();
+    let adjusted_derivative = vars[2].product(&correction);
+    let neg_eta0 = -eta0.value();
+    let neg_eta1 = -eta1.value();
 
     validate_rigid_row_admission(
         vars[2].value(),
         inputs,
-        neg_eta0.value(),
-        neg_eta1.value(),
+        neg_eta0,
+        neg_eta1,
         adjusted_derivative.value(),
     )?;
 
-    let mut entry_stack = unary_derivatives_neglog_phi(neg_eta0.value(), inputs.wi);
+    let mut entry_stack = unary_derivatives_neglog_phi(neg_eta0, inputs.wi);
     for derivative in &mut entry_stack {
         *derivative = -*derivative;
     }
-    let exit_stack = unary_derivatives_neglog_phi(neg_eta1.value(), inputs.wi * (1.0 - inputs.di));
+    let exit_stack = unary_derivatives_neglog_phi(neg_eta1, inputs.wi * (1.0 - inputs.di));
     if inputs.di > 0.0 {
         let scale = (-inputs.wi) * inputs.di;
         let mut event_stack = unary_derivatives_log_normal_pdf(eta1.value());
@@ -860,15 +864,17 @@ where
         for derivative in event_stack.iter_mut().chain(&mut time_stack) {
             *derivative *= scale;
         }
-        Ok(S::composed_sum(
-            &[neg_eta1, neg_eta0, eta1, adjusted_derivative],
+        Ok(S::affine_composed_sum(
+            &[eta1, eta0, eta1, adjusted_derivative],
+            &[-1.0, -1.0, 1.0, 1.0],
             &[exit_stack, entry_stack, event_stack, time_stack],
             dimension,
             workspace,
         ))
     } else {
-        Ok(S::composed_sum(
-            &[neg_eta1, neg_eta0],
+        Ok(S::affine_composed_sum(
+            &[eta1, eta0],
+            &[-1.0, -1.0],
             &[exit_stack, entry_stack],
             dimension,
             workspace,
