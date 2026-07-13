@@ -1336,9 +1336,10 @@ fn summary_smooth_terms(
         .geometry
         .as_ref()
         .map(|geom| geom.working_response.len() as f64);
-    let residual_df = n_obs
-        .map(|n| (n - fit.edf_total().unwrap_or(fit.beta.len() as f64)).max(1.0))
-        .unwrap_or(f64::NAN);
+    let residual_df = n_obs.zip(fit.edf_total()).and_then(|(n, edf)| {
+        let value = n - edf;
+        (edf.is_finite() && value.is_finite() && value > 0.0).then_some(value)
+    });
     let scale = if scale_is_estimated {
         SmoothTestScale::Estimated
     } else {

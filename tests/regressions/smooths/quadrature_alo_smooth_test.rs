@@ -194,7 +194,7 @@ fn smooth_test_estimated_scale_pvalue_matches_f_distribution_formula() {
         coeff_range: 1..4,
         edf: 3.0,
         nullspace_dim: 0,
-        residual_df,
+        residual_df: Some(residual_df),
         scale: SmoothTestScale::Estimated,
     })
     .expect("Wood smooth test should return a finite statistic and p-value for positive-definite covariance");
@@ -227,7 +227,7 @@ fn smooth_test_scale_has_consistent_alpha_rejection_ordering() {
         coeff_range: 1..4,
         edf: 3.0,
         nullspace_dim: 0,
-        residual_df: 80.0,
+        residual_df: Some(80.0),
         scale: SmoothTestScale::Estimated,
     })
     .expect("Wood smooth test should produce a p-value for valid estimated-scale inputs");

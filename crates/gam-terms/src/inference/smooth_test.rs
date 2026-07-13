@@ -55,7 +55,10 @@ pub enum SmoothTestScale {
 /// `nullspace_dim` is the fixed-effect (unpenalized) leading dimension within
 /// the block, used as a floor on the truncation rank (those directions are
 /// never shrunk and must always be tested). `residual_df` is the denominator
-/// d.f. for the `Estimated`-scale F branch.
+/// d.f. for the `Estimated`-scale F branch. It is `None` when that inference
+/// geometry is unavailable; the estimated-scale test then returns `None`
+/// instead of inventing denominator degrees of freedom. The known-scale branch
+/// does not consume it.
 #[derive(Debug, Clone)]
 pub struct SmoothTestInput<'a> {
     pub beta: ArrayView1<'a, f64>,
@@ -65,7 +68,7 @@ pub struct SmoothTestInput<'a> {
     pub coeff_range: Range<usize>,
     pub edf: f64,
     pub nullspace_dim: usize,
-    pub residual_df: f64,
+    pub residual_df: Option<f64>,
     pub scale: SmoothTestScale,
 }
 
@@ -187,15 +190,15 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
             1.0 - dist.cdf(statistic)
         }
         SmoothTestScale::Estimated => {
-            if !input.residual_df.is_finite() || input.residual_df <= 0.0 {
-                return None;
-            }
+            let residual_df = input
+                .residual_df
+                .filter(|value| value.is_finite() && *value > 0.0)?;
             // `statistic` is already a dispersion-free Wald χ² (the covariance
             // is scale-included), so the estimated-scale F-statistic is the
             // χ² divided by its reference d.f. only — mgcv's `Tr/rank`. Dividing
             // by `φ̂` again would re-introduce a response-unit dependence (#675).
             let f_stat = statistic / ref_df;
-            let dist = FisherSnedecor::new(ref_df, input.residual_df).ok()?;
+            let dist = FisherSnedecor::new(ref_df, residual_df).ok()?;
             1.0 - dist.cdf(f_stat)
         }
     };
@@ -376,7 +379,7 @@ mod tests {
             coeff_range: 0..2,
             edf: 1.0,
             nullspace_dim: 0,
-            residual_df: 20.0,
+            residual_df: None,
             scale: SmoothTestScale::Known,
         })
         .expect("smooth test");
@@ -398,7 +401,7 @@ mod tests {
             coeff_range: 0..2,
             edf: 1.0,
             nullspace_dim: 0,
-            residual_df: 20.0,
+            residual_df: None,
             scale: SmoothTestScale::Known,
         })
         .expect("smooth test");
@@ -406,6 +409,27 @@ mod tests {
         let dist = ChiSquared::new(out.ref_df).expect("chi-square");
         let expected = 1.0 - dist.cdf(out.statistic);
         assert!((out.p_value - expected).abs() < 1e-15);
+    }
+
+    #[test]
+    fn estimated_scale_refuses_missing_residual_degrees_of_freedom() {
+        let beta = array![1.0, 2.0];
+        let covariance = array![[2.0, 0.0], [0.0, 3.0]];
+        let result = wood_smooth_test(SmoothTestInput {
+            beta: beta.view(),
+            covariance: &covariance,
+            influence_matrix: None,
+            whitening_gram: None,
+            coeff_range: 0..2,
+            edf: 1.0,
+            nullspace_dim: 0,
+            residual_df: None,
+            scale: SmoothTestScale::Estimated,
+        });
+        assert!(
+            result.is_none(),
+            "estimated-scale inference must be omitted when denominator d.f. is unavailable"
+        );
     }
 
     /// Rescaling the response by `c` is `β → c·β`, `Σ → c²·Σ` (the covariance
@@ -431,7 +455,7 @@ mod tests {
                 coeff_range: 0..3,
                 edf: 2.0,
                 nullspace_dim: 0,
-                residual_df: 50.0,
+                residual_df: Some(50.0),
                 scale: SmoothTestScale::Estimated,
             })
             .expect("smooth test")
@@ -487,7 +511,7 @@ mod tests {
                 coeff_range: 0..3,
                 edf: 1e-6,
                 nullspace_dim: 0,
-                residual_df: 500.0,
+                residual_df: Some(500.0),
                 scale,
             })
             .expect("boundary term still produces a result");
@@ -526,7 +550,7 @@ mod tests {
             coeff_range: 0..2,
             edf: 2.0,
             nullspace_dim: 2,
-            residual_df: 500.0,
+            residual_df: None,
             scale: SmoothTestScale::Known,
         })
         .expect("smooth test");
@@ -567,7 +591,7 @@ mod tests {
             coeff_range: 0..2,
             edf: 1.0,
             nullspace_dim: 0,
-            residual_df: 100.0,
+            residual_df: None,
             scale: SmoothTestScale::Known,
         })
         .expect("raw smooth test");
@@ -586,7 +610,7 @@ mod tests {
             coeff_range: 0..2,
             edf: 1.0,
             nullspace_dim: 0,
-            residual_df: 100.0,
+            residual_df: None,
             scale: SmoothTestScale::Known,
         })
         .expect("whitened smooth test");
@@ -618,7 +642,7 @@ mod tests {
                 coeff_range: 0..3,
                 edf: 2.0,
                 nullspace_dim: 0,
-                residual_df: 100.0,
+                residual_df: None,
                 scale: SmoothTestScale::Known,
             })
             .expect("whitened smooth test")
@@ -654,7 +678,7 @@ mod tests {
             coeff_range: 0..2,
             edf: 2.0,
             nullspace_dim: 0,
-            residual_df: 100.0,
+            residual_df: None,
             scale: SmoothTestScale::Known,
         })
         .expect("rank-deficient Gram still yields a result");

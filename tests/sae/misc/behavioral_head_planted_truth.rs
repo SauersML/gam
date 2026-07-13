@@ -329,7 +329,7 @@ fn multinomial_head_feature_p_values_are_channel_bonferroni_adjusted() {
         coeff_range: 1..2,
         edf: 1.0,
         nullspace_dim: 1,
-        residual_df: 200.0,
+        residual_df: Some(200.0),
         scale: SmoothTestScale::Estimated,
     })
     .expect("channel 0 smooth test")
@@ -342,7 +342,7 @@ fn multinomial_head_feature_p_values_are_channel_bonferroni_adjusted() {
         coeff_range: 3..4,
         edf: 1.0,
         nullspace_dim: 1,
-        residual_df: 200.0,
+        residual_df: Some(200.0),
         scale: SmoothTestScale::Estimated,
     })
     .expect("channel 1 smooth test")

@@ -1343,7 +1343,7 @@ fn binding_wald_test(
         coeff_range: 0..mm,
         edf,
         nullspace_dim: 0,
-        residual_df,
+        residual_df: Some(residual_df),
         scale,
     })
 }
@@ -1406,7 +1406,7 @@ fn joint_binding_wald_test(
         coeff_range: 0..total,
         edf: per_dim_edf * d_dims as f64,
         nullspace_dim: 0,
-        residual_df,
+        residual_df: Some(residual_df),
         scale,
     })
 }

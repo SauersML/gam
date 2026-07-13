@@ -1828,7 +1828,7 @@ impl MultinomialSavedModel {
                         coeff_range: start..end,
                         edf,
                         nullspace_dim: span.nullspace_dim,
-                        residual_df: f64::INFINITY,
+                        residual_df: None,
                         scale: gam_terms::inference::smooth_test::SmoothTestScale::Known,
                     },
                 );
