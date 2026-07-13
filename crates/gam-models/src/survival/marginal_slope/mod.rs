@@ -39,8 +39,8 @@ pub(crate) use crate::model_types::UnifiedFitResult;
 pub(crate) use gam_linalg::faer_ndarray::{FaerCholesky, fast_atv, fast_av, fast_xt_diag_x};
 
 pub(crate) use crate::bms::{
-    COVARIANCE_QUADRATIC_FORM_PSD_TOL, CrossBlockIdentifiabilityWarning, DeviationBlockConfig,
-    DeviationRuntime, LatentZNormalization, LatentZPolicy, MarginalSlopeCovariance,
+    CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime,
+    LatentZNormalization, LatentZPolicy, MarginalSlopeCovariance, MarginalSlopeCovarianceRef,
     ParametricAnchorBlock, marginal_slope_covariance_from_scores, marginal_slope_preserving_scale,
     marginal_slope_probit_eta, padded_deviation_seed,
 };

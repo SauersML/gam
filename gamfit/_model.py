@@ -11,7 +11,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Sequence, cast
+from typing import Any, Iterator, Literal, Sequence, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -716,7 +716,7 @@ class Model:
         *,
         seed: int = 0,
     ) -> Any:
-        """Draw posterior-predictive replicate responses at ``data`` (#1057).
+        """Materialize posterior-predictive replicate responses at ``data``.
 
         Each of the ``n_draws`` rows is a fresh synthetic response vector drawn
         from the fitted predictive distribution. The saved model's canonical
@@ -748,6 +748,11 @@ class Model:
         -------
         numpy.ndarray
             An ``(n_draws, n_rows)`` array of synthetic responses.
+
+        Notes
+        -----
+        This convenience method allocates the complete result. Use
+        :meth:`iter_replicates` when the requested draw matrix is large.
         """
         n_draws = int(n_draws)
         if n_draws < 1:
@@ -759,6 +764,74 @@ class Model:
             )
         except Exception as exc:
             raise map_exception(exc) from exc
+
+    def iter_replicates(
+        self,
+        data: Any,
+        n_draws: int = 100,
+        *,
+        chunk_size: int,
+        seed: int = 0,
+    ) -> Iterator[NDArray[np.float64]]:
+        """Stream posterior-predictive replicates in bounded draw chunks.
+
+        This is the bounded-memory form of :meth:`sample_replicates`. Each
+        yielded array has shape ``(min(chunk_size, remaining), n_rows)``. Draws
+        are indexed globally, so changing ``chunk_size`` only changes batch
+        boundaries: concatenating the chunks is bit-for-bit identical to
+        ``sample_replicates(data, n_draws, seed=seed)``.
+
+        The values always represent the saved model's observation law. For a
+        single-cause or latent survival fit they are conditional event-in-window
+        indicators (zero or one); for competing risks, zero means no event and
+        positive integer labels identify the persisted cause. The sampler does
+        not invent censoring or inspection records that the saved response law
+        does not contain.
+
+        Parameters
+        ----------
+        data : table-like
+            New rows in any format accepted by :meth:`predict`.
+        n_draws : int, default 100
+            Total number of replicate response vectors to draw.
+        chunk_size : int
+            Maximum number of draw rows retained at once. It is required so
+            the caller, not a hidden heuristic, owns the memory bound.
+        seed : int, default 0
+            Seed for the deterministic draw stream.
+
+        Yields
+        ------
+        numpy.ndarray
+            The next contiguous range of synthetic response vectors.
+        """
+        n_draws = int(n_draws)
+        chunk_size = int(chunk_size)
+        if n_draws < 1:
+            raise ValueError(f"n_draws must be >= 1, got {n_draws}")
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+
+        headers, rows, _ = normalize_table(data)
+        ffi = rust_module()
+
+        def chunks() -> Iterator[NDArray[np.float64]]:
+            for draw_start in range(0, n_draws, chunk_size):
+                draw_count = min(chunk_size, n_draws - draw_start)
+                try:
+                    chunk = ffi.generative_replicate_chunk(
+                        self._model_bytes,
+                        headers,
+                        rows,
+                        draw_start,
+                        draw_count,
+                        int(seed),
+                    )
+                except Exception as exc:
+                    raise map_exception(exc) from exc
+                yield np.asarray(chunk, dtype=np.float64)
+
+        return chunks()
 
     def design_matrix(self, data: Any) -> AffineDesign:
         """Return the exact fitted affine predictor design for ``data``.

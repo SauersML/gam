@@ -4913,7 +4913,7 @@ mod moment_engine_tests {
             event: Arc::new(event),
             weights: Arc::new(weights),
             z: Arc::new(z.insert_axis(Axis(1))),
-            score_covariance: MarginalSlopeCovariance::Diagonal(Array1::from(vec![1.0])),
+            score_covariance: MarginalSlopeCovariance::diagonal(Array1::from(vec![1.0])).unwrap(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((n, 0))),

@@ -521,7 +521,6 @@ pub(crate) fn survival_row_gradient_from_pilot_primary_state(
             ));
         }
     }
-    covariance.validate("survival KKT pilot gradient covariance")?;
     let score_dim = covariance.dim();
     if slopes.ncols() != score_dim || z.ncols() != score_dim {
         return Err(format!(

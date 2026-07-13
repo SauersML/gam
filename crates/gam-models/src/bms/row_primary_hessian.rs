@@ -5,7 +5,9 @@ use super::cell_moment_assembly::{
 };
 use super::exact_eval_cache::*;
 use super::family::*;
-use super::flex_row_program::BmsFlexProgramPoint;
+use super::flex_row_program::{
+    BmsFlexCalibrationOrder2Node, BmsFlexProgramPoint, BmsFlexRowProgram,
+};
 use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::row_kernel::*;
@@ -95,34 +97,41 @@ impl EmpiricalCubicPrimaryJet2Schedule<'_> {
         &self,
         moments: &EmpiricalCubicMomentJet2,
         dc_da: &[f64; 4],
+        dc_daa: &[f64; 4],
+        f_aa: &mut f64,
         f_u: &mut Array1<f64>,
         f_au: &mut Array1<f64>,
         f_uv: &mut Array2<f64>,
         moment_actions: &mut [[f64; 4]],
         need_hessian: bool,
     ) {
-        for &u in self.active {
-            f_u[u] += moments.linear(&self.first[u]);
-            if need_hessian {
-                moment_actions[u] = moments.action(&self.first[u]);
-                f_au[u] += moments.linear(&self.a_first[u]) - dot4(dc_da, &moment_actions[u]);
-            }
-        }
-        if !need_hessian {
-            return;
-        }
-        for (active_u, &u) in self.active.iter().enumerate() {
-            for &v in &self.active[active_u..] {
-                let mut value = -dot4(&self.first[u], &moment_actions[v]);
-                if u == 1 {
-                    value += moments.linear(&self.b_first[v]);
+        BmsFlexRowProgram::for_each_calibration_order2(
+            self.active,
+            need_hessian,
+            |node| match node {
+                BmsFlexCalibrationOrder2Node::InterceptSecond => {
+                    *f_aa += moments.linear(dc_daa) - dot4(dc_da, &moments.action(dc_da));
                 }
-                f_uv[[u, v]] += value;
-                if u != v {
-                    f_uv[[v, u]] += value;
+                BmsFlexCalibrationOrder2Node::PrimaryFirst { primary } => {
+                    f_u[primary] += moments.linear(&self.first[primary]);
                 }
-            }
-        }
+                BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary } => {
+                    moment_actions[primary] = moments.action(&self.first[primary]);
+                    f_au[primary] += moments.linear(&self.a_first[primary])
+                        - dot4(dc_da, &moment_actions[primary]);
+                }
+                BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left, right } => {
+                    let mut value = -dot4(&self.first[left], &moment_actions[right]);
+                    if left == 1 {
+                        value += moments.linear(&self.b_first[right]);
+                    }
+                    f_uv[[left, right]] += value;
+                    if left != right {
+                        f_uv[[right, left]] += value;
+                    }
+                }
+            },
+        );
     }
 }
 
@@ -896,8 +905,7 @@ impl BernoulliMarginalSlopeFamily {
             row_primary_hessians: RowPrimaryEvalCache::Empty,
             rigid_third_full: gam_runtime::resource::RayonSafeOnce::new(),
             rigid_fourth_full: gam_runtime::resource::RayonSafeOnce::new(),
-            flex_axis_third_tensors: gam_runtime::resource::RayonSafeOnce::new(),
-            flex_axis_fourth_tensors: gam_runtime::resource::RayonSafeOnce::new(),
+            flex_row_program_derivatives: gam_runtime::resource::RayonSafeOnce::new(),
             full_data_outer_rows: std::sync::OnceLock::new(),
         })
     }
@@ -3080,9 +3088,6 @@ impl BernoulliMarginalSlopeFamily {
                 moments.push(node, weight * normal_pdf(eta), eta, need_hessian);
             }
 
-            if need_hessian {
-                f_aa += moments.linear(&obs.dc_daa) - dot4(&obs.dc_da, &moments.action(&obs.dc_da));
-            }
             EmpiricalCubicPrimaryJet2Schedule {
                 active: active_primaries,
                 first: coeff_u,
@@ -3092,6 +3097,8 @@ impl BernoulliMarginalSlopeFamily {
             .contract_into(
                 &moments,
                 &obs.dc_da,
+                &obs.dc_daa,
+                &mut f_aa,
                 f_u,
                 f_au,
                 f_uv,
@@ -3764,12 +3771,14 @@ impl BernoulliMarginalSlopeFamily {
         }
         // Allocate the per-row slot table once (one inner RayonSafeOnce per
         // global row), then build only the requested row on first touch.
-        let slots = cache.flex_axis_third_tensors.get_or_compute(|| {
+        let slots = cache.flex_row_program_derivatives.get_or_compute(|| {
             (0..self.y.len())
-                .map(|_| gam_runtime::resource::RayonSafeOnce::new())
+                .map(|_| BmsFlexRowProgramDerivativeCache::new())
                 .collect::<Vec<_>>()
         });
-        let stored = slots[row].get_or_compute(|| -> Result<FlexAxisThirdRowTensors, String> {
+        let stored = slots[row]
+            .third
+            .get_or_compute(|| -> Result<FlexAxisThirdRowTensors, String> {
             let r = cache.primary.total;
             let mut e_q = Array1::<f64>::zeros(r);
             e_q[cache.primary.q] = 1.0;
@@ -3816,14 +3825,14 @@ impl BernoulliMarginalSlopeFamily {
             Ok(FlexAxisThirdRowTensors {
                 third: [t3_q, t3_g],
             })
-        });
+            });
         let tensors = stored.as_ref().map_err(|err| err.clone())?;
         Ok(Some(tensors))
     }
 
     /// Lazily build the requested row's axis-projected fourth-derivative
-    /// tensors. Kept separate from [`Self::flex_axis_third_tensors_for_row`] so
-    /// first-order outer paths do not force degree-21 fourth-order cell work.
+    /// tensors. The fourth channel has its own lazy cell inside the same row
+    /// program cache, so first-order outer paths do not force degree-21 work.
     pub(super) fn flex_axis_fourth_tensors_for_row<'a>(
         &self,
         block_states: &[ParameterBlockState],
@@ -3833,12 +3842,14 @@ impl BernoulliMarginalSlopeFamily {
         if !self.effective_flex_active(block_states)? {
             return Ok(None);
         }
-        let slots = cache.flex_axis_fourth_tensors.get_or_compute(|| {
+        let slots = cache.flex_row_program_derivatives.get_or_compute(|| {
             (0..self.y.len())
-                .map(|_| gam_runtime::resource::RayonSafeOnce::new())
+                .map(|_| BmsFlexRowProgramDerivativeCache::new())
                 .collect::<Vec<_>>()
         });
-        let stored = slots[row].get_or_compute(|| -> Result<FlexAxisFourthRowTensors, String> {
+        let stored = slots[row]
+            .fourth
+            .get_or_compute(|| -> Result<FlexAxisFourthRowTensors, String> {
             let r = cache.primary.total;
             let mut e_q = Array1::<f64>::zeros(r);
             e_q[cache.primary.q] = 1.0;
@@ -3907,7 +3918,7 @@ impl BernoulliMarginalSlopeFamily {
                 qg: t4_qg,
                 gg: t4_gg,
             })
-        });
+            });
         let tensors = stored.as_ref().map_err(|err| err.clone())?;
         Ok(Some(tensors))
     }

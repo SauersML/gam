@@ -220,15 +220,8 @@ impl SurvivalMarginalSlopeFamily {
             .fill_shared_values(block_states[2].eta[row], workspace)
     }
 
-    pub(crate) fn shared_logslope_covariance_scale(&self) -> Result<f64, String> {
-        let k = self.score_dim();
-        if k == 1 {
-            return Ok(1.0);
-        }
-        let ones = vec![1.0; k];
-        self.score_covariance.quadratic_form(&ones).map_err(|err| {
-            format!("survival marginal-slope shared log-slope covariance scale: {err}")
-        })
+    pub(crate) fn shared_logslope_covariance_scale(&self) -> f64 {
+        self.score_covariance.ones_quadratic_form()
     }
 
     pub(crate) fn exact_shared_score_summary(
@@ -238,11 +231,13 @@ impl SurvivalMarginalSlopeFamily {
         context: &str,
     ) -> Result<(f64, f64), String> {
         let k = self.score_dim();
-        if k == 1 {
-            return Ok((self.z[[row, 0]], 1.0));
-        }
+        let z_sum = if k == 1 {
+            self.z[[row, 0]]
+        } else {
+            self.z.row(row).sum()
+        };
         let logslope_eta_len = block_states[2].eta.len();
-        if logslope_eta_len != self.n {
+        if k > 1 && logslope_eta_len != self.n {
             return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
                 reason: format!(
                     "{context}: survival marginal-slope exact shared-slope calculus for K={k} requires one log-slope eta per row (n={}); got eta len {logslope_eta_len}. Per-z log-slope derivatives require a {}-primary row kernel.",
@@ -252,9 +247,6 @@ impl SurvivalMarginalSlopeFamily {
             }
             .into());
         }
-        Ok((
-            self.z.row(row).sum(),
-            self.shared_logslope_covariance_scale()?,
-        ))
+        Ok((z_sum, self.shared_logslope_covariance_scale()))
     }
 }

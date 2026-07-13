@@ -451,71 +451,26 @@ pub fn survival_marginal_slope_vector_eta(
         .map_err(|err| format!("survival marginal-slope vector eta: {err}"))
 }
 
-enum BoundRigidValueCovariance<'covariance> {
-    Diagonal(&'covariance Array1<f64>),
-    Full(&'covariance Array2<f64>),
-    LowRank(&'covariance Array2<f64>),
-}
-
 /// Allocation-free value-only workspace bound to one covariance whose shape,
-/// finiteness, symmetry, and positive-semidefinite contract were validated once
-/// at construction. Per-row evaluation dispatches directly to the bound
-/// representation and never constructs primary-width runtime jets.
+/// finiteness, symmetry, and positive-semidefinite contract were validated at
+/// covariance admission. Per-row evaluation uses the cached square-root factor
+/// and never constructs primary-width runtime jets.
 pub struct RigidVectorValueWorkspace<'covariance> {
-    covariance: BoundRigidValueCovariance<'covariance>,
+    covariance: &'covariance MarginalSlopeCovariance,
     dimension: usize,
 }
 
 impl<'covariance> RigidVectorValueWorkspace<'covariance> {
-    pub fn new(covariance: &'covariance MarginalSlopeCovariance) -> Result<Self, String> {
-        covariance.validate("survival marginal-slope vector value workspace")?;
-        let dimension = covariance.dim();
-        let covariance = match covariance {
-            MarginalSlopeCovariance::Diagonal(diagonal) => {
-                BoundRigidValueCovariance::Diagonal(diagonal)
-            }
-            MarginalSlopeCovariance::Full(matrix) => BoundRigidValueCovariance::Full(matrix),
-            MarginalSlopeCovariance::LowRank(factor) => BoundRigidValueCovariance::LowRank(factor),
-        };
-        Ok(Self {
+    pub fn new(covariance: &'covariance MarginalSlopeCovariance) -> Self {
+        Self {
             covariance,
-            dimension,
-        })
+            dimension: covariance.dim(),
+        }
     }
 
     #[inline(always)]
     fn quadratic_value(&self, slopes: &[f64]) -> f64 {
-        match self.covariance {
-            BoundRigidValueCovariance::Diagonal(diagonal) => {
-                let mut value = 0.0;
-                for axis in 0..self.dimension {
-                    value += diagonal[axis] * slopes[axis] * slopes[axis];
-                }
-                value
-            }
-            BoundRigidValueCovariance::Full(matrix) => {
-                let mut value = 0.0;
-                for row in 0..self.dimension {
-                    let mut projected = 0.0;
-                    for column in 0..self.dimension {
-                        projected += matrix[[row, column]] * slopes[column];
-                    }
-                    value += slopes[row] * projected;
-                }
-                value
-            }
-            BoundRigidValueCovariance::LowRank(factor) => {
-                let mut value = 0.0;
-                for rank in 0..factor.ncols() {
-                    let mut projection = 0.0;
-                    for axis in 0..self.dimension {
-                        projection += factor[[axis, rank]] * slopes[axis];
-                    }
-                    value += projection * projection;
-                }
-                value
-            }
-        }
+        self.covariance.quadratic_form_unchecked(slopes)
     }
 }
 
@@ -595,7 +550,6 @@ mod vector_hand_oracle_tests {
 
     impl ReusableHandVectorRowWorkspace {
         pub(super) fn new(covariance: &MarginalSlopeCovariance) -> Result<Self, String> {
-            covariance.validate("reusable hand survival marginal-slope row workspace")?;
             let score_dimension = covariance.dim();
             let dimension = score_dimension.checked_add(3).ok_or_else(|| {
                 SurvivalMarginalSlopeError::IncompatibleDimensions {
@@ -629,9 +583,10 @@ mod vector_hand_oracle_tests {
                 }
                 .to_string()
             })?;
-            let projection_dimension = match covariance {
-                MarginalSlopeCovariance::LowRank(factor) => factor.ncols(),
-                MarginalSlopeCovariance::Diagonal(_) | MarginalSlopeCovariance::Full(_) => 0,
+            let projection_dimension = match covariance.representation() {
+                MarginalSlopeCovarianceRef::LowRank(factor) => factor.ncols(),
+                MarginalSlopeCovarianceRef::Diagonal(_)
+                | MarginalSlopeCovarianceRef::Full(_) => 0,
             };
             Ok(Self {
                 score_dimension,
@@ -672,20 +627,20 @@ mod vector_hand_oracle_tests {
             .into());
         }
         output.fill(0.0);
-        match covariance {
-            MarginalSlopeCovariance::Diagonal(diag) => {
+        match covariance.representation() {
+            MarginalSlopeCovarianceRef::Diagonal(diag) => {
                 for axis in 0..vector.len() {
                     output[axis] = diag[axis] * vector[axis];
                 }
             }
-            MarginalSlopeCovariance::Full(cov) => {
+            MarginalSlopeCovarianceRef::Full(cov) => {
                 for i in 0..cov.nrows() {
                     for j in 0..cov.ncols() {
                         output[i] += cov[[i, j]] * vector[j];
                     }
                 }
             }
-            MarginalSlopeCovariance::LowRank(factor) => {
+            MarginalSlopeCovarianceRef::LowRank(factor) => {
                 if low_rank_projection.len() != factor.ncols() {
                     return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
                         reason: format!(
@@ -764,12 +719,7 @@ mod vector_hand_oracle_tests {
         {
             return Err("marginal-slope covariance vector contains non-finite values".to_string());
         }
-        let variance = s2
-            * slopes
-                .iter()
-                .zip(workspace.sigma_g.iter())
-                .map(|(&slope, &sigma_g)| slope * sigma_g)
-                .sum::<f64>();
+        let variance = s2 * covariance.quadratic_form_unchecked(slopes);
         if !(variance.is_finite() && variance >= 0.0) {
             return Err(format!(
                 "marginal-slope covariance quadratic form must be non-negative, got {variance}"
@@ -781,16 +731,16 @@ mod vector_hand_oracle_tests {
         }
         for a in 0..k {
             for b in 0..k {
-                let sigma_ab = match covariance {
-                    MarginalSlopeCovariance::Diagonal(diag) => {
+                let sigma_ab = match covariance.representation() {
+                    MarginalSlopeCovarianceRef::Diagonal(diag) => {
                         if a == b {
                             diag[a]
                         } else {
                             0.0
                         }
                     }
-                    MarginalSlopeCovariance::Full(cov) => cov[[a, b]],
-                    MarginalSlopeCovariance::LowRank(factor) => {
+                    MarginalSlopeCovarianceRef::Full(cov) => cov[[a, b]],
+                    MarginalSlopeCovarianceRef::LowRank(factor) => {
                         let mut value = 0.0;
                         for r in 0..factor.ncols() {
                             value += factor[[a, r]] * factor[[b, r]];
@@ -1104,13 +1054,12 @@ pub(crate) struct RigidVectorRowWorkspace<'covariance> {
 
 impl<'covariance> RigidVectorRowWorkspace<'covariance> {
     pub(crate) fn new(covariance: &'covariance MarginalSlopeCovariance) -> Result<Self, String> {
-        covariance.validate("survival marginal-slope vector row workspace")?;
         let score_dimension = covariance.dim();
         let (dimension, jacobian_cells, derivative_cells) =
             checked_vector_workspace_layout(score_dimension)?;
-        let projection_dimension = match covariance {
-            MarginalSlopeCovariance::LowRank(factor) => factor.ncols(),
-            MarginalSlopeCovariance::Diagonal(_) | MarginalSlopeCovariance::Full(_) => 0,
+        let projection_dimension = match covariance.representation() {
+            MarginalSlopeCovarianceRef::LowRank(factor) => factor.ncols(),
+            MarginalSlopeCovarianceRef::Diagonal(_) | MarginalSlopeCovarianceRef::Full(_) => 0,
         };
         let mut feature_jacobian = vec![0.0; jacobian_cells].into_boxed_slice();
         feature_jacobian[FEATURE_Q0 * dimension + FEATURE_Q0] = 1.0;
@@ -1146,13 +1095,13 @@ fn bound_covariance_matvec_into(
     // `RigidVectorRowWorkspace::new` sizes both buffers from this covariance,
     // and `row_primary_closed_form_vector_into` rejects a row whose slope or
     // score width differs before reaching this hot kernel.
-    match covariance {
-        MarginalSlopeCovariance::Diagonal(diagonal) => {
+    match covariance.representation() {
+        MarginalSlopeCovarianceRef::Diagonal(diagonal) => {
             for axis in 0..vector.len() {
                 output[axis] = diagonal[axis] * vector[axis];
             }
         }
-        MarginalSlopeCovariance::Full(matrix) => {
+        MarginalSlopeCovarianceRef::Full(matrix) => {
             for row in 0..vector.len() {
                 let mut value = 0.0;
                 for column in 0..vector.len() {
@@ -1161,7 +1110,7 @@ fn bound_covariance_matvec_into(
                 output[row] = value;
             }
         }
-        MarginalSlopeCovariance::LowRank(factor) => {
+        MarginalSlopeCovarianceRef::LowRank(factor) => {
             low_rank_projection.fill(0.0);
             for rank in 0..factor.ncols() {
                 for axis in 0..vector.len() {
@@ -1237,14 +1186,14 @@ fn add_weighted_variance_hessian(
     hessian: &mut [f64],
 ) {
     let scale = 2.0 * feature_gradient[FEATURE_VARIANCE];
-    match covariance {
-        MarginalSlopeCovariance::Diagonal(diagonal) => {
+    match covariance.representation() {
+        MarginalSlopeCovarianceRef::Diagonal(diagonal) => {
             for axis in 0..diagonal.len() {
                 let primary = 3 + axis;
                 hessian[primary * dimension + primary] += scale * diagonal[axis];
             }
         }
-        MarginalSlopeCovariance::Full(matrix) => {
+        MarginalSlopeCovarianceRef::Full(matrix) => {
             for row in 0..matrix.nrows() {
                 let primary_row = 3 + row;
                 for column in row..matrix.ncols() {
@@ -1257,7 +1206,7 @@ fn add_weighted_variance_hessian(
                 }
             }
         }
-        MarginalSlopeCovariance::LowRank(factor) => {
+        MarginalSlopeCovarianceRef::LowRank(factor) => {
             for row in 0..factor.nrows() {
                 let primary_row = 3 + row;
                 for column in row..factor.nrows() {
@@ -1334,15 +1283,14 @@ pub(crate) fn row_primary_closed_form_vector_into(
     } = workspace;
     let covariance = *covariance;
     bound_covariance_matvec_into(covariance, slopes, sigma_g, low_rank_projection);
-    let mut raw_variance = 0.0;
     let mut linear_dot = 0.0;
     for axis in 0..k {
-        raw_variance += slopes[axis] * sigma_g[axis];
         linear_dot += slopes[axis] * z[axis];
         feature_jacobian[FEATURE_LINEAR * dimension + 3 + axis] = probit_scale * z[axis];
         feature_jacobian[FEATURE_VARIANCE * dimension + 3 + axis] = 2.0 * sigma_g[axis];
     }
-    raw_variance = validated_vector_variance(raw_variance, probit_scale)?;
+    let raw_variance =
+        validated_vector_variance(covariance.quadratic_form_unchecked(slopes), probit_scale)?;
     let linear = probit_scale * linear_dot;
     let inputs = RigidRowInputs {
         row: 0,
@@ -1655,7 +1603,6 @@ mod tests {
             }
             .into());
         }
-        covariance.validate("survival marginal-slope vector row program")?;
         validate_vector_probit_scale(inputs)?;
         if z.iter().any(|value| !value.is_finite())
             || vars[3..].iter().any(|slope| !slope.value().is_finite())

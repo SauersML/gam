@@ -371,6 +371,28 @@ pub(super) struct FlexAxisFourthRowTensors {
     pub(super) gg: Array2<f64>,
 }
 
+/// Lazy derivative-channel cache for one canonical BMS FLEX row program.
+///
+/// The row has one semantic program identity, while third- and fourth-order
+/// contractions retain independent lazy cells so a VGH/first-outer pass never
+/// forces degree-21 moments. Sharing the outer row slot removes the former
+/// pair of parallel cache hierarchies without coupling their work budgets.
+pub(super) struct BmsFlexRowProgramDerivativeCache {
+    pub(super) third:
+        gam_runtime::resource::RayonSafeOnce<Result<FlexAxisThirdRowTensors, String>>,
+    pub(super) fourth:
+        gam_runtime::resource::RayonSafeOnce<Result<FlexAxisFourthRowTensors, String>>,
+}
+
+impl BmsFlexRowProgramDerivativeCache {
+    pub(super) fn new() -> Self {
+        Self {
+            third: gam_runtime::resource::RayonSafeOnce::new(),
+            fourth: gam_runtime::resource::RayonSafeOnce::new(),
+        }
+    }
+}
+
 /// Shared precomputed state plus pre-solved per-row contexts. All row
 /// intercepts are solved once during cache construction so that workspace
 /// calls (matvec, diagonal, psi, directional derivatives) never redundantly
@@ -440,26 +462,11 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     pub(super) rigid_fourth_full:
         gam_runtime::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
 
-    /// Flexible-path per-row axis-projected third-derivative tensors. See
-    /// [`FlexAxisThirdRowTensors`] for the contraction algebra. Only consulted
-    /// on the FLEX path — rigid rows keep their own `rigid_third_full` cache.
-    ///
-    /// Two-level lazy: the outer `RayonSafeOnce` allocates a per-row slot table
-    /// (one inner `RayonSafeOnce` per global row) on first touch; each row's
-    /// tensors are then built **on demand** when that row is first read. Outer
-    /// derivative passes are row-subsampled, so per-row laziness builds (and
-    /// risks erroring on) only the rows actually consumed, not all `n`. Each
-    /// inner build is fallible and sticky (same contract as `rigid_third_full`).
-    pub(super) flex_axis_third_tensors: gam_runtime::resource::RayonSafeOnce<
-        Vec<gam_runtime::resource::RayonSafeOnce<Result<FlexAxisThirdRowTensors, String>>>,
-    >,
-
-    /// Flexible-path per-row axis-projected fourth-derivative tensors. Built
-    /// independently from `flex_axis_third_tensors` so first-order outer work
-    /// never forces degree-21 fourth-order cell moments.
-    pub(super) flex_axis_fourth_tensors: gam_runtime::resource::RayonSafeOnce<
-        Vec<gam_runtime::resource::RayonSafeOnce<Result<FlexAxisFourthRowTensors, String>>>,
-    >,
+    /// One lazy slot per canonical FLEX row program. Each slot owns separate
+    /// third/fourth channel cells, preserving order-specific work while making
+    /// the program/cache identity single-sourced.
+    pub(super) flex_row_program_derivatives:
+        gam_runtime::resource::RayonSafeOnce<Vec<BmsFlexRowProgramDerivativeCache>>,
 
     /// Lazily-built full-data outer row list (`index = position`, `weight = 1.0`,
     /// `stratum = 0` for every row in `0..n`). The full-data variant of

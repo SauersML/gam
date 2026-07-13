@@ -93,7 +93,6 @@ impl SurvivalRowHessian {
                 event.len()
             ));
         }
-        covariance.validate("SurvivalRowHessian covariance")?;
         let score_dim = covariance.dim();
         if slopes.ncols() != score_dim || z.ncols() != score_dim {
             return Err(format!(
@@ -1727,7 +1726,8 @@ mod tests {
             weights: Array1::ones(n),
             event: Array1::ones(n),
             z: Array2::zeros((n, score_dim)),
-            covariance: crate::bms::MarginalSlopeCovariance::Diagonal(Array1::ones(score_dim)),
+            covariance: crate::bms::MarginalSlopeCovariance::diagonal(Array1::ones(score_dim))
+                .unwrap(),
             derivative_guard:
                 crate::survival::marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
         }

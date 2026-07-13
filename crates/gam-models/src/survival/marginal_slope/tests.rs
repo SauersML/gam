@@ -103,7 +103,7 @@ fn empty_termspec() -> TermCollectionSpec {
 }
 
 fn unit_score_covariance() -> MarginalSlopeCovariance {
-    MarginalSlopeCovariance::Diagonal(array![1.0])
+    MarginalSlopeCovariance::diagonal(array![1.0]).unwrap()
 }
 
 fn base_time_block() -> TimeBlockInput {

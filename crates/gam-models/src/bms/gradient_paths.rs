@@ -788,115 +788,211 @@ pub enum MarginalSlopeCovarianceShape {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum MarginalSlopeCovariance {
-    Diagonal(Array1<f64>),
-    Full(Array2<f64>),
-    /// Low-rank factor L with Sigma = L L^T.
-    LowRank(Array2<f64>),
+enum MarginalSlopeCovarianceStorage {
+    Diagonal {
+        covariance: Array1<f64>,
+        square_root: Array1<f64>,
+    },
+    Full {
+        covariance: Array2<f64>,
+        /// Row-oriented factor `B` with `Σ = BᵀB`.
+        square_root_factor: Array2<f64>,
+    },
+    /// Low-rank factor `L` with `Σ = LLᵀ`.
+    LowRank { factor: Array2<f64> },
 }
 
-/// Negative-side tolerance on the covariance quadratic form `rᵀΣr`. The form
-/// is mathematically PSD but finite-precision accumulation in the dense / low-
-/// rank sums can produce a tiny negative value at a true zero; results within
-/// this tolerance are clamped to zero, anything more negative is a real error.
-pub(crate) const COVARIANCE_QUADRATIC_FORM_PSD_TOL: f64 = -1e-10;
+/// Immutable, validated covariance geometry for the physical log-slope vector.
+///
+/// Admission is the single validation boundary. Dense covariances cache an
+/// eigensquare-root factor so subsequent quadratic forms are exact sums of
+/// squares; runtime code never repeats an eigendecomposition or applies a
+/// negative-value tolerance. The exact `1ᵀΣ1` shared-slope geometry is cached
+/// at the same boundary.
+#[derive(Clone, Debug)]
+pub struct MarginalSlopeCovariance {
+    storage: MarginalSlopeCovarianceStorage,
+    ones_quadratic_form: f64,
+}
+
+impl PartialEq for MarginalSlopeCovariance {
+    fn eq(&self, other: &Self) -> bool {
+        self.storage == other.storage
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MarginalSlopeCovarianceRef<'a> {
+    Diagonal(&'a Array1<f64>),
+    Full(&'a Array2<f64>),
+    LowRank(&'a Array2<f64>),
+}
 
 impl MarginalSlopeCovariance {
+    pub fn diagonal(covariance: Array1<f64>) -> Result<Self, String> {
+        if covariance.is_empty() {
+            return Err("marginal-slope diagonal covariance is empty".to_string());
+        }
+        let mut square_root = Array1::<f64>::zeros(covariance.len());
+        let mut ones_quadratic_form = 0.0;
+        for (axis, &value) in covariance.iter().enumerate() {
+            if !(value.is_finite() && value >= 0.0) {
+                return Err(format!(
+                    "marginal-slope diagonal covariance entry {axis} must be finite and non-negative, got {value}"
+                ));
+            }
+            let root = value.sqrt();
+            square_root[axis] = root;
+            ones_quadratic_form += root * root;
+        }
+        if !ones_quadratic_form.is_finite() {
+            return Err("marginal-slope diagonal covariance geometry overflowed".to_string());
+        }
+        Ok(Self {
+            storage: MarginalSlopeCovarianceStorage::Diagonal {
+                covariance,
+                square_root,
+            },
+            ones_quadratic_form,
+        })
+    }
+
+    pub fn full(covariance: Array2<f64>) -> Result<Self, String> {
+        if covariance.nrows() == 0 || covariance.nrows() != covariance.ncols() {
+            return Err(format!(
+                "marginal-slope full covariance must be non-empty and square, got {}x{}",
+                covariance.nrows(),
+                covariance.ncols(),
+            ));
+        }
+        for ((row, column), &value) in covariance.indexed_iter() {
+            if !value.is_finite() {
+                return Err(format!(
+                    "marginal-slope full covariance entry ({row},{column}) is non-finite"
+                ));
+            }
+        }
+        for row in 0..covariance.nrows() {
+            for column in (row + 1)..covariance.ncols() {
+                if covariance[[row, column]] != covariance[[column, row]] {
+                    return Err(format!(
+                        "marginal-slope full covariance must be exactly symmetric at ({row},{column}): upper={}, lower={}",
+                        covariance[[row, column]],
+                        covariance[[column, row]],
+                    ));
+                }
+            }
+        }
+        let (eigenvalues, eigenvectors) = covariance.eigh(faer::Side::Lower).map_err(|error| {
+            format!("marginal-slope covariance eigendecomposition failed: {error}")
+        })?;
+        let dimension = covariance.nrows();
+        let mut square_root_factor = Array2::<f64>::zeros((dimension, dimension));
+        for (eigen_axis, &eigenvalue) in eigenvalues.iter().enumerate() {
+            if !(eigenvalue.is_finite() && eigenvalue >= 0.0) {
+                return Err(format!(
+                    "marginal-slope full covariance must be positive semidefinite; eigenvalue {eigen_axis} is {eigenvalue}"
+                ));
+            }
+            let scale = eigenvalue.sqrt();
+            for axis in 0..dimension {
+                square_root_factor[[eigen_axis, axis]] = scale * eigenvectors[[axis, eigen_axis]];
+            }
+        }
+        let mut ones_quadratic_form = 0.0;
+        for factor_row in square_root_factor.rows() {
+            let projection = factor_row.sum();
+            ones_quadratic_form += projection * projection;
+        }
+        if !ones_quadratic_form.is_finite() {
+            return Err("marginal-slope full covariance geometry overflowed".to_string());
+        }
+        Ok(Self {
+            storage: MarginalSlopeCovarianceStorage::Full {
+                covariance,
+                square_root_factor,
+            },
+            ones_quadratic_form,
+        })
+    }
+
+    pub fn low_rank(factor: Array2<f64>) -> Result<Self, String> {
+        if factor.nrows() == 0 {
+            return Err("marginal-slope low-rank covariance factor has zero rows".to_string());
+        }
+        for ((row, column), &value) in factor.indexed_iter() {
+            if !value.is_finite() {
+                return Err(format!(
+                    "marginal-slope low-rank covariance factor entry ({row},{column}) is non-finite"
+                ));
+            }
+        }
+        let mut ones_quadratic_form = 0.0;
+        for factor_column in factor.columns() {
+            let projection = factor_column.sum();
+            ones_quadratic_form += projection * projection;
+        }
+        if !ones_quadratic_form.is_finite() {
+            return Err("marginal-slope low-rank covariance geometry overflowed".to_string());
+        }
+        Ok(Self {
+            storage: MarginalSlopeCovarianceStorage::LowRank { factor },
+            ones_quadratic_form,
+        })
+    }
+
     pub fn to_dense(&self) -> Array2<f64> {
-        match self {
-            Self::Diagonal(diagonal) => Array2::from_diag(diagonal),
-            Self::Full(covariance) => covariance.clone(),
-            Self::LowRank(factor) => factor.dot(&factor.t()),
+        match &self.storage {
+            MarginalSlopeCovarianceStorage::Diagonal { covariance, .. } => {
+                Array2::from_diag(covariance)
+            }
+            MarginalSlopeCovarianceStorage::Full { covariance, .. } => covariance.clone(),
+            MarginalSlopeCovarianceStorage::LowRank { factor } => factor.dot(&factor.t()),
         }
     }
 
     pub fn shape(&self) -> MarginalSlopeCovarianceShape {
-        match self {
-            Self::Diagonal(_) => MarginalSlopeCovarianceShape::Diagonal,
-            Self::Full(_) => MarginalSlopeCovarianceShape::Full,
-            Self::LowRank(_) => MarginalSlopeCovarianceShape::LowRank,
+        match &self.storage {
+            MarginalSlopeCovarianceStorage::Diagonal { .. } => {
+                MarginalSlopeCovarianceShape::Diagonal
+            }
+            MarginalSlopeCovarianceStorage::Full { .. } => MarginalSlopeCovarianceShape::Full,
+            MarginalSlopeCovarianceStorage::LowRank { .. } => MarginalSlopeCovarianceShape::LowRank,
         }
     }
 
     pub fn dim(&self) -> usize {
-        match self {
-            Self::Diagonal(diag) => diag.len(),
-            Self::Full(cov) => cov.nrows(),
-            Self::LowRank(factor) => factor.nrows(),
+        match &self.storage {
+            MarginalSlopeCovarianceStorage::Diagonal { covariance, .. } => covariance.len(),
+            MarginalSlopeCovarianceStorage::Full { covariance, .. } => covariance.nrows(),
+            MarginalSlopeCovarianceStorage::LowRank { factor } => factor.nrows(),
         }
     }
 
-    pub fn validate(&self, context: &str) -> Result<(), String> {
-        match self {
-            Self::Diagonal(diag) => {
-                if diag.is_empty() {
-                    return Err(format!("{context} diagonal covariance is empty"));
-                }
-                for (idx, &value) in diag.iter().enumerate() {
-                    if !(value.is_finite() && value >= 0.0) {
-                        return Err(format!(
-                            "{context} diagonal covariance entry {idx} must be finite and non-negative, got {value}"
-                        ));
-                    }
-                }
+    pub fn ones_quadratic_form(&self) -> f64 {
+        self.ones_quadratic_form
+    }
+
+    pub(crate) fn representation(&self) -> MarginalSlopeCovarianceRef<'_> {
+        match &self.storage {
+            MarginalSlopeCovarianceStorage::Diagonal { covariance, .. } => {
+                MarginalSlopeCovarianceRef::Diagonal(covariance)
             }
-            Self::Full(cov) => {
-                if cov.nrows() == 0 || cov.nrows() != cov.ncols() {
-                    return Err(format!(
-                        "{context} full covariance must be non-empty and square, got {}x{}",
-                        cov.nrows(),
-                        cov.ncols()
-                    ));
-                }
-                for ((i, j), &value) in cov.indexed_iter() {
-                    if !value.is_finite() {
-                        return Err(format!(
-                            "{context} full covariance entry ({i},{j}) is non-finite"
-                        ));
-                    }
-                }
-                for i in 0..cov.nrows() {
-                    for j in (i + 1)..cov.ncols() {
-                        if cov[[i, j]] != cov[[j, i]] {
-                            return Err(format!(
-                                "{context} full covariance must be exactly symmetric at ({i},{j}): upper={}, lower={}",
-                                cov[[i, j]],
-                                cov[[j, i]],
-                            ));
-                        }
-                    }
-                }
-                let (eigenvalues, _) = cov.eigh(faer::Side::Lower).map_err(|error| {
-                    format!("{context} full covariance PSD eigendecomposition failed: {error}")
-                })?;
-                for (index, &eigenvalue) in eigenvalues.iter().enumerate() {
-                    if !(eigenvalue.is_finite() && eigenvalue >= 0.0) {
-                        return Err(format!(
-                            "{context} full covariance must be positive semidefinite; eigenvalue {index} is {eigenvalue}"
-                        ));
-                    }
-                }
+            MarginalSlopeCovarianceStorage::Full { covariance, .. } => {
+                MarginalSlopeCovarianceRef::Full(covariance)
             }
-            Self::LowRank(factor) => {
-                if factor.nrows() == 0 {
-                    return Err(format!(
-                        "{context} low-rank covariance factor has zero rows"
-                    ));
-                }
-                for ((i, j), &value) in factor.indexed_iter() {
-                    if !value.is_finite() {
-                        return Err(format!(
-                            "{context} low-rank covariance factor entry ({i},{j}) is non-finite"
-                        ));
-                    }
-                }
+            MarginalSlopeCovarianceStorage::LowRank { factor } => {
+                MarginalSlopeCovarianceRef::LowRank(factor)
             }
         }
-        Ok(())
+    }
+
+    #[inline(always)]
+    pub(crate) fn quadratic_form_unchecked(&self, vector: &[f64]) -> f64 {
+        <Self as SymmetricQuadraticCoefficients>::quadratic_value(self, vector, |value| *value)
     }
 
     pub fn quadratic_form(&self, vector: &[f64]) -> Result<f64, String> {
-        self.validate("marginal-slope covariance")?;
         if vector.len() != self.dim() {
             return Err(format!(
                 "marginal-slope covariance dimension mismatch: vector={}, covariance={}",
@@ -907,15 +1003,13 @@ impl MarginalSlopeCovariance {
         if vector.iter().any(|value| !value.is_finite()) {
             return Err("marginal-slope covariance vector contains non-finite values".to_string());
         }
-        let value =
-            <Self as SymmetricQuadraticCoefficients>::quadratic_value(self, vector, |value| *value);
-        if value.is_finite() && value >= COVARIANCE_QUADRATIC_FORM_PSD_TOL {
-            Ok(value.max(0.0))
-        } else {
-            Err(format!(
-                "marginal-slope covariance quadratic form must be non-negative, got {value}"
-            ))
+        let value = self.quadratic_form_unchecked(vector);
+        if !value.is_finite() {
+            return Err(format!(
+                "marginal-slope covariance quadratic form is non-finite: {value}"
+            ));
         }
+        Ok(value)
     }
 }
 
@@ -951,13 +1045,13 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
     fn multiply(&self, input: &[f64], output: &mut [f64]) {
         assert_eq!(input.len(), self.dim());
         assert_eq!(output.len(), self.dim());
-        match self {
-            Self::Diagonal(diagonal) => {
+        match self.representation() {
+            MarginalSlopeCovarianceRef::Diagonal(diagonal) => {
                 for axis in 0..input.len() {
                     output[axis] = diagonal[axis] * input[axis];
                 }
             }
-            Self::Full(matrix) => {
+            MarginalSlopeCovarianceRef::Full(matrix) => {
                 match vector_support(input) {
                     VectorSupport::Zero => {
                         output.fill(0.0);
@@ -979,7 +1073,7 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
                     output[row] = value;
                 }
             }
-            Self::LowRank(factor) => {
+            MarginalSlopeCovarianceRef::LowRank(factor) => {
                 output.fill(0.0);
                 match vector_support(input) {
                     VectorSupport::Zero => return,
@@ -1008,16 +1102,16 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
     }
 
     fn coefficient(&self, row: usize, column: usize) -> f64 {
-        match self {
-            Self::Diagonal(diagonal) => {
+        match self.representation() {
+            MarginalSlopeCovarianceRef::Diagonal(diagonal) => {
                 if row == column {
                     diagonal[row]
                 } else {
                     0.0
                 }
             }
-            Self::Full(matrix) => matrix[[row, column]],
-            Self::LowRank(factor) => {
+            MarginalSlopeCovarianceRef::Full(matrix) => matrix[[row, column]],
+            MarginalSlopeCovarianceRef::LowRank(factor) => {
                 let mut value = 0.0;
                 for rank in 0..factor.ncols() {
                     value += factor[[row, rank]] * factor[[column, rank]];
@@ -1036,22 +1130,22 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
         let dimension = self.dim();
         assert_eq!(direction.len(), dimension);
         assert_eq!(projected.len(), dimension);
-        match self {
-            Self::Diagonal(diagonal) => {
+        match self.representation() {
+            MarginalSlopeCovarianceRef::Diagonal(diagonal) => {
                 for column in 0..dimension {
                     for row in 0..=column {
                         visit(row, column, if row == column { diagonal[row] } else { 0.0 });
                     }
                 }
             }
-            Self::Full(matrix) => {
+            MarginalSlopeCovarianceRef::Full(matrix) => {
                 for column in 0..dimension {
                     for row in 0..=column {
                         visit(row, column, matrix[[row, column]]);
                     }
                 }
             }
-            Self::LowRank(factor) => {
+            MarginalSlopeCovarianceRef::LowRank(factor) => {
                 for column in 0..dimension {
                     for row in 0..=column {
                         let mut value = 0.0;
@@ -1070,27 +1164,30 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
         F: Fn(&T) -> f64,
     {
         assert_eq!(input.len(), self.dim());
-        match self {
-            Self::Diagonal(diagonal) => input
+        match &self.storage {
+            MarginalSlopeCovarianceStorage::Diagonal { square_root, .. } => input
                 .iter()
-                .zip(diagonal)
-                .map(|(input, &coefficient)| {
-                    let input = value(input);
-                    coefficient * input * input
+                .zip(square_root)
+                .map(|(input, &root)| {
+                    let projection = root * value(input);
+                    projection * projection
                 })
                 .sum(),
-            Self::Full(matrix) => {
+            MarginalSlopeCovarianceStorage::Full {
+                square_root_factor,
+                ..
+            } => {
                 let mut total = 0.0;
-                for row in 0..input.len() {
-                    let mut row_dot = 0.0;
-                    for column in 0..input.len() {
-                        row_dot += matrix[[row, column]] * value(&input[column]);
+                for factor_row in square_root_factor.rows() {
+                    let mut projection = 0.0;
+                    for axis in 0..input.len() {
+                        projection += factor_row[axis] * value(&input[axis]);
                     }
-                    total += value(&input[row]) * row_dot;
+                    total += projection * projection;
                 }
                 total
             }
-            Self::LowRank(factor) => {
+            MarginalSlopeCovarianceStorage::LowRank { factor } => {
                 // Sigma = L L'. Evaluate x' Sigma x as ||L' x||^2 so the
                 // primal runtime scalar remains matrix free and O(KR).
                 let mut total = 0.0;
@@ -1186,102 +1283,16 @@ pub fn marginal_slope_covariance_from_scores(
         }
     }
 
-    // ── Shape classification ──
-    //
-    // Pick the cheapest representation that preserves r'Σr for arbitrary r.
-    //
-    //   * K = 1: always Diagonal — LowRank/Full distinctions are meaningless.
-    //
-    //   * STRICT NUMERICAL DIAGONAL: if every off-diagonal is at machine
-    //     precision relative to the diagonal scale, return Diagonal.  This
-    //     catches both structurally-orthogonal inputs (post-orthogonalised
-    //     production paths) AND degenerate cases like a column of all
-    //     zeros (rank-deficient but truly diagonal).
-    //
-    //   * Otherwise eigendecompose.  positive.len() < K ⇒ the rank
-    //     deficiency comes from collinear columns (off-diagonals are
-    //     non-trivial) — Diagonal would drop the coupling and break r'Σr
-    //     ⇒ LowRank.
-    //
-    //   * Full rank: apply a 4σ statistical off-diagonal test.  Under H0
-    //     (independent population columns) the asymptotic SE of an
-    //     off-diagonal sample covariance is √(σ_aa σ_bb / N_eff) with
-    //     N_eff = (Σw)² / Σw² (Kish).  Pass ⇒ Diagonal (sample noise was
-    //     not real correlation), fail ⇒ Full.  At large-scale N_eff the 4σ
-    //     statistical floor collapses below the numerical floor, so
-    //     production behaviour is unchanged.
-    if k == 1 {
-        return Ok(MarginalSlopeCovariance::Diagonal(cov.diag().to_owned()));
-    }
-
-    let diag: Vec<f64> = (0..k).map(|i| cov[[i, i]]).collect();
-    let diag_max = diag.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let numerical_floor = 1e-10 * (1.0 + diag_max);
-
-    let mut is_strict_diagonal = true;
-    'strict: for a in 0..k {
-        for b in (a + 1)..k {
-            if cov[[a, b]].abs() > numerical_floor {
-                is_strict_diagonal = false;
-                break 'strict;
-            }
-        }
-    }
-    if is_strict_diagonal {
-        return Ok(MarginalSlopeCovariance::Diagonal(cov.diag().to_owned()));
-    }
-
-    let (evals, evecs) = cov
-        .eigh(faer::Side::Lower)
-        .map_err(|err| format!("marginal-slope covariance eigendecomposition failed: {err}"))?;
-    let max_eval = evals
-        .iter()
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-    let rank_tol = 1e-10 * max_eval.max(1.0);
-    let positive: Vec<(usize, f64)> = evals
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, &value)| (value > rank_tol).then_some((idx, value)))
-        .collect();
-
-    if positive.len() < k {
-        // Rank deficiency with non-trivial off-diagonals ⇒ collinear
-        // columns; Diagonal would lose the coupling.
-        let mut factor = Array2::<f64>::zeros((k, positive.len()));
-        for (col, (idx, value)) in positive.iter().enumerate() {
-            let scale = value.sqrt();
-            for row in 0..k {
-                factor[[row, col]] = evecs[[row, *idx]] * scale;
-            }
-        }
-        return Ok(MarginalSlopeCovariance::LowRank(factor));
-    }
-
-    // Full rank.  4σ statistical off-diagonal test.
-    let sum_w_sq = weights.iter().map(|&w| w * w).sum::<f64>();
-    let n_eff = if sum_w_sq > 0.0 {
-        (total_weight * total_weight) / sum_w_sq
+    // Representation is geometry, not a statistical model-selection decision:
+    // only an exactly diagonal matrix may discard its off-diagonal entries.
+    // Every nonzero coupling is retained in the exact dense covariance.
+    let is_diagonal = (0..k).all(|row| {
+        ((row + 1)..k).all(|column| cov[[row, column]] == 0.0)
+    });
+    if is_diagonal {
+        MarginalSlopeCovariance::diagonal(cov.diag().to_owned())
     } else {
-        1.0
-    };
-    const OFFDIAG_Z_THRESHOLD: f64 = 4.0;
-    let mut is_stat_diagonal = true;
-    'stat: for a in 0..k {
-        for b in (a + 1)..k {
-            let stat_se = (diag[a].max(0.0) * diag[b].max(0.0) / n_eff)
-                .max(0.0)
-                .sqrt();
-            let threshold = numerical_floor.max(OFFDIAG_Z_THRESHOLD * stat_se);
-            if cov[[a, b]].abs() > threshold {
-                is_stat_diagonal = false;
-                break 'stat;
-            }
-        }
-    }
-    if is_stat_diagonal {
-        Ok(MarginalSlopeCovariance::Diagonal(cov.diag().to_owned()))
-    } else {
-        Ok(MarginalSlopeCovariance::Full(cov))
+        MarginalSlopeCovariance::full(cov)
     }
 }
 
@@ -1295,11 +1306,10 @@ pub fn marginal_slope_preserving_scale(
             "marginal-slope probit scale must be finite, got {probit_scale}"
         ));
     }
-    let observed_slopes = slopes
-        .iter()
-        .map(|&slope| probit_scale * slope)
-        .collect::<Vec<_>>();
-    let variance = covariance.quadratic_form(&observed_slopes)?;
+    let variance = probit_scale * probit_scale * covariance.quadratic_form(slopes)?;
+    if !variance.is_finite() {
+        return Err("marginal-slope preserving variance is non-finite".to_string());
+    }
     Ok((1.0 + variance).sqrt())
 }
 
@@ -2262,27 +2272,21 @@ mod covariance_admission_tests {
     fn full_covariance_admission_rejects_one_ulp_asymmetry_932() {
         let upper = 0.25_f64;
         let lower = f64::from_bits(upper.to_bits() + 1);
-        let covariance = MarginalSlopeCovariance::Full(array![[1.0, upper], [lower, 1.0]]);
-        let error = covariance
-            .validate("one-ulp covariance")
+        let error = MarginalSlopeCovariance::full(array![[1.0, upper], [lower, 1.0]])
             .expect_err("any asymmetric full operator must be rejected");
         assert!(error.contains("must be exactly symmetric"), "{error}");
     }
 
     #[test]
     fn full_covariance_admission_rejects_indefinite_matrix_before_row_use_932() {
-        let covariance = MarginalSlopeCovariance::Full(array![[1.0, 2.0], [2.0, 1.0]]);
-        let error = covariance
-            .validate("indefinite covariance")
+        let error = MarginalSlopeCovariance::full(array![[1.0, 2.0], [2.0, 1.0]])
             .expect_err("an indefinite full operator is not a covariance");
         assert!(error.contains("must be positive semidefinite"), "{error}");
     }
 
     #[test]
     fn full_covariance_admission_accepts_exact_singular_psd_932() {
-        let covariance = MarginalSlopeCovariance::Full(array![[1.0, 0.0], [0.0, 0.0]]);
-        covariance
-            .validate("singular covariance")
+        MarginalSlopeCovariance::full(array![[1.0, 0.0], [0.0, 0.0]])
             .expect("an exact singular PSD covariance is admissible");
     }
 }

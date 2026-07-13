@@ -331,7 +331,7 @@ pub fn replay_saved_survival_marginal_slope_alo(
 
     let z_matrix = input.latent_z.clone().insert_axis(Axis(1));
     let score_covariance =
-        MarginalSlopeCovariance::Diagonal(Array1::from_vec(vec![input.score_variance]));
+        MarginalSlopeCovariance::diagonal(Array1::from_vec(vec![input.score_variance]))?;
     let logslope_layout = LogslopeTopology::shared()
         .materialize_identity(input.logslope_design.clone(), input.logslope_offset)?;
     let family = SurvivalMarginalSlopeFamily {

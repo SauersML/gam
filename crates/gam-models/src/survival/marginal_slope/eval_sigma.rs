@@ -48,7 +48,7 @@ impl SurvivalMarginalSlopeFamily {
                 let mut ll = 0.0;
                 let mut logslope_workspace = self.logslope_row_workspace()?;
                 let value_workspace = if score_dim > 1 {
-                    Some(RigidVectorValueWorkspace::new(&self.score_covariance)?)
+                    Some(RigidVectorValueWorkspace::new(&self.score_covariance))
                 } else {
                     None
                 };

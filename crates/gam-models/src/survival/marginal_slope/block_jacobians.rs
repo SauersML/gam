@@ -84,7 +84,6 @@ impl SurvivalMarginalSlopeFamilyScalars {
                 "survival marginal-slope family scalars require a positive finite probit scale, got {s}"
             ));
         }
-        covariance.validate("survival marginal-slope family scalars covariance")?;
         let n = q0_i.len();
         if q1_i.len() != n
             || qd1_i.len() != n
@@ -170,7 +169,6 @@ impl LogslopeBlockJacobian {
         covariance: MarginalSlopeCovariance,
     ) -> Result<Self, String> {
         layout.validate_for(z.ncols())?;
-        covariance.validate("logslope effective Jacobian covariance")?;
         if covariance.dim() != z.ncols() {
             return Err(format!(
                 "logslope effective Jacobian covariance dimension {} does not match score dimension {}",
@@ -259,17 +257,12 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
                 ));
             }
             self.covariance.multiply(values, &mut sigma_g);
-            let variance = values
-                .iter()
-                .zip(sigma_g.iter())
-                .map(|(value, sigma_value)| value * sigma_value)
-                .sum::<f64>();
-            if !(variance.is_finite() && variance >= COVARIANCE_QUADRATIC_FORM_PSD_TOL) {
+            let variance = self.covariance.quadratic_form_unchecked(values);
+            if !variance.is_finite() {
                 return Err(format!(
-                    "logslope effective Jacobian covariance quadratic form must be non-negative, got {variance} at row {i}"
+                    "logslope effective Jacobian covariance quadratic form is non-finite at row {i}: {variance}"
                 ));
             }
-            let variance = variance.max(0.0);
             let c = (1.0 + s * s * variance).sqrt();
             let (q0, q1, qd1) = match scalars {
                 Some(values) => (values.q0_i[i], values.q1_i[i], values.qd1_i[i]),
@@ -987,7 +980,7 @@ mod tests {
         let layout = topology
             .materialize_identity(DesignMatrix::from(array![[2.0, 3.0]]), &array![0.4])
             .unwrap();
-        let covariance = MarginalSlopeCovariance::Diagonal(array![2.0, 0.5]);
+        let covariance = MarginalSlopeCovariance::diagonal(array![2.0, 0.5]).unwrap();
         let callback =
             LogslopeBlockJacobian::new(layout, Arc::new(array![[1.5, -0.5]]), covariance.clone())
                 .unwrap();
@@ -1051,7 +1044,7 @@ mod tests {
             [11.0, 12.0],
         ];
         let marginal_rows = array![[13.0], [14.0], [15.0], [16.0], [17.0], [18.0]];
-        let covariance = MarginalSlopeCovariance::Diagonal(array![2.0]);
+        let covariance = MarginalSlopeCovariance::diagonal(array![2.0]).unwrap();
         let scalars = SurvivalMarginalSlopeFamilyScalars::new(
             vec![0.1, 0.2],
             vec![0.3, 0.4],

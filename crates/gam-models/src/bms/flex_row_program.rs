@@ -12,6 +12,21 @@ use super::hessian_paths::PrimarySlices;
 use gam_math::jet_scalar::{RuntimeJetScalar, filtered_implicit_solve_runtime_scalar};
 use ndarray::Array1;
 
+/// Declarative second-order lowering of the calibration-CDF semantic node.
+///
+/// Backends provide only the primitive `D(first)` and
+/// `D(explicit_second) - Q(first, first)` contractions. This schedule owns
+/// which contractions exist and their index traversal, so empirical moments,
+/// standard-normal moments, and CUDA emission cannot maintain separate loop
+/// formulas.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BmsFlexCalibrationOrder2Node {
+    InterceptSecond,
+    PrimaryFirst { primary: usize },
+    InterceptPrimarySecond { primary: usize },
+    PrimaryPairSecond { left: usize, right: usize },
+}
+
 /// Borrowed scalar coordinates of the canonical BMS FLEX row program.
 ///
 /// This is the zero-allocation input to optimized lowerings. The dense generic
@@ -170,6 +185,52 @@ pub(super) struct BmsFlexRowProgram {
 }
 
 impl BmsFlexRowProgram {
+    pub(super) fn for_each_calibration_order2(
+        active_primaries: &[usize],
+        need_hessian: bool,
+        mut visit: impl FnMut(BmsFlexCalibrationOrder2Node),
+    ) {
+        let result = Self::try_for_each_calibration_order2(
+            active_primaries,
+            need_hessian,
+            |node| -> Result<(), std::convert::Infallible> {
+                visit(node);
+                Ok(())
+            },
+        );
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    /// Interpret the canonical sparse Order2 schedule for one calibration
+    /// cell. `active_primaries` excludes the marginal target coordinate, whose
+    /// `-mu(q)` derivatives are emitted by the row finalizer.
+    pub(super) fn try_for_each_calibration_order2<E>(
+        active_primaries: &[usize],
+        need_hessian: bool,
+        mut visit: impl FnMut(BmsFlexCalibrationOrder2Node) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if need_hessian {
+            visit(BmsFlexCalibrationOrder2Node::InterceptSecond)?;
+        }
+        for &primary in active_primaries {
+            visit(BmsFlexCalibrationOrder2Node::PrimaryFirst { primary })?;
+            if need_hessian {
+                visit(BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary })?;
+            }
+        }
+        if need_hessian {
+            for (position, &left) in active_primaries.iter().enumerate() {
+                for &right in &active_primaries[position..] {
+                    visit(BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left, right })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn from_parts(
         point: BmsFlexProgramPoint<'_>,
         calibration: Vec<BmsFlexCalibrationProgramNode>,
