@@ -766,14 +766,15 @@ pub(crate) fn row_primary_closed_form(
     Ok((row.value(), row.g(), row.h()))
 }
 
+#[cfg(test)]
+mod test_support {
+use super::*;
+
 /// Historical hand-expanded K=1 V/G/H schedule, retained only as an
 /// independent strongest-hand test and performance witness for the generated
-/// [`row_primary_closed_form`] lowering. Production must never call this body:
-/// keeping the duplicate chain rule live would reintroduce the #736/#932
-/// desynchronization class.
-#[cfg(test)]
+/// [`row_primary_closed_form`] lowering. Production must never call this body.
 #[inline]
-pub(crate) fn row_primary_closed_form_hand_reference(
+pub(super) fn row_primary_closed_form_hand_reference(
     q0: f64,
     q1: f64,
     qd1: f64,
@@ -905,6 +906,7 @@ pub(crate) fn row_primary_closed_form_hand_reference(
         + u1_ad1 * d2ad1_dg2;
 
     Ok((nll, grad, hess))
+}
 }
 
 /// Crate-visible wrapper around `row_primary_closed_form` so the
@@ -1053,7 +1055,7 @@ mod tests {
         for (case, &(q0, q1, qd1, g, z, w, d, scale)) in cases.iter().enumerate() {
             let canonical = row_primary_closed_form(q0, q1, qd1, g, z, w, d, 1.0e-8, scale)
                 .expect("canonical rigid row");
-            let hand = row_primary_closed_form_hand_reference(
+            let hand = test_support::row_primary_closed_form_hand_reference(
                 q0, q1, qd1, g, z, w, d, 1.0e-8, scale,
             )
             .expect("strongest hand rigid row");
@@ -1104,7 +1106,7 @@ mod tests {
         for (case, &(q0, q1, qd1, g, z, w, d, scale)) in cases.iter().enumerate() {
             let canonical = row_primary_closed_form(q0, q1, qd1, g, z, w, d, 1.0e-8, scale)
                 .expect("canonical rigid row");
-            let hand = row_primary_closed_form_hand_reference(
+            let hand = test_support::row_primary_closed_form_hand_reference(
                 q0, q1, qd1, g, z, w, d, 1.0e-8, scale,
             )
             .expect("strongest hand rigid row");
@@ -1140,7 +1142,7 @@ mod tests {
                 .expect("timed canonical rigid row")
             });
             let hand_ns = best_ns(200_000, || {
-                row_primary_closed_form_hand_reference(
+                test_support::row_primary_closed_form_hand_reference(
                     black_box(q0),
                     black_box(q1),
                     black_box(qd1),

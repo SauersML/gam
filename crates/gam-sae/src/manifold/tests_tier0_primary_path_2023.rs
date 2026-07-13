@@ -404,29 +404,4 @@ mod tests {
         }
     }
 
-    /// DIAGNOSTIC (λ→0 zoo blocker): a near-perfectly-reconstructed target
-    /// (larger n, tiny noise) makes REML want minimal smoothing, so the outer
-    /// search drives ρ toward the λ floor — the regime where the zoo fit's
-    /// analytic outer gradient goes non-finite. Runs the full ARC search and
-    /// prints the outcome; the `[DIAG lambda-floor]` line (emitted from
-    /// `analytic_outer_rho_gradient_components_with_bundle`) pinpoints which
-    /// gradient component blows up. Non-asserting observation.
-    #[test]
-    fn diag_lambda_floor_gradient_2266() {
-        install_test_logger();
-        let mut state = 0x2266_d1a9_0000_0007u64;
-        let n = 256usize;
-        let target = Array2::from_shape_fn((n, 2), |(i, j)| {
-            let theta = std::f64::consts::TAU * (i as f64) / (n as f64);
-            let clean = if j == 0 { theta.cos() } else { theta.sin() };
-            clean + 0.0005 * lcg_normal(&mut state)
-        });
-        match run_primary_outer_search(target) {
-            Ok(report) => println!(
-                "[DIAG] low-noise circle MINTED crit={:.6e} (did not reach the floor)",
-                report.penalized_quasi_laplace_criterion
-            ),
-            Err(err) => println!("[DIAG] low-noise circle did NOT mint: {err}"),
-        }
-    }
 }

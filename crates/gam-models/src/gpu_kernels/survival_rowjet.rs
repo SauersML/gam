@@ -315,49 +315,6 @@ mod tests {
         SurvivalRowVghChannels { value, grad, hess }
     }
 
-    /// The retired strongest hand-expanded K=1 V/G/H schedule. It exists only
-    /// in tests so production cannot diverge from the canonical row program.
-    /// The historical scalar formula assumes unit score covariance, hence the
-    /// explicit fixture contract below.
-    #[must_use]
-    fn survival_rigid_row_vgh_hand(
-        rows: &[SurvivalRowInputs],
-        probit_scale: f64,
-    ) -> SurvivalRowVghChannels {
-        use crate::survival::marginal_slope::row_primary_closed_form_hand_reference;
-
-        let n = rows.len();
-        let mut value = vec![0.0_f64; n];
-        let mut grad = vec![0.0_f64; n * 4];
-        let mut hess = vec![0.0_f64; n * 16];
-        for (row, input) in rows.iter().enumerate() {
-            assert_eq!(
-                input.cov_ones, 1.0,
-                "strongest hand K=1 witness requires unit score covariance",
-            );
-            let (row_value, row_gradient, row_hessian) =
-                row_primary_closed_form_hand_reference(
-                    input.primaries[0],
-                    input.primaries[1],
-                    input.primaries[2],
-                    input.primaries[3],
-                    input.z_sum,
-                    input.wi,
-                    input.di,
-                    f64::NEG_INFINITY,
-                    probit_scale,
-                )
-                .expect("valid strongest-hand survival row");
-            value[row] = row_value;
-            grad[row * 4..row * 4 + 4].copy_from_slice(&row_gradient);
-            for a in 0..4 {
-                hess[row * 16 + a * 4..row * 16 + a * 4 + 4]
-                    .copy_from_slice(&row_hessian[a]);
-            }
-        }
-        SurvivalRowVghChannels { value, grad, hess }
-    }
-
     #[cfg(target_os = "linux")]
     fn survival_rigid_row_vgh_device_only(
         rows: &[SurvivalRowInputs],
@@ -522,15 +479,9 @@ mod tests {
         let warm =
             survival_rigid_row_vgh_device_only(&rows, 0.7).expect("warm survival VGH device call");
 
-        let hand_start = Instant::now();
-        let hand = survival_rigid_row_vgh_hand(&rows, 0.7);
-        let hand_elapsed = hand_start.elapsed();
         let canonical_start = Instant::now();
         let canonical = survival_rigid_row_vgh_cpu(&rows, 0.7);
         let canonical_elapsed = canonical_start.elapsed();
-        assert_channel_parity("canonical/hand value", &hand.value, &canonical.value);
-        assert_channel_parity("canonical/hand gradient", &hand.grad, &canonical.grad);
-        assert_channel_parity("canonical/hand Hessian", &hand.hess, &canonical.hess);
 
         let mut best_elapsed = Duration::MAX;
         let mut best_device = warm;
@@ -546,22 +497,18 @@ mod tests {
             }
         }
 
-        assert_channel_parity("measured value", &hand.value, &best_device.value);
-        assert_channel_parity("measured gradient", &hand.grad, &best_device.grad);
-        assert_channel_parity("measured Hessian", &hand.hess, &best_device.hess);
-        let hand_ns = hand_elapsed.as_secs_f64() * 1e9 / ROWS as f64;
+        assert_channel_parity("measured value", &canonical.value, &best_device.value);
+        assert_channel_parity("measured gradient", &canonical.grad, &best_device.grad);
+        assert_channel_parity("measured Hessian", &canonical.hess, &best_device.hess);
         let canonical_ns = canonical_elapsed.as_secs_f64() * 1e9 / ROWS as f64;
         let device_ns = best_elapsed.as_secs_f64() * 1e9 / ROWS as f64;
         eprintln!(
-            "SURVIVAL-VGH-CUDA-932 rows={ROWS} strongest-hand={hand_ns:.2} ns/row canonical-cpu={canonical_ns:.2} ns/row device-e2e={device_ns:.2} ns/row canonical/hand={:.3}x device/hand={:.3}x",
-            canonical_ns / hand_ns,
-            device_ns / hand_ns,
+            "SURVIVAL-VGH-CUDA-932 rows={ROWS} canonical-cpu={canonical_ns:.2} ns/row device-e2e={device_ns:.2} ns/row device/canonical={:.3}x",
+            device_ns / canonical_ns,
         );
         assert!(
-            hand_ns.is_finite()
-                && canonical_ns.is_finite()
+            canonical_ns.is_finite()
                 && device_ns.is_finite()
-                && hand_ns > 0.0
                 && canonical_ns > 0.0
                 && device_ns > 0.0
         );
