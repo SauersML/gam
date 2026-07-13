@@ -571,9 +571,12 @@ impl SmoothBasisSpec {
                 InputFrameNormalization::AutoStandardizedOriginalUnits,
             ),
             SmoothBasisSpec::Sphere { spec, .. } => {
-                let family = match spec.method {
-                    SphereMethod::Wahba => BasisScaleFamily::SphereWahba,
-                    SphereMethod::Harmonic => BasisScaleFamily::SphereHarmonic,
+                let (family, parameters) = match spec.method {
+                    SphereMethod::Wahba => (
+                        BasisScaleFamily::SphereWahba,
+                        vec![scale(1, DimensionfulBasisParameter::Centers)],
+                    ),
+                    SphereMethod::Harmonic => (BasisScaleFamily::SphereHarmonic, Vec::new()),
                 };
                 BasisScaleContract::leaf(
                     family,
@@ -582,7 +585,7 @@ impl SmoothBasisSpec {
                     BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
                     BasisDerivativeScaleLaw::IntrinsicAngularChainRule,
                     BasisNullGeometryScaleLaw::IntrinsicHarmonicSubspace,
-                    vec![scale(1, DimensionfulBasisParameter::Centers)],
+                    parameters,
                     InputFrameNormalization::Intrinsic,
                 )
             }
@@ -1409,8 +1412,13 @@ mod tests {
                 .zip(reference.active_penalties.iter())
             {
                 assert_matrix_close(&observed.matrix, &target.matrix, 2e-10);
-                assert_eq!(observed.nullity, 0);
+                assert_eq!(observed.nullity, target.nullity);
             }
+            assert_eq!(
+                joint_unpenalized_dim(actual.dim, &actual.active_penalties),
+                0,
+                "the combined random-intercept/slope penalty must be full rank"
+            );
         }
     }
 
