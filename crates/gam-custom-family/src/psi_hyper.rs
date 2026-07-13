@@ -1755,6 +1755,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         outer_hessian: gam_problem::HessianValue::Unavailable,
                         warm_start: value_only.warm_start,
                         inner_converged: inner.converged,
+                        hyper_values: hyper_layout.values().clone(),
                         inner: inner.clone(),
                     });
                 }
@@ -2018,6 +2019,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         if let Some(gradient) = batched_gradient_override {
             eval_result.gradient = gradient;
         }
+        eval_result.hyper_values = hyper_layout.values().clone();
 
         // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
         // with ρ coordinates first and ψ coordinates appended — matching the expected
@@ -2188,6 +2190,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         outer_hessian: gam_problem::HessianValue::Unavailable,
                         warm_start: value_only.warm_start,
                         inner_converged: inner.converged,
+                        hyper_values: hyper_layout.values().clone(),
                         inner: inner.clone(),
                     });
                 }
@@ -2293,6 +2296,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         {
             eval_result.gradient = batched_grad;
         }
+        eval_result.hyper_values = hyper_layout.values().clone();
         return Ok(eval_result);
     }
 
@@ -2554,7 +2558,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         }
     };
 
-    let eval_result = joint_outer_evaluate(
+    let mut eval_result = joint_outer_evaluate(
         &inner,
         specs,
         &per_block,
@@ -2604,6 +2608,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         )?,
     )?;
 
+    eval_result.hyper_values = hyper_layout.values().clone();
     Ok(eval_result)
 }
 
