@@ -654,7 +654,7 @@ impl SurvivalMarginalSlopeRowKernel {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod rigid_row_admission_tests {
     use super::*;
 
@@ -774,6 +774,7 @@ fn rigid_row_feature_values(
 /// applying its `(q0,q1,qd1,g) -> (q0,q1,qd1,L,V)` feature map to the sliced
 /// witness surface emitted from the sole rigid likelihood declaration.
 #[inline(always)]
+#[cfg(target_os = "linux")]
 pub(crate) fn rigid_row_admission_witnesses(
     primaries: &[f64; 4],
     inputs: &RigidRowInputs,

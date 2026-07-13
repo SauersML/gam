@@ -525,14 +525,14 @@ impl RowJacobianOperator for QChannelBlockOperator {
 /// those rows once as a compact `(n K) × p` matrix, then serves every hot row
 /// callback by borrowed reads. It never stores the mostly-zero `n × p × (3+K)`
 /// tensor.
-pub struct LogslopeBlockOperator {
+pub(crate) struct LogslopeBlockOperator {
     physical_rows: Array2<f64>,
     nrows: usize,
     score_dim: usize,
 }
 
 impl LogslopeBlockOperator {
-    pub fn new(
+    pub(crate) fn new(
         layout: crate::survival::marginal_slope::LogslopeLayout,
         score_dim: usize,
     ) -> Result<Self, String> {
@@ -634,9 +634,9 @@ impl RowJacobianOperator for LogslopeBlockOperator {
 /// Inputs assembled for the survival fit driver to feed `compile()`. The
 /// ordering follows `gauge_priority` descending (time=200 → marginal=150 →
 /// logslope=120 → score_warp=80 → link_dev=60).
-pub struct SurvivalCompilerInputs {
-    pub operators: Vec<Arc<dyn RowJacobianOperator>>,
-    pub ordering: Vec<BlockOrder>,
+pub(crate) struct SurvivalCompilerInputs {
+    pub(crate) operators: Vec<Arc<dyn RowJacobianOperator>>,
+    pub(crate) ordering: Vec<BlockOrder>,
 }
 
 /// Per-block V reparameterisation matrices for the three parametric
@@ -654,15 +654,15 @@ pub struct SurvivalCompilerInputs {
 /// `CompiledBlocks::blocks[i].t_lw.ncols()` — i.e., the kept-direction
 /// count after sqrt-H-metric residualisation and post-walk RRQR
 /// trailing-pivot drop.
-pub struct SurvivalParametricCompiled {
-    pub v_time: Array2<f64>,
-    pub v_marginal: Array2<f64>,
-    pub v_logslope: Array2<f64>,
+pub(crate) struct SurvivalParametricCompiled {
+    pub(crate) v_time: Array2<f64>,
+    pub(crate) v_marginal: Array2<f64>,
+    pub(crate) v_logslope: Array2<f64>,
     /// Per-block dropped raw-column count, indexed
     /// `(time_dropped, marginal_dropped, logslope_dropped)`. Equal to
     /// `(p_raw − v.ncols())` for each block. Useful for logging the
     /// gauge-attribution summary at the construction site.
-    pub drops_by_block: (usize, usize, usize),
+    pub(crate) drops_by_block: (usize, usize, usize),
 }
 
 pub(crate) fn wrap_design_with_transform(
@@ -733,7 +733,7 @@ pub struct SurvivalParametricCompiledPerTerm {
 /// Aliased directions land in the lowest-priority block that contains
 /// them, in the natural term order within that block — matching the
 /// gauge-priority ownership contract.
-pub fn compile_survival_parametric_designs_per_term(
+pub(crate) fn compile_survival_parametric_designs_per_term(
     time_dq0: Array2<f64>,
     time_dq1: Array2<f64>,
     time_dqd1: Array2<f64>,
@@ -1526,7 +1526,7 @@ fn validate_block_penalty_shapes(
 /// the V transforms to the family's captured designs (the captured-
 /// design update is the remaining integration step that touches the
 /// family's row-Hessian assembly assertions).
-pub fn compile_survival_parametric_designs(
+pub(crate) fn compile_survival_parametric_designs(
     time_dq0: Array2<f64>,
     time_dq1: Array2<f64>,
     time_dqd1: Array2<f64>,
@@ -1606,7 +1606,7 @@ pub fn compile_survival_parametric_designs(
 /// `score_warp_(dq, dqd1)` / `link_dev_(dq, dqd1)` are present only when
 /// the corresponding flex block is active. The returned `ordering` parallels
 /// `operators` so the caller can route compiled outputs back to runtime slots.
-pub fn build_survival_compiler_inputs(
+pub(crate) fn build_survival_compiler_inputs(
     time_dq0: Array2<f64>,
     time_dq1: Array2<f64>,
     time_dqd1: Array2<f64>,
