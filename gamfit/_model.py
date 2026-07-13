@@ -1002,7 +1002,10 @@ class Model:
         Returns
         -------
         dict
-            ``{"grid": array, "predicted": array, "standard_error": array}``.
+            ``{"grid": array, "predicted": array, "standard_error": array,
+            "covariance_source": "smoothing-corrected"}``. Partial-dependence
+            standard errors require smoothing-corrected covariance and never
+            silently downgrade to conditional covariance.
         """
         import numpy as np
 
@@ -1110,13 +1113,14 @@ class Model:
                 row[col_name] = str(float(value))
             rows.append([str(row[h]) for h in headers])
 
-        predicted, se = rust_module().model_partial_dependence(
+        predicted, se, covariance_source = rust_module().model_partial_dependence(
             self._model_bytes, term, headers, rows
         )
         return {
             "grid": grid_out,
             "predicted": np.asarray(predicted, dtype=float),
             "standard_error": np.asarray(se, dtype=float),
+            "covariance_source": str(covariance_source),
         }
 
     def variance_share(

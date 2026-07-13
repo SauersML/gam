@@ -90,6 +90,14 @@ def test_default_uncertainty_refuses_when_corrected_covariance_is_unavailable() 
         "contain smoothing-corrected covariance"
     )
 
+    with pytest.raises(gamfit.GamError) as partial_dependence_raised:
+        model.partial_dependence("s(x)", {"x": x}, grid=grid["x"])
+    assert type(partial_dependence_raised.value) is gamfit.GamError
+    assert str(partial_dependence_raised.value) == (
+        "partial_dependence requires smoothing-corrected covariance; refit before "
+        "requesting partial-dependence standard errors"
+    )
+
     conditional = model.predict(
         grid,
         interval=0.9,

@@ -9009,20 +9009,17 @@ fn model_partial_dependence_encoded_impl(
     model_bytes: &[u8],
     term: &str,
     source: EncodedDataset,
-) -> Result<(Vec<f64>, Vec<f64>), String> {
+) -> Result<(Vec<f64>, Vec<f64>, String), String> {
     let model = load_model_impl(model_bytes)?;
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let x = standard_mean_design_dense(&model, dataset)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     let beta = &fit.beta;
-    let cov = fit
-        .beta_covariance_corrected()
-        .or_else(|| fit.beta_covariance())
-        .ok_or_else(|| {
-            "model does not contain coefficient covariance; refit with \
-             covariance-saving inference enabled"
-                .to_string()
-        })?;
+    let cov = fit.beta_covariance_corrected().ok_or_else(|| {
+        "partial_dependence requires smoothing-corrected covariance; refit before requesting \
+         partial-dependence standard errors"
+            .to_string()
+    })?;
     let blocks = term_blocks_for_model_impl(model_bytes)?;
     let (start, end) = blocks
         .iter()
@@ -9051,7 +9048,7 @@ fn model_partial_dependence_encoded_impl(
         }
         se[i] = var.max(0.0).sqrt();
     }
-    Ok((predicted, se))
+    Ok((predicted, se, "smoothing-corrected".to_string()))
 }
 
 /// Per-term variance share: `cov(X_t β_t, X β) / var(X β)` for each
@@ -9126,15 +9123,17 @@ fn model_partial_dependence(
     term: String,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
-) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
+) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>, String)> {
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
-    let (predicted, se) = detach_py_result(py, "model_partial_dependence", move || {
-        model_partial_dependence_encoded_impl(&model_bytes, &term, dataset)
-    })?;
+    let (predicted, se, covariance_source) =
+        detach_py_result(py, "model_partial_dependence", move || {
+            model_partial_dependence_encoded_impl(&model_bytes, &term, dataset)
+        })?;
     Ok((
         predicted.into_pyarray(py).unbind(),
         se.into_pyarray(py).unbind(),
+        covariance_source,
     ))
 }
 

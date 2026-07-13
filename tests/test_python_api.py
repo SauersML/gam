@@ -1831,7 +1831,13 @@ def test_partial_dependence_and_variance_share() -> None:
 
     diagnostics = typing.cast(_ModelTermDiagnostics, model)
     pd_out = diagnostics.partial_dependence("s(x1)", frame, n_points=40)
-    assert set(pd_out.keys()) == {"grid", "predicted", "standard_error"}
+    assert set(pd_out.keys()) == {
+        "grid",
+        "predicted",
+        "standard_error",
+        "covariance_source",
+    }
+    assert pd_out["covariance_source"] == "smoothing-corrected"
     assert pd_out["grid"].shape == (40,)
     assert pd_out["predicted"].shape == (40,)
     assert pd_out["standard_error"].shape == (40,)
@@ -2268,7 +2274,13 @@ def test_model_partial_dependence_1d_shapes_and_finiteness() -> None:
     model = gamfit.fit(frame, "y ~ s(x1)")
     diagnostics = typing.cast(_ModelTermDiagnostics, model)
     pd_out = diagnostics.partial_dependence("s(x1)", frame, n_points=25)
-    assert set(pd_out.keys()) == {"grid", "predicted", "standard_error"}
+    assert set(pd_out.keys()) == {
+        "grid",
+        "predicted",
+        "standard_error",
+        "covariance_source",
+    }
+    assert pd_out["covariance_source"] == "smoothing-corrected"
     assert np.asarray(pd_out["grid"]).shape == (25,)
     assert np.asarray(pd_out["predicted"]).shape == (25,)
     assert np.asarray(pd_out["standard_error"]).shape == (25,)
