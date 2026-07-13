@@ -5712,4 +5712,309 @@ mod empirical_flex_jet_oracle_tests {
             }
         }
     }
+
+    fn scheduled_median<T>(samples: usize, mut evaluate: impl FnMut() -> T) -> (u128, T) {
+        assert!(samples > 0);
+        let mut timings = Vec::with_capacity(samples);
+        let mut output = None;
+        for _ in 0..samples {
+            let start = std::time::Instant::now();
+            let value = evaluate();
+            timings.push(start.elapsed().as_nanos());
+            std::hint::black_box(&value);
+            output = Some(value);
+        }
+        timings.sort_unstable();
+        (
+            timings[samples / 2],
+            output.expect("positive sample count produces output"),
+        )
+    }
+
+    fn scheduled_benchmark_grid() -> EmpiricalZGrid {
+        const NODES: usize = 65;
+        let nodes = (0..NODES)
+            .map(|index| -2.4 + 4.8 * index as f64 / (NODES - 1) as f64)
+            .collect::<Vec<_>>();
+        let raw = nodes
+            .iter()
+            .map(|node| (-0.5 * node * node).exp())
+            .collect::<Vec<_>>();
+        let total = raw.iter().sum::<f64>();
+        let weights = raw.into_iter().map(|weight| weight / total).collect();
+        EmpiricalZGrid::new(nodes, weights, "#932 final schedule timing grid")
+            .expect("valid timing grid")
+    }
+
+    /// Temporary exact release evidence for the final production dispatcher.
+    /// Removed immediately after the pinned MSI result is recorded.
+    #[test]
+    fn empirical_flex_final_schedule_benchmark_932() {
+        const SAMPLES: usize = 9;
+
+        for is_score_warp in [true, false] {
+            for r in [8_usize, 12, 18] {
+                let mut fixture = make_dimension_fixture(is_score_warp, r);
+                fixture.grid = scheduled_benchmark_grid();
+                fixture.family.latent_measure = LatentMeasureKind::GlobalEmpirical {
+                    grid: fixture.grid.clone(),
+                };
+                let (q, slope, beta, row_ctx) = fixture_state(&fixture);
+                let (beta_h, beta_w) = if is_score_warp {
+                    (Some(&beta), None)
+                } else {
+                    (None, Some(&beta))
+                };
+                let directions = (0..r)
+                    .map(|lane| {
+                        Array1::from_shape_fn(r, |axis| {
+                            let magnitude = ((lane + 2) * (axis + 3) % 17 + 1) as f64 / 19.0;
+                            if (lane + axis) % 2 == 0 {
+                                magnitude
+                            } else {
+                                -0.7 * magnitude
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let gram = (0..r * r)
+                    .map(|index| ((index / r + 2 * (index % r) + 1) as f64) / (3 * r) as f64)
+                    .collect::<Vec<_>>();
+                let ordered_pairs = [
+                    (&directions[0], &directions[1]),
+                    (&directions[1], &directions[0]),
+                    (&directions[2], &directions[3]),
+                    (&directions[3], &directions[2]),
+                    (&directions[0], &directions[r - 1]),
+                    (&directions[r - 1], &directions[0]),
+                    (&directions[1], &directions[r - 2]),
+                    (&directions[r - 2], &directions[1]),
+                ];
+
+                EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
+                    *workspace.borrow_mut() = DynamicJetBatchWorkspace::new(1);
+                });
+                EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|workspace| {
+                    *workspace.borrow_mut() = DynamicJetBatchWorkspace::new(1);
+                });
+                let third_bytes = || {
+                    EMPIRICAL_BMS_THIRD_WORKSPACE
+                        .with(|workspace| workspace.borrow().allocated_bytes())
+                };
+                let fourth_bytes = || {
+                    EMPIRICAL_BMS_FOURTH_WORKSPACE
+                        .with(|workspace| workspace.borrow().allocated_bytes())
+                };
+
+                for _ in 0..2 {
+                    std::hint::black_box(
+                        fixture
+                            .family
+                            .empirical_flex_row_third_contracted_many(
+                                0,
+                                &fixture.primary,
+                                q,
+                                slope,
+                                beta_h,
+                                beta_w,
+                                &row_ctx,
+                                &directions,
+                                &fixture.grid,
+                            )
+                            .expect("warm scheduled third contractions"),
+                    );
+                    std::hint::black_box(
+                        fixture
+                            .family
+                            .empirical_flex_row_fourth_contracted_many_ordered(
+                                0,
+                                &fixture.primary,
+                                q,
+                                slope,
+                                beta_h,
+                                beta_w,
+                                &row_ctx,
+                                &ordered_pairs,
+                                &fixture.grid,
+                            )
+                            .expect("warm scheduled fourth contractions"),
+                    );
+                }
+                let third_stable = third_bytes();
+                let fourth_stable = fourth_bytes();
+                assert_eq!(
+                    third_stable, 0,
+                    "common-width third schedule retained an arena"
+                );
+                assert_eq!(
+                    fourth_stable, 0,
+                    "common-width fourth schedule retained an arena"
+                );
+
+                let (third_repeated_ns, third_repeated) = scheduled_median(SAMPLES, || {
+                    directions
+                        .iter()
+                        .map(|direction| {
+                            fixture
+                                .family
+                                .empirical_flex_row_third_contracted(
+                                    0,
+                                    &fixture.primary,
+                                    q,
+                                    slope,
+                                    beta_h,
+                                    beta_w,
+                                    &row_ctx,
+                                    direction,
+                                    &fixture.grid,
+                                )
+                                .expect("repeated fixed-width third contraction")
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let (third_scheduled_ns, third_scheduled) = scheduled_median(SAMPLES, || {
+                    fixture
+                        .family
+                        .empirical_flex_row_third_contracted_many(
+                            0,
+                            &fixture.primary,
+                            q,
+                            slope,
+                            beta_h,
+                            beta_w,
+                            &row_ctx,
+                            &directions,
+                            &fixture.grid,
+                        )
+                        .expect("scheduled third contractions")
+                });
+                for lane in 0..r {
+                    assert_matrix_close(
+                        "final scheduled third",
+                        &third_repeated[lane],
+                        &third_scheduled[lane],
+                    );
+                }
+
+                let (trace_repeated_ns, trace_repeated) = scheduled_median(SAMPLES, || {
+                    let mut gradient = Array1::<f64>::zeros(r);
+                    for axis in 0..r {
+                        let mut basis = Array1::<f64>::zeros(r);
+                        basis[axis] = 1.0;
+                        let third = fixture
+                            .family
+                            .empirical_flex_row_third_contracted(
+                                0,
+                                &fixture.primary,
+                                q,
+                                slope,
+                                beta_h,
+                                beta_w,
+                                &row_ctx,
+                                &basis,
+                                &fixture.grid,
+                            )
+                            .expect("repeated fixed-width trace contraction");
+                        gradient[axis] =
+                            BernoulliMarginalSlopeFamily::row_primary_trace_contract(&third, &gram);
+                    }
+                    gradient
+                });
+                let (trace_scheduled_ns, trace_scheduled) = scheduled_median(SAMPLES, || {
+                    fixture
+                        .family
+                        .empirical_flex_row_third_trace_gradient(
+                            0,
+                            &fixture.primary,
+                            q,
+                            slope,
+                            beta_h,
+                            beta_w,
+                            &row_ctx,
+                            &gram,
+                            &fixture.grid,
+                        )
+                        .expect("scheduled trace gradient")
+                });
+                for axis in 0..r {
+                    let expected = trace_repeated[axis];
+                    let actual = trace_scheduled[axis];
+                    assert!(
+                        (expected - actual).abs()
+                            <= 2e-10 * expected.abs().max(actual.abs()).max(1.0)
+                    );
+                }
+
+                let (fourth_repeated_ns, fourth_repeated) = scheduled_median(SAMPLES, || {
+                    ordered_pairs
+                        .iter()
+                        .map(|(direction_u, direction_v)| {
+                            fixture
+                                .family
+                                .empirical_flex_row_fourth_contracted(
+                                    0,
+                                    &fixture.primary,
+                                    q,
+                                    slope,
+                                    beta_h,
+                                    beta_w,
+                                    &row_ctx,
+                                    direction_u,
+                                    direction_v,
+                                    &fixture.grid,
+                                )
+                                .expect("repeated fixed-width fourth contraction")
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let (fourth_scheduled_ns, fourth_scheduled) = scheduled_median(SAMPLES, || {
+                    fixture
+                        .family
+                        .empirical_flex_row_fourth_contracted_many_ordered(
+                            0,
+                            &fixture.primary,
+                            q,
+                            slope,
+                            beta_h,
+                            beta_w,
+                            &row_ctx,
+                            &ordered_pairs,
+                            &fixture.grid,
+                        )
+                        .expect("scheduled fourth contractions")
+                });
+                for lane in 0..ordered_pairs.len() {
+                    assert_matrix_close(
+                        "final scheduled fourth",
+                        &fourth_repeated[lane],
+                        &fourth_scheduled[lane],
+                    );
+                }
+
+                assert_eq!(
+                    third_stable,
+                    third_bytes(),
+                    "third arena grew during timing"
+                );
+                assert_eq!(
+                    fourth_stable,
+                    fourth_bytes(),
+                    "fourth arena grew during timing"
+                );
+                let kind = if is_score_warp { "score" } else { "link" };
+                eprintln!(
+                    "BMS932_FINAL kind={kind} r={r} channel=t3-many repeated_ns={third_repeated_ns} scheduled_ns={third_scheduled_ns} speedup={:.3} arena_bytes={third_stable}",
+                    third_repeated_ns as f64 / third_scheduled_ns as f64,
+                );
+                eprintln!(
+                    "BMS932_FINAL kind={kind} r={r} channel=t3-trace repeated_ns={trace_repeated_ns} scheduled_ns={trace_scheduled_ns} speedup={:.3} arena_bytes={third_stable}",
+                    trace_repeated_ns as f64 / trace_scheduled_ns as f64,
+                );
+                eprintln!(
+                    "BMS932_FINAL kind={kind} r={r} channel=t4-many repeated_ns={fourth_repeated_ns} scheduled_ns={fourth_scheduled_ns} speedup={:.3} arena_bytes={fourth_stable}",
+                    fourth_repeated_ns as f64 / fourth_scheduled_ns as f64,
+                );
+            }
+        }
+    }
 }
