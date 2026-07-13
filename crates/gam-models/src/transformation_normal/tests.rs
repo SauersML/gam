@@ -1559,6 +1559,38 @@ pub(crate) fn ctn_joint_hessian_workspace_matvec_matches_dense() {
 }
 
 #[test]
+pub(crate) fn ctn_direct_hessian_matvec_honors_outer_subsample_weights() {
+    let psi = array![0.15, -0.10];
+    let (family, _, state, _) = toy_family_and_derivatives(&psi);
+    let masked = family
+        .with_outer_subsample(&array![0.0, 2.5, 0.0, 1.5])
+        .expect("non-binary outer subsample weights");
+    let row_quantities = masked
+        .row_quantities(&state.beta)
+        .expect("masked row quantities");
+    let (_, dense) = masked
+        .scop_gradient_and_negative_hessian(&state.beta, &row_quantities)
+        .expect("masked dense Hessian");
+
+    let probe = toy_probe_vector(state.beta.len(), 607);
+    let want = dense.dot(&probe);
+    let mut got = Array1::<f64>::zeros(probe.len());
+    masked
+        .scop_hessian_matvec_into(&state.beta, &row_quantities, &probe, &mut got)
+        .expect("masked direct Hessian matvec");
+
+    for i in 0..want.len() {
+        let tolerance = 1e-11 * want[i].abs().max(1.0) + 1e-12;
+        assert!(
+            (want[i] - got[i]).abs() <= tolerance,
+            "masked direct Hessian matvec mismatch at {i}: dense={:.6e}, direct={:.6e}, tolerance={tolerance:.6e}",
+            want[i],
+            got[i]
+        );
+    }
+}
+
+#[test]
 pub(crate) fn ctn_joint_hessian_workspace_matvec_into_primes_dense_cache() {
     let psi = array![0.15, -0.10];
     let (family, _, state, _) = toy_family_and_derivatives(&psi);
