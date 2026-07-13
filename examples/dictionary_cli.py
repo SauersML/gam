@@ -99,10 +99,12 @@ def steer_atom(
 ) -> dict[str, Any]:
     """Apply a measured target-KL chart move on one atom.
 
-    ``patched_forward_kl(amplitude)`` must apply that amplitude to the real model
-    and return ``KL(p_base || p_patched)``. The Rust solver brackets the requested
-    dose, returns the exact activation delta atomically, and raises if the target
-    is unreachable or the probe budget cannot certify it.
+    ``patched_forward_kl(plan)`` must execute the supplied public steer plan and
+    return a mapping with ``effective_delta`` (after model dtype conversion),
+    ``exact_directional_nats`` (the local full-Fisher quadratic of that effective
+    delta), and ``measured_nats = KL(p_base || p_patched)`` for the same move. The
+    Rust solver validates the atomic observation, brackets the requested dose,
+    and raises if the target is unreachable or cannot be certified.
     """
     plan = fit.steer_to_target(
         {

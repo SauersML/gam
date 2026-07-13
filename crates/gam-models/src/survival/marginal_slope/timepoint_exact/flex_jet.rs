@@ -2637,6 +2637,61 @@ impl MomentTerm for ArenaJet3<'_> {
     }
 }
 
+impl<const K: usize> MomentTerm for FixedJet3<K> {
+    fn moment_term(&self, moment: &Self) -> Self {
+        let coefficient_base = &self.inner.base.0;
+        let coefficient_eps = &self.inner.eps.0;
+        let moment_base = &moment.inner.base.0;
+        let moment_eps = &moment.inner.eps.0;
+
+        let mut base = Tower2::<K>::zero();
+        for axis in 0..K {
+            base.g[axis] = coefficient_base.g[axis] * moment_base.v;
+        }
+        for row in 0..K {
+            for column in row..K {
+                let channel = coefficient_base.h[row][column] * moment_base.v
+                    + 0.5
+                        * (coefficient_base.g[row] * moment_base.g[column]
+                            + coefficient_base.g[column] * moment_base.g[row]);
+                base.h[row][column] = channel;
+                base.h[column][row] = channel;
+            }
+        }
+
+        let mut eps = Tower2::<K>::zero();
+        eps.v = coefficient_eps.v * moment_base.v;
+        for axis in 0..K {
+            eps.g[axis] = coefficient_eps.g[axis] * moment_base.v
+                + 0.5
+                    * (coefficient_eps.v * moment_base.g[axis]
+                        + coefficient_base.g[axis] * moment_eps.v);
+        }
+        for row in 0..K {
+            for column in row..K {
+                let channel = coefficient_eps.h[row][column] * moment_base.v
+                    + (2.0 / 3.0)
+                        * (coefficient_eps.g[row] * moment_base.g[column]
+                            + coefficient_eps.g[column] * moment_base.g[row])
+                    + (2.0 / 3.0) * coefficient_base.h[row][column] * moment_eps.v
+                    + (1.0 / 3.0) * coefficient_eps.v * moment_base.h[row][column]
+                    + (1.0 / 3.0)
+                        * (coefficient_base.g[row] * moment_eps.g[column]
+                            + coefficient_base.g[column] * moment_eps.g[row]);
+                eps.h[row][column] = channel;
+                eps.h[column][row] = channel;
+            }
+        }
+
+        Self {
+            inner: OneSeed {
+                base: Order2(base),
+                eps: Order2(eps),
+            },
+        }
+    }
+}
+
 impl MomentTerm for Jet4 {
     fn moment_term(&self, m: &Self) -> Self {
         // The calibration residual term lifted to the two-seed ε/δ algebra. The base
