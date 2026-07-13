@@ -1373,7 +1373,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal<
     options: &BlockwiseFitOptions,
     penalty_counts: &[usize],
     rho_current: &Array1<f64>,
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    hyper_layout: &CustomFamilyHyperLayout,
     warm_start: Option<&ConstrainedWarmStart>,
     rho_prior: gam_problem::RhoPrior,
     eval_mode: EvalMode,
@@ -1384,7 +1384,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal<
         options,
         penalty_counts,
         rho_current,
-        Arc::new(derivative_blocks.to_vec()),
+        Arc::new(hyper_layout.clone()),
         warm_start,
         rho_prior,
         eval_mode,
@@ -1399,17 +1399,17 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     options: &BlockwiseFitOptions,
     penalty_counts: &[usize],
     rho_current: &Array1<f64>,
-    derivative_blocks: SharedDerivativeBlocks,
+    hyper_layout: SharedCustomFamilyHyperLayout,
     warm_start: Option<&ConstrainedWarmStart>,
     rho_prior: gam_problem::RhoPrior,
     eval_mode: EvalMode,
     inner_quality_mode: EvalMode,
     precomputed_inner: Option<BlockwiseInnerResult>,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
-    if derivative_blocks.len() != specs.len() {
+    if hyper_layout.block_count() != specs.len() {
         crate::bail_dim_custom!(
-            "joint hyper derivative block count mismatch: got {}, expected {}",
-            derivative_blocks.len(),
+            "joint hyper layout block count mismatch: got {}, expected {}",
+            hyper_layout.block_count(),
             specs.len()
         );
     }
@@ -1422,7 +1422,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         );
     }
     let rho_dim = penalty_counts.iter().sum::<usize>();
-    let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
+    let psi_dim = hyper_layout.len();
     if rho_current.len() != rho_dim {
         crate::bail_dim_custom!(
             "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
@@ -1679,7 +1679,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             && let Ok(Some(batch)) = family.batched_outer_gradient_terms(
                 synced_joint_states.as_ref(),
                 specs,
-                derivative_blocks.as_ref(),
+                hyper_layout.as_ref(),
                 rho_current,
                 options,
                 hessian_workspace.clone(),
@@ -1777,7 +1777,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             family.exact_newton_joint_psi_workspace_with_options(
                 synced_joint_states.as_ref(),
                 specs,
-                derivative_blocks.as_ref(),
+                hyper_layout.as_ref(),
                 options,
             )?
         } else {
@@ -1794,7 +1794,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 family,
                 synced_joint_states.as_ref(),
                 specs,
-                derivative_blocks.as_ref(),
+                hyper_layout.as_ref(),
                 &beta_flat,
                 rho_slice,
                 penalty_counts,
@@ -1827,7 +1827,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             family,
                             synced_joint_states.as_ref(),
                             specs,
-                            derivative_blocks.as_ref(),
+                            hyper_layout.as_ref(),
                             beta_flat.len(),
                         )?
                     } else {
@@ -1837,7 +1837,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         family,
                         synced_joint_states.as_ref(),
                         specs,
-                        Arc::clone(&derivative_blocks),
+                        Arc::clone(&hyper_layout),
                         &beta_flat,
                         rho_slice,
                         penalty_counts,
@@ -1854,7 +1854,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     // moves `psi_workspace`.
                     let contracted_psi_fn = build_contracted_psi_hook(
                         specs,
-                        Arc::clone(&derivative_blocks),
+                        Arc::clone(&hyper_layout),
                         &beta_flat,
                         rho_slice,
                         penalty_counts,
@@ -1866,10 +1866,10 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         family,
                         synced_joint_states.as_ref(),
                         specs,
-                        Arc::clone(&derivative_blocks),
+                        Arc::clone(&hyper_layout),
                         hessian_beta_independent,
                         psi_workspace,
-                    );
+                    )?;
                     (
                         Some(ext_ext_fn),
                         Some(rho_ext_fn),
@@ -2009,7 +2009,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 family,
                 synced_joint_states.as_ref(),
                 specs,
-                derivative_blocks.as_ref(),
+                hyper_layout.as_ref(),
                 rho_current,
                 hessian_workspace.clone(),
                 eval_mode,
@@ -2079,12 +2079,10 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 .ok()
                 .flatten(),
         };
-        let derivative_blocks_for_batch =
-            vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
         if let Ok(Some(batch)) = family.batched_outer_gradient_terms(
             &synced_states_for_batch,
             specs,
-            &derivative_blocks_for_batch,
+            hyper_layout.as_ref(),
             rho_current,
             options,
             workspace_for_batch.clone(),
@@ -2282,7 +2280,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 family,
                 &inner.block_states,
                 specs,
-                derivative_blocks.as_ref(),
+                hyper_layout.as_ref(),
                 rho_current,
                 inner.joint_workspace.clone(),
                 eval_mode,
@@ -2599,7 +2597,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             family,
             &inner.block_states,
             specs,
-            derivative_blocks.as_ref(),
+            hyper_layout.as_ref(),
             rho_current,
             inner.joint_workspace.clone(),
             eval_mode,
