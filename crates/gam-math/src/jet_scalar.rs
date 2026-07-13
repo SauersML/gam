@@ -364,13 +364,9 @@ pub trait RuntimeJetScalar<'arena>: Clone {
     }
 
     /// Add a primal constant without changing derivative channels.
-    fn add_constant(&self, constant: f64) -> Self {
-        self.add(&Self::constant(constant, self.dimension(), self.workspace()))
+    fn add_constant(&self, constant: f64, workspace: &'arena Self::Workspace) -> Self {
+        self.add(&Self::constant(constant, self.dimension(), workspace))
     }
-
-    /// Workspace backing this scalar. Direct runtime lowerings use it to avoid
-    /// constructing a zero-derivative constant for [`Self::add_constant`].
-    fn workspace(&self) -> &'arena Self::Workspace;
 
     /// Evaluate `self * right + addend` in one semantic primitive.
     fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
@@ -504,6 +500,35 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
             unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
         Self {
             inner: S::linear_combination(inner, weights),
+        }
+    }
+
+    #[inline(always)]
+    fn add_constant(&self, constant: f64, &(): &'arena Self::Workspace) -> Self {
+        Self {
+            inner: self.inner.add_constant(constant),
+        }
+    }
+
+    #[inline(always)]
+    fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
+        Self {
+            inner: self.inner.multiply_add(&right.inner, &addend.inner),
+        }
+    }
+
+    #[inline(always)]
+    fn composed_sum(
+        inputs: &[Self],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        assert_eq!(dimension, K, "fixed jet dimension mismatch");
+        let inner =
+            unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
+        Self {
+            inner: S::composed_sum(inner, derivative_stacks),
         }
     }
 
@@ -929,6 +954,87 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
                 let channel = 2.0 * (inherited + curvature);
                 hessian[primary_a * dimension + primary_b] = channel;
                 hessian[primary_b * dimension + primary_a] = channel;
+            }
+        }
+        Self {
+            arena,
+            v: value,
+            g: gradient,
+            h: hessian,
+        }
+    }
+
+    #[inline(always)]
+    fn add_constant(&self, constant: f64, arena: &'arena DynamicJetArena) -> Self {
+        assert!(std::ptr::eq(self.arena, arena));
+        Self {
+            arena,
+            v: self.v + constant,
+            g: self.g,
+            h: self.h,
+        }
+    }
+
+    #[inline(always)]
+    fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
+        self.assert_compatible(right);
+        self.assert_compatible(addend);
+        let dimension = self.dimension();
+        let gradient = self.arena.zeros(dimension);
+        let hessian = self.arena.zeros(dimension * dimension);
+        for primary in 0..dimension {
+            gradient[primary] =
+                self.v * right.g[primary] + self.g[primary] * right.v + addend.g[primary];
+            for other in primary..dimension {
+                let index = primary * dimension + other;
+                let channel = self.v * right.h[index]
+                    + self.g[primary] * right.g[other]
+                    + self.g[other] * right.g[primary]
+                    + self.h[index] * right.v
+                    + addend.h[index];
+                hessian[index] = channel;
+                hessian[other * dimension + primary] = channel;
+            }
+        }
+        Self {
+            arena: self.arena,
+            v: self.v * right.v + addend.v,
+            g: gradient,
+            h: hessian,
+        }
+    }
+
+    #[inline(always)]
+    fn composed_sum(
+        inputs: &[Self],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
+        assert_eq!(inputs.len(), derivative_stacks.len());
+        assert!(
+            inputs.iter().all(|input| {
+                input.dimension() == dimension && std::ptr::eq(input.arena, arena)
+            }),
+            "dynamic composed-sum jets must share dimension and arena"
+        );
+        let gradient = arena.zeros(dimension);
+        let hessian = arena.zeros(dimension * dimension);
+        let mut value = 0.0;
+        for (input, stack) in inputs.iter().zip(derivative_stacks) {
+            value += stack[0];
+            for primary in 0..dimension {
+                gradient[primary] += stack[1] * input.g[primary];
+                for other in primary..dimension {
+                    let index = primary * dimension + other;
+                    hessian[index] += stack[1] * input.h[index]
+                        + stack[2] * input.g[primary] * input.g[other];
+                }
+            }
+        }
+        for primary in 0..dimension {
+            for other in primary + 1..dimension {
+                hessian[other * dimension + primary] = hessian[primary * dimension + other];
             }
         }
         Self {
@@ -2371,6 +2477,56 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
                 for (input, &weight) in inputs.iter().zip(weights) {
                     out.h[primary][other] += input.0.h[primary][other] * weight;
                 }
+                out.h[other][primary] = out.h[primary][other];
+            }
+        }
+        Order2(out)
+    }
+
+    #[inline(always)]
+    fn add_constant(&self, constant: f64) -> Self {
+        let mut out = *self;
+        out.0.v += constant;
+        out
+    }
+
+    #[inline(always)]
+    fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
+        let mut out = crate::jet_tower::Tower2::zero();
+        out.v = self.0.v * right.0.v + addend.0.v;
+        for primary in 0..K {
+            out.g[primary] = self.0.v * right.0.g[primary]
+                + self.0.g[primary] * right.0.v
+                + addend.0.g[primary];
+            for other in primary..K {
+                let channel = self.0.v * right.0.h[primary][other]
+                    + self.0.g[primary] * right.0.g[other]
+                    + self.0.g[other] * right.0.g[primary]
+                    + self.0.h[primary][other] * right.0.v
+                    + addend.0.h[primary][other];
+                out.h[primary][other] = channel;
+                out.h[other][primary] = channel;
+            }
+        }
+        Order2(out)
+    }
+
+    #[inline(always)]
+    fn composed_sum(inputs: &[Self], derivative_stacks: &[[f64; 5]]) -> Self {
+        assert_eq!(inputs.len(), derivative_stacks.len());
+        let mut out = crate::jet_tower::Tower2::zero();
+        for (input, stack) in inputs.iter().zip(derivative_stacks) {
+            out.v += stack[0];
+            for primary in 0..K {
+                out.g[primary] += stack[1] * input.0.g[primary];
+                for other in primary..K {
+                    out.h[primary][other] += stack[1] * input.0.h[primary][other]
+                        + stack[2] * input.0.g[primary] * input.0.g[other];
+                }
+            }
+        }
+        for primary in 0..K {
+            for other in primary + 1..K {
                 out.h[other][primary] = out.h[primary][other];
             }
         }
