@@ -358,7 +358,7 @@ fn production_objective_forced_streaming_value_gradient_matches_dense() {
         .analytic_gradient_for_outer_evaluation(&rho, &streaming_artifact)
         .expect("forced streaming production gradient");
     let streaming_eval = OuterEval {
-        cost: streaming_artifact.cost(),
+        cost: streaming_artifact.cost,
         gradient: streaming_gradient,
         hessian: HessianValue::Unavailable,
         inner_beta_hint: Some(streaming.term.flatten_beta()),

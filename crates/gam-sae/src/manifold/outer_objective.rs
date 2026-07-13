@@ -595,16 +595,10 @@ struct MatrixFreeOuterArtifacts {
 }
 
 pub(crate) struct OuterCriterionEvaluation {
-    cost: f64,
+    pub(crate) cost: f64,
     loss: SaeManifoldLoss,
     cache: ArrowFactorCache,
     matrix_free: Option<MatrixFreeOuterArtifacts>,
-}
-
-impl OuterCriterionEvaluation {
-    pub(crate) fn cost(&self) -> f64 {
-        self.cost
-    }
 }
 
 pub struct SaeManifoldOuterObjective {
