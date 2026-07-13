@@ -6444,7 +6444,53 @@ fn evidence_beta_schur_boundary_has_unit_logdet_and_authoritative_mask_2308() {
             .as_ref()
             .expect("sub-floor β direction must carry metadata");
         assert_eq!(&*spectrum.deflated, &[true, false]);
-        assert_abs_diff_eq!(spectrum.raw_evals[0], collapsed, epsilon = 1e-18);
+        assert_eq!(
+            spectrum.raw_evals[0].is_sign_negative(),
+            collapsed.is_sign_negative(),
+            "the raw eigenspectrum must preserve which side of zero the boundary lies on"
+        );
+        let raw_scale = spectrum
+            .raw_evals
+            .iter()
+            .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+        assert!(
+            spectrum.raw_evals[0].abs() < SPECTRAL_DEFLATION_REL_FLOOR * raw_scale,
+            "the authoritative mask must identify a genuinely sub-floor raw direction"
+        );
+
+        // A symmetric eigensolver is backward stable, not an exact scalar
+        // oracle. Certify each returned raw eigenpair against the source Schur
+        // operator with a gamma_n bound scaled by ||S||_inf; demanding 1e-18
+        // agreement with a diagonal literal is below the binary64 backward
+        // error of this O(1)-scaled problem.
+        let schur_norm_inf = (0..schur.nrows())
+            .map(|row| schur.row(row).iter().map(|value| value.abs()).sum::<f64>())
+            .fold(0.0_f64, f64::max);
+        let operation_count = schur.ncols().saturating_mul(2).saturating_add(2);
+        let accumulated = operation_count as f64 * (0.5 * f64::EPSILON);
+        assert!(accumulated < 1.0);
+        let gamma = accumulated / (1.0 - accumulated);
+        for eigen_index in 0..spectrum.raw_evals.len() {
+            let eigenvalue = spectrum.raw_evals[eigen_index];
+            let eigenvector = spectrum.evecs.column(eigen_index);
+            let eigenvector_norm = eigenvector
+                .iter()
+                .fold(0.0_f64, |norm, value| norm.max(value.abs()));
+            let mut residual_norm = 0.0_f64;
+            for row in 0..schur.nrows() {
+                let mut action = 0.0_f64;
+                for column in 0..schur.ncols() {
+                    action += schur[[row, column]] * eigenvector[column];
+                }
+                residual_norm = residual_norm.max((action - eigenvalue * eigenvector[row]).abs());
+            }
+            let backward_error_allowance =
+                gamma * (schur_norm_inf + eigenvalue.abs()) * eigenvector_norm;
+            assert!(
+                residual_norm <= backward_error_allowance,
+                "raw eigenpair {eigen_index} residual {residual_norm:e} exceeds its scale-derived backward-error allowance {backward_error_allowance:e}"
+            );
+        }
         assert_eq!(spectrum.cond_evals[0], 1.0);
         assert_eq!(spectrum.cond_evals[1], 4.0);
 

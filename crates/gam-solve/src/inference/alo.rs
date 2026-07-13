@@ -607,11 +607,9 @@ fn alo_rhs_block_cols(n: usize, p: usize) -> usize {
         .min(ALO_MAX_RHS_BLOCK_COLS)
 }
 
-/// Backward-error multiplier for the local deletion solve. Its pivot tolerance
-/// is derived from `B * eps * ||I-WA||_inf`, making the singularity decision
-/// invariant to a uniform rescaling of the local coordinates. A singular
-/// deletion system is a real unit-leverage diagnostic and is refused rather
-/// than silently changed by adding a ridge.
+/// Roundoff multiplier for sign checks on local PSD quadratics. The deletion
+/// systems themselves use an operation-count-derived formation and solve bound;
+/// see [`identity_minus_product_lu_tolerance`].
 const LOCAL_DELETE_SOLVE_ROUNDOFF_FACTOR: f64 = 8.0;
 
 #[inline]
@@ -1831,6 +1829,7 @@ struct MultiBlockAloScratch {
     w_flat: Vec<f64>,
     covariance_flat: Vec<f64>,
     lu_scratch: Vec<f64>,
+    original_rhs: Vec<f64>,
 }
 
 impl MultiBlockAloScratch {
@@ -1851,6 +1850,7 @@ impl MultiBlockAloScratch {
             w_flat: vec![0.0f64; bb_sz],
             covariance_flat: vec![0.0f64; bb_sz],
             lu_scratch: vec![0.0f64; b],
+            original_rhs: vec![0.0f64; b],
         }
     }
 }
@@ -1969,11 +1969,14 @@ fn compute_multiblock_alo_chunk(
             }
         }
 
-        // Unit deletion leverage makes the exact frozen-H deletion system
-        // singular. That is diagnostic information, not a request to alter the
-        // estimand with a fixed local ridge. Use a scale-aware backward-error
-        // threshold and refuse with the offending row.
-        let imwa_tolerance = local_lu_pivot_tolerance(&scratch.imwa, b);
+        // A singular frozen-H deletion system is diagnostic information, not a
+        // request to alter the estimand with a local ridge. The uncertainty in
+        // `I - product` is governed by the magnitudes of the two multiplicands,
+        // even when their product cancels the identity almost completely. A
+        // tolerance scaled only by the already-cancelled matrix would erase
+        // exactly the information needed to recognize unit deletion leverage.
+        let imwa_tolerance =
+            identity_minus_product_lu_tolerance(&scratch.w_flat, &scratch.a_i, &scratch.wa, b);
         if !lu_factor_in_place(&mut scratch.imwa, &mut scratch.perm_imwa, b, imwa_tolerance) {
             return Err(AloError::LooComputationFailed {
                 reason: format!(
@@ -1982,7 +1985,8 @@ fn compute_multiblock_alo_chunk(
                 ),
             });
         }
-        let imaw_tolerance = local_lu_pivot_tolerance(&scratch.imaw, b);
+        let imaw_tolerance =
+            identity_minus_product_lu_tolerance(&scratch.a_i, &scratch.w_flat, &scratch.aw, b);
         if !lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b, imaw_tolerance) {
             return Err(AloError::LooComputationFailed {
                 reason: format!(
@@ -1997,13 +2001,23 @@ fn compute_multiblock_alo_chunk(
         for k in 0..b {
             scratch.rhs_buf[k] = s_i[k];
         }
-        lu_solve_in_place(
+        if let Err(failure) = solve_identity_minus_product_in_place(
             &scratch.imwa,
             &scratch.perm_imwa,
+            &scratch.wa,
             &mut scratch.rhs_buf,
             &mut scratch.lu_scratch,
+            &mut scratch.original_rhs,
+            imwa_tolerance,
             b,
-        );
+        ) {
+            return Err(AloError::LooComputationFailed {
+                reason: format!(
+                    "multi-block ALO deletion solve I-WA failed backward-error certification at row {i}: residual {:.6e}, allowance {:.6e}",
+                    failure.residual_norm, failure.allowance
+                ),
+            });
+        }
         // delta_eta = A_i · v_i
         for r in 0..b {
             let mut acc = 0.0f64;
@@ -2064,13 +2078,23 @@ fn compute_multiblock_alo_chunk(
             for k in 0..b {
                 scratch.rhs_buf[k] = scratch.a_i[row_off + k];
             }
-            lu_solve_in_place(
+            if let Err(failure) = solve_identity_minus_product_in_place(
                 &scratch.imaw,
                 &scratch.perm_imaw,
+                &scratch.aw,
                 &mut scratch.rhs_buf,
                 &mut scratch.lu_scratch,
+                &mut scratch.original_rhs,
+                imaw_tolerance,
                 b,
-            );
+            ) {
+                return Err(AloError::LooComputationFailed {
+                    reason: format!(
+                        "multi-block ALO transpose variance solve I-AW failed backward-error certification at row {i}, coordinate {d}: residual {:.6e}, allowance {:.6e}",
+                        failure.residual_norm, failure.allowance
+                    ),
+                });
+            }
             // covariance_u = C u_d
             for r in 0..b {
                 let mut acc = 0.0f64;
@@ -2081,13 +2105,23 @@ fn compute_multiblock_alo_chunk(
                 scratch.covariance_u[r] = acc;
             }
             // t_d = (I - W A)⁻¹ C u_d.
-            lu_solve_in_place(
+            if let Err(failure) = solve_identity_minus_product_in_place(
                 &scratch.imwa,
                 &scratch.perm_imwa,
+                &scratch.wa,
                 &mut scratch.covariance_u,
                 &mut scratch.lu_scratch,
+                &mut scratch.original_rhs,
+                imwa_tolerance,
                 b,
-            );
+            ) {
+                return Err(AloError::LooComputationFailed {
+                    reason: format!(
+                        "multi-block ALO variance solve I-WA failed backward-error certification at row {i}, coordinate {d}: residual {:.6e}, allowance {:.6e}",
+                        failure.residual_norm, failure.allowance
+                    ),
+                });
+            }
             // v_dd = a_d^T t_d
             let mut v_dd = 0.0f64;
             for k in 0..b {
@@ -2141,17 +2175,62 @@ fn mat_mul_flat(a: &[f64], b_mat: &[f64], out: &mut [f64], b: usize) {
     }
 }
 
-/// Scale-aware pivot allowance for a B × B row-major local system.
-fn local_lu_pivot_tolerance(matrix: &[f64], b: usize) -> f64 {
-    let norm_inf = (0..b)
-        .map(|row| {
-            matrix[row * b..row * b + b]
-                .iter()
-                .map(|value| value.abs())
-                .sum::<f64>()
-        })
-        .fold(0.0_f64, f64::max);
-    LOCAL_DELETE_SOLVE_ROUNDOFF_FACTOR * b as f64 * f64::EPSILON * norm_inf
+/// Standard `gamma_n = n*u/(1-n*u)` bound for `n` rounded operations, where
+/// binary64 unit roundoff under round-to-nearest is `u = eps/2`.
+#[inline]
+fn floating_point_gamma(operation_count: usize) -> f64 {
+    let accumulated = operation_count as f64 * (0.5 * f64::EPSILON);
+    if accumulated < 1.0 {
+        accumulated / (1.0 - accumulated)
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Pivot allowance for a row-major `I - left * right` local system.
+///
+/// The scale is `max(||I-left*right||_inf,
+/// 1 + || |left||right| ||_inf)`: the second operand-derived term is the
+/// magnitude envelope before cancellation, while the first retains the actual
+/// operator scale when it is larger. Forming every product entry takes at most
+/// `2B` rounded multiply/add operations and subtracting it from the identity
+/// takes one more. The LU term accounts for the division/multiply/subtract chain
+/// along at most `B` partial-pivoting elimination stages. The resulting bound
+/// cannot collapse merely because `left * right` rounded close to the identity.
+fn identity_minus_product_lu_tolerance(
+    left: &[f64],
+    right: &[f64],
+    product: &[f64],
+    b: usize,
+) -> f64 {
+    debug_assert_eq!(left.len(), b * b);
+    debug_assert_eq!(right.len(), b * b);
+    debug_assert_eq!(product.len(), b * b);
+
+    let mut operand_envelope_inf = 0.0_f64;
+    let mut system_norm_inf = 0.0_f64;
+    for row in 0..b {
+        let mut operand_row_envelope = 1.0_f64;
+        let mut system_row_norm = 0.0_f64;
+        for column in 0..b {
+            let mut product_entry_envelope = 0.0_f64;
+            for inner in 0..b {
+                product_entry_envelope +=
+                    left[row * b + inner].abs() * right[inner * b + column].abs();
+            }
+            operand_row_envelope += product_entry_envelope;
+            let identity = if row == column { 1.0 } else { 0.0 };
+            system_row_norm += (identity - product[row * b + column]).abs();
+        }
+        operand_envelope_inf = operand_envelope_inf.max(operand_row_envelope);
+        system_norm_inf = system_norm_inf.max(system_row_norm);
+    }
+
+    let formation_operations = b.saturating_mul(2).saturating_add(1);
+    let elimination_operations = b.saturating_mul(3);
+    let backward_error_scale = operand_envelope_inf.max(system_norm_inf);
+    (floating_point_gamma(formation_operations) + floating_point_gamma(elimination_operations))
+        * backward_error_scale
 }
 
 /// LU-decompose a B × B row-major matrix in place with partial pivoting and
@@ -2175,7 +2254,7 @@ fn lu_factor_in_place(m: &mut [f64], perm: &mut [usize], b: usize, pivot_toleran
                 max_idx = row;
             }
         }
-        if max_val <= pivot_tolerance {
+        if !max_val.is_finite() || max_val <= pivot_tolerance {
             return false;
         }
         if max_idx != col {
@@ -2217,6 +2296,73 @@ fn lu_solve_in_place(m: &[f64], perm: &[usize], rhs: &mut [f64], scratch: &mut [
             s -= m[row * b + k] * rhs[k];
         }
         rhs[row] = s / m[row * b + row];
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LocalSolveResidualFailure {
+    residual_norm: f64,
+    allowance: f64,
+}
+
+/// Solve a factored `I - product` system and certify the result against the
+/// unfactored operator. The residual allowance contains both the uncertainty in
+/// forming the operator and the operation-count-derived error from LU,
+/// triangular substitution, and residual evaluation. This is a backward-error
+/// certificate, so a well-resolved but ill-conditioned system remains valid;
+/// only a solve unsupported by its own arithmetic is refused.
+fn solve_identity_minus_product_in_place(
+    lu: &[f64],
+    permutation: &[usize],
+    product: &[f64],
+    rhs: &mut [f64],
+    lu_scratch: &mut [f64],
+    original_rhs: &mut [f64],
+    operator_error_bound: f64,
+    b: usize,
+) -> Result<(), LocalSolveResidualFailure> {
+    original_rhs[..b].copy_from_slice(&rhs[..b]);
+    lu_solve_in_place(lu, permutation, rhs, lu_scratch, b);
+
+    let rhs_norm = original_rhs[..b]
+        .iter()
+        .fold(0.0_f64, |norm, value| norm.max(value.abs()));
+    let solution_norm = rhs[..b]
+        .iter()
+        .fold(0.0_f64, |norm, value| norm.max(value.abs()));
+    let mut system_norm = 0.0_f64;
+    let mut residual_norm = 0.0_f64;
+    for row in 0..b {
+        let mut row_norm = 0.0_f64;
+        let mut residual = original_rhs[row];
+        for column in 0..b {
+            let identity = if row == column { 1.0 } else { 0.0 };
+            let matrix_entry = identity - product[row * b + column];
+            row_norm += matrix_entry.abs();
+            residual -= matrix_entry * rhs[column];
+        }
+        system_norm = system_norm.max(row_norm);
+        residual_norm = residual_norm.max(residual.abs());
+    }
+
+    // Per dimension: at most 3B factorization operations on a surviving entry,
+    // 2B in each triangular substitution, and 3B to reconstruct/evaluate the
+    // residual from `I - product`.
+    let certification_operations = b.saturating_mul(10);
+    let arithmetic_scale = system_norm * solution_norm + rhs_norm;
+    let allowance = floating_point_gamma(certification_operations) * arithmetic_scale
+        + operator_error_bound * solution_norm;
+    if rhs[..b].iter().any(|value| !value.is_finite())
+        || !residual_norm.is_finite()
+        || !allowance.is_finite()
+        || residual_norm > allowance
+    {
+        Err(LocalSolveResidualFailure {
+            residual_norm,
+            allowance,
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -2475,9 +2621,27 @@ mod tests {
 
     // --- Multi-block ALO tests ---
 
-    use super::{MultiBlockAloInput, compute_multiblock_alo};
+    use super::{
+        MultiBlockAloInput, compute_multiblock_alo, floating_point_gamma,
+        identity_minus_product_lu_tolerance, lu_factor_in_place, mat_mul_flat,
+    };
     use gam_linalg::matrix::DesignMatrix;
     use ndarray::{Array1, Array2};
+
+    fn local_identity_minus_product_is_factorable(left: &[f64], right: &[f64], b: usize) -> bool {
+        let mut product = vec![0.0; b * b];
+        mat_mul_flat(left, right, &mut product, b);
+        let mut system = vec![0.0; b * b];
+        for row in 0..b {
+            for column in 0..b {
+                let identity = if row == column { 1.0 } else { 0.0 };
+                system[row * b + column] = identity - product[row * b + column];
+            }
+        }
+        let tolerance = identity_minus_product_lu_tolerance(left, right, &product, b);
+        let mut permutation = vec![0; b];
+        lu_factor_in_place(&mut system, &mut permutation, b, tolerance)
+    }
 
     #[test]
     fn multiblock_b1_matches_scalar_leverage() {
@@ -2693,5 +2857,71 @@ mod tests {
                 .to_string()
                 .contains("deletion system I-WA is singular")
         );
+    }
+
+    #[test]
+    fn multiblock_b2_identity_cancellation_is_numerically_singular() {
+        // The stored operands differ from an exact inverse pair by one ulp, so
+        // the formed diagonal of I-WA is nonzero but smaller than the error in
+        // forming the product. Scaling by ||I-WA|| alone would accept it.
+        let above_two = f64::from_bits(2.0_f64.to_bits() + 1);
+        let w = [above_two, 0.0, 0.0, above_two];
+        let a = [0.5, 0.0, 0.0, 0.5];
+        assert!(!local_identity_minus_product_is_factorable(&w, &a, 2));
+        assert!(!local_identity_minus_product_is_factorable(&a, &w, 2));
+    }
+
+    #[test]
+    fn multiblock_b2_safely_near_singular_deletion_is_accepted() {
+        // This system is ill-conditioned, but its smallest pivot is sqrt(eps),
+        // well outside the O(eps) formation uncertainty of its operands.
+        let gap = f64::EPSILON.sqrt();
+        let identity = [1.0, 0.0, 0.0, 1.0];
+        let product_operand = [1.0 - gap, 0.0, 0.0, 0.5];
+        assert!(local_identity_minus_product_is_factorable(
+            &identity,
+            &product_operand,
+            2
+        ));
+        assert!(local_identity_minus_product_is_factorable(
+            &product_operand,
+            &identity,
+            2
+        ));
+    }
+
+    #[test]
+    fn multiblock_trace_one_but_invertible_deletion_is_not_refused() {
+        // tr(AW)=1 is only a scalar summary. Here I-AW has eigenvalues 3/4 and
+        // 1/4, so a leverage gate would reject a perfectly regular exact solve.
+        let coordinate_designs = vec![
+            DesignMatrix::from(Array2::from_shape_vec((1, 2), vec![1.0, 0.0]).unwrap()),
+            DesignMatrix::from(Array2::from_shape_vec((1, 2), vec![0.0, 1.0]).unwrap()),
+        ];
+        let coordinate_coefficient_ranges = vec![0..2, 0..2];
+        let penalized_hessian = Array2::<f64>::eye(2);
+        let observed_hessians =
+            vec![Array2::from_shape_vec((2, 2), vec![0.25, 0.0, 0.0, 0.75]).unwrap()];
+        let score_covariances = vec![Array2::<f64>::zeros((2, 2))];
+        let scores = vec![Array1::from_vec(vec![0.75, -0.25])];
+        let coordinate_values = vec![Array1::<f64>::zeros(2)];
+        let input = MultiBlockAloInput {
+            n_obs: 1,
+            n_coordinates: 2,
+            coordinate_designs: &coordinate_designs,
+            coordinate_coefficient_ranges: &coordinate_coefficient_ranges,
+            penalized_hessian: &penalized_hessian,
+            observed_hessians: &observed_hessians,
+            score_covariances: &score_covariances,
+            scores: &scores,
+            coordinate_values: &coordinate_values,
+        };
+
+        let result = compute_multiblock_alo(&input)
+            .expect("trace-one but invertible deletion system must be solved exactly");
+        let roundoff = floating_point_gamma(16);
+        assert!((result.leverage[0] - 1.0).abs() <= roundoff);
+        assert!((result.eta_tilde[0][0] - 1.0).abs() <= roundoff);
+        assert!((result.eta_tilde[0][1] + 1.0).abs() <= roundoff);
     }
 }
