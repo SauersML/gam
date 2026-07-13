@@ -167,7 +167,7 @@ def _convergence_payload(fit) -> dict:
 
 
 def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, minibatch, score_mode,
-                 max_epochs, seed, collect=None):
+                 max_epochs, collect):
     import gamfit
 
     fit = gamfit.sparse_dictionary_fit(
@@ -175,13 +175,12 @@ def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, minibatch, score_mode,
         score_mode=score_mode)
     tr = fit.transform(x_te, score_mode=score_mode)
     recon = fit.reconstruct(tr.indices, tr.codes)
-    if collect is not None:
-        collect["flat_fit"] = fit
-        collect["sparse_route_stats"] = {
-            "fit": fit.score_route_stats,
-            "held_out": tr.score_route_stats,
-        }
-        collect["sparse_convergence"] = _convergence_payload(fit)
+    collect["flat_fit"] = fit
+    collect["sparse_route_stats"] = {
+        "fit": fit.score_route_stats,
+        "held_out": tr.score_route_stats,
+    }
+    collect["sparse_convergence"] = _convergence_payload(fit)
     return held_out_ev(x_te, recon, mean_tr), fit.explained_variance
 
 
@@ -197,7 +196,7 @@ def fit_curved_topk(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, max_epoc
 
 def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
                     topology, sparse_minibatch, sparse_score_mode, max_epochs,
-                    seed, k_flat=None, collect=None):
+                    seed, collect, k_flat=None):
     """ALL-RUST hybrid: gam sparse-dictionary linear tier at reduced actives plus
     a gam manifold-SAE curved TopK tier on the linear residual. Matched per-token
     active-scalar budget: k_lin + curved_k·(1+d) == top_k.
@@ -234,17 +233,16 @@ def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
     print(f"[hybrid_rust] curved tier fit {time.perf_counter()-t1:.0f}s", flush=True)
     curved_recon_te = np.asarray(curved.reconstruct(r_te), dtype=np.float32)
     combined = flat_recon_te + curved_recon_te
-    if collect is not None:
-        collect["flat_fit"] = flat
-        collect["curved_model"] = curved
-        collect["r_te"] = r_te
-        collect["recon_full"] = combined
-        collect["sparse_route_stats"] = {
-            "fit": flat.score_route_stats,
-            "train": tr_tr.score_route_stats,
-            "held_out": tr_te.score_route_stats,
-        }
-        collect["sparse_convergence"] = _convergence_payload(flat)
+    collect["flat_fit"] = flat
+    collect["curved_model"] = curved
+    collect["r_te"] = r_te
+    collect["recon_full"] = combined
+    collect["sparse_route_stats"] = {
+        "fit": flat.score_route_stats,
+        "train": tr_tr.score_route_stats,
+        "held_out": tr_te.score_route_stats,
+    }
+    collect["sparse_convergence"] = _convergence_payload(flat)
     ev = held_out_ev(x_te, combined, mean_tr)
     return ev, ev_flat
 
@@ -373,9 +371,9 @@ def main() -> int:
 
     t0 = time.perf_counter()
     extra: dict = {}
-    # Handles for the Eq-4 bits scorer (gam#2233); only the four wired arms
-    # populate it, and only when --bits is requested.
-    collect: dict | None = {"K_ext": int(args.K)} if args.bits else None
+    # Native fit handles, convergence evidence, and score-route telemetry. Bits
+    # arms add their scorer inputs to the same record.
+    collect: dict = {"K_ext": int(args.K)}
     if args.arm == "external_topk":
         ev = fit_external_topk(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                                steps=args.steps, lr=args.lr, bs=args.batch_size,
@@ -385,8 +383,7 @@ def main() -> int:
         ev, ev_train = fit_gam_flat(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                                     minibatch=args.sparse_minibatch,
                                     score_mode=args.sparse_score_mode,
-                                    max_epochs=args.max_epochs, seed=args.seed,
-                                    collect=collect)
+                                    max_epochs=args.max_epochs, collect=collect)
         extra["ev_train"] = ev_train
     elif args.arm == "curved_topk":
         ev = fit_curved_topk(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
@@ -408,7 +405,7 @@ def main() -> int:
     else:
         raise AssertionError(f"unhandled arm {args.arm!r}")
 
-    if args.bits and collect is not None:
+    if args.bits:
         bits = score_bits_for_arm(
             args.arm,
             collect,
@@ -426,7 +423,7 @@ def main() -> int:
             )
 
     wall = time.perf_counter() - t0
-    if collect is not None and "sparse_route_stats" in collect:
+    if "sparse_route_stats" in collect:
         extra["sparse_route_stats"] = collect["sparse_route_stats"]
         extra["sparse_convergence"] = collect["sparse_convergence"]
     rec = {"issue": 1026, "arm": args.arm, "tag": args.tag, "N": n, "p": p,
