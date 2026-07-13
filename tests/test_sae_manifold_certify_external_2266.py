@@ -4,9 +4,9 @@
 (torch-lane) SAE-manifold state — no closed-form solve — and get the same
 certificate/diagnostics payload a native fit returns. There is no real
 torch-trained artifact available at test-authoring time, so this test uses an
-honest replay: fit a tiny model NATIVELY first (so its decoder / coordinates /
-routing logits /
-regularization state are genuinely converged, not fabricated), then feed those
+honest replay: fit a tiny model NATIVELY first (so its decoder, coordinates,
+routing logits, and regularization state are genuinely converged, not
+fabricated), then feed those
 exact arrays back into ``gamfit.sae_manifold_certify_external`` as if they had
 arrived from an external (e.g. torch) trainer, and check the certify path
 reproduces the SAME pinned contract the Rust test checks:

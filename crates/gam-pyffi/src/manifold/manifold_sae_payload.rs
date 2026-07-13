@@ -129,7 +129,7 @@ pub(crate) struct ManifoldSaePayload {
     pub(crate) duchon_centers: Vec<Option<Vec<Vec<f64>>>>,
 
     // --- manifold crosscoder layout (#2231 Inc D) ------------------------
-    /// Required key in v3; null for a plain SAE.
+    /// Required key in v5; null for a plain SAE.
     pub(crate) crosscoder: Option<CrosscoderPayload>,
 
     // --- E. per-atom payload ---------------------------------------------
@@ -163,7 +163,7 @@ pub(crate) struct ManifoldSaePayload {
     pub(crate) selected_log_lambda_smooth: Option<Vec<f64>>,
     pub(crate) selected_log_ard: Option<Vec<Vec<f64>>>,
 
-    // --- runtime diagnostics persisted by v4 -----------------------------
+    // --- runtime diagnostics persisted by v5 -----------------------------
     pub(crate) structured_residual_diagnostics: Vec<Value>,
     /// #2235 — the outer-ρ termination verdict/ledger the fit emitted
     /// (`{"verdict", "evals", "evals_since_improvement", "wall_seconds"}`). Like

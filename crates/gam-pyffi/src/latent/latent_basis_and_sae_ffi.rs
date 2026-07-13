@@ -2349,7 +2349,7 @@ fn sae_manifold_fit_inner<'py>(
     // #997 — the evidence-guarded structure-search honesty surface: the per-round
     // SearchLedger (every harvested move in canonical order with its e-gate
     // verdict) plus the joint fit's collapse events, serialized as JSON. Present
-    // whenever the structure search ran (it runs on every fit); the value is the
+    // whenever the structure search genuinely ran; the value is the
     // certificate of which dictionary moves the held-out data does and does not
     // support — an all-contested ledger is the common, conservative outcome.
     match structure_search_json {
