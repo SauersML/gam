@@ -3318,6 +3318,7 @@ impl BernoulliMarginalSlopeFamily {
                 let dc_db = scale_coeff4(dc_db_raw, scale);
 
                 coeff_u[1] = dc_db;
+                let mut dc_daa = [0.0; 4];
                 if need_hessian {
                     let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
                         partition_cell.score_span,
@@ -3325,16 +3326,9 @@ impl BernoulliMarginalSlopeFamily {
                         a,
                         b,
                     );
-                    let dc_daa = scale_coeff4(dc_daa_raw, scale);
+                    dc_daa = scale_coeff4(dc_daa_raw, scale);
                     let dc_dab = scale_coeff4(dc_dab_raw, scale);
                     let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
-                    f_aa += exact::cell_second_derivative_from_moments(
-                        cell,
-                        &dc_da,
-                        &dc_da,
-                        &dc_daa,
-                        &state.moments,
-                    )?;
                     coeff_au[1] = dc_dab;
                     coeff_bu[1] = dc_dbb;
                 }
@@ -3383,58 +3377,96 @@ impl BernoulliMarginalSlopeFamily {
                     )?;
                 }
 
-                for u in 1..r {
-                    f_u[u] +=
-                        exact::cell_first_derivative_from_moments(&coeff_u[u], &state.moments)?;
-                    if need_hessian {
-                        f_au[u] += exact::cell_second_derivative_from_moments(
-                            cell,
-                            &dc_da,
-                            &coeff_u[u],
-                            &coeff_au[u],
-                            &state.moments,
-                        )?;
-                    }
+                active_cell_primaries.clear();
+                active_cell_primaries.push(1);
+                if let Some(range) = h_range {
+                    active_cell_primaries.extend(range.clone().filter(|&primary| {
+                        cubic_coeff_jet_channel_is_nonzero(
+                            &coeff_u[primary],
+                            &coeff_au[primary],
+                            &coeff_bu[primary],
+                            need_hessian,
+                        )
+                    }));
+                }
+                if let Some(range) = w_range {
+                    active_cell_primaries.extend(range.clone().filter(|&primary| {
+                        cubic_coeff_jet_channel_is_nonzero(
+                            &coeff_u[primary],
+                            &coeff_au[primary],
+                            &coeff_bu[primary],
+                            need_hessian,
+                        )
+                    }));
                 }
 
-                if need_hessian {
-                    let coeff_jet = SparsePrimaryCoeffJetView::new(
-                        1,
-                        h_range,
-                        w_range,
-                        coeff_u.as_slice(),
-                        coeff_au.as_slice(),
-                        coeff_bu.as_slice(),
-                        zero_family,
-                        zero_family,
-                        zero_family,
-                        zero_family,
-                        zero_family,
-                        zero_family,
-                        zero_family,
-                    );
-                    for u in 1..r {
-                        for v in u..r {
-                            let second_coeff = coeff_jet.pair_from_b_family(
-                                coeff_jet.b_first,
-                                u,
-                                v,
-                                COEFF_SUPPORT_BHW,
-                            );
-                            let val = exact::cell_second_derivative_from_moments(
-                                cell,
-                                &coeff_jet.first[u],
-                                &coeff_jet.first[v],
-                                &second_coeff,
-                                &state.moments,
-                            )?;
-                            f_uv[[u, v]] += val;
-                            if u != v {
-                                f_uv[[v, u]] += val;
+                let coeff_jet = SparsePrimaryCoeffJetView::new(
+                    1,
+                    h_range,
+                    w_range,
+                    coeff_u.as_slice(),
+                    coeff_au.as_slice(),
+                    coeff_bu.as_slice(),
+                    zero_family,
+                    zero_family,
+                    zero_family,
+                    zero_family,
+                    zero_family,
+                    zero_family,
+                    zero_family,
+                );
+                BmsFlexRowProgram::try_for_each_calibration_order2(
+                    active_cell_primaries,
+                    need_hessian,
+                    |node| -> Result<(), String> {
+                        match node {
+                            BmsFlexCalibrationOrder2Node::InterceptSecond => {
+                                f_aa += exact::cell_second_derivative_from_moments(
+                                    cell,
+                                    &dc_da,
+                                    &dc_da,
+                                    &dc_daa,
+                                    &state.moments,
+                                )?;
+                            }
+                            BmsFlexCalibrationOrder2Node::PrimaryFirst { primary } => {
+                                f_u[primary] += exact::cell_first_derivative_from_moments(
+                                    &coeff_jet.first[primary],
+                                    &state.moments,
+                                )?;
+                            }
+                            BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary } => {
+                                f_au[primary] += exact::cell_second_derivative_from_moments(
+                                    cell,
+                                    &dc_da,
+                                    &coeff_jet.first[primary],
+                                    &coeff_jet.a_first[primary],
+                                    &state.moments,
+                                )?;
+                            }
+                            BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left, right } => {
+                                let second_coeff = coeff_jet.pair_from_b_family(
+                                    coeff_jet.b_first,
+                                    left,
+                                    right,
+                                    COEFF_SUPPORT_BHW,
+                                );
+                                let value = exact::cell_second_derivative_from_moments(
+                                    cell,
+                                    &coeff_jet.first[left],
+                                    &coeff_jet.first[right],
+                                    &second_coeff,
+                                    &state.moments,
+                                )?;
+                                f_uv[[left, right]] += value;
+                                if left != right {
+                                    f_uv[[right, left]] += value;
+                                }
                             }
                         }
-                    }
-                }
+                        Ok(())
+                    },
+                )?;
             }
         }
 
