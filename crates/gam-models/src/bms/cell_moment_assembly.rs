@@ -1136,12 +1136,7 @@ impl BernoulliMarginalSlopeFamily {
         direction_pairs
             .iter()
             .map(|(direction_u, direction_v)| {
-                Self::empirical_fixed_fourth_contracted::<K>(
-                    plan,
-                    point,
-                    direction_u,
-                    direction_v,
-                )
+                Self::empirical_fixed_fourth_contracted::<K>(plan, point, direction_u, direction_v)
             })
             .collect()
     }
@@ -1227,8 +1222,8 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// Evaluate every requested third contraction from one canonical row plan.
-    /// Bounded lane chunks share the order-two base within each pass and reuse
-    /// the frozen grid/basis plan across passes.
+    /// Common widths reuse the plan across fixed-width lanes; other runtime
+    /// widths reuse it across bounded arena chunks.
     pub(super) fn empirical_flex_row_third_contracted_many(
         &self,
         row: usize,
@@ -1304,13 +1299,10 @@ impl BernoulliMarginalSlopeFamily {
                         let jet = plan.evaluate(vars, 3, &workspace)?;
                         for lane in 0..directions.len() {
                             contracted.push(
-                                Array2::from_shape_vec(
-                                    (r, r),
-                                    jet.contracted_third(lane).to_vec(),
-                                )
-                                .map_err(|error| {
-                                    format!("empirical BMS third-contraction shape: {error}")
-                                })?,
+                                Array2::from_shape_vec((r, r), jet.contracted_third(lane).to_vec())
+                                    .map_err(|error| {
+                                        format!("empirical BMS third-contraction shape: {error}")
+                                    })?,
                             );
                         }
                     }
@@ -1320,10 +1312,10 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    /// Trace-contract every Hessian index of the full third derivative in one
-    /// row-plan evaluation. Lane `c` is seeded by basis direction `e_c`, then
-    /// reduced immediately to `sum_ab gram[ab] * d3[abc]`; no rank-three
-    /// tensor is materialized.
+    /// Trace-contract every Hessian index of the full third derivative from one
+    /// row plan. Direction `c` is seeded by basis vector `e_c`, then reduced
+    /// immediately to `sum_ab gram[ab] * d3[abc]`; no rank-three tensor is
+    /// materialized.
     pub(super) fn empirical_flex_row_third_trace_gradient(
         &self,
         row: usize,
@@ -1458,9 +1450,7 @@ impl BernoulliMarginalSlopeFamily {
             .expect("one empirical BMS direction pair produces one contraction"))
     }
 
-    /// Evaluate an ordered batch of fourth contractions in one canonical
-    /// row-plan traversal. The shared order-two base is computed once; each
-    /// lane carries only its `(epsilon, delta, epsilon-delta)` coefficients.
+    /// Evaluate ordered fourth contractions from one canonical row plan.
     pub(super) fn empirical_flex_row_fourth_contracted_many_ordered(
         &self,
         row: usize,
@@ -1537,9 +1527,7 @@ impl BernoulliMarginalSlopeFamily {
                 Self::empirical_fixed_fourth_many_dispatch(plan, point, direction_pairs, r)
             }
             EmpiricalBmsJetSchedule::DynamicBatch { lanes } => {
-                let is_zero = |direction: &Array1<f64>| {
-                    direction.iter().all(|value| *value == 0.0)
-                };
+                let is_zero = |direction: &Array1<f64>| direction.iter().all(|value| *value == 0.0);
                 EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|workspace| {
                     let mut workspace = workspace.borrow_mut();
                     let mut contracted = Vec::with_capacity(direction_pairs.len());
@@ -4102,8 +4090,9 @@ mod empirical_flex_jet_oracle_tests {
     //! kernel (score-warp / link-deviation deviation blocks).
     //!
     //! The production flex path freezes one [`EmpiricalBmsRowJetPlan`] at the
-    //! scalar row state, then evaluates that single expression over the packed
-    //! [`RuntimeJetScalar`] algebra required by each consumer. The score-warp
+    //! scalar row state, then evaluates that single expression over the
+    //! fixed-width or bounded runtime [`RuntimeJetScalar`] algebra selected by
+    //! the consumer schedule. The score-warp
     //! basis enters multiplicatively through `b·Σβ_h·b_h(z)` and the
     //! link-deviation basis enters as `Σβ_w·b_w(u)` at `u = a + b·z`; the
     //! filtered implicit solve lifts the calibrated intercept in the same
@@ -4135,22 +4124,37 @@ mod empirical_flex_jet_oracle_tests {
     }
 
     #[test]
-    fn empirical_bms_directional_batch_budget_is_dimension_bounded_932() {
-        assert_eq!(empirical_bms_directional_batch_lanes(4), 8);
-        assert_eq!(empirical_bms_directional_batch_lanes(8), 8);
-        assert_eq!(empirical_bms_directional_batch_lanes(12), 2);
-        assert_eq!(empirical_bms_directional_batch_lanes(18), 1);
+    fn empirical_bms_schedule_maps_all_common_costs_and_orders_to_fixed_plan_932() {
+        let costs = [
+            EmpiricalBmsFlexCostClass::Rigid,
+            EmpiricalBmsFlexCostClass::ScoreWarp,
+            EmpiricalBmsFlexCostClass::LinkDeviation,
+            EmpiricalBmsFlexCostClass::MixedDeviation,
+        ];
+        let orders = [
+            EmpiricalBmsDerivativeOrder::Third,
+            EmpiricalBmsDerivativeOrder::Fourth,
+        ];
 
-        for r in 1..=128 {
-            let lanes = empirical_bms_directional_batch_lanes(r);
-            let tape_work_per_lane = r.saturating_mul(r).saturating_mul(r).max(1);
-            let expected = (EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET / tape_work_per_lane)
-                .max(1)
-                .min(EMPIRICAL_BMS_BATCH_LANE_CAP);
-            assert_eq!(
-                lanes, expected,
-                "r={r} must use the largest bounded batch or the irreducible one-lane schedule",
-            );
+        for cost in costs {
+            for order in orders {
+                for r in [4, 8, 12, 18] {
+                    assert_eq!(
+                        empirical_bms_jet_schedule(cost, order, r),
+                        EmpiricalBmsJetSchedule::FixedWidthFromPlan,
+                        "cost={cost:?} order={order:?} r={r} must reuse one fixed-width plan",
+                    );
+                }
+                for r in [1, 2, 3, 5, 7, 9, 16, 19, 32, 128] {
+                    assert_eq!(
+                        empirical_bms_jet_schedule(cost, order, r),
+                        EmpiricalBmsJetSchedule::DynamicBatch {
+                            lanes: empirical_bms_runtime_batch_lanes(r),
+                        },
+                        "cost={cost:?} order={order:?} r={r} must use the bounded runtime schedule",
+                    );
+                }
+            }
         }
     }
 
