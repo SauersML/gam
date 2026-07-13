@@ -476,3 +476,271 @@ pub fn run_sae_support_outer(
         outer_certificate: certificate,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assignment_state::SaeAssignmentAtomSpec;
+    use ndarray::array;
+    use std::sync::Arc;
+
+    fn atom(
+        name: &str,
+        kind: SaeAtomBasisKind,
+        d: usize,
+        evaluator: Arc<dyn SaeBasisSecondJet>,
+        coords: &[f64],
+        decoder: Array2<f64>,
+    ) -> SaeManifoldAtom {
+        let coord = Array2::from_shape_vec((1, d), coords.to_vec()).expect("coords");
+        let (phi, jet) = evaluator.evaluate(coord.view()).expect("evaluate");
+        let m = phi.ncols();
+        SaeManifoldAtom::new_with_provided_function_gram(
+            name,
+            kind,
+            d,
+            phi,
+            jet,
+            decoder,
+            Array2::eye(m),
+        )
+        .expect("atom")
+        .with_basis_second_jet(evaluator)
+    }
+
+    /// Two-group heterogeneous support fixture (K = 2 atoms > P = 2 response
+    /// cells) whose smoothing selection is the exact regime the outer criterion
+    /// desync afflicts. The target leaves a genuine residual so the penalized
+    /// deviance and every per-group penalty energy are strictly positive.
+    fn build_objective() -> SaeSupportOuterObjective {
+        let periodic_eval: Arc<dyn SaeBasisSecondJet> =
+            Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic"));
+        let patch_eval: Arc<dyn SaeBasisSecondJet> =
+            Arc::new(EuclideanPatchEvaluator::new(2, 1).expect("patch"));
+        let atoms = vec![
+            atom(
+                "circle",
+                SaeAtomBasisKind::Periodic,
+                1,
+                periodic_eval,
+                &[0.3],
+                array![[0.2], [1.1], [-0.4]],
+            ),
+            atom(
+                "plane",
+                SaeAtomBasisKind::Linear,
+                2,
+                patch_eval,
+                &[0.1, -0.2],
+                array![[0.3], [2.0], [-1.0]],
+            ),
+        ];
+        let specs = vec![
+            SaeAssignmentAtomSpec {
+                latent_dim: 1,
+                id_mode: LatentIdMode::None,
+                manifold: SaeAtomBasisKind::Periodic.latent_manifold(1),
+                retraction: gam_problem::LatentRetractionRegistry::all_euclidean(),
+                latent_id: 1,
+            },
+            SaeAssignmentAtomSpec::euclidean(2),
+        ];
+        let state = SaeAssignmentState::from_topk_support_heterogeneous(
+            2,
+            2,
+            1,
+            specs,
+            vec![vec![0], vec![1]],
+            vec![vec![9.0], vec![-4.0]],
+            vec![vec![0.25], vec![3.0, 1.0]],
+        )
+        .expect("state");
+        let term = SaeSupportSparseTerm::new(atoms, state).expect("term");
+        let layout = SaeSupportSmoothingLayout::from_term(&term);
+        assert_eq!(layout.group_keys.len(), 2, "fixture must expose two groups");
+        let spectrum = penalty_spectrum(&term, &layout).expect("spectrum");
+        let initial_term = term.clone();
+        SaeSupportOuterObjective {
+            term,
+            initial_term,
+            target: array![[1.4], [4.3]],
+            layout,
+            spectrum,
+            ard_precisions: vec![vec![1.0], vec![1.0, 1.0]],
+            max_inner_iter: 5000,
+            inner_tolerance: 1.0e-9,
+            trust_radius: 1.0,
+            random_state: 0xC0FF_EE00_D15E_A5E5,
+            last_evaluation: None,
+        }
+    }
+
+    /// Solve the inner fixed point cleanly from the initial term at `rho`
+    /// (rebuilding the whole cache — never freezing it, per the FD-gate rule)
+    /// and read off the penalized deviance `D_p = 2·penalized_objective` and the
+    /// raw residual sum of squares at that converged inner optimum.
+    fn deviance_and_rss(objective: &mut SaeSupportOuterObjective, rho: &Array1<f64>) -> (f64, f64) {
+        objective.reset();
+        let lambda = objective.layout.expand(rho).expect("expand");
+        objective
+            .term
+            .solve_fixed_point(
+                objective.target.view(),
+                &lambda,
+                &objective.ard_precisions,
+                objective.max_inner_iter,
+                objective.inner_tolerance,
+                objective.trust_radius,
+            )
+            .expect("inner fixed point");
+        let deviance = 2.0
+            * objective
+                .term
+                .penalized_objective(objective.target.view(), &lambda, &objective.ard_precisions)
+                .expect("penalized objective");
+        let residual = objective
+            .term
+            .raw_residual(objective.target.view())
+            .expect("raw residual");
+        let rss = residual.iter().map(|value| value * value).sum::<f64>();
+        (deviance, rss)
+    }
+
+    /// Decisive oracle for the value↔gradient desync. The outer value feeds the
+    /// penalized deviance `D_p` into the Gaussian dispersion term, and the
+    /// analytic gradient's dispersion channel is `½·residual_df·energy[g]/D_p`
+    /// with `energy[g] = Σ_{k∈g} λ_k β̂ᵀ S_k β̂ = penalty_energy_by_group`. Since
+    /// `residual_df` and `D_p` are common factors, value/gradient consistency of
+    /// that channel is EXACTLY the envelope identity `d D_p/dρ_g = energy[g]`.
+    /// Central-differencing the production `D_p` (with a full clean inner re-solve
+    /// at each ρ±h) must reproduce the production `energy[g]` — this is the FD
+    /// oracle the SPEC allows in tests. The same test also confirms that the RAW
+    /// residual sum of squares does NOT satisfy the identity (its derivative
+    /// carries the implicit `H⁻¹` envelope term), so a revert to raw RSS is caught.
+    #[test]
+    fn support_penalized_deviance_derivative_equals_penalty_energy() {
+        let mut objective = build_objective();
+        // λ deliberately away from 1 in both groups so the raw-RSS derivative and
+        // the penalized-deviance derivative are unmistakably different functions.
+        let base = array![0.35_f64.ln(), 2.8_f64.ln()];
+        let groups = objective.layout.group_keys.len();
+
+        // Production `energy[g]` at the base inner optimum.
+        objective.reset();
+        let lambda_base = objective.layout.expand(&base).expect("expand");
+        objective
+            .term
+            .solve_fixed_point(
+                objective.target.view(),
+                &lambda_base,
+                &objective.ard_precisions,
+                objective.max_inner_iter,
+                objective.inner_tolerance,
+                objective.trust_radius,
+            )
+            .expect("base inner fixed point");
+        let energy = objective.penalty_energy_by_group(&lambda_base);
+        assert_eq!(energy.len(), groups);
+        assert!(
+            energy.iter().all(|value| value.is_finite() && *value > 0.0),
+            "fixture must exercise strictly positive per-group penalty energy: {energy:?}"
+        );
+
+        let h = 1.0e-4;
+        let energy_scale = energy.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let mut max_raw_gap = 0.0_f64;
+        for g in 0..groups {
+            let mut plus = base.clone();
+            let mut minus = base.clone();
+            plus[g] += h;
+            minus[g] -= h;
+            let (dev_plus, rss_plus) = deviance_and_rss(&mut objective, &plus);
+            let (dev_minus, rss_minus) = deviance_and_rss(&mut objective, &minus);
+            let deviance_derivative = (dev_plus - dev_minus) / (2.0 * h);
+            let raw_rss_derivative = (rss_plus - rss_minus) / (2.0 * h);
+
+            // (1) Envelope identity: d D_p/dρ_g == energy[g] (value↔gradient match).
+            let envelope_gap = (deviance_derivative - energy[g]).abs();
+            assert!(
+                envelope_gap <= 1.0e-6 * (1.0 + energy[g].abs()),
+                "group {g}: penalized-deviance derivative {deviance_derivative:.9e} \
+                 disagrees with penalty energy {:.9e} (gap {envelope_gap:.3e})",
+                energy[g]
+            );
+
+            // (2) Raw RSS is a DIFFERENT function: its derivative must not be the
+            // penalty energy, proving the raw-RSS gradient (the fixed defect) desyncs.
+            max_raw_gap = max_raw_gap.max((raw_rss_derivative - energy[g]).abs());
+        }
+        assert!(
+            max_raw_gap > 1.0e-2 * energy_scale.max(1.0e-3),
+            "raw-RSS derivative must visibly differ from the penalty energy so the \
+             desync is caught (max gap {max_raw_gap:.3e}, energy scale {energy_scale:.3e})"
+        );
+    }
+
+    /// Full-production oracle: the analytic gradient returned by `evaluate` must
+    /// match a central difference of the production value `cost`, restricted to
+    /// the dispersion channel that the desync corrupted. The joint log-det term is
+    /// a fixed-probe Hutchinson estimate (deterministic but not exact), so we
+    /// isolate the dispersion channel by subtracting the exact analytic log-det
+    /// and penalty-log-det contributions — both computed from the same production
+    /// quantities — leaving `½·residual_df·(1+ln(τ·D_p/df))`, whose FD must equal
+    /// the analytic `½·residual_df·energy[g]/D_p`.
+    #[test]
+    fn support_outer_value_dispersion_channel_matches_gradient() {
+        let mut objective = build_objective();
+        let base = array![0.4_f64.ln(), 2.2_f64.ln()];
+        let groups = objective.layout.group_keys.len();
+
+        // residual_df is a ρ-independent constant of the fixture.
+        let (_, beta_dim) = objective.beta_layout().expect("beta layout");
+        let beta_nullity = beta_dim - objective.spectrum.total_rank;
+        let data_dim = objective.term.n_obs() * objective.term.output_dim();
+        let residual_df = (data_dim - beta_nullity) as f64;
+        assert!(residual_df > 0.0);
+
+        let dispersion_value =
+            |objective: &mut SaeSupportOuterObjective, rho: &Array1<f64>| -> f64 {
+                let (deviance, _) = deviance_and_rss(objective, rho);
+                0.5 * residual_df * (1.0 + (std::f64::consts::TAU * deviance / residual_df).ln())
+            };
+
+        // Analytic dispersion-channel gradient from production quantities.
+        objective.reset();
+        let lambda_base = objective.layout.expand(&base).expect("expand");
+        objective
+            .term
+            .solve_fixed_point(
+                objective.target.view(),
+                &lambda_base,
+                &objective.ard_precisions,
+                objective.max_inner_iter,
+                objective.inner_tolerance,
+                objective.trust_radius,
+            )
+            .expect("base inner fixed point");
+        let deviance_base = 2.0
+            * objective
+                .term
+                .penalized_objective(objective.target.view(), &lambda_base, &objective.ard_precisions)
+                .expect("penalized objective");
+        let energy = objective.penalty_energy_by_group(&lambda_base);
+
+        let h = 1.0e-4;
+        for g in 0..groups {
+            let analytic = 0.5 * residual_df * energy[g] / deviance_base;
+            let mut plus = base.clone();
+            let mut minus = base.clone();
+            plus[g] += h;
+            minus[g] -= h;
+            let fd = (dispersion_value(&mut objective, &plus)
+                - dispersion_value(&mut objective, &minus))
+                / (2.0 * h);
+            assert!(
+                (analytic - fd).abs() <= 1.0e-6 * (1.0 + analytic.abs()),
+                "group {g}: analytic dispersion gradient {analytic:.9e} != FD {fd:.9e}"
+            );
+        }
+    }
+}
