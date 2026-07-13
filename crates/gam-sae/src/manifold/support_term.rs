@@ -515,14 +515,37 @@ impl SaeSupportSparseTerm {
         Ok(())
     }
 
+    fn validate_ard(&self, ard_precisions: &[Vec<f64>]) -> Result<(), String> {
+        if ard_precisions.len() != self.k_atoms() {
+            return Err(format!(
+                "SaeSupportSparseTerm: ARD blocks {} != K={}",
+                ard_precisions.len(),
+                self.k_atoms()
+            ));
+        }
+        for (atom, values) in ard_precisions.iter().enumerate() {
+            if values.len() != self.assignment.atom_coord_dim(atom)
+                || values.iter().any(|value| !value.is_finite() || *value <= 0.0)
+            {
+                return Err(format!(
+                    "SaeSupportSparseTerm: atom {atom} ARD must contain {} finite positive precisions",
+                    self.assignment.atom_coord_dim(atom)
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Gaussian loss plus the declared final-function seminorm
     /// `0.5 λ_k tr(B_k' S_ref,k B_k)`.
     pub fn penalized_objective(
         &self,
         target: ArrayView2<'_, f64>,
         lambda_smooth: &[f64],
+        ard_precisions: &[Vec<f64>],
     ) -> Result<f64, String> {
         self.validate_smoothing(lambda_smooth)?;
+        self.validate_ard(ard_precisions)?;
         let residual = self.raw_residual(target)?;
         let mut value = 0.5 * residual.iter().map(|entry| entry * entry).sum::<f64>();
         for (atom, &lambda) in self.atoms.iter().zip(lambda_smooth) {
@@ -535,6 +558,20 @@ impl SaeSupportSparseTerm {
                     .zip(sb.iter())
                     .map(|(left, right)| left * right)
                     .sum::<f64>();
+        }
+        for row in 0..self.n_obs() {
+            for (slot, &atom) in self.assignment.support_indices(row).iter().enumerate() {
+                let atom = atom as usize;
+                let periods = self.assignment.atom_manifold(atom).axis_periods();
+                for axis in 0..self.assignment.atom_coord_dim(atom) {
+                    value += ArdAxisPrior::eval(
+                        ard_precisions[atom][axis],
+                        self.assignment.coords_for_slot(row, slot)[axis],
+                        periods[axis],
+                    )
+                    .value;
+                }
+            }
         }
         if value.is_finite() {
             Ok(value)
@@ -645,8 +682,10 @@ impl SaeSupportSparseTerm {
     fn coordinate_sweep(
         &mut self,
         target: ArrayView2<'_, f64>,
+        ard_precisions: &[Vec<f64>],
         trust_radius: f64,
     ) -> Result<f64, String> {
+        self.validate_ard(ard_precisions)?;
         if !(trust_radius.is_finite() && trust_radius > 0.0) {
             return Err(format!(
                 "SaeSupportSparseTerm::coordinate_sweep: trust_radius must be finite and positive; got {trust_radius}"
@@ -670,8 +709,25 @@ impl SaeSupportSparseTerm {
                 cursor += d;
             }
             let residual = &target.row(row) - &fitted;
-            let rhs_vector = jacobian.dot(&residual);
-            let gram = jacobian.dot(&jacobian.t());
+            let mut rhs_vector = jacobian.dot(&residual);
+            let mut gram = jacobian.dot(&jacobian.t());
+            let mut old_prior = 0.0;
+            let mut prior_cursor = 0usize;
+            for (slot, &atom) in self.assignment.support_indices(row).iter().enumerate() {
+                let atom = atom as usize;
+                let periods = self.assignment.atom_manifold(atom).axis_periods();
+                for axis in 0..self.assignment.atom_coord_dim(atom) {
+                    let prior = ArdAxisPrior::eval(
+                        ard_precisions[atom][axis],
+                        self.assignment.coords_for_slot(row, slot)[axis],
+                        periods[axis],
+                    );
+                    old_prior += prior.value;
+                    rhs_vector[prior_cursor] -= prior.grad;
+                    gram[[prior_cursor, prior_cursor]] += prior.psd_majorizer_hess();
+                    prior_cursor += 1;
+                }
+            }
             let rhs = rhs_vector
                 .clone()
                 .into_shape_with_order((q, 1))
@@ -692,7 +748,8 @@ impl SaeSupportSparseTerm {
                 continue;
             }
             let old_coords = self.assignment.coords_row(row).to_vec();
-            let old_loss = 0.5 * residual.iter().map(|value| value * value).sum::<f64>();
+            let old_loss =
+                0.5 * residual.iter().map(|value| value * value).sum::<f64>() + old_prior;
             let mut accepted = None;
             for halving in 0..=24 {
                 self.assignment.set_row_coords(row, &old_coords)?;
@@ -700,13 +757,25 @@ impl SaeSupportSparseTerm {
                 let trial_delta = delta.iter().map(|value| step * value).collect::<Vec<_>>();
                 self.assignment.apply_row_coord_step(row, &trial_delta)?;
                 let trial_fitted = self.reconstruct_row(row)?;
-                let trial_loss = 0.5
+                let mut trial_loss = 0.5
                     * target
                         .row(row)
                         .iter()
                         .zip(trial_fitted.iter())
                         .map(|(truth, fit)| (truth - fit).powi(2))
                         .sum::<f64>();
+                for (slot, &atom) in self.assignment.support_indices(row).iter().enumerate() {
+                    let atom = atom as usize;
+                    let periods = self.assignment.atom_manifold(atom).axis_periods();
+                    for axis in 0..self.assignment.atom_coord_dim(atom) {
+                        trial_loss += ArdAxisPrior::eval(
+                            ard_precisions[atom][axis],
+                            self.assignment.coords_for_slot(row, slot)[axis],
+                            periods[axis],
+                        )
+                        .value;
+                    }
+                }
                 if trial_loss.is_finite()
                     && trial_loss <= old_loss - 1.0e-4 * step * directional
                 {
@@ -736,8 +805,10 @@ impl SaeSupportSparseTerm {
         &self,
         target: ArrayView2<'_, f64>,
         lambda_smooth: &[f64],
+        ard_precisions: &[Vec<f64>],
     ) -> Result<SaeSupportStationarity, String> {
         self.validate_smoothing(lambda_smooth)?;
+        self.validate_ard(ard_precisions)?;
         let residual = self.raw_residual(target)?;
         let mut decoder_sq = 0.0;
         let mut decoder_max = 0.0_f64;
@@ -763,12 +834,20 @@ impl SaeSupportSparseTerm {
         let mut coordinate_max = 0.0_f64;
         for row in 0..self.n_obs() {
             for slot in 0..self.assignment.support_indices(row).len() {
+                let atom = self.assignment.support_indices(row)[slot] as usize;
                 let active = self.evaluate_active(row, slot)?;
+                let periods = self.assignment.atom_manifold(atom).axis_periods();
                 for axis in 0..active.jacobian.nrows() {
                     let mut gradient = 0.0;
                     for output in 0..self.output_dim {
                         gradient -= active.jacobian[[axis, output]] * residual[[row, output]];
                     }
+                    gradient += ArdAxisPrior::eval(
+                        ard_precisions[atom][axis],
+                        self.assignment.coords_for_slot(row, slot)[axis],
+                        periods[axis],
+                    )
+                    .grad;
                     coordinate_sq += gradient * gradient;
                     coordinate_max = coordinate_max.max(gradient.abs());
                 }
@@ -789,6 +868,7 @@ impl SaeSupportSparseTerm {
         &mut self,
         target: ArrayView2<'_, f64>,
         lambda_smooth: &[f64],
+        ard_precisions: &[Vec<f64>],
         max_iter: usize,
         tolerance: f64,
         trust_radius: f64,
@@ -807,14 +887,20 @@ impl SaeSupportSparseTerm {
         let mut previous_candidate = false;
         for iteration in 1..=max_iter {
             let decoder_change = self.decoder_sweep(target, lambda_smooth)?;
-            let coordinate_change = self.coordinate_sweep(target, trust_radius)?;
+            let coordinate_change =
+                self.coordinate_sweep(target, ard_precisions, trust_radius)?;
             let max_change = decoder_change.max(coordinate_change);
-            let stationarity = self.raw_stationarity(target, lambda_smooth)?;
+            let stationarity =
+                self.raw_stationarity(target, lambda_smooth, ard_precisions)?;
             let candidate = max_change <= tolerance && stationarity.max_abs() <= tolerance;
             if candidate && previous_candidate {
                 return Ok(SaeSupportFixedPointReport {
                     iterations: iteration,
-                    objective: self.penalized_objective(target, lambda_smooth)?,
+                    objective: self.penalized_objective(
+                        target,
+                        lambda_smooth,
+                        ard_precisions,
+                    )?,
                     stationarity,
                     max_recurrence_change: max_change,
                     recurred: true,
@@ -822,7 +908,7 @@ impl SaeSupportSparseTerm {
             }
             previous_candidate = candidate;
         }
-        let stationarity = self.raw_stationarity(target, lambda_smooth)?;
+        let stationarity = self.raw_stationarity(target, lambda_smooth, ard_precisions)?;
         Err(format!(
             "SaeSupportSparseTerm::solve_fixed_point did not recur within {max_iter} cycles (raw KKT max={:.6e})",
             stationarity.max_abs()
@@ -834,7 +920,7 @@ impl SaeSupportSparseTerm {
 mod tests {
     use super::*;
     use crate::assignment_state::SaeAssignmentAtomSpec;
-    use ndarray::{Array3, array};
+    use ndarray::array;
     use std::sync::Arc;
 
     fn atom(
@@ -936,10 +1022,20 @@ mod tests {
         .expect("state");
         let mut term = SaeSupportSparseTerm::new(atoms, state).expect("term");
         let target = array![[-1.0], [0.0], [1.0]];
-        let before = term.penalized_objective(target.view(), &[0.1]).expect("before");
+        let ard = vec![vec![1.0]];
+        let before = term
+            .penalized_objective(target.view(), &[0.1], &ard)
+            .expect("before");
         term.decoder_sweep(target.view(), &[0.1]).expect("sweep");
-        let after = term.penalized_objective(target.view(), &[0.1]).expect("after");
+        let after = term
+            .penalized_objective(target.view(), &[0.1], &ard)
+            .expect("after");
         assert!(after < before);
-        assert!(term.raw_stationarity(target.view(), &[0.1]).expect("kkt").decoder_max_abs < 1.0e-10);
+        assert!(
+            term.raw_stationarity(target.view(), &[0.1], &ard)
+                .expect("kkt")
+                .decoder_max_abs
+                < 1.0e-10
+        );
     }
 }
