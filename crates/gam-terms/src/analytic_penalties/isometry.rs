@@ -339,7 +339,7 @@ impl IsometryPenalty {
             .clone()
     }
 
-    /// Read the Jacobian cache, validated against the *dimensional identity*
+    /// Read the Jacobian cache under the *dimensional identity*
     /// `(latent_dim, p_out)` of the atom currently being evaluated.
     ///
     /// The cache is interior-mutable and refreshed **per atom** (see
@@ -356,12 +356,12 @@ impl IsometryPenalty {
     ///
     /// The cache's built-for `latent_dim` is recoverable from its own shape:
     /// with `p_out` fixed on the penalty, `ncols() == p_out · d_cache`. We
-    /// therefore treat any `ncols() != p_out · latent_dim` as a **cache-miss**
-    /// (returning `None`, the same graceful zero-default path as an absent
-    /// cache) rather than reading it at the wrong `d`. Cross-atom stale reads
-    /// are thus impossible by construction; the callers' shape invariants only
-    /// ever see a cache that genuinely matches the requested `(latent_dim,
-    /// p_out)`.
+    /// Per-atom SAE evaluation clones the registry descriptor, retargets it,
+    /// and refreshes that clone before any read, so a mismatched live cache is
+    /// an ownership/refresh invariant violation, not missing optional data.
+    /// Silently converting it to `None` would disable the isometry penalty and
+    /// change the fitted objective. Keep the mismatch hard: every caller sees
+    /// either no cache at all or a cache with the exact requested identity.
     fn dimensioned_jacobian_cache(
         &self,
         method: &str,
@@ -371,26 +371,21 @@ impl IsometryPenalty {
             self.missing_cache_default(method, "jacobian_cache is None");
             return None;
         };
-        let expected = self.p_out * latent_dim;
-        if jac.ncols() != expected {
-            self.missing_cache_default(
-                method,
-                &format!(
-                    "jacobian_cache has {} columns but this atom needs p_out {} × latent_dim {} = {} \
-                     (stale cross-atom cache built for latent_dim {}); treating as cache-miss",
-                    jac.ncols(),
-                    self.p_out,
-                    latent_dim,
-                    expected,
-                    if self.p_out == 0 {
-                        0
-                    } else {
-                        jac.ncols() / self.p_out
-                    },
-                ),
-            );
-            return None;
-        }
+        let expected = self
+            .p_out
+            .checked_mul(latent_dim)
+            .expect("IsometryPenalty Jacobian dimensional identity overflow");
+        assert_eq!(
+            jac.ncols(),
+            expected,
+            "IsometryPenalty::{method} stale cross-atom Jacobian cache: cache has {} columns, \
+             but this per-atom evaluation requires p_out {} × latent_dim {} = {}; the owner \
+             must clone, retarget, and refresh the penalty before evaluation",
+            jac.ncols(),
+            self.p_out,
+            latent_dim,
+            expected,
+        );
         Some(jac)
     }
 
@@ -938,13 +933,10 @@ impl IsometryPenalty {
         let jac = self.dimensioned_jacobian_cache("pullback_metric", latent_dim)?;
         let n_obs = jac.nrows();
         let p = self.p_out;
-        // Invariant: the live cache is shaped exactly `(n_obs, p·d)`. This now
-        // holds by construction — `dimensioned_jacobian_cache` returns a clean
-        // cache-miss (`None`) for a stale cross-atom cache whose column count is
-        // `p·d'` for some other atom's `d' ≠ latent_dim` (issue #2294) — so this
-        // assert can no longer fire on a mixed-dimension atom set. It is kept as
-        // the load-bearing shape contract the reshape loop below depends on.
-        assert_eq!(jac.ncols(), p * latent_dim);
+        // `dimensioned_jacobian_cache` enforces the load-bearing `(n, p·d)`
+        // shape contract before the reshape loop below. A stale cross-atom
+        // cache is a hard owner/refresh invariant failure; it is never converted
+        // into a zero isometry contribution (#2294).
         let mut g_all = Array2::<f64>::zeros((n_obs, latent_dim * latent_dim));
         for n in 0..n_obs {
             // M_n = U_n^T J_n  (or J_n itself when W = I).

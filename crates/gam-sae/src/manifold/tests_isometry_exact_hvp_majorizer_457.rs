@@ -548,6 +548,17 @@ pub(crate) fn corrected_isometry_penalty_retargets_mixed_dimension_atoms() {
         AnalyticPenaltyKind::Isometry(penalty) => penalty,
         _ => panic!("expected isometry penalty"),
     };
+    // Recreate the reported stale shared state deliberately: the registry
+    // descriptor currently carries a d=2 Jacobian when production evaluates
+    // atom 0 at d=1. `corrected_isometry_penalty` must clone the descriptor and
+    // overwrite the clone with atom 0's own d=1 cache before any value read;
+    // mutating or directly reading this registry cache would respectively
+    // violate per-atom ownership or trip the hard dimensional invariant.
+    let stale_registry_jacobian = Arc::new(Array2::<f64>::from_elem(
+        (term.n_obs(), p_out * 2),
+        -7.0,
+    ));
+    registry_iso.refresh_caches(Some(stale_registry_jacobian.clone()), None);
     let rho = array![0.0_f64];
 
     for (atom_idx, expected_dim) in [(0usize, 1usize), (1usize, 2usize)] {
@@ -572,6 +583,13 @@ pub(crate) fn corrected_isometry_penalty_retargets_mixed_dimension_atoms() {
         assert!(
             value.is_finite() && value > 0.0,
             "atom {atom_idx} must retain live, nonzero default isometry; got {value}"
+        );
+        let registry_jacobian = registry_iso
+            .jacobian_cache()
+            .expect("registry descriptor keeps its seeded cache");
+        assert!(
+            Arc::ptr_eq(&registry_jacobian, &stale_registry_jacobian),
+            "per-atom correction must refresh an owned clone, not mutate shared registry state"
         );
     }
 
