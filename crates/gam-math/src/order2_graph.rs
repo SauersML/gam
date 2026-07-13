@@ -191,12 +191,6 @@ impl Order2GraphWorkspace {
         tape.projected_curvature_len = 0;
     }
 
-    /// Number of active nodes in the current row schedule.
-    #[must_use]
-    fn node_count(&self) -> usize {
-        self.tape().node_len
-    }
-
     /// Shared tape access. `UnsafeCell` removes the dynamic borrow state that a
     /// `RefCell` would place in every scalar operation. The workspace is not
     /// `Sync`, every mutation is completed before a scalar handle is returned,
@@ -970,7 +964,7 @@ mod tests {
         }
 
         fn multiply(&self, input: &[f64], output: &mut [f64]) {
-            assert!(self.workspace.node_count() != 0);
+            assert!(self.workspace.tape().node_len != 0);
             for row in 0..3 {
                 output[row] = (0..3)
                     .map(|column| self.matrix[row][column] * input[column])
@@ -993,7 +987,7 @@ mod tests {
         }
 
         fn multiply(&self, input: &[f64], output: &mut [f64]) {
-            assert!(self.workspace.node_count() != 0);
+            assert!(self.workspace.tape().node_len != 0);
             output.copy_from_slice(input);
         }
 
@@ -1013,7 +1007,7 @@ mod tests {
         }
 
         fn multiply(&self, input: &[f64], output: &mut [f64]) {
-            assert!(self.workspace.node_count() != 0);
+            assert!(self.workspace.tape().node_len != 0);
             self.multiply_calls.set(self.multiply_calls.get() + 1);
             output.copy_from_slice(input);
         }
