@@ -1224,6 +1224,27 @@ mod tests {
     }
 
     #[test]
+    fn geometry_plan_atomically_sets_reference_metric_provenance() {
+        let reference_coords = Array2::from_shape_vec((2, 2), vec![0.1, 0.2, -0.2, 0.1]).unwrap();
+        let geometry = SaeAtomGeometryPlan::new(
+            SaeAtomBasisKind::Poincare,
+            2,
+            crate::manifold::SaeBasisResolution::Polynomial { degree: 2 },
+            crate::manifold::SaeReferenceMetricPlan::UnitPoincareBall {
+                reference_coords: reference_coords.clone(),
+            },
+        )
+        .unwrap();
+        let width = geometry.basis_size().unwrap();
+        let spec = SaeOosAtomSpec::new(geometry, Array2::zeros((width, 1))).unwrap();
+        let atom = build_oos_atom(0, &spec, reference_coords.view(), 1).unwrap();
+        assert_eq!(
+            atom.reference_roughness_kind(),
+            crate::manifold::SaeReferenceRoughnessKind::PoincareConformalDirichlet
+        );
+    }
+
+    #[test]
     fn typed_oos_entry_reconstructs_frozen_periodic_dictionary() {
         let request = periodic_request();
         let expected = request.target.clone();

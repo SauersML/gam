@@ -766,6 +766,7 @@ impl SaeManifoldAtom {
                 "SaeManifoldAtom::with_geometry_plan: installed reference Gram differs from plan by {max_difference}, tolerance {tolerance}"
             ));
         }
+        self.reference_roughness_kind = plan.reference_roughness_kind();
         self.geometry_plan = Some(plan);
         Ok(self)
     }

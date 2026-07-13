@@ -245,6 +245,15 @@ impl SaeAtomGeometryPlan {
         &self.reference_metric
     }
 
+    pub(crate) fn reference_roughness_kind(&self) -> SaeReferenceRoughnessKind {
+        match &self.reference_metric {
+            SaeReferenceMetricPlan::UnitPoincareBall { .. } => {
+                SaeReferenceRoughnessKind::PoincareConformalDirichlet
+            }
+            _ => SaeReferenceRoughnessKind::ProvidedFunctionGram,
+        }
+    }
+
     pub fn duchon_centers(&self) -> Option<&Array2<f64>> {
         match &self.resolution {
             SaeBasisResolution::DuchonCoordinates { centers } => Some(centers),
