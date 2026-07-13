@@ -1405,10 +1405,18 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 SurvivalLikelihoodMode::Latent => FittedFamily::LatentSurvival {
                     frailty: match &frailty {
                         gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-                            sigma_fixed: None,
+                            scale:
+                                gam::families::survival::lognormal_kernel::FrailtyScale::Learned {
+                                    ..
+                                },
                             loading,
                         } => gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-                            sigma_fixed: learned_latent_sd,
+                            scale: gam::families::survival::lognormal_kernel::FrailtyScale::Fixed {
+                                sigma: learned_latent_sd.ok_or_else(|| {
+                                    "latent survival learned frailty fit did not return its certified scale"
+                                        .to_string()
+                                })?,
+                            },
                             loading: *loading,
                         },
                         _ => frailty.clone(),

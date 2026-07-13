@@ -622,7 +622,15 @@ fn validate_spec_rejects_coordinate_cone_without_guard_offset() {
         marginal_offset: Array1::zeros(2),
         frailty: FrailtySpec::None,
         derivative_guard: 1e-4,
-        baseline_hyper: SurvivalMarginalSlopeBaselineHyperSpec::Linear,
+        baseline_hyper: SurvivalMarginalSlopeBaselineHyperSpec::Linear {
+            config: crate::survival::construction::SurvivalBaselineConfig {
+                target: crate::survival::construction::SurvivalBaselineTarget::Linear,
+                scale: None,
+                shape: None,
+                rate: None,
+                makeham: None,
+            },
+        },
         time_block: TimeBlockInput {
             design_entry: DesignMatrix::from(Array2::zeros((2, 1))),
             design_exit: DesignMatrix::from(Array2::zeros((2, 1))),
@@ -666,7 +674,15 @@ fn validate_spec_accepts_learned_gaussian_shift_sigma() {
             scale: FrailtyScale::Learned { initial_sigma: 0.5 },
         },
         derivative_guard: 1e-4,
-        baseline_hyper: SurvivalMarginalSlopeBaselineHyperSpec::Linear,
+        baseline_hyper: SurvivalMarginalSlopeBaselineHyperSpec::Linear {
+            config: crate::survival::construction::SurvivalBaselineConfig {
+                target: crate::survival::construction::SurvivalBaselineTarget::Linear,
+                scale: None,
+                shape: None,
+                rate: None,
+                makeham: None,
+            },
+        },
         time_block: base_time_block(),
         timewiggle_block: None,
         logslopespec: empty_termspec(),
