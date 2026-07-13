@@ -62,6 +62,60 @@
 //! is the oracle that pins the contracted scalars against the dense
 //! value/grad/Hessian/`t3`/`t4` truth, so it lives in the `#[cfg(test)]` module.
 
+/// Symmetric coefficient operator used by the universal quadratic-form jet
+/// primitive.
+///
+/// Implementations own representation-specific matrix access (diagonal,
+/// dense, low rank, structured, or matrix free). Jet scalars own the one
+/// derivative rule for `x' A x`; callers never spell its chain rule.
+pub trait SymmetricQuadraticCoefficients {
+    /// Input-space dimension of the symmetric operator.
+    fn dimension(&self) -> usize;
+
+    /// Compute `output = A * input` without materializing `A`.
+    fn multiply(&self, input: &[f64], output: &mut [f64]);
+
+    /// One symmetric coefficient `A[row, column]`.
+    fn coefficient(&self, row: usize, column: usize) -> f64;
+}
+
+fn symmetric_quadratic_form_default<T, C>(
+    inputs: &[T],
+    coefficients: &C,
+    constant: impl Fn(f64) -> T,
+    add: impl Fn(&T, &T) -> T,
+    mul: impl Fn(&T, &T) -> T,
+    scale: impl Fn(&T, f64) -> T,
+) -> T
+where
+    C: SymmetricQuadraticCoefficients,
+{
+    assert_eq!(
+        inputs.len(),
+        coefficients.dimension(),
+        "symmetric quadratic-form dimension mismatch"
+    );
+    let mut out = constant(0.0);
+    for row in 0..inputs.len() {
+        let diagonal = mul(&inputs[row], &inputs[row]);
+        out = add(
+            &out,
+            &scale(&diagonal, coefficients.coefficient(row, row)),
+        );
+        for column in row + 1..inputs.len() {
+            let cross = mul(&inputs[row], &inputs[column]);
+            out = add(
+                &out,
+                &scale(
+                    &cross,
+                    2.0 * coefficients.coefficient(row, column),
+                ),
+            );
+        }
+    }
+    out
+}
+
 /// A truncated-Taylor scalar carrying derivatives in `K` primaries.
 ///
 /// All concrete scalars here ([`Order2`], [`OneSeed`], [`TwoSeed`]) and the full
@@ -78,6 +132,23 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
     /// directional scalars are seeded zero — callers set ε/δ directions through
     /// the scalar-specific [`OneSeed::seed_direction`] / [`TwoSeed::seed`].)
     fn variable(x: f64, axis: usize) -> Self;
+
+    /// Evaluate `inputs' A inputs` from one universal semantic primitive.
+    /// Order-specific scalars may lower the mechanically derived channels
+    /// directly; the default is the exact scalar program over `mul/add/scale`.
+    fn symmetric_quadratic_form<C: SymmetricQuadraticCoefficients>(
+        inputs: &[Self],
+        coefficients: &C,
+    ) -> Self {
+        symmetric_quadratic_form_default(
+            inputs,
+            coefficients,
+            Self::constant,
+            crate::nested_dual::JetField::add,
+            crate::nested_dual::JetField::mul,
+            crate::nested_dual::JetField::scale,
+        )
+    }
 
     // The scalar-field algebra — `value`, `add`, `sub`, `mul`, `neg`, `scale`,
     // and the single Faà di Bruno `compose_unary([f64; 5])` — is declared ONCE on
@@ -175,6 +246,24 @@ pub trait RuntimeJetScalar<'arena>: Clone {
     fn constant(c: f64, dimension: usize, workspace: &'arena Self::Workspace) -> Self;
     /// A seeded variable in a `dimension`-primary algebra.
     fn variable(x: f64, axis: usize, dimension: usize, workspace: &'arena Self::Workspace) -> Self;
+
+    /// Evaluate `inputs' A inputs` from the same universal semantic primitive
+    /// as [`JetScalar::symmetric_quadratic_form`].
+    fn symmetric_quadratic_form<C: SymmetricQuadraticCoefficients>(
+        inputs: &[Self],
+        coefficients: &C,
+        dimension: usize,
+        workspace: &'arena Self::Workspace,
+    ) -> Self {
+        symmetric_quadratic_form_default(
+            inputs,
+            coefficients,
+            |value| Self::constant(value, dimension, workspace),
+            Self::add,
+            Self::mul,
+            Self::scale,
+        )
+    }
     /// Number of primary derivative axes carried by this scalar.
     fn dimension(&self) -> usize;
     /// Value channel.
@@ -249,6 +338,25 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         Self {
             inner: S::variable(x, axis),
+        }
+    }
+
+    #[inline(always)]
+    fn symmetric_quadratic_form<C: SymmetricQuadraticCoefficients>(
+        inputs: &[Self],
+        coefficients: &C,
+        dimension: usize,
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        assert_eq!(dimension, K, "fixed jet dimension mismatch");
+        assert_eq!(inputs.len(), coefficients.dimension());
+        // `FixedRuntimeJet` is `repr(transparent)` over `S`, so a slice has the
+        // same element layout, alignment, length, and provenance.
+        let inner = unsafe {
+            std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len())
+        };
+        Self {
+            inner: S::symmetric_quadratic_form(inner, coefficients),
         }
     }
 
@@ -619,6 +727,67 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: x,
             g,
             h: arena.zeros(dimension * dimension),
+        }
+    }
+
+    #[inline(always)]
+    fn symmetric_quadratic_form<C: SymmetricQuadraticCoefficients>(
+        inputs: &[Self],
+        coefficients: &C,
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
+        assert_eq!(inputs.len(), coefficients.dimension());
+        assert!(
+            inputs.iter().all(|input| {
+                input.dimension() == dimension && std::ptr::eq(input.arena, arena)
+            }),
+            "dynamic quadratic-form jets must share dimension and arena"
+        );
+        let input_dimension = inputs.len();
+        let values = arena.zeros(input_dimension);
+        for (value, input) in values.iter_mut().zip(inputs) {
+            *value = input.v;
+        }
+        let projected = arena.zeros(input_dimension);
+        coefficients.multiply(values, projected);
+
+        let mut value = 0.0;
+        for axis in 0..input_dimension {
+            value += values[axis] * projected[axis];
+        }
+        let gradient = arena.zeros(dimension);
+        for primary in 0..dimension {
+            let mut channel = 0.0;
+            for axis in 0..input_dimension {
+                channel += projected[axis] * inputs[axis].g[primary];
+            }
+            gradient[primary] = 2.0 * channel;
+        }
+        let hessian = arena.zeros(dimension * dimension);
+        for primary_a in 0..dimension {
+            for primary_b in primary_a..dimension {
+                let mut inherited = 0.0;
+                let mut curvature = 0.0;
+                for row in 0..input_dimension {
+                    inherited +=
+                        projected[row] * inputs[row].h[primary_a * dimension + primary_b];
+                    for column in 0..input_dimension {
+                        curvature += coefficients.coefficient(row, column)
+                            * inputs[row].g[primary_a]
+                            * inputs[column].g[primary_b];
+                    }
+                }
+                let channel = 2.0 * (inherited + curvature);
+                hessian[primary_a * dimension + primary_b] = channel;
+                hessian[primary_b * dimension + primary_a] = channel;
+            }
+        }
+        Self {
+            arena,
+            v: value,
+            g: gradient,
+            h: hessian,
         }
     }
 
