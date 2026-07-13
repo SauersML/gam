@@ -4716,6 +4716,8 @@ const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
                 path: "crates/gam-models/src/bms/gpu/row.rs",
                 anchors: &[
                     "fn generated_cuda_row_kernel_matches_canonical_cpu_lowering_415()",
+                    "fn generated_cuda_row_kernel_r33_matches_canonical_cpu_lowering_932()",
+                    "fn bms_flex_row_r33_consumers_match_cpu_oracles_when_cuda_available()",
                     "fn generated_source_interprets_compact_canonical_phase_streams()",
                 ],
             },
@@ -5207,6 +5209,39 @@ fn enforce_derivative_policy_negative_probes() {
         "#932 policy self-test: an SAE source bound was mistaken for a trait implementation"
     );
 
+    let registered_sae_path = "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs";
+    let registered_sae_source = "impl SaeSoftmaxRowProgramSource for InputSource<'_> {";
+    let registered_sae_mask =
+        compute_test_mask(registered_sae_source, Path::new(registered_sae_path));
+    assert!(
+        derivative_declarations(registered_sae_source, &registered_sae_mask)
+            .iter()
+            .any(|declaration| {
+                is_sae_softmax_row_program_source_declaration(&declaration.source)
+                    && specialization_site_is_registered(
+                        DerivativeSpecializationKind::Bespoke,
+                        registered_sae_path,
+                        &declaration.source,
+                    )
+            }),
+        "#932 policy self-test: the exact registered SAE implementation was not admitted"
+    );
+    let same_file_rogue = "impl SaeSoftmaxRowProgramSource for PlantedSameFileSource {}";
+    let same_file_rogue_mask = compute_test_mask(same_file_rogue, Path::new(registered_sae_path));
+    assert!(
+        derivative_declarations(same_file_rogue, &same_file_rogue_mask)
+            .iter()
+            .any(|declaration| {
+                is_sae_softmax_row_program_source_declaration(&declaration.source)
+                    && !specialization_site_is_registered(
+                        DerivativeSpecializationKind::Bespoke,
+                        registered_sae_path,
+                        &declaration.source,
+                    )
+            }),
+        "#932 policy self-test: a rogue SAE implementation in a registered source file was admitted"
+    );
+
     let retired = "fn planted_retired_identity() {}";
     assert_eq!(
         code_identifier_line_indices(retired, "planted_retired_identity"),
@@ -5383,10 +5418,31 @@ fn specialization_site_is_registered(
                 && specialization
                     .production_sources
                     .iter()
-                    .any(|source| source.path == path)
-                && normalized_source
-                    .contains(&normalized_rust_fragment(specialization.discovery_anchor))
+                    .filter(|source| source.path == path)
+                    .flat_map(|source| source.anchors.iter())
+                    .any(|anchor| registered_declaration_matches_anchor(&normalized_source, anchor))
         })
+}
+
+fn registered_declaration_matches_anchor(declaration: &str, anchor: &str) -> bool {
+    let anchor = normalized_rust_fragment(anchor);
+    if !(anchor.starts_with("impl ") || anchor.starts_with("impl<") || anchor.starts_with("fn ")) {
+        return false;
+    }
+    let Some(remainder) = declaration.strip_prefix(&anchor) else {
+        return false;
+    };
+    if remainder.is_empty() {
+        return true;
+    }
+    if anchor.ends_with('(') || remainder.starts_with('(') {
+        return true;
+    }
+    if !remainder.chars().next().is_some_and(char::is_whitespace) {
+        return false;
+    }
+    let declaration_tail = remainder.trim_start();
+    declaration_tail.starts_with('{') || declaration_tail.starts_with("where ")
 }
 
 fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {

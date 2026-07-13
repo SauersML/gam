@@ -184,10 +184,10 @@ pub enum SphereTransitionProvenance {
 /// [`UnitSpeedChartTransition`] carries — so a pole seam CANNOT be described by
 /// a one-dimensional affine map, and is stored as this distinct kind rather than
 /// a `Pole`-tagged 1-D transition (which would assert a map the overlap does not
-/// have).  Orientability is read from `det R`: `+1` (a proper rotation, the map
-/// relating two charts of an orientable sphere) preserves orientation, `-1` (an
-/// improper rotation / reflection) reverses it — exactly the role `sign` plays
-/// for the 1-D transition, so both feed the same sign cocycle.
+/// have). For an analytically derived seam, orientability is read from `det R`:
+/// `+1` preserves orientation and `-1` reverses it, exactly the role `sign`
+/// plays for the 1-D transition. A fitted polar factor retains its determinant
+/// only as geometry and never enters the exact sign cocycle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SphereChartTransition {
     from_chart: usize,
@@ -422,9 +422,9 @@ pub enum AtlasOrientability {
 ///
 /// Overlaps come in two geometric kinds. Analytic instances share one exact
 /// sign cocycle; fitted sphere polar maps remain unsigned until a statistical
-/// certificate resolves them. The
-/// one-dimensional unit-speed affine [`UnitSpeedChartTransition`] (circles,
-/// Möbius half-twists) and the two-dimensional ambient-rotation
+/// certificate resolves them. The one-dimensional unit-speed affine
+/// [`UnitSpeedChartTransition`] (circles, Möbius half-twists) and the
+/// two-dimensional ambient-rotation
 /// [`SphereChartTransition`] (sphere pole seams).  Both are stored so a single
 /// atlas can mix them; connectivity and orientability read the union of their
 /// signed edges.
@@ -1123,6 +1123,7 @@ mod tests {
         let fitted =
             SphereChartTransition::new_fitted(0, 1, identity, AtlasSeamKind::Pole).unwrap();
         assert_eq!(fitted.analytic_sign(), None);
+        assert_eq!(fitted.provenance(), SphereTransitionProvenance::Fitted);
         let atlas = ManifoldChartAtlas::from_sphere_transition(fitted).unwrap();
         assert_eq!(
             atlas.orientability(),
@@ -1133,6 +1134,7 @@ mod tests {
         let analytic =
             SphereChartTransition::new_analytic(0, 1, identity, AtlasSeamKind::Pole).unwrap();
         assert_eq!(analytic.analytic_sign(), Some(1));
+        assert_eq!(analytic.provenance(), SphereTransitionProvenance::Analytic);
         let atlas = ManifoldChartAtlas::from_sphere_transition(analytic).unwrap();
         assert_eq!(atlas.orientability(), Some(AtlasOrientability::Orientable));
     }

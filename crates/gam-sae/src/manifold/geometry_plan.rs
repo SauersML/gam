@@ -477,6 +477,41 @@ pub(crate) struct SaeAtomEvaluationBundle {
     pub(crate) reference_penalty: Array2<f64>,
 }
 
+/// Coordinate velocities of the three `SO(3)` Killing fields on the spherical
+/// cover used by `RP²`, ordered by rotations about the ambient `x`, `y`, and
+/// `z` axes.
+///
+/// The cover chart is `(latitude, longitude)`. Its longitude coordinate is
+/// singular at a pole, so an `SO(3)` orbit cannot be represented by a unique
+/// two-component chart velocity there. Refusing that state is essential: a
+/// fabricated finite longitude velocity would silently change the quotient
+/// tangent space used by both Newton gauge deflation and the identifiability
+/// certificate.
+pub(crate) fn projective_plane_cover_killing_directions(
+    latitude: f64,
+    longitude: f64,
+) -> Result<[[f64; 2]; 3], String> {
+    if !(latitude.is_finite() && longitude.is_finite()) {
+        return Err(
+            "projective_plane_cover_killing_directions requires finite cover coordinates"
+                .to_string(),
+        );
+    }
+    let cos_latitude = latitude.cos();
+    if cos_latitude.abs() <= f64::EPSILON.sqrt() {
+        return Err(format!(
+            "projective_plane_cover_killing_directions: latitude {latitude} is at the spherical-cover pole where longitude has a nontrivial stabilizer"
+        ));
+    }
+    let tan_latitude = latitude.sin() / cos_latitude;
+    let (sin_longitude, cos_longitude) = longitude.sin_cos();
+    Ok([
+        [sin_longitude, -tan_latitude * cos_longitude],
+        [-cos_longitude, -tan_latitude * sin_longitude],
+        [0.0, 1.0],
+    ])
+}
+
 fn duchon_nullspace_from_m(m: usize) -> gam_terms::basis::DuchonNullspaceOrder {
     match m {
         1 => gam_terms::basis::DuchonNullspaceOrder::Zero,
@@ -596,6 +631,33 @@ mod tests {
                 SaeReferenceMetricPlan::DiscreteCounting,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn projective_plane_killing_fields_descend_through_antipodal_deck_map() {
+        let latitude = 0.37;
+        let longitude = -0.81;
+        let original =
+            projective_plane_cover_killing_directions(latitude, longitude).unwrap();
+        let deck = projective_plane_cover_killing_directions(
+            -latitude,
+            longitude + std::f64::consts::PI,
+        )
+        .unwrap();
+
+        // Dg = diag(-1, 1) for g(lat, lon) = (-lat, lon + pi).
+        for generator in 0..3 {
+            assert!((deck[generator][0] + original[generator][0]).abs() <= 1.0e-12);
+            assert!((deck[generator][1] - original[generator][1]).abs() <= 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn projective_plane_killing_fields_refuse_cover_poles() {
+        assert!(
+            projective_plane_cover_killing_directions(std::f64::consts::FRAC_PI_2, 0.0)
+                .is_err()
         );
     }
 }

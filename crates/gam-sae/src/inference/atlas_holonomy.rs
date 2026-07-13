@@ -1306,16 +1306,46 @@ impl ProjectedAtlasEdgeGeometry {
     }
 }
 
-/// Required occupancy for one patch at the requested orientation error level.
+/// Pilot-side requirement for one patch's projection frame.
+///
+/// This is deliberately not a row-count scalar. More pilot rows cannot turn a
+/// fitted reduced frame into a population-capture theorem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtlasPilotOccupancyPrescription {
+    /// The retained frame has an analytic zero-leakage proof (including full
+    /// ambient retention), so topology certification imposes no pilot sample
+    /// size requirement.
+    ExactCaptureNoSamplingRequirement,
+    /// The retained frame is only an independent pilot estimate. A population
+    /// capture theorem is required before any finite row count is meaningful.
+    PopulationCaptureTheoremRequired,
+}
+
+/// Inference-side occupancy required for the requested orientation error.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AtlasInferenceOccupancyPrescription {
+    /// Closed-form Wishart occupancy after every population tail input has
+    /// independently supplied authority.
+    Required {
+        rows: usize,
+        covariance_degrees_of_freedom: usize,
+        projected_dimension: usize,
+        aligned_frame_error_budget: f64,
+    },
+    /// A population spectrum or cross-Gram margin is absent. More inference
+    /// rows alone cannot repair the missing authority.
+    PopulationTailInputsRequired,
+}
+
+/// Separate pilot and inference requirements for one incident atlas patch.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtlasPatchSamplePrescription {
     pub chart: usize,
-    pub current_rows: usize,
-    pub required_rows: usize,
+    pub current_pilot_rows: usize,
+    pub pilot: AtlasPilotOccupancyPrescription,
+    pub current_inference_rows: usize,
     pub current_covariance_degrees_of_freedom: usize,
-    pub required_covariance_degrees_of_freedom: usize,
-    pub projected_dimension: usize,
-    pub aligned_frame_error_budget: f64,
+    pub inference: AtlasInferenceOccupancyPrescription,
 }
 
 /// Outcome of the two-sided trivial-holonomy test.
@@ -1915,6 +1945,27 @@ mod tests {
     fn assert_near(left: f64, right: f64) {
         let scale = left.abs().max(right.abs()).max(1.0);
         assert!((left - right).abs() <= f64::EPSILON.sqrt() * scale);
+    }
+
+    fn required_inference_prescription(
+        prescription: &AtlasPatchSamplePrescription,
+    ) -> (usize, usize, usize, f64) {
+        match prescription.inference {
+            AtlasInferenceOccupancyPrescription::Required {
+                rows,
+                covariance_degrees_of_freedom,
+                projected_dimension,
+                aligned_frame_error_budget,
+            } => (
+                rows,
+                covariance_degrees_of_freedom,
+                projected_dimension,
+                aligned_frame_error_budget,
+            ),
+            AtlasInferenceOccupancyPrescription::PopulationTailInputsRequired => {
+                panic!("test fixture supplies every population tail input")
+            }
+        }
     }
 
     /// Test-only independent SplitMix64 + Box--Muller stream. The production
@@ -2772,6 +2823,10 @@ mod tests {
             analysis.orientation().refusals(),
             [AtlasStatisticalRefusal::PopulationCrossGramMarginUncertified { .. }]
         ));
+        assert!(analysis.sample_prescription().iter().all(|entry| matches!(
+            entry.inference,
+            AtlasInferenceOccupancyPrescription::PopulationTailInputsRequired
+        )));
     }
 
     #[test]
@@ -2830,15 +2885,52 @@ mod tests {
             large.orientation_flip_probability_bound().unwrap()
                 < small.orientation_flip_probability_bound().unwrap()
         );
+        let small_prescription = &small.sample_prescription()[0];
+        let large_prescription = &large.sample_prescription()[0];
+        let small_required = required_inference_prescription(small_prescription);
+        let large_required = required_inference_prescription(large_prescription);
         assert_eq!(
-            small.sample_prescription()[0].required_rows,
-            large.sample_prescription()[0].required_rows
+            small_required.0, large_required.0,
+            "the requested inference occupancy is a property of the target error level"
         );
-        assert!(
-            small.sample_prescription()[0].current_rows
-                < small.sample_prescription()[0].required_rows
+        assert!(small_prescription.current_inference_rows < small_required.0);
+        assert_eq!(small_prescription.current_pilot_rows, 1_000);
+        assert_eq!(
+            small_prescription.pilot,
+            AtlasPilotOccupancyPrescription::ExactCaptureNoSamplingRequirement,
         );
         assert!(large.orientation().certified_value().is_some());
+    }
+
+    #[test]
+    fn pilot_capture_and_inference_occupancy_are_separate_requirements() {
+        let mut estimated_pilot = patch(0, 0.0, 0.0, false, 1_000_000, 0);
+        estimated_pilot.pilot_projection = PilotProjectionProvenance::IndependentPilotEstimate;
+        let analysis = certified_analysis(
+            vec![estimated_pilot, patch(1, 0.2, 0.0, false, 1_000_000, 0)],
+            vec![certified_edge(0, 1, 0, 0.0)],
+            AtlasFamilywiseLevel::new(0.05).unwrap(),
+            None,
+        );
+
+        let estimated = analysis
+            .sample_prescription()
+            .iter()
+            .find(|entry| entry.chart == 0)
+            .unwrap();
+        assert_eq!(estimated.current_pilot_rows, 1_000);
+        assert_eq!(
+            estimated.pilot,
+            AtlasPilotOccupancyPrescription::PopulationCaptureTheoremRequired
+        );
+        assert!(matches!(
+            estimated.inference,
+            AtlasInferenceOccupancyPrescription::Required { .. }
+        ));
+        assert!(matches!(
+            analysis.orientation().refusals(),
+            [AtlasStatisticalRefusal::PilotProjectionUncertified { chart: 0 }]
+        ));
     }
 
     #[test]
@@ -2873,14 +2965,15 @@ mod tests {
             .iter()
             .find(|entry| entry.chart == 0)
             .unwrap();
+        let single_required = required_inference_prescription(single_center);
+        let two_edge_required = required_inference_prescription(two_edge_center);
         assert!(
-            two_edge_center.required_covariance_degrees_of_freedom
-                > single_center.required_covariance_degrees_of_freedom,
+            two_edge_required.1 > single_required.1,
             "the union bound must spend error probability on both non-nested edge projections"
         );
 
         let edge = &single.edges()[0];
-        let frame_budget = single_center.aligned_frame_error_budget;
+        let frame_budget = single_required.3;
         assert_near(
             2.0 * frame_budget + frame_budget * frame_budget,
             edge.population_cross_gram.certified_lower_bound().unwrap(),
@@ -2977,6 +3070,30 @@ mod tests {
             confidence.decision.refusals(),
             [AtlasStatisticalRefusal::GaussBonnetGaussianLinearizationIsPlugin]
         ));
+    }
+
+    #[test]
+    fn gauss_bonnet_degeneracy_is_relative_to_the_covariance_scale() {
+        let variance = 1.0e-30;
+        let input = GaussBonnetInput::certified_independent_gaussian(
+            vec![GaussBonnetNoiseSource::new(0, arr2(&[[variance]])).unwrap()],
+            vec![
+                GaussBonnetContribution::new(
+                    std::f64::consts::TAU,
+                    0.0,
+                    0.0,
+                    vec![GaussBonnetSourceGradient::new(0, array![1.0]).unwrap()],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let confidence = gauss_bonnet_confidence(&input, 0.05).unwrap();
+
+        assert_eq!(confidence.first_order_variance, variance);
+        assert_eq!(confidence.standard_error, Some(variance.sqrt()));
+        assert!(confidence.decision.certified_value().is_some());
+        assert!(confidence.decision.refusals().is_empty());
     }
 
     #[test]
@@ -3484,20 +3601,23 @@ fn orientation_tail_and_prescription(
     patches: &[GaussianPcaPatch],
     edges: &[EdgeWork],
     allocated_alpha: f64,
-) -> (
-    AtlasStatisticalDecision<AtlasOrientability>,
-    Option<f64>,
-    Vec<AtlasPatchSamplePrescription>,
-) {
+) -> Result<
+    (
+        AtlasStatisticalDecision<AtlasOrientability>,
+        Option<f64>,
+        Vec<AtlasPatchSamplePrescription>,
+    ),
+    String,
+> {
     if edges.is_empty() {
-        return (
+        return Ok((
             AtlasStatisticalDecision::Certified {
                 value: AtlasOrientability::Orientable,
                 error_probability_bound: 0.0,
             },
             Some(0.0),
             Vec::new(),
-        );
+        ));
     }
     let mut reasons = Vec::new();
     let incident_charts: BTreeSet<_> = edges
@@ -3505,7 +3625,7 @@ fn orientation_tail_and_prescription(
         .flat_map(|edge| [edge.public.a, edge.public.b])
         .collect();
     let mut bound_inputs_certified = true;
-    for chart in incident_charts {
+    for &chart in &incident_charts {
         let patch = &patches[chart];
         if !patch.pilot_projection.is_certified() {
             bound_inputs_certified = false;
@@ -3575,24 +3695,51 @@ fn orientation_tail_and_prescription(
         }
     }
     flip_probability_bound = flip_probability_bound.min(1.0);
-    let mut prescriptions = Vec::with_capacity(patches.len());
-    for (chart, requirement) in patch_requirements.into_iter().enumerate() {
-        let Some((required_dof, projected_dimension, frame_budget)) = requirement else {
-            continue;
-        };
+    let mut prescriptions = Vec::with_capacity(incident_charts.len());
+    for chart in incident_charts {
         let patch = &patches[chart];
-        let required_rows = patch
-            .centering
-            .rows_for_degrees_of_freedom(required_dof)
-            .unwrap_or(usize::MAX);
+        let pilot = if patch.pilot_projection.is_certified() {
+            AtlasPilotOccupancyPrescription::ExactCaptureNoSamplingRequirement
+        } else {
+            AtlasPilotOccupancyPrescription::PopulationCaptureTheoremRequired
+        };
+        let all_incident_margins_certified = edges
+            .iter()
+            .filter(|edge| edge.public.a == chart || edge.public.b == chart)
+            .all(|edge| {
+                edge.public
+                    .population_cross_gram
+                    .certified_lower_bound()
+                    .is_some()
+            });
+        let inference = if patch.spectrum_provenance.certified_bounds().is_some()
+            && all_incident_margins_certified
+        {
+            let (required_dof, projected_dimension, frame_budget) = patch_requirements[chart]
+                .ok_or_else(|| {
+                    format!(
+                        "atlas patch {chart} has certified incident tail inputs but no occupancy requirement"
+                    )
+                })?;
+            AtlasInferenceOccupancyPrescription::Required {
+                rows: patch
+                    .centering
+                    .rows_for_degrees_of_freedom(required_dof)
+                    .unwrap_or(usize::MAX),
+                covariance_degrees_of_freedom: required_dof,
+                projected_dimension,
+                aligned_frame_error_budget: frame_budget,
+            }
+        } else {
+            AtlasInferenceOccupancyPrescription::PopulationTailInputsRequired
+        };
         prescriptions.push(AtlasPatchSamplePrescription {
             chart,
-            current_rows: patch.row_split.inference_rows.len(),
-            required_rows,
+            current_pilot_rows: patch.row_split.pilot_rows.len(),
+            pilot,
+            current_inference_rows: patch.row_split.inference_rows.len(),
             current_covariance_degrees_of_freedom: patch.covariance_degrees_of_freedom(),
-            required_covariance_degrees_of_freedom: required_dof,
-            projected_dimension,
-            aligned_frame_error_budget: frame_budget,
+            inference,
         });
     }
     if bound_inputs_certified && flip_probability_bound > allocated_alpha {
@@ -3620,11 +3767,11 @@ fn orientation_tail_and_prescription(
     } else {
         AtlasStatisticalDecision::Refused { reasons }
     };
-    (
+    Ok((
         decision,
         bound_inputs_certified.then_some(flip_probability_bound),
         prescriptions,
-    )
+    ))
 }
 
 fn edge_step_matrix(edge: &EdgeWork, forward: bool) -> Option<Array2<f64>> {
@@ -4083,7 +4230,14 @@ fn gauss_bonnet_confidence(
         let covariance_gradient = source_map[source_id].covariance.dot(gradient);
         first_order_variance += gradient.dot(&covariance_gradient);
     }
-    let variance_scale = naive_contribution_variance.abs().max(1.0);
+    // Degeneracy is relative to the propagated quadratic form's own scale.
+    // An absolute `max(1)` floor would incorrectly erase a perfectly
+    // nondegenerate, exactly specified Gaussian law merely because its units
+    // make the variance smaller than machine epsilon.
+    let variance_scale = naive_contribution_variance
+        .abs()
+        .max(first_order_variance.abs())
+        .max(f64::MIN_POSITIVE);
     let variance_backward_error =
         f64::EPSILON * total_gradients.len().max(1) as f64 * variance_scale;
     if first_order_variance < -variance_backward_error {
@@ -4271,7 +4425,7 @@ impl GaussianPcaHolonomyAnalysis {
         let simultaneous_claims = 1 + fundamental.len() + usize::from(gauss_bonnet_input.is_some());
         let allocated_alpha = familywise_level.alpha() / simultaneous_claims as f64;
         let (orientation, orientation_flip_probability_bound, sample_prescription) =
-            orientation_tail_and_prescription(&patches, &edge_work, allocated_alpha);
+            orientation_tail_and_prescription(&patches, &edge_work, allocated_alpha)?;
         let cycles = fundamental
             .iter()
             .enumerate()

@@ -2085,6 +2085,63 @@ impl SaeManifoldTerm {
                         }
                     }
                 }
+                SaeAtomBasisKind::KleinBottle => {
+                    if d != 2 {
+                        return Err(format!(
+                            "dense_step_gauge_vectors: Klein atom {atom_idx} requires latent dimension 2, got {d}"
+                        ));
+                    }
+                    let mut field = Array2::<f64>::zeros((n, d));
+                    field.column_mut(0).fill(1.0);
+                    if let Some(g) = self.dense_step_gauge_vector_from_field(
+                        atom_idx,
+                        field.view(),
+                        &coord_offsets,
+                        &beta_offsets,
+                        total_len,
+                    )? {
+                        out.push(g);
+                    }
+                }
+                SaeAtomBasisKind::ProjectivePlane => {
+                    if d != 2 {
+                        return Err(format!(
+                            "dense_step_gauge_vectors: RP2 atom {atom_idx} requires latent dimension 2, got {d}"
+                        ));
+                    }
+                    let mut fields = [
+                        Array2::<f64>::zeros((n, d)),
+                        Array2::<f64>::zeros((n, d)),
+                        Array2::<f64>::zeros((n, d)),
+                    ];
+                    for row in 0..n {
+                        let directions = projective_plane_cover_killing_directions(
+                            coords[[row, 0]],
+                            coords[[row, 1]],
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "dense_step_gauge_vectors: RP2 atom {atom_idx}, row {row}: {error}"
+                            )
+                        })?;
+                        for generator in 0..3 {
+                            for axis in 0..2 {
+                                fields[generator][[row, axis]] = directions[generator][axis];
+                            }
+                        }
+                    }
+                    for field in fields {
+                        if let Some(g) = self.dense_step_gauge_vector_from_field(
+                            atom_idx,
+                            field.view(),
+                            &coord_offsets,
+                            &beta_offsets,
+                            total_len,
+                        )? {
+                            out.push(g);
+                        }
+                    }
+                }
                 // `Cylinder` (`S¹ × ℝ`) carries exactly one continuous gauge: the
                 // shift (rotation) of the periodic axis 0. The line axis 1 has no
                 // rotational gauge and its translation is pinned by the constant
@@ -2163,7 +2220,7 @@ impl SaeManifoldTerm {
     pub(crate) fn row_gauge_deflation_for_layout(
         &self,
         row_layout: Option<&SaeRowLayout>,
-    ) -> Option<ArrowRowGaugeDeflation> {
+    ) -> Result<Option<ArrowRowGaugeDeflation>, String> {
         let n = self.n_obs();
         let mut rows: Vec<Vec<Array1<f64>>> = Vec::with_capacity(n);
         for row in 0..n {
@@ -2182,7 +2239,7 @@ impl SaeManifoldTerm {
                             atom_idx,
                             start,
                             q_row,
-                        );
+                        )?;
                     }
                 }
                 None => {
@@ -2194,15 +2251,15 @@ impl SaeManifoldTerm {
                             atom_idx,
                             coord_offsets[atom_idx],
                             q_row,
-                        );
+                        )?;
                     }
                 }
             }
         }
         if rows.iter().all(Vec::is_empty) {
-            None
+            Ok(None)
         } else {
-            Some(ArrowRowGaugeDeflation::new(rows))
+            Ok(Some(ArrowRowGaugeDeflation::new(rows)))
         }
     }
 
@@ -2213,7 +2270,7 @@ impl SaeManifoldTerm {
         atom_idx: usize,
         coord_start: usize,
         q_row: usize,
-    ) {
+    ) -> Result<(), String> {
         let d = self.assignment.coords[atom_idx].latent_dim();
         let mut tangent = vec![0.0_f64; self.output_dim()];
         match self.atoms[atom_idx].basis_kind {
@@ -2247,6 +2304,54 @@ impl SaeManifoldTerm {
                     row_dirs.push(phase);
                 }
             }
+            SaeAtomBasisKind::KleinBottle => {
+                if d != 2 {
+                    return Err(format!(
+                        "push_atom_row_gauge_deflations: Klein atom {atom_idx} requires latent dimension 2, got {d}"
+                    ));
+                }
+                self.atoms[atom_idx].fill_decoded_derivative_row(row, 0, &mut tangent);
+                if tangent.iter().map(|&v| v * v).sum::<f64>() > 1.0e-24 {
+                    let mut phase = Array1::<f64>::zeros(q_row);
+                    phase[coord_start] = 1.0;
+                    row_dirs.push(phase);
+                }
+            }
+            SaeAtomBasisKind::ProjectivePlane => {
+                if d != 2 {
+                    return Err(format!(
+                        "push_atom_row_gauge_deflations: RP2 atom {atom_idx} requires latent dimension 2, got {d}"
+                    ));
+                }
+                let coords = self.assignment.coords[atom_idx].as_matrix();
+                let directions = projective_plane_cover_killing_directions(
+                    coords[[row, 0]],
+                    coords[[row, 1]],
+                )
+                .map_err(|error| {
+                    format!(
+                        "push_atom_row_gauge_deflations: RP2 atom {atom_idx}, row {row}: {error}"
+                    )
+                })?;
+                for direction in directions {
+                    let mut decoded_motion = vec![0.0_f64; self.output_dim()];
+                    for axis in 0..2 {
+                        self.atoms[atom_idx]
+                            .fill_decoded_derivative_row(row, axis, &mut tangent);
+                        for output in 0..decoded_motion.len() {
+                            decoded_motion[output] += direction[axis] * tangent[output];
+                        }
+                    }
+                    if decoded_motion.iter().map(|&v| v * v).sum::<f64>() <= 1.0e-24 {
+                        continue;
+                    }
+                    let mut rotation = Array1::<f64>::zeros(q_row);
+                    for axis in 0..2 {
+                        rotation[coord_start + axis] = direction[axis];
+                    }
+                    row_dirs.push(rotation);
+                }
+            }
             // `Cylinder` (`S¹ × ℝ`): only the periodic axis 0 carries a phase
             // (rotation) gauge; the line axis 1 has none (matching the
             // `AtomTopology::Circle` choice). Deflate the axis-0 phase only.
@@ -2262,6 +2367,7 @@ impl SaeManifoldTerm {
             }
             _ => {}
         }
+        Ok(())
     }
 
     pub(crate) fn dense_step_gauge_vector_from_field(

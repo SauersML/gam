@@ -830,7 +830,10 @@ class AtlasNerveDiagram:
     ``audit_sae`` supplies ambient observations, constructs a deterministic
     cross-fit in Rust, and returns ``analyzed_refused`` with structured
     first-order diagnostics until population spectrum/margin and Gaussian-law
-    authorities are supplied. A refusal is never a negative topology result.
+    authorities are supplied. Its sample prescription separates pilot capture
+    authority from inference occupancy: collecting more rows is never presented
+    as a substitute for a missing population theorem. A refusal is never a
+    negative topology result.
     """
 
     computed: bool

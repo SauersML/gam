@@ -84,7 +84,7 @@ use crate::chart_canonicalization::CanonicalChartTopology;
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
 use crate::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
-use crate::manifold::SaeManifoldTerm;
+use crate::manifold::{SaeManifoldTerm, projective_plane_cover_killing_directions};
 use faer::Side;
 use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
@@ -2175,13 +2175,13 @@ fn symmetric_spectral_norm_sq(g: ArrayView2<'_, f64>) -> f64 {
 
 /// Enumerate one atom's exact orbit coordinate-motion fields `δt ∈ ℝ^{n×d}`.
 ///
-/// Supported charts are the ones the group acts on **linearly** (so the
-/// first-order field is exact, not a linearisation): circle/torus axis shifts
-/// (`δt = e_ax`, chart-free) and flat-patch `so(d)` rotations
-/// (`δt_n = A_{ab} t_n`). The sphere's `so(3)` action on an intrinsic chart is
-/// nonlinear, so sphere atoms stay on the frame path (the caller must not
-/// build a view for them). Equal-ARD rotations reuse the rotation field for
-/// the tied axis pairs (the ARD prior is their pinning channel).
+/// Circle/torus/Klein shifts and flat-patch rotations are linear in their
+/// charts. `RP²` uses the exact nonlinear coordinate velocities of the ambient
+/// `SO(3)` action on its spherical cover; those velocities come from the same
+/// authority used by fit-time gauge deflation. The sphere's legacy chart basis
+/// is not closed under ambient rotations, so sphere atoms remain on the frame
+/// path. Equal-ARD rotations reuse the flat-chart rotation field for tied axis
+/// pairs (the ARD prior is their pinning channel).
 fn exact_orbit_fields(
     atom: &FittedAtom,
     view: &AtomParameterView,
@@ -2241,19 +2241,18 @@ fn exact_orbit_fields(
             for row in 0..n {
                 let latitude = view.coords[[row, 0]];
                 let longitude = view.coords[[row, 1]];
-                let cos_latitude = latitude.cos();
-                if cos_latitude.abs() <= f64::EPSILON.sqrt() {
-                    return Err(format!(
-                        "exact_orbit_fields({}): RP2 row {row} lies at a spherical-cover pole where longitude has a nontrivial stabilizer; refusing a singular chart gauge field",
-                        atom.name
-                    ));
+                let directions = projective_plane_cover_killing_directions(
+                    latitude,
+                    longitude,
+                )
+                .map_err(|error| {
+                    format!("exact_orbit_fields({}): RP2 row {row}: {error}", atom.name)
+                })?;
+                for axis in 0..2 {
+                    rotation_x[[row, axis]] = directions[0][axis];
+                    rotation_y[[row, axis]] = directions[1][axis];
+                    rotation_z[[row, axis]] = directions[2][axis];
                 }
-                let tan_latitude = latitude.sin() / cos_latitude;
-                rotation_x[[row, 0]] = longitude.sin();
-                rotation_x[[row, 1]] = -tan_latitude * longitude.cos();
-                rotation_y[[row, 0]] = -longitude.cos();
-                rotation_y[[row, 1]] = -tan_latitude * longitude.sin();
-                rotation_z[[row, 1]] = 1.0;
             }
             for (axis, field) in [
                 ("x", rotation_x),

@@ -92,6 +92,17 @@ def test_audit_sae_surfaces_atlas_nerve_covering_side_next_to_betti():
         "asymptotic_plugin"
     )
     assert atlas_nerve["holonomy_analysis"]["orientation_refusals"]
+    prescriptions = atlas_nerve["holonomy_analysis"]["sample_prescription"]
+    assert len(prescriptions) == 2
+    assert {entry["current_pilot_rows"] for entry in prescriptions} == {32}
+    assert {entry["current_inference_rows"] for entry in prescriptions} == {16}
+    assert {entry["pilot_requirement"] for entry in prescriptions} == {
+        "exact_capture_no_sampling_requirement"
+    }
+    assert {entry["inference_requirement"] for entry in prescriptions} == {
+        "population_tail_inputs_required"
+    }
+    assert all(entry["required_inference_rows"] is None for entry in prescriptions)
     assert atlas_nerve["certified_orientability"] is None
     assert atlas_nerve["topology_promotion"]["certified"] is False
     assert "null_pvalue" in atlas_nerve

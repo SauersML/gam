@@ -1073,8 +1073,10 @@ fn gaussian_holonomy_analysis_dict<'py>(
     analysis: &gam::terms::sae::inference::atlas_holonomy::GaussianPcaHolonomyAnalysis,
 ) -> PyResult<(Bound<'py, PyDict>, Vec<&'static str>, bool)> {
     use gam::terms::sae::inference::atlas_holonomy::{
-        AtlasCycleAsymptoticRegime, CrossPatchCovarianceProvenance, GaussBonnetCovarianceAuthority,
-        GaussianPcaCovarianceAuthority, GaussianPcaSpectrumProvenance, PilotProjectionProvenance,
+        AtlasCycleAsymptoticRegime, AtlasInferenceOccupancyPrescription,
+        AtlasPilotOccupancyPrescription, CrossPatchCovarianceProvenance,
+        GaussBonnetCovarianceAuthority, GaussianPcaCovarianceAuthority,
+        GaussianPcaSpectrumProvenance, PilotProjectionProvenance,
     };
     let out = PyDict::new(py);
     out.set_item("familywise_alpha", analysis.familywise_level().alpha())?;
@@ -1149,21 +1151,50 @@ fn gaussian_holonomy_analysis_dict<'py>(
     for prescription in analysis.sample_prescription() {
         let row = PyDict::new(py);
         row.set_item("chart", prescription.chart)?;
-        row.set_item("current_rows", prescription.current_rows)?;
-        row.set_item("required_rows", prescription.required_rows)?;
+        row.set_item("current_pilot_rows", prescription.current_pilot_rows)?;
+        row.set_item(
+            "pilot_requirement",
+            match prescription.pilot {
+                AtlasPilotOccupancyPrescription::ExactCaptureNoSamplingRequirement => {
+                    "exact_capture_no_sampling_requirement"
+                }
+                AtlasPilotOccupancyPrescription::PopulationCaptureTheoremRequired => {
+                    "population_capture_theorem_required"
+                }
+            },
+        )?;
+        row.set_item(
+            "current_inference_rows",
+            prescription.current_inference_rows,
+        )?;
         row.set_item(
             "current_covariance_degrees_of_freedom",
             prescription.current_covariance_degrees_of_freedom,
         )?;
-        row.set_item(
-            "required_covariance_degrees_of_freedom",
-            prescription.required_covariance_degrees_of_freedom,
-        )?;
-        row.set_item("projected_dimension", prescription.projected_dimension)?;
-        row.set_item(
-            "aligned_frame_error_budget",
-            prescription.aligned_frame_error_budget,
-        )?;
+        match prescription.inference {
+            AtlasInferenceOccupancyPrescription::Required {
+                rows,
+                covariance_degrees_of_freedom,
+                projected_dimension,
+                aligned_frame_error_budget,
+            } => {
+                row.set_item("inference_requirement", "required_occupancy")?;
+                row.set_item("required_inference_rows", rows)?;
+                row.set_item(
+                    "required_covariance_degrees_of_freedom",
+                    covariance_degrees_of_freedom,
+                )?;
+                row.set_item("projected_dimension", projected_dimension)?;
+                row.set_item("aligned_frame_error_budget", aligned_frame_error_budget)?;
+            }
+            AtlasInferenceOccupancyPrescription::PopulationTailInputsRequired => {
+                row.set_item("inference_requirement", "population_tail_inputs_required")?;
+                row.set_item("required_inference_rows", py.None())?;
+                row.set_item("required_covariance_degrees_of_freedom", py.None())?;
+                row.set_item("projected_dimension", py.None())?;
+                row.set_item("aligned_frame_error_budget", py.None())?;
+            }
+        }
         prescriptions.append(row)?;
     }
     out.set_item("sample_prescription", prescriptions)?;
@@ -2649,6 +2680,59 @@ mod sae_spectral_ffi_tests {
                         .extract::<String>()
                         .unwrap(),
                     "plugin_estimate"
+                );
+            }
+            let prescriptions = analysis
+                .get_item("sample_prescription")
+                .unwrap()
+                .unwrap()
+                .cast_into::<pyo3::types::PyList>()
+                .unwrap();
+            assert_eq!(prescriptions.len(), 2);
+            for prescription in prescriptions.iter() {
+                let prescription = prescription.cast_into::<PyDict>().unwrap();
+                assert_eq!(
+                    prescription
+                        .get_item("current_pilot_rows")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                    32
+                );
+                assert_eq!(
+                    prescription
+                        .get_item("pilot_requirement")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "exact_capture_no_sampling_requirement"
+                );
+                assert_eq!(
+                    prescription
+                        .get_item("current_inference_rows")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                    16
+                );
+                assert_eq!(
+                    prescription
+                        .get_item("inference_requirement")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "population_tail_inputs_required"
+                );
+                assert!(
+                    prescription
+                        .get_item("required_inference_rows")
+                        .unwrap()
+                        .unwrap()
+                        .is_none()
                 );
             }
             let orientation_refusals = analysis

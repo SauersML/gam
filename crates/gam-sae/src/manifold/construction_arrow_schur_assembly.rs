@@ -1468,7 +1468,7 @@ impl SaeManifoldTerm {
                 }
             }
             if let Some(deflation) = self
-                .row_gauge_deflation_for_layout(row_layout.as_ref())
+                .row_gauge_deflation_for_layout(row_layout.as_ref())?
                 .or_else(|| {
                     // #974 — see the main-path site: enable spectral discovery of
                     // the rank-deficient-metric-null `H_tt` directions on the
@@ -2219,7 +2219,7 @@ impl SaeManifoldTerm {
             self.reclaim_border_hbb_workspace(&mut sys);
         }
         if let Some(deflation) = self
-            .row_gauge_deflation_for_layout(row_layout.as_ref())
+            .row_gauge_deflation_for_layout(row_layout.as_ref())?
             .or_else(|| {
                 // #974 — enable evidence-mode spectral discovery of the
                 // metric-null / indefinite quotient directions a rank-deficient
