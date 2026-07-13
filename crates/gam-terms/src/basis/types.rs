@@ -1282,6 +1282,18 @@ pub enum BasisMetadata {
         /// available evaluation count `n`. `Some(note)` records the before→after
         /// configuration; `None` means no auto-shrink occurred for this basis.
         auto_shrink_note: Option<String>,
+        /// Raw-basis particular-solution coefficients `β_p` for a *non-zero*
+        /// endpoint anchor (#2297), if any. The term carries a fixed affine
+        /// offset function `B_raw(x) · β_p` in addition to its constrained
+        /// design `B_raw(x) · Z`; the design assembler realizes that offset into
+        /// the model's linear predictor at both fit and predict time. `None`
+        /// for free / clamped / zero-anchor bases (the ordinary pure-linear
+        /// chart). Recomputed deterministically from the frozen `knots`,
+        /// `degree` and boundary conditions on every rebuild, so a saved model
+        /// replays the identical offset; it is serialized here so the assembler
+        /// need not re-derive it from the spec. This metadata is transient
+        /// (rebuilt at predict from the serialized frozen spec), not persisted.
+        anchor_offset_coeffs: Option<Array1<f64>>,
     },
     /// Natural cubic regression spline (`bs="cr"`/`"cs"`) metadata (#1074).
     ///
