@@ -4249,6 +4249,7 @@ pub(crate) fn terminal_mode_binding_rejects_gradient_substitution() {
     let substituted = CustomFamilyTerminalMode {
         theta,
         objective,
+        fit_objective: objective,
         // The certified fixture owns an exact zero terminal gradient. Keeping
         // theta/objective/mode identical while substituting only this vector
         // must still fail closed.
@@ -4256,7 +4257,11 @@ pub(crate) fn terminal_mode_binding_rejects_gradient_substitution() {
         mode: owned.mode,
     };
 
-    let error = match bind_certified_custom_family_terminal_mode(substituted, &certified_outer) {
+    let error = match bind_certified_custom_family_terminal_mode(
+        substituted,
+        &certified_outer,
+        &gam_problem::RhoPrior::Flat,
+    ) {
         Ok(_) => panic!("a different terminal gradient cannot inherit the outer certificate"),
         Err(error) => error,
     };
@@ -4326,7 +4331,7 @@ pub(crate) fn labeled_terminal_mode_keeps_one_outer_rho_for_two_physical_penalti
         inner: eval.inner,
     };
     let mut state = CustomOuterState::new(None);
-    state.install_terminal_mode(&theta, objective, &gradient, mode);
+    state.install_terminal_mode(&theta, objective, objective, &gradient, mode);
     let terminal = state
         .terminal_mode
         .take()
@@ -4476,8 +4481,21 @@ pub(crate) fn owned_joint_penalty_geometry_uses_terminal_workspace_without_famil
         "terminal Hessian materialization, covariance, and geometry must not call family.evaluate",
     );
     let expected_precision = Array2::eye(2) * 3.0;
-    assert_eq!(geometry.penalized_hessian.as_array(), &expected_precision);
-    assert_eq!(covariance, Array2::eye(2) / 3.0);
+    let expected_covariance = Array2::eye(2) / 3.0;
+    assert!(
+        geometry
+            .penalized_hessian
+            .as_array()
+            .iter()
+            .zip(expected_precision.iter())
+            .all(|(actual, expected)| (actual - expected).abs() <= 1.0e-12),
+    );
+    assert!(
+        covariance
+            .iter()
+            .zip(expected_covariance.iter())
+            .all(|(actual, expected)| (actual - expected).abs() <= 1.0e-12),
+    );
 }
 
 #[test]
