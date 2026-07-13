@@ -1311,10 +1311,7 @@ mod tests {
         Gaussian,
         BinomialLogit,
         BinomialProbit,
-        BinomialCLogLog,
         PoissonLog,
-        TweedieLog,
-        NegativeBinomialLog,
         GammaLog,
     }
 
@@ -1334,23 +1331,8 @@ mod tests {
                     response: ResponseFamily::Binomial,
                     link: InverseLink::Standard(StandardLink::Probit),
                 },
-                Self::BinomialCLogLog => LikelihoodSpec {
-                    response: ResponseFamily::Binomial,
-                    link: InverseLink::Standard(StandardLink::CLogLog),
-                },
                 Self::PoissonLog => LikelihoodSpec {
                     response: ResponseFamily::Poisson,
-                    link: InverseLink::Standard(StandardLink::Log),
-                },
-                Self::TweedieLog => LikelihoodSpec {
-                    response: ResponseFamily::Tweedie { p: 1.5 },
-                    link: InverseLink::Standard(StandardLink::Log),
-                },
-                Self::NegativeBinomialLog => LikelihoodSpec {
-                    response: ResponseFamily::NegativeBinomial {
-                        theta: 1.0,
-                        theta_fixed: false,
-                    },
                     link: InverseLink::Standard(StandardLink::Log),
                 },
                 Self::GammaLog => LikelihoodSpec {
@@ -1442,20 +1424,8 @@ mod tests {
             NutsFamily::GammaLog => {
                 LikelihoodScaleMetadata::EstimatedGammaShape { shape: parameter }
             }
-            NutsFamily::TweedieLog => {
-                spec.response = ResponseFamily::Tweedie { p: parameter };
-                LikelihoodScaleMetadata::EstimatedTweediePhi { phi: 1.0 }
-            }
-            NutsFamily::NegativeBinomialLog => {
-                spec.response = ResponseFamily::NegativeBinomial {
-                    theta: parameter,
-                    theta_fixed: false,
-                };
-                LikelihoodScaleMetadata::EstimatedNegBinTheta { theta: parameter }
-            }
             NutsFamily::BinomialLogit
             | NutsFamily::BinomialProbit
-            | NutsFamily::BinomialCLogLog
             | NutsFamily::PoissonLog => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
         };
         GlmLikelihoodSpec { spec, scale }
