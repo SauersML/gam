@@ -21,6 +21,7 @@ struct GraphNode {
     support: u16,
     edge_start: u16,
     edge_len: u16,
+    primary_axis: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +52,7 @@ const MAX_PRIMARY_DIMENSION: usize = 16;
 const MAX_QUADRATIC_ARITY: usize = 32;
 const MAX_GRAPH_NODES: usize = 64;
 const MAX_GRAPH_EDGES: usize = MAX_GRAPH_NODES * MAX_GRAPH_NODES;
+const NO_PRIMARY_AXIS: u8 = u8::MAX;
 const MAX_PROJECTED_CURVATURE_VALUES: usize =
     MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION * (MAX_PRIMARY_DIMENSION + 1) / 2;
 const EMPTY_NODE: GraphNode = GraphNode {
@@ -58,6 +60,7 @@ const EMPTY_NODE: GraphNode = GraphNode {
     support: 0,
     edge_start: 0,
     edge_len: 0,
+    primary_axis: NO_PRIMARY_AXIS,
 };
 const EMPTY_CURVATURE_EVENT: CurvatureEvent = CurvatureEvent::RankOne {
     owner: 0,
@@ -231,6 +234,7 @@ impl Order2GraphWorkspace {
             support,
             edge_start: edge_start as u16,
             edge_len: edge_len as u16,
+            primary_axis: NO_PRIMARY_AXIS,
         };
         tape.gradients[node * K..(node + 1) * K].copy_from_slice(&gradient);
         tape.node_len += 1;
@@ -495,6 +499,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let tape = workspace.tape_mut();
         let edge_start = tape.edge_len;
         let node = Order2GraphWorkspace::push(tape, x, 1_u16 << axis, gradient, edge_start);
+        tape.nodes[node].primary_axis = axis as u8;
         Self { workspace, node }
     }
 
@@ -529,6 +534,26 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 support |= tape.nodes[input.node].support;
             }
         }
+        // A primary node carries an explicit basis identity. Grouping input
+        // positions by that axis makes the common variable-only quadratic
+        // lowering matrix free without paying the general dense J^T A J row
+        // contractions. Repeated and permuted primaries remain exact: a basis
+        // direction contains every input mapped to its axis, and each projected
+        // row is reduced over the corresponding group. Constants and derived
+        // nodes retain the unrestricted Jacobian projection below.
+        let mut primary_input_groups = [0_u32; MAX_PRIMARY_DIMENSION];
+        let all_inputs_primary = {
+            let tape = workspace.tape();
+            inputs.iter().enumerate().all(|(position, input)| {
+                let primary_axis = tape.nodes[input.node].primary_axis;
+                if primary_axis == NO_PRIMARY_AXIS {
+                    false
+                } else {
+                    primary_input_groups[primary_axis as usize] |= 1_u32 << position;
+                    true
+                }
+            })
+        };
         let mut projected_values_storage = MaybeUninit::uninit();
         let projected_values =
             InlineScalars::initialize_zeros(&mut projected_values_storage, input_dimension);
@@ -566,7 +591,15 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         while supported_columns != 0 {
             let other = supported_columns.trailing_zeros() as usize;
             supported_columns &= supported_columns - 1;
-            {
+            if all_inputs_primary {
+                let mut group = primary_input_groups[other];
+                debug_assert_ne!(group, 0);
+                while group != 0 {
+                    let position = group.trailing_zeros() as usize;
+                    group &= group - 1;
+                    direction.as_mut_slice()[position] = 1.0;
+                }
+            } else {
                 let tape = workspace.tape();
                 for (channel, input) in direction.as_mut_slice().iter_mut().zip(inputs) {
                     *channel = tape.gradients[input.node * K + other];
@@ -574,22 +607,45 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             }
             coefficients.multiply(direction.as_slice(), projected_direction.as_mut_slice());
             let mut supported_rows = support & (u16::MAX >> (MAX_PRIMARY_DIMENSION - other - 1));
-            while supported_rows != 0 {
-                let primary = supported_rows.trailing_zeros() as usize;
-                supported_rows &= supported_rows - 1;
-                let curvature = {
-                    let tape = workspace.tape();
-                    inputs
-                        .iter()
-                        .zip(projected_direction.as_slice())
-                        .map(|(input, &projected)| {
-                            tape.gradients[input.node * K + primary] * projected
-                        })
-                        .sum::<f64>()
-                };
-                workspace.tape_mut().projected_curvatures[curvature_start + curvature_offset] =
-                    2.0 * curvature;
-                curvature_offset += 1;
+            {
+                let tape = workspace.tape_mut();
+                while supported_rows != 0 {
+                    let primary = supported_rows.trailing_zeros() as usize;
+                    supported_rows &= supported_rows - 1;
+                    let curvature = if all_inputs_primary {
+                        let mut group = primary_input_groups[primary];
+                        debug_assert_ne!(group, 0);
+                        if group.is_power_of_two() {
+                            projected_direction.as_slice()[group.trailing_zeros() as usize]
+                        } else {
+                            let mut grouped_projection = 0.0;
+                            while group != 0 {
+                                let position = group.trailing_zeros() as usize;
+                                group &= group - 1;
+                                grouped_projection += projected_direction.as_slice()[position];
+                            }
+                            grouped_projection
+                        }
+                    } else {
+                        inputs
+                            .iter()
+                            .zip(projected_direction.as_slice())
+                            .map(|(input, &projected)| {
+                                tape.gradients[input.node * K + primary] * projected
+                            })
+                            .sum::<f64>()
+                    };
+                    tape.projected_curvatures[curvature_start + curvature_offset] = 2.0 * curvature;
+                    curvature_offset += 1;
+                }
+            }
+            if all_inputs_primary {
+                let mut group = primary_input_groups[other];
+                while group != 0 {
+                    let position = group.trailing_zeros() as usize;
+                    group &= group - 1;
+                    direction.as_mut_slice()[position] = 0.0;
+                }
             }
         }
         assert_eq!(
@@ -604,8 +660,13 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         for axis in 0..input_dimension {
             let first = 2.0 * projected_values.as_slice()[axis];
             Order2GraphWorkspace::push_edge(tape, inputs[axis].node, first);
-            for primary in 0..K {
-                gradient[primary] += first * tape.gradients[inputs[axis].node * K + primary];
+            if all_inputs_primary {
+                let primary = tape.nodes[inputs[axis].node].primary_axis as usize;
+                gradient[primary] += first;
+            } else {
+                for primary in 0..K {
+                    gradient[primary] += first * tape.gradients[inputs[axis].node * K + primary];
+                }
             }
         }
         Order2GraphWorkspace::push_event(
@@ -1156,6 +1217,11 @@ mod tests {
         let x = Order2Graph::<2>::variable(0.4, 0, 2, &workspace);
         let y = Order2Graph::<2>::variable(-0.7, 1, 2, &workspace);
         let xy = x.product(&y);
+        assert_eq!(
+            workspace.tape().nodes[xy.node].primary_axis,
+            NO_PRIMARY_AXIS,
+            "derived quadratic inputs must select the unrestricted Jacobian projection",
+        );
         let coefficients = MatrixFreeDense3 {
             matrix: [[1.2, -0.3, 0.25], [-0.3, 0.8, 0.17], [0.25, 0.17, 1.4]],
             workspace: &workspace,
@@ -1186,6 +1252,43 @@ mod tests {
         for row in 0..2 {
             for column in 0..2 {
                 close(graph.h()[row][column], eager.h_at(row, column));
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_graph_primary_quadratic_groups_repeated_permuted_sparse_axes() {
+        let mut workspace = Order2GraphWorkspace::new();
+        workspace.reset(4);
+        let x = Order2Graph::<4>::variable(0.4, 0, 4, &workspace);
+        let z = Order2Graph::<4>::variable(1.1, 2, 4, &workspace);
+        let coefficients = MatrixFreeDense3 {
+            matrix: [[1.2, -0.3, 0.25], [-0.3, 0.8, 0.17], [0.25, 0.17, 1.4]],
+            workspace: &workspace,
+        };
+        let graph =
+            Order2Graph::<4>::symmetric_quadratic_form(&[z, x, z], &coefficients, 4, &workspace)
+                .into_order2();
+
+        let arena = DynamicJetArena::new();
+        let eager_x = DynamicOrder2::variable(0.4, 0, 4, &arena);
+        let eager_z = DynamicOrder2::variable(1.1, 2, 4, &arena);
+        let eager = DynamicOrder2::symmetric_quadratic_form(
+            &[eager_z, eager_x, eager_z],
+            &coefficients,
+            4,
+            &arena,
+        );
+
+        let close = |actual: f64, expected: f64| {
+            let tolerance = 2.0e-13 * actual.abs().max(expected.abs()).max(1.0);
+            assert!((actual - expected).abs() <= tolerance);
+        };
+        close(graph.value(), eager.v);
+        for primary in 0..4 {
+            close(graph.g()[primary], eager.g()[primary]);
+            for other in 0..4 {
+                close(graph.h()[primary][other], eager.h_at(primary, other));
             }
         }
     }
