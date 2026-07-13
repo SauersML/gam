@@ -207,6 +207,7 @@ fn run() -> Result<(), String> {
     let rho_dim = initial_rho_flat.len();
     let search_initial_rho = objective
         .try_resume_from_checkpoint(rho_dim)
+        .map_err(|err| format!("full color checkpoint resume failed: {err}"))?
         .map(Array1::from)
         .unwrap_or(initial_rho_flat);
     let problem = OuterProblem::new(rho_dim)

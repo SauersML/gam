@@ -2,8 +2,8 @@ use faer::{Mat, Side};
 use gam::linalg::faer_ndarray::factorize_symmetricwith_fallback;
 use gam::linalg::low_rank_weight::LowRankWeight;
 use gam::linalg::matrix::{
-    ConditionedDesign, DenseDesignMatrix, DesignMatrix, LinearOperator, PsdWeightsView,
-    SignedWeightsView, xt_diag_x_psd, xt_diag_x_signed, xt_diag_x_symmetric,
+    ConditionedDesign, DenseDesignMatrix, DesignMatrix, FiniteSignedWeightsView, LinearOperator,
+    PsdWeightsView, xt_diag_x_psd, xt_diag_x_signed, xt_diag_x_symmetric,
 };
 use ndarray::{Array2, array};
 
@@ -44,9 +44,13 @@ fn xt_diag_x_signed_and_psd_paths_are_consistent_with_weight_semantics() {
     let w_signed = array![1.0, -0.5, 2.0];
     let w_psd = array![1.0, 0.5, 2.0];
 
-    let signed = xt_diag_x_signed(&design, SignedWeightsView::from_array(&w_signed))
-        .expect("xt_diag_x_signed should accept negative weights")
-        .to_dense();
+    let signed = xt_diag_x_signed(
+        &design,
+        FiniteSignedWeightsView::try_from_array(&w_signed)
+            .expect("signed test weights must be finite"),
+    )
+    .expect("xt_diag_x_signed should accept negative weights")
+    .to_dense();
     let signed_ref = x
         .t()
         .dot(&Array2::from_shape_fn((x.nrows(), x.ncols()), |(i, j)| {
@@ -58,9 +62,13 @@ fn xt_diag_x_signed_and_psd_paths_are_consistent_with_weight_semantics() {
     )
     .expect("xt_diag_x_psd should accept nonnegative weights")
     .to_dense();
-    let psd_via_signed = xt_diag_x_signed(&design, SignedWeightsView::from_array(&w_psd))
-        .expect("xt_diag_x_signed should match psd path when all weights are nonnegative")
-        .to_dense();
+    let psd_via_signed = xt_diag_x_signed(
+        &design,
+        FiniteSignedWeightsView::try_from_array(&w_psd)
+            .expect("nonnegative test weights must also be finite"),
+    )
+    .expect("xt_diag_x_signed should match psd path when all weights are nonnegative")
+    .to_dense();
 
     let signed_err = (&signed - &signed_ref)
         .iter()

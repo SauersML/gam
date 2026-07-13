@@ -84,7 +84,10 @@ fn gamma_observation_interval_covers_each_tail_not_just_the_total() {
         panic!("expected a Standard Gamma fit");
     };
 
-    let phi_hat = fit.fit.dispersion_phi();
+    let phi_hat = fit
+        .fit
+        .dispersion_phi()
+        .expect("Gamma fit must retain a valid scalar response dispersion");
     eprintln!(
         "[gamma-obs] dispersion φ̂ = {phi_hat:.4} (shape ≈ {:.3}; true shape {TRUE_SHAPE})",
         1.0 / phi_hat

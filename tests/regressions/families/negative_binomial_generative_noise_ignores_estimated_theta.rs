@@ -105,7 +105,8 @@ fn negative_binomial_generative_noise_uses_estimated_theta_not_seed() {
         fit.fit.standard_deviation,
         &seed_spec,
     )
-    .expect("NB generative dispersion must resolve");
+    .expect("NB generative dispersion resolution must succeed")
+    .expect("NB generative noise requires the fitted theta parameter");
     assert!(
         (picked - theta_hat).abs() <= 1e-9 * theta_hat.max(1.0),
         "unified picker returned {picked} (seed theta=1?), expected theta_hat={theta_hat} (#1124)"

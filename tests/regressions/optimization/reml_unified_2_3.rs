@@ -552,8 +552,10 @@ fn bug_hybrid_efs_blend_one_not_equal_plain_efs() {
         for grad_arr in &gradients {
             let gradient = grad_arr.to_vec();
 
-            let plain = compute_efs_update(&sol, &rho, &gradient);
-            let hybrid = compute_hybrid_efs_update(&sol, &rho, &gradient);
+            let plain = compute_efs_update(&sol, &rho, &gradient)
+                .expect("plain EFS update must be defined for a valid rho-only problem");
+            let hybrid = compute_hybrid_efs_update(&sol, &rho, &gradient)
+                .expect("hybrid EFS update must be defined for a valid rho-only problem");
 
             assert!(
                 hybrid.psi_indices.is_empty(),

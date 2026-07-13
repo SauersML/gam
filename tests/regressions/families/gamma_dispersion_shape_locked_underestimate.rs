@@ -155,7 +155,10 @@ fn gamma_dispersion_is_conditional_noise_not_mean_spread() {
         panic!("expected a standard GAM fit for Gamma(log)");
     };
 
-    let phi_hat = fit.fit.dispersion_phi();
+    let phi_hat = fit
+        .fit
+        .dispersion_phi()
+        .expect("Gamma fit must retain a valid scalar response dispersion");
     let shape_hat = 1.0 / phi_hat;
 
     // Pearson φ from the model's own fitted means (sanity cross-check: the
@@ -195,7 +198,9 @@ fn fit_gamma_dispersion(x: &[f64], y: &[f64]) -> f64 {
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for Gamma(log)");
     };
-    fit.fit.dispersion_phi()
+    fit.fit
+        .dispersion_phi()
+        .expect("Gamma fit must retain a valid scalar response dispersion")
 }
 
 /// Root-cause regression from the *invariance* angle (#678): for a Gamma

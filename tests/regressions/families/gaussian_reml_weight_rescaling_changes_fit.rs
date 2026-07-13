@@ -196,8 +196,12 @@ fn gaussian_reml_fit_is_invariant_to_global_weight_rescaling() {
     //    c, so φ̂ = RSS/(n−edf) → c·φ̂. That leaves `Var(yᵢ) = φ̂/wᵢ = c·φ̂/(c·wᵢ)`
     //    — and therefore the SEs and every fitted/predicted quantity —
     //    invariant. This is the dual of the λ̂ → c·λ̂ scaling above. ────────────
-    let phi1 = fit1.dispersion_phi();
-    let phic = fitc.dispersion_phi();
+    let phi1 = fit1
+        .dispersion_phi()
+        .expect("unit-weight Gaussian fit must retain profiled dispersion");
+    let phic = fitc
+        .dispersion_phi()
+        .expect("rescaled-weight Gaussian fit must retain profiled dispersion");
     let phi_ratio = phic / phi1; // expected: c
     let phi_ratio_rel = (phi_ratio - c).abs() / c;
     assert!(

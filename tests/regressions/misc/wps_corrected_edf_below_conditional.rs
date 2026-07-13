@@ -86,29 +86,47 @@ fn wps_corrected_edf_is_not_below_conditional_edf() {
     let fit = &std_fit.fit;
 
     // Sanity: this fit actually carries the inputs the WPS correction needs, so
-    // the assertion below exercises the real correction (not the silent
-    // fall-back-to-conditional branch).
+    // the assertion below exercises the certified correction.
     assert!(
         fit.penalized_hessian().is_some()
             && fit.coefficient_influence().is_some()
+            && fit.weighted_gram().is_some()
             && fit.smoothing_correction().is_some(),
-        "fit is missing the H / F / smoothing-correction inputs; the WPS \
-         correction would silently fall back to the conditional EDF and this \
-         test would not exercise the bug"
+        "fit is missing the H / F / X'WX / smoothing-correction inputs required \
+         for the WPS regression"
     );
 
     let n = ys.len();
+    let y = Array1::from(ys);
+    let eta_hat = Array1::from(
+        fit.artifacts
+            .pirls
+            .as_ref()
+            .expect("Gaussian WPS fixture retains converged PIRLS geometry")
+            .final_eta
+            .to_vec(),
+    );
     let cmp = model_comparison_from_unified(
         fit,
-        Array1::from(ys).view(),
-        Array1::zeros(n).view(), // eta_hat: unused by the corrected-EDF channel
-        Array1::ones(n).view(),  // prior weights
-        None,                    // no ALO ⇒ corrected-EDF/AIC channel only
-    );
+        y.view(),
+        eta_hat.view(),
+        Array1::ones(n).view(), // prior weights
+        None,                   // no ALO ⇒ corrected-EDF/AIC channel only
+    )
+    .expect("construct WPS comparison from a finite converged Gaussian fit");
 
     let conditional = cmp.edf.conditional;
-    let corrected = cmp.edf.corrected;
-    let rho_df = cmp.edf.rho_uncertainty_df();
+    let corrected = cmp
+        .edf
+        .corrected
+        .expect("WPS fixture must retain certified corrected EDF");
+    let rho_df = cmp
+        .edf
+        .rho_uncertainty_df()
+        .expect("WPS fixture must retain its smoothing-uncertainty EDF");
+    let aic_corrected = cmp
+        .aic_corrected
+        .expect("WPS fixture must retain certified corrected AIC");
 
     // Allow only genuine eigensolver round-off (relative to the conditional EDF).
     let tol = 1e-6 * conditional.abs().max(1.0);
@@ -124,5 +142,11 @@ fn wps_corrected_edf_is_not_below_conditional_edf() {
          and coefficient_influence (F) do not satisfy H·F = X'WX, so \
          wps_correction_term's reconstruction is not the PSD weighted Gram it \
          assumes."
+    );
+    assert!(
+        aic_corrected >= cmp.aic_conditional - tol,
+        "corrected AIC {aic_corrected:.4} must not under-penalize relative to \
+         conditional AIC {:.4}",
+        cmp.aic_conditional
     );
 }

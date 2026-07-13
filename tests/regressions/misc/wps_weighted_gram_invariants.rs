@@ -221,29 +221,49 @@ fn rho_uncertainty_df_nonnegative_across_regimes() {
             let fit = &std_fit.fit;
 
             let n = ys.len();
+            let y = Array1::from(ys);
+            let eta_hat = Array1::from(
+                fit.artifacts
+                    .pirls
+                    .as_ref()
+                    .expect("Gaussian WPS fixture retains converged PIRLS geometry")
+                    .final_eta
+                    .to_vec(),
+            );
             let cmp = model_comparison_from_unified(
                 fit,
-                Array1::from(ys).view(),
-                Array1::zeros(n).view(),
+                y.view(),
+                eta_hat.view(),
                 Array1::ones(n).view(),
                 None,
-            );
-            let rho_df = cmp.edf.rho_uncertainty_df();
+            )
+            .expect("construct WPS comparison from a finite converged Gaussian fit");
+            let corrected = cmp
+                .edf
+                .corrected
+                .expect("WPS fixture must retain certified corrected EDF");
+            let rho_df = cmp
+                .edf
+                .rho_uncertainty_df()
+                .expect("WPS fixture must retain its smoothing-uncertainty EDF");
+            let aic_corrected = cmp
+                .aic_corrected
+                .expect("WPS fixture must retain certified corrected AIC");
             let tol = 1e-6 * cmp.edf.conditional.abs().max(1.0);
             assert!(
                 rho_df >= -tol,
                 "ρ-uncertainty df must be ≥ 0 (corrected EDF ≥ conditional) in every \
                  smoothness regime; got {rho_df:.6e} at wiggle={wiggle}, seed={seed} \
-                 (conditional={:.4}, corrected={:.4}).",
+                (conditional={:.4}, corrected={:.4}).",
                 cmp.edf.conditional,
-                cmp.edf.corrected
+                corrected
             );
             // The corrected AIC must not under-penalize relative to conditional.
             assert!(
-                cmp.aic_corrected >= cmp.aic_conditional - tol,
+                aic_corrected >= cmp.aic_conditional - tol,
                 "corrected AIC {:.4} must be ≥ conditional AIC {:.4} \
                  (wiggle={wiggle}, seed={seed})",
-                cmp.aic_corrected,
+                aic_corrected,
                 cmp.aic_conditional
             );
         }
