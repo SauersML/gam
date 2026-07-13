@@ -68,7 +68,7 @@ resolver = "3"
 # 0.5.14 is published to crates.io (`cargo login` + `cargo publish -p opt`
 # from /Users/user/opt); the `version` key keeps this publish-compatible —
 # cargo strips the git ref and keeps the version requirement on publish.
-opt = { version = "=0.5.14", git = "https://github.com/SauersML/opt.git", rev = "939df41df82df5f1b23a4e8b7fb75a5364d011cf" }
+opt = { version = "=0.5.14", git = "https://github.com/SauersML/opt.git", rev = "f65b90e0d054313f35d7259a660dfeb4fb09f75b" }
 cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12000"] }
 
 [lints.rust]
