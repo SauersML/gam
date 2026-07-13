@@ -398,6 +398,29 @@ pub(crate) fn infer_covariance_mode(mode: CovarianceModeArg) -> InferenceCovaria
     }
 }
 
+/// Provenance suffix for CLI predict output (#2296): `--covariance-mode
+/// corrected` now hard-errors rather than silently downgrading to `Vb` when
+/// the fit lacks the smoothing-corrected covariance (see
+/// `InferenceCovarianceMode::SmoothingCorrected` / `select_uncertainty_backend`
+/// in `gam-predict`), so any prediction that reaches this point and actually
+/// consulted a coefficient covariance used exactly the requested source.
+/// Surface that source in the CLI's "wrote predictions" line so the user does
+/// not have to trust an unlabeled band — mirrors the `covariance_source`
+/// field the Python FFI already attaches to its prediction payload
+/// (`geometry_ffi::predict_dataset_impl`). Empty when the prediction never
+/// consulted a covariance definition (no interval, no curved-link posterior
+/// mean).
+pub(crate) fn covariance_provenance_note(args: &PredictArgs, covariance_consulted: bool) -> String {
+    if covariance_consulted {
+        format!(
+            " [covariance={}]",
+            infer_covariance_mode(args.covariance_mode).as_str()
+        )
+    } else {
+        String::new()
+    }
+}
+
 pub(crate) fn response_interval_from_mean_sd(
     mean: ArrayView1<'_, f64>,
     response_sd: ArrayView1<'_, f64>,
