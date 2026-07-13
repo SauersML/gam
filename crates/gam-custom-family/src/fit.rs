@@ -1793,27 +1793,69 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     )
 }
 
-pub fn fit_custom_family_fixed_log_lambdas<F: CustomFamily + Clone + Send + Sync + 'static>(
+enum FixedLogLambdaProvenance<'a> {
+    UserFixed,
+    CertifiedOuter {
+        selected_theta: &'a Array1<f64>,
+        outer: &'a gam_solve::rho_optimizer::CertifiedOuterResult,
+    },
+}
+
+fn fit_custom_family_fixed_log_lambdas_with_provenance<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
     family: &F,
     raw_specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     warm_start: Option<&CustomFamilyWarmStart>,
-    outer_iterations: usize,
-    outer_gradient_norm: Option<f64>,
-    outer_converged: bool,
+    provenance: FixedLogLambdaProvenance<'_>,
 ) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
-    if !outer_converged {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas",
-            reason: "the enclosing outer optimization did not certify convergence; refusing \
-                     to run inference or assemble a fixed-lambda fit from its checkpoint"
-                .to_string(),
-        });
-    }
+    let (outer_iterations, outer_gradient_norm, criterion_certificate, certified_theta) =
+        match provenance {
+            FixedLogLambdaProvenance::UserFixed => (0, None, None, None),
+            FixedLogLambdaProvenance::CertifiedOuter {
+                selected_theta,
+                outer,
+            } => {
+                if selected_theta.len() != outer.rho().len()
+                    || selected_theta
+                        .iter()
+                        .zip(outer.rho().iter())
+                        .any(|(selected, certified)| {
+                            selected.to_bits() != certified.to_bits()
+                        })
+                {
+                    return Err(CustomFamilyError::InvalidInput {
+                        context: "fit_custom_family_fixed_log_lambdas outer identity",
+                        reason: "the supplied full hyperparameter vector does not bitwise match the certified outer optimum"
+                            .to_string(),
+                    });
+                }
+                (
+                    outer.iterations(),
+                    outer.final_grad_norm(),
+                    Some(outer.criterion_certificate().clone()),
+                    Some(outer.rho()),
+                )
+            }
+        };
     let canonical = gam_identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
     let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
     let penalty_counts = validate_blockspecs(specs)?;
     let rho = flatten_log_lambdas(specs);
+    if let Some(certified_theta) = certified_theta
+        && (certified_theta.len() < rho.len()
+            || certified_theta
+                .iter()
+                .zip(rho.iter())
+                .any(|(certified, selected)| certified.to_bits() != selected.to_bits()))
+    {
+        return Err(CustomFamilyError::InvalidInput {
+            context: "fit_custom_family_fixed_log_lambdas smoothing identity",
+            reason: "the fixed smoothing coordinates do not bitwise match the certified outer optimum prefix"
+                .to_string(),
+        });
+    }
     let per_block = split_log_lambdas(&rho, &penalty_counts)?;
     let reduced_warm_start = fixed_lambda_warm_start_for_reduced_specs(warm_start, &canonical);
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, reduced_warm_start)
@@ -1891,9 +1933,50 @@ pub fn fit_custom_family_fixed_log_lambdas<F: CustomFamily + Clone + Send + Sync
             penalized_objective,
             outer_iterations,
             outer_gradient_norm,
-            criterion_certificate: None,
+            criterion_certificate,
             outer_converged: true,
             joint_log_lambdas: None,
+        },
+    )
+}
+
+/// Fit coefficients at user-fixed smoothing strengths. No outer coordinate is
+/// optimized, so a converged inner mode is the complete fit provenance.
+pub fn fit_custom_family_fixed_log_lambdas<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    raw_specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    warm_start: Option<&CustomFamilyWarmStart>,
+) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
+    fit_custom_family_fixed_log_lambdas_with_provenance(
+        family,
+        raw_specs,
+        options,
+        warm_start,
+        FixedLogLambdaProvenance::UserFixed,
+    )
+}
+
+/// Fit coefficients at the exact smoothing prefix of a certified joint outer
+/// optimum. The full theta identity is checked before the fit can be minted.
+pub fn fit_custom_family_fixed_log_lambdas_from_outer<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    raw_specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    warm_start: Option<&CustomFamilyWarmStart>,
+    selected_theta: &Array1<f64>,
+    outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
+) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
+    fit_custom_family_fixed_log_lambdas_with_provenance(
+        family,
+        raw_specs,
+        options,
+        warm_start,
+        FixedLogLambdaProvenance::CertifiedOuter {
+            selected_theta,
+            outer,
         },
     )
 }
