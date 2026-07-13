@@ -3983,6 +3983,42 @@ mod tests {
         );
     }
 
+    /// Normwise roundoff certificate for a deck-covariant spectral derivative.
+    ///
+    /// The quotient stores Laplace eigenvalues without the common torus chart
+    /// factor `(2*pi)^2`.  A retained mode with eigenvalue `lambda` therefore
+    /// has per-coordinate angular frequency at most `2*pi*sqrt(lambda)`, and an
+    /// order-`r` derivative has absolute envelope at most that frequency to the
+    /// `r`th power.  This envelope is the relevant scale when the exact result
+    /// vanishes: evaluating the deck twin forms a phase shifted by an integer
+    /// multiple of pi, whose libm argument-reduction error is then amplified by
+    /// the derivative frequency even though the rounded output itself is near
+    /// zero.  Spherical quotient frequencies are smaller, so the same bound is
+    /// conservative for the projective-plane cover.
+    fn assert_spectral_deck_close(
+        actual: f64,
+        expected: f64,
+        laplace_eigenvalue: f64,
+        derivative_order: i32,
+        label: &str,
+    ) {
+        let angular_frequency = std::f64::consts::TAU * laplace_eigenvalue.sqrt();
+        let derivative_envelope = if derivative_order == 0 {
+            1.0
+        } else {
+            angular_frequency.powi(derivative_order)
+        };
+        // 64 rounded-operation units cover the deck-coordinate map, phase
+        // construction/reduction, tensor products, and sign application.  The
+        // analytic envelope—not the observed near-zero result—sets the scale.
+        let tolerance =
+            64.0 * f64::EPSILON * (1.0 + derivative_envelope + actual.abs().max(expected.abs()));
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{label}: actual={actual:.17e}, expected={expected:.17e}, spectral envelope={derivative_envelope:.6e}, tolerance={tolerance:.3e}"
+        );
+    }
+
     /// If `q(twin(t)) = q(t)`, jets in cover coordinates obey the chain rule
     /// `J(twin)D = J(t)`, `D' H(twin)D = H(t)`, and the analogous order-3
     /// identity.  Checking all four orders pins both invariance and the exact
@@ -4001,32 +4037,40 @@ mod tests {
         let twin_third = evaluator.third_jet(twins.view()).unwrap();
         for row in 0..coords.nrows() {
             for column in 0..evaluator.basis_size() {
-                assert_machine_close(
+                assert_spectral_deck_close(
                     twin_phi[[row, column]],
                     phi[[row, column]],
+                    evaluator.laplace_eigenvalues()[column],
+                    0,
                     "deck-invariant quotient value",
                 );
                 for axis_a in 0..2 {
-                    assert_machine_close(
+                    assert_spectral_deck_close(
                         twin_jet[[row, column, axis_a]] * deck_jacobian_diagonal[axis_a],
                         jet[[row, column, axis_a]],
+                        evaluator.laplace_eigenvalues()[column],
+                        1,
                         "deck-covariant quotient first jet",
                     );
                     for axis_b in 0..2 {
-                        assert_machine_close(
+                        assert_spectral_deck_close(
                             twin_hessian[[row, column, axis_a, axis_b]]
                                 * deck_jacobian_diagonal[axis_a]
                                 * deck_jacobian_diagonal[axis_b],
                             hessian[[row, column, axis_a, axis_b]],
+                            evaluator.laplace_eigenvalues()[column],
+                            2,
                             "deck-covariant quotient second jet",
                         );
                         for axis_c in 0..2 {
-                            assert_machine_close(
+                            assert_spectral_deck_close(
                                 twin_third[[row, column, axis_a, axis_b, axis_c]]
                                     * deck_jacobian_diagonal[axis_a]
                                     * deck_jacobian_diagonal[axis_b]
                                     * deck_jacobian_diagonal[axis_c],
                                 third[[row, column, axis_a, axis_b, axis_c]],
+                                evaluator.laplace_eigenvalues()[column],
+                                3,
                                 "deck-covariant quotient third jet",
                             );
                         }

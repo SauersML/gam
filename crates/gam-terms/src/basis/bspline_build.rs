@@ -2942,6 +2942,179 @@ mod function_space_null_shrinkage_tests {
             .fold(0.0_f64, f64::max)
     }
 
+    fn max_abs(matrix: &Array2<f64>) -> f64 {
+        matrix
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn assert_matrix_close(
+        label: &str,
+        analytic: &Array2<f64>,
+        finite_difference: &Array2<f64>,
+        relative_tolerance: f64,
+        absolute_tolerance: f64,
+    ) {
+        let error = max_abs_difference(analytic, finite_difference);
+        let scale = max_abs(analytic).max(max_abs(finite_difference));
+        let bound = absolute_tolerance + relative_tolerance * scale;
+        assert!(
+            error <= bound,
+            "{label}: max error {error:.3e} exceeds {bound:.3e} (analytic scale {:.3e}, FD scale {:.3e})",
+            max_abs(analytic),
+            max_abs(finite_difference),
+        );
+    }
+
+    fn affine_chart_gram(
+        base: &Array2<f64>,
+        tangent_a: &Array2<f64>,
+        tangent_b: &Array2<f64>,
+        coordinate_a: f64,
+        coordinate_b: f64,
+    ) -> Array2<f64> {
+        let chart = base
+            + &tangent_a.mapv(|value| coordinate_a * value)
+            + &tangent_b.mapv(|value| coordinate_b * value);
+        symmetrize_penalty(&fast_ata(&chart))
+    }
+
+    #[test]
+    fn function_space_subspace_shrinkage_derivatives_match_independent_central_differences() {
+        // G(a,b) is induced by an explicitly moving, full-rank function chart
+        // B(a,b) = B0 + a Ba + b Bb.  The structural frame is deliberately
+        // non-coordinate and non-orthogonal, so every product/inverse-rule term
+        // contributes.  Finite differences below rebuild the VALUE projector;
+        // they do not reuse the derivative implementation under test.
+        let base = array![
+            [1.0, 0.2, -0.3],
+            [0.1, 1.1, 0.4],
+            [-0.5, 0.3, 1.2],
+            [0.7, -0.8, 0.2],
+            [-0.2, 0.6, -0.9],
+        ];
+        let tangent_a = array![
+            [0.2, -0.4, 0.1],
+            [-0.3, 0.2, 0.5],
+            [0.4, 0.1, -0.2],
+            [0.1, 0.3, 0.4],
+            [-0.5, 0.2, 0.3],
+        ];
+        let tangent_b = array![
+            [-0.1, 0.3, 0.2],
+            [0.5, -0.2, 0.1],
+            [0.2, 0.4, -0.3],
+            [-0.4, 0.1, 0.5],
+            [0.3, -0.5, 0.2],
+        ];
+        let frame = array![[1.0, 0.25], [-0.4, 1.1], [0.7, -0.3]];
+
+        let gram = affine_chart_gram(&base, &tangent_a, &tangent_b, 0.0, 0.0);
+        let gram_a =
+            symmetrize_penalty(&(fast_atb(&tangent_a, &base) + fast_atb(&base, &tangent_a)));
+        let gram_b =
+            symmetrize_penalty(&(fast_atb(&tangent_b, &base) + fast_atb(&base, &tangent_b)));
+        let gram_ab = symmetrize_penalty(
+            &(fast_atb(&tangent_a, &tangent_b) + fast_atb(&tangent_b, &tangent_a)),
+        );
+        let gram_aa = symmetrize_penalty(&fast_atb(&tangent_a, &tangent_a).mapv(|v| 2.0 * v));
+
+        let analytic = function_space_subspace_shrinkage_derivatives(
+            &frame, &gram, &gram_a, &gram_b, &gram_ab,
+        )
+        .expect("analytic mixed moving-metric projector jet");
+        let value = function_space_subspace_shrinkage(&frame, &gram)
+            .expect("value moving-metric projector");
+        assert_matrix_close("value", &analytic.value, &value, 5.0e-13, 5.0e-14);
+
+        let first_step = 1.0e-5;
+        let value_a_plus = function_space_subspace_shrinkage(
+            &frame,
+            &affine_chart_gram(&base, &tangent_a, &tangent_b, first_step, 0.0),
+        )
+        .expect("value at +a");
+        let value_a_minus = function_space_subspace_shrinkage(
+            &frame,
+            &affine_chart_gram(&base, &tangent_a, &tangent_b, -first_step, 0.0),
+        )
+        .expect("value at -a");
+        let value_b_plus = function_space_subspace_shrinkage(
+            &frame,
+            &affine_chart_gram(&base, &tangent_a, &tangent_b, 0.0, first_step),
+        )
+        .expect("value at +b");
+        let value_b_minus = function_space_subspace_shrinkage(
+            &frame,
+            &affine_chart_gram(&base, &tangent_a, &tangent_b, 0.0, -first_step),
+        )
+        .expect("value at -b");
+        let fd_a = (&value_a_plus - &value_a_minus) / (2.0 * first_step);
+        let fd_b = (&value_b_plus - &value_b_minus) / (2.0 * first_step);
+        assert_matrix_close("first a", &analytic.first_a, &fd_a, 2.0e-7, 2.0e-10);
+        assert_matrix_close("first b", &analytic.first_b, &fd_b, 2.0e-7, 2.0e-10);
+
+        let second_step = 2.0e-4;
+        let value_aa_plus = function_space_subspace_shrinkage(
+            &frame,
+            &affine_chart_gram(&base, &tangent_a, &tangent_b, second_step, 0.0),
+        )
+        .expect("value at second-order +a");
+        let value_aa_minus = function_space_subspace_shrinkage(
+            &frame,
+            &affine_chart_gram(&base, &tangent_a, &tangent_b, -second_step, 0.0),
+        )
+        .expect("value at second-order -a");
+        let fd_aa =
+            (&value_aa_plus - &(&value * 2.0) + &value_aa_minus) / (second_step * second_step);
+        let analytic_aa = function_space_subspace_shrinkage_derivatives(
+            &frame, &gram, &gram_a, &gram_a, &gram_aa,
+        )
+        .expect("analytic diagonal moving-metric projector jet")
+        .mixed;
+        assert_matrix_close("second diagonal a", &analytic_aa, &fd_aa, 2.0e-5, 2.0e-7);
+
+        let value_pp = function_space_subspace_shrinkage(
+            &frame,
+            &affine_chart_gram(&base, &tangent_a, &tangent_b, second_step, second_step),
+        )
+        .expect("value at +a,+b");
+        let value_pm = function_space_subspace_shrinkage(
+            &frame,
+            &affine_chart_gram(&base, &tangent_a, &tangent_b, second_step, -second_step),
+        )
+        .expect("value at +a,-b");
+        let value_mp = function_space_subspace_shrinkage(
+            &frame,
+            &affine_chart_gram(&base, &tangent_a, &tangent_b, -second_step, second_step),
+        )
+        .expect("value at -a,+b");
+        let value_mm = function_space_subspace_shrinkage(
+            &frame,
+            &affine_chart_gram(&base, &tangent_a, &tangent_b, -second_step, -second_step),
+        )
+        .expect("value at -a,-b");
+        let fd_ab =
+            (&value_pp - &value_pm - &value_mp + &value_mm) / (4.0 * second_step * second_step);
+        assert_matrix_close("mixed a,b", &analytic.mixed, &fd_ab, 2.0e-5, 2.0e-7);
+
+        // These guards make the fixture discriminating: hard-coded zero first,
+        // diagonal-second, or mixed derivatives cannot satisfy the FD oracle.
+        for (label, derivative, finite_difference) in [
+            ("first a", &analytic.first_a, &fd_a),
+            ("first b", &analytic.first_b, &fd_b),
+            ("second diagonal a", &analytic_aa, &fd_aa),
+            ("mixed a,b", &analytic.mixed, &fd_ab),
+        ] {
+            assert!(
+                max_abs(derivative) > 1.0e-4 && max_abs(finite_difference) > 1.0e-4,
+                "{label} fixture must have a resolved nonzero signal; analytic={:.3e}, FD={:.3e}",
+                max_abs(derivative),
+                max_abs(finite_difference),
+            );
+        }
+    }
+
     #[test]
     fn degree_one_hat_basis_has_exact_analytic_gram() {
         let knots = array![0.0, 0.0, 1.0, 1.0];

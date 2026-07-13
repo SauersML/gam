@@ -43,6 +43,7 @@ mod matern_2d_iso_kappa_outer_gradient_fd;
 mod matern_all_nu_sweep_diagnose;
 mod matern_aniso_eta_design_derivative_centering_fd;
 mod matern_aniso_penalty_second_derivative_centering_fd;
+mod matern_aniso_structural_ridge_derivative_fd;
 mod matern_extreme_length_scale;
 mod matern_formula_integration;
 mod matern_gate_frame_log_kappa_design_derivative_fd;
