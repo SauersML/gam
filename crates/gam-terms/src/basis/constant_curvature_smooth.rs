@@ -66,10 +66,10 @@ use serde::{Deserialize, Serialize};
 use gam_geometry::constant_curvature::{ConstantCurvature, distance_kappa_jet};
 
 use super::{
-    BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeBundle,
+    ActivePenalty, BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeBundle,
     BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy, PenaltyCandidate,
-    ActivePenalty, PenaltySource, filter_penalty_candidates, normalize_penalty,
-    select_centers_by_strategy, weighted_coefficient_sum_to_zero_transform,
+    PenaltySource, filter_penalty_candidates, normalize_penalty, select_centers_by_strategy,
+    weighted_coefficient_sum_to_zero_transform,
 };
 
 /// Realized-design identifiability policy for the constant-curvature smooth.

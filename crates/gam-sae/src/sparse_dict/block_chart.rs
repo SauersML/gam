@@ -1453,7 +1453,8 @@ mod tests {
         // relative — a few ×√ε, no summation reordering here makes it bit-exact.
         // Assert a principled RELATIVE tolerance well above the roundoff floor
         // (1e-6) yet far below any physically meaningful scale-dependence.
-        let scale_invariant = |a: f64, b: f64| (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0);
+        let scale_invariant =
+            |a: f64, b: f64| (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0);
         assert!(
             scale_invariant(base.margin, big.margin),
             "margin must be scale-invariant: {} vs {}",

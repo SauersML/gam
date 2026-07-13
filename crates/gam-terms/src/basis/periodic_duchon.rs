@@ -908,10 +908,7 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     } else {
         (base_design, penalty)
     };
-    let candidates = vec![normalize_penalty_candidate(
-        primary,
-        PenaltySource::Primary,
-    )];
+    let candidates = vec![normalize_penalty_candidate(primary, PenaltySource::Primary)];
     let filtered = filter_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -1128,10 +1125,7 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
     } else {
         (base_design, penalty)
     };
-    let candidates = vec![normalize_penalty_candidate(
-        primary,
-        PenaltySource::Primary,
-    )];
+    let candidates = vec![normalize_penalty_candidate(primary, PenaltySource::Primary)];
     let filtered = filter_penalty_candidates(candidates)?;
     Ok(BasisBuildResult {
         design,
@@ -1557,10 +1551,7 @@ pub(crate) fn duchon_native_penalty_candidates(
         None
     };
     let mut out = Vec::new();
-    out.push(normalize_penalty_candidate(
-        primary,
-        PenaltySource::Primary,
-    ));
+    out.push(normalize_penalty_candidate(primary, PenaltySource::Primary));
     if let Some(shrink) = shrink {
         out.push(normalize_penalty_candidate(
             shrink,

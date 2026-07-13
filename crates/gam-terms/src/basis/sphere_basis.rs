@@ -3206,12 +3206,10 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         // Reuse the value build already constructed at the top of this function
         // (its metadata seeded the realized geometry) — `base.active_penalties` is the
         // active-block mask sized to the realized (reduced) basis.
-        let has_shrinkage = base.active_penalties.iter().any(|penalty| {
-            matches!(
-                penalty.info.source,
-                PenaltySource::DoublePenaltyNullspace
-            )
-        });
+        let has_shrinkage = base
+            .active_penalties
+            .iter()
+            .any(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace));
         // The value path emits each block after Frobenius normalization. Keep
         // the raw center kernel and its exact axis derivatives for both the
         // primary RKHS block and the moving function-metric intercept ridge.
@@ -3334,10 +3332,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                 // structural intercept frame is fixed; only the compact center
                 // Gram moves with the two anisotropy axes.
                 let shrinkage_cross = if active_penalties.iter().any(|penalty| {
-                    matches!(
-                        penalty.info.source,
-                        PenaltySource::DoublePenaltyNullspace
-                    )
+                    matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace)
                 }) {
                     let jet = matern_center_function_metric_jet(
                         &kernel_block_owned,

@@ -6644,8 +6644,8 @@ mod tests {
 
         assert!(built.active_penalties.len() >= 2 * n_levels);
         for (idx, penalty) in built.active_penalties.iter().enumerate() {
-            let analysis = crate::basis::analyze_penalty_block(&penalty.matrix)
-                .expect("PSD penalty");
+            let analysis =
+                crate::basis::analyze_penalty_block(&penalty.matrix).expect("PSD penalty");
             assert_eq!(penalty.info.original_index, idx);
             assert_eq!(penalty.info.effective_rank, analysis.rank, "penalty {idx}");
             assert_eq!(penalty.nullity, analysis.nullity, "penalty {idx}");
@@ -6810,8 +6810,8 @@ mod tests {
             .expect("build level-gated factor-by smooth");
 
             for (idx, penalty) in built.active_penalties.iter().enumerate() {
-                let analysis = crate::basis::analyze_penalty_block(&penalty.matrix)
-                    .expect("PSD block");
+                let analysis =
+                    crate::basis::analyze_penalty_block(&penalty.matrix).expect("PSD block");
                 assert_eq!(analysis.rank + penalty.nullity, built.dim, "penalty {idx}");
                 assert_eq!(analysis.nullity, penalty.nullity, "penalty {idx}");
                 assert_eq!(penalty.info.effective_rank, analysis.rank);
