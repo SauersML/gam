@@ -5935,7 +5935,12 @@ fn serialize_competing_risks_prediction_payload(
         eta_lower,
         eta_upper,
     ) = if let Some(level) = interval_level {
-        let z = gam::inference::probability::standard_normal_quantile(0.5 + 0.5 * level);
+        let z = gam::inference::probability::standard_normal_quantile(0.5 + 0.5 * level)
+            .map_err(|error| {
+                format!(
+                    "competing-risks prediction interval cannot construct the normal quantile for level {level}: {error}"
+                )
+            })?;
         if !z.is_finite() || z <= 0.0 {
             return Err(format!(
                 "competing-risks prediction interval produced invalid normal quantile for level {level}: {z}"
