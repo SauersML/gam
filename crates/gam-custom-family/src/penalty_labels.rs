@@ -13,6 +13,20 @@ use super::*;
 use ndarray::Array1;
 use std::collections::BTreeMap;
 
+/// Stable physical-penalty label used by every custom-family layout producer.
+/// Explicit labels are preserved; unlabeled slots receive a collision-visible
+/// name derived from their authoritative flattened block position.
+pub(crate) fn resolved_physical_penalty_label(
+    penalty: &PenaltyMatrix,
+    block_idx: usize,
+    penalty_idx: usize,
+) -> String {
+    penalty
+        .precision_label()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("__block_{block_idx}_penalty_{penalty_idx}"))
+}
+
 pub(crate) fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
     let total = specs
         .iter()
@@ -95,10 +109,11 @@ pub(crate) fn penalty_label_layout_with_joint(
                 fixed_log_lambdas.push(Some(fixed));
                 continue;
             }
-            let label = spec.penalties[penalty_idx]
-                .precision_label()
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("__block_{block_idx}_penalty_{penalty_idx}"));
+            let label = resolved_physical_penalty_label(
+                &spec.penalties[penalty_idx],
+                block_idx,
+                penalty_idx,
+            );
             let rho0 = spec.initial_log_lambdas[penalty_idx];
             gam_problem::validate_log_strength(rho0).map_err(|error| {
                 CustomFamilyError::ConstraintViolation {

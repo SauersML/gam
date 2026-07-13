@@ -3,11 +3,10 @@
 //! one tied Gamma-precision rho coordinate per group, with hierarchical
 //! parent/child concatenation.
 //!
-//! Pure relocation from `custom_family.rs` (issue #780 decomposition): the
-//! block-index selector resolution, the per-coordinate rho-prior validation +
-//! penalized-complexity validator, the base-prior expansion, and the main
-//! `realize_coefficient_groups_for_custom_family`. No behavior change — bodies
-//! are byte-identical; the public realizer is re-exported by the parent.
+//! The realizer emits each physical penalty together with its nullity, initial
+//! precision, label, and optimizer-coordinate prior, then materializes every
+//! public side vector from that single ordered sequence. The public realizer is
+//! re-exported by the parent module.
 
 use super::{
     CoefficientBlockSelector, CoefficientGroupSpec, CustomFamilyError, ParameterBlockSpec,
@@ -26,7 +25,9 @@ struct RealizedPenaltyEmission {
     nullspace_dim: Option<usize>,
     initial_log_lambda: f64,
     label: String,
-    prior: gam_problem::RhoPrior,
+    /// Prior for this penalty's optimizer coordinate. Fixed penalties have no
+    /// optimizer coordinate; tied physical pieces carry the same prior.
+    prior: Option<gam_problem::RhoPrior>,
 }
 
 pub(crate) fn coefficient_group_block_index(
@@ -118,14 +119,14 @@ pub(crate) fn validate_penalized_complexity_prior(
 
 pub(crate) fn expand_custom_group_base_prior(
     base_prior: &gam_problem::RhoPrior,
-    base_count: usize,
+    base_outer_count: usize,
     context: &str,
 ) -> Result<Vec<gam_problem::RhoPrior>, String> {
     match base_prior {
         gam_problem::RhoPrior::Independent(priors) => {
-            if priors.len() != base_count {
+            if priors.len() != base_outer_count {
                 return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                    "{context} base Independent rho prior length mismatch: got {}, expected {base_count}",
+                    "{context} base Independent rho prior length mismatch: got {}, expected {base_outer_count}",
                     priors.len()
                 ) }.into());
             }
@@ -136,7 +137,7 @@ pub(crate) fn expand_custom_group_base_prior(
         }
         prior => {
             validate_group_rho_prior_coordinate(prior, context)?;
-            Ok((0..base_count).map(|_| prior.clone()).collect())
+            Ok((0..base_outer_count).map(|_| prior.clone()).collect())
         }
     }
 }
@@ -148,7 +149,7 @@ pub fn realize_coefficient_groups_for_custom_family(
 ) -> Result<RealizedCoefficientGroupSpecs, String> {
     use gam_terms::structure::coefficient_group_resolver::{ResolvedGroup, ResolvedGroupHierarchy};
 
-    validate_blockspecs(specs)?;
+    let base_penalty_counts = validate_blockspecs(specs)?;
     // Carrier-specific validation. The prior and the custom-only
     // `initial_log_precision` field are validated here because they have no
     // analogue on the standard-term carrier; label, duplicate, empty-set, and
@@ -210,10 +211,18 @@ pub fn realize_coefficient_groups_for_custom_family(
         })
         .collect::<Vec<_>>();
 
-    let base_count = specs.iter().map(|spec| spec.penalties.len()).sum::<usize>();
-    let base_priors =
-        expand_custom_group_base_prior(&base_prior, base_count, "coefficient groups")?;
-    let mut base_prior_idx = 0usize;
+    // Resolve the pre-group optimizer topology once with the same authoritative
+    // layout builder used by the fit. `Independent` priors are indexed by
+    // optimizer coordinates, not physical matrices: tied pieces share a prior
+    // and fixed pieces consume no prior coordinate.
+    let base_layout = penalty_label_layout_with_joint(specs, base_penalty_counts, Vec::new())?;
+    let base_priors = expand_custom_group_base_prior(
+        &base_prior,
+        base_layout.initial_rho.len(),
+        "coefficient groups",
+    )?;
+    let mut physical_idx = 0usize;
+    let mut base_labels = BTreeSet::<String>::new();
     let mut infer_nullity_by_block = Vec::with_capacity(specs.len());
     let mut emissions_by_block = Vec::<Vec<RealizedPenaltyEmission>>::with_capacity(specs.len());
     for (block_idx, spec) in specs.iter().enumerate() {
@@ -233,22 +242,37 @@ pub fn realize_coefficient_groups_for_custom_family(
         let mut emissions = Vec::with_capacity(spec.penalties.len());
         for penalty_idx in 0..spec.penalties.len() {
             let penalty = spec.penalties[penalty_idx].clone();
-            let label = penalty
-                .precision_label()
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("__block_{block_idx}_penalty_{penalty_idx}"));
+            let label = resolved_physical_penalty_label(&penalty, block_idx, penalty_idx);
+            base_labels.insert(label.clone());
+            let prior = base_layout.physical_to_outer[physical_idx]
+                .map(|outer_idx| base_priors[outer_idx].clone());
             emissions.push(RealizedPenaltyEmission {
                 penalty,
                 nullspace_dim: (!infer_nullity).then(|| spec.nullspace_dims[penalty_idx]),
                 initial_log_lambda: spec.initial_log_lambdas[penalty_idx],
                 label,
-                prior: base_priors[base_prior_idx].clone(),
+                prior,
             });
-            base_prior_idx += 1;
+            physical_idx += 1;
         }
         emissions_by_block.push(emissions);
     }
-    assert_eq!(base_prior_idx, base_count);
+    assert_eq!(physical_idx, base_layout.physical_count());
+
+    // Group labels classify penalty pieces as independent Gaussian factors in
+    // assembly, so silently reusing a base label would change the meaning of an
+    // unrelated base penalty. Labels therefore have one unambiguous owner.
+    for group in &realized_groups {
+        if base_labels.contains(&group.label) {
+            return Err(CustomFamilyError::ConstraintViolation {
+                reason: format!(
+                    "coefficient group label '{}' collides with an existing base penalty label",
+                    group.label
+                ),
+            }
+            .into());
+        }
+    }
 
     for group in &realized_groups {
         let group_prior = match group.prior.as_ref() {
@@ -310,7 +334,7 @@ pub fn realize_coefficient_groups_for_custom_family(
                         .then_some(p.saturating_sub(columns.len())),
                     initial_log_lambda: group.initial_log_precision,
                     label: group.label.clone(),
-                    prior: group_prior.clone(),
+                    prior: Some(group_prior.clone()),
                 });
             }
         }
@@ -357,8 +381,12 @@ pub fn realize_coefficient_groups_for_custom_family(
             if emission.penalty.fixed_log_lambda().is_some() {
                 continue;
             }
+            let prior = emission
+                .prior
+                .as_ref()
+                .expect("every optimized penalty emission owns a rho prior");
             if let Some(&outer_idx) = outer_by_label.get(&emission.label) {
-                if priors[outer_idx] != emission.prior {
+                if priors[outer_idx] != *prior {
                     return Err(CustomFamilyError::ConstraintViolation {
                         reason: format!(
                             "precision label '{}' carries inconsistent rho priors across physical penalty pieces",
@@ -382,7 +410,7 @@ pub fn realize_coefficient_groups_for_custom_family(
             let outer_idx = outer_labels.len();
             outer_by_label.insert(emission.label.clone(), outer_idx);
             outer_labels.push(emission.label.clone());
-            priors.push(emission.prior.clone());
+            priors.push(prior.clone());
             outer_initial_log_lambdas.push(emission.initial_log_lambda);
         }
     }
@@ -508,5 +536,121 @@ mod tests {
                 .expect("realized specs must reproduce the exported outer layout");
         assert_eq!(layout.initial_rho.as_slice(), Some(&[-1.0, 7.0, -2.0][..]));
         assert_eq!(layout.physical_to_outer, vec![Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn tied_and_fixed_base_penalties_use_optimizer_coordinate_priors_2315() {
+        let mut early = one_penalty_block("early", -1.0, vec![0]);
+        early.penalties = vec![
+            PenaltyMatrix::Dense(Array2::<f64>::eye(2)).with_precision_label("tied_base"),
+            PenaltyMatrix::Dense(Array2::<f64>::eye(2)).with_precision_label("tied_base"),
+            PenaltyMatrix::Dense(Array2::<f64>::eye(2)).with_fixed_log_lambda(4.0),
+        ];
+        early.nullspace_dims = vec![0, 0, 0];
+        early.initial_log_lambdas = Array1::from_vec(vec![-1.0, -1.0, 3.0]);
+        let late = one_penalty_block("late", -2.0, vec![0]);
+
+        let mut group =
+            CoefficientGroupSpec::new("group", vec![crate::coefficient_label("early", 0)])
+                .with_prior(CoefficientGroupPrior::NormalLogPrecision {
+                    mean: 30.0,
+                    sd: 3.0,
+                });
+        group.initial_log_precision = Some(7.0);
+        let base_prior = gam_problem::RhoPrior::Independent(vec![
+            gam_problem::RhoPrior::Normal {
+                mean: 10.0,
+                sd: 1.0,
+            },
+            gam_problem::RhoPrior::Normal {
+                mean: 20.0,
+                sd: 2.0,
+            },
+        ]);
+
+        let realized =
+            realize_coefficient_groups_for_custom_family(&[early, late], &[group], base_prior)
+                .expect("base priors must follow pre-group optimizer coordinates");
+
+        assert_eq!(
+            realized.penalty_labels,
+            vec![
+                "tied_base".to_string(),
+                "tied_base".to_string(),
+                "__block_0_penalty_2".to_string(),
+                "group".to_string(),
+                "__block_1_penalty_0".to_string(),
+            ]
+        );
+        assert_eq!(
+            realized.outer_labels,
+            vec![
+                "tied_base".to_string(),
+                "group".to_string(),
+                "__block_1_penalty_0".to_string(),
+            ]
+        );
+        let gam_problem::RhoPrior::Independent(priors) = &realized.rho_prior else {
+            panic!("realized coefficient-group prior must be coordinate-wise")
+        };
+        assert_eq!(
+            priors,
+            &vec![
+                gam_problem::RhoPrior::Normal {
+                    mean: 10.0,
+                    sd: 1.0,
+                },
+                gam_problem::RhoPrior::Normal {
+                    mean: 30.0,
+                    sd: 3.0,
+                },
+                gam_problem::RhoPrior::Normal {
+                    mean: 20.0,
+                    sd: 2.0,
+                },
+            ]
+        );
+
+        let layout =
+            crate::penalty_label_layout_with_joint(&realized.specs, vec![4, 1], Vec::new())
+                .expect("realized specs must preserve tied and fixed base topology");
+        assert_eq!(layout.initial_rho.as_slice(), Some(&[-1.0, 7.0, -2.0][..]));
+        assert_eq!(
+            layout.physical_to_outer,
+            vec![Some(0), Some(0), None, Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn coefficient_group_labels_cannot_reclassify_base_penalties_2315() {
+        let cases = vec![
+            (
+                PenaltyMatrix::Dense(Array2::<f64>::eye(2)).with_precision_label("declared_base"),
+                "declared_base",
+            ),
+            (
+                PenaltyMatrix::Dense(Array2::<f64>::eye(2)),
+                "__block_0_penalty_0",
+            ),
+        ];
+
+        for (penalty, colliding_label) in cases {
+            let mut spec = one_penalty_block("base", -1.0, vec![0]);
+            spec.penalties[0] = penalty;
+            let group = CoefficientGroupSpec::new(
+                colliding_label,
+                vec![crate::coefficient_label("base", 0)],
+            );
+            let error = realize_coefficient_groups_for_custom_family(
+                &[spec],
+                &[group],
+                gam_problem::RhoPrior::Flat,
+            )
+            .expect_err("group and base penalty labels must have distinct owners");
+            assert!(
+                error.contains("collides with an existing base penalty label"),
+                "unexpected collision error: {error}"
+            );
+        }
     }
 }
