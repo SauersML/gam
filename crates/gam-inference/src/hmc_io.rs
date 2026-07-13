@@ -1418,7 +1418,7 @@ mod tests {
     }
 
     fn nuts_test_likelihood(family: NutsFamily, parameter: f64) -> GlmLikelihoodSpec {
-        let mut spec = family.likelihood_spec();
+        let spec = family.likelihood_spec();
         let scale = match family {
             NutsFamily::Gaussian => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             NutsFamily::GammaLog => {
