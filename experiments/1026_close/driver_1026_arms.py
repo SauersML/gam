@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""#1026 close-bar arms — manifold/hybrid SAE vs traditional TopK at 32K on creditscope.
+"""#2283 Eq-4 arms — faithful manifold hybrid vs TopK at 32K on creditscope.
 
 The #1026 close bar (owner comment): "close if manifold SAE beats traditional SAE
 at 32K dictionary size" on the creditscope Qwen3.5-35B-A3B activation set, held-out
@@ -108,7 +108,7 @@ def _execution_provenance() -> dict:
         payload["torch"] = None
         payload["cuda"] = None
         return payload
-    payload["torch"] = torch.__version__
+    payload["torch"] = str(torch.__version__)
     payload["cuda"] = {
         "runtime": torch.version.cuda,
         "available": bool(torch.cuda.is_available()),
@@ -488,6 +488,10 @@ def main() -> int:
             ap.error(f"--arm {args.arm} requires a positive --sparse-minibatch")
         if args.sparse_score_mode != "required":
             ap.error(f"--arm {args.arm} requires --sparse-score-mode required")
+    if args.arm in {"external_topk", "hybrid_rust"} and not args.bits:
+        ap.error(f"--arm {args.arm} requires --bits for the #2283 paired measurement")
+    if args.bits_max_rows <= 0:
+        ap.error("--bits-max-rows must be positive")
 
     X, sampled_row_ids, data_manifest = load_chunk_dir(
         args.chunk_dir, args.max_rows, args.seed
@@ -497,7 +501,7 @@ def main() -> int:
     )
     mean_tr = x_tr.mean(0)
     n, p = X.shape
-    print(f"[#1026] arm={args.arm} N={n} p={p} train={x_tr.shape[0]} test={x_te.shape[0]} "
+    print(f"[#2283] arm={args.arm} N={n} p={p} train={x_tr.shape[0]} test={x_te.shape[0]} "
           f"K={args.K} top_k={args.top_k}", flush=True)
 
     t0 = time.perf_counter()
@@ -581,6 +585,7 @@ def main() -> int:
             "K": args.K,
             "top_k": args.top_k,
             "bits_max_rows": args.bits_max_rows if args.bits else None,
+            "bits_rows": extra.get("bits_rows"),
         },
     }
     rec = {"issue": 2283, "arm": args.arm, "run_id": args.run_id, "N": n, "p": p,
@@ -598,7 +603,7 @@ def main() -> int:
            "pair_identity_sha256": _payload_sha256(pair_identity),
            "execution_provenance": _execution_provenance(),
            **extra}
-    print("[#1026] RESULT " + json.dumps(rec), flush=True)
+    print("[#2283] RESULT " + json.dumps(rec), flush=True)
     with open(args.out, "a") as f:
         f.write(json.dumps(rec) + "\n")
     return 0

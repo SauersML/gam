@@ -99,3 +99,33 @@ def test_sparse_fit_is_fail_closed_and_reports_every_route(monkeypatch):
         "held_out": {"device_minibatches": 1, "cpu_minibatches": 0},
     }
     assert collect["sparse_convergence"] == dataclasses.asdict(Convergence())
+
+
+def test_row_identity_hashes_follow_the_exact_split():
+    driver = _load_driver()
+    values = np.arange(24, dtype=np.float32).reshape(12, 2)
+    row_ids = np.arange(100, 112, dtype=np.int64)
+
+    train, test, train_ids, test_ids = driver.make_split(values, row_ids, 0.25, 7)
+
+    lookup = {tuple(row): int(row_id) for row, row_id in zip(values, row_ids, strict=True)}
+    assert [lookup[tuple(row)] for row in train] == train_ids.tolist()
+    assert [lookup[tuple(row)] for row in test] == test_ids.tolist()
+    assert driver._array_sha256(train_ids) != driver._array_sha256(test_ids)
+    assert driver._array_sha256(train_ids) == driver._array_sha256(train_ids.copy())
+
+
+def test_measurement_identity_rejects_abbreviated_or_noncanonical_digests():
+    driver = _load_driver()
+    good_git = "a" * 40
+    good_wheel = "b" * 64
+    driver._validate_measurement_identity("issue2283-seed0", good_git, good_wheel)
+
+    for run_id, git_sha, wheel_sha in (
+        ("", good_git, good_wheel),
+        ("run", "a" * 12, good_wheel),
+        ("run", good_git.upper(), good_wheel),
+        ("run", good_git, "b" * 63),
+    ):
+        with np.testing.assert_raises(ValueError):
+            driver._validate_measurement_identity(run_id, git_sha, wheel_sha)
