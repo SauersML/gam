@@ -5517,8 +5517,7 @@ impl BernoulliMarginalSlopeFamily {
         row_dirs: &[Array1<f64>],
         gram: &[f64],
     ) -> Result<Vec<f64>, String> {
-        let primary = &cache.primary;
-        let r = primary.total;
+        let r = cache.primary.total;
         if row_dirs.is_empty() {
             return Ok(Vec::new());
         }
@@ -5535,7 +5534,6 @@ impl BernoulliMarginalSlopeFamily {
                 dir.len()
             ));
         }
-
         if row_dirs.len() > 1 {
             let trace_gradient = self.row_primary_third_trace_gradient_with_moments(
                 row,
@@ -5544,329 +5542,20 @@ impl BernoulliMarginalSlopeFamily {
                 row_ctx,
                 gram,
             )?;
-            let traces = row_dirs
+            return Ok(row_dirs
                 .iter()
-                .map(|dir| trace_gradient.dot(dir))
-                .collect::<Vec<_>>();
-            return Ok(traces);
+                .map(|direction| trace_gradient.dot(direction))
+                .collect());
         }
 
-        if !self.effective_flex_active(block_states)? {
-            let t = self.rigid_third_full_cached(block_states, cache, row)?;
-            let mut traces = vec![0.0; row_dirs.len()];
-            for (dir_idx, dir) in row_dirs.iter().enumerate() {
-                let m = contract_third_full(t, dir[0], dir[1]);
-                traces[dir_idx] = m[0][0] * gram[0]
-                    + m[0][1] * gram[1]
-                    + m[1][0] * gram[r]
-                    + m[1][1] * gram[r + 1];
-            }
-            return Ok(traces);
-        }
-        if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err(
-                "non-finite flexible row context in batched third-order trace contraction"
-                    .to_string(),
-            );
-        }
-        let point = self.primary_point_from_block_states(row, block_states, primary)?;
-        let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
-        let beta_h = beta_h_owned.as_ref();
-        let beta_w = beta_w_owned.as_ref();
-        let a = row_ctx.intercept;
-
-        if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
-            let mut traces = vec![0.0; row_dirs.len()];
-            for (dir_idx, dir) in row_dirs.iter().enumerate() {
-                let third = self.empirical_flex_row_third_contracted(
-                    row, primary, q, b, beta_h, beta_w, row_ctx, dir, &grid,
-                )?;
-                traces[dir_idx] = Self::row_primary_trace_contract(&third, gram);
-            }
-            return Ok(traces);
-        }
-
-        let marginal = self.marginal_link_map(q)?;
-        let h_range = primary.h.as_ref();
-        let w_range = primary.w.as_ref();
-        let score_runtime = self.score_warp.as_ref();
-        let link_runtime = self.link_dev.as_ref();
-        let scale = self.probit_frailty_scale();
-        let zero_family = vec![[0.0; 4]; r];
-        let n_dirs = row_dirs.len();
-
-        let mut f_a = 0.0;
-        let mut f_aa = 0.0;
-        let mut f_u = Array1::<f64>::zeros(r);
-        let mut f_au = Array1::<f64>::zeros(r);
-        let mut f_uv = Array2::<f64>::zeros((r, r));
-        let mut f_a_dir = vec![0.0; n_dirs];
-        let mut f_aa_dir = vec![0.0; n_dirs];
-        let mut f_au_dir = vec![0.0; n_dirs * r];
-        let mut f_uv_dir = vec![0.0; n_dirs * r * r];
-
-        let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
-            self.row_cell_moments_for_third_degree15(cache, row)?
-        {
-            cached
-        } else {
-            let partitions = self.denested_partition_cells(a, b, beta_h, beta_w)?;
-            owned_cells = partitions
-                .into_iter()
-                .map(|partition_cell| {
-                    exact_kernel::evaluate_cell_derivative_moments_uncached(partition_cell.cell, 15)
-                        .map(|state| CachedDenestedCellMoments {
-                            partition_cell,
-                            state,
-                        })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            &owned_cells
-        };
-
-        Self::accumulate_primary_third_cell_moments(
-            cells,
-            a,
-            b,
-            scale,
-            r,
-            h_range,
-            w_range,
-            score_runtime,
-            link_runtime,
-            &zero_family,
-            row_dirs,
-            "score-warp batched third-trace direction",
-            "link-wiggle batched third-trace direction",
-            &mut f_a,
-            &mut f_aa,
-            &mut f_u,
-            &mut f_au,
-            &mut f_uv,
-            &mut f_a_dir,
-            &mut f_aa_dir,
-            &mut f_au_dir,
-            &mut f_uv_dir,
+        let third = self.row_primary_third_contracted_with_moments(
+            row,
+            block_states,
+            cache,
+            row_ctx,
+            &row_dirs[0],
         )?;
-
-        f_u[0] = -marginal.mu1;
-        f_uv[[0, 0]] = -marginal.mu2;
-
-        let inv_f_a = 1.0 / f_a;
-        let mut a_u = Array1::<f64>::zeros(r);
-        for u in 0..r {
-            a_u[u] = -f_u[u] * inv_f_a;
-        }
-        let mut a_uv = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let val =
-                    -(f_uv[[u, v]] + f_au[u] * a_u[v] + f_au[v] * a_u[u] + f_aa * a_u[u] * a_u[v])
-                        * inv_f_a;
-                a_uv[[u, v]] = val;
-                a_uv[[v, u]] = val;
-            }
-        }
-
-        let z_obs = self.z[row];
-        let u_obs = a + b * z_obs;
-        let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
-        let eta_val = eval_coeff4_at(&obs.coeff, z_obs);
-
-        let mut g_u_fixed = vec![[0.0; 4]; r];
-        let mut g_au_fixed = vec![[0.0; 4]; r];
-        let mut g_bu_fixed = vec![[0.0; 4]; r];
-        let mut g_aau_fixed = vec![[0.0; 4]; r];
-        let mut g_abu_fixed = vec![[0.0; 4]; r];
-        let mut g_bbu_fixed = vec![[0.0; 4]; r];
-
-        g_u_fixed[1] = obs.dc_db;
-        g_au_fixed[1] = obs.dc_dab;
-        g_bu_fixed[1] = obs.dc_dbb;
-        g_aau_fixed[1] = obs.dc_daab;
-        g_abu_fixed[1] = obs.dc_dabb;
-        g_bbu_fixed[1] = obs.dc_dbbb;
-
-        if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
-            Self::for_each_deviation_basis_cubic_at(
-                runtime,
-                h_range,
-                z_obs,
-                "score-warp batched third-trace observed",
-                |_, idx, basis_span| {
-                    fill_score_basis_cell_coeff_jet(
-                        idx,
-                        basis_span,
-                        b,
-                        scale,
-                        &mut g_u_fixed,
-                        &mut g_bu_fixed,
-                    );
-                    Ok(())
-                },
-            )?;
-        }
-
-        if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
-            Self::for_each_deviation_basis_cubic_at(
-                runtime,
-                w_range,
-                u_obs,
-                "link-wiggle batched third-trace observed",
-                |_, idx, basis_span| {
-                    fill_link_basis_cell_coeff_jet(
-                        idx,
-                        basis_span,
-                        a,
-                        b,
-                        scale,
-                        &mut g_u_fixed,
-                        &mut g_au_fixed,
-                        &mut g_bu_fixed,
-                        &mut g_aau_fixed,
-                        &mut g_abu_fixed,
-                        &mut g_bbu_fixed,
-                    );
-                    Ok(())
-                },
-            )?;
-        }
-
-        let g_jet = SparsePrimaryCoeffJetView::new(
-            1,
-            h_range,
-            w_range,
-            &g_u_fixed,
-            &g_au_fixed,
-            &g_bu_fixed,
-            &g_aau_fixed,
-            &g_abu_fixed,
-            &g_bbu_fixed,
-            &zero_family,
-            &zero_family,
-            &zero_family,
-            &zero_family,
-        );
-
-        let g_a = eval_coeff4_at(&obs.dc_da, z_obs);
-        let g_aa = eval_coeff4_at(&obs.dc_daa, z_obs);
-        let g_aaa = eval_coeff4_at(&obs.dc_daaa, z_obs);
-        let mut g_u = Array1::<f64>::zeros(r);
-        let mut g_au = Array1::<f64>::zeros(r);
-        let mut g_aau = Array1::<f64>::zeros(r);
-        let mut g_uv = Array2::<f64>::zeros((r, r));
-        let mut g_auv = Array2::<f64>::zeros((r, r));
-        for u in 1..r {
-            g_u[u] = eval_coeff4_at(&g_jet.first[u], z_obs);
-            g_au[u] = eval_coeff4_at(&g_jet.a_first[u], z_obs);
-            g_aau[u] = eval_coeff4_at(&g_jet.aa_first[u], z_obs);
-        }
-        for u in 1..r {
-            for v in u..r {
-                let second_coeff = g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_BHW);
-                let val = eval_coeff4_at(&second_coeff, z_obs);
-                g_uv[[u, v]] = val;
-                g_uv[[v, u]] = val;
-
-                let third_coeff = g_jet.pair_from_b_family(g_jet.ab_first, u, v, COEFF_SUPPORT_BW);
-                let third_val = eval_coeff4_at(&third_coeff, z_obs);
-                g_auv[[u, v]] = third_val;
-                g_auv[[v, u]] = third_val;
-            }
-        }
-
-        let eta_u = g_a * &a_u + &g_u;
-        let mut eta_uv = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let val = g_a * a_uv[[u, v]]
-                    + g_aa * a_u[u] * a_u[v]
-                    + g_au[u] * a_u[v]
-                    + g_au[v] * a_u[u]
-                    + g_uv[[u, v]];
-                eta_uv[[u, v]] = val;
-                eta_uv[[v, u]] = val;
-            }
-        }
-
-        let y_i = self.y[row];
-        let w_i = self.weights[row];
-        let s_y = 2.0 * y_i - 1.0;
-        let m = s_y * eta_val;
-        let (k1, k2, k3, _) = signed_probit_neglog_derivatives_up_to_fourth(m, w_i)?;
-        let u1 = s_y * k1;
-        let u3 = s_y * k3;
-        let mut traces = vec![0.0; n_dirs];
-
-        for (dir_idx, dir) in row_dirs.iter().enumerate() {
-            let dir_base = dir_idx * r * r;
-            f_uv_dir[dir_base] = -dir[0] * marginal.mu3;
-
-            let a_dir = a_u.dot(dir);
-            let a_u_dir = a_uv.dot(dir);
-            let g_dir_fixed = g_jet.directional_family(g_jet.first, dir, COEFF_SUPPORT_BHW);
-            let g_a_dir_fixed = g_jet.directional_family(g_jet.a_first, dir, COEFF_SUPPORT_BW);
-            let g_aa_dir_fixed = g_jet.directional_family(g_jet.aa_first, dir, COEFF_SUPPORT_BW);
-            let g_dir = eval_coeff4_at(&g_dir_fixed, z_obs);
-            let g_a_dir = eval_coeff4_at(&g_a_dir_fixed, z_obs);
-            let g_aa_dir = eval_coeff4_at(&g_aa_dir_fixed, z_obs);
-            let eta_dir = g_a * a_dir + g_dir;
-            let eta_u_dir = eta_uv.dot(dir);
-            let dg_a_dir = g_aa * a_dir + g_a_dir;
-            let dg_aa_dir = g_aaa * a_dir + g_aa_dir;
-            let mut dg_au_dir = Array1::<f64>::zeros(r);
-            for u in 0..r {
-                let coeff =
-                    g_jet.param_directional_from_b_family(g_jet.ab_first, u, dir, COEFF_SUPPORT_BW);
-                dg_au_dir[u] = g_aau[u] * a_dir + eval_coeff4_at(&coeff, z_obs);
-            }
-
-            let mut trace = 0.0;
-            for u in 0..r {
-                for v in u..r {
-                    let fuvd = f_uv_dir[dir_base + u * r + v];
-                    let n_dir = fuvd
-                        + f_au_dir[dir_idx * r + u] * a_u[v]
-                        + f_au[u] * a_u_dir[v]
-                        + f_au_dir[dir_idx * r + v] * a_u[u]
-                        + f_au[v] * a_u_dir[u]
-                        + f_aa_dir[dir_idx] * a_u[u] * a_u[v]
-                        + f_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v]);
-                    let a_uv_dir = -(n_dir + f_a_dir[dir_idx] * a_uv[[u, v]]) * inv_f_a;
-                    let third_coeff = g_jet.pair_directional_from_bb_family(
-                        g_jet.bb_first,
-                        u,
-                        v,
-                        dir,
-                        COEFF_SUPPORT_BW,
-                    );
-                    let dg_uv_dir = g_auv[[u, v]] * a_dir + eval_coeff4_at(&third_coeff, z_obs);
-                    let eta_uv_dir = dg_a_dir * a_uv[[u, v]]
-                        + g_a * a_uv_dir
-                        + dg_aa_dir * a_u[u] * a_u[v]
-                        + g_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v])
-                        + dg_au_dir[u] * a_u[v]
-                        + g_au[u] * a_u_dir[v]
-                        + dg_au_dir[v] * a_u[u]
-                        + g_au[v] * a_u_dir[u]
-                        + dg_uv_dir;
-                    let val = u3 * eta_u[u] * eta_u[v] * eta_dir
-                        + k2 * (eta_uv[[u, v]] * eta_dir
-                            + eta_u[u] * eta_u_dir[v]
-                            + eta_u[v] * eta_u_dir[u])
-                        + u1 * eta_uv_dir;
-                    if u == v {
-                        trace += val * gram[u * r + v];
-                    } else {
-                        trace += val * (gram[u * r + v] + gram[v * r + u]);
-                    }
-                }
-            }
-            traces[dir_idx] = trace;
-        }
-
-        Ok(traces)
+        Ok(vec![Self::row_primary_trace_contract(&third, gram)])
     }
 
     /// Fourth-derivative tensor contracted with two directions dir_u, dir_v:
