@@ -2938,12 +2938,12 @@ mod reported_loglikelihood_normalization_tests {
 
     #[test]
     fn gaussian_reported_loglikelihood_is_finite() {
-        // #2096 follow-through: the reporting field switched to the
-        // fully-normalized Gaussian kernel, which reads a CONCRETE dispersion
-        // `φ = σ̂²` from `likelihood.scale`. If the reporting site ships the
-        // unresolved `ProfiledGaussian` marker (fixed_phi() == None), the kernel
-        // returns NaN — every Gaussian summary().log_likelihood / AIC becomes
-        // NaN. This asserts the profiled σ̂² is resolved into the reported scale.
+        // #2096/#2305 follow-through: the reporting field uses the
+        // fully-normalized Gaussian kernel, which requires a CONCRETE
+        // dispersion `φ = σ̂²`. The reporting site must resolve that temporary
+        // likelihood without rewriting the fit's canonical scale-ownership
+        // contract: the returned metadata remains `ProfiledGaussian`, while
+        // the reported full log-likelihood is finite.
         let n = 40usize;
         let mut design = Array2::<f64>::zeros((n, 2));
         let mut y = Array1::<f64>::zeros(n);

@@ -772,9 +772,7 @@ mod linux_impl {
         input: GpuGaussianPlsInput<'_>,
     ) -> Result<(PirlsResult, WorkingModelPirlsResult), String> {
         use crate::pirls::{
-            array1_l2_norm, calculate_deviance_from_eta,
-            calculate_loglikelihood_omitting_constants_from_eta,
-            computeworkingweight_derivatives_from_eta,
+            array1_l2_norm, calculate_deviance_from_eta, computeworkingweight_derivatives_from_eta,
         };
         use gam_linalg::matrix::LinearOperator;
         use gam_linalg::utils::inf_norm;
