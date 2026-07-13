@@ -1,11 +1,11 @@
-//! Outer-score row subsampling — re-exported from `gam-problem`.
+//! Outer-score row subsampling and the model-layer row-measure bridge.
 //!
 //! The canonical definitions of [`OuterScoreSubsample`], [`RowSet`], and
 //! [`WeightedOuterRow`] are neutral low-layer primitives that live in the
 //! `gam-problem` crate so the `CustomFamily` trait layer (and the model
 //! families above it) can depend on them downward without duplication. This
-//! module is a stable re-export so existing `gam_models::outer_subsample::*`
-//! and `crate::outer_subsample::*` paths keep resolving.
+//! module is the single model-layer authority that translates those primitives
+//! into custom-family fit options.
 
 pub use gam_problem::outer_subsample::*;
 
@@ -37,7 +37,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_outer_options_follow_the_row_set_and_clear_stale_sampling() {
+    fn exact_outer_options_bind_analytic_and_efs_lanes_to_one_row_measure() {
         let mut options = crate::custom_family::BlockwiseFitOptions::default();
         options.auto_outer_subsample = true;
         options.outer_score_subsample = Some(std::sync::Arc::new(

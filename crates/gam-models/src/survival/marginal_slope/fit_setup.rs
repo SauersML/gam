@@ -194,7 +194,7 @@ pub(crate) fn inner_fit_from_certified_outer(
     theta: &Array1<f64>,
     outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
 ) -> Result<UnifiedFitResult, String> {
-    let options = survival_marginal_slope_exact_outer_options(
+    let options = crate::outer_subsample::exact_outer_options_for_row_set(
         options,
         &crate::row_kernel::RowSet::All,
     );

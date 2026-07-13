@@ -2958,7 +2958,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let tolerance_options =
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
-            let eval_options = bms_exact_outer_options(&tolerance_options, row_set);
+            let eval_options = crate::outer_subsample::exact_outer_options_for_row_set(
+                &tolerance_options,
+                row_set,
+            );
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
                 &blocks,

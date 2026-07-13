@@ -1,33 +1,5 @@
 use super::*;
 
-/// Derive the survival location-scale outer-evaluation options from the exact
-/// row measure selected by the spatial optimizer.
-///
-/// `row_set` is the sole authority for this evaluation.  In particular, an
-/// inherited automatic/staged pilot must not survive into a full-data replay:
-/// that would let the inner mode, objective gradient, and Hessian describe
-/// different Horvitz--Thompson measures.  `All` therefore clears every stale
-/// mask just as deliberately as `Subsample` installs the selected weighted
-/// rows.
-pub(crate) fn survival_location_scale_exact_outer_options(
-    options: &BlockwiseFitOptions,
-    row_set: &crate::row_kernel::RowSet,
-) -> BlockwiseFitOptions {
-    let mut effective = options.clone();
-    effective.auto_outer_subsample = false;
-    effective.outer_score_subsample = match row_set {
-        crate::row_kernel::RowSet::All => None,
-        crate::row_kernel::RowSet::Subsample { rows, n_full } => Some(Arc::new(
-            crate::outer_subsample::OuterScoreSubsample::from_weighted_rows(
-                rows.as_ref().clone(),
-                *n_full,
-                0,
-            ),
-        )),
-    };
-    effective
-}
-
 /// Run the direct parametric-AFT MLE for a fully reduced constant-scale model
 /// and assemble the same [`UnifiedFitResult`] the coupled path would produce.
 ///
@@ -177,7 +149,7 @@ fn fit_survival_location_scale_with_geometry_authority(
         }
         fit_reduced_parametric_aft(&prepared, &options)?
     } else if let Some((theta, outer, warm_start)) = certified_outer {
-        let exact_options = survival_location_scale_exact_outer_options(
+        let exact_options = crate::outer_subsample::exact_outer_options_for_row_set(
             &options,
             &crate::row_kernel::RowSet::All,
         );
@@ -884,7 +856,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 }
                 other => other,
             };
-            let eval_options = survival_location_scale_exact_outer_options(
+            let eval_options = crate::outer_subsample::exact_outer_options_for_row_set(
                 &survival_blockwise_fit_options(&assembled),
                 row_set,
             );
@@ -952,7 +924,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             if prepared.family.x_link_wiggle.is_some() {
                 derivative_blocks.push(Vec::new());
             }
-            let eval_options = survival_location_scale_exact_outer_options(
+            let eval_options = crate::outer_subsample::exact_outer_options_for_row_set(
                 &survival_blockwise_fit_options(&assembled),
                 row_set,
             );
