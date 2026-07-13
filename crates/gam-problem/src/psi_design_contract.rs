@@ -64,6 +64,7 @@ pub enum CustomFamilyHyperAxis {
 pub struct CustomFamilyHyperLayout {
     design_derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     family_axes: Vec<usize>,
+    values: Array1<f64>,
     design_axis_count: usize,
     axis_count: usize,
 }
@@ -78,6 +79,7 @@ impl CustomFamilyHyperLayout {
     pub fn new(
         design_derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
         family_axes: Vec<usize>,
+        values: Array1<f64>,
     ) -> Result<Self, String> {
         for (expected, &actual) in family_axes.iter().enumerate() {
             if actual != expected {
@@ -98,9 +100,26 @@ impl CustomFamilyHyperLayout {
         let axis_count = design_axis_count
             .checked_add(family_axes.len())
             .ok_or_else(|| "custom-family hyper layout axis count exceeds usize".to_string())?;
+        if values.len() != axis_count {
+            return Err(format!(
+                "custom-family hyper layout value length mismatch: got {}, expected {axis_count}",
+                values.len()
+            ));
+        }
+        if let Some((axis, value)) = values
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "custom-family hyper layout axis {axis} has non-finite value {value}"
+            ));
+        }
         Ok(Self {
             design_derivative_blocks,
             family_axes,
+            values,
             design_axis_count,
             axis_count,
         })
@@ -132,6 +151,14 @@ impl CustomFamilyHyperLayout {
 
     pub fn family_axes(&self) -> &[usize] {
         &self.family_axes
+    }
+
+    /// Exact non-rho coordinate values used to realize this manifest.
+    ///
+    /// The vector is aligned one-to-one with [`Self::axis`] and is part of the
+    /// immutable evaluation identity carried into the owned coefficient mode.
+    pub fn values(&self) -> &Array1<f64> {
+        &self.values
     }
 
     /// Resolve a global hyperparameter coordinate to its typed identity.
