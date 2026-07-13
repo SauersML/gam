@@ -3,6 +3,18 @@ use crate::custom_family::custom_family_outer_derivatives;
 use gam_test_support::assert_matrix_derivativefd;
 use ndarray::array;
 
+fn test_design_hyper_layout(
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+) -> CustomFamilyHyperLayout {
+    let axis_count = derivative_blocks.iter().map(Vec::len).sum();
+    CustomFamilyHyperLayout::new(
+        derivative_blocks.to_vec(),
+        Vec::new(),
+        Array1::zeros(axis_count),
+    )
+    .expect("test CTN hyper layout")
+}
+
 #[test]
 pub(crate) fn exact_ctn_mode_branch_freezes_derivative_input() {
     let warm = |value: f64| {
@@ -870,7 +882,13 @@ pub(crate) fn transformation_normal_joint_psi_second_order_terms_match_fd() {
     let specs = vec![spec];
 
     let analytic = family
-        .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 1)
+        .exact_newton_joint_psisecond_order_terms(
+            &states,
+            &specs,
+            &test_design_hyper_layout(&derivative_blocks),
+            0,
+            1,
+        )
         .expect("analytic psi second-order terms")
         .expect("psi second-order terms should be present");
 
@@ -880,7 +898,12 @@ pub(crate) fn transformation_normal_joint_psi_second_order_terms_match_fd() {
         let states_eval = vec![state_eval];
         let specs_eval = vec![spec_eval];
         f_eval
-            .exact_newton_joint_psi_terms(&states_eval, &specs_eval, &deriv_eval, 0)
+            .exact_newton_joint_psi_terms(
+                &states_eval,
+                &specs_eval,
+                &test_design_hyper_layout(&deriv_eval),
+                0,
+            )
             .expect("first-order psi terms")
             .expect("first-order terms should be present")
     };
@@ -943,7 +966,12 @@ pub(crate) fn transformation_normal_joint_psi_first_order_matches_normalized_log
     let specs = vec![spec];
 
     let analytic = family
-        .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, 0)
+        .exact_newton_joint_psi_terms(
+            &states,
+            &specs,
+            &test_design_hyper_layout(&derivative_blocks),
+            0,
+        )
         .expect("analytic psi first-order terms")
         .expect("first-order terms should be present");
 
@@ -984,7 +1012,7 @@ pub(crate) fn transformation_normal_joint_psi_first_order_matches_normalized_log
             .exact_newton_joint_psi_terms(
                 std::slice::from_ref(&state_eval),
                 &specs,
-                &derivative_blocks,
+                &test_design_hyper_layout(&derivative_blocks),
                 0,
             )
             .expect("first-order psi terms at shifted beta")
@@ -1062,7 +1090,12 @@ pub(crate) fn ctn_psi_workspace_first_order_matches_per_axis_path_bit_equivalent
     for psi_index in 0..n_psi {
         per_axis.push(
             family
-                .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, psi_index)
+                .exact_newton_joint_psi_terms(
+                    &states,
+                    &specs,
+                    &test_design_hyper_layout(&derivative_blocks),
+                    psi_index,
+                )
                 .expect("per-axis ψ terms")
                 .expect("per-axis ψ terms must be present"),
         );
@@ -1070,7 +1103,11 @@ pub(crate) fn ctn_psi_workspace_first_order_matches_per_axis_path_bit_equivalent
 
     // All-axes pass via the workspace.
     let workspace = family
-        .exact_newton_joint_psi_workspace(&states, &specs, &derivative_blocks)
+        .exact_newton_joint_psi_workspace(
+            &states,
+            &specs,
+            &test_design_hyper_layout(&derivative_blocks),
+        )
         .expect("CTN ψ workspace constructor")
         .expect("CTN ψ workspace must be present");
     let mut shared_factor = Array2::<f64>::zeros((state.beta.len(), 3));
@@ -1256,7 +1293,11 @@ pub(crate) fn ctn_psi_workspace_second_order_matches_per_pair_path() {
     let n_psi = derivative_blocks[0].len();
 
     let workspace = family
-        .exact_newton_joint_psi_workspace(&states, &specs, &derivative_blocks)
+        .exact_newton_joint_psi_workspace(
+            &states,
+            &specs,
+            &test_design_hyper_layout(&derivative_blocks),
+        )
         .expect("CTN ψ workspace constructor")
         .expect("CTN ψ workspace must be present");
     let mut shared_factor = Array2::<f64>::zeros((state.beta.len(), 3));
@@ -1273,7 +1314,7 @@ pub(crate) fn ctn_psi_workspace_second_order_matches_per_pair_path() {
                 .exact_newton_joint_psisecond_order_terms(
                     &states,
                     &specs,
-                    &derivative_blocks,
+                    &test_design_hyper_layout(&derivative_blocks),
                     psi_i,
                     psi_j,
                 )
@@ -1340,7 +1381,13 @@ pub(crate) fn transformation_normal_joint_psi_second_order_terms_are_operator_ba
     let specs = vec![spec];
 
     let terms = family
-        .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 1)
+        .exact_newton_joint_psisecond_order_terms(
+            &states,
+            &specs,
+            &test_design_hyper_layout(&derivative_blocks),
+            0,
+            1,
+        )
         .expect("analytic psi second-order terms")
         .expect("psi second-order terms should be present");
 
@@ -1429,7 +1476,7 @@ pub(crate) fn transformation_normal_joint_psihessian_directional_derivative_matc
         .exact_newton_joint_psihessian_directional_derivative(
             std::slice::from_ref(&state),
             &specs,
-            &derivative_blocks,
+            &test_design_hyper_layout(&derivative_blocks),
             0,
             &direction,
         )
@@ -1443,7 +1490,7 @@ pub(crate) fn transformation_normal_joint_psihessian_directional_derivative_matc
             .exact_newton_joint_psi_terms(
                 std::slice::from_ref(&shifted_state),
                 &specs,
-                &derivative_blocks,
+                &test_design_hyper_layout(&derivative_blocks),
                 0,
             )
             .expect("first-order psi terms at shifted beta")
@@ -1462,7 +1509,11 @@ pub(crate) fn transformation_normal_joint_psihessian_directional_derivative_matc
     );
 
     let workspace = family
-        .exact_newton_joint_psi_workspace(&[state.clone()], &specs, &derivative_blocks)
+        .exact_newton_joint_psi_workspace(
+            &[state.clone()],
+            &specs,
+            &test_design_hyper_layout(&derivative_blocks),
+        )
         .expect("CTN psi workspace constructor")
         .expect("CTN psi workspace must be present");
     let drift_op = workspace
