@@ -72,19 +72,31 @@ fn write_training_csv(path: &Path) {
     writer.flush().expect("flush training csv");
 }
 
-/// Read the `gam generate` output matrix: one row per input covariate row, one
-/// column per draw (headers `draw_*`). Returns a row-major Vec<Vec<f64>>.
+/// Read the streamed long-form `gam generate` output (`draw,row,value`) and
+/// restore one draw vector per input row for the empirical-law assertion.
 fn read_generate_matrix(path: &Path) -> Vec<Vec<f64>> {
     let mut reader = csv::Reader::from_path(path).expect("open generate csv");
-    reader
-        .records()
-        .map(|rec| {
-            rec.expect("generate row")
-                .iter()
-                .map(|v| v.parse::<f64>().expect("numeric draw"))
-                .collect()
-        })
-        .collect()
+    assert_eq!(
+        reader.headers().expect("generate header"),
+        &csv::StringRecord::from(vec!["draw", "row", "value"]),
+    );
+    let mut by_row: Vec<Vec<f64>> = Vec::new();
+    for record in reader.records() {
+        let record = record.expect("generate row");
+        let draw = record[0].parse::<usize>().expect("draw index");
+        let row = record[1].parse::<usize>().expect("row index");
+        let value = record[2].parse::<f64>().expect("generated value");
+        if by_row.len() <= row {
+            by_row.resize_with(row + 1, Vec::new);
+        }
+        assert_eq!(
+            draw,
+            by_row[row].len(),
+            "draw indices must be contiguous within each input row"
+        );
+        by_row[row].push(value);
+    }
+    by_row
 }
 
 fn mean_var(xs: &[f64]) -> (f64, f64) {

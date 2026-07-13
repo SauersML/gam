@@ -46,6 +46,7 @@ use gam::families::survival::location_scale::{
 use gam::families::wiggle::{
     buildwiggle_block_input_from_knots, monotone_wiggle_basis_with_derivative_order,
 };
+use gam::generative::sampleobservation_seeded_replicates;
 use gam::inference::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
 };
@@ -72,7 +73,9 @@ use gam::types::{
     InverseLink, LikelihoodScaleMetadata, LinkComponent, LinkFunction, LogLikelihoodNormalization,
     ResponseColumnKind, StandardLink, WigglePenaltyConfig,
 };
-use gam_predict::{FittedModelPredictExt, PredictableModel};
+use gam_predict::{
+    FittedModelPredictExt, PredictableModel, SavedGenerativeInput, generative_spec_for_saved_model,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut2, array, s};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -6046,6 +6049,55 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
     let lines = csv.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0], "eta,survival_prob,failure_prob,risk_score");
+
+    let zero = Array1::zeros(data.nrows());
+    let spec = generative_spec_for_saved_model(
+        &model,
+        SavedGenerativeInput {
+            data: data.view(),
+            col_map: &col_map,
+            training_headers: model.training_headers.as_ref(),
+            offset: &zero,
+            offset_noise: &zero,
+            noise_offset_supplied: false,
+            prior_weights: None,
+        },
+    )
+    .expect("saved latent survival model should expose its exact event-window law");
+    assert!(
+        spec.mean
+            .iter()
+            .all(|probability| { probability.is_finite() && (0.0..=1.0).contains(probability) })
+    );
+    let draws = sampleobservation_seeded_replicates(&spec, 0, 31, 2300)
+        .expect("sample saved latent survival event-window law");
+    assert_eq!(draws.shape(), [31, data.nrows()]);
+    assert!(draws.iter().all(|value| *value == 0.0 || *value == 1.0));
+
+    let mut binary_payload = model.payload().clone();
+    binary_payload.family_state = FittedFamily::LatentBinary {
+        frailty: gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
+            sigma_fixed: Some(0.3),
+            loading: gam::families::survival::lognormal_kernel::HazardLoading::Full,
+        },
+    };
+    binary_payload.family = "latent-binary".to_string();
+    binary_payload.survival_likelihood = Some("latent-binary".to_string());
+    let binary_model = SavedModel::from_payload(binary_payload);
+    let binary_spec = generative_spec_for_saved_model(
+        &binary_model,
+        SavedGenerativeInput {
+            data: data.view(),
+            col_map: &col_map,
+            training_headers: binary_model.training_headers.as_ref(),
+            offset: &zero,
+            offset_noise: &zero,
+            noise_offset_supplied: false,
+            prior_weights: None,
+        },
+    )
+    .expect("saved latent-binary model should expose its exact event-window law");
+    assert_eq!(spec.mean, binary_spec.mean);
 }
 
 #[test]

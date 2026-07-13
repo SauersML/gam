@@ -11,9 +11,7 @@ use std::collections::HashMap;
 use gam_models::inference::generative::{
     GenerativeSpec, NoiseModel, family_noise_parameter, generativespec_from_predict,
 };
-use gam_models::inference::model::{
-    FittedEstimator, FittedFamily, FittedModel, PredictModelClass,
-};
+use gam_models::inference::model::{FittedEstimator, FittedFamily, FittedModel, PredictModelClass};
 use gam_models::inference::predict_io::PredictResult;
 use gam_models::survival::predict::{
     SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
@@ -222,13 +220,14 @@ fn survival_entry_times(
     Ok(entry)
 }
 
-fn entry_surface_chunk_rows(total_rows: usize) -> usize {
+fn entry_surface_chunk_rows(total_rows: usize, live_surfaces_per_cell: usize) -> usize {
     if total_rows == 0 {
         return 1;
     }
     let target_bytes =
         gam_runtime::resource::ResourcePolicy::default_library().row_chunk_target_bytes;
-    let max_cells = target_bytes / std::mem::size_of::<f64>();
+    let bytes_per_cell = std::mem::size_of::<f64>().saturating_mul(live_surfaces_per_cell.max(1));
+    let max_cells = target_bytes / bytes_per_cell;
     max_cells.isqrt().max(1).min(total_rows)
 }
 
@@ -286,7 +285,10 @@ fn single_cause_window_spec(
     }
     let entry_times = survival_entry_times(model, request.data.view(), request.col_map)?;
     let mut entry_survival = Array1::<f64>::zeros(n);
-    let chunk_rows = entry_surface_chunk_rows(n);
+    // `predict_survival` owns hazard, survival, and cumulative-hazard squares
+    // simultaneously. Budget the full live return, not only the one surface we
+    // retain the diagonal from.
+    let chunk_rows = entry_surface_chunk_rows(n, 3);
     for start in (0..n).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(n);
         let grid = entry_times.slice(s![start..end]).to_vec();
@@ -363,7 +365,12 @@ fn competing_risks_window_spec(
     let mut entry_cif = (0..causes)
         .map(|_| Array1::<f64>::zeros(n))
         .collect::<Vec<_>>();
-    let chunk_rows = entry_surface_chunk_rows(n);
+    // Each cause returns hazard, survival, cumulative hazard, and CIF, plus one
+    // overall-survival square. Account for all live matrices in the chunk
+    // policy; counting a single f64 surface underestimates peak memory by
+    // roughly 4K+1.
+    let live_surfaces = causes.saturating_mul(4).saturating_add(1);
+    let chunk_rows = entry_surface_chunk_rows(n, live_surfaces);
     for start in (0..n).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(n);
         let grid = entry_times.slice(s![start..end]).to_vec();
@@ -688,6 +695,17 @@ mod tests {
     fn event_window_probability_rejects_nonmonotone_or_depleted_entry_mass() {
         assert!(conditional_window_survival(0.4, 0.5, 3).is_err());
         assert!(conditional_window_survival(0.0, 0.0, 4).is_err());
+    }
+
+    #[test]
+    fn entry_surface_chunk_budget_counts_every_live_matrix() {
+        let surfaces = 9;
+        let rows = entry_surface_chunk_rows(usize::MAX, surfaces);
+        let live_bytes = rows * rows * surfaces * std::mem::size_of::<f64>();
+        assert!(
+            live_bytes
+                <= gam_runtime::resource::ResourcePolicy::default_library().row_chunk_target_bytes
+        );
     }
 
     #[test]

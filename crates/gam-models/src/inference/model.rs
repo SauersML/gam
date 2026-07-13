@@ -4399,8 +4399,9 @@ impl FittedModel {
         match self.estimator {
             FittedEstimator::Likelihood if expectile_family_tag => {
                 return Err(FittedModelError::SchemaMismatch {
-                    reason: "saved family is tagged expectile but estimator metadata says likelihood"
-                        .to_string(),
+                    reason:
+                        "saved family is tagged expectile but estimator metadata says likelihood"
+                            .to_string(),
                 });
             }
             FittedEstimator::Likelihood => {}

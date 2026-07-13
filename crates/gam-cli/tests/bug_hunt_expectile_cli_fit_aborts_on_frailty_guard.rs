@@ -76,10 +76,9 @@ fn expectile_cli_fit_does_not_abort_on_standard_frailty_guard() {
         stderr.lines().rev().take(6).collect::<Vec<_>>().join("\n")
     );
 
-    let saved: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(out.path()).expect("read saved expectile model"),
-    )
-    .expect("decode saved expectile model");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.path()).expect("read saved expectile model"))
+            .expect("decode saved expectile model");
     assert_eq!(
         saved["payload"]["estimator"],
         serde_json::json!({"estimator_kind": "expectile", "tau": 0.5}),

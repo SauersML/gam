@@ -139,7 +139,7 @@ def test_transformation_survival_parameter_count_is_independent_of_n() -> None:
     )
 
 
-def test_joint_competing_risks_survival_is_reachable_from_fit() -> None:
+def test_joint_competing_risks_survival_is_reachable_from_fit(tmp_path) -> None:
     train = make_competing_risks()
     rows = prediction_rows()[["entry", "exit", "event", "age"]]
     for likelihood_mode in ("weibull", "transformation"):
@@ -167,6 +167,23 @@ def test_joint_competing_risks_survival_is_reachable_from_fit() -> None:
         assert np.all((pred.cif >= 0.0) & (pred.cif <= 1.0))
         assert np.all(
             (pred.overall_survival >= 0.0) & (pred.overall_survival <= 1.0)
+        )
+
+        replicates = np.asarray(model.sample_replicates(rows, 41, seed=2300))
+        streamed = np.concatenate(
+            list(model.iter_replicates(rows, 41, chunk_size=7, seed=2300)),
+            axis=0,
+        )
+        np.testing.assert_array_equal(replicates, streamed)
+        assert replicates.shape == (41, len(rows))
+        assert set(np.unique(replicates)).issubset({0.0, 1.0, 2.0})
+
+        model_path = tmp_path / f"competing-{likelihood_mode}.gam"
+        model.save(model_path)
+        restored = gamfit.load(model_path)
+        np.testing.assert_array_equal(
+            replicates,
+            restored.sample_replicates(rows, 41, seed=2300),
         )
 
         interval_pred = model.predict(
@@ -263,6 +280,9 @@ def test_survival_location_scale_regressor_prediction_does_not_saturate() -> Non
     assert np.all(np.isfinite(eta))
     assert float(np.max(np.abs(eta))) < 50.0
     assert float(np.min(survival)) > 1.0e-12
+    replicates = np.asarray(model.sample_replicates(prediction_rows(), 37, seed=2300))
+    assert replicates.shape == (37, len(prediction_rows()))
+    assert set(np.unique(replicates)).issubset({0.0, 1.0})
 
 
 def test_latent_survival_accepts_frailty_kwargs() -> None:
