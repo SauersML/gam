@@ -1299,27 +1299,11 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
         return Ok(None);
     }
 
-    let beta_dim = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let structural_probe = Array1::<f64>::zeros(beta_dim);
-    for axis_idx in hyper_layout.design_axis_count()..hyper_layout.len() {
-        let drift = if let Some(workspace) = psi_workspace.as_ref() {
-            workspace.hessian_directional_derivative(axis_idx, &structural_probe)?
-        } else {
-            family
-                .exact_newton_joint_psihessian_directional_derivative(
-                    synced_states,
-                    specs,
-                    &hyper_layout,
-                    axis_idx,
-                    &structural_probe,
-                )?
-                .map(DriftDerivResult::Dense)
-        };
-        if drift.is_none() {
-            return Err(format!(
-                "family-owned hyper axis {axis_idx} has no exact D_beta H_i[u] coverage"
-            ));
-        }
+    if hyper_layout.family_axis_count() != 0 && psi_workspace.is_none() {
+        return Err(
+            "family-owned hyper axes require one owned exact-psi workspace for directional Hessian drift"
+                .to_string(),
+        );
     }
 
     let synced_arc = Arc::new(synced_states.to_vec());
@@ -1328,7 +1312,9 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
     let psi_workspace = psi_workspace;
 
     Ok(Some(Box::new(
-        move |ext_idx: usize, direction: &Array1<f64>| -> Option<DriftDerivResult> {
+        move |ext_idx: usize,
+              direction: &Array1<f64>|
+              -> Result<Option<DriftDerivResult>, String> {
             // The family hook takes a psi index (0-based within ψ coordinates)
             // and a flattened coefficient direction.
             let result = if let Some(workspace) = psi_workspace.as_ref() {
@@ -1344,15 +1330,12 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
                     )
                     .map(|drift| drift.map(DriftDerivResult::Dense))
             };
-            match result {
-                Ok(Some(drift)) => Some(drift),
-                Ok(None) if hyper_layout.family_axis(ext_idx).is_some() => panic!(
-                    "family-owned hyper axis {ext_idx} lost exact D_beta H_i[u] coverage after preflight"
-                ),
-                Ok(None) => None,
-                Err(error) => panic!(
-                    "typed hyper drift axis {ext_idx} failed after successful layout construction: {error}"
-                ),
+            match result? {
+                Some(drift) => Ok(Some(drift)),
+                None if hyper_layout.family_axis(ext_idx).is_some() => Err(format!(
+                    "family-owned hyper axis {ext_idx} has no exact D_beta H_i[u] term for the requested direction"
+                )),
+                None => Ok(None),
             }
         },
     )))
