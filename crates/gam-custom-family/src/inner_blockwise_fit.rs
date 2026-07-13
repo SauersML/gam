@@ -3069,6 +3069,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // and the dispatch agree.
                 let floor_reached = trust_update.accepted
                     && current_stationarity_residual <= residual_tol
+                    && !has_resolvable_negative_curvature
                     && joint_objective_floor_reached(
                         old_objective,
                         trialobjective,
