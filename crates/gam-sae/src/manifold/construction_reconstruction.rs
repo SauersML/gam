@@ -718,7 +718,8 @@ impl SaeManifoldTerm {
             learning_rate,
             ridge_ext_coord,
             ridge_beta,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         let residual = self.reconstruction_residual(target, rho)?;
         let dispersion =
             self.reconstruction_dispersion(&loss, &cache, rho, Some(residual.view()))?;

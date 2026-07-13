@@ -365,6 +365,7 @@ pub fn frozen_joint_penalized_quasi_laplace(
         config.ridge_ext_coord,
         config.ridge_beta,
     )
+    .map_err(|error| error.to_string())
 }
 
 /// Reconstruction explained variance of a term against `target` (the centered EV

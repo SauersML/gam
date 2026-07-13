@@ -4531,7 +4531,8 @@ impl SaeManifoldTerm {
                 ridge_ext_coord,
                 ridge_beta,
                 true,
-            )?;
+            )
+            .map_err(|error| error.to_string())?;
         let consistency = self.amortized_encoder_consistency(target, rho)?;
         // Auto-scale the co-training weights to the penalized quasi-Laplace magnitude so the
         // consistency penalty is a bounded, scale-free fraction of the objective

@@ -93,6 +93,7 @@ def test_harvest_matches_closed_form_linear_head() -> None:
     assert shard.X.shape == (n, p)
     assert shard.U.shape == (n, p, rank)
     assert shard.mass_residual.shape == (n,)
+    assert shard.factor_kind == "uncertified_approximation"
 
     # X must be the hook-site activation (here the identity-passed input).
     np.testing.assert_allclose(shard.X, X_np.astype(np.float32), rtol=0, atol=1e-5)
@@ -197,8 +198,10 @@ def test_behavioral_fisher_probe_sketch_converges_to_pullback() -> None:
     assert shard.provenance == "behavioral_fisher"
     assert shard.U.shape == (n, p, s)
     assert shard.rank == s
-    # Full-rank unbiased sketch ⇒ no truncated tail.
-    np.testing.assert_array_equal(shard.mass_residual, np.zeros((n,), dtype=np.float32))
+    # A stochastic full-operator sketch is not an exact factorization and a
+    # fabricated zero tail must not promote it.
+    assert shard.factor_kind == "uncertified_approximation"
+    assert shard.mass_residual is None
 
     for i in range(n):
         G = _closed_form_pullback(W_np, X_np[i])  # (p, p) analytic pullback
@@ -228,6 +231,8 @@ def test_behavioral_fisher_shard_roundtrips_and_loads_as_behavioral(tmp_path) ->
     loaded = load_harvest_shard(path)
 
     assert loaded["provenance"] == "behavioral_fisher"
+    assert loaded["factor_kind"] == "uncertified_approximation"
+    assert loaded["mass_residual"] is None
     assert loaded["rank"] == s
     assert loaded["U"].shape == (n, p, s)
     assert loaded["X"].dtype == np.float64
@@ -258,6 +263,8 @@ def test_shard_roundtrip_schema(tmp_path) -> None:
     assert loaded["U"].shape == (n, p, rank)
     assert loaded["mass_residual"].shape == (n,)
     assert loaded["rank"] == rank
+    assert loaded["schema"] == "gamfit.FisherHarvest/v1"
+    assert loaded["factor_kind"] == "uncertified_approximation"
 
     # Row-major U flatten must equal the RowMetric layout u[n, i*r + k].
     flat = loaded["U"].reshape(n, p * rank)
@@ -269,6 +276,34 @@ def test_shard_roundtrip_schema(tmp_path) -> None:
     # Default provenance is the same-position metric, and it round-trips.
     assert shard.provenance == "output_fisher"
     assert loaded["provenance"] == "output_fisher"
+
+
+def test_full_factorization_is_explicit_exact_without_fake_tail() -> None:
+    rng = np.random.default_rng(19)
+    c, p, n = 4, 3, 2
+    model = _LinearHead(
+        torch.from_numpy(rng.standard_normal((c, p))).to(torch.float64)
+    )
+    x = torch.from_numpy(rng.standard_normal((n, p))).to(torch.float64)
+    shard = harvest_output_fisher_factors(
+        model, model.feature, x, rank=p, trace_probes=p, seed=19
+    )
+    assert shard.factor_kind == "exact_full"
+    assert shard.mass_residual is None
+
+
+def test_loader_rejects_statusless_legacy_archive(tmp_path) -> None:
+    path = tmp_path / "legacy.npz"
+    np.savez(
+        path,
+        X=np.zeros((1, 2), dtype=np.float32),
+        U=np.zeros((1, 2, 1), dtype=np.float32),
+        mass_residual=np.zeros(1, dtype=np.float32),
+        rank=np.int64(1),
+        provenance=np.str_("output_fisher"),
+    )
+    with pytest.raises(ValueError, match="missing required fields.*factor_kind.*schema"):
+        load_harvest_shard(path)
 
 
 class _CausalSumHead(torch.nn.Module):
@@ -328,6 +363,7 @@ def test_downstream_equals_same_position_for_position_local_model(tmp_path) -> N
     out = save_harvest_shard(down, tmp_path / "down")
     loaded = load_harvest_shard(out)
     assert loaded["provenance"] == "output_fisher_downstream"
+    assert loaded["factor_kind"] == "uncertified_approximation"
 
 
 def test_downstream_aggregates_future_positions() -> None:

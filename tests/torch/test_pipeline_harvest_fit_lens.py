@@ -185,6 +185,7 @@ def test_metric_provenance_reported(
 ) -> None:
     """The shard run installs OutputFisher; the no-shard run stays Euclidean."""
     assert fit_with_shard.metric_provenance == "OutputFisher"
+    assert fit_with_shard.fisher_factor_kind == "uncertified_approximation"
     assert fit_no_shard.metric_provenance == "Euclidean"
     # The per-row truncation diagnostic rides into the model under a shard, and
     # is absent under the Euclidean path.

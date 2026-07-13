@@ -36,6 +36,7 @@ from gamfit.torch.harvest import (  # noqa: E402
     load_harvest_shard,
     save_harvest_shard,
 )
+from gamfit import _sae_manifold as sae_facade  # noqa: E402
 
 
 class _LinearHead(torch.nn.Module):
@@ -55,6 +56,21 @@ class _LinearHead(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.feature(x))
+
+
+def test_bare_factors_are_rejected_without_scientific_status() -> None:
+    with pytest.raises(TypeError, match="bare factor arrays"):
+        sae_facade._fisher_arrays(np.zeros((2, 3, 1), dtype=np.float64))
+
+
+def test_mapping_requires_current_shard_schema() -> None:
+    statusless = {
+        "U": np.zeros((2, 3, 1), dtype=np.float64),
+        "provenance": "output_fisher",
+        "factor_kind": "uncertified_approximation",
+    }
+    with pytest.raises(ValueError, match="must declare schema"):
+        sae_facade._fisher_arrays(statusless)
 
 
 def _harvest_shard(n: int, p: int, classes: int, rank: int) -> HarvestShard:
@@ -123,6 +139,7 @@ def test_fisher_shard_roundtrip_installs_metric_without_touching_data_fit() -> N
     # 2) Provenance flips to OutputFisher exactly when a shard is supplied.
     assert fit_base.metric_provenance == "Euclidean"
     assert fit_fisher.metric_provenance == "OutputFisher"
+    assert fit_fisher.fisher_factor_kind == "uncertified_approximation"
 
     # 3) The per-row truncation diagnostic rides into the report (and only then).
     assert fit_base.fisher_mass_residual is None
@@ -151,7 +168,7 @@ def test_fisher_shard_roundtrip_accepts_loaded_npz_dict(tmp_path) -> None:
     x = np.asarray(shard.X, dtype=np.float64)
 
     save_harvest_shard(shard, tmp_path / "shard.npz")
-    loaded = load_harvest_shard(tmp_path / "shard.npz")  # f64 dict {X,U,mass_residual,rank}
+    loaded = load_harvest_shard(tmp_path / "shard.npz")
 
     fit_base = _fit(x, fisher_factors=None)
     fit_dict = _fit(x, fisher_factors=loaded)

@@ -70,16 +70,19 @@ def test_attach_fisher_is_atomic_and_builds_once() -> None:
     # serialized field or resident metric is mutated.
     bad = np.zeros((1, 2, 1), dtype=np.float64)
     with pytest.raises(ValueError, match="must be \\(n, p, rank\\)"):
-        model.attach_fisher(bad, "output_fisher")
+        model.attach_fisher(bad, "output_fisher", "uncertified_approximation")
     assert model.to_dict() == original
     assert model.fisher_metric_build_count == original_count
 
     valid = np.asarray(original["fisher_factors"], dtype=np.float64) * 0.5
     mass = np.asarray(original["fisher_mass_residual"], dtype=np.float64)
-    model.attach_fisher(valid, "output_fisher", mass)
+    model.attach_fisher(
+        valid, "output_fisher", "uncertified_approximation", mass
+    )
     assert model.fisher_metric_build_count == original_count + 1
     assert model.metric_provenance == "OutputFisher"
     assert model.fisher_provenance == "output_fisher"
+    assert model.fisher_factor_kind == "uncertified_approximation"
     np.testing.assert_array_equal(model.fisher_factors, valid)
     np.testing.assert_array_equal(model.fisher_mass_residual, mass)
 
@@ -87,9 +90,10 @@ def test_attach_fisher_is_atomic_and_builds_once() -> None:
 def test_detach_is_explicit_not_attach_none() -> None:
     model = _model()
     with pytest.raises(TypeError):
-        model.attach_fisher(None, "output_fisher")
+        model.attach_fisher(None, "output_fisher", "uncertified_approximation")
     model.detach_fisher()
     assert model.fisher_factors is None
     assert model.fisher_provenance is None
+    assert model.fisher_factor_kind is None
     assert model.fisher_mass_residual is None
     assert model.metric_provenance == "Euclidean"

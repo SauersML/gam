@@ -5145,11 +5145,11 @@ impl SaeManifoldTerm {
         let identity_roundoff =
             64.0 * f64::EPSILON * (1.0 + production_value.abs().max(assembled_value.abs()));
         if (assembled_value - production_value).abs() > identity_roundoff {
-            return Err(format!(
+            return Err(SaeCriterionError::Numerical(format!(
                 "criterion_as_atoms: assembled value {assembled_value:.17e} does not equal \
                  production value {production_value:.17e} from the same cache \
                  (roundoff={identity_roundoff:.3e})"
-            ));
+            )));
         }
         Ok(criterion)
     }
