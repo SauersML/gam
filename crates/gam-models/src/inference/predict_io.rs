@@ -9,7 +9,7 @@ use crate::marginal_slope_shared::{
     ObservedDenestedCellPartials, eval_coeff4_at,
     probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
 };
-use crate::survival::lognormal_kernel::FrailtySpec;
+use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec};
 use gam_linalg::matrix::DesignMatrix;
 use gam_math::probability::{normal_cdf, normal_pdf};
 use gam_problem::types::{InverseLink, LikelihoodSpec};
@@ -1119,9 +1119,11 @@ impl BernoulliMarginalSlopePredictor {
         let gaussian_frailty_sd = match frailty {
             FrailtySpec::None => None,
             FrailtySpec::GaussianShift {
-                sigma_fixed: Some(sigma),
+                scale: FrailtyScale::Fixed { sigma },
             } => Some(sigma),
-            FrailtySpec::GaussianShift { sigma_fixed: None } => {
+            FrailtySpec::GaussianShift {
+                scale: FrailtyScale::Learned { .. },
+            } => {
                 return Err(
                     "bernoulli marginal-slope predictor requires a fixed GaussianShift sigma"
                         .to_string(),
