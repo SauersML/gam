@@ -1048,6 +1048,8 @@ pub struct CustomFamilyJointHyperResult {
     pub objective: f64,
     pub gradient: Array1<f64>,
     pub outer_hessian: gam_problem::HessianValue,
+    /// Exact non-rho coordinates used to realize this evaluation.
+    pub hyper_values: Array1<f64>,
     pub warm_start: CustomFamilyWarmStart,
     /// `false` when the inner blockwise/Newton solve hit its divergence
     /// early-exit or its max-cycle cap. Envelope-theorem outer gradients
@@ -1071,6 +1073,7 @@ pub struct CustomFamilyJointHyperResult {
 pub struct CustomFamilyOwnedMode {
     pub(crate) objective: f64,
     pub(crate) rho: Array1<f64>,
+    pub(crate) hyper_values: Array1<f64>,
     pub(crate) inner: BlockwiseInnerResult,
 }
 
@@ -1083,6 +1086,7 @@ pub struct CustomFamilyJointHyperOwnedResult {
 pub struct CustomFamilyJointHyperEfsResult {
     pub efs_eval: gam_problem::EfsEval,
     pub warm_start: CustomFamilyWarmStart,
+    pub hyper_values: Array1<f64>,
     /// See [`CustomFamilyJointHyperResult::inner_converged`]. EFS gradients
     /// also assume a stationary inner solve.
     pub inner_converged: bool,
@@ -1100,6 +1104,7 @@ pub(crate) struct OuterObjectiveEvalResult {
     pub(crate) outer_hessian: gam_problem::HessianValue,
     pub(crate) warm_start: ConstrainedWarmStart,
     pub(crate) inner_converged: bool,
+    pub(crate) hyper_values: Array1<f64>,
     /// The exact coefficient mode used to assemble this objective payload.
     ///
     /// Keeping the owned result here lets an atomic multi-start evaluation
@@ -1118,6 +1123,7 @@ pub(crate) fn outer_eval_result_into_joint_hyper_owned_result(
         outer_hessian,
         warm_start,
         inner_converged,
+        hyper_values,
         inner,
     } = result;
     let rho = warm_start.rho.clone();
@@ -1126,12 +1132,14 @@ pub(crate) fn outer_eval_result_into_joint_hyper_owned_result(
             objective,
             gradient,
             outer_hessian,
+            hyper_values: hyper_values.clone(),
             warm_start: CustomFamilyWarmStart { inner: warm_start },
             inner_converged,
         },
         mode: CustomFamilyOwnedMode {
             objective,
             rho,
+            hyper_values,
             inner,
         },
     }
