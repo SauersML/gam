@@ -4047,6 +4047,21 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .analytic_gradient_for_outer_evaluation(&rho_state, &evaluation)
             .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?;
         let beta_hat = self.term.flatten_beta();
+        // PATH C (#2253) — assemble the exact fixed-stratum outer Hessian from the
+        // landed analytic channels. The assembler currently REFUSES (only the
+        // solver-free explicit channel is implemented), so this yields
+        // `Unavailable` and the planner stays on the analytic-gradient BFGS route
+        // that `capability()` declares. When every channel lands the assembler
+        // succeeds, this becomes a `Dense` curvature, and `capability()` flips to
+        // `Dense` so the small-dense planner routes ARC through it.
+        let hessian = match self.term.exact_fixed_stratum_outer_hessian(
+            &rho_state,
+            &evaluation.loss,
+            &evaluation.cache,
+        ) {
+            Ok(dense) => HessianValue::Dense(dense),
+            Err(_incomplete) => HessianValue::Unavailable,
+        };
         // #1206 — the gradient lane (`OuterEvalOrder::ValueAndGradient`, consumed
         // by the outer BFGS Armijo line search) MUST return a cost whose gradient
         // is the gradient we return: the consistent pair `(f, ∇f)` for the pure
@@ -4079,7 +4094,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         Ok(OuterEval {
             cost,
             gradient,
-            hessian: HessianValue::Unavailable,
+            hessian,
             inner_beta_hint: Some(beta_hat),
         })
     }
