@@ -1297,13 +1297,36 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
     family: &F,
     synced_states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
-    derivative_blocks_arc: SharedDerivativeBlocks,
+    hyper_layout: SharedCustomFamilyHyperLayout,
     hessian_beta_independent: bool,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
-) -> Option<FixedDriftDerivFn> {
+) -> Result<Option<FixedDriftDerivFn>, String> {
     if hessian_beta_independent {
         // Likelihood Hessian is β-independent; M_i ≡ 0.
-        return None;
+        return Ok(None);
+    }
+
+    let beta_dim = specs.iter().map(|spec| spec.design.ncols()).sum();
+    let structural_probe = Array1::<f64>::zeros(beta_dim);
+    for axis_idx in hyper_layout.design_axis_count()..hyper_layout.len() {
+        let drift = if let Some(workspace) = psi_workspace.as_ref() {
+            workspace.hessian_directional_derivative(axis_idx, &structural_probe)?
+        } else {
+            family
+                .exact_newton_joint_psihessian_directional_derivative(
+                    synced_states,
+                    specs,
+                    &hyper_layout,
+                    axis_idx,
+                    &structural_probe,
+                )?
+                .map(DriftDerivResult::Dense)
+        };
+        if drift.is_none() {
+            return Err(format!(
+                "family-owned hyper axis {axis_idx} has no exact D_beta H_i[u] coverage"
+            ));
+        }
     }
 
     let synced_arc = Arc::new(synced_states.to_vec());
@@ -1311,30 +1334,35 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
     let family_arc = Arc::new(family.clone());
     let psi_workspace = psi_workspace;
 
-    Some(Box::new(
+    Ok(Some(Box::new(
         move |ext_idx: usize, direction: &Array1<f64>| -> Option<DriftDerivResult> {
             // The family hook takes a psi index (0-based within ψ coordinates)
             // and a flattened coefficient direction.
-            if let Some(workspace) = psi_workspace.as_ref() {
-                workspace
-                    .hessian_directional_derivative(ext_idx, direction)
-                    .ok()
-                    .flatten()
+            let result = if let Some(workspace) = psi_workspace.as_ref() {
+                workspace.hessian_directional_derivative(ext_idx, direction)
             } else {
                 family_arc
                     .exact_newton_joint_psihessian_directional_derivative(
                         &synced_arc,
                         &specs_arc,
-                        &derivative_blocks_arc,
+                        &hyper_layout,
                         ext_idx,
                         direction,
                     )
-                    .ok()
-                    .flatten()
-                    .map(DriftDerivResult::Dense)
+                    .map(|drift| drift.map(DriftDerivResult::Dense))
+            };
+            match result {
+                Ok(Some(drift)) => Some(drift),
+                Ok(None) if hyper_layout.family_axis(ext_idx).is_some() => panic!(
+                    "family-owned hyper axis {ext_idx} lost exact D_beta H_i[u] coverage after preflight"
+                ),
+                Ok(None) => None,
+                Err(error) => panic!(
+                    "typed hyper drift axis {ext_idx} failed after successful layout construction: {error}"
+                ),
             }
         },
-    ))
+    )))
 }
 
 pub(crate) fn evaluate_custom_family_hyper_internal<
