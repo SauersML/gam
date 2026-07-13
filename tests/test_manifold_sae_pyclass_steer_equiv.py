@@ -119,11 +119,16 @@ def test_target_dose_probe_is_wired_through_the_public_model() -> None:
     t_to = np.array([0.25], dtype=np.float64)
     unit = model.steer(0, 0, 1.0, t_from, t_to)
     target = 0.5 * float(unit["predicted_nats"])
-    probe_calls: list[float] = []
+    probe_calls: list[dict[str, object]] = []
 
-    def patched_forward_kl(amplitude: float) -> float:
-        probe_calls.append(amplitude)
-        return float(model.steer(0, 0, amplitude, t_from, t_to)["predicted_nats"])
+    def patched_forward_kl(steer_plan: dict[str, object]) -> dict[str, object]:
+        probe_calls.append(steer_plan)
+        exact = float(steer_plan["predicted_nats"])
+        return {
+            "effective_delta": list(steer_plan["delta"]),
+            "exact_directional_nats": exact,
+            "measured_nats": exact,
+        }
 
     plan = model.steer_to_target(
         {
@@ -139,11 +144,14 @@ def test_target_dose_probe_is_wired_through_the_public_model() -> None:
         patched_forward_kl,
     )
 
-    assert plan["validation"] == "patched_forward"
+    assert plan["validation"] == "applied_dose_probe"
     assert plan["iterations"] == 1
-    assert probe_calls == [plan["amplitude"]]
+    assert len(probe_calls) == 1
+    assert probe_calls[0]["amplitude"] == plan["amplitude"]
     assert plan["measured_nats"] == pytest.approx(target, rel=1.0e-12)
     assert plan["predicted_nats"] == pytest.approx(target, rel=1.0e-12)
+    assert plan["predicted_nats_kind"] == "exact_directional"
+    assert plan["resident_metric_nats_kind"] == "uncertified_approximation"
     np.testing.assert_allclose(
         plan["delta"],
         model.steer(0, 0, plan["amplitude"], t_from, t_to)["delta"],
@@ -233,8 +241,13 @@ def test_public_target_dose_rebuilds_cylinder_metadata() -> None:
     unit = model.steer(0, 0, 1.0, t_from, t_to)
     target = 0.5 * float(unit["predicted_nats"])
 
-    def patched_forward_kl(amplitude: float) -> float:
-        return float(model.steer(0, 0, amplitude, t_from, t_to)["predicted_nats"])
+    def patched_forward_kl(steer_plan: dict[str, object]) -> dict[str, object]:
+        exact = float(steer_plan["predicted_nats"])
+        return {
+            "effective_delta": list(steer_plan["delta"]),
+            "exact_directional_nats": exact,
+            "measured_nats": exact,
+        }
 
     plan = model.steer_to_target(
         {
@@ -249,7 +262,7 @@ def test_public_target_dose_rebuilds_cylinder_metadata() -> None:
         },
         patched_forward_kl,
     )
-    assert plan["validation"] == "patched_forward"
+    assert plan["validation"] == "applied_dose_probe"
     assert plan["measured_nats"] == pytest.approx(target, rel=1e-12)
 
 

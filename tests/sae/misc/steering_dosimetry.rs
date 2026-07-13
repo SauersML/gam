@@ -40,7 +40,8 @@ use ndarray::{Array1, Array2};
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::inference::steering::{
-    TargetDoseConfig, TargetDoseError, TargetDoseRequest, steer_delta, steer_to_target_nats,
+    AppliedDoseObservation, AppliedDoseProbe, SteerPlan, TargetDoseConfig, TargetDoseError,
+    TargetDoseRequest, steer_delta, steer_to_target_nats,
 };
 use gam::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 use gam::terms::{
@@ -488,7 +489,7 @@ fn target_dose_closed_form_seed_hits_dose_exactly() {
         (applied_nats - target).abs() / target < 1e-12,
         "the atomic applied plan must land the dose: {applied_nats} vs {target}"
     );
-    assert!(plan.measured_nats.is_none());
+    assert!(plan.applied_probe.is_none());
     assert_eq!(plan.iterations, 0);
     assert!(plan.readout_kl_radius.is_none());
     assert!(
@@ -511,9 +512,13 @@ fn target_dose_exact_probe_converges_in_one_step() {
 
     // Exact-quadratic probe: measured KL == the endpoint Fisher quadratic (the
     // planted readout IS a quadratic, so the second-order dose is the true KL).
-    let mut probe = |a: f64| -> Result<f64, String> {
-        let p = steer_delta(&term, &metric, 0, 0, a, &[t0], &[t0 + delta])?;
-        Ok(p.predicted_nats.expect("dose"))
+    let mut probe = |plan: &SteerPlan| -> Result<AppliedDoseObservation, String> {
+        let exact = plan.predicted_nats.expect("dose");
+        Ok(AppliedDoseObservation {
+            effective_delta: plan.delta.clone(),
+            exact_directional_nats: exact,
+            measured_nats: exact,
+        })
     };
     let plan = steer_to_target_nats(
         &term,
@@ -526,7 +531,7 @@ fn target_dose_exact_probe_converges_in_one_step() {
             target_nats: target,
             config: TargetDoseConfig::default(),
         },
-        Some(&mut probe as &mut dyn FnMut(f64) -> Result<f64, String>),
+        Some(&mut probe as &mut AppliedDoseProbe<'_>),
     )
     .expect("target-dose plan");
 
@@ -534,7 +539,9 @@ fn target_dose_exact_probe_converges_in_one_step() {
         plan.iterations, 1,
         "the seed already hits the target exactly"
     );
-    let measured = plan.measured_nats.expect("measured");
+    let observation = plan.applied_probe.as_ref().expect("applied probe");
+    let measured = observation.measured_nats;
+    assert_eq!(observation.effective_delta, plan.steer.delta);
     assert!(
         (measured - target).abs() / target < 1e-9,
         "measured KL {measured} must equal target {target}"
@@ -566,9 +573,13 @@ fn target_dose_saturating_probe_secant_corrects_upward() {
     // Saturating monotone KL: measured = K·(1 − exp(−quad/K)), ≈ quad for small
     // quad, bounded by K. quad(a) = a²·unit_nats.
     let k_sat = 1.0_f64;
-    let mut probe = |a: f64| -> Result<f64, String> {
-        let quad = a * a * unit_nats;
-        Ok(k_sat * (1.0 - (-quad / k_sat).exp()))
+    let mut probe = |plan: &SteerPlan| -> Result<AppliedDoseObservation, String> {
+        let exact = plan.predicted_nats.expect("exact local dose");
+        Ok(AppliedDoseObservation {
+            effective_delta: plan.delta.clone(),
+            exact_directional_nats: exact,
+            measured_nats: k_sat * (1.0 - (-exact / k_sat).exp()),
+        })
     };
     let plan = steer_to_target_nats(
         &term,
@@ -581,11 +592,15 @@ fn target_dose_saturating_probe_secant_corrects_upward() {
             target_nats: target,
             config: TargetDoseConfig::default(),
         },
-        Some(&mut probe as &mut dyn FnMut(f64) -> Result<f64, String>),
+        Some(&mut probe as &mut AppliedDoseProbe<'_>),
     )
     .expect("target-dose plan");
 
-    let measured = plan.measured_nats.expect("measured");
+    let measured = plan
+        .applied_probe
+        .as_ref()
+        .expect("applied probe")
+        .measured_nats;
     assert!(
         (measured - target).abs() / target <= TargetDoseConfig::default().tol_rel,
         "corrected measured KL {measured} must reach target {target}"
@@ -617,7 +632,13 @@ fn target_dose_plateau_is_an_explicit_unreachable_error() {
     let (term, metric) = planted_circle(t0);
     let delta = 0.05_f64;
     let target = 0.5_f64;
-    let mut probe = |_amplitude: f64| -> Result<f64, String> { Ok(0.1) };
+    let mut probe = |plan: &SteerPlan| -> Result<AppliedDoseObservation, String> {
+        Ok(AppliedDoseObservation {
+            effective_delta: plan.delta.clone(),
+            exact_directional_nats: plan.predicted_nats.expect("exact local dose"),
+            measured_nats: 0.1,
+        })
+    };
     let error = steer_to_target_nats(
         &term,
         &metric,
@@ -643,8 +664,13 @@ fn target_dose_probe_exhaustion_never_returns_an_unconverged_plan() {
     let unit = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("unit");
     let unit_nats = unit.predicted_nats.expect("unit dose");
     let target = 0.5_f64;
-    let mut probe =
-        |amplitude: f64| -> Result<f64, String> { Ok(0.5 * amplitude * amplitude * unit_nats) };
+    let mut probe = |plan: &SteerPlan| -> Result<AppliedDoseObservation, String> {
+        Ok(AppliedDoseObservation {
+            effective_delta: plan.delta.clone(),
+            exact_directional_nats: plan.predicted_nats.expect("exact local dose"),
+            measured_nats: 0.5 * plan.amplitude * plan.amplitude * unit_nats,
+        })
+    };
     let error = steer_to_target_nats(
         &term,
         &metric,
@@ -751,4 +777,57 @@ fn target_dose_rejects_unrepresentable_seed_amplitude() {
     )
     .expect_err("an infinite closed-form seed must fail before steering execution");
     assert!(matches!(error, TargetDoseError::InvalidRequest(_)));
+}
+
+#[test]
+fn applied_dose_probe_payload_fails_closed() {
+    let t0 = 0.0;
+    let (term, metric) = planted_circle(t0);
+    let delta = 0.02_f64;
+    let target = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta])
+        .expect("unit")
+        .predicted_nats
+        .expect("dose");
+    let cases = [
+        AppliedDoseObservation {
+            effective_delta: Array1::zeros(1),
+            exact_directional_nats: target,
+            measured_nats: target,
+        },
+        AppliedDoseObservation {
+            effective_delta: Array1::from(vec![f64::NAN, 0.0]),
+            exact_directional_nats: target,
+            measured_nats: target,
+        },
+        AppliedDoseObservation {
+            effective_delta: Array1::zeros(2),
+            exact_directional_nats: f64::NAN,
+            measured_nats: target,
+        },
+        AppliedDoseObservation {
+            effective_delta: Array1::zeros(2),
+            exact_directional_nats: target,
+            measured_nats: -1.0,
+        },
+    ];
+    for invalid in cases {
+        let mut probe = |_plan: &SteerPlan| -> Result<AppliedDoseObservation, String> {
+            Ok(invalid.clone())
+        };
+        let error = steer_to_target_nats(
+            &term,
+            &metric,
+            TargetDoseRequest {
+                atom_k: 0,
+                metric_row: 0,
+                t_from: &[t0],
+                t_to: &[t0 + delta],
+                target_nats: target,
+                config: TargetDoseConfig::default(),
+            },
+            Some(&mut probe),
+        )
+        .expect_err("invalid applied-dose observations must fail closed");
+        assert!(matches!(error, TargetDoseError::Probe(_)));
+    }
 }

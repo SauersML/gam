@@ -39,7 +39,8 @@
 #[cfg(test)]
 mod tests {
     use crate::inference::steering::{
-        TargetDoseConfig, TargetDoseRequest, steer_delta, steer_to_target_nats,
+        AppliedDoseObservation, SteerPlan, TargetDoseConfig, TargetDoseRequest, steer_delta,
+        steer_to_target_nats,
     };
     use crate::manifold::{
         SaeFisherRowMetricRequest, SaeFitAssignmentKind, SaeFitConfig, SaeFitSeedReport,
@@ -485,20 +486,25 @@ mod tests {
             "seed amplitude {} must be sqrt(q*/unit_nats) = {expect_a0}",
             seed_plan.seed_amplitude
         );
-        assert!(seed_plan.measured_nats.is_none());
+        assert!(seed_plan.applied_probe.is_none());
 
         // Model-in-the-loop probe: exact categorical KL of the applied chord.
         let z_from_probe = z_from.clone();
         let dg_probe = dg_raw.clone();
         let p_from_probe = p_from.clone();
-        let mut probe = move |a: f64| -> Result<f64, String> {
+        let mut probe = move |plan: &SteerPlan| -> Result<AppliedDoseObservation, String> {
             let z_to: Vec<f64> = z_from_probe
                 .iter()
-                .zip(dg_probe.iter())
-                .map(|(&z, &d)| z + a * d)
+                .zip(plan.delta.iter())
+                .map(|(&z, &d)| z + d)
                 .collect();
             let p_to = softmax(ArrayView1::from(&z_to));
-            Ok(kl(&p_from_probe, &p_to))
+            Ok(AppliedDoseObservation {
+                effective_delta: plan.delta.clone(),
+                exact_directional_nats: 0.5
+                    * categorical_quad_form(&p_from_probe, plan.delta.as_slice().unwrap()),
+                measured_nats: kl(&p_from_probe, &p_to),
+            })
         };
         let plan = steer_to_target_nats(
             &term,
@@ -515,7 +521,11 @@ mod tests {
         )
         .expect("target-dose loop with exact-KL probe");
 
-        let measured = plan.measured_nats.expect("measured dose");
+        let measured = plan
+            .applied_probe
+            .as_ref()
+            .expect("applied probe")
+            .measured_nats;
         assert!(
             (measured - target_nats).abs() / target_nats <= 2.0e-2,
             "measured KL {measured} must land within 2% of target {target_nats}"
