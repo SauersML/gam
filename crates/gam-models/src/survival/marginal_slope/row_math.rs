@@ -904,21 +904,39 @@ fn row_primary_closed_form_vector_fixed<const DIM: usize>(
     Ok((row.0.v, gradient, hessian))
 }
 
-/// Reusable storage for the production reverse graph and runtime-width backend.
-/// Common widths use the stack-packed lowering; wider const-primary rows use
-/// the reverse graph, and dimensions above its exact support use the dynamic
-/// packed instantiation of the same row expression.
+enum RigidVectorRowBackend {
+    Fixed,
+    Graph(Box<Order2GraphWorkspace>),
+    Dynamic(DynamicJetArena),
+}
+
+/// Width-bound storage for exactly one production row backend. Fixed widths
+/// carry no workspace, graph widths own one boxed tape, and dynamic widths own
+/// one arena; a fold can never silently reuse storage configured for another
+/// score dimension.
 pub(crate) struct RigidVectorRowWorkspace {
-    graph: Order2GraphWorkspace,
-    dynamic: DynamicJetArena,
+    score_dimension: usize,
+    backend: RigidVectorRowBackend,
 }
 
 impl RigidVectorRowWorkspace {
-    pub(crate) fn new() -> Self {
-        Self {
-            graph: Order2GraphWorkspace::new(),
-            dynamic: DynamicJetArena::new(),
-        }
+    pub(crate) fn new(score_dimension: usize) -> Result<Self, String> {
+        let backend = match score_dimension {
+            0 => {
+                return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                    reason: "survival marginal-slope vector row requires at least one score slope"
+                        .to_string(),
+                }
+                .into());
+            }
+            1..=8 => RigidVectorRowBackend::Fixed,
+            9..=13 => RigidVectorRowBackend::Graph(Box::new(Order2GraphWorkspace::new())),
+            14.. => RigidVectorRowBackend::Dynamic(DynamicJetArena::new()),
+        };
+        Ok(Self {
+            score_dimension,
+            backend,
+        })
     }
 }
 
@@ -996,9 +1014,18 @@ pub(crate) fn row_primary_closed_form_vector(
         }
         .into());
     }
+    if workspace.score_dimension != k {
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope vector workspace width mismatch: configured={}, row={k}",
+                workspace.score_dimension
+            ),
+        }
+        .into());
+    }
 
     macro_rules! graph_row {
-        ($dimension:literal) => {
+        ($dimension:literal, $graph:expr) => {
             row_primary_closed_form_vector_graph::<$dimension>(
                 q0,
                 q1,
@@ -1010,7 +1037,7 @@ pub(crate) fn row_primary_closed_form_vector(
                 d,
                 derivative_guard,
                 probit_scale,
-                &mut workspace.graph,
+                $graph,
             )
         };
     }
@@ -1032,26 +1059,21 @@ pub(crate) fn row_primary_closed_form_vector(
         };
     }
 
-    match k {
-        0 => Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: "survival marginal-slope vector row requires at least one score slope"
-                .to_string(),
-        }
-        .into()),
-        1 => fixed_row!(4),
-        2 => fixed_row!(5),
-        3 => fixed_row!(6),
-        4 => fixed_row!(7),
-        5 => fixed_row!(8),
-        6 => fixed_row!(9),
-        7 => fixed_row!(10),
-        8 => fixed_row!(11),
-        9 => graph_row!(12),
-        10 => graph_row!(13),
-        11 => graph_row!(14),
-        12 => graph_row!(15),
-        13 => graph_row!(16),
-        14.. => row_primary_closed_form_vector_dynamic(
+    match (&mut workspace.backend, k) {
+        (RigidVectorRowBackend::Fixed, 1) => fixed_row!(4),
+        (RigidVectorRowBackend::Fixed, 2) => fixed_row!(5),
+        (RigidVectorRowBackend::Fixed, 3) => fixed_row!(6),
+        (RigidVectorRowBackend::Fixed, 4) => fixed_row!(7),
+        (RigidVectorRowBackend::Fixed, 5) => fixed_row!(8),
+        (RigidVectorRowBackend::Fixed, 6) => fixed_row!(9),
+        (RigidVectorRowBackend::Fixed, 7) => fixed_row!(10),
+        (RigidVectorRowBackend::Fixed, 8) => fixed_row!(11),
+        (RigidVectorRowBackend::Graph(graph), 9) => graph_row!(12, graph.as_mut()),
+        (RigidVectorRowBackend::Graph(graph), 10) => graph_row!(13, graph.as_mut()),
+        (RigidVectorRowBackend::Graph(graph), 11) => graph_row!(14, graph.as_mut()),
+        (RigidVectorRowBackend::Graph(graph), 12) => graph_row!(15, graph.as_mut()),
+        (RigidVectorRowBackend::Graph(graph), 13) => graph_row!(16, graph.as_mut()),
+        (RigidVectorRowBackend::Dynamic(arena), 14..) => row_primary_closed_form_vector_dynamic(
             q0,
             q1,
             qd1,
@@ -1062,8 +1084,14 @@ pub(crate) fn row_primary_closed_form_vector(
             d,
             derivative_guard,
             probit_scale,
-            &mut workspace.dynamic,
+            arena,
         ),
+        _ => Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope vector workspace backend does not support score width {k}"
+            ),
+        }
+        .into()),
     }
 }
 
@@ -1323,7 +1351,19 @@ mod tests {
 
     impl RigidVectorRowWorkspace {
         fn retained_bytes(&self) -> usize {
-            self.graph.retained_bytes() + self.dynamic.allocated_bytes()
+            match &self.backend {
+                RigidVectorRowBackend::Fixed => 0,
+                RigidVectorRowBackend::Graph(graph) => graph.retained_bytes(),
+                RigidVectorRowBackend::Dynamic(arena) => arena.allocated_bytes(),
+            }
+        }
+
+        fn backend_name(&self) -> &'static str {
+            match self.backend {
+                RigidVectorRowBackend::Fixed => "fixed",
+                RigidVectorRowBackend::Graph(_) => "graph",
+                RigidVectorRowBackend::Dynamic(_) => "dynamic",
+            }
         }
     }
 
@@ -1511,7 +1551,7 @@ mod tests {
         ];
         let slopes = [0.55, -0.8, 0.35];
         let scores = [-1.2, 0.65, 1.4];
-        let mut workspace = RigidVectorRowWorkspace::new();
+        let mut workspace = RigidVectorRowWorkspace::new(3).expect("k=3 production workspace");
         let mut dynamic_arena = DynamicJetArena::new();
         let close = |label: &str, actual: f64, expected: f64| {
             let tolerance = 5.0e-11 * actual.abs().max(expected.abs()).max(1.0);
@@ -1679,11 +1719,10 @@ mod tests {
                 );
             };
 
-            let mut production_workspace = RigidVectorRowWorkspace::new();
+            let mut production_workspace =
+                RigidVectorRowWorkspace::new(k).expect("production width workspace");
             let mut graph_workspace = Order2GraphWorkspace::new();
             let mut dynamic_arena = DynamicJetArena::new();
-            let initial_graph_nodes = production_workspace.graph.node_count();
-            let initial_dynamic_bytes = production_workspace.dynamic.allocated_bytes();
             for (shape_index, covariance) in covariances.iter().enumerate() {
                 for event in [0.0, 0.35, 1.0] {
                     let production = row_primary_closed_form_vector(
@@ -1714,28 +1753,8 @@ mod tests {
                     )
                     .expect("zero-order canonical vector row");
                     if shape_index == 0 && event == 0.0 {
-                        if k <= 8 {
-                            assert_eq!(
-                                production_workspace.graph.node_count(),
-                                initial_graph_nodes,
-                                "k={k}: fixed schedule unexpectedly recorded a graph"
-                            );
-                            assert_eq!(
-                                production_workspace.dynamic.allocated_bytes(),
-                                initial_dynamic_bytes,
-                                "k={k}: fixed schedule unexpectedly used the dynamic arena"
-                            );
-                        } else {
-                            assert!(
-                                production_workspace.graph.node_count() > initial_graph_nodes,
-                                "k={k}: scheduled production graph did not record a row"
-                            );
-                            assert_eq!(
-                                production_workspace.dynamic.allocated_bytes(),
-                                initial_dynamic_bytes,
-                                "k={k}: scheduled graph width unexpectedly used the dynamic arena"
-                            );
-                        }
+                        let expected_backend = if k <= 8 { "fixed" } else { "graph" };
+                        assert_eq!(production_workspace.backend_name(), expected_backend);
                     }
                     let graph = row_primary_closed_form_vector_graph::<DIM>(
                         q0,
@@ -1882,10 +1901,9 @@ mod tests {
                 sign * (0.14 + 0.018 * row as f64 + 0.035 * column as f64)
             }));
         let covariances = [diagonal, full, low_rank];
-        let mut production_workspace = RigidVectorRowWorkspace::new();
+        let mut production_workspace =
+            RigidVectorRowWorkspace::new(K).expect("k=14 production workspace");
         let mut dynamic_arena = DynamicJetArena::new();
-        let initial_graph_nodes = production_workspace.graph.node_count();
-        let initial_dynamic_bytes = production_workspace.dynamic.allocated_bytes();
 
         let close = |shape: usize, event: f64, channel: &str, actual: f64, expected: f64| {
             let tolerance = 8.0e-11 * actual.abs().max(expected.abs()).max(1.0);
@@ -1974,15 +1992,8 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            production_workspace.graph.node_count(),
-            initial_graph_nodes,
-            "k={K}: dynamic schedule must not record a compiled graph"
-        );
-        assert!(
-            production_workspace.dynamic.allocated_bytes() > initial_dynamic_bytes,
-            "k={K}: production did not select the dynamic packed arena"
-        );
+        assert_eq!(production_workspace.backend_name(), "dynamic");
+        assert!(production_workspace.retained_bytes() > 0);
     }
 
     /// Temporary #932 release measurement for the runtime-width row program.
@@ -2028,7 +2039,8 @@ mod tests {
         let scores = [-1.2, 0.65, 1.4];
 
         for &(label, covariance, event, q0, q1, qd1, probit_scale) in &cases {
-            let mut workspace = RigidVectorRowWorkspace::new();
+            let mut workspace =
+                RigidVectorRowWorkspace::new(3).expect("k=3 production workspace");
             let mut dynamic_arena = DynamicJetArena::new();
             let evaluate_production = |workspace: &mut RigidVectorRowWorkspace| {
                 row_primary_closed_form_vector(
@@ -2177,7 +2189,8 @@ mod tests {
 
                 for &(label, covariance) in &cases {
                     for event in [0.0, 1.0] {
-                        let mut workspace = RigidVectorRowWorkspace::new();
+                        let mut workspace = RigidVectorRowWorkspace::new($k)
+                            .expect("packed production workspace");
                         let mut graph_workspace = Order2GraphWorkspace::new();
                         let mut dynamic_arena = DynamicJetArena::new();
                         let evaluate_production = |workspace: &mut RigidVectorRowWorkspace| {

@@ -1,4 +1,5 @@
 pub mod conformal;
+pub mod generative;
 pub mod input;
 pub mod interval_policy;
 pub mod linalg;
@@ -10,6 +11,7 @@ pub use gam_models::inference::predict_io::{
     BernoulliMarginalSlopePredictor, PredictInput, PredictResult,
 };
 pub use gam_problem::dispersion_cov::se_from_covariance;
+pub use generative::*;
 pub use posterior_bands::*;
 pub use posterior_predict::*;
 
