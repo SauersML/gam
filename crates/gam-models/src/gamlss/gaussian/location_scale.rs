@@ -1444,13 +1444,17 @@ impl CustomFamily for GaussianLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_index: usize,
     ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("GaussianLocationScaleFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
         self.exact_newton_joint_psi_terms_for_specs(
             block_states,
             specs,
-            derivative_blocks,
+            hyper_layout.design_derivative_blocks(),
             psi_index,
         )
     }
@@ -1459,14 +1463,18 @@ impl CustomFamily for GaussianLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("GaussianLocationScaleFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
         self.exact_newton_joint_psisecond_order_terms_for_specs(
             block_states,
             specs,
-            derivative_blocks,
+            hyper_layout.design_derivative_blocks(),
             psi_i,
             psi_j,
         )
@@ -1476,14 +1484,18 @@ impl CustomFamily for GaussianLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("GaussianLocationScaleFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
         self.exact_newton_joint_psihessian_directional_derivative_for_specs(
             block_states,
             specs,
-            derivative_blocks,
+            hyper_layout.design_derivative_blocks(),
             psi_index,
             d_beta_flat,
         )
