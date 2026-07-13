@@ -816,9 +816,32 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
 
     #[inline(always)]
     fn mul(&self, o: &Self) -> Self {
+        self.base.assert_compatible(&o.base);
+        self.eps.assert_compatible(&o.eps);
         Self {
             base: self.base.mul(&o.base),
-            eps: self.base.mul(&o.eps).add(&self.eps.mul(&o.base)),
+            eps: DynamicOrder2::from_channel_functions(
+                self.base.v * o.eps.v + self.eps.v * o.base.v,
+                self.dimension(),
+                self.base.arena,
+                |i| {
+                    self.base.v * o.eps.g[i]
+                        + self.base.g[i] * o.eps.v
+                        + self.eps.v * o.base.g[i]
+                        + self.eps.g[i] * o.base.v
+                },
+                |i, j| {
+                    let ij = i * self.dimension() + j;
+                    self.base.v * o.eps.h[ij]
+                        + self.base.g[i] * o.eps.g[j]
+                        + self.base.g[j] * o.eps.g[i]
+                        + self.base.h[ij] * o.eps.v
+                        + self.eps.v * o.base.h[ij]
+                        + self.eps.g[i] * o.base.g[j]
+                        + self.eps.g[j] * o.base.g[i]
+                        + self.eps.h[ij] * o.base.v
+                },
+            ),
         }
     }
 
@@ -841,8 +864,22 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
     #[inline(always)]
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         let base = self.base.compose_unary(d);
-        let fprime = self.base.compose_unary([d[1], d[2], d[3], d[4], d[4]]);
-        let eps = fprime.mul(&self.eps);
+        let dimension = self.dimension();
+        let eps = DynamicOrder2::from_channel_functions(
+            d[1] * self.eps.v,
+            dimension,
+            self.base.arena,
+            |i| d[2] * self.base.g[i] * self.eps.v + d[1] * self.eps.g[i],
+            |i, j| {
+                let ij = i * dimension + j;
+                d[1] * self.eps.h[ij]
+                    + d[2]
+                        * (self.base.g[i] * self.eps.g[j]
+                            + self.base.g[j] * self.eps.g[i]
+                            + self.base.h[ij] * self.eps.v)
+                    + d[3] * self.base.g[i] * self.base.g[j] * self.eps.v
+            },
+        );
         Self { base, eps }
     }
 }
