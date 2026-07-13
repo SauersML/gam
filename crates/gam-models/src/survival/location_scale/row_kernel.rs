@@ -74,99 +74,6 @@ impl SurvivalExactRowKernel {
     pub(crate) fn log_likelihood(self) -> f64 {
         self.w * (event_mix(self.d, self.logphi1 + self.log_g, self.log_s1) - self.log_s0)
     }
-
-    /// The exactly-eight NLL-index derivative channels the inner-Newton consumer
-    /// ([`row_derivatives_rescaled`]) reads — the gradient/diagonal-Hessian of
-    /// the three functionally INDEPENDENT survival indices `(u0, u1, g)`, plus
-    /// the two diagonal third derivatives it needs.
-    ///
-    /// History: this was a `Tower4<3>`, then a `Tower3<3>`, built as a sum of
-    /// three `compose_unary`s on the three independent variables `u0 = var(0)`,
-    /// `u1 = var(1)`, `g = var(2)`. Because the variables are independent, the
-    /// index NLL is a SUM OF THREE UNIVARIATE functions: its Hessian and third
-    /// tensor are structurally DIAGONAL (every mixed/off-axis entry is zero). The
-    /// `Tower3<3>` nevertheless materialized all `K³ = 27` third-tensor entries
-    /// and all `K² = 9` Hessian entries via the full multivariate Faà-di-Bruno
-    /// walk, while the consumer reads only `g[0/1/2]`, `h[0..][0..]` diagonal
-    /// `[0][0]/[1][1]/[2][2]`, and `t3[0][0][0]/[1][1][1]` (never `t3[2][2][2]`,
-    /// never the value). For a unit-seed variable at value 0 the diagonal output
-    /// of `compose_unary` equals its derivative stack EXACTLY (the off-diagonal
-    /// Faà-di-Bruno terms all carry a factor of the zero higher-order seed), so
-    /// each channel reduces to a plain scaled stack coefficient. The cross-channel
-    /// `Add`s only ever added structural zeros into the read slots. This computes
-    /// exactly those eight scalars.
-    ///
-    /// **Bit-identity.** Proven `f64::to_bits`-identical to the old `Tower3<3>`
-    /// build on the eight read channels over 5000 random kernels (all three
-    /// `d ∈ {1, 0, mixed}` weight regimes); the per-channel univariate diagonal
-    /// arithmetic and the channel-1 censored→event accumulation order are
-    /// replicated term-for-term. Asm (`-O`, target-cpu=native): the full-tower
-    /// read dropped from 89 FP ops / 224 loads-stores to 16 FP ops / 7. (#1591)
-    #[inline]
-    pub(crate) fn nll_index_read_channels(self) -> SurvivalIndexNllReadChannels {
-        // Channel 0 (entry index u0): only the entry log-survival term. For the
-        // unit-seed variable the compose diagonal is the stack `[·, -r0, -dr0,
-        // -ddr0]`, then `scale(w)` multiplies each.
-        let g0 = -self.r0 * self.w;
-        let h0 = -self.dr0 * self.w;
-        let t30 = -self.ddr0 * self.w;
-
-        // Channel 1 (exit index u1): censored log-survival + event log-pdf,
-        // accumulated in the SAME order the `Tower3` `Add` used (0 base, then the
-        // censored compose·(-cw), then the event compose·(-ew)).
-        let censored_weight = self.w * (1.0 - self.d);
-        let event_weight = self.w * self.d;
-        let mut g1 = 0.0;
-        let mut h1 = 0.0;
-        let mut t31 = 0.0;
-        if censored_weight != 0.0 {
-            g1 += -self.r1 * -censored_weight;
-            h1 += -self.dr1 * -censored_weight;
-            t31 += -self.ddr1 * -censored_weight;
-        }
-        if event_weight != 0.0 {
-            g1 += self.dlogphi1 * -event_weight;
-            h1 += self.d2logphi1 * -event_weight;
-            t31 += self.d3logphi1 * -event_weight;
-        }
-
-        // Channel 2 (event log-jacobian g): only the event term, read to order 2
-        // (the consumer never reads `t3[2][2][2]`).
-        let mut g2 = 0.0;
-        let mut h2 = 0.0;
-        if event_weight != 0.0 {
-            g2 += self.d_log_g * -event_weight;
-            h2 += self.d2_log_g * -event_weight;
-        }
-
-        SurvivalIndexNllReadChannels {
-            g0,
-            h0,
-            t30,
-            g1,
-            h1,
-            t31,
-            g2,
-            h2,
-        }
-    }
-}
-
-/// The eight survival index-NLL derivative channels the inner-Newton consumer
-/// reads — gradient and diagonal Hessian of the three independent indices
-/// `(u0, u1, g)` plus the two diagonal third derivatives. These are exactly the
-/// channels [`SurvivalExactRowKernel::nll_index_read_channels`] computes; field
-/// `gX`/`hX`/`t3X` is the NLL `∂/∂uX`, `∂²/∂uX²`, `∂³/∂uX³` (negated by the
-/// consumer to recover the log-likelihood derivatives).
-pub(crate) struct SurvivalIndexNllReadChannels {
-    pub(crate) g0: f64,
-    pub(crate) h0: f64,
-    pub(crate) t30: f64,
-    pub(crate) g1: f64,
-    pub(crate) h1: f64,
-    pub(crate) t31: f64,
-    pub(crate) g2: f64,
-    pub(crate) h2: f64,
 }
 
 pub(crate) struct SurvivalJointQuantities {
@@ -457,6 +364,50 @@ struct SlsOuterPlan {
     u0: [f64; 5],
     u1: Option<[f64; 5]>,
     g: Option<[f64; 5]>,
+}
+
+/// Exactly the eight diagonal index-space NLL channels consumed by the
+/// inner-Newton update: orders one and two for `(u0, u1, g)`, and order three
+/// for `(u0, u1)`. The channel count is encoded in the array widths, so the
+/// unused `d³/dg³` channel cannot be materialized or accidentally consumed.
+#[derive(Clone, Copy, Debug)]
+struct SlsIndexDerivativeChannels {
+    gradient: [f64; 3],
+    hessian_diagonal: [f64; 3],
+    third_diagonal: [f64; 2],
+}
+
+/// Project one derivative order from the canonical outer stacks. Both the
+/// number of live indices and the derivative order are compile-time constants;
+/// optimized code is a fixed set of scalar loads with no dense jet storage.
+#[inline(always)]
+fn project_index_diagonal<const CHANNELS: usize, const ORDER: usize>(
+    stacks: &[[f64; 5]; 3],
+) -> [f64; CHANNELS] {
+    assert!(CHANNELS <= stacks.len());
+    assert!(ORDER < stacks[0].len());
+    std::array::from_fn(|index| stacks[index][ORDER])
+}
+
+impl SlsOuterPlan {
+    /// Mechanically lower the canonical `(u0, u1, g)` outer derivative stacks
+    /// to the sparse diagonal channels read by the inner-Newton consumer.
+    /// Inactive event/censoring branches are structural zero stacks, while the
+    /// active `u1` stack retains [`sls_outer_plan`]'s censored-then-event
+    /// accumulation order. No derivative formula exists in this lowering.
+    #[inline(always)]
+    fn lower_index_derivative_channels(self) -> SlsIndexDerivativeChannels {
+        let stacks = [
+            self.u0,
+            self.u1.unwrap_or([0.0; 5]),
+            self.g.unwrap_or([0.0; 5]),
+        ];
+        SlsIndexDerivativeChannels {
+            gradient: project_index_diagonal::<3, 1>(&stacks),
+            hessian_diagonal: project_index_diagonal::<3, 2>(&stacks),
+            third_diagonal: project_index_diagonal::<2, 3>(&stacks),
+        }
+    }
 }
 
 #[inline(always)]
@@ -4297,15 +4248,18 @@ impl SurvivalLocationScaleFamily {
         let Some(kernel) = self.exact_row_kernel_rescaled(row, state, deriv_log_scale)? else {
             return Ok(None);
         };
-        let ch = kernel.nll_index_read_channels();
-        let d1_q0 = -ch.g0;
-        let d2_q0 = -ch.h0;
-        let d3_q0 = -ch.t30;
-        let d1_q1 = -ch.g1;
-        let d2_q1 = -ch.h1;
-        let d3_q1 = -ch.t31;
-        let d1_qdot1 = -ch.g2;
-        let d2_qdot1 = -ch.h2;
+        let channels = sls_outer_plan(&kernel).lower_index_derivative_channels();
+        let [nll_d1_q0, nll_d1_q1, nll_d1_qdot1] = channels.gradient;
+        let [nll_d2_q0, nll_d2_q1, nll_d2_qdot1] = channels.hessian_diagonal;
+        let [nll_d3_q0, nll_d3_q1] = channels.third_diagonal;
+        let d1_q0 = -nll_d1_q0;
+        let d2_q0 = -nll_d2_q0;
+        let d3_q0 = -nll_d3_q0;
+        let d1_q1 = -nll_d1_q1;
+        let d2_q1 = -nll_d2_q1;
+        let d3_q1 = -nll_d3_q1;
+        let d1_qdot1 = -nll_d1_qdot1;
+        let d2_qdot1 = -nll_d2_qdot1;
         Ok(Some(SurvivalRowDerivatives {
             ll: kernel.log_likelihood(),
             d1_q0,
@@ -4335,6 +4289,187 @@ pub(crate) fn q_chain_derivs_scalar(eta_t: f64, eta_ls: f64) -> (f64, f64, f64, 
     let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
     let q = -safe_product(eta_t, inv_sigma);
     (-inv_sigma, -q, inv_sigma, q, -inv_sigma, -q)
+}
+
+#[cfg(test)]
+mod index_derivative_lowering_tests {
+    use super::*;
+    use gam_math::jet_tower::Tower3;
+
+    const U0: f64 = -0.37;
+    const U1: f64 = 0.41;
+    const G: f64 = 1.31;
+    const W: f64 = 1.27;
+
+    fn log_survival(u: f64) -> f64 {
+        -(0.7 * u).exp()
+    }
+
+    fn log_density(u: f64) -> f64 {
+        -(0.4 * u).exp() - 0.15 * u * u
+    }
+
+    fn analytic_kernel(d: f64) -> SurvivalExactRowKernel {
+        let exp0 = (0.7 * U0).exp();
+        let exp1 = (0.7 * U1).exp();
+        let density_exp = (0.4 * U1).exp();
+        SurvivalExactRowKernel {
+            w: W,
+            d,
+            log_s0: -exp0,
+            r0: 0.7 * exp0,
+            dr0: 0.49 * exp0,
+            ddr0: 0.343 * exp0,
+            dddr0: 0.2401 * exp0,
+            log_s1: -exp1,
+            r1: 0.7 * exp1,
+            dr1: 0.49 * exp1,
+            ddr1: 0.343 * exp1,
+            dddr1: 0.2401 * exp1,
+            logphi1: log_density(U1),
+            dlogphi1: -0.4 * density_exp - 0.3 * U1,
+            d2logphi1: -0.16 * density_exp - 0.3,
+            d3logphi1: -0.064 * density_exp,
+            d4logphi1: -0.0256 * density_exp,
+            log_g: G.ln(),
+            d_log_g: G.recip(),
+            d2_log_g: -G.recip().powi(2),
+            d3_log_g: 2.0 * G.recip().powi(3),
+            d4_log_g: -6.0 * G.recip().powi(4),
+        }
+    }
+
+    fn generic_index_channels(kernel: &SurvivalExactRowKernel) -> SlsIndexDerivativeChannels {
+        // Constants on the six nonlinear predictor inputs reduce the canonical
+        // row program's three inner atoms to independent unit seeds on h0, h1,
+        // and hdot. This is the former dense generic-jet oracle, retained only
+        // in the parity test; production never materializes its 9³ tensor.
+        let vars: [Tower3<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|axis| {
+            if axis < 3 {
+                Tower3::variable(0.0, axis)
+            } else {
+                Tower3::constant(0.0)
+            }
+        });
+        let nll = sls_row_nll(&vars, kernel).expect("canonical survival row NLL");
+        SlsIndexDerivativeChannels {
+            gradient: [nll.g[0], nll.g[1], nll.g[2]],
+            hessian_diagonal: [nll.h[0][0], nll.h[1][1], nll.h[2][2]],
+            third_diagonal: [nll.t3[0][0][0], nll.t3[1][1][1]],
+        }
+    }
+
+    fn flatten(channels: SlsIndexDerivativeChannels) -> [f64; 8] {
+        [
+            channels.gradient[0],
+            channels.gradient[1],
+            channels.gradient[2],
+            channels.hessian_diagonal[0],
+            channels.hessian_diagonal[1],
+            channels.hessian_diagonal[2],
+            channels.third_diagonal[0],
+            channels.third_diagonal[1],
+        ]
+    }
+
+    #[test]
+    fn sls_index_sparse_lowering_matches_generic_jet_all_branches_932() {
+        for d in [0.0, 1.0, 0.37] {
+            let kernel = analytic_kernel(d);
+            let sparse = flatten(sls_outer_plan(&kernel).lower_index_derivative_channels());
+            let generic = flatten(generic_index_channels(&kernel));
+            for channel in 0..sparse.len() {
+                assert_eq!(
+                    sparse[channel].to_bits(),
+                    generic[channel].to_bits(),
+                    "d={d} channel={channel}: sparse={} generic={}",
+                    sparse[channel],
+                    generic[channel]
+                );
+            }
+        }
+    }
+
+    fn analytic_index_nll(point: [f64; 3], d: f64) -> f64 {
+        W * (log_survival(point[0])
+            - (1.0 - d) * log_survival(point[1])
+            - d * (log_density(point[1]) + point[2].ln()))
+    }
+
+    fn sample_shifted(point: [f64; 3], axis: usize, shift: f64, d: f64) -> f64 {
+        let mut shifted = point;
+        shifted[axis] += shift;
+        analytic_index_nll(shifted, d)
+    }
+
+    fn finite_difference_first(point: [f64; 3], axis: usize, d: f64) -> f64 {
+        let h = 1.0e-4;
+        (-sample_shifted(point, axis, 2.0 * h, d) + 8.0 * sample_shifted(point, axis, h, d)
+            - 8.0 * sample_shifted(point, axis, -h, d)
+            + sample_shifted(point, axis, -2.0 * h, d))
+            / (12.0 * h)
+    }
+
+    fn finite_difference_second(point: [f64; 3], axis: usize, d: f64) -> f64 {
+        let h = 3.0e-4;
+        (-sample_shifted(point, axis, 2.0 * h, d) + 16.0 * sample_shifted(point, axis, h, d)
+            - 30.0 * analytic_index_nll(point, d)
+            + 16.0 * sample_shifted(point, axis, -h, d)
+            - sample_shifted(point, axis, -2.0 * h, d))
+            / (12.0 * h * h)
+    }
+
+    fn finite_difference_third(point: [f64; 3], axis: usize, d: f64) -> f64 {
+        let h = 3.0e-3;
+        (-sample_shifted(point, axis, 3.0 * h, d) + 8.0 * sample_shifted(point, axis, 2.0 * h, d)
+            - 13.0 * sample_shifted(point, axis, h, d)
+            + 13.0 * sample_shifted(point, axis, -h, d)
+            - 8.0 * sample_shifted(point, axis, -2.0 * h, d)
+            + sample_shifted(point, axis, -3.0 * h, d))
+            / (8.0 * h * h * h)
+    }
+
+    fn assert_fd_close(d: f64, order: usize, axis: usize, exact: f64, fd: f64) {
+        let tolerance = if order == 3 { 2.0e-5 } else { 2.0e-7 };
+        let error = (exact - fd).abs();
+        assert!(
+            error <= tolerance * exact.abs().max(1.0),
+            "d={d} order={order} axis={axis}: exact={exact:.16e} fd={fd:.16e} error={error:.3e}"
+        );
+    }
+
+    #[test]
+    fn sls_index_sparse_lowering_matches_independent_fd_all_branches_932() {
+        let point = [U0, U1, G];
+        for d in [0.0, 1.0, 0.37] {
+            let channels = sls_outer_plan(&analytic_kernel(d)).lower_index_derivative_channels();
+            for axis in 0..3 {
+                assert_fd_close(
+                    d,
+                    1,
+                    axis,
+                    channels.gradient[axis],
+                    finite_difference_first(point, axis, d),
+                );
+                assert_fd_close(
+                    d,
+                    2,
+                    axis,
+                    channels.hessian_diagonal[axis],
+                    finite_difference_second(point, axis, d),
+                );
+            }
+            for axis in 0..2 {
+                assert_fd_close(
+                    d,
+                    3,
+                    axis,
+                    channels.third_diagonal[axis],
+                    finite_difference_third(point, axis, d),
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
