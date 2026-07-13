@@ -1378,7 +1378,7 @@ pub(crate) fn reference_function_gram_is_fixed_and_has_exact_trace_form() {
     atom.basis_jacobian.fill(13.0);
     assert_eq!(atom.smooth_penalty(), &frozen);
     assert_eq!(
-        atom.reference_roughness_kind,
+        atom.reference_roughness_kind(),
         SaeReferenceRoughnessKind::ProvidedFunctionGram
     );
 
