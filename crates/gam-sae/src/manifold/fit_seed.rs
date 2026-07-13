@@ -80,12 +80,12 @@ impl SaeFitAssignmentKind {
 /// Borrowed arrays and owned policy needed to construct one fit seed.
 pub struct SaeFitSeedRequest<'a, 'context> {
     pub target: ArrayView2<'a, f64>,
-    pub atom_basis: &'a [String],
-    pub atom_dim: &'a [usize],
-    pub atom_centers: &'context [Option<Array2<f64>>],
+    /// Complete immutable atom geometry. Kinds, dimensions, analytic
+    /// resolutions, widths, centers, and reference metrics are derived from
+    /// these plans; the padded arrays below carry no parallel metadata.
+    pub geometry_plans: &'context [SaeAtomGeometryPlan],
     pub basis_values: ArrayView3<'a, f64>,
     pub basis_jacobian: ArrayView4<'a, f64>,
-    pub basis_sizes: &'a [usize],
     pub decoder_coefficients: ArrayView3<'a, f64>,
     pub smooth_penalties: ArrayView3<'a, f64>,
     pub initial_logits: ArrayView2<'a, f64>,
@@ -147,22 +147,25 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
     if n_obs == 0 || p_out == 0 {
         return Err("sae_manifold_fit requires a non-empty (N, p) response".to_string());
     }
-    let k_atoms = request.atom_dim.len();
+    let k_atoms = request.geometry_plans.len();
     if k_atoms == 0 {
         return Err("sae_manifold_fit requires at least one atom".to_string());
     }
-    if request.atom_basis.len() != k_atoms || request.basis_sizes.len() != k_atoms {
-        return Err(format!(
-            "sae_manifold_fit metadata lengths must equal K={k_atoms}; got atom_basis={}, basis_sizes={}",
-            request.atom_basis.len(),
-            request.basis_sizes.len()
-        ));
-    }
+    let basis_sizes: Vec<usize> = request
+        .geometry_plans
+        .iter()
+        .map(SaeAtomGeometryPlan::basis_size)
+        .collect::<Result<_, _>>()?;
+    let latent_dims: Vec<usize> = request
+        .geometry_plans
+        .iter()
+        .map(SaeAtomGeometryPlan::latent_dim)
+        .collect();
     let admission = admit_sae_fit_shape(
         n_obs,
         p_out,
         k_atoms,
-        request.atom_dim.iter().copied().max().unwrap_or(1),
+        latent_dims.iter().copied().max().unwrap_or(1),
         request.assignment_kind,
         request.top_k,
     )?;
@@ -269,25 +272,25 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
     let max_dim = coords_shape[2];
     let mut coord_blocks = Vec::with_capacity(k_atoms);
     for atom_idx in 0..k_atoms {
-        let d = request.atom_dim[atom_idx];
-        let m = request.basis_sizes[atom_idx];
+        let d = latent_dims[atom_idx];
+        let m = basis_sizes[atom_idx];
         if m > basis_values_shape[2]
             || m > basis_jacobian_shape[2]
             || m > decoder_shape[1]
             || m > smooth_shape[1]
         {
             return Err(format!(
-                "basis_sizes[{atom_idx}]={m} exceeds one of the padded M_max dimensions"
+                "geometry plan {atom_idx} derives basis width {m}, which exceeds one of the padded M_max dimensions"
             ));
         }
         if d > max_dim {
             return Err(format!(
-                "atom_dim[{atom_idx}]={d} exceeds initial_coords D_max={max_dim}"
+                "geometry plan {atom_idx} derives latent_dim={d}, which exceeds initial_coords D_max={max_dim}"
             ));
         }
         if d > basis_jacobian_shape[3] {
             return Err(format!(
-                "atom_dim[{atom_idx}]={d} exceeds basis_jacobian D_max={}",
+                "geometry plan {atom_idx} derives latent_dim={d}, which exceeds basis_jacobian D_max={}",
                 basis_jacobian_shape[3]
             ));
         }
@@ -298,18 +301,6 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
                 .to_owned(),
         );
     }
-    if request.atom_centers.len() != k_atoms {
-        return Err(format!(
-            "sae_manifold_fit: atom_centers length {} must equal K={k_atoms}",
-            request.atom_centers.len()
-        ));
-    }
-
-    let basis_kinds: Vec<SaeAtomBasisKind> = request
-        .atom_basis
-        .iter()
-        .map(|kind| sae_atom_basis_kind_from_str(kind))
-        .collect();
     let assignment_alpha = request
         .fit_config
         .ordered_beta_bernoulli_alpha_override
@@ -321,27 +312,17 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         request.threshold,
         request.top_k,
     )?;
-    let evaluators = build_sae_basis_evaluators(
-        &basis_kinds,
-        request.basis_sizes,
-        request.atom_dim,
-        &coord_blocks,
-        request.atom_centers,
-    )?;
-    let mut base_term = term_from_padded_blocks_with_mode(
+    let mut base_term = term_from_geometry_plans_with_mode(
         n_obs,
         p_out,
-        &basis_kinds,
+        request.geometry_plans,
         request.basis_values,
         request.basis_jacobian,
-        request.basis_sizes,
-        request.atom_dim,
         request.decoder_coefficients,
         request.smooth_penalties,
         request.initial_logits,
         &coord_blocks,
         mode,
-        &evaluators,
     )?;
     base_term.set_data_row_reseed(request.data_row_reseed);
     base_term.set_fit_config(request.fit_config);
@@ -359,7 +340,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         sae_refine_routing_seed(
             &mut base_term,
             request.target,
-            request.basis_sizes,
+            &basis_sizes,
             request.assignment_kind.tag(),
             request.alpha,
             request.tau,
@@ -386,8 +367,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         base_term.set_row_loss_weights(weights.to_vec())?;
     }
 
-    let log_ard: Vec<Array1<f64>> = request
-        .atom_dim
+    let log_ard: Vec<Array1<f64>> = latent_dims
         .iter()
         .map(|&d| {
             if request.native_ard_enabled {
@@ -437,10 +417,7 @@ mod tests {
 
     #[test]
     fn seed_entry_rejects_empty_target_before_construction() {
-        let atom_basis = Vec::<String>::new();
-        let atom_dim = Vec::<usize>::new();
-        let centers = Vec::<Option<Array2<f64>>>::new();
-        let basis_sizes = Vec::<usize>::new();
+        let geometry_plans = Vec::<SaeAtomGeometryPlan>::new();
         let registry = AnalyticPenaltyRegistry::new();
         let target = Array2::<f64>::zeros((0, 0));
         let basis_values = ndarray::Array3::<f64>::zeros((0, 0, 0));
@@ -451,12 +428,9 @@ mod tests {
         let initial_coords = ndarray::Array3::<f64>::zeros((0, 0, 0));
         let request = SaeFitSeedRequest {
             target: target.view(),
-            atom_basis: &atom_basis,
-            atom_dim: &atom_dim,
-            atom_centers: &centers,
+            geometry_plans: &geometry_plans,
             basis_values: basis_values.view(),
             basis_jacobian: basis_jacobian.view(),
-            basis_sizes: &basis_sizes,
             decoder_coefficients: decoder_coefficients.view(),
             smooth_penalties: smooth_penalties.view(),
             initial_logits: initial_logits.view(),

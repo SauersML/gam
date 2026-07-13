@@ -552,7 +552,19 @@ pub fn fit_transformation_normal(
         None,
         outer_derivative_policy,
         // fit_fn
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta,
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign],
+         provenance| {
+            let certified_outer = match provenance {
+                SpatialFitProvenance::Certified(outer) => outer,
+                SpatialFitProvenance::NoOuterOptimization => {
+                    return Err(
+                        "transformation selected-mode finalization requires certified spatial outer provenance"
+                            .to_string(),
+                    );
+                }
+            };
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             ensure_exact_geometry(&specs[0], &designs[0], &rho)?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
@@ -581,9 +593,8 @@ pub fn fit_transformation_normal(
                 &geometry.blocks,
                 &options,
                 selection,
-                0,
-                None,
-                true,
+                theta,
+                certified_outer,
             )
             .map_err(|e| format!("transformation fit_fn: {e}"))?;
             if let Some(block) = fit.block_states.first() {

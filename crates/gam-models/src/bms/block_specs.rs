@@ -2744,7 +2744,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         true,
         None,
         outer_policy,
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], _provenance| {
             if let Some(err) = runaway_error.borrow().as_ref().cloned() {
                 return Err(err);
             }

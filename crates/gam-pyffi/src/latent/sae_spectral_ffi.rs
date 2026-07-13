@@ -1071,9 +1071,8 @@ fn gaussian_holonomy_analysis_dict<'py>(
     analysis: &gam::terms::sae::inference::atlas_holonomy::GaussianPcaHolonomyAnalysis,
 ) -> PyResult<(Bound<'py, PyDict>, Vec<&'static str>, bool)> {
     use gam::terms::sae::inference::atlas_holonomy::{
-        AtlasCycleAsymptoticRegime, CrossPatchCovarianceProvenance,
-        GaussianPcaCovarianceAuthority, GaussianPcaSpectrumProvenance,
-        PilotProjectionProvenance,
+        AtlasCycleAsymptoticRegime, CrossPatchCovarianceProvenance, GaussianPcaCovarianceAuthority,
+        GaussianPcaSpectrumProvenance, PilotProjectionProvenance,
     };
     let out = PyDict::new(py);
     out.set_item("familywise_alpha", analysis.familywise_level().alpha())?;
@@ -1089,12 +1088,8 @@ fn gaussian_holonomy_analysis_dict<'py>(
     out.set_item(
         "cross_patch_covariance_provenance",
         match analysis.error_model().cross_patch_provenance() {
-            CrossPatchCovarianceProvenance::DisjointInferenceRows => {
-                "disjoint_inference_rows"
-            }
-            CrossPatchCovarianceProvenance::ExplicitJointCovariance => {
-                "explicit_joint_covariance"
-            }
+            CrossPatchCovarianceProvenance::DisjointInferenceRows => "disjoint_inference_rows",
+            CrossPatchCovarianceProvenance::ExplicitJointCovariance => "explicit_joint_covariance",
         },
     )?;
     let patches = pyo3::types::PyList::empty(py);
@@ -1113,9 +1108,7 @@ fn gaussian_holonomy_analysis_dict<'py>(
             "pilot_projection_provenance",
             match patch.pilot_projection {
                 PilotProjectionProvenance::ExactAnalyticCapture => "exact_analytic_capture",
-                PilotProjectionProvenance::IndependentPilotEstimate => {
-                    "independent_pilot_estimate"
-                }
+                PilotProjectionProvenance::IndependentPilotEstimate => "independent_pilot_estimate",
             },
         )?;
         row.set_item(
@@ -1173,9 +1166,9 @@ fn gaussian_holonomy_analysis_dict<'py>(
     }
     out.set_item("sample_prescription", prescriptions)?;
     let cycles = pyo3::types::PyList::empty(py);
-    let mut missing = std::collections::BTreeSet::new();
+    let mut refusal_codes = std::collections::BTreeSet::new();
     for refusal in analysis.orientation().refusals() {
-        missing.insert(atlas_refusal_code(refusal));
+        refusal_codes.insert(atlas_refusal_code(refusal));
     }
     let mut fully_certified = analysis.orientation().certified_value().is_some();
     for cycle in analysis.cycles() {
@@ -1209,11 +1202,11 @@ fn gaussian_holonomy_analysis_dict<'py>(
         )?;
         row.set_item(
             "bilinear_quadratic_bias_diagnostic",
-            cycle.bilinear_quadratic_bias,
+            cycle.bilinear_quadratic_bias_diagnostic,
         )?;
         row.set_item(
             "bilinear_quadratic_variance_diagnostic",
-            cycle.bilinear_quadratic_variance,
+            cycle.bilinear_quadratic_variance_diagnostic,
         )?;
         row.set_item("standard_error", cycle.standard_error)?;
         row.set_item(
@@ -1242,7 +1235,7 @@ fn gaussian_holonomy_analysis_dict<'py>(
             cycle.decision.error_probability_bound(),
         )?;
         for refusal in cycle.decision.refusals() {
-            missing.insert(atlas_refusal_code(refusal));
+            refusal_codes.insert(atlas_refusal_code(refusal));
         }
         fully_certified &= cycle.decision.certified_value().is_some();
         cycles.append(row)?;
@@ -1280,14 +1273,14 @@ fn gaussian_holonomy_analysis_dict<'py>(
             confidence.decision.error_probability_bound(),
         )?;
         for refusal in confidence.decision.refusals() {
-            missing.insert(atlas_refusal_code(refusal));
+            refusal_codes.insert(atlas_refusal_code(refusal));
         }
         fully_certified &= confidence.decision.certified_value().is_some();
         out.set_item("gauss_bonnet", gauss_bonnet)?;
     } else {
         out.set_item("gauss_bonnet", py.None())?;
     }
-    Ok((out, missing.into_iter().collect(), fully_certified))
+    Ok((out, refusal_codes.into_iter().collect(), fully_certified))
 }
 
 fn atlas_nerve_dict<'py>(
@@ -1337,7 +1330,7 @@ fn atlas_nerve_dict<'py>(
                 analysis,
             ),
         ) => {
-            let (payload, missing, fully_certified) =
+            let (payload, refusal_codes, fully_certified) =
                 gaussian_holonomy_analysis_dict(py, analysis)?;
             out.set_item(
                 "holonomy_status",
@@ -1347,10 +1340,10 @@ fn atlas_nerve_dict<'py>(
                     "analyzed_refused"
                 },
             )?;
-            if missing.is_empty() {
+            if refusal_codes.is_empty() {
                 out.set_item("holonomy_refusal_codes", py.None())?;
             } else {
-                out.set_item("holonomy_refusal_codes", missing)?;
+                out.set_item("holonomy_refusal_codes", refusal_codes)?;
             }
             out.set_item("holonomy_unavailable_reason", py.None())?;
             out.set_item("holonomy_analysis", payload)?;
@@ -2603,6 +2596,50 @@ mod sae_spectral_ffi_tests {
                 .extract()
                 .unwrap();
             assert_eq!(authority, "asymptotic_plugin");
+            let cross_patch: String = analysis
+                .get_item("cross_patch_covariance_provenance")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(cross_patch, "disjoint_inference_rows");
+            let patches = analysis
+                .get_item("patches")
+                .unwrap()
+                .unwrap()
+                .cast_into::<pyo3::types::PyList>()
+                .unwrap();
+            assert_eq!(patches.len(), 2);
+            for patch in patches.iter() {
+                let patch = patch.cast_into::<PyDict>().unwrap();
+                assert_eq!(
+                    patch
+                        .get_item("pilot_rows")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                    32
+                );
+                assert_eq!(
+                    patch
+                        .get_item("inference_rows")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                    16
+                );
+                assert_eq!(
+                    patch
+                        .get_item("spectrum_provenance")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "plugin_estimate"
+                );
+            }
             let orientation_refusals = analysis
                 .get_item("orientation_refusals")
                 .unwrap()

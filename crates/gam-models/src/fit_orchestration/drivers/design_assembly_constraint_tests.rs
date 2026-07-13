@@ -3418,7 +3418,7 @@ pub(super) fn run_two_block_exact_joint_optimize(
         false,
         None,
         policy,
-        |theta, specs, designs| {
+        |theta, specs, designs, _provenance| {
             assert_eq!(theta.len(), theta_dim);
             assert_eq!(specs.len(), 2);
             Ok(designs[0].design.ncols() as f64
@@ -6548,10 +6548,14 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
         false,
         None,
         policy,
-        |theta, specs, designs| {
+        |theta, specs, designs, provenance| {
             assert_eq!(theta.len(), theta_dim);
             assert_eq!(specs.len(), 2);
             assert_eq!(designs.len(), 2);
+            assert!(matches!(
+                provenance,
+                SpatialFitProvenance::NoOuterOptimization
+            ));
             Ok(designs[0].design.ncols() as f64 + designs[1].design.ncols() as f64)
         },
         |theta, specs, designs, eval_mode, _| {

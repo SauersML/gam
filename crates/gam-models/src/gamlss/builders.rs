@@ -2096,7 +2096,10 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 gamlss_disable_fixed_point,
                 None,
                 outer_policy,
-                |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                |theta,
+                 specs: &[TermCollectionSpec],
+                 designs: &[TermCollectionDesign],
+                 provenance| {
                     assert_eq!(
                         specs.len(),
                         2,
@@ -2153,14 +2156,22 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         //   set on every spatial term.
                         if joint_setup.log_kappa_dim() > 0 && kappa_options.enabled {
                             let warm_start = hyper_warm_start_cell.borrow().clone();
-                            fit_custom_family_fixed_log_lambdas(
+                            let certified_outer = match provenance {
+                                SpatialFitProvenance::Certified(outer) => outer,
+                                SpatialFitProvenance::NoOuterOptimization => {
+                                    return Err(
+                                        "active GAMLSS spatial optimization returned no certified outer provenance"
+                                            .to_string(),
+                                    );
+                                }
+                            };
+                            fit_custom_family_fixed_log_lambdas_from_outer(
                                 &family,
                                 &blocks,
                                 options,
                                 warm_start.as_ref(),
-                                0,
-                                None,
-                                true,
+                                theta,
+                                certified_outer,
                             )?
                         } else {
                             fit_custom_family(&family, &blocks, options)?

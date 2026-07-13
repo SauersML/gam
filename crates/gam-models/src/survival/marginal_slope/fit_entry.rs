@@ -2310,7 +2310,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         true,
         None,
         outer_policy,
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], _provenance| {
             assert_eq!(
                 specs.len(),
                 designs.len(),

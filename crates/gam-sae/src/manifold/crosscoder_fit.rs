@@ -592,12 +592,9 @@ pub fn run_auto_sae_crosscoder_fit(
         initial_coords: None,
     })?;
     let SaeMinimalSeedReport {
-        atom_basis,
-        effective_atom_dim,
-        atom_centers,
+        geometry_plans,
         basis_values,
         basis_jacobian,
-        basis_sizes,
         decoder_coefficients,
         smooth_penalties,
         initial_logits,
@@ -607,12 +604,9 @@ pub fn run_auto_sae_crosscoder_fit(
     let registry = AnalyticPenaltyRegistry::new();
     let seed = build_sae_fit_seed(SaeFitSeedRequest {
         target: stacked.view(),
-        atom_basis: &atom_basis,
-        atom_dim: &effective_atom_dim,
-        atom_centers: &atom_centers,
+        geometry_plans: &geometry_plans,
         basis_values: basis_values.view(),
         basis_jacobian: basis_jacobian.view(),
-        basis_sizes: &basis_sizes,
         decoder_coefficients: decoder_coefficients.view(),
         smooth_penalties: smooth_penalties.view(),
         initial_logits: initial_logits.view(),

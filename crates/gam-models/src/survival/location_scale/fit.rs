@@ -725,7 +725,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         true,
         None,
         outer_policy,
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], _provenance| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let (fit, geom) = fit_survival_location_scale_with_geometry(build_spec(
                 &rho,

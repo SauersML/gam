@@ -1,17 +1,15 @@
 //! Typed construction of the single-atom seed consumed by stagewise SAE.
 
 use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
-use ndarray::{Array2, ArrayView2, ArrayView3, ArrayView4};
+use ndarray::{ArrayView2, ArrayView3, ArrayView4};
 
 use super::*;
 
 pub struct SaeStagewiseSeedRequest<'a> {
     pub target: ArrayView2<'a, f64>,
-    pub atom_basis: &'a [String],
-    pub atom_dim: &'a [usize],
+    pub geometry_plans: &'a [SaeAtomGeometryPlan],
     pub basis_values: ArrayView3<'a, f64>,
     pub basis_jacobian: ArrayView4<'a, f64>,
-    pub basis_sizes: &'a [usize],
     pub decoder_coefficients: ArrayView3<'a, f64>,
     pub smooth_penalties: ArrayView3<'a, f64>,
     pub initial_logits: ArrayView2<'a, f64>,
@@ -38,15 +36,10 @@ pub struct SaeStagewiseSeedReport {
 pub fn build_sae_stagewise_seed(
     request: SaeStagewiseSeedRequest<'_>,
 ) -> Result<SaeStagewiseSeedReport, String> {
-    if request.atom_basis.len() != 1
-        || request.atom_dim.len() != 1
-        || request.basis_sizes.len() != 1
-    {
+    if request.geometry_plans.len() != 1 {
         return Err(format!(
-            "sae_manifold_fit_stagewise requires a single-atom seed; got atom_basis={}, atom_dim={}, basis_sizes={}",
-            request.atom_basis.len(),
-            request.atom_dim.len(),
-            request.basis_sizes.len()
+            "sae_manifold_fit_stagewise requires one geometry plan; got {}",
+            request.geometry_plans.len()
         ));
     }
     if request.assignment_kind == SaeFitAssignmentKind::TopK {
@@ -55,16 +48,12 @@ pub fn build_sae_stagewise_seed(
                 .to_string(),
         );
     }
-    let centers = vec![None::<Array2<f64>>];
     let registry = AnalyticPenaltyRegistry::new();
     let seed = build_sae_fit_seed(SaeFitSeedRequest {
         target: request.target,
-        atom_basis: request.atom_basis,
-        atom_dim: request.atom_dim,
-        atom_centers: &centers,
+        geometry_plans: request.geometry_plans,
         basis_values: request.basis_values,
         basis_jacobian: request.basis_jacobian,
-        basis_sizes: request.basis_sizes,
         decoder_coefficients: request.decoder_coefficients,
         smooth_penalties: request.smooth_penalties,
         initial_logits: request.initial_logits,

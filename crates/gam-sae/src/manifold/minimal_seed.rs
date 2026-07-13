@@ -22,12 +22,11 @@ pub struct SaeMinimalSeedRequest<'a> {
 }
 
 pub struct SaeMinimalSeedReport {
-    pub atom_basis: Vec<String>,
-    pub effective_atom_dim: Vec<usize>,
-    pub atom_centers: Vec<Option<Array2<f64>>>,
+    /// One immutable authority for every atom kind, chart dimension,
+    /// resolution, center set, basis width, and reference metric.
+    pub geometry_plans: Vec<SaeAtomGeometryPlan>,
     pub basis_values: Array3<f64>,
     pub basis_jacobian: Array4<f64>,
-    pub basis_sizes: Vec<usize>,
     pub decoder_coefficients: Array3<f64>,
     pub smooth_penalties: Array3<f64>,
     pub initial_logits: Array2<f64>,
@@ -264,15 +263,12 @@ pub fn build_sae_minimal_seed(
         request.threshold,
         request.top_k,
     )?;
-    let atom_centers = plans.into_iter().map(|plan| plan.duchon_centers).collect();
+    let geometry_plans = plans.into_iter().map(|plan| plan.geometry).collect();
 
     Ok(SaeMinimalSeedReport {
-        atom_basis: request.atom_basis,
-        effective_atom_dim,
-        atom_centers,
+        geometry_plans,
         basis_values,
         basis_jacobian,
-        basis_sizes,
         decoder_coefficients,
         smooth_penalties,
         initial_logits,

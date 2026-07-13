@@ -415,6 +415,8 @@ fn basis_kind_tag(kind: &SaeAtomBasisKind) -> &str {
         SaeAtomBasisKind::Periodic => "periodic",
         SaeAtomBasisKind::Sphere => "sphere",
         SaeAtomBasisKind::Torus => "torus",
+        SaeAtomBasisKind::ProjectivePlane => "projective_plane",
+        SaeAtomBasisKind::KleinBottle => "klein_bottle",
         SaeAtomBasisKind::Linear => "linear",
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch",
         SaeAtomBasisKind::Poincare => "poincare",
@@ -1812,7 +1814,7 @@ fn fit_sphere_seam_transition(
 }
 
 /// The sphere pole-seam equivalence certificate (#1890 Increment 2). Returns the
-/// exact ambient-rotation transition (`b -> a`) plus its equivalence log-e-value,
+/// fitted orthogonal transition (`b -> a`) plus its equivalence log-e-value,
 /// or `None` if the pair is not an identifiable pole seam.  Only genuine POLE
 /// seams (each pole interior to the other chart) are certified for registration;
 /// a regular sphere overlap has no register/fuse outcome wired in this lane and
@@ -1836,7 +1838,8 @@ fn sphere_glue_pair_evalue(
         &seam.points_b,
         &seam.mapped_b_to_a,
     )?;
-    let transition = SphereChartTransition::new(b, a, seam.rotation, AtlasSeamKind::Pole).ok()?;
+    let transition =
+        SphereChartTransition::new_fitted(b, a, seam.rotation, AtlasSeamKind::Pole).ok()?;
     Some((transition, log_e))
 }
 
@@ -2126,12 +2129,14 @@ pub fn apply_structure_move(
                                 "apply_structure_move: sphere seam ({a},{b}) is not a pole seam"
                             ));
                         }
-                        child.register_sphere_chart_transition(SphereChartTransition::new(
-                            *b,
-                            *a,
-                            seam.rotation,
-                            AtlasSeamKind::Pole,
-                        )?)?;
+                        child.register_sphere_chart_transition(
+                            SphereChartTransition::new_fitted(
+                                *b,
+                                *a,
+                                seam.rotation,
+                                AtlasSeamKind::Pole,
+                            )?,
+                        )?;
                     }
                     ChartGlueOutcome::Fuse => {
                         return Err(format!(
@@ -2640,24 +2645,28 @@ fn refresh_registered_atlas_transitions(term: &mut SaeManifoldTerm) -> Result<()
         .collect();
     for transition in registered_spheres {
         // `fit_sphere_seam_transition(a,b)` likewise returns the map b -> a.
-        let seam = fit_sphere_seam_transition(term, transition.to_chart, transition.from_chart)
+        let seam = fit_sphere_seam_transition(term, transition.to_chart(), transition.from_chart())
             .ok_or_else(|| {
                 format!(
                     "terminal sphere atlas seam {}->{} is no longer identifiable",
-                    transition.from_chart, transition.to_chart
+                    transition.from_chart(),
+                    transition.to_chart()
                 )
             })?;
-        if seam.seam_kind != transition.seam_kind {
+        if seam.seam_kind != transition.seam_kind() {
             return Err(format!(
                 "terminal sphere atlas seam {}->{} changed kind ({:?} -> {:?})",
-                transition.from_chart, transition.to_chart, transition.seam_kind, seam.seam_kind
+                transition.from_chart(),
+                transition.to_chart(),
+                transition.seam_kind(),
+                seam.seam_kind
             ));
         }
-        term.refresh_sphere_chart_transition(SphereChartTransition::new(
-            transition.from_chart,
-            transition.to_chart,
+        term.refresh_sphere_chart_transition(SphereChartTransition::new_fitted(
+            transition.from_chart(),
+            transition.to_chart(),
             seam.rotation,
-            transition.seam_kind,
+            transition.seam_kind(),
         )?)?;
     }
     Ok(())
@@ -4553,6 +4562,15 @@ pub fn resolve_auto_primary_atoms(
             SaeAtomBasisKind::Sphere => {
                 atom_basis[atom_idx] = "sphere".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
+            }
+            SaeAtomBasisKind::ProjectivePlane => {
+                atom_basis[atom_idx] = "projective_plane".to_string();
+                atom_dim[atom_idx] = choice.latent_dim;
+            }
+            SaeAtomBasisKind::KleinBottle => {
+                atom_basis[atom_idx] = "klein_bottle".to_string();
+                atom_dim[atom_idx] = choice.latent_dim;
+                resolution_overrides[atom_idx] = choice.n_torus_harmonics;
             }
             SaeAtomBasisKind::Mobius => {
                 atom_basis[atom_idx] = "mobius".to_string();

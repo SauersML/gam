@@ -1336,8 +1336,8 @@ pub struct AtlasCycleHolonomy {
     pub first_order_variance: Option<f64>,
     pub naive_edgewise_first_order_variance: Option<f64>,
     pub covariance_aggregation_adjustment: Option<f64>,
-    pub bilinear_quadratic_bias: Option<f64>,
-    pub bilinear_quadratic_variance: Option<f64>,
+    pub bilinear_quadratic_bias_diagnostic: Option<f64>,
+    pub bilinear_quadratic_variance_diagnostic: Option<f64>,
     pub standard_error: Option<f64>,
     pub polar_linearization_remainder_bound: Option<f64>,
     pub geometric_remainder_bound: f64,
@@ -2163,6 +2163,23 @@ mod tests {
             model.cross_patch_provenance(),
             &CrossPatchCovarianceProvenance::ExplicitJointCovariance
         );
+        assert_eq!(
+            model.authority(),
+            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization
+        );
+    }
+
+    #[test]
+    fn fitted_patch_scalars_can_only_build_an_asymptotic_plugin_covariance() {
+        let patches = vec![
+            patch(0, 0.0, 0.0, false, 1_000, 0),
+            patch(1, 0.2, 0.0, false, 1_000, 0),
+        ];
+        let model = GaussianPcaErrorModel::independent(&patches).unwrap();
+        assert_eq!(
+            model.authority(),
+            GaussianPcaCovarianceAuthority::AsymptoticPlugIn
+        );
     }
 
     #[test]
@@ -2220,7 +2237,7 @@ mod tests {
     }
 
     #[test]
-    fn fundamental_cycle_preserves_parallel_overlap_identity() {
+    fn zero_tilt_parallel_cycle_preserves_overlap_identity_and_refuses_normal_law() {
         let analysis = certified_analysis(
             vec![
                 patch(0, 0.0, 0.0, false, 1_000_000, 0),
@@ -2258,7 +2275,7 @@ mod tests {
         );
         let cycle = &analysis.cycles()[0];
         assert_near(cycle.first_order_variance.unwrap(), 0.0);
-        assert_near(cycle.bilinear_quadratic_variance.unwrap(), 0.0);
+        assert_near(cycle.bilinear_quadratic_variance_diagnostic.unwrap(), 0.0);
         assert!(matches!(
             cycle.asymptotic_regime,
             Some(AtlasCycleAsymptoticRegime::FirstOrderDegenerate { .. })
@@ -2316,8 +2333,8 @@ mod tests {
             right.first_order_variance.unwrap(),
         );
         assert_near(
-            left.bilinear_quadratic_variance.unwrap(),
-            right.bilinear_quadratic_variance.unwrap(),
+            left.bilinear_quadratic_variance_diagnostic.unwrap(),
+            right.bilinear_quadratic_variance_diagnostic.unwrap(),
         );
     }
 
@@ -2708,8 +2725,12 @@ mod tests {
             padded.cycles()[0].decision.certified_value()
         );
         assert_near(
-            base.cycles()[0].bilinear_quadratic_variance.unwrap(),
-            padded.cycles()[0].bilinear_quadratic_variance.unwrap(),
+            base.cycles()[0]
+                .bilinear_quadratic_variance_diagnostic
+                .unwrap(),
+            padded.cycles()[0]
+                .bilinear_quadratic_variance_diagnostic
+                .unwrap(),
         );
     }
 
@@ -3616,8 +3637,8 @@ fn analyze_cycle(
         first_order_variance: None,
         naive_edgewise_first_order_variance: None,
         covariance_aggregation_adjustment: None,
-        bilinear_quadratic_bias: None,
-        bilinear_quadratic_variance: None,
+        bilinear_quadratic_bias_diagnostic: None,
+        bilinear_quadratic_variance_diagnostic: None,
         standard_error: None,
         polar_linearization_remainder_bound: None,
         geometric_remainder_bound,
@@ -3902,8 +3923,8 @@ fn analyze_cycle(
         first_order_variance: Some(first_order_variance),
         naive_edgewise_first_order_variance: Some(naive_first_order_variance),
         covariance_aggregation_adjustment: Some(covariance_aggregation_adjustment),
-        bilinear_quadratic_bias: Some(quadratic_bias),
-        bilinear_quadratic_variance: Some(quadratic_variance),
+        bilinear_quadratic_bias_diagnostic: Some(quadratic_bias),
+        bilinear_quadratic_variance_diagnostic: Some(quadratic_variance),
         standard_error,
         polar_linearization_remainder_bound: Some(polar_linearization_remainder_bound),
         geometric_remainder_bound,

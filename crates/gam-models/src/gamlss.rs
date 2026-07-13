@@ -40,9 +40,10 @@ use crate::custom_family::{
     CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiDirectCache, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     PenaltyMatrix, PsiDesignMap, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
-    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
-    shared_dense_arc, weighted_crossprod_psi_maps,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas_from_outer,
+    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map,
+    second_psi_linear_map, shared_dense_arc, weighted_crossprod_psi_maps,
 };
 use gam_problem::{ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace};
 
@@ -93,7 +94,7 @@ use gam_solve::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_logcdf, normal_logsf, standard_normal_quantile};
 
 use crate::fit_orchestration::drivers::{
-    ExactJointHyperSetup, freeze_term_collection_from_design,
+    ExactJointHyperSetup, SpatialFitProvenance, freeze_term_collection_from_design,
     optimize_spatial_length_scale_exact_joint, spatial_dims_per_term,
     spatial_length_scale_term_indices,
 };

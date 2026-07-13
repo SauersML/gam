@@ -320,7 +320,7 @@ impl SphereChartTransition {
             .then(|| if self.determinant() >= 0.0 { 1 } else { -1 })
     }
 
-    /// Apply the exact ambient rotation to a unit vector.
+    /// Apply the validated orthogonal ambient map to a unit vector.
     #[must_use]
     pub fn apply(&self, u: [f64; 3]) -> [f64; 3] {
         let mut out = [0.0; 3];
@@ -330,7 +330,7 @@ impl SphereChartTransition {
         out
     }
 
-    /// Exact inverse isometry (`R⁻¹ = Rᵀ` for an orthogonal `R`), endpoints
+    /// Inverse isometry (`R⁻¹ = Rᵀ` for an orthogonal `R`), endpoints
     /// swapped.
     #[must_use]
     pub fn inverse(&self) -> Self {
@@ -420,7 +420,9 @@ pub enum AtlasOrientability {
 
 /// Several local charts representing one manifold atom.
 ///
-/// Overlaps come in two exact kinds that share one sign cocycle: the
+/// Overlaps come in two geometric kinds. Analytic instances share one exact
+/// sign cocycle; fitted sphere polar maps remain unsigned until a statistical
+/// certificate resolves them. The
 /// one-dimensional unit-speed affine [`UnitSpeedChartTransition`] (circles,
 /// Möbius half-twists) and the two-dimensional ambient-rotation
 /// [`SphereChartTransition`] (sphere pole seams).  Both are stored so a single
@@ -480,9 +482,8 @@ impl ManifoldChartAtlas {
         &self.sphere_transitions
     }
 
-    /// Every registered overlap as a signed combinatorial edge
-    /// `(from, to, sign)`, unioning the 1-D and sphere transitions.  This is the
-    /// cocycle connectivity and orientability read from.
+    /// Every transition with an analytic sign as `(from, to, sign)`. Fitted
+    /// sphere edges are intentionally absent from this exact cocycle.
     fn signed_edges(&self) -> impl Iterator<Item = (usize, usize, i8)> + '_ {
         self.transitions
             .iter()

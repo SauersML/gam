@@ -378,7 +378,6 @@ impl SaeAtomGeometryPlan {
             basis_values,
             basis_jacobian,
             reference_penalty,
-            evaluator,
         })
     }
 
@@ -476,7 +475,6 @@ pub(crate) struct SaeAtomEvaluationBundle {
     pub(crate) basis_values: Array2<f64>,
     pub(crate) basis_jacobian: Array3<f64>,
     pub(crate) reference_penalty: Array2<f64>,
-    pub(crate) evaluator: Arc<dyn SaeBasisSecondJet>,
 }
 
 fn duchon_nullspace_from_m(m: usize) -> gam_terms::basis::DuchonNullspaceOrder {
