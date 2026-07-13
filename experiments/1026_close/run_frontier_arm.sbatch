@@ -65,6 +65,10 @@ LR=${LR:-1e-3}
 BATCH_SIZE=${BATCH_SIZE:-2048}  # r4 used bs2048 (the strong external bar)
 MAX_ROWS=${MAX_ROWS:-120000}
 BITS_MAX_ROWS=${BITS_MAX_ROWS:-8192}
+# Declared dictionary amortization horizon N (#2283): separate from the bits
+# estimation subsample. Defaults to the corpus token count so it is identical
+# across every paired arm; NEVER the estimation subsample size.
+AMORTIZATION_HORIZON=${AMORTIZATION_HORIZON:-$MAX_ROWS}
 ATOM_MANIFOLD=${ATOM_MANIFOLD:-product}
 ATOM_BASIS=${ATOM_BASIS:-fourier}
 TAG=${TAG:-frontier-K${K}-s${SEED}}
@@ -100,7 +104,8 @@ case "$ARM" in
   external_topk)
     $PY -u "$DRIVER" "${COMMON[@]}" \
       --steps "$STEPS" --lr "$LR" --batch-size "$BATCH_SIZE" --cosine-lr \
-      --bits --bits-max-rows "$BITS_MAX_ROWS"
+      --bits --bits-max-rows "$BITS_MAX_ROWS" \
+      --amortization-horizon "$AMORTIZATION_HORIZON"
     ;;
   hybrid)
     $PY -u "$DRIVER" "${COMMON[@]}" \
@@ -108,7 +113,8 @@ case "$ARM" in
       --batch-size "$BATCH_SIZE" --d-atom "$D_ATOM" \
       --curved-atoms "$CURVED_ATOMS" --curved-k "$CURVED_K" \
       --atom-manifold "$ATOM_MANIFOLD" --atom-basis "$ATOM_BASIS" \
-      --bits --bits-max-rows "$BITS_MAX_ROWS"
+      --bits --bits-max-rows "$BITS_MAX_ROWS" \
+      --amortization-horizon "$AMORTIZATION_HORIZON"
     ;;
   pca_bar)
     # K-independent linear-optimum yardstick — run ONCE (frontier_matrix.sh

@@ -28,4 +28,4 @@ export OMP_NUM_THREADS=16 OPENBLAS_NUM_THREADS=16 MKL_NUM_THREADS=16 NUMEXPR_NUM
   --run-id "$RUN_ID" --code-revision "$CODE_REVISION" --wheel-sha256 "$WHEEL_SHA256" \
   --max-rows 120000 --test-frac 0.2 --seed 0 --K 32768 --top-k 32 \
   --steps 8000 --lr 0.001 --batch-size 2048 --cosine-lr \
-  --bits --bits-max-rows 8192 --out "$OUT"
+  --bits --bits-max-rows 8192 --amortization-horizon 120000 --out "$OUT"

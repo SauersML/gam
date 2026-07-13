@@ -11,7 +11,12 @@ the two terms the theorem turns on and the config that makes the contest fair.
 
 Scorer terms reproduced verbatim (see eq4_description_length.rs):
   * support_bits   = log2 C(G, round(L0))                      [selection_bits]
-  * dictionary_bits = 0.5 * dictionary_params / N * log2(max(N,2))
+  * dictionary_bits = 0.5 * dictionary_params / N * log2(N)
+Here N is the DECLARED amortization horizon (the message/deployment or declared
+training-N), NOT the number of rows sampled to estimate the score (#2283 / audit
+§21). The scorer now requires N >= 2 and takes it as a separate argument from the
+estimation subsample, so this term is invariant to how many rows the score was
+estimated on.
 The code + residual terms are joint reverse-water-filling on fitted spectra;
 for a MATCHED-recon circle (s = d+1) the theorem gives dcode = 0, dresid = 0,
 so at fixed R^2 the flat-vs-hybrid gap is exactly dsupport - ddict, which this
@@ -32,16 +37,25 @@ def selection_bits(g_dict: int, k_active: int) -> float:
     return sum(math.log2((g_dict - k + i) / i) for i in range(1, k + 1))
 
 
-def dict_bits(dictionary_params: int, n: int) -> float:
-    """0.5 * params / N * log2(max(N,2)) — the scorer's BIC dictionary term."""
-    return 0.5 * dictionary_params / n * math.log2(max(n, 2))
+def dict_bits(dictionary_params: int, amortization_horizon: int) -> float:
+    """0.5 * params / N * log2(N) — the scorer's BIC dictionary term.
+
+    ``amortization_horizon`` is the DECLARED N (>= 2), never the estimation
+    subsample size (#2283); the scorer rejects N < 2, so no ``max(N, 2)`` floor.
+    """
+    n = amortization_horizon
+    return 0.5 * dictionary_params / n * math.log2(n)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--K", type=int, default=32768, help="external flat atom count")
     ap.add_argument("--P", type=int, default=2048, help="ambient (decoder-row) dim")
-    ap.add_argument("--N", type=int, default=8192, help="bits-scoring sample size")
+    ap.add_argument("--N", type=int, default=120_000,
+                    help="declared dictionary amortization horizon N (>= 2): the "
+                         "message/deployment or training-observation count charged "
+                         "in the BIC dict term, NOT the bits estimation subsample "
+                         "(#2283 / audit §21)")
     ap.add_argument("--top-k", type=int, default=32, help="mean active atoms/token L0")
     ap.add_argument("--curved-atoms", type=int, default=256)
     ap.add_argument("--harmonics", type=int, default=3, help="H; circle basis b = 2H+1")
@@ -49,6 +63,8 @@ def main() -> int:
                     help="how many of the L0 active flat slots are circle planes "
                          "(each = 2 flat atoms the curved tier collapses to 1)")
     args = ap.parse_args()
+    if args.N < 2:
+        ap.error("--N (amortization horizon) must be >= 2")
 
     K, P, N, L0 = args.K, args.P, args.N, args.top_k
     b = 2 * args.harmonics + 1           # circle Fourier basis width (decoder cols/atom)

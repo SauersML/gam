@@ -29,4 +29,4 @@ export OMP_NUM_THREADS=32 OPENBLAS_NUM_THREADS=32 MKL_NUM_THREADS=32 NUMEXPR_NUM
   --max-rows 120000 --test-frac 0.2 --seed 0 --K 32768 --top-k 32 \
   --k-flat 32000 --d-atom 1 --atom-topology circle --curved-atoms 256 --curved-k 2 \
   --sparse-minibatch 8192 --sparse-score-mode required --max-epochs 30 \
-  --bits --bits-max-rows 8192 --out "$OUT"
+  --bits --bits-max-rows 8192 --amortization-horizon 120000 --out "$OUT"
