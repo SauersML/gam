@@ -429,8 +429,10 @@ fn build_saved_marginal_slope_survival_alo_input(
         col_map,
         "resolved_termspec_logslope",
     )?;
-    let logslope_build = build_term_collection_design(design_input, &logslopespec)
-        .map_err(|error| format!("failed to build saved marginal-slope logslope design: {error}"))?;
+    let logslope_build =
+        build_term_collection_design(design_input, &logslopespec).map_err(|error| {
+            format!("failed to build saved marginal-slope logslope design: {error}")
+        })?;
     let mut logslope_offset = logslope_build
         .compose_offset(
             noise_offset.view(),
@@ -479,10 +481,7 @@ fn build_saved_marginal_slope_survival_alo_input(
         &mut derivative_offset_exit,
     )?;
 
-    let p_timewiggle = model
-        .beta_baseline_timewiggle
-        .as_ref()
-        .map_or(0, Vec::len);
+    let p_timewiggle = model.beta_baseline_timewiggle.as_ref().map_or(0, Vec::len);
     match (
         model.baseline_timewiggle_knots.as_ref(),
         model.baseline_timewiggle_degree,
@@ -499,12 +498,9 @@ fn build_saved_marginal_slope_survival_alo_input(
     }
     if p_timewiggle > 0 {
         let zeros = DesignMatrix::from(Array2::<f64>::zeros((n, p_timewiggle)));
-        time_build.x_entry_time = DesignMatrix::hstack(vec![
-            time_build.x_entry_time,
-            zeros.clone(),
-        ])?;
-        time_build.x_exit_time =
-            DesignMatrix::hstack(vec![time_build.x_exit_time, zeros.clone()])?;
+        time_build.x_entry_time =
+            DesignMatrix::hstack(vec![time_build.x_entry_time, zeros.clone()])?;
+        time_build.x_exit_time = DesignMatrix::hstack(vec![time_build.x_exit_time, zeros.clone()])?;
         time_build.x_derivative_time =
             DesignMatrix::hstack(vec![time_build.x_derivative_time, zeros])?;
     }
@@ -555,16 +551,14 @@ pub(crate) fn build_saved_alo_predict_input(
 ) -> Result<gam_predict::SavedModelAloInput, String> {
     if model.predict_model_class() == PredictModelClass::Survival {
         return match require_saved_survival_likelihood_mode(model)? {
-            SurvivalLikelihoodMode::MarginalSlope => {
-                build_saved_marginal_slope_survival_alo_input(
-                    model,
-                    data,
-                    col_map,
-                    training_headers,
-                    offset,
-                    noise_offset,
-                )
-            }
+            SurvivalLikelihoodMode::MarginalSlope => build_saved_marginal_slope_survival_alo_input(
+                model,
+                data,
+                col_map,
+                training_headers,
+                offset,
+                noise_offset,
+            ),
             SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
                 build_saved_cause_specific_survival_alo_input(
                     model,
@@ -1827,13 +1821,6 @@ pub(crate) fn run_predict_survival(
         let effective_noise_offset = raw_sigma_design
             .compose_offset(noise_offset.view(), "survival CLI log-sigma block")
             .map_err(|error| error.to_string())?;
-        let survival_noise_transform = scale_transform_from_payload(
-            &model.survival_noise_projection,
-            &model.survival_noise_center,
-            &model.survival_noise_scale,
-            model.survival_noise_non_intercept_start,
-            model.survival_noise_projection_ridge_alpha,
-        )?;
         let x_time_exit_dense = time_build
             .x_exit_time
             .try_to_dense_arc("survival location-scale prediction time-exit design")?;
@@ -1846,18 +1833,7 @@ pub(crate) fn run_predict_survival(
         } else {
             x_time_exit_dense.as_ref().clone()
         };
-        let time_design = DesignMatrix::from(x_time_exit.clone());
-        let survival_primary_design =
-            DesignMatrix::hstack(vec![time_design, threshold_design.design.clone()])?;
-        let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
-            build_scale_deviation_operator(
-                survival_primary_design,
-                raw_sigma_design.design.clone(),
-                transform,
-            )?
-        } else {
-            raw_sigma_design.design.clone()
-        };
+        let prepared_sigma_design = raw_sigma_design.design.clone();
         let link_wiggle_knots = model
             .linkwiggle_knots
             .as_ref()

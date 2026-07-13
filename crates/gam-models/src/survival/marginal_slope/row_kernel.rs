@@ -756,6 +756,7 @@ row_program! {
         q0, q1, qd1, g;
         wi, di, z_sum, covariance_ones, probit_scale
     )
+    emit [generic, order2, witnesses, cuda];
     leaves {
         sqrt => unary_derivatives_sqrt => d_sqrt,
         neglog_phi => unary_derivatives_neglog_phi => neglog_phi_stack,

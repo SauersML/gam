@@ -3,8 +3,7 @@ use crate::survival::construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
 };
 use crate::survival::location_scale::{
-    ResidualDistribution, SurvivalCovariateTimeBasis,
-    SurvivalLocationScaleTimeParameterization,
+    ResidualDistribution, SurvivalCovariateTimeBasis, SurvivalLocationScaleTimeParameterization,
 };
 use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::wiggle::{
@@ -1180,11 +1179,13 @@ fn validate_survival_covariate_time_basis(
     basis: &SurvivalCovariateTimeBasis,
     label: &str,
 ) -> Result<usize, FittedModelError> {
-    let minimum_knots = basis.degree.checked_add(2).ok_or_else(|| {
-        FittedModelError::SchemaMismatch {
-            reason: format!("location-scale survival saved {label} degree overflows"),
-        }
-    })?;
+    let minimum_knots =
+        basis
+            .degree
+            .checked_add(2)
+            .ok_or_else(|| FittedModelError::SchemaMismatch {
+                reason: format!("location-scale survival saved {label} degree overflows"),
+            })?;
     if basis.knots.len() < minimum_knots {
         return Err(FittedModelError::SchemaMismatch {
             reason: format!(
@@ -1485,6 +1486,25 @@ fn validate_survival_marginal_slope_replay_state(
     fit: &UnifiedFitResult,
     fit_label: &str,
 ) -> Result<(), FittedModelError> {
+    let score_covariance = payload
+        .survival_marginal_slope_score_covariance
+        .as_ref()
+        .ok_or_else(|| FittedModelError::MissingField {
+            reason: format!(
+                "survival marginal-slope saved {fit_label} is missing its exact latent-score covariance"
+            ),
+        })?;
+    if score_covariance.len() != 1
+        || score_covariance[0].len() != 1
+        || !score_covariance[0][0].is_finite()
+        || score_covariance[0][0] < 0.0
+    {
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "survival marginal-slope saved {fit_label} scalar latent-score covariance must be a finite non-negative 1x1 matrix"
+            ),
+        });
+    }
     match (
         payload.influence_absorber_width,
         payload.influence_absorber_design.as_ref(),
@@ -1492,9 +1512,9 @@ fn validate_survival_marginal_slope_replay_state(
         (None, None) => {}
         (Some(width), Some(rows)) => {
             if rows.is_empty()
-                || rows.iter().any(|row| {
-                    row.len() != width || row.iter().any(|value| !value.is_finite())
-                })
+                || rows
+                    .iter()
+                    .any(|row| row.len() != width || row.iter().any(|value| !value.is_finite()))
             {
                 return Err(FittedModelError::SchemaMismatch {
                     reason: format!(
@@ -1532,7 +1552,10 @@ fn validate_survival_marginal_slope_replay_state(
             }
             let time_beta = &fit.blocks[0].beta;
             if time_beta.len() < beta.len()
-                || time_beta.slice(ndarray::s![time_beta.len() - beta.len()..]).to_vec() != *beta
+                || time_beta
+                    .slice(ndarray::s![time_beta.len() - beta.len()..])
+                    .to_vec()
+                    != *beta
             {
                 return Err(FittedModelError::SchemaMismatch {
                     reason: format!(
@@ -3521,11 +3544,7 @@ impl FittedModel {
                         .to_string(),
                 }
             })?;
-            validate_survival_marginal_slope_saved_fit(
-                self.payload(),
-                fit,
-                "fit_result",
-            )?;
+            validate_survival_marginal_slope_saved_fit(self.payload(), fit, "fit_result")?;
         }
         Ok(runtime)
     }
@@ -4855,11 +4874,7 @@ impl FittedModel {
                 "fit_result",
             )?;
             if let Some(unified) = self.unified.as_ref() {
-                validate_survival_marginal_slope_saved_fit(
-                    self,
-                    unified,
-                    "unified",
-                )?;
+                validate_survival_marginal_slope_saved_fit(self, unified, "unified")?;
             }
         }
 
@@ -5373,6 +5388,7 @@ mod tests {
         payload.formula_logslope = Some("1".to_string());
         payload.z_column = Some("z".to_string());
         payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });
+        payload.survival_marginal_slope_score_covariance = Some(vec![vec![1.0]]);
         payload.logslope_baseline = Some(0.0);
         payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         payload

@@ -4925,9 +4925,7 @@ fn build_survival_marginal_slope_ffi_payload(
                     .timewiggle
                     .as_ref()
                     .map(|config| config.double_penalty),
-                beta: SurvivalTimewiggleBeta::Single(
-                    beta_time.slice(s![p_base..]).to_vec(),
-                ),
+                beta: SurvivalTimewiggleBeta::Single(beta_time.slice(s![p_base..]).to_vec()),
             })
         }
         _ => {
@@ -4972,6 +4970,7 @@ fn build_survival_marginal_slope_ffi_payload(
             link_dev_runtime: ms_result.link_dev_runtime.as_ref(),
             influence_absorber_width: ms_result.influence_absorber_width,
             influence_absorber_design: ms_result.influence_absorber_design.as_ref(),
+            score_covariance: &ms_result.score_covariance,
         },
         SavedModelSourceMetadata {
             training_headers: dataset.headers.clone(),

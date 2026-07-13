@@ -12,9 +12,8 @@ use gam_models::inference::model::{
 };
 use gam_models::survival::{
     CauseSpecificSurvivalAloRowInput, SurvivalLikelihoodMode,
-    SurvivalMarginalSlopeSavedAloReplayInput,
-    cause_specific_survival_alo_row_geometry, require_saved_survival_likelihood_mode,
-    replay_saved_survival_marginal_slope_alo,
+    SurvivalMarginalSlopeSavedAloReplayInput, cause_specific_survival_alo_row_geometry,
+    replay_saved_survival_marginal_slope_alo, require_saved_survival_likelihood_mode,
     survival_event_code_from_value,
 };
 use gam_models::transformation_normal::{
@@ -1669,13 +1668,30 @@ fn compute_saved_marginal_slope_survival_alo(
         .beta_baseline_timewiggle
         .as_ref()
         .map_or(0, Vec::len);
+    let saved_score_covariance = payload
+        .survival_marginal_slope_score_covariance
+        .as_ref()
+        .ok_or_else(|| {
+            invalid(
+                "saved survival marginal-slope ALO is missing its exact scalar score covariance",
+            )
+        })?;
+    if saved_score_covariance.len() != 1 || saved_score_covariance[0].len() != 1 {
+        return Err(invalid(format!(
+            "saved survival marginal-slope ALO scalar score covariance must be 1x1, got {} rows with widths {:?}",
+            saved_score_covariance.len(),
+            saved_score_covariance
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+        )));
+    }
+    let score_variance = saved_score_covariance[0][0];
     let influence_design = match payload.influence_absorber_design.as_ref() {
         None => None,
         Some(rows) => {
             let width = payload.influence_absorber_width.ok_or_else(|| {
-                invalid(
-                    "saved survival marginal-slope ALO influence design has no persisted width",
-                )
+                invalid("saved survival marginal-slope ALO influence design has no persisted width")
             })?;
             if rows.len() != n || rows.iter().any(|row| row.len() != width) {
                 return Err(invalid(format!(
@@ -1693,14 +1709,12 @@ fn compute_saved_marginal_slope_survival_alo(
     };
     let gaussian_frailty_sd = match payload.family_state.frailty() {
         Some(gam_models::survival::lognormal_kernel::FrailtySpec::None) => None,
-        Some(
-            gam_models::survival::lognormal_kernel::FrailtySpec::GaussianShift {
-                sigma_fixed: Some(sigma),
-            },
-        ) => Some(*sigma),
+        Some(gam_models::survival::lognormal_kernel::FrailtySpec::GaussianShift {
+            sigma_fixed: Some(sigma),
+        }) => Some(*sigma),
         Some(frailty) => {
             return Err(invalid(format!(
-                "saved survival marginal-slope ALO has unsupported fitted frailty state {frailty:?}"
+                "saved survival marginal-slope ALO has a fitted frailty state forbidden by the marginal-slope schema: {frailty:?}"
             )));
         }
         None => {
@@ -1710,8 +1724,8 @@ fn compute_saved_marginal_slope_survival_alo(
         }
     };
 
-    let replay = replay_saved_survival_marginal_slope_alo(
-        SurvivalMarginalSlopeSavedAloReplayInput {
+    let replay =
+        replay_saved_survival_marginal_slope_alo(SurvivalMarginalSlopeSavedAloReplayInput {
             design_entry: &input.design_entry,
             design_exit: &input.design_exit,
             design_derivative_exit: &input.design_derivative_exit,
@@ -1725,6 +1739,7 @@ fn compute_saved_marginal_slope_survival_alo(
             latent_z: &normalized_z,
             event: &input.event,
             prior_weights: observations.prior_weights,
+            score_variance,
             derivative_guard: gam_models::survival::survival_derivative_guard_for_likelihood(
                 likelihood_mode,
             ),
@@ -1741,9 +1756,12 @@ fn compute_saved_marginal_slope_survival_alo(
             link_deviation_runtime: runtime.link_deviation.as_ref(),
             influence_design: influence_design.as_ref(),
             gaussian_frailty_sd,
-        },
-    )
-    .map_err(|reason| invalid(format!("saved survival marginal-slope ALO replay: {reason}")))?;
+        })
+        .map_err(|reason| {
+            invalid(format!(
+                "saved survival marginal-slope ALO replay: {reason}"
+            ))
+        })?;
     let parameter_dimension = fit.beta.len();
     let geometry = require_saved_geometry(model, class, parameter_dimension)?;
     if replay.block_dimensions.iter().sum::<usize>() != parameter_dimension {

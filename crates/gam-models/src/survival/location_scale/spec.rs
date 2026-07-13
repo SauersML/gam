@@ -21,6 +21,18 @@ pub struct SurvivalCovariateTimeBasis {
     pub knots: Vec<f64>,
 }
 
+/// Exact prediction-row designs for one saved threshold/log-scale block.
+/// Time-varying blocks carry all three likelihood channels; static blocks
+/// carry only the exit design and use the same value at entry with zero time
+/// derivative inside the row program.
+#[derive(Clone)]
+pub struct SurvivalCovariateReplayDesign {
+    pub design_exit: DesignMatrix,
+    pub design_entry: Option<DesignMatrix>,
+    pub design_derivative_exit: Option<DesignMatrix>,
+    pub offset: Array1<f64>,
+}
+
 /// How a time block's parameterization enforces the derivative-guard
 /// monotonicity `q'(t) ≥ guard`.
 ///

@@ -481,6 +481,99 @@ pub(crate) fn prepare_cov_block_kind(
     }
 }
 
+/// Rebuild the exact saved threshold/log-scale likelihood channels on new
+/// rows. A resolved time basis is authoritative when present; `None` is the
+/// explicit static-block topology.
+pub fn replay_survival_covariate_block_design(
+    cov_design: &TermCollectionDesign,
+    offset: &Array1<f64>,
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    time_basis: Option<&SurvivalCovariateTimeBasis>,
+    block_name: &str,
+) -> Result<SurvivalCovariateReplayDesign, String> {
+    let effective_offset = match time_basis {
+        None => cov_design
+            .compose_offset(offset.view(), block_name)
+            .map_err(|error| error.to_string())?,
+        Some(_) => {
+            if cov_design.affine_offset.iter().any(|value| *value != 0.0) {
+                return Err(format!(
+                    "{block_name} time-varying replay cannot tensor a non-zero smooth anchor"
+                ));
+            }
+            offset.clone()
+        }
+    };
+    replay_survival_covariate_channels(
+        &cov_design.design,
+        &effective_offset,
+        age_entry,
+        age_exit,
+        time_basis,
+        block_name,
+    )
+}
+
+/// Matrix-level replay primitive used when subject rows have already been
+/// expanded over an explicit time grid.
+pub fn replay_survival_covariate_channels(
+    cov_design: &DesignMatrix,
+    effective_offset: &Array1<f64>,
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    time_basis: Option<&SurvivalCovariateTimeBasis>,
+    block_name: &str,
+) -> Result<SurvivalCovariateReplayDesign, String> {
+    if cov_design.nrows() != age_entry.len()
+        || age_entry.len() != age_exit.len()
+        || effective_offset.len() != age_entry.len()
+    {
+        return Err(format!(
+            "{block_name} replay row mismatch: design={}, offset={}, entry={}, exit={}",
+            cov_design.nrows(),
+            effective_offset.len(),
+            age_entry.len(),
+            age_exit.len()
+        ));
+    }
+    let Some(time_basis) = time_basis else {
+        return Ok(SurvivalCovariateReplayDesign {
+            design_exit: cov_design.clone(),
+            design_entry: None,
+            design_derivative_exit: None,
+            offset: effective_offset.clone(),
+        });
+    };
+    let template =
+        crate::survival::construction::replay_time_varying_survival_covariate_template(
+            age_entry,
+            age_exit,
+            time_basis,
+            block_name,
+        )?;
+    let SurvivalCovariateTermBlockTemplate::TimeVarying {
+        time_basis_entry,
+        time_basis_exit,
+        time_basis_derivative_exit,
+        ..
+    } = template
+    else {
+        return Err(format!(
+            "{block_name} resolved time basis replay returned a static template"
+        ));
+    };
+    Ok(SurvivalCovariateReplayDesign {
+        design_exit: rowwise_kronecker(cov_design, &time_basis_exit),
+        design_entry: Some(rowwise_kronecker(cov_design, &time_basis_entry)),
+        design_derivative_exit: Some(rowwise_kronecker(
+            cov_design,
+            &time_basis_derivative_exit,
+        )),
+        offset: effective_offset.clone(),
+    })
+}
+
 pub(crate) fn build_survival_covariate_block_from_design(
     cov_design: &TermCollectionDesign,
     template: &SurvivalCovariateTermBlockTemplate,

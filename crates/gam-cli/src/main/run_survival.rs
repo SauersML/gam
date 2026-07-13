@@ -1173,6 +1173,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     link_dev_runtime: fit.link_dev_runtime.as_ref(),
                     influence_absorber_width: fit.influence_absorber_width,
                     influence_absorber_design: fit.influence_absorber_design.as_ref(),
+                    score_covariance: &fit.score_covariance,
                 },
                 SavedModelSourceMetadata {
                     training_headers: ds.headers.clone(),

@@ -24,6 +24,7 @@ pub struct SurvivalMarginalSlopeSavedAloReplayInput<'a> {
     pub latent_z: &'a Array1<f64>,
     pub event: &'a Array1<f64>,
     pub prior_weights: &'a Array1<f64>,
+    pub score_variance: f64,
     pub derivative_guard: f64,
     pub time_wiggle_knots: Option<&'a Array1<f64>>,
     pub time_wiggle_degree: Option<usize>,
@@ -53,10 +54,7 @@ pub struct SurvivalMarginalSlopeSavedAloReplay {
     pub block_dimensions: Vec<usize>,
 }
 
-fn dense_hstack(
-    designs: &[DesignMatrix],
-    context: &str,
-) -> Result<Array2<f64>, String> {
+fn dense_hstack(designs: &[DesignMatrix], context: &str) -> Result<Array2<f64>, String> {
     DesignMatrix::hstack(designs.to_vec())?
         .try_to_dense_arc(context)
         .map(|matrix| matrix.as_ref().clone())
@@ -135,7 +133,9 @@ fn flex_anchor_rows(
     Ok(Some(rows))
 }
 
-fn validate_replay_input(input: &SurvivalMarginalSlopeSavedAloReplayInput<'_>) -> Result<(), String> {
+fn validate_replay_input(
+    input: &SurvivalMarginalSlopeSavedAloReplayInput<'_>,
+) -> Result<(), String> {
     let n = input.event.len();
     if n == 0
         || input.prior_weights.len() != n
@@ -178,6 +178,12 @@ fn validate_replay_input(input: &SurvivalMarginalSlopeSavedAloReplayInput<'_>) -
             input.derivative_guard,
         ));
     }
+    if !input.score_variance.is_finite() || input.score_variance < 0.0 {
+        return Err(format!(
+            "saved survival marginal-slope ALO score variance must be finite and non-negative, got {}",
+            input.score_variance,
+        ));
+    }
     for (row, ((event, weight), z)) in input
         .event
         .iter()
@@ -217,7 +223,9 @@ fn validate_replay_input(input: &SurvivalMarginalSlopeSavedAloReplayInput<'_>) -
         }
     };
     if expected_time_wiggle > input.time_beta.len() {
-        return Err("saved survival marginal-slope ALO timewiggle tail exceeds time beta".to_string());
+        return Err(
+            "saved survival marginal-slope ALO timewiggle tail exceeds time beta".to_string(),
+        );
     }
     match (input.influence_beta, input.influence_design) {
         (None, None) => {}
@@ -233,7 +241,11 @@ fn validate_replay_input(input: &SurvivalMarginalSlopeSavedAloReplayInput<'_>) -
         }
     }
     for (label, runtime, beta) in [
-        ("score-warp", input.score_warp_runtime, input.score_warp_beta),
+        (
+            "score-warp",
+            input.score_warp_runtime,
+            input.score_warp_beta,
+        ),
         (
             "link-deviation",
             input.link_deviation_runtime,
@@ -273,10 +285,8 @@ pub fn replay_saved_survival_marginal_slope_alo(
     let logslope_dense = input
         .logslope_design
         .try_to_dense_arc("saved survival marginal-slope logslope anchor")?;
-    let mut parametric_anchor = Array2::<f64>::zeros((
-        n,
-        location_anchor.ncols() + logslope_dense.ncols(),
-    ));
+    let mut parametric_anchor =
+        Array2::<f64>::zeros((n, location_anchor.ncols() + logslope_dense.ncols()));
     parametric_anchor
         .slice_mut(s![.., ..location_anchor.ncols()])
         .assign(&location_anchor);
@@ -321,11 +331,9 @@ pub fn replay_saved_survival_marginal_slope_alo(
 
     let z_matrix = input.latent_z.clone().insert_axis(Axis(1));
     let score_covariance =
-        marginal_slope_covariance_from_scores(z_matrix.view(), input.prior_weights)?;
-    let logslope_layout = LogslopeTopology::shared().materialize_identity(
-        input.logslope_design.clone(),
-        input.logslope_offset,
-    )?;
+        MarginalSlopeCovariance::Diagonal(Array1::from_vec(vec![input.score_variance]));
+    let logslope_layout = LogslopeTopology::shared()
+        .materialize_identity(input.logslope_design.clone(), input.logslope_offset)?;
     let family = SurvivalMarginalSlopeFamily {
         n,
         event: Arc::new(input.event.clone()),
@@ -482,8 +490,8 @@ mod tests {
         let latent_z = Array1::from_vec(vec![-1.5_f64.sqrt(), 0.0, 1.5_f64.sqrt()]);
         let events = Array1::from_elem(n, event);
         let weights = Array1::from_elem(n, weight);
-        let replay = replay_saved_survival_marginal_slope_alo(
-            SurvivalMarginalSlopeSavedAloReplayInput {
+        let replay =
+            replay_saved_survival_marginal_slope_alo(SurvivalMarginalSlopeSavedAloReplayInput {
                 design_entry: &time_entry,
                 design_exit: &time_exit,
                 design_derivative_exit: &time_derivative,
@@ -497,6 +505,7 @@ mod tests {
                 latent_z: &latent_z,
                 event: &events,
                 prior_weights: &weights,
+                score_variance: 1.0,
                 derivative_guard: 1.0e-6,
                 time_wiggle_knots: None,
                 time_wiggle_degree: None,
@@ -511,9 +520,8 @@ mod tests {
                 link_deviation_runtime: None,
                 influence_design: None,
                 gaussian_frailty_sd: None,
-            },
-        )
-        .expect("rigid saved survival row replays");
+            })
+            .expect("rigid saved survival row replays");
         let row = &replay.rows[1];
         let mills0 = normal_pdf(-q0) / normal_cdf(-q0);
         let mills1 = normal_pdf(-q1) / normal_cdf(-q1);

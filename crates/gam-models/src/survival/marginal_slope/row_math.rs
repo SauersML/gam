@@ -845,6 +845,7 @@ row_program! {
         q0, q1, qd1, linear, variance;
         wi, di, probit_scale
     )
+    emit [runtime, order2];
     leaves {
         sqrt => unary_derivatives_sqrt => d_sqrt,
         neglog_phi => unary_derivatives_neglog_phi => neglog_phi_stack,
@@ -959,8 +960,9 @@ where
 /// Runtime-width correctness oracle for independent score slopes.
 ///
 /// The covariance representation changes only how `(L, V)` are constructed.
-/// Every likelihood operation is delegated to [`rigid_vector_feature_program`],
-/// whose runtime lowering lets these five features carry the full primary width.
+/// Every likelihood operation is delegated to the `rigid_vector_feature_program`
+/// row-program declaration, whose runtime lowering lets these five features carry
+/// the full primary width.
 fn rigid_vector_row_nll<'arena, S>(
     vars: &[S],
     z: &[f64],

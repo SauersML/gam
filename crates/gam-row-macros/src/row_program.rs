@@ -30,11 +30,51 @@ struct RawBody {
     result: Expr,
 }
 
+#[derive(Default)]
+struct EmissionSurfaces {
+    generic: bool,
+    runtime: bool,
+    order2: bool,
+    witnesses: bool,
+    cuda: bool,
+}
+
+impl EmissionSurfaces {
+    fn insert(&mut self, surface: &Ident) -> Result<()> {
+        let selected = match surface.to_string().as_str() {
+            "generic" => &mut self.generic,
+            "runtime" => &mut self.runtime,
+            "order2" => &mut self.order2,
+            "witnesses" => &mut self.witnesses,
+            "cuda" => &mut self.cuda,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    surface,
+                    "row_program emission surface must be one of `generic`, `runtime`, `order2`, `witnesses`, or `cuda`",
+                ));
+            }
+        };
+        if *selected {
+            return Err(syn::Error::new_spanned(
+                surface,
+                format!("duplicate row_program emission surface `{surface}`"),
+            ));
+        }
+        *selected = true;
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        !(self.generic || self.runtime || self.order2 || self.witnesses || self.cuda)
+    }
+}
+
 pub(crate) struct Input {
     visibility: Visibility,
     name: Ident,
     primaries: Vec<Ident>,
     constants: Vec<Ident>,
+    emissions: EmissionSurfaces,
     leaves: Vec<Leaf>,
     witnesses: Vec<Ident>,
     body: RawBody,
@@ -75,6 +115,33 @@ impl Parse for Input {
         if !arguments.is_empty() {
             return Err(arguments.error("invalid row_program argument list"));
         }
+
+        let emit_keyword = input.parse::<Ident>()?;
+        if emit_keyword != "emit" {
+            return Err(syn::Error::new_spanned(
+                emit_keyword,
+                "row_program expects mandatory `emit [ ... ];` surfaces",
+            ));
+        }
+        let emission_tokens;
+        bracketed!(emission_tokens in input);
+        let mut emissions = EmissionSurfaces::default();
+        while !emission_tokens.is_empty() {
+            let surface = emission_tokens.parse::<Ident>()?;
+            emissions.insert(&surface)?;
+            if emission_tokens.peek(Token![,]) {
+                emission_tokens.parse::<Token![,]>()?;
+            } else {
+                break;
+            }
+        }
+        if emissions.is_empty() {
+            return Err(emission_tokens.error("row_program must emit at least one surface"));
+        }
+        if !emission_tokens.is_empty() {
+            return Err(emission_tokens.error("invalid row_program emission surface list"));
+        }
+        input.parse::<Token![;]>()?;
 
         let leaves_keyword = input.parse::<Ident>()?;
         if leaves_keyword != "leaves" {
@@ -185,6 +252,7 @@ impl Parse for Input {
             name,
             primaries,
             constants,
+            emissions,
             leaves,
             witnesses,
             body: RawBody { statements, result },
@@ -1537,6 +1605,7 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
         name,
         primaries,
         constants,
+        emissions,
         leaves,
         witnesses,
         body,
@@ -1629,99 +1698,166 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
             ));
         }
     }
-
-    let rust_statements = statements.iter().map(|statement| match statement {
-        Statement::Local {
-            name,
-            mutable,
-            value,
-        } => {
-            let value = rust_expression(value, &leaves);
-            if *mutable {
-                quote!(let mut #name = #value;)
-            } else {
-                quote!(let #name = #value;)
-            }
-        }
-        Statement::If {
-            condition,
-            assignments,
-        } => {
-            let assignments = assignments.iter().map(|(target, value)| {
-                let value = rust_expression(value, &leaves);
-                quote!(#target = #value;)
-            });
-            quote!(if #condition { #(#assignments)* })
-        }
-    });
-    let rust_result = rust_expression(&result, &leaves);
-    let witness_values = witnesses.iter().map(|witness| quote!(#witness.value()));
-    let runtime_primary_bindings = primaries
-        .iter()
-        .map(|primary| quote!(let #primary = (*#primary).clone();));
-    let runtime_statements = statements.iter().map(|statement| match statement {
-        Statement::Local {
-            name,
-            mutable,
-            value,
-        } => {
-            let value = rust_runtime_expression(value, &leaves);
-            if *mutable {
-                quote!(let mut #name = #value;)
-            } else {
-                quote!(let #name = #value;)
-            }
-        }
-        Statement::If {
-            condition,
-            assignments,
-        } => {
-            let assignments = assignments.iter().map(|(target, value)| {
-                let value = rust_runtime_expression(value, &leaves);
-                quote!(#target = #value;)
-            });
-            quote!(if #condition { #(#assignments)* })
-        }
-    });
-    let runtime_result = rust_runtime_expression(&result, &leaves);
-    let runtime_witness_values = witnesses.iter().map(|witness| quote!(#witness.value()));
     let witness_count = witnesses.len();
-    let scalar_witness_dependencies = witness_dependencies(&statements, &witnesses);
-    let scalar_witness_scalar_dependencies =
-        witness_scalar_dependencies(&statements, &scalar_witness_dependencies)?;
-    let scalar_witness_statements = statements.iter().filter_map(|statement| match statement {
-        Statement::Local {
-            name,
-            mutable,
-            value,
-        } if scalar_witness_dependencies.contains(&name.to_string()) => {
-            let value = rust_scalar_expression(value, &leaves);
-            Some(if *mutable {
-                quote!(let mut #name = #value;)
-            } else {
-                quote!(let #name = #value;)
-            })
-        }
-        Statement::If {
-            condition,
-            assignments,
-        } => {
-            let assignments = assignments
-                .iter()
-                .filter(|(target, _)| scalar_witness_dependencies.contains(&target.to_string()))
-                .map(|(target, value)| {
-                    let value = rust_scalar_expression(value, &leaves);
+    if emissions.witnesses && witnesses.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &name,
+            "row_program cannot emit a `witnesses` surface with no declared witnesses",
+        ));
+    }
+    let dimension = primaries.len();
+
+    let generic_function = if emissions.generic {
+        let rust_statements = statements.iter().map(|statement| match statement {
+            Statement::Local {
+                name,
+                mutable,
+                value,
+            } => {
+                let value = rust_expression(value, &leaves);
+                if *mutable {
+                    quote!(let mut #name = #value;)
+                } else {
+                    quote!(let #name = #value;)
+                }
+            }
+            Statement::If {
+                condition,
+                assignments,
+            } => {
+                let assignments = assignments.iter().map(|(target, value)| {
+                    let value = rust_expression(value, &leaves);
                     quote!(#target = #value;)
-                })
-                .collect::<Vec<_>>();
-            (!assignments.is_empty()).then(|| quote!(if #condition { #(#assignments)* }))
+                });
+                quote!(if #condition { #(#assignments)* })
+            }
+        });
+        let rust_result = rust_expression(&result, &leaves);
+        let witness_values = witnesses.iter().map(|witness| quote!(#witness.value()));
+        quote! {
+            #[inline(always)]
+            #visibility fn #name<S: ::gam_math::jet_scalar::JetScalar<#dimension>>(
+                #(#primaries: &S,)*
+                #(#constants: f64),*
+            ) -> (S, [f64; #witness_count]) {
+                #(#rust_statements)*
+                let emitted_row_program_value = #rust_result;
+                (emitted_row_program_value, [#(#witness_values),*])
+            }
         }
-        Statement::Local { .. } => None,
-    });
-    let scalar_witness_name = format_ident!("{}_witnesses", name);
-    let scalar_witness_function = if witnesses.is_empty() {
-        quote!()
     } else {
+        quote!()
+    };
+
+    let runtime_function = if emissions.runtime {
+        let runtime_name = format_ident!("{}_runtime", name);
+        let runtime_primary_bindings = primaries
+            .iter()
+            .map(|primary| quote!(let #primary = (*#primary).clone();));
+        let runtime_statements = statements.iter().map(|statement| match statement {
+            Statement::Local {
+                name,
+                mutable,
+                value,
+            } => {
+                let value = rust_runtime_expression(value, &leaves);
+                if *mutable {
+                    quote!(let mut #name = #value;)
+                } else {
+                    quote!(let #name = #value;)
+                }
+            }
+            Statement::If {
+                condition,
+                assignments,
+            } => {
+                let assignments = assignments.iter().map(|(target, value)| {
+                    let value = rust_runtime_expression(value, &leaves);
+                    quote!(#target = #value;)
+                });
+                quote!(if #condition { #(#assignments)* })
+            }
+        });
+        let runtime_result = rust_runtime_expression(&result, &leaves);
+        let runtime_witness_values = witnesses.iter().map(|witness| quote!(#witness.value()));
+        quote! {
+            #[inline(always)]
+            #visibility fn #runtime_name<'arena, S: ::gam_math::jet_scalar::RuntimeJetScalar<'arena>>(
+                #(#primaries: &S,)*
+                #(#constants: f64,)*
+                __row_program_dimension: usize,
+                __row_program_workspace: &'arena S::Workspace,
+            ) -> (S, [f64; #witness_count]) {
+                #(#runtime_primary_bindings)*
+                #(#runtime_statements)*
+                let emitted_row_program_value = #runtime_result;
+                (emitted_row_program_value, [#(#runtime_witness_values),*])
+            }
+        }
+    } else {
+        quote!()
+    };
+
+    let order2_function = if emissions.order2 {
+        let order2_name = format_ident!("{}_order2", name);
+        let order2_body = rust_order2_body(
+            &primaries,
+            &constant_names,
+            &leaves,
+            &statements,
+            &result,
+            &witnesses,
+        )?;
+        quote! {
+            #[inline(always)]
+            #visibility fn #order2_name(
+                #(#primaries: f64,)*
+                #(#constants: f64),*
+            ) -> (
+                f64,
+                [f64; #dimension],
+                [[f64; #dimension]; #dimension],
+                [f64; #witness_count],
+            ) #order2_body
+        }
+    } else {
+        quote!()
+    };
+
+    let scalar_witness_function = if emissions.witnesses {
+        let scalar_witness_dependencies = witness_dependencies(&statements, &witnesses);
+        let scalar_witness_scalar_dependencies =
+            witness_scalar_dependencies(&statements, &scalar_witness_dependencies)?;
+        let scalar_witness_statements = statements.iter().filter_map(|statement| match statement {
+            Statement::Local {
+                name,
+                mutable,
+                value,
+            } if scalar_witness_dependencies.contains(&name.to_string()) => {
+                let value = rust_scalar_expression(value, &leaves);
+                Some(if *mutable {
+                    quote!(let mut #name = #value;)
+                } else {
+                    quote!(let #name = #value;)
+                })
+            }
+            Statement::If {
+                condition,
+                assignments,
+            } => {
+                let assignments = assignments
+                    .iter()
+                    .filter(|(target, _)| scalar_witness_dependencies.contains(&target.to_string()))
+                    .map(|(target, value)| {
+                        let value = rust_scalar_expression(value, &leaves);
+                        quote!(#target = #value;)
+                    })
+                    .collect::<Vec<_>>();
+                (!assignments.is_empty()).then(|| quote!(if #condition { #(#assignments)* }))
+            }
+            Statement::Local { .. } => None,
+        });
+        let scalar_witness_name = format_ident!("{}_witnesses", name);
         let scalar_witness_primaries = primaries
             .iter()
             .filter(|primary| scalar_witness_dependencies.contains(&primary.to_string()));
@@ -1739,67 +1875,32 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
                 [#(#scalar_witness_values),*]
             }
         }
+    } else {
+        quote!()
     };
-    let dimension = primaries.len();
-    let runtime_name = format_ident!("{}_runtime", name);
-    let order2_name = format_ident!("{}_order2", name);
-    let order2_body = rust_order2_body(
-        &primaries,
-        &constant_names,
-        &leaves,
-        &statements,
-        &result,
-        &witnesses,
-    )?;
-    let cuda = cuda_source(
-        &name,
-        &primaries,
-        &constant_names,
-        &leaves,
-        &statements,
-        &result,
-    )?;
-    let cuda_literal = Literal::string(&cuda);
-    let cuda_name = format_ident!("{}_CUDA_VGH", name.to_string().to_uppercase());
+
+    let cuda_constant = if emissions.cuda {
+        let cuda = cuda_source(
+            &name,
+            &primaries,
+            &constant_names,
+            &leaves,
+            &statements,
+            &result,
+        )?;
+        let cuda_literal = Literal::string(&cuda);
+        let cuda_name = format_ident!("{}_CUDA_VGH", name.to_string().to_uppercase());
+        quote!(#visibility const #cuda_name: &str = #cuda_literal;)
+    } else {
+        quote!()
+    };
 
     Ok(quote! {
-        #[inline(always)]
-        #visibility fn #name<S: ::gam_math::jet_scalar::JetScalar<#dimension>>(
-            #(#primaries: &S,)*
-            #(#constants: f64),*
-        ) -> (S, [f64; #witness_count]) {
-            #(#rust_statements)*
-            let emitted_row_program_value = #rust_result;
-            (emitted_row_program_value, [#(#witness_values),*])
-        }
-
-        #[inline(always)]
-        #visibility fn #runtime_name<'arena, S: ::gam_math::jet_scalar::RuntimeJetScalar<'arena>>(
-            #(#primaries: &S,)*
-            #(#constants: f64,)*
-            __row_program_dimension: usize,
-            __row_program_workspace: &'arena S::Workspace,
-        ) -> (S, [f64; #witness_count]) {
-            #(#runtime_primary_bindings)*
-            #(#runtime_statements)*
-            let emitted_row_program_value = #runtime_result;
-            (emitted_row_program_value, [#(#runtime_witness_values),*])
-        }
-
-        #[inline(always)]
-        #visibility fn #order2_name(
-            #(#primaries: f64,)*
-            #(#constants: f64),*
-        ) -> (
-            f64,
-            [f64; #dimension],
-            [[f64; #dimension]; #dimension],
-            [f64; #witness_count],
-        ) #order2_body
-
+        #generic_function
+        #runtime_function
+        #order2_function
         #scalar_witness_function
-
-        #visibility const #cuda_name: &str = #cuda_literal;
+        #cuda_constant
     })
 }
 
@@ -1844,10 +1945,32 @@ mod tests {
             .expect("expanded function")
     }
 
+    fn emitted_item_names(input: TokenStream2) -> Vec<String> {
+        let input = syn::parse2::<Input>(input).expect("parse row program");
+        let expanded = expand(input).expect("expand row program");
+        let file = syn::parse2::<syn::File>(expanded).expect("parse macro expansion");
+        file.items
+            .into_iter()
+            .map(|item| match item {
+                syn::Item::Fn(item) => item.sig.ident.to_string(),
+                syn::Item::Const(item) => item.ident.to_string(),
+                _ => panic!("unexpected emitted row-program item"),
+            })
+            .collect()
+    }
+
+    fn parse_error(input: TokenStream2) -> String {
+        match syn::parse2::<Input>(input) {
+            Ok(_) => panic!("row program unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        }
+    }
+
     #[test]
     fn emits_generic_and_shared_symbolic_rust_cuda_schedules() {
         let input = syn::parse2::<Input>(quote! {
             pub(crate) fn sample(q, g; weight, event, scale)
+            emit [generic, runtime, order2, witnesses, cuda];
             leaves {
                 sqrt => sqrt_stack => d_sqrt,
                 log => log_stack => d_log,
@@ -1882,10 +2005,89 @@ mod tests {
     }
 
     #[test]
+    fn emits_exactly_the_mandatory_per_program_surfaces() {
+        let names = emitted_item_names(quote! {
+            fn selective(x; shift)
+            emit [runtime, order2];
+            leaves { curve => curve_stack => d_curve }
+            witnesses [curved];
+            {
+                let shifted = add_constant(x, shift);
+                let curved = compose(curve, shifted);
+                return curved;
+            }
+        });
+
+        assert_eq!(
+            names,
+            vec![
+                "selective_runtime".to_owned(),
+                "selective_order2".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn emission_surfaces_are_mandatory_nonempty_known_and_unique() {
+        let missing = parse_error(quote! {
+            fn missing(x;)
+            leaves {}
+            witnesses [];
+            { return x; }
+        });
+        assert!(missing.contains("mandatory `emit [ ... ];`"));
+
+        let empty = parse_error(quote! {
+            fn empty(x;)
+            emit [];
+            leaves {}
+            witnesses [];
+            { return x; }
+        });
+        assert!(empty.contains("must emit at least one surface"));
+
+        let unknown = parse_error(quote! {
+            fn unknown(x;)
+            emit [jet];
+            leaves {}
+            witnesses [];
+            { return x; }
+        });
+        assert!(
+            unknown
+                .contains("must be one of `generic`, `runtime`, `order2`, `witnesses`, or `cuda`")
+        );
+
+        let duplicate = parse_error(quote! {
+            fn duplicate(x;)
+            emit [runtime, runtime];
+            leaves {}
+            witnesses [];
+            { return x; }
+        });
+        assert!(duplicate.contains("duplicate row_program emission surface `runtime`"));
+    }
+
+    #[test]
+    fn rejects_empty_scalar_witness_surface() {
+        let input = syn::parse2::<Input>(quote! {
+            fn empty_witnesses(x;)
+            emit [witnesses];
+            leaves {}
+            witnesses [];
+            { return x; }
+        })
+        .expect("parse row program");
+        let error = expand(input).expect_err("empty witness surface must be rejected");
+        assert!(error.to_string().contains("no declared witnesses"));
+    }
+
+    #[test]
     fn runtime_rust_schedule_clones_reusable_bindings_and_uses_runtime_workspace() {
         let rust = emitted_function(
             quote! {
                 fn runtime_formula(x, y; take, shift)
+                emit [runtime];
                 leaves { curve => curve_stack => d_curve }
                 witnesses [curved];
                 {
@@ -1922,6 +2124,7 @@ mod tests {
         let rust = emitted_function(
             quote! {
                 fn formulas(x, y; take)
+                emit [order2];
                 leaves { curve => curve_stack => d_curve }
                 witnesses [curved];
                 {
@@ -1970,6 +2173,7 @@ mod tests {
     fn rejects_primary_dependent_runtime_branch() {
         let input = syn::parse2::<Input>(quote! {
             fn bad(q; event)
+            emit [generic];
             leaves { log => log_stack => d_log }
             witnesses [];
             {
@@ -1987,6 +2191,7 @@ mod tests {
     fn cuda_formulas_pin_sparse_mul_compose_and_mutable_support_union() {
         let cuda = emitted_cuda(quote! {
             fn formulas(x, y; take)
+            emit [cuda];
             leaves { curve => curve_stack => d_curve }
             witnesses [];
             {
@@ -2035,6 +2240,7 @@ mod tests {
     fn cuda_compose_temporaries_are_unique_across_repeated_assignments() {
         let cuda = emitted_cuda(quote! {
             fn repeated(q; event)
+            emit [order2, cuda];
             leaves { log => log_stack => d_log }
             witnesses [];
             {
@@ -2054,6 +2260,7 @@ mod tests {
         let rust = emitted_function(
             quote! {
                 fn repeated(q; event)
+                emit [order2, cuda];
                 leaves { log => log_stack => d_log }
                 witnesses [];
                 {
@@ -2077,6 +2284,7 @@ mod tests {
         let witness = emitted_function(
             quote! {
                 fn sliced(q, g; event)
+                emit [witnesses];
                 leaves {
                     sqrt => sqrt_stack => d_sqrt,
                     log => log_stack => d_log,
@@ -2105,6 +2313,7 @@ mod tests {
         let witness = emitted_function(
             quote! {
                 fn branched(q; event, unused)
+                emit [witnesses];
                 leaves {}
                 witnesses [out];
                 {

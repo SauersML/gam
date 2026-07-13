@@ -18,7 +18,6 @@ use crate::inference::model::{
 use crate::inference::predict_io::{BernoulliMarginalSlopePredictor, PredictInput};
 use crate::model_types::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResult};
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
-use crate::scale_design::scale_transform_from_payload;
 use crate::survival::construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset, build_survival_time_basis,
@@ -2952,7 +2951,6 @@ fn predict_survival_location_scale_batch(
     time_grid: Option<&[f64]>,
     with_uncertainty: bool,
 ) -> Result<SurvivalPredictResult, String> {
-    use crate::scale_design::build_scale_deviation_operator;
     use crate::survival::construction::evaluate_survival_time_basis_row;
     use crate::survival::location_scale::{
         SurvivalLocationScalePredictInput, predict_survival_location_scale,
@@ -2984,26 +2982,19 @@ fn predict_survival_location_scale_batch(
     let saved_likelihood_mode = SurvivalLikelihoodMode::LocationScale;
     let baseline_cfg = saved_survival_runtime_baseline_config(model)?;
     let saved_fit = saved_survival_location_scale_fit_result(model)?;
-    // Reduced parametric-AFT regime (issue #892): the fit removed the time warp
-    // entirely (`h ≡ 0`, zero free time columns) and carried the σ-scaled `log t`
-    // baseline as a per-row LOCATION shift `η_t → η_t − log t`, so the
-    // standardized residual is `u = inv_sigma·(log t − η_t) = (log t − μ)/σ` and
-    // σ is identified through the event Jacobian's `−log σ` term (the
-    // survreg / lifelines / flexsurv AFT gauge). The saved model therefore carries
-    // a time-warp β that is identically ZERO: the reduced time block has zero free
-    // columns and the Gauge-owned affine shift is zero, so the finalized
-    // `beta_time = T·β_reduced + a` is an all-zero length-`p` vector (exact zeros
-    // — no arithmetic noise — or empty when p==0). A genuine
-    // flexible location-scale fit always retains a non-zero unpenalized monotone
-    // log-t trend in its warp (its affine null space is never shrunk away), so an
-    // all-zero `beta_time` uniquely identifies the reduced regime. Predict must
-    // MIRROR the `−log t` location shift instead of reconstructing a warp from the
-    // zero `beta_time`; otherwise `S(t|x)` carries no `log t` dependence and is
-    // wrong for every saved reduced-AFT model. Detected from the saved payload
-    // alone (zero time-warp β + no learned baseline timewiggle), so no new
-    // persisted flag is needed. (`iter().all` is `true` on an empty β too.)
-    let reduced_parametric_aft =
-        !model.has_baseline_time_wiggle() && saved_fit.beta_time().iter().all(|&b| b == 0.0);
+    // Reduced AFT changes the likelihood program (`h ≡ 0` and `-log(t)` moves
+    // to the location channel), so it is persisted as topology. Coefficient
+    // values are never interpreted as a model-class discriminator.
+    let saved_structure = model
+        .survival_location_scale_structure
+        .as_ref()
+        .ok_or_else(|| {
+            "saved location-scale survival model is missing exact replay structure".to_string()
+        })?;
+    let reduced_parametric_aft = matches!(
+        saved_structure.time_parameterization,
+        crate::survival::location_scale::SurvivalLocationScaleTimeParameterization::ReducedParametricAft
+    );
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(age_entry, age_exit, time_cfg.clone(), None)?;
     let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
@@ -3121,13 +3112,6 @@ fn predict_survival_location_scale_batch(
             "survival location-scale log-sigma block",
         )
         .map_err(|error| error.to_string())?;
-    let survival_noise_transform = scale_transform_from_payload(
-        &model.survival_noise_projection,
-        &model.survival_noise_center,
-        &model.survival_noise_scale,
-        model.survival_noise_non_intercept_start,
-        model.survival_noise_projection_ridge_alpha,
-    )?;
 
     let x_time_exit_dense = time_build
         .x_exit_time
@@ -3171,18 +3155,11 @@ fn predict_survival_location_scale_batch(
         "survival location-scale prediction log-sigma design",
     )?;
 
-    // Scale-deviation primary mirrors the fit's full location design: `x_time_exit`
-    // carries the full centered basis (plus any timewiggle columns) in every regime
-    // — including the reduced parametric-AFT regime, where the basis is retained at
-    // full width with an all-zero `beta_time` — matching the fit's `time_design_exit`.
-    let time_design = DesignMatrix::from(x_time_exit.clone());
-    let survival_primary_design =
-        DesignMatrix::hstack(vec![time_design, threshold_matrix.clone()])?;
-    let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
-        build_scale_deviation_operator(survival_primary_design, raw_sigma_matrix, transform)?
-    } else {
-        raw_sigma_matrix
-    };
+    // The fitted location-scale family keeps the log-scale predictor in its raw
+    // coordinate space: location and log-scale are distinct likelihood
+    // channels, so residualizing one against the other would erase valid
+    // heteroscedastic signal. Saved replay therefore uses this exact raw design.
+    let prepared_sigma_design = raw_sigma_matrix;
     let link_wiggle_knots = model
         .linkwiggle_knots
         .as_ref()
