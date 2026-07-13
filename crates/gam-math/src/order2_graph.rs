@@ -78,7 +78,7 @@ const MAX_PRIMARY_DIMENSION: usize = 16;
 const MAX_GRAPH_NODES: usize = 32;
 const MAX_GRAPH_TERMS: usize = MAX_GRAPH_NODES * MAX_GRAPH_NODES;
 const MAX_DENSE_CURVATURE_VALUES: usize =
-    MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION * MAX_PRIMARY_DIMENSION;
+    MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION * (MAX_PRIMARY_DIMENSION + 1) / 2;
 const EMPTY_TERM: GraphTerm = GraphTerm {
     node: 0,
     first: 0.0,
@@ -261,18 +261,6 @@ impl Order2GraphWorkspace {
     }
 
     #[inline(always)]
-    fn push_dense_curvature(tape: &mut GraphTape, curvature: &[f64]) -> usize {
-        assert!(
-            curvature.len() <= MAX_DENSE_CURVATURE_VALUES - tape.dense_curvature_len,
-            "compiled graph dense-curvature capacity exceeded"
-        );
-        let start = tape.dense_curvature_len;
-        tape.dense_curvatures[start..start + curvature.len()].copy_from_slice(curvature);
-        tape.dense_curvature_len += curvature.len();
-        start
-    }
-
-    #[inline(always)]
     fn lower<const K: usize>(&self, output: usize) -> Order2<K> {
         let tape = self.tape_mut();
         assert_eq!(tape.dimension, K, "compiled graph dimension mismatch");
@@ -380,10 +368,15 @@ impl Order2GraphWorkspace {
                     for term in &tape.terms[term_start..term_start + len] {
                         tape.adjoints[term.node] += adjoint * term.first;
                     }
-                    for_each_supported_upper(tape.nodes[node_index].support, |primary, other| {
-                        out.h[primary][other] +=
-                            adjoint * tape.dense_curvatures[curvature_start + primary * K + other];
-                    });
+                    let mut curvature_offset = 0;
+                    for_each_supported_upper_by_column(
+                        tape.nodes[node_index].support,
+                        |primary, other| {
+                            out.h[primary][other] +=
+                                adjoint * tape.dense_curvatures[curvature_start + curvature_offset];
+                            curvature_offset += 1;
+                        },
+                    );
                 }
             }
         }
@@ -394,6 +387,21 @@ impl Order2GraphWorkspace {
             }
         }
         Order2(out)
+    }
+}
+
+#[inline(always)]
+fn for_each_supported_upper_by_column(support: u128, mut visit: impl FnMut(usize, usize)) {
+    let mut columns = support;
+    while columns != 0 {
+        let other = columns.trailing_zeros() as usize;
+        columns &= columns - 1;
+        let mut rows = support & ((1_u128 << (other + 1)) - 1);
+        while rows != 0 {
+            let primary = rows.trailing_zeros() as usize;
+            rows &= rows - 1;
+            visit(primary, other);
+        }
     }
 }
 
@@ -540,12 +548,24 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         // no tape borrow is live. Besides preserving structured `multiply`
         // implementations, this prevents arbitrary coefficient callbacks from
         // aliasing the workspace's `UnsafeCell` accessors.
-        let mut local_curvature = [[0.0; K]; K];
         let mut direction_storage = MaybeUninit::uninit();
         let direction = InlineScalars::initialize_zeros(&mut direction_storage, input_dimension);
         let mut projected_direction_storage = MaybeUninit::uninit();
         let projected_direction =
             InlineScalars::initialize_zeros(&mut projected_direction_storage, input_dimension);
+        let supported_dimension = support.count_ones() as usize;
+        let curvature_len = supported_dimension * (supported_dimension + 1) / 2;
+        let curvature_start = {
+            let tape = workspace.tape_mut();
+            assert!(
+                curvature_len <= MAX_DENSE_CURVATURE_VALUES - tape.dense_curvature_len,
+                "compiled graph dense-curvature capacity exceeded"
+            );
+            let start = tape.dense_curvature_len;
+            tape.dense_curvature_len += curvature_len;
+            start
+        };
+        let mut curvature_offset = 0;
         let mut supported_columns = support;
         while supported_columns != 0 {
             let other = supported_columns.trailing_zeros() as usize;
@@ -557,18 +577,26 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 }
             }
             coefficients.multiply(direction.as_slice(), projected_direction.as_mut_slice());
-            let tape = workspace.tape();
             let mut supported_rows = support & ((1_u128 << (other + 1)) - 1);
             while supported_rows != 0 {
                 let primary = supported_rows.trailing_zeros() as usize;
                 supported_rows &= supported_rows - 1;
-                let mut curvature = 0.0;
-                for (input, &projected) in inputs.iter().zip(projected_direction.as_slice()) {
-                    curvature += tape.gradients[input.node * K + primary] * projected;
-                }
-                local_curvature[primary][other] = 2.0 * curvature;
+                let curvature = {
+                    let tape = workspace.tape();
+                    inputs
+                        .iter()
+                        .zip(projected_direction.as_slice())
+                        .map(|(input, &projected)| {
+                            tape.gradients[input.node * K + primary] * projected
+                        })
+                        .sum::<f64>()
+                };
+                workspace.tape_mut().dense_curvatures[curvature_start + curvature_offset] =
+                    2.0 * curvature;
+                curvature_offset += 1;
             }
         }
+        debug_assert_eq!(curvature_offset, curvature_len);
 
         let tape = workspace.tape_mut();
         let term_start = tape.term_len;
@@ -587,8 +615,6 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 gradient[primary] += first * tape.gradients[inputs[axis].node * K + primary];
             }
         }
-        let curvature_start =
-            Order2GraphWorkspace::push_dense_curvature(tape, local_curvature.as_flattened());
         let node = Order2GraphWorkspace::push(
             tape,
             value,

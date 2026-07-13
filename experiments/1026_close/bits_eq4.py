@@ -11,9 +11,31 @@ repository run and a wheel-only deployment execute identical math.
 
 from __future__ import annotations
 
-from gamfit._description_length import FittedFeaturizer, description_length
+from typing import TYPE_CHECKING, Any
 
-__all__ = ["FittedFeaturizer", "description_length", "scorer_source"]
+if TYPE_CHECKING:
+    from gamfit._description_length import FittedFeaturizer
+
+__all__ = ["make_fitted_featurizer", "description_length", "scorer_source"]
+
+
+def make_fitted_featurizer(**fields: Any) -> FittedFeaturizer:
+    """Construct the canonical package scoring surface only when it is needed."""
+    from gamfit._description_length import FittedFeaturizer
+
+    return FittedFeaturizer(**fields)
+
+
+def description_length(
+    fitted: FittedFeaturizer,
+    test_x: Any,
+    *,
+    r2_targets: tuple[float, ...] | None = None,
+) -> dict[str, Any]:
+    """Load the native-backed Eq. 4 scorer at the actual scoring boundary."""
+    from gamfit._description_length import description_length as score
+
+    return score(fitted, test_x, r2_targets=r2_targets)
 
 
 def scorer_source() -> str:

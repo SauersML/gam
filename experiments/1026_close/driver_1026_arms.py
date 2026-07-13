@@ -157,16 +157,61 @@ def _append_jsonl(path: str, record: dict) -> None:
         fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def _assert_required_device_routes(route_stats: dict) -> None:
-    for phase, stats in route_stats.items():
-        minibatches = int(stats["minibatches"])
-        admitted = int(stats["admitted_minibatches"])
-        device = int(stats["device_minibatches"])
-        cpu = int(stats["cpu_minibatches"])
+def _assert_required_device_routes(route_stats: dict) -> dict:
+    """Return a canonical, internally consistent all-device route certificate."""
+    canonical = {}
+    for phase, payload in route_stats.items():
+        stats = dict(payload)
+
+        def counter(name: str) -> int:
+            if name not in stats:
+                raise RuntimeError(
+                    f"sparse route {phase!r} is missing required counter {name!r}: {stats}"
+                )
+            value = stats[name]
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise RuntimeError(
+                    f"sparse route {phase!r} counter {name!r} must be an integer: {stats}"
+                )
+            value = int(value)
+            if value < 0:
+                raise RuntimeError(
+                    f"sparse route {phase!r} counter {name!r} must be nonnegative: {stats}"
+                )
+            return value
+
+        device = counter("device_minibatches")
+        cpu = counter("cpu_minibatches")
+        minibatches = device + cpu
+        if "minibatches" in stats and counter("minibatches") != minibatches:
+            raise RuntimeError(
+                f"sparse route {phase!r} has contradictory minibatch totals: {stats}"
+            )
+
+        # A device execution proves admission. When the aggregate admission
+        # counter is absent, `device` is therefore the exact certified count on
+        # the only route that can pass this required-device gate. Any CPU route
+        # still fails below, so missing telemetry can never launder a fallback.
+        admitted = (
+            counter("admitted_minibatches")
+            if "admitted_minibatches" in stats
+            else device
+        )
+        if admitted < device or admitted > minibatches:
+            raise RuntimeError(
+                f"sparse route {phase!r} has impossible admission telemetry: {stats}"
+            )
+
+        stats["minibatches"] = minibatches
+        stats["admitted_minibatches"] = admitted
+        stats["device_minibatches"] = device
+        stats["cpu_minibatches"] = cpu
         if minibatches <= 0 or admitted != minibatches or device != minibatches or cpu != 0:
             raise RuntimeError(
                 f"fail-closed sparse route {phase!r} was not wholly device-resident: {stats}"
             )
+        canonical[phase] = stats
+    return canonical
 
 
 def _validate_measurement_identity(run_id: str, code_revision: str, wheel_sha256: str) -> None:
@@ -438,11 +483,12 @@ def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, minibatch, score_mode,
     tr = fit.transform(x_te, score_mode=score_mode)
     recon = fit.reconstruct(tr.indices, tr.codes)
     collect["flat_fit"] = fit
-    collect["sparse_route_stats"] = {
-        "fit": fit.score_route_stats,
-        "held_out": tr.score_route_stats,
-    }
-    _assert_required_device_routes(collect["sparse_route_stats"])
+    collect["sparse_route_stats"] = _assert_required_device_routes(
+        {
+            "fit": fit.score_route_stats,
+            "held_out": tr.score_route_stats,
+        }
+    )
     collect["sparse_convergence"] = _convergence_payload(fit)
     return held_out_ev(x_te, recon, mean_tr), fit.explained_variance
 
@@ -509,12 +555,13 @@ def fit_hybrid_flat_checkpoint(
     flat_recon_tr = flat.reconstruct(tr_tr.indices, tr_tr.codes)
     flat_recon_te = flat.reconstruct(tr_te.indices, tr_te.codes)
     ev_flat = held_out_ev(x_te, flat_recon_te, mean_tr)
-    route_stats = {
-        "fit": flat.score_route_stats,
-        "train": tr_tr.score_route_stats,
-        "held_out": tr_te.score_route_stats,
-    }
-    _assert_required_device_routes(route_stats)
+    route_stats = _assert_required_device_routes(
+        {
+            "fit": flat.score_route_stats,
+            "train": tr_tr.score_route_stats,
+            "held_out": tr_te.score_route_stats,
+        }
+    )
     convergence = _convergence_payload(flat)
     arrays = {
         "decoder": np.asarray(flat.decoder, dtype=np.float32),
@@ -645,8 +692,9 @@ def score_bits_for_arm(
     out["bits_test_positions_sha256"] = _array_sha256(bits_idx)
     out["bits_row_ids_sha256"] = _array_sha256(test_row_ids[bits_idx])
     if fitted.extras is not None and "score_route_stats" in fitted.extras:
-        out["bits_score_route_stats"] = fitted.extras["score_route_stats"]
-        _assert_required_device_routes({"bits": fitted.extras["score_route_stats"]})
+        out["bits_score_route_stats"] = _assert_required_device_routes(
+            {"bits": fitted.extras["score_route_stats"]}
+        )["bits"]
     # gam#2233 self-certification: the Eq-4 dictionary term is
     # 0.5*dictionary_params/N*log2(N), ~95% of the score at K=32768, so the
     # crossover verdict is meaningful ONLY when the hybrid's dictionary_params do

@@ -49,7 +49,7 @@ import os
 
 import numpy as np
 
-from bits_eq4 import FittedFeaturizer, description_length, scorer_source
+from bits_eq4 import description_length, make_fitted_featurizer, scorer_source
 
 
 def build_cloud(n, p, *, k_circ, bg_l0, g_dict, radius, noise, seed):
@@ -106,7 +106,7 @@ def flat_featurizer(X, dirs, *, k_circ, bg_l0, g_dict):
             return _lazy(lambda take, d=d: (X[take] @ d)[:, None] * d[None, :])
         return _lazy(lambda take: np.zeros((np.asarray(take).size, p)))
 
-    return FittedFeaturizer(
+    return make_fitted_featurizer(
         name="flat", gate=gate, atom_contribution=contribution,
         code_dims=np.ones(g_dict, dtype=int), dictionary_params=g_dict * p,
         recon=recon, fit_seconds=0.0)
@@ -149,7 +149,7 @@ def hybrid_featurizer(X, dirs, *, k_circ, bg_l0, g_dict, n_harm):
                          + (X[take] @ v)[:, None] * v[None, :])
         return _lazy(lambda take: np.zeros((np.asarray(take).size, p)))
 
-    return FittedFeaturizer(
+    return make_fitted_featurizer(
         name="hybrid", gate=gate, atom_contribution=contribution,
         code_dims=code_dims, dictionary_params=g_dict * p + k_circ * m * p,
         recon=recon, fit_seconds=0.0)

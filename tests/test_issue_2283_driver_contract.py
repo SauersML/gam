@@ -95,8 +95,18 @@ def test_sparse_fit_is_fail_closed_and_reports_every_route(monkeypatch):
     )
     assert calls[1] == ("transform", "required", (1, 2))
     assert collect["sparse_route_stats"] == {
-        "fit": {"device_minibatches": 7, "cpu_minibatches": 0},
-        "held_out": {"device_minibatches": 1, "cpu_minibatches": 0},
+        "fit": {
+            "minibatches": 7,
+            "admitted_minibatches": 7,
+            "device_minibatches": 7,
+            "cpu_minibatches": 0,
+        },
+        "held_out": {
+            "minibatches": 1,
+            "admitted_minibatches": 1,
+            "device_minibatches": 1,
+            "cpu_minibatches": 0,
+        },
     }
     assert collect["sparse_convergence"] == dataclasses.asdict(Convergence())
 
@@ -187,6 +197,17 @@ def test_required_route_certificate_rejects_any_cpu_minibatch():
                     "admitted_minibatches": 3,
                     "device_minibatches": 2,
                     "cpu_minibatches": 1,
+                }
+            }
+        )
+    with np.testing.assert_raises_regex(RuntimeError, "contradictory minibatch totals"):
+        driver._assert_required_device_routes(
+            {
+                "fit": {
+                    "minibatches": 4,
+                    "admitted_minibatches": 3,
+                    "device_minibatches": 3,
+                    "cpu_minibatches": 0,
                 }
             }
         )

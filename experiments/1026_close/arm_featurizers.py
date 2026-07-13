@@ -24,11 +24,14 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
-from bits_eq4 import FittedFeaturizer
+from bits_eq4 import make_fitted_featurizer
+
+if TYPE_CHECKING:
+    from gamfit._description_length import FittedFeaturizer
 
 
 def _ensure_bench_on_path() -> None:
@@ -115,7 +118,7 @@ def build_external_topk(x_bits, *, W_enc, W_dec, b_dec, top_k) -> FittedFeaturiz
     gate, contrib, code_dims, dparams = _flat_block_from_sparse(
         W_dec, topi, topv)
     recon = np.einsum("nk,nkp->np", topv, W_dec[topi]) + b_dec[None, :]
-    return FittedFeaturizer(
+    return make_fitted_featurizer(
         name="external_topk", gate=gate, atom_contribution=contrib,
         code_dims=code_dims, dictionary_params=dparams,
         recon=recon.astype(np.float64), fit_seconds=0.0)
@@ -127,7 +130,7 @@ def build_gam_flat(x_bits, *, fit, score_mode: str) -> FittedFeaturizer:
     recon = fit.reconstruct(tr.indices, tr.codes)
     gate, contrib, code_dims, dparams = _flat_block_from_sparse(
         np.asarray(fit.decoder), tr.indices, tr.codes)
-    return FittedFeaturizer(
+    return make_fitted_featurizer(
         name="gam_flat", gate=gate, atom_contribution=contrib,
         code_dims=code_dims, dictionary_params=dparams,
         recon=np.asarray(recon, dtype=np.float64), fit_seconds=0.0,
@@ -182,7 +185,7 @@ def _stack_blocks(flat, curved, recon_full) -> FittedFeaturizer:
     def atom_contribution(g: int):
         return contrib_f(g) if g < k_flat else contrib_c(g - k_flat)
 
-    return FittedFeaturizer(
+    return make_fitted_featurizer(
         name="hybrid", gate=gate, atom_contribution=atom_contribution,
         code_dims=code_dims, dictionary_params=dp_f + dp_c,
         recon=np.asarray(recon_full, dtype=np.float64), fit_seconds=0.0)
