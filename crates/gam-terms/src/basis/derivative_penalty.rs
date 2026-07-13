@@ -84,6 +84,161 @@ pub fn bspline_derivative_penalty_matrix(
     Ok(s)
 }
 
+/// Exact function-space penalties for the anchored I-spline basis.
+///
+/// `roughness` is the derivative Gram of the represented value function and
+/// `nullspace_shrinkage`, when requested and structurally non-empty, is the
+/// exact L² metric restricted to `null(roughness)`.  The latter is a separate
+/// REML coordinate; it never adds a coefficient-space ridge to directions the
+/// primary roughness already controls.
+#[derive(Clone, Debug)]
+pub struct IsplineFunctionPenalties {
+    pub roughness: Array2<f64>,
+    pub roughness_nullspace_dim: usize,
+    pub nullspace_shrinkage: Option<Array2<f64>>,
+}
+
+/// Exact I-spline roughness and optional function-space null shrinkage.
+///
+/// The `ispline_degree` argument has the same meaning as
+/// [`BasisOptions::i_spline`]: the represented value basis has per-span degree
+/// `q = ispline_degree + 1`.  Writing that basis as
+///
+/// ```text
+/// I(x) = B_q(x) C - I(left),
+/// C[r,j] = 1{r >= j + 1},
+/// ```
+///
+/// gives, for every positive derivative order `m`,
+///
+/// ```text
+/// ∫ I^(m)(x) I^(m)(x)ᵀ dx = Cᵀ [∫ B_q^(m)(x) B_q^(m)(x)ᵀ dx] C.
+/// ```
+///
+/// The middle Gram is assembled exactly span by span by
+/// [`bspline_derivative_penalty_matrix`], including nonuniform knot widths.
+/// Thus this is an exact quadratic functional of the represented function,
+/// not a P-spline difference approximation on its coefficients.
+///
+/// I-splines are anchored at the left endpoint, so the order-`m` polynomial
+/// null space loses its constant direction and has structural dimension
+/// `m - 1`.  When `include_nullspace_shrinkage` is true, that component alone
+/// is penalized in the exact function Gram via
+/// `G Z (Zᵀ G Z)⁻¹ Zᵀ G`.
+pub fn ispline_function_penalties(
+    knot_vector: ArrayView1<f64>,
+    ispline_degree: usize,
+    derivative_order: usize,
+    include_nullspace_shrinkage: bool,
+) -> Result<IsplineFunctionPenalties, BasisError> {
+    if ispline_degree < 1 {
+        return Err(BasisError::InvalidDegree(ispline_degree));
+    }
+    let value_degree = ispline_degree
+        .checked_add(1)
+        .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?;
+    if derivative_order == 0 {
+        let num_basis = knot_vector.len().saturating_sub(value_degree + 2);
+        return Err(BasisError::InvalidPenaltyOrder {
+            order: derivative_order,
+            num_basis,
+        });
+    }
+
+    let bspline_roughness = bspline_derivative_penalty_matrix(
+        knot_vector,
+        value_degree,
+        derivative_order,
+    )?;
+    let num_bspline_basis = bspline_roughness.nrows();
+    let num_ispline_basis = num_bspline_basis.checked_sub(1).ok_or_else(|| {
+        BasisError::InvalidKnotVector(
+            "I-spline roughness requires at least two value B-spline columns".to_string(),
+        )
+    })?;
+    if num_ispline_basis == 0 {
+        return Err(BasisError::InvalidKnotVector(
+            "I-spline roughness has no represented columns".to_string(),
+        ));
+    }
+
+    let mut cumulative = Array2::<f64>::zeros((num_bspline_basis, num_ispline_basis));
+    for column in 0..num_ispline_basis {
+        cumulative.slice_mut(s![column + 1.., column]).fill(1.0);
+    }
+    let mut roughness = cumulative
+        .t()
+        .dot(&bspline_roughness)
+        .dot(&cumulative);
+    symmetrize_in_place(&mut roughness);
+
+    let roughness_nullspace_dim = derivative_order - 1;
+    let nullspace_shrinkage = if include_nullspace_shrinkage
+        && roughness_nullspace_dim > 0
+    {
+        let function_gram = ispline_function_gram(knot_vector, ispline_degree)?;
+        Some(
+            function_space_nullspace_shrinkage(&roughness, &function_gram)?.ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "order-{derivative_order} I-spline roughness has structural nullity {roughness_nullspace_dim}, but its function-space null frame was not resolved"
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
+
+    Ok(IsplineFunctionPenalties {
+        roughness,
+        roughness_nullspace_dim,
+        nullspace_shrinkage,
+    })
+}
+
+/// Exact L² Gram `G_ij = ∫ I_i(x) I_j(x) dx` for an anchored I-spline basis.
+///
+/// The value functions have per-span degree `ispline_degree + 1`, so
+/// `ispline_degree + 2` Gauss–Legendre nodes integrate every product exactly.
+pub fn ispline_function_gram(
+    knot_vector: ArrayView1<f64>,
+    ispline_degree: usize,
+) -> Result<Array2<f64>, BasisError> {
+    if ispline_degree < 1 {
+        return Err(BasisError::InvalidDegree(ispline_degree));
+    }
+    let value_degree = ispline_degree
+        .checked_add(1)
+        .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?;
+    validate_knots_for_degree(knot_vector, value_degree)?;
+    let knot_count = knot_vector.len();
+    if knot_count < 2 * (value_degree + 1) {
+        crate::bail_invalid_basis!(
+            "I-spline function Gram requires at least {} knots for value degree {value_degree}, got {knot_count}",
+            2 * (value_degree + 1)
+        );
+    }
+    let mut breaks = Vec::<f64>::with_capacity(knot_count - 2 * value_degree);
+    for index in value_degree..=(knot_count - 1 - value_degree) {
+        let knot = knot_vector[index];
+        if breaks.last().is_none_or(|&previous| knot > previous) {
+            breaks.push(knot);
+        }
+    }
+    piecewise_polynomial_function_gram(
+        &breaks,
+        value_degree + 1,
+        &mut |points| {
+            let (basis, _) = create_basis::<Dense>(
+                points,
+                KnotSource::Provided(knot_vector),
+                ispline_degree,
+                BasisOptions::i_spline(),
+            )?;
+            Ok((*basis).clone())
+        },
+    )
+}
+
 /// Exact cyclic (periodic) B-spline roughness penalty over one full period:
 /// `S_ab = ∮ B_a^{(order)}(θ) B_b^{(order)}(θ) dθ` for the wrapped uniform
 /// basis of `num_basis` cardinal translates with spacing `h = period /
@@ -370,6 +525,14 @@ mod tests {
         Array1::from(v)
     }
 
+    /// Convert B-spline coefficients for an anchored function (`b[0] = 0`)
+    /// into the cumulative I-spline chart `b = C alpha`.
+    fn anchored_bspline_to_ispline_coefficients(b: &Array1<f64>) -> Array1<f64> {
+        assert!(b.len() >= 2);
+        assert!(b[0].abs() < 1e-12, "anchored function must vanish at left");
+        Array1::from_iter((0..b.len() - 1).map(|index| b[index + 1] - b[index]))
+    }
+
     fn assert_symmetric_psd_with_nullity(s: &Array2<f64>, expected_nullity: usize) {
         assert_eq!(s.nrows(), s.ncols());
         for i in 0..s.nrows() {
@@ -507,6 +670,242 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Independent closed-form oracle for the I-spline cumulative chart on a
+    /// strongly nonuniform knot vector.  Every anchored monomial
+    /// `(x-a)^r`, `r>=1`, belongs to the I-spline span.  Its order-`m` energy is
+    /// known analytically and cannot depend on the coefficient geometry.
+    #[test]
+    fn ispline_penalty_matches_closed_form_on_nonuniform_knots() {
+        let (a, b) = (-1.3_f64, 2.6_f64);
+        let width = b - a;
+        let value_degree = 3usize;
+        let ispline_degree = value_degree - 1;
+        let knots = clamped_knots(
+            &[
+                a + 0.03 * width,
+                a + 0.21 * width,
+                a + 0.22 * width,
+                a + 0.68 * width,
+                a + 0.94 * width,
+            ],
+            value_degree,
+            a,
+            b,
+        );
+        let shifted_knots = knots.mapv(|knot| knot - a);
+
+        for order in 1..=value_degree {
+            let built =
+                ispline_function_penalties(knots.view(), ispline_degree, order, false).unwrap();
+            assert_eq!(built.roughness_nullspace_dim, order - 1);
+            assert!(built.nullspace_shrinkage.is_none());
+            assert_symmetric_psd_with_nullity(&built.roughness, order - 1);
+
+            for polynomial_degree in 1..=value_degree {
+                let b_coefficients =
+                    monomial_coefficients(shifted_knots.view(), value_degree, polynomial_degree);
+                let alpha = anchored_bspline_to_ispline_coefficients(&b_coefficients);
+                let observed = alpha.dot(&built.roughness.dot(&alpha));
+                let expected = if polynomial_degree < order {
+                    0.0
+                } else {
+                    let derivative_factor =
+                        ((polynomial_degree - order + 1)..=polynomial_degree)
+                            .map(|factor| factor as f64)
+                            .product::<f64>();
+                    let residual_degree = polynomial_degree - order;
+                    derivative_factor.powi(2)
+                        * width.powi((2 * residual_degree + 1) as i32)
+                        / (2 * residual_degree + 1) as f64
+                };
+                let relative_error = (observed - expected).abs() / expected.abs().max(1.0);
+                assert!(
+                    relative_error < 2e-10,
+                    "I-spline degree={value_degree}, order={order}, polynomial degree={polynomial_degree}: expected {expected}, observed {observed}, relative error {relative_error}"
+                );
+            }
+        }
+    }
+
+    /// The cumulative-map assembly and the public I-spline derivative
+    /// evaluator are independent routes to the same exact integral.  An
+    /// deliberately over-resolved Gauss rule must reproduce the matrix energy
+    /// on every unequal knot span to roundoff.
+    #[test]
+    fn ispline_penalty_matches_independent_span_quadrature() {
+        let value_degree = 4usize;
+        let ispline_degree = value_degree - 1;
+        let order = 3usize;
+        let knots = clamped_knots(&[0.04, 0.19, 0.2, 0.61, 0.91], value_degree, 0.0, 1.0);
+        let built =
+            ispline_function_penalties(knots.view(), ispline_degree, order, false).unwrap();
+        let alpha = Array1::from_iter(
+            (0..built.roughness.nrows()).map(|index| (0.37 + 1.91 * index as f64).sin()),
+        );
+        let exact = alpha.dot(&built.roughness.dot(&alpha));
+
+        let (nodes, weights) = gauss_legendre(2 * value_degree + 3);
+        let mut points = Vec::<f64>::new();
+        let mut quadrature_weights = Vec::<f64>::new();
+        for span in knots.windows(2) {
+            let (left, right) = (span[0], span[1]);
+            if right <= left {
+                continue;
+            }
+            let half = 0.5 * (right - left);
+            let mid = 0.5 * (left + right);
+            for (&node, &weight) in nodes.iter().zip(weights.iter()) {
+                points.push(mid + half * node);
+                quadrature_weights.push(half * weight);
+            }
+        }
+        let derivative = create_ispline_derivative_dense(
+            Array1::from(points).view(),
+            &knots,
+            ispline_degree,
+            order,
+        )
+        .unwrap()
+        .dot(&alpha);
+        let oracle = derivative
+            .iter()
+            .zip(quadrature_weights.iter())
+            .map(|(&value, &weight)| weight * value * value)
+            .sum::<f64>();
+        let relative_error = (exact - oracle).abs() / exact.abs().max(1.0);
+        assert!(
+            relative_error < 2e-11,
+            "exact cumulative Gram {exact} differs from span quadrature {oracle}; relative error {relative_error}"
+        );
+    }
+
+    /// Knot insertion only changes coordinates.  The same anchored spline in
+    /// the coarse and Boehm-refined I-spline charts must agree pointwise and
+    /// carry identical function roughness.
+    #[test]
+    fn ispline_penalty_is_invariant_under_exact_knot_insertion() {
+        let value_degree = 3usize;
+        let ispline_degree = value_degree - 1;
+        let order = 2usize;
+        let coarse_knots = clamped_knots(&[0.16, 0.53, 0.88], value_degree, 0.0, 1.0);
+        let coarse_b = array![0.0, 0.7, -0.4, 1.6, 0.2, 1.1, -0.3];
+        let (fine_knots, fine_b) =
+            insert_knot_once(&coarse_knots, &coarse_b, value_degree, 0.37);
+        let coarse_alpha = anchored_bspline_to_ispline_coefficients(&coarse_b);
+        let fine_alpha = anchored_bspline_to_ispline_coefficients(&fine_b);
+
+        let points = Array1::linspace(0.0, 1.0, 137);
+        let (coarse_basis, _) = create_basis::<Dense>(
+            points.view(),
+            KnotSource::Provided(coarse_knots.view()),
+            ispline_degree,
+            BasisOptions::i_spline(),
+        )
+        .unwrap();
+        let (fine_basis, _) = create_basis::<Dense>(
+            points.view(),
+            KnotSource::Provided(fine_knots.view()),
+            ispline_degree,
+            BasisOptions::i_spline(),
+        )
+        .unwrap();
+        let value_error = (&coarse_basis.dot(&coarse_alpha) - &fine_basis.dot(&fine_alpha))
+            .iter()
+            .fold(0.0_f64, |error, value| error.max(value.abs()));
+        assert!(value_error < 2e-12, "knot insertion changed f by {value_error}");
+
+        let coarse =
+            ispline_function_penalties(coarse_knots.view(), ispline_degree, order, false).unwrap();
+        let fine =
+            ispline_function_penalties(fine_knots.view(), ispline_degree, order, false).unwrap();
+        let coarse_energy = coarse_alpha.dot(&coarse.roughness.dot(&coarse_alpha));
+        let fine_energy = fine_alpha.dot(&fine.roughness.dot(&fine_alpha));
+        let relative_error =
+            (coarse_energy - fine_energy).abs() / coarse_energy.abs().max(1.0);
+        assert!(
+            relative_error < 2e-12,
+            "knot insertion changed roughness: coarse={coarse_energy}, fine={fine_energy}, relative error {relative_error}"
+        );
+    }
+
+    /// Double penalty acts only on the primary derivative null space in the
+    /// function metric.  It is covariant under a dense change of basis and is
+    /// exactly zero on the G-orthogonal primary range, unlike `eye(p)`.
+    #[test]
+    fn ispline_null_shrinkage_is_metric_exact_and_reparameterization_covariant() {
+        let value_degree = 3usize;
+        let ispline_degree = value_degree - 1;
+        let knots = clamped_knots(&[0.08, 0.31, 0.73, 0.95], value_degree, 0.0, 1.0);
+        let built =
+            ispline_function_penalties(knots.view(), ispline_degree, 2, true).unwrap();
+        let ridge = built
+            .nullspace_shrinkage
+            .as_ref()
+            .expect("order-two anchored spline has one linear null direction");
+        let gram = ispline_function_gram(knots.view(), ispline_degree).unwrap();
+
+        let linear_b = monomial_coefficients(knots.view(), value_degree, 1);
+        let linear = anchored_bspline_to_ispline_coefficients(&linear_b);
+        let roughness_scale = built
+            .roughness
+            .iter()
+            .fold(0.0_f64, |scale, value| scale.max(value.abs()))
+            .max(1.0);
+        let null_residual = built
+            .roughness
+            .dot(&linear)
+            .iter()
+            .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+        assert!(null_residual < 2e-11 * roughness_scale);
+        let null_function_energy = linear.dot(&gram.dot(&linear));
+        let null_ridge_energy = linear.dot(&ridge.dot(&linear));
+        assert!(
+            (null_ridge_energy - null_function_energy).abs()
+                < 2e-11 * null_function_energy.max(1.0),
+            "ridge must equal the exact L2 norm on null(S): ridge={null_ridge_energy}, L2={null_function_energy}"
+        );
+
+        let mut range = Array1::from_iter(
+            (0..linear.len()).map(|index| (0.2 + index as f64 * 1.7).cos()),
+        );
+        let projection = linear.dot(&gram.dot(&range)) / null_function_energy;
+        range -= &(projection * &linear);
+        let range_ridge_energy = range.dot(&ridge.dot(&range));
+        let range_roughness_energy = range.dot(&built.roughness.dot(&range));
+        assert!(range_roughness_energy > 1e-8 * roughness_scale);
+        assert!(
+            range_ridge_energy.abs() < 2e-11 * null_function_energy.max(1.0),
+            "null ridge leaked onto the function-metric range: {range_ridge_energy}"
+        );
+
+        let p = built.roughness.nrows();
+        let mut map = Array2::<f64>::eye(p);
+        for index in 0..p {
+            map[[index, index]] = 0.7 + 0.13 * index as f64;
+        }
+        if p >= 3 {
+            map[[0, 1]] = 0.31;
+            map[[1, 2]] = -0.22;
+        }
+        let roughness_mapped = map.t().dot(&built.roughness).dot(&map);
+        let gram_mapped = map.t().dot(&gram).dot(&map);
+        let ridge_mapped = function_space_nullspace_shrinkage(&roughness_mapped, &gram_mapped)
+            .unwrap()
+            .expect("mapped null direction");
+        let expected_mapped = map.t().dot(ridge).dot(&map);
+        let map_scale = expected_mapped
+            .iter()
+            .fold(0.0_f64, |scale, value| scale.max(value.abs()))
+            .max(1.0);
+        let map_error = (&ridge_mapped - &expected_mapped)
+            .iter()
+            .fold(0.0_f64, |error, value| error.max(value.abs()));
+        assert!(
+            map_error < 2e-10 * map_scale,
+            "function-space ridge failed basis covariance: error={map_error}, scale={map_scale}"
+        );
     }
 
     /// Exact polynomial null space: monomials of degree < order are

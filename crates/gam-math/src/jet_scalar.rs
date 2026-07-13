@@ -77,6 +77,33 @@ pub trait SymmetricQuadraticCoefficients {
 
     /// One symmetric coefficient `A[row, column]`.
     fn coefficient(&self, row: usize, column: usize) -> f64;
+
+    /// Evaluate the primal quadratic form without materializing the input as a
+    /// separate `f64` vector. Structured operators should override this to
+    /// preserve their representation's natural complexity (for example O(KR)
+    /// for a K-by-R low-rank factor).
+    fn quadratic_value<T, F>(&self, inputs: &[T], value: F) -> f64
+    where
+        F: Fn(&T) -> f64,
+    {
+        assert_eq!(
+            inputs.len(),
+            self.dimension(),
+            "symmetric quadratic-form dimension mismatch"
+        );
+        let mut out = 0.0;
+        for row in 0..inputs.len() {
+            let row_value = value(&inputs[row]);
+            out += self.coefficient(row, row) * row_value * row_value;
+            for column in row + 1..inputs.len() {
+                out += 2.0
+                    * self.coefficient(row, column)
+                    * row_value
+                    * value(&inputs[column]);
+            }
+        }
+        out
+    }
 }
 
 fn symmetric_quadratic_form_default<T, C>(
@@ -548,6 +575,209 @@ pub trait RuntimeJetScalar<'arena>: Clone {
         let r = 1.0 / self.value();
         let r2 = r * r;
         self.compose_unary([r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
+    }
+}
+
+/// Zero-order runtime scalar for evaluating the primal value of a canonical
+/// runtime-width row program without constructing derivative channels.
+///
+/// The primary dimension remains part of the scalar so it obeys the same
+/// runtime algebra contract as derivative-carrying implementations. Unary
+/// derivative stacks contribute only their value entry, while structured
+/// quadratic operators retain their representation-specific primal lowering.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RuntimeValue {
+    value: f64,
+    dimension: usize,
+}
+
+impl<'arena> RuntimeJetScalar<'arena> for RuntimeValue {
+    type Workspace = ();
+
+    #[inline(always)]
+    fn constant(c: f64, dimension: usize, &(): &'arena Self::Workspace) -> Self {
+        Self {
+            value: c,
+            dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn variable(x: f64, axis: usize, dimension: usize, &(): &'arena Self::Workspace) -> Self {
+        assert!(axis < dimension, "runtime value variable axis out of bounds");
+        Self {
+            value: x,
+            dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn symmetric_quadratic_form<C: SymmetricQuadraticCoefficients>(
+        inputs: &[Self],
+        coefficients: &C,
+        dimension: usize,
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        assert_eq!(inputs.len(), coefficients.dimension());
+        assert!(inputs.iter().all(|input| input.dimension == dimension));
+        Self {
+            value: coefficients.quadratic_value(inputs, |input| input.value),
+            dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn linear_combination(
+        inputs: &[Self],
+        weights: &[f64],
+        dimension: usize,
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        assert_eq!(inputs.len(), weights.len());
+        assert!(inputs.iter().all(|input| input.dimension == dimension));
+        let value = inputs
+            .iter()
+            .zip(weights)
+            .map(|(input, &weight)| input.value * weight)
+            .sum();
+        Self { value, dimension }
+    }
+
+    #[inline(always)]
+    fn add_constant(&self, constant: f64, &(): &'arena Self::Workspace) -> Self {
+        Self {
+            value: self.value + constant,
+            dimension: self.dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
+        self.assert_same_dimension(right);
+        self.assert_same_dimension(addend);
+        Self {
+            value: self.value * right.value + addend.value,
+            dimension: self.dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn composed_sum(
+        inputs: &[Self],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        assert_eq!(inputs.len(), derivative_stacks.len());
+        assert!(inputs.iter().all(|input| input.dimension == dimension));
+        Self {
+            value: derivative_stacks.iter().map(|stack| stack[0]).sum(),
+            dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn product(&self, right: &Self) -> Self {
+        self.mul(right)
+    }
+
+    #[inline(always)]
+    fn affine_compose(
+        &self,
+        _input_scale: f64,
+        _input_shift: f64,
+        derivative_stack: [f64; 5],
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        Self {
+            value: derivative_stack[0],
+            dimension: self.dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn affine_composed_sum(
+        inputs: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        assert_eq!(inputs.len(), input_scales.len());
+        assert_eq!(inputs.len(), derivative_stacks.len());
+        assert!(inputs.iter().all(|input| input.dimension == dimension));
+        Self {
+            value: derivative_stacks.iter().map(|stack| stack[0]).sum(),
+            dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    #[inline(always)]
+    fn value(&self) -> f64 {
+        self.value
+    }
+
+    #[inline(always)]
+    fn add(&self, other: &Self) -> Self {
+        self.assert_same_dimension(other);
+        Self {
+            value: self.value + other.value,
+            dimension: self.dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn sub(&self, other: &Self) -> Self {
+        self.assert_same_dimension(other);
+        Self {
+            value: self.value - other.value,
+            dimension: self.dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn mul(&self, other: &Self) -> Self {
+        self.assert_same_dimension(other);
+        Self {
+            value: self.value * other.value,
+            dimension: self.dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn neg(&self) -> Self {
+        Self {
+            value: -self.value,
+            dimension: self.dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn scale(&self, scale: f64) -> Self {
+        Self {
+            value: self.value * scale,
+            dimension: self.dimension,
+        }
+    }
+
+    #[inline(always)]
+    fn compose_unary(&self, derivative_stack: [f64; 5]) -> Self {
+        Self {
+            value: derivative_stack[0],
+            dimension: self.dimension,
+        }
+    }
+}
+
+impl RuntimeValue {
+    #[inline(always)]
+    fn assert_same_dimension(&self, other: &Self) {
+        assert_eq!(self.dimension, other.dimension);
     }
 }
 
@@ -4734,6 +4964,19 @@ mod tests {
             JetField::compose_unary,
         );
 
+        let value_vars: [RuntimeValue; K] =
+            std::array::from_fn(|axis| RuntimeValue::variable(values[axis], axis, K, &()));
+        let value_inputs = [
+            value_vars[0].mul(&value_vars[1]).add(&value_vars[3]),
+            value_vars[1].exp().add(&value_vars[2].scale(0.4)),
+            value_vars[2].mul(&value_vars[2]).sub(&value_vars[0]),
+        ];
+        let value_quadratic =
+            RuntimeValue::symmetric_quadratic_form(&value_inputs, &coefficients, K, &());
+        let value_linear = RuntimeValue::linear_combination(&value_inputs, &weights, K, &());
+        let value_composed =
+            RuntimeValue::composed_sum(&value_inputs, &derivative_stacks, K, &());
+
         let arena = DynamicJetArena::new();
         let dynamic_vars: [DynamicOrder2<'_>; K] =
             std::array::from_fn(|axis| DynamicOrder2::variable(values[axis], axis, K, &arena));
@@ -4785,6 +5028,21 @@ mod tests {
         let tolerance = 2.0e-13;
         for (label, actual, expected) in [
             ("fixed value", fixed_direct.value(), fixed_scalar.value()),
+            (
+                "zero-order quadratic value",
+                value_quadratic.value(),
+                fixed_direct.value(),
+            ),
+            (
+                "zero-order linear value",
+                value_linear.value(),
+                fixed_linear_direct.value(),
+            ),
+            (
+                "zero-order composed value",
+                value_composed.value(),
+                fixed_composed_direct.value(),
+            ),
             (
                 "dynamic value",
                 dynamic_direct.value(),

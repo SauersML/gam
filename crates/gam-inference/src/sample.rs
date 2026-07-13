@@ -42,7 +42,7 @@ use gam_models::survival::{
     PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec,
 };
 use gam_models::wiggle::{
-    append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
+    append_selected_wiggle_function_penalties, buildwiggle_block_input_from_knots,
     split_wiggle_penalty_orders,
 };
 use gam_problem::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
@@ -1385,7 +1385,7 @@ fn sample_survival(
             seed[n + i] = eta_offset_exit[i];
         }
         let (primary_order, extra_orders) =
-            split_wiggle_penalty_orders(2, &wiggle_cfg.penalty_orders);
+            split_wiggle_penalty_orders(2, &wiggle_cfg.penalty_orders)?;
         let mut block = buildwiggle_block_input_from_knots(
             seed.view(),
             &wiggle_knots,
@@ -1393,7 +1393,12 @@ fn sample_survival(
             primary_order,
             wiggle_cfg.double_penalty,
         )?;
-        append_selected_wiggle_penalty_orders(&mut block, &extra_orders)
+        append_selected_wiggle_function_penalties(
+            &mut block,
+            &wiggle_knots,
+            wiggle_degree,
+            &extra_orders,
+        )
             .map_err(|e| format!("baseline-timewiggle penalty reconstruction failed: {e}"))?;
         for (widx, s) in block.penalties.iter().enumerate() {
             let s = match s {

@@ -7427,13 +7427,14 @@ pub(crate) fn wiggle_block_design_matches_ispline_basis() {
 
 #[test]
 pub(crate) fn split_wiggle_penalty_orders_uses_requested_order_one_as_primary() {
-    let (primary, extras) = split_wiggle_penalty_orders(2, &[1, 2, 3, 3]);
+    let (primary, extras) =
+        split_wiggle_penalty_orders(2, &[1, 2, 3, 3]).expect("valid derivative orders");
     assert_eq!(primary, 1);
     assert_eq!(extras, vec![2, 3]);
 }
 
 #[test]
-pub(crate) fn append_selected_wiggle_penalty_orders_keeps_order_one() {
+pub(crate) fn selected_wiggle_function_penalties_keep_order_one() {
     let q_seed = Array1::linspace(-1.0, 1.0, 11);
     let degree = 3usize;
     let num_internal_knots = 5usize;
@@ -7447,7 +7448,7 @@ pub(crate) fn append_selected_wiggle_penalty_orders_keeps_order_one() {
         select_wiggle_basis_from_seed(q_seed.view(), &cfg, &[1, 3]).expect("selected wiggle basis");
 
     assert_eq!(selected.block.penalties.len(), 2);
-    assert_eq!(selected.block.nullspace_dims, vec![1, 3]);
+    assert_eq!(selected.block.nullspace_dims, vec![0, 2]);
 }
 
 #[test]

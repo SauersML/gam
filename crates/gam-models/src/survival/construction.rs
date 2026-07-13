@@ -17,8 +17,9 @@ use crate::survival::location_scale::{
 use crate::survival::lognormal_kernel::HazardLoading;
 use crate::survival::marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD;
 use crate::wiggle::{
-    WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
-    monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
+    WiggleBlockConfig, append_selected_wiggle_function_penalties,
+    buildwiggle_block_input_from_seed, monotone_wiggle_basis_with_derivative_order,
+    split_wiggle_penalty_orders,
 };
 use gam_linalg::matrix::{
     DenseDesignMatrix, DesignMatrix, SparseDesignMatrix, symmetrize_in_place,
@@ -3497,10 +3498,10 @@ pub fn build_survival_timewiggle_from_baseline(
         seed[i] = eta_entry[i];
         seed[n + i] = eta_exit[i];
     }
-    // Use the smallest requested positive penalty order as the primary
-    // coefficient-space penalty so the fitted wiggle penalty system matches
-    // the public formula exactly, including the slope (`order = 1`) case.
-    let (primary_order, extra_orders) = split_wiggle_penalty_orders(2, &cfg.penalty_orders);
+    // Use the smallest requested derivative order as the primary exact
+    // function-space roughness so the fitted penalty system matches the public
+    // formula exactly, including the slope (`order = 1`) case.
+    let (primary_order, extra_orders) = split_wiggle_penalty_orders(2, &cfg.penalty_orders)?;
     let wiggle_cfg = WiggleBlockConfig {
         degree: cfg.degree,
         num_internal_knots: cfg.num_internal_knots,
@@ -3508,7 +3509,12 @@ pub fn build_survival_timewiggle_from_baseline(
         double_penalty: cfg.double_penalty,
     };
     let (mut combined_block, knots) = buildwiggle_block_input_from_seed(seed.view(), &wiggle_cfg)?;
-    append_selected_wiggle_penalty_orders(&mut combined_block, &extra_orders)?;
+    append_selected_wiggle_function_penalties(
+        &mut combined_block,
+        &knots,
+        cfg.degree,
+        &extra_orders,
+    )?;
     let ncols = combined_block.design.ncols();
     Ok(SurvivalTimeWiggleBuild {
         nullspace_dims: combined_block.nullspace_dims.clone(),

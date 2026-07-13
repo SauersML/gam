@@ -1,6 +1,7 @@
 use super::family::clamp_bernoulli_link_probability;
 use super::*;
 use gam_linalg::matrix::{FiniteSignedWeightsView, LinearOperator};
+use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 use gam_math::jet_tower::Tower4;
 use gam_math::probability::normal_logcdf_derivatives;
 use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge};
@@ -886,46 +887,167 @@ impl MarginalSlopeCovariance {
         if vector.iter().any(|value| !value.is_finite()) {
             return Err("marginal-slope covariance vector contains non-finite values".to_string());
         }
-        let value = match self {
-            Self::Diagonal(diag) => vector
-                .iter()
-                .zip(diag.iter())
-                .map(|(&v, &sigma)| v * v * sigma)
-                .sum::<f64>(),
-            Self::Full(cov) => {
-                let mut total = 0.0;
-                for i in 0..cov.nrows() {
-                    let mut row_dot = 0.0;
-                    for j in 0..cov.ncols() {
-                        row_dot += cov[[i, j]] * vector[j];
-                    }
-                    total += vector[i] * row_dot;
-                }
-                total
-            }
-            Self::LowRank(factor) => {
-                // Sigma = L L'. The Gaussian-probit scale only needs
-                // r' Sigma r = ||L' r||^2. Equivalently,
-                // det(I + L' r r' L) = 1 + ||L' r||^2 by the matrix
-                // determinant lemma, so the low-rank path never builds
-                // the full K x K covariance.
-                let mut total = 0.0;
-                for r in 0..factor.ncols() {
-                    let mut projection = 0.0;
-                    for k in 0..factor.nrows() {
-                        projection += factor[[k, r]] * vector[k];
-                    }
-                    total += projection * projection;
-                }
-                total
-            }
-        };
+        let value = <Self as SymmetricQuadraticCoefficients>::quadratic_value(
+            self,
+            vector,
+            |value| *value,
+        );
         if value.is_finite() && value >= COVARIANCE_QUADRATIC_FORM_PSD_TOL {
             Ok(value.max(0.0))
         } else {
             Err(format!(
                 "marginal-slope covariance quadratic form must be non-negative, got {value}"
             ))
+        }
+    }
+}
+
+enum VectorSupport {
+    Zero,
+    Singleton { axis: usize, value: f64 },
+    Multiple,
+}
+
+#[inline(always)]
+fn vector_support(input: &[f64]) -> VectorSupport {
+    let mut singleton = None;
+    for (axis, &value) in input.iter().enumerate() {
+        if value == 0.0 {
+            continue;
+        }
+        if singleton.is_some() {
+            return VectorSupport::Multiple;
+        }
+        singleton = Some((axis, value));
+    }
+    match singleton {
+        None => VectorSupport::Zero,
+        Some((axis, value)) => VectorSupport::Singleton { axis, value },
+    }
+}
+
+impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
+    fn dimension(&self) -> usize {
+        self.dim()
+    }
+
+    fn multiply(&self, input: &[f64], output: &mut [f64]) {
+        assert_eq!(input.len(), self.dim());
+        assert_eq!(output.len(), self.dim());
+        match self {
+            Self::Diagonal(diagonal) => {
+                for axis in 0..input.len() {
+                    output[axis] = diagonal[axis] * input[axis];
+                }
+            }
+            Self::Full(matrix) => {
+                match vector_support(input) {
+                    VectorSupport::Zero => {
+                        output.fill(0.0);
+                        return;
+                    }
+                    VectorSupport::Singleton { axis, value } => {
+                        for row in 0..input.len() {
+                            output[row] = matrix[[row, axis]] * value;
+                        }
+                        return;
+                    }
+                    VectorSupport::Multiple => {}
+                }
+                for row in 0..input.len() {
+                    let mut value = 0.0;
+                    for column in 0..input.len() {
+                        value += matrix[[row, column]] * input[column];
+                    }
+                    output[row] = value;
+                }
+            }
+            Self::LowRank(factor) => {
+                output.fill(0.0);
+                match vector_support(input) {
+                    VectorSupport::Zero => return,
+                    VectorSupport::Singleton { axis, value } => {
+                        for rank in 0..factor.ncols() {
+                            let projection = factor[[axis, rank]] * value;
+                            for row in 0..input.len() {
+                                output[row] += factor[[row, rank]] * projection;
+                            }
+                        }
+                        return;
+                    }
+                    VectorSupport::Multiple => {}
+                }
+                for rank in 0..factor.ncols() {
+                    let mut projection = 0.0;
+                    for row in 0..input.len() {
+                        projection += factor[[row, rank]] * input[row];
+                    }
+                    for row in 0..input.len() {
+                        output[row] += factor[[row, rank]] * projection;
+                    }
+                }
+            }
+        }
+    }
+
+    fn coefficient(&self, row: usize, column: usize) -> f64 {
+        match self {
+            Self::Diagonal(diagonal) => {
+                if row == column {
+                    diagonal[row]
+                } else {
+                    0.0
+                }
+            }
+            Self::Full(matrix) => matrix[[row, column]],
+            Self::LowRank(factor) => {
+                let mut value = 0.0;
+                for rank in 0..factor.ncols() {
+                    value += factor[[row, rank]] * factor[[column, rank]];
+                }
+                value
+            }
+        }
+    }
+
+    fn quadratic_value<T, F>(&self, input: &[T], value: F) -> f64
+    where
+        F: Fn(&T) -> f64,
+    {
+        assert_eq!(input.len(), self.dim());
+        match self {
+            Self::Diagonal(diagonal) => input
+                .iter()
+                .zip(diagonal)
+                .map(|(input, &coefficient)| {
+                    let input = value(input);
+                    coefficient * input * input
+                })
+                .sum(),
+            Self::Full(matrix) => {
+                let mut total = 0.0;
+                for row in 0..input.len() {
+                    let mut row_dot = 0.0;
+                    for column in 0..input.len() {
+                        row_dot += matrix[[row, column]] * value(&input[column]);
+                    }
+                    total += value(&input[row]) * row_dot;
+                }
+                total
+            }
+            Self::LowRank(factor) => {
+                // Sigma = L L'. Evaluate x' Sigma x as ||L' x||^2 so the
+                // primal runtime scalar remains matrix free and O(KR).
+                let mut total = 0.0;
+                for rank in 0..factor.ncols() {
+                    let mut projection = 0.0;
+                    for row in 0..input.len() {
+                        projection += factor[[row, rank]] * value(&input[row]);
+                    }
+                    total += projection * projection;
+                }
+                total
+            }
         }
     }
 }

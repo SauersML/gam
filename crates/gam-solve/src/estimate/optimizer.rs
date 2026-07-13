@@ -956,7 +956,7 @@ where
                 // search; `(lo, hi)` already widens `hi` to `RHO_BOUND` so a
                 // genuinely large `λ_j` is not clipped to the seed band. The seed is
                 // order-independent, so no canonical permutation is needed.
-                // Three principled, data-derived candidates are scored against the
+                // Two principled, data-derived candidates are scored against the
                 // anchor, each adopted only when it STRICTLY lowers the true
                 // REML/LAML cost — exactly the criterion the old grid used, but
                 // scoring a handful of hand-derived candidates instead of a
@@ -970,51 +970,18 @@ where
                 //      analytic high-λ basin (#1266 double-penalty null-space,
                 //      #1464 collapsing-kernel spatial).
                 //
-                //   2. The Demmler–Reinsch closed-form GLOBAL Gaussian-identity
-                //      REML optimum, PER BLOCK, via cyclic exact 1-D
-                //      minimisation. The profiled Gaussian REML criterion is an
-                //      explicit scalar whose ρ-derivative decays to zero on the
-                //      high-λ shelf, so a descent method (mgcv included) rails to
-                //      an over-smoothed λ̂ there even though a finite-λ basin has a
-                //      strictly lower REML (sin8 k=40: shelf edf≈2 vs basin
-                //      edf≈39). The closed form SELECTS each block's global
-                //      minimiser from an eigendecomposition of the `(S_k, A_k)`
-                //      pencil (A_k folds the other blocks' λ into the metric)
-                //      rather than descending, so no coordinate shelf-traps and a
-                //      double-penalty smooth's blocks can split (λ_bend high /
-                //      λ_null low). Only fires for a dense Gaussian-identity
-                //      design (see `analytic_gaussian_closed_form_rho`).
-                //
                 // The generated-seed screen (`generate_rho_candidates` +
                 // `rank_seeds_with_screening`) remains the multi-basin backstop.
                 let initial_sp = reml_state.analytic_initial_sp_rho(&base, (lo, hi));
-                let closed_form =
-                    reml_state
-                        .analytic_gaussian_closed_form_rho((lo, hi))
-                        .map(|rho_blocks| {
-                            // Map the per-block ρ onto the leading penalty
-                            // coordinates; any trailing ext/ψ coordinates in `base`
-                            // are not smoothing parameters and pass through unchanged
-                            // (the same 1:1 layout `analytic_initial_sp_rho` uses).
-                            let mut seed = base.clone();
-                            for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
-                                *coord = r.clamp(lo, hi);
-                            }
-                            seed
-                        });
-                //   3. The GLOBAL single-λ (diagonal) closed-form optimum on the
+                //   2. The certified single-λ (diagonal) profiled optimum on the
                 //      SUMMED penalty `Σ_j S_j`, broadcast to a uniform per-block
-                //      ρ. The per-block cyclic solver (candidate 2) descends one
-                //      coordinate at a time and can PARK at a coordinate-wise
-                //      stationary interior point that is not the joint optimum —
-                //      on the double-penalty null-recovery fixture the joint REML
-                //      rails both blocks onto the collapse shelf, but cyclic
-                //      descent stalls at an inferior split (#1815/#1867). The
-                //      diagonal restriction is solved by grid-free stationary
-                //      enumeration (no coordinate stall), so it supplies that
-                //      shelf corner as a scored candidate.
+                //      ρ. This is an honest one-dimensional restriction of the
+                //      coupled multi-λ objective: overlapping penalty blocks make
+                //      the penalty pseudo-determinant nonseparable, so there is no
+                //      per-block "exact" cyclic closed form. The candidate is
+                //      admitted only after the true coupled REML cost scores it.
                 let summed_diagonal = reml_state
-                    .analytic_gaussian_summed_diagonal_rho((lo, hi))
+                    .analytic_gaussian_profiled_diagonal_rho((lo, hi))
                     .map(|rho_blocks| {
                         let mut seed = base.clone();
                         for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
@@ -1026,10 +993,10 @@ where
                     .compute_cost(&base)
                     .ok()
                     .filter(|c| c.is_finite());
-                // Keep the strictly-cheapest of {anchor, initial.sp, closed-form}.
+                // Keep the strictly-cheapest certified/scored candidate.
                 let mut refined = base.clone();
                 let mut best_cost = base_cost;
-                for candidate in [initial_sp, closed_form, summed_diagonal]
+                for candidate in [initial_sp, summed_diagonal]
                     .into_iter()
                     .flatten()
                 {

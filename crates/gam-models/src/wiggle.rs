@@ -2,8 +2,8 @@ use crate::parameter_block::ParameterBlockInput;
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam_solve::pirls::LinearInequalityConstraints;
 use gam_terms::basis::{
-    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
-    create_ispline_derivative_dense,
+    BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
+    ispline_function_penalties,
 };
 use ndarray::{Array1, Array2, ArrayView1};
 
@@ -53,24 +53,29 @@ pub fn buildwiggle_block_input_from_knots(
     if p == 0 {
         return Err("wiggle basis has no free monotone columns".to_string());
     }
-    let mut penalties: Vec<crate::model_types::PenaltySpec> = Vec::new();
-    let mut nullspace_dims = Vec::new();
-    if p == 1 {
-        penalties.push(crate::model_types::PenaltySpec::Dense(Array2::<f64>::eye(
-            1,
-        )));
-        nullspace_dims.push(0);
-    } else {
-        let effective_order = penalty_order.max(1).min(p - 1);
-        let diff_penalty = create_difference_penalty_matrix(p, effective_order, None)
-            .map_err(|e| e.to_string())?;
-        penalties.push(crate::model_types::PenaltySpec::Dense(diff_penalty));
-        nullspace_dims.push(effective_order);
+    let internal_degree = monotone_wiggle_internal_degree(degree)?;
+    let function_penalties = ispline_function_penalties(
+        knots.view(),
+        internal_degree,
+        penalty_order,
+        double_penalty,
+    )
+    .map_err(|error| error.to_string())?;
+    if function_penalties.roughness.dim() != (p, p) {
+        return Err(format!(
+            "I-spline function penalty is {}x{} but wiggle design has {p} columns",
+            function_penalties.roughness.nrows(),
+            function_penalties.roughness.ncols(),
+        ));
     }
-    if double_penalty {
-        penalties.push(crate::model_types::PenaltySpec::Dense(Array2::<f64>::eye(
-            p,
-        )));
+    let mut penalties = vec![crate::model_types::PenaltySpec::Dense(
+        function_penalties.roughness,
+    )];
+    let mut nullspace_dims = vec![function_penalties.roughness_nullspace_dim];
+    if let Some(nullspace_shrinkage) = function_penalties.nullspace_shrinkage {
+        penalties.push(crate::model_types::PenaltySpec::Dense(
+            nullspace_shrinkage,
+        ));
         nullspace_dims.push(0);
     }
     Ok(ParameterBlockInput {
@@ -191,72 +196,71 @@ pub(crate) fn project_monotone_wiggle_beta_nonnegative(mut beta: Array1<f64>) ->
 
 /// Resolve a requested wiggle penalty-order set into:
 ///
-/// - the primary order used by the monotone I-spline coefficient penalty, and
-/// - the remaining plain difference-penalty orders to append on the same basis.
+/// - the primary derivative order used by the monotone I-spline function
+///   roughness, and
+/// - the remaining function-derivative orders to append on the same basis.
 ///
-/// The primary order is the smallest positive requested order. If no positive
-/// order is requested, `fallback_primary` is used instead. Extra orders are
-/// returned in the original order, deduplicated, and exclude the primary order.
+/// The primary order is the smallest requested order. If the list is empty,
+/// `default_primary` is used. Zero is never silently dropped: it is not a
+/// roughness derivative and is therefore a typed configuration error. Extra
+/// orders are returned in original order, deduplicated, and exclude primary.
 pub fn split_wiggle_penalty_orders(
-    fallback_primary: usize,
+    default_primary: usize,
     penalty_orders: &[usize],
-) -> (usize, Vec<usize>) {
+) -> Result<(usize, Vec<usize>), String> {
+    if default_primary == 0 {
+        return Err("default wiggle penalty derivative order must be positive".to_string());
+    }
+    if penalty_orders.contains(&0) {
+        return Err("wiggle penalty derivative orders must all be positive".to_string());
+    }
     let primary_order = penalty_orders
         .iter()
         .copied()
-        .filter(|&order| order >= 1)
         .min()
-        .unwrap_or_else(|| fallback_primary.max(1));
+        .unwrap_or(default_primary);
     let mut extras = Vec::new();
     for &order in penalty_orders {
-        if order == 0 || order == primary_order || extras.contains(&order) {
+        if order == primary_order || extras.contains(&order) {
             continue;
         }
         extras.push(order);
     }
-    (primary_order, extras)
+    Ok((primary_order, extras))
 }
 
-/// Append raw difference penalties for the given orders to an existing block.
-///
-/// These are plain difference penalties `D_k^T D_k` on the monotone I-spline
-/// coefficients, whose nullspace is the set of polynomial sequences of degree
-/// ≤ k−1, giving `nullspace_dim = k`.
-pub fn append_selected_wiggle_penalty_orders(
+/// Append exact function-derivative roughness penalties for the requested
+/// orders to an existing monotone I-spline block.
+pub fn append_selected_wiggle_function_penalties(
     block: &mut ParameterBlockInput,
+    knots: &Array1<f64>,
+    degree: usize,
     penalty_orders: &[usize],
 ) -> Result<(), String> {
     let p = block.design.ncols();
     if p == 0 {
-        return Ok(());
+        return Err("cannot append wiggle penalties to an empty basis".to_string());
     }
+    let internal_degree = monotone_wiggle_internal_degree(degree)?;
     for &order in penalty_orders {
-        if order == 0 {
-            continue;
+        let function_penalty =
+            ispline_function_penalties(knots.view(), internal_degree, order, false)
+                .map_err(|error| error.to_string())?;
+        if function_penalty.roughness.dim() != (p, p) {
+            return Err(format!(
+                "order-{order} I-spline function penalty is {}x{} but wiggle design has {p} columns",
+                function_penalty.roughness.nrows(),
+                function_penalty.roughness.ncols(),
+            ));
         }
-        if order >= p {
-            // A k-th order difference operator applied to a length-p coefficient
-            // vector produces a (p-k)-row matrix. When p <= k, that operator has
-            // zero rows and `S = Dᵀ D` is the p×p zero matrix; equivalently,
-            // every length-p sequence is a polynomial of degree < k restricted
-            // to the integer grid, so the entire coefficient space is in the
-            // penalty's null space. Append that degenerate-but-mathematically-
-            // consistent penalty rather than silently dropping the user's
-            // request — silently discarding requested penalty orders hides
-            // misconfiguration and changes the model the caller asked for.
-            let zero_penalty = ndarray::Array2::<f64>::zeros((p, p));
-            block
-                .penalties
-                .push(crate::model_types::PenaltySpec::Dense(zero_penalty));
-            block.nullspace_dims.push(p);
-            continue;
-        }
-        let penalty =
-            create_difference_penalty_matrix(p, order, None).map_err(|e| e.to_string())?;
         block
             .penalties
-            .push(crate::model_types::PenaltySpec::Dense(penalty));
-        block.nullspace_dims.push(order);
+            .push(crate::model_types::PenaltySpec::Dense(
+                function_penalty.roughness,
+            ));
+        block
+            .nullspace_dims
+            .push(function_penalty.roughness_nullspace_dim);
     }
     Ok(())
 }
@@ -267,7 +271,7 @@ pub(crate) fn select_wiggle_basis_from_seed(
     penalty_orders: &[usize],
 ) -> Result<SelectedWiggleBasis, String> {
     let (primary_order, extra_orders) =
-        split_wiggle_penalty_orders(cfg.penalty_order, penalty_orders);
+        split_wiggle_penalty_orders(cfg.penalty_order, penalty_orders)?;
     let effective_cfg = WiggleBlockConfig {
         degree: cfg.degree,
         num_internal_knots: cfg.num_internal_knots,
@@ -275,7 +279,7 @@ pub(crate) fn select_wiggle_basis_from_seed(
         double_penalty: cfg.double_penalty,
     };
     let (mut block, knots) = buildwiggle_block_input_from_seed(seed, &effective_cfg)?;
-    append_selected_wiggle_penalty_orders(&mut block, &extra_orders)?;
+    append_selected_wiggle_function_penalties(&mut block, &knots, cfg.degree, &extra_orders)?;
     Ok(SelectedWiggleBasis {
         knots,
         degree: cfg.degree,
@@ -371,45 +375,57 @@ mod tests {
         // Without double penalty there is exactly one penalty.
         assert_eq!(block.penalties.len(), 1);
         assert_eq!(block.nullspace_dims.len(), 1);
-        // The penalty is the p x p difference penalty; symmetric (S = Dᵀ D).
+        // The exact function-derivative Gram is p x p and symmetric.
         let s = dense_penalty(&block.penalties[0]);
         assert_eq!(s.dim(), (p, p));
         assert!(is_symmetric(s));
-        // effective_order = penalty_order.max(1).min(p-1); here 2 (<= p-1 since p>=3
-        // for this seed). nullspace_dim equals the effective difference order.
-        let effective = 2usize.max(1).min(p - 1);
-        assert_eq!(block.nullspace_dims[0], effective);
+        // The anchored I-spline excludes the constant polynomial, so the
+        // order-two derivative null space contains only the linear direction.
+        assert_eq!(block.nullspace_dims[0], 1);
     }
 
     #[test]
-    fn double_penalty_appends_identity_ridge() {
+    fn double_penalty_appends_nullspace_only_function_ridge() {
         let (block, p) = build(true, 2);
         assert!(p >= 2);
-        // double_penalty -> two penalties: difference penalty then p x p identity.
+        // Order two has one structural null direction, so double penalty emits
+        // one separate function-space shrinkage block.
         assert_eq!(block.penalties.len(), 2);
         assert_eq!(block.nullspace_dims.len(), 2);
         let ridge = dense_penalty(&block.penalties[1]);
         assert_eq!(ridge.dim(), (p, p));
-        // Identity: diagonal ones, off-diagonal zeros.
-        for i in 0..p {
-            for j in 0..p {
-                let expected = if i == j { 1.0 } else { 0.0 };
-                assert_eq!(ridge[[i, j]], expected);
-            }
-        }
-        // The appended identity is full rank, so its nullspace dim is 0.
+        assert!(is_symmetric(ridge));
+        assert!(
+            (0..p).any(|i| (0..p).any(|j| i != j && ridge[[i, j]].abs() > 1e-12)),
+            "function-metric null shrinkage must not collapse to eye(p)"
+        );
         assert_eq!(block.nullspace_dims[1], 0);
     }
 
     #[test]
-    fn penalty_order_clamped_to_p_minus_one() {
-        // Requesting an absurdly large penalty order clamps effective_order to p-1
-        // (still a valid difference penalty), per `penalty_order.max(1).min(p-1)`.
-        let (block, p) = build(false, 10_000);
-        assert!(p >= 2);
-        let s = dense_penalty(&block.penalties[0]);
-        assert_eq!(s.dim(), (p, p));
-        assert!(is_symmetric(s));
-        assert_eq!(block.nullspace_dims[0], p - 1);
+    fn order_one_has_no_nullspace_ridge() {
+        let (block, _) = build(true, 1);
+        assert_eq!(block.penalties.len(), 1);
+        assert_eq!(block.nullspace_dims, vec![0]);
+    }
+
+    #[test]
+    fn unsupported_derivative_order_is_rejected_not_clamped() {
+        let seed = Array1::linspace(0.0, 1.0, 40);
+        let knots = initializewiggle_knots_from_seed(seed.view(), 3, 5).expect("knot init");
+        let error = match buildwiggle_block_input_from_knots(seed.view(), &knots, 3, 4, false) {
+            Ok(_) => panic!("order above represented value degree must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("derivative"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn explicit_zero_penalty_order_is_rejected() {
+        let error = split_wiggle_penalty_orders(2, &[0, 2]).unwrap_err();
+        assert_eq!(
+            error,
+            "wiggle penalty derivative orders must all be positive"
+        );
     }
 }
