@@ -198,8 +198,7 @@ fn bernoulli_survival_eta_agreement_k_up_to_6_all_shapes() {
             let cov_full = MarginalSlopeCovariance::full(sigma_full.clone()).unwrap();
 
             // Shape B: Diagonal (just the diagonal of sigma_full)
-            let cov_diag =
-                MarginalSlopeCovariance::diagonal(sigma_full.diag().to_owned()).unwrap();
+            let cov_diag = MarginalSlopeCovariance::diagonal(sigma_full.diag().to_owned()).unwrap();
 
             // Shape C: LowRank: random factor of width = min(k, rng-pick)
             let rank = rng.usize_in(1, k);

@@ -1174,8 +1174,7 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
                 })
                 .sum(),
             MarginalSlopeCovarianceStorage::Full {
-                square_root_factor,
-                ..
+                square_root_factor, ..
             } => {
                 let mut total = 0.0;
                 for factor_row in square_root_factor.rows() {
@@ -1286,9 +1285,7 @@ pub fn marginal_slope_covariance_from_scores(
     // Representation is geometry, not a statistical model-selection decision:
     // only an exactly diagonal matrix may discard its off-diagonal entries.
     // Every nonzero coupling is retained in the exact dense covariance.
-    let is_diagonal = (0..k).all(|row| {
-        ((row + 1)..k).all(|column| cov[[row, column]] == 0.0)
-    });
+    let is_diagonal = (0..k).all(|row| ((row + 1)..k).all(|column| cov[[row, column]] == 0.0));
     if is_diagonal {
         MarginalSlopeCovariance::diagonal(cov.diag().to_owned())
     } else {
@@ -2309,10 +2306,8 @@ mod covariance_admission_tests {
         assert_ne!(dense[[0, 1]], 0.0);
         assert_eq!(dense[[0, 1]], dense[[1, 0]]);
         let direction = [0.75, -1.25];
-        let expected = direction[0]
-            * (dense[[0, 0]] * direction[0] + dense[[0, 1]] * direction[1])
-            + direction[1]
-                * (dense[[1, 0]] * direction[0] + dense[[1, 1]] * direction[1]);
+        let expected = direction[0] * (dense[[0, 0]] * direction[0] + dense[[0, 1]] * direction[1])
+            + direction[1] * (dense[[1, 0]] * direction[0] + dense[[1, 1]] * direction[1]);
         let actual = covariance.quadratic_form(&direction).unwrap();
         assert!((actual - expected).abs() <= 2.0e-15);
     }
@@ -2321,11 +2316,9 @@ mod covariance_admission_tests {
     fn equal_dense_covariance_quadratic_forms_match_all_representations_932() {
         let diagonal = MarginalSlopeCovariance::diagonal(array![1.2, 0.7]).unwrap();
         let full = MarginalSlopeCovariance::full(array![[1.2, 0.0], [0.0, 0.7]]).unwrap();
-        let low_rank = MarginalSlopeCovariance::low_rank(array![
-            [1.2_f64.sqrt(), 0.0],
-            [0.0, 0.7_f64.sqrt()]
-        ])
-        .unwrap();
+        let low_rank =
+            MarginalSlopeCovariance::low_rank(array![[1.2_f64.sqrt(), 0.0], [0.0, 0.7_f64.sqrt()]])
+                .unwrap();
         let direction = [0.35, -0.8];
         let expected = diagonal.quadratic_form(&direction).unwrap();
         for covariance in [&full, &low_rank] {

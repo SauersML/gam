@@ -110,13 +110,9 @@ fn survival_multi_z_k4_low_rank_covariance_preserves_identity() {
     let q = 0.19;
     let z = [-0.4, 0.8, 1.2, -1.5];
     let slopes = [0.25, -0.32, 0.08, 0.21];
-    let covariance = MarginalSlopeCovariance::low_rank(array![
-        [1.0, 0.0],
-        [0.2, 0.4],
-        [-0.3, 0.5],
-        [0.7, -0.1]
-    ])
-    .unwrap();
+    let covariance =
+        MarginalSlopeCovariance::low_rank(array![[1.0, 0.0], [0.2, 0.4], [-0.3, 0.5], [0.7, -0.1]])
+            .unwrap();
     let eta = survival_marginal_slope_vector_eta(q, &z, &slopes, &covariance, 0.9).expect("eta");
     assert!(eta.is_finite());
     assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::LowRank);

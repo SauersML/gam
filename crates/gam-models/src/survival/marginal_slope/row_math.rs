@@ -585,8 +585,7 @@ mod vector_hand_oracle_tests {
             })?;
             let projection_dimension = match covariance.representation() {
                 MarginalSlopeCovarianceRef::LowRank(factor) => factor.ncols(),
-                MarginalSlopeCovarianceRef::Diagonal(_)
-                | MarginalSlopeCovarianceRef::Full(_) => 0,
+                MarginalSlopeCovarianceRef::Diagonal(_) | MarginalSlopeCovarianceRef::Full(_) => 0,
             };
             Ok(Self {
                 score_dimension,
@@ -2159,22 +2158,19 @@ mod tests {
             let scores: Vec<f64> = (0..k)
                 .map(|axis| -0.9 + 1.8 * (axis + 1) as f64 / (k + 1) as f64)
                 .collect();
-            let diagonal =
-                MarginalSlopeCovariance::diagonal(Array1::from_shape_fn(k, |axis| {
-                    0.75 + 0.08 * axis as f64
-                }))
-                .unwrap();
-            let full = MarginalSlopeCovariance::full(Array2::from_shape_fn(
-                (k, k),
-                |(row, col)| {
+            let diagonal = MarginalSlopeCovariance::diagonal(Array1::from_shape_fn(k, |axis| {
+                0.75 + 0.08 * axis as f64
+            }))
+            .unwrap();
+            let full =
+                MarginalSlopeCovariance::full(Array2::from_shape_fn((k, k), |(row, col)| {
                     if row == col {
                         1.0 + 0.06 * row as f64
                     } else {
                         0.025 / (1.0 + row.abs_diff(col) as f64)
                     }
-                },
-            ))
-            .unwrap();
+                }))
+                .unwrap();
             let rank = k.min(3);
             let low_rank = MarginalSlopeCovariance::low_rank(Array2::from_shape_fn(
                 (k, rank),
@@ -2378,25 +2374,20 @@ mod tests {
             0.8 + 0.055 * axis as f64
         }))
         .unwrap();
-        let full = MarginalSlopeCovariance::full(Array2::from_shape_fn(
-            (K, K),
-            |(row, col)| {
-                if row == col {
-                    1.0 + 0.04 * row as f64
-                } else {
-                    0.018 / (1.0 + row.abs_diff(col) as f64)
-                }
-            },
-        ))
+        let full = MarginalSlopeCovariance::full(Array2::from_shape_fn((K, K), |(row, col)| {
+            if row == col {
+                1.0 + 0.04 * row as f64
+            } else {
+                0.018 / (1.0 + row.abs_diff(col) as f64)
+            }
+        }))
         .unwrap();
-        let low_rank = MarginalSlopeCovariance::low_rank(Array2::from_shape_fn(
-            (K, 3),
-            |(row, column)| {
+        let low_rank =
+            MarginalSlopeCovariance::low_rank(Array2::from_shape_fn((K, 3), |(row, column)| {
                 let sign = if (row + column) % 2 == 0 { 1.0 } else { -1.0 };
                 sign * (0.14 + 0.018 * row as f64 + 0.035 * column as f64)
-            },
-        ))
-        .unwrap();
+            }))
+            .unwrap();
         let covariances = [diagonal, full, low_rank];
         let mut dynamic_arena = DynamicJetArena::new();
 
