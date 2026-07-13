@@ -4073,6 +4073,65 @@ mod tests {
         );
     }
 
+    /// Independent oracle for the restriction constructor: evaluate the exact
+    /// Reynolds group average `(f(x) + f(gx)) / 2` on every cover column.
+    /// Retained columns must be fixed by the average and omitted columns must
+    /// be annihilated.  This catches both an incomplete character table and the
+    /// invalid use of column selection for a deck action that mixes columns.
+    fn assert_group_average_equals_diagonal_restriction(
+        evaluator: &QuotientSpectralEvaluator,
+        cover: &dyn SaeBasisEvaluator,
+        cover_eigenvalues: &[f64],
+        coords: &Array2<f64>,
+        twins: &Array2<f64>,
+    ) {
+        let (cover_phi, _) = cover.evaluate(coords.view()).unwrap();
+        let (twin_cover_phi, _) = cover.evaluate(twins.view()).unwrap();
+        let (quotient_phi, _) = evaluator.evaluate(coords.view()).unwrap();
+        assert_eq!(cover_phi.dim(), twin_cover_phi.dim());
+        assert_eq!(cover_phi.ncols(), evaluator.cover_width());
+        assert_eq!(cover_eigenvalues.len(), evaluator.cover_width());
+        assert_eq!(quotient_phi.ncols(), evaluator.basis_size());
+
+        let mut quotient_column = 0usize;
+        for cover_column in 0..cover_phi.ncols() {
+            let retained =
+                evaluator.cover_columns().get(quotient_column).copied() == Some(cover_column);
+            for row in 0..cover_phi.nrows() {
+                let group_average =
+                    0.5 * (cover_phi[[row, cover_column]] + twin_cover_phi[[row, cover_column]]);
+                if retained {
+                    assert_spectral_deck_close(
+                        group_average,
+                        cover_phi[[row, cover_column]],
+                        cover_eigenvalues[cover_column],
+                        0,
+                        "trivial-character column fixed by exact group average",
+                    );
+                    assert_spectral_deck_close(
+                        quotient_phi[[row, quotient_column]],
+                        group_average,
+                        cover_eigenvalues[cover_column],
+                        0,
+                        "quotient restriction equals exact group average",
+                    );
+                } else {
+                    assert_spectral_deck_close(
+                        group_average,
+                        0.0,
+                        cover_eigenvalues[cover_column],
+                        0,
+                        "sign-character column annihilated by exact group average",
+                    );
+                }
+            }
+            if retained {
+                quotient_column += 1;
+            }
+        }
+        assert_eq!(quotient_column, evaluator.basis_size());
+    }
+
     /// If `q(twin(t)) = q(t)`, jets in cover coordinates obey the chain rule
     /// `J(twin)D = J(t)`, `D' H(twin)D = H(t)`, and the analogous order-3
     /// identity.  Checking all four orders pins both invariance and the exact
@@ -4166,7 +4225,7 @@ mod tests {
     }
 
     #[test]
-    fn quotient_spectral_projective_plane_mask_jets_penalty_and_null_are_exact() {
+    fn quotient_spectral_projective_plane_group_average_jets_penalty_and_null_are_exact() {
         let harmonic_order = 3;
         let evaluator = QuotientSpectralEvaluator::projective_plane(harmonic_order).unwrap();
         assert_eq!(evaluator.quotient_name(), "projective-plane");
@@ -4174,13 +4233,7 @@ mod tests {
 
         let cover = SphericalHarmonicEvaluator::new(2 * harmonic_order).unwrap();
         let cover_modes = cover.spectral_modes();
-        let expected_cover_columns = cover_modes
-            .iter()
-            .enumerate()
-            .filter_map(|(column, mode)| (mode.degree % 2 == 0).then_some(column))
-            .collect::<Vec<_>>();
         assert_eq!(evaluator.cover_width(), cover.basis_size());
-        assert_eq!(evaluator.cover_columns(), expected_cover_columns);
         for (quotient_column, &cover_column) in evaluator.cover_columns().iter().enumerate() {
             assert_eq!(
                 evaluator.laplace_eigenvalues()[quotient_column],
@@ -4205,11 +4258,22 @@ mod tests {
             twins[[row, 0]] = -twins[[row, 0]];
             twins[[row, 1]] += std::f64::consts::PI;
         }
+        let cover_eigenvalues = cover_modes
+            .iter()
+            .map(|mode| mode.laplace_eigenvalue)
+            .collect::<Vec<_>>();
+        assert_group_average_equals_diagonal_restriction(
+            &evaluator,
+            &cover,
+            &cover_eigenvalues,
+            &coords,
+            &twins,
+        );
         assert_quotient_deck_covariance(&evaluator, &coords, &twins, [-1.0, 1.0]);
     }
 
     #[test]
-    fn quotient_spectral_klein_mask_jets_penalty_and_null_are_exact() {
+    fn quotient_spectral_klein_group_average_jets_penalty_and_null_are_exact() {
         let num_harmonics = 3;
         let evaluator = QuotientSpectralEvaluator::klein_bottle(num_harmonics).unwrap();
         assert_eq!(evaluator.quotient_name(), "klein-bottle");
@@ -4217,18 +4281,7 @@ mod tests {
 
         let cover = TorusHarmonicEvaluator::new(2, num_harmonics).unwrap();
         let cover_modes = cover.spectral_modes();
-        let expected_cover_columns = cover_modes
-            .iter()
-            .enumerate()
-            .filter_map(|(column, mode)| {
-                let theta = mode.components[0];
-                let phi = mode.components[1];
-                let half_turn_sign = if theta.harmonic() % 2 == 0 { 1 } else { -1 };
-                (half_turn_sign * phi.reflection_sign() == 1).then_some(column)
-            })
-            .collect::<Vec<_>>();
         assert_eq!(evaluator.cover_width(), cover.basis_size());
-        assert_eq!(evaluator.cover_columns(), expected_cover_columns);
         for (quotient_column, &cover_column) in evaluator.cover_columns().iter().enumerate() {
             assert_eq!(
                 evaluator.laplace_eigenvalues()[quotient_column],
@@ -4239,6 +4292,27 @@ mod tests {
                 cover_modes[cover_column].l2_gram_weight
             );
         }
+        let split = evaluator.phi_eta_split(evaluator.basis_size()).unwrap();
+        assert_eq!(
+            split.base_cols.len(),
+            7,
+            "the standard R4 Klein embedding is one constant plus six coordinates"
+        );
+        assert_eq!(split.curved_cols.len(), evaluator.basis_size() - 7);
+        let mut embedding_category_counts = [0usize; 4];
+        for quotient_column in split.base_cols {
+            let cover_mode = &cover_modes[evaluator.cover_columns()[quotient_column]];
+            let theta = cover_mode.components[0];
+            let phi = cover_mode.components[1];
+            match (theta.harmonic(), phi.harmonic(), phi.reflection_sign()) {
+                (0, 0, 1) => embedding_category_counts[0] += 1,
+                (2, 0, 1) => embedding_category_counts[1] += 1,
+                (2, 1, 1) => embedding_category_counts[2] += 1,
+                (1, 1, -1) => embedding_category_counts[3] += 1,
+                identity => panic!("unexpected Klein embedding-base character {identity:?}"),
+            }
+        }
+        assert_eq!(embedding_category_counts, [1, 2, 2, 2]);
         assert_exact_quotient_spectral_contract(&evaluator);
 
         let coords = Array2::from_shape_vec(
@@ -4251,11 +4325,53 @@ mod tests {
             twins[[row, 0]] += 0.5;
             twins[[row, 1]] = -twins[[row, 1]];
         }
+        let cover_eigenvalues = cover_modes
+            .iter()
+            .map(|mode| mode.laplace_eigenvalue)
+            .collect::<Vec<_>>();
+        assert_group_average_equals_diagonal_restriction(
+            &evaluator,
+            &cover,
+            &cover_eigenvalues,
+            &coords,
+            &twins,
+        );
         assert_quotient_deck_covariance(&evaluator, &coords, &twins, [1.0, -1.0]);
     }
 
     #[test]
-    fn harmonic_cover_constructors_reject_width_overflow_without_panicking() {
+    fn quotient_and_cover_constructors_enforce_minimum_order_and_checked_widths() {
+        assert!(projective_plane_basis_size(0).is_err());
+        assert!(klein_bottle_basis_size(0).is_err());
+        assert!(QuotientSpectralEvaluator::projective_plane(0).is_err());
+        assert!(QuotientSpectralEvaluator::klein_bottle(0).is_err());
+        assert!(QuotientSpectralEvaluator::klein_bottle(1).is_err());
+
+        let projective_plane = QuotientSpectralEvaluator::projective_plane(1).unwrap();
+        assert_eq!(projective_plane.basis_size(), 6);
+        assert_eq!(
+            projective_plane.basis_size(),
+            projective_plane_basis_size(1).unwrap()
+        );
+        let klein_bottle = QuotientSpectralEvaluator::klein_bottle(2).unwrap();
+        assert_eq!(klein_bottle.basis_size(), 13);
+        assert_eq!(
+            klein_bottle.basis_size(),
+            klein_bottle_basis_size(2).unwrap()
+        );
+        assert_eq!(
+            klein_bottle
+                .phi_eta_split(klein_bottle.basis_size())
+                .unwrap()
+                .base_cols
+                .len(),
+            7
+        );
+
+        assert!(projective_plane_basis_size(usize::MAX).is_err());
+        assert!(klein_bottle_basis_size(usize::MAX).is_err());
+        assert!(QuotientSpectralEvaluator::projective_plane(usize::MAX).is_err());
+        assert!(QuotientSpectralEvaluator::klein_bottle(usize::MAX).is_err());
         assert!(SphericalHarmonicEvaluator::new(usize::MAX).is_err());
         assert!(TorusHarmonicEvaluator::new(1, usize::MAX).is_err());
         assert!(TorusHarmonicEvaluator::new(usize::BITS as usize, 1).is_err());
