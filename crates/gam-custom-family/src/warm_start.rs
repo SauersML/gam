@@ -1024,20 +1024,42 @@ pub(crate) struct OuterObjectiveEvalResult {
     pub(crate) outer_hessian: gam_problem::HessianValue,
     pub(crate) warm_start: ConstrainedWarmStart,
     pub(crate) inner_converged: bool,
+    /// The exact coefficient mode used to assemble this objective payload.
+    ///
+    /// Keeping the owned result here lets an atomic multi-start evaluation
+    /// reuse the already-certified mode for derivative assembly. A warm start
+    /// is only a seed/cache carrier and must never stand in for this identity:
+    /// re-entering the inner solver can select a different nonconvex basin.
+    pub(crate) inner: BlockwiseInnerResult,
 }
 
 pub(crate) fn outer_eval_result_to_joint_hyper_result(
     result: OuterObjectiveEvalResult,
 ) -> CustomFamilyJointHyperResult {
-    CustomFamilyJointHyperResult {
-        objective: result.objective,
-        gradient: result.gradient,
-        outer_hessian: result.outer_hessian,
-        warm_start: CustomFamilyWarmStart {
-            inner: result.warm_start,
+    outer_eval_result_into_joint_hyper_result_and_inner(result).0
+}
+
+pub(crate) fn outer_eval_result_into_joint_hyper_result_and_inner(
+    result: OuterObjectiveEvalResult,
+) -> (CustomFamilyJointHyperResult, BlockwiseInnerResult) {
+    let OuterObjectiveEvalResult {
+        objective,
+        gradient,
+        outer_hessian,
+        warm_start,
+        inner_converged,
+        inner,
+    } = result;
+    (
+        CustomFamilyJointHyperResult {
+            objective,
+            gradient,
+            outer_hessian,
+            warm_start: CustomFamilyWarmStart { inner: warm_start },
+            inner_converged,
         },
-        inner_converged: result.inner_converged,
-    }
+        inner,
+    )
 }
 
 pub(crate) struct OwnedDenseHessianOperator {

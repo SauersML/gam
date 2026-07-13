@@ -1260,14 +1260,9 @@ pub(crate) fn evaluate_custom_family_hyper_internal<
         warm_start,
         rho_prior,
         eval_mode,
-        PsiWarmStartScope::UnknownGeometry,
+        eval_mode,
+        None,
     )
-}
-
-#[derive(Clone, Copy)]
-enum PsiWarmStartScope {
-    UnknownGeometry,
-    CurrentEvaluation,
 }
 
 fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -1280,7 +1275,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     warm_start: Option<&ConstrainedWarmStart>,
     rho_prior: gam_problem::RhoPrior,
     eval_mode: EvalMode,
-    warm_start_scope: PsiWarmStartScope,
+    inner_quality_mode: EvalMode,
+    precomputed_inner: Option<BlockwiseInnerResult>,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     if derivative_blocks.len() != specs.len() {
         crate::bail_dim_custom!(
@@ -1313,12 +1309,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, penalty_counts)?;
-    let psi_safe_warm_start = match warm_start_scope {
-        PsiWarmStartScope::UnknownGeometry => {
-            warm_start_without_cached_inner_for_psi_derivatives(warm_start, psi_dim > 0)
-        }
-        PsiWarmStartScope::CurrentEvaluation => warm_start.cloned(),
-    };
+    let psi_safe_warm_start =
+        warm_start_without_cached_inner_for_psi_derivatives(warm_start, psi_dim > 0);
 
     // gam#1820: for a COUPLED family whose joint Hessian depends on β, the
     // exact-Newton LAML outer GRADIENT `½tr(H⁻¹Ḣ)` — including its `D_βH[β_i]`
@@ -1331,9 +1323,10 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // converges quadratically, so tightening the derivative-path inner solve to
     // a stationarity floor costs ~one extra step while pinning β̂ at the true
     // optimum where the trace-gradient's block-coupled `D_βH` term is exact.
-    // Value-only (line-search) evaluations keep the caller's tolerance; if the
-    // tightened solve fails to converge we fall back to the caller's tolerance
-    // so ill-conditioned large-scale fits are never regressed into a hard error.
+    // Value-only line-search evaluations normally keep the caller's tolerance.
+    // Atomic multi-start screening supplies the requested derivative mode as
+    // `inner_quality_mode`, so the objective winner is solved once at the exact
+    // quality its derivatives require and that owned mode can be reused below.
     // Restricted to the ρ-only joint path (`psi_dim == 0`): ψ-bearing
     // evaluations already have their inner tolerance managed deliberately by
     // `derivative_quality_options_and_warm_start` (which intentionally LOOSENS
@@ -1341,7 +1334,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     const JOINT_LAML_DERIV_INNER_TOL_FLOOR: f64 = 1e-11;
     let tighten_inner_for_deriv = psi_dim == 0
         && include_logdet_h
-        && eval_mode != EvalMode::ValueOnly
+        && inner_quality_mode != EvalMode::ValueOnly
         && family.has_explicit_joint_hessian()
         && options.inner_tol > JOINT_LAML_DERIV_INNER_TOL_FLOOR;
     let tightened_options = tighten_inner_for_deriv.then(|| {
@@ -1351,25 +1344,16 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         tightened
     });
     let inner_solve_options = tightened_options.as_ref().unwrap_or(options);
-    let mut inner = inner_blockwise_fit(
-        family,
-        specs,
-        &per_block,
-        inner_solve_options,
-        psi_safe_warm_start.as_ref().or(warm_start),
-    )?;
-    if tightened_options.is_some() && !inner.converged {
-        // The stationarity-tight solve stalled (ill-conditioned joint mode).
-        // Recover the caller's original convergence behaviour rather than
-        // failing the whole outer evaluation.
-        inner = inner_blockwise_fit(
+    let mut inner = match precomputed_inner {
+        Some(inner) => inner,
+        None => inner_blockwise_fit(
             family,
             specs,
             &per_block,
-            options,
+            inner_solve_options,
             psi_safe_warm_start.as_ref().or(warm_start),
-        )?;
-    }
+        )?,
+    };
     if !inner.converged {
         let theta_dim = rho_dim + psi_dim;
         return Err(CustomFamilyError::UnsupportedConfiguration {
@@ -1650,6 +1634,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         outer_hessian: gam_problem::HessianValue::Unavailable,
                         warm_start: value_only.warm_start,
                         inner_converged: inner.converged,
+                        inner: inner.clone(),
                     });
                 }
             }
@@ -2084,6 +2069,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         outer_hessian: gam_problem::HessianValue::Unavailable,
                         warm_start: value_only.warm_start,
                         inner_converged: inner.converged,
+                        inner: inner.clone(),
                     });
                 }
             }
@@ -2560,7 +2546,8 @@ pub fn evaluate_custom_family_joint_hyper_shared<
             .or_else(|| warm_start.map(|w| &w.inner)),
         gam_problem::RhoPrior::Flat,
         eval_mode,
-        PsiWarmStartScope::UnknownGeometry,
+        eval_mode,
+        None,
     )?;
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
 }
@@ -2570,19 +2557,23 @@ pub struct CustomFamilyJointHyperModeSelection {
     pub selected_candidate: usize,
     pub screened_objectives: Vec<Option<f64>>,
     pub rejected_candidates: Vec<Option<String>>,
+    /// Exact owned coefficient mode that produced `result`.
+    ///
+    /// Crate-internal finalization consumes this directly so a fixed-hyper fit
+    /// cannot re-enter the nonconvex inner solver and silently change basins.
+    pub(crate) selected_inner: BlockwiseInnerResult,
 }
 
 /// Profile a nonconvex coefficient mode without assembling expensive outer
 /// derivatives for every candidate.
 ///
-/// Every candidate is first solved under the derivative-quality inner options
-/// in value-only mode. Finite converged candidates are ranked by objective
-/// (candidate order breaks exact ties), then derivative assembly proceeds in
-/// rank order until one succeeds. The common path assembles derivatives once;
-/// extra assemblies occur only after a mode-specific failure. A candidate's
-/// cached inner result is reused only inside this atomic call, where family,
-/// specs, rho, ψ geometry, and options are unchanged; ordinary public warm
-/// starts retain the conservative cross-geometry cache invalidation policy.
+/// Every candidate is solved once at the requested derivative quality while
+/// assembling only its value. The finite objective winner (candidate order
+/// breaks exact ties) owns the exact [`BlockwiseInnerResult`] used for that
+/// value; requested derivatives are assembled directly from that same mode.
+/// If the winning branch cannot provide the requested derivative payload, the
+/// evaluation errors instead of silently changing the profiled objective by
+/// selecting a worse coefficient basin.
 pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
@@ -2603,17 +2594,31 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
 
     let mut screened_objectives = vec![None; candidates.len()];
     let mut rejected_candidates = vec![None; candidates.len()];
-    let mut screened_results: Vec<Option<CustomFamilyJointHyperResult>> =
+    let mut screened_results: Vec<Option<OuterObjectiveEvalResult>> =
         (0..candidates.len()).map(|_| None).collect();
+    let penalty_counts = validate_blockspecs(specs)?;
+    let has_psi_derivatives = derivative_blocks.iter().any(|block| !block.is_empty());
     for (candidate_idx, warm_start) in candidates.iter().enumerate() {
-        let candidate = match evaluate_custom_family_joint_hyper_shared(
+        let (eval_options, strict_warm_start) = derivative_quality_options_and_warm_start(
+            options,
+            warm_start.as_ref(),
+            has_psi_derivatives,
+        );
+        let candidate = match evaluate_custom_family_hyper_internal_shared(
             family,
             specs,
-            options,
+            &eval_options,
+            &penalty_counts,
             rho_current,
             Arc::clone(&derivative_blocks),
-            warm_start.as_ref(),
+            strict_warm_start
+                .as_ref()
+                .map(|warm| &warm.inner)
+                .or_else(|| warm_start.as_ref().map(|warm| &warm.inner)),
+            gam_problem::RhoPrior::Flat,
             EvalMode::ValueOnly,
+            eval_mode,
+            None,
         ) {
             Ok(candidate) => candidate,
             Err(error) => {
@@ -2669,114 +2674,122 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
 
     if matches!(eval_mode, EvalMode::ValueOnly) {
         let selected_candidate = ranked_candidates[0];
-        let result = screened_results[selected_candidate]
-            .take()
-            .expect("ranked candidate retains its screened result");
+        let (result, selected_inner) = outer_eval_result_into_joint_hyper_result_and_inner(
+            screened_results[selected_candidate]
+                .take()
+                .expect("ranked candidate retains its screened result"),
+        );
         return Ok(CustomFamilyJointHyperModeSelection {
             result,
             selected_candidate,
             screened_objectives,
             rejected_candidates,
+            selected_inner,
         });
     }
 
-    let penalty_counts = validate_blockspecs(specs)?;
-    let has_psi_derivatives = derivative_blocks.iter().any(|block| !block.is_empty());
+    let selected_candidate = ranked_candidates[0];
+    let screened_winner = screened_results[selected_candidate]
+        .take()
+        .expect("ranked candidate retains its screened result");
+    let screened_objective_bits = screened_winner.objective.to_bits();
+    let selected_inner = screened_winner.inner;
     let (eval_options, _) =
         derivative_quality_options_and_warm_start(options, None, has_psi_derivatives);
-    for selected_candidate in ranked_candidates {
-        let screened_winner = screened_results[selected_candidate]
-            .take()
-            .expect("ranked candidate retains its screened result");
-        let screened_beta_bits: Vec<Vec<u64>> = screened_winner
-            .warm_start
-            .inner
-            .block_beta
-            .iter()
-            .map(|beta| beta.iter().map(|value| value.to_bits()).collect())
-            .collect();
-        let screened_objective_bits = screened_winner.objective.to_bits();
-        let derivative_eval = match evaluate_custom_family_hyper_internal_shared(
-            family,
-            specs,
-            &eval_options,
-            &penalty_counts,
-            rho_current,
-            Arc::clone(&derivative_blocks),
-            Some(&screened_winner.warm_start.inner),
-            gam_problem::RhoPrior::Flat,
-            eval_mode,
-            PsiWarmStartScope::CurrentEvaluation,
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                rejected_candidates[selected_candidate] =
-                    Some(format!("derivative assembly error: {error}"));
-                continue;
-            }
-        };
-        let result = outer_eval_result_to_joint_hyper_result(derivative_eval);
-        if !result.inner_converged
-            || !result.objective.is_finite()
-            || result.gradient.iter().any(|value| !value.is_finite())
-        {
-            rejected_candidates[selected_candidate] =
-                Some("requested derivatives were not finite and converged".to_string());
-            continue;
-        }
-        let returned_beta_matches = result.warm_start.inner.block_beta.len()
-            == screened_beta_bits.len()
-            && result
-                .warm_start
-                .inner
-                .block_beta
-                .iter()
-                .zip(&screened_beta_bits)
-                .all(|(beta, expected)| {
-                    beta.len() == expected.len()
-                        && beta
-                            .iter()
-                            .zip(expected)
-                            .all(|(value, bits)| value.to_bits() == *bits)
-                });
-        if !returned_beta_matches {
-            rejected_candidates[selected_candidate] = Some(
-                "coefficient basin changed between value screening and derivative assembly"
-                    .to_string(),
-            );
-            continue;
-        }
-        if result.objective.to_bits() != screened_objective_bits {
-            rejected_candidates[selected_candidate] = Some(
-                "profile objective changed between value screening and derivative assembly"
-                    .to_string(),
-            );
-            continue;
-        }
-
-        return Ok(CustomFamilyJointHyperModeSelection {
-            result,
-            selected_candidate,
-            screened_objectives,
-            rejected_candidates,
+    let derivative_eval = evaluate_custom_family_hyper_internal_shared(
+        family,
+        specs,
+        &eval_options,
+        &penalty_counts,
+        rho_current,
+        Arc::clone(&derivative_blocks),
+        None,
+        gam_problem::RhoPrior::Flat,
+        eval_mode,
+        eval_mode,
+        Some(selected_inner),
+    )
+    .map_err(|error| CustomFamilyError::UnsupportedConfiguration {
+        reason: format!(
+            "best coefficient-mode candidate {selected_candidate} failed requested derivative assembly: {error}"
+        ),
+    })?;
+    if derivative_eval.objective.to_bits() != screened_objective_bits {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: format!(
+                "best coefficient-mode candidate {selected_candidate} changed profile objective between value screening and derivative assembly"
+            ),
         });
     }
-
-    let reasons = rejected_candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, reason)| {
-            reason
-                .as_ref()
-                .map(|reason| format!("candidate {idx}: {reason}"))
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(CustomFamilyError::UnsupportedConfiguration {
-        reason: format!(
-            "no screened coefficient mode produced valid requested derivatives: {reasons}"
-        ),
+    validate_requested_best_mode_derivatives(
+        &derivative_eval,
+        eval_mode,
+        rho_current.len() + derivative_blocks.iter().map(Vec::len).sum::<usize>(),
+        selected_candidate,
+    )?;
+    let (result, selected_inner) =
+        outer_eval_result_into_joint_hyper_result_and_inner(derivative_eval);
+    Ok(CustomFamilyJointHyperModeSelection {
+        result,
+        selected_candidate,
+        screened_objectives,
+        rejected_candidates,
+        selected_inner,
     })
+}
+
+fn validate_requested_best_mode_derivatives(
+    result: &OuterObjectiveEvalResult,
+    eval_mode: EvalMode,
+    expected_theta_dim: usize,
+    selected_candidate: usize,
+) -> Result<(), CustomFamilyError> {
+    if !result.inner_converged
+        || !result.objective.is_finite()
+        || result.gradient.len() != expected_theta_dim
+        || result.gradient.iter().any(|value| !value.is_finite())
+    {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: format!(
+                "best coefficient-mode candidate {selected_candidate} did not produce finite, converged requested derivatives of dimension {expected_theta_dim}"
+            ),
+        });
+    }
+    if eval_mode != EvalMode::ValueGradientHessian {
+        return Ok(());
+    }
+    if !result.outer_hessian.is_analytic()
+        || result.outer_hessian.dim() != Some(expected_theta_dim)
+    {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: format!(
+                "best coefficient-mode candidate {selected_candidate} did not produce an analytic {expected_theta_dim}x{expected_theta_dim} Hessian"
+            ),
+        });
+    }
+    let dense = result
+        .outer_hessian
+        .materialize_dense()
+        .map_err(|error| CustomFamilyError::UnsupportedConfiguration {
+            reason: format!(
+                "best coefficient-mode candidate {selected_candidate} Hessian materialization failed: {error}"
+            ),
+        })?
+        .ok_or_else(|| CustomFamilyError::UnsupportedConfiguration {
+            reason: format!(
+                "best coefficient-mode candidate {selected_candidate} did not expose an analytic Hessian"
+            ),
+        })?;
+    if dense.dim() != (expected_theta_dim, expected_theta_dim)
+        || dense.iter().any(|value| !value.is_finite())
+    {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: format!(
+                "best coefficient-mode candidate {selected_candidate} materialized Hessian was not finite with shape {expected_theta_dim}x{expected_theta_dim}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn derivative_quality_options_and_warm_start(
