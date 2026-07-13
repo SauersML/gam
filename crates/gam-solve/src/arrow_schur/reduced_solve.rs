@@ -1697,15 +1697,15 @@ pub struct SurrogateLaneState {
     plan: Option<RationalLogdetPlan>,
     cfg: SurrogateLaneConfig,
     /// When set, the next matrix-free evidence eval also computes the shared
-    /// `(probes, S⁻¹·probes)` bundle for the tr(S⁻¹·M) gradient channels (the
-    /// #2080 selected-inverse umbrella) and stashes it in `inverse_probes`. The
-    /// gradient lane (EFS α-step) sets this before its criterion call and takes
-    /// the bundle after; the value probes leave it unset and pay nothing.
+    /// `(probes, S⁻¹·probes)` bundle for EFS/MacKay proposal traces and stashes
+    /// it in `inverse_probes`. It is never an outer gradient artifact: the fixed
+    /// rational value's derivative is `logdet_derivative_bundle` below.
     request_inverse_probes: bool,
     /// The last-computed shared bundle: the FROZEN plan's probes `v_j` and their
     /// `S⁻¹ v_j` (t = 0) solves at the current operator. One bundle drives every
     /// selected-inverse trace `tr(S⁻¹·M) ≈ (1/m)Σ_j (S⁻¹v_j)ᵀ(M v_j)` off the
-    /// SAME probes as the value, so value and ρ-gradient never desync.
+    /// same frozen raw probes as the value plan. This is useful for EFS trace
+    /// proposals but is not the derivative of the shifted rational value.
     inverse_probes: Option<(Vec<Array1<f64>>, Vec<Array1<f64>>)>,
     /// Request/stash the lossless weighted derivative representation emitted by
     /// the next rational value evaluation.  Unlike `inverse_probes`, this is the
@@ -1887,11 +1887,11 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                 .expect("plan installed just above when absent");
             let want_bundle = state.request_inverse_probes;
             let want_logdet_derivative = state.request_logdet_derivative_bundle;
-            // Value (and, when the gradient lane asked for it, the shared
-            // (probes, S⁻¹·probes) bundle) computed under one borrow of the
-            // frozen plan; the bundle is stashed on the lane after the borrow
-            // ends. The bundle uses the plan's RAW probes v_j (not the deflation-
-            // projected ones) since tr(S⁻¹·M) contracts the full S⁻¹ v_j.
+            // Value, its lossless shifted derivative representation, and any
+            // EFS-only `(probes, S⁻¹·probes)` trace bundle are computed under one
+            // borrow of the frozen plan and stashed after that borrow ends. The
+            // EFS bundle uses raw probes; the outer gradient consumes only the
+            // weighted shifted derivative bundle.
             let (estimate, derivative_bundle, bundle) = {
                 // #1017: ONE reduced-Schur operator for the whole value ladder —
                 // the frozen plan walks its shift ladder through this single
@@ -1914,8 +1914,9 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                         reason: "rational log-det surrogate evaluation returned non-finite"
                             .to_string(),
                     })?;
+                let estimate = eval.estimate;
                 let derivative_bundle = if want_logdet_derivative {
-                    Some(plan.directional_derivative_bundle(&eval).ok_or_else(|| {
+                    Some(plan.into_directional_derivative_bundle(eval).ok_or_else(|| {
                         ArrowSchurError::SchurFactorFailed {
                             reason: "rational log-det derivative bundle assembly failed"
                                 .to_string(),
@@ -1944,7 +1945,7 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                 } else {
                     None
                 };
-                (eval.estimate, derivative_bundle, bundle)
+                (estimate, derivative_bundle, bundle)
             };
             if want_logdet_derivative {
                 state.logdet_derivative_bundle = derivative_bundle;

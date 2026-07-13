@@ -285,7 +285,7 @@ fn wide_border_routes_to_streaming_with_complete_analytic_gradient_certificate()
         "a non-direct-admitted plan must select streaming"
     );
     assert_eq!(
-        sae_outer_gradient_capability(plan),
+        sae_outer_gradient_capability(),
         Derivative::Analytic,
         "matrix-free SAE must advertise the complete rational-value/single-adjoint gradient"
     );
@@ -301,7 +301,7 @@ fn wide_border_routes_to_streaming_with_complete_analytic_gradient_certificate()
     );
     assert!(dense_plan.direct_admitted);
     assert_eq!(
-        sae_outer_gradient_capability(dense_plan),
+        sae_outer_gradient_capability(),
         Derivative::Analytic,
         "dense SAE retains its exact joint-Hessian IFT gradient"
     );
@@ -363,9 +363,18 @@ fn production_objective_forced_streaming_value_gradient_matches_dense() {
 
     let dense_eval = OuterObjective::eval(&mut dense, &rho.to_flat())
         .expect("dense production value+gradient");
-    let streaming_eval = streaming
-        .evaluate_forced_streaming_value_gradient(&rho)
-        .expect("forced streaming production value+gradient");
+    let streaming_artifact = streaming
+        .evaluate_outer_criterion_route(&rho, false, false)
+        .expect("forced streaming production artifact");
+    let streaming_gradient = streaming
+        .analytic_gradient_for_outer_evaluation(&rho, &streaming_artifact)
+        .expect("forced streaming production gradient");
+    let streaming_eval = OuterEval {
+        cost: streaming_artifact.cost,
+        gradient: streaming_gradient,
+        hessian: HessianValue::Unavailable,
+        inner_beta_hint: Some(streaming.term.flatten_beta()),
+    };
 
     assert!(dense_eval.cost.is_finite() && streaming_eval.cost.is_finite());
     assert_eq!(dense_eval.gradient.len(), streaming_eval.gradient.len());

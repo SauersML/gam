@@ -734,7 +734,7 @@ fn basin_bundle_member_capacity(term: &SaeManifoldTerm) -> usize {
 /// gradient. The streaming route uses the frozen rational-logdet probe bundle
 /// and one matrix-free adjoint solve; it never manufactures a zero derivative or
 /// retries through the dense factorization.
-pub(crate) fn sae_outer_gradient_capability(_plan: SaeStreamingPlan) -> Derivative {
+pub(crate) fn sae_outer_gradient_capability() -> Derivative {
     Derivative::Analytic
 }
 
@@ -1012,25 +1012,6 @@ impl SaeManifoldOuterObjective {
             }
         }
         Ok(gradient)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn evaluate_forced_streaming_value_gradient(
-        &mut self,
-        rho: &SaeManifoldRho,
-    ) -> Result<OuterEval, String> {
-        let evaluated = self
-            .evaluate_outer_criterion_route(rho, false, false)
-            .map_err(|error| error.to_string())?;
-        let gradient = self
-            .analytic_gradient_for_outer_evaluation(rho, &evaluated)
-            .map_err(|error| error.to_string())?;
-        Ok(OuterEval {
-            cost: evaluated.cost,
-            gradient,
-            hessian: HessianValue::Unavailable,
-            inner_beta_hint: Some(self.term.flatten_beta()),
-        })
     }
 
     /// #2231 Inc-B (stage 1) — enable crosscoder block-relevance PRICING.
@@ -3696,8 +3677,7 @@ fn reactive_rho_domain_upper(
 
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
-        let streaming_plan = self.term.streaming_plan();
-        let gradient = sae_outer_gradient_capability(streaming_plan);
+        let gradient = sae_outer_gradient_capability();
         // SAE's Fellner--Schall/MacKay updates are useful simultaneous proposal
         // directions, but their zeros omit the profiled criterion's state-
         // response/third-order channels. They may drive a fixed-point solver

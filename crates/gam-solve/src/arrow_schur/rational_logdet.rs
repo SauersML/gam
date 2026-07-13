@@ -543,12 +543,14 @@ impl RationalLogdetPlan {
     /// `tr(S^-1 D)`, which is generally NOT the derivative of this fixed-node
     /// rational surrogate and would reopen the objective/gradient desynchrony
     /// the surrogate exists to prevent.
-    pub fn directional_derivative_bundle(
+    pub fn into_directional_derivative_bundle(
         &self,
-        eval: &RationalLogdetEval,
+        eval: RationalLogdetEval,
     ) -> Option<RationalLogdetDerivativeBundle> {
+        let expected_deflation_nodes =
+            usize::from(!eval.deflation_basis.is_empty()) * self.nodes.len();
         if eval.shifted_solves.len() != self.nodes.len()
-            || eval.deflation_solves.len() != eval.deflation_basis.len().min(1) * self.nodes.len()
+            || eval.deflation_solves.len() != expected_deflation_nodes
         {
             return None;
         }
@@ -558,9 +560,10 @@ impl RationalLogdetPlan {
                 .shifted_solves
                 .iter()
                 .any(|solves| solves.len() != probe_count)
-            || eval.deflation_solves.iter().any(|solves| {
-                solves.len() != eval.deflation_basis.len()
-            })
+            || eval
+                .deflation_solves
+                .iter()
+                .any(|solves| solves.len() != eval.deflation_basis.len())
         {
             return None;
         }
@@ -573,7 +576,16 @@ impl RationalLogdetPlan {
         let mut vectors = Vec::with_capacity(term_count);
         let rank = term_count as f64;
         let probes = probe_count as f64;
-        for (node, &(_, weight)) in self.nodes.iter().enumerate() {
+        let mut deflation_by_node = eval.deflation_solves;
+        if deflation_by_node.is_empty() {
+            deflation_by_node.resize_with(self.nodes.len(), Vec::new);
+        }
+        for ((mut probe_solves, mut deflation_solves), &(_, weight)) in eval
+            .shifted_solves
+            .into_iter()
+            .zip(deflation_by_node)
+            .zip(&self.nodes)
+        {
             if !(weight.is_finite() && weight > 0.0) {
                 return None;
             }
@@ -582,17 +594,19 @@ impl RationalLogdetPlan {
             if !(probe_scale.is_finite() && deflation_scale.is_finite()) {
                 return None;
             }
-            for solve in &eval.shifted_solves[node] {
+            for mut solve in probe_solves.drain(..) {
                 if solve.len() != self.dim {
                     return None;
                 }
-                vectors.push(solve * probe_scale);
+                solve *= probe_scale;
+                vectors.push(solve);
             }
-            for solve in &eval.deflation_solves[node] {
+            for mut solve in deflation_solves.drain(..) {
                 if solve.len() != self.dim {
                     return None;
                 }
-                vectors.push(solve * deflation_scale);
+                solve *= deflation_scale;
+                vectors.push(solve);
             }
         }
         Some(RationalLogdetDerivativeBundle { vectors })
@@ -1021,7 +1035,7 @@ mod tests {
             .directional_derivative(&eval, &dmatvec)
             .expect("rational directional derivative");
         let bundle = plan
-            .directional_derivative_bundle(&eval)
+            .into_directional_derivative_bundle(eval)
             .expect("lossless rational derivative bundle");
         let represented = bundle
             .directional_derivative(&dmatvec)

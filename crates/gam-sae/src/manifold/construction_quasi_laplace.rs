@@ -6,9 +6,9 @@
 // construction.rs under the 10k limit.
 
 /// One coherent matrix-free outer sample. The value, factor cache, reduced
-/// operator, and selected-inverse probes are all emitted by the same frozen
-/// surrogate evaluation, so no consumer can accidentally differentiate a
-/// reassembled or differently-randomized operator.
+/// operator, and lossless rational derivative are all emitted by the same
+/// frozen surrogate evaluation, so no consumer can accidentally differentiate
+/// a reassembled or differently-randomized operator.
 pub(crate) struct StreamingOuterEvaluation {
     pub(crate) cost: f64,
     pub(crate) loss: SaeManifoldLoss,
@@ -2313,10 +2313,12 @@ impl SaeManifoldTerm {
     }
 
     /// Matrix-free outer value/gradient artifact. Unlike the scalar/cache
-    /// convenience entries, this requires the rational surrogate to emit its
-    /// frozen `(z, S^-1 z)` bundle and retains the exact `ArrowSchurSystem` used
-    /// to produce it. Per-row spectral deflation is rejected explicitly: the
-    /// border-only bundle does not contain the Daleckii--Krein correction, and a
+    /// convenience entries, this requires the rational surrogate to retain its
+    /// complete weighted shifted-solve derivative and the exact
+    /// `ArrowSchurSystem` used to produce it. Optional shift-zero inverse probes
+    /// are requested separately and are scoped to EFS proposals. Per-row
+    /// spectral deflation is rejected explicitly: the border-only derivative
+    /// representation does not contain the Daleckii--Krein correction, and a
     /// dense retry would violate both the declared memory route and the single-
     /// functional derivative contract.
     pub(crate) fn penalized_quasi_laplace_streaming_outer_evaluation(
@@ -2349,8 +2351,8 @@ impl SaeManifoldTerm {
         let (cost, loss, cache, system) = match evaluated {
             Ok(evaluated) => evaluated,
             Err(error) => {
-                let _ = lane.take_logdet_derivative_bundle();
-                let _ = lane.take_inverse_probes();
+                drop(lane.take_logdet_derivative_bundle());
+                drop(lane.take_inverse_probes());
                 return Err(error);
             }
         };

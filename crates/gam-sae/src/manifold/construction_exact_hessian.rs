@@ -694,15 +694,19 @@ impl SaeManifoldTerm {
     }
 
     /// #2080 forward plumbing — the analytic outer-ρ gradient with an OPTIONAL
-    /// shared selected-inverse probe bundle `(z_j, S⁻¹ z_j)`.
+    /// low-rank representation of the reduced-logdet derivative.
     ///
-    /// When `inverse_probe_bundle` is `Some`, the THREE selected-inverse channels
+    /// When `logdet_derivative_bundle` is `Some`, the THREE reduced-logdet channels
     /// that have matrix-free siblings — the per-atom decoder smoothness EDF
     /// `tr(H⁻¹ M_k)`, the per-(atom,axis) ARD log-precision Hessian trace
     /// `½tr(H⁻¹ ∂H/∂logα)`, and the #1006 envelope Γ = tr(H⁻¹ ∂H/∂θ) — are evaluated
     /// off that bundle (`decoder_smoothness_effective_dof_per_atom_from_probes` /
     /// `ard_log_precision_hessian_trace_from_probes` / `logdet_theta_adjoint_from_probes`)
-    /// instead of the dense `DeflatedArrowSolver` selected inverse. They convert
+    /// instead of the dense `DeflatedArrowSolver` selected inverse. For the
+    /// rational route the two slices are the identical weighted vectors emitted
+    /// by `RationalLogdetPlan::into_directional_derivative_bundle`, so every
+    /// contraction is the derivative of the SAME shifted rational value, not a
+    /// separately sampled `S^-1`. They convert
     /// together as ONE all-or-nothing cluster on the single `Some` (invariant #1):
     /// never a partial mix within a single eval. Each from-probes channel hard-refuses
     /// deflated rows (the plain-S⁻¹ bundle cannot reconstruct the Daleckii–Krein
@@ -718,7 +722,7 @@ impl SaeManifoldTerm {
     /// reduced-Schur CG on the reassembled undamped operator) with
     /// `solver = DeflatedArrowSolver::plain(cache)` for the cheap per-row
     /// `coordinate_block_*` subtractions — the K≥4096, direct-logdet-not-admitted
-    /// route, mirroring [`Self::analytic_assignment_strength_gradient_matrix_free`].
+    /// route, mirroring the matrix-free branch of this complete assembler.
     /// Pass `matrix_free_system = None` to use the dense [`DeflatedArrowSolver`]
     /// adjoint (the direct-logdet-admitted route). Both produce the same complete
     /// derivative; the from-probes trace channels and the matrix-free adjoint
@@ -730,7 +734,7 @@ impl SaeManifoldTerm {
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
-        inverse_probe_bundle: Option<(&[Array1<f64>], &[Array1<f64>])>,
+        logdet_derivative_bundle: Option<(&[Array1<f64>], &[Array1<f64>])>,
         matrix_free_system: Option<&ArrowSchurSystem>,
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
         self.assignment
@@ -758,7 +762,7 @@ impl SaeManifoldTerm {
             // likelihood and its Gauss--Newton blocks have no direct alpha
             // derivative. Structurally fixed assignments have no sparse index
             // and skip this channel entirely.
-            let joint_trace = match inverse_probe_bundle {
+            let joint_trace = match logdet_derivative_bundle {
                 Some((probes, sinv)) => self
                     .assignment_log_strength_hessian_trace_from_probes(rho, cache, probes, sinv)
                     .map_err(OuterGradientError::internal)?,
@@ -792,10 +796,10 @@ impl SaeManifoldTerm {
                 *v *= renorm;
             }
         }
-        // #2080: the per-atom smoothness EDF `tr(H⁻¹ M_k)` off the shared
-        // selected-inverse bundle when the surrogate lane supplied it; the dense
-        // `DeflatedArrowSolver` selected inverse otherwise (all callers today).
-        let smooth_logdet = match inverse_probe_bundle {
+        // #2080: the per-atom smoothness logdet derivative off the shared
+        // low-rank derivative representation when the rational lane supplied it;
+        // the dense `DeflatedArrowSolver` selected inverse otherwise.
+        let smooth_logdet = match logdet_derivative_bundle {
             Some((probes, sinv)) => self
                 .decoder_smoothness_effective_dof_per_atom_from_probes(
                     probes,
@@ -830,14 +834,14 @@ impl SaeManifoldTerm {
         let ard_explicit = self
             .ard_log_precision_explicit_derivatives(rho)
             .map_err(OuterGradientError::internal)?;
-        // #2080: the per-(atom,axis) ARD log-precision Hessian trace
-        // `½tr(H⁻¹ ∂H/∂logα)` off the SAME shared selected-inverse bundle (the
-        // all-or-nothing cluster's second channel) when present; the dense
+        // #2080: the per-(atom,axis) ARD log-precision Hessian derivative off the
+        // SAME shared low-rank representation (the all-or-nothing cluster's
+        // second channel) when present; the dense
         // deflated selected inverse otherwise. The from-probes channel HARD-REFUSES
         // any row carrying gauge/rotation deflation (the plain-S⁻¹ bundle cannot
         // reconstruct the Daleckii–Krein correction), routing that fit to the dense
         // channel rather than silently dropping the correction.
-        let ard_joint_trace = match inverse_probe_bundle {
+        let ard_joint_trace = match logdet_derivative_bundle {
             Some((probes, sinv)) => self
                 .ard_log_precision_hessian_trace_from_probes(rho, cache, probes, sinv)
                 .map_err(|err| OuterGradientError::InternalInvariant {
@@ -880,10 +884,12 @@ impl SaeManifoldTerm {
         // penalty channels and is present on every layout (dense or probes).
         explicit += &rank_charge.direct_rho;
 
-        // #2080: the envelope Γ = tr(H⁻¹ ∂H/∂θ) off the SAME shared selected-inverse
-        // bundle (the all-or-nothing cluster's third channel) when present; the dense
+        // #2080: the envelope Γ off the SAME shared low-rank logdet derivative
+        // representation (the all-or-nothing cluster's third channel) when
+        // present; the dense
         // selected inverse otherwise. The border-only bundle reconstructs the NO-SELF
-        // base inverse `(H₀')⁻¹`, so `logdet_theta_adjoint_from_probes` hard-refuses
+        // base derivative on the undeflated row chart, so
+        // `logdet_theta_adjoint_from_probes` hard-refuses
         // (routes to dense) a cache carrying a T-space gauge/rotation deflation
         // that the border probes cannot span. Ordered Beta--Bernoulli uses its
         // row-local PSD majorizer and shared-mass derivative directly.
@@ -891,7 +897,7 @@ impl SaeManifoldTerm {
         // Hessian trace + θ-adjoint); assignment log-strength traces remain
         // solver-bound
         // — the last gaps before the routing flip (see the docstring).
-        let mut gamma = match inverse_probe_bundle {
+        let mut gamma = match logdet_derivative_bundle {
             Some((probes, sinv)) => self
                 .logdet_theta_adjoint_from_probes(rho, cache, probes, sinv)
                 .map_err(OuterGradientError::internal)?,
