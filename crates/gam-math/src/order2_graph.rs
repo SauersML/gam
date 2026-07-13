@@ -400,7 +400,7 @@ fn for_each_supported_upper_by_column(support: u16, mut visit: impl FnMut(usize,
     while columns != 0 {
         let other = columns.trailing_zeros() as usize;
         columns &= columns - 1;
-        let mut rows = support & ((1_u16 << (other + 1)) - 1);
+        let mut rows = support & (u16::MAX >> (MAX_PRIMARY_DIMENSION - other - 1));
         while rows != 0 {
             let primary = rows.trailing_zeros() as usize;
             rows &= rows - 1;
@@ -574,7 +574,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 }
             }
             coefficients.multiply(direction.as_slice(), projected_direction.as_mut_slice());
-            let mut supported_rows = support & ((1_u16 << (other + 1)) - 1);
+            let mut supported_rows = support & (u16::MAX >> (MAX_PRIMARY_DIMENSION - other - 1));
             while supported_rows != 0 {
                 let primary = supported_rows.trailing_zeros() as usize;
                 supported_rows &= supported_rows - 1;
