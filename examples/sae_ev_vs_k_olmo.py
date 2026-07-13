@@ -426,25 +426,15 @@ def main() -> None:
             args.n_iter,
             args.sep_mu,
         )
-        # The pure-linear comparison arm rides a separate basis lane whose OOS /
-        # basis_with_jet plumbing can error independently of the curved arm (e.g.
-        # the unsupported "linear" basis kind). A failure there must NOT discard
-        # the curved EV-vs-K climb — the #1026 headline measurement — so the
-        # linear arm is reported as NaN and the row still prints.
-        try:
-            ev_l_pca, fit_l, recon_l, linear_split, linear_topologies = _fit_ev(
-                z_tr,
-                z_te,
-                k,
-                "linear",
-                args.seed,
-                args.n_iter,
-                args.sep_mu,
-            )
-        except Exception as exc:  # noqa: BLE001 — arm-isolated, reported honestly
-            print(f"[linear K={k}] arm failed, reporting NaN: {exc}", flush=True)
-            ev_l_pca, fit_l, recon_l = float("nan"), float("nan"), float("nan")
-            linear_split, linear_topologies = None, None
+        ev_l_pca, fit_l, recon_l, linear_split, linear_topologies = _fit_ev(
+            z_tr,
+            z_te,
+            k,
+            "linear",
+            args.seed,
+            args.n_iter,
+            args.sep_mu,
+        )
         # FULL-space EV = r * EV_Z (see _pca_project): the PCA-space EV is inflated
         # by ~1/r relative to a full-space reconstruction, so the acceptance gate and
         # the official-reference parity must use the full-space numbers.
