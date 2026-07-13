@@ -6203,6 +6203,100 @@ mod tests {
         array![0.15, 0.25, 0.1, -0.15, 0.35_f64.ln()]
     }
 
+    #[test]
+    fn saved_latent_survival_alo_matches_deterministic_frailty_oracle() {
+        const K: usize = 5;
+        let weight = 1.7;
+        let quadrature = QuadratureContext::new();
+        let geometry = latent_survival_alo_row_geometry(LatentSurvivalAloRowInput {
+            quadrature: &quadrature,
+            hazard_loading: HazardLoading::Full,
+            event_code: 0,
+            prior_weight: weight,
+            q_entry: -0.4,
+            q_exit: 0.2,
+            qdot_exit: 1.1,
+            q_right: 0.2,
+            mu: -0.1,
+            sigma: LatentSurvivalAloSigma::Fixed(0.0),
+            unloaded_mass_entry: 0.0,
+            unloaded_mass_exit: 0.0,
+            unloaded_mass_right: 0.0,
+            unloaded_hazard_exit: 0.0,
+        })
+        .expect("exact saved latent-survival row");
+
+        let values: [f64; K] = geometry
+            .coordinate_values
+            .as_slice()
+            .expect("owned coordinates are contiguous")
+            .try_into()
+            .expect("fixed-scale latent survival has five primaries");
+        let variables: [Order2<K>; K] =
+            std::array::from_fn(|axis| Order2::variable(values[axis], axis));
+        // At sigma=0 and full loading, right-censoring has
+        // NLL = w[exp(q_exit + mu) - exp(q_entry + mu)].
+        let oracle = variables[1]
+            .add(&variables[4])
+            .exp()
+            .sub(&variables[0].add(&variables[4]).exp())
+            .scale(weight);
+        for left in 0..K {
+            assert!((geometry.nll_score[left] - oracle.g()[left]).abs() <= 3e-12);
+            for right in 0..K {
+                assert!(
+                    (geometry.observed_hessian[[left, right]] - oracle.h()[left][right]).abs()
+                        <= 4e-12
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saved_latent_binary_alo_matches_deterministic_frailty_oracle() {
+        const K: usize = 3;
+        let weight = 0.8;
+        let quadrature = QuadratureContext::new();
+        let geometry = latent_binary_alo_row_geometry(LatentBinaryAloRowInput {
+            quadrature: &quadrature,
+            hazard_loading: HazardLoading::Full,
+            event: 1,
+            prior_weight: weight,
+            q_entry: -0.6,
+            q_exit: 0.3,
+            mu: -0.2,
+            sigma: 0.0,
+            unloaded_mass_entry: 0.0,
+            unloaded_mass_exit: 0.0,
+        })
+        .expect("exact saved latent-binary row");
+
+        let values: [f64; K] = geometry
+            .coordinate_values
+            .as_slice()
+            .expect("owned coordinates are contiguous")
+            .try_into()
+            .expect("latent binary has three live primaries");
+        let variables: [Order2<K>; K] =
+            std::array::from_fn(|axis| Order2::variable(values[axis], axis));
+        let log_survival = variables[0]
+            .add(&variables[2])
+            .exp()
+            .sub(&variables[1].add(&variables[2]).exp());
+        let one = variables[0].compose_unary([1.0, 0.0, 0.0, 0.0, 0.0]);
+        // Event NLL = -w log(1 - exp(log_survival)).
+        let oracle = one.sub(&log_survival.exp()).ln().neg().scale(weight);
+        for left in 0..K {
+            assert!((geometry.nll_score[left] - oracle.g()[left]).abs() <= 4e-12);
+            for right in 0..K {
+                assert!(
+                    (geometry.observed_hessian[[left, right]] - oracle.h()[left][right]).abs()
+                        <= 6e-12
+                );
+            }
+        }
+    }
+
     /// Regression (frailty scale block deletion): a learnable-σ latent-survival
     /// fit routes the pre-fit identifiability audit CHANNEL-AWARE, so the
     /// `log_sigma` scale block — realised as a single constant-of-ones column —

@@ -975,6 +975,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         const GEOMETRIC_TAIL_WINDOW: usize = 5;
         let mut geometric_tail_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(GEOMETRIC_TAIL_WINDOW);
+        // A first-order convergence event at a post-step beta is only tentative
+        // until exact curvature at that same beta proves second-order
+        // stationarity. If the fresh certificate exposes a strict saddle, resume
+        // this same Newton state machine at that beta and force one dense
+        // spectral cycle so the existing finite-radius More-Sorensen hard case
+        // can take the negative-curvature escape. This is continuation of the
+        // inner solve, not a new seed or a retry with different semantics.
+        let mut recovering_from_returned_saddle = false;
 
         // Fit-level wall-clock budget guard at inner-solve ENTRY. The
         // per-cycle guard below only fires from `cycle > 0`, so it returns a
@@ -987,7 +995,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // directly. Extra damping must be wired through an accepted/rejected
         // step policy before it belongs here; keep the matvec faithful to the
         // objective until then.
-        for cycle in 0..inner_loop_hard_ceiling {
+        'joint_mode_search: loop {
+            for cycle in cycles_done..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
                 break;
             }
@@ -1801,7 +1810,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         .as_ref()
                         .map(|(_grad_phi, hphi)| Arc::new(symmetric_psd_projection(hphi)));
                     let pcg_started = std::time::Instant::now();
-                    let pcg_requested = matrix_free_joint_requested && !joint_hessian_is_dense;
+                    let pcg_requested = matrix_free_joint_requested
+                        && !joint_hessian_is_dense
+                        && !recovering_from_returned_saddle;
+                    recovering_from_returned_saddle = false;
                     let mut spectral_nullity_for_step = 0usize;
                     let mut delta = if pcg_requested {
                         let preconditioner_diag = match &joint_hessian_source {
@@ -5716,45 +5728,77 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // scale-aware tolerances); whether convergence is *reachable within
             // the cycle budget* is judged by the deterministic descent-rate
             // guard alongside the residual-stall detector above.
-        }
+            }
 
-        if converged {
-            let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
-            let joint_constraints =
-                assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
-            // A full-space PSD test is exact for the unconstrained CTN mode.
-            // Constrained and Jeffreys-augmented families require their own
-            // critical-cone / augmented-objective certificate and retain the
-            // existing first-order contract here.
-            if joint_constraints.is_none() && joint_jeffreys_subspace.is_none() {
-                let certificate = exact_joint_mode_curvature_certificate(
-                    family,
-                    &states,
-                    specs,
-                    options,
-                    &ranges,
-                    &s_lambdas,
-                    joint_mode_diagonal_ridge,
-                    joint_bundle,
-                    total_p,
-                )?;
-                let has_negative_curvature = certificate.has_resolvable_negative_curvature();
-                let minimum_whitened_eigenvalue = certificate.minimum_whitened_eigenvalue;
-                let numerical_floor = certificate.numerical_floor;
-                cached_joint_workspace = certificate.workspace;
-                if has_negative_curvature {
-                    return Err(format!(
-                        "joint Newton tentative convergence rejected by fresh exact returned-mode curvature: lambda_min={:.6e} < -floor={:.6e}; an indefinite coefficient point cannot define a Laplace mode",
-                        minimum_whitened_eigenvalue, numerical_floor,
-                    ));
-                } else {
-                    log::info!(
-                        "[PIRLS/joint-Newton mode certificate] returned beta certified from fresh exact curvature: lambda_min={:.6e}, floor={:.6e}",
-                        minimum_whitened_eigenvalue,
-                        numerical_floor,
-                    );
+            if converged {
+                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+                let joint_constraints =
+                    assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
+                // A full-space PSD test is exact for the unconstrained CTN mode.
+                // Constrained and Jeffreys-augmented families require their own
+                // critical-cone / augmented-objective certificate and retain the
+                // existing first-order contract here.
+                if joint_constraints.is_none() && joint_jeffreys_subspace.is_none() {
+                    let certificate = exact_joint_mode_curvature_certificate(
+                        family,
+                        &states,
+                        specs,
+                        options,
+                        &ranges,
+                        &s_lambdas,
+                        joint_mode_diagonal_ridge,
+                        joint_bundle,
+                        total_p,
+                    )?;
+                    let has_negative_curvature = certificate.has_resolvable_negative_curvature();
+                    let minimum_whitened_eigenvalue = certificate.minimum_whitened_eigenvalue;
+                    let numerical_floor = certificate.numerical_floor;
+                    cached_joint_workspace = certificate.workspace;
+                    if has_negative_curvature {
+                        if cycles_done >= inner_max_cycles {
+                            return Err(format!(
+                                "joint Newton tentative convergence rejected by fresh exact returned-mode curvature after exhausting {inner_max_cycles} cycles: lambda_min={:.6e} < -floor={:.6e}; an indefinite coefficient point cannot define a Laplace mode",
+                                minimum_whitened_eigenvalue, numerical_floor,
+                            ));
+                        }
+                        log::info!(
+                            "[PIRLS/joint-Newton mode certificate] tentative first-order convergence revoked at returned beta: fresh lambda_min={:.6e} < -floor={:.6e}; continuing at the same beta with an exact spectral cycle so the finite-radius negative-curvature hard case can escape the saddle",
+                            minimum_whitened_eigenvalue,
+                            numerical_floor,
+                        );
+                        converged = false;
+                        recovering_from_returned_saddle = true;
+                        last_cycle_residual_below_tol = false;
+                        last_cycle_obj_change_below_tol = false;
+                        best_residual_seen = f64::INFINITY;
+                        cycles_since_residual_improved = 0;
+                        residual_descent_history.clear();
+                        tr_clamped_during_stall = false;
+                        residual_rate_history.clear();
+                        merit_window.clear();
+                        prev_rejected_trust_radius = None;
+                        consecutive_held_rejected_cycles = 0;
+                        prev_rejected_first_attempt_objective = None;
+                        consecutive_identical_rejected_cycles = 0;
+                        consecutive_all_reject_at_floor_cycles = 0;
+                        last_joint_math = None;
+                        last_kkt_refusal_report = None;
+                        prev_kkt_norm = None;
+                        obj_flat_streak = gam_solve::loop_guard::FlatStreak::new(
+                            gam_solve::loop_guard::PLATEAU_DEFAULT_WINDOW,
+                        );
+                        geometric_tail_history.clear();
+                        continue 'joint_mode_search;
+                    } else {
+                        log::info!(
+                            "[PIRLS/joint-Newton mode certificate] returned beta certified from fresh exact curvature: lambda_min={:.6e}, floor={:.6e}",
+                            minimum_whitened_eigenvalue,
+                            numerical_floor,
+                        );
+                    }
                 }
             }
+            break 'joint_mode_search;
         }
 
         // Explicit terminal verdict for the joint-Newton inner solve.

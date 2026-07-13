@@ -1045,74 +1045,6 @@ where
     Ok(nll)
 }
 
-/// Runtime-width correctness oracle for independent score slopes.
-///
-/// The covariance representation changes only how `(L, V)` are constructed.
-/// Every likelihood operation is delegated to the `rigid_feature_program`
-/// row-program declaration, whose runtime lowering lets these five features carry
-/// the full primary width.
-#[cfg(test)]
-fn rigid_vector_row_nll<'arena, S>(
-    vars: &[S],
-    z: &[f64],
-    covariance: &MarginalSlopeCovariance,
-    inputs: &RigidRowInputs,
-    workspace: &'arena S::Workspace,
-) -> Result<S, String>
-where
-    S: RuntimeJetScalar<'arena>,
-{
-    let dimension = vars.len();
-    let k = dimension.checked_sub(3).ok_or_else(|| {
-        SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "survival marginal-slope vector row needs three index primaries, got {dimension}"
-            ),
-        }
-        .to_string()
-    })?;
-    if z.len() != k || covariance.dim() != k {
-        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "survival marginal-slope vector row dimension mismatch: slopes={k}, z={}, covariance={}",
-                z.len(),
-                covariance.dim()
-            ),
-        }
-        .into());
-    }
-    covariance.validate("survival marginal-slope vector row program")?;
-    validate_vector_probit_scale(inputs)?;
-    if z.iter().any(|value| !value.is_finite())
-        || vars[3..].iter().any(|slope| !slope.value().is_finite())
-    {
-        return Err(SurvivalMarginalSlopeError::InvalidInput {
-            reason: "survival marginal-slope vector scores and slopes must be finite".to_string(),
-        }
-        .into());
-    }
-
-    let linear =
-        S::linear_combination(&vars[3..], z, dimension, workspace).scale(inputs.probit_scale);
-
-    // One semantic primitive owns the mechanically derived V/G/H channels for
-    // `g' Sigma g`; representation-specific multiplication stays matrix free.
-    let mut variance = S::symmetric_quadratic_form(&vars[3..], covariance, dimension, workspace);
-    let validated_variance = validated_vector_variance(variance.value(), inputs.probit_scale)?;
-    if validated_variance != variance.value() {
-        variance = variance.add_constant(validated_variance - variance.value(), workspace);
-    }
-
-    let features = [
-        vars[0].clone(),
-        vars[1].clone(),
-        vars[2].clone(),
-        linear,
-        variance,
-    ];
-    rigid_feature_runtime_nll(&features, inputs, dimension, workspace)
-}
-
 #[inline]
 fn checked_vector_workspace_layout(
     score_dimension: usize,
@@ -1706,6 +1638,74 @@ mod tests {
         SymmetricQuadraticCoefficients,
     };
     use gam_math::order2_graph::{Order2Graph, Order2GraphWorkspace};
+
+    /// Runtime-width correctness oracle for independent score slopes.
+    ///
+    /// The covariance representation changes only how `(L, V)` are constructed.
+    /// Every likelihood operation is delegated to the shared rigid feature row
+    /// program while these five features carry the full primary width.
+    fn rigid_vector_row_nll<'arena, S>(
+        vars: &[S],
+        z: &[f64],
+        covariance: &MarginalSlopeCovariance,
+        inputs: &RigidRowInputs,
+        workspace: &'arena S::Workspace,
+    ) -> Result<S, String>
+    where
+        S: RuntimeJetScalar<'arena>,
+    {
+        let dimension = vars.len();
+        let k = dimension.checked_sub(3).ok_or_else(|| {
+            SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope vector row needs three index primaries, got {dimension}"
+                ),
+            }
+            .to_string()
+        })?;
+        if z.len() != k || covariance.dim() != k {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope vector row dimension mismatch: slopes={k}, z={}, covariance={}",
+                    z.len(),
+                    covariance.dim()
+                ),
+            }
+            .into());
+        }
+        covariance.validate("survival marginal-slope vector row program")?;
+        validate_vector_probit_scale(inputs)?;
+        if z.iter().any(|value| !value.is_finite())
+            || vars[3..].iter().any(|slope| !slope.value().is_finite())
+        {
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: "survival marginal-slope vector scores and slopes must be finite"
+                    .to_string(),
+            }
+            .into());
+        }
+
+        let linear =
+            S::linear_combination(&vars[3..], z, dimension, workspace).scale(inputs.probit_scale);
+        let mut variance =
+            S::symmetric_quadratic_form(&vars[3..], covariance, dimension, workspace);
+        let validated_variance = validated_vector_variance(variance.value(), inputs.probit_scale)?;
+        if validated_variance != variance.value() {
+            variance = variance.add_constant(validated_variance - variance.value(), workspace);
+        }
+        rigid_feature_runtime_nll(
+            &[
+                vars[0].clone(),
+                vars[1].clone(),
+                vars[2].clone(),
+                linear,
+                variance,
+            ],
+            inputs,
+            dimension,
+            workspace,
+        )
+    }
 
     fn row_primary_closed_form_vector_dynamic_into(
         q0: f64,

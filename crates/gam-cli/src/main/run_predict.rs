@@ -822,6 +822,16 @@ pub(crate) fn build_saved_alo_predict_input(
 ) -> Result<gam_predict::SavedModelAloInput, String> {
     if model.predict_model_class() == PredictModelClass::Survival {
         return match require_saved_survival_likelihood_mode(model)? {
+            SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary => {
+                build_saved_latent_window_alo_input(
+                    model,
+                    data,
+                    col_map,
+                    training_headers,
+                    offset,
+                    noise_offset_supplied,
+                )
+            }
             SurvivalLikelihoodMode::LocationScale => build_saved_location_scale_survival_alo_input(
                 model,
                 data,
@@ -848,9 +858,6 @@ pub(crate) fn build_saved_alo_predict_input(
                     noise_offset_supplied,
                 )
             }
-            other => Err(format!(
-                "saved {other:?} survival ALO requires its typed fitted row geometry"
-            )),
         };
     }
     if model.predict_model_class() != PredictModelClass::TransformationNormal {
@@ -1404,6 +1411,168 @@ pub(crate) fn run_transformation_score(args: TransformationScoreArgs) -> Result<
         scores.len()
     );
     Ok(())
+}
+
+fn build_saved_latent_window_alo_input(
+    model: &SavedModel,
+    data: ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    primary_offset: &Array1<f64>,
+    noise_offset_supplied: bool,
+) -> Result<gam_predict::SavedModelAloInput, String> {
+    let mode = require_saved_survival_likelihood_mode(model)?;
+    if !matches!(
+        mode,
+        SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
+    ) {
+        return Err(format!(
+            "saved latent-window ALO carrier cannot rebuild {mode:?} survival"
+        ));
+    }
+    if noise_offset_supplied {
+        return Err("saved latent-window ALO has no secondary offset coordinate".to_string());
+    }
+    if model.has_baseline_time_wiggle() {
+        return Err(
+            "saved latent-window ALO model contains forbidden baseline timewiggle metadata"
+                .to_string(),
+        );
+    }
+    let n = data.nrows();
+    if n == 0 || primary_offset.len() != n {
+        return Err(format!(
+            "saved latent-window ALO row mismatch: data={n}, primary_offset={}",
+            primary_offset.len()
+        ));
+    }
+    let event_name = model.survival_event.as_ref().ok_or_else(|| {
+        "saved latent-window ALO model is missing its fitted event column".to_string()
+    })?;
+    let event_column = resolve_role_col(col_map, event_name, "survival event")?;
+    let event = Array1::from_vec(
+        data.column(event_column)
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(row, value)| {
+                let code = survival_event_code_from_value(value, row)?;
+                if code > 1 {
+                    return Err(format!(
+                        "saved latent-window ALO event[{row}] must be exactly 0 or 1, got {code}"
+                    ));
+                }
+                Ok(code)
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    );
+
+    let time_columns = resolve_saved_survival_time_columns(model, col_map)?;
+    let mut age_entry = Array1::<f64>::zeros(n);
+    let mut age_exit = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let (entry, exit) = normalize_survival_time_pair(
+            time_columns.row_entry_time(data, row),
+            data[[row, time_columns.exit_col]],
+            row,
+        )?;
+        age_entry[row] = entry;
+        age_exit[row] = exit;
+    }
+
+    let termspec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )?;
+    let clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let design_input = clipped.as_ref().map_or(data, |values| values.view());
+    let mean_build = build_term_collection_design(design_input, &termspec)
+        .map_err(|error| format!("failed to build saved latent-window ALO mean design: {error}"))?;
+    let mean_offset = mean_build
+        .compose_offset(
+            primary_offset.view(),
+            "saved latent-window ALO mean block",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let time_config = load_survival_time_basis_config_from_model(model)?;
+    let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_config, None)?;
+    let anchor = model
+        .survival_time_anchor
+        .ok_or_else(|| "saved latent-window ALO model is missing survival_time_anchor".to_string())?;
+    let resolved_time_config = resolved_survival_time_basis_config_from_build(
+        &time_build.basisname,
+        time_build.degree,
+        time_build.knots.as_ref(),
+        time_build.keep_cols.as_ref(),
+        time_build.smooth_lambda,
+    )?;
+    let anchor_row = evaluate_survival_time_basis_row(anchor, &resolved_time_config)?;
+    center_survival_time_designs_at_anchor(
+        &mut time_build.x_entry_time,
+        &mut time_build.x_exit_time,
+        &anchor_row,
+    )?;
+    require_structural_survival_time_basis(
+        &time_build.basisname,
+        "saved latent-window ALO",
+    )?;
+    let baseline_config = saved_survival_runtime_baseline_config(model)?;
+    let (_, loading) = fixed_hazard_multiplier_from_saved_family(&model.family_state)?;
+    let prepared = prepare_survival_time_stack(
+        &age_entry,
+        &age_exit,
+        &baseline_config,
+        mode,
+        None,
+        anchor,
+        survival_derivative_guard_for_likelihood(mode),
+        &time_build,
+        None,
+        Some(loading),
+    )?;
+    let time = gam_predict::SavedSurvivalAffineBlockAloInput::new(
+        prepared.time_design_entry,
+        prepared.time_design_exit,
+        prepared.time_design_derivative_exit,
+        prepared.eta_offset_entry,
+        prepared.eta_offset_exit,
+        prepared.derivative_offset_exit,
+    )?;
+    let input = match mode {
+        SurvivalLikelihoodMode::Latent => gam_predict::SavedSurvivalAloInput::Latent(
+            gam_predict::SavedLatentSurvivalAloInput::new(
+                event,
+                time,
+                mean_build.design,
+                mean_offset,
+                prepared.unloaded_mass_entry,
+                prepared.unloaded_mass_exit,
+                prepared.unloaded_hazard_exit,
+            )?,
+        ),
+        SurvivalLikelihoodMode::LatentBinary => gam_predict::SavedSurvivalAloInput::LatentBinary(
+            gam_predict::SavedLatentBinaryAloInput::new(
+                event,
+                time,
+                mean_build.design,
+                mean_offset,
+                prepared.unloaded_mass_entry,
+                prepared.unloaded_mass_exit,
+            )?,
+        ),
+        SurvivalLikelihoodMode::Transformation
+        | SurvivalLikelihoodMode::Weibull
+        | SurvivalLikelihoodMode::LocationScale
+        | SurvivalLikelihoodMode::MarginalSlope => {
+            return Err(format!(
+                "internal: non-latent mode {mode:?} reached latent-window ALO assembly"
+            ));
+        }
+    };
+    Ok(gam_predict::SavedModelAloInput::survival(input))
 }
 
 pub(crate) struct LatentWindowPluginJet {

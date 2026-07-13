@@ -157,6 +157,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         }
         .into());
     }
+    let origin_logslope_beta =
+        Array1::<f64>::zeros(raw_logslope_layout.coefficient_design().ncols());
+    let origin_slopes =
+        raw_logslope_layout.physical_values(spec.z.ncols(), origin_logslope_beta.view())?;
 
     // Phase-4b parametric identifiability pre-flight (observability-only).
     //
@@ -239,10 +243,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
             )?;
             let m_dqd1 = ndarray::Array2::<f64>::zeros(m_dq.dim());
-            let g_dg = logslope_design.design.try_to_dense_by_chunks_budgeted(
-                "smgs phase-4b preflight logslope",
-                PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
-            )?;
             // Channel-aware per-subject Fisher Gram (T8). Pilot primary
             // state at β=0: q0 = offset_entry + marginal_offset, q1 =
             // offset_exit + marginal_offset, qd1 = derivative_offset_exit,
@@ -259,7 +259,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 q1_pf[i] += spec.marginal_offset[i];
             }
             let qd1_pf = spec.time_block.derivative_offset_exit.clone();
-            let g_pf = spec.logslope_offset.clone();
             // Replace the zero placeholder timewiggle tail columns with the
             // analytic basis-derived time Jacobian at the β=0 pilot state, so
             // the compiler sees the real time block instead of a structural
@@ -273,15 +272,23 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 &q0_pf,
                 &q1_pf,
                 &qd1_pf,
-                &g_pf,
-                &z_primary,
+                &origin_slopes,
+                &spec.z,
+                &score_covariance,
                 &spec.weights,
                 &spec.event_target,
                 spec.derivative_guard,
                 probit_scale,
             )?;
-            let compiled =
-                compile_survival_parametric_designs(dq0, dq1, dqd1, m_dq, m_dqd1, g_dg, &row_hess)?;
+            let compiled = compile_survival_parametric_designs(
+                dq0,
+                dq1,
+                dqd1,
+                m_dq,
+                m_dqd1,
+                raw_logslope_layout.clone(),
+                &row_hess,
+            )?;
             let (dt, dm, dg) = compiled.drops_by_block;
             if dt + dm + dg > 0 {
                 log::info!(
@@ -810,14 +817,15 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         dqd1: ndarray::Array2<f64>,
         m_dq: ndarray::Array2<f64>,
         m_dqd1: ndarray::Array2<f64>,
-        g_dg: ndarray::Array2<f64>,
+        logslope_layout: LogslopeLayout,
         time_partition: Vec<std::ops::Range<usize>>,
         marginal_partition: Vec<std::ops::Range<usize>>,
         logslope_partition: Vec<std::ops::Range<usize>>,
         offset_entry: Array1<f64>,
         offset_exit: Array1<f64>,
         derivative_offset_exit: Array1<f64>,
-        z_primary: Array1<f64>,
+        z: Array2<f64>,
+        covariance: MarginalSlopeCovariance,
         weights: Array1<f64>,
         event: Array1<f64>,
         derivative_guard: f64,
@@ -969,7 +977,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             let mut q0_pilot = spec.time_block.offset_entry.clone();
             let mut q1_pilot = spec.time_block.offset_exit.clone();
             let qd1_pilot = spec.time_block.derivative_offset_exit.clone();
-            let g_pilot = spec.logslope_offset.clone();
+            let slopes_pilot = origin_slopes.clone();
             for i in 0..n_rows {
                 q0_pilot[i] += spec.marginal_offset[i];
                 q1_pilot[i] += spec.marginal_offset[i];
@@ -1089,7 +1097,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             let g_range = {
                                 let mut lo = f64::INFINITY;
                                 let mut hi = f64::NEG_INFINITY;
-                                for &g in g_pilot.iter() {
+                                for &g in slopes_pilot.iter() {
                                     lo = lo.min(g);
                                     hi = hi.max(g);
                                 }
@@ -1188,8 +1196,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                 &q0_pilot,
                                 &q1_pilot,
                                 &qd1_pilot,
-                                &g_pilot,
-                                &z_primary,
+                                &slopes_pilot,
+                                &spec.z,
+                                &score_covariance,
                                 &spec.weights,
                                 &spec.event_target,
                                 derivative_guard,
@@ -1203,7 +1212,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                 m_dq.clone(),
                                 m_dqd1.clone(),
                                 &marginal_partition,
-                                g_dg.clone(),
+                                raw_logslope_layout.clone(),
                                 &logslope_partition,
                                 &row_hess,
                                 spec.timewiggle_block.is_some(),
@@ -1276,7 +1285,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                     use crate::bms::block_specs::ReducedLogslopeOutcome;
                                     match survival_reduced_logslope_transform_effective(
                                         m_dq.view(),
-                                        g_dg.view(),
+                                        &raw_logslope_layout,
                                         &row_hess,
                                     ) {
                                         Ok(ReducedLogslopeOutcome::Reduced(t_log)) => {
@@ -1355,15 +1364,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                             dqd1: &dqd1,
                                             m_dq: &m_dq,
                                             m_dqd1: &m_dqd1,
-                                            g_dg: &g_dg,
+                                            logslope_layout: &raw_logslope_layout,
                                         },
                                         &row_hess,
                                         SurvivalPilotRows {
                                             q0: &q0_pilot,
                                             q1: &q1_pilot,
                                             qd1: &qd1_pilot,
-                                            g: &g_pilot,
-                                            z: &z_primary,
+                                            slopes: &slopes_pilot,
+                                            z: &spec.z,
+                                            covariance: &score_covariance,
                                             weights: &spec.weights,
                                             event: &spec.event_target,
                                         },
@@ -1459,14 +1469,15 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             dqd1: dqd1.clone(),
                             m_dq: m_dq.clone(),
                             m_dqd1: m_dqd1.clone(),
-                            g_dg: g_dg.clone(),
+                            logslope_layout: raw_logslope_layout.clone(),
                             time_partition: time_partition.clone(),
                             marginal_partition: marginal_partition.clone(),
                             logslope_partition: logslope_partition.clone(),
                             offset_entry: spec.time_block.offset_entry.clone(),
                             offset_exit: spec.time_block.offset_exit.clone(),
                             derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
-                            z_primary: z_primary.clone(),
+                            z: spec.z.clone(),
+                            covariance: score_covariance.clone(),
                             weights: spec.weights.clone(),
                             event: spec.event_target.clone(),
                             derivative_guard,
@@ -2594,7 +2605,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         // Lift compiled β → raw β when the cutover fired. Otherwise the
         // block_states already carry raw-width β.
         let n_lift = smgs_lift_v.as_ref().map(|l| l.n_blocks()).unwrap_or(0);
-        let raw_time_beta = if let Some(ref lift) = smgs_lift_v {
+        let raw_core_betas: Vec<Array1<f64>> = if let Some(ref lift) = smgs_lift_v {
             let compiled_betas: Vec<Array1<f64>> = solved
                 .fit
                 .block_states
@@ -2602,18 +2613,26 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 .take(n_lift)
                 .map(|s| s.beta.clone())
                 .collect();
-            let lifted = lift.lift_block_betas(&compiled_betas);
-            lifted.into_iter().next()
+            lift.lift_block_betas(&compiled_betas)
         } else {
-            solved.fit.block_states.first().map(|s| s.beta.clone())
+            solved
+                .fit
+                .block_states
+                .iter()
+                .take(3)
+                .map(|state| state.beta.clone())
+                .collect()
         };
         let recompile_result = (|| -> Result<(usize, usize, usize), String> {
             use crate::survival::marginal_slope::identifiability::{
                 SurvivalRowHessian, compile_survival_parametric_designs_per_term,
             };
-            let beta_time = raw_time_beta
-                .as_ref()
+            let beta_time = raw_core_betas
+                .first()
                 .ok_or_else(|| "no time block β available".to_string())?;
+            let beta_logslope = raw_core_betas
+                .get(2)
+                .ok_or_else(|| "no logslope block β available".to_string())?;
             if beta_time.len() != ctx.dq0.ncols() {
                 return Err(format!(
                     "raw time β width {} != raw design width {}",
@@ -2622,26 +2641,19 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 ));
             }
             let n_rows = ctx.dq0.nrows();
-            // Marginal and logslope η are lift-invariant: block_states[i].eta
-            // are the per-row η values at convergence regardless of which
-            // β-coord system they were computed in.
+            // Marginal η is lift-invariant. Physical logslope channels are not
+            // a scalar η: evaluate them from the raw coefficient vector through
+            // the canonical layout below.
             let marginal_eta = solved
                 .fit
                 .block_states
                 .get(1)
                 .map(|s| s.eta.clone())
                 .ok_or_else(|| "no marginal block_state".to_string())?;
-            let logslope_eta = solved
-                .fit
-                .block_states
-                .get(2)
-                .map(|s| s.eta.clone())
-                .ok_or_else(|| "no logslope block_state".to_string())?;
-            if marginal_eta.len() != n_rows || logslope_eta.len() != n_rows {
+            if marginal_eta.len() != n_rows {
                 return Err(format!(
-                    "block_state eta length mismatch: marginal={}, logslope={}, n_rows={}",
+                    "block_state eta length mismatch: marginal={}, n_rows={}",
                     marginal_eta.len(),
-                    logslope_eta.len(),
                     n_rows
                 ));
             }
@@ -2656,13 +2668,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 q1[i] = time_q1[i] + ctx.offset_exit[i] + marginal_eta[i];
                 qd1[i] = time_qd1[i] + ctx.derivative_offset_exit[i];
             }
-            let g = logslope_eta;
+            let slopes = ctx
+                .logslope_layout
+                .physical_values(ctx.z.ncols(), beta_logslope.view())?;
             let row_hess = SurvivalRowHessian::from_pilot_primary_state(
                 &q0,
                 &q1,
                 &qd1,
-                &g,
-                &ctx.z_primary,
+                &slopes,
+                &ctx.z,
+                &ctx.covariance,
                 &ctx.weights,
                 &ctx.event,
                 ctx.derivative_guard,
@@ -2676,7 +2691,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 ctx.m_dq.clone(),
                 ctx.m_dqd1.clone(),
                 &ctx.marginal_partition,
-                ctx.g_dg.clone(),
+                ctx.logslope_layout.clone(),
                 &ctx.logslope_partition,
                 &row_hess,
                 ctx.protect_time,

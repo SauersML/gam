@@ -37,9 +37,11 @@ use gam_linalg::faer_ndarray::FaerEigh;
 use gam_problem::diagnostics::KktRefusalDiagnosis;
 use ndarray::{Array1, Array2, Array3};
 
-use super::identifiability::SurvivalRowHessian;
-
-const K_SURVIVAL: usize = 4;
+use super::identifiability::{
+    LogslopeBlockOperator, QChannelBlockOperator, SurvivalRowHessian, TimeBlockOperator,
+};
+use super::{LogslopeLayout, MarginalSlopeCovariance};
+use gam_identifiability::families::compiler::RowJacobianOperator;
 
 /// Default coefficient-space trust radius for the phantom gate. A near-null
 /// direction is a projectable phantom only when its unconstrained Newton
@@ -173,12 +175,11 @@ impl SurvivalKktRefusalReport {
     }
 }
 
-/// The six effective per-row designs that chain the stacked block layouts
-/// into the survival primary state `(q0, q1, qd1, g)`: the time columns
+/// The effective per-row designs that chain the stacked block layouts into
+/// the survival primary state `(q0, q1, qd1, g_0, …, g_{K-1})`: the time columns
 /// (`dq0`/`dq1`/`dqd1` driving `q0`/`q1`/`qd1`), the marginal columns (`m_dq`
-/// driving `q0` and `q1`, `m_dqd1` driving `qd1`), and the logslope columns
-/// (`g_dg` driving `g`). Grouped because every assembly threads the same six
-/// matrices together as one effective metric.
+/// driving `q0` and `q1`, `m_dqd1` driving `qd1`), and the canonical logslope
+/// layout driving every physical score channel.
 #[derive(Clone, Copy)]
 pub(crate) struct SurvivalEffectiveDesigns<'a> {
     pub(crate) dq0: &'a Array2<f64>,
@@ -186,19 +187,20 @@ pub(crate) struct SurvivalEffectiveDesigns<'a> {
     pub(crate) dqd1: &'a Array2<f64>,
     pub(crate) m_dq: &'a Array2<f64>,
     pub(crate) m_dqd1: &'a Array2<f64>,
-    pub(crate) g_dg: &'a Array2<f64>,
+    pub(crate) logslope_layout: &'a LogslopeLayout,
 }
 
 /// Per-row pilot operating point: the linearisation primary state
-/// `(q0, q1, qd1, g)` paired with the observation columns `(z, weights,
-/// event)` the survival row kernel needs to evaluate the score there.
+/// `(q0, q1, qd1, g_0, …, g_{K-1})` paired with the vector score, covariance,
+/// weights, and event columns the survival row kernel needs.
 #[derive(Clone, Copy)]
 pub(crate) struct SurvivalPilotRows<'a> {
     pub(crate) q0: &'a Array1<f64>,
     pub(crate) q1: &'a Array1<f64>,
     pub(crate) qd1: &'a Array1<f64>,
-    pub(crate) g: &'a Array1<f64>,
-    pub(crate) z: &'a Array1<f64>,
+    pub(crate) slopes: &'a Array2<f64>,
+    pub(crate) z: &'a Array2<f64>,
+    pub(crate) covariance: &'a MarginalSlopeCovariance,
     pub(crate) weights: &'a Array1<f64>,
     pub(crate) event: &'a Array1<f64>,
 }
@@ -213,15 +215,15 @@ pub(crate) struct SurvivalLinkParams {
 /// Assemble the joint penalized Hessian `M = Σ_i J_iᵀ H_i J_i + S` and the
 /// joint score `g = Σ_i J_iᵀ grad_i` at a fixed operating point.
 ///
-/// The per-row effective primary Jacobian `J_i` (`4 × p_total`) chains the
-/// stacked block designs into the survival primary state `(q0, q1, qd1, g)`:
+/// The per-row effective primary Jacobian `J_i` (`(3+K) × p_total`) chains the
+/// stacked block designs into `(q0, q1, qd1, g_0, …, g_{K-1})`:
 /// time columns drive `(q0, q1, qd1)`; marginal columns drive `(q0, q1)`
 /// equally and `qd1` via the marginal derivative design; logslope columns
-/// drive `g`. This is the same effective metric the full 4×4 row-Hessian
+/// drive their physical score channels. This is the same effective metric the
 /// identifiability compiler residualises in.
 ///
-/// `row_hess` is the PSD per-row `(n × 4 × 4)` Hessian and `row_grad` the
-/// per-row `(n × 4)` gradient, both in `(q0, q1, qd1, g)` order. `s_total`
+/// `row_hess` is the PSD per-row `(n × (3+K) × (3+K))` Hessian and `row_grad`
+/// the matching gradient. `s_total`
 /// is the unit-weight block-diagonal penalty (its NULLSPACE is what makes a
 /// confounded direction unidentifiable for ALL smoothing parameters, so unit
 /// weights suffice to expose the phantom).
@@ -237,12 +239,25 @@ pub(crate) fn assemble_joint_penalized_hessian_and_score(
         dqd1,
         m_dq,
         m_dqd1,
-        g_dg,
+        logslope_layout,
     } = designs;
     let n = dq0.nrows();
     let p_time = dq0.ncols();
     let p_marg = m_dq.ncols();
-    let p_log = g_dg.ncols();
+    let primary_width = *row_hess
+        .shape()
+        .get(1)
+        .ok_or_else(|| "kkt_refusal assembly: row_hess has no primary axis".to_string())?;
+    let score_dim = primary_width.checked_sub(3).ok_or_else(|| {
+        format!(
+            "kkt_refusal assembly: row_hess primary width {primary_width} omits required q channels"
+        )
+    })?;
+    if score_dim == 0 {
+        return Err("kkt_refusal assembly requires at least one score channel".to_string());
+    }
+    logslope_layout.validate_for(score_dim)?;
+    let p_log = logslope_layout.coefficient_design().ncols();
     let p_total = p_time + p_marg + p_log;
     for (name, rows, cols, want_rows, want_cols) in [
         ("dq1", dq1.nrows(), dq1.ncols(), n, p_time),
@@ -255,16 +270,22 @@ pub(crate) fn assemble_joint_penalized_hessian_and_score(
             ));
         }
     }
-    if row_hess.shape() != [n, K_SURVIVAL, K_SURVIVAL] {
+    if row_hess.shape() != [n, primary_width, primary_width] {
         return Err(format!(
-            "kkt_refusal assembly: row_hess is {:?}, expected [{n}, {K_SURVIVAL}, {K_SURVIVAL}]",
+            "kkt_refusal assembly: row_hess is {:?}, expected [{n}, {primary_width}, {primary_width}]",
             row_hess.shape()
         ));
     }
-    if row_grad.shape() != [n, K_SURVIVAL] {
+    if row_grad.shape() != [n, primary_width] {
         return Err(format!(
-            "kkt_refusal assembly: row_grad is {:?}, expected [{n}, {K_SURVIVAL}]",
+            "kkt_refusal assembly: row_grad is {:?}, expected [{n}, {primary_width}]",
             row_grad.shape()
+        ));
+    }
+    if logslope_layout.coefficient_design().nrows() != n {
+        return Err(format!(
+            "kkt_refusal assembly: logslope rows {} do not match n={n}",
+            logslope_layout.coefficient_design().nrows(),
         ));
     }
     if s_total.shape() != [p_total, p_total] {
@@ -276,32 +297,51 @@ pub(crate) fn assemble_joint_penalized_hessian_and_score(
 
     let mut m = s_total.clone();
     let mut g = Array1::<f64>::zeros(p_total);
-    // Per-row 4×p_total effective Jacobian, reused across rows.
-    let mut j_i = Array2::<f64>::zeros((K_SURVIVAL, p_total));
+    let time_operator = TimeBlockOperator::new(
+        dq0.clone(),
+        dq1.clone(),
+        dqd1.clone(),
+        score_dim,
+    );
+    let marginal_operator =
+        QChannelBlockOperator::new(m_dq.clone(), m_dqd1.clone(), score_dim);
+    let logslope_operator = LogslopeBlockOperator::new(logslope_layout.clone(), score_dim)?;
+    let mut time_rows = Array2::<f64>::zeros((n * primary_width, p_time));
+    let mut marginal_rows = Array2::<f64>::zeros((n * primary_width, p_marg));
+    let mut logslope_rows = Array2::<f64>::zeros((n * primary_width, p_log));
+    time_operator.channel_flattened_rows(0..n, &mut time_rows);
+    marginal_operator.channel_flattened_rows(0..n, &mut marginal_rows);
+    logslope_operator.channel_flattened_rows(0..n, &mut logslope_rows);
+    // Per-row `(3+K) × p_total` effective Jacobian and product, reused.
+    let mut j_i = Array2::<f64>::zeros((primary_width, p_total));
+    let mut hj = Array2::<f64>::zeros((primary_width, p_total));
     let marg_off = p_time;
     let log_off = p_time + p_marg;
     for i in 0..n {
         j_i.fill(0.0);
         for c in 0..p_time {
-            j_i[[0, c]] = dq0[[i, c]];
-            j_i[[1, c]] = dq1[[i, c]];
-            j_i[[2, c]] = dqd1[[i, c]];
+            for channel in 0..primary_width {
+                j_i[[channel, c]] = time_rows[[i * primary_width + channel, c]];
+            }
         }
         for c in 0..p_marg {
             let gc = marg_off + c;
-            j_i[[0, gc]] = m_dq[[i, c]];
-            j_i[[1, gc]] = m_dq[[i, c]];
-            j_i[[2, gc]] = m_dqd1[[i, c]];
+            for channel in 0..primary_width {
+                j_i[[channel, gc]] = marginal_rows[[i * primary_width + channel, c]];
+            }
         }
         for c in 0..p_log {
-            j_i[[3, log_off + c]] = g_dg[[i, c]];
+            for channel in 0..primary_width {
+                j_i[[channel, log_off + c]] =
+                    logslope_rows[[i * primary_width + channel, c]];
+            }
         }
-        // H_i J_i  (4 × p_total)
-        let mut hj = Array2::<f64>::zeros((K_SURVIVAL, p_total));
-        for a in 0..K_SURVIVAL {
+        // H_i J_i  (`(3+K) × p_total`).
+        hj.fill(0.0);
+        for a in 0..primary_width {
             for col in 0..p_total {
                 let mut acc = 0.0;
-                for b in 0..K_SURVIVAL {
+                for b in 0..primary_width {
                     acc += row_hess[[i, a, b]] * j_i[[b, col]];
                 }
                 hj[[a, col]] = acc;
@@ -311,13 +351,13 @@ pub(crate) fn assemble_joint_penalized_hessian_and_score(
         for col in 0..p_total {
             for row in 0..p_total {
                 let mut acc = 0.0;
-                for a in 0..K_SURVIVAL {
+                for a in 0..primary_width {
                     acc += j_i[[a, row]] * hj[[a, col]];
                 }
                 m[[row, col]] += acc;
             }
             let mut gacc = 0.0;
-            for a in 0..K_SURVIVAL {
+            for a in 0..primary_width {
                 gacc += j_i[[a, col]] * row_grad[[i, a]];
             }
             g[col] += gacc;
@@ -452,8 +492,8 @@ pub(crate) fn survival_kkt_refusal_report_from_designs(
     build_refusal_report_from_hessian(&m, &g, step)
 }
 
-/// Per-row gradient `(n × 4)` of the survival neg-log-likelihood at the pilot
-/// primary state, in `(q0, q1, qd1, g)` order — the score companion to
+/// Per-row gradient `(n × (3+K))` of the survival neg-log-likelihood at the
+/// pilot primary state — the score companion to
 /// [`SurvivalRowHessian::from_pilot_primary_state`].
 pub(crate) fn survival_row_gradient_from_pilot_primary_state(
     rows: SurvivalPilotRows<'_>,
@@ -463,8 +503,9 @@ pub(crate) fn survival_row_gradient_from_pilot_primary_state(
         q0,
         q1,
         qd1,
-        g,
+        slopes,
         z,
+        covariance,
         weights,
         event,
     } = rows;
@@ -476,8 +517,8 @@ pub(crate) fn survival_row_gradient_from_pilot_primary_state(
     for (name, len) in [
         ("q1", q1.len()),
         ("qd1", qd1.len()),
-        ("g", g.len()),
-        ("z", z.len()),
+        ("slopes", slopes.nrows()),
+        ("z", z.nrows()),
         ("weights", weights.len()),
         ("event", event.len()),
     ] {
@@ -487,22 +528,37 @@ pub(crate) fn survival_row_gradient_from_pilot_primary_state(
             ));
         }
     }
-    let mut out = Array2::<f64>::zeros((n, K_SURVIVAL));
+    covariance.validate("survival KKT pilot gradient covariance")?;
+    let score_dim = covariance.dim();
+    if slopes.ncols() != score_dim || z.ncols() != score_dim {
+        return Err(format!(
+            "survival_row_gradient: score dimension mismatch slopes={}, z={}, covariance={score_dim}",
+            slopes.ncols(),
+            z.ncols(),
+        ));
+    }
+    let primary_width = 3 + score_dim;
+    let mut out = Array2::<f64>::zeros((n, primary_width));
+    let mut workspace = super::RigidVectorRowWorkspace::new(covariance)?;
     for i in 0..n {
-        let (_, grad, _) = super::row_primary_for_compiler(
+        super::row_primary_closed_form_vector_into(
             q0[i],
             q1[i],
             qd1[i],
-            g[i],
-            z[i],
+            slopes.row(i).as_slice().ok_or_else(|| {
+                "survival_row_gradient: slope row is not contiguous".to_string()
+            })?,
+            z.row(i)
+                .as_slice()
+                .ok_or_else(|| "survival_row_gradient: score row is not contiguous".to_string())?,
             weights[i],
             event[i],
             derivative_guard,
             probit_scale,
+            &mut workspace,
         )?;
-        for a in 0..K_SURVIVAL {
-            out[[i, a]] = grad[a];
-        }
+        let (gradient, _) = workspace.derivatives();
+        out.row_mut(i).assign(&gradient);
     }
     Ok(out)
 }
@@ -622,6 +678,18 @@ mod tests {
     use super::*;
     use ndarray::Array3;
 
+    const K_SURVIVAL: usize = 4;
+
+    fn shared_logslope_layout(design: Array2<f64>) -> LogslopeLayout {
+        let n = design.nrows();
+        super::super::LogslopeTopology::shared()
+            .materialize_identity(
+                super::super::DesignMatrix::from(design),
+                &Array1::<f64>::zeros(n),
+            )
+            .unwrap()
+    }
+
     /// Build a per-row Hessian tensor where every row is the same 4×4 PSD
     /// matrix `h`.
     fn constant_row_hess(n: usize, h: &Array2<f64>) -> Array3<f64> {
@@ -653,6 +721,48 @@ mod tests {
         h
     }
 
+    #[test]
+    fn two_score_kkt_assembly_uses_all_physical_logslope_channels_932() {
+        let n = 2;
+        let logslope_design = ndarray::array![[1.0, 10.0], [2.0, 20.0]];
+        let logslope_layout = super::super::LogslopeTopology::per_score(vec![0..1, 1..2], 2)
+            .unwrap()
+            .materialize_identity(
+                super::super::DesignMatrix::from(logslope_design),
+                &Array1::<f64>::zeros(n),
+            )
+            .unwrap();
+        let empty = Array2::<f64>::zeros((n, 0));
+        let mut row_hess = Array3::<f64>::zeros((n, 5, 5));
+        for row in 0..n {
+            for channel in 0..5 {
+                row_hess[[row, channel, channel]] = 1.0;
+            }
+        }
+        let row_grad = Array2::<f64>::zeros((n, 5));
+        let penalty = Array2::<f64>::zeros((2, 2));
+        let (hessian, score) = assemble_joint_penalized_hessian_and_score(
+            SurvivalEffectiveDesigns {
+                dq0: &empty,
+                dq1: &empty,
+                dqd1: &empty,
+                m_dq: &empty,
+                m_dqd1: &empty,
+                logslope_layout: &logslope_layout,
+            },
+            &row_hess,
+            &row_grad,
+            &penalty,
+        )
+        .unwrap();
+
+        assert_eq!(hessian[[0, 0]], 5.0);
+        assert_eq!(hessian[[1, 1]], 500.0);
+        assert_eq!(hessian[[0, 1]], 0.0);
+        assert_eq!(hessian[[1, 0]], 0.0);
+        assert_eq!(score, Array1::<f64>::zeros(2));
+    }
+
     /// A confounded design: the marginal column and the logslope column are
     /// the SAME basis evaluated on the same rows, so in the q1/g effective
     /// metric the combined direction `(marginal, -logslope)` is flat. With
@@ -675,6 +785,7 @@ mod tests {
         let m_dq = basis.clone();
         let m_dqd1 = Array2::<f64>::zeros((n, p_marg));
         let g_dg = basis.clone();
+        let logslope_layout = shared_logslope_layout(g_dg);
         let row_hess = constant_row_hess(n, &coupled_q1_g_hessian());
         // Gradient driving BOTH channels equally and in the SAME sign as the
         // shared basis, so the score lies along (marginal + logslope) — the
@@ -693,7 +804,7 @@ mod tests {
                 dqd1: &dqd1,
                 m_dq: &m_dq,
                 m_dqd1: &m_dqd1,
-                g_dg: &g_dg,
+                logslope_layout: &logslope_layout,
             },
             &row_hess,
             &row_grad,
@@ -745,6 +856,7 @@ mod tests {
         let m_dq = basis.clone();
         let m_dqd1 = Array2::<f64>::zeros((n, p_marg));
         let g_dg = basis.clone();
+        let logslope_layout = shared_logslope_layout(g_dg);
         let row_hess = constant_row_hess(n, &coupled_q1_g_hessian());
         // Score along the FLAT direction: marginal channel pushed up, logslope
         // channel pushed down (opposite signs) ⇒ projects onto (marginal -
@@ -762,7 +874,7 @@ mod tests {
                 dqd1: &dqd1,
                 m_dq: &m_dq,
                 m_dqd1: &m_dqd1,
-                g_dg: &g_dg,
+                logslope_layout: &logslope_layout,
             },
             &row_hess,
             &row_grad,
@@ -807,6 +919,7 @@ mod tests {
         let dq1 = Array2::<f64>::zeros((n, 0));
         let dqd1 = Array2::<f64>::zeros((n, 0));
         let m_dqd1 = Array2::<f64>::zeros((n, p_marg));
+        let logslope_layout = shared_logslope_layout(logb);
         let row_hess = constant_row_hess(n, &coupled_q1_g_hessian());
         let row_grad = Array2::<f64>::zeros((n, K_SURVIVAL));
         let s_total = Array2::<f64>::zeros((p_marg + p_log, p_marg + p_log));
@@ -817,7 +930,7 @@ mod tests {
                 dqd1: &dqd1,
                 m_dq: &marg,
                 m_dqd1: &m_dqd1,
-                g_dg: &logb,
+                logslope_layout: &logslope_layout,
             },
             &row_hess,
             &row_grad,
@@ -857,6 +970,7 @@ mod tests {
         let dq1 = Array2::<f64>::zeros((n, 0));
         let dqd1 = Array2::<f64>::zeros((n, 0));
         let m_dqd1 = Array2::<f64>::zeros((n, p_marg));
+        let logslope_layout = shared_logslope_layout(logb);
         let row_hess = constant_row_hess(n, &coupled_q1_g_hessian());
         let row_grad = Array2::<f64>::zeros((n, K_SURVIVAL));
         // Zero penalty everywhere: every direction is penalty-null, yet the
@@ -870,7 +984,7 @@ mod tests {
                 dqd1: &dqd1,
                 m_dq: &marg,
                 m_dqd1: &m_dqd1,
-                g_dg: &logb,
+                logslope_layout: &logslope_layout,
             },
             &row_hess,
             &row_grad,
