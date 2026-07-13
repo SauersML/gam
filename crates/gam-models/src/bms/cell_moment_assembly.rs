@@ -2509,7 +2509,7 @@ impl BernoulliMarginalSlopeFamily {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi: Array2::zeros((0, 0)),
-            hessian_psi_psi_operator: Some(Box::new(acc.into_operator(&slices))),
+            hessian_psi_psi_operator: Some(Arc::new(acc.into_operator(&slices))),
         }))
     }
 
