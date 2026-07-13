@@ -1802,7 +1802,7 @@ impl SurvivalMarginalSlopeFamily {
                 self.n,
                 |range| -> Result<_, String> {
                     let mut acc = make_per_z_acc();
-                    let mut row_jet_arena = RigidVectorRowWorkspace::new(k)?;
+                    let mut row_jet_arena = RigidVectorRowWorkspace::new(&self.score_covariance)?;
                     let mut logslope_workspace = self.logslope_row_workspace()?;
                     for row in range {
                         let q0 = self.design_entry.dot_row(row, beta_time)
@@ -1828,7 +1828,6 @@ impl SurvivalMarginalSlopeFamily {
                             qd1,
                             logslope_workspace.values(),
                             z,
-                            &self.score_covariance,
                             self.weights[row],
                             self.event[row],
                             self.derivative_guard,
@@ -1948,7 +1947,7 @@ impl SurvivalMarginalSlopeFamily {
                 self.n,
                 |range| -> Result<_, String> {
                     let mut acc = make_per_z_joint_acc();
-                    let mut row_jet_arena = RigidVectorRowWorkspace::new(k)?;
+                    let mut row_jet_arena = RigidVectorRowWorkspace::new(&self.score_covariance)?;
                     let mut logslope_workspace = self.logslope_row_workspace()?;
                     let mut j = Array2::<f64>::zeros((dim, total));
                     for row in range {
@@ -1975,7 +1974,6 @@ impl SurvivalMarginalSlopeFamily {
                             qd1,
                             logslope_workspace.values(),
                             z,
-                            &self.score_covariance,
                             self.weights[row],
                             self.event[row],
                             self.derivative_guard,
