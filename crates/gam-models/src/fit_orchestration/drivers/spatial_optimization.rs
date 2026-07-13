@@ -8676,9 +8676,11 @@ pub fn smooth_term_lr_inference_forspec(
         let (statistic_lr, eta_null) = match null_fit {
             Ok(null) if null.fit.log_likelihood.is_finite() => {
                 let w = (2.0 * (ll_full - null.fit.log_likelihood)).max(0.0);
-                // η at the null fit: X_null β_null + offset (per-row linear
-                // predictor; design-layout independent — Lawley reads it on the
-                // full design rows).
+                // η at the null fit: X_null β_null + affine_offset + offset
+                // (per-row linear predictor; design-layout independent — Lawley
+                // reads it on the full design rows). `compose_offset` folds the
+                // design's fixed affine channel (non-zero endpoint anchor,
+                // #2297) into the user offset.
                 let null_offset = null
                     .design
                     .compose_offset(offset, "smooth likelihood-ratio null model")

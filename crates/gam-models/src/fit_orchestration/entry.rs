@@ -1401,6 +1401,10 @@ fn fit_expectile_laws(
                 ),
             });
         }
+        // `design.apply` already folds the design's fixed affine channel
+        // (non-zero endpoint anchor, #2297) into `X·β`, so only the user offset
+        // is added; adding `affine_offset` again would double-count the pin and
+        // bias every expectile working weight for an anchored smooth.
         let mut mu_off = mu;
         mu_off += offset.as_ref();
 
