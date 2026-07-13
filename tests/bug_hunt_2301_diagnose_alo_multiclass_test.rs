@@ -5,20 +5,15 @@
 //! The fix generalized the saved-model ALO core
 //! (`gam_predict::compute_saved_model_alo`) to dispatch location-scale
 //! (Gaussian / binomial / dispersion), Bernoulli marginal-slope, and
-//! transformation-normal fits through the shared parameter-aligned,
-//! saved-Hessian ALO machinery, and `gam diagnose` now calls that one
-//! dispatcher instead of duplicating a Standard-only replay. Survival is the
-//! one class that genuinely cannot reuse this machinery (leave-one-out for a
-//! risk-set likelihood needs typed event/time row replay, which does not
-//! exist yet), so it keeps a hard error — but the error must name the class
-//! and explain why, not just say "unavailable".
+//! transformation-normal and every survival likelihood through the shared
+//! parameter-aligned, saved-Hessian ALO machinery, and `gam diagnose` now calls
+//! that one dispatcher instead of duplicating a Standard-only replay.
 //!
 //! This test drives the real CLI (`gam fit` + `gam diagnose --alo`) on:
 //! 1. a Gaussian location-scale fit (`--predict-noise`) — must now SUCCEED
 //!    and print an ALO diagnostics table;
-//! 2. a survival fit (`Surv(...) ~ x`) — must still FAIL, but with a message
-//!    that names "survival" and explains the risk-set/event-replay reason,
-//!    not the old bare "unavailable in this binary" wording.
+//! 2. a survival fit (`Surv(...) ~ x`) — must also succeed through its typed
+//!    entry/exit/derivative replay and print the same ALO diagnostics contract.
 
 use std::path::Path;
 use std::process::Command;
@@ -37,7 +32,7 @@ fn write_csv(path: &Path, header: &[&str], rows: &[Vec<f64>]) {
 }
 
 #[test]
-fn diagnose_alo_supports_gaussian_location_scale_and_names_survival_reason_2301() {
+fn diagnose_alo_supports_location_scale_and_survival_2301() {
     let dir = tempfile::tempdir().expect("create tempdir");
 
     // --- Part 1: Gaussian location-scale fit gets real ALO diagnostics. ---
@@ -103,7 +98,7 @@ fn diagnose_alo_supports_gaussian_location_scale_and_names_survival_reason_2301(
         "location-scale diagnose must name its multicoordinate frame: {ls_stdout}"
     );
 
-    // --- Part 2: survival fit still fails, but with a named, explained error. ---
+    // --- Part 2: survival uses typed entry/exit/derivative row replay. ---
     let mut surv_rows = Vec::with_capacity(n);
     for _ in 0..n {
         let x = -1.5 + 3.0 * next();
@@ -139,21 +134,19 @@ fn diagnose_alo_supports_gaussian_location_scale_and_names_survival_reason_2301(
     let surv_output = diagnose_surv
         .output()
         .expect("spawn gam diagnose --alo (survival)");
+    let surv_stdout = String::from_utf8_lossy(&surv_output.stdout);
     let surv_stderr = String::from_utf8_lossy(&surv_output.stderr);
     assert!(
-        !surv_output.status.success(),
-        "survival ALO replay is not implemented yet and must still fail (#2301)"
+        surv_output.status.success(),
+        "diagnose --alo must succeed for a survival fit (#2301):\n\
+         --- stdout ---\n{surv_stdout}\n--- stderr ---\n{surv_stderr}"
     );
     assert!(
-        surv_stderr.to_lowercase().contains("survival"),
-        "survival diagnose error must name the class, not a bare 'unavailable': {surv_stderr}"
+        surv_stdout.contains("ALO diagnostics"),
+        "survival diagnose must print an ALO table: {surv_stdout}"
     );
     assert!(
-        surv_stderr.contains("risk-set") || surv_stderr.contains("event/time"),
-        "survival diagnose error must explain WHY (risk-set/event-time replay), not just fail silently: {surv_stderr}"
-    );
-    assert!(
-        !surv_stderr.contains("unavailable in this binary"),
-        "the old bare, unexplained error message must be gone: {surv_stderr}"
+        surv_stdout.contains("ALO coordinates"),
+        "survival diagnose must name its typed multicoordinate frame: {surv_stdout}"
     );
 }

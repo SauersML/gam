@@ -377,19 +377,31 @@ pub struct TimeBlockOperator {
     dq0: Array2<f64>,
     dq1: Array2<f64>,
     dqd1: Array2<f64>,
+    score_dim: usize,
 }
 
 impl TimeBlockOperator {
-    pub fn new(dq0: Array2<f64>, dq1: Array2<f64>, dqd1: Array2<f64>) -> Self {
+    pub fn new(
+        dq0: Array2<f64>,
+        dq1: Array2<f64>,
+        dqd1: Array2<f64>,
+        score_dim: usize,
+    ) -> Self {
         assert_eq!(dq0.dim(), dq1.dim());
         assert_eq!(dq0.dim(), dqd1.dim());
-        Self { dq0, dq1, dqd1 }
+        assert!(score_dim > 0);
+        Self {
+            dq0,
+            dq1,
+            dqd1,
+            score_dim,
+        }
     }
 }
 
 impl RowJacobianOperator for TimeBlockOperator {
     fn k(&self) -> usize {
-        K_SURVIVAL
+        3 + self.score_dim
     }
     fn ncols(&self) -> usize {
         self.dq0.ncols()
@@ -398,20 +410,20 @@ impl RowJacobianOperator for TimeBlockOperator {
         self.dq0.nrows()
     }
     fn apply_row(&self, row: usize, delta_beta: &[f64], out: &mut [f64]) {
-        assert_eq!(out.len(), K_SURVIVAL);
+        let k = self.k();
+        assert_eq!(out.len(), k);
         assert_eq!(delta_beta.len(), self.dq0.ncols());
-        let mut acc = [0.0_f64; K_SURVIVAL];
+        out.fill(0.0);
         for (j, &b) in delta_beta.iter().enumerate() {
-            acc[0] += self.dq0[[row, j]] * b;
-            acc[1] += self.dq1[[row, j]] * b;
-            acc[2] += self.dqd1[[row, j]] * b;
+            out[0] += self.dq0[[row, j]] * b;
+            out[1] += self.dq1[[row, j]] * b;
+            out[2] += self.dqd1[[row, j]] * b;
         }
-        out.copy_from_slice(&acc);
     }
     fn evaluate_full(&self) -> Array3<f64> {
         let n = self.dq0.nrows();
         let p = self.dq0.ncols();
-        let mut out = Array3::<f64>::zeros((n, p, K_SURVIVAL));
+        let mut out = Array3::<f64>::zeros((n, p, self.k()));
         for i in 0..n {
             for j in 0..p {
                 out[[i, j, 0]] = self.dq0[[i, j]];
@@ -429,7 +441,7 @@ impl RowJacobianOperator for TimeBlockOperator {
         // (#738: a capability is not a representation.)
         let n = self.dq0.nrows();
         let p = self.dq0.ncols();
-        scale_jacobian_by_sqrt_h_with(n, p, K_SURVIVAL, h_full, |i, a, c| match c {
+        scale_jacobian_by_sqrt_h_with(n, p, self.k(), h_full, |i, a, c| match c {
             0 => self.dq0[[i, a]],
             1 => self.dq1[[i, a]],
             2 => self.dqd1[[i, a]],
@@ -445,18 +457,24 @@ impl RowJacobianOperator for TimeBlockOperator {
 pub struct QChannelBlockOperator {
     dq: Array2<f64>,
     dqd1: Array2<f64>,
+    score_dim: usize,
 }
 
 impl QChannelBlockOperator {
-    pub fn new(dq: Array2<f64>, dqd1: Array2<f64>) -> Self {
+    pub fn new(dq: Array2<f64>, dqd1: Array2<f64>, score_dim: usize) -> Self {
         assert_eq!(dq.dim(), dqd1.dim());
-        Self { dq, dqd1 }
+        assert!(score_dim > 0);
+        Self {
+            dq,
+            dqd1,
+            score_dim,
+        }
     }
 }
 
 impl RowJacobianOperator for QChannelBlockOperator {
     fn k(&self) -> usize {
-        K_SURVIVAL
+        3 + self.score_dim
     }
     fn ncols(&self) -> usize {
         self.dq.ncols()
@@ -465,7 +483,7 @@ impl RowJacobianOperator for QChannelBlockOperator {
         self.dq.nrows()
     }
     fn apply_row(&self, row: usize, delta_beta: &[f64], out: &mut [f64]) {
-        assert_eq!(out.len(), K_SURVIVAL);
+        assert_eq!(out.len(), self.k());
         assert_eq!(delta_beta.len(), self.dq.ncols());
         let mut dq_acc = 0.0;
         let mut dqd_acc = 0.0;
@@ -476,12 +494,12 @@ impl RowJacobianOperator for QChannelBlockOperator {
         out[0] = dq_acc;
         out[1] = dq_acc;
         out[2] = dqd_acc;
-        out[3] = 0.0;
+        out[3..].fill(0.0);
     }
     fn evaluate_full(&self) -> Array3<f64> {
         let n = self.dq.nrows();
         let p = self.dq.ncols();
-        let mut out = Array3::<f64>::zeros((n, p, K_SURVIVAL));
+        let mut out = Array3::<f64>::zeros((n, p, self.k()));
         for i in 0..n {
             for j in 0..p {
                 let v = self.dq[[i, j]];
@@ -498,7 +516,7 @@ impl RowJacobianOperator for QChannelBlockOperator {
         // dense `(n, p, K)` tensor `evaluate_full()` would build. (#738.)
         let n = self.dq.nrows();
         let p = self.dq.ncols();
-        scale_jacobian_by_sqrt_h_with(n, p, K_SURVIVAL, h_full, |i, a, c| match c {
+        scale_jacobian_by_sqrt_h_with(n, p, self.k(), h_full, |i, a, c| match c {
             0 | 1 => self.dq[[i, a]],
             2 => self.dqd1[[i, a]],
             _ => 0.0,
@@ -506,61 +524,153 @@ impl RowJacobianOperator for QChannelBlockOperator {
     }
 }
 
-/// Row Jacobian operator for the survival logslope block: contribution
-/// lives entirely on the g channel.
+/// Row Jacobian operator for the survival log-slope block. The canonical
+/// [`crate::survival::marginal_slope::LogslopeLayout`] emits one physical
+/// channel row per score coordinate; this operator lifts those rows into
+/// primary channels `3..3+K` without storing an `n × p × K` tensor.
 pub struct LogslopeBlockOperator {
-    dg: Array2<f64>,
+    layout: crate::survival::marginal_slope::LogslopeLayout,
+    score_dim: usize,
+    columns: std::ops::Range<usize>,
 }
 
 impl LogslopeBlockOperator {
-    pub fn new(dg: Array2<f64>) -> Self {
-        Self { dg }
+    pub fn new(
+        layout: crate::survival::marginal_slope::LogslopeLayout,
+        score_dim: usize,
+    ) -> Result<Self, String> {
+        let width = layout.coefficient_design().ncols();
+        Self::restricted(layout, score_dim, 0..width)
+    }
+
+    fn restricted(
+        layout: crate::survival::marginal_slope::LogslopeLayout,
+        score_dim: usize,
+        columns: std::ops::Range<usize>,
+    ) -> Result<Self, String> {
+        layout.validate_for(score_dim)?;
+        let width = layout.coefficient_design().ncols();
+        if columns.end < columns.start || columns.end > width {
+            return Err(format!(
+                "logslope identifiability operator column range {:?} is outside 0..{width}",
+                columns,
+            ));
+        }
+        Ok(Self {
+            layout,
+            score_dim,
+            columns,
+        })
+    }
+
+    fn fill_physical_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        out: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        self.layout.fill_primary_jacobian_rows(
+            self.score_dim,
+            rows,
+            self.columns.clone(),
+            out,
+        )
     }
 }
 
 impl RowJacobianOperator for LogslopeBlockOperator {
     fn k(&self) -> usize {
-        K_SURVIVAL
+        3 + self.score_dim
     }
     fn ncols(&self) -> usize {
-        self.dg.ncols()
+        self.columns.len()
     }
     fn nrows(&self) -> usize {
-        self.dg.nrows()
+        self.layout.coefficient_design().nrows()
     }
     fn apply_row(&self, row: usize, delta_beta: &[f64], out: &mut [f64]) {
-        assert_eq!(out.len(), K_SURVIVAL);
-        assert_eq!(delta_beta.len(), self.dg.ncols());
-        let mut acc = 0.0;
-        for (j, &b) in delta_beta.iter().enumerate() {
-            acc += self.dg[[row, j]] * b;
+        assert_eq!(out.len(), self.k());
+        assert_eq!(delta_beta.len(), self.ncols());
+        let mut physical = Array2::<f64>::zeros((self.score_dim, self.ncols()));
+        self.fill_physical_rows(row..row + 1, &mut physical)
+            .expect("validated logslope layout must emit its requested row");
+        out.fill(0.0);
+        for channel in 0..self.score_dim {
+            for (column, &coefficient) in delta_beta.iter().enumerate() {
+                out[3 + channel] += physical[[channel, column]] * coefficient;
+            }
         }
-        out[0] = 0.0;
-        out[1] = 0.0;
-        out[2] = 0.0;
-        out[3] = acc;
     }
     fn evaluate_full(&self) -> Array3<f64> {
-        let n = self.dg.nrows();
-        let p = self.dg.ncols();
-        let mut out = Array3::<f64>::zeros((n, p, K_SURVIVAL));
+        let n = self.nrows();
+        let p = self.ncols();
+        let mut physical = Array2::<f64>::zeros((n * self.score_dim, p));
+        self.fill_physical_rows(0..n, &mut physical)
+            .expect("validated logslope layout must emit all rows");
+        let mut out = Array3::<f64>::zeros((n, p, self.k()));
         for i in 0..n {
             for j in 0..p {
-                out[[i, j, 3]] = self.dg[[i, j]];
+                for channel in 0..self.score_dim {
+                    out[[i, j, 3 + channel]] = physical[[i * self.score_dim + channel, j]];
+                }
             }
         }
         out
     }
     fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
-        // The logslope contribution lives entirely on the g channel (3); the
-        // other three channels are identically zero. Scale directly from the
-        // compact `(n, p)` design, skipping the mostly-zero dense `(n, p, K)`
-        // tensor `evaluate_full()` would build. (#738.)
-        let n = self.dg.nrows();
-        let p = self.dg.ncols();
-        scale_jacobian_by_sqrt_h_with(n, p, K_SURVIVAL, h_full, |i, a, c| {
-            if c == 3 { self.dg[[i, a]] } else { 0.0 }
-        })
+        const ROW_CHUNK: usize = 256;
+        let n = self.nrows();
+        let p = self.ncols();
+        let primary_width = self.k();
+        assert_eq!(h_full.shape(), &[n, primary_width, primary_width]);
+        let mut out = Array2::<f64>::zeros((n * primary_width, p));
+        for start in (0..n).step_by(ROW_CHUNK) {
+            let end = (start + ROW_CHUNK).min(n);
+            let chunk = end - start;
+            let mut physical = Array2::<f64>::zeros((chunk * self.score_dim, p));
+            self.fill_physical_rows(start..end, &mut physical)
+                .expect("validated logslope layout must emit compiler rows");
+            let h_chunk = h_full.slice(s![start..end, .., ..]).to_owned();
+            let scaled = scale_jacobian_by_sqrt_h_with(
+                chunk,
+                p,
+                primary_width,
+                &h_chunk,
+                |local_row, column, channel| {
+                    if channel < 3 {
+                        0.0
+                    } else {
+                        physical[[
+                            local_row * self.score_dim + channel - 3,
+                            column,
+                        ]]
+                    }
+                },
+            );
+            out.slice_mut(s![start * primary_width..end * primary_width, ..])
+                .assign(&scaled);
+        }
+        out
+    }
+
+    fn channel_flattened_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        out: &mut Array2<f64>,
+    ) {
+        let start = rows.start.min(self.nrows());
+        let end = rows.end.min(self.nrows());
+        let chunk = end - start;
+        assert_eq!(out.dim(), (chunk * self.k(), self.ncols()));
+        out.fill(0.0);
+        let mut physical = Array2::<f64>::zeros((chunk * self.score_dim, self.ncols()));
+        self.fill_physical_rows(start..end, &mut physical)
+            .expect("validated logslope layout must emit audit rows");
+        for local_row in 0..chunk {
+            for channel in 0..self.score_dim {
+                out.row_mut(local_row * self.k() + 3 + channel)
+                    .assign(&physical.row(local_row * self.score_dim + channel));
+            }
+        }
     }
 }
 
@@ -674,7 +784,7 @@ pub fn compile_survival_parametric_designs_per_term(
     marginal_dq: Array2<f64>,
     marginal_dqd1: Array2<f64>,
     marginal_partition: &[std::ops::Range<usize>],
-    logslope_dg: Array2<f64>,
+    logslope_layout: crate::survival::marginal_slope::LogslopeLayout,
     logslope_partition: &[std::ops::Range<usize>],
     row_hess: &dyn RowHessian,
     protect_time: bool,
@@ -683,7 +793,17 @@ pub fn compile_survival_parametric_designs_per_term(
 
     let p_time = time_dq0.ncols();
     let p_marg = marginal_dq.ncols();
-    let p_log = logslope_dg.ncols();
+    let score_dim = row_hess.k().checked_sub(3).ok_or_else(|| {
+        format!(
+            "per-term compile row Hessian width {} is smaller than the three q channels",
+            row_hess.k()
+        )
+    })?;
+    if score_dim == 0 {
+        return Err("per-term compile requires at least one score channel".to_string());
+    }
+    logslope_layout.validate_for(score_dim)?;
+    let p_log = logslope_layout.coefficient_design().ncols();
     validate_partition(time_partition, p_time, "time")?;
     validate_partition(marginal_partition, p_marg, "marginal")?;
     validate_partition(logslope_partition, p_log, "logslope")?;
@@ -697,7 +817,9 @@ pub fn compile_survival_parametric_designs_per_term(
         let dq0 = time_dq0.slice(ndarray::s![.., range.clone()]).to_owned();
         let dq1 = time_dq1.slice(ndarray::s![.., range.clone()]).to_owned();
         let dqd1 = time_dqd1.slice(ndarray::s![.., range.clone()]).to_owned();
-        operators.push(Arc::new(TimeBlockOperator::new(dq0, dq1, dqd1)));
+        operators.push(Arc::new(TimeBlockOperator::new(
+            dq0, dq1, dqd1, score_dim,
+        )));
         ordering.push(BlockOrder::Time);
     }
     for range in marginal_partition {
@@ -705,12 +827,17 @@ pub fn compile_survival_parametric_designs_per_term(
         let dqd1 = marginal_dqd1
             .slice(ndarray::s![.., range.clone()])
             .to_owned();
-        operators.push(Arc::new(QChannelBlockOperator::new(dq, dqd1)));
+        operators.push(Arc::new(QChannelBlockOperator::new(
+            dq, dqd1, score_dim,
+        )));
         ordering.push(BlockOrder::Marginal);
     }
     for range in logslope_partition {
-        let dg = logslope_dg.slice(ndarray::s![.., range.clone()]).to_owned();
-        operators.push(Arc::new(LogslopeBlockOperator::new(dg)));
+        operators.push(Arc::new(LogslopeBlockOperator::restricted(
+            logslope_layout.clone(),
+            score_dim,
+            range.clone(),
+        )?));
         ordering.push(BlockOrder::Logslope);
     }
 
@@ -1014,80 +1141,61 @@ pub fn compiled_map_from_per_term(
 /// Schur Gram), keeping every surviving logslope direction. The result is
 /// full-rank `M` BY CONSTRUCTION — no runtime projection needed.
 ///
-/// # The metric collapse to scalar weights
-///
-/// At the pilot the marginal design feeds the primary channels `(q0, q1)`
-/// identically (`∂q0/∂β_m = ∂q1/∂β_m = m`, and `∂qd1/∂β_m = 0` because the
-/// `#808` fallback always builds a zero marginal-derivative design) and the
-/// logslope design feeds only `g` (`∂g/∂β_s = g_dg`). With the per-row PSD 4×4
-/// Hessian `H` in channel order `(q0, q1, qd1, g)` and `H[0,1] = 0` (q0 and q1
-/// enter the disjoint outputs η0, η1), the combined effective Gram
-/// `[[A, Bᵀ], [B, C]] = J_combinedᵀ H J_combined` (PSD per row) collapses to
-/// scalar-weighted Grams of the raw block designs:
+/// The metric is assembled from the true vector operators:
 ///
 /// ```text
-///     w_mm = H00 + H11           (marginal self weight, ≥ 0)
-///     w_mg = H03 + H13           (marginal↔logslope cross weight)
-///     w_gg = H33                 (logslope self weight, ≥ 0)
-///     A = m_dqᵀ diag(w_mm) m_dq + εI     (p_m × p_m)
-///     B = m_dqᵀ diag(w_mg) g_dg          (p_m × p_log)
-///     C = g_dgᵀ diag(w_gg) g_dg          (p_log × p_log)
+///     W_m = stack_i sqrt(H_i) J_m,i
+///     W_g = stack_i sqrt(H_i) J_g,i
+///     A = W_mᵀ W_m + εI
+///     B = W_mᵀ W_g
+///     C = W_gᵀ W_g
 ///     Gtt = C − Bᵀ A⁻¹ B                 (p_log × p_log, PSD Schur complement)
 /// ```
 ///
-/// `T` is the orthonormal eigenbasis of `Gtt` for eigenvalues above a tolerance
-/// relative to the effective logslope energy scale (single-sourced from the BMS
-/// reference cut). Returns `Ok(None)` when there is nothing to reduce
-/// (`r == p_log`) or the entire effective logslope image collapses into the
-/// marginal span (`r == 0`); in both cases the caller keeps its existing path.
-///
-/// Precondition: `marginal_dq`'s derivative-into-qd1 contribution is zero (the
-/// `#808` fallback constructs `m_dqd1` as an all-zero matrix), so marginal
-/// touches only `(q0, q1)` and the scalar collapse above is exact.
+/// This remains exact for shared and per-score layouts, arbitrary score
+/// covariance, and coefficient transforms that mix raw physical channels.
 pub(crate) fn survival_reduced_logslope_transform_effective(
     marginal_dq: ndarray::ArrayView2<'_, f64>,
-    logslope_dg: ndarray::ArrayView2<'_, f64>,
+    logslope_layout: &crate::survival::marginal_slope::LogslopeLayout,
     row_hess: &SurvivalRowHessian,
 ) -> Result<crate::bms::block_specs::ReducedLogslopeOutcome, String> {
     use crate::bms::block_specs::{LOGSLOPE_REDUCED_BASIS_RELATIVE_TOL, ReducedLogslopeOutcome};
-    use gam_linalg::faer_ndarray::{
-        FaerArrayView, factorize_symmetricwith_fallback, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
-    };
+    use gam_linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback, fast_atb};
 
     let n = marginal_dq.nrows();
     let p_m = marginal_dq.ncols();
-    let p_log = logslope_dg.ncols();
+    let score_dim = row_hess.k().checked_sub(3).ok_or_else(|| {
+        "survival reduced logslope row Hessian omits required q channels".to_string()
+    })?;
+    if score_dim == 0 {
+        return Err("survival reduced logslope requires at least one score channel".to_string());
+    }
+    logslope_layout.validate_for(score_dim)?;
+    let p_log = logslope_layout.coefficient_design().ncols();
     if p_m == 0 || p_log == 0 {
         return Ok(ReducedLogslopeOutcome::FullRank);
     }
-    if logslope_dg.nrows() != n || row_hess.h.shape()[0] != n {
+    if logslope_layout.coefficient_design().nrows() != n || row_hess.h.shape()[0] != n {
         return Err(format!(
             "survival reduced logslope: row mismatch marginal={n}, logslope={}, row_hess={}",
-            logslope_dg.nrows(),
+            logslope_layout.coefficient_design().nrows(),
             row_hess.h.shape()[0],
         ));
     }
 
-    // Scalar effective weights from the per-row 4×4 PSD Hessian, channel order
-    // (q0, q1, qd1, g). Marginal → {q0, q1} (identical column m), logslope → {g}.
-    let mut w_mm = Array1::<f64>::zeros(n);
-    let mut w_mg = Array1::<f64>::zeros(n);
-    let mut w_gg = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        w_mm[i] = row_hess.h[[i, 0, 0]] + row_hess.h[[i, 1, 1]];
-        w_mg[i] = row_hess.h[[i, 0, 3]] + row_hess.h[[i, 1, 3]];
-        w_gg[i] = row_hess.h[[i, 3, 3]];
-        if !(w_mm[i].is_finite() && w_mg[i].is_finite() && w_gg[i].is_finite()) {
-            return Err("survival reduced logslope: non-finite row Hessian weight".to_string());
-        }
-    }
-
     let marg = marginal_dq.to_owned();
-    let log = logslope_dg.to_owned();
+    let marginal_operator = QChannelBlockOperator::new(
+        marg.clone(),
+        Array2::<f64>::zeros(marg.dim()),
+        score_dim,
+    );
+    let logslope_operator = LogslopeBlockOperator::new(logslope_layout.clone(), score_dim)?;
+    let marginal_scaled = marginal_operator.scaled_design_by_sqrt_h(&row_hess.h);
+    let logslope_scaled = logslope_operator.scaled_design_by_sqrt_h(&row_hess.h);
 
     // C = G_effᵀ W G_eff (raw-coordinate effective logslope Gram); its diagonal
     // sets the energy scale for the relative kept-direction tolerance.
-    let c_gram = fast_xt_diag_x(&log, &w_gg);
+    let c_gram = fast_atb(&logslope_scaled, &logslope_scaled);
     let energy_scale = (0..p_log).map(|i| c_gram[[i, i]]).fold(0.0_f64, f64::max);
     if !energy_scale.is_finite() {
         return Err(
@@ -1103,7 +1211,7 @@ pub(crate) fn survival_reduced_logslope_transform_effective(
     // A = M_effᵀ W M_eff + εI (ridge relative to the marginal effective energy
     // so the Schur solve is well-posed even when the marginal pilot Gram is
     // rank-soft; the ridge only under-removes, i.e. is conservative).
-    let mut a_gram = fast_xt_diag_x(&marg, &w_mm);
+    let mut a_gram = fast_atb(&marginal_scaled, &marginal_scaled);
     let a_scale = (0..p_m).map(|i| a_gram[[i, i]]).fold(0.0_f64, f64::max);
     let a_ridge = (a_scale * LOGSLOPE_REDUCED_BASIS_RELATIVE_TOL).max(f64::EPSILON);
     for i in 0..p_m {
@@ -1111,7 +1219,7 @@ pub(crate) fn survival_reduced_logslope_transform_effective(
     }
 
     // B = M_effᵀ W G_eff (p_m × p_log);  Gtt = C − Bᵀ A⁻¹ B (p_log × p_log, PSD).
-    let b_cross = fast_xt_diag_y(&marg, &w_mg, &log);
+    let b_cross = fast_atb(&marginal_scaled, &logslope_scaled);
     let a_view = FaerArrayView::new(&a_gram);
     let a_factor = factorize_symmetricwith_fallback(a_view.as_ref(), Side::Lower).map_err(|e| {
         format!("survival reduced logslope: marginal effective Gram factorization failed: {e}")
@@ -1474,14 +1582,26 @@ pub fn compile_survival_parametric_designs(
     time_dqd1: Array2<f64>,
     marginal_dq: Array2<f64>,
     marginal_dqd1: Array2<f64>,
-    logslope_dg: Array2<f64>,
+    logslope_layout: crate::survival::marginal_slope::LogslopeLayout,
     row_hess: &dyn RowHessian,
 ) -> Result<SurvivalParametricCompiled, String> {
     use gam_identifiability::families::compiler::compile;
 
     let p_time_raw = time_dq0.ncols();
     let p_marg_raw = marginal_dq.ncols();
-    let p_log_raw = logslope_dg.ncols();
+    let score_dim = row_hess.k().checked_sub(3).ok_or_else(|| {
+        format!(
+            "compile_survival_parametric_designs row Hessian width {} is smaller than the three q channels",
+            row_hess.k()
+        )
+    })?;
+    if score_dim == 0 {
+        return Err(
+            "compile_survival_parametric_designs requires at least one score channel".to_string(),
+        );
+    }
+    logslope_layout.validate_for(score_dim)?;
+    let p_log_raw = logslope_layout.coefficient_design().ncols();
 
     let inputs = build_survival_compiler_inputs(
         time_dq0,
@@ -1489,10 +1609,11 @@ pub fn compile_survival_parametric_designs(
         time_dqd1,
         marginal_dq,
         marginal_dqd1,
-        logslope_dg,
+        logslope_layout,
+        score_dim,
         None,
         None,
-    );
+    )?;
     if inputs.operators.len() != 3 {
         return Err(format!(
             "compile_survival_parametric_designs: expected exactly 3 parametric operators \
@@ -1541,40 +1662,56 @@ pub fn build_survival_compiler_inputs(
     time_dqd1: Array2<f64>,
     marginal_dq: Array2<f64>,
     marginal_dqd1: Array2<f64>,
-    logslope_dg: Array2<f64>,
+    logslope_layout: crate::survival::marginal_slope::LogslopeLayout,
+    score_dim: usize,
     score_warp_dq_dqd1: Option<(Array2<f64>, Array2<f64>)>,
     link_dev_dq_dqd1: Option<(Array2<f64>, Array2<f64>)>,
-) -> SurvivalCompilerInputs {
+) -> Result<SurvivalCompilerInputs, String> {
+    if score_dim == 0 {
+        return Err("survival compiler inputs require at least one score channel".to_string());
+    }
+    logslope_layout.validate_for(score_dim)?;
     let mut operators: Vec<Arc<dyn RowJacobianOperator>> = Vec::with_capacity(5);
     let mut ordering: Vec<BlockOrder> = Vec::with_capacity(5);
 
     operators.push(Arc::new(TimeBlockOperator::new(
-        time_dq0, time_dq1, time_dqd1,
+        time_dq0,
+        time_dq1,
+        time_dqd1,
+        score_dim,
     )));
     ordering.push(BlockOrder::Time);
 
     operators.push(Arc::new(QChannelBlockOperator::new(
         marginal_dq,
         marginal_dqd1,
+        score_dim,
     )));
     ordering.push(BlockOrder::Marginal);
 
-    operators.push(Arc::new(LogslopeBlockOperator::new(logslope_dg)));
+    operators.push(Arc::new(LogslopeBlockOperator::new(
+        logslope_layout,
+        score_dim,
+    )?));
     ordering.push(BlockOrder::Logslope);
 
     if let Some((dq, dqd1)) = score_warp_dq_dqd1 {
-        operators.push(Arc::new(QChannelBlockOperator::new(dq, dqd1)));
+        operators.push(Arc::new(QChannelBlockOperator::new(
+            dq, dqd1, score_dim,
+        )));
         ordering.push(BlockOrder::ScoreWarp);
     }
     if let Some((dq, dqd1)) = link_dev_dq_dqd1 {
-        operators.push(Arc::new(QChannelBlockOperator::new(dq, dqd1)));
+        operators.push(Arc::new(QChannelBlockOperator::new(
+            dq, dqd1, score_dim,
+        )));
         ordering.push(BlockOrder::LinkDev);
     }
 
-    SurvivalCompilerInputs {
+    Ok(SurvivalCompilerInputs {
         operators,
         ordering,
-    }
+    })
 }
 
 /// V+M-exact compiled designs + per-block penalties for the survival
@@ -1619,6 +1756,18 @@ pub struct CompiledSurvivalDesignsVMExact {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use gam_problem::Gauge;
+    use ndarray::array;
+
+    const K_SURVIVAL: usize = 4;
+
+    fn shared_logslope_layout(design: Array2<f64>) -> LogslopeLayout {
+        let n = design.nrows();
+        LogslopeTopology::shared()
+            .materialize_identity(DesignMatrix::from(design), &Array1::<f64>::zeros(n))
+            .unwrap()
+    }
 
     /// Construct a synthetic tensor-backed `SurvivalRowHessian` for the unit
     /// tests below. Production instances must retain their real row data so a
@@ -1632,12 +1781,12 @@ mod tests {
             h,
             weights: Array1::ones(n),
             event: Array1::ones(n),
+            z: Array2::zeros((n, 1)),
+            covariance: crate::bms::MarginalSlopeCovariance::Diagonal(array![1.0]),
             derivative_guard:
                 crate::survival::marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
         }
     }
-    use super::*;
-    use gam_problem::Gauge;
 
     #[test]
     fn psd_clamp_zeros_negative_eigenvalues() {
@@ -1651,7 +1800,7 @@ mod tests {
         m[[1, 1]] = -1.0;
         m[[2, 2]] = 0.5;
         m[[3, 3]] = -0.25;
-        let clamped = psd_clamp_4x4(&m).expect("finite 4x4 eigendecomposition must succeed");
+        let clamped = psd_clamp(&m).expect("finite 4x4 eigendecomposition must succeed");
         assert!((clamped[[0, 0]] - 2.0).abs() < 1e-12);
         assert!(clamped[[1, 1]].abs() < 1e-12);
         assert!((clamped[[2, 2]] - 0.5).abs() < 1e-12);
@@ -1665,7 +1814,7 @@ mod tests {
         let dq0 = Array2::from_shape_fn((n, p), |(i, j)| (i + j) as f64);
         let dq1 = Array2::from_shape_fn((n, p), |(i, j)| (i as f64) * 2.0 + j as f64);
         let dqd1 = Array2::from_shape_fn((n, p), |(i, j)| 0.5 * ((i * j) as f64));
-        let op = TimeBlockOperator::new(dq0.clone(), dq1.clone(), dqd1.clone());
+        let op = TimeBlockOperator::new(dq0.clone(), dq1.clone(), dqd1.clone(), 1);
         let full = op.evaluate_full();
         assert_eq!(full.shape(), &[n, p, K_SURVIVAL]);
         for i in 0..n {
@@ -1684,7 +1833,7 @@ mod tests {
         let p = 2;
         let dq = Array2::from_shape_fn((n, p), |(i, j)| (i as f64) * (j as f64 + 1.0));
         let dqd1 = Array2::from_shape_fn((n, p), |(i, j)| (j as f64) - (i as f64));
-        let op = QChannelBlockOperator::new(dq.clone(), dqd1.clone());
+        let op = QChannelBlockOperator::new(dq.clone(), dqd1.clone(), 1);
         let mut out = [0.0_f64; K_SURVIVAL];
         let delta = [1.0_f64, -0.5];
         op.apply_row(3, &delta, &mut out);
@@ -1701,7 +1850,7 @@ mod tests {
         let n = 4;
         let p = 2;
         let dg = Array2::from_shape_fn((n, p), |(i, j)| (i as f64) + 0.1 * (j as f64));
-        let op = LogslopeBlockOperator::new(dg.clone());
+        let op = LogslopeBlockOperator::new(shared_logslope_layout(dg.clone()), 1).unwrap();
         let mut out = [0.0_f64; K_SURVIVAL];
         let delta = [2.0_f64, -1.0];
         op.apply_row(1, &delta, &mut out);

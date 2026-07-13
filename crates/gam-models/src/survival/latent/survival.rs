@@ -4497,6 +4497,298 @@ fn binary_from_log_survival_through_fourth(
     Ok((base, outer_scale_prime, -ell_pppp))
 }
 
+/// Fitted frailty-scale coordinate used by exact saved latent-survival ALO.
+///
+/// A fixed scale is likelihood metadata and therefore contributes no fitted
+/// coordinate. A learned scale is represented by the exact raw `log_sigma`
+/// coefficient consumed by the fitter; replay evaluates `sigma = exp(eta)`
+/// inside the same primary row program.
+#[derive(Clone, Copy, Debug)]
+pub enum LatentSurvivalAloSigma {
+    Fixed(f64),
+    LearnedLogScale(f64),
+}
+
+/// One saved latent-survival row in the fitter's affine primary coordinates.
+pub struct LatentSurvivalAloRowInput<'a> {
+    pub quadrature: &'a QuadratureContext,
+    pub hazard_loading: HazardLoading,
+    pub event_code: u8,
+    pub prior_weight: f64,
+    pub q_entry: f64,
+    pub q_exit: f64,
+    pub qdot_exit: f64,
+    pub q_right: f64,
+    pub mu: f64,
+    pub sigma: LatentSurvivalAloSigma,
+    pub unloaded_mass_entry: f64,
+    pub unloaded_mass_exit: f64,
+    pub unloaded_mass_right: f64,
+    pub unloaded_hazard_exit: f64,
+}
+
+/// One saved latent-binary row in its three live affine coordinates
+/// `[q_entry, q_exit, mu]`.
+pub struct LatentBinaryAloRowInput<'a> {
+    pub quadrature: &'a QuadratureContext,
+    pub hazard_loading: HazardLoading,
+    pub event: u8,
+    pub prior_weight: f64,
+    pub q_entry: f64,
+    pub q_exit: f64,
+    pub mu: f64,
+    pub sigma: f64,
+    pub unloaded_mass_entry: f64,
+    pub unloaded_mass_exit: f64,
+}
+
+/// Exact NLL row geometry returned by the saved latent-window replay seam.
+pub struct LatentWindowAloRowGeometry {
+    pub nll_score: Array1<f64>,
+    pub observed_hessian: Array2<f64>,
+    pub coordinate_values: Array1<f64>,
+}
+
+fn validate_saved_alo_weight(weight: f64, context: &str) -> Result<(), String> {
+    if weight.is_finite() && weight >= 0.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context} prior weight must be finite and non-negative, got {weight}"
+        ))
+    }
+}
+
+fn checked_saved_alo_scale_vector(
+    values: Array1<f64>,
+    scale: f64,
+    context: &str,
+) -> Result<Array1<f64>, String> {
+    let mut out = Array1::<f64>::zeros(values.len());
+    for (axis, value) in values.into_iter().enumerate() {
+        let product = scale * value;
+        if !product.is_finite() || (scale != 0.0 && value != 0.0 && product == 0.0) {
+            return Err(format!(
+                "{context}[{axis}] is not representable: {scale:?} * {value:?}"
+            ));
+        }
+        out[axis] = product;
+    }
+    Ok(out)
+}
+
+fn checked_saved_alo_scale_matrix(
+    values: Array2<f64>,
+    scale: f64,
+    context: &str,
+) -> Result<Array2<f64>, String> {
+    let mut out = Array2::<f64>::zeros(values.dim());
+    for ((row, column), value) in values.indexed_iter() {
+        let product = scale * value;
+        if !product.is_finite() || (scale != 0.0 && *value != 0.0 && product == 0.0) {
+            return Err(format!(
+                "{context}[{row},{column}] is not representable: {scale:?} * {value:?}"
+            ));
+        }
+        out[[row, column]] = product;
+    }
+    Ok(out)
+}
+
+/// Replay one saved latent-survival likelihood row through the exact fitting
+/// program.
+///
+/// Coordinates are `[q_entry, q_exit, qdot_exit, q_right, mu]` followed by
+/// `log_sigma` only when that scale was learned. The primary authority returns
+/// log-likelihood score and negative log-likelihood Hessian; this boundary
+/// applies the row weight and flips only the score to the NLL convention.
+pub fn latent_survival_alo_row_geometry(
+    input: LatentSurvivalAloRowInput<'_>,
+) -> Result<LatentWindowAloRowGeometry, String> {
+    validate_saved_alo_weight(input.prior_weight, "latent-survival ALO")?;
+    let mut coordinate_values = vec![
+        input.q_entry,
+        input.q_exit,
+        input.qdot_exit,
+        input.q_right,
+        input.mu,
+    ];
+    let (sigma, include_log_sigma) = match input.sigma {
+        LatentSurvivalAloSigma::Fixed(sigma) => (sigma, false),
+        LatentSurvivalAloSigma::LearnedLogScale(log_sigma) => {
+            coordinate_values.push(log_sigma);
+            (log_sigma.exp(), true)
+        }
+    };
+    let coordinate_values = Array1::from_vec(coordinate_values);
+    let dimension = coordinate_values.len();
+    if input.prior_weight == 0.0 {
+        return Ok(LatentWindowAloRowGeometry {
+            nll_score: Array1::zeros(dimension),
+            observed_hessian: Array2::zeros((dimension, dimension)),
+            coordinate_values,
+        });
+    }
+    if !matches!(input.event_code, 0 | 1 | LATENT_SURVIVAL_EVENT_INTERVAL) {
+        return Err(format!(
+            "latent-survival ALO event code must be 0, 1, or the interval sentinel {LATENT_SURVIVAL_EVENT_INTERVAL}, got {}",
+            input.event_code
+        ));
+    }
+    if !sigma.is_finite()
+        || sigma < 0.0
+        || (include_log_sigma && (sigma == 0.0 || !coordinate_values[5].is_finite()))
+    {
+        return Err(format!(
+            "latent-survival ALO frailty scale is invalid: sigma={sigma:?}, learned={include_log_sigma}"
+        ));
+    }
+    if coordinate_values.iter().any(|value| !value.is_finite()) {
+        return Err("latent-survival ALO affine coordinates must be finite".to_string());
+    }
+    let event_type = latent_survival_event_type_for(input.event_code);
+    let row = build_latent_survival_row(
+        0,
+        input.hazard_loading,
+        event_type,
+        input.q_entry,
+        input.q_exit,
+        input.qdot_exit,
+        input.q_right,
+        input.unloaded_mass_entry,
+        input.unloaded_mass_exit,
+        input.unloaded_mass_right,
+        input.unloaded_hazard_exit,
+    )
+    .map_err(String::from)?;
+    let (_, log_likelihood_score, negative_log_likelihood_hessian) =
+        latent_survival_row_primary_gradient_hessian(
+            input.quadrature,
+            &row,
+            LatentSurvivalPrimaryPoint {
+                q_entry: input.q_entry,
+                q_exit: input.q_exit,
+                qdot_exit: input.qdot_exit,
+                q_right: input.q_right,
+                mu: input.mu,
+                sigma,
+            },
+            include_log_sigma,
+        )?;
+    let nll_score = checked_saved_alo_scale_vector(
+        log_likelihood_score.slice(s![0..dimension]).to_owned(),
+        -input.prior_weight,
+        "latent-survival ALO NLL score",
+    )?;
+    let observed_hessian = checked_saved_alo_scale_matrix(
+        negative_log_likelihood_hessian
+            .slice(s![0..dimension, 0..dimension])
+            .to_owned(),
+        input.prior_weight,
+        "latent-survival ALO observed Hessian",
+    )?;
+    Ok(LatentWindowAloRowGeometry {
+        nll_score,
+        observed_hessian,
+        coordinate_values,
+    })
+}
+
+/// Replay one saved latent-binary row through the exact right-censored latent
+/// survival authority and the fitter's analytic binary-from-log-survival
+/// chain. `W` is the observed NLL Hessian; the score outer product remains a
+/// separate downstream ALO covariance channel.
+pub fn latent_binary_alo_row_geometry(
+    input: LatentBinaryAloRowInput<'_>,
+) -> Result<LatentWindowAloRowGeometry, String> {
+    validate_saved_alo_weight(input.prior_weight, "latent-binary ALO")?;
+    let coordinate_values = Array1::from_vec(vec![input.q_entry, input.q_exit, input.mu]);
+    const DIMENSION: usize = 3;
+    if input.prior_weight == 0.0 {
+        return Ok(LatentWindowAloRowGeometry {
+            nll_score: Array1::zeros(DIMENSION),
+            observed_hessian: Array2::zeros((DIMENSION, DIMENSION)),
+            coordinate_values,
+        });
+    }
+    if input.event > 1 {
+        return Err(format!(
+            "latent-binary ALO event must be 0 or 1, got {}",
+            input.event
+        ));
+    }
+    if !input.sigma.is_finite() || input.sigma < 0.0 {
+        return Err(format!(
+            "latent-binary ALO frailty sigma must be finite and non-negative, got {:?}",
+            input.sigma
+        ));
+    }
+    if coordinate_values.iter().any(|value| !value.is_finite()) {
+        return Err("latent-binary ALO affine coordinates must be finite".to_string());
+    }
+    let row = build_latent_survival_row(
+        0,
+        input.hazard_loading,
+        LatentSurvivalEventType::RightCensored,
+        input.q_entry,
+        input.q_exit,
+        1.0,
+        input.q_exit,
+        input.unloaded_mass_entry,
+        input.unloaded_mass_exit,
+        0.0,
+        0.0,
+    )
+    .map_err(String::from)?;
+    let (log_survival, survival_score, survival_negative_hessian) =
+        latent_survival_row_primary_gradient_hessian(
+            input.quadrature,
+            &row,
+            LatentSurvivalPrimaryPoint {
+                q_entry: input.q_entry,
+                q_exit: input.q_exit,
+                qdot_exit: 1.0,
+                q_right: input.q_exit,
+                mu: input.mu,
+                sigma: input.sigma,
+            },
+            false,
+        )?;
+    let binary = binary_from_log_survival(log_survival, input.event).map_err(String::from)?;
+    let primary_indices = [
+        LATENT_SURVIVAL_PRIMARY_Q_ENTRY,
+        LATENT_SURVIVAL_PRIMARY_Q_EXIT,
+        LATENT_SURVIVAL_PRIMARY_MU,
+    ];
+    let binary_log_likelihood_score = Array1::from_shape_fn(DIMENSION, |axis| {
+        binary.grad_scale * survival_score[primary_indices[axis]]
+    });
+    let binary_negative_log_likelihood_hessian =
+        Array2::from_shape_fn((DIMENSION, DIMENSION), |(left, right)| {
+            let source_left = primary_indices[left];
+            let source_right = primary_indices[right];
+            binary.neg_hess_scale * survival_negative_hessian[[source_left, source_right]]
+                + binary.outer_scale
+                    * survival_score[source_left]
+                    * survival_score[source_right]
+        });
+    let nll_score = checked_saved_alo_scale_vector(
+        binary_log_likelihood_score,
+        -input.prior_weight,
+        "latent-binary ALO NLL score",
+    )?;
+    let observed_hessian = checked_saved_alo_scale_matrix(
+        binary_negative_log_likelihood_hessian,
+        input.prior_weight,
+        "latent-binary ALO observed Hessian",
+    )?;
+    Ok(LatentWindowAloRowGeometry {
+        nll_score,
+        observed_hessian,
+        coordinate_values,
+    })
+}
+
 impl LatentBinaryFamily {
     /// Assemble the per-row [`LatentSurvivalRow`] for a row treated as a pure
     /// right-censored survival contribution (exit time is the censoring
