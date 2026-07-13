@@ -1586,6 +1586,449 @@ mod observed_single_source_oracle_tests {
     }
 
     #[test]
+    fn generated_gaussian_psi_chain_matches_generic_nested_jet_all_channels_932() {
+        use gam_math::jet_tower::{
+            program_fourth_contracted, program_row_kernel, program_third_contracted,
+        };
+
+        let rows =
+            gaussian_jointrow_scalars(&array![0.55], &array![0.3], &array![-0.4], &array![1.7])
+                .expect("row scalars");
+        let program = GaussianJointRowProgram::new(&rows);
+        let direction_a = [0.5, -0.7];
+        let direction_b = [-0.3, 0.8];
+        let direction_ab = [0.2, -0.15];
+        let drift = [0.6, 0.25];
+        let psi = [-0.4, 0.75];
+        let drift_psi = [0.12, -0.18];
+
+        let atom = program.row_order2(0);
+        let (jet_value, jet_score, jet_hessian) =
+            program_row_kernel(&program, 0).expect("generic order2");
+        assert_close(atom.value(), jet_value, 1e-12, "row value");
+        for axis in 0..2 {
+            assert_close(
+                atom.gradient()[axis],
+                jet_score[axis],
+                1e-12,
+                &format!("row score[{axis}]"),
+            );
+        }
+        let generated_hessian = [
+            [atom.hessian_at(0, 0), atom.hessian_at(0, 1)],
+            [atom.hessian_at(1, 0), atom.hessian_at(1, 1)],
+        ];
+        assert_matrix_close(&generated_hessian, &jet_hessian, 1e-12, "row Hessian");
+
+        let jet_third_a =
+            program_third_contracted(&program, 0, &direction_a).expect("generic third a");
+        let jet_third_ab =
+            program_third_contracted(&program, 0, &direction_ab).expect("generic third ab");
+        let jet_fourth_ab = program_fourth_contracted(&program, 0, &direction_a, &direction_b)
+            .expect("generic fourth ab");
+        assert_matrix_close(
+            &program.row_third_contracted(0, &direction_a),
+            &jet_third_a,
+            1e-9,
+            "generated dH",
+        );
+        assert_matrix_close(
+            &program.row_fourth_contracted(0, &direction_a, &direction_b),
+            &jet_fourth_ab,
+            1e-9,
+            "generated d2H",
+        );
+
+        let first = gaussian_joint_psi_firstweights(
+            &rows,
+            &array![direction_a[0]],
+            &array![direction_a[1]],
+        );
+        let expected_score_a = matrix_vector_2(&jet_hessian, &direction_a);
+        assert_close(
+            first.objective_psirow[0],
+            dot_2(&jet_score, &direction_a),
+            1e-9,
+            "first psi objective",
+        );
+        assert_close(first.scoremu[0], jet_score[0], 1e-12, "first score mu");
+        assert_close(first.score_ls[0], jet_score[1], 1e-12, "first score ls");
+        assert_close(
+            first.dscoremu[0],
+            expected_score_a[0],
+            1e-9,
+            "first dscore mu",
+        );
+        assert_close(
+            first.dscore_ls[0],
+            expected_score_a[1],
+            1e-9,
+            "first dscore ls",
+        );
+        assert_close(first.hmumu[0], jet_hessian[0][0], 1e-12, "first H mm");
+        assert_close(first.hmu_ls[0], jet_hessian[0][1], 1e-12, "first H ml");
+        assert_close(first.h_ls_ls[0], jet_hessian[1][1], 1e-12, "first H ll");
+        assert_close(first.dhmumu[0], jet_third_a[0][0], 1e-9, "first dH mm");
+        assert_close(first.dhmu_ls[0], jet_third_a[0][1], 1e-9, "first dH ml");
+        assert_close(first.dh_ls_ls[0], jet_third_a[1][1], 1e-9, "first dH ll");
+
+        let second = gaussian_joint_psisecondweights(
+            &rows,
+            &array![direction_a[0]],
+            &array![direction_a[1]],
+            &array![direction_b[0]],
+            &array![direction_b[1]],
+            &array![direction_ab[0]],
+            &array![direction_ab[1]],
+        );
+        let expected_second_score = add_vector_2(
+            matrix_vector_2(&jet_third_a, &direction_b),
+            matrix_vector_2(&jet_hessian, &direction_ab),
+        );
+        let expected_second_hessian = add_matrix_2(jet_fourth_ab, jet_third_ab);
+        assert_close(
+            second.objective_psi_psirow[0],
+            dot_2(&direction_a, &matrix_vector_2(&jet_hessian, &direction_b))
+                + dot_2(&jet_score, &direction_ab),
+            1e-9,
+            "second psi objective",
+        );
+        assert_close(
+            second.d2scoremu[0],
+            expected_second_score[0],
+            1e-9,
+            "second psi score mu",
+        );
+        assert_close(
+            second.d2score_ls[0],
+            expected_second_score[1],
+            1e-9,
+            "second psi score ls",
+        );
+        assert_close(
+            second.d2hmumu[0],
+            expected_second_hessian[0][0],
+            1e-9,
+            "second psi H mm",
+        );
+        assert_close(
+            second.d2hmu_ls[0],
+            expected_second_hessian[0][1],
+            1e-9,
+            "second psi H ml",
+        );
+        assert_close(
+            second.d2h_ls_ls[0],
+            expected_second_hessian[1][1],
+            1e-9,
+            "second psi H ll",
+        );
+
+        let mixed = gaussian_joint_psi_mixed_driftweights(
+            &rows,
+            &array![drift[0]],
+            &array![drift[1]],
+            &array![psi[0]],
+            &array![psi[1]],
+            &array![drift_psi[0]],
+            &array![drift_psi[1]],
+        );
+        let jet_third_drift =
+            program_third_contracted(&program, 0, &drift).expect("generic third drift");
+        let jet_mixed_hessian = add_matrix_2(
+            program_fourth_contracted(&program, 0, &drift, &psi).expect("generic fourth mixed"),
+            program_third_contracted(&program, 0, &drift_psi)
+                .expect("generic third mixed direction"),
+        );
+        assert_close(
+            mixed.dhmumu_u[0],
+            jet_third_drift[0][0],
+            1e-9,
+            "mixed dH mm",
+        );
+        assert_close(
+            mixed.dhmu_ls_u[0],
+            jet_third_drift[0][1],
+            1e-9,
+            "mixed dH ml",
+        );
+        assert_close(
+            mixed.dh_ls_ls_u[0],
+            jet_third_drift[1][1],
+            1e-9,
+            "mixed dH ll",
+        );
+        assert_close(
+            mixed.d2hmumu[0],
+            jet_mixed_hessian[0][0],
+            1e-9,
+            "mixed d2H mm",
+        );
+        assert_close(
+            mixed.d2hmu_ls[0],
+            jet_mixed_hessian[0][1],
+            1e-9,
+            "mixed d2H ml",
+        );
+        assert_close(
+            mixed.d2h_ls_ls[0],
+            jet_mixed_hessian[1][1],
+            1e-9,
+            "mixed d2H ll",
+        );
+    }
+
+    #[test]
+    fn generated_gaussian_psi_chain_matches_likelihood_finite_differences_932() {
+        let y = 0.55;
+        let base = [0.3, -0.4];
+        let weight = 1.7;
+        let direction_a = [0.5, -0.7];
+        let direction_b = [-0.3, 0.8];
+        let direction_ab = [0.2, -0.15];
+        let drift = [0.6, 0.25];
+        let psi = [-0.4, 0.75];
+        let drift_psi = [0.12, -0.18];
+        let rows = gaussian_jointrow_scalars(
+            &array![y],
+            &array![base[0]],
+            &array![base[1]],
+            &array![weight],
+        )
+        .expect("row scalars");
+        let program = GaussianJointRowProgram::new(&rows);
+        let atom = program.row_order2(0);
+
+        let normalized_value =
+            0.5 * weight * rows.standardized_residual[0] * rows.standardized_residual[0];
+        assert_close(
+            atom.value(),
+            normalized_value,
+            1e-12,
+            "normalized row value",
+        );
+        let score_fd = gradient_fd(y, base[0], base[1], weight, 2e-5);
+        let hessian_fd0 = hessian_fd(y, base[0], base[1], weight, 1e-3);
+        for axis in 0..2 {
+            assert_close(
+                atom.gradient()[axis],
+                score_fd[axis],
+                2e-8,
+                &format!("score FD {axis}"),
+            );
+        }
+        let atom_hessian = [
+            [atom.hessian_at(0, 0), atom.hessian_at(0, 1)],
+            [atom.hessian_at(1, 0), atom.hessian_at(1, 1)],
+        ];
+        assert_matrix_close(&atom_hessian, &hessian_fd0, 3e-6, "Hessian FD");
+
+        let first = gaussian_joint_psi_firstweights(
+            &rows,
+            &array![direction_a[0]],
+            &array![direction_a[1]],
+        );
+        let first_step = 1e-2;
+        let plus = [
+            base[0] + first_step * direction_a[0],
+            base[1] + first_step * direction_a[1],
+        ];
+        let minus = [
+            base[0] - first_step * direction_a[0],
+            base[1] - first_step * direction_a[1],
+        ];
+        let objective_first_fd = (row_nll(y, plus[0], plus[1], weight)
+            - row_nll(y, minus[0], minus[1], weight))
+            / (2.0 * first_step);
+        let gradient_plus = gradient_fd(y, plus[0], plus[1], weight, 2e-5);
+        let gradient_minus = gradient_fd(y, minus[0], minus[1], weight, 2e-5);
+        let score_first_fd: [f64; 2] = std::array::from_fn(|axis| {
+            (gradient_plus[axis] - gradient_minus[axis]) / (2.0 * first_step)
+        });
+        let hessian_plus = hessian_fd(y, plus[0], plus[1], weight, 1e-3);
+        let hessian_minus = hessian_fd(y, minus[0], minus[1], weight, 1e-3);
+        let hessian_first_fd: [[f64; 2]; 2] = std::array::from_fn(|row| {
+            std::array::from_fn(|column| {
+                (hessian_plus[row][column] - hessian_minus[row][column]) / (2.0 * first_step)
+            })
+        });
+        assert_close(
+            first.objective_psirow[0],
+            objective_first_fd,
+            2e-4,
+            "first objective FD",
+        );
+        assert_close(
+            first.dscoremu[0],
+            score_first_fd[0],
+            2e-4,
+            "first score mu FD",
+        );
+        assert_close(
+            first.dscore_ls[0],
+            score_first_fd[1],
+            2e-4,
+            "first score ls FD",
+        );
+        assert_close(
+            first.dhmumu[0],
+            hessian_first_fd[0][0],
+            2e-3,
+            "first H mm FD",
+        );
+        assert_close(
+            first.dhmu_ls[0],
+            hessian_first_fd[0][1],
+            2e-3,
+            "first H ml FD",
+        );
+        assert_close(
+            first.dh_ls_ls[0],
+            hessian_first_fd[1][1],
+            2e-3,
+            "first H ll FD",
+        );
+
+        let second = gaussian_joint_psisecondweights(
+            &rows,
+            &array![direction_a[0]],
+            &array![direction_a[1]],
+            &array![direction_b[0]],
+            &array![direction_b[1]],
+            &array![direction_ab[0]],
+            &array![direction_ab[1]],
+        );
+        let objective_second_fd = mixed_value_fd(
+            y,
+            base,
+            weight,
+            direction_a,
+            direction_b,
+            direction_ab,
+            5e-3,
+        );
+        let score_second_fd = mixed_gradient_fd(
+            y,
+            base,
+            weight,
+            direction_a,
+            direction_b,
+            direction_ab,
+            1e-2,
+            2e-5,
+        );
+        let hessian_second_fd = mixed_hessian_fd(
+            y,
+            base,
+            weight,
+            direction_a,
+            direction_b,
+            direction_ab,
+            2e-2,
+            1e-3,
+        );
+        assert_close(
+            second.objective_psi_psirow[0],
+            objective_second_fd,
+            5e-4,
+            "second objective FD",
+        );
+        assert_close(
+            second.d2scoremu[0],
+            score_second_fd[0],
+            2e-3,
+            "second score mu FD",
+        );
+        assert_close(
+            second.d2score_ls[0],
+            score_second_fd[1],
+            2e-3,
+            "second score ls FD",
+        );
+        assert_close(
+            second.d2hmumu[0],
+            hessian_second_fd[0][0],
+            3e-2,
+            "second H mm FD",
+        );
+        assert_close(
+            second.d2hmu_ls[0],
+            hessian_second_fd[0][1],
+            3e-2,
+            "second H ml FD",
+        );
+        assert_close(
+            second.d2h_ls_ls[0],
+            hessian_second_fd[1][1],
+            3e-2,
+            "second H ll FD",
+        );
+
+        let mixed = gaussian_joint_psi_mixed_driftweights(
+            &rows,
+            &array![drift[0]],
+            &array![drift[1]],
+            &array![psi[0]],
+            &array![psi[1]],
+            &array![drift_psi[0]],
+            &array![drift_psi[1]],
+        );
+        let drift_plus = [
+            base[0] + first_step * drift[0],
+            base[1] + first_step * drift[1],
+        ];
+        let drift_minus = [
+            base[0] - first_step * drift[0],
+            base[1] - first_step * drift[1],
+        ];
+        let drift_hessian_plus = hessian_fd(y, drift_plus[0], drift_plus[1], weight, 1e-3);
+        let drift_hessian_minus = hessian_fd(y, drift_minus[0], drift_minus[1], weight, 1e-3);
+        let drift_hessian_fd: [[f64; 2]; 2] = std::array::from_fn(|row| {
+            std::array::from_fn(|column| {
+                (drift_hessian_plus[row][column] - drift_hessian_minus[row][column])
+                    / (2.0 * first_step)
+            })
+        });
+        let mixed_hessian = mixed_hessian_fd(y, base, weight, drift, psi, drift_psi, 2e-2, 1e-3);
+        assert_close(
+            mixed.dhmumu_u[0],
+            drift_hessian_fd[0][0],
+            2e-3,
+            "mixed dH mm FD",
+        );
+        assert_close(
+            mixed.dhmu_ls_u[0],
+            drift_hessian_fd[0][1],
+            2e-3,
+            "mixed dH ml FD",
+        );
+        assert_close(
+            mixed.dh_ls_ls_u[0],
+            drift_hessian_fd[1][1],
+            2e-3,
+            "mixed dH ll FD",
+        );
+        assert_close(
+            mixed.d2hmumu[0],
+            mixed_hessian[0][0],
+            3e-2,
+            "mixed d2H mm FD",
+        );
+        assert_close(
+            mixed.d2hmu_ls[0],
+            mixed_hessian[0][1],
+            3e-2,
+            "mixed d2H ml FD",
+        );
+        assert_close(
+            mixed.d2h_ls_ls[0],
+            mixed_hessian[1][1],
+            3e-2,
+            "mixed d2H ll FD",
+        );
+    }
+
+    #[test]
     fn observed_joint_row_coeffs_match_likelihood_fd_single_source() {
         // Residual-dependent cases: y ≠ μ so the cross and (ls,ls) observed
         // weights are material (not the Fisher limit m→0, n→a).
