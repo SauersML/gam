@@ -2562,6 +2562,22 @@ pub(crate) mod whitened_spectrum {
             })
         }
 
+        /// Whether the penalized coefficient objective has a numerically
+        /// resolvable direction of negative curvature at the current iterate.
+        ///
+        /// First-order stationarity is not a mode certificate for a nonconvex
+        /// custom family. In particular, CTN's squared SCOP shape chart has
+        /// finite stationary hyperplanes at `gamma_k = 0`; the score vanishes
+        /// there while the exact Hessian can be strictly indefinite. Keep the
+        /// threshold identical to the trust-region step's numerical-rank
+        /// threshold so every direction that blocks convergence is also one the
+        /// Moré–Sorensen hard-case step can resolve.
+        pub(crate) fn has_resolvable_negative_curvature(&self) -> bool {
+            self.gamma
+                .iter()
+                .any(|&value| value < -self.numerical_floor)
+        }
+
         /// `‖η(λ)‖²_2 = Σ_{identified k} c_k² / (γ_k + λ)²` — the squared `D`-metric
         /// norm of the trial step as a function of the Levenberg shift `λ`. Only
         /// identified (above-`null_cutoff`) modes participate; the null space carries
@@ -3037,6 +3053,30 @@ mod trust_region_subproblem_tests {
         let dd = &d * &step.delta;
         let lam = dd.dot(&(&rhs - &h.dot(&step.delta))) / dd.dot(&dd);
         assert!(lam >= 1.0 - 1e-6, "λ must dominate -γ_min=1, got {lam}");
+    }
+
+    /// A strict saddle has zero first-order residual, so an unconstrained
+    /// reflected-Newton seed is also exactly zero. The finite-radius
+    /// Moré–Sorensen solve must nevertheless take its hard-case boundary step
+    /// along the negative eigenspace; otherwise a first-order convergence test
+    /// can mint the saddle as a fitted Laplace mode.
+    #[test]
+    pub(crate) fn zero_gradient_strict_saddle_takes_hard_case_boundary_step() {
+        let h = array![[-2.0, 0.0], [0.0, 1.0]];
+        let rhs = array![0.0, 0.0];
+        let d = array![1.0, 1.0];
+        let spec = WhitenedHessianSpectrum::decompose(&h, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();
+        assert!(spec.has_resolvable_negative_curvature());
+
+        let radius = 0.5;
+        let step = spec.trust_region_step(radius);
+        let norm = metric_norm(&step.delta, &d);
+        assert!((norm - radius).abs() < 1e-10, "hard-case step norm {norm}");
+        let predicted_reduction = rhs.dot(&step.delta) - 0.5 * step.delta.dot(&h.dot(&step.delta));
+        assert!(
+            predicted_reduction > 0.0,
+            "strict-saddle hard-case step must lower the quadratic model"
+        );
     }
 
     /// Self-vanishing: as rhs → 0 the step → 0 regardless of the radius, so the

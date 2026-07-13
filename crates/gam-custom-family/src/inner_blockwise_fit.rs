@@ -2181,17 +2181,30 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let residual_tol = inner_tol * (1.0 + grad_inf.max(penalty_inf));
             last_residual_tol = residual_tol;
             let current_stationarity_residual = current_kkt_norm;
-            // KKT certificate: ‖∇L − Sβ‖_∞ ≤ residual_tol together with
-            // ‖δ‖_∞ ≤ step_tol is sufficient first-order optimality of the
-            // penalized objective; no descent direction exists from the
-            // current point. Conditioning that exit on additional evidence
+            // Local-mode certificate: first-order KKT and a small Newton
+            // proposal are sufficient only when the exact penalized Hessian
+            // has no resolvable negative curvature. CTN's squared SCOP shape
+            // chart contains finite strict saddles where both the score and the
+            // unconstrained reflected-Newton proposal are exactly zero. Calling
+            // those points converged bypasses the finite-radius Moré–Sorensen
+            // hard case below and hands an indefinite matrix to the outer LAML
+            // determinant. The spectrum uses the same numerical-rank threshold
+            // for this certificate and for the hard-case step, so a direction
+            // that blocks convergence is guaranteed to be actionable.
+            // Conditioning the valid local-minimum exit on additional evidence
             // of objective progress in the previous cycle would refuse to
             // recognize convergence at a starting point that already sits
             // at the optimum (e.g. balanced data with an intercept-only
             // fit, where ∇ℓ vanishes by symmetry from cycle 0 and the
             // Newton step is identically zero so the trust-region search
             // can never produce a strictly negative actual reduction).
-            if current_stationarity_residual <= residual_tol && step_inf <= step_tol {
+            let has_resolvable_negative_curvature = joint_spectrum
+                .as_ref()
+                .is_some_and(|spectrum| spectrum.has_resolvable_negative_curvature());
+            if current_stationarity_residual <= residual_tol
+                && step_inf <= step_tol
+                && !has_resolvable_negative_curvature
+            {
                 log::info!(
                     "[PIRLS/joint-Newton convergence] cycle {:>3} | pre-line-search converged: proposal_inf={:.3e} (tol={:.3e}) | residual={:.3e} (tol={:.3e})",
                     cycle,
@@ -2209,6 +2222,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 cycles_done = cycle;
                 converged = true;
                 break;
+            }
+            if current_stationarity_residual <= residual_tol
+                && step_inf <= step_tol
+                && has_resolvable_negative_curvature
+            {
+                log::info!(
+                    "[PIRLS/joint-Newton] cycle {cycle:>3} | first-order stationary strict saddle; refusing convergence and invoking the finite-radius negative-curvature hard case"
+                );
             }
 
             // Trust-region retries preserve the objective-decrease guarantee
@@ -2444,7 +2465,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             &search_delta,
                             &joint_trust_metric_diag,
                         );
-                        if search_norm.is_finite()
+                        if !spectrum.has_resolvable_negative_curvature()
+                            && search_norm.is_finite()
                             && joint_trust_radius.is_finite()
                             && search_norm <= joint_trust_radius * (1.0 + 1e-12)
                         {
