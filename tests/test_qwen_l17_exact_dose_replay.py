@@ -129,3 +129,24 @@ def test_readout_radius_never_uses_heldout_measurements() -> None:
     )
     assert first["readout_radius_nats_by_atom"] == second["readout_radius_nats_by_atom"]
     assert first["included_intervention_ids"] == second["included_intervention_ids"]
+
+
+def test_one_failure_blocks_the_entire_equal_dose_calibration_stratum() -> None:
+    ledger = _ledger()
+    rows = ledger["rows"]
+    rows.insert(
+        1,
+        _row(
+            "c0-fail",
+            atom=0,
+            prompt="c-fail",
+            split="calibration",
+            predicted=0.01,
+            measured=0.02,
+        ),
+    )
+    ledger["protocol"]["row_count"] = len(rows)
+    with pytest.raises(ValueError, match="atom 0 has no contiguous calibration dose"):
+        replay.acceptance_report(
+            ledger, readout_tol_rel=0.1, bootstrap_draws=20, seed=1
+        )

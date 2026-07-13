@@ -178,10 +178,22 @@ def _calibrate_readout_radii(
             key=lambda row: (float(row["predicted_nats"]), row["intervention_id"]),
         )
         radius: float | None = None
-        for row in ordered:
-            if _relative_readout_error(row) > tolerance:
+        cursor = 0
+        while cursor < len(ordered):
+            dose = float(ordered[cursor]["predicted_nats"])
+            end = cursor + 1
+            while end < len(ordered) and float(ordered[end]["predicted_nats"]) == dose:
+                end += 1
+            # A radius certifies the whole calibration stratum at this dose. One
+            # failing prompt prevents another prompt at the same dose from
+            # extending the boundary by sort-order accident.
+            if any(
+                _relative_readout_error(row) > tolerance
+                for row in ordered[cursor:end]
+            ):
                 break
-            radius = float(row["predicted_nats"])
+            radius = dose
+            cursor = end
         if radius is None:
             raise ValueError(
                 f"atom {atom} has no contiguous calibration dose inside readout tolerance"

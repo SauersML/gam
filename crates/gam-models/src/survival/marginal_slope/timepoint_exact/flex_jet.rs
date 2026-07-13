@@ -84,7 +84,7 @@ use crate::bms::signed_probit_neglog_unary_stack;
 use crate::survival::marginal_slope::gpu;
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicOrder2Accumulator, DynamicOrder2Term,
-    JetScalar, OneSeed, Order2, RuntimeJetScalar,
+    OneSeed, Order2, RuntimeJetScalar,
 };
 use gam_math::jet_tower::Tower2;
 
@@ -929,8 +929,8 @@ impl<const K: usize> FixedJet3<K> {
             OneSeed::seed_direction(x, axis, direction)
         } else {
             OneSeed {
-                base: Order2::constant(x),
-                eps: Order2::constant(direction),
+                base: <Order2<K> as gam_math::jet_scalar::JetScalar<K>>::constant(x),
+                eps: <Order2<K> as gam_math::jet_scalar::JetScalar<K>>::constant(direction),
             }
         };
         Self { inner }
@@ -988,6 +988,89 @@ impl<const K: usize> JetField for FixedJet3<K> {
 
 impl<const K: usize> FlexJet for FixedJet3<K> {
     const ORDER: usize = 3;
+}
+
+trait FlexThirdOutput: FlexJet + MomentTerm {
+    fn pack_timepoint_outputs(
+        eta: &Self,
+        chi: &Self,
+        d: &Self,
+    ) -> (
+        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
+    );
+}
+
+impl FlexThirdOutput for ArenaJet3<'_> {
+    fn pack_timepoint_outputs(
+        eta: &Self,
+        chi: &Self,
+        d: &Self,
+    ) -> (
+        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
+    ) {
+        (
+            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase {
+                eta: eta.inner.base.v,
+                chi: chi.inner.base.v,
+                d: d.inner.base.v,
+                eta_u: eta.inner.base.g.to_vec(),
+                eta_uv: eta.inner.base.h.to_vec(),
+                chi_u: chi.inner.base.g.to_vec(),
+                chi_uv: chi.inner.base.h.to_vec(),
+                d_u: d.inner.base.g.to_vec(),
+                d_uv: d.inner.base.h.to_vec(),
+            },
+            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
+                eta_u_dir: eta.inner.eps.g.to_vec(),
+                eta_uv_dir: eta.inner.eps.h.to_vec(),
+                chi_u_dir: chi.inner.eps.g.to_vec(),
+                chi_uv_dir: chi.inner.eps.h.to_vec(),
+                d_u_dir: d.inner.eps.g.to_vec(),
+                d_uv_dir: d.inner.eps.h.to_vec(),
+            },
+        )
+    }
+}
+
+impl<const K: usize> FlexThirdOutput for FixedJet3<K> {
+    fn pack_timepoint_outputs(
+        eta: &Self,
+        chi: &Self,
+        d: &Self,
+    ) -> (
+        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
+    ) {
+        let flatten = |matrix: &[[f64; K]; K]| {
+            matrix
+                .iter()
+                .flat_map(|row| row.iter().copied())
+                .collect()
+        };
+        (
+            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase {
+                eta: eta.inner.base.0.v,
+                chi: chi.inner.base.0.v,
+                d: d.inner.base.0.v,
+                eta_u: eta.inner.base.0.g.to_vec(),
+                eta_uv: flatten(&eta.inner.base.0.h),
+                chi_u: chi.inner.base.0.g.to_vec(),
+                chi_uv: flatten(&chi.inner.base.0.h),
+                d_u: d.inner.base.0.g.to_vec(),
+                d_uv: flatten(&d.inner.base.0.h),
+            },
+            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
+                eta_u_dir: eta.inner.eps.0.g.to_vec(),
+                eta_uv_dir: flatten(&eta.inner.eps.0.h),
+                chi_u_dir: chi.inner.eps.0.g.to_vec(),
+                chi_uv_dir: flatten(&chi.inner.eps.0.h),
+                d_u_dir: d.inner.eps.0.g.to_vec(),
+                d_uv_dir: flatten(&d.inner.eps.0.h),
+            },
+        )
+    }
 }
 
 // ── Jet4: two-seed, contracted fourth (doc §A.3) ───────────────────────────
@@ -2818,49 +2901,47 @@ impl SurvivalMarginalSlopeFamily {
         let (obs_coeff, obs_fixed) = observed_fixed_for(self, primary, row, a, b, beta_h, beta_w)?;
         let cells = cells_from_cached(cached);
 
-        let template = ArenaJet3::primary(0.0, usize::MAX, p, 0.0, arena);
-        let b_jet = ArenaJet3::primary(b, primary.g, p, dir[primary.g], arena);
-        let du: Vec<ArenaJet3<'_>> = (0..p)
-            .map(|axis| ArenaJet3::primary(0.0, axis, p, dir[axis], arena))
-            .collect();
-        let (eta, chi, d) = flex_timepoint_inputs_generic(
-            &template,
-            &b_jet,
-            &du,
-            a,
-            d_check,
-            primary.g,
-            primary.infl,
-            q_index,
-            q,
-            z_obs,
-            o_infl,
-            obs_coeff,
-            &obs_fixed,
-            &cells,
-        )?;
+        macro_rules! evaluate {
+            ($template:expr, $b_jet:expr, $du:expr) => {{
+                let template = $template;
+                let b_jet = $b_jet;
+                let du = $du;
+                let (eta, chi, d) = flex_timepoint_inputs_generic(
+                    &template,
+                    &b_jet,
+                    &du,
+                    a,
+                    d_check,
+                    primary.g,
+                    primary.infl,
+                    q_index,
+                    q,
+                    z_obs,
+                    o_infl,
+                    obs_coeff,
+                    &obs_fixed,
+                    &cells,
+                )?;
+                Ok(FlexThirdOutput::pack_timepoint_outputs(&eta, &chi, &d))
+            }};
+        }
 
-        Ok((
-            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase {
-                eta: eta.inner.base.v,
-                chi: chi.inner.base.v,
-                d: d.inner.base.v,
-                eta_u: eta.inner.base.g.to_vec(),
-                eta_uv: eta.inner.base.h.to_vec(),
-                chi_u: chi.inner.base.g.to_vec(),
-                chi_uv: chi.inner.base.h.to_vec(),
-                d_u: d.inner.base.g.to_vec(),
-                d_uv: d.inner.base.h.to_vec(),
-            },
-            crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
-                eta_u_dir: eta.inner.eps.g.to_vec(),
-                eta_uv_dir: eta.inner.eps.h.to_vec(),
-                chi_u_dir: chi.inner.eps.g.to_vec(),
-                chi_uv_dir: chi.inner.eps.h.to_vec(),
-                d_u_dir: d.inner.eps.g.to_vec(),
-                d_uv_dir: d.inner.eps.h.to_vec(),
-            },
-        ))
+        match p {
+            8 => evaluate!(
+                FixedJet3::<8>::primary(0.0, usize::MAX, p, 0.0),
+                FixedJet3::<8>::primary(b, primary.g, p, dir[primary.g]),
+                (0..p)
+                    .map(|axis| FixedJet3::<8>::primary(0.0, axis, p, dir[axis]))
+                    .collect::<Vec<_>>()
+            ),
+            _ => evaluate!(
+                ArenaJet3::primary(0.0, usize::MAX, p, 0.0, arena),
+                ArenaJet3::primary(b, primary.g, p, dir[primary.g], arena),
+                (0..p)
+                    .map(|axis| ArenaJet3::primary(0.0, axis, p, dir[axis], arena))
+                    .collect::<Vec<_>>()
+            ),
+        }
     }
 
     /// #932-2 PRODUCTION cutover (increment 2): the mixed second-directional
