@@ -2933,9 +2933,8 @@ fn royston_parmar_survival_hazard_components(
 ///
 /// Mirrors the CLI's LocationScale predict path (main.rs::run_predict_survival
 /// LocationScale arm) but stays library-only: builds the threshold/log_sigma
-/// designs from the saved frozen specs, replays the saved scale-deviation
-/// transform on the noise design, applies the survival time-derivative guard,
-/// and calls `predict_survival_location_scale`.
+/// designs from the saved frozen specs and resolved time margins, applies the
+/// survival time-derivative guard, and calls `predict_survival_location_scale`.
 ///
 /// Plugin survival only — uncertainty paths still live in the CLI.
 fn predict_survival_location_scale_batch(
@@ -2954,8 +2953,8 @@ fn predict_survival_location_scale_batch(
     use crate::survival::construction::evaluate_survival_time_basis_row;
     use crate::survival::location_scale::{
         SurvivalLocationScalePredictInput, predict_survival_location_scale,
-        predict_survival_location_scale_from_linear_components,
         predict_survival_location_scalewith_uncertainty,
+        replay_survival_covariate_channels,
     };
     use gam_linalg::matrix::DesignMatrix;
 
@@ -3146,20 +3145,59 @@ fn predict_survival_location_scale_batch(
             }
             Ok(DesignMatrix::from(repeated))
         };
-    let threshold_matrix = repeat_rows(
+    let expand_vector = |values: &Array1<f64>| -> Array1<f64> {
+        if per_row_eval {
+            values.clone()
+        } else {
+            Array1::from_shape_fn(total_rows, |k| values[k / eval_width])
+        }
+    };
+    if saved_structure.threshold_time_basis.is_some()
+        && threshold_design
+            .affine_offset
+            .iter()
+            .any(|value| *value != 0.0)
+    {
+        return Err(
+            "saved time-varying survival threshold cannot carry a non-zero smooth anchor"
+                .to_string(),
+        );
+    }
+    if saved_structure.log_sigma_time_basis.is_some()
+        && raw_sigma_design
+            .affine_offset
+            .iter()
+            .any(|value| *value != 0.0)
+    {
+        return Err(
+            "saved time-varying survival log-sigma cannot carry a non-zero smooth anchor"
+                .to_string(),
+        );
+    }
+    let threshold_base_matrix = repeat_rows(
         &threshold_design.design,
         "survival location-scale prediction threshold design",
     )?;
-    let raw_sigma_matrix = repeat_rows(
+    let raw_sigma_base_matrix = repeat_rows(
         &raw_sigma_design.design,
         "survival location-scale prediction log-sigma design",
     )?;
-
-    // The fitted location-scale family keeps the log-scale predictor in its raw
-    // coordinate space: location and log-scale are distinct likelihood
-    // channels, so residualizing one against the other would erase valid
-    // heteroscedastic signal. Saved replay therefore uses this exact raw design.
-    let prepared_sigma_design = raw_sigma_matrix;
+    let mut threshold_replay = replay_survival_covariate_channels(
+        &threshold_base_matrix,
+        &expand_vector(primary_offset),
+        &eval_entry,
+        &eval_exit,
+        saved_structure.threshold_time_basis.as_ref(),
+        "survival location-scale threshold",
+    )?;
+    let sigma_replay = replay_survival_covariate_channels(
+        &raw_sigma_base_matrix,
+        &expand_vector(&effective_noise_offset),
+        &eval_entry,
+        &eval_exit,
+        saved_structure.log_sigma_time_basis.as_ref(),
+        "survival location-scale log-sigma",
+    )?;
     let link_wiggle_knots = model
         .linkwiggle_knots
         .as_ref()
@@ -3173,13 +3211,6 @@ fn predict_survival_location_scale_batch(
         .as_ref()
         .map_or(0, |w| w.beta.len());
 
-    let expand_vector = |values: &Array1<f64>| -> Array1<f64> {
-        if per_row_eval {
-            values.clone()
-        } else {
-            Array1::from_shape_fn(total_rows, |k| values[k / eval_width])
-        }
-    };
     // Threshold (location) offset. In the reduced parametric-AFT regime the
     // σ-scaled `log t` baseline rides the location channel: shift the effective
     // location `η_t → η_t − log t` per query time so the predicted standardized
@@ -3188,17 +3219,13 @@ fn predict_survival_location_scale_batch(
     // per-(row, time) query exit times in the same flattened layout as the
     // expanded offsets; `−log t` uses the same `SURVIVAL_TIME_FLOOR` floor as the
     // fit's `checked_log_survival_times` (issue #892).
-    let eta_threshold_offset = {
-        let mut offset = expand_vector(primary_offset);
-        if reduced_parametric_aft {
-            for (slot, &t) in offset.iter_mut().zip(eval_exit.iter()) {
+    if reduced_parametric_aft {
+        for (slot, &t) in threshold_replay.offset.iter_mut().zip(eval_exit.iter()) {
                 *slot -= t
                     .max(crate::survival::construction::SURVIVAL_TIME_FLOOR)
                     .ln();
-            }
         }
-        offset
-    };
+    }
     // Build the SurvivalLocationScalePredictInput once, with replicated /
     // expanded designs and offsets, regardless of `per_row_eval`.  This
     // unifies the mean-only and uncertainty paths and lets the
@@ -3209,10 +3236,10 @@ fn predict_survival_location_scale_batch(
         time_wiggle_knots: time_wiggle_knots.clone(),
         time_wiggle_degree,
         time_wiggle_ncols,
-        x_threshold: threshold_matrix,
-        eta_threshold_offset,
-        x_log_sigma: prepared_sigma_design,
-        eta_log_sigma_offset: expand_vector(&effective_noise_offset),
+        x_threshold: threshold_replay.design_exit.clone(),
+        eta_threshold_offset: threshold_replay.offset.clone(),
+        x_log_sigma: sigma_replay.design_exit.clone(),
+        eta_log_sigma_offset: sigma_replay.offset.clone(),
         x_link_wiggle: None,
         link_wiggle_knots: link_wiggle_knots.clone(),
         link_wiggle_degree,
@@ -3252,69 +3279,39 @@ fn predict_survival_location_scale_batch(
             Some(response_se),
             Some(unc.eta_standard_error),
         )
-    } else if per_row_eval {
+    } else {
         let pred = predict_survival_location_scale(&pred_input, &saved_fit)
             .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
         (pred.eta, pred.survival_prob, None, None)
-    } else {
-        let beta_threshold = saved_fit.beta_threshold();
-        let beta_log_sigma = saved_fit.beta_log_sigma();
-        let eta_t_subject =
-            cov_design.design.matrixvectormultiply(&beta_threshold) + primary_offset;
-        // `expand_vector(noise_offset)` already lives on `pred_input` as
-        // `eta_log_sigma_offset`; reuse it instead of re-expanding the noise
-        // offset (a per-call allocation when the time grid is explicit).
-        let eta_ls_subject = prepared_sigma_design_view(&pred_input)
-            .matrixvectormultiply(&beta_log_sigma)
-            + &pred_input.eta_log_sigma_offset;
-        // This explicit-grid branch rebuilds the per-(row, time) location predictor
-        // from the per-subject `eta_t_subject` directly (bypassing
-        // `pred_input.eta_threshold_offset`), so it must apply the reduced-AFT
-        // `−log t` location shift here too — otherwise the grid path would predict a
-        // `log t`-flat surface even though the per-row path is shifted (issue #892).
-        let mut eta_t = expand_vector(&eta_t_subject);
-        if reduced_parametric_aft {
-            for (slot, &t) in eta_t.iter_mut().zip(eval_exit.iter()) {
-                *slot -= t
-                    .max(crate::survival::construction::SURVIVAL_TIME_FLOOR)
-                    .ln();
-            }
-        }
-        let pred = predict_survival_location_scale_from_linear_components(
-            &pred_input.x_time_exit,
-            &eta_offset_exit,
-            time_wiggle_knots.as_ref(),
-            time_wiggle_degree,
-            time_wiggle_ncols,
-            &eta_t,
-            &eta_ls_subject,
-            link_wiggle_knots.as_ref(),
-            link_wiggle_degree,
-            &saved_inverse_link,
-            &saved_fit,
-        )
-        .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
-        (pred.eta, pred.survival_prob, None, None)
     };
 
-    let eta_derivative_full = if reduced_parametric_aft {
-        // Reduced-AFT regime: the warp is `h ≡ 0` and the location carries the
-        // `−log t` shift, so the standardized-residual time derivative is
-        // `du/dt = d/dt[inv_sigma·(log t − μ)] = inv_sigma / t` (the fit's
-        // `qdot = inv_sigma/t`). The time-warp design contributes nothing, so
-        // reconstruct `eta_derivative` directly from `inv_sigma` and the query
-        // times rather than from the (empty) time-derivative design (issue #892).
-        use crate::sigma_link::exp_sigma_inverse_from_eta_scalar;
-        let beta_log_sigma = saved_fit.beta_log_sigma();
-        let eta_ls = prepared_sigma_design_view(&pred_input).matrixvectormultiply(&beta_log_sigma)
-            + &pred_input.eta_log_sigma_offset;
-        let mut deriv = Array1::<f64>::zeros(eval_exit.len());
-        for (k, slot) in deriv.iter_mut().enumerate() {
-            let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls[k]);
-            let t = eval_exit[k].max(crate::survival::construction::SURVIVAL_TIME_FLOOR);
-            *slot = inv_sigma / t;
+    let beta_threshold = saved_fit.beta_threshold();
+    let beta_log_sigma = saved_fit.beta_log_sigma();
+    let eta_threshold = threshold_replay
+        .design_exit
+        .matrixvectormultiply(&beta_threshold)
+        + &threshold_replay.offset;
+    let mut eta_threshold_derivative = threshold_replay
+        .design_derivative_exit
+        .as_ref()
+        .map(|design| design.matrixvectormultiply(&beta_threshold))
+        .unwrap_or_else(|| Array1::zeros(total_rows));
+    if reduced_parametric_aft {
+        for (slot, &time) in eta_threshold_derivative.iter_mut().zip(eval_exit.iter()) {
+            *slot -= 1.0 / time.max(crate::survival::construction::SURVIVAL_TIME_FLOOR);
         }
-        deriv
+    }
+    let eta_log_sigma = sigma_replay
+        .design_exit
+        .matrixvectormultiply(&beta_log_sigma)
+        + &sigma_replay.offset;
+    let eta_log_sigma_derivative = sigma_replay
+        .design_derivative_exit
+        .as_ref()
+        .map(|design| design.matrixvectormultiply(&beta_log_sigma))
+        .unwrap_or_else(|| Array1::zeros(total_rows));
+    let hdot = if reduced_parametric_aft {
+        Array1::zeros(total_rows)
     } else {
         let x_time_derivative = time_build
             .x_derivative_time
@@ -3330,6 +3327,42 @@ fn predict_survival_location_scale_batch(
             &saved_fit,
         )?
     };
+    let inv_sigma = eta_log_sigma.mapv(crate::sigma_link::exp_sigma_inverse_from_eta_scalar);
+    let q_base = -&eta_threshold * &inv_sigma;
+    let mut qdot = &inv_sigma
+        * &(&eta_threshold * &eta_log_sigma_derivative - &eta_threshold_derivative);
+    if let Some(beta_wiggle) = saved_fit.beta_link_wiggle() {
+        let knots = link_wiggle_knots.as_ref().ok_or_else(|| {
+            "saved location-scale link-wiggle coefficients are missing knots".to_string()
+        })?;
+        let degree = link_wiggle_degree.ok_or_else(|| {
+            "saved location-scale link-wiggle coefficients are missing degree".to_string()
+        })?;
+        let derivative_basis = crate::wiggle::monotone_wiggle_basis_with_derivative_order(
+            q_base.view(),
+            knots,
+            degree,
+            1,
+        )?;
+        if derivative_basis.ncols() != beta_wiggle.len() {
+            return Err(format!(
+                "saved location-scale link-wiggle derivative width mismatch: design={}, beta={}",
+                derivative_basis.ncols(),
+                beta_wiggle.len()
+            ));
+        }
+        qdot *= &(derivative_basis.dot(&beta_wiggle) + 1.0);
+    }
+    let eta_derivative_full = hdot + qdot;
+    if eta_derivative_full
+        .iter()
+        .any(|value| !(value.is_finite() && *value > 0.0))
+    {
+        return Err(
+            "saved location-scale survival event-rate derivative must be finite and positive"
+                .to_string(),
+        );
+    }
     let hazard_full = location_scale_hazard_from_eta_derivative(
         &eta_full,
         &eta_derivative_full,
@@ -3419,15 +3452,6 @@ fn predict_survival_location_scale_batch(
         survival_se,
         eta_se: eta_se_per_row,
     })
-}
-
-/// Helper: borrow the prepared sigma design back from the pred_input
-/// without consuming it.  Used so the mean-only fast path can reuse the
-/// log-sigma design without an extra clone.
-fn prepared_sigma_design_view(
-    input: &crate::survival::location_scale::SurvivalLocationScalePredictInput,
-) -> &gam_linalg::matrix::DesignMatrix {
-    &input.x_log_sigma
 }
 
 pub(crate) struct LocationScaleEtaComponents {
