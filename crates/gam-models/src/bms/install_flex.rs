@@ -689,15 +689,7 @@ pub(super) fn validate_spec(
     spec.frailty.validate_for_marginal_slope()?;
     match &spec.frailty {
         FrailtySpec::None => {}
-        FrailtySpec::GaussianShift { sigma_fixed } => {
-            if let Some(sigma) = sigma_fixed
-                && (!sigma.is_finite() || *sigma < 0.0)
-            {
-                return Err(format!(
-                    "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
-                ));
-            }
-        }
+        FrailtySpec::GaussianShift { .. } => {}
         FrailtySpec::HazardMultiplier { .. } => {
             return Err(
                 "bernoulli-marginal-slope does not support FrailtySpec::HazardMultiplier"
