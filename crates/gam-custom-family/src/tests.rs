@@ -634,21 +634,14 @@ pub(crate) fn joint_outer_gradient_projected_trace_drops_joint_null() {
     )
     .expect("projected outer evaluation succeeds on a singular joint Hessian");
 
-    let (_, kernel) = joint_penalty_subspace_trace_parts(
-        &JointHessianSource::Dense(h.clone()),
-        &ranges,
-        std::slice::from_ref(&s_lambda),
-        3,
-        0.0,
-        None,
-        None,
-    )
-    .expect("projection kernel builds");
-    let projected_trace = kernel
-        .expect("rank-deficient joint Hessian has a positive subspace")
-        .trace_projected_logdet(&s_lambda);
-    let expected_gradient =
-        0.5 * beta.dot(&fast_av(&s_lambda, &beta)) + 0.5 * projected_trace - 0.5 * 2.0;
+    // Independent closed form. On the identified (e1,e2) quotient,
+    // M = H + S = [[5, 0.2], [0.2, 11]], so
+    // tr(M⁻¹S) = (11·1 + 5·2) / (5·11 - 0.2²) = 21/54.96.
+    // The penalty quadratic is βᵀSβ = 1² + 2(-1)² = 3 and rank(S)=2.
+    // Keep this arithmetic independent of the production trace kernel so a
+    // shared kernel defect cannot satisfy both sides of the assertion.
+    let hand_projected_trace = 21.0 / 54.96;
+    let expected_gradient = 0.5 * 3.0 + 0.5 * hand_projected_trace - 0.5 * 2.0;
 
     assert!(
         projected.objective.is_finite(),

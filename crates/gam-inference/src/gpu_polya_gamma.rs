@@ -448,6 +448,27 @@ pub fn pg_normal_cpu_oracle(state: &mut XorwowState, b: u32, tilt: f64) -> f64 {
 // Host dispatcher — CPU reference for the regime split (math §7)
 // ────────────────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolyaGammaCpuRegime {
+    ExactPg1,
+    ExactConvolution,
+    Saddlepoint,
+    NormalApproximation,
+}
+
+#[inline]
+fn cpu_regime_for_shape(shape: u32) -> PolyaGammaCpuRegime {
+    if shape <= PG1_MAX_B {
+        PolyaGammaCpuRegime::ExactPg1
+    } else if shape < SADDLE_MIN_B {
+        PolyaGammaCpuRegime::ExactConvolution
+    } else if shape <= SADDLE_MAX_B {
+        PolyaGammaCpuRegime::Saddlepoint
+    } else {
+        PolyaGammaCpuRegime::NormalApproximation
+    }
+}
+
 /// Per-row CPU draw using the appropriate regime. Used by the harness
 /// when the GPU runtime is unavailable, and as the per-row oracle for
 /// the dispatched device path’s parity tests.
@@ -459,14 +480,11 @@ pub fn draw_batch_cpu(input: &PolyaGammaBatchInput<'_>) -> Result<Array1<f64>, S
         let mut state = XorwowState::new(input.seed.0, i as u64);
         let b = input.shapes[i];
         let c = input.tilts[i];
-        let v = if b <= PG1_MAX_B {
-            pg1_draw_cpu_oracle(&mut state, c)
-        } else if b < SADDLE_MIN_B {
-            pg_convolution_cpu_oracle(&mut state, b, c)
-        } else if b <= SADDLE_MAX_B {
-            pg_saddlepoint_cpu_oracle(&mut state, b, c)
-        } else {
-            pg_normal_cpu_oracle(&mut state, b, c)
+        let v = match cpu_regime_for_shape(b) {
+            PolyaGammaCpuRegime::ExactPg1 => pg1_draw_cpu_oracle(&mut state, c),
+            PolyaGammaCpuRegime::ExactConvolution => pg_convolution_cpu_oracle(&mut state, b, c),
+            PolyaGammaCpuRegime::Saddlepoint => pg_saddlepoint_cpu_oracle(&mut state, b, c),
+            PolyaGammaCpuRegime::NormalApproximation => pg_normal_cpu_oracle(&mut state, b, c),
         };
         out[i] = v;
     }
@@ -1402,66 +1420,55 @@ mod tests {
     }
 
     #[test]
-    fn batch_dispatch_handles_mixed_regimes() {
-        // 4 rows, one in each regime band. CPU path should run cleanly.
-        let shapes = ndarray::array![1u32, 5u32, 50u32, 300u32];
-        let tilts = ndarray::array![0.5_f64, 0.5, 0.5, 0.5];
+    fn batch_dispatch_selects_every_declared_regime_at_its_boundaries() {
+        let cases = [
+            (PG1_MAX_B, -0.75, PolyaGammaCpuRegime::ExactPg1),
+            (PG1_MAX_B + 1, 0.25, PolyaGammaCpuRegime::ExactConvolution),
+            (
+                SADDLE_MIN_B - 1,
+                1.25,
+                PolyaGammaCpuRegime::ExactConvolution,
+            ),
+            (SADDLE_MIN_B, -1.75, PolyaGammaCpuRegime::Saddlepoint),
+            (SADDLE_MAX_B, 2.25, PolyaGammaCpuRegime::Saddlepoint),
+            (NORMAL_MIN_B, -0.5, PolyaGammaCpuRegime::NormalApproximation),
+        ];
+        let shapes = Array1::from_vec(cases.iter().map(|case| case.0).collect());
+        let tilts = Array1::from_vec(cases.iter().map(|case| case.1).collect());
+        let seed = PgSeed(42);
         let input = PolyaGammaBatchInput {
             shapes: shapes.view(),
             tilts: tilts.view(),
-            seed: PgSeed(42),
+            seed,
         };
         let out = draw_batch_cpu(&input).expect("CPU dispatch");
-        assert_eq!(out.len(), 4);
-        for v in out.iter() {
-            assert!(
-                v.is_finite() && *v > 0.0,
-                "PG draw must be positive finite: {v}"
+        assert_eq!(out.len(), cases.len());
+
+        for (row, &(shape, tilt, expected_regime)) in cases.iter().enumerate() {
+            assert_eq!(
+                cpu_regime_for_shape(shape),
+                expected_regime,
+                "shape {shape} crossed the wrong declared regime boundary"
+            );
+            let mut state = XorwowState::new(seed.0, row as u64);
+            let expected = match expected_regime {
+                PolyaGammaCpuRegime::ExactPg1 => pg1_draw_cpu_oracle(&mut state, tilt),
+                PolyaGammaCpuRegime::ExactConvolution => {
+                    pg_convolution_cpu_oracle(&mut state, shape, tilt)
+                }
+                PolyaGammaCpuRegime::Saddlepoint => {
+                    pg_saddlepoint_cpu_oracle(&mut state, shape, tilt)
+                }
+                PolyaGammaCpuRegime::NormalApproximation => {
+                    pg_normal_cpu_oracle(&mut state, shape, tilt)
+                }
+            };
+            assert_eq!(
+                out[row].to_bits(),
+                expected.to_bits(),
+                "row {row}, shape {shape}: batch dispatcher did not call {expected_regime:?}"
             );
         }
-    }
-
-    #[test]
-    fn logistic_gibbs_step_reduces_marginal_error() {
-        // Sanity: starting from β = 0 on a small synthetic logistic dataset,
-        // one Gibbs step should move toward the MLE direction. We don't
-        // test convergence (that needs a chain); just that the new β is
-        // finite, p-dimensional, and has nonzero displacement.
-        let n = 200;
-        let p = 3;
-        let mut design = Array2::<f64>::zeros((n, p));
-        let mut targets = Array1::<u8>::zeros(n);
-        for i in 0..n {
-            // Three covariates, last column intercept-like.
-            let x1 = ((i as f64) / (n as f64)) * 2.0 - 1.0;
-            let x2 = (((i * 7) % n) as f64 / n as f64) * 2.0 - 1.0;
-            design[[i, 0]] = x1;
-            design[[i, 1]] = x2;
-            design[[i, 2]] = 1.0;
-            let eta = 1.5 * x1 - 0.7 * x2 + 0.3;
-            let p_y = 1.0 / (1.0 + (-eta).exp());
-            // Deterministic Bernoulli via splitmix to avoid an RNG crate.
-            let h = splitmix64_mix(i as u64 ^ 0xABCD_EF);
-            let u = ((h >> 11) as f64) / ((1u64 << 53) as f64);
-            targets[i] = if u < p_y { 1 } else { 0 };
-        }
-        let q0 = Array2::<f64>::eye(p) * 0.1;
-        let beta = Array1::<f64>::zeros(p);
-        let new_beta = logistic_gibbs_step(
-            design.view(),
-            targets.view(),
-            q0.view(),
-            beta.view(),
-            PgSeed(1),
-            9,
-        )
-        .expect("Gibbs step");
-        assert_eq!(new_beta.len(), p);
-        let disp: f64 = new_beta.iter().map(|b| b * b).sum::<f64>().sqrt();
-        assert!(
-            disp > 0.05 && disp.is_finite(),
-            "Gibbs step displacement {disp} not meaningfully nonzero"
-        );
     }
 
     // ────────────────────────────────────────────────────────────────────

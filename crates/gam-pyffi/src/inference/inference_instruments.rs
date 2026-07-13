@@ -1693,15 +1693,13 @@ mod tests {
         assert_eq!(&*perturbed_ring_trace.borrow(), &[ring_selected_k]);
     }
 
-    /// #2262 structureless-null control: on pure isotropic Gaussian noise (no
-    /// ring, no cluster structure whatsoever) both matched controls must still
-    /// run cleanly end to end and produce a well-formed
-    /// `control_circular_win_fraction` in `{0.0, 0.5, 1.0}` — a descriptive
-    /// two-control result, not a false-positive-rate or floor estimate. This exercises the
-    /// SAME `matched_control_verdicts` path `adjudicate_atom_shape` calls, just
-    /// without the Python boundary.
+    /// #2262 structureless-null control: this frozen isotropic-Gaussian fixture
+    /// contains no ring or cluster structure, so neither independently seeded
+    /// matched control may promote the circular model. This exercises the same
+    /// `matched_control_verdicts` path `adjudicate_atom_shape` calls without
+    /// recomputing the expected aggregate from production's returned flags.
     #[test]
-    fn matched_controls_report_a_well_formed_circular_win_fraction_on_pure_noise_2262() {
+    fn matched_controls_do_not_promote_circle_on_seeded_isotropic_noise_2262() {
         use rand::SeedableRng;
         use rand::rngs::StdRng;
         use rand_distr::{Distribution, Normal};
@@ -1735,21 +1733,17 @@ mod tests {
         );
 
         assert!(
-            (0.0..=1.0).contains(&control_circular_win_fraction),
-            "two-control circular-win fraction must lie in [0, 1]: {control_circular_win_fraction}"
+            !shuffle_verdict.circle_wins,
+            "the per-dimension-shuffle null must not promote a circle on the frozen isotropic-noise fixture"
         );
         assert!(
-            (control_circular_win_fraction - 0.0).abs() < 1e-12
-                || (control_circular_win_fraction - 0.5).abs() < 1e-12
-                || (control_circular_win_fraction - 1.0).abs() < 1e-12,
-            "two-control circular-win fraction must be exactly {{0, 1/2, 1}}: got {control_circular_win_fraction}"
+            !gaussian_verdict.circle_wins,
+            "the covariance-matched Gaussian null must not promote a circle on the frozen isotropic-noise fixture"
         );
         assert_eq!(
-            control_circular_win_fraction,
-            (usize::from(shuffle_verdict.circle_wins) + usize::from(gaussian_verdict.circle_wins))
-                as f64
-                / 2.0,
-            "reported fraction must equal the mean of the two controls' own circle_wins flags"
+            control_circular_win_fraction.to_bits(),
+            0.0_f64.to_bits(),
+            "two independently structureless controls must produce an exact zero circular-win fraction"
         );
 
         // mean_l0 is mandatory: omitting it must be a clean error, not a panic
