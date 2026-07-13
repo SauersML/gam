@@ -2764,16 +2764,50 @@ fn cycle_rejection_boundary(
     )
 }
 
+fn covariance_quadratic(covariance: &Array2<f64>, gradient: &Array1<f64>) -> f64 {
+    gradient.dot(&covariance.dot(gradient))
+}
+
+fn write_patch_gradient(
+    model: &GaussianPcaErrorModel,
+    patch: usize,
+    gradient: &Array2<f64>,
+    scale: f64,
+    target: &mut Array1<f64>,
+) {
+    let offset = model.offsets[patch];
+    for row in 0..gradient.nrows() {
+        for column in 0..INTRINSIC_DIMENSION {
+            target[offset + row * INTRINSIC_DIMENSION + column] +=
+                scale * gradient[[row, column]];
+        }
+    }
+}
+
+fn quadratic_gaussian_moments(
+    quadratic: &Array2<f64>,
+    covariance: &Array2<f64>,
+) -> (f64, f64) {
+    let product = quadratic.dot(covariance);
+    let bias: f64 = (0..product.nrows()).map(|index| product[[index, index]]).sum();
+    let trace_square: f64 = (0..product.nrows())
+        .flat_map(|row| (0..product.ncols()).map(move |column| (row, column)))
+        .map(|(row, column)| product[[row, column]] * product[[column, row]])
+        .sum();
+    (bias, (2.0 * trace_square).max(0.0))
+}
+
 fn analyze_cycle(
     cycle_index: usize,
     cycle: &FundamentalCycle,
     patches: &[GaussianPcaPatch],
     edges: &[EdgeWork],
+    error_model: &GaussianPcaErrorModel,
     allocated_alpha: f64,
 ) -> Result<AtlasCycleHolonomy, String> {
     let gaussian_error_budget = allocated_alpha / 2.0;
     let subspace_tail_probability_bound = allocated_alpha - gaussian_error_budget;
-    let cycle_steps: Vec<AtlasHolonomyCycleStep> = cycle
+    let cycle_steps: Vec<_> = cycle
         .steps
         .iter()
         .map(|&(edge, forward)| {
@@ -2785,6 +2819,23 @@ fn analyze_cycle(
         .iter()
         .map(|&(edge, _)| edges[edge].public.geometric_remainder_bound)
         .sum();
+    let empty_refusal = |reasons| AtlasCycleHolonomy {
+        cycle_index,
+        steps: cycle_steps.clone(),
+        absolute_angle: None,
+        limit_law: None,
+        first_order_variance: None,
+        naive_edgewise_first_order_variance: None,
+        covariance_aggregation_adjustment: None,
+        bilinear_quadratic_bias: None,
+        bilinear_quadratic_variance: None,
+        standard_error: None,
+        polar_linearization_remainder_bound: None,
+        geometric_remainder_bound,
+        gaussian_error_budget,
+        subspace_tail_probability_bound,
+        decision: AtlasStatisticalDecision::Refused { reasons },
+    };
     let mut reasons = Vec::new();
     for &(edge_index, _) in &cycle.steps {
         let edge = &edges[edge_index];
@@ -2797,24 +2848,7 @@ fn analyze_cycle(
         }
     }
     if !reasons.is_empty() {
-        return Ok(AtlasCycleHolonomy {
-            cycle_index,
-            steps: cycle_steps,
-            absolute_angle: None,
-            first_order_variance: None,
-            naive_edgewise_first_order_variance: None,
-            shared_patch_covariance_adjustment: None,
-            second_order_variance: None,
-            naive_edgewise_second_order_variance: None,
-            shared_pair_second_order_covariance_adjustment: None,
-            raw_ambient_second_order_variance: None,
-            standard_error: None,
-            polar_linearization_remainder_bound: None,
-            geometric_remainder_bound,
-            gaussian_error_budget,
-            subspace_tail_probability_bound,
-            decision: AtlasStatisticalDecision::Refused { reasons },
-        });
+        return Ok(empty_refusal(reasons));
     }
     let step_matrices: Vec<Array2<f64>> = cycle
         .steps
@@ -2822,10 +2856,8 @@ fn analyze_cycle(
         .map(|&(edge, forward)| {
             edge_step_matrix(&edges[edge], forward).ok_or_else(|| {
                 format!(
-                    "cycle {cycle_index} edge ({}, {}, overlap {}) lost its validated polar transition",
-                    edges[edge].public.a,
-                    edges[edge].public.b,
-                    edges[edge].public.overlap
+                    "cycle {cycle_index} edge {:?} lost its validated polar transition",
+                    edges[edge].public.identity()
                 )
             })
         })
@@ -2838,26 +2870,9 @@ fn analyze_cycle(
     }
     let holonomy = product;
     if determinant_2(holonomy.view()) < 0.0 {
-        return Ok(AtlasCycleHolonomy {
-            cycle_index,
-            steps: cycle_steps,
-            absolute_angle: None,
-            first_order_variance: None,
-            naive_edgewise_first_order_variance: None,
-            shared_patch_covariance_adjustment: None,
-            second_order_variance: None,
-            naive_edgewise_second_order_variance: None,
-            shared_pair_second_order_covariance_adjustment: None,
-            raw_ambient_second_order_variance: None,
-            standard_error: None,
-            polar_linearization_remainder_bound: None,
-            geometric_remainder_bound,
-            gaussian_error_budget,
-            subspace_tail_probability_bound,
-            decision: AtlasStatisticalDecision::Refused {
-                reasons: vec![AtlasStatisticalRefusal::ImproperCycleHolonomy { cycle_index }],
-            },
-        });
+        return Ok(empty_refusal(vec![
+            AtlasStatisticalRefusal::ImproperCycleHolonomy { cycle_index },
+        ]));
     }
     let mut after = vec![identity_2(); step_matrices.len()];
     let mut suffix = identity_2();
@@ -2874,21 +2889,12 @@ fn analyze_cycle(
             .dot(&holonomy_gradient)
             .dot(&before[position].t());
         let canonical = edges[edge_index].transition.as_ref().ok_or_else(|| {
-            format!(
-                "cycle {cycle_index} edge ({}, {}, overlap {}) lost its validated transition during derivative assembly",
-                edges[edge_index].public.a,
-                edges[edge_index].public.b,
-                edges[edge_index].public.overlap
-            )
+            format!("cycle {cycle_index} lost edge {}", edge_index)
         })?;
         let canonical_tangent = canonical.dot(&generator);
         let step_tangent = if forward {
             canonical_tangent
         } else {
-            // The reverse transition is `R^T`; differentiating it with
-            // respect to the canonical edge angle gives `(R J)^T` directly.
-            // Negating this transpose double-flips the orientation and makes
-            // the exact two-edge walk `R R^T` acquire spurious variance.
             canonical_tangent.t().to_owned()
         };
         coefficients.push(frobenius_inner(
@@ -2896,121 +2902,154 @@ fn analyze_cycle(
             step_tangent.view(),
         ));
     }
-    let ambient = patches[0].ambient_dimension();
-    let mut patch_gradients =
-        vec![Array2::<f64>::zeros((ambient, INTRINSIC_DIMENSION)); patches.len()];
+
+    let dimension = error_model.covariance.nrows();
+    let mut aggregate_gradient = Array1::<f64>::zeros(dimension);
     let mut naive_first_order_variance = 0.0_f64;
-    let mut naive_edgewise_second_order_variance = 0.0_f64;
-    let mut projected_pair_coefficients = BTreeMap::<(usize, usize, usize), f64>::new();
-    let mut raw_pair_coefficients = BTreeMap::<(usize, usize), f64>::new();
+    let mut quadratic = Array2::<f64>::zeros((dimension, dimension));
     for (position, &(edge_index, _)) in cycle.steps.iter().enumerate() {
         let coefficient = coefficients[position];
         let edge = &edges[edge_index];
         let gradient_a = edge.patch_gradient_a.as_ref().ok_or_else(|| {
-            format!(
-                "cycle {cycle_index} edge ({}, {}, overlap {}) lost patch-a projector gradient",
-                edge.public.a, edge.public.b, edge.public.overlap
-            )
+            format!("cycle {cycle_index} lost patch-a gradient for edge {edge_index}")
         })?;
         let gradient_b = edge.patch_gradient_b.as_ref().ok_or_else(|| {
-            format!(
-                "cycle {cycle_index} edge ({}, {}, overlap {}) lost patch-b projector gradient",
-                edge.public.a, edge.public.b, edge.public.overlap
-            )
+            format!("cycle {cycle_index} lost patch-b gradient for edge {edge_index}")
         })?;
-        patch_gradients[edge.public.a].scaled_add(coefficient, gradient_a);
-        patch_gradients[edge.public.b].scaled_add(coefficient, gradient_b);
-        naive_first_order_variance += coefficient
-            * coefficient
-            * (patches[edge.public.a].projector_variance_scale()
-                * frobenius_squared(gradient_a.view())
-                + patches[edge.public.b].projector_variance_scale()
-                    * frobenius_squared(gradient_b.view()));
-        naive_edgewise_second_order_variance += coefficient
-            * coefficient
-            * (edge.public.projected_dimension - INTRINSIC_DIMENSION) as f64
-            * patches[edge.public.a].projector_variance_scale()
-            * patches[edge.public.b].projector_variance_scale()
-            / 2.0;
-        *projected_pair_coefficients
-            .entry((
-                edge.public.a,
-                edge.public.b,
-                edge.public.projected_dimension,
-            ))
-            .or_default() += coefficient;
-        *raw_pair_coefficients
-            .entry((edge.public.a, edge.public.b))
-            .or_default() += coefficient;
+        let mut edge_gradient = Array1::<f64>::zeros(dimension);
+        write_patch_gradient(
+            error_model,
+            edge.public.a,
+            gradient_a,
+            coefficient,
+            &mut edge_gradient,
+        );
+        write_patch_gradient(
+            error_model,
+            edge.public.b,
+            gradient_b,
+            coefficient,
+            &mut edge_gradient,
+        );
+        aggregate_gradient += &edge_gradient;
+        naive_first_order_variance +=
+            covariance_quadratic(&error_model.covariance, &edge_gradient);
+
+        let angle_gradient = edge.angle_gradient.as_ref().ok_or_else(|| {
+            format!("cycle {cycle_index} lost angle gradient for edge {edge_index}")
+        })?;
+        let offset_a = error_model.offsets[edge.public.a];
+        let offset_b = error_model.offsets[edge.public.b];
+        for coordinate_b in 0..edge.projection_cross_gram_ba.nrows() {
+            for coordinate_a in 0..edge.projection_cross_gram_ba.ncols() {
+                let frame_inner = edge.projection_cross_gram_ba[[coordinate_b, coordinate_a]];
+                for tangent_b in 0..INTRINSIC_DIMENSION {
+                    for tangent_a in 0..INTRINSIC_DIMENSION {
+                        let a_index = offset_a
+                            + coordinate_a * INTRINSIC_DIMENSION
+                            + tangent_a;
+                        let b_index = offset_b
+                            + coordinate_b * INTRINSIC_DIMENSION
+                            + tangent_b;
+                        let value = coefficient
+                            * angle_gradient[[tangent_b, tangent_a]]
+                            * frame_inner
+                            / 2.0;
+                        quadratic[[a_index, b_index]] += value;
+                        quadratic[[b_index, a_index]] += value;
+                    }
+                }
+            }
+        }
     }
-    let first_order_variance: f64 = patch_gradients
-        .iter()
-        .zip(patches)
-        .map(|(gradient, patch)| {
-            patch.projector_variance_scale() * frobenius_squared(gradient.view())
-        })
-        .sum();
-    let shared_patch_covariance_adjustment = first_order_variance - naive_first_order_variance;
-    // The quadratic `delta_a^T delta_b` term is independent across distinct
-    // patch pairs, but overlap components connecting the same pair reuse the
-    // same two estimated projectors. Add their signed cycle coefficients before
-    // squaring, exactly as the first-order shared-patch terms are aggregated.
-    let second_order_variance: f64 = projected_pair_coefficients
-        .iter()
-        .map(|(&(a, b, projected_dimension), &coefficient)| {
-            coefficient
-                * coefficient
-                * (projected_dimension - INTRINSIC_DIMENSION) as f64
-                * patches[a].projector_variance_scale()
-                * patches[b].projector_variance_scale()
-                / 2.0
-        })
-        .sum();
-    let shared_pair_second_order_covariance_adjustment =
-        second_order_variance - naive_edgewise_second_order_variance;
-    let raw_ambient_second_order_variance: f64 = raw_pair_coefficients
-        .iter()
-        .map(|(&(a, b), &coefficient)| {
-            coefficient
-                * coefficient
-                * (ambient - INTRINSIC_DIMENSION) as f64
-                * patches[a].projector_variance_scale()
-                * patches[b].projector_variance_scale()
-                / 2.0
-        })
-        .sum();
-    let standard_error = (first_order_variance + second_order_variance).sqrt();
+    let first_order_variance =
+        covariance_quadratic(&error_model.covariance, &aggregate_gradient).max(0.0);
+    let covariance_aggregation_adjustment =
+        first_order_variance - naive_first_order_variance;
+    let (quadratic_bias, quadratic_variance) =
+        quadratic_gaussian_moments(&quadratic, &error_model.covariance);
+    let variance_scale = first_order_variance
+        .abs()
+        .max(naive_first_order_variance.abs())
+        .max(f64::MIN_POSITIVE);
+    let variance_backward_error = f64::EPSILON * dimension.max(1) as f64 * variance_scale;
+    let degenerate = first_order_variance <= variance_backward_error;
+    let limit_law = if degenerate {
+        AtlasCycleLimitLaw::DegenerateQuadraticGaussian {
+            bias: quadratic_bias,
+            variance: quadratic_variance,
+        }
+    } else {
+        AtlasCycleLimitLaw::FirstOrderGaussian {
+            variance: first_order_variance,
+            authority: error_model.authority,
+        }
+    };
+    let standard_error = (!degenerate).then(|| first_order_variance.sqrt());
     let absolute_angle = (holonomy[[1, 0]] - holonomy[[0, 1]])
         .atan2(holonomy[[0, 0]] + holonomy[[1, 1]])
         .abs();
 
-    // Pairwise projection spaces on adjacent edges need not be nested. Allocate
-    // the subspace-tail probability over the 2L projected endpoint events,
-    // preserving the advertised familywise bound for arbitrary cycles.
+    for patch in patches {
+        if !patch.pilot_projection.is_certified() {
+            reasons.push(AtlasStatisticalRefusal::PilotProjectionUncertified {
+                chart: patch.chart,
+            });
+        }
+        if patch.spectrum_provenance.certified_bounds().is_none() {
+            reasons.push(AtlasStatisticalRefusal::PopulationSpectrumUncertified {
+                chart: patch.chart,
+            });
+        }
+    }
+    if matches!(
+        error_model.authority,
+        GaussianPcaCovarianceAuthority::AsymptoticPlugIn
+    ) {
+        reasons.push(AtlasStatisticalRefusal::GaussianLinearizationIsPlugin { cycle_index });
+    }
+    if degenerate {
+        reasons.push(AtlasStatisticalRefusal::DegenerateQuadraticGaussianLimit {
+            cycle_index,
+            quadratic_bias,
+            quadratic_variance,
+        });
+    }
+
     let endpoint_event_count = 2 * cycle.steps.len();
-    let tail_parameter = (2.0 * endpoint_event_count as f64 / subspace_tail_probability_bound).ln();
+    let tail_parameter = (2.0 * endpoint_event_count as f64
+        / subspace_tail_probability_bound)
+        .ln();
     let mut polar_linearization_remainder_bound = 0.0_f64;
     for (position, &(edge_index, _)) in cycle.steps.iter().enumerate() {
         let edge = &edges[edge_index];
-        let tail_a = patch_tail(
+        let Some(tail_a) = patch_tail(
             &patches[edge.public.a],
-            edge.public.projected_dimension,
+            patches[edge.public.a].retained_dimension(),
             tail_parameter,
-        );
-        let tail_b = patch_tail(
+        ) else {
+            continue;
+        };
+        let Some(tail_b) = patch_tail(
             &patches[edge.public.b],
-            edge.public.projected_dimension,
+            patches[edge.public.b].retained_dimension(),
             tail_parameter,
-        );
+        ) else {
+            continue;
+        };
         for (chart, tail) in [(edge.public.a, tail_a), (edge.public.b, tail_b)] {
-            if tail.covariance_error >= patches[chart].population_bounds.eigengap_lower / 2.0
+            let bounds = patches[chart]
+                .spectrum_provenance
+                .certified_bounds()
+                .ok_or_else(|| format!("cycle {cycle_index} lost certified patch bounds"))?;
+            if tail.covariance_error >= bounds.eigengap_lower / 2.0
                 || tail.projector_error >= 1.0
             {
                 reasons.push(AtlasStatisticalRefusal::PatchTailCrossesEigengap {
                     edge: edge.public.identity(),
                     chart,
                     covariance_error_bound: tail.covariance_error,
-                    eigengap_lower: patches[chart].population_bounds.eigengap_lower,
+                    eigengap_lower: bounds.eigengap_lower,
                 });
             }
         }
@@ -3043,94 +3082,58 @@ fn analyze_cycle(
             .as_ref()
             .map(|gradient| frobenius_squared(gradient.view()).sqrt())
             .unwrap_or(0.0);
-        let linear_change_bound = gradient_norm * (INTRINSIC_DIMENSION as f64).sqrt() * cross_error;
+        let linear_change_bound =
+            gradient_norm * (INTRINSIC_DIMENSION as f64).sqrt() * cross_error;
         polar_linearization_remainder_bound +=
             coefficients[position].abs() * (total_angle_change + linear_change_bound);
     }
+
+    let analyzed = |decision| AtlasCycleHolonomy {
+        cycle_index,
+        steps: cycle_steps.clone(),
+        absolute_angle: Some(absolute_angle),
+        limit_law: Some(limit_law),
+        first_order_variance: Some(first_order_variance),
+        naive_edgewise_first_order_variance: Some(naive_first_order_variance),
+        covariance_aggregation_adjustment: Some(covariance_aggregation_adjustment),
+        bilinear_quadratic_bias: Some(quadratic_bias),
+        bilinear_quadratic_variance: Some(quadratic_variance),
+        standard_error,
+        polar_linearization_remainder_bound: Some(polar_linearization_remainder_bound),
+        geometric_remainder_bound,
+        gaussian_error_budget,
+        subspace_tail_probability_bound,
+        decision,
+    };
     if !reasons.is_empty() {
-        return Ok(AtlasCycleHolonomy {
-            cycle_index,
-            steps: cycle_steps,
-            absolute_angle: Some(absolute_angle),
-            first_order_variance: Some(first_order_variance),
-            naive_edgewise_first_order_variance: Some(naive_first_order_variance),
-            shared_patch_covariance_adjustment: Some(shared_patch_covariance_adjustment),
-            second_order_variance: Some(second_order_variance),
-            naive_edgewise_second_order_variance: Some(naive_edgewise_second_order_variance),
-            shared_pair_second_order_covariance_adjustment: Some(
-                shared_pair_second_order_covariance_adjustment,
-            ),
-            raw_ambient_second_order_variance: Some(raw_ambient_second_order_variance),
-            standard_error: Some(standard_error),
-            polar_linearization_remainder_bound: Some(polar_linearization_remainder_bound),
-            geometric_remainder_bound,
-            gaussian_error_budget,
-            subspace_tail_probability_bound,
-            decision: AtlasStatisticalDecision::Refused { reasons },
-        });
+        return Ok(analyzed(AtlasStatisticalDecision::Refused { reasons }));
     }
     let rejection_boundary = cycle_rejection_boundary(
-        standard_error,
+        standard_error.ok_or_else(|| {
+            format!("cycle {cycle_index} degenerate Gaussian law reached z-test")
+        })?,
         polar_linearization_remainder_bound,
         geometric_remainder_bound,
         gaussian_error_budget,
     )?;
     if std::f64::consts::PI - absolute_angle <= rejection_boundary {
-        return Ok(AtlasCycleHolonomy {
-            cycle_index,
-            steps: cycle_steps,
-            absolute_angle: Some(absolute_angle),
-            first_order_variance: Some(first_order_variance),
-            naive_edgewise_first_order_variance: Some(naive_first_order_variance),
-            shared_patch_covariance_adjustment: Some(shared_patch_covariance_adjustment),
-            second_order_variance: Some(second_order_variance),
-            naive_edgewise_second_order_variance: Some(naive_edgewise_second_order_variance),
-            shared_pair_second_order_covariance_adjustment: Some(
-                shared_pair_second_order_covariance_adjustment,
-            ),
-            raw_ambient_second_order_variance: Some(raw_ambient_second_order_variance),
-            standard_error: Some(standard_error),
-            polar_linearization_remainder_bound: Some(polar_linearization_remainder_bound),
-            geometric_remainder_bound,
-            gaussian_error_budget,
-            subspace_tail_probability_bound,
-            decision: AtlasStatisticalDecision::Refused {
-                reasons: vec![AtlasStatisticalRefusal::CycleAngleBranchCutCrossed {
-                    cycle_index,
-                    absolute_angle,
-                    uncertainty_radius: rejection_boundary,
-                }],
-            },
-        });
+        return Ok(analyzed(AtlasStatisticalDecision::Refused {
+            reasons: vec![AtlasStatisticalRefusal::CycleAngleBranchCutCrossed {
+                cycle_index,
+                absolute_angle,
+                uncertainty_radius: rejection_boundary,
+            }],
+        }));
     }
     let conclusion = if absolute_angle > rejection_boundary {
         AtlasCycleConclusion::NonTrivialHolonomy
     } else {
         AtlasCycleConclusion::NotRejected
     };
-    Ok(AtlasCycleHolonomy {
-        cycle_index,
-        steps: cycle_steps,
-        absolute_angle: Some(absolute_angle),
-        first_order_variance: Some(first_order_variance),
-        naive_edgewise_first_order_variance: Some(naive_first_order_variance),
-        shared_patch_covariance_adjustment: Some(shared_patch_covariance_adjustment),
-        second_order_variance: Some(second_order_variance),
-        naive_edgewise_second_order_variance: Some(naive_edgewise_second_order_variance),
-        shared_pair_second_order_covariance_adjustment: Some(
-            shared_pair_second_order_covariance_adjustment,
-        ),
-        raw_ambient_second_order_variance: Some(raw_ambient_second_order_variance),
-        standard_error: Some(standard_error),
-        polar_linearization_remainder_bound: Some(polar_linearization_remainder_bound),
-        geometric_remainder_bound,
-        gaussian_error_budget,
-        subspace_tail_probability_bound,
-        decision: AtlasStatisticalDecision::Certified {
-            value: conclusion,
-            error_probability_bound: gaussian_error_budget + subspace_tail_probability_bound,
-        },
-    })
+    Ok(analyzed(AtlasStatisticalDecision::Certified {
+        value: conclusion,
+        error_probability_bound: gaussian_error_budget + subspace_tail_probability_bound,
+    }))
 }
 
 fn gauss_bonnet_confidence(

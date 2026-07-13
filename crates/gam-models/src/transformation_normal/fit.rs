@@ -86,7 +86,23 @@ impl TransformationExactGeometryCache {
             }
             .into());
         }
+        if log_lambdas.len() != self.family.initial_log_lambdas.len() {
+            return Err(TransformationNormalError::InvalidInput {
+                reason: format!(
+                    "transformation family rho length mismatch: got {}, expected {}",
+                    log_lambdas.len(),
+                    self.family.initial_log_lambdas.len(),
+                ),
+            }
+            .into());
+        }
+        gam_problem::validate_log_strengths(log_lambdas.iter().copied()).map_err(|error| {
+            TransformationNormalError::InvalidInput {
+                reason: format!("invalid transformation smoothing strength: {error}"),
+            }
+        })?;
         spec.initial_log_lambdas = log_lambdas.clone();
+        self.family.initial_log_lambdas = log_lambdas.clone();
         Ok(())
     }
 }
@@ -237,6 +253,7 @@ pub fn fit_transformation_normal(
                 .collect(),
             &effective_config,
             warm_start,
+            InitialLogLambdaSource::PenaltyScaleFromWeightedGram,
         )?;
         let blocks = vec![family.block_spec()];
         let fit = fit_custom_family(&family, &blocks, &options)
@@ -327,6 +344,7 @@ pub fn fit_transformation_normal(
             .collect(),
         &effective_config,
         warm_start,
+        InitialLogLambdaSource::PenaltyScaleFromWeightedGram,
     )?;
     let probe_block = probe_family.block_spec();
     let n_penalties = probe_block.initial_log_lambdas.len();
@@ -401,8 +419,9 @@ pub fn fit_transformation_normal(
     let ws = warm_start.cloned();
 
     // Helper: build family from prebuilt response basis + covariate design.
-    let make_family =
-        |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
+    let make_family = |cov_design: &TermCollectionDesign,
+                       rho: &Array1<f64>|
+     -> Result<TransformationNormalFamily, String> {
             let effective_offset = cov_design
                 .compose_offset(offset.view(), "transformation-normal spatial fit")
                 .map_err(|error| error.to_string())?;
@@ -424,6 +443,7 @@ pub fn fit_transformation_normal(
                     .collect(),
                 &cfg,
                 ws.as_ref(),
+                InitialLogLambdaSource::Supplied(rho.clone()),
             )
         };
 
@@ -434,7 +454,8 @@ pub fn fit_transformation_normal(
     let spatial_terms_for_cache = spatial_terms.clone();
 
     let ensure_exact_geometry = |spec: &TermCollectionSpec,
-                                 design: &TermCollectionDesign|
+                                 design: &TermCollectionDesign,
+                                 rho: &Array1<f64>|
      -> Result<(), String> {
         let effective_spec = freeze_term_collection_from_design(spec, design)
             .map_err(|e| format!("failed to freeze transformation geometry key: {e}"))?;
@@ -445,13 +466,17 @@ pub fn fit_transformation_normal(
             .map(|cached| cached.key != key)
             .unwrap_or(true);
         if !needs_rebuild {
-            return Ok(());
+            return exact_geometry_cache
+                .borrow_mut()
+                .as_mut()
+                .ok_or_else(|| "missing transformation exact geometry cache".to_string())?
+                .update_initial_log_lambdas(rho);
         }
 
         let geom_start = std::time::Instant::now();
         let exact_design = build_term_collection_design(covariate_data, &effective_spec)
             .map_err(|e| format!("failed to rebuild frozen transformation geometry: {e}"))?;
-        let family = make_family(&exact_design)?;
+        let family = make_family(&exact_design, rho)?;
         let cov_psi_derivs =
             build_block_spatial_psi_derivatives(covariate_data, &effective_spec, &exact_design)?
                 .ok_or_else(|| {
@@ -521,13 +546,12 @@ pub fn fit_transformation_normal(
         outer_derivative_policy,
         // fit_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
-            ensure_exact_geometry(&specs[0], &designs[0])?;
+            let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
+            ensure_exact_geometry(&specs[0], &designs[0], &rho)?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
-            let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            geometry.update_initial_log_lambdas(&rho)?;
             let warm_starts = exact_mode_candidates(gam_problem::EvalMode::ValueOnly, &rho);
             let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
                 &geometry.family,
@@ -596,12 +620,12 @@ pub fn fit_transformation_normal(
          designs: &[TermCollectionDesign],
          eval_mode,
          _row_set| {
-            ensure_exact_geometry(&specs[0], &designs[0])?;
+            let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
+            ensure_exact_geometry(&specs[0], &designs[0], &rho)?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
-            let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let warm_starts = exact_mode_candidates(eval_mode, &rho);
             let competing_modes = warm_starts.len() > 1;
             let selection = evaluate_custom_family_joint_hyper_best_mode_shared(

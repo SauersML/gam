@@ -18,6 +18,18 @@ pub struct TransformationWarmStart {
     pub scale: Array1<f64>,
 }
 
+/// Explicit authority for the smoothing strengths stored on a family built
+/// from a precomputed response basis.
+///
+/// The data-scaled arm is used exactly once to seed a new fit. During joint
+/// spatial optimization, rho is already an optimizer coordinate and must be
+/// supplied directly; rebuilding the same O(n p^2) likelihood Gram there is
+/// both wasted work and a second, conflicting initialization authority.
+pub(crate) enum InitialLogLambdaSource {
+    PenaltyScaleFromWeightedGram,
+    Supplied(Array1<f64>),
+}
+
 // ---------------------------------------------------------------------------
 // The family
 // ---------------------------------------------------------------------------
@@ -432,7 +444,7 @@ impl TransformationNormalFamily {
     ///
     /// For the outer loop where the response basis is precomputed once and reused
     /// across κ iterations.
-    pub fn from_prebuilt_response_basis(
+    pub(crate) fn from_prebuilt_response_basis(
         response: &Array1<f64>,
         response_val_basis: Array2<f64>,
         response_deriv_basis: Array2<f64>,
@@ -446,6 +458,7 @@ impl TransformationNormalFamily {
         covariate_penalties: Vec<PenaltyMatrix>,
         config: &TransformationNormalConfig,
         warm_start: Option<&TransformationWarmStart>,
+        initial_log_lambda_source: InitialLogLambdaSource,
     ) -> Result<Self, String> {
         let n = response_val_basis.nrows();
         if n == 0 {
@@ -578,11 +591,31 @@ impl TransformationNormalFamily {
             p_cov,
             config,
         )?;
-        let policy = ResourcePolicy::default_library();
-        let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy)?;
-
-        let initial_log_lambdas =
-            ctn_penalty_scale_log_lambdas(&tensor_penalties, &x_val_weighted_gram);
+        let initial_log_lambdas = match initial_log_lambda_source {
+            InitialLogLambdaSource::PenaltyScaleFromWeightedGram => {
+                let policy = ResourcePolicy::default_library();
+                let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy)?;
+                ctn_penalty_scale_log_lambdas(&tensor_penalties, &x_val_weighted_gram)
+            }
+            InitialLogLambdaSource::Supplied(log_lambdas) => {
+                if log_lambdas.len() != tensor_penalties.len() {
+                    return Err(TransformationNormalError::InvalidInput {
+                        reason: format!(
+                            "supplied transformation smoothing vector has length {}, expected {}",
+                            log_lambdas.len(),
+                            tensor_penalties.len(),
+                        ),
+                    }
+                    .into());
+                }
+                gam_problem::validate_log_strengths(log_lambdas.iter().copied()).map_err(
+                    |error| TransformationNormalError::InvalidInput {
+                        reason: format!("invalid supplied transformation smoothing strength: {error}"),
+                    },
+                )?;
+                log_lambdas
+            }
+        };
 
         // Compute response median.
         let mut sorted_resp = response.to_vec();
