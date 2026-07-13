@@ -4940,7 +4940,9 @@ fn slq_reduced_schur_log_det_matches_dense_evidence() {
     let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
     let exact_logdet: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
 
-    // Matrix-free SLQ estimate — never forms S.
+    // Matrix-free SLQ estimate — never forms S. Well-conditioned SPD fixture with
+    // no near-null directions, so the plain SPD estimator matches the exact
+    // Cholesky log-determinant (unit deflation would be a no-op here).
     let slq = slq_reduced_schur_log_det(
         &sys,
         &htt_factors,
@@ -4948,6 +4950,7 @@ fn slq_reduced_schur_log_det_matches_dense_evidence() {
         &backend,
         None,
         None,
+        ArrowEvidencePolicy::Strict,
         48,
         60,
         seed,
@@ -4972,6 +4975,7 @@ fn slq_reduced_schur_log_det_matches_dense_evidence() {
         &backend,
         None,
         None,
+        ArrowEvidencePolicy::Strict,
         48,
         60,
         seed,

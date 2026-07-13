@@ -1610,6 +1610,7 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     backend: &B,
     resident: Option<&SaeResidentReducedSchur>,
     gpu_matvec: Option<&GpuSchurMatvec>,
+    evidence_policy: ArrowEvidencePolicy,
     num_probes: usize,
     lanczos_steps: usize,
     seed: u64,
@@ -1625,7 +1626,23 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     // the byte-identical CPU `schur_matvec` lane is taken.
     let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident)
         .with_gpu_matvec(gpu_matvec);
-    slq_logdet(k, |v| op.apply(v), num_probes, lanczos_steps, seed)
+    // The evidence log|S| must obey the SAME conditioning convention as the dense
+    // reduced-Schur factor (#2308). Under `UnitDeflation` a collapsed / near-null
+    // decoder direction is pinned to unit stiffness (`ln 1 = 0`), so the SLQ
+    // estimate uses the unit-deflated spectral function `φ(θ)=θ≥floor ? ln θ : 0`
+    // instead of the plain `ln` (which would floor a sub-null Ritz value to
+    // `RITZ_LN_FLOOR`, contributing `≈ −690` per collapsed direction and a
+    // ρ-dependent Occam reward). `Strict` / `PositiveDefinite` keep the plain SPD
+    // estimator — they never form an undamped evidence with nulls.
+    match evidence_policy {
+        ArrowEvidencePolicy::UnitDeflation { relative_floor } => {
+            slq_logdet_unit_deflated(k, |v| op.apply(v), num_probes, lanczos_steps, seed, relative_floor)
+                .as_logdet()
+        }
+        ArrowEvidencePolicy::Strict | ArrowEvidencePolicy::PositiveDefinite => {
+            slq_logdet(k, |v| op.apply(v), num_probes, lanczos_steps, seed)
+        }
+    }
 }
 
 /// One-call matrix-free arrow evidence log-determinant for an assembled system.
@@ -1691,6 +1708,7 @@ pub fn matrix_free_arrow_evidence_log_det(
         &backend,
         resident.as_ref(),
         gpu_matvec,
+        options.evidence_policy,
         num_probes,
         lanczos_steps,
         seed,
@@ -1939,6 +1957,7 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                 &backend,
                 resident.as_ref(),
                 gpu_matvec,
+                options.evidence_policy,
                 slq_num_probes,
                 slq_lanczos_steps,
                 slq_seed,

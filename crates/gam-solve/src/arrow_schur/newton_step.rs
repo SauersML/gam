@@ -765,6 +765,7 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
                     backend,
                     resident.as_ref(),
                     gpu_matvec,
+                    options.evidence_policy,
                     SCHUR_SLQ_LOGDET_PROBES,
                     SCHUR_SLQ_LOGDET_LANCZOS_STEPS,
                     SCHUR_SLQ_LOGDET_SEED,
