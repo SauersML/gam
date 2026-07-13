@@ -368,74 +368,43 @@ pub(crate) fn gls_wiggle_second_directional_coeffs(
         g2_v,
         g2_uv,
     } = *dir;
-    let szeta_u = &rows.kappa * zeta_u;
-    let szeta_v = &rows.kappa * zeta_v;
-    let zeta_u_zeta_v = zeta_u * zeta_v;
-    let dw_u = -2.0 * &rows.w * &szeta_u;
-    let dw_v = -2.0 * &rows.w * &szeta_v;
-    let dw_uv =
-        4.0 * &rows.w * &(&szeta_u * &szeta_v) - 2.0 * &rows.w * &rows.kappa_prime * &zeta_u_zeta_v;
-    let dm_u = -(&rows.w * q_u) - &(2.0 * &rows.m * &szeta_u);
-    let dm_v = -(&rows.w * q_v) - &(2.0 * &rows.m * &szeta_v);
-    let dm_uv = &(2.0 * &rows.w * &(q_u * &szeta_v + q_v * &szeta_u)) - &(&rows.w * q_uv)
-        + &(4.0 * &rows.m * &(&szeta_u * &szeta_v))
-        - 2.0 * &rows.m * &rows.kappa_prime * &zeta_u_zeta_v;
-    let coeff_mm_uv = &(&dw_uv * &geom.dq_dq0.mapv(|v| v * v))
-        + &(2.0 * &dw_u * &geom.dq_dq0 * s1_v)
-        + &(2.0 * &dw_v * &geom.dq_dq0 * s1_u)
-        + &(2.0 * &rows.w * s1_u * s1_v)
-        + &(2.0 * &rows.w * &geom.dq_dq0 * s1_uv)
-        - &(&dm_uv * &geom.d2q_dq02)
-        - &(&dm_u * g2_v)
-        - &(&dm_v * g2_u)
-        - &(&rows.m * g2_uv);
-    // OBSERVED joint Hessian second directional derivatives (#1561). Second δn
-    // along (u, v); η_ls is linear in β so there is no zeta_uv leg.
-    let dn_u = &(-(2.0 * &rows.m * q_u)) - &(2.0 * &rows.n * &szeta_u);
-    let dn_v = &(-(2.0 * &rows.m * q_v)) - &(2.0 * &rows.n * &szeta_v);
-    let dn_uv = &(&(&(2.0 * &rows.w * &(q_u * q_v)) - &(2.0 * &rows.m * q_uv))
-        + &(4.0 * &rows.m * &(&(q_u * &szeta_v) + &(q_v * &szeta_u))))
-        + &(&(4.0 * &rows.n * &(&szeta_u * &szeta_v))
-            - &(2.0 * &rows.n * &rows.kappa_prime * &zeta_u_zeta_v));
-    // κ''' = κ''(1−2κ) − 2(κ')² (logb); a_coef = 2κ²−κ'.
-    let ktp = &(&rows.kappa_dprime * &(1.0 - 2.0 * &rows.kappa))
-        - &(2.0 * &rows.kappa_prime * &rows.kappa_prime);
-    let a_coef = 2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime;
-    let amn = &rows.obs_weight - &rows.n;
-    // D²(2κm·dq_dq0)[u,v]: differentiate κ (zeta), m (dm), dq_dq0=D (s1).
+    let zero_mixed_scale = Array1::zeros(rows.obs_weight.len());
+    let tower = gaussian_row_second_tower(rows, q_u, zeta_u, q_v, zeta_v, q_uv, &zero_mixed_scale);
+    let base = &tower.base;
+    let first_u = &tower.first_a;
+    let first_v = &tower.first_b;
+    let second_uv = &tower.second;
     let d = &geom.dq_dq0;
-    let ml_term_kpp = &rows.kappa_dprime * &zeta_u_zeta_v * &rows.m * d;
-    let ml_term_kp_d = &rows.kappa_prime * d * &(&(zeta_v * &dm_u) + &(zeta_u * &dm_v));
-    let ml_term_kp_m = &rows.kappa_prime * &rows.m * &(&(zeta_v * s1_u) + &(zeta_u * s1_v));
-    let ml_term_k_d = &rows.kappa * d * &dm_uv;
-    let ml_term_k_s = &rows.kappa * &(&(&dm_v * s1_u) + &(&dm_u * s1_v));
-    let ml_term_k_m = &rows.kappa * &rows.m * s1_uv;
-    let coeff_ml_uv = 2.0
-        * &(&(&(&(&(&ml_term_kpp + &ml_term_kp_d) + &ml_term_kp_m) + &ml_term_k_d) + &ml_term_k_s)
-            + &ml_term_k_m);
-    // D²(κ'(a−n)+2κ²n)[u,v] via dn: κ'''(a−n)ζ_uζ_v + 4(κ'²+κκ'')nζ_uζ_v
-    // + (4κκ'−κ'')(ζ_v·dn_u + ζ_u·dn_v) + (2κ²−κ')·dn_uv.
-    let four_kkp_minus_kdp = 4.0 * &rows.kappa * &rows.kappa_prime - &rows.kappa_dprime;
-    let coeff_ll_uv = &(&(&(&ktp * &amn * &zeta_u_zeta_v)
-        + &(4.0
-            * &(&(&rows.kappa_prime * &rows.kappa_prime) + &(&rows.kappa * &rows.kappa_dprime))
-            * &rows.n
-            * &zeta_u_zeta_v))
-        + &(&four_kkp_minus_kdp * &(&(zeta_v * &dn_u) + &(zeta_u * &dn_v))))
-        + &(&a_coef * &dn_uv);
-
-    let a_u = &dw_u * &geom.dq_dq0 + &rows.w * s1_u;
-    let a_v = &dw_v * &geom.dq_dq0 + &rows.w * s1_v;
-    let a_uv = &dw_uv * &geom.dq_dq0 + &dw_u * s1_v + &dw_v * s1_u + &rows.w * s1_uv;
-    let c_u = -&dm_u;
-    let c_v = -&dm_v;
-    let c_uv = -&dm_uv;
-    // OBSERVED ls↔wiggle cross 2κm: l_u/l_v = D(2κm), l_uv = D²(2κm).
-    let l_u = &(2.0 * &rows.kappa_prime * zeta_u * &rows.m) + &(2.0 * &rows.kappa * &dm_u);
-    let l_v = &(2.0 * &rows.kappa_prime * zeta_v * &rows.m) + &(2.0 * &rows.kappa * &dm_v);
-    let l_uv = &(&(2.0 * &rows.kappa_dprime * &zeta_u_zeta_v * &rows.m)
-        + &(2.0 * &rows.kappa_prime * &(&(zeta_v * &dm_u) + &(zeta_u * &dm_v))))
-        + &(2.0 * &rows.kappa * &dm_uv);
+    let d2 = &geom.d2q_dq02;
+    let coeff_mm_uv = &(&second_uv.hessian_mm * &d.mapv(|value| value * value))
+        + &(2.0 * &first_u.hessian_mm * d * s1_v)
+        + &(2.0 * &first_v.hessian_mm * d * s1_u)
+        + &(2.0 * &base.hessian_mm * s1_u * s1_v)
+        + &(2.0 * &base.hessian_mm * d * s1_uv)
+        + &(&second_uv.gradient_mu * d2)
+        + &(&first_u.gradient_mu * g2_v)
+        + &(&first_v.gradient_mu * g2_u)
+        + &(&base.gradient_mu * g2_uv);
+    let coeff_ml_uv = &(&second_uv.hessian_ml * d)
+        + &(&first_u.hessian_ml * s1_v)
+        + &(&first_v.hessian_ml * s1_u)
+        + &(&base.hessian_ml * s1_uv);
+    let coeff_ll_uv = second_uv.hessian_ll.clone();
+    let a_u = &first_u.hessian_mm * d + &base.hessian_mm * s1_u;
+    let a_v = &first_v.hessian_mm * d + &base.hessian_mm * s1_v;
+    let a_uv = &second_uv.hessian_mm * d
+        + &first_u.hessian_mm * s1_v
+        + &first_v.hessian_mm * s1_u
+        + &base.hessian_mm * s1_uv;
+    let c_u = first_u.gradient_mu.clone();
+    let c_v = first_v.gradient_mu.clone();
+    let c_uv = second_uv.gradient_mu.clone();
+    let l_u = first_u.hessian_ml.clone();
+    let l_v = first_v.hessian_ml.clone();
+    let l_uv = second_uv.hessian_ml.clone();
+    let dw_u = first_u.hessian_mm.clone();
+    let dw_v = first_v.hessian_mm.clone();
+    let dw_uv = second_uv.hessian_mm.clone();
 
     GlsWiggleSecondDirCoeffs {
         coeff_mm_uv,
