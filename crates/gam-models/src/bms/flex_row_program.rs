@@ -332,10 +332,7 @@ impl BmsFlexRowProgram {
             visit(BmsFlexCalibrationOrder4Node::InterceptMixedThird { pair })?;
             visit(BmsFlexCalibrationOrder4Node::InterceptMixedFourth { pair })?;
             for &primary in active_primaries {
-                visit(BmsFlexCalibrationOrder4Node::InterceptPrimaryMixedFourth {
-                    pair,
-                    primary,
-                })?;
+                visit(BmsFlexCalibrationOrder4Node::InterceptPrimaryMixedFourth { pair, primary })?;
             }
             for (position, &left) in active_primaries.iter().enumerate() {
                 for &right in &active_primaries[position..] {

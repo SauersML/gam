@@ -6,8 +6,8 @@ use super::cell_moment_assembly::{
 use super::exact_eval_cache::*;
 use super::family::*;
 use super::flex_row_program::{
-    BmsFlexCalibrationOrder2Node, BmsFlexCalibrationOrder3Node,
-    BmsFlexCalibrationOrder4Node, BmsFlexProgramPoint, BmsFlexRowProgram,
+    BmsFlexCalibrationOrder2Node, BmsFlexCalibrationOrder3Node, BmsFlexCalibrationOrder4Node,
+    BmsFlexProgramPoint, BmsFlexRowProgram,
 };
 use super::gradient_paths::*;
 use super::hessian_paths::*;
@@ -3811,56 +3811,61 @@ impl BernoulliMarginalSlopeFamily {
                 .map(|_| BmsFlexRowProgramDerivativeCache::new())
                 .collect::<Vec<_>>()
         });
-        let stored = slots[row]
-            .third
-            .get_or_compute(|| -> Result<FlexAxisThirdRowTensors, String> {
-            let r = cache.primary.total;
-            let mut e_q = Array1::<f64>::zeros(r);
-            e_q[cache.primary.q] = 1.0;
-            let mut e_g = Array1::<f64>::zeros(r);
-            e_g[cache.primary.logslope] = 1.0;
-            let row_ctx = Self::row_ctx(cache, row);
-            let [t3_q, t3_g] =
-                if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
-                    let point =
-                        self.primary_point_from_block_states(row, block_states, &cache.primary)?;
-                    let (q, b, beta_h_owned, beta_w_owned) =
-                        self.primary_point_components(&point, &cache.primary);
-                    self.empirical_flex_row_third_contracted_many(
-                        row,
-                        &cache.primary,
-                        q,
-                        b,
-                        beta_h_owned.as_ref(),
-                        beta_w_owned.as_ref(),
-                        row_ctx,
-                        &[e_q, e_g],
-                        &grid,
-                    )?
-                    .try_into()
-                    .expect("two empirical BMS axis directions produce two contractions")
-                } else {
-                    [
-                        self.row_primary_third_contracted_with_moments(
+        let stored =
+            slots[row]
+                .third
+                .get_or_compute(|| -> Result<FlexAxisThirdRowTensors, String> {
+                    let r = cache.primary.total;
+                    let mut e_q = Array1::<f64>::zeros(r);
+                    e_q[cache.primary.q] = 1.0;
+                    let mut e_g = Array1::<f64>::zeros(r);
+                    e_g[cache.primary.logslope] = 1.0;
+                    let row_ctx = Self::row_ctx(cache, row);
+                    let [t3_q, t3_g] = if let Some(grid) =
+                        self.latent_measure.empirical_grid_for_training_row(row)?
+                    {
+                        let point = self.primary_point_from_block_states(
                             row,
                             block_states,
-                            cache,
-                            row_ctx,
-                            &e_q,
-                        )?,
-                        self.row_primary_third_contracted_with_moments(
+                            &cache.primary,
+                        )?;
+                        let (q, b, beta_h_owned, beta_w_owned) =
+                            self.primary_point_components(&point, &cache.primary);
+                        self.empirical_flex_row_third_contracted_many(
                             row,
-                            block_states,
-                            cache,
+                            &cache.primary,
+                            q,
+                            b,
+                            beta_h_owned.as_ref(),
+                            beta_w_owned.as_ref(),
                             row_ctx,
-                            &e_g,
-                        )?,
-                    ]
-                };
-            Ok(FlexAxisThirdRowTensors {
-                third: [t3_q, t3_g],
-            })
-            });
+                            &[e_q, e_g],
+                            &grid,
+                        )?
+                        .try_into()
+                        .expect("two empirical BMS axis directions produce two contractions")
+                    } else {
+                        [
+                            self.row_primary_third_contracted_with_moments(
+                                row,
+                                block_states,
+                                cache,
+                                row_ctx,
+                                &e_q,
+                            )?,
+                            self.row_primary_third_contracted_with_moments(
+                                row,
+                                block_states,
+                                cache,
+                                row_ctx,
+                                &e_g,
+                            )?,
+                        ]
+                    };
+                    Ok(FlexAxisThirdRowTensors {
+                        third: [t3_q, t3_g],
+                    })
+                });
         let tensors = stored.as_ref().map_err(|err| err.clone())?;
         Ok(Some(tensors))
     }
@@ -3882,78 +3887,83 @@ impl BernoulliMarginalSlopeFamily {
                 .map(|_| BmsFlexRowProgramDerivativeCache::new())
                 .collect::<Vec<_>>()
         });
-        let stored = slots[row]
-            .fourth
-            .get_or_compute(|| -> Result<FlexAxisFourthRowTensors, String> {
-            let r = cache.primary.total;
-            let mut e_q = Array1::<f64>::zeros(r);
-            e_q[cache.primary.q] = 1.0;
-            let mut e_g = Array1::<f64>::zeros(r);
-            e_g[cache.primary.logslope] = 1.0;
-            let row_ctx = Self::row_ctx(cache, row);
-            let [t4_qq, t4_gg, t4_qg_ordered, t4_qg_swapped] =
-                if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
-                    let point =
-                        self.primary_point_from_block_states(row, block_states, &cache.primary)?;
-                    let (q, b, beta_h_owned, beta_w_owned) =
-                        self.primary_point_components(&point, &cache.primary);
-                    self.empirical_flex_row_fourth_contracted_many_ordered(
-                        row,
-                        &cache.primary,
-                        q,
-                        b,
-                        beta_h_owned.as_ref(),
-                        beta_w_owned.as_ref(),
-                        row_ctx,
-                        &[(&e_q, &e_q), (&e_g, &e_g), (&e_q, &e_g), (&e_g, &e_q)],
-                        &grid,
-                    )?
-                    .try_into()
-                    .expect("four empirical BMS axis pairs produce four contractions")
-                } else {
-                    [
-                        self.row_primary_fourth_contracted_ordered(
+        let stored =
+            slots[row]
+                .fourth
+                .get_or_compute(|| -> Result<FlexAxisFourthRowTensors, String> {
+                    let r = cache.primary.total;
+                    let mut e_q = Array1::<f64>::zeros(r);
+                    e_q[cache.primary.q] = 1.0;
+                    let mut e_g = Array1::<f64>::zeros(r);
+                    e_g[cache.primary.logslope] = 1.0;
+                    let row_ctx = Self::row_ctx(cache, row);
+                    let [t4_qq, t4_gg, t4_qg_ordered, t4_qg_swapped] = if let Some(grid) =
+                        self.latent_measure.empirical_grid_for_training_row(row)?
+                    {
+                        let point = self.primary_point_from_block_states(
                             row,
                             block_states,
-                            cache,
-                            row_ctx,
-                            &e_q,
-                            &e_q,
-                        )?,
-                        self.row_primary_fourth_contracted_ordered(
+                            &cache.primary,
+                        )?;
+                        let (q, b, beta_h_owned, beta_w_owned) =
+                            self.primary_point_components(&point, &cache.primary);
+                        self.empirical_flex_row_fourth_contracted_many_ordered(
                             row,
-                            block_states,
-                            cache,
+                            &cache.primary,
+                            q,
+                            b,
+                            beta_h_owned.as_ref(),
+                            beta_w_owned.as_ref(),
                             row_ctx,
-                            &e_g,
-                            &e_g,
-                        )?,
-                        self.row_primary_fourth_contracted_ordered(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &e_q,
-                            &e_g,
-                        )?,
-                        self.row_primary_fourth_contracted_ordered(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &e_g,
-                            &e_q,
-                        )?,
-                    ]
-                };
-            let mut t4_qg = t4_qg_ordered;
-            t4_qg.zip_mut_with(&t4_qg_swapped, |a, &b| *a = 0.5 * (*a + b));
-            Ok(FlexAxisFourthRowTensors {
-                qq: t4_qq,
-                qg: t4_qg,
-                gg: t4_gg,
-            })
-            });
+                            &[(&e_q, &e_q), (&e_g, &e_g), (&e_q, &e_g), (&e_g, &e_q)],
+                            &grid,
+                        )?
+                        .try_into()
+                        .expect("four empirical BMS axis pairs produce four contractions")
+                    } else {
+                        [
+                            self.row_primary_fourth_contracted_ordered(
+                                row,
+                                block_states,
+                                cache,
+                                row_ctx,
+                                &e_q,
+                                &e_q,
+                            )?,
+                            self.row_primary_fourth_contracted_ordered(
+                                row,
+                                block_states,
+                                cache,
+                                row_ctx,
+                                &e_g,
+                                &e_g,
+                            )?,
+                            self.row_primary_fourth_contracted_ordered(
+                                row,
+                                block_states,
+                                cache,
+                                row_ctx,
+                                &e_q,
+                                &e_g,
+                            )?,
+                            self.row_primary_fourth_contracted_ordered(
+                                row,
+                                block_states,
+                                cache,
+                                row_ctx,
+                                &e_g,
+                                &e_q,
+                            )?,
+                        ]
+                    };
+                    let mut t4_qg = t4_qg_ordered;
+                    t4_qg.zip_mut_with(&t4_qg_swapped, |a, &b| *a = 0.5 * (*a + b));
+                    Ok(FlexAxisFourthRowTensors {
+                        qq: t4_qq,
+                        qg: t4_qg,
+                        gg: t4_gg,
+                    })
+                });
         let tensors = stored.as_ref().map_err(|err| err.clone())?;
         Ok(Some(tensors))
     }
@@ -6190,12 +6200,6 @@ impl BernoulliMarginalSlopeFamily {
                 &coeff_bbbu,
             );
 
-            f_a += exact::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
-            f_aa += exact::cell_second_derivative_from_moments(
-                cell,
-                &dc_da,
-                &dc_da,
-                &dc_daa,
             BmsFlexRowProgram::try_for_each_calibration_order2(
                 &active_primaries,
                 true,
@@ -6282,15 +6286,15 @@ impl BernoulliMarginalSlopeFamily {
                             );
                             let base = direction * r;
                             for &primary in &active_primaries {
-                                coeff_u_dirs[base + primary] =
-                                    coeff_jet.param_directional_from_b_family(
+                                coeff_u_dirs[base + primary] = coeff_jet
+                                    .param_directional_from_b_family(
                                         coeff_jet.b_first,
                                         primary,
                                         dir,
                                         COEFF_SUPPORT_BHW,
                                     );
-                                coeff_au_dirs[base + primary] =
-                                    coeff_jet.param_directional_from_b_family(
+                                coeff_au_dirs[base + primary] = coeff_jet
+                                    .param_directional_from_b_family(
                                         coeff_jet.ab_first,
                                         primary,
                                         dir,
@@ -6325,18 +6329,17 @@ impl BernoulliMarginalSlopeFamily {
                             primary,
                         } => {
                             let base = direction * r;
-                            f_au_dir[base + primary] +=
-                                exact::cell_third_derivative_from_moments(
-                                    cell,
-                                    &dc_da,
-                                    &coeff_jet.first[primary],
-                                    &coeff_dirs[direction],
-                                    &coeff_jet.a_first[primary],
-                                    &coeff_a_dirs[direction],
-                                    &coeff_u_dirs[base + primary],
-                                    &coeff_au_dirs[base + primary],
-                                    &state.moments,
-                                )?;
+                            f_au_dir[base + primary] += exact::cell_third_derivative_from_moments(
+                                cell,
+                                &dc_da,
+                                &coeff_jet.first[primary],
+                                &coeff_dirs[direction],
+                                &coeff_jet.a_first[primary],
+                                &coeff_a_dirs[direction],
+                                &coeff_u_dirs[base + primary],
+                                &coeff_au_dirs[base + primary],
+                                &state.moments,
+                            )?;
                         }
                         BmsFlexCalibrationOrder3Node::PrimaryPairDirectionalThird {
                             direction,
@@ -6559,7 +6562,29 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(())
                 },
             )?;
-        f_uv_uv[[0, 0]] = -dir_u[0] * dir_v[0] * marginal.mu4;
+        }
+
+        f_u[0] = -marginal.mu1;
+        f_uv[[0, 0]] = -marginal.mu2;
+        f_uv_dir[0] = -dir_u[0] * marginal.mu3;
+        f_uv_dir[r * r] = -dir_v[0] * marginal.mu3;
+        f_uv_mixed[0] = -dir_u[0] * dir_v[0] * marginal.mu4;
+
+        let f_a_u = f_a_dir[0];
+        let f_a_v = f_a_dir[1];
+        let f_aa_u = f_aa_dir[0];
+        let f_aa_v = f_aa_dir[1];
+        let f_a_uv = f_a_mixed[0];
+        let f_aa_uv = f_aa_mixed[0];
+        let f_au_u = ndarray::ArrayView1::from(&f_au_dir[..r]);
+        let f_au_v = ndarray::ArrayView1::from(&f_au_dir[r..]);
+        let f_au_uv = ndarray::ArrayView1::from(&f_au_mixed[..]);
+        let f_uv_u = ndarray::ArrayView2::from_shape((r, r), &f_uv_dir[..r * r])
+            .map_err(|error| format!("invalid BMS fourth left-direction shape: {error}"))?;
+        let f_uv_v = ndarray::ArrayView2::from_shape((r, r), &f_uv_dir[r * r..])
+            .map_err(|error| format!("invalid BMS fourth right-direction shape: {error}"))?;
+        let f_uv_uv = ndarray::ArrayView2::from_shape((r, r), &f_uv_mixed[..])
+            .map_err(|error| format!("invalid BMS fourth mixed-direction shape: {error}"))?;
 
         let inv_f_a = 1.0 / f_a;
         let mut a_u = Array1::<f64>::zeros(r);
