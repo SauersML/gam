@@ -2546,6 +2546,9 @@ fn compute_saved_location_scale_survival_alo(
     let link_exit_d2 = link_exit_d2.map_err(|error| map_link_basis_error("exit d2", error))?;
     let link_exit_d3 = link_exit_d3.map_err(|error| map_link_basis_error("exit d3", error))?;
     let link_wiggle_beta = link_wiggle.map_or(&[][..], |wiggle| wiggle.beta.as_slice());
+    let time_wiggle_beta = time_wiggle_beta
+        .as_slice()
+        .expect("fitted beta slice contiguous");
 
     let parameter_dimension = fit.beta.len();
     let geometry = require_saved_geometry(model, class, parameter_dimension)?;
@@ -2553,93 +2556,57 @@ fn compute_saved_location_scale_survival_alo(
     let mut scores = Vec::with_capacity(n);
     let mut coordinate_values = Vec::with_capacity(n);
     for row in 0..n {
-        let time_wiggle_row =
-            time_wiggle_basis
-                .as_ref()
-                .map(|basis| SurvivalLocationScaleAloTimeWiggleInput {
-                    beta: time_wiggle_beta
-                        .as_slice()
-                        .expect("fitted beta slice contiguous"),
-                    entry_basis: basis
-                        .entry
-                        .value
-                        .row(row)
-                        .as_slice()
-                        .expect("basis row contiguous"),
-                    entry_basis_d1: basis
-                        .entry
-                        .d1
-                        .row(row)
-                        .as_slice()
-                        .expect("basis row contiguous"),
-                    entry_basis_d2: basis
-                        .entry
-                        .d2
-                        .row(row)
-                        .as_slice()
-                        .expect("basis row contiguous"),
-                    entry_basis_d3: basis
-                        .entry
-                        .d3
-                        .row(row)
-                        .as_slice()
-                        .expect("basis row contiguous"),
-                    exit_basis: basis
-                        .exit
-                        .value
-                        .row(row)
-                        .as_slice()
-                        .expect("basis row contiguous"),
-                    exit_basis_d1: basis
-                        .exit
-                        .d1
-                        .row(row)
-                        .as_slice()
-                        .expect("basis row contiguous"),
-                    exit_basis_d2: basis
-                        .exit
-                        .d2
-                        .row(row)
-                        .as_slice()
-                        .expect("basis row contiguous"),
-                    exit_basis_d3: basis
-                        .exit
-                        .d3
-                        .row(row)
-                        .as_slice()
-                        .expect("basis row contiguous"),
-                });
+        // `ArrayBase::row` returns a view. Keep every view alive through the
+        // row-kernel call; taking a slice directly from the temporary view
+        // would manufacture a reference whose owner is dropped at the end of
+        // the field initializer.
+        let time_wiggle_rows = time_wiggle_basis.as_ref().map(|basis| {
+            (
+                basis.entry.value.row(row),
+                basis.entry.d1.row(row),
+                basis.entry.d2.row(row),
+                basis.entry.d3.row(row),
+                basis.exit.value.row(row),
+                basis.exit.d1.row(row),
+                basis.exit.d2.row(row),
+                basis.exit.d3.row(row),
+            )
+        });
+        let time_wiggle_row = time_wiggle_rows.as_ref().map(
+            |(entry, entry_d1, entry_d2, entry_d3, exit, exit_d1, exit_d2, exit_d3)| {
+                SurvivalLocationScaleAloTimeWiggleInput {
+                    beta: time_wiggle_beta,
+                    entry_basis: entry.as_slice().expect("basis row contiguous"),
+                    entry_basis_d1: entry_d1.as_slice().expect("basis row contiguous"),
+                    entry_basis_d2: entry_d2.as_slice().expect("basis row contiguous"),
+                    entry_basis_d3: entry_d3.as_slice().expect("basis row contiguous"),
+                    exit_basis: exit.as_slice().expect("basis row contiguous"),
+                    exit_basis_d1: exit_d1.as_slice().expect("basis row contiguous"),
+                    exit_basis_d2: exit_d2.as_slice().expect("basis row contiguous"),
+                    exit_basis_d3: exit_d3.as_slice().expect("basis row contiguous"),
+                }
+            },
+        );
+        let link_wiggle_rows = (
+            link_entry.row(row),
+            link_entry_d1.row(row),
+            link_entry_d2.row(row),
+            link_entry_d3.row(row),
+            link_exit.row(row),
+            link_exit_d1.row(row),
+            link_exit_d2.row(row),
+            link_exit_d3.row(row),
+        );
         let link_wiggle_row = link_wiggle.map(|_| SurvivalLocationScaleAloWiggleInput {
             beta: link_wiggle_beta,
-            entry_basis: link_entry
-                .row(row)
-                .as_slice()
-                .expect("basis row contiguous"),
-            entry_basis_d1: link_entry_d1
-                .row(row)
-                .as_slice()
-                .expect("basis row contiguous"),
-            entry_basis_d2: link_entry_d2
-                .row(row)
-                .as_slice()
-                .expect("basis row contiguous"),
-            entry_basis_d3: link_entry_d3
-                .row(row)
-                .as_slice()
-                .expect("basis row contiguous"),
-            exit_basis: link_exit.row(row).as_slice().expect("basis row contiguous"),
-            exit_basis_d1: link_exit_d1
-                .row(row)
-                .as_slice()
-                .expect("basis row contiguous"),
-            exit_basis_d2: link_exit_d2
-                .row(row)
-                .as_slice()
-                .expect("basis row contiguous"),
-            exit_basis_d3: link_exit_d3
-                .row(row)
-                .as_slice()
-                .expect("basis row contiguous"),
+            entry_basis: link_wiggle_rows.0.as_slice().expect("basis row contiguous"),
+            entry_basis_d1: link_wiggle_rows.1.as_slice().expect("basis row contiguous"),
+            entry_basis_d2: link_wiggle_rows.2.as_slice().expect("basis row contiguous"),
+            entry_basis_d3: link_wiggle_rows.3.as_slice().expect("basis row contiguous"),
+            exit_basis: link_wiggle_rows.4.as_slice().expect("basis row contiguous"),
+            exit_basis_d1: link_wiggle_rows.5.as_slice().expect("basis row contiguous"),
+            exit_basis_d2: link_wiggle_rows.6.as_slice().expect("basis row contiguous"),
+            exit_basis_d3: link_wiggle_rows.7.as_slice().expect("basis row contiguous"),
         });
         let row_geometry =
             survival_location_scale_alo_row_geometry(SurvivalLocationScaleAloRowInput {
