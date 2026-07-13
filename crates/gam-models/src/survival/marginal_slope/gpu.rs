@@ -1422,7 +1422,7 @@ impl Step6DeviceBatch {
 /// asserts that the `.cu` still spells the arithmetic the emulator mirrors on
 /// every test target; no CUDA device is required. Production retains the source
 /// only on Linux, where the NVRTC consumers are available.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 const SURVIVAL_FLEX_STEP6_SOURCE: &str = r#"
 extern "C" __global__ void survival_flex_step6_rows(
     const double * __restrict__ g_p_flat,
@@ -3103,6 +3103,7 @@ mod step6_tests {
     /// one of these load-bearing substrings and fails every test build,
     /// flagging that the CPU emulator is now stale relative to the device
     /// program. No CUDA device is required.
+    #[cfg(target_os = "linux")]
     #[test]
     fn step6_device_emulator_source_lockstep_fingerprint_415() {
         let src = SURVIVAL_FLEX_STEP6_SOURCE;
