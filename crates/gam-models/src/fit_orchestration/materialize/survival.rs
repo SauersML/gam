@@ -843,44 +843,38 @@ pub(crate) fn materialize_survival<'a>(
     // complete prepared time stack exactly once so a baseline probe can move
     // only the three offset channels, never designs, knots, penalties, or the
     // feasibility cone.
-    let marginal_slope_time_state =
-        if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-            let prepared = prepare_survival_time_stack(
-                &age_entry,
-                &age_exit,
-                &baseline_cfg,
-                SurvivalLikelihoodMode::MarginalSlope,
-                None,
-                time_anchor,
-                exact_derivative_guard,
-                &time_build,
-                effective_timewiggle.as_ref(),
-                None,
-            )?;
-            let baseline_hyper = match baseline_cfg.target {
-                SurvivalBaselineTarget::Linear => {
-                    SurvivalMarginalSlopeBaselineHyperSpec::Linear {
-                        config: survival_marginal_slope_offset_baseline_config(
-                            &age_exit,
-                            &baseline_cfg,
-                        ),
-                    }
-                }
-                _ => SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear {
-                    chart: SurvivalMarginalSlopeFrozenOffsetChart::new(
-                        &age_entry,
-                        &age_exit,
-                        &baseline_cfg,
-                        &prepared.eta_offset_entry,
-                        &prepared.eta_offset_exit,
-                        &prepared.derivative_offset_exit,
-                    )?,
-                },
-            };
-            Some((prepared, baseline_hyper))
-        } else {
-            None
+    let marginal_slope_time_state = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+        let prepared = prepare_survival_time_stack(
+            &age_entry,
+            &age_exit,
+            &baseline_cfg,
+            SurvivalLikelihoodMode::MarginalSlope,
+            None,
+            time_anchor,
+            exact_derivative_guard,
+            &time_build,
+            effective_timewiggle.as_ref(),
+            None,
+        )?;
+        let baseline_hyper = match baseline_cfg.target {
+            SurvivalBaselineTarget::Linear => SurvivalMarginalSlopeBaselineHyperSpec::Linear {
+                config: survival_marginal_slope_offset_baseline_config(&age_exit, &baseline_cfg),
+            },
+            _ => SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear {
+                chart: SurvivalMarginalSlopeFrozenOffsetChart::new(
+                    &age_entry,
+                    &age_exit,
+                    &baseline_cfg,
+                    &prepared.eta_offset_entry,
+                    &prepared.eta_offset_exit,
+                    &prepared.derivative_offset_exit,
+                )?,
+            },
         };
+        Some((prepared, baseline_hyper))
+    } else {
+        None
+    };
 
     let build_time_block = |candidate: &crate::survival::construction::SurvivalBaselineConfig| {
         let prepared = prepare_survival_time_stack(
@@ -986,73 +980,73 @@ pub(crate) fn materialize_survival<'a>(
         };
 
     let build_marginal_slope_request = || {
-            let (prepared, baseline_hyper) = marginal_slope_time_state.as_ref().ok_or_else(|| {
-                "internal error: frozen marginal-slope time state is missing".to_string()
-            })?;
-            let time_p = prepared.time_design_exit.ncols();
-            let time_initial_log_lambdas = if prepared.time_penalties.is_empty() {
-                None
-            } else {
-                Some(Array1::from_elem(
-                    prepared.time_penalties.len(),
-                    config.time_smooth_lambda.ln(),
-                ))
-            };
-            let time_block = TimeBlockInput {
-                design_entry: prepared.time_design_entry.clone(),
-                design_exit: prepared.time_design_exit.clone(),
-                design_derivative_exit: prepared.time_design_derivative_exit.clone(),
-                offset_entry: prepared.eta_offset_entry.clone(),
-                offset_exit: prepared.eta_offset_exit.clone(),
-                derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity:
-                    crate::survival::location_scale::TimeBlockMonotonicity::StructuralISpline,
-                penalties: prepared.time_penalties.clone(),
-                nullspace_dims: prepared.time_nullspace_dims.clone(),
-                initial_log_lambdas: time_initial_log_lambdas,
-                initial_beta: Some(Array1::zeros(time_p)),
-            };
-            Ok::<_, String>(SurvivalMarginalSlopeFitRequest {
-                data: data.values.view(),
-                spec: SurvivalMarginalSlopeTermSpec {
-                    age_entry: age_entry.clone(),
-                    age_exit: age_exit.clone(),
-                    event_target: event.clone(),
-                    weights: weights.clone(),
-                    z: marginal_z.clone().ok_or_else(|| {
-                        "marginal-slope survival requires z_column in FitConfig".to_string()
-                    })?,
-                    base_link: marginal_slope_base_link.clone().ok_or_else(|| {
-                        "internal error: marginal-slope base link validation missing".to_string()
-                    })?,
-                    marginalspec: termspec.clone(),
-                    marginal_offset: threshold_offset.clone(),
-                    frailty: marginal_slope_frailty.clone().ok_or_else(|| {
-                        "internal error: marginal-slope frailty validation missing".to_string()
-                    })?,
-                    derivative_guard: exact_derivative_guard,
-                    baseline_hyper: baseline_hyper.clone(),
-                    time_block,
-                    timewiggle_block: prepared.timewiggle_block.clone(),
-                    logslopespec: marginal_logslopespec.clone().ok_or_else(|| {
-                        "marginal-slope survival is missing logslope spec".to_string()
-                    })?,
-                    logslopespecs: marginal_logslopespecs.clone(),
-                    logslope_offset: log_sigma_offset.clone(),
-                    score_warp: marginal_slope_score_warp.clone(),
-                    link_dev: marginal_slope_link_dev.clone(),
-                    latent_z_policy: Default::default(),
-                    score_influence_jacobian: marginal_slope_jac_oof.clone(),
-                },
-                options: BlockwiseFitOptions {
-                    compute_covariance: false,
-                    // Robustness (Firth/Jeffreys stabilizer) is the unconditional
-                    // default for survival marginal-slope — no flag to thread.
-                    ..Default::default()
-                },
-                kappa_options: config.spatial_optimization.clone(),
-            })
+        let (prepared, baseline_hyper) = marginal_slope_time_state.as_ref().ok_or_else(|| {
+            "internal error: frozen marginal-slope time state is missing".to_string()
+        })?;
+        let time_p = prepared.time_design_exit.ncols();
+        let time_initial_log_lambdas = if prepared.time_penalties.is_empty() {
+            None
+        } else {
+            Some(Array1::from_elem(
+                prepared.time_penalties.len(),
+                config.time_smooth_lambda.ln(),
+            ))
         };
+        let time_block = TimeBlockInput {
+            design_entry: prepared.time_design_entry.clone(),
+            design_exit: prepared.time_design_exit.clone(),
+            design_derivative_exit: prepared.time_design_derivative_exit.clone(),
+            offset_entry: prepared.eta_offset_entry.clone(),
+            offset_exit: prepared.eta_offset_exit.clone(),
+            derivative_offset_exit: prepared.derivative_offset_exit.clone(),
+            time_monotonicity:
+                crate::survival::location_scale::TimeBlockMonotonicity::StructuralISpline,
+            penalties: prepared.time_penalties.clone(),
+            nullspace_dims: prepared.time_nullspace_dims.clone(),
+            initial_log_lambdas: time_initial_log_lambdas,
+            initial_beta: Some(Array1::zeros(time_p)),
+        };
+        Ok::<_, String>(SurvivalMarginalSlopeFitRequest {
+            data: data.values.view(),
+            spec: SurvivalMarginalSlopeTermSpec {
+                age_entry: age_entry.clone(),
+                age_exit: age_exit.clone(),
+                event_target: event.clone(),
+                weights: weights.clone(),
+                z: marginal_z.clone().ok_or_else(|| {
+                    "marginal-slope survival requires z_column in FitConfig".to_string()
+                })?,
+                base_link: marginal_slope_base_link.clone().ok_or_else(|| {
+                    "internal error: marginal-slope base link validation missing".to_string()
+                })?,
+                marginalspec: termspec.clone(),
+                marginal_offset: threshold_offset.clone(),
+                frailty: marginal_slope_frailty.clone().ok_or_else(|| {
+                    "internal error: marginal-slope frailty validation missing".to_string()
+                })?,
+                derivative_guard: exact_derivative_guard,
+                baseline_hyper: baseline_hyper.clone(),
+                time_block,
+                timewiggle_block: prepared.timewiggle_block.clone(),
+                logslopespec: marginal_logslopespec.clone().ok_or_else(|| {
+                    "marginal-slope survival is missing logslope spec".to_string()
+                })?,
+                logslopespecs: marginal_logslopespecs.clone(),
+                logslope_offset: log_sigma_offset.clone(),
+                score_warp: marginal_slope_score_warp.clone(),
+                link_dev: marginal_slope_link_dev.clone(),
+                latent_z_policy: Default::default(),
+                score_influence_jacobian: marginal_slope_jac_oof.clone(),
+            },
+            options: BlockwiseFitOptions {
+                compute_covariance: false,
+                // Robustness (Firth/Jeffreys stabilizer) is the unconditional
+                // default for survival marginal-slope — no flag to thread.
+                ..Default::default()
+            },
+            kappa_options: config.spatial_optimization.clone(),
+        })
+    };
 
     let build_latent_survival_request =
         |candidate: &crate::survival::construction::SurvivalBaselineConfig| {
