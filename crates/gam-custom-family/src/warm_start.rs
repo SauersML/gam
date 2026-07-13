@@ -676,11 +676,11 @@ pub fn blockwise_fit_from_parts(
             .into());
         }
         if let Some(working) = geom.working.as_ref()
-            && working.working_weights.len() != n
+            && working.weights.len() != n
         {
             return Err(CustomFamilyError::DimensionMismatch { reason: format!(
                 "blockwise_fit.geometry single-diagonal working row count mismatch: got {}, expected {n}",
-                working.working_weights.len(),
+                working.weights.len(),
             ) }.into());
         }
     }

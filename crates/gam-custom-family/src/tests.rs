@@ -108,8 +108,8 @@ pub(crate) fn blockwise_fit_from_parts_accepts_stacked_solver_eta_with_canonical
                 coefficient_gauge: gam_problem::gauge::Gauge::identity(&[1]),
                 penalized_hessian: Array2::eye(1).into(),
                 working: Some(WorkingGeometry {
-                    working_weights: Array1::ones(2),
-                    working_response: Array1::zeros(2),
+                    weights: Array1::ones(2),
+                    response: Array1::zeros(2),
                 }),
             }),
             precomputed_edf: Some((1.0, Vec::new(), vec![1.0], Vec::new())),
@@ -127,7 +127,7 @@ pub(crate) fn blockwise_fit_from_parts_accepts_stacked_solver_eta_with_canonical
             .working
             .as_ref()
             .unwrap()
-            .working_weights
+            .weights
             .len(),
         2,
     );
@@ -146,8 +146,8 @@ pub(crate) fn custom_family_geometry_keeps_active_precision_under_rectangular_ra
         coefficient_gauge: Gauge::identity(&[2]),
         penalized_hessian: active_hessian.clone().into(),
         working: Some(WorkingGeometry {
-            working_weights: array![1.0],
-            working_response: array![0.0],
+            weights: array![1.0],
+            response: array![0.0],
         }),
     };
 

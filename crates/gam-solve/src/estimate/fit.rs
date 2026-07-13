@@ -289,8 +289,8 @@ where
         coefficient_gauge: gam_problem::Gauge::identity(&[result.beta.len()]),
         penalized_hessian: inf.penalized_hessian.clone(),
         working: result.artifacts.pirls.as_ref().map(|pirls| WorkingGeometry {
-            working_weights: pirls.solveweights.to_owned(),
-            working_response: pirls.solveworking_response.to_owned(),
+            weights: pirls.solveweights.to_owned(),
+            response: pirls.solveworking_response.to_owned(),
         }),
     });
     let covariance_conditional = result

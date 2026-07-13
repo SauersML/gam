@@ -1048,13 +1048,13 @@ impl<'a> AloInput<'a> {
         // diagonal is the Fisher weight `h'²/(φ V(μ)) ≥ 0`, so the PSD
         // obligation is discharged algebraically without a runtime scan;
         // `as_signed()` re-views the same buffer for the Hessian-side slot.
-        let psd_w = PsdWeightsView::from_view_unchecked(working.working_weights.view());
+        let psd_w = PsdWeightsView::from_view_unchecked(working.weights.view());
         Self {
             design,
             penalized_hessian: &geom.penalized_hessian,
             hessian_weights: psd_w.as_signed(),
             score_weights: psd_w,
-            working_response: &working.working_response,
+            working_response: &working.response,
             eta,
             offset,
             phi,

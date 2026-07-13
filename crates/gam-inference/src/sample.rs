@@ -941,14 +941,14 @@ fn sample_standard_truncated(
                 .to_string()
         })?;
         let n = design.nrows();
-        if working.working_weights.len() != n || working.working_response.len() != n {
+        if working.weights.len() != n || working.response.len() != n {
             return Err(format!(
                 "standard constrained-coefficient posterior: saved working geometry has {} rows \
                  but the rebuilt design has {n}",
-                working.working_weights.len(),
+                working.weights.len(),
             ));
         }
-        let wz = &working.working_weights * &working.working_response;
+        let wz = &working.weights * &working.response;
         let rhs = design.transpose_vector_multiply(&wz);
         let chol = penalized_hessian.cholesky(Side::Lower).map_err(|e| {
             format!(

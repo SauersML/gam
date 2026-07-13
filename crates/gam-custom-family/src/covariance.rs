@@ -1432,8 +1432,8 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
                     ));
                 }
                 Some(WorkingGeometry {
-                    working_weights: working_weights.clone(),
-                    working_response: working_response.clone(),
+                    weights: working_weights.clone(),
+                    response: working_response.clone(),
                 })
             }
             [BlockWorkingSet::ExactNewton { .. }] => None,

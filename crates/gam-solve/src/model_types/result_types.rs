@@ -1299,10 +1299,10 @@ pub struct FittedBlock {
 /// Gaussian centering) must explicitly require this value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkingGeometry {
-    /// Score-side Fisher IRLS weights paired with `working_response`.
-    pub working_weights: Array1<f64>,
+    /// Score-side Fisher IRLS weights paired with `response`.
+    pub weights: Array1<f64>,
     /// IRLS working response at convergence.
-    pub working_response: Array1<f64>,
+    pub response: Array1<f64>,
 }
 
 /// Coefficient geometry retained at convergence for inference and post-fit
@@ -1621,20 +1621,20 @@ impl FitGeometry {
 
 impl WorkingGeometry {
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
-        if self.working_weights.len() != self.working_response.len() {
+        if self.weights.len() != self.response.len() {
             return Err(EstimationError::InvalidInput(format!(
-                "fit_result.geometry working vector length mismatch: working_weights={}, working_response={}",
-                self.working_weights.len(),
-                self.working_response.len(),
+                "fit_result.geometry working vector length mismatch: weights={}, response={}",
+                self.weights.len(),
+                self.response.len(),
             )));
         }
         validate_all_finite_estimation(
-            "fit_result.geometry.working.working_weights",
-            self.working_weights.iter().copied(),
+            "fit_result.geometry.working.weights",
+            self.weights.iter().copied(),
         )?;
         validate_all_finite_estimation(
-            "fit_result.geometry.working.working_response",
-            self.working_response.iter().copied(),
+            "fit_result.geometry.working.response",
+            self.response.iter().copied(),
         )?;
         Ok(())
     }
@@ -2603,13 +2603,13 @@ impl UnifiedFitResult {
     /// Get working weights if single diagonal row evidence is available.
     pub fn working_weights(&self) -> Option<&Array1<f64>> {
         self.working_geometry()
-            .map(|working| &working.working_weights)
+            .map(|working| &working.weights)
     }
 
     /// Get working response if single diagonal row evidence is available.
     pub fn working_response(&self) -> Option<&Array1<f64>> {
         self.working_geometry()
-            .map(|working| &working.working_response)
+            .map(|working| &working.response)
     }
 
     /// Smoothing-parameter uncertainty covariance contribution `J·Var(ρ)·Jᵀ`

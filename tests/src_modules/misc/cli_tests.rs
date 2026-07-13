@@ -799,8 +799,8 @@ fn cli_sample_bounded_model_reaches_sampler_config_validation() {
             coefficient_gauge: gam_problem::Gauge::identity(&[2]),
             penalized_hessian: array![[4.0, 1.0], [1.0, 3.0]].into(),
             working: Some(gam::estimate::WorkingGeometry {
-                working_weights: array![1.0, 1.0, 1.0],
-                working_response: array![0.0, 1.0, 1.0],
+                weights: array![1.0, 1.0, 1.0],
+                response: array![0.0, 1.0, 1.0],
             }),
         }),
         saved_fit_summary_fixture(),
@@ -2994,8 +2994,8 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             coefficient_gauge: gam_problem::Gauge::identity(&[2]),
             penalized_hessian: hessian.into(),
             working: Some(gam::estimate::WorkingGeometry {
-                working_weights,
-                working_response,
+                weights: working_weights,
+                response: working_response,
             }),
         }),
         block_states: Vec::new(),
@@ -3027,8 +3027,8 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
         .working
         .as_ref()
         .unwrap_or_else(|| panic!("{} failed", "working geometry kept"));
-    assert_eq!(working.working_weights.len(), 3);
-    assert_eq!(working.working_response.len(), 3);
+    assert_eq!(working.weights.len(), 3);
+    assert_eq!(working.response.len(), 3);
     fit.validate_numeric_finiteness().unwrap_or_else(|e| {
         panic!(
             "{} failed: {:?}",

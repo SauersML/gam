@@ -708,8 +708,8 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
             coefficient_gauge: gam_problem::Gauge::identity(&[2]),
             penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]].into(),
             working: Some(crate::model_types::WorkingGeometry {
-                working_weights: array![1.0, 0.5, 0.75],
-                working_response: array![0.1, 0.2, 0.3],
+                weights: array![1.0, 0.5, 0.75],
+                response: array![0.1, 0.2, 0.3],
             }),
         }),
         block_states: Vec::new(),

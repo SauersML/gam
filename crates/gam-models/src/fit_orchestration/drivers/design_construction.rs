@@ -2614,8 +2614,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             let log_lambdas =
                 checked_fit_log_lambdas(&full_lambdas, "final exact spatial adaptive fit")?;
             let working = gam_solve::estimate::WorkingGeometry {
-                working_weights: final_eval.obs.fisherweight.clone(),
-                working_response: exact_standard_working_response(&final_eval.obs)?,
+                weights: final_eval.obs.fisherweight.clone(),
+                response: exact_standard_working_response(&final_eval.obs)?,
             };
             let inf = FitInference {
                 edf_by_block,
@@ -6811,8 +6811,8 @@ fn fit_bounded_term_collection_with_design(
         coefficient_gauge: gam_problem::gauge::Gauge::identity(&[beta_user.len()]),
         penalized_hessian: penalized_hessian.clone().into(),
         working: Some(gam_solve::estimate::WorkingGeometry {
-            working_weights: eta_state.fisherweight.clone(),
-            working_response,
+            weights: eta_state.fisherweight.clone(),
+            response: working_response,
         }),
     });
     let max_abs_eta = eta_state
