@@ -947,6 +947,8 @@ pub struct SphericalHarmonicMode {
     pub order: i64,
     /// Positive-Laplacian eigenvalue `l(l+1)` on the unit sphere.
     pub laplace_eigenvalue: f64,
+    /// Diagonal `L²(S²)` Gram entry.  The real harmonics are orthonormal.
+    pub l2_gram_weight: f64,
 }
 
 /// Legendre polynomials `P_0..=P_degree` as ascending-power coefficient vectors,
@@ -1053,6 +1055,7 @@ impl SphericalHarmonicEvaluator {
                 degree: column.degree,
                 order: column.m,
                 laplace_eigenvalue: (column.degree * (column.degree + 1)) as f64,
+                l2_gram_weight: 1.0,
             })
             .collect()
     }
@@ -1333,6 +1336,9 @@ pub struct TorusHarmonicMode {
     /// Positive-Laplacian eigenvalue `sum_a k_a^2`, up to the common `(2π)^2`
     /// chart-unit scale absorbed by the smoothing strength.
     pub laplace_eigenvalue: f64,
+    /// Diagonal Gram entry under normalized Haar measure on the torus.  Each
+    /// sine/cosine factor contributes `1/2`; constant factors contribute one.
+    pub l2_gram_weight: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1401,9 +1407,17 @@ impl TorusHarmonicEvaluator {
                 .iter()
                 .map(|component| component.harmonic().pow(2) as f64)
                 .sum();
+            let l2_gram_weight = components.iter().fold(1.0, |weight, component| {
+                if *component == RealHarmonicComponent::Constant {
+                    weight
+                } else {
+                    0.5 * weight
+                }
+            });
             modes.push(TorusHarmonicMode {
                 components,
                 laplace_eigenvalue,
+                l2_gram_weight,
             });
             for axis in (0..self.latent_dim).rev() {
                 index[axis] += 1;
