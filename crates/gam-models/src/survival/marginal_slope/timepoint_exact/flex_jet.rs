@@ -84,8 +84,9 @@ use crate::bms::signed_probit_neglog_unary_stack;
 use crate::survival::marginal_slope::gpu;
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicOrder2Accumulator, DynamicOrder2Term,
-    RuntimeJetScalar,
+    JetScalar, OneSeed, Order2, RuntimeJetScalar,
 };
+use gam_math::jet_tower::Tower2;
 
 thread_local! {
     /// Per-worker FLEX directional workspace. The largest row tape is retained
@@ -908,6 +909,84 @@ impl JetField for ArenaJet3<'_> {
 }
 
 impl FlexJet for ArenaJet3<'_> {
+    const ORDER: usize = 3;
+}
+
+/// Inline fixed-width one-seed scalar for the common eight-primary FLEX row.
+/// It instantiates the same generic timepoint program as [`ArenaJet3`], but the
+/// compiler can scalarize every value/gradient/Hessian channel and eliminate
+/// runtime-width indexing and arena traffic.
+#[derive(Clone, Copy)]
+struct FixedJet3<const K: usize> {
+    inner: OneSeed<K>,
+}
+
+impl<const K: usize> FixedJet3<K> {
+    #[inline]
+    fn primary(x: f64, axis: usize, p: usize, direction: f64) -> Self {
+        assert_eq!(p, K, "fixed FLEX Jet3 width mismatch");
+        let inner = if axis < K {
+            OneSeed::seed_direction(x, axis, direction)
+        } else {
+            OneSeed {
+                base: Order2::constant(x),
+                eps: Order2::constant(direction),
+            }
+        };
+        Self { inner }
+    }
+}
+
+impl<const K: usize> JetField for FixedJet3<K> {
+    #[inline(always)]
+    fn value(&self) -> f64 {
+        self.inner.value()
+    }
+
+    #[inline(always)]
+    fn add(&self, other: &Self) -> Self {
+        Self {
+            inner: self.inner.add(&other.inner),
+        }
+    }
+
+    #[inline(always)]
+    fn sub(&self, other: &Self) -> Self {
+        Self {
+            inner: self.inner.sub(&other.inner),
+        }
+    }
+
+    #[inline(always)]
+    fn mul(&self, other: &Self) -> Self {
+        Self {
+            inner: self.inner.mul(&other.inner),
+        }
+    }
+
+    #[inline(always)]
+    fn neg(&self) -> Self {
+        Self {
+            inner: self.inner.neg(),
+        }
+    }
+
+    #[inline(always)]
+    fn scale(&self, scale: f64) -> Self {
+        Self {
+            inner: self.inner.scale(scale),
+        }
+    }
+
+    #[inline(always)]
+    fn compose_unary(&self, derivatives: [f64; 5]) -> Self {
+        Self {
+            inner: self.inner.compose_unary(derivatives),
+        }
+    }
+}
+
+impl<const K: usize> FlexJet for FixedJet3<K> {
     const ORDER: usize = 3;
 }
 
