@@ -223,7 +223,14 @@ mod amortized_encoder_tests {
                 }
             }
         }
-        rho.log_lambda_sparse = 0.5;
+        // Converge θ̂ at the SAME regularization `converged_state_with_residual` uses
+        // (this perturbed target vanishes atom 1 at the −6 floor; these levels keep
+        // both atoms alive and reach a PD stationary state).
+        rho.log_lambda_sparse = -0.5;
+        for v in rho.log_lambda_smooth.iter_mut() {
+            *v = -1.0;
+        }
+        rho.log_ard = vec![array![-0.5_f64], array![-0.5_f64]];
         term.penalized_quasi_laplace_criterion_with_cache(
             target.view(),
             &rho,
@@ -246,6 +253,7 @@ mod amortized_encoder_tests {
         // A ρ perturbation scales only α, never the frozen circle coordinate t, so
         // the max(·,0) majorizer active set is invariant — no subgradient ambiguity.
         let mut rho_eval = rho.clone();
+        rho_eval.log_lambda_sparse = 0.5;
         for v in rho_eval.log_lambda_smooth.iter_mut() {
             *v = -2.0;
         }
