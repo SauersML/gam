@@ -882,11 +882,26 @@ impl GaussBonnetInput {
     }
 }
 
+/// Integer Euler characteristic certified by a Gauss--Bonnet rounding cell.
+///
+/// Keeping this distinct from an arbitrary integer prevents topology-promotion
+/// consumers from accidentally treating an unqualified rounded scalar as a
+/// finite-sample Euler-characteristic claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AtlasEulerCharacteristic(i64);
+
+impl AtlasEulerCharacteristic {
+    #[must_use]
+    pub fn value(self) -> i64 {
+        self.0
+    }
+}
+
 /// Integer Gauss--Bonnet readout and its shared-source covariance audit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GaussBonnetConfidence {
     pub total_curvature_estimate: f64,
-    pub nearest_integer_candidate: i64,
+    pub nearest_integer_candidate: AtlasEulerCharacteristic,
     pub residual_to_integer_curvature: f64,
     pub first_order_variance: f64,
     pub naive_contribution_variance: f64,
@@ -896,7 +911,7 @@ pub struct GaussBonnetConfidence {
     pub geometric_remainder_bound: f64,
     pub rounding_margin: f64,
     pub misround_probability_bound: f64,
-    pub decision: AtlasStatisticalDecision<i64>,
+    pub decision: AtlasStatisticalDecision<AtlasEulerCharacteristic>,
 }
 
 /// Complete noisy-PCA analysis, including refused decisions.
@@ -958,6 +973,16 @@ impl GaussianPcaHolonomyAnalysis {
     pub fn gauss_bonnet(&self) -> Option<&GaussBonnetConfidence> {
         self.gauss_bonnet.as_ref()
     }
+
+    /// Integer topology claim only when the Gauss--Bonnet rounding cell meets
+    /// its allocated familywise error probability.
+    #[must_use]
+    pub fn certified_euler_characteristic(&self) -> Option<AtlasEulerCharacteristic> {
+        self.gauss_bonnet
+            .as_ref()
+            .and_then(|confidence| confidence.decision.certified_value())
+            .copied()
+    }
 }
 
 /// Closed provenance sum for every production atlas holonomy result.
@@ -1004,6 +1029,17 @@ impl AtlasHolonomyCertificate {
         match self {
             Self::ExactAnalytic(certificate) => Some(certificate.orientability()),
             Self::GaussianPcaPlugin(analysis) => analysis.orientation.certified_value().copied(),
+        }
+    }
+
+    /// A noisy PCA certificate can additionally sign an integer
+    /// Gauss--Bonnet claim. Exact transition cocycles make no curvature claim;
+    /// their consumer must use a separate exact good-cover proof.
+    #[must_use]
+    pub fn certified_euler_characteristic(&self) -> Option<AtlasEulerCharacteristic> {
+        match self {
+            Self::ExactAnalytic(_) => None,
+            Self::GaussianPcaPlugin(analysis) => analysis.certified_euler_characteristic(),
         }
     }
 
@@ -1365,7 +1401,10 @@ mod tests {
         assert_eq!(confidence.first_order_variance, 0.0);
         assert_eq!(confidence.naive_contribution_variance, 2.0);
         assert_eq!(confidence.shared_source_covariance_adjustment, -2.0);
-        assert_eq!(confidence.decision.certified_value(), Some(&1));
+        assert_eq!(
+            confidence.decision.certified_value().copied(),
+            Some(AtlasEulerCharacteristic(1))
+        );
     }
 
     #[test]
@@ -2235,9 +2274,10 @@ fn gauss_bonnet_confidence(
     {
         return Err("Gauss-Bonnet integer candidate is outside i64 range".to_string());
     }
-    let nearest_integer_candidate = integer_f64 as i64;
-    let residual_to_integer_curvature =
-        (total_curvature_estimate - std::f64::consts::TAU * nearest_integer_candidate as f64).abs();
+    let nearest_integer_candidate = AtlasEulerCharacteristic(integer_f64 as i64);
+    let residual_to_integer_curvature = (total_curvature_estimate
+        - std::f64::consts::TAU * nearest_integer_candidate.value() as f64)
+        .abs();
     let total_remainder = polar_linearization_remainder_bound + geometric_remainder_bound;
     let rounding_margin = std::f64::consts::PI - residual_to_integer_curvature - total_remainder;
     let (misround_probability_bound, decision) = if rounding_margin <= 0.0 {

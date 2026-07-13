@@ -11,7 +11,9 @@
 //! five or more charts share an overlap.
 
 use crate::chart_transfer::TransferCertificate;
-use crate::inference::atlas_holonomy::{AtlasHolonomyCertificate, AtlasHolonomyEdgeId};
+use crate::inference::atlas_holonomy::{
+    AtlasEulerCharacteristic, AtlasHolonomyCertificate, AtlasHolonomyEdgeId,
+};
 use crate::inference::layer_transport::FittedTransport;
 use crate::manifold::{
     AtlasOrientability, BettiSignature, GraphCompressionKind, GraphCompressionReport,
@@ -318,6 +320,16 @@ impl AtlasNerveDiagram {
             .and_then(AtlasHolonomyCertificate::certified_orientability)
     }
 
+    /// Independently certified integer curvature readout, when the noisy-PCA
+    /// certificate carried a Gauss--Bonnet input and its rounding confidence
+    /// met the allocated familywise level.
+    #[must_use]
+    pub fn certified_gauss_bonnet_euler_characteristic(&self) -> Option<AtlasEulerCharacteristic> {
+        self.holonomy_certificate
+            .as_ref()
+            .and_then(AtlasHolonomyCertificate::certified_euler_characteristic)
+    }
+
     /// Certified named compression of the atlas nerve. The name is a codebook
     /// compression of the exact nerve homology, never an input topology choice.
     pub fn certified_compression(&self) -> GraphCompressionReport {
@@ -329,8 +341,24 @@ impl AtlasNerveDiagram {
                 simplex_selection_bits(self.n_vertices, dimension + 1, present)
             })
             .sum();
+        let curvature_agrees = match self.holonomy_certificate.as_ref() {
+            // The nerve theorem makes the combinatorial Euler characteristic
+            // exact once the exhaustive good-cover proof is present. An exact
+            // transition cocycle therefore needs no statistical curvature
+            // surrogate.
+            Some(AtlasHolonomyCertificate::ExactAnalytic(_)) => true,
+            // A fitted PCA cocycle is a statistical path: promotion additionally
+            // requires its independently certified Gauss--Bonnet integer to
+            // agree with the exact nerve count. Missing/refused/mismatched
+            // curvature evidence is not a negative result and cannot promote.
+            Some(AtlasHolonomyCertificate::GaussianPcaPlugin(_)) => self
+                .certified_gauss_bonnet_euler_characteristic()
+                .is_some_and(|chi| i128::from(chi.value()) == self.euler_characteristic),
+            None => false,
+        };
         if !self.good_cover_certified
             || self.certified_orientability() != Some(AtlasOrientability::Orientable)
+            || !curvature_agrees
         {
             return GraphCompressionReport::unnamed(generic);
         }
