@@ -22,10 +22,9 @@ use crate::inference::steering::{
 use super::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
     MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeBasisSecondJet, SaeCertifyRequest, SaeFitError,
-    SaeManifoldAtom, SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm, SaeStreamingPlan,
-    SphereChartEvaluator, TorusHarmonicEvaluator, run_sae_manifold_certify,
-    sae_pca_seed_initial_coords,
+    SaeBasisEvaluator, SaeBasisSecondJet, SaeCertifyRequest, SaeFitError, SaeManifoldAtom,
+    SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm, SaeStreamingPlan, SphereChartEvaluator,
+    TorusHarmonicEvaluator, run_sae_manifold_certify, sae_pca_seed_initial_coords,
 };
 
 const SAE_MAX_PERIODIC_HARMONICS: usize = 4096;
@@ -1314,11 +1313,7 @@ pub fn run_sae_manifold_certify_external(
         }
     }
     if let Some(scale) = tier0_scale.as_ref() {
-        if scale.len() != p_out
-            || !scale
-                .iter()
-                .all(|value| value.is_finite() && *value > 0.0)
-        {
+        if scale.len() != p_out || !scale.iter().all(|value| value.is_finite() && *value > 0.0) {
             return Err(format!(
                 "run_sae_manifold_certify_external: tier0_scale must be a finite positive length-{p_out} vector; got length {}",
                 scale.len()

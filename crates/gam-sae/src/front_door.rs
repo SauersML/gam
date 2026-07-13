@@ -400,15 +400,9 @@ mod tests {
             8 * 1024 * 1024 * 1024,
         );
         assert!(ledger.streaming_admitted);
-        let admission = admit_topk_manifold_with_budget(
-            4096,
-            64,
-            10_000,
-            1,
-            8,
-            8 * 1024 * 1024 * 1024,
-        )
-        .expect("support-sparse shape must admit to the curved lane");
+        let admission =
+            admit_topk_manifold_with_budget(4096, 64, 10_000, 1, 8, 8 * 1024 * 1024 * 1024)
+                .expect("support-sparse shape must admit to the curved lane");
         assert_eq!(
             admission.lane,
             SaeFitLane::CurvedStreaming,

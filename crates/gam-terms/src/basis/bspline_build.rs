@@ -2412,6 +2412,147 @@ fn ridge_from_null_metric_action(
     Ok(fast_abt(&gz, &gz))
 }
 
+/// Function-space ridge for an explicitly identified coefficient subspace.
+///
+/// `frame` may be any full-column-rank frame for the target function subspace;
+/// it need not be Euclidean-orthonormal.  With `G` the Gram matrix of the
+/// represented basis under its domain measure, this returns
+///
+/// `R = G N (Nᵀ G N)⁻¹ Nᵀ G`.
+///
+/// This is the same metric projector used by
+/// [`function_space_nullspace_shrinkage`], but accepting a structural frame is
+/// important for penalties such as Duchon's selectable trend block: that block
+/// is a known function subspace even when a separate machine-scale conditioning
+/// term means it is not the numerical null space of another matrix.
+pub(crate) fn function_space_subspace_shrinkage(
+    frame: &Array2<f64>,
+    gram: &Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    if gram.nrows() != gram.ncols() || frame.nrows() != gram.nrows() {
+        crate::bail_dim_basis!(
+            "function-space subspace shrinkage: frame is {}x{} but Gram is {}x{}",
+            frame.nrows(),
+            frame.ncols(),
+            gram.nrows(),
+            gram.ncols()
+        );
+    }
+    if frame.ncols() == 0 {
+        return Ok(Array2::<f64>::zeros(gram.raw_dim()));
+    }
+    let metric_action = gram.dot(frame);
+    ridge_from_null_metric_action(frame, &metric_action)
+}
+
+fn strict_metric_inverse(matrix: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
+    let (sym, evals, evecs) = spectral_summary(matrix)?;
+    let tol = generalized_spectral_tolerance(&evals, &sym);
+    if let Some(&invalid) = evals.iter().find(|&&value| value <= tol) {
+        crate::bail_invalid_basis!(
+            "function-space subspace metric is not strictly positive definite; eigenvalue {invalid:.6e} is at or below tolerance {tol:.6e}"
+        );
+    }
+    let mut scaled = evecs.clone();
+    for (mut col, &value) in scaled.axis_iter_mut(Axis(1)).zip(evals.iter()) {
+        col /= value;
+    }
+    Ok(fast_abt(&scaled, &evecs))
+}
+
+/// Value, two first derivatives, and their mixed derivative for a fixed
+/// structural subspace under a moving function metric.
+///
+/// For hyper-coordinates `a` and `b`, callers supply `(G, G_a, G_b, G_ab)`.
+/// The subspace frame itself is structural and therefore fixed; only the basis
+/// Gram moves.  All derivatives are closed-form product/inverse rules, so κ and
+/// anisotropy optimizers remain analytic (SPEC: no production finite
+/// differences or autodiff).
+pub(crate) struct FunctionSpaceSubspaceShrinkageDerivatives {
+    pub(crate) value: Array2<f64>,
+    pub(crate) first_a: Array2<f64>,
+    pub(crate) first_b: Array2<f64>,
+    pub(crate) mixed: Array2<f64>,
+}
+
+pub(crate) fn function_space_subspace_shrinkage_derivatives(
+    frame: &Array2<f64>,
+    gram: &Array2<f64>,
+    gram_a: &Array2<f64>,
+    gram_b: &Array2<f64>,
+    gram_ab: &Array2<f64>,
+) -> Result<FunctionSpaceSubspaceShrinkageDerivatives, BasisError> {
+    let p = gram.nrows();
+    if gram.ncols() != p
+        || frame.nrows() != p
+        || gram_a.dim() != gram.dim()
+        || gram_b.dim() != gram.dim()
+        || gram_ab.dim() != gram.dim()
+    {
+        crate::bail_dim_basis!(
+            "function-space subspace derivative shape mismatch: frame={:?}, G={:?}, G_a={:?}, G_b={:?}, G_ab={:?}",
+            frame.dim(),
+            gram.dim(),
+            gram_a.dim(),
+            gram_b.dim(),
+            gram_ab.dim()
+        );
+    }
+    if frame.ncols() == 0 {
+        let zero = || Array2::<f64>::zeros((p, p));
+        return Ok(FunctionSpaceSubspaceShrinkageDerivatives {
+            value: zero(),
+            first_a: zero(),
+            first_b: zero(),
+            mixed: zero(),
+        });
+    }
+
+    let w = gram.dot(frame);
+    let w_a = gram_a.dot(frame);
+    let w_b = gram_b.dot(frame);
+    let w_ab = gram_ab.dot(frame);
+    let c = frame.t().dot(&w);
+    let c_a = frame.t().dot(&w_a);
+    let c_b = frame.t().dot(&w_b);
+    let c_ab = frame.t().dot(&w_ab);
+    let inverse = strict_metric_inverse(&c)?;
+    let inverse_a = -fast_ab(&fast_ab(&inverse, &c_a), &inverse);
+    let inverse_b = -fast_ab(&fast_ab(&inverse, &c_b), &inverse);
+    let inverse_ab = fast_ab(
+        &fast_ab(&fast_ab(&fast_ab(&inverse, &c_b), &inverse), &c_a),
+        &inverse,
+    ) + fast_ab(
+        &fast_ab(&fast_ab(&fast_ab(&inverse, &c_a), &inverse), &c_b),
+        &inverse,
+    ) - fast_ab(&fast_ab(&inverse, &c_ab), &inverse);
+
+    let sandwich = |left: &Array2<f64>, middle: &Array2<f64>, right: &Array2<f64>| {
+        fast_abt(&fast_ab(left, middle), right)
+    };
+    let value = sandwich(&w, &inverse, &w);
+    let first_a =
+        sandwich(&w_a, &inverse, &w) + sandwich(&w, &inverse_a, &w) + sandwich(&w, &inverse, &w_a);
+    let first_b =
+        sandwich(&w_b, &inverse, &w) + sandwich(&w, &inverse_b, &w) + sandwich(&w, &inverse, &w_b);
+    let mixed = sandwich(&w_ab, &inverse, &w)
+        + sandwich(&w_a, &inverse_b, &w)
+        + sandwich(&w_a, &inverse, &w_b)
+        + sandwich(&w_b, &inverse_a, &w)
+        + sandwich(&w, &inverse_ab, &w)
+        + sandwich(&w, &inverse_a, &w_b)
+        + sandwich(&w_b, &inverse, &w_a)
+        + sandwich(&w, &inverse_b, &w_a)
+        + sandwich(&w, &inverse, &w_ab);
+
+    Ok(FunctionSpaceSubspaceShrinkageDerivatives {
+        value: symmetrize_penalty(&value),
+        first_a: symmetrize_penalty(&first_a),
+        first_b: symmetrize_penalty(&first_b),
+        mixed: symmetrize_penalty(&mixed),
+    })
+}
+
 /// Function-space double-penalty ridge: shrink the *function* component that
 /// the primary penalty cannot see, not the raw coefficients (SPEC rule 5).
 ///

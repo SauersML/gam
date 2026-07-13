@@ -781,7 +781,11 @@ fn probe_applied_dose(
             plan.delta.len()
         )));
     }
-    if !observation.effective_delta.iter().all(|value| value.is_finite()) {
+    if !observation
+        .effective_delta
+        .iter()
+        .all(|value| value.is_finite())
+    {
         return Err(TargetDoseError::Probe(
             "steer_to_target_nats: probe effective_delta must be finite".to_string(),
         ));

@@ -458,15 +458,6 @@ fn fit_penalized_1d(
         None,
     )
     .map_err(|error| format!("penalized 1-D REML stationary enumeration failed: {error}"))?;
-    if stationary.hit_resolution_floor {
-        return Err(format!(
-            "penalized 1-D REML is underresolved: the stationary-point enclosure reached its \
-             resolution floor ({} isolated roots, selected log-lambda {}, endpoint costs {:?})",
-            stationary.roots.len(),
-            stationary.selected_rho,
-            stationary.endpoint_costs,
-        ));
-    }
     let reml = gaussian_reml_closed_form_with_nullspace_dim(
         design.view(),
         response.view(),

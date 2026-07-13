@@ -3914,131 +3914,19 @@ impl<'a> RemlState<'a> {
         Some(rho)
     }
 
-    /// Exact global Gaussian-identity REML smoothing parameter via the
-    /// Demmler–Reinsch closed form — the structural cure for the high-λ shelf.
-    ///
-    /// For a Gaussian/identity fit the profiled REML criterion, written in the
-    /// pencil `(S, XᵀWX)` eigenbasis, is an EXPLICIT scalar `V(ρ)`. Every term's
-    /// ρ-derivative decays like `e^{-ρ}` as `ρ→∞`, so `V'(ρ)→0` at large λ for
-    /// EVERY dataset: the over-smoothing shelf is a structural stationary region
-    /// at infinity, not a data pathology. A descent method on ρ (Newton /
-    /// quasi-Newton, mgcv's `newton`/`efs` included) that starts on — or is
-    /// pushed onto — that plateau declares convergence there and rails to an
-    /// over-smoothed `λ̂` even though the true global optimum sits in a
-    /// finite-λ basin with a strictly lower REML (measured for sin8 k=40: shelf
-    /// edf≈2 REML≈+252 vs basin edf≈39 REML≈−104). The closed form does not
-    /// descend `V`; it selects the global minimiser over the whole ρ range from
-    /// the one eigendecomposition of the pencil, so the shelf cannot capture it.
-    ///
-    /// This returns the single shared-λ optimum `ρ*` over `S = Σ_j S_j` (all
-    /// penalty blocks summed). It is consumed as ONE scored seed for the
-    /// multi-λ outer search: setting every block coordinate to `ρ*` reproduces
-    /// the closed form's penalization `e^{ρ*}·Σ_j S_j` exactly, so its REML cost
-    /// equals the closed form's global optimum, and the keep-best seed screen
-    /// adopts it only when it strictly beats the mgcv-style `initial.sp` anchor.
-    /// The outer optimizer then refines each block's λ independently from this
-    /// good-basin start, so a genuinely multi-λ surface is never worsened.
-    ///
-    /// Returns `None` (caller keeps its other seeds) whenever the closed form's
-    /// assumptions do not hold: a non-Gaussian/identity likelihood, a
-    /// constrained fit (inequality constraints, coefficient bounds, mixture/SAS
-    /// link states) whose profiled ridge the closed form does not model, no
-    /// penalties, or a sparse design (skipped rather than densified so a huge
-    /// random-effects design never pays an `n×p` materialization).
-    pub(crate) fn analytic_gaussian_closed_form_rho(
-        &self,
-        bounds: (f64, f64),
-    ) -> Option<Array1<f64>> {
-        if !reml_is_gaussian_identity(&self.config.likelihood) {
-            return None;
-        }
-        // The closed form solves an unconstrained ridge `min ‖W^½(y−Xβ)‖² +
-        // Σ_j λ_j βᵀS_jβ`; it models none of these side conditions, so defer to
-        // the general seeds when any are present.
-        if self.linear_constraints.is_some()
-            || self.coefficient_lower_bounds.is_some()
-            || self.runtime_mixture_link_state.is_some()
-            || self.runtime_sas_link_state.is_some()
-        {
-            return None;
-        }
-        let k = self.canonical_penalties.len();
-        if k == 0 {
-            return None;
-        }
-        // Densify only an already-dense design: a sparse (e.g. large
-        // random-effects) design is skipped rather than materialized, so this
-        // prepass never allocates an `n×p` dense block behind the caller's back.
-        if !matches!(self.x, DesignMatrix::Dense(_)) {
-            return None;
-        }
-        let x_dense = self
-            .x
-            .try_to_dense_by_chunks("gaussian_closed_form_seed")
-            .ok()?;
-        let p = self.p;
-        if x_dense.ncols() != p {
-            return None;
-        }
-        // One Demmler–Reinsch penalty block per canonical penalty, so the cyclic
-        // solver optimises each block's λ_j INDEPENDENTLY (a double-penalty
-        // smooth's bend and null-space blocks can split, e.g. λ_bend high /
-        // λ_null low — the single summed-λ optimum cannot express that).
-        let blocks: Vec<crate::gaussian_reml::GaussianRemlLambdaBlock<'_>> = self
-            .canonical_penalties
-            .iter()
-            .map(|pen| crate::gaussian_reml::GaussianRemlLambdaBlock {
-                col_range: pen.col_range.clone(),
-                local: pen.local.view(),
-            })
-            .collect();
-        // The closed form fits `y ~ Xβ` with no offset term, so fold any offset
-        // into the response.
-        let mut y_eff = self.y.to_owned();
-        if self.offset.len() == y_eff.len() {
-            y_eff -= &self.offset;
-        }
-        let weights = self.weights.to_owned();
-        // Start every block at λ = 1 (ρ = 0); each coordinate's first sweep is a
-        // GLOBAL 1-D solve, so the outcome is init-independent.
-        let init_rho = vec![0.0_f64; k];
-        let rho = crate::gaussian_reml::gaussian_reml_cyclic_multi_lambda_rho(
-            x_dense.view(),
-            y_eff.view(),
-            &blocks,
-            Some(weights.view()),
-            &init_rho,
-            bounds,
-        )
-        .ok()?;
-        if rho.len() != k || rho.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        let (lo, hi) = if bounds.0 <= bounds.1 {
-            bounds
-        } else {
-            (bounds.1, bounds.0)
-        };
-        Some(Array1::from_iter(rho.into_iter().map(|v| v.clamp(lo, hi))))
-    }
-
-    /// The GLOBAL single-λ (diagonal) Gaussian-identity REML optimum, mapped to a
-    /// UNIFORM per-block ρ seed. Setting every block's λ equal makes the effective
+    /// Certified finite-window single-λ Gaussian-identity REML optimum, mapped
+    /// to a uniform per-block ρ seed. Setting every block's λ equal makes the effective
     /// penalty `λ·Σ_j S_j`, so the profiled Gaussian REML criterion collapses to
     /// the one-dimensional closed form on the summed penalty, whose global
-    /// minimiser is selected by grid-free stationary enumeration
-    /// (`gaussian_reml_closed_form`) rather than descent. Unlike the per-block
-    /// cyclic solver (`analytic_gaussian_closed_form_rho`), coordinate descent
-    /// cannot stall here at a coordinate-wise-stationary interior point: on a
-    /// double-penalty null-recovery fixture (#1815/#1867) the joint REML optimum
-    /// rails BOTH blocks onto the collapse shelf (edf → null dimension), but
-    /// cyclic descent parks at a strictly-inferior split (e.g. ρ ≈ [7.5, 1.1]).
-    /// The diagonal is the best single-λ RESTRICTION of the multi-λ problem, so a
-    /// feasible, principled candidate; the outer optimizer refines it and the
+    /// minimizer is selected by stationary-bracket certification
+    /// (`gaussian_reml_closed_form`) rather than descent. The diagonal is the
+    /// best candidate on this explicit one-dimensional restriction of the
+    /// multi-λ problem; it is not represented as a coordinate-wise solution of
+    /// the coupled determinant. The outer optimizer refines it and the
     /// candidate is adopted only when it strictly lowers the true REML cost, so a
     /// genuinely split-λ optimum (bend high / null low) and healthy fits are
-    /// unaffected — this only supplies the shelf corner the cyclic seed misses.
-    pub(crate) fn analytic_gaussian_summed_diagonal_rho(
+    /// unaffected.
+    pub(crate) fn analytic_gaussian_profiled_diagonal_rho(
         &self,
         bounds: (f64, f64),
     ) -> Option<Array1<f64>> {

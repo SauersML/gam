@@ -352,13 +352,7 @@ fn coefficient_payload_field_audits(payload: &CoefficientUncertaintyResult) -> V
         upper,
         covariance_source,
     } = payload;
-    std::hint::black_box((
-        estimate,
-        standard_error,
-        lower,
-        upper,
-        covariance_source,
-    ));
+    std::hint::black_box((estimate, standard_error, lower, upper, covariance_source));
     vec![
         FieldAudit::point("estimate"),
         FieldAudit::audited("standard_error", "coefficient_wald_interval"),
@@ -642,9 +636,7 @@ fn covariance_and_interval_modes_map_to_registered_bands() {
     ] {
         let target = match mode {
             InferenceCovarianceMode::Conditional => "mean_credible_band_conditional",
-            InferenceCovarianceMode::SmoothingCorrected => {
-                "mean_credible_band_smoothing_corrected"
-            }
+            InferenceCovarianceMode::SmoothingCorrected => "mean_credible_band_smoothing_corrected",
         };
         assert!(
             names.contains(target),

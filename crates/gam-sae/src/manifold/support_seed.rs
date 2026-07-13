@@ -146,7 +146,14 @@ fn effective_atom(
 fn resolve_support_atoms(
     atom_basis: &[String],
     atom_dim: &[usize],
-) -> Result<(Vec<SaeAtomBasisKind>, Vec<usize>, Vec<SaeAssignmentAtomSpec>), String> {
+) -> Result<
+    (
+        Vec<SaeAtomBasisKind>,
+        Vec<usize>,
+        Vec<SaeAssignmentAtomSpec>,
+    ),
+    String,
+> {
     if atom_basis.len() != atom_dim.len() {
         return Err(format!(
             "support-sparse atom metadata lengths differ: basis={}, dims={}",
@@ -184,9 +191,7 @@ pub(super) fn chart_coordinate(kind: &SaeAtomBasisKind, axis: usize, raw: f64) -
         }
         SaeAtomBasisKind::Sphere if axis == 0 => raw.atan(),
         SaeAtomBasisKind::Sphere => std::f64::consts::PI + 2.0 * raw.atan(),
-        SaeAtomBasisKind::Mobius if axis == 0 => {
-            1.0 + 2.0 * raw.atan() / std::f64::consts::PI
-        }
+        SaeAtomBasisKind::Mobius if axis == 0 => 1.0 + 2.0 * raw.atan() / std::f64::consts::PI,
         SaeAtomBasisKind::Mobius => raw.tanh(),
         _ => raw,
     }
@@ -380,7 +385,10 @@ fn bounded_atom_chart_samples(
     let effective_dim = assignment.atom_coord_dim(atom);
     let mut observed = Vec::<Vec<f64>>::new();
     for row in 0..assignment.n_obs() {
-        if let Ok(slot) = assignment.support_indices(row).binary_search(&(atom as u32)) {
+        if let Ok(slot) = assignment
+            .support_indices(row)
+            .binary_search(&(atom as u32))
+        {
             observed.push(assignment.coords_for_slot(row, slot).to_vec());
         }
     }
@@ -496,9 +504,9 @@ pub fn build_sae_support_term_seed(
             request.random_state.wrapping_add(atom as u64),
             &[None],
         )?;
-        let plan = plans
-            .pop()
-            .ok_or_else(|| "build_sae_support_term_seed: atom planner returned no plan".to_string())?;
+        let plan = plans.pop().ok_or_else(|| {
+            "build_sae_support_term_seed: atom planner returned no plan".to_string()
+        })?;
         if plan.latent_dim != effective_dim {
             return Err(format!(
                 "build_sae_support_term_seed: atom {atom} plan latent dim {} != sparse state dim {effective_dim}",
@@ -518,11 +526,10 @@ pub fn build_sae_support_term_seed(
             &coord_blocks,
             std::slice::from_ref(&plan.duchon_centers),
         )?;
-        let evaluator = evaluators
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| format!("build_sae_support_term_seed: atom {atom} has no evaluator"))?;
+        let evaluator =
+            evaluators.into_iter().next().flatten().ok_or_else(|| {
+                format!("build_sae_support_term_seed: atom {atom} has no evaluator")
+            })?;
         let m = basis_sizes[0];
         let phi = phi_stack.slice(s![0, 0..1, 0..m]).to_owned();
         let jet = jet_stack
@@ -607,10 +614,20 @@ mod tests {
         };
         let (first, second) = (build(), build());
         for row in 0..2 {
-            assert_eq!(first.assignment.support_indices(row), second.assignment.support_indices(row));
-            assert_eq!(first.assignment.coords_row(row), second.assignment.coords_row(row));
-            let expected: usize = first.assignment.support_indices(row).iter()
-                .map(|&atom| first.effective_atom_dim[atom as usize]).sum();
+            assert_eq!(
+                first.assignment.support_indices(row),
+                second.assignment.support_indices(row)
+            );
+            assert_eq!(
+                first.assignment.coords_row(row),
+                second.assignment.coords_row(row)
+            );
+            let expected: usize = first
+                .assignment
+                .support_indices(row)
+                .iter()
+                .map(|&atom| first.effective_atom_dim[atom as usize])
+                .sum();
             assert_eq!(first.assignment.coords_row(row).len(), expected);
         }
     }

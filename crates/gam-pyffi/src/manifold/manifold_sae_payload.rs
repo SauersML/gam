@@ -295,9 +295,7 @@ impl ManifoldSaePayload {
         }
         if let Some(scale) = payload.tier0_scale.as_ref() {
             if scale.len() != payload.training_mean.len()
-                || !scale
-                    .iter()
-                    .all(|value| value.is_finite() && *value > 0.0)
+                || !scale.iter().all(|value| value.is_finite() && *value > 0.0)
             {
                 return Err(format!(
                     "ManifoldSAE.from_json: tier0_scale must be a finite positive length-{} vector",

@@ -4100,14 +4100,11 @@ mod tests {
             minus[axis] -= h;
             let mut plus_grad = Array1::<f64>::zeros(3);
             let mut minus_grad = Array1::<f64>::zeros(3);
-            let plus_logp =
-                HamiltonianTarget::logp_and_grad(&posterior, &plus, &mut plus_grad);
-            let minus_logp =
-                HamiltonianTarget::logp_and_grad(&posterior, &minus, &mut minus_grad);
+            let plus_logp = HamiltonianTarget::logp_and_grad(&posterior, &plus, &mut plus_grad);
+            let minus_logp = HamiltonianTarget::logp_and_grad(&posterior, &minus, &mut minus_grad);
             let finite_difference = (plus_logp - minus_logp) / (2.0 * h);
             assert!(
-                (grad[axis] - finite_difference).abs()
-                    <= 2e-5 * finite_difference.abs().max(1.0),
+                (grad[axis] - finite_difference).abs() <= 2e-5 * finite_difference.abs().max(1.0),
                 "structural sparse HMC gradient[{axis}]: analytic={}, finite_difference={finite_difference}",
                 grad[axis]
             );

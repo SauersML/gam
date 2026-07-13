@@ -923,17 +923,14 @@ pub(crate) fn hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d(
     // exponent cannot repair that value/derivative mismatch.
     let pair_p_order = m.checked_mul(2)?;
     let pair_s_order = s.checked_mul(2)?;
-    let spectral_decay_order = pair_p_order
-        .checked_add(pair_s_order)?
-        .checked_mul(2)?;
+    let spectral_decay_order = pair_p_order.checked_add(pair_s_order)?.checked_mul(2)?;
     let required = d.checked_add(q.checked_mul(2)?)?;
     if spectral_decay_order <= required {
         return None;
     }
 
     let length_scale = 1.0 / kappa;
-    let coeffs =
-        super::duchon_partial_fraction_coeffs(pair_p_order, pair_s_order, kappa);
+    let coeffs = super::duchon_partial_fraction_coeffs(pair_p_order, pair_s_order, kappa);
     let f = super::duchon_phi_even_derivative_collision(
         length_scale,
         pair_p_order,
@@ -2799,11 +2796,7 @@ mod tests {
         //   2*(-1/(4*pi)) + 1/(8*pi) = -3/(8*pi).
         // The erroneous single-kernel expansion returned +1/(4*pi).
         let lead_value = odd_d(0, 1, 1, 3, 1.0).expect("valid lead self-pair").0;
-        assert_relative_close(
-            lead_value,
-            -3.0 / (8.0 * std::f64::consts::PI),
-            1e-12,
-        );
+        assert_relative_close(lead_value, -3.0 / (8.0 * std::f64::consts::PI), 1e-12);
 
         // (d, m, s, q): the lead d=3,m=s=1 case plus q=0,1,2 from a smoother
         // odd-dimensional self-pair, exercising every supported radial block.

@@ -1751,7 +1751,11 @@ mod tests {
         let g = array![1.3_f64, 2.0, -0.7];
 
         let projected = product.project_gradient_to_tangent(t.view(), g.view());
-        assert_eq!(projected.len(), 3, "composite output tiles the full ambient");
+        assert_eq!(
+            projected.len(),
+            3,
+            "composite output tiles the full ambient"
+        );
 
         // Each factor projected standalone at its own offset/width must match the
         // composite's corresponding block.

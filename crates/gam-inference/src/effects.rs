@@ -59,8 +59,8 @@ pub fn select_covariance<'a>(
     fit: &'a UnifiedFitResult,
     source: CovarianceSource,
 ) -> Result<SelectedCovariance<'a>, EffectError> {
-    let matrix = covariance_by_source(fit, source)
-        .ok_or(EffectError::MissingCovariance { source })?;
+    let matrix =
+        covariance_by_source(fit, source).ok_or(EffectError::MissingCovariance { source })?;
 
     Ok(SelectedCovariance {
         source,

@@ -46,8 +46,8 @@ use crate::tiered::Tier0Mean;
 use super::{
     AmortizedEncoderConsistency, AssignmentMode, CoordinateFidelityCertificate,
     SaeManifoldFitDiagnostics, SaeManifoldLoss, SaeManifoldOuterObjective, SaeManifoldRho,
-    SaeManifoldTerm, SaeOuterTermination, SaeShapeUncertainty,
-    SaeTrustDiagnostics, TopologyPersistenceCertificate, VanishedAtoms,
+    SaeManifoldTerm, SaeOuterTermination, SaeShapeUncertainty, SaeTrustDiagnostics,
+    TopologyPersistenceCertificate, VanishedAtoms,
 };
 
 /// Hard cap on evidence-certified #2021 whitened-residual refit passes.
@@ -287,11 +287,8 @@ fn installed_inner_kkt_audit(
     let raw_gradient_norm_sq = SaeManifoldTerm::system_grad_norm_sq(&system);
     let raw_gradient_norm = raw_gradient_norm_sq.sqrt();
     let lambda_smooth = rho.lambda_smooth_vec().map_err(SaeFitError::Fit)?;
-    let quotient_gradient_norm = term.quotient_gradient_norm_from_system(
-        &system,
-        raw_gradient_norm_sq,
-        &lambda_smooth,
-    );
+    let quotient_gradient_norm =
+        term.quotient_gradient_norm_from_system(&system, raw_gradient_norm_sq, &lambda_smooth);
     Ok(SaeInstalledInnerKktAudit {
         raw_gradient_norm,
         quotient_gradient_norm,
@@ -310,8 +307,7 @@ fn external_nonstationary_report(
     SaeExternalCertificationOutcome::NonStationary(SaeExternalEvaluationReport {
         inner,
         outer_raw_gradient_norm: stationarity.map(|certificate| certificate.raw_norm()),
-        outer_projected_gradient_norm: stationarity
-            .map(|certificate| certificate.projected_norm()),
+        outer_projected_gradient_norm: stationarity.map(|certificate| certificate.projected_norm()),
         outer_stationarity_bound: stationarity.map(|certificate| certificate.bound()),
         optimization_iterations: outer.map_or(0, |result| result.iterations),
         reason,
@@ -866,8 +862,7 @@ mod vanished_stage_tests {
                 decoder[[0, 0]] = 1.0;
             }
             let evaluator = Arc::new(
-                EuclideanPatchEvaluator::new(1, 0)
-                    .expect("degree-zero Euclidean evaluator"),
+                EuclideanPatchEvaluator::new(1, 0).expect("degree-zero Euclidean evaluator"),
             );
             atoms.push(
                 SaeManifoldAtom::new_with_provided_function_gram(

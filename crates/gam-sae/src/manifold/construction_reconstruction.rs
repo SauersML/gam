@@ -270,8 +270,7 @@ impl SaeManifoldTerm {
         residual: Option<ArrayView2<'_, f64>>,
     ) -> Result<f64, String> {
         let n_scalar = self.n_obs().checked_mul(self.output_dim()).ok_or_else(|| {
-            "reconstruction_dispersion_lower_bound: scalar observation count overflowed"
-                .to_string()
+            "reconstruction_dispersion_lower_bound: scalar observation count overflowed".to_string()
         })?;
         if n_scalar == 0 {
             return Err(

@@ -682,7 +682,7 @@ pub fn gaussian_reml_multi_shared_dispersion_closed_form(
                 b,
             )
         };
-        enumerate_and_select_rho(eval, enclose, init_rho, |_r, _e| {})?.0
+        enumerate_and_select_rho(eval, enclose, init_rho, |_r, _e| {})?.rho
     };
     let objective = eval(rho);
     let lambda = gam_problem::checked_exp_log_strength(rho)
@@ -3240,143 +3240,9 @@ impl GaussianRemlPrepared {
     }
 }
 
-/// One penalty block for the cyclic multi-λ Demmler–Reinsch solver: a
-/// block-local penalty `local` (S_j restricted to `col_range`) placed at
-/// `col_range` in the global p-dimensional coefficient vector.
-pub struct GaussianRemlLambdaBlock<'a> {
-    pub col_range: std::ops::Range<usize>,
-    pub local: ArrayView2<'a, f64>,
-}
-
-/// ρ-space fixed-point tolerance for the cyclic solver: a coordinate that
-/// moves by less than this is at its conditional optimum. ρ = ln λ is O(1)–O(10),
-/// so `1e-6` pins λ̂ to ~6 significant figures — far tighter than a seed needs.
-const CYCLIC_RHO_TOL: f64 = 1.0e-6;
-/// Safety cap on the number of full coordinate sweeps. Each sweep replaces every
-/// ρ_k with the EXACT conditional global minimiser of the joint REML (others
-/// held fixed), so the joint criterion decreases monotonically and the sweep
-/// count is the real stop; this only bounds pathological non-termination.
-const CYCLIC_MAX_PASSES: usize = 16;
-
-/// Cyclic exact multi-λ Gaussian-identity REML via coordinate-wise
-/// Demmler–Reinsch — the multi-λ generalisation of the single-λ closed form.
-///
-/// The joint profiled REML `V(ρ_1,…,ρ_K)` is minimised by cyclic coordinate
-/// descent where each 1-D subproblem is solved GLOBALLY, not descended. Holding
-/// the other blocks fixed, the penalized Hessian is `H = A_k + λ_k S_k` with the
-/// folded metric `A_k = XᵀWX + Σ_{j≠k} λ_j S_j`; every ρ_k-dependent term of `V`
-/// (log|H|, the profiled dispersion, and −½log|λ_k S_k|₊ + rank_k·ρ_k) is exactly
-/// the single-penalty closed-form scalar in the `(S_k, A_k)` pencil eigenbasis,
-/// with the other blocks' log-determinants constant in ρ_k. So diagonalising the
-/// pencil `(S_k, A_k)` once and selecting the global minimiser of that scalar is
-/// the EXACT conditional minimiser of the joint `V` over ρ_k — no per-coordinate
-/// Newton, hence no per-coordinate high-λ shelf trap. Each sweep is a global move
-/// on every coordinate, so `V` decreases monotonically and the fixed point is a
-/// coordinate-wise global optimum of the joint criterion.
-///
-/// Returns the per-block ρ vector; consumed as a scored seed for the multi-λ
-/// outer search (keep-best-by-cost guarantees it never worsens a fit).
-pub fn gaussian_reml_cyclic_multi_lambda_rho(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    penalty_blocks: &[GaussianRemlLambdaBlock<'_>],
-    weights: Option<ArrayView1<'_, f64>>,
-    init_rho: &[f64],
-    bounds: (f64, f64),
-) -> Result<Vec<f64>, EstimationError> {
-    let n = x.nrows();
-    let p = x.ncols();
-    let k = penalty_blocks.len();
-    if k == 0 {
-        return Ok(Vec::new());
-    }
-    let (lo, hi) = if bounds.0 <= bounds.1 {
-        bounds
-    } else {
-        (bounds.1, bounds.0)
-    };
-    let weight = gaussian_reml_weights(n, weights)?;
-    let n_effective = effective_observation_count(weight.view());
-    let y2 = y.insert_axis(Axis(1));
-    if y2.nrows() != n {
-        crate::bail_invalid_estim!(
-            "Gaussian REML cyclic: X has {n} rows but y has {}",
-            y2.nrows()
-        );
-    }
-    let xtwy = dense_xt_diag_y(x, weight.view(), y2.view());
-    let ywy_val: f64 = (0..n)
-        .map(|row| weight[row] * y2[[row, 0]] * y2[[row, 0]])
-        .sum();
-    let ywy = Array1::from_elem(1, ywy_val);
-    let xtwx = dense_xt_diag_x(x, weight.view());
-
-    // Pre-scatter each block penalty to full p×p once (reused every sweep).
-    let mut s_full: Vec<Array2<f64>> = Vec::with_capacity(k);
-    for block in penalty_blocks {
-        let mut s = Array2::<f64>::zeros((p, p));
-        let r = block.col_range.clone();
-        if r.end > p || block.local.nrows() != r.len() || block.local.ncols() != r.len() {
-            crate::bail_invalid_estim!("Gaussian REML cyclic: penalty block shape/range mismatch");
-        }
-        for (li, gi) in r.clone().enumerate() {
-            for (lj, gj) in r.clone().enumerate() {
-                s[[gi, gj]] = block.local[[li, lj]];
-            }
-        }
-        s_full.push(s);
-    }
-
-    // Seed ρ from the caller's per-block hint (clamped); pad/truncate to k.
-    let mut rho: Vec<f64> = (0..k)
-        .map(|j| init_rho.get(j).copied().unwrap_or(0.0).clamp(lo, hi))
-        .collect();
-
-    for _pass in 0..CYCLIC_MAX_PASSES {
-        let mut max_delta = 0.0_f64;
-        for kk in 0..k {
-            // Fold the other blocks' current λ into the metric A_k.
-            let mut a = xtwx.clone();
-            for (j, s_j) in s_full.iter().enumerate() {
-                if j != kk {
-                    let lambda = gam_problem::checked_exp_log_strength(rho[j])
-                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-                    a.scaled_add(lambda, s_j);
-                }
-            }
-            // Diagonalise the (S_k, A_k) pencil; a non-PD metric (singular
-            // folded system) skips this coordinate for the sweep.
-            let cache = match gaussian_reml_eigen_cache_from_xtwx(a, s_full[kk].view(), None) {
-                Ok(cache) => cache,
-                Err(_) => continue,
-            };
-            if n_effective <= cache.nullity {
-                continue;
-            }
-            let projected_rhs = dense_atb(cache.coefficient_basis.view(), xtwy.view());
-            let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
-            let prepared = GaussianRemlPrepared {
-                cache,
-                ywy: ywy.clone(),
-                projected_rhs_squared,
-                projected_rhs,
-                n_effective,
-                n_outputs: 1,
-            };
-            let new_rho = optimize_rho(&prepared, Some(rho[kk]))?.clamp(lo, hi);
-            max_delta = max_delta.max((new_rho - rho[kk]).abs());
-            rho[kk] = new_rho;
-        }
-        if max_delta < CYCLIC_RHO_TOL {
-            break;
-        }
-    }
-    Ok(rho)
-}
-
 // ============================================================================
-// Grid-free, provably-complete stationary-point enumeration for the closed-form
-// Gaussian-REML ρ-objective `V(ρ)` (ρ = ln λ).
+// Grid-free stationary-point certification for the profiled Gaussian-REML
+// ρ-objective `V(ρ)` (ρ = ln λ).
 // ============================================================================
 //
 // The previous optimizer sampled `V′` on a fixed 96-point ρ grid and refined
@@ -3464,12 +3330,6 @@ pub fn gaussian_reml_cyclic_multi_lambda_rho(
 /// closed-form REML reverse-mode VJP against finite differences).
 const RHO_BRACKET_RESOLUTION: f64 = 1.0e-12;
 
-/// Safety cap on safeguarded-Newton iterations. Bisection alone halves the
-/// bracket each fallback step, so 80 steps drive a 60-wide window to 60/2⁸⁰ ≈
-/// 5e-23 — astronomically below `RHO_BRACKET_RESOLUTION`; with quadratic Newton
-/// convergence this cap is never binding, it only bounds pathological cases.
-const REFINE_MAX_ITERS: usize = 80;
-
 /// ⌈log₂(range/resolution)⌉ computed at compile time: the smallest depth `d`
 /// with `resolution·2^d ≥ range`, i.e. the number of midpoint bisections needed
 /// to drive the window down to the ρ-bracket resolution. `const fn` so the DFS
@@ -3492,6 +3352,15 @@ const MAX_DEPTH: usize = dfs_max_depth(RHO_UPPER - RHO_LOWER, RHO_BRACKET_RESOLU
 struct Interval {
     lo: f64,
     hi: f64,
+}
+
+impl Interval {
+    fn entire() -> Self {
+        Self {
+            lo: f64::NEG_INFINITY,
+            hi: f64::INFINITY,
+        }
+    }
 }
 
 /// Next representable f64 strictly below `x` (toward −∞): outward rounding for
@@ -3522,8 +3391,29 @@ fn round_up(x: f64) -> f64 {
     f64::from_bits(next)
 }
 
-/// Exact per-eigenvalue ranges of the four `V′`/`V″` kernels over a monotone
-/// `t`-window `[t_lo, t_hi]` (0 ≤ t_lo ≤ t_hi). See the module derivation above:
+/// Enclose accumulated nearest-rounded arithmetic under the standard
+/// `gamma_n = n*eps/(1-n*eps)` model, then step both endpoints outward once.
+/// `magnitude` is an absolute sum of the contributing terms, so cancellation
+/// in the final bound cannot erase its roundoff allowance. Non-finite
+/// arithmetic refuses pruning by returning the entire real line.
+fn conservative_interval(lo: f64, hi: f64, magnitude: f64, operations: usize) -> Interval {
+    if !(lo.is_finite() && hi.is_finite() && magnitude.is_finite() && lo <= hi) {
+        return Interval::entire();
+    }
+    let n_eps = (operations as f64) * f64::EPSILON;
+    if n_eps >= 1.0 {
+        return Interval::entire();
+    }
+    let pad = (n_eps / (1.0 - n_eps))
+        * magnitude.max(lo.abs()).max(hi.abs()).max(f64::MIN_POSITIVE);
+    Interval {
+        lo: round_down(lo - pad),
+        hi: round_up(hi + pad),
+    }
+}
+
+/// Analytic per-eigenvalue ranges of the four `V′`/`V″` kernels over a monotone
+/// log-`t` window. See the module derivation above:
 /// `u=t/(1+t)` ↑, `v=1/(1+t)` ↓, `w=t/(1+t)²` unimodal (peak ¼ at t=1),
 /// `k=t(1−t)/(1+t)³` with interior extrema at t = 2 ± √3.
 #[derive(Clone, Copy)]
@@ -3538,23 +3428,23 @@ struct KernelRange {
     k_hi: f64,
 }
 
-fn kernel_ranges(t_lo: f64, t_hi: f64) -> KernelRange {
-    let u = |t: f64| t / (1.0 + t);
-    let v = |t: f64| 1.0 / (1.0 + t);
-    let w = |t: f64| t / ((1.0 + t) * (1.0 + t));
-    let k = |t: f64| t * (1.0 - t) / ((1.0 + t) * (1.0 + t) * (1.0 + t));
+fn kernel_ranges(log_t_lo: f64, log_t_hi: f64) -> KernelRange {
+    let kernels = |log_t: f64| modal_kernels(log_t, 1.0);
+    let left = kernels(log_t_lo);
+    let right = kernels(log_t_hi);
 
-    // t/(1+t) increasing; 1/(1+t) decreasing.
-    let u_lo = u(t_lo);
-    let u_hi = u(t_hi);
-    let v_lo = v(t_hi);
-    let v_hi = v(t_lo);
+    // t/(1+t) increasing; 1/(1+t) decreasing. Evaluating in log-t space
+    // retains the finite limiting values when exp(log_t) is not representable.
+    let u_lo = left.u;
+    let u_hi = right.u;
+    let v_lo = right.v;
+    let v_hi = left.v;
 
     // t/(1+t)² unimodal, single interior peak ¼ at t=1.
-    let w_a = w(t_lo);
-    let w_b = w(t_hi);
+    let w_a = left.w;
+    let w_b = right.w;
     let w_lo = w_a.min(w_b);
-    let w_hi = if t_lo <= 1.0 && 1.0 <= t_hi {
+    let w_hi = if log_t_lo <= 0.0 && 0.0 <= log_t_hi {
         0.25
     } else {
         w_a.max(w_b)
@@ -3563,17 +3453,17 @@ fn kernel_ranges(t_lo: f64, t_hi: f64) -> KernelRange {
     // k(t)=t(1−t)/(1+t)³: interior extrema are the roots t = 2 ± √3 of the fixed
     // quadratic t²−4t+1 (derived in the module comment).
     let sqrt3 = 3.0_f64.sqrt();
-    let cp_lo = 2.0 - sqrt3;
-    let cp_hi = 2.0 + sqrt3;
-    let mut k_lo = k(t_lo).min(k(t_hi));
-    let mut k_hi = k(t_lo).max(k(t_hi));
-    if t_lo < cp_lo && cp_lo < t_hi {
-        let kc = k(cp_lo);
+    let cp_lo = (2.0 - sqrt3).ln();
+    let cp_hi = (2.0 + sqrt3).ln();
+    let mut k_lo = left.k.min(right.k);
+    let mut k_hi = left.k.max(right.k);
+    if log_t_lo < cp_lo && cp_lo < log_t_hi {
+        let kc = kernels(cp_lo).k;
         k_lo = k_lo.min(kc);
         k_hi = k_hi.max(kc);
     }
-    if t_lo < cp_hi && cp_hi < t_hi {
-        let kc = k(cp_hi);
+    if log_t_lo < cp_hi && cp_hi < log_t_hi {
+        let kc = kernels(cp_hi).k;
         k_lo = k_lo.min(kc);
         k_hi = k_hi.max(kc);
     }
@@ -3591,10 +3481,12 @@ fn kernel_ranges(t_lo: f64, t_hi: f64) -> KernelRange {
 }
 
 /// Outward-rounded interval enclosure of `(V′([a,b]), V″([a,b]))` for the DFS.
-/// Both intervals are valid OUTER bounds of the exact derivative range over the
-/// ρ-cell; the g2/dispersion ratios are conservative (they may widen the box,
-/// never shrink it below the true range), so a "0 ∉ box" test can only prune a
-/// cell that provably contains no root of `V′`.
+/// Both intervals are conservative bounds for the analytic profiled derivative
+/// range over the ρ-cell. Kernel extrema are included explicitly and the final
+/// accumulated arithmetic is padded by an operation-count roundoff bound. A
+/// non-finite or non-positive residual bound returns the entire line, which
+/// prevents pruning and therefore ends in a typed unresolved-search refusal if
+/// tighter children cannot certify the cell.
 fn reml_deriv_enclosure(
     cache: &GaussianRemlEigenCache,
     ywy: ArrayView1<'_, f64>,
@@ -3634,9 +3526,6 @@ fn reml_deriv_enclosure_profile(
     let rank = cache.penalty_rank as f64;
     let half_d = 0.5 * d;
     let half_nu = 0.5 * dispersion_dof;
-    let lambda_lo = a.exp();
-    let lambda_hi = b.exp();
-
     // g1 = ½d(Σ t/(1+t) − rank) and the logdet part of V″ = ½d·Σ t/(1+t)²,
     // both summing only over the strictly positive penalty eigenvalues.
     let mut sum_u_lo = 0.0;
@@ -3645,7 +3534,8 @@ fn reml_deriv_enclosure_profile(
     let mut sum_w_hi = 0.0;
     for &delta in &cache.penalty_eigenvalues {
         if delta > 0.0 {
-            let kr = kernel_ranges(lambda_lo * delta, lambda_hi * delta);
+            let log_delta = delta.ln();
+            let kr = kernel_ranges(a + log_delta, b + log_delta);
             sum_u_lo += kr.u_lo;
             sum_u_hi += kr.u_hi;
             sum_w_lo += kr.w_lo;
@@ -3671,7 +3561,12 @@ fn reml_deriv_enclosure_profile(
         for eig in 0..cache.penalty_eigenvalues.len() {
             let delta = cache.penalty_eigenvalues[eig];
             let c2 = projected_rhs_squared[[eig, j]];
-            let kr = kernel_ranges(lambda_lo * delta, lambda_hi * delta);
+            let log_delta = if delta == 0.0 {
+                f64::NEG_INFINITY
+            } else {
+                delta.ln()
+            };
+            let kr = kernel_ranges(a + log_delta, b + log_delta);
             num_lo += c2 * kr.w_lo;
             num_hi += c2 * kr.w_hi;
             sv_lo += c2 * kr.v_lo;
@@ -3679,11 +3574,14 @@ fn reml_deriv_enclosure_profile(
             dph_lo += c2 * kr.k_lo;
             dph_hi += c2 * kr.k_hi;
         }
-        // dp is monotone increasing, so its endpoint values are EXACT: dp_lo =
-        // dp(a) > 0, dp_hi = dp(b) > 0 (floored at MIN_DEVIANCE to mirror the
-        // evaluator's residual-deviance floor).
-        let dp_lo = (ywy[j] - sv_hi).max(MIN_DEVIANCE);
-        let dp_hi = (ywy[j] - sv_lo).max(MIN_DEVIANCE);
+        // dp is monotone increasing. A non-positive conservative lower bound
+        // means the profiled log residual cannot be certified on this cell;
+        // never replace that mathematical failure with a tiny positive floor.
+        let dp_lo = ywy[j] - sv_hi;
+        let dp_hi = ywy[j] - sv_lo;
+        if !(dp_lo.is_finite() && dp_hi.is_finite() && dp_lo > 0.0 && dp_hi >= dp_lo) {
+            return (Interval::entire(), Interval::entire());
+        }
 
         // g2_j = num_j / dp_j  (num ≥ 0, dp > 0).
         g2_lo += num_lo / dp_hi;
@@ -3714,154 +3612,326 @@ fn reml_deriv_enclosure_profile(
     let vpp_lo = half_d * sum_w_lo + half_nu * vpp_disp_lo;
     let vpp_hi = half_d * sum_w_hi + half_nu * vpp_disp_hi;
 
+    let operations = 64usize.saturating_add(
+        32usize.saturating_mul(
+            cache
+                .penalty_eigenvalues
+                .len()
+                .saturating_mul(ywy.len().max(1)),
+        ),
+    );
+    let vp_magnitude = g1_lo.abs()
+        + g1_hi.abs()
+        + half_nu.abs() * (g2_lo.abs() + g2_hi.abs());
+    let vpp_magnitude = half_d.abs() * (sum_w_lo.abs() + sum_w_hi.abs())
+        + half_nu.abs() * (vpp_disp_lo.abs() + vpp_disp_hi.abs());
     (
-        Interval {
-            lo: round_down(vp_lo),
-            hi: round_up(vp_hi),
-        },
-        Interval {
-            lo: round_down(vpp_lo),
-            hi: round_up(vpp_hi),
-        },
+        conservative_interval(vp_lo, vp_hi, vp_magnitude, operations),
+        conservative_interval(vpp_lo, vpp_hi, vpp_magnitude, operations),
     )
 }
 
-/// Safeguarded-Newton isolation of a single `V′` root inside a bracket the
-/// caller has established (`V′(lo)` and `V′(hi)` straddle 0). Newton steps that
-/// leave the bracket fall back to bisection, and the bracket is maintained by
-/// the sign of `V′` relative to the low end, so the routine converges for a root
-/// of either orientation (a minimum where V′ crosses ↑, or a maximum ↓). Shared
-/// by both optimizers and the certificate builder so all three reduce
-/// identically. Stops when |V′| ≤ GRAD_TOL·(1+|V|) or the bracket reaches the
-/// ρ-resolution. (Factored from the former `refine_stationary_rho` /
-/// `refine_stationary_rho_no_alloc` copies into one `eval`-closure body.)
-fn refine_stationary_rho_core(
-    eval: impl Fn(f64) -> ObjectiveEval,
-    mut lo: f64,
-    mut hi: f64,
-    mut rho: f64,
-) -> f64 {
-    let g_lo_positive = eval(lo).grad > 0.0;
-    for _ in 0..REFINE_MAX_ITERS {
-        let e = eval(rho);
-        if e.grad.abs() <= GRAD_TOL * (1.0 + e.cost.abs()) {
-            return rho;
-        }
-        // Keep [lo, hi] bracketing the sign change regardless of orientation.
-        if (e.grad > 0.0) == g_lo_positive {
-            lo = rho;
-        } else {
-            hi = rho;
-        }
-        let newton = if e.hess != 0.0 {
-            let candidate = rho - e.grad / e.hess;
-            (candidate > lo && candidate < hi).then_some(candidate)
-        } else {
-            None
-        };
-        if (hi - lo).abs() <= RHO_BRACKET_RESOLUTION * (1.0 + rho.abs()) {
-            break;
-        }
-        rho = newton.unwrap_or(0.5 * (lo + hi));
-    }
-    0.5 * (lo + hi)
+#[derive(Clone, Copy)]
+struct StationaryRoot {
+    rho: f64,
+    bracket: [f64; 2],
 }
 
-/// Branch-and-bound enumeration of the stationary points of `V′` on
-/// `[RHO_LOWER, RHO_UPPER]` followed by a single running-best (strict `<`)
-/// argmin over {roots (ascending), RHO_LOWER, RHO_UPPER, init}. Both optimizers
-/// and the certificate builder call this with the SAME candidate order and the
-/// SAME strict comparison, so they select a bit-identical ρ (closing the old
-/// `min_by(total_cmp)` vs strict-`<` divergence between the two paths). The DFS
-/// uses a fixed-size on-stack array (no heap) and pushes children right-then-left,
-/// so `visit` receives roots in ascending ρ.
-fn enumerate_and_select_rho(
+#[derive(Clone, Copy)]
+struct ProfileSelection {
+    rho: f64,
+    projected_gradient_residual: f64,
+}
+
+#[derive(Clone, Copy)]
+struct ProfileSearchControls {
+    lower: f64,
+    upper: f64,
+    resolution: f64,
+    max_depth: usize,
+}
+
+impl ProfileSearchControls {
+    const PRODUCTION: Self = Self {
+        lower: RHO_LOWER,
+        upper: RHO_UPPER,
+        resolution: RHO_BRACKET_RESOLUTION,
+        max_depth: MAX_DEPTH,
+    };
+}
+
+fn profile_search_refusal(
+    eval: &impl Fn(f64) -> ObjectiveEval,
+    checkpoint: f64,
+    reason: String,
+) -> EstimationError {
+    let e = eval(checkpoint);
+    EstimationError::RemlDidNotConverge {
+        context: "closed-form Gaussian profiled REML stationary search".to_string(),
+        reason,
+        iterations: 0,
+        final_value: e.cost,
+        projected_grad_norm: e.grad.is_finite().then_some(e.grad.abs()),
+        stationarity_bound: GRAD_TOL * (1.0 + e.cost.abs()),
+        rho_checkpoint: vec![checkpoint],
+    }
+}
+
+/// Isolate one unique derivative root to a geometric rho bracket. Newton is
+/// accepted only in the central half of the maintained sign bracket, so every
+/// iteration contracts it by at least one quarter. There is no iteration cap:
+/// termination follows from geometric contraction, and loss of a representable
+/// interior point is a typed refusal rather than a best-effort root.
+fn refine_stationary_rho_core(
+    eval: &impl Fn(f64) -> ObjectiveEval,
+    mut lo: f64,
+    mut hi: f64,
+    resolution: f64,
+    mut hint: Option<f64>,
+) -> Result<StationaryRoot, EstimationError> {
+    let mut left = eval(lo);
+    let mut right = eval(hi);
+    if left.grad == 0.0 {
+        return Ok(StationaryRoot {
+            rho: lo,
+            bracket: [lo, lo],
+        });
+    }
+    if right.grad == 0.0 {
+        return Ok(StationaryRoot {
+            rho: hi,
+            bracket: [hi, hi],
+        });
+    }
+    if left.grad.is_sign_positive() == right.grad.is_sign_positive() {
+        return Err(profile_search_refusal(
+            eval,
+            0.5 * (lo + hi),
+            format!("stationary refinement received a non-bracketing cell [{lo}, {hi}]"),
+        ));
+    }
+
+    loop {
+        let width = hi - lo;
+        let scale = 1.0 + lo.abs().max(hi.abs());
+        if width <= resolution * scale {
+            let midpoint = lo + 0.5 * width;
+            let middle = if midpoint > lo && midpoint < hi {
+                Some((midpoint, eval(midpoint)))
+            } else {
+                None
+            };
+            let mut representative = (lo, left);
+            if right.grad.abs() < representative.1.grad.abs() {
+                representative = (hi, right);
+            }
+            if let Some(candidate) = middle
+                && candidate.1.grad.abs() < representative.1.grad.abs()
+            {
+                representative = candidate;
+            }
+            return Ok(StationaryRoot {
+                rho: representative.0,
+                bracket: [lo, hi],
+            });
+        }
+
+        let midpoint = lo + 0.5 * width;
+        if !(midpoint > lo && midpoint < hi) {
+            return Err(profile_search_refusal(
+                eval,
+                midpoint,
+                format!(
+                    "stationary root on [{lo}, {hi}] reached floating-point spacing before rho resolution {resolution}"
+                ),
+            ));
+        }
+        let guard = 0.25 * width;
+        let base = if left.grad.abs() <= right.grad.abs() {
+            (lo, left)
+        } else {
+            (hi, right)
+        };
+        let newton = if base.1.hess != 0.0 {
+            base.0 - base.1.grad / base.1.hess
+        } else {
+            f64::NAN
+        };
+        let candidate = hint
+            .take()
+            .filter(|&rho| rho >= lo + guard && rho <= hi - guard)
+            .or_else(|| {
+                (newton.is_finite() && newton >= lo + guard && newton <= hi - guard)
+                    .then_some(newton)
+            })
+            .unwrap_or(midpoint);
+        if !(candidate > lo && candidate < hi) {
+            return Err(profile_search_refusal(
+                eval,
+                midpoint,
+                format!("stationary refinement could not represent an interior point on [{lo}, {hi}]"),
+            ));
+        }
+        let current = eval(candidate);
+        if current.grad == 0.0 {
+            return Ok(StationaryRoot {
+                rho: candidate,
+                bracket: [candidate, candidate],
+            });
+        }
+        if current.grad.is_sign_positive() == left.grad.is_sign_positive() {
+            lo = candidate;
+            left = current;
+        } else {
+            hi = candidate;
+            right = current;
+        }
+    }
+}
+
+fn interval_contains(interval: Interval, value: f64) -> bool {
+    value.is_finite() && interval.lo <= value && value <= interval.hi
+}
+
+/// Certify the stationary structure of the actual profiled objective on the
+/// finite rho window, then compare one representative of every isolated root
+/// with both boundaries. `init_rho` is only a refinement hint; an arbitrary
+/// nonstationary seed is never eligible to become the estimator.
+fn enumerate_and_select_rho_with_controls(
     eval: impl Fn(f64) -> ObjectiveEval,
     enclose: impl Fn(f64, f64) -> (Interval, Interval),
     init_rho: Option<f64>,
-    mut visit: impl FnMut(f64, &ObjectiveEval),
-) -> Result<(f64, bool), EstimationError> {
+    controls: ProfileSearchControls,
+    mut visit: impl FnMut(StationaryRoot, &ObjectiveEval),
+) -> Result<ProfileSelection, EstimationError> {
     const CAP: usize = MAX_DEPTH + 4;
-    let mut stack = [(0.0f64, 0.0f64); CAP];
+    let mut stack = [(0.0f64, 0.0f64, 0usize); CAP];
     let mut top = 0usize;
-    stack[top] = (RHO_LOWER, RHO_UPPER);
+    stack[top] = (controls.lower, controls.upper, 0);
     top += 1;
 
-    let mut best_rho = RHO_LOWER;
-    let mut best_cost = f64::INFINITY;
-    let mut hit_resolution_floor = false;
+    let lower_eval = eval(controls.lower);
+    let upper_eval = eval(controls.upper);
+    let (mut best_rho, mut best_eval) = if upper_eval.cost < lower_eval.cost {
+        (controls.upper, upper_eval)
+    } else {
+        (controls.lower, lower_eval)
+    };
+    let mut last_root: Option<StationaryRoot> = None;
 
     while top > 0 {
         top -= 1;
-        let (a, b) = stack[top];
-
+        let (a, b, depth) = stack[top];
+        let ea = eval(a);
+        let eb = eval(b);
         let (dv, dvv) = enclose(a, b);
-        // Prune: 0 ∉ V′ enclosure ⇒ no root in [a,b].
+        if !(interval_contains(dv, ea.grad)
+            && interval_contains(dv, eb.grad)
+            && interval_contains(dvv, ea.hess)
+            && interval_contains(dvv, eb.hess))
+        {
+            return Err(profile_search_refusal(
+                &eval,
+                0.5 * (a + b),
+                format!(
+                    "analytic derivative enclosure [{}, {}] / curvature enclosure [{}, {}] missed an endpoint jet on [{a}, {b}]",
+                    dv.lo, dv.hi, dvv.lo, dvv.hi
+                ),
+            ));
+        }
         if dv.lo > 0.0 || dv.hi < 0.0 {
             continue;
         }
 
         let monotone = dvv.lo > 0.0 || dvv.hi < 0.0;
-        let at_floor = (b - a) <= RHO_BRACKET_RESOLUTION * (1.0 + a.abs().max(b.abs()));
+        let at_floor = depth >= controls.max_depth
+            || (b - a) <= controls.resolution * (1.0 + a.abs().max(b.abs()));
+        if !monotone && at_floor {
+            return Err(profile_search_refusal(
+                &eval,
+                0.5 * (a + b),
+                format!(
+                    "stationary structure remained non-monotone on [{a}, {b}] at rho resolution {}",
+                    controls.resolution
+                ),
+            ));
+        }
 
-        if monotone || at_floor {
-            // V′ monotone on [a,b] (≤ 1 root) or the cell is at the resolution
-            // floor: decide by the EXACT endpoint gradients.
-            let ga = eval(a).grad;
-            let gb = eval(b).grad;
-            let crosses = (ga <= 0.0 && gb >= 0.0) || (ga >= 0.0 && gb <= 0.0);
+        if monotone {
+            let crosses = (ea.grad <= 0.0 && eb.grad >= 0.0)
+                || (ea.grad >= 0.0 && eb.grad <= 0.0);
             if crosses {
-                let root = refine_stationary_rho_core(&eval, a, b, 0.5 * (a + b));
-                let e = eval(root);
-                if e.cost < best_cost {
-                    best_cost = e.cost;
-                    best_rho = root;
+                let hint = init_rho.filter(|rho| rho.is_finite() && *rho >= a && *rho <= b);
+                let root = refine_stationary_rho_core(
+                    &eval,
+                    a,
+                    b,
+                    controls.resolution,
+                    hint,
+                )?;
+                let duplicate = last_root.is_some_and(|previous| {
+                    root.rho.to_bits() == previous.rho.to_bits()
+                        || (root.bracket[0] <= previous.bracket[1]
+                            && previous.bracket[0] <= root.bracket[1])
+                });
+                if !duplicate {
+                    let e = eval(root.rho);
+                    if e.cost < best_eval.cost {
+                        best_rho = root.rho;
+                        best_eval = e;
+                    }
+                    visit(root, &e);
+                    last_root = Some(root);
                 }
-                visit(root, &e);
-            }
-            if at_floor && !monotone {
-                hit_resolution_floor = true;
             }
             continue;
         }
 
-        // Cannot certify monotonicity: split. Push right then left so the left
-        // half is processed first ⇒ roots emit in ascending ρ.
-        let mid = 0.5 * (a + b);
-        if top + 2 > CAP {
-            hit_resolution_floor = true;
-            continue;
+        let mid = a + 0.5 * (b - a);
+        if !(mid > a && mid < b) || top + 2 > CAP {
+            return Err(profile_search_refusal(
+                &eval,
+                mid,
+                format!("stationary subdivision could not continue on [{a}, {b}]"),
+            ));
         }
-        stack[top] = (mid, b);
+        stack[top] = (mid, b, depth + 1);
         top += 1;
-        stack[top] = (a, mid);
+        stack[top] = (a, mid, depth + 1);
         top += 1;
     }
 
-    // Endpoints, then the caller's init seed — fixed order, same strict argmin.
-    for cand in [RHO_LOWER, RHO_UPPER] {
-        let e = eval(cand);
-        if e.cost < best_cost {
-            best_cost = e.cost;
-            best_rho = cand;
-        }
+    if !(best_eval.cost.is_finite() && best_eval.grad.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "Gaussian REML profiled search produced no finite candidate".to_string(),
+        ));
     }
-    if let Some(rho0) = init_rho {
-        let rho0 = rho0.clamp(RHO_LOWER, RHO_UPPER);
-        let e = eval(rho0);
-        if e.cost < best_cost {
-            best_cost = e.cost;
-            best_rho = rho0;
-        }
-    }
-
-    if best_cost.is_finite() {
-        Ok((best_rho, hit_resolution_floor))
+    let projected_gradient_residual = if best_rho == controls.lower {
+        (-best_eval.grad).max(0.0)
+    } else if best_rho == controls.upper {
+        best_eval.grad.max(0.0)
     } else {
-        Err(EstimationError::InvalidInput(
-            "Gaussian REML optimizer produced no finite candidates".to_string(),
-        ))
-    }
+        best_eval.grad.abs()
+    };
+    Ok(ProfileSelection {
+        rho: best_rho,
+        projected_gradient_residual,
+    })
+}
+
+fn enumerate_and_select_rho(
+    eval: impl Fn(f64) -> ObjectiveEval,
+    enclose: impl Fn(f64, f64) -> (Interval, Interval),
+    init_rho: Option<f64>,
+    visit: impl FnMut(StationaryRoot, &ObjectiveEval),
+) -> Result<ProfileSelection, EstimationError> {
+    enumerate_and_select_rho_with_controls(
+        eval,
+        enclose,
+        init_rho,
+        ProfileSearchControls::PRODUCTION,
+        visit,
+    )
 }
 
 /// Select ρ̂ = ln λ̂ by grid-free stationary-point enumeration (allocating path).
@@ -3884,8 +3954,7 @@ fn optimize_rho(
             b,
         )
     };
-    let (selected, _hit_floor) = enumerate_and_select_rho(eval, enclose, init_rho, |_r, _e| {})?;
-    Ok(selected)
+    Ok(enumerate_and_select_rho(eval, enclose, init_rho, |_r, _e| {})?.rho)
 }
 
 fn fill_weighted_rhs_no_alloc(
@@ -3968,7 +4037,6 @@ fn evaluate_reml_profile(
     dispersion_dof: f64,
     rho: f64,
 ) -> ObjectiveEval {
-    let lambda = rho.exp();
     let d = logdet_output_count as f64;
 
     // Each term's value and its ρ-derivatives come back from ONE function so
@@ -3988,7 +4056,7 @@ fn evaluate_reml_profile(
             projected_rhs_squared,
             output,
             dispersion_dof,
-            lambda,
+            rho,
         );
     }
     eval
@@ -4031,8 +4099,7 @@ fn optimize_rho_no_alloc(
             b,
         )
     };
-    let (selected, _hit_floor) = enumerate_and_select_rho(eval, enclose, init_rho, |_r, _e| {})?;
-    Ok(selected)
+    Ok(enumerate_and_select_rho(eval, enclose, init_rho, |_r, _e| {})?.rho)
 }
 
 fn fill_coefficients_no_alloc(

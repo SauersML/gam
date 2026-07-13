@@ -190,14 +190,8 @@ mod tests {
     #[test]
     fn raw_external_seed_is_a_typed_nonfit() {
         let (target, term, rho, pin, provenance) = seeded_external_fixture();
-        let outcome = run_sae_manifold_certify(certify_request(
-            target,
-            term,
-            rho,
-            pin,
-            provenance,
-        ))
-        .expect("stationarity audit itself must evaluate");
+        let outcome = run_sae_manifold_certify(certify_request(target, term, rho, pin, provenance))
+            .expect("stationarity audit itself must evaluate");
         let SaeExternalCertificationOutcome::NonStationary(report) = outcome else {
             panic!("an unoptimized seed must never mint SaeFitReport");
         };
@@ -206,7 +200,13 @@ mod tests {
         assert!(report.reason.contains("inner KKT stationarity"));
     }
 
-    fn native_converged_state() -> (Array2<f64>, SaeManifoldTerm, SaeManifoldRho, bool, &'static str) {
+    fn native_converged_state() -> (
+        Array2<f64>,
+        SaeManifoldTerm,
+        SaeManifoldRho,
+        bool,
+        &'static str,
+    ) {
         let (target, term, rho, pin, provenance) = seeded_external_fixture();
         let rho_flat = rho.to_flat();
         let registry = AnalyticPenaltyRegistry::new();
@@ -224,7 +224,10 @@ mod tests {
             .with_initial_rho(rho_flat)
             .run(&mut objective, "#2263 native replay fixture")
             .expect("native outer search must run");
-        assert!(result.converged, "native fixture must be genuinely converged");
+        assert!(
+            result.converged,
+            "native fixture must be genuinely converged"
+        );
         objective
             .certify_outer_result(&result)
             .expect("native result must carry the shared stationarity certificate");
@@ -255,14 +258,9 @@ mod tests {
             SaeExternalCertificationOutcome::NonStationary(_)
         ));
 
-        let outcome = run_sae_manifold_certify(certify_request(
-            target.clone(),
-            term,
-            rho,
-            pin,
-            provenance,
-        ))
-        .expect("converged replay audit");
+        let outcome =
+            run_sae_manifold_certify(certify_request(target.clone(), term, rho, pin, provenance))
+                .expect("converged replay audit");
         let SaeExternalCertificationOutcome::Certified(report) = outcome else {
             panic!("a natively converged exact replay must pass the zero-step audit");
         };

@@ -203,7 +203,9 @@ impl SaeSupportSparseTerm {
         };
         let output_dim = atoms[0].output_dim();
         if output_dim == 0 {
-            return Err("SaeSupportSparseTerm::new: decoder output dimension must be positive".into());
+            return Err(
+                "SaeSupportSparseTerm::new: decoder output dimension must be positive".into(),
+            );
         }
         for (atom, template) in atoms.iter().enumerate() {
             if template.output_dim() != output_dim {
@@ -275,7 +277,8 @@ impl SaeSupportSparseTerm {
         if target.ncols() != self.output_dim || target.nrows() == 0 {
             return Err(format!(
                 "SaeSupportSparseTerm::reroute_fixed_decoder: target {:?} must have positive rows and P={}",
-                target.dim(), self.output_dim
+                target.dim(),
+                self.output_dim
             ));
         }
         if support_k == 0 || support_k > self.k_atoms() {
@@ -320,13 +323,11 @@ impl SaeSupportSparseTerm {
                         super::support_seed::chart_coordinate(&atom.basis_kind, axis, raw)
                     })
                     .collect::<Vec<_>>();
-                let coordinate = Array2::from_shape_vec(
-                    (1, atom.latent_dim),
-                    candidate_coords.clone(),
-                )
-                .map_err(|error| {
-                    format!("SaeSupportSparseTerm::reroute_fixed_decoder: {error}")
-                })?;
+                let coordinate =
+                    Array2::from_shape_vec((1, atom.latent_dim), candidate_coords.clone())
+                        .map_err(|error| {
+                            format!("SaeSupportSparseTerm::reroute_fixed_decoder: {error}")
+                        })?;
                 let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
                     format!(
                         "SaeSupportSparseTerm::reroute_fixed_decoder: atom {atom_index} has no evaluator"
@@ -402,13 +403,12 @@ impl SaeSupportSparseTerm {
         let mut cursor = 0usize;
         for atom in &self.atoms {
             offsets.push(cursor);
-            cursor = cursor
-                .checked_add(
-                    atom.basis_size()
-                        .checked_mul(self.output_dim)
-                        .ok_or_else(|| "SaeSupportSparseTerm: beta block width overflow".to_string())?,
-                )
-                .ok_or_else(|| "SaeSupportSparseTerm: beta dimension overflow".to_string())?;
+            cursor =
+                cursor
+                    .checked_add(atom.basis_size().checked_mul(self.output_dim).ok_or_else(
+                        || "SaeSupportSparseTerm: beta block width overflow".to_string(),
+                    )?)
+                    .ok_or_else(|| "SaeSupportSparseTerm: beta dimension overflow".to_string())?;
         }
         Ok((offsets, cursor))
     }
@@ -426,19 +426,24 @@ impl SaeSupportSparseTerm {
         if target.dim() != (self.n_obs(), self.output_dim) {
             return Err(format!(
                 "SaeSupportSparseTerm::assemble_arrow_schur: target {:?} != ({}, {})",
-                target.dim(), self.n_obs(), self.output_dim
+                target.dim(),
+                self.n_obs(),
+                self.output_dim
             ));
         }
         self.validate_smoothing(lambda_smooth)?;
         if ard_precisions.len() != self.k_atoms() {
             return Err(format!(
                 "SaeSupportSparseTerm::assemble_arrow_schur: ARD blocks {} != K={}",
-                ard_precisions.len(), self.k_atoms()
+                ard_precisions.len(),
+                self.k_atoms()
             ));
         }
         for (atom, values) in ard_precisions.iter().enumerate() {
             if values.len() != self.assignment.atom_coord_dim(atom)
-                || values.iter().any(|value| !value.is_finite() || *value <= 0.0)
+                || values
+                    .iter()
+                    .any(|value| !value.is_finite() || *value <= 0.0)
             {
                 return Err(format!(
                     "SaeSupportSparseTerm::assemble_arrow_schur: atom {atom} ARD must contain {} finite positive precisions",
@@ -548,10 +553,7 @@ impl SaeSupportSparseTerm {
             beta_dim,
         });
         let shared = Arc::clone(&operator);
-        system.set_shared_beta_operator(
-            move |vector, out| shared.apply(vector, out),
-            hbb_diag,
-        );
+        system.set_shared_beta_operator(move |vector, out| shared.apply(vector, out), hbb_diag);
         let forward = Arc::clone(&operator);
         let transpose = Arc::clone(&operator);
         system.set_row_htbeta_operator(
@@ -563,8 +565,7 @@ impl SaeSupportSparseTerm {
             .iter()
             .enumerate()
             .map(|(atom, template)| {
-                beta_offsets[atom]
-                    ..beta_offsets[atom] + template.basis_size() * self.output_dim
+                beta_offsets[atom]..beta_offsets[atom] + template.basis_size() * self.output_dim
             })
             .collect::<Vec<_>>()
             .into();
@@ -577,11 +578,9 @@ impl SaeSupportSparseTerm {
         let atom_idx = self.assignment.support_indices(row)[slot] as usize;
         let atom = &self.atoms[atom_idx];
         let d = atom.latent_dim;
-        let coords = Array2::from_shape_vec(
-            (1, d),
-            self.assignment.coords_for_slot(row, slot).to_vec(),
-        )
-        .map_err(|error| format!("SaeSupportSparseTerm::evaluate_active: {error}"))?;
+        let coords =
+            Array2::from_shape_vec((1, d), self.assignment.coords_for_slot(row, slot).to_vec())
+                .map_err(|error| format!("SaeSupportSparseTerm::evaluate_active: {error}"))?;
         let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
             format!("SaeSupportSparseTerm::evaluate_active: atom {atom_idx} has no evaluator")
         })?;
@@ -601,8 +600,7 @@ impl SaeSupportSparseTerm {
             for basis in 0..m {
                 let weight = jet[[0, basis, axis]];
                 for output in 0..self.output_dim {
-                    jacobian[[axis, output]] +=
-                        weight * atom.decoder_coefficients[[basis, output]];
+                    jacobian[[axis, output]] += weight * atom.decoder_coefficients[[basis, output]];
                 }
             }
         }
@@ -657,7 +655,9 @@ impl SaeSupportSparseTerm {
             .iter()
             .any(|value| !value.is_finite() || *value < 0.0)
         {
-            return Err("SaeSupportSparseTerm: smoothing strengths must be finite and non-negative".into());
+            return Err(
+                "SaeSupportSparseTerm: smoothing strengths must be finite and non-negative".into(),
+            );
         }
         Ok(())
     }
@@ -672,7 +672,9 @@ impl SaeSupportSparseTerm {
         }
         for (atom, values) in ard_precisions.iter().enumerate() {
             if values.len() != self.assignment.atom_coord_dim(atom)
-                || values.iter().any(|value| !value.is_finite() || *value <= 0.0)
+                || values
+                    .iter()
+                    .any(|value| !value.is_finite() || *value <= 0.0)
             {
                 return Err(format!(
                     "SaeSupportSparseTerm: atom {atom} ARD must contain {} finite positive precisions",
@@ -750,7 +752,9 @@ impl SaeSupportSparseTerm {
         let scale = eigenvalues.iter().copied().fold(0.0_f64, f64::max).max(1.0);
         let tolerance = f64::EPSILON.sqrt() * scale * m.max(1) as f64;
         if eigenvalues.iter().any(|value| *value < -tolerance) {
-            return Err(format!("{context}: normal equation is not positive semidefinite"));
+            return Err(format!(
+                "{context}: normal equation is not positive semidefinite"
+            ));
         }
         let projected = eigenvectors.t().dot(rhs);
         let rhs_scale = rhs.iter().fold(1.0_f64, |acc, value| acc.max(value.abs()));
@@ -797,18 +801,15 @@ impl SaeSupportSparseTerm {
                         gram[[left, right]] += active.phi[left] * active.phi[right];
                     }
                     for output in 0..self.output_dim {
-                        let residual_without = target[[row, output]] - fitted[[row, output]]
-                            + active.decoded[output];
+                        let residual_without =
+                            target[[row, output]] - fitted[[row, output]] + active.decoded[output];
                         rhs[[left, output]] += active.phi[left] * residual_without;
                     }
                 }
                 rows.push((row, active.phi, active.decoded));
             }
-            let decoder = Self::solve_psd_minimum_norm(
-                &gram,
-                &rhs,
-                "SaeSupportSparseTerm::decoder_sweep",
-            )?;
+            let decoder =
+                Self::solve_psd_minimum_norm(&gram, &rhs, "SaeSupportSparseTerm::decoder_sweep")?;
             for (new, old) in decoder.iter().zip(old_decoder.iter()) {
                 max_change = max_change.max((new - old).abs());
             }
@@ -923,9 +924,7 @@ impl SaeSupportSparseTerm {
                         .value;
                     }
                 }
-                if trial_loss.is_finite()
-                    && trial_loss <= old_loss - 1.0e-4 * step * directional
-                {
+                if trial_loss.is_finite() && trial_loss <= old_loss - 1.0e-4 * step * directional {
                     accepted = Some(step);
                     break;
                 }
@@ -961,14 +960,13 @@ impl SaeSupportSparseTerm {
         let mut decoder_max = 0.0_f64;
         for atom_idx in 0..self.k_atoms() {
             let atom = &self.atoms[atom_idx];
-            let mut gradient = atom.smooth_penalty.dot(&atom.decoder_coefficients)
-                * lambda_smooth[atom_idx];
+            let mut gradient =
+                atom.smooth_penalty.dot(&atom.decoder_coefficients) * lambda_smooth[atom_idx];
             for &(row, slot) in &self.atom_rows[atom_idx] {
                 let active = self.evaluate_active(row, slot)?;
                 for basis in 0..atom.basis_size() {
                     for output in 0..self.output_dim {
-                        gradient[[basis, output]] -=
-                            active.phi[basis] * residual[[row, output]];
+                        gradient[[basis, output]] -= active.phi[basis] * residual[[row, output]];
                     }
                 }
             }
@@ -1088,7 +1086,9 @@ impl SaeSupportSparseTerm {
         if target.dim() != (self.n_obs(), self.output_dim) {
             return Err(format!(
                 "SaeSupportSparseTerm::solve_coordinates_fixed_decoder: target {:?} != ({}, {})",
-                target.dim(), self.n_obs(), self.output_dim
+                target.dim(),
+                self.n_obs(),
+                self.output_dim
             ));
         }
         if max_iter == 0 || !(tolerance.is_finite() && tolerance > 0.0) {
@@ -1103,8 +1103,7 @@ impl SaeSupportSparseTerm {
             if candidate && previous_candidate {
                 return Ok(SaeSupportCoordinateFixedPointReport {
                     iterations: iteration,
-                    objective: self
-                        .frozen_decoder_coordinate_objective(target, ard_precisions)?,
+                    objective: self.frozen_decoder_coordinate_objective(target, ard_precisions)?,
                     coordinate_l2,
                     coordinate_max_abs,
                     max_recurrence_change: max_change,
@@ -1113,8 +1112,7 @@ impl SaeSupportSparseTerm {
             }
             previous_candidate = candidate;
         }
-        let (_, coordinate_max_abs) =
-            self.raw_coordinate_stationarity(target, ard_precisions)?;
+        let (_, coordinate_max_abs) = self.raw_coordinate_stationarity(target, ard_precisions)?;
         Err(format!(
             "SaeSupportSparseTerm::solve_coordinates_fixed_decoder did not recur within {max_iter} cycles (raw coordinate KKT max={coordinate_max_abs:.6e})"
         ))
@@ -1146,20 +1144,14 @@ impl SaeSupportSparseTerm {
         let mut previous_candidate = false;
         for iteration in 1..=max_iter {
             let decoder_change = self.decoder_sweep(target, lambda_smooth)?;
-            let coordinate_change =
-                self.coordinate_sweep(target, ard_precisions, trust_radius)?;
+            let coordinate_change = self.coordinate_sweep(target, ard_precisions, trust_radius)?;
             let max_change = decoder_change.max(coordinate_change);
-            let stationarity =
-                self.raw_stationarity(target, lambda_smooth, ard_precisions)?;
+            let stationarity = self.raw_stationarity(target, lambda_smooth, ard_precisions)?;
             let candidate = max_change <= tolerance && stationarity.max_abs() <= tolerance;
             if candidate && previous_candidate {
                 return Ok(SaeSupportFixedPointReport {
                     iterations: iteration,
-                    objective: self.penalized_objective(
-                        target,
-                        lambda_smooth,
-                        ard_precisions,
-                    )?,
+                    objective: self.penalized_objective(target, lambda_smooth, ard_precisions)?,
                     stationarity,
                     max_recurrence_change: max_change,
                     recurred: true,

@@ -1692,8 +1692,7 @@ impl SaeManifoldTerm {
             let gram_inf_norm = (0..m)
                 .map(|row| (0..m).map(|col| gram[[row, col]].abs()).sum::<f64>())
                 .fold(0.0_f64, f64::max);
-            let decoder_frobenius_squared =
-                decoder.iter().map(|value| value * value).sum::<f64>();
+            let decoder_frobenius_squared = decoder.iter().map(|value| value * value).sum::<f64>();
             let signal_upper_bound = gram_inf_norm * decoder_frobenius_squared / occupancy;
             if !signal_upper_bound.is_finite() {
                 return Err(format!(

@@ -554,10 +554,8 @@ pub(crate) fn corrected_isometry_penalty_retargets_mixed_dimension_atoms() {
     // overwrite the clone with atom 0's own d=1 cache before any value read;
     // mutating or directly reading this registry cache would respectively
     // violate per-atom ownership or trip the hard dimensional invariant.
-    let stale_registry_jacobian = Arc::new(Array2::<f64>::from_elem(
-        (term.n_obs(), p_out * 2),
-        -7.0,
-    ));
+    let stale_registry_jacobian =
+        Arc::new(Array2::<f64>::from_elem((term.n_obs(), p_out * 2), -7.0));
     registry_iso.refresh_caches(Some(stale_registry_jacobian.clone()), None);
     let rho = array![0.0_f64];
 

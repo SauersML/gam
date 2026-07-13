@@ -7483,13 +7483,7 @@ pub(crate) fn joint_newton_math_unconstrained_progress_does_not_match_certificat
     };
     assert_eq!(
         constrained_stationary_certificate_decision(
-            &math,
-            1.0e-12,
-            1.0e-8,
-            1.0e-8,
-            None,
-            1.0e-12,
-            1.0e-8,
+            &math, 1.0e-12, 1.0e-8, 1.0e-8, None, 1.0e-12, 1.0e-8,
         ),
         ConstrainedStationaryCertificate::NotCandidate,
         "objective and step exhaustion must not certify a Newton step whose linearized residual is genuinely falling"

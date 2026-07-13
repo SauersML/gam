@@ -214,8 +214,7 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
         )
         .expect("gam rho-marginalized uncertainty prediction");
         assert!(
-            pred_rho_marginalized.covariance_source
-                == InferenceCovarianceMode::SmoothingCorrected,
+            pred_rho_marginalized.covariance_source == InferenceCovarianceMode::SmoothingCorrected,
             "smooth fit should expose and use the smoothing-parameter-corrected covariance"
         );
         let rho_mean_lower = pred_rho_marginalized.mean_lower.to_vec();

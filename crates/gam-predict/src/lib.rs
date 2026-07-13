@@ -528,12 +528,10 @@ impl UncertaintyCovarianceSource for Array2<f64> {
             )));
         }
         match mode {
-            InferenceCovarianceMode::Conditional => {
-                Ok((
-                    PredictionCovarianceBackend::from_dense(self.view()),
-                    InferenceCovarianceMode::Conditional,
-                ))
-            }
+            InferenceCovarianceMode::Conditional => Ok((
+                PredictionCovarianceBackend::from_dense(self.view()),
+                InferenceCovarianceMode::Conditional,
+            )),
             InferenceCovarianceMode::SmoothingCorrected => {
                 Err(EstimationError::InvalidInput(format!(
                     "{label}: raw covariance source cannot provide smoothing-corrected covariance"
@@ -2596,8 +2594,7 @@ where
     // On the conditional path, a bias-corrected centre needs the A·V·Aᵀ band
     // (the smoothing-corrected covariance already folds A in, so exclude it on
     // that path to avoid double-applying A). #1870.
-    let bias_jacobian = if bias_applied
-        && covariance_source == InferenceCovarianceMode::Conditional
+    let bias_jacobian = if bias_applied && covariance_source == InferenceCovarianceMode::Conditional
     {
         source
             .resolved_bias_correction_jacobian()
@@ -3131,12 +3128,14 @@ pub fn coefficient_uncertaintywith_mode(
     // - conditional covariance H^{-1}, or
     // - first-order corrected covariance H^{-1} + J V_rho J^T.
     let se = match covariance_mode {
-        InferenceCovarianceMode::Conditional => fit.beta_standard_errors().cloned().ok_or_else(|| {
+        InferenceCovarianceMode::Conditional => {
+            fit.beta_standard_errors().cloned().ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "fit result does not contain conditional coefficient standard errors"
                         .to_string(),
                 )
-            })?,
+            })?
+        }
         InferenceCovarianceMode::SmoothingCorrected => fit
             .beta_standard_errors_corrected()
             .cloned()

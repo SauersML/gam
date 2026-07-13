@@ -235,12 +235,8 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
         "tr(F) should equal edf_total: trace={trace_f}, edf_total={edf_total}"
     );
 
-    let coef_ci = coefficient_uncertainty(
-        &fit,
-        0.95,
-        InferenceCovarianceMode::SmoothingCorrected,
-    )
-    .expect("coefficient CI should work");
+    let coef_ci = coefficient_uncertainty(&fit, 0.95, InferenceCovarianceMode::SmoothingCorrected)
+        .expect("coefficient CI should work");
     assert_eq!(coef_ci.estimate.len(), fit.beta.len());
     assert_eq!(coef_ci.standard_error.len(), fit.beta.len());
     assert!(
@@ -263,12 +259,9 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     }
 
     // --- 95% CI is wider than 80% CI for the same coefficient ---
-    let coef_ci_80 = coefficient_uncertainty(
-        &fit,
-        0.80,
-        InferenceCovarianceMode::SmoothingCorrected,
-    )
-    .expect("80% coefficient CI should also work");
+    let coef_ci_80 =
+        coefficient_uncertainty(&fit, 0.80, InferenceCovarianceMode::SmoothingCorrected)
+            .expect("80% coefficient CI should also work");
     for i in 0..p {
         let width_95 = coef_ci.upper[i] - coef_ci.lower[i];
         let width_80 = coef_ci_80.upper[i] - coef_ci_80.lower[i];

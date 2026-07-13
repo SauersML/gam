@@ -6795,8 +6795,8 @@ mod tests {
         // must carry a non-trivial joint-null chart. The production default is
         // double-penalized, whose primary and null-space ridge have a full-rank
         // joint sum and therefore correctly produce no joint-null rotation.
-        let parsed = parse_formula("y ~ s(x, by=g, k=8, double_penalty=false)")
-            .expect("parse by smooth");
+        let parsed =
+            parse_formula("y ~ s(x, by=g, k=8, double_penalty=false)").expect("parse by smooth");
         let mut notes = Vec::new();
         let terms = build_termspec(
             &parsed.terms,
@@ -6846,7 +6846,9 @@ mod tests {
                 assert_eq!(analysis.nullity, nullity, "penalty {idx}");
                 assert_eq!(active_info[idx].effective_rank, analysis.rank);
                 assert_eq!(active_info[idx].nullspace_dim_hint, nullity);
-                let basis = null_basis.as_ref().expect("nontrivial factor-level null basis");
+                let basis = null_basis
+                    .as_ref()
+                    .expect("nontrivial factor-level null basis");
                 assert_eq!(basis.nrows(), built.dim);
                 assert_eq!(basis.ncols(), nullity);
             }

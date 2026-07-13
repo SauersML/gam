@@ -318,10 +318,7 @@ impl SaeAssignmentState {
             }
             indices[i] = slots.iter().map(|slot| slot.0).collect();
             gate_params[i] = slots.iter().map(|slot| slot.1).collect();
-            coords[i] = slots
-                .into_iter()
-                .flat_map(|slot| slot.2)
-                .collect();
+            coords[i] = slots.into_iter().flat_map(|slot| slot.2).collect();
         }
         let atom_coord_meta = atom_specs
             .into_iter()
@@ -840,7 +837,11 @@ mod tests {
         assert_eq!(state.gate_params(0), &[0.8, 0.2]);
         assert_eq!(state.coords_for_slot(0, 0), &[0.75]);
         assert_eq!(state.coords_for_slot(0, 1), &[0.25, -0.5]);
-        assert_eq!(state.coord_cells(), 3, "sum of active d_k, no d_max padding");
+        assert_eq!(
+            state.coord_cells(),
+            3,
+            "sum of active d_k, no d_max padding"
+        );
         assert_eq!(state.atom_coord_dim(0), 1);
         assert_eq!(state.atom_coord_dim(1), 3);
         assert_eq!(state.atom_coord_dim(2), 2);

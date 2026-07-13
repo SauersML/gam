@@ -888,7 +888,10 @@ mod tests {
         let mu = try_inverse_link_array(&likelihood, eta.view()).expect("standard logit spec");
         assert_eq!(mu.len(), eta.len());
         for (&got, &eta_i) in mu.iter().zip(eta.iter()) {
-            assert_eq!(got.to_bits(), gam_linalg::utils::stable_logistic(eta_i).to_bits());
+            assert_eq!(
+                got.to_bits(),
+                gam_linalg::utils::stable_logistic(eta_i).to_bits()
+            );
         }
     }
 
@@ -905,10 +908,8 @@ mod tests {
                 .expect("direct SAS jet")
                 .mu
         });
-        let sas_likelihood = LikelihoodSpec::new(
-            ResponseFamily::Binomial,
-            InverseLink::Sas(sas_state),
-        );
+        let sas_likelihood =
+            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(sas_state));
         let sas = try_inverse_link_array(&sas_likelihood, eta.view()).expect("SAS with params");
         for (&got, &expected) in sas.iter().zip(sas_expected.iter()) {
             assert_eq!(got.to_bits(), expected.to_bits());

@@ -753,9 +753,7 @@ pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
         eta_interval_for(&policy),
         mean_bound_method_for(transform, &policy, &response_map, &mean_se),
         observation_interval,
-        UncertaintyProvenance {
-            covariance_source,
-        },
+        UncertaintyProvenance { covariance_source },
     )
 }
 
@@ -1051,10 +1049,7 @@ mod parity_tests {
         assert_close(&out.mean_upper, &ref_mean_upper, "mean upper");
         assert!(out.observation_lower.is_none());
         assert!(out.observation_upper.is_none());
-        assert_eq!(
-            out.covariance_source,
-            InferenceCovarianceMode::Conditional
-        );
+        assert_eq!(out.covariance_source, InferenceCovarianceMode::Conditional);
     }
 
     /// BernoulliMarginalSlopePredictor shape: symmetric η interval, response

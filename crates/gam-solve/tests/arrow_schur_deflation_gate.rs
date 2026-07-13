@@ -24,7 +24,11 @@ use ndarray::{Array1, array};
 
 /// `|a - b| <= tol` with a helpful panic message.
 fn close(a: f64, b: f64, tol: f64, what: &str) {
-    assert!((a - b).abs() <= tol, "{what}: {a} vs {b} (|Δ|={})", (a - b).abs());
+    assert!(
+        (a - b).abs() <= tol,
+        "{what}: {a} vs {b} (|Δ|={})",
+        (a - b).abs()
+    );
 }
 
 #[test]
@@ -59,7 +63,12 @@ fn deflated_selected_inverse_finite_at_boundary_matches_plain_interior() {
                 .schur_inverse_apply_deflated(e.view())
                 .expect("deflated apply");
             for r in 0..k {
-                close(deflated[r], plain[r], 1e-9, "interior deflated vs plain apply");
+                close(
+                    deflated[r],
+                    plain[r],
+                    1e-9,
+                    "interior deflated vs plain apply",
+                );
             }
         }
         let plain_block = cache.schur_inverse_block(0..k).expect("plain block");
