@@ -220,22 +220,21 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         rho: &Array1<f64>,
         options: &BlockwiseFitOptions,
         hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
-        let psi_dim: usize = derivative_blocks.iter().map(Vec::len).sum();
+        if hyper_layout.family_axis_count() != 0 {
+            return Ok(None);
+        }
+        let derivative_blocks = hyper_layout.design_derivative_blocks();
+        let psi_dim = hyper_layout.design_axis_count();
         if block_states.len() != specs.len() {
             return Ok(None);
         }
         if derivative_blocks.len() != specs.len() {
             return Ok(None);
-        }
-        for psi_index in 0..psi_dim {
-            if self.is_sigma_aux_index(derivative_blocks, psi_index) {
-                return Ok(None);
-            }
         }
         // Two-phase auto-subsample schedule. Phase 1: stratified
         // Horvitz–Thompson mask (≈ 1 % gradient noise) for the first
@@ -1280,16 +1279,30 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        if self.is_sigma_aux_index(derivative_blocks, psi_index) {
-            return self.sigma_exact_joint_psi_terms(block_states, specs);
+        match hyper_layout.axis(psi_index) {
+            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 }) => {
+                return self.sigma_exact_joint_psi_terms(block_states, specs);
+            }
+            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }) => {
+                return Err(format!(
+                    "BernoulliMarginalSlopeFamily does not declare family hyper axis {family_axis}"
+                ));
+            }
+            Some(crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. }) => {}
+            None => {
+                return Err(format!(
+                    "BernoulliMarginalSlopeFamily hyper axis {psi_index} is out of range for {} axes",
+                    hyper_layout.len()
+                ));
+            }
         }
         let cache = self.build_exact_eval_cache(block_states)?;
         self.exact_newton_joint_psi_terms_from_cache(
             block_states,
-            derivative_blocks,
+            hyper_layout.design_derivative_blocks(),
             psi_index,
             &cache,
         )
@@ -1299,25 +1312,55 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        if self.is_sigma_aux_index(derivative_blocks, psi_i)
-            || self.is_sigma_aux_index(derivative_blocks, psi_j)
-        {
-            if self.is_sigma_aux_index(derivative_blocks, psi_i)
-                && self.is_sigma_aux_index(derivative_blocks, psi_j)
-            {
+        let axis_i = hyper_layout.axis(psi_i).ok_or_else(|| {
+            format!(
+                "BernoulliMarginalSlopeFamily hyper axis {psi_i} is out of range for {} axes",
+                hyper_layout.len()
+            )
+        })?;
+        let axis_j = hyper_layout.axis(psi_j).ok_or_else(|| {
+            format!(
+                "BernoulliMarginalSlopeFamily hyper axis {psi_j} is out of range for {} axes",
+                hyper_layout.len()
+            )
+        })?;
+        match (axis_i, axis_j) {
+            (
+                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
+                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
+            ) => {
                 return self.sigma_exact_joint_psisecond_order_terms(block_states);
             }
-            return Err("bernoulli marginal-slope mixed log-sigma/spatial psi second derivatives require cross auxiliary terms; only pure log-sigma second derivatives are supported"
-                        .to_string());
+            (
+                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
+                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
+            )
+            | (
+                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
+                crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 },
+            ) => {
+                return Err("bernoulli marginal-slope mixed log-sigma/spatial hyper second derivatives require analytic cross-family terms"
+                    .to_string());
+            }
+            (crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }, _)
+            | (_, crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }) => {
+                return Err(format!(
+                    "BernoulliMarginalSlopeFamily does not declare family hyper axis {family_axis}"
+                ));
+            }
+            (
+                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
+                crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. },
+            ) => {}
         }
         let cache = self.build_exact_eval_cache(block_states)?;
         self.exact_newton_joint_psisecond_order_terms_from_cache(
             block_states,
-            derivative_blocks,
+            hyper_layout.design_derivative_blocks(),
             psi_i,
             psi_j,
             &cache,
@@ -1328,18 +1371,34 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if self.is_sigma_aux_index(derivative_blocks, psi_index) {
-            return self
-                .sigma_exact_joint_psihessian_directional_derivative(block_states, d_beta_flat);
+        match hyper_layout.axis(psi_index) {
+            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis: 0 }) => {
+                return self.sigma_exact_joint_psihessian_directional_derivative(
+                    block_states,
+                    d_beta_flat,
+                );
+            }
+            Some(crate::custom_family::CustomFamilyHyperAxis::Family { family_axis }) => {
+                return Err(format!(
+                    "BernoulliMarginalSlopeFamily does not declare family hyper axis {family_axis}"
+                ));
+            }
+            Some(crate::custom_family::CustomFamilyHyperAxis::DesignPenalty { .. }) => {}
+            None => {
+                return Err(format!(
+                    "BernoulliMarginalSlopeFamily hyper axis {psi_index} is out of range for {} axes",
+                    hyper_layout.len()
+                ));
+            }
         }
         let cache = self.build_exact_eval_cache(block_states)?;
         self.exact_newton_joint_psihessian_directional_derivative_from_cache(
             block_states,
-            derivative_blocks,
+            hyper_layout.design_derivative_blocks(),
             psi_index,
             d_beta_flat,
             &cache,
@@ -1350,7 +1409,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         Ok(Some(Arc::new(
             crate::marginal_slope_shared::MarginalSlopeExactNewtonPsiWorkspace::new(
@@ -1358,7 +1417,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     self.clone(),
                     block_states.to_vec(),
                     specs.to_vec(),
-                    derivative_blocks.to_vec(),
+                    hyper_layout.clone(),
                     BlockwiseFitOptions::default(),
                 )?,
             ),
@@ -1369,7 +1428,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         Ok(Some(Arc::new(
@@ -1378,7 +1437,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                     self.clone(),
                     block_states.to_vec(),
                     specs.to_vec(),
-                    derivative_blocks.to_vec(),
+                    hyper_layout.clone(),
                     options.clone(),
                 )?,
             ),
@@ -2910,9 +2969,21 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         family: BernoulliMarginalSlopeFamily,
         block_states: Vec<ParameterBlockState>,
         specs: Vec<ParameterBlockSpec>,
-        derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+        hyper_layout: crate::custom_family::CustomFamilyHyperLayout,
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
+        if hyper_layout.family_axis_count() > 1 {
+            return Err(format!(
+                "BernoulliMarginalSlopeFamily declares one family hyper axis, got {}",
+                hyper_layout.family_axis_count()
+            ));
+        }
+        if hyper_layout.family_axis_count() == 1 && family.gaussian_frailty_sd.is_none() {
+            return Err(
+                "BernoulliMarginalSlopeFamily log-sigma axis requires Gaussian frailty"
+                    .to_string(),
+            );
+        }
         // Build (or reuse, at a bit-identical β) the exact-cache. This workspace
         // does not materialize per-row primary Hessians, so it keys a separate
         // store slot from the Hessian-workspace build.
@@ -2947,7 +3018,7 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
             family,
             block_states,
             specs,
-            derivative_blocks,
+            hyper_layout,
             cache,
             options,
         })
@@ -2958,8 +3029,7 @@ impl crate::marginal_slope_shared::MarginalSlopePsiFamily
     for BernoulliMarginalSlopeExactNewtonJointPsiWorkspace
 {
     fn is_sigma_aux(&self, psi_index: usize) -> bool {
-        self.family
-            .is_sigma_aux_index(&self.derivative_blocks, psi_index)
+        self.hyper_layout.family_axis(psi_index) == Some(0)
     }
 
     fn sigma_first_order_terms(&self) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
@@ -2977,7 +3047,7 @@ impl crate::marginal_slope_shared::MarginalSlopePsiFamily
         self.family
             .exact_newton_joint_psi_terms_from_cache_with_options(
                 &self.block_states,
-                &self.derivative_blocks,
+                self.hyper_layout.design_derivative_blocks(),
                 psi_index,
                 &self.cache,
                 &self.options,
@@ -2985,27 +3055,22 @@ impl crate::marginal_slope_shared::MarginalSlopePsiFamily
     }
 
     fn psi_first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
-        let total: usize = self.derivative_blocks.iter().map(Vec::len).sum();
+        let total = self.hyper_layout.len();
         if total == 0 {
             return Ok(Some(Vec::new()));
         }
-        for psi_index in 0..total {
-            if self
-                .family
-                .is_sigma_aux_index(&self.derivative_blocks, psi_index)
-            {
-                return Ok(None);
-            }
+        if self.hyper_layout.family_axis_count() != 0 {
+            return Ok(None);
         }
         let mut axes: Vec<PsiAxisSpec> = Vec::with_capacity(total);
         for psi_index in 0..total {
             let Some((block_idx, local_idx)) =
-                psi_derivative_location(&self.derivative_blocks, psi_index)
+                psi_derivative_location(self.hyper_layout.design_derivative_blocks(), psi_index)
             else {
                 return Ok(None);
             };
             axes.push(self.family.resolve_psi_axis_spec(
-                &self.derivative_blocks,
+                self.hyper_layout.design_derivative_blocks(),
                 block_idx,
                 local_idx,
             )?);
@@ -3020,11 +3085,8 @@ impl crate::marginal_slope_shared::MarginalSlopePsiFamily
     }
 
     fn both_sigma_aux_second_order(&self, psi_i: usize, psi_j: usize) -> bool {
-        self.family
-            .is_sigma_aux_index(&self.derivative_blocks, psi_i)
-            && self
-                .family
-                .is_sigma_aux_index(&self.derivative_blocks, psi_j)
+        self.hyper_layout.family_axis(psi_i) == Some(0)
+            && self.hyper_layout.family_axis(psi_j) == Some(0)
     }
 
     fn sigma_second_order_terms(
@@ -3049,7 +3111,7 @@ impl crate::marginal_slope_shared::MarginalSlopePsiFamily
         self.family
             .exact_newton_joint_psisecond_order_terms_from_cache_with_options(
                 &self.block_states,
-                &self.derivative_blocks,
+                self.hyper_layout.design_derivative_blocks(),
                 psi_i,
                 psi_j,
                 &self.cache,
@@ -3064,7 +3126,7 @@ impl crate::marginal_slope_shared::MarginalSlopePsiFamily
         self.family
             .exact_newton_joint_psisecond_order_terms_contracted_from_cache_with_options(
                 &self.block_states,
-                &self.derivative_blocks,
+                self.hyper_layout.design_derivative_blocks(),
                 alpha_psi,
                 &self.cache,
                 &self.options,
@@ -3091,7 +3153,7 @@ impl crate::marginal_slope_shared::MarginalSlopePsiFamily
         self.family
             .exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
                 &self.block_states,
-                &self.derivative_blocks,
+                self.hyper_layout.design_derivative_blocks(),
                 psi_index,
                 d_beta_flat,
                 &self.cache,
