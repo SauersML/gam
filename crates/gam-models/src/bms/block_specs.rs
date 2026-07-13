@@ -1799,9 +1799,7 @@ pub(crate) fn push_deviation_aux_blockspecs(
     ) -> Result<Array1<f64>, String> {
         let start = *cursor;
         let end = start.checked_add(count).ok_or_else(|| {
-            format!(
-                "{block_name} penalty-rho range overflow: start={start}, count={count}"
-            )
+            format!("{block_name} penalty-rho range overflow: start={start}, count={count}")
         })?;
         if end > rho.len() {
             return Err(format!(
@@ -1829,12 +1827,7 @@ pub(crate) fn push_deviation_aux_blockspecs(
         )?);
     }
     if let Some(prepared) = link_dev_prepared {
-        let rho_w = take_rho_slice(
-            rho,
-            cursor,
-            prepared.block.penalties.len(),
-            "link_dev",
-        )?;
+        let rho_w = take_rho_slice(rho, cursor, prepared.block.penalties.len(), "link_dev")?;
         blocks.push(build_deviation_aux_blockspec(
             "link_dev",
             prepared,
@@ -1892,7 +1885,10 @@ mod deviation_penalty_layout_tests {
 
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].name, "score_warp_dev");
-        assert_eq!(blocks[0].initial_log_lambdas.as_slice(), Some(&[11.0, 12.0][..]));
+        assert_eq!(
+            blocks[0].initial_log_lambdas.as_slice(),
+            Some(&[11.0, 12.0][..])
+        );
         assert_eq!(blocks[1].name, "link_dev");
         assert_eq!(
             blocks[1].initial_log_lambdas.as_slice(),
