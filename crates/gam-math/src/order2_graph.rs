@@ -381,8 +381,8 @@ impl Order2GraphWorkspace {
                         tape.adjoints[term.node] += adjoint * term.first;
                     }
                     for_each_supported_upper(tape.nodes[node_index].support, |primary, other| {
-                        out.h[primary][other] += adjoint
-                            * tape.dense_curvatures[curvature_start + primary * K + other];
+                        out.h[primary][other] +=
+                            adjoint * tape.dense_curvatures[curvature_start + primary * K + other];
                     });
                 }
             }
