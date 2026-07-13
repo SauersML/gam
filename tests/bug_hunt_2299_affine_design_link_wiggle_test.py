@@ -27,7 +27,10 @@ def _assert_affine_identity(model, data, expected_frame: str) -> gamfit.AffineDe
     assert affine.offset.ndim == 1
     assert affine.matrix.ndim == 2
     assert affine.coefficients.ndim == 1
-    assert affine.matrix.shape == (affine.offset.shape[0], affine.coefficients.shape[0])
+    assert affine.matrix.shape == (
+        affine.offset.shape[0],
+        affine.coefficients.shape[0],
+    )
 
     reconstructed = affine.offset + affine.matrix @ affine.coefficients
     expected = _linear_predictor(model, data)

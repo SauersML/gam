@@ -1848,6 +1848,73 @@ mod mixed_periodicity_psd_tests {
     }
 
     #[test]
+    fn native_trend_ridge_acts_as_center_function_metric_on_structural_trends() {
+        let centers = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.2],
+            [0.2, 0.7],
+        ];
+        let order = DuchonNullspaceOrder::Linear;
+        let mut workspace = BasisWorkspace::default();
+        let z = kernel_constraint_nullspace(centers.view(), order, &mut workspace.cache)
+            .expect("kernel constraint nullspace");
+        let n_kernel = z.ncols();
+        let candidates =
+            duchon_native_penalty_candidates(centers.view(), None, 0.0, order, None, &z, None)
+                .expect("native Duchon penalties");
+        let ridge = candidates
+            .iter()
+            .find(|candidate| matches!(candidate.source, PenaltySource::DoublePenaltyNullspace))
+            .expect("affine Duchon basis must emit a trend ridge");
+        let ridge = &ridge.matrix * ridge.normalization_scale;
+
+        let (center_kernel, amplification) =
+            duchon_center_kernel_value_matrix(centers.view(), None, 0.0, order, None)
+                .expect("center kernel");
+        let center_kernel_design = fast_ab(&center_kernel, &z).mapv(|value| value * amplification);
+        let center_mean: Vec<f64> = (0..centers.ncols())
+            .map(|axis| centers.column(axis).sum() / centers.nrows() as f64)
+            .collect();
+        let mut centered = centers.clone();
+        for axis in 0..centers.ncols() {
+            let mean = center_mean[axis];
+            centered.column_mut(axis).mapv_inplace(|value| value - mean);
+        }
+        let poly = polynomial_block_from_order(centered.view(), order);
+        let mut center_design = Array2::<f64>::zeros((centers.nrows(), n_kernel + poly.ncols()));
+        center_design
+            .slice_mut(s![.., 0..n_kernel])
+            .assign(&center_kernel_design);
+        center_design.slice_mut(s![.., n_kernel..]).assign(&poly);
+        let gram = symmetrize_penalty(&fast_ata(&center_design));
+        let mut trend_frame = Array2::<f64>::zeros((center_design.ncols(), poly.ncols() - 1));
+        for column in 1..poly.ncols() {
+            trend_frame[[n_kernel + column, column - 1]] = 1.0;
+        }
+
+        // A function-metric projector equals G on every vector in its target
+        // subspace. A Euclidean coefficient selector fails this identity as
+        // soon as the center chart is non-orthonormal, making this assertion a
+        // discriminating guard against regressing to coefficient shrinkage.
+        let error = (&ridge.dot(&trend_frame) - &gram.dot(&trend_frame))
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let scale = gram
+            .dot(&trend_frame)
+            .iter()
+            .map(|value| value.abs())
+            .fold(1.0_f64, f64::max);
+        assert!(
+            error <= 2.0e-11 * scale,
+            "Duchon trend ridge must equal the center function metric on structural trends; error={error:.3e}, scale={scale:.3e}"
+        );
+    }
+
+    #[test]
     fn cylinder_penalty_is_symmetric_psd_gam1422() {
         // gam#1422: with the conditionally-PD chord-polyharmonic kernel this
         // fixture produced λ_min ≈ −0.426 (3 materially negative eigenvalues).

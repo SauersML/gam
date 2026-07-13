@@ -2780,7 +2780,6 @@ fn matern_basis<'py>(
         identifiability: MaternIdentifiability::None,
         aniso_log_scales: aniso_vec,
         periodic: None,
-        nullspace_shrinkage_survived: None,
     };
     // Honor an explicit all-zero `aniso_log_scales` literally as the isotropic
     // metric — this is a caller's explicit request, NOT the κ-optimizer's
@@ -7111,7 +7110,6 @@ fn build_latent_forward_design(
                 identifiability: MaternIdentifiability::None,
                 aniso_log_scales: None,
                 periodic: None,
-                nullspace_shrinkage_survived: None,
             };
             let built = build_matern_basis(t_mat.view(), &spec)
                 .map_err(|err| format!("failed to evaluate Matérn latent basis: {err}"))?;

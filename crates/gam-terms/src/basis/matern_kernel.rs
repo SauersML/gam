@@ -3174,6 +3174,82 @@ pub(crate) fn build_thin_plate_penalty_matrices(
     Ok((penalty_bending, penalty_ridge))
 }
 
+#[cfg(test)]
+mod thin_plate_function_metric_tests {
+    use super::*;
+    use ndarray::{Array2, array};
+
+    #[test]
+    fn canonical_thin_plate_null_ridge_equals_center_metric_on_polynomials() {
+        let centers = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.3, 0.6],
+            [0.8, 0.25],
+        ];
+        let mut workspace = BasisWorkspace::default();
+        let kernel_transform =
+            thin_plate_kernel_constraint_nullspace(centers.view(), &mut workspace.cache)
+                .expect("thin-plate constraint frame");
+        let (_primary, ridge) =
+            build_thin_plate_penalty_matrices(centers.view(), 1.0, &kernel_transform, true)
+                .expect("thin-plate penalties");
+        let ridge = ridge.expect("canonical thin plate has a polynomial null space");
+
+        let k = centers.nrows();
+        let d = centers.ncols();
+        let kernel_cols = kernel_transform.ncols();
+        let poly_cols = thin_plate_polynomial_basis_dimension(d);
+        let mut omega = Array2::<f64>::zeros((k, k));
+        fill_symmetric_from_row_kernel(&mut omega, |i, j| {
+            let dist2 = (0..d)
+                .map(|axis| {
+                    let delta = centers[[i, axis]] - centers[[j, axis]];
+                    delta * delta
+                })
+                .sum();
+            thin_plate_kernel_from_dist2(dist2, d)
+        })
+        .expect("thin-plate center kernel");
+        let center_kernel = fast_ab(&omega, &kernel_transform);
+        let center_mean: Vec<f64> = (0..d)
+            .map(|axis| centers.column(axis).sum() / k as f64)
+            .collect();
+        let mut centered = centers.clone();
+        for axis in 0..d {
+            let mean = center_mean[axis];
+            centered.column_mut(axis).mapv_inplace(|value| value - mean);
+        }
+        let poly = thin_plate_polynomial_block(centered.view());
+        let mut center_design = Array2::<f64>::zeros((k, kernel_cols + poly_cols));
+        center_design
+            .slice_mut(s![.., 0..kernel_cols])
+            .assign(&center_kernel);
+        center_design.slice_mut(s![.., kernel_cols..]).assign(&poly);
+        let gram = symmetrize_penalty(&fast_ata(&center_design));
+        let mut polynomial_frame = Array2::<f64>::zeros((center_design.ncols(), poly_cols));
+        for column in 0..poly_cols {
+            polynomial_frame[[kernel_cols + column, column]] = 1.0;
+        }
+
+        let error = (&ridge.dot(&polynomial_frame) - &gram.dot(&polynomial_frame))
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let scale = gram
+            .dot(&polynomial_frame)
+            .iter()
+            .map(|value| value.abs())
+            .fold(1.0_f64, f64::max);
+        assert!(
+            error <= 2.0e-11 * scale,
+            "thin-plate null ridge must equal the center function metric on polynomial functions; error={error:.3e}, scale={scale:.3e}"
+        );
+    }
+}
+
 /// Drop redundant Matérn centers when an over-specified `centers=K` exceeds the
 /// kernel's numerical rank on the data cloud (#755).
 ///

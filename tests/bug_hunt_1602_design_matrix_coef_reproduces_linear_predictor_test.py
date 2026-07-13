@@ -21,13 +21,13 @@ centered on the conditional posterior mode ``X β̂``).
 
 Angles covered:
 
-* **The defining identity, all links** — ``max|design_matrix @ coef −
+* **The defining identity, all links** — ``max|offset + matrix @ coefficients −
   linear_predictor|`` must be at the floating-point floor relative to the
   linear-predictor range for Poisson, Gamma, binomial-logit, binomial-probit
   (the four failing cases), with Gaussian-identity as the always-passing control.
-* **Documented ``samples @ X.T`` recipe** — the mean of ``posterior.samples @
-  X.T`` is centered at the reported ``linear_predictor`` (same point estimate),
-  not offset by a hidden bias-correction shift.
+* **Documented affine posterior recipe** — the mean of ``offset +
+  posterior.samples @ X.T`` is centered at the reported ``linear_predictor``
+  (same point estimate), not shifted by a hidden bias correction.
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ CASES = [
 
 
 def test_design_matrix_coef_reproduces_linear_predictor_all_links() -> None:
-    """``design_matrix @ coef == linear_predictor`` to fp floor for every link.
+    """The fitted affine identity holds to fp floor for every link.
 
     Before the fix the four non-identity links drifted 1.5–4 % of the lp range;
     Gaussian identity was always exact.
@@ -108,18 +108,18 @@ def test_design_matrix_coef_reproduces_linear_predictor_all_links() -> None:
         lp_range = float(np.ptp(eta_engine))
         max_abs = float(np.max(np.abs(eta_from_coef - eta_engine)))
         rel = max_abs / lp_range if lp_range > 0 else max_abs
-        # Pure linear composition X@β̂ vs the engine's reported η — must agree to
+        # Exact affine composition vs the engine's reported η — must agree to
         # the floating-point floor (matmul round-off), << the old 1.5–4 % gap.
         assert rel < 1e-9, (
-            f"{family}/{link}: max|design@coef - linear_predictor|={max_abs:.3e} "
+            f"{family}/{link}: max|affine - linear_predictor|={max_abs:.3e} "
             f"({rel:.2%} of lp range {lp_range:.3f}) — coef no longer reproduces "
             f"the engine linear predictor"
         )
 
 
 def test_posterior_samples_recipe_centered_on_linear_predictor() -> None:
-    """The documented ``posterior.samples @ X.T`` recipe is centered on the
-    reported ``linear_predictor`` (same point estimate), for a curved link."""
+    """The documented affine posterior recipe is centered on the reported
+    ``linear_predictor`` (same point estimate), for a curved link."""
     df = _make("poisson", None)
     model = _fit(df, "poisson", None)
     affine = model.design_matrix(df)

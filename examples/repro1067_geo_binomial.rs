@@ -118,7 +118,6 @@ fn smooth_term(basis: &str, n_pcs: usize, centers: usize) -> SmoothTermSpec {
                 double_penalty: false,
                 identifiability: MaternIdentifiability::default(),
                 aniso_log_scales: None,
-                nullspace_shrinkage_survived: None,
             },
             input_scales: None,
         },

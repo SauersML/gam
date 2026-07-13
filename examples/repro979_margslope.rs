@@ -36,7 +36,6 @@ fn matern_smooth(name: &str, centers: usize) -> SmoothTermSpec {
                 double_penalty: false,
                 identifiability: MaternIdentifiability::default(),
                 aniso_log_scales: None,
-                nullspace_shrinkage_survived: None,
             },
             input_scales: None,
         },

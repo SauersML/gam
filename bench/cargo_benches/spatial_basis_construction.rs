@@ -33,7 +33,6 @@ fn bench_spatial_basis_construction(c: &mut Criterion) {
             double_penalty: false,
             identifiability: MaternIdentifiability::None,
             aniso_log_scales: Some(vec![0.15, -0.05, 0.0]),
-            nullspace_shrinkage_survived: None,
         };
         b.iter(|| black_box(build_matern_basis(data.view(), &spec).unwrap()));
     });
