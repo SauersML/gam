@@ -203,7 +203,6 @@ impl TransformationNormalFamily {
             .map_err(|e| format!("SCOP dH directional requires cached covariate design: {e}"))?;
         let weights = self.effective_weights();
         let h_prime = row_quantities.h_prime.as_ref();
-        let response_val_basis = &self.response_val_basis;
         let response_deriv_basis = &self.response_deriv_basis;
         let response_lower_basis = &self.response_lower_basis;
         let response_upper_basis = &self.response_upper_basis;
@@ -276,7 +275,6 @@ impl TransformationNormalFamily {
         }
         // The (k,l) block factors are symmetric in (k,l) by construction and
         // each block is covᵀ D cov (symmetric), so `out` is exactly symmetric.
-        let _ = response_val_basis;
         Ok(out)
     }
 
