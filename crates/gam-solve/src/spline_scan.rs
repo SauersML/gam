@@ -371,15 +371,20 @@ struct FilterPass {
     steps: Vec<FilterStep>,
     /// Σ over proper steps of `log F̃_t` (innovation variances at σ²=1).
     sum_log_f: f64,
-    /// First and second analytic derivatives of `sum_log_f` with respect to
-    /// `rho = log lambda` (`q = exp(-rho)`).
+    /// First three analytic derivatives of `sum_log_f` with respect to
+    /// `rho = log lambda` (`q = exp(-rho)`). The third order feeds the
+    /// cube-rate certified-search enclosure (#2300): anchoring the derivative
+    /// radius on endpoint `V‴` jets certifies λ→∞ tail cells at width
+    /// `(|V′|/L₄)^{1/3}` instead of `(|V′|/L₃)^{1/2}`.
     sum_log_f_d1: f64,
     sum_log_f_d2: f64,
+    sum_log_f_d3: f64,
     /// Σ over proper steps of `v_t² / F̃_t`.
     sum_v2_over_f: f64,
-    /// First and second analytic `rho` derivatives of `sum_v2_over_f`.
+    /// First three analytic `rho` derivatives of `sum_v2_over_f`.
     sum_v2_over_f_d1: f64,
     sum_v2_over_f_d2: f64,
+    sum_v2_over_f_d3: f64,
     /// Number of proper (non-diffuse) innovations.
     n_proper: usize,
 }
@@ -394,9 +399,11 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
     let mut a: Vec2 = [0.0; MAX_ORDER];
     let mut a_d1: Vec2 = [0.0; MAX_ORDER];
     let mut a_d2: Vec2 = [0.0; MAX_ORDER];
+    let mut a_d3: Vec2 = [0.0; MAX_ORDER];
     let mut p_star: Mat2 = [[0.0; MAX_ORDER]; MAX_ORDER];
     let mut p_star_d1: Mat2 = [[0.0; MAX_ORDER]; MAX_ORDER];
     let mut p_star_d2: Mat2 = [[0.0; MAX_ORDER]; MAX_ORDER];
+    let mut p_star_d3: Mat2 = [[0.0; MAX_ORDER]; MAX_ORDER];
     let mut p_inf: Mat2 = [[0.0; MAX_ORDER]; MAX_ORDER];
     for i in 0..order {
         p_inf[i][i] = 1.0;
@@ -405,9 +412,11 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
     let mut sum_log_f = 0.0;
     let mut sum_log_f_d1 = 0.0;
     let mut sum_log_f_d2 = 0.0;
+    let mut sum_log_f_d3 = 0.0;
     let mut sum_v2_over_f = 0.0;
     let mut sum_v2_over_f_d1 = 0.0;
     let mut sum_v2_over_f_d2 = 0.0;
+    let mut sum_v2_over_f_d3 = 0.0;
     let mut n_proper = 0usize;
     for t in 0..n {
         let a_pred = a;
@@ -416,18 +425,22 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
         let v = nodes[t].y - a[0];
         let v_d1 = -a_d1[0];
         let v_d2 = -a_d2[0];
+        let v_d3 = -a_d3[0];
         // H = [1 0 … 0] ⇒ M = P·H' is the first column, F = M[0] (+ r).
         let mut m_star: Vec2 = [0.0; MAX_ORDER];
         let mut m_star_d1: Vec2 = [0.0; MAX_ORDER];
         let mut m_star_d2: Vec2 = [0.0; MAX_ORDER];
+        let mut m_star_d3: Vec2 = [0.0; MAX_ORDER];
         for i in 0..order {
             m_star[i] = p_star[i][0];
             m_star_d1[i] = p_star_d1[i][0];
             m_star_d2[i] = p_star_d2[i][0];
+            m_star_d3[i] = p_star_d3[i][0];
         }
         let f_star = m_star[0] + r;
         let f_star_d1 = m_star_d1[0];
         let f_star_d2 = m_star_d2[0];
+        let f_star_d3 = m_star_d3[0];
         let mut proper_update = diffuse_rank == 0;
         if diffuse_rank > 0 {
             let mut m_inf: Vec2 = [0.0; MAX_ORDER];
@@ -444,10 +457,12 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
                     a[i] += k_inf * v;
                     a_d1[i] += k_inf * v_d1;
                     a_d2[i] += k_inf * v_d2;
+                    a_d3[i] += k_inf * v_d3;
                 }
                 let mut p_new = p_star;
                 let mut p_new_d1 = p_star_d1;
                 let mut p_new_d2 = p_star_d2;
+                let mut p_new_d3 = p_star_d3;
                 for i in 0..order {
                     for j in 0..order {
                         p_new[i][j] += -m_inf[i] * m_star[j] / f_inf - m_star[i] * m_inf[j] / f_inf
@@ -458,14 +473,19 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
                         p_new_d2[i][j] += -m_inf[i] * m_star_d2[j] / f_inf
                             - m_star_d2[i] * m_inf[j] / f_inf
                             + m_inf[i] * m_inf[j] * f_star_d2 / (f_inf * f_inf);
+                        p_new_d3[i][j] += -m_inf[i] * m_star_d3[j] / f_inf
+                            - m_star_d3[i] * m_inf[j] / f_inf
+                            + m_inf[i] * m_inf[j] * f_star_d3 / (f_inf * f_inf);
                     }
                 }
                 p_star = p_new;
                 p_star_d1 = p_new_d1;
                 p_star_d2 = p_new_d2;
+                p_star_d3 = p_new_d3;
                 symmetrize(&mut p_star, order);
                 symmetrize(&mut p_star_d1, order);
                 symmetrize(&mut p_star_d2, order);
+                symmetrize(&mut p_star_d3, order);
                 for i in 0..order {
                     for j in 0..order {
                         p_inf[i][j] -= m_inf[i] * m_inf[j] / f_inf;
@@ -487,29 +507,42 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
                 return Err("spline scan: non-positive innovation variance".to_string());
             }
             let inv_f = 1.0 / f_star;
-            let inv_f2 = inv_f * inv_f;
-            let inv_f3 = inv_f2 * inv_f;
+            // Quotient jets in the recursive Leibniz form: for s = num/f,
+            //   s_k = (num_k − Σ_{j=1..k} C(k,j)·s_{k−j}·f_j) / f,
+            // which is exactly the closed inv_f² / inv_f³ expansion used
+            // before, extended to third order.
             let mut gain = [0.0; MAX_ORDER];
             let mut gain_d1 = [0.0; MAX_ORDER];
             let mut gain_d2 = [0.0; MAX_ORDER];
+            let mut gain_d3 = [0.0; MAX_ORDER];
             for i in 0..order {
                 gain[i] = m_star[i] * inv_f;
-                gain_d1[i] = m_star_d1[i] * inv_f - m_star[i] * f_star_d1 * inv_f2;
-                gain_d2[i] = m_star_d2[i] * inv_f
-                    - 2.0 * m_star_d1[i] * f_star_d1 * inv_f2
-                    - m_star[i] * f_star_d2 * inv_f2
-                    + 2.0 * m_star[i] * f_star_d1 * f_star_d1 * inv_f3;
+                gain_d1[i] = (m_star_d1[i] - gain[i] * f_star_d1) * inv_f;
+                gain_d2[i] =
+                    (m_star_d2[i] - 2.0 * gain_d1[i] * f_star_d1 - gain[i] * f_star_d2) * inv_f;
+                gain_d3[i] = (m_star_d3[i]
+                    - 3.0 * gain_d2[i] * f_star_d1
+                    - 3.0 * gain_d1[i] * f_star_d2
+                    - gain[i] * f_star_d3)
+                    * inv_f;
             }
             let a_old_d1 = a_d1;
             let a_old_d2 = a_d2;
+            let a_old_d3 = a_d3;
             for i in 0..order {
                 a[i] += gain[i] * v;
                 a_d1[i] = a_old_d1[i] + gain_d1[i] * v + gain[i] * v_d1;
                 a_d2[i] = a_old_d2[i] + gain_d2[i] * v + 2.0 * gain_d1[i] * v_d1 + gain[i] * v_d2;
+                a_d3[i] = a_old_d3[i]
+                    + gain_d3[i] * v
+                    + 3.0 * gain_d2[i] * v_d1
+                    + 3.0 * gain_d1[i] * v_d2
+                    + gain[i] * v_d3;
             }
             let mut p_new = p_star;
             let mut p_new_d1 = p_star_d1;
             let mut p_new_d2 = p_star_d2;
+            let mut p_new_d3 = p_star_d3;
             for i in 0..order {
                 for j in 0..order {
                     let mm = m_star[i] * m_star[j];
@@ -517,31 +550,54 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
                     let mm_d2 = m_star_d2[i] * m_star[j]
                         + 2.0 * m_star_d1[i] * m_star_d1[j]
                         + m_star[i] * m_star_d2[j];
-                    p_new[i][j] -= mm * inv_f;
-                    p_new_d1[i][j] -= mm_d1 * inv_f - mm * f_star_d1 * inv_f2;
-                    p_new_d2[i][j] -=
-                        mm_d2 * inv_f - 2.0 * mm_d1 * f_star_d1 * inv_f2 - mm * f_star_d2 * inv_f2
-                            + 2.0 * mm * f_star_d1 * f_star_d1 * inv_f3;
+                    let mm_d3 = m_star_d3[i] * m_star[j]
+                        + 3.0 * m_star_d2[i] * m_star_d1[j]
+                        + 3.0 * m_star_d1[i] * m_star_d2[j]
+                        + m_star[i] * m_star_d3[j];
+                    let s0 = mm * inv_f;
+                    let s1 = (mm_d1 - s0 * f_star_d1) * inv_f;
+                    let s2 = (mm_d2 - 2.0 * s1 * f_star_d1 - s0 * f_star_d2) * inv_f;
+                    let s3 = (mm_d3
+                        - 3.0 * s2 * f_star_d1
+                        - 3.0 * s1 * f_star_d2
+                        - s0 * f_star_d3)
+                        * inv_f;
+                    p_new[i][j] -= s0;
+                    p_new_d1[i][j] -= s1;
+                    p_new_d2[i][j] -= s2;
+                    p_new_d3[i][j] -= s3;
                 }
             }
             p_star = p_new;
             p_star_d1 = p_new_d1;
             p_star_d2 = p_new_d2;
+            p_star_d3 = p_new_d3;
             symmetrize(&mut p_star, order);
             symmetrize(&mut p_star_d1, order);
             symmetrize(&mut p_star_d2, order);
+            symmetrize(&mut p_star_d3, order);
 
             let vv = v * v;
             let vv_d1 = 2.0 * v * v_d1;
             let vv_d2 = 2.0 * (v_d1 * v_d1 + v * v_d2);
+            let vv_d3 = 2.0 * (v * v_d3 + 3.0 * v_d1 * v_d2);
+            let logf_d1 = f_star_d1 * inv_f;
+            let logf_d2 = f_star_d2 * inv_f - logf_d1 * logf_d1;
+            let logf_d3 = f_star_d3 * inv_f - 3.0 * (f_star_d2 * inv_f) * logf_d1
+                + 2.0 * logf_d1 * logf_d1 * logf_d1;
             sum_log_f += f_star.ln();
-            sum_log_f_d1 += f_star_d1 * inv_f;
-            sum_log_f_d2 += f_star_d2 * inv_f - f_star_d1 * f_star_d1 * inv_f2;
-            sum_v2_over_f += vv * inv_f;
-            sum_v2_over_f_d1 += vv_d1 * inv_f - vv * f_star_d1 * inv_f2;
-            sum_v2_over_f_d2 +=
-                vv_d2 * inv_f - 2.0 * vv_d1 * f_star_d1 * inv_f2 - vv * f_star_d2 * inv_f2
-                    + 2.0 * vv * f_star_d1 * f_star_d1 * inv_f3;
+            sum_log_f_d1 += logf_d1;
+            sum_log_f_d2 += logf_d2;
+            sum_log_f_d3 += logf_d3;
+            let t0 = vv * inv_f;
+            let t1 = (vv_d1 - t0 * f_star_d1) * inv_f;
+            let t2 = (vv_d2 - 2.0 * t1 * f_star_d1 - t0 * f_star_d2) * inv_f;
+            let t3 = (vv_d3 - 3.0 * t2 * f_star_d1 - 3.0 * t1 * f_star_d2 - t0 * f_star_d3)
+                * inv_f;
+            sum_v2_over_f += t0;
+            sum_v2_over_f_d1 += t1;
+            sum_v2_over_f_d2 += t2;
+            sum_v2_over_f_d3 += t3;
             n_proper += 1;
         }
         steps.push(FilterStep {
@@ -557,6 +613,7 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
             a = mat_vec(&f_t, &a, order);
             a_d1 = mat_vec(&f_t, &a_d1, order);
             a_d2 = mat_vec(&f_t, &a_d2, order);
+            a_d3 = mat_vec(&f_t, &a_d3, order);
             let f_t_t = mat_t(&f_t, order);
             let q_noise = process_noise(delta, q, order);
             let mut p_next = mat_add(
@@ -574,12 +631,20 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
                 &q_noise,
                 order,
             );
+            // d^k q / d rho^k = (−1)^k q, so the noise term alternates sign.
+            let mut p_next_d3 = mat_sub(
+                &mat_mul(&mat_mul(&f_t, &p_star_d3, order), &f_t_t, order),
+                &q_noise,
+                order,
+            );
             symmetrize(&mut p_next, order);
             symmetrize(&mut p_next_d1, order);
             symmetrize(&mut p_next_d2, order);
+            symmetrize(&mut p_next_d3, order);
             p_star = p_next;
             p_star_d1 = p_next_d1;
             p_star_d2 = p_next_d2;
+            p_star_d3 = p_next_d3;
             if diffuse_rank > 0 {
                 let mut pi_next =
                     mat_mul(&mat_mul(&f_t, &p_inf, order), &mat_t(&f_t, order), order);
@@ -593,9 +658,11 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
         sum_log_f,
         sum_log_f_d1,
         sum_log_f_d2,
+        sum_log_f_d3,
         sum_v2_over_f,
         sum_v2_over_f_d1,
         sum_v2_over_f_d2,
+        sum_v2_over_f_d3,
         n_proper,
     })
 }
@@ -709,17 +776,19 @@ fn pool_nodes(
     Ok((nodes, ssr_within, n))
 }
 
-/// Concentrated diffuse restricted log-likelihood and its exact first two
+/// Concentrated diffuse restricted log-likelihood and its exact first three
 /// derivatives with respect to `log λ` (σ² profiled). The derivatives are
 /// propagated through the same diffuse Kalman recursion as the value; no
-/// finite differencing or surrogate objective is involved.
+/// finite differencing or surrogate objective is involved. The third order
+/// exists solely to anchor the certified-search enclosure radius on endpoint
+/// jets (#2300 cube-rate tail).
 fn concentrated_criterion_jet(
     nodes: &[PooledNode],
     ssr_within: f64,
     n_obs: usize,
     log_lambda: f64,
     order: usize,
-) -> Result<(f64, f64, f64), String> {
+) -> Result<(f64, f64, f64, f64), String> {
     let q = gam_problem::checked_exp_log_strength(-log_lambda)
         .map_err(|error| format!("spline scan inverse log strength: {error}"))?;
     let pass = run_filter(nodes, q, order)?;
@@ -740,12 +809,16 @@ fn concentrated_criterion_jet(
     }
     let rss_d1 = pass.sum_v2_over_f_d1;
     let rss_d2 = pass.sum_v2_over_f_d2;
+    let rss_d3 = pass.sum_v2_over_f_d3;
     let rss_log_d1 = rss_d1 / rss;
     let rss_log_d2 = rss_d2 / rss - rss_log_d1 * rss_log_d1;
+    let rss_log_d3 = rss_d3 / rss - 3.0 * (rss_d2 / rss) * rss_log_d1
+        + 2.0 * rss_log_d1 * rss_log_d1 * rss_log_d1;
     Ok((
         -0.5 * (pass.sum_log_f + dof * sigma2.ln()),
         -0.5 * (pass.sum_log_f_d1 + dof * rss_log_d1),
         -0.5 * (pass.sum_log_f_d2 + dof * rss_log_d2),
+        -0.5 * (pass.sum_log_f_d3 + dof * rss_log_d3),
     ))
 }
 
@@ -756,13 +829,17 @@ fn concentrated_criterion_jet(
 /// `u in [0,1]`; every normalized profiled-residual derivative is a convex
 /// average of the same kernels. Consequently
 ///
-/// `|L''| <= 1/2 (r/4 + 2 nu)` and
-/// `|L'''| <= 1/2 (r/4 + 6 nu)`,
+/// `|L''| <= 1/2 (r/4 + 2 nu)`, `|L'''| <= 1/2 (r/4 + 6 nu)`, and
+/// `|L''''| <= 1/2 (r/4 + 26 nu)`,
 ///
 /// where `r` is the number of proper innovation modes and `nu=n-order` is the
-/// residual d.f. Within-tie residual energy is lambda-independent and only
-/// tightens these bounds. Endpoint jets plus these analytic Lipschitz bounds
-/// therefore enclose the entire interval without a sampling lattice.
+/// residual d.f. The fourth-order coefficients: per determinant mode
+/// `|u''''| = u(1-u)|1-14u+36u^2-24u^3| <= 1/4` on `u in [0,1]`, and per
+/// residual kernel `t = z^2 (1-u)` every ratio `|t^{(k)}/t| <= 1` for
+/// `k <= 4`, so Faa di Bruno on `log R` gives `1+4+3+12+6 = 26`. Within-tie
+/// residual energy is lambda-independent and only tightens these bounds.
+/// Endpoint jets plus these analytic Lipschitz bounds therefore enclose the
+/// entire interval without a sampling lattice.
 fn concentrated_criterion_enclosure(
     nodes: &[PooledNode],
     ssr_within: f64,
@@ -781,26 +858,29 @@ fn concentrated_criterion_enclosure(
     let width = hi - lo;
     let proper_modes = (nodes.len() - order) as f64;
     let residual_dof = (n_obs - order) as f64;
-    let third_abs_bound = 0.5 * (0.25 * proper_modes + 6.0 * residual_dof);
-    // Derivative enclosure from the ENDPOINT CURVATURE JETS, not a global
-    // curvature constant. For any u in [lo, hi], Taylor with the L3-Lipschitz
-    // second derivative gives
-    //     |V'(u) − V'(endpoint)| ≤ (max|V''(endpoints)| + L3·w) · w,
-    // so hull(V'(lo), V'(hi)) padded by that radius is a valid OUTER range.
-    // The old radius was the global curvature bound × width
-    // (≈ n·w): in the λ→∞ saturation tail the true derivative decays
-    // exponentially while that radius stays O(n·w), so no interval wider
-    // than |V'|/n could certify no-root and the certified search ground
-    // through O(n·bracket/|V'|) cells — measured as >2·10⁶ criterion
-    // evaluations (an effective hang) on the #2300 weighted-scan fit. With
-    // the endpoint-jet radius the pad is (|V''|+L3·w)·w — QUADRATIC in w
-    // wherever the criterion is flat — and the tail certifies at width
-    // ~√(|V'|/L3) instead of |V'|/n.
+    let fourth_abs_bound = 0.5 * (0.25 * proper_modes + 26.0 * residual_dof);
+    // Derivative enclosure from ENDPOINT JETS through third order, not a
+    // global constant. For any u in [lo, hi], Taylor with the L4-Lipschitz
+    // third derivative gives
+    //     |V'(u) − V'(e)| ≤ |V''(e)|·w + |V'''(e)|·w²/2 + L4·w³/6,
+    // so hull(V'(lo), V'(hi)) padded by that radius (with endpoint-max
+    // magnitudes) is a valid OUTER range. History of this radius (#2300):
+    // the original global bound (≈ n·w) made the λ→∞ saturation tail — where
+    // |V'| decays exponentially — grind through O(e^X) certify cells
+    // (>2·10⁶ evaluations, an effective hang); the endpoint-CURVATURE jet
+    // ((|V''(e)|+L3·w)·w) cut that to a half-rate e^{X/2} tail, still a
+    // node timeout at order 3 where L3 ≈ 1.8·10³ at n=600. Anchoring on the
+    // exact V''' endpoint jets makes the pad CUBIC in w on plateaus, so a
+    // tail cell certifies at width ~(|V'|/L4)^{1/3} and the walk costs
+    // e^{X/3} — each exact derivative order divides the exponent again.
     let curvature_endpoint_abs = left.2.abs().max(right.2.abs());
-    let derivative_radius = (curvature_endpoint_abs + third_abs_bound * width) * width;
-    // Curvature enclosure: V'' is L3-Lipschitz, so endpoint hull ± L3·w is
-    // outer (unchanged — this one was already endpoint-anchored in scale).
-    let curvature_radius = third_abs_bound * width;
+    let third_endpoint_abs = left.3.abs().max(right.3.abs());
+    let derivative_radius = curvature_endpoint_abs * width
+        + 0.5 * third_endpoint_abs * width * width
+        + fourth_abs_bound * width * width * width / 6.0;
+    // Curvature enclosure, endpoint-anchored the same way: V''' is
+    // L4-Lipschitz, so |V''(u) − V''(e)| ≤ |V'''(e)|·w + L4·w²/2.
+    let curvature_radius = third_endpoint_abs * width + 0.5 * fourth_abs_bound * width * width;
     Ok(DerivativeEnclosure {
         derivative: ClosedInterval::outward(
             (left.1 - derivative_radius).min(right.1 - derivative_radius),
@@ -1148,7 +1228,7 @@ pub fn fit_spline_scan(
         f64::EPSILON.sqrt(),
         |ll| {
             concentrated_criterion_jet(&nodes, ssr_within, n_obs, ll, order).map(
-                |(value, derivative, curvature)| ScoreJet {
+                |(value, derivative, curvature, _third)| ScoreJet {
                     value,
                     derivative,
                     curvature,
@@ -1588,52 +1668,61 @@ mod tests {
             w.push(wi);
             y.push(0.4 + (1.3 * xi).sin() + (0.45 / wi.sqrt()) * z);
         }
-        let order = 2usize;
-        let (nodes, ssr_within, n_obs) = pool_nodes(&x, &y, &w, order).expect("pool");
-        let span = nodes.last().unwrap().x - nodes.first().unwrap().x;
-        let scale_shift = (2 * order - 1) as f64 * span.ln();
-        let lo = LOG_LAMBDA_LO + scale_shift;
-        let hi = LOG_LAMBDA_HI + scale_shift;
+        // Every smoothing order, not just the cubic: the order-3 (quintic)
+        // search has a deeper λ→∞ tail walk (scale shift (2m−1)·log L) and a
+        // larger residual-d.f. Lipschitz constant, and was the remaining
+        // effective hang after the order-2 fix (#2300 — the degree-5
+        // observation-interval node timed out at 1500s). The V‴ endpoint-jet
+        // enclosure certifies its tail at cube rate, so a uniform budget far
+        // below the pre-fix eval counts must hold at all orders.
+        for order in 1..=MAX_ORDER {
+            let (nodes, ssr_within, n_obs) = pool_nodes(&x, &y, &w, order).expect("pool");
+            let span = nodes.last().unwrap().x - nodes.first().unwrap().x;
+            let scale_shift = (2 * order - 1) as f64 * span.ln();
+            let lo = LOG_LAMBDA_LO + scale_shift;
+            let hi = LOG_LAMBDA_HI + scale_shift;
 
-        let evals = std::cell::Cell::new(0u64);
-        let last_x = std::cell::Cell::new(f64::NAN);
-        let budget = 2_000_000u64;
-        let result = gam_math::score_opt::maximize_score_1d(
-            lo,
-            hi,
-            f64::EPSILON.sqrt(),
-            |ll| {
-                let count = evals.get() + 1;
-                evals.set(count);
-                last_x.set(ll);
-                assert!(
-                    count <= budget,
-                    "certified scan search exceeded {budget} criterion evaluations \
-                     (last log-lambda sample {ll:.9}; bracket [{lo:.3}, {hi:.3}]) — \
-                     non-terminating subdivision reproduced"
-                );
-                concentrated_criterion_jet(&nodes, ssr_within, n_obs, ll, order).map(
-                    |(value, derivative, curvature)| gam_math::score_opt::ScoreJet {
-                        value,
-                        derivative,
-                        curvature,
-                    },
-                )
-            },
-            |a, b| concentrated_criterion_enclosure(&nodes, ssr_within, n_obs, a, b, order),
-        );
-        match result {
-            Ok(search) => {
-                assert!(
-                    search.optimum.x.is_finite(),
-                    "search must return a finite optimum"
-                );
+            let evals = std::cell::Cell::new(0u64);
+            let last_x = std::cell::Cell::new(f64::NAN);
+            let budget = 2_000_000u64;
+            let result = gam_math::score_opt::maximize_score_1d(
+                lo,
+                hi,
+                f64::EPSILON.sqrt(),
+                |ll| {
+                    let count = evals.get() + 1;
+                    evals.set(count);
+                    last_x.set(ll);
+                    assert!(
+                        count <= budget,
+                        "order-{order} certified scan search exceeded {budget} criterion \
+                         evaluations (last log-lambda sample {ll:.9}; bracket \
+                         [{lo:.3}, {hi:.3}]) — non-terminating subdivision reproduced"
+                    );
+                    concentrated_criterion_jet(&nodes, ssr_within, n_obs, ll, order).map(
+                        |(value, derivative, curvature, _third)| gam_math::score_opt::ScoreJet {
+                            value,
+                            derivative,
+                            curvature,
+                        },
+                    )
+                },
+                |a, b| concentrated_criterion_enclosure(&nodes, ssr_within, n_obs, a, b, order),
+            );
+            match result {
+                Ok(search) => {
+                    assert!(
+                        search.optimum.x.is_finite(),
+                        "order-{order} search must return a finite optimum"
+                    );
+                }
+                Err(error) => panic!(
+                    "order-{order} weighted scan search failed after {} evaluations \
+                     (last x {:.9}): {error:?}",
+                    evals.get(),
+                    last_x.get()
+                ),
             }
-            Err(error) => panic!(
-                "weighted scan search failed after {} evaluations (last x {:.9}): {error:?}",
-                evals.get(),
-                last_x.get()
-            ),
         }
     }
     /// Value-only diagnostic surface retained for the derivative oracle tests.
@@ -1656,8 +1745,9 @@ mod tests {
         for order in 1..=MAX_ORDER {
             let (nodes, within, n_obs) = pool_nodes(&x, &y, &w, order).expect("pooled data");
             for &rho in &[-4.0, -0.3, 2.5] {
-                let (value, d1, d2) = concentrated_criterion_jet(&nodes, within, n_obs, rho, order)
-                    .expect("analytic score jet");
+                let (value, d1, d2, d3) =
+                    concentrated_criterion_jet(&nodes, within, n_obs, rho, order)
+                        .expect("analytic score jet");
                 // Finite differences are deliberately confined to this oracle
                 // test; production selection uses the analytic sensitivities.
                 let h = 2.0e-4;
@@ -1665,10 +1755,16 @@ mod tests {
                     .expect("left score");
                 let fp = concentrated_criterion(&nodes, within, n_obs, rho + h, order)
                     .expect("right score");
+                let fm2 = concentrated_criterion(&nodes, within, n_obs, rho - 2.0 * h, order)
+                    .expect("far left score");
+                let fp2 = concentrated_criterion(&nodes, within, n_obs, rho + 2.0 * h, order)
+                    .expect("far right score");
                 let d1_fd = (fp - fm) / (2.0 * h);
                 let d2_fd = (fp - 2.0 * value + fm) / (h * h);
+                let d3_fd = (fp2 - 2.0 * fp + 2.0 * fm - fm2) / (2.0 * h * h * h);
                 let d1_scale = 1.0 + d1.abs().max(d1_fd.abs());
                 let d2_scale = 1.0 + d2.abs().max(d2_fd.abs());
+                let d3_scale = 1.0 + d3.abs().max(d3_fd.abs());
                 assert!(
                     (d1 - d1_fd).abs() <= 2.0e-6 * d1_scale,
                     "order={order} rho={rho}: analytic d1={d1}, FD={d1_fd}"
@@ -1676,6 +1772,10 @@ mod tests {
                 assert!(
                     (d2 - d2_fd).abs() <= 2.0e-4 * d2_scale,
                     "order={order} rho={rho}: analytic d2={d2}, FD={d2_fd}"
+                );
+                assert!(
+                    (d3 - d3_fd).abs() <= 5.0e-3 * d3_scale,
+                    "order={order} rho={rho}: analytic d3={d3}, FD={d3_fd}"
                 );
             }
         }
