@@ -160,7 +160,10 @@ impl ArrowBlocks {
     /// loop pays zero PCIe traffic per apply (accumulate once, apply many).
     ///
     /// `direction.t` is `[n_rows, q]`, `direction.beta` is `[n_beta]`.
-    pub fn apply_exact_hvp_data(&self, direction: &ArrowDirection) -> Result<ArrowDirection, String> {
+    pub fn apply_exact_hvp_data(
+        &self,
+        direction: &ArrowDirection,
+    ) -> Result<ArrowDirection, String> {
         if direction.t.len() != self.n_rows * self.q || direction.beta.len() != self.n_beta {
             return Err(format!(
                 "arrow HVP direction shape ({}, {}) != blocks ({}, {})",
@@ -471,9 +474,11 @@ fn fused_row_arrow(
 /// paired strictly (`in[2i] + in[2i+1]`, odd tail CARRIED). Identical in shape
 /// to the device `sae_arrow_beta_leaf` + `sae_arrow_beta_merge` pair, so the two
 /// backends associate their additions the same way.
-fn canonical_row_tree_reduce(n_rows: usize, width: usize, leaf: impl Fn(usize) -> Vec<f64> + Sync) -> Vec<f64>
-where
-{
+fn canonical_row_tree_reduce(
+    n_rows: usize,
+    width: usize,
+    leaf: impl Fn(usize) -> Vec<f64>,
+) -> Vec<f64> {
     if n_rows == 0 || width == 0 {
         return vec![0.0; width];
     }
@@ -1163,8 +1168,11 @@ mod device {
         g_t: CudaSlice<f64>,
         h_tt: CudaSlice<f64>,
         h_tb: CudaSlice<f64>,
-        beta_ping: CudaSlice<f64>,
-        beta_pong: CudaSlice<f64>,
+        /// The two scratch levels of the canonical β reduction tree. They are
+        /// `Option` only so the merge loop can take them out of `self` and swap
+        /// owned locals — no reallocation ever happens.
+        beta_ping: Option<CudaSlice<f64>>,
+        beta_pong: Option<CudaSlice<f64>>,
     }
 
     impl DeviceResidency {
@@ -1208,8 +1216,11 @@ mod device {
                 g_t: alloc_f64(n * q, "resident arrow alloc g_t")?,
                 h_tt: alloc_f64(n * q * q, "resident arrow alloc h_tt")?,
                 h_tb: alloc_f64(n * q * nb, "resident arrow alloc h_tb")?,
-                beta_ping: alloc_f64(leaves * width, "resident arrow alloc beta ping")?,
-                beta_pong: alloc_f64(leaves.div_ceil(2).max(1) * width, "resident arrow alloc beta pong")?,
+                // Both tree levels are allocated at the full leaf width: the merge
+                // loop SWAPS the two owned buffers, so either one can host the
+                // widest (leaf) level on a later call.
+                beta_ping: Some(alloc_f64(leaves * width, "resident arrow alloc beta ping")?),
+                beta_pong: Some(alloc_f64(leaves * width, "resident arrow alloc beta pong")?),
                 stream,
                 module: b.module.clone(),
             })
@@ -1417,89 +1428,87 @@ mod device {
                 let width = nb + nb * nb;
                 let leaves = n.div_ceil(ARROW_REDUCTION_LEAF_ROWS);
                 let leaf_total = leaves * width;
-                let function = self
-                    .module
-                    .load_function("sae_arrow_beta_leaf")
-                    .gpu_ctx("resident arrow beta leaf load")?;
-                let total = leaf_total as u64;
+                // Own the two tree levels for the whole reduction: swapping owned
+                // locals keeps the buffers resident without aliasing `self`.
+                let mut ping = self.beta_ping.take().ok_or_else(|| {
+                    gam_gpu::gpu_err!("resident arrow beta scratch was not restored")
+                })?;
+                let mut pong = self.beta_pong.take().ok_or_else(|| {
+                    gam_gpu::gpu_err!("resident arrow beta scratch was not restored")
+                })?;
                 let leaf_rows_i32 = i32::try_from(ARROW_REDUCTION_LEAF_ROWS)
                     .map_err(|_| gam_gpu::gpu_err!("resident arrow leaf size overflows i32"))?;
                 let n_rows_i32 = i32::try_from(n)
                     .map_err(|_| gam_gpu::gpu_err!("resident arrow row count overflows i32"))?;
-                let mut launch = stream.launch_builder(&function);
-                launch
-                    .arg(&self.z)
-                    .arg(&self.active)
-                    .arg(&self.beta_atom)
-                    .arg(&self.beta_phi)
-                    .arg(&self.beta_output)
-                    .arg(&self.sqrt_w)
-                    .arg(&self.residual)
-                    .arg(&k_i32)
-                    .arg(&p_i32)
-                    .arg(&nb_i32)
-                    .arg(&leaf_rows_i32)
-                    .arg(&n_rows_i32)
-                    .arg(&total)
-                    .arg(&mut self.beta_ping);
-                // SAFETY: as above; one thread per (leaf, beta-block element).
-                unsafe { launch.launch(grid(leaf_total)?) }
-                    .gpu_ctx("resident arrow beta leaf launch")?;
-
-                // Strict binary pairing, one kernel per level. The pairing is a
-                // pure function of the leaf count, so the association order —
-                // hence the exact f64 result — is scheduling-independent.
-                let mut nodes = leaves;
-                let mut ping_is_source = true;
                 let width_i32 = i32::try_from(width)
                     .map_err(|_| gam_gpu::gpu_err!("resident arrow beta width overflows i32"))?;
-                while nodes > 1 {
-                    let next_nodes = nodes.div_ceil(2);
-                    let level_total = next_nodes * width;
+                let leaf_result = (|| -> Result<Vec<f64>, GpuError> {
                     let function = self
                         .module
-                        .load_function("sae_arrow_beta_merge")
-                        .gpu_ctx("resident arrow beta merge load")?;
-                    let total = level_total as u64;
-                    let in_nodes = i32::try_from(nodes).map_err(|_| {
-                        gam_gpu::gpu_err!("resident arrow beta node count overflows i32")
-                    })?;
-                    let (source, target) = if ping_is_source {
-                        let (ping, pong) = (&self.beta_ping, &mut self.beta_pong);
-                        (ping as *const CudaSlice<f64>, pong as *mut CudaSlice<f64>)
-                    } else {
-                        let (pong, ping) = (&self.beta_pong, &mut self.beta_ping);
-                        (pong as *const CudaSlice<f64>, ping as *mut CudaSlice<f64>)
-                    };
-                    // SAFETY: `source` and `target` are the two distinct resident
-                    // ping/pong buffers of this handle; the raw pointers only
-                    // avoid an aliasing borrow of `self` across the two fields,
-                    // and both are live for the whole launch.
-                    let (source, target) = unsafe { (&*source, &mut *target) };
+                        .load_function("sae_arrow_beta_leaf")
+                        .gpu_ctx("resident arrow beta leaf load")?;
+                    let total = leaf_total as u64;
                     let mut launch = stream.launch_builder(&function);
                     launch
-                        .arg(source)
-                        .arg(&in_nodes)
-                        .arg(&width_i32)
+                        .arg(&self.z)
+                        .arg(&self.active)
+                        .arg(&self.beta_atom)
+                        .arg(&self.beta_phi)
+                        .arg(&self.beta_output)
+                        .arg(&self.sqrt_w)
+                        .arg(&self.residual)
+                        .arg(&k_i32)
+                        .arg(&p_i32)
+                        .arg(&nb_i32)
+                        .arg(&leaf_rows_i32)
+                        .arg(&n_rows_i32)
                         .arg(&total)
-                        .arg(target);
-                    // SAFETY: the kernel ABI matches; the grid covers exactly the
-                    // `level_total` outputs of this level.
-                    unsafe { launch.launch(grid(level_total)?) }
-                        .gpu_ctx("resident arrow beta merge launch")?;
-                    nodes = next_nodes;
-                    ping_is_source = !ping_is_source;
-                }
+                        .arg(&mut ping);
+                    // SAFETY: the kernel ABI matches this builder; one thread per
+                    // (leaf, beta-block element) covers exactly `leaf_total`.
+                    unsafe { launch.launch(grid(leaf_total)?) }
+                        .gpu_ctx("resident arrow beta leaf launch")?;
 
-                let mut root = vec![0.0_f64; width];
-                let source = if ping_is_source {
-                    &self.beta_ping
-                } else {
-                    &self.beta_pong
-                };
-                stream
-                    .memcpy_dtoh(&source.slice(0..width), &mut root)
-                    .gpu_ctx("resident arrow dtoh beta blocks")?;
+                    // Strict binary pairing, one kernel per level. The pairing is a
+                    // pure function of the leaf count, so the association order —
+                    // hence the exact f64 result — is scheduling-independent.
+                    let mut nodes = leaves;
+                    while nodes > 1 {
+                        let next_nodes = nodes.div_ceil(2);
+                        let level_total = next_nodes * width;
+                        let function = self
+                            .module
+                            .load_function("sae_arrow_beta_merge")
+                            .gpu_ctx("resident arrow beta merge load")?;
+                        let total = level_total as u64;
+                        let in_nodes = i32::try_from(nodes).map_err(|_| {
+                            gam_gpu::gpu_err!("resident arrow beta node count overflows i32")
+                        })?;
+                        let mut launch = stream.launch_builder(&function);
+                        launch
+                            .arg(&ping)
+                            .arg(&in_nodes)
+                            .arg(&width_i32)
+                            .arg(&total)
+                            .arg(&mut pong);
+                        // SAFETY: the kernel ABI matches; the grid covers exactly
+                        // the `level_total` outputs of this level, and `ping` /
+                        // `pong` are distinct resident buffers.
+                        unsafe { launch.launch(grid(level_total)?) }
+                            .gpu_ctx("resident arrow beta merge launch")?;
+                        std::mem::swap(&mut ping, &mut pong);
+                        nodes = next_nodes;
+                    }
+
+                    let mut root = vec![0.0_f64; width];
+                    stream
+                        .memcpy_dtoh(&ping.slice(0..width), &mut root)
+                        .gpu_ctx("resident arrow dtoh beta blocks")?;
+                    Ok(root)
+                })();
+                self.beta_ping = Some(ping);
+                self.beta_pong = Some(pong);
+                let root = leaf_result?;
                 blocks.g_beta.copy_from_slice(&root[..nb]);
                 blocks.h_bb.copy_from_slice(&root[nb..]);
             }
@@ -1543,7 +1552,6 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu_kernels::sae_rowjet::SaeCoordinateSlot;
 
     fn fixture(n: usize) -> (Vec<SaeSoftmaxRowJetInput>, Vec<f64>) {
         let k = 3;
@@ -1605,8 +1613,6 @@ mod tests {
                 let beta_outputs: Vec<f64> = (0..n_beta * p)
                     .map(|index| ((index * 5 + 1) as f64 * 0.11).sin())
                     .collect();
-                let _slots: Vec<SaeCoordinateSlot> =
-                    SaeSoftmaxRowJetInput::coordinate_slots_for(&primaries);
                 SaeSoftmaxRowJetInput {
                     n_atoms: k,
                     out_dim: p,

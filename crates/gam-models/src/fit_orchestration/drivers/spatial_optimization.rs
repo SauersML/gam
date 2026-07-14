@@ -69,8 +69,15 @@ fn try_build_spatial_term_log_kappa_derivative(
             let mut spec_local = spec.clone();
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
-                spec_local.length_scale =
-                    compensate_length_scale_for_standardization(spec.length_scale, s);
+                let length_scale = spec.length_scale.resolved().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "Matérn Auto length_scale reached derivative construction unresolved"
+                            .to_string(),
+                    )
+                })?;
+                spec_local.length_scale.set_resolved(
+                    compensate_length_scale_for_standardization(length_scale, s),
+                );
             }
             // The realized Matérn DESIGN penalty is ALWAYS the operator-collocation
             // {mass, tension, stiffness} triplet — the term-collection assembler
@@ -4280,7 +4287,7 @@ fn set_single_term_spatial_length_scale(
             Ok(())
         }
         SmoothBasisSpec::Matern { spec, .. } => {
-            spec.length_scale = length_scale;
+            spec.length_scale.set_resolved(length_scale);
             Ok(())
         }
         SmoothBasisSpec::Duchon { spec, .. } => {

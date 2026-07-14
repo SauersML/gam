@@ -1626,7 +1626,7 @@ mod cuda {
             return Err(ArrowSchurGpuFailure::Unavailable);
         }
 
-        let runtime = resolve_runtime_for_device_path()?
+        let runtime = super::resolve_runtime_for_device_path()?
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         if runtime.device_count() < 2 {
             return Err(ArrowSchurGpuFailure::Unavailable);

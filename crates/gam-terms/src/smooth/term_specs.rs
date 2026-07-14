@@ -1662,6 +1662,17 @@ impl TermCollectionSpec {
                             "{label} term '{}' is not frozen: Matern centers must be UserProvided",
                             st.name
                         ))
+                            .into());
+                    }
+                    if spec
+                        .length_scale
+                        .resolved()
+                        .is_none_or(|value| !value.is_finite() || value <= 0.0)
+                    {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: Matern length_scale must be resolved, finite, and positive",
+                            st.name
+                        ))
                         .into());
                     }
                 }
@@ -4165,7 +4176,7 @@ pub fn log_spatial_aniso_scales(spec: &TermCollectionSpec) {
     for (term_idx, term) in spec.smooth_terms.iter().enumerate() {
         let (aniso, length_scale) = match &term.basis {
             SmoothBasisSpec::Matern { spec, .. } => {
-                (spec.aniso_log_scales.as_ref(), Some(spec.length_scale))
+                (spec.aniso_log_scales.as_ref(), spec.length_scale.resolved())
             }
             SmoothBasisSpec::Duchon { spec, .. } => {
                 (spec.aniso_log_scales.as_ref(), spec.length_scale)

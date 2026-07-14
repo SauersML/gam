@@ -776,6 +776,12 @@ pub(crate) fn build_matern_basis_seeded(
     workspace: &mut BasisWorkspace,
     aniso_seed_mode: AnisoSeedMode,
 ) -> Result<BasisBuildResult, BasisError> {
+    let length_scale = spec.length_scale.resolved().ok_or_else(|| {
+        BasisError::InvalidInput(
+            "Matérn Auto length_scale must be resolved before basis construction".to_string(),
+        )
+    })?;
+    validate_matern_length_scale(length_scale)?;
     let selected_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     // Drop redundant centers when an over-specified `centers=K` exceeds the
     // Matérn kernel's numerical rank on the data cloud (#755). Reducing the base
@@ -808,7 +814,7 @@ pub(crate) fn build_matern_basis_seeded(
         matern_rank_reduce_centers(
             data,
             &selected_centers,
-            spec.length_scale,
+            length_scale,
             spec.nu,
             reduce_aniso.as_deref(),
         )?
@@ -851,7 +857,7 @@ pub(crate) fn build_matern_basis_seeded(
         let op = StreamingMaternEvaluator::new(
             shared_data,
             Arc::new(centers.clone()),
-            spec.length_scale,
+            length_scale,
             spec.nu,
             aniso.clone(),
             z_opt.as_ref().map(|z| Arc::new(z.clone())),
@@ -863,7 +869,7 @@ pub(crate) fn build_matern_basis_seeded(
         let candidates = if spec.double_penalty {
             let penalty_kernel = build_matern_kernel_penalty(
                 centers.view(),
-                spec.length_scale,
+                length_scale,
                 spec.nu,
                 spec.include_intercept,
                 aniso.as_deref(),
@@ -878,7 +884,7 @@ pub(crate) fn build_matern_basis_seeded(
         } else {
             build_matern_operator_penalty_candidates(
                 centers.view(),
-                spec.length_scale,
+                length_scale,
                 spec.nu,
                 spec.include_intercept,
                 z_opt.as_ref(),
@@ -896,7 +902,6 @@ pub(crate) fn build_matern_basis_seeded(
         );
         let shared_data = shared_owned_data_matrix(data, &workspace.cache);
         let d = data.ncols();
-        let length_scale = spec.length_scale;
         let nu = spec.nu;
         let poly_basis = if spec.include_intercept {
             Some(Arc::new(Array2::<f64>::ones((data.nrows(), 1))))
@@ -947,7 +952,7 @@ pub(crate) fn build_matern_basis_seeded(
         let candidates = if spec.double_penalty {
             let penalty_kernel = build_matern_kernel_penalty(
                 centers.view(),
-                spec.length_scale,
+                length_scale,
                 spec.nu,
                 spec.include_intercept,
                 aniso.as_deref(),
@@ -962,7 +967,7 @@ pub(crate) fn build_matern_basis_seeded(
         } else {
             build_matern_operator_penalty_candidates(
                 centers.view(),
-                spec.length_scale,
+                length_scale,
                 spec.nu,
                 spec.include_intercept,
                 z_opt.as_ref(),
@@ -974,7 +979,7 @@ pub(crate) fn build_matern_basis_seeded(
         let m = create_matern_spline_basiswithworkspace(
             data,
             centers.view(),
-            spec.length_scale,
+            length_scale,
             spec.nu,
             spec.include_intercept,
             aniso.as_deref(),
@@ -992,7 +997,7 @@ pub(crate) fn build_matern_basis_seeded(
         } else {
             build_matern_operator_penalty_candidates(
                 centers.view(),
-                spec.length_scale,
+                length_scale,
                 spec.nu,
                 spec.include_intercept,
                 z_opt.as_ref(),
@@ -1009,7 +1014,7 @@ pub(crate) fn build_matern_basis_seeded(
         dropped_penalties: filtered.dropped,
         metadata: BasisMetadata::Matern {
             centers: original_centers,
-            length_scale: spec.length_scale,
+            length_scale,
             periodic: spec.periodic.clone(),
             nu: spec.nu,
             include_intercept: spec.include_intercept,
@@ -2904,9 +2909,10 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
     // the realized centers, transform, and anisotropy from the value build so the
     // two are byte-consistent by construction.
     let base = build_matern_basiswithworkspace(data, spec, workspace)?;
-    let (base_centers, base_transform, base_aniso) = match &base.metadata {
+    let (base_centers, base_transform, base_aniso, length_scale) = match &base.metadata {
         BasisMetadata::Matern {
             centers,
+            length_scale,
             identifiability_transform,
             aniso_log_scales,
             ..
@@ -2914,6 +2920,7 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
             centers.clone(),
             identifiability_transform.clone(),
             aniso_log_scales.clone(),
+            *length_scale,
         ),
         other => {
             return Err(BasisError::InvalidInput(format!(
@@ -2930,7 +2937,7 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
     let design_derivatives = build_matern_design_psi_derivatives(
         data,
         centers.view(),
-        spec.length_scale,
+        length_scale,
         spec.nu,
         spec.include_intercept,
         z_opt.as_ref(),
@@ -2940,7 +2947,7 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
         let (_, primary_derivative, primarysecond_derivative, shrinkage_first, shrinkagesecond) =
             build_matern_double_penalty_primarywith_psi_derivatives(
                 centers.view(),
-                spec.length_scale,
+                length_scale,
                 spec.nu,
                 spec.include_intercept,
                 z_opt.as_ref(),
@@ -2961,7 +2968,7 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
     } else {
         build_matern_operator_penalty_psi_derivatives(
             centers.view(),
-            spec.length_scale,
+            length_scale,
             spec.nu,
             spec.include_intercept,
             z_opt.as_ref(),
@@ -3156,9 +3163,10 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         &mut BasisWorkspace::default(),
         AnisoSeedMode::Literal,
     )?;
-    let (base_centers, z_opt, base_aniso) = match &base.metadata {
+    let (base_centers, z_opt, base_aniso, length_scale) = match &base.metadata {
         BasisMetadata::Matern {
             centers,
+            length_scale,
             identifiability_transform,
             aniso_log_scales,
             ..
@@ -3166,6 +3174,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
             centers.clone(),
             identifiability_transform.clone(),
             aniso_log_scales.clone(),
+            *length_scale,
         ),
         other => {
             return Err(BasisError::InvalidInput(format!(
@@ -3191,7 +3200,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
     let mut result = build_matern_design_psi_aniso_derivatives(
         data,
         centers.view(),
-        spec.length_scale,
+        length_scale,
         spec.nu,
         eta,
         spec.include_intercept,
@@ -3212,7 +3221,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let (raw_first, raw_second_diag) = build_matern_aniso_primary_raw_derivative_matrices(
             centers.view(),
             eta,
-            spec.length_scale,
+            length_scale,
             spec.nu,
         )?;
         for a in 0..dim {
@@ -3252,7 +3261,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         // primary RKHS block and the moving function-metric intercept ridge.
         let kernel = build_matern_kernel_penalty(
             centers.view(),
-            spec.length_scale,
+            length_scale,
             spec.nu,
             spec.include_intercept,
             Some(eta),
@@ -3322,7 +3331,6 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
             .as_ref()
             .map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
         let active_penalties = base.active_penalties.clone();
-        let length_scale = spec.length_scale;
         let nu = spec.nu;
         let primary_first_raw_owned = primary_first_raw.clone();
         let a_raw_owned = a_raw.clone();
@@ -3404,7 +3412,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         let (per_axis, cross_pairs, cross_provider) =
             build_matern_operator_penalty_aniso_derivatives(
                 centers.view(),
-                spec.length_scale,
+                length_scale,
                 spec.nu,
                 spec.include_intercept,
                 z_opt.as_ref(),
