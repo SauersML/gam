@@ -70,7 +70,7 @@ fn matern_basis_cols(data: &Array2<f64>, k: usize) -> usize {
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::FarthestPoint { num_centers: k },
         periodic: None,
-        length_scale,
+        length_scale: length_scale.into(),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,

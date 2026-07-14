@@ -61,7 +61,7 @@ fn aniso_matern_recovers_signal_axis() {
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     periodic: None,
-                    length_scale: 1.0,
+                    length_scale: 1.0.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,

@@ -112,7 +112,7 @@ fn smooth_term(basis: &str, n_pcs: usize, centers: usize) -> SmoothTermSpec {
                     num_centers: centers,
                 },
                 periodic: None,
-                length_scale: 1.0,
+                length_scale: 1.0.into(),
                 nu: MaternNu::ThreeHalves,
                 include_intercept: false,
                 double_penalty: false,

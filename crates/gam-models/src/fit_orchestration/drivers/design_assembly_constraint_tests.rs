@@ -1224,7 +1224,7 @@ fn build_smooth_design_rejects_uncertified_monotone_matern_1d() {
             spec: MaternBasisSpec {
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                length_scale: 0.7,
+                length_scale: 0.7.into(),
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
                 double_penalty: false,
@@ -2372,7 +2372,7 @@ fn frozen_spatial_replay_preserves_standardized_length_scale_compensation() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                    length_scale: 1.1,
+                    length_scale: 1.1.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -2470,7 +2470,7 @@ fn matern_smooth_buildswith_double_penalty_in_high_dim() {
             spec: MaternBasisSpec {
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-                length_scale: 0.75,
+                length_scale: 0.75.into(),
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
                 double_penalty: true,
@@ -2671,7 +2671,7 @@ fn frozen_joint_maternspec_rebuild_keeps_adaptive_cache_in_sync() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                    length_scale: 1.0,
+                    length_scale: 1.0.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -3341,7 +3341,7 @@ fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                    length_scale: 20.0,
+                    length_scale: 20.0.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -3485,7 +3485,7 @@ fn staged_exact_joint_outer_reoptimizes_and_certifies_the_full_row_measure() {
             spec: MaternBasisSpec {
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                length_scale: 1.0,
+                length_scale: 1.0.into(),
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
                 double_penalty: true,
@@ -3677,7 +3677,7 @@ fn exact_joint_two_block_spatial_length_scale_freezes_matern_centers() {
             spec: MaternBasisSpec {
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                length_scale,
+                length_scale: length_scale.into(),
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
                 double_penalty: true,
@@ -3787,7 +3787,7 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-                    length_scale: 0.85,
+                    length_scale: 0.85.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -3984,7 +3984,7 @@ fn iso_kappa_fd_variant_driver(
             spec: MaternBasisSpec {
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                 periodic: None,
-                length_scale: 1.0,
+                length_scale: 1.0.into(),
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
                 double_penalty: false,
@@ -6596,7 +6596,7 @@ fn joint_build_and_freeze_shares_auto_spatial_centers_across_blocks() {
                 center_strategy: CenterStrategy::Auto(Box::new(CenterStrategy::FarthestPoint {
                     num_centers: 8,
                 })),
-                length_scale: 0.8,
+                length_scale: 0.8.into(),
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
                 double_penalty: true,
@@ -6844,7 +6844,7 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                        length_scale: 0.8,
+                        length_scale: 0.8.into(),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,
@@ -6984,7 +6984,7 @@ fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
             spec: MaternBasisSpec {
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-                length_scale,
+                length_scale: length_scale.into(),
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
                 double_penalty: true,
@@ -7332,7 +7332,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                    length_scale: 0.85,
+                    length_scale: 0.85.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -7543,7 +7543,7 @@ fn exact_matern_log_kappa_derivative_uses_feature_columns_only() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                    length_scale: 0.4,
+                    length_scale: 0.4.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -7833,7 +7833,7 @@ fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                    length_scale: 12.0,
+                    length_scale: 12.0.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -7891,7 +7891,7 @@ fn spatial_length_scale_optimization_runs_binomial_logit_matern_with_exact_laml_
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
-                    length_scale: 1.8,
+                    length_scale: 1.8.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -8247,7 +8247,7 @@ fn from_length_scales_aniso_keeps_nonaniso_spatial_terms_scalar() {
                             [1.0, 0.0],
                             [0.0, 1.0],
                         ]),
-                        length_scale: 0.5,
+                        length_scale: 0.5.into(),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: false,
@@ -8270,7 +8270,7 @@ fn from_length_scales_aniso_keeps_nonaniso_spatial_terms_scalar() {
                             [1.0, 0.0],
                             [0.0, 1.0],
                         ]),
-                        length_scale: 0.25,
+                        length_scale: 0.25.into(),
                         nu: MaternNu::ThreeHalves,
                         include_intercept: false,
                         double_penalty: false,
@@ -8318,7 +8318,7 @@ fn aniso_bounds_clamp_preserves_in_range_global_length_scale_and_eta() {
                         [0.0, 1.0],
                         [1.0, 1.0],
                     ]),
-                    length_scale: 1.0,
+                    length_scale: 1.0.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -8467,7 +8467,7 @@ fn spatial_anisotropy_pilot_initializer_seeds_geometry_without_fit() {
                         [0.0, 0.05],
                         [1.0, 0.05],
                     ]),
-                    length_scale: 1.0,
+                    length_scale: 1.0.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,

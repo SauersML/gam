@@ -2801,7 +2801,7 @@ fn matern_basis<'py>(
         .map(|slice| slice.to_vec());
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
-        length_scale,
+        length_scale: length_scale.into(),
         nu: nu_parsed,
         include_intercept: false,
         double_penalty: false,

@@ -84,7 +84,7 @@ fn radial_periodic_smooth_uses_ghost_centers_but_freezes_original_centers() {
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::UserProvided(centers.clone()),
                     periodic: Some(vec![Some(two_pi), None]),
-                    length_scale: 1.0,
+                    length_scale: 1.0.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,

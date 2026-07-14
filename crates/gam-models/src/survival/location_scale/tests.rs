@@ -250,7 +250,7 @@ fn survival_static_spatial_psi_blocks_match_shared_engine() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
-                    length_scale: 0.7,
+                    length_scale: 0.7.into(),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,

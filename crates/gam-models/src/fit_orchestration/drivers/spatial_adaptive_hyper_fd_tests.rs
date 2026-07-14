@@ -148,7 +148,7 @@ fn exact_spatial_adaptive_joint_hypergradient_matches_finite_difference() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale: 0.6,
+                    length_scale: 0.6.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,

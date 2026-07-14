@@ -73,7 +73,7 @@ fn matern_2d_spec(num_centers: usize) -> TermCollectionSpec {
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers },
                     periodic: None,
-                    length_scale: 1.0,
+                    length_scale: 1.0.into(),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,

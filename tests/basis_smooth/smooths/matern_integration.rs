@@ -59,7 +59,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
                 feature_cols: (0..d).collect(),
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 34 },
-                    length_scale: 0.95,
+                    length_scale: 0.95.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -159,7 +159,7 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                 feature_cols: (0..d).collect(),
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale: 0.95,
+                    length_scale: 0.95.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -303,7 +303,7 @@ fn matern_3d_aniso_fits_successfully() {
                 feature_cols: (0..d).collect(),
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 14 },
-                    length_scale: 1.0,
+                    length_scale: 1.0.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,

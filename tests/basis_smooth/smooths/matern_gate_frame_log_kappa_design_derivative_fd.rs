@@ -95,7 +95,7 @@ fn frozen_frame_design_derivative_max_error(
             num_centers: 40,
         })),
         periodic: None,
-        length_scale: ls_freeze_eff,
+        length_scale: ls_freeze_eff.into(),
         nu,
         include_intercept: false,
         double_penalty,

@@ -125,7 +125,7 @@ mod spatial_length_scale_monotone_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers },
-                        length_scale: short_seed,
+                        length_scale: short_seed.into(),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,
@@ -230,7 +230,7 @@ mod spatial_length_scale_monotone_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                        length_scale: 20.0,
+                        length_scale: 20.0.into(),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,
@@ -284,7 +284,7 @@ mod spatial_length_scale_monotone_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                        length_scale: 12.0,
+                        length_scale: 12.0.into(),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,

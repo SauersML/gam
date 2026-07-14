@@ -111,12 +111,12 @@ pub(crate) struct FlexFamilyCoefficientTerms {
 }
 
 /// Exact first and same-direction second family derivatives of a complete FLEX
-/// row, plus an optional coefficient-direction drift of the first channel.
+/// row, plus an optional coefficient-map drift of the first channel.
 #[derive(Clone, Debug)]
 pub(crate) struct FlexFamilyDirectionRowTerms {
     pub(crate) first: FlexFamilyCoefficientTerms,
     pub(crate) second: FlexFamilyCoefficientTerms,
-    pub(crate) beta_drift: Option<FlexFamilyCoefficientTerms>,
+    pub(crate) directional: Option<FlexFamilyCoefficientTerms>,
 }
 
 pub(crate) fn pack_flex_timepoint_base(base: &SurvivalFlexTimepointExact) -> FlexTimepointBasePack {
@@ -957,10 +957,20 @@ impl FlexJet for Jet3 {
 /// drift of those same channels. The outer baseline coordinate is supplied by
 /// `Dual2<J>` and is intentionally absent from this constructor.
 trait FlexCoefficientJet: FlexJet {
-    fn affine(value: f64, gradient: Vec<f64>, directional_value: f64) -> Self;
+    fn affine(
+        value: f64,
+        gradient: Vec<f64>,
+        directional_value: f64,
+        directional_gradient: Vec<f64>,
+    ) -> Self;
 
     fn constant(value: f64, dimension: usize) -> Self {
-        Self::affine(value, vec![0.0; dimension], 0.0)
+        Self::affine(
+            value,
+            vec![0.0; dimension],
+            0.0,
+            vec![0.0; dimension],
+        )
     }
 
     fn owned_base_terms(&self) -> FlexFamilyCoefficientTerms;
@@ -979,8 +989,14 @@ fn owned_jet2_terms(jet: &Jet2) -> FlexFamilyCoefficientTerms {
 }
 
 impl FlexCoefficientJet for Jet2 {
-    fn affine(value: f64, gradient: Vec<f64>, directional_value: f64) -> Self {
+    fn affine(
+        value: f64,
+        gradient: Vec<f64>,
+        directional_value: f64,
+        directional_gradient: Vec<f64>,
+    ) -> Self {
         debug_assert_eq!(directional_value, 0.0);
+        debug_assert!(directional_gradient.iter().all(|value| *value == 0.0));
         Self::from_parts(value, &gradient, &[])
     }
 
@@ -994,11 +1010,15 @@ impl FlexCoefficientJet for Jet2 {
 }
 
 impl FlexCoefficientJet for Jet3 {
-    fn affine(value: f64, gradient: Vec<f64>, directional_value: f64) -> Self {
-        let zeros = vec![0.0; gradient.len()];
+    fn affine(
+        value: f64,
+        gradient: Vec<f64>,
+        directional_value: f64,
+        directional_gradient: Vec<f64>,
+    ) -> Self {
         Self {
             base: Jet2::from_parts(value, &gradient, &[]),
-            eps: Jet2::from_parts(directional_value, &zeros, &[]),
+            eps: Jet2::from_parts(directional_value, &directional_gradient, &[]),
         }
     }
 
@@ -3000,6 +3020,21 @@ struct FlexFamilyCoefficientJets<J> {
     o_infl: f64,
 }
 
+enum FlexCoefficientRowDirection<'a> {
+    /// Move the canonical flattened coefficient vector while holding every
+    /// coefficient-to-row map fixed.
+    Beta(&'a Array1<f64>),
+    /// Move one coefficient-to-row design map.  The epsilon seed owns both
+    /// `X_psi beta` and `X_psi`, so the resulting Jet3 channel includes the
+    /// derivative of the score/Hessian pullback, not only row-value motion.
+    Design {
+        block: usize,
+        derivative_row: &'a Array1<f64>,
+        beta: &'a Array1<f64>,
+        coefficient_range: std::ops::Range<usize>,
+    },
+}
+
 fn add_coefficient_row(
     gradient: &mut [f64],
     range: &std::ops::Range<usize>,
@@ -3022,20 +3057,43 @@ fn add_coefficient_row(
 fn lifted_coefficient_affine<J: FlexCoefficientJet>(
     value: f64,
     gradient: Vec<f64>,
-    beta_direction: Option<&Array1<f64>>,
+    coefficient_direction: Option<&FlexCoefficientRowDirection<'_>>,
+    design_affected: bool,
     family_first: f64,
     family_second: f64,
 ) -> Dual2<J> {
     let dimension = gradient.len();
-    let directional_value = beta_direction.map_or(0.0, |direction| {
-        gradient
+    let mut directional_gradient = vec![0.0; dimension];
+    let directional_value = match coefficient_direction {
+        None => 0.0,
+        Some(FlexCoefficientRowDirection::Beta(direction)) => gradient
             .iter()
             .zip(direction.iter())
             .map(|(&coefficient, &step)| coefficient * step)
-            .sum()
-    });
+            .sum(),
+        Some(FlexCoefficientRowDirection::Design {
+            derivative_row,
+            beta,
+            coefficient_range,
+            ..
+        }) if design_affected => {
+            for (axis, value) in coefficient_range
+                .clone()
+                .zip(derivative_row.iter().copied())
+            {
+                directional_gradient[axis] = value;
+            }
+            derivative_row.dot(*beta)
+        }
+        Some(FlexCoefficientRowDirection::Design { .. }) => 0.0,
+    };
     Dual2 {
-        v: J::affine(value, gradient, directional_value),
+        v: J::affine(
+            value,
+            gradient,
+            directional_value,
+            directional_gradient,
+        ),
         g: J::constant(family_first, dimension),
         h: J::constant(family_second, dimension),
     }
@@ -3055,7 +3113,7 @@ impl SurvivalMarginalSlopeFamily {
         slices: &BlockSlices,
         first: FlexFamilyRowDirection,
         second: FlexFamilyRowDirection,
-        beta_direction: Option<&Array1<f64>>,
+        coefficient_direction: Option<&FlexCoefficientRowDirection<'_>>,
     ) -> Result<(), String> {
         if row >= self.n {
             return Err(format!(
@@ -3078,19 +3136,57 @@ impl SurvivalMarginalSlopeFamily {
                 "survival marginal-slope FLEX family row directions must be finite".to_string(),
             );
         }
-        if let Some(direction) = beta_direction {
-            if direction.len() != slices.total {
-                return Err(format!(
-                    "survival marginal-slope FLEX family beta direction length {} != flattened coefficient width {}",
-                    direction.len(),
-                    slices.total,
-                ));
+        match coefficient_direction {
+            Some(FlexCoefficientRowDirection::Beta(direction)) => {
+                if direction.len() != slices.total {
+                    return Err(format!(
+                        "survival marginal-slope FLEX family beta direction length {} != flattened coefficient width {}",
+                        direction.len(),
+                        slices.total,
+                    ));
+                }
+                if direction.iter().any(|value| !value.is_finite()) {
+                    return Err(
+                        "survival marginal-slope FLEX family beta direction must be finite"
+                            .to_string(),
+                    );
+                }
             }
-            if direction.iter().any(|value| !value.is_finite()) {
-                return Err(
-                    "survival marginal-slope FLEX family beta direction must be finite".to_string(),
-                );
+            Some(FlexCoefficientRowDirection::Design {
+                block,
+                derivative_row,
+                beta,
+                coefficient_range,
+            }) => {
+                if !matches!(block, 1 | 2) {
+                    return Err(format!(
+                        "survival marginal-slope FLEX family design direction supports marginal/logslope blocks 1 or 2, got block {block}"
+                    ));
+                }
+                if derivative_row.len() != coefficient_range.len()
+                    || beta.len() != coefficient_range.len()
+                {
+                    return Err(format!(
+                        "survival marginal-slope FLEX family design direction block {block} widths disagree: derivative={}, beta={}, range={}",
+                        derivative_row.len(),
+                        beta.len(),
+                        coefficient_range.len(),
+                    ));
+                }
+                if coefficient_range.end > slices.total {
+                    return Err(format!(
+                        "survival marginal-slope FLEX family design direction range {:?} exceeds flattened width {}",
+                        coefficient_range, slices.total,
+                    ));
+                }
+                if derivative_row.iter().any(|value| !value.is_finite()) {
+                    return Err(
+                        "survival marginal-slope FLEX family design derivative row must be finite"
+                            .to_string(),
+                    );
+                }
             }
+            None => {}
         }
 
         let mut expected = vec![
@@ -3142,9 +3238,17 @@ impl SurvivalMarginalSlopeFamily {
         slices: &BlockSlices,
         first: FlexFamilyRowDirection,
         second: FlexFamilyRowDirection,
-        beta_direction: Option<&Array1<f64>>,
+        coefficient_direction: Option<&FlexCoefficientRowDirection<'_>>,
     ) -> Result<FlexFamilyCoefficientJets<J>, String> {
         let dimension = slices.total;
+        let design_targets_marginal = matches!(
+            coefficient_direction,
+            Some(FlexCoefficientRowDirection::Design { block: 1, .. })
+        );
+        let design_targets_logslope = matches!(
+            coefficient_direction,
+            Some(FlexCoefficientRowDirection::Design { block: 2, .. })
+        );
         let q_values = self.row_dynamic_q_values(row, block_states)?;
         let time_entry_chunk = self
             .design_entry
@@ -3225,21 +3329,24 @@ impl SurvivalMarginalSlopeFamily {
             let h0_jet = lifted_coefficient_affine::<J>(
                 h0,
                 q0_gradient,
-                beta_direction,
+                coefficient_direction,
+                design_targets_marginal,
                 first.entry,
                 second.entry,
             );
             let h1_jet = lifted_coefficient_affine::<J>(
                 h1,
                 q1_gradient,
-                beta_direction,
+                coefficient_direction,
+                design_targets_marginal,
                 first.exit,
                 second.exit,
             );
             let d_raw_jet = lifted_coefficient_affine::<J>(
                 d_raw,
                 qd1_gradient,
-                beta_direction,
+                coefficient_direction,
+                false,
                 first.derivative_exit,
                 second.derivative_exit,
             );
@@ -3249,7 +3356,8 @@ impl SurvivalMarginalSlopeFamily {
                     lifted_coefficient_affine::<J>(
                         beta_time[local_axis],
                         one_hot_coefficient_gradient(dimension, slices.time.start + local_axis),
-                        beta_direction,
+                        coefficient_direction,
+                        false,
                         0.0,
                         0.0,
                     )
@@ -3321,21 +3429,24 @@ impl SurvivalMarginalSlopeFamily {
                 lifted_coefficient_affine::<J>(
                     q_values.q0,
                     q0_gradient,
-                    beta_direction,
+                    coefficient_direction,
+                    design_targets_marginal,
                     first.entry,
                     second.entry,
                 ),
                 lifted_coefficient_affine::<J>(
                     q_values.q1,
                     q1_gradient,
-                    beta_direction,
+                    coefficient_direction,
+                    design_targets_marginal,
                     first.exit,
                     second.exit,
                 ),
                 lifted_coefficient_affine::<J>(
                     q_values.qd1,
                     qd1_gradient,
-                    beta_direction,
+                    coefficient_direction,
+                    false,
                     first.derivative_exit,
                     second.derivative_exit,
                 ),
@@ -3347,11 +3458,21 @@ impl SurvivalMarginalSlopeFamily {
         let g = lifted_coefficient_affine::<J>(
             block_states[2].eta[row],
             g_gradient,
-            beta_direction,
+            coefficient_direction,
+            design_targets_logslope,
             0.0,
             0.0,
         );
-        let zero = || lifted_coefficient_affine::<J>(0.0, vec![0.0; dimension], None, 0.0, 0.0);
+        let zero = || {
+            lifted_coefficient_affine::<J>(
+                0.0,
+                vec![0.0; dimension],
+                None,
+                false,
+                0.0,
+                0.0,
+            )
+        };
         let template = zero();
         let mut du = vec![template.clone(); primary.total];
         du[primary.q0] = tangent_jet(&q0);
@@ -3372,7 +3493,8 @@ impl SurvivalMarginalSlopeFamily {
                 let coefficient = lifted_coefficient_affine::<J>(
                     beta_h[local_axis],
                     one_hot_coefficient_gradient(dimension, coefficient_axis),
-                    beta_direction,
+                    coefficient_direction,
+                    false,
                     0.0,
                     0.0,
                 );
@@ -3394,7 +3516,8 @@ impl SurvivalMarginalSlopeFamily {
                 let coefficient = lifted_coefficient_affine::<J>(
                     beta_w[local_axis],
                     one_hot_coefficient_gradient(dimension, coefficient_axis),
-                    beta_direction,
+                    coefficient_direction,
+                    false,
                     0.0,
                     0.0,
                 );
@@ -3418,7 +3541,8 @@ impl SurvivalMarginalSlopeFamily {
             let influence_jet = lifted_coefficient_affine::<J>(
                 o_infl,
                 influence_gradient,
-                beta_direction,
+                coefficient_direction,
+                false,
                 0.0,
                 0.0,
             );
@@ -3454,7 +3578,7 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         first: FlexFamilyRowDirection,
         second: FlexFamilyRowDirection,
-        beta_direction: Option<&Array1<f64>>,
+        coefficient_direction: Option<&FlexCoefficientRowDirection<'_>>,
     ) -> Result<FlexFamilyDirectionRowTerms, String> {
         self.ensure_scalar_flex_exact_score_geometry("FLEX family-direction row program")?;
         let expected_blocks = 3
@@ -3475,7 +3599,7 @@ impl SurvivalMarginalSlopeFamily {
             &slices,
             first,
             second,
-            beta_direction,
+            coefficient_direction,
         )?;
         let jets = self.build_flex_family_coefficient_jets::<J>(
             row,
@@ -3484,7 +3608,7 @@ impl SurvivalMarginalSlopeFamily {
             &slices,
             first,
             second,
-            beta_direction,
+            coefficient_direction,
         )?;
         if survival_derivative_guard_violated(jets.qd1.value(), self.derivative_guard) {
             return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
@@ -3565,7 +3689,7 @@ impl SurvivalMarginalSlopeFamily {
         Ok(FlexFamilyDirectionRowTerms {
             first: output.g.owned_base_terms(),
             second: output.h.owned_base_terms(),
-            beta_drift: output.g.owned_directional_terms(),
+            directional: output.g.owned_directional_terms(),
         })
     }
 
@@ -3590,13 +3714,14 @@ impl SurvivalMarginalSlopeFamily {
         second: FlexFamilyRowDirection,
         beta_direction: Option<&Array1<f64>>,
     ) -> Result<FlexFamilyDirectionRowTerms, String> {
-        if beta_direction.is_some() {
+        if let Some(beta_direction) = beta_direction {
+            let coefficient_direction = FlexCoefficientRowDirection::Beta(beta_direction);
             self.flex_family_direction_row_terms_generic::<Jet3>(
                 row,
                 block_states,
                 first,
                 second,
-                beta_direction,
+                Some(&coefficient_direction),
             )
         } else {
             self.flex_family_direction_row_terms_generic::<Jet2>(
@@ -3607,6 +3732,48 @@ impl SurvivalMarginalSlopeFamily {
                 None,
             )
         }
+    }
+
+    /// Evaluate the derivative of the complete family row channel with respect
+    /// to one marginal/logslope design coordinate at fixed coefficients.
+    ///
+    /// `derivative_row` is one row of `X_psi`.  Its Jet3 epsilon part is seeded
+    /// with both `X_psi beta` and the coefficient gradient `X_psi`; therefore
+    /// `directional` includes `X_psi^T score` and both Hessian pullback-map
+    /// drift terms automatically, including their nonlinear time-wiggle
+    /// composition.
+    pub(crate) fn flex_family_design_direction_row_terms(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        first: FlexFamilyRowDirection,
+        second: FlexFamilyRowDirection,
+        block: usize,
+        derivative_row: &Array1<f64>,
+    ) -> Result<FlexFamilyDirectionRowTerms, String> {
+        let slices = block_slices(self, block_states);
+        let (beta, coefficient_range) = match block {
+            1 => (&block_states[1].beta, slices.marginal),
+            2 => (&block_states[2].beta, slices.logslope),
+            _ => {
+                return Err(format!(
+                    "survival marginal-slope FLEX family design direction supports marginal/logslope blocks 1 or 2, got block {block}"
+                ));
+            }
+        };
+        let coefficient_direction = FlexCoefficientRowDirection::Design {
+            block,
+            derivative_row,
+            beta,
+            coefficient_range,
+        };
+        self.flex_family_direction_row_terms_generic::<Jet3>(
+            row,
+            block_states,
+            first,
+            second,
+            Some(&coefficient_direction),
+        )
     }
 }
 

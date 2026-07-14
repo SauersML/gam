@@ -336,7 +336,7 @@ fn freeze_smooth_basis_from_metadata(
             },
         ) => {
             s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
-            s.length_scale = *length_scale;
+            s.length_scale.set_resolved(*length_scale);
             s.nu = *nu;
             s.include_intercept = *include_intercept;
             s.identifiability = match identifiability_transform {

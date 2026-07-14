@@ -15,7 +15,7 @@ fn matern_log_kappa_second_derivative_matches_finite_difference() {
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
-        length_scale: (-rho).exp(),
+        length_scale: (-rho).exp().into(),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,

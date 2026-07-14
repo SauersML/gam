@@ -878,7 +878,7 @@ mod tests {
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     periodic: None,
-                    length_scale: 0.7,
+                    length_scale: 0.7.into(),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,
@@ -1584,7 +1584,7 @@ mod tests {
                 spec: MaternBasisSpec {
                     center_strategy: centers,
                     periodic: None,
-                    length_scale: 0.55 * factor,
+                    length_scale: (0.55 * factor).into(),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,

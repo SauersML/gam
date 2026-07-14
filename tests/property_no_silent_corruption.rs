@@ -92,7 +92,7 @@ fn matern_spec() -> MaternBasisSpec {
     MaternBasisSpec {
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
         periodic: None,
-        length_scale: 0.5,
+        length_scale: 0.5.into(),
         nu: MaternNu::ThreeHalves,
         include_intercept: false,
         double_penalty: false,

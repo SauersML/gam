@@ -100,7 +100,7 @@ fn aniso_matern_design_psi_derivative_matches_fd_and_is_not_sum_zero() {
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
-        length_scale: ls0,
+        length_scale: ls0.into(),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,
@@ -205,7 +205,7 @@ fn aniso_matern_full_outer_loop_recovers_planted_signal_r2() {
                     // signal axis needs well over ~8 effective centers to resolve.
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 30 },
                     periodic: None,
-                    length_scale: 1.0,
+                    length_scale: 1.0.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -343,7 +343,7 @@ fn fit_aniso_recovery(double_penalty: bool, num_centers: usize) -> AnisoRecovery
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers },
                     periodic: None,
-                    length_scale: 1.0,
+                    length_scale: 1.0.into(),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty,

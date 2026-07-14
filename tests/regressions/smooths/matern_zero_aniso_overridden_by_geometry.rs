@@ -41,7 +41,7 @@ fn forward_kernel(
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
-        length_scale,
+        length_scale: length_scale.into(),
         nu,
         include_intercept: false,
         double_penalty: false,
