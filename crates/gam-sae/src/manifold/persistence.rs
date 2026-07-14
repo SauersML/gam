@@ -178,7 +178,9 @@ pub struct AtomTopologyPersistence {
     pub h0: Vec<PersistenceBar>,
     /// The measured H₁ bars.
     pub h1: Vec<PersistenceBar>,
-    /// The measured H₂ bars. Empty unless the raced topology is sphere/torus.
+    /// The measured H₂ bars. Empty unless the raced topology makes a closed-
+    /// surface H₂ claim (sphere, torus, projective plane, or Klein bottle; the
+    /// non-orientable cases use the same F2 coefficient field as the reducer).
     pub h2: Vec<PersistenceBar>,
     /// The certificate flag: the measured topology disagrees with the raced
     /// type's expected Betti signature. Fed to the probe planner.

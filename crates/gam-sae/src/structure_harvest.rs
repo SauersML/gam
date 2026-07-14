@@ -6699,6 +6699,134 @@ mod tests {
         );
     }
 
+    #[test]
+    fn projective_plane_veronese_embedding_beats_the_unquotiented_sphere_chart() {
+        use ndarray::Array1;
+
+        let (n_latitude, n_longitude) = (10usize, 16usize);
+        let n = n_latitude * n_longitude;
+        let mut coords = Array2::<f64>::zeros((n, 2));
+        let mut target = Array2::<f64>::zeros((n, 4));
+        for latitude_index in 0..n_latitude {
+            let latitude = -std::f64::consts::FRAC_PI_2
+                + std::f64::consts::PI * (latitude_index as f64 + 0.5) / n_latitude as f64;
+            for longitude_index in 0..n_longitude {
+                let longitude = std::f64::consts::TAU * longitude_index as f64 / n_longitude as f64;
+                let row = latitude_index * n_longitude + longitude_index;
+                coords[[row, 0]] = latitude;
+                coords[[row, 1]] = longitude;
+                let x = latitude.cos() * longitude.cos();
+                let y = latitude.cos() * longitude.sin();
+                let z = latitude.sin();
+                target[[row, 0]] = x * y;
+                target[[row, 1]] = y * z;
+                target[[row, 2]] = z * x;
+                target[[row, 3]] = 0.5 * (x * x - y * y);
+            }
+        }
+        let manifold = LatentManifold::Product(vec![
+            LatentManifold::Interval {
+                lo: -std::f64::consts::FRAC_PI_2,
+                hi: std::f64::consts::FRAC_PI_2,
+            },
+            LatentManifold::Circle {
+                period: std::f64::consts::TAU,
+            },
+        ]);
+        let projective = TopologyCandidateSpec::new(
+            AutoTopologyKind::ProjectivePlane,
+            SaeAtomGeometryPlan::projective_plane(1).unwrap(),
+            manifold.clone(),
+            coords.clone(),
+        )
+        .unwrap();
+        let sphere = TopologyCandidateSpec::new(
+            AutoTopologyKind::Sphere,
+            SaeAtomGeometryPlan::new(
+                SaeAtomBasisKind::Sphere,
+                2,
+                SaeBasisResolution::SphereChart,
+                SaeReferenceMetricPlan::SphereChart,
+            )
+            .unwrap(),
+            manifold,
+            coords,
+        )
+        .unwrap();
+        let weights = Array1::<f64>::ones(n);
+        let projective_fit = fit_topology_candidate(&projective, target.view(), weights.view())
+            .expect("RP2 Veronese fit");
+        let sphere_fit = fit_topology_candidate(&sphere, target.view(), weights.view())
+            .expect("unquotiented sphere-chart fit");
+        assert!(
+            projective_fit.raw_reml < sphere_fit.raw_reml,
+            "RP2 invariant basis must win its Veronese DGP: RP2={}, sphere={}",
+            projective_fit.raw_reml,
+            sphere_fit.raw_reml
+        );
+    }
+
+    #[test]
+    fn klein_r4_embedding_beats_the_unrestricted_torus_cover() {
+        use ndarray::Array1;
+
+        let side = 14usize;
+        let n = side * side;
+        let mut coords = Array2::<f64>::zeros((n, 2));
+        let mut target = Array2::<f64>::zeros((n, 4));
+        for theta_index in 0..side {
+            for phi_index in 0..side {
+                let row = theta_index * side + phi_index;
+                let theta_fraction = theta_index as f64 / side as f64;
+                let phi_fraction = phi_index as f64 / side as f64;
+                coords[[row, 0]] = theta_fraction;
+                coords[[row, 1]] = phi_fraction;
+                let theta = std::f64::consts::TAU * theta_fraction;
+                let phi = std::f64::consts::TAU * phi_fraction;
+                let radial = 2.0 + 0.5 * phi.cos();
+                target[[row, 0]] = radial * (2.0 * theta).cos();
+                target[[row, 1]] = radial * (2.0 * theta).sin();
+                target[[row, 2]] = 0.5 * phi.sin() * theta.cos();
+                target[[row, 3]] = 0.5 * phi.sin() * theta.sin();
+            }
+        }
+        let manifold = LatentManifold::Product(vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ]);
+        let klein = TopologyCandidateSpec::new(
+            AutoTopologyKind::KleinBottle,
+            SaeAtomGeometryPlan::klein_bottle(2).unwrap(),
+            manifold.clone(),
+            coords.clone(),
+        )
+        .unwrap();
+        let torus = TopologyCandidateSpec::new(
+            AutoTopologyKind::Torus,
+            SaeAtomGeometryPlan::new(
+                SaeAtomBasisKind::Torus,
+                2,
+                SaeBasisResolution::TorusHarmonics { per_axis_order: 2 },
+                SaeReferenceMetricPlan::FlatRectangularTorus { tau: 0.0 },
+            )
+            .unwrap(),
+            manifold,
+            coords,
+        )
+        .unwrap();
+        let weights = Array1::<f64>::ones(n);
+        let klein_fit = fit_topology_candidate(&klein, target.view(), weights.view())
+            .expect("Klein quotient fit");
+        let torus_fit = fit_topology_candidate(&torus, target.view(), weights.view())
+            .expect("unrestricted torus-cover fit");
+        assert!(
+            klein_fit.raw_reml < torus_fit.raw_reml,
+            "Klein invariant basis must win its R4 DGP: Klein={}, torus={}",
+            klein_fit.raw_reml,
+            torus_fit.raw_reml
+        );
+    }
+
     /// #2238 — a genuinely two-dimensional primary factor must not be pinned to
     /// the old one-dimensional circle. A full 8x8 planar grid is represented
     /// exactly by the flat 2-D candidate, while phase alone discards radius.
