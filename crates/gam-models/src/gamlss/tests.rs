@@ -15,8 +15,8 @@ use super::binomial_q_derivs::{
 };
 use super::dispersion_family::{DispersionRowKernel, dispersion_row_kernel};
 use super::test_support::{binomial_location_scale_nll_tower, dispersion_tweedie_nll_generic};
-use crate::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use crate::custom_family::CustomFamilyHyperLayout;
+use crate::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 
 /// Dense `Tower4<2>` Tweedie row NLL oracle: the #932 all-channels instantiation
 /// of the single-source [`dispersion_tweedie_nll_generic`] that production runs
@@ -474,10 +474,10 @@ pub(crate) fn binomial_location_scale_joint_hessian_matches_single_sourced_tower
 /// #932: at βw = 0 the WIGGLE joint-Hessian assembler must reduce EXACTLY to
 /// the (already tower-pinned) non-wiggle assembler on the (η_t, η_ls) block.
 ///
-/// `wiggle_hessian_row_pieces` hand-derives the composed-index `q = q0 +
-/// Σ_j βw_j·B_j(q0)` chain through `m = B'·βw + 1` and `g2 = B''·βw`; its
-/// `coeff_tw_*` / `coeff_lw_*` / `coeffww` cross blocks are the #736 genus and
-/// have no exact (non-FD, non-operator-vs-dense) oracle. A full wiggle tower is
+/// The canonical wiggle row program differentiates the composed index `q = q0 +
+/// Σ_j βw_j·B_j(q0)` through `m = B'·βw + 1` and `g2 = B''·βw`; its
+/// `coeff_tw_*` / `coeff_lw_*` / `coeff_ww` cross blocks are the #736 genus. A
+/// full wiggle tower is
 /// a larger unit (#932 comment), but one structurally-certain invariant is
 /// cheap and independent: at `βw = 0` we have `m = 1`, `g2 = 0`, `etaw = 0`, so
 /// `q = q0` and the wiggle base coefficients collapse to the non-wiggle ones
@@ -2488,7 +2488,7 @@ pub(crate) fn gaussian_location_scale_workspace_d2h_operator_matches_dense() {
 pub(crate) fn binomial_location_scale_wiggle_workspace_matvec_matches_dense() {
     // Probit + linkwiggle is the production-pipeline supervised link.
     // This is the load-bearing cross-block test: it pins the b/d wiggle
-    // coefficients (`coeff_tw_b/d`, `coeff_lw_b/d`, `coeffww`) and the
+    // coefficients (`coeff_tw_b/d`, `coeff_lw_b/d`, `coeff_ww`) and the
     // t↔ℓ block against the dense assembly used by
     // `exact_newton_joint_hessian` for the wiggle variant.
     let (family, states, specs, _xt, _xls, wiggle_design_current) = bls_wiggle_workspace_fixture();
@@ -8688,16 +8688,18 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
     }
 }
 
-/// #932 exact-tower oracle for the binomial location-scale WIGGLE joint Hessian.
+/// #932 exact-tower oracle for the canonical binomial location-scale WIGGLE
+/// order-two row program.
 ///
-/// `BinomialLocationScaleWiggleFamily::wiggle_hessian_row_pieces` hand-derives the
-/// per-row joint-Hessian coefficients for the composed index
+/// `BinomialLocationScaleWiggleFamily::wiggle_order2_rows` lowers the shared
+/// row expression into per-row joint-Hessian coefficients for the composed
+/// index
 /// `q = q0(η_t, η_ls) + Σ_j βw_j·B_j(q0)` via the chain factors `m = B'·βw + 1`,
 /// `g2 = B''·βw`. The cross-block coefficients (`coeff_tw_*`, `coeff_lw_*`,
-/// `coeffww`: threshold/log-sigma × wiggle and wiggle × wiggle) are exactly the
+/// `coeff_ww`: threshold/log-sigma × wiggle and wiggle × wiggle) are exactly the
 /// #736 dropped/sign-flipped cross-term genus, and until now no exact oracle
-/// pinned them to an independent tower — only an operator-vs-dense check (both
-/// built from the same hand pieces) and an FD approximation covered them.
+/// pinned them to an independent tower — only an operator-vs-dense check and
+/// an FD approximation covered them.
 ///
 /// This is the #932 single-source guard. For each row `i` and basis column `j`
 /// we build an INDEPENDENT order-2 jet `Tower2<3>` over `(η_t, η_ls, βw_j)`
@@ -8710,13 +8712,14 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
 ///   `h[0][0]=coeff_tt`, `h[0][1]=coeff_tl`, `h[1][1]=coeff_ll`,
 ///   `h[0][2]=coeff_tw_b·B_j + coeff_tw_d·B'_j`,
 ///   `h[1][2]=coeff_lw_b·B_j + coeff_lw_d·B'_j`,
-///   `h[2][2]=coeffww·B_j²`.
-/// A dropped or sign-flipped hand coefficient shifts a block well outside 1e-9
+///   `h[2][2]=coeff_ww·B_j²`.
+/// A dropped or sign-flipped generated coefficient shifts a block well outside
+/// 1e-9
 /// and fails loudly, for probit / logit / cloglog. The value channel is
 /// irrelevant to the Hessian (`compose_unary`'s `h` reads only `f'`/`f''`), so a
 /// placeholder `0.0` is passed for the objective value.
 #[test]
-pub(crate) fn binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_932() {
+pub(crate) fn binomial_location_scale_wiggle_order2_rows_match_jet_tower_932() {
     use super::binomial_q_derivs::binomial_neglog_q_derivatives_dispatch;
     use gam_math::jet_tower::Tower2;
 
@@ -8743,8 +8746,8 @@ pub(crate) fn binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_
         };
 
         let pieces = family
-            .wiggle_hessian_row_pieces(&states)
-            .expect("wiggle hessian row pieces");
+            .wiggle_order2_rows(&states)
+            .expect("canonical wiggle order-two rows");
 
         let eta_t = &states[BinomialLocationScaleWiggleFamily::BLOCK_T].eta;
         let eta_ls = &states[BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA].eta;
@@ -8761,8 +8764,9 @@ pub(crate) fn binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_
         )
         .expect("binomial location-scale core");
 
-        // Same basis tensors the hand path consumes: pieces.{b0,d0} are exactly
-        // B and B' it used; recompute B'' for the order-2 composition.
+        // Same basis tensors the canonical row program consumes:
+        // pieces.{b0,d0} are exactly B and B' it used; recompute B'' for the
+        // order-2 composition.
         let b0 = &pieces.b0;
         let d0 = &pieces.d0;
         let dd0 = family
@@ -8808,41 +8812,41 @@ pub(crate) fn binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_
 
                 assert!(
                     close(h[0][0], pieces.coeff_tt[i]),
-                    "{link:?} coeff_tt[{i},{j}]: tower={:.9e} hand={:.9e}",
+                    "{link:?} coeff_tt[{i},{j}]: tower={:.9e} canonical={:.9e}",
                     h[0][0],
                     pieces.coeff_tt[i]
                 );
                 assert!(
                     close(h[0][1], pieces.coeff_tl[i]),
-                    "{link:?} coeff_tl[{i},{j}]: tower={:.9e} hand={:.9e}",
+                    "{link:?} coeff_tl[{i},{j}]: tower={:.9e} canonical={:.9e}",
                     h[0][1],
                     pieces.coeff_tl[i]
                 );
                 assert!(
                     close(h[1][1], pieces.coeff_ll[i]),
-                    "{link:?} coeff_ll[{i},{j}]: tower={:.9e} hand={:.9e}",
+                    "{link:?} coeff_ll[{i},{j}]: tower={:.9e} canonical={:.9e}",
                     h[1][1],
                     pieces.coeff_ll[i]
                 );
 
                 let tw = pieces.coeff_tw_b[i] * b0[[i, j]] + pieces.coeff_tw_d[i] * d0[[i, j]];
                 let lw = pieces.coeff_lw_b[i] * b0[[i, j]] + pieces.coeff_lw_d[i] * d0[[i, j]];
-                let ww = pieces.coeffww[i] * b0[[i, j]] * b0[[i, j]];
+                let ww = pieces.coeff_ww[i] * b0[[i, j]] * b0[[i, j]];
                 assert!(
                     close(h[0][2], tw),
-                    "{link:?} (η_t,βw) cross[{i},{j}]: tower={:.9e} hand={:.9e}",
+                    "{link:?} (η_t,βw) cross[{i},{j}]: tower={:.9e} canonical={:.9e}",
                     h[0][2],
                     tw
                 );
                 assert!(
                     close(h[1][2], lw),
-                    "{link:?} (η_ls,βw) cross[{i},{j}]: tower={:.9e} hand={:.9e}",
+                    "{link:?} (η_ls,βw) cross[{i},{j}]: tower={:.9e} canonical={:.9e}",
                     h[1][2],
                     lw
                 );
                 assert!(
                     close(h[2][2], ww),
-                    "{link:?} (βw,βw)[{i},{j}]: tower={:.9e} hand={:.9e}",
+                    "{link:?} (βw,βw)[{i},{j}]: tower={:.9e} canonical={:.9e}",
                     h[2][2],
                     ww
                 );
