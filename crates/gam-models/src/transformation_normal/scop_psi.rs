@@ -2104,10 +2104,9 @@ impl TransformationNormalFamily {
 
         struct PsiPairTraceAccum {
             pub(crate) value: f64,
-            pub(crate) gamma: Vec<f64>,
-            pub(crate) gamma_i: Vec<f64>,
-            pub(crate) gamma_j: Vec<f64>,
-            pub(crate) gamma_ij: Vec<f64>,
+            pub(crate) alpha_i: Vec<f64>,
+            pub(crate) alpha_j: Vec<f64>,
+            pub(crate) alpha_ij: Vec<f64>,
             pub(crate) f: Vec<f64>,
             pub(crate) f_i: Vec<f64>,
             pub(crate) f_j: Vec<f64>,
@@ -2119,10 +2118,9 @@ impl TransformationNormalFamily {
                 let projected_len = p_resp * rank;
                 Self {
                     value: 0.0,
-                    gamma: vec![0.0; p_resp],
-                    gamma_i: vec![0.0; p_resp],
-                    gamma_j: vec![0.0; p_resp],
-                    gamma_ij: vec![0.0; p_resp],
+                    alpha_i: vec![0.0; p_resp],
+                    alpha_j: vec![0.0; p_resp],
+                    alpha_ij: vec![0.0; p_resp],
                     f: vec![0.0; projected_len],
                     f_i: vec![0.0; projected_len],
                     f_j: vec![0.0; projected_len],
@@ -2144,36 +2142,33 @@ impl TransformationNormalFamily {
                     let global_row = row_start + row_idx;
                     let rv = self.response_val_basis.row(global_row);
                     let rd = self.response_deriv_basis.row(global_row);
-                    let gamma_row = cached_gamma.row(row_idx);
 
                     for k in 0..p_resp {
                         let beta_k = beta_mat.row(k);
-                        acc.gamma[k] = gamma_row[k];
-                        acc.gamma_i[k] = beta_k.dot(&cov_i_row);
-                        acc.gamma_j[k] = beta_k.dot(&cov_j_row);
-                        acc.gamma_ij[k] = beta_k.dot(&cov_ij_row);
+                        acc.alpha_i[k] = beta_k.dot(&cov_i_row);
+                        acc.alpha_j[k] = beta_k.dot(&cov_j_row);
+                        acc.alpha_ij[k] = beta_k.dot(&cov_ij_row);
                     }
 
-                    let h = cached_h[row_idx];
                     let hp = cached_h_prime[row_idx];
-                    let [h_i, h_j, h_ij, hp_i, hp_j, hp_ij] = scop_second_order_h(
+                    // Linear chart: the value-level h functionals drop out of
+                    // the projected trace (all `*_ff` chart products vanish).
+                    let [_h_i, _h_j, _h_ij, hp_i, hp_j, hp_ij] = scop_second_order_h(
                         rv,
                         rd,
                         p_resp,
-                        &acc.gamma,
-                        &acc.gamma_i,
-                        &acc.gamma_j,
-                        &acc.gamma_ij,
+                        &acc.alpha_i,
+                        &acc.alpha_j,
+                        &acc.alpha_ij,
                     );
 
                     let q = endpoint_q[row_idx];
                     let (endpoint_i, endpoint_j, endpoint_ij) = scop_second_order_endpoints(
                         endpoint_basis,
                         p_resp,
-                        &acc.gamma,
-                        &acc.gamma_i,
-                        &acc.gamma_j,
-                        &acc.gamma_ij,
+                        &acc.alpha_i,
+                        &acc.alpha_j,
+                        &acc.alpha_ij,
                     );
 
                     let inv_hp = 1.0 / hp;
@@ -2207,106 +2202,49 @@ impl TransformationNormalFamily {
                     }
 
                     for col in 0..rank {
-                        let mut h_f = rv[0] * acc.f[col];
-                        let mut hp_f = rd[0] * acc.f[col];
-                        let mut h_i_f = rv[0] * acc.f_i[col];
-                        let mut h_j_f = rv[0] * acc.f_j[col];
-                        let mut h_ij_f = rv[0] * acc.f_ij[col];
-                        let mut hp_i_f = rd[0] * acc.f_i[col];
-                        let mut hp_j_f = rd[0] * acc.f_j[col];
-                        let mut hp_ij_f = rd[0] * acc.f_ij[col];
-
-                        let mut h_ff = 0.0;
-                        let mut hp_ff = 0.0;
-                        let mut h_i_ff = 0.0;
-                        let mut h_j_ff = 0.0;
-                        let mut h_ij_ff = 0.0;
-                        let mut hp_i_ff = 0.0;
-                        let mut hp_j_ff = 0.0;
-                        let mut hp_ij_ff = 0.0;
-
-                        for k in 1..p_resp {
-                            let g = acc.gamma[k];
-                            let gi = acc.gamma_i[k];
-                            let gj = acc.gamma_j[k];
-                            let gij = acc.gamma_ij[k];
+                        let mut h_f = 0.0;
+                        let mut hp_f = 0.0;
+                        let mut h_i_f = 0.0;
+                        let mut h_j_f = 0.0;
+                        let mut h_ij_f = 0.0;
+                        let mut hp_i_f = 0.0;
+                        let mut hp_j_f = 0.0;
+                        let mut hp_ij_f = 0.0;
+                        let mut endpoint_f = [0.0; 2];
+                        let mut endpoint_i_f = [0.0; 2];
+                        let mut endpoint_j_f = [0.0; 2];
+                        let mut endpoint_ij_f = [0.0; 2];
+                        for k in 0..p_resp {
                             let projected_idx = k * rank + col;
                             let f = acc.f[projected_idx];
                             let fi = acc.f_i[projected_idx];
                             let fj = acc.f_j[projected_idx];
                             let fij = acc.f_ij[projected_idx];
-
-                            h_f += 2.0 * rv[k] * g * f;
-                            hp_f += 2.0 * rd[k] * g * f;
-                            h_i_f += 2.0 * rv[k] * (f * gi + g * fi);
-                            h_j_f += 2.0 * rv[k] * (f * gj + g * fj);
-                            h_ij_f += 2.0 * rv[k] * (fj * gi + gj * fi + f * gij + g * fij);
-                            hp_i_f += 2.0 * rd[k] * (f * gi + g * fi);
-                            hp_j_f += 2.0 * rd[k] * (f * gj + g * fj);
-                            hp_ij_f += 2.0 * rd[k] * (fj * gi + gj * fi + f * gij + g * fij);
-
-                            h_ff += 2.0 * rv[k] * f * f;
-                            hp_ff += 2.0 * rd[k] * f * f;
-                            h_i_ff += 4.0 * rv[k] * f * fi;
-                            h_j_ff += 4.0 * rv[k] * f * fj;
-                            h_ij_ff += 2.0 * rv[k] * (fj * fi + fj * fi + f * fij + f * fij);
-                            hp_i_ff += 4.0 * rd[k] * f * fi;
-                            hp_j_ff += 4.0 * rd[k] * f * fj;
-                            hp_ij_ff += 2.0 * rd[k] * (fj * fi + fj * fi + f * fij + f * fij);
-                        }
-
-                        let mut endpoint_f = [0.0; 2];
-                        let mut endpoint_i_f = [0.0; 2];
-                        let mut endpoint_j_f = [0.0; 2];
-                        let mut endpoint_ij_f = [0.0; 2];
-                        let mut endpoint_ff = [0.0; 2];
-                        let mut endpoint_i_ff = [0.0; 2];
-                        let mut endpoint_j_ff = [0.0; 2];
-                        let mut endpoint_ij_ff = [0.0; 2];
-                        for e in 0..2 {
-                            let basis = endpoint_basis[e];
-                            endpoint_f[e] = basis[0] * acc.f[col];
-                            endpoint_i_f[e] = basis[0] * acc.f_i[col];
-                            endpoint_j_f[e] = basis[0] * acc.f_j[col];
-                            endpoint_ij_f[e] = basis[0] * acc.f_ij[col];
-                            for k in 1..p_resp {
-                                let basis_k = basis[k];
-                                let g = acc.gamma[k];
-                                let gi = acc.gamma_i[k];
-                                let gj = acc.gamma_j[k];
-                                let gij = acc.gamma_ij[k];
-                                let projected_idx = k * rank + col;
-                                let f = acc.f[projected_idx];
-                                let fi = acc.f_i[projected_idx];
-                                let fj = acc.f_j[projected_idx];
-                                let fij = acc.f_ij[projected_idx];
-                                endpoint_f[e] += 2.0 * basis_k * g * f;
-                                endpoint_i_f[e] += 2.0 * basis_k * (f * gi + g * fi);
-                                endpoint_j_f[e] += 2.0 * basis_k * (f * gj + g * fj);
-                                endpoint_ij_f[e] +=
-                                    2.0 * basis_k * (fj * gi + gj * fi + f * gij + g * fij);
-                                endpoint_ff[e] += 2.0 * basis_k * f * f;
-                                endpoint_i_ff[e] += 4.0 * basis_k * f * fi;
-                                endpoint_j_ff[e] += 4.0 * basis_k * f * fj;
-                                endpoint_ij_ff[e] += 4.0 * basis_k * (fj * fi + f * fij);
+                            h_f += rv[k] * f;
+                            hp_f += rd[k] * f;
+                            h_i_f += rv[k] * fi;
+                            h_j_f += rv[k] * fj;
+                            h_ij_f += rv[k] * fij;
+                            hp_i_f += rd[k] * fi;
+                            hp_j_f += rd[k] * fj;
+                            hp_ij_f += rd[k] * fij;
+                            for e in 0..2 {
+                                let basis_k = endpoint_basis[e][k];
+                                endpoint_f[e] += basis_k * f;
+                                endpoint_i_f[e] += basis_k * fi;
+                                endpoint_j_f[e] += basis_k * fj;
+                                endpoint_ij_f[e] += basis_k * fij;
                             }
                         }
 
                         let numerator_f = hp_i_f * hp_j + hp_i * hp_j_f;
-                        let numerator_ff = hp_i_ff * hp_j + 2.0 * hp_i_f * hp_j_f + hp_i * hp_j_ff;
-                        let value_ff = h_i_ff * h_j
-                            + 2.0 * h_i_f * h_j_f
-                            + h_i * h_j_ff
-                            + h_ff * h_ij
+                        let numerator_ff = 2.0 * hp_i_f * hp_j_f;
+                        let value_ff = 2.0 * h_i_f * h_j_f
                             + 2.0 * h_f * h_ij_f
-                            + h * h_ij_ff
-                            - hp_ij_ff * inv_hp
                             + 2.0 * hp_ij_f * hp_f * inv_hp_sq
-                            + hp_ij * hp_ff * inv_hp_sq
                             - 2.0 * hp_ij * hp_f * hp_f * inv_hp_cu
                             + numerator_ff * inv_hp_sq
                             - 4.0 * numerator_f * hp_f * inv_hp_cu
-                            - 2.0 * hp_i * hp_j * hp_ff * inv_hp_cu
                             + 6.0 * hp_i * hp_j * hp_f * hp_f * inv_hp_qu
                             + endpoint_chain_fourth(
                                 &q,
@@ -2319,12 +2257,12 @@ impl TransformationNormalFamily {
                                 endpoint_i_f,
                                 endpoint_j_f,
                                 endpoint_j_f,
-                                endpoint_ff,
+                                [0.0; 2],
                                 endpoint_ij_f,
                                 endpoint_ij_f,
-                                endpoint_i_ff,
-                                endpoint_j_ff,
-                                endpoint_ij_ff,
+                                [0.0; 2],
+                                [0.0; 2],
+                                [0.0; 2],
                             );
                         acc.value += wi * value_ff;
                     }
