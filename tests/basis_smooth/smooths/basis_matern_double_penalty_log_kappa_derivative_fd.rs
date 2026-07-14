@@ -96,7 +96,7 @@ fn spec_at(rho: f64, nu: MaternNu) -> MaternBasisSpec {
     MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(centers()),
         periodic: None,
-        length_scale: (-rho).exp().into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed((-rho).exp()),
         nu,
         include_intercept: true,
         double_penalty: true,

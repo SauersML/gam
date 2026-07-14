@@ -33,7 +33,7 @@ fn spec_at(data: &Array2<f64>, rho: f64, nu: MaternNu) -> MaternBasisSpec {
     MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
-        length_scale: (-rho).exp().into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed((-rho).exp()),
         nu,
         include_intercept: false,
         double_penalty: false,

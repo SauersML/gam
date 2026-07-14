@@ -78,7 +78,7 @@ mod matern_nfree_rekey_topology_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::EqualMass { num_centers: 24 },
-                        length_scale: length_scale.into(),
+                        length_scale: gam_terms::basis::MaternLengthScale::fixed(length_scale),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         // The user default for `matern(x1, x2)` — and the exact

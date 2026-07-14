@@ -27,7 +27,7 @@ fn bench_spatial_basis_construction(c: &mut Criterion) {
         let spec = MaternBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             periodic: None,
-            length_scale: 1.25.into(),
+            length_scale: gam::terms::basis::MaternLengthScale::fixed(1.25),
             nu: MaternNu::ThreeHalves,
             include_intercept: true,
             double_penalty: false,

@@ -1502,7 +1502,7 @@ mod adaptive_bounded_duchon_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
-                        length_scale: 0.7.into(),
+                        length_scale: gam_terms::basis::MaternLengthScale::fixed(0.7),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,
@@ -1679,7 +1679,7 @@ mod adaptive_bounded_duchon_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
-                        length_scale: 0.7.into(),
+                        length_scale: gam_terms::basis::MaternLengthScale::fixed(0.7),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,
@@ -2143,7 +2143,7 @@ mod adaptive_bounded_duchon_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 7 },
-                        length_scale: 0.8.into(),
+                        length_scale: gam_terms::basis::MaternLengthScale::fixed(0.8),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,

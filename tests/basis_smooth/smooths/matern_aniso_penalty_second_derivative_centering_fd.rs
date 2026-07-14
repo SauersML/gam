@@ -62,7 +62,7 @@ fn aniso_penalty_raw_psi_second_derivative_matches_single_axis_fd() {
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
-        length_scale: ls0.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(ls0),
         nu: MaternNu::ThreeHalves,
         include_intercept: false,
         double_penalty: true,

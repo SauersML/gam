@@ -854,7 +854,7 @@ mod tests {
                 spec: ThinPlateBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     periodic: None,
-                    length_scale: 0.7.into(),
+                    length_scale: 0.7,
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::None,
                     radial_reparam: None,
@@ -878,7 +878,7 @@ mod tests {
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     periodic: None,
-                    length_scale: 0.7.into(),
+                    length_scale: crate::basis::MaternLengthScale::fixed(0.7),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,
@@ -1572,7 +1572,7 @@ mod tests {
                 spec: ThinPlateBasisSpec {
                     center_strategy: centers,
                     periodic: None,
-                    length_scale: (0.55 * factor).into(),
+                    length_scale: 0.55 * factor,
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::None,
                     radial_reparam: None,
@@ -1584,7 +1584,7 @@ mod tests {
                 spec: MaternBasisSpec {
                     center_strategy: centers,
                     periodic: None,
-                    length_scale: (0.55 * factor).into(),
+                    length_scale: crate::basis::MaternLengthScale::fixed(0.55 * factor),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,

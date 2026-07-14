@@ -4087,7 +4087,7 @@ pub(crate) fn simple_matern_term_collection(
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
-                    length_scale: length_scale.into(),
+                    length_scale: gam_terms::basis::MaternLengthScale::fixed(length_scale),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,

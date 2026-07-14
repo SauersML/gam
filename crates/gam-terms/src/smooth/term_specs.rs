@@ -3953,7 +3953,7 @@ mod spatial_psi_bound_coordinate_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::UserProvided(centers),
-                        length_scale: 1.0.into(),
+                        length_scale: crate::basis::MaternLengthScale::fixed(1.0),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,

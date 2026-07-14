@@ -17,7 +17,7 @@ fn anisotropic_axis_derivatives_are_independent() {
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
-        length_scale: 0.9.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.9),
         nu: MaternNu::ThreeHalves,
         include_intercept: false,
         double_penalty: false,
@@ -51,7 +51,7 @@ fn anisotropic_penalty_contrast_derivative_matches_finite_difference() {
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
-        length_scale: 0.85.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.85),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,

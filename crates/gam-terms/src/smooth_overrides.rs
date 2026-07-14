@@ -1185,7 +1185,7 @@ mod tests {
         ThinPlateBasisSpec {
             center_strategy: CenterStrategy::EqualMass { num_centers: 10 },
             periodic: None,
-            length_scale: 1.0.into(),
+            length_scale: 1.0,
             double_penalty: false,
             identifiability: SpatialIdentifiability::default(),
             radial_reparam: None,
@@ -1196,7 +1196,7 @@ mod tests {
         MaternBasisSpec {
             center_strategy: CenterStrategy::EqualMass { num_centers: 10 },
             periodic: None,
-            length_scale: 1.0.into(),
+            length_scale: MaternLengthScale::fixed(1.0),
             nu: MaternNu::ThreeHalves,
             include_intercept: false,
             double_penalty: false,

@@ -278,7 +278,7 @@ fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     periodic: None,
-                    length_scale: 1.0.into(),
+                    length_scale: gam::terms::basis::MaternLengthScale::fixed(1.0),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,

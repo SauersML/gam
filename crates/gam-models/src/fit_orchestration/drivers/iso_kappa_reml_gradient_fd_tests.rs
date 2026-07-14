@@ -138,7 +138,7 @@ fn iso_kappa_fd_variant_driver(
             spec: MaternBasisSpec {
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                 periodic: None,
-                length_scale: 1.0.into(),
+                length_scale: gam_terms::basis::MaternLengthScale::fixed(1.0),
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
                 // The realized Matérn design ALWAYS carries the operator triplet
@@ -506,7 +506,7 @@ fn iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic() {
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 37 },
                     periodic: None,
-                    length_scale: length_scale.into(),
+                    length_scale: gam_terms::basis::MaternLengthScale::fixed(length_scale),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,

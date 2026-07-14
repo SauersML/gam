@@ -46,7 +46,7 @@ fn fixture() -> (Array2<f64>, MaternBasisSpec, Vec<f64>) {
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(centers),
         periodic: None,
-        length_scale: length_scale.into(),
+        length_scale: gam_terms::basis::MaternLengthScale::fixed(length_scale),
         nu: MaternNu::FiveHalves,
         include_intercept: true,
         double_penalty: true,

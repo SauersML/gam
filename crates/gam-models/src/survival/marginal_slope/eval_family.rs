@@ -44,6 +44,27 @@ fn combine_rigid_family_primary_terms(
     }
 }
 
+fn combine_flex_family_coefficient_terms(
+    left: &FlexFamilyCoefficientTerms,
+    left_scale: f64,
+    middle: &FlexFamilyCoefficientTerms,
+    middle_scale: f64,
+    right: &FlexFamilyCoefficientTerms,
+    right_scale: f64,
+) -> FlexFamilyCoefficientTerms {
+    FlexFamilyCoefficientTerms {
+        objective: left_scale * left.objective
+            + middle_scale * middle.objective
+            + right_scale * right.objective,
+        gradient: left_scale * &left.gradient
+            + middle_scale * &middle.gradient
+            + right_scale * &right.gradient,
+        hessian: left_scale * &left.hessian
+            + middle_scale * &middle.hessian
+            + right_scale * &right.hessian,
+    }
+}
+
 fn rigid_family_primary_terms(channel: Order2<N_PRIMARY>) -> RigidFamilyPrimaryTerms {
     let gradient = channel.g();
     let hessian = channel.h();
@@ -103,6 +124,37 @@ impl SurvivalMarginalSlopeFamily {
             geometry.derivative_offset_exit_theta_second[[row, axis, other_axis]],
             0.0,
         ])
+    }
+
+    fn flex_baseline_first(
+        geometry: &crate::survival::construction::SurvivalMarginalSlopeOffsetGeometry,
+        row: usize,
+        axis: usize,
+    ) -> Result<FlexFamilyRowDirection, String> {
+        let [entry, exit, derivative_exit, _] =
+            Self::rigid_baseline_primary_first(geometry, row, axis)?;
+        Ok(FlexFamilyRowDirection {
+            entry,
+            exit,
+            derivative_exit,
+            probit_scale: 0.0,
+        })
+    }
+
+    fn flex_baseline_second(
+        geometry: &crate::survival::construction::SurvivalMarginalSlopeOffsetGeometry,
+        row: usize,
+        axis: usize,
+        other_axis: usize,
+    ) -> Result<FlexFamilyRowDirection, String> {
+        let [entry, exit, derivative_exit, _] =
+            Self::rigid_baseline_primary_second(geometry, row, axis, other_axis)?;
+        Ok(FlexFamilyRowDirection {
+            entry,
+            exit,
+            derivative_exit,
+            probit_scale: 0.0,
+        })
     }
 
     fn reduce_rigid_family_primary_terms<F>(
@@ -196,6 +248,74 @@ impl SurvivalMarginalSlopeFamily {
         ))
     }
 
+    /// Sum row terms which already live in the canonical flattened coefficient
+    /// coordinates.  Unlike the rigid reducer, this must not apply a second
+    /// q/design pullback: the nested FLEX row program owns nonlinear
+    /// time-wiggle composition and every coefficient-map derivative itself.
+    fn reduce_flex_family_coefficient_terms<F>(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+        row_terms: F,
+    ) -> Result<(f64, Array1<f64>, Arc<dyn HyperOperator>), String>
+    where
+        F: Fn(usize) -> Result<FlexFamilyCoefficientTerms, String> + Sync,
+    {
+        let dimension = block_slices(self, block_states).total;
+        let rows = outer_row_indices(options, self.n).to_vec();
+        let row_weights = outer_row_weights_by_index(options, self.n);
+        let (objective, score, hessian) = chunked_row_reduction(
+            rows.as_slice(),
+            || {
+                (
+                    0.0,
+                    Array1::zeros(dimension),
+                    Array2::zeros((dimension, dimension)),
+                )
+            },
+            |row, accumulated| -> Result<(), String> {
+                let mut terms = row_terms(row)?;
+                if terms.gradient.len() != dimension
+                    || terms.hessian.dim() != (dimension, dimension)
+                {
+                    return Err(format!(
+                        "FLEX family row {row} returned coefficient shape gradient={}, Hessian={:?}, expected {dimension} and ({dimension}, {dimension})",
+                        terms.gradient.len(),
+                        terms.hessian.dim(),
+                    ));
+                }
+                if !terms.objective.is_finite()
+                    || terms.gradient.iter().any(|value| !value.is_finite())
+                    || terms.hessian.iter().any(|value| !value.is_finite())
+                {
+                    return Err(format!(
+                        "FLEX family row {row} returned non-finite flattened coefficient terms"
+                    ));
+                }
+                let weight = row_weights[row];
+                if weight != 1.0 {
+                    terms.objective *= weight;
+                    terms.gradient.mapv_inplace(|value| value * weight);
+                    terms.hessian.mapv_inplace(|value| value * weight);
+                }
+                accumulated.0 += terms.objective;
+                accumulated.1 += &terms.gradient;
+                accumulated.2 += &terms.hessian;
+                Ok(())
+            },
+            |total, chunk| {
+                total.0 += chunk.0;
+                total.1 += &chunk.1;
+                total.2 += &chunk.2;
+            },
+        )?;
+        Ok((
+            objective,
+            score,
+            Arc::new(gam_problem::DenseMatrixHyperOperator { matrix: hessian }),
+        ))
+    }
+
     /// Exact first and same-direction second family derivatives of one rigid
     /// row, including complete primary value/gradient/Hessian channels.
     ///
@@ -281,15 +401,34 @@ impl SurvivalMarginalSlopeFamily {
         Ok(rigid_family_primary_terms(output.g.eps))
     }
 
-    pub(crate) fn rigid_baseline_exact_joint_psi_terms_with_options(
+    pub(crate) fn baseline_exact_joint_psi_terms_with_options(
         &self,
         block_states: &[ParameterBlockState],
         axis: usize,
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         let geometry = self.rigid_baseline_geometry()?;
-        let (objective_psi, score_psi, hessian_psi_operator) = self
-            .reduce_rigid_family_primary_terms(block_states, options, |row| {
+        if self.per_z_logslope_active() {
+            return Err(
+                "survival marginal-slope baseline family derivatives do not support per-score logslope geometry"
+                    .to_string(),
+            );
+        }
+        let use_flex = self.effective_flex_active(block_states)? || self.flex_timewiggle_active();
+        let (objective_psi, score_psi, hessian_psi_operator) = if use_flex {
+            self.reduce_flex_family_coefficient_terms(block_states, options, |row| {
+                let first = Self::flex_baseline_first(geometry, row, axis)?;
+                self.flex_family_direction_row_terms(
+                    row,
+                    block_states,
+                    first,
+                    FlexFamilyRowDirection::default(),
+                    None,
+                )
+                .map(|terms| terms.first)
+            })?
+        } else {
+            self.reduce_rigid_family_primary_terms(block_states, options, |row| {
                 let first = Self::rigid_baseline_primary_first(geometry, row, axis)?;
                 self.rigid_family_direction_terms(
                     row,
@@ -298,7 +437,8 @@ impl SurvivalMarginalSlopeFamily {
                     [0.0; N_PRIMARY],
                 )
                 .map(|terms| terms.0)
-            })?;
+            })?
+        };
         Ok(Some(ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,

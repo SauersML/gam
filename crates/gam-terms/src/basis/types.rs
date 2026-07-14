@@ -926,12 +926,6 @@ impl MaternLengthScale {
     }
 }
 
-impl From<f64> for MaternLengthScale {
-    fn from(value: f64) -> Self {
-        Self::fixed(value)
-    }
-}
-
 /// Matérn basis configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaternBasisSpec {
