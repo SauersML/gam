@@ -555,18 +555,23 @@ extern "C" __global__ void bms_flex_row_kernel(
 
         // D(R) = κ · Σ_k R_k · m_k.
         // CPU parity: `cell_first_derivative_from_moments`.
-        #define D_OF(R) (INV_TWO_PI * (R[0]*m[0] + R[1]*m[1] + R[2]*m[2] + R[3]*m[3]))
+        // The argument is parenthesized because callers pass pointer
+        // ARITHMETIC (`D_OF(base + offset)`): without it the expansion binds
+        // as `base + offset[0]`, which NVRTC rejects ("pointer-to-object
+        // type" on the integer term) — the calibration-phase emitter was the
+        // first caller to hit this.
+        #define D_OF(R) (INV_TWO_PI * ((R)[0]*m[0] + (R)[1]*m[1] + (R)[2]*m[2] + (R)[3]*m[3]))
 
         // Q(R, S) = Σ_{p,q} R_p · S_q · T_{p+q}.
         // CPU parity: the `eta_rs` folded dot in
         // `cell_second_derivative_from_moments`.
         #define Q_OF(R, S)                                                                 \
-            ((R[0]*S[0])*T[0] + (R[0]*S[1] + R[1]*S[0])*T[1]                               \
-             + (R[0]*S[2] + R[1]*S[1] + R[2]*S[0])*T[2]                                    \
-             + (R[0]*S[3] + R[1]*S[2] + R[2]*S[1] + R[3]*S[0])*T[3]                        \
-             + (R[1]*S[3] + R[2]*S[2] + R[3]*S[1])*T[4]                                    \
-             + (R[2]*S[3] + R[3]*S[2])*T[5]                                                \
-             + (R[3]*S[3])*T[6])
+            (((R)[0]*(S)[0])*T[0] + ((R)[0]*(S)[1] + (R)[1]*(S)[0])*T[1]                   \
+             + ((R)[0]*(S)[2] + (R)[1]*(S)[1] + (R)[2]*(S)[0])*T[2]                        \
+             + ((R)[0]*(S)[3] + (R)[1]*(S)[2] + (R)[2]*(S)[1] + (R)[3]*(S)[0])*T[3]        \
+             + ((R)[1]*(S)[3] + (R)[2]*(S)[2] + (R)[3]*(S)[1])*T[4]                        \
+             + ((R)[2]*(S)[3] + (R)[3]*(S)[2])*T[5]                                        \
+             + ((R)[3]*(S)[3])*T[6])
 
         // The typed calibration schedule below consumes these primitive
         // coefficient views through D_OF/Q_OF.
@@ -3624,10 +3629,13 @@ mod row_kernel_tests {
             );
             gam_gpu::device_runtime::GpuRuntime::require()
                 .expect("#932 mandatory r=33 CUDA runtime");
-            // Cubic deviation runtimes with the third-order smoothness null
-            // space removed expose `num_internal_knots + 2` live controls.
-            // These unequal blocks therefore give p_h=16, p_w=15, r=33.
-            assert_generated_cuda_row_kernel_matches_canonical_cpu_lowering(40, 14, 13, Some(33));
+            // Cubic deviation runtimes expose `num_internal_knots + 1` live
+            // controls since the #2319 knot-selection orbit canonicalization
+            // (one control fewer per block than the pre-orbit layout this
+            // fixture was written against). These unequal blocks therefore
+            // give p_h=16, p_w=15, r=33 — the width just past the 32-lane
+            // warp boundary this regression exists to exercise.
+            assert_generated_cuda_row_kernel_matches_canonical_cpu_lowering(40, 15, 14, Some(33));
         }
     }
 }
@@ -3645,7 +3653,9 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
-    fn cuda_runtime_for_test(test_name: &str) -> Option<&'static gam_gpu::device_runtime::GpuRuntime> {
+    fn cuda_runtime_for_test(
+        test_name: &str,
+    ) -> Option<&'static gam_gpu::device_runtime::GpuRuntime> {
         match gam_gpu::device_runtime::GpuRuntime::resolve(GpuPolicy::Auto) {
             Ok(Some(runtime)) => Some(runtime),
             Ok(None) => {
@@ -3679,8 +3689,7 @@ mod tests {
             GpuPolicy::Required,
             "fresh-process acceptance test must claim Required before any competing policy"
         );
-        gam_gpu::device_runtime::GpuRuntime::require()
-            .expect("#932 mandatory CUDA runtime");
+        gam_gpu::device_runtime::GpuRuntime::require().expect("#932 mandatory CUDA runtime");
 
         let (family, states) = row_kernel_tests::parity_415::make_flex_parity_family(256, 8, 6);
         let mut workspace = BernoulliMarginalSlopeExactNewtonJointHessianWorkspace::new(
@@ -3890,7 +3899,8 @@ mod tests {
                 && primary.w.as_ref().is_some_and(|range| !range.is_empty()),
             "full-row timing fixture must exercise both h and w"
         );
-        let pin_bytes = crate::bms::family::BernoulliMarginalSlopeFamily::row_primary_eval_tile_bytes(N, r);
+        let pin_bytes =
+            crate::bms::family::BernoulliMarginalSlopeFamily::row_primary_eval_tile_bytes(N, r);
 
         let run_cpu = || {
             let completed = AtomicUsize::new(0);

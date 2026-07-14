@@ -565,7 +565,17 @@ fn row_gamma_log(
     let observed_ratio = match mode {
         CurvatureMode::Fisher => None,
         CurvatureMode::Observed => {
-            let weighted_ratio = positive_mul_div(w_fisher, input.y, mu);
+            // Ratio-first: at `y == mu` the observed weight must reproduce the
+            // Fisher weight EXACTLY (`y/mu` is bit-for-bit 1.0), which the
+            // product-first reordering destroys by one ulp. The reordering
+            // fallback remains for tails where the direct form is not
+            // representable.
+            let direct = w_fisher * (input.y / mu);
+            let weighted_ratio = if direct.is_finite() && direct > 0.0 {
+                direct
+            } else {
+                positive_mul_div(w_fisher, input.y, mu)
+            };
             if !(weighted_ratio.is_finite() && weighted_ratio > 0.0) {
                 return Err(row_error(
                     row,

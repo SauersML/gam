@@ -4124,14 +4124,20 @@ mod stream_device_parity_tests {
                 }
             }
             let h = x.t().dot(&wx_full) + &penalty;
-            let rhs = x.t().dot(&g);
+            // Penalized Fisher-scoring step: `grad_eta` is the per-row
+            // LIKELIHOOD score `w·(y−μ)` (ascent direction), so the penalized
+            // objective's ascent step is `β += H⁻¹(Xᵀg − Sβ)`. The original
+            // reference subtracted the step and dropped the `−Sβ` term — a
+            // divergent iteration (η reached ~−1e5 by iteration 30) that no
+            // CPU-only run ever executed because this test skips without CUDA.
+            let rhs = x.t().dot(&g) - penalty.dot(&beta);
             use gam_linalg::faer_ndarray::FaerCholesky;
             let chol = h
                 .cholesky(faer::Side::Lower)
                 .expect("CPU PIRLS reference Cholesky");
             let d = chol.solvevec(&rhs);
             for i in 0..p {
-                beta[i] -= d[i];
+                beta[i] += d[i];
             }
         }
         let cpu_secs = t1.elapsed().as_secs_f64();
