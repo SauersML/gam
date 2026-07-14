@@ -416,17 +416,38 @@ pub(super) fn build_firth_design_factor_dense(
     )
 }
 
-/// Compute the three PIRLS Firth diagnostics from a cached β-independent design
-/// factor at the current `η` (#1575). Bit-identical to building the full
-/// operator via `compute_jeffreys_pirls_diagnostics` and reading its accessors,
-/// but skips the per-iteration Gram/eigendecomposition and the unused `B`/`P·B`
-/// Hadamard blocks.
-pub(super) fn jeffreys_pirls_diagnostics_from_factor(
+/// Compute the Firth working-response diagnostics and the exact Jeffreys
+/// coefficient Hessian from one cached β-independent design factor.
+///
+/// The inner objective is `data + penalty - Φ`, so its Newton curvature is
+/// `H₀ - HΦ`, not the Fisher-scoring surrogate `H₀`.  Building the full
+/// β-dependent operator here shares the reduced Fisher inverse, leverage, and
+/// Hadamard-Gram contraction between the score shift and `HΦ`; the expensive
+/// design Gram/eigenspace remains cached in `factor` (#1575).
+pub(super) fn jeffreys_pirls_diagnostics_and_hessian_from_factor(
     factor: &FirthDesignFactor,
     link: &InverseLink,
     eta: ArrayView1<f64>,
-) -> Result<(Array1<f64>, f64, Array1<f64>), EstimationError> {
-    FirthDenseOperator::pirls_diagnostics_from_factor(factor, link, &eta.to_owned())
+) -> Result<(Array1<f64>, f64, Array1<f64>, Array2<f64>), EstimationError> {
+    let op = FirthDenseOperator::build_from_design_factor(factor, link, &eta.to_owned())?;
+    let hat_diag = &op.w * &op.h_diag;
+    let mut score_shift = Array1::<f64>::zeros(op.w.len());
+    for i in 0..op.w.len() {
+        if op.w[i] > 0.0 {
+            score_shift[i] = 0.5 * (op.w1[i] / op.w[i]) * op.h_diag[i];
+        }
+    }
+    let diag_term = gam_linalg::faer_ndarray::fast_xt_diag_x(
+        &op.x_dense,
+        &(&op.w2 * &op.h_diag),
+    );
+    let bpb = gam_linalg::faer_ndarray::fast_atb(&op.b_base, &op.p_b_base);
+    let mut hphi = 0.5 * (diag_term - bpb);
+    gam_linalg::matrix::symmetrize_in_place(&mut hphi);
+    if !hphi.iter().all(|value| value.is_finite()) {
+        crate::bail_invalid_estim!("Firth/Jeffreys coefficient Hessian is non-finite");
+    }
+    Ok((hat_diag, op.jeffreys_logdet(), score_shift, hphi))
 }
 
 pub(crate) fn ensure_positive_definitewithridge(
@@ -565,9 +586,24 @@ pub(super) fn solve_newton_direction_dense(
 /// `A' residual`. Householder QR sees condition `kappa(A)`, whereas forming
 /// the normal equations squares it and can erase stationarity digits when
 /// large score and penalty components cancel.
+#[cfg(test)]
 pub(super) fn solve_newton_direction_from_root(
     root: &Array2<f64>,
     root_residual: &Array1<f64>,
+    direction_out: &mut Array1<f64>,
+) -> Result<f64, EstimationError> {
+    solve_newton_direction_from_root_with_firth_hessian(
+        root,
+        root_residual,
+        None,
+        direction_out,
+    )
+}
+
+pub(super) fn solve_newton_direction_from_root_with_firth_hessian(
+    root: &Array2<f64>,
+    root_residual: &Array1<f64>,
+    firth_hessian: Option<&Array2<f64>>,
     direction_out: &mut Array1<f64>,
 ) -> Result<f64, EstimationError> {
     let p = root.ncols();
@@ -649,6 +685,16 @@ pub(super) fn solve_newton_direction_from_root(
     if !array_is_finite(direction_out) {
         crate::bail_invalid_estim!("PIRLS square-root Newton direction is non-finite");
     }
+    if let Some(hphi) = firth_hessian {
+        let fisher_direction = direction_out.clone();
+        let lower = r.t().to_owned();
+        correct_fisher_direction_for_firth_hessian_from_root_factor(
+            &lower,
+            hphi,
+            &fisher_direction,
+            direction_out,
+        )?;
+    }
     log::info!(
         "[STAGE] PIRLS dense newton solve backend=CPU p={} rows={} route=\"Householder QR of PSD root\" backward_error={:.3e} damped_decrement_sq={:.3e}",
         p,
@@ -657,6 +703,95 @@ pub(super) fn solve_newton_direction_from_root(
         projected_residual.dot(&projected_residual),
     );
     Ok(projected_residual.dot(&projected_residual))
+}
+
+/// Convert the cancellation-safe Fisher/penalty direction into the exact
+/// Firth-Newton direction without ever reconstructing the cancelled score.
+///
+/// Let `H₀ = L Lᵀ` be the damped Fisher-plus-penalty system and let `d₀` solve
+/// `H₀ d₀ = -g`, obtained from the augmented QR root.  The exact Firth
+/// curvature is `H = H₀ - HΦ`.  Under the Cholesky congruence,
+///
+/// `C = I - L⁻¹ HΦ L⁻ᵀ`, `C y = Lᵀ d₀`, `d = L⁻ᵀ y`.
+///
+/// Thus the small cancelled vector `g` is never formed or recovered through
+/// `H₀ d₀`; all operations act on the accurately resolved direction `d₀`.
+/// Failure of the strict congruence Cholesky means the requested damping does
+/// not make the exact objective curvature positive definite, and the LM
+/// controller must increase damping rather than silently solve another system.
+fn correct_fisher_direction_for_firth_hessian_from_root_factor(
+    fisher_root_lower: &Array2<f64>,
+    firth_hessian: &Array2<f64>,
+    fisher_direction: &Array1<f64>,
+    direction_out: &mut Array1<f64>,
+) -> Result<(), EstimationError> {
+    let p = fisher_root_lower.nrows();
+    if fisher_root_lower.ncols() != p
+        || firth_hessian.dim() != (p, p)
+        || fisher_direction.len() != p
+    {
+        crate::bail_invalid_estim!(
+            "Firth congruence solve dimension mismatch: root={}x{}, Hphi={}x{}, direction={}",
+            fisher_root_lower.nrows(),
+            fisher_root_lower.ncols(),
+            firth_hessian.nrows(),
+            firth_hessian.ncols(),
+            fisher_direction.len()
+        );
+    }
+
+    // Left- and right-whiten HΦ.  The right solve is evaluated by transposing:
+    // (Y L⁻ᵀ)ᵀ = L⁻¹ Yᵀ.
+    let left_whitened = gam_linalg::triangular::forward_substitution_lower_matrix(
+        fisher_root_lower,
+        firth_hessian,
+    );
+    let whitened_transpose = gam_linalg::triangular::forward_substitution_lower_matrix(
+        fisher_root_lower,
+        &left_whitened.t().to_owned(),
+    );
+    let mut congruence = Array2::<f64>::eye(p) - whitened_transpose.t().to_owned();
+    gam_linalg::matrix::symmetrize_in_place(&mut congruence);
+    let congruence_factor = congruence
+        .cholesky(Side::Lower)
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
+
+    let transformed_rhs = fisher_root_lower.t().dot(fisher_direction);
+    let transformed_direction = congruence_factor.solvevec(&transformed_rhs);
+    let direction = gam_linalg::triangular::back_substitution_lower_transpose(
+        fisher_root_lower,
+        &transformed_direction,
+    );
+
+    let residual = &congruence.dot(&transformed_direction) - &transformed_rhs;
+    let residual_inf = inf_norm(residual.iter().copied());
+    let congruence_inf = congruence
+        .rows()
+        .into_iter()
+        .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
+        .fold(0.0_f64, f64::max);
+    let transformed_direction_inf = inf_norm(transformed_direction.iter().copied());
+    let transformed_rhs_inf = inf_norm(transformed_rhs.iter().copied());
+    let scale = congruence_inf * transformed_direction_inf + transformed_rhs_inf;
+    let backward_error = if scale > 0.0 {
+        residual_inf / scale
+    } else {
+        residual_inf
+    };
+    let tolerance = 256.0 * f64::EPSILON * p.max(1) as f64;
+    if !backward_error.is_finite() || backward_error > tolerance {
+        crate::bail_invalid_estim!(
+            "Firth congruence Newton direction failed its backward-error certificate: error {backward_error:.3e} exceeds {tolerance:.3e}"
+        );
+    }
+    if !array_is_finite(&direction) {
+        crate::bail_invalid_estim!("Firth congruence Newton direction is non-finite");
+    }
+    if direction_out.len() != p {
+        *direction_out = Array1::zeros(p);
+    }
+    direction_out.assign(&direction);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -711,6 +846,31 @@ mod square_root_solve_tests {
         .expect("stationary least-squares root certificate");
         assert!(stationary_direction.dot(&stationary_direction) <= 1.0e-28);
         assert!(stationary_decrement <= 1.0e-28);
+    }
+
+    #[test]
+    fn firth_congruence_preserves_the_root_direction_without_reforming_the_score() {
+        let root = array![[1.0e3, 1.0e3], [1.0, -1.0], [0.0, 1.0]];
+        let fisher_hessian = root.t().dot(&root);
+        let exact_root_direction = array![0.25, -0.25];
+        let root_residual = -root.dot(&exact_root_direction);
+        let firth_hessian = array![[0.20, 0.03], [0.03, 0.15]];
+        let mut corrected = Array1::<f64>::zeros(2);
+
+        solve_newton_direction_from_root_with_firth_hessian(
+            &root,
+            &root_residual,
+            Some(&firth_hessian),
+            &mut corrected,
+        )
+        .expect("exact Firth congruence solve");
+
+        // Check the congruent equation.  `H0 * d0` is used only in this test
+        // oracle; production never reforms this cancellation-prone RHS.
+        let true_hessian = &fisher_hessian - &firth_hessian;
+        let residual = true_hessian.dot(&corrected) - fisher_hessian.dot(&exact_root_direction);
+        assert!(inf_norm(residual.iter().copied()) < 1.0e-8);
+        assert!(array_is_finite(&corrected));
     }
 }
 

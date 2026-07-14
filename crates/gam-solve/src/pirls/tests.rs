@@ -145,7 +145,7 @@ mod tests {
     }
 
     // Full-operator Firth/Jeffreys diagnostics reference (#1575): bit-identical to
-    // the production `jeffreys_pirls_diagnostics_from_factor` fast path, used here
+    // the production factor-cached Firth diagnostics path, used here
     // as the operator-equivalence oracle. Lives in this test module (its only
     // consumer) rather than as a `#[cfg(test)]`-gated production fn.
     fn compute_jeffreys_pirls_diagnostics(
@@ -270,7 +270,7 @@ mod tests {
     pub(crate) fn firth_factored_path_matches_full_operator_oracle_1575() {
         // #1575 hoisted the β-INDEPENDENT Firth design factor out of the inner
         // Newton loop: `build_design_factor_with_observation_weights` (η-free,
-        // built once) followed by `pirls_diagnostics_from_factor` (per-η) must
+        // built once) followed by `build_from_design_factor` (per-η) must
         // reproduce the full operator rebuilt fresh at each η — the
         // by-construction equivalence the hoist's correctness rests on. This
         // pins that equivalence directly (the surrounding tests only exercise
@@ -314,9 +314,11 @@ mod tests {
 
             for eta in &etas {
                 // Weighted: factored fast path vs full-operator oracle.
-                let (hat_f, logdet_f, shift_f) =
-                    FirthDenseOperator::pirls_diagnostics_from_factor(&factor_w, link, eta)
-                        .expect("factored weighted diagnostics");
+                let op_f = FirthDenseOperator::build_from_design_factor(&factor_w, link, eta)
+                    .expect("factored weighted operator");
+                let hat_f = op_f.pirls_hat_diag();
+                let logdet_f = op_f.jeffreys_logdet();
+                let shift_f = op_f.pirls_firth_score_shift();
                 let (hat_o, logdet_o, shift_o) =
                     compute_jeffreys_pirls_diagnostics(link, x.view(), eta.view(), weights.view())
                         .expect("oracle weighted diagnostics");
@@ -333,9 +335,11 @@ mod tests {
 
                 // Unweighted (`None` branch of the factor builder) vs the full
                 // operator with no observation weights.
-                let (hat_fu, logdet_fu, shift_fu) =
-                    FirthDenseOperator::pirls_diagnostics_from_factor(&factor_u, link, eta)
-                        .expect("factored unweighted diagnostics");
+                let op_fu = FirthDenseOperator::build_from_design_factor(&factor_u, link, eta)
+                    .expect("factored unweighted operator");
+                let hat_fu = op_fu.pirls_hat_diag();
+                let logdet_fu = op_fu.jeffreys_logdet();
+                let shift_fu = op_fu.pirls_firth_score_shift();
                 let op_u = FirthDenseOperator::build_for_link(link, &x, eta)
                     .expect("full unweighted operator");
                 assert_relative_eq!(

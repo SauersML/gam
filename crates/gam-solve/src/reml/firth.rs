@@ -538,9 +538,8 @@ impl FirthDenseOperator {
         })
     }
 
-    /// β-dependent reduced core shared by [`Self::build_from_design_factor`] and
-    /// [`Self::pirls_diagnostics_from_factor`]: from the cached design factor and
-    /// the current `η`, compute the Fisher-weight 5-jet, the reduced Fisher
+    /// β-dependent reduced core used by [`Self::build_from_design_factor`]:
+    /// from the cached design factor and the current `η`, compute the Fisher-weight 5-jet, the reduced Fisher
     /// inverse `K_r`, the identifiable-subspace half-log-determinant, and the hat
     /// diagonal `h`. The operations and their order match the un-hoisted
     /// `build_with_observation_weights_impl` exactly, so every consumer stays
@@ -661,37 +660,6 @@ impl FirthDenseOperator {
             b_base,
             p_b_base,
         })
-    }
-
-    /// Compute ONLY the three PIRLS Firth diagnostics — `(hat_diag,
-    /// jeffreys_logdet, firth_score_shift)` — from a cached design factor at a
-    /// new `η`, skipping the per-iteration `B = diag(w') X` and `P·B` Hadamard
-    /// blocks that the inner PIRLS solve never consumes. Each output is the same
-    /// closed form the full operator's accessors return:
-    ///   hat_diag         = w ⊙ h_diag             (`pirls_hat_diag`),
-    ///   jeffreys_logdet  = half_log_det           (`jeffreys_logdet`),
-    ///   firth_score_shift= ½ (w'/w) ⊙ h_diag      (`pirls_firth_score_shift`),
-    /// so the result is bit-for-bit identical to building the full operator and
-    /// calling those accessors, at a fraction of the cost (#1575).
-    pub(crate) fn pirls_diagnostics_from_factor(
-        factor: &FirthDesignFactor,
-        link: &InverseLink,
-        eta: &Array1<f64>,
-    ) -> Result<(Array1<f64>, f64, Array1<f64>), EstimationError> {
-        let core = Self::firth_reduced_core(factor, link, eta)?;
-        let (w, w1, h_diag, half_log_det) = (core.w, core.w1, core.h_diag, core.half_log_det);
-        // hat_diag = w ⊙ h_diag (matches `pirls_hat_diag`).
-        let hat_diag = &w * &h_diag;
-        // firth_score_shift_i = ½ (w'_i / w_i) h_diag_i for w_i > 0, else 0
-        // (matches `pirls_firth_score_shift`).
-        let mut score_shift = Array1::<f64>::zeros(w.len());
-        for i in 0..w.len() {
-            let wi = w[i];
-            if wi > 0.0 {
-                score_shift[i] = 0.5 * (w1[i] / wi) * h_diag[i];
-            }
-        }
-        Ok((hat_diag, half_log_det, score_shift))
     }
 
     pub(crate) fn build_with_observation_weights_impl(
@@ -2975,10 +2943,10 @@ mod tests {
     use ndarray::{Array1, Array2, array};
 
     // Operator-equivalence oracle accessors (#1575). The production inner-PIRLS
-    // path memoizes the β-independent design factor and reads diagnostics through
-    // `pirls_diagnostics_from_factor`; these full-operator accessors are retained
-    // ONLY for the equivalence unit tests, so they live in this `#[cfg(test)]`
-    // module rather than gating individual production methods with `#[cfg(test)]`.
+    // path memoizes the β-independent design factor and rebuilds the exact
+    // state-dependent operator. These accessors are needed only by equivalence
+    // unit tests, so they live in this `#[cfg(test)]` module rather than gating
+    // individual production methods with `#[cfg(test)]`.
     impl FirthDenseOperator {
         pub(crate) fn pirls_hat_diag(&self) -> Array1<f64> {
             &self.w * &self.h_diag

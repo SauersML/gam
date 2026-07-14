@@ -4692,9 +4692,9 @@ pub struct FirthDenseOperator {
 /// The β-dependent remainder (Fisher weights `w(η)`, reduced Fisher
 /// `I_r = X_rᵀ W X_r`, its inverse `K_r`, the hat diagonal `h`, and the
 /// half-log-determinant) is rebuilt per iteration from this factor via
-/// [`FirthDenseOperator::build_from_design_factor`] (full operator) or
-/// [`FirthDenseOperator::pirls_diagnostics_from_factor`] (the three PIRLS
-/// diagnostics only). Both reproduce the un-hoisted build bit-for-bit.
+/// [`FirthDenseOperator::build_from_design_factor`]. The design-only work stays
+/// hoisted while the full per-state operator supplies both PIRLS diagnostics
+/// and the exact Jeffreys coefficient curvature.
 #[derive(Clone)]
 pub(crate) struct FirthDesignFactor {
     // Raw design and its transpose (the operator stores owned copies).

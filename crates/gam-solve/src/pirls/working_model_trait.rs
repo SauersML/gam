@@ -98,6 +98,21 @@ pub trait WorkingModel {
         Ok(None)
     }
 
+    /// Add the model-specific curvature term omitted from `WorkingState`'s
+    /// assembled statistical/penalty Hessian when evaluating the bare
+    /// objective quadratic `dᵀ H d`.
+    ///
+    /// Most models store the complete objective Hessian and return zero.  Firth
+    /// keeps `HΦ` beside its cancellation-safe root operands because the outer
+    /// Laplace layer also consumes `H₀` and `HΦ` separately; its correction is
+    /// therefore `-dᵀHΦd`.
+    fn objective_hessian_quadratic_correction(
+        &self,
+        _direction: &Array1<f64>,
+    ) -> Result<f64, EstimationError> {
+        Ok(0.0)
+    }
+
     /// Dispersion factor `k` the inner working weight carries but the reported
     /// deviance (`state.deviance` / `CandidateScreen::deviance`) does not, so the
     /// LM gain-ratio / stall-detection objective must be

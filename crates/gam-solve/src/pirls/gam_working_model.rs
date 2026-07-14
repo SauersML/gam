@@ -121,6 +121,11 @@ pub(crate) struct GamWorkingModel<'a> {
     /// diagnostic build and reused thereafter; a fresh working model is built
     /// per inner solve so it refreshes naturally when the design changes.
     pub(crate) firth_design_factor: Option<Arc<FirthDesignFactor>>,
+    /// Exact `HΦ = ∇²β Φ` for the same state as the mutable Firth working
+    /// arrays.  The inner objective curvature is `H₀ - HΦ`; keeping this beside
+    /// the row-space score operands prevents the inner and outer Jeffreys
+    /// geometries from diverging.
+    pub(crate) last_firth_hessian: Option<Array2<f64>>,
     /// Exact coefficient bits for the state represented by the mutable working
     /// arrays (`lastz`, `lasthessian_weights`, and their derivative siblings).
     ///
@@ -260,6 +265,7 @@ impl<'a> GamWorkingModel<'a> {
             glm_first_step_gram,
             glm_first_step_gram_consumed: false,
             firth_design_factor: None,
+            last_firth_hessian: None,
             working_array_beta_bits: Vec::new(),
         }
     }
@@ -439,6 +445,7 @@ impl<'a> GamWorkingModel<'a> {
         state: &WorkingState,
         loop_lambda: f64,
         lm_d2: &Array1<f64>,
+        firth_hessian: Option<&Array2<f64>>,
         direction_out: &mut Array1<f64>,
     ) -> Result<f64, EstimationError> {
         let n = self.lasthessian_weights.len();
@@ -488,7 +495,12 @@ impl<'a> GamWorkingModel<'a> {
             residual[diagonal_start + j] =
                 state.ridge_used * beta.as_ref()[j] / root_energy;
         }
-        let result = solve_newton_direction_from_root(&root, &residual, direction_out);
+        let result = solve_newton_direction_from_root_with_firth_hessian(
+            &root,
+            &residual,
+            firth_hessian,
+            direction_out,
+        );
         drop(root_qr_reservation);
         result
     }
@@ -998,6 +1010,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // evaluation must never leave a key that certifies partially-updated
         // row-space operands as belonging to the prior successful state.
         self.working_array_beta_bits.clear();
+        self.last_firth_hessian = None;
         let n = self.offset.len();
         if self.workspace.eta_buf.len() != n {
             self.workspace.eta_buf = Array1::zeros(n);
@@ -1241,17 +1254,19 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             // #1575: the design and prior weights are constant across the inner
             // Newton iterations of this solve, so the β-independent Firth design
             // factor (Gram, identifiable basis Q, reduced design X_r, retained
-            // spectrum S_r) is built once and memoized; only the cheap per-η
-            // reduced-Fisher/hat-diagonal remainder is rebuilt here. The factor
-            // is built in the correct (transformed) coefficient basis exactly as
-            // the per-iteration diagnostics path used to.
+            // spectrum S_r) is built once and memoized. The per-η operator
+            // rebuild then shares its reduced Fisher inverse and Hadamard-Gram
+            // contractions between the working-response diagnostics and the
+            // exact Jeffreys coefficient Hessian. The factor is built in the
+            // correct (transformed) coefficient basis.
             let factor = self.ensure_firth_design_factor()?;
-            let (hat_diag, jeffreys_logdet, firth_score_shift) =
-                jeffreys_pirls_diagnostics_from_factor(
+            let (hat_diag, jeffreys_logdet, firth_score_shift, firth_hessian) =
+                jeffreys_pirls_diagnostics_and_hessian_from_factor(
                     &factor,
                     &self.link_kind,
                     self.workspace.eta_buf.view(),
                 )?;
+            self.last_firth_hessian = Some(firth_hessian);
             firth = FirthDiagnostics::Active {
                 jeffreys_logdet,
                 hat_diag: hat_diag.clone(),
@@ -1472,18 +1487,50 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             self.penalty.requires_root_solve(stabilizing_floor),
             &self.lasthessian_weights,
         ) {
+            let firth_hessian = if self.firth_bias_reduction {
+                Some(self.last_firth_hessian.as_ref().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "Firth root solve is missing the state-local Jeffreys Hessian".to_string(),
+                    )
+                })?)
+            } else {
+                None
+            };
             self.solve_fisher_direction_from_root(
                 beta,
                 state,
                 loop_lambda,
                 lm_d2,
+                firth_hessian,
                 direction_out,
-            )
-            .map(|_| ())
+            )?;
+            Ok(())
         } else {
             solve_newton_direction_dense(regularized_hessian, &state.gradient, direction_out)?;
             Ok(())
         }
+    }
+
+    fn objective_hessian_quadratic_correction(
+        &self,
+        direction: &Array1<f64>,
+    ) -> Result<f64, EstimationError> {
+        let Some(firth_hessian) = self.last_firth_hessian.as_ref() else {
+            return Ok(0.0);
+        };
+        if firth_hessian.dim() != (direction.len(), direction.len()) {
+            crate::bail_invalid_estim!(
+                "Firth objective-curvature correction shape {}x{} does not match direction length {}",
+                firth_hessian.nrows(),
+                firth_hessian.ncols(),
+                direction.len()
+            );
+        }
+        let correction = -direction.dot(&firth_hessian.dot(direction));
+        if !correction.is_finite() {
+            crate::bail_invalid_estim!("Firth objective-curvature correction is non-finite");
+        }
+        Ok(correction)
     }
 
     fn exact_unconstrained_decrement_sq(
@@ -1507,6 +1554,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             state,
             0.0,
             &unit_diagonal,
+            None,
             &mut direction,
         )
         .map(Some)

@@ -1095,8 +1095,11 @@ where
             //     δ'(H+λD²)δ = δ'Hδ + λ·Σᵢ D²[i]·δᵢ²
             //               ⇒  δ'Hδ = δ'(H+λD²)δ − λ·Σᵢ D²[i]·δᵢ².
             // Subtracting `0.5·λ·Σᵢ D²[i]·δᵢ²` from the regularized-matrix
-            // quadratic recovers the bare-H quadratic without re-doing the
-            // matvec on `state.hessian`. With diagonal damping (H + λD²) the
+            // quadratic recovers the stored bare-H quadratic without re-doing
+            // the matvec on `state.hessian`. A model-specific correction then
+            // supplies any objective curvature intentionally stored outside
+            // `WorkingState` (the Firth `-HΦ` block). With diagonal damping
+            // (H + λD²) the
             // correction term generalises the scalar `λ‖δ‖²` to a D²-weighted
             // norm; this keeps the gain-ratio numerator calibrated regardless
             // of the column-scale anisotropy that exists across
@@ -1119,8 +1122,12 @@ where
                         .zip(lm_d2.iter())
                         .map(|(di, d2i)| d2i * di * di)
                         .sum();
-                    // δ'(H+λD²)δ − λ·Σᵢ D²[i]·δᵢ² = δ'Hδ
-                    let quad = 0.5 * (direction.dot(&q_term) - loop_lambda * d2_weighted_sq);
+                    let model_curvature_correction =
+                        model.objective_hessian_quadratic_correction(direction)?;
+                    // Stored curvature plus the model-specific omitted block.
+                    let quad = 0.5
+                        * (direction.dot(&q_term) - loop_lambda * d2_weighted_sq
+                            + model_curvature_correction);
                     -(lin + quad)
                 };
             lm_predred_total += predred_start.elapsed();
