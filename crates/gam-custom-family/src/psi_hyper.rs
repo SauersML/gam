@@ -105,14 +105,15 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         let psi_terms = if let Some(batched) = batched_terms.as_ref() {
             Some(batched[psi_global].clone())
         } else if let Some(workspace) = psi_workspace.as_ref() {
-            workspace.first_order_terms(psi_global)?.or(
-                family.exact_newton_joint_psi_terms(
+            match workspace.first_order_terms(psi_global)? {
+                Some(terms) => Some(terms),
+                None => family.exact_newton_joint_psi_terms(
                     synced_states,
                     specs,
                     hyper_layout,
                     psi_global,
                 )?,
-            )
+            }
         } else {
             family.exact_newton_joint_psi_terms(
                 synced_states,
