@@ -5436,6 +5436,42 @@ fn checkpointing_objective_persists_finite_evals() {
 }
 
 #[test]
+fn checkpointing_objective_never_persists_reactive_initialization_waypoints() {
+    let (_d, session) = tmp_cache_session("ckpt-reactive-phase");
+    let mut inner =
+        ReactiveDomainObjective::new(0.125, ReactiveDomainMode::FiniteAtColdSeed);
+    let mut wrapped = CheckpointingObjective::new(&mut inner, Arc::clone(&session), Vec::new());
+
+    wrapped
+        .begin_reactive_domain_waypoint()
+        .expect("begin typed reactive waypoint");
+    let entry_cost = wrapped
+        .eval_cost(&array![2.5])
+        .expect("finite initialization waypoint");
+    assert!(entry_cost.is_finite());
+    assert!(
+        session.try_load().is_none(),
+        "a reactive initialization waypoint is not an outer candidate and must not become a restart seed",
+    );
+    wrapped
+        .commit_reactive_domain_waypoint(&array![2.5])
+        .expect("commit typed reactive waypoint");
+
+    wrapped
+        .eval_cost(&array![0.125])
+        .expect("literal target evaluation");
+    let payload = decode_iterate(
+        &session
+            .try_load()
+            .expect("literal target should checkpoint")
+            .payload,
+        1,
+    )
+    .expect("literal checkpoint decodes");
+    assert_eq!(payload.rho, vec![0.125]);
+}
+
+#[test]
 fn checkpointing_objective_rejects_wrong_dim_on_decode() {
     // A payload from a 3-dim fit is invalid input for a 5-dim resume.
     let bytes = encode_iterate(&array![1.0, 2.0, 3.0], None, None, 0.5, 0).expect("encode");
@@ -5659,6 +5695,87 @@ fn classify_extracts_beta_from_v2_payload() {
         decoded_beta.is_empty(),
         "ρ-only payload must produce an empty beta so the dispatcher skips seed_inner_state"
     );
+}
+
+#[test]
+fn cached_beta_binds_only_to_its_bitwise_matching_generated_seed() {
+    struct ReplayObj {
+        installed: Option<Array1<f64>>,
+        seed_calls: usize,
+    }
+    impl OuterObjective for ReplayObj {
+        fn capability(&self) -> OuterCapability {
+            OuterCapability {
+                gradient: Derivative::Analytic,
+                hessian: DeclaredHessianForm::Unavailable,
+                n_params: 2,
+                psi_dim: 0,
+                fixed_point_available: false,
+                barrier_config: None,
+                prefer_gradient_only: false,
+                disable_fixed_point: false,
+            }
+        }
+
+        fn eval_cost(&mut self, theta: &Array1<f64>) -> Result<f64, EstimationError> {
+            Ok(theta.dot(theta))
+        }
+
+        fn eval(&mut self, theta: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+            Ok(OuterEval {
+                cost: theta.dot(theta),
+                gradient: 2.0 * theta,
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        }
+
+        fn reset(&mut self) {
+            self.installed = None;
+        }
+
+        fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+            self.seed_calls += 1;
+            self.installed = Some(beta.clone());
+            Ok(SeedOutcome::Installed)
+        }
+    }
+
+    let owner = array![1.0, 2.0];
+    let beta = array![7.0, 8.0, 9.0];
+    let config = OuterConfig {
+        initial_inner_seed: Some(BoundInnerSeed {
+            theta: owner.clone(),
+            beta: beta.clone(),
+        }),
+        ..OuterConfig::default()
+    };
+    let one_ulp_away = array![f64::from_bits(1.0_f64.to_bits() + 1), 2.0];
+    let candidates = [one_ulp_away, owner, array![-1.0, 2.0]];
+    let mut objective = ReplayObj {
+        installed: None,
+        seed_calls: 0,
+    };
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        objective.reset();
+        install_matching_initial_inner_seed(
+            &mut objective,
+            &config,
+            candidate,
+            "bitwise seed ownership",
+        )
+        .expect("cache replay decision");
+        if index == 1 {
+            assert_eq!(objective.installed, Some(beta.clone()));
+        } else {
+            assert!(
+                objective.installed.is_none(),
+                "cached beta leaked into non-owning generated seed {index}",
+            );
+        }
+    }
+    assert_eq!(objective.seed_calls, 1);
 }
 
 #[test]
