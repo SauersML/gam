@@ -460,6 +460,16 @@ pub(crate) fn ensure_positive_definitewithridge(
         0.0
     };
 
+    // A non-finite assembly is a different defect class from indefiniteness
+    // (and eigh of a NaN-carrying triangle can report arbitrary "positive"
+    // spectra); name it precisely instead of letting it masquerade as a
+    // not-positive-definite refusal (#2316 triage).
+    if !hess.iter().all(|value| value.is_finite()) {
+        crate::bail_invalid_estim!(
+            "{label}: assembled Hessian contains non-finite entries; refusing to factor"
+        );
+    }
+
     if hess.cholesky(Side::Lower).is_ok() {
         return Ok(0.0);
     }

@@ -400,9 +400,7 @@ pub enum EstimationError {
         row_index: usize,
     },
 
-    #[error(
-        "Hessian matrix is not positive definite (minimum eigenvalue: {min_eigenvalue:.4e}). This indicates a numerical instability."
-    )]
+    #[error("{}", hessian_not_positive_definite_message(*min_eigenvalue))]
     HessianNotPositiveDefinite { min_eigenvalue: f64 },
 
     #[error("REML smoothing optimization failed to converge: {0}")]
@@ -859,5 +857,29 @@ mod tests {
             err,
             EstimationError::HessianNotPositiveDefinite { .. }
         ));
+    }
+}
+
+/// Honest failure text for [`EstimationError::HessianNotPositiveDefinite`].
+///
+/// A failed Cholesky with a strictly POSITIVE reported minimum eigenvalue is
+/// not an indefinite matrix — it is a positive spectrum whose condition
+/// number exceeds float precision (the pivots collapse under roundoff), or a
+/// non-finite assembly. Saying "not positive definite (minimum eigenvalue:
+/// 4.1e1)" sent debugging at the wrong defect class (#2316 triage), so the
+/// message now names the regime the eigenvalue actually indicates.
+fn hessian_not_positive_definite_message(min_eigenvalue: f64) -> String {
+    if min_eigenvalue.is_finite() && min_eigenvalue > 0.0 {
+        format!(
+            "Hessian factorization failed although the (lower-triangle) spectrum is positive \
+             (minimum eigenvalue: {min_eigenvalue:.4e}): the condition number exceeds float \
+             precision or the assembled matrix is asymmetric/non-finite outside the factored \
+             triangle. This indicates a numerical instability in the Hessian assembly or scaling."
+        )
+    } else {
+        format!(
+            "Hessian matrix is not positive definite (minimum eigenvalue: {min_eigenvalue:.4e}). \
+             This indicates a numerical instability."
+        )
     }
 }
