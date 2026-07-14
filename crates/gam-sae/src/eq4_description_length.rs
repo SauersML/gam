@@ -496,17 +496,18 @@ mod tests {
     /// the acceptance test for #2283: the dictionary code no longer picks up the
     /// estimation subsample size.
     ///
-    /// # Why the totals need a `1/√n` tolerance, not a flat one
+    /// # Why the totals need an n-dependent tolerance, not a flat one
     ///
     /// Only the DICTIONARY term is an exact function of declared quantities. The
     /// code / residual / support terms are expectations under the row distribution,
-    /// estimated from the `n` sampled rows: the bits functional is a smooth
-    /// (water-filling) function of the sample covariance / firing statistics, so by
-    /// the CLT + delta method `bits(n) = bits(∞) + O_p(σ_bits/√n)`. A constant
-    /// relative tolerance is therefore mis-calibrated by construction — it demands
-    /// that a 256-row estimate be as accurate as an 8192-row one. The bound below
-    /// scales like `1/√n`, and its scale `σ_bits` is measured from the data rather
-    /// than asserted.
+    /// estimated from the `n` sampled rows, so
+    ///     `bits(n) = bits(∞) + O(1/n) [bias] + O_p(σ_bits/√n) [variance]`.
+    /// A constant relative tolerance is mis-calibrated by construction — it demands
+    /// that a 256-row estimate be as accurate as an 8192-row one. The bound used
+    /// below covers both terms and shrinks with `n`: the variance scale `σ_bits` is
+    /// MEASURED from 32 disjoint row blocks, and the bias term is DERIVED from the
+    /// scorer's own `n−1`-vs-`n` normalisation mismatch (see the block comment at
+    /// the tolerance). Neither is a tuned constant.
     ///
     /// Rows are drawn i.i.d. from a fixed deterministic generator, so the leading
     /// `n` rows really are a random subsample of the same population (the previous
@@ -537,7 +538,9 @@ mod tests {
         let mut test_x = Array2::<f64>::zeros((full_rows, d));
         for i in 0..full_rows {
             // Correlated, non-isotropic rows so the residual spectrum is nontrivial.
-            let (z0, z1, z2) = (next_normal(), next_normal(), next_normal());
+            let z0 = next_normal();
+            let z1 = next_normal();
+            let z2 = next_normal();
             test_x[[i, 0]] = z0;
             test_x[[i, 1]] = 0.6 * z0 + 0.8 * z1;
             test_x[[i, 2]] = 0.3 * z0 - 0.4 * z1 + 0.5 * z2;
@@ -595,11 +598,36 @@ mod tests {
         assert_eq!(medium.dictionary_bits, small.dictionary_bits);
         assert_eq!(large.dictionary_bits, small.dictionary_bits);
 
-        // ── Calibrating σ_bits from the sample itself ─────────────────────────
-        // Split the 8192 rows into 32 DISJOINT 256-row blocks and score each. The
-        // spread of those 32 totals is a direct, assumption-light estimate of the
-        // sampling standard deviation of a 256-row bits estimate, `σ̂₂₅₆`, per
-        // target. Nothing about the tolerance is asserted a priori: it is measured.
+        // ── The estimator's two n-dependent error terms ───────────────────────
+        // `bits(n) − bits(∞)` has exactly two sources, and the tolerance must cover
+        // BOTH. Neither is a free constant: one is measured, one is derived.
+        //
+        // (1) VARIANCE, O(σ/√n). Measured, not assumed. Split the 8192 rows into 32
+        //     DISJOINT 256-row blocks and score each: the spread of those 32 totals
+        //     is a direct, assumption-light estimate of the sampling sd of a 256-row
+        //     bits estimate, `σ̂₂₅₆`, per target.
+        //
+        // (2) BIAS, O(1/n). Derived. The bits functional is scale-invariant —
+        //     `bits(α·spectra, α·D) = bits(spectra, D)`, since reverse water-filling
+        //     only ever sees variance RATIOS. The scorer forms the spectra with the
+        //     Bessel denominator `n−1` (`covariance_eigenvalues`, `atom_code_spectrum`)
+        //     but forms `reference_variance` — hence the distortion budget
+        //     `D = (1−R²)·reference_variance` — with denominator `n`. By scale
+        //     invariance that mismatch is EXACTLY equivalent to inflating the budget
+        //     by `c(n) = n/(n−1)`, a deterministic O(1/n) perturbation that survives
+        //     even at zero sampling noise (at the loose targets the block spread is
+        //     ~1e-15, yet the totals still move — this term, not noise, is what a
+        //     variance-only tolerance would wrongly flag).
+        //
+        // Bounding (2) by the envelope theorem: at the shared water level `L`,
+        // `∂bits/∂D = −M/(2 ln2 · L)` with `M = Σ_{above water} wᵢ`, and the budget
+        // moves by `D·(c−1) = D/(n−1)`, so
+        //     |Δbits| ≤ M/(2 ln2) · (D/L) / (n−1) ≤ W²/(2 ln2) / (n−1),
+        // using `M ≤ W` and `D/L ≤ W`, where `W = Σ_g p_g + 1` is the total
+        // water-filling component weight (every atom weighted by its firing
+        // probability, plus the weight-1 residual). `Σ_g p_g` is exactly the reported
+        // mean per-token support cardinality, so `W` is read off the report — it is a
+        // derived quantity, not a tuned one.
         const BLOCK: usize = 256;
         let blocks = full_rows / BLOCK;
         let mut block_bits: Vec<Vec<f64>> = vec![Vec::with_capacity(blocks); targets.len()];
@@ -619,23 +647,30 @@ mod tests {
             })
             .collect();
 
-        // The standard error of the DIFFERENCE between a nested n-row estimate and
-        // the N-row estimate. For an average-like estimator the n-row sample is a
-        // subset of the N-row sample, so
-        //     Var[bits(n) − bits(N)] = σ² · (1/n − 1/N)
-        // (the shared rows cancel; this is strictly smaller than the independent-
-        // samples σ²(1/n + 1/N), and it vanishes as n → N as it must). We
-        // extrapolate σ² from the measured block spread: σ² = BLOCK · σ̂₂₅₆².
+        // Total component weight W = Σ_g p_g + 1 (residual). Σ_g p_g is the reported
+        // mean support cardinality.
+        let total_weight = large.achieved_block_l0 + 1.0;
+        let bias_bound = |n: usize| -> f64 {
+            total_weight * total_weight / (2.0 * std::f64::consts::LN_2)
+                * (1.0 / (n as f64 - 1.0) - 1.0 / (full_rows as f64 - 1.0))
+        };
+
+        // Standard error of the DIFFERENCE between a nested n-row estimate and the
+        // N-row estimate. The n rows are a SUBSET of the N rows, so for an
+        // average-like estimator the shared rows cancel and
+        //     Var[bits(n) − bits(N)] = σ²·(1/n − 1/N)
+        // (strictly tighter than the independent-samples σ²(1/n + 1/N), and it
+        // correctly vanishes as n → N). σ² is extrapolated from the measured block
+        // spread by the CLT scaling law: σ² = BLOCK·σ̂₂₅₆².
         let se_diff = |sd: f64, n: usize| -> f64 {
             (sd * sd * BLOCK as f64 * (1.0 / n as f64 - 1.0 / full_rows as f64)).sqrt()
         };
-        // k = 6 standard errors. Under the CLT/delta-method normal approximation
-        // that is a ~2e-9 two-sided tail per comparison (8 comparisons here, so the
-        // family-wise false-alarm rate is ~1e-8); even with NO distributional
-        // assumption at all, Chebyshev caps each comparison at 1/36. It is a
-        // significance level, not a fudge factor — it does not scale with the
-        // observed discrepancy. The additive 1e-9·(1+|l|) floor only absorbs
-        // floating-point noise in the exactly-shared support/dictionary terms.
+        // k = 6 standard errors on the variance term. Under the CLT/delta-method
+        // normal approximation that is a ~2e-9 two-sided tail per comparison (8
+        // comparisons here ⇒ family-wise false-alarm rate ~1e-8); with NO
+        // distributional assumption at all, Chebyshev still caps each comparison at
+        // 1/36. It is a significance level, not a fudge factor: it does not scale
+        // with the observed discrepancy.
         const K_SIGMA: f64 = 6.0;
 
         for (target_idx, &target) in targets.iter().enumerate() {
@@ -644,44 +679,54 @@ mod tests {
             let l = large.per_target[target_idx].bits;
             let sd = block_sd[target_idx];
             assert!(
-                sd > 0.0 && sd.is_finite(),
-                "target {target} block spread must be positive and finite, got {sd}"
+                sd.is_finite() && sd >= 0.0,
+                "target {target} block spread must be finite and nonnegative, got {sd}"
             );
-            let float_floor = 1.0e-9 * (1.0 + l.abs());
-            let tol_small = K_SIGMA * se_diff(sd, 256) + float_floor;
-            let tol_medium = K_SIGMA * se_diff(sd, 1024) + float_floor;
+            // bias(n) + k·se(n); the 1e-9·(1+|l|) floor only absorbs float noise in
+            // the exactly-shared support/dictionary terms.
+            let tolerance = |n: usize| -> f64 {
+                bias_bound(n) + K_SIGMA * se_diff(sd, n) + 1.0e-9 * (1.0 + l.abs())
+            };
+            let tol_small = tolerance(256);
+            let tol_medium = tolerance(1024);
             assert!(
                 (s - l).abs() <= tol_small,
-                "target {target}: 256-row total {s} differs from 8192-row total {l} by \
-                 {} > {K_SIGMA}·se ({tol_small}); σ̂₂₅₆ = {sd}",
+                "target {target}: 256-row total {s} differs from the 8192-row total {l} \
+                 by {} > bias+{K_SIGMA}σ ({tol_small}); σ̂₂₅₆ = {sd}",
                 (s - l).abs()
             );
-            // Convergence: the 1024-row bound is 2× tighter than the 256-row bound
-            // (`se ∝ 1/√n`), and the estimate still meets it. That is the monotone
-            // "more rows ⇒ closer to the limit" guard, stated as a shrinking bound
-            // the estimator must satisfy rather than as a strict ordering of two
-            // single noisy realisations (which would be flaky by construction).
-            assert!(tol_medium < tol_small);
+            // Convergence: BOTH error terms shrink with n, so the 1024-row bound is
+            // strictly tighter than the 256-row bound — and the estimate still meets
+            // it. This is the "more rows ⇒ closer to the limit" guard, stated as a
+            // shrinking bound the estimator must satisfy rather than as a strict
+            // ordering of two single noisy realisations (which would be flaky by
+            // construction).
+            assert!(
+                tol_medium < tol_small,
+                "the n-row bound must tighten with n: {tol_medium} !< {tol_small}"
+            );
             assert!(
                 (m - l).abs() <= tol_medium,
-                "target {target}: 1024-row total {m} differs from 8192-row total {l} by \
-                 {} > {K_SIGMA}·se ({tol_medium}); σ̂₂₅₆ = {sd}",
+                "target {target}: 1024-row total {m} differs from the 8192-row total {l} \
+                 by {} > bias+{K_SIGMA}σ ({tol_medium}); σ̂₂₅₆ = {sd}",
                 (m - l).abs()
             );
 
             // ── Anti-vacuity ──────────────────────────────────────────────────
-            // The tolerance must be far too tight to hide the #2283 confound. Under
+            // The tolerance must stay far too tight to hide the #2283 confound. Under
             // the OLD behaviour the dictionary term was `0.5·params·log₂(n)/n` in the
-            // ESTIMATION rows, so the same fitted model's total moved by ~60.7 bits
-            // between 256 and 8192 rows. Assert that gap is orders of magnitude above
-            // the tolerance we just allowed: this test would have FAILED loudly on the
-            // pre-fix scorer.
-            let confounded_dict = |n: usize| 0.5 * dictionary_params as f64 * (n as f64).log2() / n as f64;
-            let confound_gap = (confounded_dict(256) - confounded_dict(8192)).abs();
+            // ESTIMATION rows, so the SAME fitted model's total moved by ~60.7 bits
+            // between 256 and 8192 rows. Assert that swing is orders of magnitude
+            // above the tolerance just allowed — i.e. this test would still FAIL
+            // loudly on the pre-fix scorer, and has not been widened into vacuity.
+            let confounded_dictionary_bits =
+                |n: usize| 0.5 * dictionary_params as f64 * (n as f64).log2() / n as f64;
+            let confound_swing =
+                (confounded_dictionary_bits(256) - confounded_dictionary_bits(8192)).abs();
             assert!(
-                confound_gap > 10.0 * tol_small,
-                "tolerance {tol_small} is too loose to catch the #2283 confound, whose \
-                 256-vs-8192 dictionary swing is {confound_gap} bits (target {target})"
+                confound_swing > 10.0 * tol_small,
+                "target {target}: tolerance {tol_small} is too loose to catch the #2283 \
+                 confound, whose 256-vs-8192 dictionary swing is {confound_swing} bits"
             );
         }
     }

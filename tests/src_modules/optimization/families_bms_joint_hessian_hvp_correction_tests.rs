@@ -1,5 +1,13 @@
 // ── Phase 7: joint-Hessian directional-derivative subsample tests ──
 
+fn bms_test_design_hyper_layout(
+    derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+    values: Array1<f64>,
+) -> crate::custom_family::CustomFamilyHyperLayout {
+    crate::custom_family::CustomFamilyHyperLayout::new(derivative_blocks, Vec::new(), values)
+        .expect("BMS test hyper layout must satisfy the typed axis contract")
+}
+
 #[test]
 fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_full_equals_unsampled() {
     use crate::outer_subsample::OuterScoreSubsample;
@@ -968,7 +976,7 @@ fn auto_outer_subsample_two_phase_converges_to_full_data_optimum() {
     let family = make_block_psi_test_family(n);
     let states: Vec<ParameterBlockState> = Vec::new();
     let specs: Vec<ParameterBlockSpec> = Vec::new();
-    let deriv_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>> = Vec::new();
+    let hyper_layout = bms_test_design_hyper_layout(Vec::new(), Array1::zeros(0));
     // Non-empty ρ — empty arrays would have zero L2 distance and the
     // counter would never bump after the first call, defeating the
     // distinct-ρ check. With empty specs, `total == 0` short-circuits
@@ -990,7 +998,7 @@ fn auto_outer_subsample_two_phase_converges_to_full_data_optimum() {
     for step in 0..15usize {
         let rho_step = Array1::<f64>::from_elem(rho_dim, step as f64 * 0.1);
         family
-            .batched_outer_gradient_terms(&states, &specs, &deriv_blocks, &rho_step, &opts, None)
+            .batched_outer_gradient_terms(&states, &specs, &hyper_layout, &rho_step, &opts, None)
             .expect("guard ok");
         distinct_calls += 1;
         assert_eq!(
@@ -1005,7 +1013,7 @@ fn auto_outer_subsample_two_phase_converges_to_full_data_optimum() {
                 .batched_outer_gradient_terms(
                     &states,
                     &specs,
-                    &deriv_blocks,
+                    &hyper_layout,
                     &rho_retry,
                     &opts,
                     None,
@@ -1033,7 +1041,7 @@ fn auto_outer_subsample_two_phase_converges_to_full_data_optimum() {
             .batched_outer_gradient_terms(
                 &states,
                 &specs,
-                &deriv_blocks,
+                &hyper_layout,
                 &rho_step,
                 &opts_off,
                 None,
@@ -1111,7 +1119,7 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
     let x_psi_1 = Array2::from_shape_fn((n, 2), |(r, c)| {
         ((r * 5 + c * 2 + 4) % 8) as f64 / 8.0 - 0.55
     });
-    let derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>> = vec![
+    let hyper_layout = bms_test_design_hyper_layout(vec![
         vec![
             CustomFamilyBlockPsiDerivative::new(
                 None,
@@ -1133,15 +1141,15 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
             ),
         ],
         Vec::new(),
-    ];
+    ], Array1::zeros(2));
 
     let opts = BlockwiseFitOptions::default();
     let ws = family
-        .exact_newton_joint_psi_workspace_with_options(&states, &specs, &derivative_blocks, &opts)
+        .exact_newton_joint_psi_workspace_with_options(&states, &specs, &hyper_layout, &opts)
         .expect("psi workspace with options")
         .expect("psi workspace some");
 
-    let psi_dim: usize = derivative_blocks.iter().map(Vec::len).sum();
+    let psi_dim = hyper_layout.len();
     assert_eq!(psi_dim, 2, "fixture should expose two marginal ψ axes");
 
     // A non-trivial ψ direction (no axis dominant, opposite signs).
@@ -1305,8 +1313,8 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         array![[0.45_f64, -0.18], [-0.18, 0.55]], // (1,0) = (0,1)^sym
         array![[0.95_f64, 0.20], [0.20, 0.65]],   // (1,1)
     ];
-    let derivative_blocks: std::sync::Arc<Vec<Vec<CustomFamilyBlockPsiDerivative>>> =
-        std::sync::Arc::new(vec![
+    let hyper_layout = std::sync::Arc::new(bms_test_design_hyper_layout(
+        vec![
             vec![
                 CustomFamilyBlockPsiDerivative::new(
                     Some(0),
@@ -1328,11 +1336,13 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
                 ),
             ],
             Vec::new(),
-        ]);
+        ],
+        Array1::zeros(2),
+    ));
 
     let opts = BlockwiseFitOptions::default();
     let psi_workspace = family
-        .exact_newton_joint_psi_workspace_with_options(&states, &specs, &derivative_blocks, &opts)
+        .exact_newton_joint_psi_workspace_with_options(&states, &specs, &hyper_layout, &opts)
         .expect("psi workspace")
         .expect("psi workspace some");
 
@@ -1350,7 +1360,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         &family,
         &states,
         &specs,
-        std::sync::Arc::clone(&derivative_blocks),
+        std::sync::Arc::clone(&hyper_layout),
         &beta_flat,
         rho_slice,
         &penalty_counts,
@@ -1362,7 +1372,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
 
     let hook = build_contracted_psi_hook(
         &specs,
-        std::sync::Arc::clone(&derivative_blocks),
+        std::sync::Arc::clone(&hyper_layout),
         &beta_flat,
         rho_slice,
         &penalty_counts,
@@ -1386,7 +1396,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
             if aj == 0.0 {
                 continue;
             }
-            let pair = ext_ext(i, j);
+            let pair = ext_ext(i, j).expect("per-pair callback");
             ref_a += aj * pair.a;
             ref_ld += aj * pair.ld_s;
             let g_j = pair.g.mapv(|v| aj * v);
@@ -1453,12 +1463,14 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
     // S_ψψβ score terms from s_psi_psi regardless of s_logdet (only the
     // τ-Hessian ld_s is gated on it), so a same-derivative-blocks baseline would
     // be identical in objective/score and the guard would falsely fire.
-    let derivative_blocks_no_pen: std::sync::Arc<Vec<Vec<CustomFamilyBlockPsiDerivative>>> =
-        std::sync::Arc::new(vec![
+    let hyper_layout_no_pen = std::sync::Arc::new(bms_test_design_hyper_layout(
+        vec![
             vec![
                 CustomFamilyBlockPsiDerivative::new(
                     None,
-                    derivative_blocks[0][0].x_psi.clone(),
+                    hyper_layout.design_derivative_blocks()[0][0]
+                        .x_psi
+                        .clone(),
                     Array2::zeros((2, 2)),
                     None,
                     None,
@@ -1467,7 +1479,9 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
                 ),
                 CustomFamilyBlockPsiDerivative::new(
                     None,
-                    derivative_blocks[0][1].x_psi.clone(),
+                    hyper_layout.design_derivative_blocks()[0][1]
+                        .x_psi
+                        .clone(),
                     Array2::zeros((2, 2)),
                     None,
                     None,
@@ -1476,10 +1490,12 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
                 ),
             ],
             Vec::new(),
-        ]);
+        ],
+        Array1::zeros(2),
+    ));
     let hook_no_pen = build_contracted_psi_hook(
         &specs,
-        std::sync::Arc::clone(&derivative_blocks_no_pen),
+        std::sync::Arc::clone(&hyper_layout_no_pen),
         &beta_flat,
         rho_slice,
         &penalty_counts,
@@ -1575,7 +1591,7 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
         array![[0.45_f64, -0.18], [-0.18, 0.55]],
         array![[0.95_f64, 0.20], [0.20, 0.65]],
     ];
-    let derivative_blocks = vec![
+    let hyper_layout = bms_test_design_hyper_layout(vec![
         vec![
             crate::custom_family::CustomFamilyBlockPsiDerivative::new(
                 Some(0),
@@ -1597,17 +1613,17 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
             ),
         ],
         Vec::new(),
-    ];
-    let psi_dim: usize = derivative_blocks.iter().map(Vec::len).sum();
+    ], Array1::zeros(2));
+    let psi_dim = hyper_layout.len();
     assert_eq!(psi_dim, 2, "fixture should expose two ψ coordinates");
 
     let opts = BlockwiseFitOptions::default();
     let workspace = family
-        .exact_newton_joint_psi_workspace_with_options(&states, &specs, &derivative_blocks, &opts)
+        .exact_newton_joint_psi_workspace_with_options(&states, &specs, &hyper_layout, &opts)
         .expect("psi workspace")
         .expect("psi workspace some");
     let batched = family
-        .batched_outer_gradient_terms(&states, &specs, &derivative_blocks, &rho, &opts, None)
+        .batched_outer_gradient_terms(&states, &specs, &hyper_layout, &rho, &opts, None)
         .expect("batched outer gradient")
         .expect("batched terms some");
 
@@ -1712,7 +1728,7 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
         &family,
         &states,
         &specs,
-        &derivative_blocks,
+        &hyper_layout,
         &beta,
         rho_slice,
         &penalty_counts,
@@ -1832,7 +1848,7 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
-                    length_scale: gam::terms::basis::MaternLengthScale::fixed(length_scale),
+                    length_scale: gam_terms::basis::MaternLengthScale::fixed(length_scale),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,
@@ -1867,7 +1883,10 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
         let logslope_psi = build_block_spatial_psi_derivatives(data.view(), &spec, &design)
             .expect("psi deriv")
             .expect("psi deriv rows");
-        let derivative_blocks = vec![Vec::new(), logslope_psi];
+        let hyper_layout = bms_test_design_hyper_layout(
+            vec![Vec::new(), logslope_psi],
+            array![psi_offset],
+        );
         let marginal_mat =
             Array2::from_shape_fn((n, 2), |(r, c)| if c == 0 { 1.0 } else { marginal_cov[r] });
         let marginal_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
@@ -1906,7 +1925,7 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
             .exact_newton_joint_psi_workspace_with_options(
                 &states,
                 &specs,
-                &derivative_blocks,
+                &hyper_layout,
                 &opts,
             )
             .expect("ws")
@@ -2062,7 +2081,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
-                    length_scale: gam::terms::basis::MaternLengthScale::fixed(length_scale),
+                    length_scale: gam_terms::basis::MaternLengthScale::fixed(length_scale),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,
@@ -2109,7 +2128,10 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         let logslope_psi = build_block_spatial_psi_derivatives(data.view(), &spec, &design)
             .expect("spatial psi derivatives")
             .expect("spatial psi derivative rows");
-        let derivative_blocks = vec![Vec::new(), logslope_psi];
+        let hyper_layout = bms_test_design_hyper_layout(
+            vec![Vec::new(), logslope_psi],
+            array![psi_offset],
+        );
 
         // Well-identified marginal block: [intercept | covariate] (p=2), so the
         // marginal is not degenerate and is less coupled to the logslope block.
@@ -2189,7 +2211,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
             &specs,
             &opts,
             &rho,
-            &derivative_blocks,
+            &hyper_layout,
             None,
             mode,
         )

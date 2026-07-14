@@ -16,6 +16,7 @@ use super::binomial_q_derivs::{
 use super::dispersion_family::{DispersionRowKernel, dispersion_row_kernel};
 use super::test_support::{binomial_location_scale_nll_tower, dispersion_tweedie_nll_generic};
 use crate::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
+use crate::custom_family::CustomFamilyHyperLayout;
 
 /// Dense `Tower4<2>` Tweedie row NLL oracle: the #932 all-channels instantiation
 /// of the single-source [`dispersion_tweedie_nll_generic`] that production runs
@@ -51,7 +52,7 @@ use statrs::function::gamma::ln_gamma;
 fn test_design_hyper_layout(
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
 ) -> CustomFamilyHyperLayout {
-    let axis_count = derivative_blocks.iter().map(Vec::len).sum();
+    let axis_count = derivative_blocks.iter().map(Vec::len).sum::<usize>();
     CustomFamilyHyperLayout::new(
         derivative_blocks.to_vec(),
         Vec::new(),
@@ -4456,7 +4457,7 @@ pub(crate) fn binomial_location_scale_exact_newton_spatial_joint_hyper_returns_f
             ..BlockwiseFitOptions::default()
         },
         &rho,
-        &derivative_blocks,
+        &test_design_hyper_layout(&derivative_blocks),
         None,
         gam_problem::EvalMode::ValueGradientHessian,
     )
@@ -4541,7 +4542,7 @@ pub(crate) fn binomial_location_scalewiggle_exact_newton_spatial_joint_hyper_ret
             ..BlockwiseFitOptions::default()
         },
         &rho,
-        &derivative_blocks,
+        &test_design_hyper_layout(&derivative_blocks),
         None,
         gam_problem::EvalMode::ValueGradientHessian,
     )
@@ -4636,7 +4637,7 @@ pub(crate) fn gaussian_location_scale_exact_newton_spatial_joint_hyper_returns_f
             ..BlockwiseFitOptions::default()
         },
         &rho,
-        &derivative_blocks,
+        &test_design_hyper_layout(&derivative_blocks),
         None,
         gam_problem::EvalMode::ValueGradientHessian,
     )
@@ -7709,7 +7710,7 @@ pub(crate) fn binomial_location_scale_batched_gradient_matches_finite_difference
             &specs,
             &options,
             rho,
-            &derivative_blocks,
+            &test_design_hyper_layout(&derivative_blocks),
             None,
             gam_problem::EvalMode::ValueAndGradient,
         )

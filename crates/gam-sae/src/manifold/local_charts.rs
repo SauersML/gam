@@ -16,20 +16,33 @@
 //!      [`super::intrinsic_seed::farthest_point_landmarks`], the same greedy
 //!      coverage pattern the intrinsic seeder uses), so the patches tile the
 //!      manifold with sublinearly many charts;
-//!   2. one PATCH per center — its `patch_size` nearest ambient rows — sized so
-//!      neighboring patches OVERLAP (controlled by [`LocalAtlasConfig`]);
+//!   2. one PATCH per center — its nearest ambient rows, at most `patch_size` of
+//!      them — sized so neighboring patches OVERLAP (controlled by
+//!      [`LocalAtlasConfig`]). The neighborhood is the LARGEST prefix of the
+//!      distance order that yields a certified chart: a local-PCA frame is a
+//!      TANGENT plane only while the patch stays inside the local curvature scale,
+//!      so a patch that outgrows it is shrunk (dropping its farthest row) until it
+//!      certifies, rather than being handed a frame that is not tangent;
 //!   3. one CHART per patch — local PCA of the centered neighborhood (SVD of the
 //!      `m × p` centered block), whose leading `d` right singular vectors are an
 //!      orthonormal frame and whose chart map is the injective projection
-//!      `x ↦ Fᵀ(x − μ)`. Each chart carries a [`ChartCertificate`]: a rank gate
-//!      (the `d`-th captured singular value clears a floor) and an injectivity
+//!      `x ↦ Fᵀ(x − μ)`. The frame is put in a CANONICAL SIGN GAUGE (each axis's
+//!      largest-magnitude component is made positive), since a singular vector is
+//!      only defined up to sign. Each chart carries a [`ChartCertificate`]: a rank
+//!      gate (the `d`-th captured singular value clears a floor) and an injectivity
 //!      gate (no two neighborhood rows collapse to the same chart coordinate). A
-//!      degenerate patch is rejected with a typed [`LocalChartError`];
-//!   4. one TRANSITION per overlapping patch pair — the orthogonal Procrustes map
-//!      `R ∈ O(d)` best aligning the two charts on their shared support, together
-//!      with its translation and its orientation `sign = det R ∈ {±1}`. The plain
-//!      `U Vᵀ` Procrustes factor is used (reflections ALLOWED), so `sign` records
-//!      a genuine handedness flip rather than being forced to `+1`.
+//!      patch that cannot certify at any admissible size is rejected with a typed
+//!      [`LocalChartError`];
+//!   4. one TRANSITION per overlapping patch pair. Its orientation is the EXACT
+//!      transition Jacobian's determinant: on the overlap the chart change is
+//!      `c_to = F_toᵀ(μ_from − μ_to) + (F_toᵀ F_from) c_from + O(curvature)`, so the
+//!      handedness relation of the two charts is `sign = sgn det(F_toᵀ F_from)` —
+//!      a well-conditioned frame quantity (`|det| = ∏ cos θ_k` over the principal
+//!      angles), not a fit to the overlap point cloud. The transition also carries
+//!      the orthogonal Procrustes map `R ∈ O(d)` best aligning the two charts on
+//!      their shared support WITHIN that handedness class, together with its
+//!      translation, so `det R = sign` by construction and reflections are recorded
+//!      rather than forced to `+1`.
 //!
 //! # Transition cocycle interface
 //!

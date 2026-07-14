@@ -6,7 +6,7 @@ use ndarray::array;
 fn test_design_hyper_layout(
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
 ) -> CustomFamilyHyperLayout {
-    let axis_count = derivative_blocks.iter().map(Vec::len).sum();
+    let axis_count = derivative_blocks.iter().map(Vec::len).sum::<usize>();
     CustomFamilyHyperLayout::new(
         derivative_blocks.to_vec(),
         Vec::new(),
