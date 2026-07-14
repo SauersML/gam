@@ -623,7 +623,8 @@ pub fn active_constraint_tangent_geometry(
         // keeps the constructed complement accurate for ill-conditioned faces.
         for _ in 0..2 {
             for q in &orthonormal_basis {
-                candidate.scaled_add(-q.dot(&candidate), q);
+                let projection = q.dot(&candidate);
+                candidate.scaled_add(-projection, q);
             }
         }
         let norm = candidate.dot(&candidate).sqrt();
