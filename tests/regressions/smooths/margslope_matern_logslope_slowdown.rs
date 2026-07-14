@@ -6,10 +6,10 @@
 //!   logslope: matern(PC1, PC2, centers=4)
 //!   family = bernoulli-marginal-slope, link = probit, rigid (no warp/dev).
 //!
-//! At centers=4, n~2500 the fit's continuation pre-warm alone took ~34s and
-//! the inner joint-Newton ~28s (cycles=17) — absurd for so small a basis.
-//! This test rebuilds the same shape at a tractable size and asserts the
-//! whole fit completes well under a wall-clock budget.
+//! At centers=4, n~2500 speculative startup work took ~34s and the inner
+//! joint-Newton ~28s (cycles=17) — absurd for so small a basis. The generic
+//! speculative phase has been deleted; this test keeps the same shape at a
+//! tractable size and guards whole-fit iteration speed.
 
 use gam::ResourcePolicy;
 use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};

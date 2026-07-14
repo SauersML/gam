@@ -1071,17 +1071,10 @@ where
                     state.compute_screening_proxy(rho)
                 },
             );
-            // Standard REML's eval closure publishes
-            // `inner_beta_hint = state.current_original_basis_beta()` on
-            // every accepted eval. The continuation pre-warm carries that
-            // hint forward and calls `seed_inner_state(beta)` before the
-            // next eval — see src/solver/reml/continuation.rs:209-212,
-            // 434-438. Without a hook here, `ClosureObjective::seed_inner_state`
-            // (src/solver/rho_optimizer.rs:2097-2107) rejected any
-            // non-empty β fatally, dropping every seed before the inner
-            // solver started (issue #236). Wire the symmetric consumer:
-            // when the pre-warm forwards the cached β, install it into the
-            // same `warm_start_beta` slot the publisher reads from.
+            // Standard REML publishes its current original-basis coefficients
+            // and consumes a cached coefficient vector through the symmetric
+            // hook below. The runner calls it only after reset and only for the
+            // bitwise-matching outer seed that owns the cached vector.
             let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
 
             let strategy_result = problem.run(&mut obj, "standard REML")?;
@@ -1388,11 +1381,8 @@ where
                 },
             ),
         );
-            // Same publish/consume symmetry as the standard REML arm above
-            // (issue #236). The mixture/SAS eval closure also surfaces
-            // `inner_beta_hint = state.current_original_basis_beta()` (see
-            // src/solver/estimate.rs:3275), so continuation pre-warm needs
-            // a real seed hook to install it.
+            // Same exact-seed cache publish/consume symmetry as the standard
+            // REML arm above (issue #236).
             let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
             let outer_result = problem.run(&mut obj, "mixture/SAS flexible link")?;
             drop(obj);

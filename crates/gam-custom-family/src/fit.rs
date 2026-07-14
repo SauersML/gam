@@ -1289,17 +1289,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                       rho: &Array1<f64>,
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
-        // Genuinely value-only fulfilment (#979). A `Value` request — issued only
-        // by the continuation pre-warm and outer cost probes — never consumes the
-        // outer gradient. Routing it through the value+gradient assembly below
-        // paid a full coupled-joint LAML gradient (the k²·n·p² marginal/log-slope
-        // outer-derivative) at EVERY continuation step purely to carry the warm β
-        // forward — the dominant cost of the ~35s/seed marginal-slope pre-warm and
-        // the bernoulli-MS centers=20 non-finish (#979). The inner solve in
-        // `EvalMode::ValueOnly` already produces the converged block β (the only
-        // product the pre-warm needs); surface it as `inner_beta_hint` (and into
-        // `outer.warm_cache`) with a zero-length gradient and skip the outer
-        // gradient assembly. ValueAndGradient / ValueGradientHessian are unchanged.
+        // Genuinely value-only fulfilment (#979). A `Value` request from an outer
+        // cost, screening, or reactive-domain probe never consumes the outer
+        // gradient. The inner solve in `EvalMode::ValueOnly` already produces the
+        // converged block β; surface it as `inner_beta_hint` (and into
+        // `outer.warm_cache`) with a zero-length gradient and skip the full
+        // k²·n·p² coupled-joint LAML gradient assembly.
         if matches!(order, OuterEvalOrder::Value) {
             let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
             return match outerobjectivegradienthessian_labeled(

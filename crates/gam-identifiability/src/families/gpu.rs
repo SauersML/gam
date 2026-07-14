@@ -56,12 +56,9 @@ pub fn try_primary_state_gram_cuda(
     h_packed: &Array2<f64>,
     raw_block_ranges: &[Range<usize>],
 ) -> Result<Option<GramBundle>, gam_gpu::gpu_error::GpuError> {
-    let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())?
-    else {
-        return Ok(None);
-    };
     #[cfg(not(target_os = "linux"))]
     {
+        let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())?;
         // Validate signature on non-Linux so callers still get the
         // same shape-checks they would on Linux, then report the
         // absence of a CUDA backend.
@@ -72,11 +69,20 @@ pub fn try_primary_state_gram_cuda(
         {
             return Ok(None);
         }
-        let _ = runtime;
+        if runtime.is_some() {
+            gam_gpu::gpu_bail!(
+                "identifiability GPU Gram resolved CUDA on a platform without the compiled CUDA backend"
+            );
+        }
         Ok(None)
     }
     #[cfg(target_os = "linux")]
     {
+        let Some(runtime) =
+            gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())?
+        else {
+            return Ok(None);
+        };
         primary_state_gram_cuda_with_runtime(
             runtime,
             channel_blocks,

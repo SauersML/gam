@@ -866,7 +866,7 @@ mod tests {
             obj.orders
                 .iter()
                 .all(|order| matches!(order, OuterEvalOrder::Value)),
-            "coupled continuation pre-warm must not request outer gradients: {:?}",
+            "reactive domain-entry waypoints must not request outer gradients: {:?}",
             obj.orders
         );
     }

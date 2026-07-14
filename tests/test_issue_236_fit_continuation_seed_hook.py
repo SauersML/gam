@@ -1,24 +1,9 @@
-"""RED tests for https://github.com/SauersML/gam/issues/236
+"""Public fit-to-completion guards for https://github.com/SauersML/gam/issues/236.
 
-Standard REML fits via `gamfit.fit(...)` / `gamfit.fit_array(...)` and the
-README quickstart all fail with::
-
-    GamError: REML smoothing optimization failed to converge: no candidate
-    seeds passed outer startup validation (standard REML):
-      ... solver_started=0
-      seed 0 (validation): continuation pre-warm refused before seed eval:
-      Invalid input: cached inner beta has length N, but this objective
-      does not expose an inner-state seeding hook
-
-Root cause: standard REML's value-and-grad closure publishes
-`inner_beta_hint = Some(non-empty)`, continuation forwards that hint into
-`ClosureObjective::seed_inner_state`, which rejects any non-empty β
-because the standard REML closure is built without
-`with_seed_inner_state(...)`. Pre-warm wraps the error into a
-SeedRejection and every seed is dropped before the inner solver starts.
-
-These tests must be GREEN once the contract is restored: every Gaussian
-formula fit on a minimal dataset returns a fitted model.
+Standard REML publishes and consumes original-basis coefficient state. Cached
+coefficients are now bound to the exact outer coordinate that owns them and are
+installed after the per-seed reset. These tests keep the public Gaussian paths
+honest without asserting behavior of a deleted speculative startup phase.
 """
 
 from __future__ import annotations
@@ -80,26 +65,3 @@ def test_issue_236_readme_quickstart_runs() -> None:
     ]
     model = gamfit.fit(train, "y ~ s(x)")
     assert model is not None, "README quickstart fit must return a model"
-
-
-def test_issue_236_pre_warm_error_does_not_leak_to_user() -> None:
-    """If a fit raises, the seed-hook error message must not be the cause.
-
-    This is the most specific symptom check: even if the fit fails for
-    some unrelated reason, the user must never see "this objective does
-    not expose an inner-state seeding hook" surfaced from continuation
-    pre-warm.
-    """
-    train = _quickstart_table()
-    try:
-        gamfit.fit(train, "y ~ s(x)", family="gaussian")
-    except Exception as exc:  # noqa: BLE001 — we inspect the message
-        message = str(exc)
-        assert "inner-state seeding hook" not in message, (
-            "issue #236: continuation pre-warm leaked the seed-hook "
-            f"rejection through to the user. message={message!r}"
-        )
-        assert "continuation pre-warm refused before seed eval" not in message, (
-            "issue #236: continuation pre-warm refused before seed eval "
-            f"is the original bug. message={message!r}"
-        )

@@ -735,7 +735,9 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         // CPU loop: a barely-PD but ill-conditioned block forces the whole batch
         // back onto the per-row path so its ridge can lift, never silently using
         // a contaminated factor.
-        if let Some(batched) = try_factor_blocks_batched(rows, ridge_t, d, evidence_factorization) {
+        if let Some(batched) =
+            try_factor_blocks_batched(rows, ridge_t, d, evidence_factorization)?
+        {
             return Ok(batched);
         }
         // Per-row Cholesky factorizations are INDEPENDENT (each reads only its own

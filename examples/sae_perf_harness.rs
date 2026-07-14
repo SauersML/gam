@@ -129,9 +129,6 @@ impl OuterObjective for CountingObjective {
         self.inner.seed_inner_state(beta)
     }
 
-    fn allow_continuation_prewarm(&self) -> bool {
-        false
-    }
 }
 
 fn shape_named(name: &str) -> Option<Shape> {

@@ -125,6 +125,9 @@ pub enum DispatchOp {
 #[inline]
 fn runtime_for_dispatch(policy: GpuPolicy) -> Option<&'static GpuRuntime> {
     GpuRuntime::resolve(policy).unwrap_or_else(|error| {
+        // SAFETY: the gam-linalg optimization hook is an infallible `Option`
+        // boundary. `None` means "run on the CPU", so returning it for a probe
+        // fault or Required-device absence would silently change semantics.
         panic!(
             "GPU runtime resolution failed under policy '{}': {error}",
             policy
@@ -140,6 +143,8 @@ fn runtime_for_dispatch(policy: GpuPolicy) -> Option<&'static GpuRuntime> {
 #[track_caller]
 fn decline_gpu<T>(operation: &'static str, reason: &'static str) -> Option<T> {
     if super::global_policy() == GpuPolicy::Required {
+        // SAFETY: this legacy `Option` hook has no typed error channel and
+        // `None` explicitly authorizes CPU execution, which Required forbids.
         panic!("gpu=required operation '{operation}' cannot execute on the GPU: {reason}");
     }
     None
@@ -151,6 +156,8 @@ fn decline_gpu<T>(operation: &'static str, reason: &'static str) -> Option<T> {
 #[inline]
 #[track_caller]
 fn invalid_gpu_request(operation: &'static str, reason: &'static str) -> ! {
+    // SAFETY: invalid dimensions are caller-contract violations, not an
+    // optional accelerator decline that may be represented by `None`.
     panic!("GPU operation '{operation}' received invalid input: {reason}");
 }
 
@@ -158,6 +165,8 @@ fn invalid_gpu_request(operation: &'static str, reason: &'static str) -> ! {
 #[inline]
 #[track_caller]
 fn invalid_gpu_result(operation: &'static str, reason: &'static str) -> ! {
+    // SAFETY: a malformed result after device execution cannot be represented
+    // by this hook's `Option` without authorizing a misleading CPU retry.
     panic!("GPU operation '{operation}' produced invalid output: {reason}");
 }
 
@@ -170,6 +179,9 @@ fn invalid_gpu_result(operation: &'static str, reason: &'static str) -> ! {
 fn complete_gpu_attempt<T>(operation: &'static str, result: Option<T>) -> T {
     match result {
         Some(value) => value,
+        // SAFETY: runtime availability and policy admission already succeeded;
+        // backend `None` is an execution fault, while this hook's `None` means
+        // an ordinary pre-admission decline and would silently retry on CPU.
         None => panic!(
             "GPU operation '{operation}' failed after admission under policy '{}'",
             super::global_policy()

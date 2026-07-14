@@ -1,11 +1,9 @@
 """#392 / #369 regression: non-linear survival baselines (and timewiggle) must
 actually fit through the public API.
 
-Both issues had the same root cause: the transformation/weibull survival
-workflow optimizes the scalar baseline whenever it is non-linear, and the outer
-continuation pre-warm unconditionally invoked the *gradient-free* CompassSearch
-baseline's "unreachable by construction" gradient stub, so every outer seed was
-rejected with::
+Both issues exposed the same startup-authority failure: a generic outer phase
+invoked a derivative operation that the scalar baseline route did not own, so
+every outer seed was rejected with::
 
     no candidate seeds passed outer startup validation
     ... CompassSearch dispatch only calls eval_cost; eval(gradient) is
@@ -18,16 +16,9 @@ rejected with::
   the identical data fit without the term and failed with it (the timewiggle
   term forces the same non-linear baseline optimization path).
 
-The CompassSearch / AuxiliaryGradientFree subsystem was later purged entirely,
-so the offending pre-warm path no longer exists and the baseline always supplies
-an analytic gradient. BUT the regression tests both issues were closed on were
-*deleted* with that purge and never replaced (``CompassSearch`` and
-``aux_compass_skips_continuation_prewarm_with_interior_seed`` have zero hits in
-the tree), leaving this cluster with no fit-to-completion guard. This test
-restores one: it pins that each advertised non-linear baseline, and the
-timewiggle path, fits to a finite, predictable model — so a future reintroduction
-of a gradient-free baseline pre-warm (or any startup-validation regression on
-this path) fails loudly here.
+The obsolete gradient-free subsystem and speculative generic startup phase are
+both gone. This test pins the enduring contract: each advertised non-linear
+baseline and the timewiggle path fits to a finite, predictable model.
 """
 from __future__ import annotations
 

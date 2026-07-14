@@ -1979,7 +1979,7 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
         // full 8-core parallelism instead of a single lock-holder worker.
         //
         // gam#979: forward `eval_mode` so a value-only probe (line search,
-        // seed screen, continuation pre-warm) primes nothing, and a
+        // seed screen, reactive domain entry) primes nothing, and a
         // first-order (`ValueAndGradient`) eval primes only the third-
         // derivative cache its `coord_corrections` trace consumes — skipping
         // the fourth-derivative outer-Hessian cache that only `ValueGradientHessian`

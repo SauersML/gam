@@ -711,24 +711,20 @@ pub fn plan_softmax_row_jets(
 
     #[cfg(target_os = "linux")]
     {
-        let runtime = match mode {
-            gam_gpu::GpuPolicy::Required => gam_gpu::device_runtime::GpuRuntime::require()
-                .map_err(|error| format!("complete SAE row jet requires CUDA: {error}"))?,
-            gam_gpu::GpuPolicy::Auto => {
-                let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::resolve(mode)
-                    .map_err(|error| {
-                        format!("complete SAE row-jet CUDA admission failed: {error}")
-                    })?
-                else {
-                    return Ok(SaeRowJetExecutionPlan {
-                        path: SaeRowJetPath::Cpu,
-                        tile_rows: 1,
-                        ledger,
-                    });
-                };
-                runtime
-            }
-            gam_gpu::GpuPolicy::Off => unreachable!("Off returns before CUDA resolution"),
+        let runtime = if mode == gam_gpu::GpuPolicy::Required {
+            gam_gpu::device_runtime::GpuRuntime::require()
+                .map_err(|error| format!("complete SAE row jet requires CUDA: {error}"))?
+        } else {
+            let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::resolve(mode)
+                .map_err(|error| format!("complete SAE row-jet CUDA admission failed: {error}"))?
+            else {
+                return Ok(SaeRowJetExecutionPlan {
+                    path: SaeRowJetPath::Cpu,
+                    tile_rows: 1,
+                    ledger,
+                });
+            };
+            runtime
         };
         if mode == gam_gpu::GpuPolicy::Auto && total_rows < runtime.policy.row_kernel_min_n {
             return Ok(SaeRowJetExecutionPlan {

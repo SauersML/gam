@@ -274,10 +274,10 @@ pub fn route_blocks_required(
         return Ok((cpu_route(), BlockRoutePath::Cpu, 0));
     }
 
-    let runtime = match mode {
-        GpuPolicy::Required => Some(gam_gpu::GpuRuntime::require()?),
-        GpuPolicy::Auto => gam_gpu::GpuRuntime::resolve(mode)?,
-        GpuPolicy::Off => unreachable!("Off returns before CUDA admission"),
+    let runtime = if mode == GpuPolicy::Required {
+        Some(gam_gpu::GpuRuntime::require()?)
+    } else {
+        gam_gpu::GpuRuntime::resolve(mode)?
     };
     if runtime.is_none() {
         note_block_route_engagement(false, "Auto admission found no CUDA device");

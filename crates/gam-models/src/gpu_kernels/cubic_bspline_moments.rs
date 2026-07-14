@@ -1748,8 +1748,7 @@ pub fn try_device_tetrahedral_moments(
 pub fn try_device_tetrahedral_moments(
     inputs: &TetrahedralMomentInputs<'_>,
 ) -> Result<Option<DeviceCubicMomentTable>, GpuError> {
-    let _runtime =
-        gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())?;
+    let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())?;
     // Auto/Off on a non-Linux host reaches this validation before reporting
     // typed device absence as Ok(None).
     inputs.cells.validate()?;
@@ -1757,6 +1756,11 @@ pub fn try_device_tetrahedral_moments(
         gam_gpu::gpu_bail!(
             "try_device_tetrahedral_moments: tetrahedral path requires D >= 3 (got {})",
             inputs.cells.d
+        );
+    }
+    if runtime.is_some() {
+        gam_gpu::gpu_bail!(
+            "try_device_tetrahedral_moments: CUDA runtime resolved on a platform without the compiled CUDA backend"
         );
     }
     Ok(None)

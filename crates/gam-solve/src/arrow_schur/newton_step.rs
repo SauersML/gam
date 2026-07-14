@@ -39,6 +39,39 @@ fn pin_evidence_beta_schur(sys: &ArrowSchurSystem, schur: Array2<f64>) -> Array2
     }
 }
 
+fn device_failure_as_arrow_error(
+    context: &'static str,
+    failure: crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure,
+) -> ArrowSchurError {
+    use crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure;
+
+    match failure {
+        ArrowSchurGpuFailure::RidgeBumpRequired { row, bump } => {
+            ArrowSchurError::PerRowFactorFailed {
+                row,
+                reason: format!("{context}: per-row block requires ridge bump {bump:e}"),
+            }
+        }
+        ArrowSchurGpuFailure::SchurFactorFailed { reason } => {
+            ArrowSchurError::SchurFactorFailed {
+                reason: format!("{context}: {reason}"),
+            }
+        }
+        ArrowSchurGpuFailure::Unavailable => ArrowSchurError::SchurFactorFailed {
+            reason: format!("{context}: device execution became unavailable after admission"),
+        },
+        ArrowSchurGpuFailure::GpuRequiresDenseSystem {
+            had_hbb_matvec,
+            had_htbeta_matvec,
+        } => ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "{context}: admitted device path requires a dense system \
+                 (hbb_matvec={had_hbb_matvec}, htbeta_matvec={had_htbeta_matvec})"
+            ),
+        },
+    }
+}
+
 /// Schur-eliminate the per-row latent block and solve with an explicit BA
 /// mode, returning the factor cache alongside the increments.
 ///

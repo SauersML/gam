@@ -8,18 +8,16 @@
 //! `λ_nullspace → ∞`, which would force the real slope to EXACTLY 0 (`edf ≈ 1`,
 //! RMSE ≈ 0.87) and report a strong effect as non-significant.
 //!
-//! Root cause this guards against (gam#1371): the outer REML loop FALSE-CONVERGES
-//! on the high-λ_nullspace shelf. The continuation pre-warm starts from an
-//! over-smoothing ρ₀ that pushes the null-space coordinate up; there the
-//! null-space coefficients are already shrunk to 0, so the analytic ρ-gradient
+//! Root cause this guards against (gam#1371): the outer REML loop can
+//! false-converge on the high-λ_nullspace shelf. There the null-space
+//! coefficients are already shrunk to 0, so the analytic ρ-gradient
 //! vanishes (∂deviance/∂ρ_null → 0 and the Occam terms cancel) and the optimizer
 //! certifies a stationary point whose REML cost is FAR WORSE than the basin it
 //! seeded from (which retains the trend). The fit must instead keep the
 //! lower-cost basin (slope ≈ 3, EDF ≈ 2).
 //!
-//! Path: this exercises the FORMULA path (`fit_from_formula`), which is the one
-//! that drives the continuation pre-warm / outer-seed machinery the bug lives in
-//! — the lower-level term-collection path in
+//! Path: this exercises the formula-level outer-seed and basin-selection path;
+//! the lower-level term-collection path in
 //! `double_penalty_edf_inflation_repro_1266.rs` does not reproduce it.
 
 use csv::StringRecord;

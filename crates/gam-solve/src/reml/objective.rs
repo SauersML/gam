@@ -2543,18 +2543,12 @@ impl<'a> RemlState<'a> {
         };
 
         // Genuinely value-only fulfilment (#979). A `Value` request never needs
-        // the outer gradient — the continuation pre-warm asks for it purely to
-        // run the inner P-IRLS and warm `warm_start_beta`, which the inner solve
-        // above (`obtain_eval_bundle`) has already done. The previous code rode
-        // the value+gradient path for `Value`, paying the full k²·n·p² LAML
-        // gradient assembly at EVERY continuation step (the dominant cost of the
-        // ~35s/seed marginal-slope pre-warm and the centers=20 non-finish). Skip
-        // the gradient assembly entirely: assemble the cost with `ValueOnly`,
-        // return a zero-length gradient (no outer optimiser ever consumes a
-        // `Value`-order gradient — the runner only requests `Value` for cost
-        // probes / pre-warm), and surface the warmed β so the continuation walk's
-        // `inner_beta_hint` forwarding is unchanged. ValueAndGradient and
-        // ValueGradientHessian are byte-identical to before.
+        // the outer gradient. The inner solve above (`obtain_eval_bundle`) has
+        // already established its owned mode, so assemble only the scalar cost,
+        // return a zero-length gradient, and surface the coefficient hint for a
+        // typed reactive waypoint when one is active. Line-search, screening,
+        // and domain probes therefore avoid the k²·n·p² LAML gradient assembly.
+        // ValueAndGradient and ValueGradientHessian are unchanged.
         if matches!(order, crate::rho_optimizer::OuterEvalOrder::Value) {
             let t_assemble = std::time::Instant::now();
             let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {

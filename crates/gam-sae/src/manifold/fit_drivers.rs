@@ -6918,11 +6918,10 @@ impl SaeManifoldTerm {
         // seeded `(t, β)` and asks for a single factor at exactly that iterate
         // WITHOUT moving it. The polish is a decoder least-squares solve, so
         // running it on a freeze would silently overwrite the warm-started β
-        // with the data-optimal refit — breaking the verbatim-reuse contract the
-        // continuation pre-warm depends on for its speedup (the cold-vs-warm
-        // hint would always equal the cold LSQ decoder, never the seed). A freeze
-        // is by definition not a convergence request, so there is no
-        // under-converged decoder to rescue here.
+        // with the data-optimal refit — breaking the verbatim-reuse contract of
+        // cached and typed reactive waypoint state. A freeze is by definition
+        // not a convergence request, so there is no under-converged decoder to
+        // rescue here.
         if max_iter > 0
             && self.sweep_blocks_to_objective_fixed_point(
                 target,

@@ -492,10 +492,10 @@ pub fn score_block_required(
         ));
     }
     if plan.device_admitted {
-        let runtime = match mode {
-            GpuPolicy::Required => Some(gam_gpu::GpuRuntime::require()?),
-            GpuPolicy::Auto => gam_gpu::GpuRuntime::resolve(mode)?,
-            GpuPolicy::Off => unreachable!("Off returns before device admission"),
+        let runtime = if mode == GpuPolicy::Required {
+            Some(gam_gpu::GpuRuntime::require()?)
+        } else {
+            gam_gpu::GpuRuntime::resolve(mode)?
         };
         if runtime.is_none() {
             return Ok((score_block_cpu(rows, atoms), ScoreBlockPath::Cpu));
@@ -623,10 +623,10 @@ pub fn route_minibatch_required(
         return Ok((cpu_route(), ScoreBlockPath::Cpu, 0));
     }
 
-    let runtime = match mode {
-        gam_gpu::GpuPolicy::Required => Some(gam_gpu::GpuRuntime::require()?),
-        gam_gpu::GpuPolicy::Auto => gam_gpu::GpuRuntime::resolve(mode)?,
-        gam_gpu::GpuPolicy::Off => unreachable!("Off returns before CUDA admission"),
+    let runtime = if mode == gam_gpu::GpuPolicy::Required {
+        Some(gam_gpu::GpuRuntime::require()?)
+    } else {
+        gam_gpu::GpuRuntime::resolve(mode)?
     };
     if runtime.is_none() {
         note_route_engagement(false, "Auto admission found no CUDA device");

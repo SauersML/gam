@@ -13,15 +13,13 @@
 //!   * the dispatch entry [`solve_batched_k1_border`],
 //!   * the CPU reference path, which is ALSO the bit-parity oracle the device
 //!     kernel will be validated against, and
-//!   * the per-atom decline contract (a capability mismatch on one atom is served
-//!     by the CPU reference for that atom; a genuine numerical PD failure is
-//!     returned per-atom so the caller can bump that atom's ridge).
+//!   * the per-atom numerical-failure contract: a genuine PD failure is returned
+//!     per atom so the caller can bump only that atom's ridge.
 //!
-//! The device batched kernel (one thread-block per atom over the CSR pack of
-//! `BATCHED_K1_DESIGN.md` §3) is the follow-up: [`try_device_batched_k1`] is where
-//! `cuda::solve_batched_k1` will attach. Until it lands, every class declines to
-//! the CPU reference, so the numbers are correct on every host and the device path
-//! is purely an acceleration of an already-validated result.
+//! There is no device implementation in this module. Keeping a fake admission
+//! seam that always declined only paid runtime-probe cost and obscured the actual
+//! execution path; the CPU reference is therefore the single implementation
+//! until a real batched kernel exists end to end.
 
 use crate::arrow_schur::ArrowSchurSystem;
 use crate::gpu_kernels::arrow_schur::{
@@ -48,9 +46,6 @@ pub fn solve_batched_k1_border(
     ridge_t: f64,
     ridge_beta: f64,
 ) -> Vec<Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure>> {
-    if let Some(batched) = try_device_batched_k1(systems) {
-        return batched;
-    }
     systems
         .iter()
         .map(|sys| cpu_reference_k1(sys, ridge_t, ridge_beta))
@@ -69,40 +64,6 @@ fn cpu_reference_k1(
 ) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
     solve_arrow_newton_step_dense_reference(sys, ridge_t, ridge_beta)
         .map_err(|reason| ArrowSchurGpuFailure::SchurFactorFailed { reason })
-}
-
-/// Device admission for the batched color class. Applies the same work-based
-/// offload floor the single-system reduced-Schur paths use, keyed on the class's
-/// AGGREGATE active-row mass and mean border width (CG budget 1: a K=1 Direct
-/// solve is a single factor, not a CG loop — see `BATCHED_K1_DESIGN.md` §5).
-/// Returns `None` to decline the whole class to the CPU reference. Off Linux
-/// there is no CUDA path: Auto resolves typed absence and the class declines
-/// through the same admission flow. Probe faults fail rather than declining.
-///
-/// The batched per-atom device kernel is not yet attached, so an admitted class
-/// still declines to the CPU reference rather than fabricate a step: this function
-/// is the seam where `cuda::solve_batched_k1` will produce the per-atom results
-/// (and where the caller's ridge pair re-enters the signature once consumed).
-fn try_device_batched_k1(
-    systems: &[ArrowSchurSystem],
-) -> Option<Vec<Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure>>> {
-    if systems.is_empty() {
-        return None;
-    }
-    let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-        .unwrap_or_else(|error| panic!("batched K=1 GPU runtime resolution failed: {error}"))?;
-    let total_rows: usize = systems.iter().map(|s| s.rows.len()).sum();
-    let mean_k = systems.iter().map(|s| s.k).sum::<usize>() / systems.len();
-    let max_d = systems.iter().map(|s| s.d).max().unwrap_or(0);
-    if !runtime
-        .policy()
-        .reduced_schur_matvec_should_offload(total_rows, mean_k, max_d, 1)
-    {
-        return None;
-    }
-    // Admitted by the work floor, but the batched kernel is the follow-up; decline
-    // to the CPU reference (bit-parity oracle) rather than emit an unvalidated step.
-    None
 }
 
 #[cfg(test)]

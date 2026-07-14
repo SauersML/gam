@@ -5820,9 +5820,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // wall-clock happens to fall below a fraction of a running EMA is
             // non-deterministic — under CPU contention (a parallel sweep) the
             // same fit accepts at a different iterate than it does run alone,
-            // which cascades into a different outer seed and a different
-            // continuation-pre-warm fire/collapse decision (gam#979's
-            // "collapses sequentially, fires in parallel" instability). It also
+            // which cascades into a different accepted outer state (gam#979's
+            // sequential-versus-parallel instability). It also
             // accepts iterates up to 10× outside the real KKT/objective
             // tolerance, biasing the REML/LAML criterion the inner residual
             // feeds. Convergence is certified ONLY by the mathematical tests

@@ -52,9 +52,9 @@ pub(crate) fn try_factor_blocks_batched(
     ridge_t: f64,
     d: usize,
     evidence_factorization: bool,
-) -> Option<ArrowFactorSlab> {
+) -> Result<Option<ArrowFactorSlab>, ArrowSchurError> {
     if d == 0 || rows.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Uniform-shape gate: a heterogeneous row defeats the single-shape batched
     // POTRF and deliberately falls through to per-row CPU escalation.
@@ -62,7 +62,7 @@ pub(crate) fn try_factor_blocks_batched(
         .iter()
         .any(|row| row.htt.dim() != (d, d) || row.gt.len() != d)
     {
-        return None;
+        return Ok(None);
     }
     // Size gate BEFORE the device probe (startup-tax ordering fix): the batched
     // POTRF below routes through `try_cholesky_batched_lower_inplace`, whose
@@ -78,14 +78,16 @@ pub(crate) fn try_factor_blocks_batched(
         && !(gam_gpu::linalg_dispatch::DispatchOp::Potrf { p: d, batch })
             .admissible_under_any_policy()
     {
-        return None;
+        return Ok(None);
     }
     // No device → let the CPU path own the work (it is the exact fallback).
     if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-        .unwrap_or_else(|error| panic!("batched Arrow-Schur GPU probe failed: {error}"))
+        .map_err(|error| ArrowSchurError::SchurFactorFailed {
+            reason: format!("batched Arrow-Schur GPU runtime resolution failed: {error}"),
+        })?
         .is_none()
     {
-        return None;
+        return Ok(None);
     }
 
     // Assemble the damped blocks `H_tt^(i) + ridge_t·I` for the batched POTRF.
@@ -101,7 +103,9 @@ pub(crate) fn try_factor_blocks_batched(
     // Batched lower Cholesky over ALL usable GPUs. `None` ⇒ either no device
     // accepted the workload or some block was not PD at the base ridge; either
     // way the per-row CPU path must own escalation.
-    gam_gpu::try_cholesky_batched_lower_inplace(&mut blocks)?;
+    let Some(()) = gam_gpu::try_cholesky_batched_lower_inplace(&mut blocks) else {
+        return Ok(None);
+    };
 
     // Re-apply the κ-conditioning rejection so a barely-PD block forces the
     // whole batch back to the per-row path (where its ridge lifts), matching
@@ -112,11 +116,11 @@ pub(crate) fn try_factor_blocks_batched(
             let diag_scale = row_block_diag_scale(row, d);
             let kappa_est = cholesky_factor_kappa_estimate(factor);
             if !cholesky_factor_passes_safe_inversion(factor, d, diag_scale, kappa_est) {
-                return None;
+                return Ok(None);
             }
         }
     }
-    Some(ArrowFactorSlab::from_blocks(blocks))
+    Ok(Some(ArrowFactorSlab::from_blocks(blocks)))
 }
 
 pub(crate) fn row_block_diag_scale(row: &ArrowRowBlock, d: usize) -> f64 {

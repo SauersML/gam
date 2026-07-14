@@ -116,8 +116,8 @@ fn clamped_zero_offset_sine_does_not_abort_startup_validation() {
     // The #500 contract: the clamped fit must COMPLETE — not abort during
     // outer startup validation. Before the fix this returned
     // `Err(RemlOptimizationFailed("... no candidate seeds passed outer
-    // startup validation ..."))` because the continuation pre-warm refused
-    // every seed over a spuriously-inflated raw primal-KKT residual.
+    // startup validation ..."))` because every seed was refused over a
+    // spuriously-inflated raw primal-KKT residual.
     let result = fit_from_formula("y ~ s(x, k=12, bc=clamped)", &data, &cfg);
     let result = result.unwrap_or_else(|e| {
         panic!(
