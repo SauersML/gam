@@ -5277,6 +5277,179 @@ fn block_psi_test_block_states(
     ]
 }
 
+fn make_rigid_baseline_psi_test_family(
+    n: usize,
+) -> (
+    SurvivalMarginalSlopeFamily,
+    crate::custom_family::CustomFamilyHyperLayout,
+) {
+    let mut family = make_block_psi_test_family(n);
+    let age_entry = Array1::from_shape_fn(n, |row| 0.25 + 0.1 * row as f64);
+    let age_exit = Array1::from_shape_fn(n, |row| age_entry[row] + 0.75 + 0.03 * row as f64);
+    let baseline_config = crate::survival::construction::SurvivalBaselineConfig {
+        target: crate::survival::construction::SurvivalBaselineTarget::GompertzMakeham,
+        scale: None,
+        shape: Some(0.08),
+        rate: Some(0.22),
+        makeham: Some(0.04),
+    };
+    let geometry = Arc::new(
+        crate::survival::construction::build_survival_marginal_slope_baseline_geometry(
+            &age_entry,
+            &age_exit,
+            &baseline_config,
+        )
+        .expect("build rigid baseline geometry")
+        .expect("Gompertz-Makeham has a nonlinear baseline chart"),
+    );
+    family.offset_entry = Arc::new(geometry.offset_entry.clone());
+    family.offset_exit = Arc::new(geometry.offset_exit.clone());
+    family.derivative_offset_exit = Arc::new(geometry.derivative_offset_exit.clone());
+    family.family_hyper = SurvivalMarginalSlopeFamilyHyperState::new(
+        Some(Arc::clone(&geometry)),
+        None,
+    )
+    .expect("install rigid baseline family coordinates");
+
+    let family_axes = (0..geometry.theta.len()).collect::<Vec<_>>();
+    let layout = crate::custom_family::CustomFamilyHyperLayout::new(
+        vec![Vec::new(), Vec::new(), Vec::new()],
+        family_axes,
+        geometry.theta.clone(),
+    )
+    .expect("build typed baseline hyper layout");
+    (family, layout)
+}
+
+fn assert_psi_first_terms_match(
+    direct: &ExactNewtonJointPsiTerms,
+    workspace: &ExactNewtonJointPsiTerms,
+) {
+    assert_close(
+        direct.objective_psi,
+        workspace.objective_psi,
+        1e-13,
+        "baseline first objective direct/workspace",
+    );
+    assert!(
+        rel_diff_array1_survival(&direct.score_psi, &workspace.score_psi) < 1e-13,
+        "baseline first score direct/workspace mismatch",
+    );
+    let direct_hessian = direct
+        .hessian_psi_operator
+        .as_ref()
+        .expect("direct baseline Hessian operator")
+        .to_dense();
+    let workspace_hessian = workspace
+        .hessian_psi_operator
+        .as_ref()
+        .expect("workspace baseline Hessian operator")
+        .to_dense();
+    assert!(
+        rel_diff_array2_survival(&direct_hessian, &workspace_hessian) < 1e-13,
+        "baseline first Hessian direct/workspace mismatch",
+    );
+}
+
+fn assert_psi_second_terms_match(
+    direct: &ExactNewtonJointPsiSecondOrderTerms,
+    workspace: &ExactNewtonJointPsiSecondOrderTerms,
+) {
+    assert_close(
+        direct.objective_psi_psi,
+        workspace.objective_psi_psi,
+        1e-13,
+        "baseline pair objective direct/workspace",
+    );
+    assert!(
+        rel_diff_array1_survival(&direct.score_psi_psi, &workspace.score_psi_psi) < 1e-13,
+        "baseline pair score direct/workspace mismatch",
+    );
+    let direct_hessian = direct
+        .hessian_psi_psi_operator
+        .as_ref()
+        .expect("direct baseline-pair Hessian operator")
+        .to_dense();
+    let workspace_hessian = workspace
+        .hessian_psi_psi_operator
+        .as_ref()
+        .expect("workspace baseline-pair Hessian operator")
+        .to_dense();
+    assert!(
+        rel_diff_array2_survival(&direct_hessian, &workspace_hessian) < 1e-13,
+        "baseline pair Hessian direct/workspace mismatch",
+    );
+}
+
+#[test]
+fn rigid_baseline_dispatch_matches_direct_and_owned_workspace_without_fd() {
+    let (family, hyper_layout) = make_rigid_baseline_psi_test_family(12);
+    let states = block_psi_test_block_states(&family, 0.15, 0.25);
+    let specs = vec![dummy_blockspec(0), dummy_blockspec(1), dummy_blockspec(1)];
+    let workspace = family
+        .exact_newton_joint_psi_workspace_with_options(
+            &states,
+            &specs,
+            &hyper_layout,
+            &BlockwiseFitOptions::default(),
+        )
+        .expect("construct rigid baseline workspace")
+        .expect("rigid baseline workspace is available");
+
+    for axis in 0..hyper_layout.len() {
+        let direct = family
+            .exact_newton_joint_psi_terms(&states, &specs, &hyper_layout, axis)
+            .expect("direct rigid baseline first terms")
+            .expect("direct rigid baseline first terms available");
+        let owned = workspace
+            .first_order_terms(axis)
+            .expect("workspace rigid baseline first terms")
+            .expect("workspace rigid baseline first terms available");
+        assert_psi_first_terms_match(&direct, &owned);
+    }
+
+    let axis = 0;
+    let other_axis = usize::from(hyper_layout.len() > 1);
+    let direct_pair = family
+        .exact_newton_joint_psisecond_order_terms(
+            &states,
+            &specs,
+            &hyper_layout,
+            axis,
+            other_axis,
+        )
+        .expect("direct rigid baseline pair terms")
+        .expect("direct rigid baseline pair terms available");
+    let owned_pair = workspace
+        .second_order_terms(axis, other_axis)
+        .expect("workspace rigid baseline pair terms")
+        .expect("workspace rigid baseline pair terms available");
+    assert_psi_second_terms_match(&direct_pair, &owned_pair);
+
+    let direction = array![0.17, -0.09];
+    let direct_drift = family
+        .exact_newton_joint_psihessian_directional_derivative(
+            &states,
+            &specs,
+            &hyper_layout,
+            axis,
+            &direction,
+        )
+        .expect("direct rigid baseline Hessian drift")
+        .expect("direct rigid baseline Hessian drift available");
+    let owned_drift = workspace
+        .hessian_directional_derivative(axis, &direction)
+        .expect("workspace rigid baseline Hessian drift")
+        .expect("workspace rigid baseline Hessian drift available");
+    let gam_problem::DriftDerivResult::Dense(owned_drift) = owned_drift else {
+        panic!("rigid baseline workspace drift must preserve the dense exact carrier");
+    };
+    assert!(
+        rel_diff_array2_survival(&direct_drift, &owned_drift) < 1e-13,
+        "baseline Hessian drift direct/workspace mismatch",
+    );
+}
+
 /// Derivative blocks with a single ψ on the marginal block (block_idx=1).
 /// `x_psi` has shape (n, 1) so the test family gets a per-row psi map.
 fn block_psi_test_marginal_derivative_blocks(
