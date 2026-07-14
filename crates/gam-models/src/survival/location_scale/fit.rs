@@ -857,6 +857,11 @@ pub(crate) fn fit_survival_location_scale_terms(
             if prepared.family.x_link_wiggle.is_some() {
                 derivative_blocks.push(Vec::new());
             }
+            let hyper_layout = CustomFamilyHyperLayout::new(
+                derivative_blocks,
+                Vec::new(),
+                theta.slice(s![joint_setup.rho_dim()..]).to_owned(),
+            )?;
             // If the caller asked for a Hessian but the family can't provide
             // an analytic one, downgrade the request to ValueAndGradient.
             // ValueOnly stays ValueOnly so cost-only line-search probes skip
@@ -876,7 +881,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 &prepared.blockspecs,
                 &eval_options,
                 &rho,
-                &derivative_blocks,
+                &hyper_layout,
                 exact_warm_start.borrow().as_ref(),
                 effective_mode,
             )
@@ -940,6 +945,11 @@ pub(crate) fn fit_survival_location_scale_terms(
             if prepared.family.x_link_wiggle.is_some() {
                 derivative_blocks.push(Vec::new());
             }
+            let hyper_layout = CustomFamilyHyperLayout::new(
+                derivative_blocks,
+                Vec::new(),
+                theta.slice(s![joint_setup.rho_dim()..]).to_owned(),
+            )?;
             let eval_options = crate::outer_subsample::exact_outer_options_for_row_set(
                 &survival_blockwise_fit_options(&assembled),
                 row_set,
@@ -949,7 +959,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 &prepared.blockspecs,
                 &eval_options,
                 &rho,
-                &derivative_blocks,
+                &hyper_layout,
                 exact_warm_start.borrow().as_ref(),
             )
             .map_err(|e| e.to_string())?;
