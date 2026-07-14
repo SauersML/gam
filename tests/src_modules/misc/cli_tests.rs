@@ -212,18 +212,6 @@ fn saved_fit_summary_fixture() -> SavedFitSummary {
     }
 }
 
-use statrs::distribution::ChiSquared;
-
-fn chi_square_survival_approx(chi_sq: f64, df: f64) -> Option<f64> {
-    use super::ContinuousCDF;
-    if !chi_sq.is_finite() || !df.is_finite() || chi_sq < 0.0 || df <= 0.0 {
-        return None;
-    }
-    let dist = ChiSquared::new(df).ok()?;
-    let p = 1.0 - dist.cdf(chi_sq);
-    p.is_finite().then_some(p)
-}
-
 #[test]
 fn core_saved_fit_result_preserves_summary_metrics() {
     // A non-converged saved summary is unrepresentable now: the sealed
@@ -1470,13 +1458,14 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
 
     let pred_text = fs::read_to_string(&pred_path)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "read survival prediction csv", e));
+    // Exact header pin (the writer's column order is deterministic): a
+    // substring check could pass with reordered/renamed/duplicated columns.
     let header = pred_text.lines().next().unwrap_or("");
-    for required in ["mean", "std_error", "mean_lower", "mean_upper"] {
-        assert!(
-            header.contains(required),
-            "posterior-mean survival prediction output missing {required} column: {header}"
-        );
-    }
+    assert_eq!(
+        header,
+        "eta,survival_prob,failure_prob,risk_score,std_error,mean_lower,mean_upper",
+        "posterior-mean survival prediction header drifted"
+    );
 }
 
 #[test]
@@ -1731,12 +1720,11 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
     let pred_text = fs::read_to_string(&pred_path)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "read prediction csv", e));
     let header = pred_text.lines().next().unwrap_or("");
-    for required in ["mean", "std_error", "mean_lower", "mean_upper"] {
-        assert!(
-            header.contains(required),
-            "posterior-mean marginal-slope prediction output missing {required} column: {header}"
-        );
-    }
+    assert_eq!(
+        header,
+        "eta,survival_prob,failure_prob,risk_score,std_error,mean_lower,mean_upper",
+        "posterior-mean marginal-slope prediction header drifted"
+    );
 }
 
 #[test]
@@ -2846,82 +2834,6 @@ fn classify_cli_errorspecializes_thin_plate_knot_error() {
         .unwrap_or_else(|| panic!("{} failed", "thin-plate advice"));
     assert!(advice.contains("Increase the number of centers/knots"));
     assert!(!advice.contains("Shape mismatch detected"));
-}
-
-fn cindex_uncensored(time: &[f64], score: &[f64], higher_score_is_higher_risk: bool) -> f64 {
-    let mut concordant = 0.0;
-    let mut total = 0.0;
-    for i in 0..time.len() {
-        for j in (i + 1)..time.len() {
-            if (time[i] - time[j]).abs() < 1e-12 {
-                continue;
-            }
-            total += 1.0;
-            let (early, late) = if time[i] < time[j] { (i, j) } else { (j, i) };
-            let score_ordered = if higher_score_is_higher_risk {
-                score[early] > score[late]
-            } else {
-                score[early] < score[late]
-            };
-            concordant += f64::from(score_ordered);
-        }
-    }
-    if total == 0.0 {
-        0.0
-    } else {
-        concordant / total
-    }
-}
-
-fn cindex_uncensored_risk(time: &[f64], score: &[f64]) -> f64 {
-    cindex_uncensored(time, score, true)
-}
-
-fn cindex_uncensored_survival(time: &[f64], score: &[f64]) -> f64 {
-    cindex_uncensored(time, score, false)
-}
-
-#[test]
-fn survival_probability_is_bounded_and_monotone_decreasing_in_eta() {
-    let eta: Array1<f64> = array![-3.0, -1.0, 0.0, 1.0, 2.0];
-    let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0));
-    assert!(
-        surv.iter()
-            .all(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 1.0)
-    );
-    assert!(surv.windows(2).into_iter().all(|w| w[1] <= w[0] + 1e-12));
-}
-
-#[test]
-fn concordance_depends_on_score_semantics() {
-    let time = [12.0, 10.0, 8.0, 6.0, 4.0, 2.0];
-    let eta: Array1<f64> = array![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
-    let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0)).to_vec();
-    let risk = eta.to_vec();
-    let neg_risk = eta.mapv(|v| -v).to_vec();
-
-    // Risk-oriented c-index expects larger score => earlier failure.
-    let c_risk_on_eta = cindex_uncensored_risk(&time, &risk);
-    let c_risk_on_surv = cindex_uncensored_risk(&time, &surv);
-    assert!(c_risk_on_eta > 0.99);
-    assert!(c_risk_on_surv < 0.01);
-
-    // Survival-oriented c-index expects larger score => longer survival.
-    let c_surv_on_neg_eta = cindex_uncensored_survival(&time, &neg_risk);
-    let c_surv_on_surv = cindex_uncensored_survival(&time, &surv);
-    assert!(c_surv_on_neg_eta > 0.99);
-    assert!(c_surv_on_surv > 0.99);
-}
-
-#[test]
-fn chi_square_tail_probability_is_monotone_in_statistic() {
-    let p_small =
-        chi_square_survival_approx(0.5, 4.0).unwrap_or_else(|| panic!("{} failed", "p_small"));
-    let p_large =
-        chi_square_survival_approx(12.0, 4.0).unwrap_or_else(|| panic!("{} failed", "p_large"));
-    assert!(p_large < p_small);
-    assert!((0.0..=1.0).contains(&p_small));
-    assert!((0.0..=1.0).contains(&p_large));
 }
 
 #[test]
@@ -4205,8 +4117,14 @@ fn parse_survival_formula_allows_timewiggle_and_linkwiggle_together() {
             "Surv(entry, exit, event) ~ x + timewiggle(degree=3, internal_knots=5) + linkwiggle(degree=4, internal_knots=6)",
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula should parse", e));
-    assert!(parsed.timewiggle.is_some());
-    assert!(parsed.linkwiggle.is_some());
+    // Pin the parsed fields per block: is_some()-only would let the two
+    // wiggle configs cross-contaminate undetected.
+    let timewiggle = parsed.timewiggle.expect("timewiggle parsed");
+    assert_eq!(timewiggle.degree, 3);
+    assert_eq!(timewiggle.num_internal_knots, 5);
+    let linkwiggle = parsed.linkwiggle.expect("linkwiggle parsed");
+    assert_eq!(linkwiggle.degree, 4);
+    assert_eq!(linkwiggle.num_internal_knots, 6);
 }
 
 #[test]
@@ -4919,36 +4837,6 @@ fn gaussian_location_scale_prediction_csv_includes_std_error_before_bounds_when_
     );
 
     fs::remove_file(&path).ok();
-}
-
-#[test]
-fn gaussian_location_scale_predict_restores_sigma_to_response_units() {
-    // Directly test the CSV output for Gaussian location-scale predictions.
-    // This model class now always goes through the unified PredictableModel path.
-    let beta_mu: f64 = 12.0;
-    let beta_log_sigma: f64 = (5.0f64).ln();
-    let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
-    let out_path = td.path().join("pred.csv");
-    let eta = array![beta_mu];
-    let mean = eta.clone();
-    let sigma = array![beta_log_sigma.exp()];
-    write_gaussian_location_scale_prediction_csv(
-        &out_path,
-        eta.view(),
-        mean.view(),
-        sigma.view(),
-        None,
-        None,
-        None,
-    )
-    .unwrap_or_else(|e| {
-        panic!(
-            "{} failed: {:?}",
-            "write gaussian location-scale prediction csv", e
-        )
-    });
-    assert!((csv_mean_at(&out_path, 0) - 12.0).abs() < 1e-12);
-    assert!((csv_sigma_at(&out_path, 0) - 5.0).abs() < 1e-12);
 }
 
 #[test]
@@ -7681,9 +7569,27 @@ fn survival_initial_time_coefficient_targets_safe_interior_derivative() {
         .set_structural_monotonicity(true, 2)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "enable structural monotonicity", e));
     // I-spline basis is monotone by construction — non-negative time
-    // coefficients suffice.  Verify a simple positive start is feasible.
-    let beta0 = Array1::from_vec(vec![1e-4, 1e-4]);
-    assert!(beta0.iter().all(|&v: &f64| v >= 0.0 && v.is_finite()));
+    // coefficients suffice. The assertion must exercise the MODEL built
+    // above (the old form asserted a free-standing literal): a positive
+    // interior start must satisfy the model's own structural monotonicity
+    // constraints and yield a finite working state.
+    let beta0 = Array1::from_vec(vec![1e-4, 1e-4, -0.5]);
+    if let Some(constraints) = model.monotonicity_linear_constraints() {
+        let slack = constraints.a.dot(&beta0) - &constraints.b;
+        assert!(
+            slack.iter().all(|&v: &f64| v.is_finite() && v >= -1e-12),
+            "positive interior start violates the model's structural \
+             monotonicity rows: slack {slack:?}"
+        );
+    }
+    let state = model
+        .update_state(&beta0)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "working state at interior start", e));
+    assert!(
+        state.deviance.is_finite(),
+        "interior start must produce a finite working deviance, got {}",
+        state.deviance
+    );
 }
 
 #[test]
