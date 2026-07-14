@@ -7345,7 +7345,10 @@ mod batch_tests {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::{JetScalar, OneSeed, Order1, Order2, filtered_implicit_solve_scalar};
+    use super::{
+        DynamicJetArena, DynamicOrder2, JetScalar, OneSeed, Order1, Order2, RuntimeJetScalar,
+        filtered_implicit_solve_scalar,
+    };
     use crate::nested_dual::{Dual2, JetField};
 
     // A deliberately mixed beta/family program. Its family derivatives below
