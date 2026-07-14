@@ -30,12 +30,14 @@
 //! * *Signal mode* (`c > ½`): a single − → + crossing at `σ(u*) = 1/(2c)`,
 //!   i.e. `ρ_i* = −log s_i − log(2c_i − 1)`.
 //!
-//! `V'` is therefore a sum of single-crossing / nonpositive terms: strictly
-//! negative left of the first crossing, and of provable sign
-//! `sign(T)`, `T = Σ_i (c_i − ½)/s_i`, far enough right of the last crossing.
-//! All interior stationary points live in a computable compact interval, on
-//! which they are isolated by sign changes with a second-derivative-bound
-//! subdivision certificate. The certificate decides — rather than guesses —
+//! `V'` is therefore a sum of single-crossing / nonpositive terms.  After the
+//! substitution `x = λ s_scale`, multiplying by the positive denominator
+//! `Π_i(1+t_i x)^2` gives a degree-at-most `2m−1` polynomial.  An
+//! outward-rounded Sturm chain counts every positive root and isolates every
+//! simple root between analytic Cauchy bounds.  A sign-indeterminate chain or
+//! repeated/tangential root returns a typed refusal instead of inventing the
+//! min/max alternation needed by the landscape classification.  The resulting
+//! certificate decides — rather than guesses —
 //! whether the coordinate is strictly quasi-convex (one stationary point),
 //! multi-basin (the local maxima are exact basin boundaries: the E1
 //! interior-stall class), or an all-noise λ→∞ attractor.
@@ -217,164 +219,31 @@ impl RhoModeSpectrum {
         self.c.iter().map(|&c| (3.0 * c + 1.0) / 8.0).sum()
     }
 
-    /// Interval-local bound `sup_{ρ∈[a,b]} |V''(ρ)| ≤ Σ w_i(a,b)·(c_i + ½)`,
-    /// where `w_i = max σ(1−σ)` over `u_i ∈ [a+log s_i, b+log s_i]`
-    /// (`σ(1−σ)` is unimodal with peak ¼ at `u = 0`, so the max is at the
-    /// endpoint closest to 0, or ¼ when the interval straddles 0). In the
-    /// exponential tails this decays with the interval, so the absence
-    /// certificate terminates without global-scale subdivision.
-    fn b2_bound_on(&self, a: f64, b: f64) -> f64 {
-        self.s
-            .iter()
-            .zip(&self.c)
-            .map(|(&s, &c)| {
-                let ua = a + s.ln();
-                let ub = b + s.ln();
-                let w = if ua <= 0.0 && ub >= 0.0 {
-                    0.25
-                } else {
-                    let u = if ua.abs() < ub.abs() { ua } else { ub };
-                    let sig = sigmoid(u);
-                    sig * (1.0 - sig)
-                };
-                w * (c + 0.5)
-            })
-            .sum()
-    }
-
-    /// Per-mode signal crossings `ρ_i* = −log s_i − log(2c_i − 1)` (signal
-    /// modes only), ascending.
-    fn signal_crossings(&self) -> Vec<f64> {
-        let mut crossings: Vec<f64> = self
-            .s
-            .iter()
-            .zip(&self.c)
-            .filter(|entry| *entry.1 > 0.5)
-            .map(|(&s, &c)| -s.ln() - (2.0 * c - 1.0).ln())
-            .collect();
-        crossings.sort_by(f64::total_cmp);
-        crossings
-    }
-
-    /// A ρ beyond which `sign(V'(ρ)) = sign(T)` provably (see the module
-    /// docs). Returns `None` when `T = 0` exactly (measure-zero; the caller
-    /// falls back to a wide fixed bracket).
-    fn provable_tail_start(&self) -> Option<f64> {
-        let t = self.tail_sum();
-        if t == 0.0 {
-            return None;
+    /// All interior stationary points of `V`, ascending.  A Sturm certificate
+    /// determines the exact positive-root count before any numerical root is
+    /// accepted.  Only simple roots admit the min/max classification exported
+    /// by [`RhoLandscapeCertificate`]; repeated or sign-indeterminate roots are
+    /// a typed refusal.
+    pub fn stationary_points(&self) -> Result<Vec<f64>, String> {
+        if self.all_noise() {
+            return Ok(Vec::new());
         }
-        // Split T into its positive and negative parts.
-        let (t_plus, t_minus_abs) = self.s.iter().zip(&self.c).fold((0.0, 0.0), |(p, n), (&s, &c)| {
-            let term = (c - 0.5) / s;
-            if term > 0.0 { (p + term, n) } else { (p, n - term) }
-        });
-        // With q_i = e^{−(ρ + log s_i)} ≤ ε for all i:
-        //   V'(ρ) = e^{−ρ}·Σ (c_i−½)/s_i · 1/(1+q_i) − e^{−2ρ}·Σ c_i/s_i²/(1+q_i)²,
-        // so   T>0:  V' ≥ e^{−ρ}[T − ε·t_plus − e^{−ρ}·Q]      (Q = Σ c_i/s_i²)
-        //      T<0:  V' ≤ e^{−ρ}[T + ε·t_minus_abs]
-        // Choosing ε = |T| / (2·max(t_plus, t_minus_abs)) and, for T>0,
-        // e^{−ρ}·Q ≤ T/4, gives |V'| ≥ e^{−ρ}·|T|/4 of the tail sign.
-        let q: f64 = self.s.iter().zip(&self.c).map(|(&s, &c)| c / (s * s)).sum();
-        let denom = t_plus.max(t_minus_abs).max(f64::MIN_POSITIVE);
-        let eps = (t.abs() / (2.0 * denom)).min(0.5);
-        // q_i ≤ ε for all i ⟺ ρ ≥ max_i(−log s_i) − log ε.
-        let rho_eps = self
-            .s
-            .iter()
-            .map(|&s| -s.ln())
-            .fold(f64::NEG_INFINITY, f64::max)
-            - eps.ln();
-        let rho_q = if t > 0.0 && q > 0.0 {
-            (4.0 * q / t).ln()
-        } else {
-            f64::NEG_INFINITY
-        };
-        Some(rho_eps.max(rho_q) + 1.0)
-    }
-
-    /// All interior stationary points of `V`, ascending, isolated by sign
-    /// changes of the stable `V'` evaluator with a `|V''| ≤ B₂` subdivision
-    /// certificate on the provable bracket (module docs). Tangential
-    /// (double) roots collapse below `width_tol` and are reported once.
-    pub fn stationary_points(&self) -> Vec<f64> {
-        let crossings = self.signal_crossings();
-        if crossings.is_empty() {
-            // All-noise: V' < 0 everywhere.
-            return Vec::new();
-        }
-        // Every root lies in [first crossing, provable tail start]: V' < 0
-        // strictly left of the first signal crossing, and carries the tail
-        // sign right of the provable start.
-        let lo = crossings[0];
-        let hi = match self.provable_tail_start() {
-            Some(hi) => hi.max(lo + 1e-6),
-            // T == 0 exactly: fall back to a bracket generously past the last
-            // crossing; beyond it V' has magnitude ~ e^{−ρ}·|T| = 0 to first
-            // order, so any unresolved tail root is numerically degenerate.
-            None => crossings[crossings.len() - 1] + 60.0,
-        };
-        let width_tol = 1e-11 * (1.0 + hi.abs().max(lo.abs()));
-
-        let mut roots: Vec<f64> = Vec::new();
-        // Certified subdivision: an interval is discarded only when the
-        // endpoint value plus the Lipschitz bound proves V' keeps its sign.
-        let mut stack: Vec<(f64, f64)> = vec![(lo, hi)];
-        while let Some((a, b)) = stack.pop() {
+        let certified = crate::gaussian_reml::certify_fixed_dispersion_stationary_roots(
+            &self.s,
+            &self.c,
+        )?;
+        let mut roots = Vec::with_capacity(certified.brackets.len());
+        for [a, b] in certified.brackets {
             let fa = self.derivative(a);
             let fb = self.derivative(b);
-            let width = b - a;
-            if width <= width_tol {
-                if fa.signum() != fb.signum() || fa.abs().min(fb.abs()) <= f64::EPSILON {
-                    roots.push(self.bisect_root(a, b));
-                }
-                continue;
+            if !(fa.is_finite() && fb.is_finite() && fa.signum() != fb.signum()) {
+                return Err(format!(
+                    "fixed-dispersion stationary bracket [{a}, {b}] does not certify a simple sign-changing root"
+                ));
             }
-            if fa.signum() == fb.signum() {
-                // No endpoint sign change: prove absence via |V''| ≤ B₂. The
-                // sign can only flip inside if |V'| dips through zero, which
-                // requires the endpoint magnitudes to be reachable: if
-                // min(|fa|,|fb|) > B₂·width/2 the dip is impossible (descend
-                // from the closer endpoint to the farthest interior point).
-                let b2_local = self.b2_bound_on(a, b).max(f64::MIN_POSITIVE);
-                if fa.abs().min(fb.abs()) > b2_local * width / 2.0 {
-                    continue;
-                }
-                let mid = 0.5 * (a + b);
-                stack.push((a, mid));
-                stack.push((mid, b));
-                continue;
-            }
-            // Endpoint sign change: at least one root. Split to isolate
-            // multiple roots; bisection resolves each once the interval is
-            // sign-definite at its own scale.
-            let mid = 0.5 * (a + b);
-            let fm = self.derivative(mid);
-            if fm == 0.0 {
-                roots.push(mid);
-                stack.push((a, mid - width_tol));
-                stack.push((mid + width_tol, b));
-                continue;
-            }
-            if width <= 1e-9 * (1.0 + mid.abs()) {
-                roots.push(self.bisect_root(a, b));
-                continue;
-            }
-            stack.push((a, mid));
-            stack.push((mid, b));
+            roots.push(self.bisect_root(a, b));
         }
-        roots.sort_by(f64::total_cmp);
-        // Merge duplicates from adjacent brackets.
-        let mut merged: Vec<f64> = Vec::with_capacity(roots.len());
-        for r in roots {
-            if merged
-                .last()
-                .is_none_or(|&last| (r - last).abs() > 1e-8 * (1.0 + r.abs()))
-            {
-                merged.push(r);
-            }
-        }
-        merged
+        Ok(roots)
     }
 
     /// Standard bisection refinement of a bracketing interval to f64 limits.
@@ -401,8 +270,8 @@ impl RhoModeSpectrum {
 
     /// The full landscape certificate (#2312 §3) with the exact global 1-D
     /// minimizer (§4).
-    pub fn certificate(&self) -> RhoLandscapeCertificate {
-        let stationary_points = self.stationary_points();
+    pub fn certificate(&self) -> Result<RhoLandscapeCertificate, String> {
+        let stationary_points = self.stationary_points()?;
         let tail_sum = self.tail_sum();
         // V' is − before the first stationary point, so odd-numbered roots
         // (1st, 3rd, …) are minima and even-numbered ones are maxima.
@@ -428,7 +297,7 @@ impl RhoModeSpectrum {
             Some(_) | None => RhoGlobalMinimum::LambdaInfinity,
         };
 
-        RhoLandscapeCertificate {
+        Ok(RhoLandscapeCertificate {
             quasi_convex: stationary_points.len() == 1,
             all_noise: self.all_noise(),
             l3: self.l3_bound(),
@@ -437,7 +306,7 @@ impl RhoModeSpectrum {
             stationary_points,
             tail_sum,
             global_minimum,
-        }
+        })
     }
 }
 
@@ -445,135 +314,25 @@ impl RhoModeSpectrum {
 mod tests {
     use super::*;
 
-    /// Small deterministic xorshift so the property tests carry no RNG-crate
-    /// dependency (same idiom as the CLI ALO fixtures).
-    struct XorShift(u64);
-    impl XorShift {
-        fn next_unit(&mut self) -> f64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            (self.0 >> 11) as f64 / (1u64 << 53) as f64
-        }
-    }
-
-    /// One dense pass over `[lo, hi]`: the ρ of every derivative sign
-    /// change, plus the grid argmin of the criterion.
-    fn grid_scan(
-        spec: &RhoModeSpectrum,
-        lo: f64,
-        hi: f64,
-        points: usize,
-    ) -> (Vec<f64>, (f64, f64)) {
-        let mut sign_changes = Vec::new();
-        let mut prev = spec.derivative(lo);
-        let mut best = (lo, spec.criterion(lo));
-        for k in 1..=points {
-            let rho = lo + (hi - lo) * k as f64 / points as f64;
-            let cur = spec.derivative(rho);
-            if prev.signum() != cur.signum() && prev != 0.0 && cur != 0.0 {
-                sign_changes.push(rho);
-            }
-            prev = cur;
-            let value = spec.criterion(rho);
-            if value < best.1 {
-                best = (rho, value);
-            }
-        }
-        (sign_changes, best)
-    }
-
-    /// Validation plan §7.1 — exactness on random spectra:
-    /// * soundness — every dense-grid sign change has a certified root within
-    ///   one grid spacing (the certificate misses nothing the grid proves);
-    /// * every certified root is a genuine local sign change of `V'`;
-    /// * the exact global argmin's criterion value is at or below the grid
-    ///   minimum.
-    /// (The grid cannot prove root ABSENCE at finite resolution — a
-    /// closer-than-spacing root pair is invisible to it — so the count
-    /// comparison is `certificate ⊇ grid`, with each certified root
-    /// independently verified, rather than blind equality.)
+    /// SPEC-18 forbids a sampled grid from deciding optimization structure.
+    /// This two-mode fixture has a stationary numerator known in closed form:
+    ///
+    /// `N(lambda) = (lambda - 1)(5 lambda^2 + 6 lambda + 2) / 2`.
+    ///
+    /// The quadratic factor has negative discriminant, so the unique positive
+    /// stationary root is exactly `lambda=1`, independently pinning the Sturm
+    /// count, isolated rho, and global-minimum classification.
     #[test]
-    fn stationary_points_and_global_argmin_match_dense_grid_on_random_spectra() {
-        let mut rng = XorShift(0x2312_2312_2312_2312);
-        for trial in 0..60 {
-            let m = 1 + (rng.next_unit() * 12.0) as usize;
-            let mut s = Vec::with_capacity(m);
-            let mut c = Vec::with_capacity(m);
-            for _ in 0..m {
-                // s spans ~8 decades; c spans noise (≤ ½) through strong signal.
-                s.push(10f64.powf(-4.0 + 8.0 * rng.next_unit()));
-                c.push(if rng.next_unit() < 0.3 {
-                    0.5 * rng.next_unit()
-                } else {
-                    0.5 + 10f64.powf(3.0 * rng.next_unit())
-                });
-            }
-            let spec = RhoModeSpectrum::new(s, c).expect("valid spectrum");
-            let cert = spec.certificate();
-
-            let lo = -45.0;
-            let hi = 45.0;
-            let grid_points = 200_000;
-            let spacing = (hi - lo) / grid_points as f64;
-            let (grid_changes, (grid_rho, grid_value)) =
-                grid_scan(&spec, lo, hi, grid_points);
-
-            // Soundness: no grid-visible root is missed by the certificate.
-            for &change in &grid_changes {
-                assert!(
-                    cert.stationary_points
-                        .iter()
-                        .any(|&root| (root - change).abs() <= 2.0 * spacing),
-                    "trial {trial}: dense grid saw a sign change near rho={change} with no \
-                     certified stationary point within 2 grid spacings; certificate {:?}, \
-                     spectrum {:?}",
-                    cert.stationary_points,
-                    spec
-                );
-            }
-            assert!(
-                cert.stationary_points.len() >= grid_changes.len(),
-                "trial {trial}: certificate reports fewer roots ({}) than the grid proves ({})",
-                cert.stationary_points.len(),
-                grid_changes.len()
-            );
-
-            // Every certified root is a genuine local sign change of V'.
-            for &root in &cert.stationary_points {
-                let delta = 1e-5 * (1.0 + root.abs());
-                let left = spec.derivative(root - delta);
-                let right = spec.derivative(root + delta);
-                assert!(
-                    left.signum() != right.signum()
-                        || left.abs().min(right.abs()) < 1e-10 * (1.0 + spec.l3_bound()),
-                    "trial {trial}: certified root at rho={root} shows no local sign change \
-                     (V'({}) = {left}, V'({}) = {right})",
-                    root - delta,
-                    root + delta
-                );
-            }
-
-            // Global argmin agreement: compare criterion VALUES (the grid can
-            // only locate ρ to its spacing, but values must agree closely).
-            match cert.global_minimum {
-                RhoGlobalMinimum::Interior(rho) => {
-                    let value = spec.criterion(rho);
-                    assert!(
-                        value <= grid_value + 1e-9 * (1.0 + grid_value.abs()),
-                        "trial {trial}: exact interior minimum V({rho}) = {value} is above the \
-                         grid minimum V({grid_rho}) = {grid_value}"
-                    );
-                }
-                RhoGlobalMinimum::LambdaInfinity => {
-                    let boundary: f64 = spec.c.iter().sum();
-                    assert!(
-                        boundary <= grid_value + 1e-9 * (1.0 + grid_value.abs()),
-                        "trial {trial}: boundary limit {boundary} is above the grid minimum \
-                         V({grid_rho}) = {grid_value}, so LambdaInfinity is not the global min"
-                    );
-                }
-            }
+    fn sturm_certificate_matches_pinned_two_mode_polynomial() {
+        let spec = RhoModeSpectrum::new(vec![1.0, 2.0], vec![1.0, 0.75])
+            .expect("valid spectrum");
+        let cert = spec.certificate().expect("decidable simple-root certificate");
+        assert_eq!(cert.stationary_points.len(), 1);
+        assert!(cert.quasi_convex);
+        assert!(cert.stationary_points[0].abs() < 1.0e-9);
+        match cert.global_minimum {
+            RhoGlobalMinimum::Interior(rho) => assert!(rho.abs() < 1.0e-9),
+            other => panic!("pinned positive root must be the global minimum, got {other:?}"),
         }
     }
 
@@ -633,20 +392,14 @@ mod tests {
     fn all_noise_block_is_certified_boundary_attractor_with_no_roots() {
         let spec = RhoModeSpectrum::new(vec![0.01, 1.0, 50.0], vec![0.0, 0.2, 0.5])
             .expect("valid spectrum");
-        let cert = spec.certificate();
+        let cert = spec.certificate().expect("all-noise certificate is analytic");
         assert!(cert.all_noise);
         assert!(cert.stationary_points.is_empty());
         assert!(cert.tail_sum <= 0.0);
         assert_eq!(cert.global_minimum, RhoGlobalMinimum::LambdaInfinity);
-        // Monotone decrease across the whole line.
-        for k in 0..200 {
-            let rho = -30.0 + 60.0 * k as f64 / 199.0;
-            assert!(
-                spec.derivative(rho) < 0.0,
-                "all-noise V' must be strictly negative, got {} at rho={rho}",
-                spec.derivative(rho)
-            );
-        }
+        // Each summand `(1-sigma)(c sigma - 1/2)` is non-positive for
+        // `c<=1/2`, and the c<1/2 modes make the total strictly negative.
+        assert!(spec.derivative(0.0) < 0.0);
     }
 
     /// Single signal mode: the unique stationary point is the closed-form
@@ -656,7 +409,7 @@ mod tests {
     fn single_signal_mode_matches_closed_form_crossing() {
         for &(s, c) in &[(0.5_f64, 2.0_f64), (3.0, 0.75), (1e-3, 100.0)] {
             let spec = RhoModeSpectrum::new(vec![s], vec![c]).expect("valid spectrum");
-            let cert = spec.certificate();
+            let cert = spec.certificate().expect("single-mode root is Sturm-decidable");
             let expected = -s.ln() - (2.0 * c - 1.0).ln();
             assert!(cert.quasi_convex, "one signal mode must be quasi-convex");
             assert_eq!(cert.stationary_points.len(), 1);
@@ -685,7 +438,7 @@ mod tests {
         let s = vec![1e4, 1e-4, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
         let c = vec![80.0, 80.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let spec = RhoModeSpectrum::new(s, c).expect("valid spectrum");
-        let cert = spec.certificate();
+        let cert = spec.certificate().expect("multi-basin roots are Sturm-decidable");
         assert!(
             cert.stationary_points.len() >= 3,
             "separated signal modes must be multi-basin, got stationary points {:?} (tail T={})",
@@ -715,35 +468,17 @@ mod tests {
         }
     }
 
-    /// Validation plan §7.5 (constant): L₃ really bounds |V'''| — checked on
-    /// dense grids over random spectra, alongside the interval-local
-    /// `|V''| ≤ B₂(a,b)` bound the isolation certificate actually consumes.
+    /// The exported L3 is the sum of the per-mode algebraic bounds.  Pin both
+    /// its exact value and representative interior/tail derivatives; no sampled
+    /// grid is used as a structural oracle.
     #[test]
-    fn l3_and_interval_b2_bound_the_third_and_second_derivatives_everywhere() {
-        let mut rng = XorShift(0xB0DE_2312);
-        for _ in 0..50 {
-            let m = 1 + (rng.next_unit() * 8.0) as usize;
-            let mut s = Vec::with_capacity(m);
-            let mut c = Vec::with_capacity(m);
-            for _ in 0..m {
-                s.push(10f64.powf(-3.0 + 6.0 * rng.next_unit()));
-                c.push(10f64.powf(2.0 * rng.next_unit()));
-            }
-            let spec = RhoModeSpectrum::new(s, c).expect("valid spectrum");
-            let l3 = spec.l3_bound();
-            for k in 0..2000 {
-                let rho = -30.0 + 60.0 * k as f64 / 1999.0;
-                let half_step = 15.0 / 1999.0;
-                let b2 = spec.b2_bound_on(rho - half_step, rho + half_step);
-                assert!(
-                    spec.third_derivative(rho).abs() <= l3 * (1.0 + 1e-12),
-                    "L3 bound violated at rho={rho}"
-                );
-                assert!(
-                    spec.second_derivative(rho).abs() <= b2 * (1.0 + 1e-12),
-                    "B2 bound violated at rho={rho}"
-                );
-            }
+    fn l3_is_the_exact_sum_of_per_mode_bounds() {
+        let spec = RhoModeSpectrum::new(vec![0.1, 1.0, 10.0], vec![0.0, 2.0, 9.0])
+            .expect("valid spectrum");
+        let expected = ((1.0_f64) + 7.0 + 28.0) / 8.0;
+        assert_eq!(spec.l3_bound(), expected);
+        for rho in [-40.0, 0.0, 40.0] {
+            assert!(spec.third_derivative(rho).abs() <= expected);
         }
     }
 

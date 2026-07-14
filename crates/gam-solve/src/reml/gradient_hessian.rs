@@ -4180,7 +4180,21 @@ impl<'a> RemlState<'a> {
             else {
                 continue;
             };
-            let certificate = spectrum.certificate();
+            let certificate = match spectrum.certificate() {
+                Ok(certificate) => certificate,
+                Err(reason) => {
+                    // This sweep is an optional working-model proposal, not the
+                    // fitted profiled objective.  A Sturm-indeterminate or
+                    // repeated-root landscape therefore disables this proposal
+                    // for the coordinate; it must never be guessed or promoted
+                    // to a fit.  The true coupled REML optimizer remains the
+                    // sole authority.
+                    log::debug!(
+                        "[OUTER] fixed-dispersion rho proposal unavailable for coordinate {kk}: {reason}"
+                    );
+                    continue;
+                }
+            };
             rho[kk] = match certificate.global_minimum {
                 crate::rho_optimizer::RhoGlobalMinimum::Interior(r) => r.clamp(lo, hi),
                 crate::rho_optimizer::RhoGlobalMinimum::LambdaInfinity => hi,
