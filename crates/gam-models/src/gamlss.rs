@@ -90,8 +90,6 @@ use gam_linalg::matrix::{DenseDesignOperator, DesignMatrix};
 
 use gam_solve::mixture_link::inverse_link_jet_for_inverse_link;
 
-use gam_solve::pirls::LinearInequalityConstraints;
-
 use crate::probability::{normal_logcdf, normal_logsf, standard_normal_quantile};
 
 use crate::fit_orchestration::drivers::{
