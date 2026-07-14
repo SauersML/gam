@@ -67,7 +67,14 @@ pub fn try_primary_state_gram_cuda(
             || raw_block_ranges.is_empty()
             || channel_blocks.len() != raw_block_ranges.len()
         {
-            return Ok(None);
+            gam_gpu::gpu_bail!(
+                "identifiability GPU Gram requires non-empty, block-aligned channel/range inputs \
+                 (channel_blocks={}, h_rows={}, h_cols={}, raw_block_ranges={})",
+                channel_blocks.len(),
+                h_packed.nrows(),
+                h_packed.ncols(),
+                raw_block_ranges.len()
+            );
         }
         if runtime.is_some() {
             gam_gpu::gpu_bail!(
