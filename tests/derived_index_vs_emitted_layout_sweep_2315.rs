@@ -79,6 +79,15 @@ fn block(name: &str, p: usize, penalties: Vec<PenaltyMatrix>, base_lambda: f64) 
     }
 }
 
+fn with_initial_log_lambdas(
+    mut spec: ParameterBlockSpec,
+    values: &[f64],
+) -> ParameterBlockSpec {
+    assert_eq!(spec.penalties.len(), values.len());
+    spec.initial_log_lambdas = Array1::from_vec(values.to_vec());
+    spec
+}
+
 fn flat_group(label: &str, coords: Vec<(&str, usize)>, mean: f64) -> CoefficientGroupSpec {
     let mut g = CoefficientGroupSpec::new(
         label,
@@ -118,11 +127,14 @@ fn layout_zoo() -> Vec<LayoutCase> {
         },
         LayoutCase {
             name: "within_block_tie",
-            specs: vec![block(
-                "m",
-                2,
-                vec![labeled(2, "t"), labeled(2, "t"), plain(2)],
-                -1.0,
+            specs: vec![with_initial_log_lambdas(
+                block(
+                    "m",
+                    2,
+                    vec![labeled(2, "t"), labeled(2, "t"), plain(2)],
+                    -1.0,
+                ),
+                &[-1.0, -1.0, -0.5],
             )],
             groups: vec![],
             base_prior: scalar(),
@@ -131,7 +143,10 @@ fn layout_zoo() -> Vec<LayoutCase> {
             name: "cross_block_tie",
             specs: vec![
                 block("a", 2, vec![plain(2), labeled(2, "shared")], -1.0),
-                block("b", 2, vec![labeled(2, "shared"), plain(2)], 0.0),
+                with_initial_log_lambdas(
+                    block("b", 2, vec![labeled(2, "shared"), plain(2)], 0.0),
+                    &[-0.75, 0.25],
+                ),
             ],
             groups: vec![],
             base_prior: scalar(),
@@ -151,7 +166,10 @@ fn layout_zoo() -> Vec<LayoutCase> {
             name: "tie_and_fixed_mixed",
             specs: vec![
                 block("a", 2, vec![labeled(2, "t"), fixed(2, 2.0)], -1.0),
-                block("b", 2, vec![labeled(2, "t"), plain(2)], 0.0),
+                with_initial_log_lambdas(
+                    block("b", 2, vec![labeled(2, "t"), plain(2)], 0.0),
+                    &[-1.0, 0.25],
+                ),
             ],
             groups: vec![],
             base_prior: scalar(),
@@ -319,6 +337,27 @@ fn candidate(diag: &[f64], scale: f64, tag: &str) -> (PenaltyCandidate, bool, us
     (cand, is_zero, rank, dense)
 }
 
+fn assert_matrix_roundoff_equal(
+    actual: &Array2<f64>,
+    expected: &Array2<f64>,
+    context: &str,
+) {
+    assert_eq!(actual.dim(), expected.dim(), "{context}: shape mismatch");
+    let scale = expected
+        .iter()
+        .fold(1.0_f64, |current, value| current.max(value.abs()));
+    let tolerance = 32.0 * f64::EPSILON * scale;
+    let max_error = actual
+        .iter()
+        .zip(expected.iter())
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_error <= tolerance,
+        "{context}: canonical PSD reconstruction changed a penalty beyond roundoff: max error {max_error:e}, tolerance {tolerance:e}"
+    );
+}
+
 struct FilterCase {
     name: &'static str,
     /// Each entry: (diagonal spectrum, normalization_scale, tag).
@@ -445,10 +484,13 @@ fn dropped_candidates_never_shift_active_penalty_original_index_sweep_2315() {
                 "[{}] active penalty at original index {orig_index} lost its source identity",
                 case.name
             );
-            assert_eq!(
-                active.matrix, expected_active_matrices[k],
-                "[{}] active penalty at original index {orig_index} has a mismatched matrix",
-                case.name
+            assert_matrix_roundoff_equal(
+                &active.matrix,
+                &expected_active_matrices[k],
+                &format!(
+                    "[{}] active penalty at original index {orig_index}",
+                    case.name
+                ),
             );
             let p = active.matrix.nrows();
             assert_eq!(
