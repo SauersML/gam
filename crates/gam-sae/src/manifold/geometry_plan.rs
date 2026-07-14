@@ -651,6 +651,34 @@ pub fn anisotropic_flat_product_torus_penalty(
     Ok(penalty)
 }
 
+/// Analytic aspect derivative of
+/// [`anisotropic_flat_product_torus_penalty`]. The flat family is diagonal in
+/// the tensor Fourier basis, so differentiating its eigenvalue
+/// `k^2/A^2 + l^2` is exact and allocation-linear in the basis width.
+pub fn anisotropic_flat_product_torus_penalty_aspect_derivative(
+    per_axis_order: usize,
+    aspect: f64,
+) -> Result<Array2<f64>, String> {
+    if !(aspect.is_finite() && aspect >= 1.0) {
+        return Err(format!(
+            "anisotropic_flat_product_torus_penalty_aspect_derivative requires a finite aspect A >= 1, got {aspect}"
+        ));
+    }
+    let evaluator = TorusHarmonicEvaluator::new(2, per_axis_order)?;
+    let inverse_aspect_cubed = aspect.recip().powi(3);
+    let modes = evaluator.spectral_modes();
+    let mut derivative = Array2::<f64>::zeros((modes.len(), modes.len()));
+    for (column, mode) in modes.iter().enumerate() {
+        let long_frequency = mode.components[0].harmonic() as f64;
+        let short_frequency = mode.components[1].harmonic() as f64;
+        let eigenvalue = long_frequency.powi(2) / aspect.powi(2) + short_frequency.powi(2);
+        let eigenvalue_derivative = -2.0 * long_frequency.powi(2) * inverse_aspect_cubed;
+        derivative[[column, column]] =
+            2.0 * eigenvalue * eigenvalue_derivative * mode.l2_gram_weight;
+    }
+    Ok(derivative)
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Embedded donut torus: exact closed-form Laplace--Beltrami penalty operator.
 //
@@ -790,7 +818,10 @@ fn donut_inverse_weight_integral_derivative(m: usize, aspect: f64) -> f64 {
 /// `I_inv` supplies the `k^2` (theta-curvature) contribution to the weak
 /// Laplacian; `I_stiff` the `phi`-curvature contribution; `G` is the donut L2
 /// Gram. Returned in the evaluator's per-axis column order.
-fn donut_phi_block_integrals(per_axis_order: usize, aspect: f64) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
+fn donut_phi_block_integrals(
+    per_axis_order: usize,
+    aspect: f64,
+) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
     let width = 2 * per_axis_order + 1;
     let mut i_inv = Array2::<f64>::zeros((width, width));
     let mut i_stiff = Array2::<f64>::zeros((width, width));
@@ -904,11 +935,7 @@ fn donut_block_scale(k: usize, aspect: f64) -> f64 {
 }
 
 /// Weak `-Delta_g` block `B_k = k^2 I_inv + I_stiff` for `theta`-frequency `k`.
-fn donut_weak_laplacian_block(
-    k: usize,
-    i_inv: &Array2<f64>,
-    i_stiff: &Array2<f64>,
-) -> Array2<f64> {
+fn donut_weak_laplacian_block(k: usize, i_inv: &Array2<f64>, i_stiff: &Array2<f64>) -> Array2<f64> {
     let mut block = i_stiff.clone();
     if k > 0 {
         let k2 = (k * k) as f64;
@@ -934,7 +961,9 @@ pub fn embedded_donut_laplacian_block_eigenvalues(
         ));
     }
     if per_axis_order == 0 {
-        return Err("embedded_donut_laplacian_block_eigenvalues requires per_axis_order >= 1".to_string());
+        return Err(
+            "embedded_donut_laplacian_block_eigenvalues requires per_axis_order >= 1".to_string(),
+        );
     }
     let (i_inv, i_stiff, gram) = donut_phi_block_integrals(per_axis_order, aspect);
     let block = donut_weak_laplacian_block(k, &i_inv, &i_stiff);
@@ -988,7 +1017,8 @@ pub fn embedded_donut_torus_reference_penalty(
     per_axis_order: usize,
     aspect: f64,
 ) -> Result<Array2<f64>, String> {
-    let (penalty, _) = embedded_donut_penalty_and_optional_derivative(per_axis_order, aspect, false)?;
+    let (penalty, _) =
+        embedded_donut_penalty_and_optional_derivative(per_axis_order, aspect, false)?;
     Ok(penalty)
 }
 
@@ -1000,7 +1030,8 @@ pub fn embedded_donut_torus_reference_penalty_aspect_derivative(
     per_axis_order: usize,
     aspect: f64,
 ) -> Result<Array2<f64>, String> {
-    let (_, derivative) = embedded_donut_penalty_and_optional_derivative(per_axis_order, aspect, true)?;
+    let (_, derivative) =
+        embedded_donut_penalty_and_optional_derivative(per_axis_order, aspect, true)?;
     derivative.ok_or_else(|| "donut aspect derivative was not produced".to_string())
 }
 
@@ -1244,8 +1275,8 @@ mod tests {
         // k^2/A^2 = 9/A^2 (~2.25e-6), while the ISOTROPIC flat torus would put
         // this mode at k^2 = 9. The smallest block eigenvalue must land on the
         // former, nowhere near the latter.
-        let smallest = embedded_donut_laplacian_block_eigenvalues(per_axis_order, aspect, 3)
-            .unwrap()[0];
+        let smallest =
+            embedded_donut_laplacian_block_eigenvalues(per_axis_order, aspect, 3).unwrap()[0];
         let anisotropic_target = 9.0 / (aspect * aspect);
         assert!(
             (smallest - anisotropic_target).abs() <= 1.0e-3,
@@ -1261,11 +1292,9 @@ mod tests {
     fn embedded_donut_aspect_derivative_matches_central_difference() {
         let per_axis_order = 3;
         let aspect = 1.7;
-        let analytic = embedded_donut_torus_reference_penalty_aspect_derivative(
-            per_axis_order,
-            aspect,
-        )
-        .unwrap();
+        let analytic =
+            embedded_donut_torus_reference_penalty_aspect_derivative(per_axis_order, aspect)
+                .unwrap();
         let h = 1.0e-6;
         let plus = embedded_donut_torus_reference_penalty(per_axis_order, aspect + h).unwrap();
         let minus = embedded_donut_torus_reference_penalty(per_axis_order, aspect - h).unwrap();
@@ -1299,13 +1328,16 @@ mod tests {
         );
         // The tau entry point (A = cosh(tau)) is exactly this family evaluated
         // at the same aspect.
-        let via_tau = flat_rectangular_torus_reference_penalty(per_axis_order, (3.0_f64).acosh())
-            .unwrap();
+        let via_tau =
+            flat_rectangular_torus_reference_penalty(per_axis_order, (3.0_f64).acosh()).unwrap();
         let tau_gap = via_tau
             .iter()
             .zip(anisotropic.iter())
             .fold(0.0_f64, |acc, (lhs, rhs)| acc.max((lhs - rhs).abs()));
-        assert!(tau_gap <= 1.0e-9, "tau entry point must match aspect entry point");
+        assert!(
+            tau_gap <= 1.0e-9,
+            "tau entry point must match aspect entry point"
+        );
     }
 
     #[test]
@@ -1330,9 +1362,8 @@ mod tests {
         assert!(max_asymmetry <= 1.0e-9, "donut penalty must be symmetric");
         // It must be a genuinely phi-coupled dense operator, not the diagonal
         // flat comparator: at least one within-k off-diagonal entry is nonzero.
-        let has_offdiagonal = (0..width).any(|i| {
-            (0..width).any(|j| i != j && penalty[[i, j]].abs() > 1.0e-9)
-        });
+        let has_offdiagonal =
+            (0..width).any(|i| (0..width).any(|j| i != j && penalty[[i, j]].abs() > 1.0e-9));
         assert!(
             has_offdiagonal,
             "embedded donut penalty must couple Fourier modes (be non-diagonal)"

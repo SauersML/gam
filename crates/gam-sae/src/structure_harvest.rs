@@ -89,13 +89,19 @@ use crate::manifold::{
     SAE_MAX_PERIODIC_HARMONICS, SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisResolution,
     SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SaeReferenceMetricPlan,
     SphereChartTransition, UnitSpeedChartTransition, amplitude_concentration_certificate,
-    classify_occupancy_interval,
+    anisotropic_flat_product_torus_penalty,
+    anisotropic_flat_product_torus_penalty_aspect_derivative, classify_occupancy_interval,
+    embedded_donut_torus_reference_penalty,
+    embedded_donut_torus_reference_penalty_aspect_derivative,
 };
 use crate::migration_ledger::SaeMigrationLedger;
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
 use gam_linalg::faer_ndarray::FaerSvd;
 use gam_runtime::warm_start::Fingerprinter;
-use gam_solve::gaussian_reml::gaussian_reml_multi_shared_dispersion_closed_form;
+use gam_solve::gaussian_reml::{
+    gaussian_reml_multi_shared_dispersion_closed_form,
+    gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit,
+};
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use gam_solve::structure_search::{
     ChartGlueOutcome, CollapseAction, MoveBudget, MoveProposal, SearchLedger, SearchOutcome,
@@ -109,6 +115,10 @@ use gam_terms::inference::structure_evidence::{ClaimKind, StructureLedger};
 use gam_terms::latent::{LatentIdMode, LatentManifold};
 use gam_terms::structure::anova_atom::{
     CarveReport, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
+};
+use opt::{
+    Bfgs, Bounds, FirstOrderSample, FusedObjective, GradientTolerance, MaxIterations,
+    ObjectiveEvalError, Profile,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3101,6 +3111,227 @@ fn topology_candidates_for_dim(
 /// what [`race_birth_topology`] compares across candidates to pick the
 /// rigid — hence identifiable — winner.
 fn fit_topology_candidate(
+    spec: &TopologyCandidateSpec,
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Result<TopologyAutoFitEvidence<TopologyRaceFit>, String> {
+    if spec.geometry.kind() == &SaeAtomBasisKind::Torus {
+        fit_torus_metric_candidate(spec, target, weights)
+    } else {
+        fit_topology_candidate_at_fixed_metric(spec, target, weights)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TorusMetricFamily {
+    Flat,
+    EmbeddedDonut,
+}
+
+fn torus_metric_penalty_and_coordinate_derivative(
+    per_axis_order: usize,
+    family: TorusMetricFamily,
+    coordinate: f64,
+) -> Result<(Array2<f64>, Array2<f64>, f64), String> {
+    match family {
+        // q = A^-2 makes the flat eigenvalues affine in the optimized
+        // coordinate and keeps a nonzero one-sided gradient at the square
+        // boundary A=1. Optimizing tau directly would have dA/dtau=0 there and
+        // could falsely certify the seed as stationary.
+        TorusMetricFamily::Flat => {
+            if !(coordinate.is_finite() && coordinate > 0.0 && coordinate <= 1.0) {
+                return Err(format!(
+                    "flat torus inverse-aspect-squared coordinate must lie in (0, 1], got {coordinate}"
+                ));
+            }
+            let aspect = coordinate.sqrt().recip();
+            let penalty = anisotropic_flat_product_torus_penalty(per_axis_order, aspect)?;
+            let mut derivative =
+                anisotropic_flat_product_torus_penalty_aspect_derivative(per_axis_order, aspect)?;
+            let aspect_derivative = -0.5 * coordinate.powf(-1.5);
+            derivative.mapv_inplace(|value| value * aspect_derivative);
+            Ok((penalty, derivative, aspect.acosh()))
+        }
+        // beta = A - sqrt(A^2-1) = exp(-tau) is the natural generating-
+        // integral coordinate already used by the exact donut blocks. It maps
+        // the full proper-donut domain A>1 to beta in (0,1) without overflow.
+        TorusMetricFamily::EmbeddedDonut => {
+            if !(coordinate.is_finite() && coordinate > 0.0 && coordinate < 1.0) {
+                return Err(format!(
+                    "embedded donut beta coordinate must lie in (0, 1), got {coordinate}"
+                ));
+            }
+            let aspect = (1.0 + coordinate * coordinate) / (2.0 * coordinate);
+            let penalty = embedded_donut_torus_reference_penalty(per_axis_order, aspect)?;
+            let mut derivative =
+                embedded_donut_torus_reference_penalty_aspect_derivative(per_axis_order, aspect)?;
+            let aspect_derivative = 0.5 * (1.0 - coordinate.recip().powi(2));
+            derivative.mapv_inplace(|value| value * aspect_derivative);
+            Ok((penalty, derivative, -coordinate.ln()))
+        }
+    }
+}
+
+fn optimize_torus_metric_coordinate(
+    phi: ArrayView2<'_, f64>,
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    per_axis_order: usize,
+    family: TorusMetricFamily,
+    seed: f64,
+    lower: f64,
+    upper: f64,
+) -> Result<f64, String> {
+    let evaluate = |point: &Array1<f64>| -> Result<FirstOrderSample, ObjectiveEvalError> {
+        let (penalty, penalty_derivative, _) =
+            torus_metric_penalty_and_coordinate_derivative(per_axis_order, family, point[0])
+                .map_err(ObjectiveEvalError::fatal)?;
+        let fit = gaussian_reml_multi_shared_dispersion_closed_form(
+            phi,
+            target,
+            penalty.view(),
+            Some(weights),
+            None,
+        )
+        .map_err(|error| ObjectiveEvalError::fatal(format!("torus metric REML: {error}")))?;
+        let penalty_gradient = gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(
+            phi,
+            target,
+            penalty.view(),
+            Some(weights),
+            &fit,
+        )
+        .map_err(|error| {
+            ObjectiveEvalError::fatal(format!("torus metric REML gradient: {error}"))
+        })?;
+        let coordinate_gradient = penalty_gradient
+            .iter()
+            .zip(penalty_derivative.iter())
+            .map(|(left, right)| left * right)
+            .sum::<f64>();
+        if !coordinate_gradient.is_finite() {
+            return Err(ObjectiveEvalError::fatal(
+                "torus metric REML coordinate gradient is non-finite",
+            ));
+        }
+        Ok(FirstOrderSample {
+            value: fit.reml_score,
+            gradient: Array1::from_vec(vec![coordinate_gradient]),
+        })
+    };
+    let bound_resolution = f64::EPSILON.sqrt();
+    let bounds = Bounds::new(
+        Array1::from_vec(vec![lower]),
+        Array1::from_vec(vec![upper]),
+        bound_resolution,
+    )
+    .map_err(|error| format!("torus metric bounds: {error}"))?;
+    let seed_point = Array1::from_vec(vec![seed.clamp(lower, upper)]);
+    let objective = FusedObjective::new(evaluate);
+    let mut optimizer = Bfgs::new(seed_point, objective)
+        .with_bounds(bounds)
+        .with_profile(Profile::Deterministic)
+        .with_max_iterations(
+            MaxIterations::new(f64::MANTISSA_DIGITS as usize)
+                .map_err(|error| format!("torus metric iteration budget: {error}"))?,
+        )
+        .with_gradient_tolerance(GradientTolerance::relative_to_cost(bound_resolution));
+    let solution = optimizer.run().map_err(|error| {
+        format!("torus reference-metric optimization did not converge: {error}")
+    })?;
+    let coordinate = solution.final_point[0];
+    if !(coordinate.is_finite() && coordinate >= lower && coordinate <= upper) {
+        return Err(format!(
+            "torus reference-metric optimizer returned invalid coordinate {coordinate} outside [{lower}, {upper}]"
+        ));
+    }
+    Ok(coordinate)
+}
+
+fn fit_torus_metric_candidate(
+    spec: &TopologyCandidateSpec,
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Result<TopologyAutoFitEvidence<TopologyRaceFit>, String> {
+    let SaeBasisResolution::TorusHarmonics { per_axis_order } = spec.geometry.resolution() else {
+        return Err("torus candidate does not carry a torus harmonic resolution".to_string());
+    };
+    let evaluator = spec.geometry.build_evaluator()?;
+    let (phi, _) = evaluator.evaluate(spec.coords.view())?;
+    let numerical_resolution = f64::EPSILON.sqrt();
+
+    let flat_coordinate = optimize_torus_metric_coordinate(
+        phi.view(),
+        target,
+        weights,
+        *per_axis_order,
+        TorusMetricFamily::Flat,
+        1.0,
+        f64::EPSILON,
+        1.0,
+    )?;
+    let (_, _, flat_tau) = torus_metric_penalty_and_coordinate_derivative(
+        *per_axis_order,
+        TorusMetricFamily::Flat,
+        flat_coordinate,
+    )?;
+    let flat_geometry = SaeAtomGeometryPlan::new(
+        SaeAtomBasisKind::Torus,
+        2,
+        SaeBasisResolution::TorusHarmonics {
+            per_axis_order: *per_axis_order,
+        },
+        SaeReferenceMetricPlan::FlatRectangularTorus { tau: flat_tau },
+    )?;
+    let flat_spec = TopologyCandidateSpec::new(
+        AutoTopologyKind::Torus,
+        flat_geometry,
+        spec.manifold.clone(),
+        spec.coords.clone(),
+    )?;
+    let flat_fit = fit_topology_candidate_at_fixed_metric(&flat_spec, target, weights)?;
+
+    let embedded_lower = numerical_resolution;
+    let embedded_upper = 1.0 - numerical_resolution.sqrt();
+    let embedded_seed = (-flat_tau).exp().clamp(embedded_lower, embedded_upper);
+    let embedded_coordinate = optimize_torus_metric_coordinate(
+        phi.view(),
+        target,
+        weights,
+        *per_axis_order,
+        TorusMetricFamily::EmbeddedDonut,
+        embedded_seed,
+        embedded_lower,
+        embedded_upper,
+    )?;
+    let (_, _, embedded_tau) = torus_metric_penalty_and_coordinate_derivative(
+        *per_axis_order,
+        TorusMetricFamily::EmbeddedDonut,
+        embedded_coordinate,
+    )?;
+    let embedded_geometry = SaeAtomGeometryPlan::new(
+        SaeAtomBasisKind::Torus,
+        2,
+        SaeBasisResolution::TorusHarmonics {
+            per_axis_order: *per_axis_order,
+        },
+        SaeReferenceMetricPlan::EmbeddedDonutTorus { tau: embedded_tau },
+    )?;
+    let embedded_spec = TopologyCandidateSpec::new(
+        AutoTopologyKind::Torus,
+        embedded_geometry,
+        spec.manifold.clone(),
+        spec.coords.clone(),
+    )?;
+    let embedded_fit = fit_topology_candidate_at_fixed_metric(&embedded_spec, target, weights)?;
+    if embedded_fit.raw_reml < flat_fit.raw_reml {
+        Ok(embedded_fit)
+    } else {
+        Ok(flat_fit)
+    }
+}
+
+fn fit_topology_candidate_at_fixed_metric(
     spec: &TopologyCandidateSpec,
     target: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -6398,6 +6629,73 @@ mod tests {
                 LatentManifold::Circle { period: 1.0 },
                 LatentManifold::Circle { period: 1.0 },
             ])
+        );
+    }
+
+    #[test]
+    fn torus_race_persists_the_evidence_selected_reference_metric() {
+        use ndarray::Array1;
+
+        let side = 10usize;
+        let n = side * side;
+        let mut coords = Array2::<f64>::zeros((n, 2));
+        for i in 0..side {
+            for j in 0..side {
+                let row = i * side + j;
+                coords[[row, 0]] = i as f64 / side as f64;
+                coords[[row, 1]] = j as f64 / side as f64;
+            }
+        }
+        let geometry = SaeAtomGeometryPlan::new(
+            SaeAtomBasisKind::Torus,
+            2,
+            SaeBasisResolution::TorusHarmonics { per_axis_order: 2 },
+            SaeReferenceMetricPlan::FlatRectangularTorus { tau: 0.0 },
+        )
+        .unwrap();
+        let bundle = geometry.evaluate_bundle(coords.view()).unwrap();
+        let mut decoder = Array2::<f64>::zeros((bundle.basis_values.ncols(), 3));
+        for row in 0..decoder.nrows() {
+            for col in 0..decoder.ncols() {
+                decoder[[row, col]] = (((row + 1) * (col + 2)) as f64).sin() / (1.0 + row as f64);
+            }
+        }
+        let mut target = bundle.basis_values.dot(&decoder);
+        for row in 0..n {
+            for col in 0..target.ncols() {
+                target[[row, col]] += ((row + 3 * col + 1) as f64).cos() / n as f64;
+            }
+        }
+        let spec = TopologyCandidateSpec::new(
+            AutoTopologyKind::Torus,
+            geometry,
+            LatentManifold::Product(vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ]),
+            coords,
+        )
+        .unwrap();
+        let fit = fit_topology_candidate(&spec, target.view(), Array1::ones(n).view())
+            .expect("torus metric family must reach a converged evidence winner")
+            .fit_handle;
+        match fit.geometry.reference_metric() {
+            SaeReferenceMetricPlan::FlatRectangularTorus { tau } => {
+                assert!(tau.is_finite() && *tau >= 0.0)
+            }
+            SaeReferenceMetricPlan::EmbeddedDonutTorus { tau } => {
+                assert!(tau.is_finite() && *tau > 0.0)
+            }
+            other => panic!("torus race persisted a non-torus reference metric: {other:?}"),
+        }
+        let persisted_penalty = fit.geometry.build_reference_penalty().unwrap();
+        let max_gap = persisted_penalty
+            .iter()
+            .zip(fit.penalty.iter())
+            .fold(0.0_f64, |gap, (left, right)| gap.max((left - right).abs()));
+        assert!(
+            max_gap <= f64::EPSILON.sqrt(),
+            "winning metric plan and installed penalty diverged by {max_gap}"
         );
     }
 

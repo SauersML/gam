@@ -1588,6 +1588,90 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
     })
 }
 
+/// Exact envelope derivative of shared-dispersion Gaussian REML with respect
+/// to its symmetric penalty matrix at a converged inner fit.
+///
+/// The coefficient matrix and log smoothing strength are stationary in
+/// [`gaussian_reml_multi_shared_dispersion_closed_form`], so their implicit
+/// derivatives vanish from the outer derivative. What remains is the explicit
+/// penalty derivative of the restricted determinant and the single pooled
+/// deviance. This is the authority for continuously optimized reference-metric
+/// parameters: a metric supplies `dS/dtheta`, and the outer derivative is the
+/// Frobenius contraction `<dV/dS, dS/dtheta>`.
+pub fn gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    fit: &GaussianRemlMultiResult,
+) -> Result<Array2<f64>, EstimationError> {
+    validate_gaussian_reml_forward_fit(x, y, penalty, weights, fit)?;
+    let n = x.nrows();
+    let p = x.ncols();
+    let d = y.ncols();
+    let weight = gaussian_reml_weights(n, weights)?;
+    let n_effective = effective_observation_count(weight.view());
+    let per_output_nu = n_effective.checked_sub(fit.cache.nullity).ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "shared-dispersion REML penalty gradient has non-positive residual degrees of freedom"
+                .to_string(),
+        )
+    })?;
+    if per_output_nu == 0 {
+        crate::bail_invalid_estim!(
+            "shared-dispersion REML penalty gradient requires positive residual degrees of freedom"
+        );
+    }
+    let shared_nu = (d as f64) * (per_output_nu as f64);
+    let residual = y.to_owned() - &fit.fitted;
+    let penalty_times_coefficients = dense_ab(penalty, fit.coefficients.view());
+    let mut pooled_deviance = 0.0_f64;
+    for output in 0..d {
+        for row in 0..n {
+            let value = residual[[row, output]];
+            pooled_deviance += weight[row] * value * value;
+        }
+        pooled_deviance += fit.lambda
+            * fit
+                .coefficients
+                .column(output)
+                .dot(&penalty_times_coefficients.column(output));
+    }
+    pooled_deviance = pooled_deviance.max(MIN_DEVIANCE);
+
+    let inverse_hessian = gaussian_reml_inverse_hessian_from_cache(&fit.cache, fit.lambda)?;
+    let penalty_pseudoinverse = gaussian_reml_penalty_pseudoinverse_from_cache(&fit.cache);
+    let mut gradient = Array2::<f64>::zeros((p, p));
+    for row in 0..p {
+        for col in 0..p {
+            gradient[[row, col]] = 0.5
+                * (d as f64)
+                * (fit.lambda * inverse_hessian[[col, row]] - penalty_pseudoinverse[[col, row]]);
+        }
+    }
+    let deviance_scale = 0.5 * shared_nu * fit.lambda / pooled_deviance;
+    for output in 0..d {
+        add_rank_one_penalty_vjp(
+            deviance_scale,
+            fit.coefficients.column(output),
+            &mut gradient,
+        );
+    }
+    for row in 0..p {
+        for col in (row + 1)..p {
+            let mean = 0.5 * (gradient[[row, col]] + gradient[[col, row]]);
+            gradient[[row, col]] = mean;
+            gradient[[col, row]] = mean;
+        }
+    }
+    if gradient.iter().any(|value| !value.is_finite()) {
+        crate::bail_invalid_estim!(
+            "shared-dispersion REML penalty gradient produced a non-finite value"
+        );
+    }
+    Ok(gradient)
+}
+
 fn gaussian_reml_multi_closed_form_from_parts(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -4592,6 +4676,70 @@ mod tests {
             "shared sigma2 {} must equal pooled vector deviance / shared dof {}",
             fit.sigma2[0],
             expected_sigma2
+        );
+    }
+
+    #[test]
+    fn shared_dispersion_penalty_envelope_gradient_matches_refitted_direction() {
+        let n = 24usize;
+        let mut x = Array2::<f64>::zeros((n, 3));
+        let mut y = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let t = -1.0 + 2.0 * row as f64 / (n - 1) as f64;
+            x[[row, 0]] = 1.0;
+            x[[row, 1]] = t;
+            x[[row, 2]] = t * t;
+            y[[row, 0]] = 0.3 + 1.2 * t - 0.8 * t * t + 0.04 * (7.0 * t).sin();
+            y[[row, 1]] = -0.2 + 0.5 * t + 0.4 * t * t + 0.03 * (5.0 * t).cos();
+        }
+        let penalty = array![[0.0, 0.0, 0.0], [0.0, 0.7, 0.1], [0.0, 0.1, 1.4]];
+        let direction = array![[0.0, 0.0, 0.0], [0.0, 0.3, -0.08], [0.0, -0.08, 0.6]];
+        let fit = gaussian_reml_multi_shared_dispersion_closed_form(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            None,
+            None,
+        )
+        .unwrap();
+        let gradient = gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            None,
+            &fit,
+        )
+        .unwrap();
+        let analytic = gradient
+            .iter()
+            .zip(direction.iter())
+            .map(|(gradient, direction)| gradient * direction)
+            .sum::<f64>();
+
+        let step = f64::EPSILON.cbrt();
+        let plus_penalty = &penalty + &(direction.mapv(|value| step * value));
+        let minus_penalty = &penalty - &(direction.mapv(|value| step * value));
+        let plus = gaussian_reml_multi_shared_dispersion_closed_form(
+            x.view(),
+            y.view(),
+            plus_penalty.view(),
+            None,
+            Some(fit.rho),
+        )
+        .unwrap();
+        let minus = gaussian_reml_multi_shared_dispersion_closed_form(
+            x.view(),
+            y.view(),
+            minus_penalty.view(),
+            None,
+            Some(fit.rho),
+        )
+        .unwrap();
+        let numerical = (plus.reml_score - minus.reml_score) / (2.0 * step);
+        let scale = analytic.abs().max(numerical.abs()).max(1.0);
+        assert!(
+            (analytic - numerical).abs() <= 2.0e-5 * scale,
+            "shared-dispersion penalty envelope derivative mismatch: analytic={analytic}, refitted={numerical}"
         );
     }
 
