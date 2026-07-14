@@ -726,7 +726,7 @@ pub(crate) fn transformation_normal_uses_compact_gaussian_outer_seeding() {
 }
 
 #[test]
-pub(crate) fn max_feasible_step_size_is_unconstrained_for_scop_derivative() {
+pub(crate) fn max_feasible_step_size_delegates_to_the_factored_cone() {
     let psi = array![0.15, -0.10];
     let (family, _, state, _) = toy_family_and_derivatives(&psi);
     let p_total = state.beta.len();
@@ -750,7 +750,7 @@ pub(crate) fn max_feasible_step_size_is_unconstrained_for_scop_derivative() {
 
 #[test]
 pub(crate) fn warm_start_absorbs_offset_into_affine_seed() {
-    // The SCOP squared-γ warm start is built directly in β-space: choose a
+    // The direct-alpha warm start is built directly in coefficient space: choose a
     // positive constant shape seed for h', subtract its induced value
     // contribution, then solve the unconstrained location row. The fixed
     // monotonicity floor is part of h, so the value target includes

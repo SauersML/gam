@@ -160,7 +160,7 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
     ///   first HVP both populate that exact same cache, so returning `Operator`
     ///   would hide an already-materialized Hessian behind an SPD-PCG contract.
     ///   That loses the negative-curvature certificate and hard-case step needed
-    ///   by SCOP's nonconvex squared shape chart while saving no row work. Wider
+    ///   by the exact finite-support objective while saving no row work. Wider
     ///   systems, for which the cache is disabled, remain streamed.
     /// - `LogdetFactorization` factorizes `H + S_λ` and therefore needs a dense
     ///   matrix regardless. Returning `Operator` here only makes the dispatch

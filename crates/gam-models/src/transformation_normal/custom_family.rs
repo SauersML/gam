@@ -26,8 +26,8 @@ impl CustomFamily for TransformationNormalFamily {
 
         let log_likelihood = row_quantities.log_likelihood;
         // SCOP gradient and exact negative Hessian. Response column 0 is the
-        // linear location component b(x); response columns >=1 are squared
-        // γ_k(x)^2 shape components.
+        // affine location component b(x); response columns >=1 are direct
+        // non-negative alpha shape fields.
         let grad_start = std::time::Instant::now();
         let (grad, hessian) = self.scop_gradient_and_negative_hessian(beta, &row_quantities)?;
         log::info!(

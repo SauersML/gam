@@ -389,8 +389,8 @@ pub fn fit_transformation_normal(
         );
     }
 
-    // SCOP's squared shape coordinates make the coefficient objective
-    // non-convex. Value-only trials compare cold and carried modes;
+    // The finite-support normalized objective can have multiple coefficient
+    // modes. Value-only trials compare cold and carried modes;
     // the first derivative-bearing evaluation freezes the selected mode's
     // INPUT as the branch anchor. Every later trial restarts from that fixed
     // anchor, making the profile independent of rejected-trial cache history.
