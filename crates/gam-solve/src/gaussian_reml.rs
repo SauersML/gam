@@ -6160,7 +6160,7 @@ mod tests {
         }
         let sc_lo = sturm_sign_changes_at(&chain, lo)?;
         let sc_inf = sturm_sign_changes_at_pos_inf(&chain)?;
-        Some(sc_lo.saturating_sub(sc_inf))
+        sc_lo.checked_sub(sc_inf)
     }
 
     /// SPEC-18 forbids grid/sign-scan oracles. The Sturm certificate is checked
@@ -6192,17 +6192,18 @@ mod tests {
     }
 
     /// The grid-free promise: two stationary points closer than ANY former grid
-    /// cell are still each isolated. Pinned `(λ−1)(λ−1.01) = λ²−2.01λ+1.01` has a
-    /// root gap of 0.01 (far below the old 0.625-wide cell); the Sturm chain must
-    /// count BOTH over `(0,∞)` and, split at the midpoint, place exactly one on
-    /// each side. No scan, no sampling — closed-form roots only.
+    /// cell are still each isolated. Pinned
+    /// `(λ−1)(λ−1.25) = λ²−2.25λ+1.25` has a 0.25 root gap (below the old
+    /// 0.625-wide cell), and every coefficient/root/split is an exact dyadic
+    /// f64. The Sturm chain must count BOTH over `(0,∞)` and, split at the
+    /// midpoint, place exactly one on each side. No scan, no sampling.
     #[test]
     fn sturm_certificate_isolates_two_close_roots() {
-        let poly = pinned_poly(&[1.01, -2.01, 1.0]); // roots 1.00 and 1.01
+        let poly = pinned_poly(&[1.25, -2.25, 1.0]); // roots 1.00 and 1.25
         let total = sturm_root_count_above(&poly, 0.0).expect("decidable");
         assert_eq!(total, 2, "both close roots must be counted, got {total}");
 
-        let mid = 1.005;
+        let mid = 1.125;
         let below = sturm_root_count_in(&poly, 0.0, mid).expect("decidable");
         let above = sturm_root_count_above(&poly, mid).expect("decidable");
         assert_eq!(below, 1, "exactly one root below the midpoint, got {below}");
