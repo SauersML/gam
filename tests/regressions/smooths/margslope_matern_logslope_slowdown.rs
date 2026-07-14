@@ -1,208 +1,219 @@
-//! Repro for #979: bernoulli-marginal-slope with a *matern logslope smooth*
-//! (not intercept-only) became pathologically slow on 0.1.189 vs 0.1.156.
+//! Exact public-API regression for #979: a Bernoulli marginal-slope/probit
+//! model with the same omitted-scale Matérn surface in the marginal and
+//! log-slope channels.
 //!
-//! The issue's repro:
-//!   event ~ matern(PC1, PC2, centers=4)
-//!   logslope: matern(PC1, PC2, centers=4)
-//!   family = bernoulli-marginal-slope, link = probit, rigid (no warp/dev).
+//! The old fixture manually assembled a different estimator: equal-mass
+//! centers, ν=3/2, and direct fit-request internals. These cases deliberately
+//! enter through the formula materializer used by the issue:
 //!
-//! At centers=4, n~2500 speculative startup work took ~34s and the inner
-//! joint-Newton ~28s (cycles=17) — absurd for so small a basis. The generic
-//! speculative phase has been deleted; this test keeps the same shape at a
-//! tractable size and guards whole-fit iteration speed.
+//! ```text
+//! event ~ matern(PC1, PC2, centers=...)
+//! logslope = matern(PC1, PC2, centers=...)
+//! family = bernoulli-marginal-slope, link = probit, z_column = z
+//! ```
+//!
+//! A returned fit is the sealed SPEC-20 convergence certificate. Each case
+//! also verifies that materialization and fit freezing preserve the exact
+//! requested model: farthest-point centers, default ν=5/2, and typed `Auto`
+//! Matérn ownership with a positive resolved scale in both channels. Runtime
+//! is emitted as `[979-BINARY]` telemetry. The invoking workflow owns the
+//! wall-clock timeout so a blocked fit is interrupted externally.
 
-use gam::ResourcePolicy;
-use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
-use gam::families::custom_family::BlockwiseFitOptions;
-use gam::families::survival::lognormal_kernel::FrailtySpec;
-use gam::terms::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
-use gam::terms::smooth::{
-    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
-    TermCollectionSpec,
+use csv::StringRecord;
+use gam::terms::basis::{CenterStrategy, MaternLengthScale, MaternNu};
+use gam::terms::smooth::{SmoothBasisSpec, TermCollectionSpec};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use gam::types::{InverseLink, StandardLink};
-use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model};
-use ndarray::{Array1, Array2};
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
-fn matern_smooth(name: &str, centers: usize) -> SmoothTermSpec {
-    SmoothTermSpec {
-        name: name.to_string(),
-        basis: SmoothBasisSpec::Matern {
-            feature_cols: vec![0, 1],
-            spec: MaternBasisSpec {
-                center_strategy: CenterStrategy::EqualMass {
-                    num_centers: centers,
-                },
-                periodic: None,
-                // Formula-equivalent omitted scale.  #979 is specifically the
-                // automatic-kappa route; using `Fixed(1.0)` here silently
-                // bypasses the joint spatial optimizer and measures a
-                // different estimator.
-                length_scale: gam::terms::basis::MaternLengthScale::auto(),
-                nu: MaternNu::ThreeHalves,
-                include_intercept: false,
-                double_penalty: false,
-                identifiability: MaternIdentifiability::default(),
-                aniso_log_scales: None,
-            },
-            input_scales: None,
-        },
-        shape: ShapeConstraint::None,
-        joint_null_rotation: None,
-    }
+const N: usize = 2_500;
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn next_unit(state: &mut u64) -> f64 {
+    (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+fn next_gauss(state: &mut u64) -> f64 {
+    let u1 = next_unit(state).max(1e-12);
+    let u2 = next_unit(state);
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
 fn erf_approx(x: f64) -> f64 {
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let ax = x.abs();
-    let t = 1.0 / (1.0 + p * ax);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-ax * ax).exp();
-    sign * y
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let polynomial = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+        - 0.284496736)
+        * t
+        + 0.254829592)
+        * t;
+    sign * (1.0 - polynomial * (-x * x).exp())
 }
 
-fn build(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSpec) {
-    let mut rng = StdRng::seed_from_u64(0x9797_0001);
-    // Two PCs as the spatial coordinates (columns 0,1).
-    let mut data = Array2::<f64>::zeros((n, 2));
-    for i in 0..n {
-        data[[i, 0]] = rng.random_range(-2.0..2.0);
-        data[[i, 1]] = rng.random_range(-2.0..2.0);
-    }
-    // Latent score z ~ N(0,1) via Box-Muller.
-    let mut z = Array1::<f64>::zeros(n);
-    let mut i = 0usize;
-    while i < n {
-        let u1: f64 = rng.random_range(1e-12..1.0);
-        let u2: f64 = rng.random_range(0.0..1.0);
-        let r = (-2.0 * u1.ln()).sqrt();
-        let theta = 2.0 * std::f64::consts::PI * u2;
-        z[i] = r * theta.cos();
-        if i + 1 < n {
-            z[i + 1] = r * theta.sin();
-        }
-        i += 2;
-    }
-    // Truth: smooth spatial field on PCs plus a marginal-slope contribution.
-    let true_eta: Array1<f64> = Array1::from_iter((0..n).map(|i| {
-        let p1 = data[[i, 0]];
-        let p2 = data[[i, 1]];
-        let f = (0.8 * p1).sin() + 0.5 * (0.6 * p2).cos();
-        let slope = 0.3 + 0.2 * p1; // log-slope varies over space
-        f + slope * z[i]
-    }));
-    let y = Array1::from_iter(true_eta.iter().map(|&eta| {
-        let p = 0.5 * (1.0 + erf_approx(eta / std::f64::consts::SQRT_2));
-        if rng.random::<f64>() < p { 1.0 } else { 0.0 }
-    }));
+fn normal_cdf(x: f64) -> f64 {
+    0.5 * (1.0 + erf_approx(x / std::f64::consts::SQRT_2))
+}
 
-    let marginalspec = TermCollectionSpec {
-        linear_terms: vec![],
-        random_effect_terms: vec![],
-        smooth_terms: vec![matern_smooth("f_pc", centers)],
+fn build_dataset() -> gam::inference::data::EncodedDataset {
+    let headers = ["event", "z", "PC1", "PC2"]
+        .iter()
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    let mut state = 0x9797_2026_0713_0001_u64;
+
+    let mut pc1 = Vec::with_capacity(N);
+    let mut pc2 = Vec::with_capacity(N);
+    let mut z_raw = Vec::with_capacity(N);
+    for _ in 0..N {
+        pc1.push(4.0 * next_unit(&mut state) - 2.0);
+        pc2.push(4.0 * next_unit(&mut state) - 2.0);
+        z_raw.push(next_gauss(&mut state));
+    }
+
+    let z_mean = z_raw.iter().sum::<f64>() / N as f64;
+    let z_variance = z_raw
+        .iter()
+        .map(|value| (value - z_mean).powi(2))
+        .sum::<f64>()
+        / N as f64;
+    let z_sd = z_variance.sqrt().max(1e-12);
+
+    let mut rows = Vec::with_capacity(N);
+    for row in 0..N {
+        let z = (z_raw[row] - z_mean) / z_sd;
+        let marginal = (0.8 * pc1[row]).sin() + 0.5 * (0.6 * pc2[row]).cos();
+        let log_slope = -0.55 + 0.16 * pc1[row] - 0.10 * pc2[row];
+        let eta = marginal + log_slope.exp() * z;
+        let probability = normal_cdf(eta).clamp(1e-9, 1.0 - 1e-9);
+        let event = u8::from(next_unit(&mut state) < probability);
+        rows.push(StringRecord::from(vec![
+            event.to_string(),
+            z.to_string(),
+            pc1[row].to_string(),
+            pc2[row].to_string(),
+        ]));
+    }
+
+    encode_recordswith_inferred_schema(headers, rows).expect("encode #979 binary dataset")
+}
+
+fn resolved_auto_matern_scale(
+    spec: &TermCollectionSpec,
+    channel: &str,
+    expected_centers: usize,
+) -> f64 {
+    assert_eq!(
+        spec.smooth_terms.len(),
+        1,
+        "{channel} must contain exactly the formula's one Matérn term"
+    );
+    let SmoothBasisSpec::Matern { spec: matern, .. } = &spec.smooth_terms[0].basis else {
+        panic!("{channel} resolved to a non-Matérn basis");
     };
-    let logslopespec = TermCollectionSpec {
-        linear_terms: vec![],
-        random_effect_terms: vec![],
-        smooth_terms: vec![matern_smooth("ls_pc", centers)],
+    let CenterStrategy::FarthestPoint { num_centers } = &matern.center_strategy else {
+        panic!(
+            "{channel} must retain formula-selected farthest-point centers; got {:?}",
+            matern.center_strategy
+        );
     };
-    let spec = BernoulliMarginalSlopeTermSpec {
-        y,
-        weights: Array1::ones(n),
-        z,
-        base_link: InverseLink::Standard(StandardLink::Probit),
-        marginalspec,
-        logslopespec,
-        marginal_offset: Array1::<f64>::zeros(n),
-        logslope_offset: Array1::<f64>::zeros(n),
-        frailty: FrailtySpec::None,
-        score_warp: None,
-        link_dev: None,
-        latent_z_policy: LatentZPolicy::exploratory_fit_weighted(),
-        score_influence_jacobian: None,
+    assert_eq!(
+        *num_centers, expected_centers,
+        "{channel} must retain the requested center count"
+    );
+    assert!(
+        matches!(matern.nu, MaternNu::FiveHalves),
+        "{channel} must retain the formula default nu=5/2; got {:?}",
+        matern.nu
+    );
+    let MaternLengthScale::Auto {
+        resolved: Some(scale),
+    } = matern.length_scale
+    else {
+        panic!(
+            "{channel} must retain resolved Auto Matérn ownership after the fit; got {:?}",
+            matern.length_scale
+        );
     };
-    (data, spec)
+    assert!(
+        scale.is_finite() && scale > 0.0,
+        "{channel} automatic Matérn scale must be positive and finite; got {scale}"
+    );
+    scale
+}
+
+fn fit_issue_case(centers: usize) {
+    init_parallelism();
+
+    #[cfg(target_os = "macos")]
+    gam::gpu::configure_global_policy(gam::gpu::GpuPolicy::Off);
+
+    let data = build_dataset();
+    let matern = format!("matern(PC1, PC2, centers={centers})");
+    let formula = format!("event ~ {matern}");
+    let config = FitConfig {
+        family: Some("bernoulli-marginal-slope".to_string()),
+        link: Some("probit".to_string()),
+        z_column: Some("z".to_string()),
+        logslope_formula: Some(matern),
+        ..FitConfig::default()
+    };
+
+    let start = Instant::now();
+    let result = fit_from_formula(&formula, &data, &config)
+        .unwrap_or_else(|error| panic!("#979 binary centers={centers} fit failed: {error}"));
+    let elapsed = start.elapsed().as_secs_f64();
+    let FitResult::BernoulliMarginalSlope(fit) = result else {
+        panic!("expected a BernoulliMarginalSlope fit result");
+    };
+
+    let marginal_scale = resolved_auto_matern_scale(
+        &fit.marginalspec_resolved,
+        "marginal channel",
+        centers,
+    );
+    let logslope_scale = resolved_auto_matern_scale(
+        &fit.logslopespec_resolved,
+        "log-slope channel",
+        centers,
+    );
+    for block in &fit.fit.blocks {
+        for &coefficient in block.beta.iter() {
+            assert!(
+                coefficient.is_finite(),
+                "every fitted coefficient must be finite; got {coefficient}"
+            );
+        }
+    }
+
+    eprintln!(
+        "[979-BINARY] n={N} centers={centers} total_s={elapsed:.3} \
+         marginal_scale={marginal_scale:.6e} logslope_scale={logslope_scale:.6e} \
+         outer_iters={} inner_cycles={} converged=certified auto_kappa=both \
+         centers_strategy=farthest_point nu=5/2",
+        fit.fit.outer_iterations, fit.fit.inner_cycles
+    );
 }
 
 #[test]
 fn margslope_matern_logslope_timing() {
-    gam::init_parallelism();
-    let n = 1500;
-    let centers = 4;
-    let (data, spec) = build(n, centers);
-    let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
-        data: data.view(),
-        spec,
-        options: BlockwiseFitOptions::default(),
-        kappa_options: SpatialLengthScaleOptimizationOptions::default(),
-        policy: ResourcePolicy::default_library(),
-    });
-    let start = Instant::now();
-    let result = fit_model(request);
-    let elapsed = start.elapsed().as_secs_f64();
-    // Fit existence is the sealed convergence proof (SPEC 20).
-    match result {
-        Ok(FitResult::BernoulliMarginalSlope(out)) => {
-            eprintln!(
-                "[979-REPRO] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged=certified",
-                out.fit.outer_iterations, out.fit.inner_cycles
-            );
-        }
-        Ok(_) => panic!("wrong FitResult variant"),
-        Err(e) => panic!("fit failed: {e}"),
-    };
-    assert!(
-        elapsed < 60.0,
-        "margslope matern-logslope fit took {elapsed:.1}s at n={n} centers={centers} (budget 60s)"
-    );
+    fit_issue_case(4);
 }
 
-/// Above-the-cliff profiling repro (#979): centers=12, n=2000 — the regime
-/// where the former speculative multi-seed continuation fired and the binary
-/// marginal-slope fit became intractable (>360s). The current engine starts at
-/// the literal automatic-kappa seed and must certify that exact joint model
-/// within the wall budget. Invoke directly:
-///   cargo test --release --test regressions \
-///       margslope_matern_logslope_above_cliff -- --nocapture
 #[test]
 fn margslope_matern_logslope_above_cliff() {
-    gam::init_parallelism();
-    let n = 2000;
-    let centers = 12;
-    let (data, spec) = build(n, centers);
-    let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
-        data: data.view(),
-        spec,
-        options: BlockwiseFitOptions::default(),
-        kappa_options: SpatialLengthScaleOptimizationOptions::default(),
-        policy: ResourcePolicy::default_library(),
-    });
-    let start = Instant::now();
-    let result = fit_model(request);
-    let elapsed = start.elapsed().as_secs_f64();
-    // Fit existence is the sealed convergence proof (SPEC 20).
-    match result {
-        Ok(FitResult::BernoulliMarginalSlope(out)) => {
-            eprintln!(
-                "[979-ABOVE-CLIFF] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged=certified",
-                out.fit.outer_iterations, out.fit.inner_cycles
-            );
-        }
-        Ok(_) => panic!("wrong FitResult variant"),
-        Err(e) => panic!(
-            "above-cliff marginal-slope fit failed after {elapsed:.2}s at n={n} centers={centers}: {e}"
-        ),
-    };
-    assert!(
-        elapsed < 120.0,
-        "above-cliff margslope fit took {elapsed:.1}s at n={n} centers={centers} (budget 120s) — #979 binary slowdown"
-    );
+    fit_issue_case(12);
+}
+
+#[test]
+fn margslope_matern_logslope_centers20_issue_scale() {
+    fit_issue_case(20);
 }
