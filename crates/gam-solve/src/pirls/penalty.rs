@@ -116,8 +116,21 @@ impl PirlsPenalty {
 
     pub(super) fn apply(&self, beta: &Array1<f64>) -> Array1<f64> {
         match self {
-            Self::Dense { s_transformed, .. } => {
-                gam_linalg::faer_ndarray::fast_av(s_transformed, beta)
+            Self::Dense { e_transformed, .. } => {
+                // Apply the dense penalty through its square root rather than
+                // through the assembled Gram matrix:
+                //
+                //     S beta = E' (E beta),  S = E' E.
+                //
+                // Forming `S` is unavoidable for the direct Hessian solve, but
+                // using it again for the gradient squares the conditioning of
+                // `E`.  At wide smoothing-parameter ratios a coefficient can
+                // have large cancelling coordinates, so `beta.dot(S beta)` can
+                // even become negative although the represented penalty is
+                // positive semidefinite.  Keeping value and gradient on the
+                // root representation makes them one coherent numerical atom.
+                let e_beta = fast_av(e_transformed, beta);
+                fast_atv(e_transformed, &e_beta)
             }
             Self::Diagonal { diag, .. } => diag * beta,
         }
@@ -158,8 +171,46 @@ impl PirlsPenalty {
     }
 
     pub(super) fn shifted_quadratic(&self, beta: &Array1<f64>) -> f64 {
-        let s_beta = self.apply(beta);
-        beta.dot(&s_beta) - 2.0 * beta.dot(self.linear_shift()) + self.constant_shift()
+        let unshifted = match self {
+            Self::Dense { e_transformed, .. } => {
+                let e_beta = fast_av(e_transformed, beta);
+                e_beta.dot(&e_beta)
+            }
+            Self::Diagonal { diag, .. } => beta
+                .iter()
+                .zip(diag.iter())
+                .map(|(&coefficient, &weight)| weight * coefficient * coefficient)
+                .sum(),
+        };
+        unshifted - 2.0 * beta.dot(self.linear_shift()) + self.constant_shift()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PirlsPenalty;
+    use ndarray::{Array1, array};
+
+    #[test]
+    fn dense_penalty_value_and_gradient_use_the_psd_root() {
+        // The small eigen-direction is exactly representable in E, but is lost
+        // when E' E is rounded: every entry of the Gram rounds to 1e32.  This is
+        // the cancellation pattern reached by stiff outer-REML trial points in
+        // #2316.  The represented penalty is nevertheless unambiguously
+        // ||E beta||^2 = 4 with gradient E'(E beta) = [2, -2].
+        let e_transformed = array![[1.0e16, 1.0e16], [1.0, -1.0]];
+        let s_transformed = e_transformed.t().dot(&e_transformed);
+        let penalty = PirlsPenalty::Dense {
+            s_transformed,
+            e_transformed,
+            linear_shift: Array1::zeros(2),
+            constant_shift: 0.0,
+            prior_mean_target: Array1::zeros(2),
+        };
+        let beta = array![1.0, -1.0];
+
+        assert_eq!(penalty.shifted_quadratic(&beta), 4.0);
+        assert_eq!(penalty.shifted_gradient(&beta), array![2.0, -2.0]);
     }
 }
 
