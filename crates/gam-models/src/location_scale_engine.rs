@@ -141,7 +141,7 @@ mod tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                        length_scale,
+                        length_scale: length_scale.into(),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: false,

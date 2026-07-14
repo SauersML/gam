@@ -3262,7 +3262,7 @@ pub fn set_spatial_length_scale(
             Ok(())
         }
         SmoothBasisSpec::Matern { spec, .. } => {
-            spec.length_scale = length_scale;
+            spec.length_scale.set_resolved(length_scale);
             Ok(())
         }
         SmoothBasisSpec::Duchon { spec, .. } => {
@@ -3281,7 +3281,7 @@ pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> O
         .get(term_idx)
         .and_then(|term| match &term.basis {
             SmoothBasisSpec::ThinPlate { spec, .. } => Some(spec.length_scale),
-            SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
+            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale.resolved(),
             SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale,
             _ => None,
         })
@@ -3689,8 +3689,16 @@ pub fn set_single_term_constant_curvature_kappa(
 /// marginal-slope, where the joint-spatial outer solver otherwise spends
 /// ~80 iters stalled on the user's chosen ρ at high gradient).
 pub fn spatial_term_has_locked_kappa(spec: &TermCollectionSpec, term_idx: usize) -> bool {
-    get_spatial_length_scale(spec, term_idx).is_some()
-        && !spatial_term_uses_per_axis_psi(spec, term_idx)
+    let explicitly_fixed = spec
+        .smooth_terms
+        .get(term_idx)
+        .is_some_and(|term| match &term.basis {
+            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale.is_fixed(),
+            SmoothBasisSpec::ThinPlate { .. } => true,
+            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale.is_some(),
+            _ => false,
+        });
+    explicitly_fixed && !spatial_term_uses_per_axis_psi(spec, term_idx)
 }
 
 pub fn all_spatial_terms_kappa_fixed(spec: &TermCollectionSpec) -> bool {
@@ -3934,7 +3942,7 @@ mod spatial_psi_bound_coordinate_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::UserProvided(centers),
-                        length_scale: 1.0,
+                        length_scale: 1.0.into(),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,
@@ -4776,12 +4784,10 @@ pub fn plan_joint_spatial_centers_for_term_blocks(
         }
     }
 
-    // Sentinel auto-init: Matern and thin-plate builders write length_scale =
-    // 0.0 when the user didn't pass `length_scale=...`. Replace those with a
-    // data-driven initialization here so REML starts in a regime where it can
-    // escape; the hard-coded 1.0 default was a basin from which ν ≥ 5/2 Matern
-    // could not recover on high-frequency truths, silently collapsing the fit
-    // to a near-constant prediction.
+    // Resolve typed Matérn Auto scales and the legacy thin-plate numeric
+    // auto marker to a data-driven initialization here so REML starts in a
+    // regime where it can escape. Matérn retains Auto provenance after this
+    // numeric seed is installed, so it cannot later masquerade as user-fixed.
     for block in planned_blocks.iter_mut() {
         for term in block.iter_mut() {
             auto_init_length_scale_in_place(data, term);
@@ -5048,31 +5054,30 @@ fn center_strategy_requested_count(strategy: &CenterStrategy) -> Option<usize> {
     }
 }
 
-/// Walk a term and, if it is a Matern or thin-plate smooth whose length_scale
-/// was left at the auto sentinel (`0.0`), overwrite it with
-/// [`auto_initial_length_scale`].
+/// Walk a term and resolve an omitted Matérn length scale, or a thin-plate
+/// smooth still carrying its numeric auto marker, with
+/// [`auto_initial_length_scale`]. Matérn's typed Auto provenance survives.
 pub fn auto_init_length_scale_in_place(data: ArrayView2<'_, f64>, term: &mut SmoothTermSpec) {
     auto_init_length_scale_in_basis(data, &mut term.basis);
 }
 
-/// Replace the `0.0` auto-init length-scale sentinel with a data-derived value
-/// for any Matern / thin-plate kernel reachable from this basis — including the
+/// Resolve the typed Matérn Auto length scale (and thin-plate's numeric auto
+/// marker) with a data-derived value for any reachable kernel — including the
 /// inner kernel of a `by=`/factor-smooth wrapper.
 ///
 /// `by=<factor>` and the sum-to-zero factor smooth wrap a spatial kernel inside
 /// `SmoothBasisSpec::ByVariable` / `SmoothBasisSpec::FactorSumToZero` /
 /// `SmoothBasisSpec::BySmooth`, so the wrapper variant is what the planner sees.
-/// Without recursing into the wrapped basis the inner ThinPlate/Matern keeps the
-/// `0.0` sentinel (the post-`1605b3a6e` builder default), which makes the kernel
-/// distance divide by `length_scale² = 0`, producing a non-finite design at both
-/// fit and predict time. Recurse so the inner kernel is initialized identically
+/// Without recursing into the wrapped basis the inner Matérn remains unresolved
+/// (and ThinPlate keeps its numeric marker), so no valid kernel scale exists at
+/// fit or predict time. Recurse so the inner kernel is initialized identically
 /// to a top-level one.
 pub fn auto_init_length_scale_in_basis(data: ArrayView2<'_, f64>, basis: &mut SmoothBasisSpec) {
     match basis {
         SmoothBasisSpec::Matern {
             feature_cols, spec, ..
         } => {
-            if spec.length_scale == 0.0 {
+            if spec.length_scale.resolved().is_none() {
                 // Density-adaptive seed (#1731): when the requested center count
                 // is known, scale the auto length scale with the *center*
                 // spacing so a richer `k` stays numerically full-rank instead of
@@ -5081,10 +5086,11 @@ pub fn auto_init_length_scale_in_basis(data: ArrayView2<'_, f64>, basis: &mut Sm
                 // sqrt(n)` seed in 2-D, so small-`k` results are unchanged. The
                 // unconstrained / non-explicit `UniformGrid` strategy falls back
                 // to the plain seed.
-                spec.length_scale = match center_strategy_requested_count(&spec.center_strategy) {
+                let resolved = match center_strategy_requested_count(&spec.center_strategy) {
                     Some(k) => auto_initial_length_scale_for_centers(data, feature_cols, k),
                     None => auto_initial_length_scale(data, feature_cols),
                 };
+                spec.length_scale.resolve_auto_once(resolved);
             }
         }
         SmoothBasisSpec::ThinPlate {
@@ -8692,10 +8698,16 @@ pub fn build_single_local_smooth_term(
                     );
                 }
             }
+            let original_length_scale = spec.length_scale.resolved().ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "term '{}' reached Matérn construction before its Auto length scale was resolved",
+                    term.name
+                ))
+            })?;
             let frame = term.basis.scale_contract().normalize_euclidean_frame(
                 select_columns(data, feature_cols)?,
                 input_scales.as_deref(),
-                Some(spec.length_scale),
+                Some(original_length_scale),
             )?;
             let x = frame.coordinates;
             let scales = frame.input_scales;
@@ -8703,7 +8715,7 @@ pub fn build_single_local_smooth_term(
                 .length_scale
                 .expect("Matérn declares a required length-scale coordinate");
             let mut spec_local = spec.clone();
-            spec_local.length_scale = length_scale_eff;
+            spec_local.length_scale.set_resolved(length_scale_eff);
             let mut result = build_matern_basiswithworkspace(x.view(), &spec_local, workspace)?;
             if let BasisMetadata::Matern {
                 input_scales,
@@ -8712,7 +8724,7 @@ pub fn build_single_local_smooth_term(
             } = &mut result.metadata
             {
                 *input_scales = scales;
-                *length_scale = spec.length_scale;
+                *length_scale = original_length_scale;
             }
             result
         }

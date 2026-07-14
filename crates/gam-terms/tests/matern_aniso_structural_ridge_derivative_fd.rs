@@ -46,7 +46,7 @@ fn fixture() -> (Array2<f64>, MaternBasisSpec, Vec<f64>) {
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(centers),
         periodic: None,
-        length_scale,
+        length_scale: length_scale.into(),
         nu: MaternNu::FiveHalves,
         include_intercept: true,
         double_penalty: true,
@@ -65,7 +65,7 @@ fn realized_active_penalties_at_psi(
 ) -> Vec<ActivePenalty> {
     let (length_scale, eta) = psi_to_length_scale_and_eta(psi);
     let mut trial = spec.clone();
-    trial.length_scale = length_scale;
+    trial.length_scale.set_resolved(length_scale);
     trial.aniso_log_scales = Some(eta);
     build_matern_basiswithworkspace(data.view(), &trial, &mut BasisWorkspace::default())
         .expect("realized anisotropic Matérn value build")

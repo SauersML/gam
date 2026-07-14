@@ -874,13 +874,71 @@ pub use sphere_spectral::{
     sphere_truncated_spectral_eval,
 };
 
+/// User intent and resolved numeric state for a Matérn kernel length scale.
+///
+/// `Auto` remains auto-owned after the planner resolves its data-dependent
+/// numeric seed.  This is deliberately not represented by a magic floating
+/// point value: callers can distinguish an omitted `length_scale` from an
+/// explicit value before and after center planning, and subsequent κ updates
+/// preserve that provenance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum MaternLengthScale {
+    Auto { resolved: Option<f64> },
+    Fixed(f64),
+}
+
+impl MaternLengthScale {
+    pub const fn auto() -> Self {
+        Self::Auto { resolved: None }
+    }
+
+    pub const fn fixed(value: f64) -> Self {
+        Self::Fixed(value)
+    }
+
+    pub const fn is_fixed(self) -> bool {
+        matches!(self, Self::Fixed(_))
+    }
+
+    pub const fn resolved(self) -> Option<f64> {
+        match self {
+            Self::Auto { resolved } => resolved,
+            Self::Fixed(value) => Some(value),
+        }
+    }
+
+    /// Install a numeric value without changing who owns the scale.
+    pub fn set_resolved(&mut self, value: f64) {
+        match self {
+            Self::Auto { resolved } => *resolved = Some(value),
+            Self::Fixed(fixed) => *fixed = value,
+        }
+    }
+
+    /// Resolve an omitted scale exactly once.  Replanning a frozen or
+    /// κ-updated Auto scale must retain its current numeric value.
+    pub fn resolve_auto_once(&mut self, value: f64) {
+        if let Self::Auto { resolved } = self
+            && resolved.is_none()
+        {
+            *resolved = Some(value);
+        }
+    }
+}
+
+impl From<f64> for MaternLengthScale {
+    fn from(value: f64) -> Self {
+        Self::fixed(value)
+    }
+}
+
 /// Matérn basis configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaternBasisSpec {
     pub center_strategy: CenterStrategy,
     #[serde(default)]
     pub periodic: Option<Vec<Option<f64>>>,
-    pub length_scale: f64,
+    pub length_scale: MaternLengthScale,
     pub nu: MaternNu,
     #[serde(default)]
     pub include_intercept: bool,

@@ -14,7 +14,8 @@ use crate::basis::{
     BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy,
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
-    MaternNu, MeasureJetBasisSpec, MeasureJetIdentifiability, OneDimensionalBoundary,
+    MaternLengthScale, MaternNu, MeasureJetBasisSpec, MeasureJetIdentifiability,
+    OneDimensionalBoundary,
     SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
     SphericalSplineIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy,
     default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
@@ -2916,24 +2917,24 @@ pub fn build_smooth_basis(
                 spec: MaternBasisSpec {
                     center_strategy,
                     periodic: parse_periodic_axes_option(options, cols.len())?,
-                    // Sentinel: leave at 0.0 when the user didn't pass an
-                    // explicit length_scale so the planner's
-                    // `auto_init_length_scale_in_place` can replace it with the
-                    // SAME data-derived wiggly-side initialization the thin-plate
-                    // path uses (`max_range / sqrt(n)`), then let the κ-optimizer
-                    // refine from there.
+                    // Preserve whether the user supplied `length_scale` as typed
+                    // provenance. The planner resolves `Auto` to the same
+                    // data-derived wiggly-side initialization the thin-plate path
+                    // uses (`max_range / sqrt(n)`), then lets the κ-optimizer refine
+                    // it without ever turning it into a user-fixed scale.
                     //
                     // gam#1629: the previous `default_matern_length_scale` seeded
                     // the FULL data diameter — the maximally over-smoothed corner.
-                    // Because that value is non-zero, the `0.0`-gated auto-init was
-                    // a no-op for Matérn, so the κ-optimizer started in the flat
+                    // Because that value looked explicit, the old auto-init was a
+                    // no-op for Matérn, so the κ-optimizer started in the flat
                     // over-smoothed basin and parked there, leaving high-frequency
                     // 2-D surfaces unresolved (truth-RMSE ~6× worse than
                     // thin-plate/tensor on identical data, and insensitive to `k`).
-                    // Routing Matérn through the same `0.0` sentinel as thin-plate
-                    // (see the ThinPlate branch above) starts REML in the resolving
-                    // regime it can actually escape from.
-                    length_scale: option_f64(options, "length_scale").unwrap_or(0.0),
+                    // Typed Auto starts REML in the resolving regime it can escape
+                    // from and cannot be confused with explicit zero.
+                    length_scale: option_f64(options, "length_scale")
+                        .map(MaternLengthScale::fixed)
+                        .unwrap_or_else(MaternLengthScale::auto),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
                     double_penalty: smooth_double_penalty,
@@ -5143,15 +5144,11 @@ mod tests {
     }
 
     /// gam#1629: a default 2-D `matern(x1, x2)` (no explicit `length_scale`)
-    /// must leave the length-scale at the `0.0` auto sentinel — NOT the full
-    /// data diameter — so the planner's `auto_init_length_scale_in_place` seeds
-    /// it on the wiggly/resolving side (`max_range / sqrt(n)`), the same regime
-    /// thin-plate uses. The previous `default_matern_length_scale` returned the
-    /// full diameter, which is non-zero, so the `0.0`-gated auto-init was a
-    /// no-op and the κ-optimizer started in the over-smoothed corner and parked
-    /// there (truth-RMSE ~6× worse than thin-plate/tensor on identical
-    /// high-frequency 2-D surfaces, insensitive to `k`). This pins the corrected
-    /// seed geometry without a fit/optimizer in the loop.
+    /// must retain typed Auto ownership — NOT a baked-in data diameter — so the
+    /// planner's `auto_init_length_scale_in_place` seeds it on the
+    /// wiggly/resolving side (`max_range / sqrt(n)`), the same regime thin-plate
+    /// uses. This pins the corrected seed geometry without a fit/optimizer in
+    /// the loop.
     #[test]
     fn default_matern_2d_seeds_resolving_length_scale_not_overscaled_diameter() {
         // A fine multi-frequency 2-D grid (the #1629 reproduction shape): the
@@ -5185,26 +5182,25 @@ mod tests {
         )
         .expect("build default 2-D matern smooth");
 
-        // (1) The builder must emit the auto sentinel, not a baked-in diameter.
+        // (1) The builder must emit typed unresolved Auto provenance, not a
+        // baked-in diameter or a magic numeric sentinel.
         let (feature_cols, seeded_length_scale) = match &basis {
             SmoothBasisSpec::Matern {
                 feature_cols, spec, ..
             } => (feature_cols.clone(), spec.length_scale),
             other => panic!("expected Matern basis, got {other:?}"),
         };
-        assert_eq!(
-            seeded_length_scale, 0.0,
-            "default matern() must leave length_scale at the 0.0 auto sentinel \
-             (got {seeded_length_scale}); a non-zero diameter default re-enters the \
-             over-smoothed basin and disables the planner's wiggly-side auto-init",
-        );
+        assert_eq!(seeded_length_scale, MaternLengthScale::auto());
 
         // (2) After the shared auto-init runs, the realized length-scale must
         // land in the resolving regime: `max_range / sqrt(n)`, far below the
         // data diameter. This is the seed the κ-optimizer starts REML from.
         crate::smooth::auto_init_length_scale_in_basis(ds.values.view(), &mut basis);
         let realized = match &basis {
-            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
+            SmoothBasisSpec::Matern { spec, .. } => spec
+                .length_scale
+                .resolved()
+                .expect("auto-init must resolve Matérn length scale"),
             other => panic!("expected Matern basis after auto-init, got {other:?}"),
         };
         let expected = crate::smooth::auto_initial_length_scale(ds.values.view(), &feature_cols);
@@ -5223,6 +5219,105 @@ mod tests {
             "matern seed length_scale {realized} must be in the resolving regime, \
              not the over-smoothed diameter corner (n={n}, max_range≈{max_range})",
         );
+    }
+
+    /// gam#979: the BMS entry point asks `all_spatial_terms_kappa_fixed` before
+    /// any design build. Omitted Matérn scales must therefore be distinguishable
+    /// from explicit scales both before and after Auto seed resolution.
+    #[test]
+    fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
+        let ds = continuous_dataset(
+            &["y", "x1", "x2"],
+            vec![
+                vec![0.0, -1.0, -0.5],
+                vec![1.0, -0.2, 0.7],
+                vec![0.0, 0.6, -0.8],
+                vec![1.0, 1.1, 0.4],
+            ],
+        );
+        let build = |length_scale: Option<&str>| {
+            let mut options = BTreeMap::new();
+            options.insert("bs".to_string(), "gp".to_string());
+            if let Some(value) = length_scale {
+                options.insert("length_scale".to_string(), value.to_string());
+            }
+            let mut notes = Vec::new();
+            build_smooth_basis(
+                SmoothKind::S,
+                &["x1".to_string(), "x2".to_string()],
+                &[1, 2],
+                &options,
+                &ds,
+                &mut notes,
+                &ResourcePolicy::default_library(),
+                1,
+            )
+            .expect("build Matérn provenance fixture")
+        };
+        let collection = |basis| TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: vec![SmoothTermSpec {
+                name: "spatial".to_string(),
+                basis,
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        };
+
+        let mut auto = collection(build(None));
+        assert!(matches!(
+            &auto.smooth_terms[0].basis,
+            SmoothBasisSpec::Matern {
+                spec: MaternBasisSpec {
+                    length_scale: MaternLengthScale::Auto { resolved: None },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(
+            !crate::smooth::all_spatial_terms_kappa_fixed(&auto),
+            "BMS pre-design query must enroll omitted Matérn κ"
+        );
+        crate::smooth::auto_init_length_scale_in_place(
+            ds.values.view(),
+            &mut auto.smooth_terms[0],
+        );
+        assert!(matches!(
+            &auto.smooth_terms[0].basis,
+            SmoothBasisSpec::Matern {
+                spec: MaternBasisSpec {
+                    length_scale: MaternLengthScale::Auto {
+                        resolved: Some(value)
+                    },
+                    ..
+                },
+                ..
+            } if value.is_finite() && *value > 0.0
+        ));
+        assert!(
+            !crate::smooth::all_spatial_terms_kappa_fixed(&auto),
+            "resolved Auto Matérn κ must remain optimizer-owned"
+        );
+
+        for explicit in ["0.75", "0.0"] {
+            let fixed = collection(build(Some(explicit)));
+            assert!(matches!(
+                &fixed.smooth_terms[0].basis,
+                SmoothBasisSpec::Matern {
+                    spec: MaternBasisSpec {
+                        length_scale: MaternLengthScale::Fixed(value),
+                        ..
+                    },
+                    ..
+                } if *value == explicit.parse::<f64>().unwrap()
+            ));
+            assert!(
+                crate::smooth::all_spatial_terms_kappa_fixed(&fixed),
+                "explicit Matérn length_scale={explicit} must lock κ before design build"
+            );
+        }
     }
 
     /// gam#1778: `matern(..., periodic=true)` and `thinplate(..., periodic=true)`

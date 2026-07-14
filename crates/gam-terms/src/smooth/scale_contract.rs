@@ -854,7 +854,7 @@ mod tests {
                 spec: ThinPlateBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     periodic: None,
-                    length_scale: 0.7,
+                    length_scale: 0.7.into(),
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::None,
                     radial_reparam: None,
@@ -1572,7 +1572,7 @@ mod tests {
                 spec: ThinPlateBasisSpec {
                     center_strategy: centers,
                     periodic: None,
-                    length_scale: 0.55 * factor,
+                    length_scale: (0.55 * factor).into(),
                     double_penalty: false,
                     identifiability: SpatialIdentifiability::None,
                     radial_reparam: None,

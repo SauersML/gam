@@ -1185,7 +1185,7 @@ mod tests {
         ThinPlateBasisSpec {
             center_strategy: CenterStrategy::EqualMass { num_centers: 10 },
             periodic: None,
-            length_scale: 1.0,
+            length_scale: 1.0.into(),
             double_penalty: false,
             identifiability: SpatialIdentifiability::default(),
             radial_reparam: None,

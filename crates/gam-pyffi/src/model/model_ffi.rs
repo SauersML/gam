@@ -2713,7 +2713,7 @@ fn duchon_basis_with_jets<'py>(
     let any_periodic = periodic_flags.iter().any(|&b| b);
     let cfg = resolve_duchon_hybrid_config(
         d,
-        length_scale,
+        length_scale: length_scale.into(),
         nullspace_order,
         power,
         /* max_op = */ 0,
@@ -7155,7 +7155,7 @@ fn build_latent_forward_design(
             let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
             let spec = MaternBasisSpec {
                 center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
-                length_scale: 1.0,
+                length_scale: 1.0.into(),
                 nu: MaternNu::ThreeHalves,
                 include_intercept: false,
                 double_penalty: false,
