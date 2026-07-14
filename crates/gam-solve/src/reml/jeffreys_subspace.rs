@@ -2699,8 +2699,8 @@ mod tests {
 
         assert_eq!(all_axis_builds.get(), 0);
         assert_eq!(phi, 0.0);
-        assert_eq!(grad, Array1::zeros(3));
-        assert_eq!(hphi, Array2::zeros((3, 3)));
+        assert_eq!(grad, Array1::<f64>::zeros(3));
+        assert_eq!(hphi, Array2::<f64>::zeros((3, 3)));
 
         let outer_axis_builds = AtomicUsize::new(0);
         let outer_base = JeffreysHphiDriftBase::prepare(h.view(), z.view(), |_axis| {

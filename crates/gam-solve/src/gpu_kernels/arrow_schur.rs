@@ -6492,7 +6492,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 .frame
                 .as_ref()
                 .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-            let runtime = super::resolve_runtime_for_device_path()?
+            let runtime = super::super::resolve_runtime_for_device_path()?
                 .ok_or(ArrowSchurGpuFailure::Unavailable)?;
             let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
                 .ok_or(ArrowSchurGpuFailure::Unavailable)?;
