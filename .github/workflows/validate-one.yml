@@ -120,8 +120,13 @@ jobs:
               exit 1
             fi
             if [[ -n "$RUST_PACKAGE" ]]; then
-              echo "cargo test -p ${RUST_PACKAGE} -- ${filter}"
-              cargo test -p "$RUST_PACKAGE" -- "${filter}" --nocapture 2>&1 | tee cargo_filter_out.log
+              if [[ "$RUST_PACKAGE" == "gam-pyffi" ]]; then
+                echo "cargo test -p gam-pyffi --no-default-features -- ${filter}"
+                cargo test -p gam-pyffi --no-default-features -- "${filter}" --nocapture 2>&1 | tee cargo_filter_out.log
+              else
+                echo "cargo test -p ${RUST_PACKAGE} -- ${filter}"
+                cargo test -p "$RUST_PACKAGE" -- "${filter}" --nocapture 2>&1 | tee cargo_filter_out.log
+              fi
             else
               echo "cargo test --workspace --exclude gam-pyffi -- ${filter}"
               cargo test --workspace --exclude gam-pyffi -- "${filter}" --nocapture 2>&1 | tee cargo_filter_out.log
