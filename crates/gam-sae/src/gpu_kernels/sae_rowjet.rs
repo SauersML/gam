@@ -461,6 +461,203 @@ impl SaeRowJetChannels {
     }
 }
 
+/// One resident contraction against the complete row-jet tower (#2304).
+///
+/// The A10 trace on the elementwise tile proved the tower itself is cheap
+/// (9.9 ms of kernels) while materializing and downloading the packed
+/// channels is not (646 ms of copies, 98.5% of copy+kernel time): the sole
+/// production consumers immediately reduce every channel against per-row
+/// vectors. These contraction shapes keep the tower on device: the kernels
+/// compute the same channel formulas but reduce them in place, so the only
+/// downloads are the `n·q` t-outputs and `n·n_beta` β-outputs and the only
+/// row-varying upload beyond the semantic inputs is one `n·p` probe vector
+/// (plus the small direction coefficients for the bilinear form).
+#[derive(Debug, Clone, Copy)]
+pub enum SaeRowJetContraction<'a> {
+    /// `t[r][a] = ⟨first(r,a,·), probe_r⟩`, `beta[r][c] = ⟨beta(r,c,·), probe_r⟩`.
+    ///
+    /// This is the IFT right-hand-side shape: the consumer's whitened metric
+    /// (when present) folds into the probe as `probe = U(Uᵀv)` because the
+    /// consumer dot is `⟨Uᵀ jet, Uᵀ v⟩ = ⟨jet, U Uᵀ v⟩` exactly.
+    Linear {
+        /// Row-major `n_rows × p`.
+        probe: &'a [f64],
+    },
+    /// The exact-Hessian HVP residual-curvature shape:
+    ///
+    /// `t[r][a]    = Σ_b ⟨probe_r, second(r,a,b,·)⟩ v_t[r][b]
+    ///             + Σ_c ⟨probe_r, mixed(r,a,c,·)⟩ v_beta[r][c]`
+    /// `beta[r][c] = Σ_a ⟨probe_r, mixed(r,a,c,·)⟩ v_t[r][a]`
+    ///
+    /// with `probe` the (metric-applied) per-row residual.
+    Bilinear {
+        /// Row-major `n_rows × p`.
+        probe: &'a [f64],
+        /// Row-major `n_rows × q`.
+        v_t: &'a [f64],
+        /// Row-major `n_rows × n_beta`.
+        v_beta: &'a [f64],
+    },
+}
+
+/// Reduced outputs of one contracted tile: per-row t and β coefficients only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SaeRowJetContractedTile {
+    pub n_rows: usize,
+    pub q: usize,
+    pub n_beta: usize,
+    /// Row-major `n_rows × q`.
+    pub t: Vec<f64>,
+    /// Row-major `n_rows × n_beta`.
+    pub beta: Vec<f64>,
+}
+
+impl<'a> SaeRowJetContraction<'a> {
+    fn validate(&self, n: usize, q: usize, p: usize, n_beta: usize) -> Result<(), String> {
+        let expect = |label: &str, got: usize, want: usize| -> Result<(), String> {
+            if got != want {
+                return Err(format!(
+                    "SAE row-jet contraction {label} length {got} != expected {want}"
+                ));
+            }
+            Ok(())
+        };
+        match *self {
+            SaeRowJetContraction::Linear { probe } => {
+                expect("probe", probe.len(), checked_product(&[n, p])?)?;
+                finite_or_err("probe", probe)
+            }
+            SaeRowJetContraction::Bilinear { probe, v_t, v_beta } => {
+                expect("probe", probe.len(), checked_product(&[n, p])?)?;
+                expect("v_t", v_t.len(), checked_product(&[n, q])?)?;
+                expect("v_beta", v_beta.len(), checked_product(&[n, n_beta])?)?;
+                finite_or_err("probe", probe)?;
+                finite_or_err("v_t", v_t)?;
+                finite_or_err("v_beta", v_beta)
+            }
+        }
+    }
+}
+
+fn finite_or_err(label: &str, values: &[f64]) -> Result<(), String> {
+    if let Some((index, value)) = values
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "SAE row-jet contraction {label}[{index}] must be finite; got {value}"
+        ));
+    }
+    Ok(())
+}
+
+/// Evaluate one already-planned bounded tile REDUCED against a contraction,
+/// never materializing the packed channel tensors on the host. Device failures
+/// propagate; the CPU path evaluates the identical reduction against the
+/// authoritative row program one row at a time.
+pub fn execute_softmax_row_jet_tile_contracted(
+    rows: &[SaeSoftmaxRowJetInput],
+    inv_tau: f64,
+    path: SaeRowJetPath,
+    contraction: SaeRowJetContraction<'_>,
+) -> Result<SaeRowJetContractedTile, String> {
+    if !inv_tau.is_finite() || inv_tau <= 0.0 {
+        return Err(format!(
+            "SAE row-jet inverse temperature must be finite and positive; got {inv_tau}"
+        ));
+    }
+    let (_k, q, p, n_beta) = validate_tile(rows)?;
+    contraction.validate(rows.len(), q, p, n_beta)?;
+    if rows.is_empty() {
+        return Ok(SaeRowJetContractedTile {
+            n_rows: 0,
+            q: 0,
+            n_beta: 0,
+            t: Vec::new(),
+            beta: Vec::new(),
+        });
+    }
+    match path {
+        SaeRowJetPath::Cpu => cpu_contracted_tile(rows, inv_tau, q, p, n_beta, contraction),
+        SaeRowJetPath::Device => {
+            #[cfg(target_os = "linux")]
+            {
+                device::device_contracted_tile(rows, inv_tau, contraction)
+                    .map_err(|error| error.to_string())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err("contracted SAE row-jet device tile requested on a non-Linux host".to_string())
+            }
+        }
+    }
+}
+
+/// CPU reduction: run the authoritative row program per row and apply the SAME
+/// dot/accumulation order the production consumers use on scheduled rows. Only
+/// one row's channels are live at a time — the tile's packed tensors are never
+/// materialized.
+fn cpu_contracted_tile(
+    rows: &[SaeSoftmaxRowJetInput],
+    inv_tau: f64,
+    q: usize,
+    p: usize,
+    n_beta: usize,
+    contraction: SaeRowJetContraction<'_>,
+) -> Result<SaeRowJetContractedTile, String> {
+    let n = rows.len();
+    let dot = |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum() };
+    let mut t = vec![0.0_f64; checked_product(&[n, q])?];
+    let mut beta = vec![0.0_f64; checked_product(&[n, n_beta])?];
+    for (row, input) in rows.iter().enumerate() {
+        let source = InputSource::new(input);
+        let scheduled = execute_softmax_row_program(&source, inv_tau, input.sqrt_row_weight);
+        source.finish()?;
+        match contraction {
+            SaeRowJetContraction::Linear { probe } => {
+                let probe_row = &probe[row * p..(row + 1) * p];
+                for slot in 0..q {
+                    t[row * q + slot] = dot(scheduled.first(slot), probe_row);
+                }
+                for border in 0..n_beta {
+                    beta[row * n_beta + border] = dot(scheduled.beta(border), probe_row);
+                }
+            }
+            SaeRowJetContraction::Bilinear { probe, v_t, v_beta } => {
+                let probe_row = &probe[row * p..(row + 1) * p];
+                let v_t_row = &v_t[row * q..(row + 1) * q];
+                let v_beta_row = &v_beta[row * n_beta..(row + 1) * n_beta];
+                for a in 0..q {
+                    let mut acc = 0.0_f64;
+                    for b in 0..q {
+                        acc += dot(probe_row, scheduled.second(a, b)) * v_t_row[b];
+                    }
+                    for border in 0..n_beta {
+                        acc += dot(probe_row, scheduled.beta_deriv(a, border)) * v_beta_row[border];
+                    }
+                    t[row * q + a] = acc;
+                }
+                for border in 0..n_beta {
+                    let mut acc = 0.0_f64;
+                    for a in 0..q {
+                        acc += dot(probe_row, scheduled.beta_deriv(a, border)) * v_t_row[a];
+                    }
+                    beta[row * n_beta + border] = acc;
+                }
+            }
+        }
+    }
+    Ok(SaeRowJetContractedTile {
+        n_rows: n,
+        q,
+        n_beta,
+        t,
+        beta,
+    })
+}
+
 /// Exact byte accounting for one same-shape row-jet tile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaeRowJetMemoryLedger {
@@ -1103,15 +1300,192 @@ extern "C" __global__ void sae_rowjet_beta_mixed(
   scalar*=sqrt_w[row];
   mixed[index]=scalar*beta_output[border*p+c];
 }
+
+// ---- resident contraction kernels (#2304) ----
+//
+// The tower is reduced on device instead of materialized: phase one computes
+// per-row dot tables of the semantic input tensors against one probe vector,
+// phase two assembles the contracted t/beta outputs from the SAME scalar
+// coefficient formulas the elementwise kernels above use. Both phases are
+// gated against the authoritative CPU row program, so the formulas cannot
+// drift apart silently.
+
+// out[row*m + j] = sum_c mat[(row*m + j)*p + c] * x[row*p + c]
+extern "C" __global__ void sae_rowjet_dot_rowmat(
+    const double* mat, const double* x, int m, int p,
+    unsigned long long total, double* out)
+{
+  unsigned long long index=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  if(index>=total) return;
+  int row=(int)(index/(unsigned long long)m);
+  double acc=0.0;
+  for(int c=0;c<p;++c) acc += mat[index*(unsigned long long)p+c]*x[row*p+c];
+  out[index]=acc;
+}
+
+// out[row*m + j] = sum_c mat[j*p + c] * x[row*p + c]   (row-shared matrix)
+extern "C" __global__ void sae_rowjet_dot_shared(
+    const double* mat, const double* x, int m, int p,
+    unsigned long long total, double* out)
+{
+  unsigned long long index=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  if(index>=total) return;
+  int j=(int)(index%(unsigned long long)m);
+  int row=(int)(index/(unsigned long long)m);
+  double acc=0.0;
+  for(int c=0;c<p;++c) acc += mat[j*p+c]*x[row*p+c];
+  out[index]=acc;
+}
+
+// t[row*q + slot] = <first(row,slot,.), probe_row> via the dot tables.
+extern "C" __global__ void sae_rowjet_contract_linear_t(
+    const double* z, const int* active, const int* kind, const int* atom,
+    const double* dd, const double* d1dot, const double* sqrt_w,
+    double inv_tau, int k, int q, unsigned long long total, double* t_out)
+{
+  unsigned long long index=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  if(index>=total) return;
+  int slot=(int)(index%(unsigned long long)q);
+  int row=(int)(index/(unsigned long long)q);
+  int a=atom[row*q+slot];
+  double root=sqrt_w[row];
+  if(kind[row*q+slot]==0){
+    double mean_dot=0.0;
+    for(int component=0;component<k;++component){
+      if(active[row*k+component]) mean_dot += z[row*k+component]*dd[row*k+component];
+    }
+    double component=active[row*k+a] ? dd[row*k+a] : 0.0;
+    t_out[index]=root*(inv_tau*z[row*k+a])*(component-mean_dot);
+  }else{
+    t_out[index]=active[row*k+a] ? z[row*k+a]*root*d1dot[row*q+slot] : 0.0;
+  }
+}
+
+// beta[row*nb + border] = <beta(row,border,.), probe_row> via the shared dot.
+extern "C" __global__ void sae_rowjet_contract_linear_beta(
+    const double* z, const int* active, const int* beta_atom,
+    const double* beta_phi, const double* bodot, const double* sqrt_w,
+    int k, int nb, unsigned long long total, double* beta_out)
+{
+  unsigned long long index=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  if(index>=total) return;
+  int border=(int)(index%(unsigned long long)nb);
+  int row=(int)(index/(unsigned long long)nb);
+  int a=beta_atom[border];
+  if(!active[row*k+a]) { beta_out[index]=0.0; return; }
+  beta_out[index]=sqrt_w[row]*z[row*k+a]*beta_phi[row*nb+border]*bodot[row*nb+border];
+}
+
+// t[row*q + a] = sum_b <probe, second(a,b)> v_t[b] + sum_c <probe, mixed(a,c)> v_beta[c]
+extern "C" __global__ void sae_rowjet_contract_bilinear_t(
+    const double* z, const int* active, const int* kind, const int* atom,
+    const int* beta_atom, const double* beta_phi, const double* beta_first,
+    const double* dd, const double* d1dot, const double* d2dot,
+    const double* bodot, const double* v_t, const double* v_beta,
+    const double* sqrt_w, double inv_tau, int k, int q, int nb,
+    unsigned long long total, double* t_out)
+{
+  unsigned long long index=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  if(index>=total) return;
+  int slot_a=(int)(index%(unsigned long long)q);
+  int row=(int)(index/(unsigned long long)q);
+  int ka=kind[row*q+slot_a];
+  int aa=atom[row*q+slot_a];
+  double root=sqrt_w[row];
+  double mean_dot=0.0;
+  for(int component=0;component<k;++component){
+    if(active[row*k+component]) mean_dot += z[row*k+component]*dd[row*k+component];
+  }
+  double acc=0.0;
+  for(int slot_b=0;slot_b<q;++slot_b){
+    int kb=kind[row*q+slot_b];
+    int ab=atom[row*q+slot_b];
+    double sdot;
+    if(ka==0 && kb==0){
+      double component_a=active[row*k+aa] ? dd[row*k+aa] : 0.0;
+      double component_b=active[row*k+ab] ? dd[row*k+ab] : 0.0;
+      double centered_a=component_a-mean_dot;
+      double centered_b=component_b-mean_dot;
+      double za=z[row*k+aa], zb=z[row*k+ab];
+      double diagonal=aa==ab ? 1.0 : 0.0;
+      double common=inv_tau*inv_tau*za;
+      sdot=root*(common*(diagonal-zb))*centered_a+root*(-common*zb)*centered_b;
+    }else if(ka==0 || kb==0){
+      int logit_atom=ka==0 ? aa : ab;
+      int coord_atom=ka==0 ? ab : aa;
+      int coord_slot=ka==0 ? slot_b : slot_a;
+      if(active[row*k+coord_atom]){
+        double diagonal=coord_atom==logit_atom ? 1.0 : 0.0;
+        double coefficient=z[row*k+coord_atom]*(diagonal-z[row*k+logit_atom])*inv_tau;
+        sdot=root*coefficient*d1dot[row*q+coord_slot];
+      }else{
+        sdot=0.0;
+      }
+    }else if(aa==ab){
+      sdot=active[row*k+aa] ? root*z[row*k+aa]*d2dot[(row*q+slot_a)*q+slot_b] : 0.0;
+    }else{
+      sdot=0.0;
+    }
+    acc += sdot*v_t[row*q+slot_b];
+  }
+  for(int border=0;border<nb;++border){
+    int target=beta_atom[border];
+    double scalar=0.0;
+    if(active[row*k+target]){
+      if(ka==0){
+        double diagonal=target==aa ? 1.0 : 0.0;
+        scalar=z[row*k+target]*(diagonal-z[row*k+aa])*inv_tau*beta_phi[row*nb+border];
+      }else if(aa==target){
+        scalar=z[row*k+target]*beta_first[(row*q+slot_a)*nb+border];
+      }
+      scalar*=root;
+    }
+    acc += scalar*bodot[row*nb+border]*v_beta[row*nb+border];
+  }
+  t_out[index]=acc;
+}
+
+// beta[row*nb + border] = sum_a <probe, mixed(a,border)> v_t[a]
+extern "C" __global__ void sae_rowjet_contract_bilinear_beta(
+    const double* z, const int* active, const int* kind, const int* atom,
+    const int* beta_atom, const double* beta_phi, const double* beta_first,
+    const double* bodot, const double* v_t, const double* sqrt_w,
+    double inv_tau, int k, int q, int nb, unsigned long long total,
+    double* beta_out)
+{
+  unsigned long long index=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  if(index>=total) return;
+  int border=(int)(index%(unsigned long long)nb);
+  int row=(int)(index/(unsigned long long)nb);
+  int target=beta_atom[border];
+  if(!active[row*k+target]) { beta_out[index]=0.0; return; }
+  double root=sqrt_w[row];
+  double acc=0.0;
+  for(int slot=0;slot<q;++slot){
+    int source_atom=atom[row*q+slot];
+    double scalar;
+    if(kind[row*q+slot]==0){
+      double diagonal=target==source_atom ? 1.0 : 0.0;
+      scalar=z[row*k+target]*(diagonal-z[row*k+source_atom])*inv_tau;
+      scalar*=beta_phi[row*nb+border];
+    }else if(source_atom==target){
+      scalar=z[row*k+target]*beta_first[(row*q+slot)*nb+border];
+    }else{
+      scalar=0.0;
+    }
+    acc += root*scalar*bodot[row*nb+border]*v_t[row*q+slot];
+  }
+  beta_out[index]=acc;
+}
 "#;
 
 #[cfg(target_os = "linux")]
 mod device {
     use super::{
-        COMPLETE_SOFTMAX_KERNEL_SOURCE, SaeRowJetChannels, SaeRowJetPrimary, SaeSoftmaxRowJetInput,
-        checked_product,
+        COMPLETE_SOFTMAX_KERNEL_SOURCE, SaeRowJetChannels, SaeRowJetContractedTile,
+        SaeRowJetContraction, SaeRowJetPrimary, SaeSoftmaxRowJetInput, checked_product,
     };
-    use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
     use std::borrow::Cow;
     use std::sync::{Arc, OnceLock};
@@ -1177,18 +1551,35 @@ mod device {
         }
     }
 
-    pub(super) fn device_tile(
+    /// Uploaded semantic inputs shared by the elementwise and contracted tiles.
+    struct Staged {
+        z_dev: CudaSlice<f64>,
+        active_dev: CudaSlice<i32>,
+        kind_dev: CudaSlice<i32>,
+        atom_dev: CudaSlice<i32>,
+        decoded_dev: CudaSlice<f64>,
+        d1_dev: CudaSlice<f64>,
+        d2_dev: CudaSlice<f64>,
+        sqrt_w_dev: CudaSlice<f64>,
+        beta_atom_dev: CudaSlice<i32>,
+        beta_phi_dev: CudaSlice<f64>,
+        beta_first_dev: CudaSlice<f64>,
+        beta_output_dev: CudaSlice<f64>,
+        k_i32: i32,
+        q_i32: i32,
+        p_i32: i32,
+        nb_i32: i32,
+    }
+
+    fn stage_inputs(
+        stream: &Arc<CudaStream>,
         rows: &[SaeSoftmaxRowJetInput],
-        inv_tau: f64,
         k: usize,
         q: usize,
         p: usize,
         n_beta: usize,
-    ) -> Result<SaeRowJetChannels, GpuError> {
+    ) -> Result<Staged, GpuError> {
         let n = rows.len();
-        let b = backend()?;
-        let stream = b.stream.clone();
-
         let mut z = Vec::with_capacity(device_length(&[n, k])?);
         let mut active = Vec::with_capacity(device_length(&[n, k])?);
         let mut kind = Vec::with_capacity(device_length(&[n, q])?);
@@ -1271,6 +1662,63 @@ mod device {
         let beta_output_dev = stream
             .clone_htod(nonempty_f64(rows[0].beta_outputs.as_ref()).as_ref())
             .gpu_ctx("SAE row-jet htod beta outputs")?;
+        let k_i32 =
+            i32::try_from(k).map_err(|_| gam_gpu::gpu_err!("SAE row-jet K overflows i32"))?;
+        let q_i32 =
+            i32::try_from(q).map_err(|_| gam_gpu::gpu_err!("SAE row-jet q overflows i32"))?;
+        let p_i32 =
+            i32::try_from(p).map_err(|_| gam_gpu::gpu_err!("SAE row-jet p overflows i32"))?;
+        let nb_i32 = i32::try_from(n_beta)
+            .map_err(|_| gam_gpu::gpu_err!("SAE row-jet beta count overflows i32"))?;
+        Ok(Staged {
+            z_dev,
+            active_dev,
+            kind_dev,
+            atom_dev,
+            decoded_dev,
+            d1_dev,
+            d2_dev,
+            sqrt_w_dev,
+            beta_atom_dev,
+            beta_phi_dev,
+            beta_first_dev,
+            beta_output_dev,
+            k_i32,
+            q_i32,
+            p_i32,
+            nb_i32,
+        })
+    }
+
+    pub(super) fn device_tile(
+        rows: &[SaeSoftmaxRowJetInput],
+        inv_tau: f64,
+        k: usize,
+        q: usize,
+        p: usize,
+        n_beta: usize,
+    ) -> Result<SaeRowJetChannels, GpuError> {
+        let n = rows.len();
+        let b = backend()?;
+        let stream = b.stream.clone();
+        let Staged {
+            z_dev,
+            active_dev,
+            kind_dev,
+            atom_dev,
+            decoded_dev,
+            d1_dev,
+            d2_dev,
+            sqrt_w_dev,
+            beta_atom_dev,
+            beta_phi_dev,
+            beta_first_dev,
+            beta_output_dev,
+            k_i32,
+            q_i32,
+            p_i32,
+            nb_i32,
+        } = stage_inputs(&stream, rows, k, q, p, n_beta)?;
 
         let first_len = device_length(&[n, q, p])?;
         let second_len = device_length(&[n, q, q, p])?;
@@ -1288,14 +1736,6 @@ mod device {
         let mut mixed_dev = stream
             .alloc_zeros::<f64>(mixed_len.max(1))
             .gpu_ctx("SAE row-jet alloc beta mixed")?;
-        let k_i32 =
-            i32::try_from(k).map_err(|_| gam_gpu::gpu_err!("SAE row-jet K overflows i32"))?;
-        let q_i32 =
-            i32::try_from(q).map_err(|_| gam_gpu::gpu_err!("SAE row-jet q overflows i32"))?;
-        let p_i32 =
-            i32::try_from(p).map_err(|_| gam_gpu::gpu_err!("SAE row-jet p overflows i32"))?;
-        let nb_i32 = i32::try_from(n_beta)
-            .map_err(|_| gam_gpu::gpu_err!("SAE row-jet beta count overflows i32"))?;
 
         if first_len != 0 {
             let function = b
@@ -1428,6 +1868,273 @@ mod device {
         }
         stream.synchronize().gpu_ctx("SAE row-jet synchronize")?;
         Ok(out)
+    }
+
+    /// Resident contracted tile (#2304): the tower is reduced on device and
+    /// only the `n·q` / `n·n_beta` coefficients come back to the host. The
+    /// packed `q²p`-class channel tensors are never allocated on either side.
+    pub(super) fn device_contracted_tile(
+        rows: &[SaeSoftmaxRowJetInput],
+        inv_tau: f64,
+        contraction: SaeRowJetContraction<'_>,
+    ) -> Result<SaeRowJetContractedTile, GpuError> {
+        let n = rows.len();
+        let first = &rows[0];
+        let (k, q, p, n_beta) = (
+            first.n_atoms,
+            first.n_primaries(),
+            first.out_dim,
+            first.n_beta_borders(),
+        );
+        let b = backend()?;
+        let stream = b.stream.clone();
+        let staged = stage_inputs(&stream, rows, k, q, p, n_beta)?;
+
+        let probe = match contraction {
+            SaeRowJetContraction::Linear { probe }
+            | SaeRowJetContraction::Bilinear { probe, .. } => probe,
+        };
+        let probe_dev = stream
+            .clone_htod(nonempty_f64(probe).as_ref())
+            .gpu_ctx("SAE row-jet htod contraction probe")?;
+
+        // Phase one: dot tables of the semantic tensors against the probe.
+        let dd_len = device_length(&[n, k])?;
+        let d1dot_len = device_length(&[n, q])?;
+        let bodot_len = device_length(&[n, n_beta])?;
+        let mut dd_dev = stream
+            .alloc_zeros::<f64>(dd_len.max(1))
+            .gpu_ctx("SAE row-jet alloc decoded dots")?;
+        let mut d1dot_dev = stream
+            .alloc_zeros::<f64>(d1dot_len.max(1))
+            .gpu_ctx("SAE row-jet alloc d1 dots")?;
+        let mut bodot_dev = stream
+            .alloc_zeros::<f64>(bodot_len.max(1))
+            .gpu_ctx("SAE row-jet alloc beta-output dots")?;
+        let dot_rowmat = b
+            .module
+            .load_function("sae_rowjet_dot_rowmat")
+            .gpu_ctx("SAE row-jet dot rowmat load")?;
+        let launch_rowmat = |mat: &CudaSlice<f64>,
+                             m: usize,
+                             out: &mut CudaSlice<f64>,
+                             label: &'static str|
+         -> Result<(), GpuError> {
+            let total = device_length(&[n, m])?;
+            if total == 0 {
+                return Ok(());
+            }
+            let m_i32 = i32::try_from(m)
+                .map_err(|_| gam_gpu::gpu_err!("SAE row-jet dot width overflows i32"))?;
+            let total_u64 = u64::try_from(total)
+                .map_err(|_| gam_gpu::gpu_err!("SAE row-jet dot length overflows u64"))?;
+            let mut launch = stream.launch_builder(&dot_rowmat);
+            launch
+                .arg(mat)
+                .arg(&probe_dev)
+                .arg(&m_i32)
+                .arg(&staged.p_i32)
+                .arg(&total_u64)
+                .arg(out);
+            // SAFETY: the loaded kernel's argument ABI matches this builder,
+            // and `grid(total)` covers only the `total` allocated outputs.
+            unsafe { launch.launch(grid(total)?) }.gpu_ctx(label)
+        };
+        launch_rowmat(
+            &staged.decoded_dev,
+            k,
+            &mut dd_dev,
+            "SAE row-jet decoded dots",
+        )?;
+        launch_rowmat(&staged.d1_dev, q, &mut d1dot_dev, "SAE row-jet d1 dots")?;
+        if bodot_len != 0 {
+            let function = b
+                .module
+                .load_function("sae_rowjet_dot_shared")
+                .gpu_ctx("SAE row-jet dot shared load")?;
+            let total_u64 = u64::try_from(bodot_len)
+                .map_err(|_| gam_gpu::gpu_err!("SAE row-jet dot length overflows u64"))?;
+            let mut launch = stream.launch_builder(&function);
+            launch
+                .arg(&staged.beta_output_dev)
+                .arg(&probe_dev)
+                .arg(&staged.nb_i32)
+                .arg(&staged.p_i32)
+                .arg(&total_u64)
+                .arg(&mut bodot_dev);
+            // SAFETY: the loaded kernel's argument ABI matches this builder,
+            // and `grid(bodot_len)` covers only the allocated outputs.
+            unsafe { launch.launch(grid(bodot_len)?) }.gpu_ctx("SAE row-jet beta-output dots")?;
+        }
+
+        // Phase two: assemble the reduced outputs.
+        let t_len = device_length(&[n, q])?;
+        let beta_len = device_length(&[n, n_beta])?;
+        let mut t_dev = stream
+            .alloc_zeros::<f64>(t_len.max(1))
+            .gpu_ctx("SAE row-jet alloc contracted t")?;
+        let mut beta_dev = stream
+            .alloc_zeros::<f64>(beta_len.max(1))
+            .gpu_ctx("SAE row-jet alloc contracted beta")?;
+        match contraction {
+            SaeRowJetContraction::Linear { .. } => {
+                if t_len != 0 {
+                    let function = b
+                        .module
+                        .load_function("sae_rowjet_contract_linear_t")
+                        .gpu_ctx("SAE row-jet linear t load")?;
+                    let total_u64 = u64::try_from(t_len)
+                        .map_err(|_| gam_gpu::gpu_err!("SAE row-jet t length overflows u64"))?;
+                    let mut launch = stream.launch_builder(&function);
+                    launch
+                        .arg(&staged.z_dev)
+                        .arg(&staged.active_dev)
+                        .arg(&staged.kind_dev)
+                        .arg(&staged.atom_dev)
+                        .arg(&dd_dev)
+                        .arg(&d1dot_dev)
+                        .arg(&staged.sqrt_w_dev)
+                        .arg(&inv_tau)
+                        .arg(&staged.k_i32)
+                        .arg(&staged.q_i32)
+                        .arg(&total_u64)
+                        .arg(&mut t_dev);
+                    // SAFETY: the loaded kernel's argument ABI matches this
+                    // builder, and `grid(t_len)` covers only the outputs.
+                    unsafe { launch.launch(grid(t_len)?) }
+                        .gpu_ctx("SAE row-jet linear t launch")?;
+                }
+                if beta_len != 0 {
+                    let function = b
+                        .module
+                        .load_function("sae_rowjet_contract_linear_beta")
+                        .gpu_ctx("SAE row-jet linear beta load")?;
+                    let total_u64 = u64::try_from(beta_len)
+                        .map_err(|_| gam_gpu::gpu_err!("SAE row-jet beta length overflows u64"))?;
+                    let mut launch = stream.launch_builder(&function);
+                    launch
+                        .arg(&staged.z_dev)
+                        .arg(&staged.active_dev)
+                        .arg(&staged.beta_atom_dev)
+                        .arg(&staged.beta_phi_dev)
+                        .arg(&bodot_dev)
+                        .arg(&staged.sqrt_w_dev)
+                        .arg(&staged.k_i32)
+                        .arg(&staged.nb_i32)
+                        .arg(&total_u64)
+                        .arg(&mut beta_dev);
+                    // SAFETY: the loaded kernel's argument ABI matches this
+                    // builder, and `grid(beta_len)` covers only the outputs.
+                    unsafe { launch.launch(grid(beta_len)?) }
+                        .gpu_ctx("SAE row-jet linear beta launch")?;
+                }
+            }
+            SaeRowJetContraction::Bilinear { v_t, v_beta, .. } => {
+                let d2dot_len = device_length(&[n, q, q])?;
+                let mut d2dot_dev = stream
+                    .alloc_zeros::<f64>(d2dot_len.max(1))
+                    .gpu_ctx("SAE row-jet alloc d2 dots")?;
+                launch_rowmat(
+                    &staged.d2_dev,
+                    checked_product(&[q, q]).map_err(|reason| gam_gpu::gpu_err!("{reason}"))?,
+                    &mut d2dot_dev,
+                    "SAE row-jet d2 dots",
+                )?;
+                let v_t_dev = stream
+                    .clone_htod(nonempty_f64(v_t).as_ref())
+                    .gpu_ctx("SAE row-jet htod v_t")?;
+                let v_beta_dev = stream
+                    .clone_htod(nonempty_f64(v_beta).as_ref())
+                    .gpu_ctx("SAE row-jet htod v_beta")?;
+                if t_len != 0 {
+                    let function = b
+                        .module
+                        .load_function("sae_rowjet_contract_bilinear_t")
+                        .gpu_ctx("SAE row-jet bilinear t load")?;
+                    let total_u64 = u64::try_from(t_len)
+                        .map_err(|_| gam_gpu::gpu_err!("SAE row-jet t length overflows u64"))?;
+                    let mut launch = stream.launch_builder(&function);
+                    launch
+                        .arg(&staged.z_dev)
+                        .arg(&staged.active_dev)
+                        .arg(&staged.kind_dev)
+                        .arg(&staged.atom_dev)
+                        .arg(&staged.beta_atom_dev)
+                        .arg(&staged.beta_phi_dev)
+                        .arg(&staged.beta_first_dev)
+                        .arg(&dd_dev)
+                        .arg(&d1dot_dev)
+                        .arg(&d2dot_dev)
+                        .arg(&bodot_dev)
+                        .arg(&v_t_dev)
+                        .arg(&v_beta_dev)
+                        .arg(&staged.sqrt_w_dev)
+                        .arg(&inv_tau)
+                        .arg(&staged.k_i32)
+                        .arg(&staged.q_i32)
+                        .arg(&staged.nb_i32)
+                        .arg(&total_u64)
+                        .arg(&mut t_dev);
+                    // SAFETY: the loaded kernel's argument ABI matches this
+                    // builder, and `grid(t_len)` covers only the outputs.
+                    unsafe { launch.launch(grid(t_len)?) }
+                        .gpu_ctx("SAE row-jet bilinear t launch")?;
+                }
+                if beta_len != 0 {
+                    let function = b
+                        .module
+                        .load_function("sae_rowjet_contract_bilinear_beta")
+                        .gpu_ctx("SAE row-jet bilinear beta load")?;
+                    let total_u64 = u64::try_from(beta_len)
+                        .map_err(|_| gam_gpu::gpu_err!("SAE row-jet beta length overflows u64"))?;
+                    let mut launch = stream.launch_builder(&function);
+                    launch
+                        .arg(&staged.z_dev)
+                        .arg(&staged.active_dev)
+                        .arg(&staged.kind_dev)
+                        .arg(&staged.atom_dev)
+                        .arg(&staged.beta_atom_dev)
+                        .arg(&staged.beta_phi_dev)
+                        .arg(&staged.beta_first_dev)
+                        .arg(&bodot_dev)
+                        .arg(&v_t_dev)
+                        .arg(&staged.sqrt_w_dev)
+                        .arg(&inv_tau)
+                        .arg(&staged.k_i32)
+                        .arg(&staged.q_i32)
+                        .arg(&staged.nb_i32)
+                        .arg(&total_u64)
+                        .arg(&mut beta_dev);
+                    // SAFETY: the loaded kernel's argument ABI matches this
+                    // builder, and `grid(beta_len)` covers only the outputs.
+                    unsafe { launch.launch(grid(beta_len)?) }
+                        .gpu_ctx("SAE row-jet bilinear beta launch")?;
+                }
+            }
+        }
+
+        let mut t = vec![0.0_f64; t_len];
+        let mut beta = vec![0.0_f64; beta_len];
+        if t_len != 0 {
+            stream
+                .memcpy_dtoh(&t_dev, &mut t)
+                .gpu_ctx("SAE row-jet dtoh contracted t")?;
+        }
+        if beta_len != 0 {
+            stream
+                .memcpy_dtoh(&beta_dev, &mut beta)
+                .gpu_ctx("SAE row-jet dtoh contracted beta")?;
+        }
+        stream
+            .synchronize()
+            .gpu_ctx("SAE row-jet contracted synchronize")?;
+        Ok(SaeRowJetContractedTile {
+            n_rows: n,
+            q,
+            n_beta,
+            t,
+            beta,
+        })
     }
 }
 
@@ -1718,5 +2425,222 @@ mod tests {
             max_error <= 1.0e-12,
             "complete SAE device/CPU row-jet error {max_error:e} exceeds 1e-12"
         );
+    }
+
+    /// Deterministic per-row contraction vectors matched to `complete_fixture`.
+    fn contraction_vectors(
+        n: usize,
+        q: usize,
+        p: usize,
+        n_beta: usize,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let probe: Vec<f64> = (0..n * p)
+            .map(|index| ((index * 29 + 5) as f64 * 0.011).sin())
+            .collect();
+        let v_t: Vec<f64> = (0..n * q)
+            .map(|index| ((index * 31 + 7) as f64 * 0.013).cos())
+            .collect();
+        let v_beta: Vec<f64> = (0..n * n_beta)
+            .map(|index| ((index * 37 + 11) as f64 * 0.017).sin())
+            .collect();
+        (probe, v_t, v_beta)
+    }
+
+    /// The CPU contracted seam must equal reducing the materialized CPU
+    /// channels with the production consumers' own dot/accumulation order —
+    /// bit for bit, because both run the identical row program and the
+    /// identical f64 reduction order.
+    #[test]
+    fn contracted_cpu_tile_equals_materialized_channel_reduction_2304() {
+        let rows = complete_fixture(5);
+        let channels = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Cpu)
+            .expect("complete CPU row jet");
+        let (n, q, p, n_beta) = (channels.n_rows, channels.q, channels.p, channels.n_beta);
+        let (probe, v_t, v_beta) = contraction_vectors(n, q, p, n_beta);
+        let scheduled = channels.into_scheduled_rows();
+        let dot =
+            |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum() };
+
+        let linear = execute_softmax_row_jet_tile_contracted(
+            &rows,
+            1.0,
+            SaeRowJetPath::Cpu,
+            SaeRowJetContraction::Linear { probe: &probe },
+        )
+        .expect("CPU linear contraction");
+        assert_eq!((linear.n_rows, linear.q, linear.n_beta), (n, q, n_beta));
+        for (row, jets) in scheduled.iter().enumerate() {
+            let probe_row = &probe[row * p..(row + 1) * p];
+            for slot in 0..q {
+                let expected = dot(jets.first(slot), probe_row);
+                assert_eq!(
+                    linear.t[row * q + slot],
+                    expected,
+                    "linear t mismatch at row={row}, slot={slot}"
+                );
+            }
+            for border in 0..n_beta {
+                let expected = dot(jets.beta(border), probe_row);
+                assert_eq!(
+                    linear.beta[row * n_beta + border],
+                    expected,
+                    "linear beta mismatch at row={row}, border={border}"
+                );
+            }
+        }
+
+        let bilinear = execute_softmax_row_jet_tile_contracted(
+            &rows,
+            1.0,
+            SaeRowJetPath::Cpu,
+            SaeRowJetContraction::Bilinear {
+                probe: &probe,
+                v_t: &v_t,
+                v_beta: &v_beta,
+            },
+        )
+        .expect("CPU bilinear contraction");
+        for (row, jets) in scheduled.iter().enumerate() {
+            let probe_row = &probe[row * p..(row + 1) * p];
+            let v_t_row = &v_t[row * q..(row + 1) * q];
+            let v_beta_row = &v_beta[row * n_beta..(row + 1) * n_beta];
+            for a in 0..q {
+                let mut expected = 0.0_f64;
+                for b in 0..q {
+                    expected += dot(probe_row, jets.second(a, b)) * v_t_row[b];
+                }
+                for border in 0..n_beta {
+                    expected += dot(probe_row, jets.beta_deriv(a, border)) * v_beta_row[border];
+                }
+                assert_eq!(
+                    bilinear.t[row * q + a],
+                    expected,
+                    "bilinear t mismatch at row={row}, slot={a}"
+                );
+            }
+            for border in 0..n_beta {
+                let mut expected = 0.0_f64;
+                for a in 0..q {
+                    expected += dot(probe_row, jets.beta_deriv(a, border)) * v_t_row[a];
+                }
+                assert_eq!(
+                    bilinear.beta[row * n_beta + border],
+                    expected,
+                    "bilinear beta mismatch at row={row}, border={border}"
+                );
+            }
+        }
+    }
+
+    /// Non-trivial-value guard: on the complete fixture the contracted outputs
+    /// must be generically nonzero in every block (t logit, t coordinate, and
+    /// β), so the parity assertions above cannot pass on an all-zeros bug.
+    #[test]
+    fn contracted_cpu_tile_outputs_are_generically_nonzero_2304() {
+        let rows = complete_fixture(3);
+        let (n, q, p, n_beta) = (3, 6, 2, 3);
+        let (probe, v_t, v_beta) = contraction_vectors(n, q, p, n_beta);
+        let linear = execute_softmax_row_jet_tile_contracted(
+            &rows,
+            1.0,
+            SaeRowJetPath::Cpu,
+            SaeRowJetContraction::Linear { probe: &probe },
+        )
+        .expect("CPU linear contraction");
+        // Slots 0-1 are logits, slots 2+ are coordinates (see complete_fixture).
+        assert!(linear.t[0] != 0.0, "logit-slot contraction must engage");
+        assert!(
+            linear.t[2] != 0.0,
+            "coordinate-slot contraction must engage"
+        );
+        assert!(linear.beta.iter().any(|&value| value != 0.0));
+        let bilinear = execute_softmax_row_jet_tile_contracted(
+            &rows,
+            1.0,
+            SaeRowJetPath::Cpu,
+            SaeRowJetContraction::Bilinear {
+                probe: &probe,
+                v_t: &v_t,
+                v_beta: &v_beta,
+            },
+        )
+        .expect("CPU bilinear contraction");
+        assert!(bilinear.t.iter().any(|&value| value != 0.0));
+        assert!(bilinear.beta.iter().any(|&value| value != 0.0));
+    }
+
+    /// Resident-contraction acceptance (#2304): on an admitted device, both
+    /// contraction shapes must reproduce the CPU reduction at the same
+    /// workload scale as the elementwise gate, while transferring only the
+    /// `n·q`/`n·n_beta` reduced outputs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contracted_device_matches_cpu_reduction_when_admitted_2304() {
+        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(error) => panic!("contracted row-jet CUDA admission failed: {error}"),
+        }
+        const ROW_COUNT: usize = 1 << 17;
+        const MEASURED_PASSES: usize = 4;
+        let rows = complete_fixture(ROW_COUNT);
+        let (q, p, n_beta) = (
+            rows[0].n_primaries(),
+            rows[0].out_dim,
+            rows[0].n_beta_borders(),
+        );
+        let (probe, v_t, v_beta) = contraction_vectors(ROW_COUNT, q, p, n_beta);
+        let shapes: [(&str, SaeRowJetContraction<'_>); 2] = [
+            ("linear", SaeRowJetContraction::Linear { probe: &probe }),
+            (
+                "bilinear",
+                SaeRowJetContraction::Bilinear {
+                    probe: &probe,
+                    v_t: &v_t,
+                    v_beta: &v_beta,
+                },
+            ),
+        ];
+        for (label, contraction) in shapes {
+            let cpu = execute_softmax_row_jet_tile_contracted(
+                &rows,
+                1.0,
+                SaeRowJetPath::Cpu,
+                contraction,
+            )
+            .expect("CPU contraction oracle");
+            execute_softmax_row_jet_tile_contracted(&rows, 1.0, SaeRowJetPath::Device, contraction)
+                .expect("admitted contracted device warm-up must execute without a host retry");
+            let mut max_error = 0.0_f64;
+            for pass in 0..MEASURED_PASSES {
+                let device = execute_softmax_row_jet_tile_contracted(
+                    &rows,
+                    1.0,
+                    SaeRowJetPath::Device,
+                    contraction,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "admitted contracted device pass {pass} must execute without a host retry: {error}"
+                    )
+                });
+                max_error = cpu
+                    .t
+                    .iter()
+                    .chain(&cpu.beta)
+                    .zip(device.t.iter().chain(&device.beta))
+                    .fold(max_error, |maximum, (left, right)| {
+                        maximum.max((left - right).abs())
+                    });
+            }
+            let outputs_per_pass = cpu.t.len() + cpu.beta.len();
+            eprintln!(
+                "SAE_ROWJET_CONTRACT_GPU_ACCEPT shape={label} rows={ROW_COUNT} measured_passes={MEASURED_PASSES} outputs_per_pass={outputs_per_pass} max_abs_error={max_error:.17e}"
+            );
+            assert!(
+                max_error <= 1.0e-12,
+                "contracted SAE device/CPU {label} reduction error {max_error:e} exceeds 1e-12"
+            );
+        }
     }
 }
