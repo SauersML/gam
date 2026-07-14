@@ -121,6 +121,19 @@ pub(crate) struct GamWorkingModel<'a> {
     /// diagnostic build and reused thereafter; a fresh working model is built
     /// per inner solve so it refreshes naturally when the design changes.
     pub(crate) firth_design_factor: Option<Arc<FirthDesignFactor>>,
+    /// Exact coefficient bits for the state represented by the mutable working
+    /// arrays (`lastz`, `lasthessian_weights`, and their derivative siblings).
+    ///
+    /// A Firth candidate screen is a full state evaluation.  Rejected LM
+    /// candidates therefore leave these scratch arrays at the rejected point
+    /// while the loop's authoritative [`WorkingState`] remains at the current
+    /// coefficient vector.  Dense Newton solves consume only `WorkingState`,
+    /// but the cancellation-safe square-root solve consumes these row-space
+    /// arrays too.  The key makes that otherwise-hidden split state explicit so
+    /// the root operands can be refreshed before use.  Exact bits are required:
+    /// a hash collision cannot be allowed to select another state's Newton
+    /// system.
+    pub(crate) working_array_beta_bits: Vec<u64>,
 }
 
 pub(crate) struct GamModelFinalState {
@@ -139,6 +152,37 @@ pub(crate) struct GamModelFinalState {
 }
 
 impl<'a> GamWorkingModel<'a> {
+    fn working_arrays_match_state(
+        &self,
+        beta: &Coefficients,
+        state: &WorkingState,
+    ) -> bool {
+        self.lasthessian_curvature == state.hessian_curvature
+            && self
+                .working_array_beta_bits
+                .iter()
+                .copied()
+                .eq(beta.as_ref().iter().map(|value| value.to_bits()))
+    }
+
+    fn refresh_firth_working_arrays_for_state(
+        &mut self,
+        beta: &Coefficients,
+        state: &WorkingState,
+        operation: &'static str,
+    ) -> Result<(), EstimationError> {
+        if !self.firth_bias_reduction || self.working_arrays_match_state(beta, state) {
+            return Ok(());
+        }
+        let refreshed = self.update_with_curvature(beta, state.hessian_curvature)?;
+        if refreshed.eta.as_ref() != state.eta.as_ref() {
+            crate::bail_invalid_estim!(
+                "PIRLS Firth {operation} refresh changed the authoritative linear predictor"
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         x_transformed: Option<DesignMatrix>,
         x_original: DesignMatrix,
@@ -216,6 +260,7 @@ impl<'a> GamWorkingModel<'a> {
             glm_first_step_gram,
             glm_first_step_gram_consumed: false,
             firth_design_factor: None,
+            working_array_beta_bits: Vec::new(),
         }
     }
 
@@ -949,6 +994,10 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         beta: &Coefficients,
         requested_curvature: HessianCurvatureKind,
     ) -> Result<WorkingState, EstimationError> {
+        // Invalidate before touching any scratch array.  A failed candidate
+        // evaluation must never leave a key that certifies partially-updated
+        // row-space operands as belonging to the prior successful state.
+        self.working_array_beta_bits.clear();
         let n = self.offset.len();
         if self.workspace.eta_buf.len() != n {
             self.workspace.eta_buf = Array1::zeros(n);
@@ -1314,6 +1363,9 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         self.last_penalty_term = penalty_term;
         let gradient_natural_scale = score_norm + s_beta_norm + ridge_grad_norm;
 
+        self.working_array_beta_bits
+            .extend(beta.as_ref().iter().map(|value| value.to_bits()));
+
         Ok(WorkingState {
             eta: LinearPredictor::new(std::mem::replace(
                 &mut self.workspace.eta_buf,
@@ -1391,6 +1443,15 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         regularized_hessian: &Array2<f64>,
         direction_out: &mut Array1<f64>,
     ) -> Result<(), EstimationError> {
+        // `screen_candidate` evaluates Firth candidates through the full
+        // mutable working model.  If such a candidate is rejected, the loop
+        // intentionally retains `beta`/`state`, but the model's row scratch
+        // belongs to the rejected point.  Rehydrate the exact authoritative
+        // state before constructing A and q for min ||A d + q||.  Without this
+        // state-locality repair, an LM retry combined A(candidate), q(candidate),
+        // and beta/state(current), so it was not a Newton or Fisher-scoring step
+        // for any objective.
+        self.refresh_firth_working_arrays_for_state(beta, state, "square-root operand")?;
         let stabilizing_floor = lm_d2
             .iter()
             .map(|&scale| state.ridge_used + loop_lambda * scale)
@@ -1430,6 +1491,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         beta: &Coefficients,
         state: &WorkingState,
     ) -> Result<Option<f64>, EstimationError> {
+        self.refresh_firth_working_arrays_for_state(beta, state, "decrement")?;
         if !augmented_root_represents_working_system(
             state.hessian_curvature,
             self.firth_bias_reduction,
