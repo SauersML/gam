@@ -1774,7 +1774,17 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             );
                             (beta_new, Some(active_set), 0usize)
                         }
-                        Err(_) => break,
+                        Err(error) => {
+                            return Err(format!(
+                                "joint constrained Newton QP failed at cycle {cycle} \
+                                 (constraint_rows={}, warm_active_rows={}, beta_inf={:.6e}, \
+                                 rhs_inf={:.6e}): {error}",
+                                constraints.nrows(),
+                                warm_joint_active.as_ref().map_or(0, Vec::len),
+                                beta_joint.iter().map(|value| value.abs()).fold(0.0_f64, f64::max),
+                                rhs_step.iter().map(|value| value.abs()).fold(0.0_f64, f64::max),
+                            ));
+                        }
                     }
                 } else {
                     // Stationarity residual: r = S*beta - gradient (for penalized NLL)
