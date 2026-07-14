@@ -991,8 +991,7 @@ impl FlexCoefficientJet for Jet2 {
         directional_gradient: Vec<f64>,
     ) -> Self {
         assert!(
-            directional_value == 0.0
-                && directional_gradient.iter().all(|value| *value == 0.0),
+            directional_value == 0.0 && directional_gradient.iter().all(|value| *value == 0.0),
             "Jet2 cannot erase a coefficient-direction seed; use Jet3"
         );
         Self::from_parts(value, &gradient, &[])
@@ -3007,7 +3006,7 @@ impl SurvivalMarginalSlopeFamily {
     }
 }
 
-struct FlexFamilyCoefficientJets<J> {
+struct FlexFamilyCoefficientJets<J: FlexCoefficientJet> {
     template: Dual2<J>,
     q0: Dual2<J>,
     q1: Dual2<J>,
@@ -3214,11 +3213,13 @@ impl SurvivalMarginalSlopeFamily {
                 block_states.len(),
             ));
         }
-        for (block, (name, range)) in block_states.iter().zip(expected.iter()).enumerate() {
-            if block.beta.len() != range.len() {
+        for (block_index, (block_state, (name, range))) in
+            block_states.iter().zip(expected.iter()).enumerate()
+        {
+            if block_state.beta.len() != range.len() {
                 return Err(format!(
-                    "survival marginal-slope FLEX family {name} block {block} beta width {} != layout width {}",
-                    block.beta.len(),
+                    "survival marginal-slope FLEX family {name} block {block_index} beta width {} != layout width {}",
+                    block_state.beta.len(),
                     range.len(),
                 ));
             }
@@ -3790,7 +3791,9 @@ impl SurvivalMarginalSlopeFamily {
 // scalar-FD sanity gate (the last FD-limited seam in the #932 tower). It is an
 // ORACLE only — never used on the production sweep — so it lives beside, not
 // inside, the p-primary jet types.
-use gam_math::nested_dual::{Dual2, Dual22, JetField};
+#[cfg(test)]
+use gam_math::nested_dual::Dual22;
+use gam_math::nested_dual::{Dual2, JetField};
 
 #[cfg(test)]
 mod moment_engine_tests {

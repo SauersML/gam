@@ -7,12 +7,10 @@
 //! beta-directional variant nests [`OneSeed`] inside the same outer dual, so the
 //! Jeffreys/LAML Hessian drift is a derivative of that identical row program.
 
+use super::timepoint_exact::flex_jet::{FlexFamilyCoefficientTerms, FlexFamilyRowDirection};
 use super::*;
-use super::timepoint_exact::flex_jet::{
-    FlexFamilyCoefficientTerms, FlexFamilyRowDirection,
-};
 use gam_math::jet_scalar::{JetScalar, OneSeed, Order2};
-use gam_math::nested_dual::Dual2;
+use gam_math::nested_dual::{Dual2, JetField};
 
 /// One family-direction channel in the rigid four-primary coordinates.
 ///
