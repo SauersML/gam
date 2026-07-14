@@ -226,7 +226,7 @@ impl CustomFamily for OneBlockExactPsiHookFamily {
         &self,
         _: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        _: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _: &CustomFamilyHyperLayout,
         _: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         // Default implementation ignores this parameter.

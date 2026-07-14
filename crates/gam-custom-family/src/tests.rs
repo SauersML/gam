@@ -5046,14 +5046,15 @@ pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay
         compute_covariance: true,
         ..BlockwiseFitOptions::default()
     };
-    let derivative_blocks: SharedDerivativeBlocks =
-        Arc::new((0..specs.len()).map(|_| Vec::new()).collect::<Vec<_>>());
+    let hyper_layout = Arc::new(test_design_hyper_layout(
+        (0..specs.len()).map(|_| Vec::new()).collect(),
+    ));
     let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
         &family,
         &specs,
         &options,
         &Array1::zeros(0),
-        derivative_blocks,
+        hyper_layout,
         &[None],
         EvalMode::ValueOnly,
     )
@@ -5125,7 +5126,9 @@ pub(crate) fn returned_mode_finalizer_rejects_different_certified_theta() {
         &specs,
         &options,
         &Array1::zeros(0),
-        Arc::new((0..specs.len()).map(|_| Vec::new()).collect()),
+        Arc::new(test_design_hyper_layout(
+            (0..specs.len()).map(|_| Vec::new()).collect(),
+        )),
         &[None],
         EvalMode::ValueOnly,
     )
@@ -5162,7 +5165,9 @@ pub(crate) fn returned_mode_finalizer_rejects_different_certified_objective() {
         &specs,
         &options,
         &Array1::zeros(0),
-        Arc::new((0..specs.len()).map(|_| Vec::new()).collect()),
+        Arc::new(test_design_hyper_layout(
+            (0..specs.len()).map(|_| Vec::new()).collect(),
+        )),
         &[None],
         EvalMode::ValueOnly,
     )
