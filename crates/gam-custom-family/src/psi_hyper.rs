@@ -710,10 +710,10 @@ pub fn build_contracted_psi_hook(
 ///
 /// Returns two closures:
 ///
-/// 1. **ext-ext** `(psi_i, psi_j) -> HyperCoordPair`: second-order
+/// 1. **ext-ext** `(psi_i, psi_j) -> Result<HyperCoordPair, String>`: second-order
 ///    fixed-β objects for a pair of ψ coordinates.
 ///
-/// 2. **rho-ext** `(rho_k, psi_j) -> HyperCoordPair`: mixed second-order
+/// 2. **rho-ext** `(rho_k, psi_j) -> Result<HyperCoordPair, String>`: mixed second-order
 ///    fixed-β objects for a ρ-ψ pair.
 ///
 /// The closures capture (via `Arc`) shared references to penalty derivatives,
@@ -742,8 +742,8 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     jeffreys_ctx: Option<(Array2<f64>, Array2<f64>)>,
 ) -> Result<
     (
-        Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>,
-        Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>,
+        Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, String> + Send + Sync>,
+        Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, String> + Send + Sync>,
     ),
     String,
 > {
@@ -837,6 +837,14 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                         Some(ws) => ws.first_order_terms_all()?,
                         None => None,
                     };
+                if let Some(all) = batched_first.as_ref()
+                    && all.len() != psi_dim
+                {
+                    return Err(format!(
+                        "custom-family hyper workspace returned {} first-order axes for layout length {psi_dim}",
+                        all.len()
+                    ));
+                }
                 let mut pert_first: Vec<Array2<f64>> = Vec::with_capacity(psi_dim);
                 let mut ok = true;
                 for axis in 0..psi_dim {
@@ -979,12 +987,14 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let firth_pair_ctx = firth_pair_ctx.clone();
         let family_pair_cache = Arc::clone(&family_pair_cache);
 
-        Box::new(move |psi_i: usize, psi_j: usize| -> HyperCoordPair {
-            assert!(
-                psi_i < hyper_layout.len() && psi_j < hyper_layout.len(),
-                "typed hyper pair index out of bounds: ({psi_i}, {psi_j}) for {} axes",
-                hyper_layout.len()
-            );
+        Box::new(
+            move |psi_i: usize, psi_j: usize| -> Result<HyperCoordPair, String> {
+            if psi_i >= hyper_layout.len() || psi_j >= hyper_layout.len() {
+                return Err(format!(
+                    "typed hyper pair index out of bounds: ({psi_i}, {psi_j}) for {} axes",
+                    hyper_layout.len()
+                ));
+            }
             let cache_i = psi_penalty_cache[psi_i].as_ref();
             let cache_j = psi_penalty_cache[psi_j].as_ref();
 
@@ -992,9 +1002,13 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             let family_pair_required = hyper_layout.family_axis(psi_i).is_some()
                 || hyper_layout.family_axis(psi_j).is_some();
             let psi2 = if family_pair_required {
-                family_pair_cache[psi_i][psi_j].clone()
+                Some(family_pair_cache[psi_i][psi_j].clone().ok_or_else(|| {
+                    format!(
+                        "typed family hyper pair ({psi_i}, {psi_j}) was not retained by its validated pair cache"
+                    )
+                })?)
             } else {
-                let result = if let Some(workspace) = psi_workspace.as_ref() {
+                if let Some(workspace) = psi_workspace.as_ref() {
                     workspace.second_order_terms(psi_i, psi_j)
                 } else {
                     family_arc.exact_newton_joint_psisecond_order_terms(
@@ -1004,13 +1018,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                         psi_i,
                         psi_j,
                     )
-                };
-                match result {
-                    Ok(terms) => terms,
-                    Err(error) => panic!(
-                        "typed design hyper pair ({psi_i}, {psi_j}) failed during immutable Hessian assembly: {error}"
-                    ),
-                }
+                }?
             };
 
             let (obj_ll, score_ll, hess_ll, hess_ll_op) = match psi2 {
@@ -1032,6 +1040,18 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             let mut g = score_ll;
             let mut b_mat = hess_ll;
             let mut b_operator = hess_ll_op;
+            if g.len() != total {
+                return Err(format!(
+                    "typed hyper pair ({psi_i}, {psi_j}) returned score length {}, expected {total}",
+                    g.len()
+                ));
+            }
+            if b_mat.dim() != (0, 0) && b_mat.dim() != (total, total) {
+                return Err(format!(
+                    "typed hyper pair ({psi_i}, {psi_j}) returned dense Hessian shape {:?}, expected (0, 0) or ({total}, {total})",
+                    b_mat.dim()
+                ));
+            }
 
             // EXPLICIT Firth/Jeffreys ψψ VALUE second derivative (gam#1607):
             //   a -= ∂_{ψ_i}∂_{ψ_j}Φ
@@ -1043,8 +1063,8 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             // captured HERE, before the `S_{ψ_i ψ_j}` penalty drift is folded in below
             // — the Jeffreys info is the unpenalized data Hessian). The helper returns
             // `0.0` when the conditioning gate skips the term, so a clean fit is
-            // byte-unchanged; an error (shape/eigh) is swallowed exactly like the
-            // family `psi2` term above.
+            // byte-unchanged. Invalid shape/eigensystem evidence propagates through
+            // the pair callback together with workspace failures.
             if let Some((z_j, h_joint, pert_first)) = firth_pair_ctx.as_ref()
                 && psi_i < pert_first.len()
                 && psi_j < pert_first.len()
@@ -1057,16 +1077,15 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                             .as_ref()
                             .map(|op| op.mul_mat(&Array2::<f64>::eye(total)))
                     };
-                if let Some(pert_ij) = pert_ij_opt
-                    && let Ok(phi_psi_psi) =
+                if let Some(pert_ij) = pert_ij_opt {
+                    let phi_psi_psi =
                         gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
                             h_joint.view(),
                             z_j.view(),
                             &pert_first[psi_i],
                             &pert_first[psi_j],
                             &pert_ij,
-                        )
-                {
+                        )?;
                     a -= phi_psi_psi;
                 }
             }
@@ -1126,11 +1145,19 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     let s_psi_i = cache_i
                         .s_local
                         .as_ref()
-                        .expect("psi cache should include S_psi when penalty logdet is active");
+                        .ok_or_else(|| {
+                            format!(
+                                "typed hyper axis {psi_i} has no cached S_psi for active penalty logdet"
+                            )
+                        })?;
                     let s_psi_j = cache_j
                         .s_local
                         .as_ref()
-                        .expect("psi cache should include S_psi when penalty logdet is active");
+                        .ok_or_else(|| {
+                            format!(
+                                "typed hyper axis {psi_j} has no cached S_psi for active penalty logdet"
+                            )
+                        })?;
                     // τ-Hessian: tr(S⁺ S_{ψi ψj}) − tr(S⁺ S_ψi S⁺ S_ψj) + 2 tr(Σ₊⁻² L_i L_j^T)
                     pld.tau_hessian_component(s_psi_i, s_psi_j, Some(&s_local))
                 } else {
@@ -1140,14 +1167,14 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 0.0
             };
 
-            HyperCoordPair {
+            Ok(HyperCoordPair {
                 a,
                 g,
                 b_mat,
                 b_operator,
                 ld_s,
-            }
-        }) as Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>
+            })
+        }) as Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, String> + Send + Sync>
     };
 
     // ρ-ψ pair callback
@@ -1159,13 +1186,15 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let rho_penalty_cache = Arc::clone(&rho_penalty_cache);
         let s_logdet_block_cache = Arc::clone(&s_logdet_block_cache);
 
-        Box::new(move |rho_k: usize, psi_j: usize| -> HyperCoordPair {
-            assert!(
-                rho_k < rho_penalty_cache.len() && psi_j < hyper_layout.len(),
-                "rho×typed-hyper pair index out of bounds: ({rho_k}, {psi_j}) for {} rho and {} non-rho axes",
-                rho_penalty_cache.len(),
-                hyper_layout.len()
-            );
+        Box::new(
+            move |rho_k: usize, psi_j: usize| -> Result<HyperCoordPair, String> {
+            if rho_k >= rho_penalty_cache.len() || psi_j >= hyper_layout.len() {
+                return Err(format!(
+                    "rho×typed-hyper pair index out of bounds: ({rho_k}, {psi_j}) for {} rho and {} non-rho axes",
+                    rho_penalty_cache.len(),
+                    hyper_layout.len()
+                ));
+            }
             let rho_cache = &rho_penalty_cache[rho_k];
             let psi_cache = psi_penalty_cache[psi_j].as_ref();
             let mut a = 0.0;
@@ -1226,7 +1255,11 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     let s_psi_j = psi_cache
                         .s_local
                         .as_ref()
-                        .expect("psi cache should include S_psi when penalty logdet is active");
+                        .ok_or_else(|| {
+                            format!(
+                                "typed hyper axis {psi_j} has no cached S_psi for active penalty logdet"
+                            )
+                        })?;
                     // ∂S_k/∂ψ_j (unscaled): extract from local by dividing out λ_k.
                     let ds_k_dpsi = if lambda_k.abs() > 1e-300 {
                         Some(local.mapv(|v| v / lambda_k))
@@ -1247,14 +1280,14 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 0.0
             };
 
-            HyperCoordPair {
+            Ok(HyperCoordPair {
                 a,
                 g,
                 b_mat,
                 b_operator: None,
                 ld_s,
-            }
-        }) as Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>
+            })
+        }) as Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, String> + Send + Sync>
     };
 
     Ok((ext_ext, rho_ext))

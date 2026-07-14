@@ -129,7 +129,7 @@ impl CgroupMemoryAvailability {
 }
 
 #[cfg(test)]
-mod test_fixtures {
+mod tests_fixtures {
     use super::*;
 
     impl CgroupMemoryProbeFailure {

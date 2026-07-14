@@ -1702,7 +1702,7 @@ pub fn matrix_free_arrow_evidence_log_det(
         ridge_beta,
         options,
         num_probes.saturating_mul(lanczos_steps),
-    );
+    )?;
     let gpu_matvec: Option<&GpuSchurMatvec> =
         options.gpu_matvec.as_ref().or(device_matvec.as_ref());
     let resident = if gpu_matvec.is_none() {
@@ -1747,14 +1747,14 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
     ridge_beta: f64,
     options: &ArrowSolveOptions,
     apply_budget: usize,
-) -> Option<GpuSchurMatvec> {
+) -> Result<Option<GpuSchurMatvec>, ArrowSchurError> {
     // A caller-supplied operator (threaded through `options.gpu_matvec`) already
     // owns its residency; the caller passes it directly, so never double-build.
     if options.gpu_matvec.is_some() {
-        return None;
+        return Ok(None);
     }
     if !sys.cross_row_penalties.is_empty() || options.streaming_chunk_size.is_some() {
-        return None;
+        return Ok(None);
     }
     // Size gate BEFORE the device probe (startup-tax ordering): the predicate
     // reads only associated constants, so a shape it rejects skips
@@ -1766,10 +1766,16 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
         sys.d,
         apply_budget.max(1),
     ) {
-        return None;
+        return Ok(None);
     }
-    gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-        .unwrap_or_else(|error| panic!("evidence GPU runtime resolution failed: {error}"))?;
+    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .map_err(|error| ArrowSchurError::SchurFactorFailed {
+            reason: format!("evidence GPU runtime resolution failed: {error}"),
+        })?
+        .is_none()
+    {
+        return Ok(None);
+    }
     // #1017: framed matrix-free system with resident device operands — prefer the
     // device-resident DETERMINISTIC reduced-Schur apply (upload operands once,
     // cross only x/out per apply, atomics-free so the SLQ log|S| determinism
@@ -1778,16 +1784,23 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
     // this ridge) fall through to the backend/CPU path. Non-Linux/CPU: this always
     // returns `None` (no `device_sae_pcg`), so the lane is byte-identical.
     if sys.device_sae_pcg.is_some() {
-        if let Some(matvec) = crate::gpu_kernels::arrow_schur::build_framed_resident_evidence_matvec(
-            sys,
-            ridge_t,
-            ridge_beta,
-            apply_budget.max(1),
-        ) {
-            return Some(matvec);
+        if let Some(matvec) =
+            crate::gpu_kernels::arrow_schur::build_framed_resident_evidence_matvec(
+                sys,
+                ridge_t,
+                ridge_beta,
+                apply_budget.max(1),
+            )
+            .map_err(|failure| {
+                device_failure_as_arrow_error("resident evidence matvec build", failure)
+            })?
+        {
+            return Ok(Some(matvec));
         }
     }
-    crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta).ok()
+    crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta)
+        .map(Some)
+        .map_err(|failure| device_failure_as_arrow_error("evidence matvec build", failure))
 }
 
 /// Fixed configuration for the #2080 rational-surrogate evidence lane: the probe

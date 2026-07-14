@@ -151,7 +151,7 @@ pub(crate) use gam_linalg::matrix::{
 pub use gam_problem::{
     ContractedPsiSecondOrderFn, DenseMatrixHyperOperator, DriftDerivResult, EvalMode,
     FixedDriftDerivFn, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperCoordPairFn,
-    HyperOperator, ProjectedFactorCache, ProjectedFactorKey, PseudoLogdetMode,
+    HyperCoordPairResult, HyperOperator, ProjectedFactorCache, ProjectedFactorKey, PseudoLogdetMode,
     SharedFixedDriftDerivFn,
 };
 

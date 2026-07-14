@@ -986,8 +986,16 @@ pub struct HyperCoordPair {
     pub ld_s: f64,
 }
 
+/// Fallible result of computing one second-order fixed-β coordinate pair.
+///
+/// Pair assembly may call an immutable family workspace whose shape and
+/// numerical validation are deliberately error-capable. Keeping that failure
+/// in the callback contract lets dense and operator Hessian consumers stop
+/// with the original evidence instead of converting it into a panic.
+pub type HyperCoordPairResult = Result<HyperCoordPair, String>;
+
 /// Shared-ownership callback computing a second-order fixed-β
-/// [`HyperCoordPair`] for a coordinate pair `(i, j)`.
+/// [`HyperCoordPairResult`] for a coordinate pair `(i, j)`.
 ///
 /// `Arc` (not `Box`) so the same callback can be cloned into a derived
 /// `InnerSolution` — notably the tangent-projected solution built under active
@@ -996,7 +1004,7 @@ pub struct HyperCoordPair {
 /// are p-space; every consumer contracts them through the (possibly
 /// tangent-wrapped) Hessian operator, which applies the `ZᵀMZ` / `Z H_T⁻¹ Zᵀ`
 /// projection internally, so a clone-through is mathematically exact.
-pub type HyperCoordPairFn = Arc<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>;
+pub type HyperCoordPairFn = Arc<dyn Fn(usize, usize) -> HyperCoordPairResult + Send + Sync>;
 
 impl HyperCoordPair {
     pub fn zero() -> Self {

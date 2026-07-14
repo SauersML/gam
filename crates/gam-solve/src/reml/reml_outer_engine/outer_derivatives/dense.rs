@@ -675,7 +675,7 @@ pub(crate) fn compute_outer_hessian(
     if let Some(ref rho_ext_fn) = solution.rho_ext_pair_fn {
         for rho_idx in 0..k {
             for ext_idx in 0..ext_dim {
-                let pair = rho_ext_fn(rho_idx, ext_idx);
+                let pair = rho_ext_fn(rho_idx, ext_idx)?;
                 let a_ext = solution.ext_coords[ext_idx].a;
 
                 let (cross_trace, h2_trace) = if incl_logdet_h {
@@ -777,7 +777,7 @@ pub(crate) fn compute_outer_hessian(
         // `Par::Seq`), exactly as the rigid row-kernel all-axes sweep does. The
         // results are collected index-ordered so the subsequent trace/write loop
         // is byte-identical to the prior serial `ext_pair_fn` evaluation order.
-        let ext_pairs: Vec<gam_problem::HyperCoordPair> = {
+        let ext_pairs: Result<Vec<gam_problem::HyperCoordPair>, String> = {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let pair_count = ext_dim * (ext_dim + 1) / 2;
             (0..pair_count)
@@ -789,6 +789,7 @@ pub(crate) fn compute_outer_hessian(
                 })
                 .collect()
         };
+        let ext_pairs = ext_pairs?;
         let ext_pair_at = |ii: usize, jj: usize| -> usize {
             // Upper-triangle row-major index for (ii <= jj), the exact inverse of
             // `upper_triangle_pair_from_index`: row_start = ii*(2*ext_dim-ii+1)/2.

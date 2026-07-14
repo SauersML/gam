@@ -27,7 +27,7 @@ pub(crate) struct BinomialLocationScaleWiggleRowProgram<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum BinomialWiggleRowOuter {
+pub(super) enum BinomialWiggleRowOuter {
     Observed,
     ExpectedInformation,
 }

@@ -76,7 +76,7 @@ pub(crate) fn sae_streaming_plan_from_budget(
     in_core_budget_bytes: usize,
     chunk_window_bytes: usize,
     process_available_bytes: usize,
-) -> Result<SaeStreamingPlan, String> {
+) -> SaeStreamingPlan {
     let per_row_words = total_basis
         .saturating_mul(1 + d_max)
         .saturating_add(k_atoms)
@@ -182,7 +182,7 @@ pub fn sae_streaming_plan_for_shape(
     k_atoms: usize,
     d_max: usize,
     border_dim: usize,
-) -> SaeStreamingPlan {
+) -> Result<SaeStreamingPlan, String> {
     // Size gate BEFORE any CUDA probe (startup-tax fix, #1017 ordering): decide
     // admission against `min(host budget, conservative device-pool floor)`
     // first. If the direct plan is admitted even under that pessimistic budget,

@@ -9,9 +9,9 @@
 
 use super::reml_outer_engine::{
     BarrierConfig, ContractedPsiSecondOrderFn, DispersionHandling, EvalMode, FixedDriftDerivFn,
-    HessianDerivativeProvider, HessianFactorization, HyperCoord, HyperCoordPair, InnerSolution,
-    InnerSolutionBuilder, PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace,
-    RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
+    HessianDerivativeProvider, HessianFactorization, HyperCoord, HyperCoordPairResult,
+    InnerSolution, InnerSolutionBuilder, PenaltyCoordinate, PenaltyLogdetDerivs,
+    PenaltySubspaceTrace, RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::model_types::ProjectedKktResidual;
 use gam_linalg::faer_ndarray::fast_xt_diag_y;
@@ -327,8 +327,10 @@ pub struct InnerAssembly<'dp> {
 
     // === Extended hyperparameter coordinates ===
     pub ext_coords: Vec<HyperCoord>,
-    pub ext_coord_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
-    pub rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    pub ext_coord_pair_fn:
+        Option<Box<dyn Fn(usize, usize) -> HyperCoordPairResult + Send + Sync>>,
+    pub rho_ext_pair_fn:
+        Option<Box<dyn Fn(usize, usize) -> HyperCoordPairResult + Send + Sync>>,
     pub fixed_drift_deriv: Option<FixedDriftDerivFn>,
     /// Direction-contracted ψψ second-order hook (#740). When set, the
     /// outer-Hessian operator builder skips the `K²` per-pair ψψ assembly and

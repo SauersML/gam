@@ -39,7 +39,7 @@ fn pin_evidence_beta_schur(sys: &ArrowSchurSystem, schur: Array2<f64>) -> Array2
     }
 }
 
-fn device_failure_as_arrow_error(
+pub(crate) fn device_failure_as_arrow_error(
     context: &'static str,
     failure: crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure,
 ) -> ArrowSchurError {
@@ -321,7 +321,9 @@ pub fn solve_arrow_newton_step_core(
     // and inject it through a cloned options so the existing InexactPCG branch
     // consumes it. On any device decline the original (CPU) options are used
     // unchanged, so results are bit-identical.
-    if let Some(device_options) = maybe_inject_gpu_schur_matvec(sys, ridge_t, ridge_beta, options) {
+    if let Some(device_options) =
+        maybe_inject_gpu_schur_matvec(sys, ridge_t, ridge_beta, options)?
+    {
         return solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, &device_options).map(
             |step| {
                 let mut diagnostics = step.pcg_diagnostics;
@@ -368,12 +370,12 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
     ridge_t: f64,
     ridge_beta: f64,
     options: &ArrowSolveOptions,
-) -> Option<ArrowSolveOptions> {
+) -> Result<Option<ArrowSolveOptions>, ArrowSchurError> {
     if options.mode != ArrowSolverMode::InexactPCG || options.gpu_matvec.is_some() {
-        return None;
+        return Ok(None);
     }
     if !sys.cross_row_penalties.is_empty() || options.streaming_chunk_size.is_some() {
-        return None;
+        return Ok(None);
     }
     // #1017 Phase-1 call-site re-key: the reduced-Schur matvec is `O(n · d · k)`
     // per apply and the PCG runs `cg_iters` applies over device-resident frames,
@@ -403,17 +405,27 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
         sys.d,
         cg_iters,
     ) {
-        return None;
+        return Ok(None);
     }
     // Require a live device before assembling the GPU matvec backend; the
     // runtime handle itself is not needed here, only its presence.
-    gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-        .unwrap_or_else(|error| panic!("Arrow-Schur GPU runtime resolution failed: {error}"))?;
-    let matvec =
-        crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta).ok()?;
+    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .map_err(|error| ArrowSchurError::SchurFactorFailed {
+            reason: format!("Arrow-Schur GPU runtime resolution failed: {error}"),
+        })?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let matvec = crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(
+        sys,
+        ridge_t,
+        ridge_beta,
+    )
+    .map_err(|failure| device_failure_as_arrow_error("Arrow-Schur matvec build", failure))?;
     let mut device_options = options.clone();
     device_options.gpu_matvec = Some(matvec);
-    Some(device_options)
+    Ok(Some(device_options))
 }
 
 /// Admission + dispatch for the device-resident Direct Arrow-Schur point solve.
@@ -483,8 +495,15 @@ pub(crate) fn try_device_arrow_direct(
     {
         return None;
     }
-    let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-        .unwrap_or_else(|error| panic!("Arrow-Schur direct runtime resolution failed: {error}"))?;
+    let runtime = match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy()) {
+        Ok(Some(runtime)) => runtime,
+        Ok(None) => return None,
+        Err(error) => {
+            return Some(Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!("Arrow-Schur direct runtime resolution failed: {error}"),
+            }));
+        }
+    };
     let admitted = runtime
         .policy()
         .dense_hessian_work_target_is_gpu(sys.rows.len(), sys.k);
@@ -518,10 +537,10 @@ pub(crate) fn try_device_arrow_direct(
         Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed {
             reason,
         }) => Some(Err(ArrowSchurError::SchurFactorFailed { reason })),
-        // Unavailable (transient / below device policy) and
-        // GpuRequiresDenseSystem (matrix-free, already filtered above) both mean
-        // "device declined" — fall back to CPU transparently.
-        Err(_) => None,
+        Err(failure) => Some(Err(device_failure_as_arrow_error(
+            "Arrow-Schur direct solve after admission",
+            failure,
+        ))),
     }
 }
 
@@ -641,12 +660,17 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
         );
         return None;
     }
-    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-        .unwrap_or_else(|error| panic!("SAE direct GPU runtime resolution failed: {error}"))
-        .is_none()
-    {
-        trace_decline!("typed CUDA absence under the configured policy");
-        return None;
+    match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy()) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            trace_decline!("typed CUDA absence under the configured policy");
+            return None;
+        }
+        Err(error) => {
+            return Some(Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!("SAE direct GPU runtime resolution failed: {error}"),
+            }));
+        }
     }
     log::debug!(
         "arrow-schur device SAE Direct PCG ENGAGING device (n={}, k={}, d={}, frame={})",
@@ -783,13 +807,17 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
                 // per-apply host round-trip); when it declines the shape/device
                 // the byte-identical CPU resident row-factor lane is staged
                 // instead.
-                let device_matvec = crate::arrow_schur::maybe_build_evidence_gpu_matvec(
-                    sys,
-                    ridge_t,
-                    ridge_beta,
-                    options,
-                    (SCHUR_SLQ_LOGDET_PROBES * SCHUR_SLQ_LOGDET_LANCZOS_STEPS).max(1),
-                );
+                let device_matvec =
+                    match crate::arrow_schur::maybe_build_evidence_gpu_matvec(
+                        sys,
+                        ridge_t,
+                        ridge_beta,
+                        options,
+                        (SCHUR_SLQ_LOGDET_PROBES * SCHUR_SLQ_LOGDET_LANCZOS_STEPS).max(1),
+                    ) {
+                        Ok(matvec) => matvec,
+                        Err(error) => return Some(Err(error)),
+                    };
                 let gpu_matvec = options.gpu_matvec.as_ref().or(device_matvec.as_ref());
                 let resident = if gpu_matvec.is_none() {
                     SaeResidentReducedSchur::build(sys, htt_factors, backend)
@@ -872,15 +900,10 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
         Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed {
             reason,
         }) => Some(Err(ArrowSchurError::SchurFactorFailed { reason })),
-        // Unavailable / transient / framed-mismatch all mean "device declined" —
-        // fall through to the CPU dense Direct path transparently.
-        Err(other) => {
-            trace_decline!(
-                "device kernel returned {:?} — falling back to CPU dense",
-                other
-            );
-            None
-        }
+        Err(failure) => Some(Err(device_failure_as_arrow_error(
+            "SAE direct device solve after admission",
+            failure,
+        ))),
     }
 }
 

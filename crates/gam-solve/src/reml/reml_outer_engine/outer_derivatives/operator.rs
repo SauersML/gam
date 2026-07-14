@@ -1058,15 +1058,15 @@ pub(crate) fn build_outer_hessian_operator(
     if let Some(rho_ext_fn) = solution.rho_ext_pair_fn.as_ref() {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let pair_count = k * ext_dim;
-        let entries: Vec<(usize, usize, HyperCoordPair)> = (0..pair_count)
+        let entries: Result<Vec<(usize, usize, HyperCoordPair)>, String> = (0..pair_count)
             .into_par_iter()
             .map(|pair_idx| {
                 let rho_idx = pair_idx / ext_dim;
                 let ext_idx = pair_idx % ext_dim;
-                let pair = rho_ext_fn(rho_idx, ext_idx);
-                (rho_idx, ext_idx, pair)
+                rho_ext_fn(rho_idx, ext_idx).map(|pair| (rho_idx, ext_idx, pair))
             })
             .collect();
+        let entries = entries?;
         // Batch all second-drift traces so `--scale-dimensions` pays one
         // shared Hutchinson solve stream for the whole rho-ext block instead
         // of one estimator per pair.  Projected subspace traces skip the
@@ -1106,14 +1106,14 @@ pub(crate) fn build_outer_hessian_operator(
     ) {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let pair_count = ext_dim * (ext_dim + 1) / 2;
-        let entries: Vec<(usize, usize, HyperCoordPair)> = (0..pair_count)
+        let entries: Result<Vec<(usize, usize, HyperCoordPair)>, String> = (0..pair_count)
             .into_par_iter()
             .map(|pair_idx| {
                 let (ii, jj) = upper_triangle_pair_from_index(pair_idx, ext_dim);
-                let pair = ext_pair_fn(ii, jj);
-                (ii, jj, pair)
+                ext_pair_fn(ii, jj).map(|pair| (ii, jj, pair))
             })
             .collect();
+        let entries = entries?;
         let pair_refs: Vec<&HyperCoordPair> = entries.iter().map(|(_, _, pair)| pair).collect();
         let bases = compute_base_h2_traces(
             hop.as_ref(),

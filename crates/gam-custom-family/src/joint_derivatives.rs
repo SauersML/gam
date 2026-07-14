@@ -522,8 +522,10 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
 /// to an `InnerSolution` before calling the unified evaluator.
 pub(crate) struct ExtCoordBundle {
     pub(crate) coords: Vec<HyperCoord>,
-    pub(crate) ext_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
-    pub(crate) rho_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
+    pub(crate) ext_ext_fn:
+        Option<Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, String> + Send + Sync>>,
+    pub(crate) rho_ext_fn:
+        Option<Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, String> + Send + Sync>>,
     pub(crate) drift_fn: Option<FixedDriftDerivFn>,
     /// Direction-contracted ψψ second-order hook (#740). When `Some`, the
     /// outer-Hessian operator builder skips the `K²` per-pair ψψ assembly
@@ -642,12 +644,20 @@ impl ExtCoordBundle {
             .map(|coord| scale_hypercoord(coord, scale))
             .collect();
         let ext_ext_fn = self.ext_ext_fn.map(|callback| {
-            Box::new(move |i: usize, j: usize| scale_hypercoord_pair(callback(i, j), scale))
-                as Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>
+            Box::new(move |i: usize, j: usize| {
+                callback(i, j).map(|pair| scale_hypercoord_pair(pair, scale))
+            })
+                as Box<
+                    dyn Fn(usize, usize) -> Result<HyperCoordPair, String> + Send + Sync,
+                >
         });
         let rho_ext_fn = self.rho_ext_fn.map(|callback| {
-            Box::new(move |i: usize, j: usize| scale_hypercoord_pair(callback(i, j), scale))
-                as Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>
+            Box::new(move |i: usize, j: usize| {
+                callback(i, j).map(|pair| scale_hypercoord_pair(pair, scale))
+            })
+                as Box<
+                    dyn Fn(usize, usize) -> Result<HyperCoordPair, String> + Send + Sync,
+                >
         });
         let drift_fn = self.drift_fn.map(|callback| {
             Box::new(move |ext_idx: usize, direction: &Array1<f64>| {
