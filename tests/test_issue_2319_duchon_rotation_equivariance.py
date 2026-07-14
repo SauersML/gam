@@ -55,21 +55,21 @@ def test_duchon_fit_is_rotation_equivariant_in_one_scalar_frame_2319() -> None:
     # REML solve describe the same statistical problem after a rigid rotation.
     # The comparison is against the optimizer's numerical resolution, not the
     # loose 0.18 downstream classification band that exposed the regression.
-    assert prediction_defect <= 5.0e-6, prediction_defect
+    assert prediction_defect <= 1.0e-8, prediction_defect
 
     summary = fit.summary()
     summary_rot = fit_rot.summary()
     np.testing.assert_allclose(
         summary_rot.edf_total,
         summary.edf_total,
-        rtol=5.0e-6,
-        atol=5.0e-8,
+        rtol=1.0e-8,
+        atol=1.0e-10,
     )
     np.testing.assert_allclose(
         summary_rot.reml_score,
         summary.reml_score,
-        rtol=5.0e-8,
-        atol=5.0e-8,
+        rtol=1.0e-9,
+        atol=1.0e-9,
     )
 
     smooth = fit.smoothing_parameters()
@@ -78,6 +78,6 @@ def test_duchon_fit_is_rotation_equivariant_in_one_scalar_frame_2319() -> None:
     np.testing.assert_allclose(
         [smooth_rot[key] for key in smooth],
         [smooth[key] for key in smooth],
-        rtol=5.0e-6,
-        atol=5.0e-8,
+        rtol=1.0e-7,
+        atol=1.0e-9,
     )
