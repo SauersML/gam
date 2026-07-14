@@ -508,6 +508,20 @@ mod tests {
     /// cells) whose smoothing selection is the exact regime the outer criterion
     /// desync afflicts. The target leaves a genuine residual so the penalized
     /// deviance and every per-group penalty energy are strictly positive.
+    ///
+    /// The periodic latent coordinate is seeded AWAY from a quarter period. With
+    /// one active row per atom the exact ridge decoder block makes the fitted row
+    /// interpolate the target, so the likelihood coordinate Jacobian
+    /// `b·phi'(t)` collapses and the coordinate normal equation is carried
+    /// entirely by the von-Mises PSD majorizer `max(alpha·cos(kappa·t), 0)`. That
+    /// majorizer is exactly zero at `t = p/4` (period `p`), where the prior
+    /// gradient `(alpha/kappa)·sin(kappa·t)` is still maximal — a zero-curvature
+    /// block with a non-zero right-hand side, which `solve_psd_minimum_norm`
+    /// (correctly) refuses as an RHS in the normal-equation null space. Seeding at
+    /// `t = 0.1` (period 1) keeps `cos(kappa·t) = 0.809 > 0`, and because the
+    /// von-Mises prior pulls the coordinate toward its mode at `t = 0`, every
+    /// later iterate moves further from `p/4`, so the coordinate block stays
+    /// strictly positive definite all the way to the recurring fixed point.
     fn build_objective() -> SaeSupportOuterObjective {
         let periodic_eval: Arc<dyn SaeBasisSecondJet> =
             Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic"));
@@ -548,7 +562,7 @@ mod tests {
             specs,
             vec![vec![0], vec![1]],
             vec![vec![9.0], vec![-4.0]],
-            vec![vec![0.25], vec![3.0, 1.0]],
+            vec![vec![0.1], vec![3.0, 1.0]],
         )
         .expect("state");
         let term = SaeSupportSparseTerm::new(atoms, state).expect("term");
