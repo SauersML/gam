@@ -7059,10 +7059,12 @@ pub(crate) fn duchon_rotation_is_equivariant_before_outer_optimization_gh2319() 
     let rotated = build_duchon_basis(rotated_data.view(), &spec)
         .expect("rotated Duchon preoptimizer build");
 
-    let centers = |built: &BasisBuildResult| match &built.metadata {
-        BasisMetadata::Duchon { centers, .. } => centers,
-        _ => panic!("Duchon builder must return Duchon metadata"),
-    };
+    fn centers(built: &BasisBuildResult) -> &Array2<f64> {
+        match &built.metadata {
+            BasisMetadata::Duchon { centers, .. } => centers,
+            _ => panic!("Duchon builder must return Duchon metadata"),
+        }
+    }
     let expected_rotated_centers = rotate(centers(&base));
     let actual_rotated_centers = centers(&rotated);
     assert_eq!(expected_rotated_centers.raw_dim(), actual_rotated_centers.raw_dim());

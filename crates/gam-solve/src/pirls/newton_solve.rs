@@ -835,7 +835,7 @@ mod square_root_solve_tests {
         // This component is exactly orthogonal to both columns of `root` but
         // is much larger than the projected residual in the weak direction.
         let orthogonal_residual = array![1.0e-8, -1.0, -2.0];
-        let residual = -root.dot(&expected) + orthogonal_residual;
+        let residual = -root.dot(&expected) + &orthogonal_residual;
         let mut actual = Array1::<f64>::zeros(2);
 
         solve_newton_direction_from_root(&root, &residual, &mut actual)
