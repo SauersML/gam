@@ -327,132 +327,103 @@ pub fn project_stationarity_residual_on_constraint_cone(
     }
 
     let m = active_a.nrows();
-    let residual_scale = residual
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-        .max(1.0);
-    let row_scale = active_a
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-        .max(1.0);
-    let tol = 100.0 * f64::EPSILON * (p.max(m).max(1) as f64) * residual_scale * row_scale;
+    let constraints = LinearInequalityConstraints::new(
+        active_a.clone(),
+        Array1::<f64>::zeros(m),
+    )
+    .ok()?
+    .canonicalized()
+    .ok()?;
 
-    let mut lambda = Array1::<f64>::zeros(m);
-    let mut passive = vec![false; m];
-    let mut projected = residual.clone();
-    let max_iter = (3 * m * m).max(10);
+    // Moreau projection onto the tangent cone is the strictly convex primal
+    // QP
+    //
+    //   min_d  1/2 ||d + residual||^2    s.t. A d >= 0.
+    //
+    // The former implementation solved its dual with a second, nested
+    // Lawson-Hanson active-set method. On the issue-979 CTN faces that nested
+    // solver enumerated up to `3*m*m` passive sets, first with one dense SVD
+    // and later with one fresh QR per pivot. Route the geometry through the
+    // repository's single Bland-ordered, rank-compressed primal QP instead.
+    // Its identity Hessian is strictly positive definite, so the returned face
+    // and direction are unique and need no projected-gradient escape.
+    let identity = Array2::<f64>::eye(p);
+    let origin = Array1::<f64>::zeros(p);
+    let mut tangent_direction = Array1::<f64>::zeros(p);
+    let mut tangent_active = Vec::new();
+    let max_iterations = (p + m + 8) * 4;
+    solve_newton_direction_with_linear_constraints_impl(
+        &identity,
+        residual,
+        &origin,
+        &constraints,
+        &mut tangent_direction,
+        Some(&mut tangent_active),
+        max_iterations,
+        false,
+    )
+    .ok()?;
+    if !array_is_finite(&tangent_direction) {
+        return None;
+    }
+    let projected = -&tangent_direction;
 
-    for _ in 0..max_iter {
-        let dual = active_a.dot(&projected);
-        let entering = (0..m)
-            .filter(|&idx| !passive[idx] && dual[idx] > tol)
-            .max_by(|&left, &right| {
-                dual[left]
-                    .partial_cmp(&dual[right])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        let Some(entering) = entering else {
-            lambda.mapv_inplace(|v| if v > tol { v } else { 0.0 });
-            projected = residual - &active_a.t().dot(&lambda);
-            if !array_is_finite(&projected) || !array_is_finite(&lambda) {
+    // Reconstruct the primal QP's nonnegative KKT multipliers once on its
+    // canonical full-row-rank face: residual + d = A_active^T lambda. This is
+    // a single rectangular least-squares solve, never normal equations and
+    // never another active-set loop.
+    let mut lambda_canonical = Array1::<f64>::zeros(m);
+    if !tangent_active.is_empty() {
+        let gathered = gather_linear_constraint_rows(&constraints, &tangent_active).ok()?;
+        let design = gathered.a.t().to_owned();
+        let mut rhs = Array2::<f64>::zeros((p, 1));
+        rhs.column_mut(0).assign(&(residual + &tangent_direction));
+        let design_view = FaerArrayView::new(&design);
+        let rhs_view = FaerArrayView::new(&rhs);
+        let solved = design_view
+            .as_ref()
+            .col_piv_qr()
+            .solve_lstsq(rhs_view.as_ref());
+        let scale = residual
+            .iter()
+            .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
+            .max(1.0);
+        let tol = 100.0 * f64::EPSILON * (p.max(m) as f64) * scale;
+        for (position, &row) in tangent_active.iter().enumerate() {
+            let value = solved[(position, 0)];
+            if !value.is_finite() || value < -tol {
                 return None;
             }
-            return Some((projected, lambda));
-        };
-        passive[entering] = true;
-
-        loop {
-            let passive_rows: Vec<usize> = (0..m).filter(|&idx| passive[idx]).collect();
-            if passive_rows.is_empty() {
-                lambda.fill(0.0);
-                projected.assign(residual);
-                break;
-            }
-            // A passive NNLS basis cannot contain more independent normal
-            // generators than the ambient coefficient dimension. Crossing
-            // that bound is numerical rank failure, not a least-squares
-            // system that the tall column-pivoted QR below can certify.
-            if passive_rows.len() > p {
-                return None;
-            }
-
-            let mut a_passive = Array2::<f64>::zeros((passive_rows.len(), p));
-            for (pos, &row) in passive_rows.iter().enumerate() {
-                a_passive.row_mut(pos).assign(&active_a.row(row));
-            }
-            let mut lambda_passive = Array1::<f64>::zeros(passive_rows.len());
-            // Solve the passive least-squares problem in its original
-            // rectangular coordinates,
-            //
-            //     min_lambda ||A_passive^T lambda - residual||_2,
-            //
-            // rather than forming `A_passive A_passive^T` and taking an SVD
-            // of that normal matrix at every Lawson-Hanson pivot. The old
-            // route squared the condition number and made each face exchange
-            // a fresh cubic SVD; the 93-row issue-979 CTN face spent more than
-            // 70 seconds here after the outer active-set loop had already
-            // detected its repeated working set. Column-pivoted QR solves the
-            // same least-squares subproblem directly, including rank-deficient
-            // passive sets, without normal equations.
-            let design = a_passive.t().to_owned();
-            let mut rhs = Array2::<f64>::zeros((p, 1));
-            rhs.column_mut(0).assign(residual);
-            let design_view = FaerArrayView::new(&design);
-            let rhs_view = FaerArrayView::new(&rhs);
-            let solved = design_view
-                .as_ref()
-                .col_piv_qr()
-                .solve_lstsq(rhs_view.as_ref());
-            for pos in 0..passive_rows.len() {
-                lambda_passive[pos] = solved[(pos, 0)];
-            }
-            if !array_is_finite(&lambda_passive) {
-                return None;
-            }
-
-            let all_positive = lambda_passive.iter().all(|&v| v > tol);
-            if all_positive {
-                lambda.fill(0.0);
-                for (pos, &row) in passive_rows.iter().enumerate() {
-                    lambda[row] = lambda_passive[pos];
-                }
-                projected = residual - &active_a.t().dot(&lambda);
-                break;
-            }
-
-            let mut alpha = f64::INFINITY;
-            for (pos, &row) in passive_rows.iter().enumerate() {
-                let candidate = lambda_passive[pos];
-                if candidate <= tol {
-                    let current = lambda[row];
-                    let denom = current - candidate;
-                    if denom > 0.0 {
-                        alpha = alpha.min(current / denom);
-                    }
-                }
-            }
-            if !alpha.is_finite() {
-                alpha = 0.0;
-            }
-            alpha = alpha.clamp(0.0, 1.0);
-
-            for (pos, &row) in passive_rows.iter().enumerate() {
-                lambda[row] += alpha * (lambda_passive[pos] - lambda[row]);
-                if lambda[row] <= tol {
-                    lambda[row] = 0.0;
-                    passive[row] = false;
-                }
-            }
-            if passive.iter().all(|&is_passive| !is_passive) {
-                projected.assign(residual);
-                break;
-            }
+            lambda_canonical[row] = value.max(0.0);
         }
     }
+    let reconstructed = residual - &constraints.a.t().dot(&lambda_canonical);
+    let reconstruction_error = reconstructed
+        .iter()
+        .zip(projected.iter())
+        .fold(0.0_f64, |acc, (&left, &right)| {
+            acc.max((left - right).abs())
+        });
+    let scale = residual
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
+        .max(1.0);
+    if reconstruction_error > 1e-8 * scale || !array_is_finite(&lambda_canonical) {
+        return None;
+    }
 
-    // Exhausting the Lawson-Hanson iterations means we do not have the
-    // normal-cone projection required for a KKT certificate.
-    None
+    // `constraints` has unit rows, but this public helper historically returns
+    // multipliers in the caller's original row units. If a_i^canon = a_i/s_i,
+    // then lambda_i^original = lambda_i^canon/s_i preserves
+    // A_original^T lambda_original = A_canon^T lambda_canon.
+    let mut lambda = Array1::<f64>::zeros(m);
+    for row in 0..m {
+        let norm = active_a.row(row).dot(&active_a.row(row)).sqrt();
+        if norm > 0.0 {
+            lambda[row] = lambda_canonical[row] / norm;
+        }
+    }
+    Some((projected, lambda))
 }
 
 pub(crate) fn feasible_point_for_linear_constraints(
@@ -1316,9 +1287,10 @@ fn fallback_projected_gradient_direction(
     // the equality tangent space `A_active d = 0`. A negative multiplier means
     // descent exists by moving away from that boundary into the cone; equality
     // projection erases exactly that direction and can mistake a wrong working
-    // face for stationarity. Lawson-Hanson projects the gradient onto the
-    // nonnegative normal cone, so negating the residual is the Euclidean
-    // projection of `-gradient` onto the feasible tangent cone (Moreau).
+    // face for stationarity. The strictly convex primal cone QP projects the
+    // gradient onto the nonnegative normal cone, so negating the residual is
+    // the Euclidean projection of `-gradient` onto the feasible tangent cone
+    // (Moreau).
     let tangent_direction = if working_constraints.a.nrows() == 0 {
         -gradient
     } else {
@@ -1467,6 +1439,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
     direction_out: &mut Array1<f64>,
     active_hint: Option<&mut Vec<usize>>,
     max_iterations: usize,
+    allow_projected_gradient_fallback: bool,
 ) -> Result<(), EstimationError> {
     let p = gradient.len();
     if direction_out.len() != p {
@@ -1706,7 +1679,6 @@ fn solve_newton_direction_with_linear_constraints_impl(
         &lambda_true,
         m,
     )?;
-    let kkt = compute_constraint_kkt_diagnostics(&x, &g_cur, constraints);
     let grad_inf = gradient_inf_norm(&g_cur);
     let stationarity_rel = working_kkt.stationarity / grad_inf.max(1.0);
     let step_inf = d_total.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
@@ -1731,7 +1703,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
             || stationarity_rel <= ACTIVE_SET_KKT_STATIONARITY_TOL);
     if worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
         && ((working_kkt.dual_feasibility <= ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL
-            && (kkt_strong_ok || model_descent_ok))
+            && (kkt_strong_ok || (allow_projected_gradient_fallback && model_descent_ok)))
             || degenerate_boundary_ok)
     {
         if let Some(hint) = active_hint {
@@ -1745,6 +1717,18 @@ fn solve_newton_direction_with_linear_constraints_impl(
         direction_out.assign(&d_total);
         return Ok(());
     }
+    if !allow_projected_gradient_fallback {
+        return Err(EstimationError::ParameterConstraintViolation(format!(
+            "linear-constrained Newton active-set did not certify the strict-convex projection QP; max(Aβ-b violation)={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]",
+            working_kkt.primal_feasibility,
+            working_kkt.dual_feasibility,
+            working_kkt.complementarity,
+            working_kkt.stationarity,
+            working_kkt.n_active,
+            working_kkt.n_constraints,
+        )));
+    }
+    let kkt = compute_constraint_kkt_diagnostics(&x, &g_cur, constraints);
     let fallback_working = gather_linear_constraint_rows(constraints, &active)?;
     if let Some((fallback_direction, fallback_active)) =
         fallback_projected_gradient_direction(&x, &d_total, &g_cur, &fallback_working, constraints)?
@@ -1914,8 +1898,8 @@ impl<'a> ConstraintSetOps<'a> {
 /// candidate feasible-tangent direction. If any omitted tight row cuts that
 /// direction off, add the most violated row and re-project. This separation
 /// loop terminates with the same normal/tangent-cone certificate that a dense
-/// all-tight-row NNLS would compute, while gathering only rows that carry
-/// necessary cone geometry.
+/// all-tight-row projection QP would compute, while gathering only rows that
+/// carry necessary cone geometry.
 pub fn project_stationarity_residual_on_constraint_set(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
@@ -2538,6 +2522,7 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
         direction_out,
         active_hint,
         max_iterations,
+        true,
     )
 }
 
@@ -2777,6 +2762,7 @@ mod tests {
             &mut direction,
             Some(&mut active_hint),
             1,
+            true,
         )
         .expect("solver should accept the current boundary solution at the iteration limit");
 
@@ -2861,6 +2847,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cone_projection_preserves_original_multiplier_units_after_row_canonicalization() {
+        let residual = array![2.0, -1.0];
+        let unit_row = array![[1.0, 0.0]];
+        let scaled_row = array![[4.0, 0.0]];
+
+        let (projected_unit, multiplier_unit) =
+            project_stationarity_residual_on_constraint_cone(&residual, &unit_row)
+                .expect("unit-row cone projection should solve");
+        let (projected_scaled, multiplier_scaled) =
+            project_stationarity_residual_on_constraint_cone(&residual, &scaled_row)
+                .expect("scaled-row cone projection should solve");
+
+        assert_relative_eq!(projected_unit[0], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(projected_unit[1], -1.0, epsilon = 1e-12);
+        assert_relative_eq!(projected_scaled[0], projected_unit[0], epsilon = 1e-12);
+        assert_relative_eq!(projected_scaled[1], projected_unit[1], epsilon = 1e-12);
+        assert_relative_eq!(multiplier_unit[0], 2.0, epsilon = 1e-12);
+        assert_relative_eq!(multiplier_scaled[0], 0.5, epsilon = 1e-12);
+
+        let reconstructed_unit = &residual - &unit_row.t().dot(&multiplier_unit);
+        let reconstructed_scaled = &residual - &scaled_row.t().dot(&multiplier_scaled);
+        assert_relative_eq!(reconstructed_unit[0], projected_unit[0], epsilon = 1e-12);
+        assert_relative_eq!(reconstructed_scaled[0], projected_scaled[0], epsilon = 1e-12);
     }
 
     // #500: the KKT primal residual must be the *geometric* distance to the
