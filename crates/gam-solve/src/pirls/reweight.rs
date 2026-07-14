@@ -1271,6 +1271,24 @@ where
                         } else {
                             -1.0
                         };
+                        if rho > 100.0 && actual_reduction > noise_floor {
+                            log::info!(
+                                "[PIRLS gain-ratio audit] rho={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e} current_deviance={:.6e} candidate_deviance={:.6e} current_penalty={:.6e} candidate_penalty={:.6e}",
+                                rho,
+                                actual_reduction,
+                                predicted_reduction,
+                                lin,
+                                direction.dot(direction).sqrt(),
+                                0.5
+                                    * penalized_dev_scale
+                                    * (state.deviance - accepted_state.deviance),
+                                0.5 * (state.penalty_term - accepted_state.penalty_term),
+                                state.deviance,
+                                accepted_state.deviance,
+                                state.penalty_term,
+                                accepted_state.penalty_term,
+                            );
+                        }
                         if !(rho > 0.0 && candidate_penalized.is_finite()) {
                             if aa_attempt {
                                 aa_state.note_reject(iter);
