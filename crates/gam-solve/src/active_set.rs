@@ -3,7 +3,7 @@ use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use faer::{Side, Unbind};
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerLinalgError, FaerSvd, array1_to_col_matmut};
 use gam_linalg::utils::{StableSolver, array_is_finite, boundary_hit_step_fraction};
-use gam_problem::LinearInequalityConstraints;
+use gam_problem::{ConstraintSet, LinearInequalityConstraints};
 use ndarray::{Array1, Array2, s};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -1713,6 +1713,545 @@ fn solve_newton_direction_with_linear_constraints_impl(
     )))
 }
 
+// ============================================================================
+// Operator (ConstraintSet) active-set solver — gam#2306
+//
+// The factored Khatri-Rao monotonicity cone has `n · p_shape` rows over
+// `p_resp · p_cov` coefficients; its dense materialization is gigabytes while
+// every operation the primal active-set method performs factors through the
+// `n × p_cov` covariate design. This section is the operator sibling of
+// `solve_newton_direction_with_linear_constraints_impl`: identical
+// per-row-scaled (geometric) tolerance semantics, identical KKT core
+// (`solve_kkt_direction` on the rank-reduced working set) — but every
+// full-row-set sweep (activation scan, ratio test, violation gate) runs on
+// batched constraint values, never on explicit rows. Dense inputs delegate to
+// the dense loop verbatim, so existing callers are byte-identical.
+// ============================================================================
+
+/// Batched full-row-set geometry for a [`ConstraintSet`].
+///
+/// `scaled_margin` shifts every non-vacuous row inward by that amount in
+/// scaled (geometric) units — `a_iᵀβ ≥ b_i + scaled_margin·‖a_i‖` — which is
+/// exactly the uniform interior-seed shift the dense strict projection
+/// applies. The main QP solve uses `scaled_margin = 0`.
+struct ConstraintSetOps<'a> {
+    set: &'a ConstraintSet,
+    norms: Vec<f64>,
+    bounds: Vec<f64>,
+    scaled_margin: f64,
+}
+
+impl<'a> ConstraintSetOps<'a> {
+    fn new(set: &'a ConstraintSet, scaled_margin: f64) -> Result<Self, EstimationError> {
+        let m = set.nrows();
+        let mut norms = Vec::with_capacity(m);
+        let mut bounds = Vec::with_capacity(m);
+        for row in 0..m {
+            norms.push(set.row_norm(row).map_err(|e| {
+                EstimationError::ParameterConstraintViolation(format!(
+                    "constraint-set row norm: {e}"
+                ))
+            })?);
+            bounds.push(set.bound(row).map_err(|e| {
+                EstimationError::ParameterConstraintViolation(format!(
+                    "constraint-set row bound: {e}"
+                ))
+            })?);
+        }
+        Ok(Self {
+            set,
+            norms,
+            bounds,
+            scaled_margin,
+        })
+    }
+
+    fn nrows(&self) -> usize {
+        self.norms.len()
+    }
+
+    fn values(&self, x: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+        self.set.values(x.view()).map_err(|e| {
+            EstimationError::ParameterConstraintViolation(format!("constraint-set values: {e}"))
+        })
+    }
+
+    /// Signed scaled slack of one row given the batched raw values, with the
+    /// same ±∞ zero-norm semantics as [`scaled_constraint_slack`].
+    #[inline]
+    fn scaled_slack(&self, values: &Array1<f64>, row: usize) -> f64 {
+        let norm = self.norms[row];
+        if norm > 0.0 {
+            (values[row] - self.bounds[row]) / norm - self.scaled_margin
+        } else if self.bounds[row] > 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    fn max_violation(&self, values: &Array1<f64>) -> (f64, usize) {
+        let mut worst = 0.0_f64;
+        let mut worst_row = 0usize;
+        for row in 0..self.nrows() {
+            let violation = (-self.scaled_slack(values, row)).max(0.0);
+            if violation > worst {
+                worst = violation;
+                worst_row = row;
+            }
+        }
+        (worst, worst_row)
+    }
+
+    /// Gather the working rows as an explicit UNIT-normalized system (the
+    /// per-row scale the dense path reaches via up-front canonicalization),
+    /// with the margin shift folded into `b`. Zero-norm rows are rejected —
+    /// they are vacuous and must never enter a working set.
+    fn gather_unit_rows(
+        &self,
+        rows: &[usize],
+    ) -> Result<LinearInequalityConstraints, EstimationError> {
+        let mut gathered = self.set.gather_rows(rows).map_err(|e| {
+            EstimationError::ParameterConstraintViolation(format!(
+                "constraint-set working-row gather: {e}"
+            ))
+        })?;
+        for (out_row, &row) in rows.iter().enumerate() {
+            let norm = self.norms[row];
+            if norm <= 0.0 {
+                crate::bail_invalid_estim!(
+                    "vacuous zero-norm constraint row {} entered the working set",
+                    row
+                );
+            }
+            let inv = 1.0 / norm;
+            gathered.a.row_mut(out_row).mapv_inplace(|v| v * inv);
+            gathered.b[out_row] = gathered.b[out_row] * inv + self.scaled_margin;
+        }
+        Ok(gathered)
+    }
+
+    /// Rank-reduced compressed working set over the gathered unit rows —
+    /// the operator analogue of [`compress_active_working_set`].
+    fn compress_working(
+        &self,
+        active: &[usize],
+    ) -> Result<CompressedActiveWorkingSet, EstimationError> {
+        let gathered = self.gather_unit_rows(active)?;
+        let groups: Vec<Vec<usize>> = (0..active.len()).map(|pos| vec![pos]).collect();
+        let (a_out, b_out, groups_out, multiplier_dependence) =
+            rank_reduce_rows_pivoted_qr_with_dependence(gathered.a, gathered.b, groups);
+        Ok(CompressedActiveWorkingSet {
+            constraints: LinearInequalityConstraints::new(a_out, b_out)
+                .expect("compressed operator working-set shape invariant"),
+            groups: groups_out,
+            multiplier_dependence,
+            original_active_count: active.len(),
+        })
+    }
+}
+
+fn solve_newton_direction_with_constraint_set_impl(
+    hessian: &Array2<f64>,
+    gradient: &Array1<f64>,
+    beta: &Array1<f64>,
+    ops: &ConstraintSetOps<'_>,
+    direction_out: &mut Array1<f64>,
+    mut active_hint: Option<&mut Vec<usize>>,
+    max_iterations: usize,
+) -> Result<(), EstimationError> {
+    let p = gradient.len();
+    if direction_out.len() != p {
+        *direction_out = Array1::zeros(p);
+    }
+    let m = ops.nrows();
+    if ops.set.ncols() != p || beta.len() != p {
+        crate::bail_invalid_estim!(
+            "constraint-set shape mismatch: set={}x{}, p={}",
+            m,
+            ops.set.ncols(),
+            p
+        );
+    }
+
+    let tol_active = 1e-10;
+    let tol_step = 1e-12;
+    let tol_dual = 1e-10;
+    let mut x = beta.to_owned();
+    let mut d_total = Array1::<f64>::zeros(p);
+    let mut g_cur = gradient.to_owned();
+    let mut values_x = ops.values(&x)?;
+
+    let has_active_hint = active_hint
+        .as_ref()
+        .map(|hint| !hint.is_empty())
+        .unwrap_or(false);
+    if !has_active_hint && solve_newton_direction_dense(hessian, gradient, direction_out).is_ok() {
+        let candidate = beta + &*direction_out;
+        let candidate_values = ops.values(&candidate)?;
+        let feasible =
+            (0..m).all(|row| ops.scaled_slack(&candidate_values, row) >= -tol_active);
+        if feasible {
+            return Ok(());
+        }
+    }
+
+    let mut active: Vec<usize> = Vec::new();
+    let mut is_active = vec![false; m];
+    if let Some(hint) = active_hint.as_ref() {
+        for &idx in hint.iter() {
+            if idx < m && !is_active[idx] && ops.norms[idx] > 0.0 {
+                active.push(idx);
+                is_active[idx] = true;
+                log_active_set_transition("warm-add", 0, active.len(), Some(idx));
+            }
+        }
+    }
+    for row in 0..m {
+        if !is_active[row]
+            && ops.norms[row] > 0.0
+            && ops.scaled_slack(&values_x, row) <= tol_active
+        {
+            active.push(row);
+            is_active[row] = true;
+            log_active_set_transition("initial-boundary-add", 0, active.len(), Some(row));
+        }
+    }
+    let mut visited_working_sets: HashSet<Vec<usize>> = HashSet::new();
+    record_active_working_set(&mut visited_working_sets, &active, 0);
+
+    for iteration in 0..max_iterations {
+        let compressed_working = ops.compress_working(&active)?;
+        let mut residualw = Array1::<f64>::zeros(compressed_working.constraints.a.nrows());
+        for r in 0..compressed_working.constraints.a.nrows() {
+            residualw[r] = compressed_working.constraints.b[r]
+                - compressed_working.constraints.a.row(r).dot(&x);
+        }
+        let (d, lambdaw) = solve_kkt_direction(
+            hessian,
+            &g_cur,
+            &compressed_working.constraints.a,
+            Some(&residualw),
+        )?;
+        let step_norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if step_norm <= tol_step {
+            let (worst, worst_row) = ops.max_violation(&values_x);
+            if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL && !is_active[worst_row] {
+                active.push(worst_row);
+                is_active[worst_row] = true;
+                log_active_set_transition(
+                    "stationary-infeasible-add",
+                    iteration,
+                    active.len(),
+                    Some(worst_row),
+                );
+                if !record_active_working_set(&mut visited_working_sets, &active, iteration) {
+                    break;
+                }
+                continue;
+            }
+            if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+                break;
+            }
+            if compressed_working.groups.is_empty() {
+                direction_out.assign(&d_total);
+                return Ok(());
+            }
+            let remove_pos = compressed_working
+                .reconstructed_active_multipliers(&lambdaw)
+                .into_iter()
+                .filter(|&(_, lambda_true)| lambda_true < -tol_dual)
+                .min_by_key(|(active_pos, _)| (active[*active_pos], *active_pos))
+                .map(|(active_pos, _)| active_pos);
+            if let Some(active_pos) = remove_pos {
+                let idx = active.remove(active_pos);
+                is_active[idx] = false;
+                log_active_set_transition(
+                    "remove-negative-dual",
+                    iteration,
+                    active.len(),
+                    Some(idx),
+                );
+                if !record_active_working_set(&mut visited_working_sets, &active, iteration) {
+                    break;
+                }
+                continue;
+            }
+            if let Some(hint) = active_hint.as_mut() {
+                hint.clear();
+                let compressed = ops.compress_working(&active)?;
+                for group in &compressed.groups {
+                    if let Some(&active_pos) = group.first() {
+                        hint.push(active[active_pos]);
+                    }
+                }
+            }
+            direction_out.assign(&d_total);
+            return Ok(());
+        }
+
+        let values_d = ops.values(&d)?;
+        let mut alpha = 1.0_f64;
+        for row in 0..m {
+            if is_active[row] || ops.norms[row] <= 0.0 {
+                continue;
+            }
+            let slack = ops.scaled_slack(&values_x, row);
+            let rate = values_d[row] / ops.norms[row];
+            if let Some(cand) = boundary_hit_step_fraction(slack, rate, alpha) {
+                alpha = cand;
+            }
+        }
+
+        ndarray::Zip::from(&mut x)
+            .and(&mut d_total)
+            .and(&d)
+            .for_each(|x_i, dt_i, &d_i| {
+                let alpha_d = alpha * d_i;
+                *x_i += alpha_d;
+                *dt_i += alpha_d;
+            });
+        g_cur = gradient + &hessian.dot(&d_total);
+        values_x = ops.values(&x)?;
+
+        let mut added_new_active = false;
+        let mut working_set_repeated = false;
+        for row in 0..m {
+            if is_active[row] || ops.norms[row] <= 0.0 {
+                continue;
+            }
+            if ops.scaled_slack(&values_x, row) <= tol_active {
+                active.push(row);
+                is_active[row] = true;
+                added_new_active = true;
+                log_active_set_transition("blocking-add", iteration, active.len(), Some(row));
+                working_set_repeated =
+                    !record_active_working_set(&mut visited_working_sets, &active, iteration);
+                break;
+            }
+        }
+        if working_set_repeated {
+            break;
+        }
+
+        if active.is_empty() && !added_new_active {
+            if let Some(hint) = active_hint.as_mut() {
+                hint.clear();
+            }
+            direction_out.assign(&d_total);
+            return Ok(());
+        }
+    }
+
+    // Exit gate: same acceptance structure as the dense loop — primal
+    // feasibility on the full set plus working-set KKT residuals on the
+    // rank-reduced unit-row system.
+    let compressed_working = ops.compress_working(&active)?;
+    let mut residualw = Array1::<f64>::zeros(compressed_working.constraints.a.nrows());
+    for r in 0..compressed_working.constraints.a.nrows() {
+        residualw[r] =
+            compressed_working.constraints.b[r] - compressed_working.constraints.a.row(r).dot(&x);
+    }
+    let (_, lambdaw) = solve_kkt_direction(
+        hessian,
+        &g_cur,
+        &compressed_working.constraints.a,
+        Some(&residualw),
+    )?;
+    let lambda_true = lambdaw.mapv(|lam_sys| -lam_sys);
+    let (worst, row) = ops.max_violation(&values_x);
+    let working_kkt = working_set_kkt_diagnostics_from_multipliers(
+        &x,
+        &g_cur,
+        &compressed_working.constraints,
+        &lambda_true,
+        m,
+    )?;
+    let grad_inf = gradient_inf_norm(&g_cur);
+    let stationarity_rel = working_kkt.stationarity / grad_inf.max(1.0);
+    let step_inf = d_total.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let hd_total = hessian.dot(&d_total);
+    let predicted_delta = gradient.dot(&d_total)
+        + 0.5
+            * d_total
+                .iter()
+                .zip(hd_total.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f64>();
+    let kkt_strong_ok = (working_kkt.stationarity <= ACTIVE_SET_KKT_STATIONARITY_TOL
+        || stationarity_rel <= ACTIVE_SET_KKT_STATIONARITY_TOL)
+        && working_kkt.complementarity <= ACTIVE_SET_KKT_COMPLEMENTARITY_TOL;
+    let model_descent_ok =
+        predicted_delta <= -ACTIVE_SET_MODEL_DESCENT_REL_TOL * (1.0 + grad_inf * step_inf);
+    let degenerate_boundary_ok = compressed_working.is_degenerate_face()
+        && worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+        && working_kkt.primal_feasibility <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+        && working_kkt.complementarity <= ACTIVE_SET_KKT_COMPLEMENTARITY_TOL
+        && (working_kkt.stationarity <= ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL
+            || stationarity_rel <= ACTIVE_SET_KKT_STATIONARITY_TOL);
+    if worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+        && ((working_kkt.dual_feasibility <= ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL
+            && (kkt_strong_ok || model_descent_ok))
+            || degenerate_boundary_ok)
+    {
+        if let Some(hint) = active_hint.as_mut() {
+            hint.clear();
+            for group in &compressed_working.groups {
+                if let Some(&active_pos) = group.first() {
+                    hint.push(active[active_pos]);
+                }
+            }
+        }
+        direction_out.assign(&d_total);
+        return Ok(());
+    }
+    Err(EstimationError::ParameterConstraintViolation(format!(
+        "operator-constrained Newton active-set failed to converge; max scaled violation={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]",
+        working_kkt.primal_feasibility,
+        working_kkt.dual_feasibility,
+        working_kkt.complementarity,
+        working_kkt.stationarity,
+        working_kkt.n_active,
+        working_kkt.n_constraints,
+    )))
+}
+
+/// Strictly-interior projection onto a [`ConstraintSet`]: the operator
+/// analogue of [`project_point_strictly_into_feasible_cone`]. Dense sets
+/// delegate to the dense projection (including its anti-parallel equality
+/// lift); the factored cone is homogeneous and one-sided, so the projection
+/// is a single identity-Hessian QP against the margin-shifted rows.
+pub fn project_point_strictly_into_feasible_constraint_set(
+    point: &Array1<f64>,
+    set: &ConstraintSet,
+) -> Option<Array1<f64>> {
+    match set {
+        ConstraintSet::Dense(dense) => project_point_strictly_into_feasible_cone(point, dense),
+        ConstraintSet::KhatriRaoCone(_) => {
+            let repair_guard = FeasibilityRepairGuard::enter()?;
+            let p = point.len();
+            if set.ncols() != p {
+                return None;
+            }
+            let ops = ConstraintSetOps::new(set, ACTIVE_SET_INTERIOR_SEED_MARGIN).ok()?;
+            let identity = Array2::<f64>::eye(p);
+            // min ½‖β − point‖² ⇒ Hessian = I, gradient at `point` = 0;
+            // the margin-shifted rows carry the strict-interior shift.
+            let mut direction = Array1::<f64>::zeros(p);
+            let gradient = Array1::<f64>::zeros(p);
+            let max_iterations = (p + set.nrows() + 8) * 4;
+            solve_newton_direction_with_constraint_set_impl(
+                &identity,
+                &gradient,
+                point,
+                &ops,
+                &mut direction,
+                None,
+                max_iterations,
+            )
+            .ok()?;
+            let beta = point + &direction;
+            if beta.iter().any(|v| !v.is_finite()) {
+                return None;
+            }
+            // Certify against the ORIGINAL (unshifted) rows with half-margin
+            // clearance, mirroring the dense projection's exit contract.
+            const SEED_FEASIBILITY_TOL: f64 = 1e-9;
+            let unshifted = ConstraintSetOps::new(set, 0.0).ok()?;
+            let values = unshifted.values(&beta).ok()?;
+            for row in 0..unshifted.nrows() {
+                if unshifted.norms[row] <= 0.0 {
+                    continue;
+                }
+                if unshifted.scaled_slack(&values, row)
+                    < 0.5 * ACTIVE_SET_INTERIOR_SEED_MARGIN - SEED_FEASIBILITY_TOL
+                {
+                    return None;
+                }
+            }
+            drop(repair_guard);
+            Some(beta)
+        }
+    }
+}
+
+/// Operator-carrier constrained quadratic solve: minimize
+/// `½ βᵀHβ − rhsᵀβ` subject to the [`ConstraintSet`]. Dense sets take the
+/// existing dense path byte-identically; the factored cone runs the operator
+/// active-set loop. Same public feasibility contract as
+/// [`solve_quadratic_with_linear_constraints`]: the returned point is
+/// feasible to [`ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`] or the solve errors.
+pub fn solve_quadratic_with_constraint_set(
+    hessian: &Array2<f64>,
+    rhs: &Array1<f64>,
+    beta_start: &Array1<f64>,
+    set: &ConstraintSet,
+    warm_active_set: Option<&[usize]>,
+) -> Result<(Array1<f64>, Vec<usize>), EstimationError> {
+    match set {
+        ConstraintSet::Dense(dense) => {
+            solve_quadratic_with_linear_constraints(hessian, rhs, beta_start, dense, warm_active_set)
+        }
+        ConstraintSet::KhatriRaoCone(_) => {
+            if hessian.ncols() != hessian.nrows()
+                || rhs.len() != hessian.nrows()
+                || beta_start.len() != hessian.nrows()
+                || set.ncols() != hessian.nrows()
+            {
+                crate::bail_invalid_estim!(
+                    "operator-constrained quadratic solve: system dimension mismatch"
+                );
+            }
+            let ops = ConstraintSetOps::new(set, 0.0)?;
+            let gradient = hessian.dot(beta_start) - rhs;
+            let mut delta = Array1::<f64>::zeros(beta_start.len());
+            let mut active_hint =
+                warm_active_set.map_or_else(Vec::new, |active| active.to_vec());
+            let max_iterations = (beta_start.len() + set.nrows() + 8) * 4;
+            solve_newton_direction_with_constraint_set_impl(
+                hessian,
+                &gradient,
+                beta_start,
+                &ops,
+                &mut delta,
+                Some(&mut active_hint),
+                max_iterations,
+            )?;
+            let candidate = beta_start + &delta;
+            let candidate_values = ops.values(&candidate)?;
+            let (worst, _) = ops.max_violation(&candidate_values);
+            if worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+                return Ok((candidate, active_hint));
+            }
+            let repaired = project_point_strictly_into_feasible_constraint_set(&candidate, set)
+                .filter(|repaired_point| {
+                    ops.values(repaired_point)
+                        .map(|values| ops.max_violation(&values).0)
+                        .map(|violation| violation <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL)
+                        .unwrap_or(false)
+                });
+            match repaired {
+                Some(feasible) => {
+                    let feasible_values = ops.values(&feasible)?;
+                    let active: Vec<usize> = (0..ops.nrows())
+                        .filter(|&row| {
+                            ops.norms[row] > 0.0
+                                && ops.scaled_slack(&feasible_values, row)
+                                    <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+                        })
+                        .collect();
+                    Ok((feasible, active))
+                }
+                None => Err(EstimationError::ParameterConstraintViolation(format!(
+                    "operator-constrained quadratic solve returned an infeasible iterate \
+                     (max scaled violation {worst:.3e}) and no feasible projection could be \
+                     certified onto the constraint cone",
+                ))),
+            }
+        }
+    }
+}
+
 pub(crate) fn solve_newton_direction_with_linear_constraints(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -1809,13 +2348,15 @@ pub fn solve_quadratic_with_linear_constraints(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_SET_INTERIOR_SEED_MARGIN, LinearInequalityConstraints,
+        ACTIVE_SET_INTERIOR_SEED_MARGIN, ConstraintSet, LinearInequalityConstraints,
         compute_constraint_kkt_diagnostics, project_point_strictly_into_feasible_cone,
+        project_point_strictly_into_feasible_constraint_set,
         project_stationarity_residual_on_constraint_cone,
         rank_reduce_rows_pivoted_qr_with_dependence, scaled_constraint_slack,
         solve_newton_direction_with_linear_constraints_impl,
-        solve_quadratic_with_linear_constraints,
+        solve_quadratic_with_constraint_set, solve_quadratic_with_linear_constraints,
     };
+    use gam_problem::KhatriRaoConeConstraints;
     use approx::assert_relative_eq;
     use ndarray::{Array1, Array2, array};
 
@@ -2245,5 +2786,138 @@ mod tests {
             "equality B not pinned under ill-conditioning: β1+β3 = {:.6e}",
             beta[1] + beta[3]
         );
+    }
+
+    // ==== gam#2306: operator (ConstraintSet) solver vs dense oracle ====
+
+    /// Small Khatri-Rao cone whose dense materialization is exact: Ψ is
+    /// 4 × 2, coefficient block is 3 × 2 (row 0 unconstrained location,
+    /// rows 1–2 coupled), so p = 6 and the cone has 8 rows.
+    fn small_cone() -> KhatriRaoConeConstraints {
+        let psi = array![
+            [1.0_f64, 0.2],
+            [1.0, -0.4],
+            [1.0, 1.3],
+            [1.0, 0.8],
+        ];
+        KhatriRaoConeConstraints::new(psi, vec![1, 2], 3).expect("small cone")
+    }
+
+    /// Deterministic PD Hessian with off-diagonal coupling so active-set
+    /// choices are not axis-trivial.
+    fn coupled_pd_hessian(p: usize) -> Array2<f64> {
+        let mut h = Array2::<f64>::eye(p) * 2.0;
+        for i in 0..p {
+            for j in 0..p {
+                if i != j {
+                    h[[i, j]] = 0.3 / (1.0 + (i as f64 - j as f64).abs());
+                }
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn operator_cone_qp_matches_dense_oracle_when_constraints_bind() {
+        let cone = small_cone();
+        let set = ConstraintSet::KhatriRaoCone(cone.clone());
+        let dense = cone.to_dense().expect("dense oracle");
+        let p = set.ncols();
+        let hessian = coupled_pd_hessian(p);
+        // rhs pulls the coupled rows negative so the unconstrained optimum
+        // violates the cone and several rows must bind.
+        let rhs = array![0.5_f64, -0.3, -2.0, 1.0, -1.5, -0.7];
+        // Feasible start: coupled coefficient rows give strictly positive
+        // functionals under every Ψ row (constant 1 with small slope loads).
+        let beta_start = array![0.0_f64, 0.0, 1.0, 0.1, 1.0, 0.1];
+
+        let (beta_op, mut active_op) =
+            solve_quadratic_with_constraint_set(&hessian, &rhs, &beta_start, &set, None)
+                .expect("operator solve");
+        let (beta_dense, mut active_dense) =
+            solve_quadratic_with_linear_constraints(&hessian, &rhs, &beta_start, &dense, None)
+                .expect("dense solve");
+
+        for j in 0..p {
+            assert!(
+                (beta_op[j] - beta_dense[j]).abs() < 1e-7,
+                "operator/dense coefficient {j} mismatch: {} vs {}",
+                beta_op[j],
+                beta_dense[j]
+            );
+        }
+        // The binding face must agree row-for-row (ids share the same layout).
+        active_op.sort_unstable();
+        active_dense.sort_unstable();
+        assert_eq!(active_op, active_dense, "active faces disagree");
+        assert!(
+            !active_op.is_empty(),
+            "fixture must actually bind at least one cone row"
+        );
+        // And the operator answer must be feasible on the full cone.
+        let values = set.values(beta_op.view()).expect("values");
+        let (worst, _) = set.max_scaled_violation(beta_op.view()).expect("violation");
+        assert!(worst <= 1e-8, "operator answer infeasible: {worst:.3e}");
+        assert_eq!(values.len(), 8);
+    }
+
+    #[test]
+    fn operator_cone_qp_takes_unconstrained_path_when_interior() {
+        let cone = small_cone();
+        let set = ConstraintSet::KhatriRaoCone(cone);
+        let p = set.ncols();
+        let hessian = coupled_pd_hessian(p);
+        // rhs pushing every coupled functional UP: unconstrained optimum is
+        // strictly interior, so the operator path must equal the plain solve.
+        let rhs = array![0.2_f64, 0.1, 3.0, 0.2, 2.5, 0.1];
+        let beta_start = array![0.0_f64, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let (beta_op, active_op) =
+            solve_quadratic_with_constraint_set(&hessian, &rhs, &beta_start, &set, None)
+                .expect("operator solve");
+        // Dense unconstrained oracle: H β = rhs.
+        let mut beta_unconstrained = Array1::<f64>::zeros(p);
+        super::solve_newton_direction_dense(
+            &hessian,
+            &(hessian.dot(&beta_start) - &rhs),
+            &mut beta_unconstrained,
+        )
+        .expect("unconstrained newton");
+        let beta_unconstrained = &beta_start + &beta_unconstrained;
+        for j in 0..p {
+            assert!(
+                (beta_op[j] - beta_unconstrained[j]).abs() < 1e-8,
+                "interior operator solve must match unconstrained optimum at {j}"
+            );
+        }
+        assert!(active_op.is_empty(), "interior optimum must have empty face");
+    }
+
+    #[test]
+    fn operator_projection_returns_strictly_interior_point() {
+        let cone = small_cone();
+        let set = ConstraintSet::KhatriRaoCone(cone);
+        // Infeasible point: coupled row 1 loaded negative everywhere.
+        let point = array![0.4_f64, -0.2, -1.0, -0.5, 0.3, 0.05];
+        let projected = project_point_strictly_into_feasible_constraint_set(&point, &set)
+            .expect("projection must succeed on a one-sided homogeneous cone");
+        let values = set.values(projected.view()).expect("values");
+        for row in 0..set.nrows() {
+            let norm = set.row_norm(row).expect("norm");
+            if norm <= 0.0 {
+                continue;
+            }
+            let slack = values[row] / norm;
+            assert!(
+                slack >= 0.5 * ACTIVE_SET_INTERIOR_SEED_MARGIN - 1e-9,
+                "projected point not strictly interior on row {row}: slack {slack:.3e}"
+            );
+        }
+        // The location coordinates (unconstrained) must be untouched by the
+        // projection objective's optimum only if already optimal; at minimum
+        // they must remain finite and close to the input (they carry no
+        // constraint rows, and the identity-Hessian QP has no incentive to
+        // move them).
+        assert!((projected[0] - point[0]).abs() < 1e-8);
+        assert!((projected[1] - point[1]).abs() < 1e-8);
     }
 }
