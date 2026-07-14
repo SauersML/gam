@@ -248,10 +248,17 @@ def test_scan_predictions_intervals_and_summary_replay_exactly_after_save_load(t
         "mean_upper",
         "observation_lower",
         "observation_upper",
+        # Result-owned provenance tag (#2296): interval dicts name the exact
+        # covariance definition the band used.
+        "covariance_source",
     }
     assert bands_after.keys() == bands_before.keys()
     assert set(bands_before) == expected_band_columns
+    assert bands_before["covariance_source"] == "conditional"
     for key in bands_before:
+        if key == "covariance_source":
+            assert bands_after[key] == bands_before[key]
+            continue
         np.testing.assert_array_equal(bands_after[key], bands_before[key])
 
     s0 = model.summary()

@@ -8004,20 +8004,23 @@ fn predict_columns(
     // predictor. SE/intervals come from the exact posterior variance.
     if let Some((feature_column, fit)) = model.saved_spline_scan().map_err(String::from)? {
         // #2296: the scan bridge's exact posterior variance is conditional on
-        // the profiled smoothing parameter. A smoothing-corrected request
-        // (including the default) must refuse rather than silently deliver
-        // conditional bands under a corrected policy; the provenance below is
-        // therefore always `conditional`, never an ad hoc scan-specific label.
+        // the profiled smoothing parameter — the COMPLETE uncertainty story
+        // for this model class (lambda is profiled; no corrected object
+        // exists to misrepresent). An EXPLICIT smoothing-corrected request
+        // therefore refuses rather than silently delivering conditional
+        // bands under a corrected policy, while the DEFAULT (no mode named)
+        // resolves to the class's best-available definition and is labeled
+        // `conditional` in the result-owned provenance below — never an ad
+        // hoc scan label, never an unlabeled substitution.
         if options.interval.is_some()
             && parse_covariance_mode(options.covariance_mode.as_deref())?
-                .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
-                == gam_predict::InferenceCovarianceMode::SmoothingCorrected
+                == Some(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
         {
             return Err(
                 "exact spline-scan uncertainty carries only the conditional-on-\u{3bb}\u{302} \
                  posterior variance; a smoothing-corrected (Vp) band is not persisted for \
-                 scan fits (#2296). Pass covariance_mode=\"conditional\" to accept \
-                 conditional intervals."
+                 scan fits (#2296). Pass covariance_mode=\"conditional\" (or omit the mode) to accept \
+                 labeled conditional intervals."
                     .to_string(),
             );
         }

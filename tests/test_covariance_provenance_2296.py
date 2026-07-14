@@ -185,9 +185,20 @@ def test_spline_scan_interval_refuses_corrected_and_labels_conditional() -> None
     )
     grid = {"x": np.linspace(0.05, 0.95, 7)}
 
+    # An EXPLICIT smoothing-corrected request refuses: no corrected object
+    # exists for the profiled-lambda scan, and substituting the conditional
+    # band under a corrected requirement would under-report uncertainty.
     with pytest.raises(gamfit.GamError) as refusal:
-        model.predict(grid, interval=0.9, return_type="dict")
+        model.predict(
+            grid, interval=0.9, covariance_mode="smoothing", return_type="dict"
+        )
     assert "conditional" in str(refusal.value)
+
+    # The DEFAULT (no mode named) is a policy, not a Vp requirement: it
+    # resolves to the class's best-available definition and says so in the
+    # result-owned label — conditional IS the scan's complete uncertainty.
+    default = model.predict(grid, interval=0.9, return_type="dict")
+    assert default["covariance_source"] == "conditional"
 
     conditional = model.predict(
         grid,
