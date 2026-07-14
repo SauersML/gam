@@ -62,11 +62,13 @@ impl std::fmt::Display for MemoryAvailabilitySource {
 
 /// Provenance-preserving memory availability for the current process.
 ///
-/// A finite cgroup-v2 ceiling admits exactly `min(host available, reclaim-aware
-/// cgroup available)`. A literal `memory.max = max` remains typed as unbounded
-/// and therefore defers to the host. If an active controller cannot be parsed
-/// exactly, admission fails closed with zero bytes while retaining the typed
-/// probe failure; it never silently inherits host capacity.
+/// A finite cgroup-v1 or cgroup-v2 ceiling admits exactly `min(host available,
+/// reclaim-aware cgroup available)`. A v2 literal `memory.max = max` remains
+/// typed as unbounded and therefore defers to the host; v1's numeric unlimited
+/// sentinel participates exactly and likewise loses to a tighter host value.
+/// If an active controller cannot be parsed exactly, admission fails closed
+/// with zero bytes while retaining the typed probe failure; it never silently
+/// inherits host capacity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryAvailability {
     host_available_bytes: u64,
@@ -87,7 +89,8 @@ impl MemoryAvailability {
             | CgroupMemoryObservation::V2Unbounded { .. } => {
                 (host_available_bytes, MemoryAvailabilitySource::Host)
             }
-            CgroupMemoryObservation::V2Limited(observation) => {
+            CgroupMemoryObservation::V2Limited(observation)
+            | CgroupMemoryObservation::V1Limited(observation) => {
                 match observation.available_bytes().cmp(&host_available_bytes) {
                     Ordering::Less => (
                         observation.available_bytes(),
@@ -1455,6 +1458,29 @@ mod resource_policy_tests {
             1_823_195_136
         );
         assert!(format!("{unlimited}").contains("unbounded cgroup-v2"));
+    }
+
+    #[test]
+    fn finite_cgroup_v1_headroom_participates_in_the_same_exact_minimum() {
+        let availability = MemoryAvailability::from_observation(
+            8_000,
+            CgroupMemoryObservation::V1Limited(CgroupMemoryAvailability::fixture(
+                "/sys/fs/cgroup/memory/slurm/job",
+                4_000,
+                1_500,
+                500,
+                4,
+            )),
+        );
+        assert_eq!(availability.available_bytes(), 3_000);
+        assert_eq!(
+            availability.limiting_source(),
+            MemoryAvailabilitySource::Cgroup
+        );
+        assert_eq!(governor_budget_from_availability(&availability), 2_250);
+        let evidence = format!("{availability}");
+        assert!(evidence.contains("cgroup-v1"));
+        assert!(evidence.contains("available=3000"));
     }
 
     #[test]

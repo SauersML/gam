@@ -29,7 +29,6 @@ pub enum CgroupMemoryProbeFailureKind {
     InvalidCounter,
     MissingCounter,
     InconsistentCounters,
-    UnsupportedCgroupV1,
 }
 
 impl fmt::Display for CgroupMemoryProbeFailureKind {
@@ -43,7 +42,6 @@ impl fmt::Display for CgroupMemoryProbeFailureKind {
             Self::InvalidCounter => "invalid-counter",
             Self::MissingCounter => "missing-counter",
             Self::InconsistentCounters => "inconsistent-counters",
-            Self::UnsupportedCgroupV1 => "unsupported-cgroup-v1",
         };
         formatter.write_str(name)
     }
@@ -81,7 +79,7 @@ impl fmt::Display for CgroupMemoryProbeFailure {
     }
 }
 
-/// Reclaim-aware headroom under the binding finite cgroup-v2 ancestor.
+/// Reclaim-aware headroom under the binding finite cgroup ancestor.
 ///
 /// `working_set_bytes = memory.current - inactive_file`. Only inactive file
 /// cache is credited as reclaimable; active file cache and reclaimable slab are
@@ -174,7 +172,7 @@ impl fmt::Display for CgroupMemoryAvailability {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "finite cgroup-v2 ceiling at {} (limit={}, current={}, inactive_file={}, working_set={}, available={}, visible_levels={})",
+            "finite cgroup ceiling at {} (limit={}, current={}, inactive_file={}, working_set={}, available={}, visible_levels={})",
             self.binding_path,
             self.limit_bytes,
             self.current_bytes,
@@ -200,6 +198,11 @@ pub enum CgroupMemoryObservation {
     /// At least one finite hard ceiling applies. This carries the ancestor with
     /// the least reclaim-aware headroom.
     V2Limited(CgroupMemoryAvailability),
+    /// A cgroup-v1 memory hierarchy is active. V1 exposes its unlimited state
+    /// as an architecture-dependent numeric sentinel rather than a token, so
+    /// every visible numeric ceiling participates in the minimum; an enormous
+    /// sentinel naturally loses to host availability.
+    V1Limited(CgroupMemoryAvailability),
     /// A memory controller appears active but its semantics could not be read
     /// exactly. Admission must fail closed rather than inherit host memory.
     ProbeFailed(CgroupMemoryProbeFailure),
@@ -216,7 +219,8 @@ impl fmt::Display for CgroupMemoryObservation {
                 formatter,
                 "unbounded cgroup-v2 hierarchy at {cgroup_path} ({inspected_levels} memory.max levels)"
             ),
-            Self::V2Limited(observation) => observation.fmt(formatter),
+            Self::V2Limited(observation) => write!(formatter, "cgroup-v2 {observation}"),
+            Self::V1Limited(observation) => write!(formatter, "cgroup-v1 {observation}"),
             Self::ProbeFailed(failure) => write!(formatter, "cgroup probe failed: {failure}"),
         }
     }
@@ -275,9 +279,15 @@ mod linux {
     const PROC_SELF_MOUNTINFO: &str = "/proc/self/mountinfo";
 
     #[derive(Debug)]
-    struct UnifiedMount {
+    struct ControllerMount {
         root: PathBuf,
         mount_point: PathBuf,
+    }
+
+    #[derive(Debug)]
+    struct MemoryMembership {
+        unified: Option<PathBuf>,
+        legacy: Option<PathBuf>,
     }
 
     pub(super) fn detect() -> CgroupMemoryObservation {
@@ -293,36 +303,39 @@ mod linux {
         mountinfo_file: &Path,
     ) -> Result<CgroupMemoryObservation, CgroupMemoryProbeFailure> {
         let membership_text = read_required(cgroup_file)?;
-        let membership = match parse_unified_membership(&membership_text, cgroup_file)? {
-            Some(path) => path,
-            None => return Ok(CgroupMemoryObservation::NotPresent),
-        };
+        let membership = parse_memory_membership(&membership_text, cgroup_file)?;
         let mountinfo_text = read_required(mountinfo_file)?;
-        let mount = select_unified_mount(&mountinfo_text, &membership, mountinfo_file)?;
-        let relative = membership.strip_prefix(&mount.root).map_err(|_| {
-            failure(
-                CgroupMemoryProbeFailureKind::MissingUnifiedMount,
+        if let Some(legacy) = membership.legacy {
+            let mount = select_controller_mount(
+                &mountinfo_text,
+                &legacy,
                 mountinfo_file,
-                format!(
-                    "cgroup path {} is outside selected mount root {}",
-                    membership.display(),
-                    mount.root.display()
-                ),
-            )
-        })?;
-        let relative = relative
-            .strip_prefix(Path::new("/"))
-            .unwrap_or(relative);
-        let leaf = mount.mount_point.join(relative);
-        inspect_visible_hierarchy(&leaf, &mount.mount_point)
+                "cgroup",
+                Some("memory"),
+            )?;
+            let leaf = resolve_membership_leaf(&legacy, &mount, mountinfo_file)?;
+            return inspect_visible_v1_hierarchy(&leaf, &mount.mount_point);
+        }
+        if let Some(unified) = membership.unified {
+            let mount = select_controller_mount(
+                &mountinfo_text,
+                &unified,
+                mountinfo_file,
+                "cgroup2",
+                None,
+            )?;
+            let leaf = resolve_membership_leaf(&unified, &mount, mountinfo_file)?;
+            return inspect_visible_v2_hierarchy(&leaf, &mount.mount_point);
+        }
+        Ok(CgroupMemoryObservation::NotPresent)
     }
 
-    fn parse_unified_membership(
+    fn parse_memory_membership(
         text: &str,
         source: &Path,
-    ) -> Result<Option<PathBuf>, CgroupMemoryProbeFailure> {
+    ) -> Result<MemoryMembership, CgroupMemoryProbeFailure> {
         let mut unified = None;
-        let mut legacy_memory = false;
+        let mut legacy = None;
         for line in text.lines().filter(|line| !line.is_empty()) {
             let mut fields = line.splitn(3, ':');
             let hierarchy = fields.next();
@@ -338,7 +351,16 @@ mod linux {
                 ));
             };
             if controllers.split(',').any(|name| name == "memory") {
-                legacy_memory = true;
+                if legacy.is_some() {
+                    return Err(failure(
+                        CgroupMemoryProbeFailureKind::MalformedMembership,
+                        source,
+                        "multiple cgroup-v1 memory memberships",
+                    ));
+                }
+                let path = PathBuf::from(path);
+                validate_absolute_cgroup_path(&path, source)?;
+                legacy = Some(path);
             }
             if hierarchy == "0" && controllers.is_empty() {
                 if unified.is_some() {
@@ -353,14 +375,7 @@ mod linux {
                 unified = Some(path);
             }
         }
-        if legacy_memory {
-            return Err(failure(
-                CgroupMemoryProbeFailureKind::UnsupportedCgroupV1,
-                source,
-                "an active cgroup-v1 memory controller has no cgroup-v2 limit semantics",
-            ));
-        }
-        Ok(unified)
+        Ok(MemoryMembership { unified, legacy })
     }
 
     fn validate_absolute_cgroup_path(
@@ -381,12 +396,14 @@ mod linux {
         Ok(())
     }
 
-    fn select_unified_mount(
+    fn select_controller_mount(
         text: &str,
         membership: &Path,
         source: &Path,
-    ) -> Result<UnifiedMount, CgroupMemoryProbeFailure> {
-        let mut selected: Option<UnifiedMount> = None;
+        filesystem: &str,
+        required_super_option: Option<&str>,
+    ) -> Result<ControllerMount, CgroupMemoryProbeFailure> {
+        let mut selected: Option<ControllerMount> = None;
         for line in text.lines().filter(|line| !line.is_empty()) {
             let Some((before_separator, after_separator)) = line.split_once(" - ") else {
                 return Err(failure(
@@ -396,7 +413,14 @@ mod linux {
                 ));
             };
             let after_fields = after_separator.split_whitespace().collect::<Vec<_>>();
-            if after_fields.first().copied() != Some("cgroup2") {
+            if after_fields.first().copied() != Some(filesystem) {
+                continue;
+            }
+            if let Some(required) = required_super_option
+                && !after_fields
+                    .get(2)
+                    .is_some_and(|options| options.split(',').any(|option| option == required))
+            {
                 continue;
             }
             let before_fields = before_separator.split_whitespace().collect::<Vec<_>>();
@@ -404,7 +428,7 @@ mod linux {
                 return Err(failure(
                     CgroupMemoryProbeFailureKind::MalformedMountInfo,
                     source,
-                    format!("short cgroup2 mountinfo record: {line:?}"),
+                    format!("short {filesystem} mountinfo record: {line:?}"),
                 ));
             }
             let root = decode_mountinfo_path(before_fields[3], source)?;
@@ -414,7 +438,7 @@ mod linux {
                     CgroupMemoryProbeFailureKind::MalformedMountInfo,
                     source,
                     format!(
-                        "cgroup2 mount paths must be absolute (root={}, mount_point={})",
+                        "{filesystem} mount paths must be absolute (root={}, mount_point={})",
                         root.display(),
                         mount_point.display()
                     ),
@@ -423,7 +447,7 @@ mod linux {
             if membership.strip_prefix(&root).is_err() {
                 continue;
             }
-            let candidate = UnifiedMount { root, mount_point };
+            let candidate = ControllerMount { root, mount_point };
             let candidate_depth = candidate.root.components().count();
             let selected_depth = selected
                 .as_ref()
@@ -437,11 +461,31 @@ mod linux {
                 CgroupMemoryProbeFailureKind::MissingUnifiedMount,
                 source,
                 format!(
-                    "no cgroup2 mount covers process membership {}",
+                    "no {filesystem} memory mount covers process membership {}",
                     membership.display()
                 ),
             )
         })
+    }
+
+    fn resolve_membership_leaf(
+        membership: &Path,
+        mount: &ControllerMount,
+        source: &Path,
+    ) -> Result<PathBuf, CgroupMemoryProbeFailure> {
+        let relative = membership.strip_prefix(&mount.root).map_err(|_| {
+            failure(
+                CgroupMemoryProbeFailureKind::MissingUnifiedMount,
+                source,
+                format!(
+                    "cgroup path {} is outside selected mount root {}",
+                    membership.display(),
+                    mount.root.display()
+                ),
+            )
+        })?;
+        let relative = relative.strip_prefix(Path::new("/")).unwrap_or(relative);
+        Ok(mount.mount_point.join(relative))
     }
 
     fn decode_mountinfo_path(
@@ -483,7 +527,7 @@ mod linux {
         Ok(PathBuf::from(OsString::from_vec(decoded)))
     }
 
-    fn inspect_visible_hierarchy(
+    fn inspect_visible_v2_hierarchy(
         leaf: &Path,
         mount_point: &Path,
     ) -> Result<CgroupMemoryObservation, CgroupMemoryProbeFailure> {
@@ -619,6 +663,112 @@ mod linux {
                 inspected_levels,
             })
         }
+    }
+
+    fn inspect_visible_v1_hierarchy(
+        leaf: &Path,
+        mount_point: &Path,
+    ) -> Result<CgroupMemoryObservation, CgroupMemoryProbeFailure> {
+        if !leaf.starts_with(mount_point) {
+            return Err(failure(
+                CgroupMemoryProbeFailureKind::MissingUnifiedMount,
+                leaf,
+                format!("leaf is outside mount point {}", mount_point.display()),
+            ));
+        }
+        let leaf_metadata = fs::metadata(leaf).map_err(|error| io_failure(leaf, error))?;
+        if !leaf_metadata.is_dir() {
+            return Err(failure(
+                CgroupMemoryProbeFailureKind::MissingUnifiedMount,
+                leaf,
+                "resolved process cgroup is not a directory",
+            ));
+        }
+
+        let hierarchy_path = leaf.join("memory.use_hierarchy");
+        let hierarchy_raw = read_required(&hierarchy_path)?;
+        let hierarchical = match parse_counter(&hierarchy_raw, &hierarchy_path)? {
+            0 => false,
+            1 => true,
+            value => {
+                return Err(failure(
+                    CgroupMemoryProbeFailureKind::InvalidCounter,
+                    &hierarchy_path,
+                    format!("memory.use_hierarchy must be 0 or 1, got {value}"),
+                ));
+            }
+        };
+
+        let mut directory = leaf.to_path_buf();
+        let mut inspected_levels = 0usize;
+        let mut binding: Option<CgroupMemoryAvailability> = None;
+        loop {
+            let limit_path = directory.join("memory.limit_in_bytes");
+            let usage_path = directory.join("memory.usage_in_bytes");
+            let stat_path = directory.join("memory.stat");
+            let limit_bytes = parse_counter(&read_required(&limit_path)?, &limit_path)?;
+            let usage_before = parse_counter(&read_required(&usage_path)?, &usage_path)?;
+            let stat_raw = read_required(&stat_path)?;
+            let inactive_key = if hierarchical {
+                "total_inactive_file"
+            } else {
+                "inactive_file"
+            };
+            let inactive_file_bytes = parse_stat_counter(&stat_raw, inactive_key, &stat_path)?;
+            let usage_after = parse_counter(&read_required(&usage_path)?, &usage_path)?;
+            let current_bytes = usage_before.max(usage_after);
+            if inactive_file_bytes > current_bytes {
+                return Err(failure(
+                    CgroupMemoryProbeFailureKind::InconsistentCounters,
+                    &stat_path,
+                    format!(
+                        "{inactive_key}={inactive_file_bytes} exceeds memory.usage_in_bytes={current_bytes}"
+                    ),
+                ));
+            }
+            inspected_levels = inspected_levels.saturating_add(1);
+            let candidate = CgroupMemoryAvailability::from_consistent_counters(
+                directory.display().to_string().into_boxed_str(),
+                limit_bytes,
+                current_bytes,
+                inactive_file_bytes,
+                0,
+            )
+            .ok_or_else(|| {
+                failure(
+                    CgroupMemoryProbeFailureKind::InconsistentCounters,
+                    &stat_path,
+                    "memory counters became inconsistent during construction",
+                )
+            })?;
+            if binding.as_ref().is_none_or(|current| {
+                candidate.available_bytes() < current.available_bytes()
+            }) {
+                binding = Some(candidate);
+            }
+
+            if !hierarchical || directory == mount_point {
+                break;
+            }
+            let Some(parent) = directory.parent() else {
+                return Err(failure(
+                    CgroupMemoryProbeFailureKind::MissingUnifiedMount,
+                    &directory,
+                    "cgroup hierarchy ended before its mount point",
+                ));
+            };
+            directory = parent.to_path_buf();
+        }
+
+        let mut binding = binding.ok_or_else(|| {
+            failure(
+                CgroupMemoryProbeFailureKind::MissingCounter,
+                leaf,
+                "cgroup-v1 memory hierarchy exposed no accounting level",
+            )
+        })?;
+        binding.inspected_levels = inspected_levels;
+        Ok(CgroupMemoryObservation::V1Limited(binding))
     }
 
     fn parse_limit(
@@ -921,37 +1071,72 @@ mod linux {
         }
 
         #[test]
-        fn active_cgroup_v1_memory_controller_fails_closed() {
+        fn active_cgroup_v1_memory_controller_is_measured_exactly() {
             let temp = TempDir::new().expect("fixture tempdir");
+            let mount = temp.path().join("cgroup-memory");
+            let leaf = mount.join("legacy");
+            fs::create_dir_all(&leaf).expect("v1 leaf");
+            fs::write(leaf.join("memory.use_hierarchy"), "0\n").expect("hierarchy");
+            fs::write(leaf.join("memory.limit_in_bytes"), "1024\n").expect("limit");
+            fs::write(leaf.join("memory.usage_in_bytes"), "512\n").expect("usage");
+            fs::write(
+                leaf.join("memory.stat"),
+                "inactive_file 128\ntotal_inactive_file 128\n",
+            )
+            .expect("stat");
             let cgroup_file = temp.path().join("self.cgroup");
             fs::write(&cgroup_file, "4:memory:/legacy\n").expect("membership");
             let mountinfo_file = temp.path().join("self.mountinfo");
-            fs::write(&mountinfo_file, "").expect("mountinfo");
-            let failure = detect_from_proc_files(&cgroup_file, &mountinfo_file)
-                .expect_err("v1 memory cannot inherit host availability");
-            assert_eq!(
-                failure.kind(),
-                CgroupMemoryProbeFailureKind::UnsupportedCgroupV1
-            );
+            fs::write(
+                &mountinfo_file,
+                format!(
+                    "31 23 0:30 / {} rw - cgroup cgroup rw,memory\n",
+                    mount.display()
+                ),
+            )
+            .expect("mountinfo");
+            let CgroupMemoryObservation::V1Limited(observation) =
+                detect_from_proc_files(&cgroup_file, &mountinfo_file)
+                    .expect("v1 memory observation")
+            else {
+                panic!("v1 memory ceiling must be authoritative");
+            };
+            assert_eq!(observation.working_set_bytes(), 384);
+            assert_eq!(observation.available_bytes(), 640);
         }
 
         #[test]
-        fn hybrid_v1_memory_and_v2_membership_fails_closed() {
+        fn hybrid_hierarchy_uses_the_active_v1_memory_controller() {
             let fixture = Fixture::new("/tenant/leaf");
+            let v1_mount = fixture.mount.parent().unwrap().join("cgroup-memory");
+            let v1_leaf = v1_mount.join("legacy");
+            fs::create_dir_all(&v1_leaf).expect("v1 leaf");
+            fs::write(v1_leaf.join("memory.use_hierarchy"), "0\n").expect("hierarchy");
+            fs::write(v1_leaf.join("memory.limit_in_bytes"), "2048\n").expect("limit");
+            fs::write(v1_leaf.join("memory.usage_in_bytes"), "1024\n").expect("usage");
+            fs::write(
+                v1_leaf.join("memory.stat"),
+                "inactive_file 256\ntotal_inactive_file 256\n",
+            )
+            .expect("stat");
             fs::write(
                 &fixture.cgroup_file,
                 "0::/tenant/leaf\n4:memory:/legacy\n",
             )
             .expect("hybrid membership");
-            let failure = detect_from_proc_files(
-                &fixture.cgroup_file,
+            let original = fs::read_to_string(&fixture.mountinfo_file).expect("mountinfo");
+            fs::write(
                 &fixture.mountinfo_file,
+                format!(
+                    "{original}31 23 0:30 / {} rw - cgroup cgroup rw,memory\n",
+                    v1_mount.display()
+                ),
             )
-            .expect_err("an active v1 memory controller cannot be ignored");
-            assert_eq!(
-                failure.kind(),
-                CgroupMemoryProbeFailureKind::UnsupportedCgroupV1
-            );
+            .expect("hybrid mountinfo");
+            let CgroupMemoryObservation::V1Limited(observation) = fixture.observe() else {
+                panic!("hybrid memory accounting must follow v1");
+            };
+            assert_eq!(observation.available_bytes(), 1280);
         }
     }
 }
