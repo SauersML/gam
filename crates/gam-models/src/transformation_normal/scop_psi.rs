@@ -379,10 +379,9 @@ impl TransformationNormalFamily {
 
         struct PsiBatchedAccum {
             pub(crate) hvp: Array2<f64>,
-            pub(crate) gamma: Vec<f64>,
-            pub(crate) gamma_psi: Vec<f64>,
-            pub(crate) gamma_dir: Vec<f64>,
-            pub(crate) gamma_psi_dir: Vec<f64>,
+            pub(crate) alpha_psi: Vec<f64>,
+            pub(crate) alpha_dir: Vec<f64>,
+            pub(crate) alpha_psi_dir: Vec<f64>,
             pub(crate) h_dir: Vec<f64>,
             pub(crate) hp_dir: Vec<f64>,
             pub(crate) h_psi_dir: Vec<f64>,
@@ -396,10 +395,9 @@ impl TransformationNormalFamily {
                 let projected_len = p_resp * rank;
                 Self {
                     hvp: Array2::<f64>::zeros((p_total, rank)),
-                    gamma: vec![0.0; p_resp],
-                    gamma_psi: vec![0.0; p_resp],
-                    gamma_dir: vec![0.0; projected_len],
-                    gamma_psi_dir: vec![0.0; projected_len],
+                    alpha_psi: vec![0.0; p_resp],
+                    alpha_dir: vec![0.0; projected_len],
+                    alpha_psi_dir: vec![0.0; projected_len],
                     h_dir: vec![0.0; rank],
                     hp_dir: vec![0.0; rank],
                     h_psi_dir: vec![0.0; rank],
@@ -416,7 +414,6 @@ impl TransformationNormalFamily {
         }
 
         let weights = self.effective_weights();
-        let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let accum = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
             n,
@@ -428,21 +425,18 @@ impl TransformationNormalFamily {
                     let rv = self.response_val_basis.row(i);
                     let rd = self.response_deriv_basis.row(i);
                     let wi = weights[i];
-                    let hi = h[i];
                     let hp = h_prime[i];
                     let inv_hp = 1.0 / hp;
                     let inv_hp_sq = inv_hp * inv_hp;
                     let inv_hp_cu = inv_hp_sq * inv_hp;
                     let q = row_quantities.endpoint_q[i];
-                    let gamma_row = row_quantities.gamma.row(i);
 
                     for k in 0..p_resp {
-                        acc.gamma[k] = gamma_row[k];
-                        acc.gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+                        acc.alpha_psi[k] = beta_mat.row(k).dot(&psi_row);
                     }
 
-                    acc.gamma_dir.fill(0.0);
-                    acc.gamma_psi_dir.fill(0.0);
+                    acc.alpha_dir.fill(0.0);
+                    acc.alpha_psi_dir.fill(0.0);
                     for k in 0..p_resp {
                         let factor_row_base = k * p_cov;
                         let projected_base = k * rank;
@@ -453,51 +447,36 @@ impl TransformationNormalFamily {
                             for col in 0..rank {
                                 let coeff = factor[[factor_row, col]];
                                 let idx = projected_base + col;
-                                acc.gamma_dir[idx] += coeff * cov_v;
-                                acc.gamma_psi_dir[idx] += coeff * psi_v;
+                                acc.alpha_dir[idx] += coeff * cov_v;
+                                acc.alpha_psi_dir[idx] += coeff * psi_v;
                             }
                         }
                     }
 
-                    let (h_psi, hp_psi, endpoint_psi) = scop_psi_marginal(
-                        rv,
-                        rd,
-                        p_resp,
-                        endpoint_basis,
-                        &acc.gamma,
-                        &acc.gamma_psi,
-                    );
+                    let (h_psi, hp_psi, endpoint_psi) =
+                        scop_psi_marginal(rv, rd, p_resp, endpoint_basis, &acc.alpha_psi);
 
                     for col in 0..rank {
-                        acc.h_dir[col] = rv[0] * acc.gamma_dir[col];
-                        acc.hp_dir[col] = rd[0] * acc.gamma_dir[col];
-                        acc.h_psi_dir[col] = rv[0] * acc.gamma_psi_dir[col];
-                        acc.hp_psi_dir[col] = rd[0] * acc.gamma_psi_dir[col];
-                        acc.endpoint_dir[col] = [
-                            endpoint_basis[0][0] * acc.gamma_dir[col],
-                            endpoint_basis[1][0] * acc.gamma_dir[col],
-                        ];
-                        acc.endpoint_psi_dir[col] = [
-                            endpoint_basis[0][0] * acc.gamma_psi_dir[col],
-                            endpoint_basis[1][0] * acc.gamma_psi_dir[col],
-                        ];
+                        acc.h_dir[col] = 0.0;
+                        acc.hp_dir[col] = 0.0;
+                        acc.h_psi_dir[col] = 0.0;
+                        acc.hp_psi_dir[col] = 0.0;
+                        acc.endpoint_dir[col] = [0.0, 0.0];
+                        acc.endpoint_psi_dir[col] = [0.0, 0.0];
                     }
-                    for k in 1..p_resp {
-                        let g = acc.gamma[k];
-                        let g_psi = acc.gamma_psi[k];
+                    for k in 0..p_resp {
                         for col in 0..rank {
                             let idx = k * rank + col;
-                            let g_dir = acc.gamma_dir[idx];
-                            let g_psi_dir = acc.gamma_psi_dir[idx];
-                            acc.h_dir[col] += 2.0 * rv[k] * g * g_dir;
-                            acc.hp_dir[col] += 2.0 * rd[k] * g * g_dir;
-                            acc.h_psi_dir[col] += 2.0 * rv[k] * (g_dir * g_psi + g * g_psi_dir);
-                            acc.hp_psi_dir[col] += 2.0 * rd[k] * (g_dir * g_psi + g * g_psi_dir);
+                            let a_dir = acc.alpha_dir[idx];
+                            let a_psi_dir = acc.alpha_psi_dir[idx];
+                            acc.h_dir[col] += rv[k] * a_dir;
+                            acc.hp_dir[col] += rd[k] * a_dir;
+                            acc.h_psi_dir[col] += rv[k] * a_psi_dir;
+                            acc.hp_psi_dir[col] += rd[k] * a_psi_dir;
                             for e in 0..2 {
                                 let basis = endpoint_basis[e];
-                                acc.endpoint_dir[col][e] += 2.0 * basis[k] * g * g_dir;
-                                acc.endpoint_psi_dir[col][e] +=
-                                    2.0 * basis[k] * (g_dir * g_psi + g * g_psi_dir);
+                                acc.endpoint_dir[col][e] += basis[k] * a_dir;
+                                acc.endpoint_psi_dir[col][e] += basis[k] * a_psi_dir;
                             }
                         }
                     }
@@ -506,137 +485,24 @@ impl TransformationNormalFamily {
                         let offset = k * p_cov;
                         let rvk = rv[k];
                         let rdk = rd[k];
-                        let g = acc.gamma[k];
-                        let g_psi = acc.gamma_psi[k];
-                        let h_factor = if k == 0 { rvk } else { 2.0 * rvk * g };
-                        let hp_factor = if k == 0 { rdk } else { 2.0 * rdk * g };
-                        let hpsi_cov_factor = if k == 0 { 0.0 } else { 2.0 * rvk * g_psi };
-                        let hppsi_cov_factor = if k == 0 { 0.0 } else { 2.0 * rdk * g_psi };
-                        let hpsi_psi_factor = if k == 0 { rvk } else { 2.0 * rvk * g };
-                        let hppsi_psi_factor = if k == 0 { rdk } else { 2.0 * rdk * g };
-                        let endpoint_factor = [
-                            if k == 0 {
-                                endpoint_basis[0][k]
-                            } else {
-                                2.0 * endpoint_basis[0][k] * g
-                            },
-                            if k == 0 {
-                                endpoint_basis[1][k]
-                            } else {
-                                2.0 * endpoint_basis[1][k] * g
-                            },
-                        ];
-                        let endpoint_psi_cov_factor = [
-                            if k == 0 {
-                                0.0
-                            } else {
-                                2.0 * endpoint_basis[0][k] * g_psi
-                            },
-                            if k == 0 {
-                                0.0
-                            } else {
-                                2.0 * endpoint_basis[1][k] * g_psi
-                            },
-                        ];
-                        let endpoint_psi_psi_factor = [
-                            if k == 0 {
-                                endpoint_basis[0][k]
-                            } else {
-                                2.0 * endpoint_basis[0][k] * g
-                            },
-                            if k == 0 {
-                                endpoint_basis[1][k]
-                            } else {
-                                2.0 * endpoint_basis[1][k] * g
-                            },
-                        ];
+                        let e_k = [endpoint_basis[0][k], endpoint_basis[1][k]];
                         for cidx in 0..p_cov {
                             let c = cov_row[cidx];
                             let psi = psi_row[cidx];
-                            let h_a = h_factor * c;
-                            let hp_a = hp_factor * c;
-                            let hpsi_a = hpsi_cov_factor * c + hpsi_psi_factor * psi;
-                            let hppsi_a = hppsi_cov_factor * c + hppsi_psi_factor * psi;
-                            let endpoint_a = [endpoint_factor[0] * c, endpoint_factor[1] * c];
-                            let endpoint_psi_a = [
-                                endpoint_psi_cov_factor[0] * c + endpoint_psi_psi_factor[0] * psi,
-                                endpoint_psi_cov_factor[1] * c + endpoint_psi_psi_factor[1] * psi,
-                            ];
+                            let h_a = rvk * c;
+                            let hp_a = rdk * c;
+                            let hpsi_a = rvk * psi;
+                            let hppsi_a = rdk * psi;
+                            let endpoint_a = [e_k[0] * c, e_k[1] * c];
+                            let endpoint_psi_a = [e_k[0] * psi, e_k[1] * psi];
                             let out_idx = offset + cidx;
                             for col in 0..rank {
-                                let projected_idx = k * rank + col;
-                                let g_dir = acc.gamma_dir[projected_idx];
-                                let g_psi_dir = acc.gamma_psi_dir[projected_idx];
-                                let h_factor_dir = if k == 0 { 0.0 } else { 2.0 * rvk * g_dir };
-                                let hp_factor_dir = if k == 0 { 0.0 } else { 2.0 * rdk * g_dir };
-                                let hpsi_cov_factor_dir =
-                                    if k == 0 { 0.0 } else { 2.0 * rvk * g_psi_dir };
-                                let hppsi_cov_factor_dir =
-                                    if k == 0 { 0.0 } else { 2.0 * rdk * g_psi_dir };
-                                let hpsi_psi_factor_dir =
-                                    if k == 0 { 0.0 } else { 2.0 * rvk * g_dir };
-                                let hppsi_psi_factor_dir =
-                                    if k == 0 { 0.0 } else { 2.0 * rdk * g_dir };
-                                let h_a_dir = h_factor_dir * c;
-                                let hp_a_dir = hp_factor_dir * c;
-                                let hpsi_a_dir =
-                                    hpsi_cov_factor_dir * c + hpsi_psi_factor_dir * psi;
-                                let hppsi_a_dir =
-                                    hppsi_cov_factor_dir * c + hppsi_psi_factor_dir * psi;
-                                let endpoint_factor_dir = [
-                                    if k == 0 {
-                                        0.0
-                                    } else {
-                                        2.0 * endpoint_basis[0][k] * g_dir
-                                    },
-                                    if k == 0 {
-                                        0.0
-                                    } else {
-                                        2.0 * endpoint_basis[1][k] * g_dir
-                                    },
-                                ];
-                                let endpoint_psi_cov_factor_dir = [
-                                    if k == 0 {
-                                        0.0
-                                    } else {
-                                        2.0 * endpoint_basis[0][k] * g_psi_dir
-                                    },
-                                    if k == 0 {
-                                        0.0
-                                    } else {
-                                        2.0 * endpoint_basis[1][k] * g_psi_dir
-                                    },
-                                ];
-                                let endpoint_psi_psi_factor_dir = [
-                                    if k == 0 {
-                                        0.0
-                                    } else {
-                                        2.0 * endpoint_basis[0][k] * g_dir
-                                    },
-                                    if k == 0 {
-                                        0.0
-                                    } else {
-                                        2.0 * endpoint_basis[1][k] * g_dir
-                                    },
-                                ];
-                                let endpoint_a_dir =
-                                    [endpoint_factor_dir[0] * c, endpoint_factor_dir[1] * c];
-                                let endpoint_psi_a_dir = [
-                                    endpoint_psi_cov_factor_dir[0] * c
-                                        + endpoint_psi_psi_factor_dir[0] * psi,
-                                    endpoint_psi_cov_factor_dir[1] * c
-                                        + endpoint_psi_psi_factor_dir[1] * psi,
-                                ];
                                 let d_inv_hp = -acc.hp_dir[col] * inv_hp_sq;
                                 let d_inv_hp_sq = -2.0 * acc.hp_dir[col] * inv_hp_cu;
-                                let value = h_a_dir * h_psi
-                                    + h_a * acc.h_psi_dir[col]
+                                let value = h_a * acc.h_psi_dir[col]
                                     + acc.h_dir[col] * hpsi_a
-                                    + hi * hpsi_a_dir
-                                    - hppsi_a_dir * inv_hp
                                     - hppsi_a * d_inv_hp
                                     + acc.hp_psi_dir[col] * hp_a * inv_hp_sq
-                                    + hp_psi * hp_a_dir * inv_hp_sq
                                     + hp_psi * hp_a * d_inv_hp_sq
                                     + endpoint_chain_third(
                                         &q,
@@ -645,8 +511,8 @@ impl TransformationNormalFamily {
                                         acc.endpoint_dir[col],
                                         endpoint_psi_a,
                                         acc.endpoint_psi_dir[col],
-                                        endpoint_a_dir,
-                                        endpoint_psi_a_dir,
+                                        [0.0, 0.0],
+                                        [0.0, 0.0],
                                     );
                                 acc.hvp[[out_idx, col]] += wi * value;
                             }
@@ -719,22 +585,15 @@ impl TransformationNormalFamily {
 
         struct PsiTraceAccum {
             pub(crate) value: f64,
-            pub(crate) gamma: Vec<f64>,
-            pub(crate) gamma_psi: Vec<f64>,
-            pub(crate) gamma_dir: Vec<f64>,
-            pub(crate) gamma_psi_dir: Vec<f64>,
+            pub(crate) alpha_psi: Vec<f64>,
+            pub(crate) alpha_dir: Vec<f64>,
+            pub(crate) alpha_psi_dir: Vec<f64>,
             pub(crate) h_dir: Vec<f64>,
             pub(crate) hp_dir: Vec<f64>,
-            pub(crate) h_vv: Vec<f64>,
-            pub(crate) hp_vv: Vec<f64>,
             pub(crate) h_psi_dir: Vec<f64>,
             pub(crate) hp_psi_dir: Vec<f64>,
-            pub(crate) h_psi_vv: Vec<f64>,
-            pub(crate) hp_psi_vv: Vec<f64>,
             pub(crate) endpoint_dir: Vec<[f64; 2]>,
             pub(crate) endpoint_psi_dir: Vec<[f64; 2]>,
-            pub(crate) endpoint_vv: Vec<[f64; 2]>,
-            pub(crate) endpoint_psi_vv: Vec<[f64; 2]>,
         }
 
         impl PsiTraceAccum {
@@ -742,22 +601,15 @@ impl TransformationNormalFamily {
                 let projected_len = p_resp * rank;
                 Self {
                     value: 0.0,
-                    gamma: vec![0.0; p_resp],
-                    gamma_psi: vec![0.0; p_resp],
-                    gamma_dir: vec![0.0; projected_len],
-                    gamma_psi_dir: vec![0.0; projected_len],
+                    alpha_psi: vec![0.0; p_resp],
+                    alpha_dir: vec![0.0; projected_len],
+                    alpha_psi_dir: vec![0.0; projected_len],
                     h_dir: vec![0.0; rank],
                     hp_dir: vec![0.0; rank],
-                    h_vv: vec![0.0; rank],
-                    hp_vv: vec![0.0; rank],
                     h_psi_dir: vec![0.0; rank],
                     hp_psi_dir: vec![0.0; rank],
-                    h_psi_vv: vec![0.0; rank],
-                    hp_psi_vv: vec![0.0; rank],
                     endpoint_dir: vec![[0.0; 2]; rank],
                     endpoint_psi_dir: vec![[0.0; 2]; rank],
-                    endpoint_vv: vec![[0.0; 2]; rank],
-                    endpoint_psi_vv: vec![[0.0; 2]; rank],
                 }
             }
 
@@ -768,7 +620,6 @@ impl TransformationNormalFamily {
         }
 
         let weights = self.effective_weights();
-        let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let accum = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
             n,
@@ -780,20 +631,17 @@ impl TransformationNormalFamily {
                     let rv = self.response_val_basis.row(i);
                     let rd = self.response_deriv_basis.row(i);
                     let wi = weights[i];
-                    let hi = h[i];
                     let hp = h_prime[i];
                     let inv_hp = 1.0 / hp;
                     let inv_hp_sq = inv_hp * inv_hp;
                     let q = row_quantities.endpoint_q[i];
-                    let gamma_row = row_quantities.gamma.row(i);
 
                     for k in 0..p_resp {
-                        acc.gamma[k] = gamma_row[k];
-                        acc.gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+                        acc.alpha_psi[k] = beta_mat.row(k).dot(&psi_row);
                     }
 
-                    acc.gamma_dir.fill(0.0);
-                    acc.gamma_psi_dir.fill(0.0);
+                    acc.alpha_dir.fill(0.0);
+                    acc.alpha_psi_dir.fill(0.0);
                     for k in 0..p_resp {
                         let factor_row_base = k * p_cov;
                         let projected_base = k * rank;
@@ -804,76 +652,52 @@ impl TransformationNormalFamily {
                             for col in 0..rank {
                                 let coeff = factor[[factor_row, col]];
                                 let idx = projected_base + col;
-                                acc.gamma_dir[idx] += coeff * cov_v;
-                                acc.gamma_psi_dir[idx] += coeff * psi_v;
+                                acc.alpha_dir[idx] += coeff * cov_v;
+                                acc.alpha_psi_dir[idx] += coeff * psi_v;
                             }
                         }
                     }
 
-                    let (h_psi, hp_psi, endpoint_psi) = scop_psi_marginal(
-                        rv,
-                        rd,
-                        p_resp,
-                        endpoint_basis,
-                        &acc.gamma,
-                        &acc.gamma_psi,
-                    );
+                    // `h_psi` participates only through the (zero) chart
+                    // second-derivative term for the linear map.
+                    let (_h_psi, hp_psi, endpoint_psi) =
+                        scop_psi_marginal(rv, rd, p_resp, endpoint_basis, &acc.alpha_psi);
 
                     for col in 0..rank {
-                        acc.h_dir[col] = rv[0] * acc.gamma_dir[col];
-                        acc.hp_dir[col] = rd[0] * acc.gamma_dir[col];
-                        acc.h_vv[col] = 0.0;
-                        acc.hp_vv[col] = 0.0;
-                        acc.h_psi_dir[col] = rv[0] * acc.gamma_psi_dir[col];
-                        acc.hp_psi_dir[col] = rd[0] * acc.gamma_psi_dir[col];
-                        acc.h_psi_vv[col] = 0.0;
-                        acc.hp_psi_vv[col] = 0.0;
-                        acc.endpoint_dir[col] = [
-                            endpoint_basis[0][0] * acc.gamma_dir[col],
-                            endpoint_basis[1][0] * acc.gamma_dir[col],
-                        ];
-                        acc.endpoint_psi_dir[col] = [
-                            endpoint_basis[0][0] * acc.gamma_psi_dir[col],
-                            endpoint_basis[1][0] * acc.gamma_psi_dir[col],
-                        ];
-                        acc.endpoint_vv[col] = [0.0; 2];
-                        acc.endpoint_psi_vv[col] = [0.0; 2];
+                        acc.h_dir[col] = 0.0;
+                        acc.hp_dir[col] = 0.0;
+                        acc.h_psi_dir[col] = 0.0;
+                        acc.hp_psi_dir[col] = 0.0;
+                        acc.endpoint_dir[col] = [0.0, 0.0];
+                        acc.endpoint_psi_dir[col] = [0.0, 0.0];
                     }
-                    for k in 1..p_resp {
-                        let g = acc.gamma[k];
-                        let g_psi = acc.gamma_psi[k];
+                    for k in 0..p_resp {
                         for col in 0..rank {
                             let idx = k * rank + col;
-                            let g_dir = acc.gamma_dir[idx];
-                            let g_psi_dir = acc.gamma_psi_dir[idx];
-                            acc.h_dir[col] += 2.0 * rv[k] * g * g_dir;
-                            acc.hp_dir[col] += 2.0 * rd[k] * g * g_dir;
-                            acc.h_vv[col] += 2.0 * rv[k] * g_dir * g_dir;
-                            acc.hp_vv[col] += 2.0 * rd[k] * g_dir * g_dir;
-                            acc.h_psi_dir[col] += 2.0 * rv[k] * (g_dir * g_psi + g * g_psi_dir);
-                            acc.hp_psi_dir[col] += 2.0 * rd[k] * (g_dir * g_psi + g * g_psi_dir);
-                            acc.h_psi_vv[col] += 4.0 * rv[k] * g_dir * g_psi_dir;
-                            acc.hp_psi_vv[col] += 4.0 * rd[k] * g_dir * g_psi_dir;
+                            let a_dir = acc.alpha_dir[idx];
+                            let a_psi_dir = acc.alpha_psi_dir[idx];
+                            acc.h_dir[col] += rv[k] * a_dir;
+                            acc.hp_dir[col] += rd[k] * a_dir;
+                            acc.h_psi_dir[col] += rv[k] * a_psi_dir;
+                            acc.hp_psi_dir[col] += rd[k] * a_psi_dir;
                             for e in 0..2 {
                                 let basis = endpoint_basis[e];
-                                acc.endpoint_dir[col][e] += 2.0 * basis[k] * g * g_dir;
-                                acc.endpoint_psi_dir[col][e] +=
-                                    2.0 * basis[k] * (g_dir * g_psi + g * g_psi_dir);
-                                acc.endpoint_vv[col][e] += 2.0 * basis[k] * g_dir * g_dir;
-                                acc.endpoint_psi_vv[col][e] += 4.0 * basis[k] * g_dir * g_psi_dir;
+                                acc.endpoint_dir[col][e] += basis[k] * a_dir;
+                                acc.endpoint_psi_dir[col][e] += basis[k] * a_psi_dir;
                             }
                         }
                     }
 
                     for col in 0..rank {
-                        let barrier = -acc.hp_psi_vv[col] * inv_hp
-                            + 2.0 * acc.hp_psi_dir[col] * acc.hp_dir[col] * inv_hp_sq
-                            + hp_psi * acc.hp_vv[col] * inv_hp_sq
-                            - 2.0 * hp_psi * acc.hp_dir[col] * acc.hp_dir[col] * inv_hp_sq * inv_hp;
+                        let barrier = 2.0 * acc.hp_psi_dir[col] * acc.hp_dir[col] * inv_hp_sq
+                            - 2.0
+                                * hp_psi
+                                * acc.hp_dir[col]
+                                * acc.hp_dir[col]
+                                * inv_hp_sq
+                                * inv_hp;
                         acc.value += wi
-                            * (acc.h_vv[col] * h_psi
-                                + 2.0 * acc.h_dir[col] * acc.h_psi_dir[col]
-                                + hi * acc.h_psi_vv[col]
+                            * (2.0 * acc.h_dir[col] * acc.h_psi_dir[col]
                                 + barrier
                                 + endpoint_chain_third(
                                     &q,
@@ -882,8 +706,8 @@ impl TransformationNormalFamily {
                                     acc.endpoint_dir[col],
                                     acc.endpoint_psi_dir[col],
                                     acc.endpoint_psi_dir[col],
-                                    acc.endpoint_vv[col],
-                                    acc.endpoint_psi_vv[col],
+                                    [0.0, 0.0],
+                                    [0.0, 0.0],
                                 ));
                     }
                 }
@@ -982,22 +806,15 @@ impl TransformationNormalFamily {
 
         struct PsiAllAxesTraceAccum {
             pub(crate) values: Vec<f64>,
-            pub(crate) gamma: Vec<f64>,
-            pub(crate) gamma_dir: Vec<f64>,
+            pub(crate) alpha_dir: Vec<f64>,
             pub(crate) h_dir: Vec<f64>,
             pub(crate) hp_dir: Vec<f64>,
-            pub(crate) h_vv: Vec<f64>,
-            pub(crate) hp_vv: Vec<f64>,
             pub(crate) endpoint_dir: Vec<[f64; 2]>,
-            pub(crate) endpoint_vv: Vec<[f64; 2]>,
-            pub(crate) gamma_psi: Vec<f64>,
-            pub(crate) gamma_psi_dir: Vec<f64>,
+            pub(crate) alpha_psi: Vec<f64>,
+            pub(crate) alpha_psi_dir: Vec<f64>,
             pub(crate) h_psi_dir: Vec<f64>,
             pub(crate) hp_psi_dir: Vec<f64>,
-            pub(crate) h_psi_vv: Vec<f64>,
-            pub(crate) hp_psi_vv: Vec<f64>,
             pub(crate) endpoint_psi_dir: Vec<[f64; 2]>,
-            pub(crate) endpoint_psi_vv: Vec<[f64; 2]>,
         }
 
         impl PsiAllAxesTraceAccum {
@@ -1005,22 +822,15 @@ impl TransformationNormalFamily {
                 let projected_len = p_resp * rank;
                 Self {
                     values: vec![0.0; n_psi],
-                    gamma: vec![0.0; p_resp],
-                    gamma_dir: vec![0.0; projected_len],
+                    alpha_dir: vec![0.0; projected_len],
                     h_dir: vec![0.0; rank],
                     hp_dir: vec![0.0; rank],
-                    h_vv: vec![0.0; rank],
-                    hp_vv: vec![0.0; rank],
                     endpoint_dir: vec![[0.0; 2]; rank],
-                    endpoint_vv: vec![[0.0; 2]; rank],
-                    gamma_psi: vec![0.0; p_resp],
-                    gamma_psi_dir: vec![0.0; projected_len],
+                    alpha_psi: vec![0.0; p_resp],
+                    alpha_psi_dir: vec![0.0; projected_len],
                     h_psi_dir: vec![0.0; rank],
                     hp_psi_dir: vec![0.0; rank],
-                    h_psi_vv: vec![0.0; rank],
-                    hp_psi_vv: vec![0.0; rank],
                     endpoint_psi_dir: vec![[0.0; 2]; rank],
-                    endpoint_psi_vv: vec![[0.0; 2]; rank],
                 }
             }
 
@@ -1033,7 +843,6 @@ impl TransformationNormalFamily {
         }
 
         let weights = self.effective_weights();
-        let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let accum = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
             n,
@@ -1045,19 +854,13 @@ impl TransformationNormalFamily {
                     let rv = self.response_val_basis.row(i);
                     let rd = self.response_deriv_basis.row(i);
                     let wi = weights[i];
-                    let hi = h[i];
                     let hp = h_prime[i];
                     let inv_hp = 1.0 / hp;
                     let inv_hp_sq = inv_hp * inv_hp;
                     let q = row_quantities.endpoint_q[i];
-                    let gamma_row = row_quantities.gamma.row(i);
 
                     // ---- Axis-INDEP per-row state (computed exactly once) ----
-                    for k in 0..p_resp {
-                        acc.gamma[k] = gamma_row[k];
-                    }
-
-                    acc.gamma_dir.fill(0.0);
+                    acc.alpha_dir.fill(0.0);
                     for k in 0..p_resp {
                         let factor_row_base = k * p_cov;
                         let projected_base = k * rank;
@@ -1067,35 +870,24 @@ impl TransformationNormalFamily {
                             for col in 0..rank {
                                 let coeff = factor[[factor_row, col]];
                                 let idx = projected_base + col;
-                                acc.gamma_dir[idx] += coeff * cov_v;
+                                acc.alpha_dir[idx] += coeff * cov_v;
                             }
                         }
                     }
 
                     for col in 0..rank {
-                        acc.h_dir[col] = rv[0] * acc.gamma_dir[col];
-                        acc.hp_dir[col] = rd[0] * acc.gamma_dir[col];
-                        acc.h_vv[col] = 0.0;
-                        acc.hp_vv[col] = 0.0;
-                        acc.endpoint_dir[col] = [
-                            endpoint_basis[0][0] * acc.gamma_dir[col],
-                            endpoint_basis[1][0] * acc.gamma_dir[col],
-                        ];
-                        acc.endpoint_vv[col] = [0.0; 2];
+                        acc.h_dir[col] = 0.0;
+                        acc.hp_dir[col] = 0.0;
+                        acc.endpoint_dir[col] = [0.0, 0.0];
                     }
-                    for k in 1..p_resp {
-                        let g = acc.gamma[k];
+                    for k in 0..p_resp {
                         for col in 0..rank {
                             let idx = k * rank + col;
-                            let g_dir = acc.gamma_dir[idx];
-                            acc.h_dir[col] += 2.0 * rv[k] * g * g_dir;
-                            acc.hp_dir[col] += 2.0 * rd[k] * g * g_dir;
-                            acc.h_vv[col] += 2.0 * rv[k] * g_dir * g_dir;
-                            acc.hp_vv[col] += 2.0 * rd[k] * g_dir * g_dir;
+                            let a_dir = acc.alpha_dir[idx];
+                            acc.h_dir[col] += rv[k] * a_dir;
+                            acc.hp_dir[col] += rd[k] * a_dir;
                             for e in 0..2 {
-                                let basis = endpoint_basis[e];
-                                acc.endpoint_dir[col][e] += 2.0 * basis[k] * g * g_dir;
-                                acc.endpoint_vv[col][e] += 2.0 * basis[k] * g_dir * g_dir;
+                                acc.endpoint_dir[col][e] += endpoint_basis[e][k] * a_dir;
                             }
                         }
                     }
@@ -1105,10 +897,10 @@ impl TransformationNormalFamily {
                         let psi_row = cov_psi_per_axis[axis_idx].row(local_i);
 
                         for k in 0..p_resp {
-                            acc.gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+                            acc.alpha_psi[k] = beta_mat.row(k).dot(&psi_row);
                         }
 
-                        acc.gamma_psi_dir.fill(0.0);
+                        acc.alpha_psi_dir.fill(0.0);
                         for k in 0..p_resp {
                             let factor_row_base = k * p_cov;
                             let projected_base = k * rank;
@@ -1118,58 +910,38 @@ impl TransformationNormalFamily {
                                 for col in 0..rank {
                                     let coeff = factor[[factor_row, col]];
                                     let idx = projected_base + col;
-                                    acc.gamma_psi_dir[idx] += coeff * psi_v;
+                                    acc.alpha_psi_dir[idx] += coeff * psi_v;
                                 }
                             }
                         }
 
-                        let (h_psi, hp_psi, endpoint_psi) = scop_psi_marginal(
-                            rv,
-                            rd,
-                            p_resp,
-                            endpoint_basis,
-                            &acc.gamma,
-                            &acc.gamma_psi,
-                        );
+                        let (_h_psi, hp_psi, endpoint_psi) =
+                            scop_psi_marginal(rv, rd, p_resp, endpoint_basis, &acc.alpha_psi);
 
                         for col in 0..rank {
-                            acc.h_psi_dir[col] = rv[0] * acc.gamma_psi_dir[col];
-                            acc.hp_psi_dir[col] = rd[0] * acc.gamma_psi_dir[col];
-                            acc.h_psi_vv[col] = 0.0;
-                            acc.hp_psi_vv[col] = 0.0;
-                            acc.endpoint_psi_dir[col] = [
-                                endpoint_basis[0][0] * acc.gamma_psi_dir[col],
-                                endpoint_basis[1][0] * acc.gamma_psi_dir[col],
-                            ];
-                            acc.endpoint_psi_vv[col] = [0.0; 2];
+                            acc.h_psi_dir[col] = 0.0;
+                            acc.hp_psi_dir[col] = 0.0;
+                            acc.endpoint_psi_dir[col] = [0.0, 0.0];
                         }
-                        for k in 1..p_resp {
-                            let g = acc.gamma[k];
-                            let g_psi = acc.gamma_psi[k];
+                        for k in 0..p_resp {
                             for col in 0..rank {
                                 let idx = k * rank + col;
-                                let g_dir = acc.gamma_dir[idx];
-                                let g_psi_dir = acc.gamma_psi_dir[idx];
-                                acc.h_psi_dir[col] += 2.0 * rv[k] * (g_dir * g_psi + g * g_psi_dir);
-                                acc.hp_psi_dir[col] +=
-                                    2.0 * rd[k] * (g_dir * g_psi + g * g_psi_dir);
-                                acc.h_psi_vv[col] += 4.0 * rv[k] * g_dir * g_psi_dir;
-                                acc.hp_psi_vv[col] += 4.0 * rd[k] * g_dir * g_psi_dir;
+                                let a_psi_dir = acc.alpha_psi_dir[idx];
+                                acc.h_psi_dir[col] += rv[k] * a_psi_dir;
+                                acc.hp_psi_dir[col] += rd[k] * a_psi_dir;
                                 for e in 0..2 {
-                                    let basis = endpoint_basis[e];
                                     acc.endpoint_psi_dir[col][e] +=
-                                        2.0 * basis[k] * (g_dir * g_psi + g * g_psi_dir);
-                                    acc.endpoint_psi_vv[col][e] +=
-                                        4.0 * basis[k] * g_dir * g_psi_dir;
+                                        endpoint_basis[e][k] * a_psi_dir;
                                 }
                             }
                         }
 
                         let mut axis_value = 0.0;
                         for col in 0..rank {
-                            let barrier = -acc.hp_psi_vv[col] * inv_hp
-                                + 2.0 * acc.hp_psi_dir[col] * acc.hp_dir[col] * inv_hp_sq
-                                + hp_psi * acc.hp_vv[col] * inv_hp_sq
+                            let barrier = 2.0
+                                * acc.hp_psi_dir[col]
+                                * acc.hp_dir[col]
+                                * inv_hp_sq
                                 - 2.0
                                     * hp_psi
                                     * acc.hp_dir[col]
@@ -1177,9 +949,7 @@ impl TransformationNormalFamily {
                                     * inv_hp_sq
                                     * inv_hp;
                             axis_value += wi
-                                * (acc.h_vv[col] * h_psi
-                                    + 2.0 * acc.h_dir[col] * acc.h_psi_dir[col]
-                                    + hi * acc.h_psi_vv[col]
+                                * (2.0 * acc.h_dir[col] * acc.h_psi_dir[col]
                                     + barrier
                                     + endpoint_chain_third(
                                         &q,
@@ -1188,8 +958,8 @@ impl TransformationNormalFamily {
                                         acc.endpoint_dir[col],
                                         acc.endpoint_psi_dir[col],
                                         acc.endpoint_psi_dir[col],
-                                        acc.endpoint_vv[col],
-                                        acc.endpoint_psi_vv[col],
+                                        [0.0, 0.0],
+                                        [0.0, 0.0],
                                     ));
                         }
                         acc.values[axis_idx] += axis_value;
@@ -1326,10 +1096,9 @@ impl TransformationNormalFamily {
             struct PsiPairScoreAccum {
                 pub(crate) objective: f64,
                 pub(crate) score: Array1<f64>,
-                pub(crate) gamma: Vec<f64>,
-                pub(crate) gamma_i: Vec<f64>,
-                pub(crate) gamma_j: Vec<f64>,
-                pub(crate) gamma_ij: Vec<f64>,
+                pub(crate) alpha_i: Vec<f64>,
+                pub(crate) alpha_j: Vec<f64>,
+                pub(crate) alpha_ij: Vec<f64>,
             }
 
             impl PsiPairScoreAccum {
@@ -1337,10 +1106,9 @@ impl TransformationNormalFamily {
                     Self {
                         objective: 0.0,
                         score: Array1::<f64>::zeros(p_total),
-                        gamma: vec![0.0; p_resp],
-                        gamma_i: vec![0.0; p_resp],
-                        gamma_j: vec![0.0; p_resp],
-                        gamma_ij: vec![0.0; p_resp],
+                        alpha_i: vec![0.0; p_resp],
+                        alpha_j: vec![0.0; p_resp],
+                        alpha_ij: vec![0.0; p_resp],
                     }
                 }
 
@@ -1363,14 +1131,12 @@ impl TransformationNormalFamily {
                         let global_row = row_start + row_idx;
                         let rv = self.response_val_basis.row(global_row);
                         let rd = self.response_deriv_basis.row(global_row);
-                        let gamma_row = cached_gamma.row(row_idx);
 
                         for k in 0..p_resp {
                             let beta_k = beta_mat.row(k);
-                            acc.gamma[k] = gamma_row[k];
-                            acc.gamma_i[k] = beta_k.dot(&cov_i_row);
-                            acc.gamma_j[k] = beta_k.dot(&cov_j_row);
-                            acc.gamma_ij[k] = beta_k.dot(&cov_ij_row);
+                            acc.alpha_i[k] = beta_k.dot(&cov_i_row);
+                            acc.alpha_j[k] = beta_k.dot(&cov_j_row);
+                            acc.alpha_ij[k] = beta_k.dot(&cov_ij_row);
                         }
 
                         let h = cached_h[row_idx];
@@ -1379,10 +1145,9 @@ impl TransformationNormalFamily {
                             rv,
                             rd,
                             p_resp,
-                            &acc.gamma,
-                            &acc.gamma_i,
-                            &acc.gamma_j,
-                            &acc.gamma_ij,
+                            &acc.alpha_i,
+                            &acc.alpha_j,
+                            &acc.alpha_ij,
                         );
 
                         let inv_hp = 1.0 / hp;
@@ -1392,10 +1157,9 @@ impl TransformationNormalFamily {
                         let (endpoint_i, endpoint_j, endpoint_ij) = scop_second_order_endpoints(
                             endpoint_basis,
                             p_resp,
-                            &acc.gamma,
-                            &acc.gamma_i,
-                            &acc.gamma_j,
-                            &acc.gamma_ij,
+                            &acc.alpha_i,
+                            &acc.alpha_j,
+                            &acc.alpha_ij,
                         );
                         let value = h_i * h_j + h * h_ij - hp_ij * inv_hp
                             + hp_i * hp_j * inv_hp_sq
@@ -1406,74 +1170,27 @@ impl TransformationNormalFamily {
                         for k in 0..p_resp {
                             let offset = k * p_cov;
                             let (rvk, rdk) = (rv[k], rd[k]);
-                            let (g, gi, gj, gij) = (
-                                acc.gamma[k],
-                                acc.gamma_i[k],
-                                acc.gamma_j[k],
-                                acc.gamma_ij[k],
-                            );
+                            let e_k = [endpoint_basis[0][k], endpoint_basis[1][k]];
                             for cidx in 0..p_cov {
                                 let c = cov_row[cidx];
                                 let ci = cov_i_row[cidx];
                                 let cj = cov_j_row[cidx];
                                 let cij = cov_ij_row[cidx];
-                                let (dh, dhp, dh_i, dh_j, dh_ij, dhp_i, dhp_j, dhp_ij) = if k == 0 {
-                                    (
-                                        rvk * c,
-                                        rdk * c,
-                                        rvk * ci,
-                                        rvk * cj,
-                                        rvk * cij,
-                                        rdk * ci,
-                                        rdk * cj,
-                                        rdk * cij,
-                                    )
-                                } else {
-                                    (
-                                        2.0 * rvk * g * c,
-                                        2.0 * rdk * g * c,
-                                        2.0 * rvk * (gi * c + g * ci),
-                                        2.0 * rvk * (gj * c + g * cj),
-                                        2.0 * rvk * (gj * ci + gi * cj + gij * c + g * cij),
-                                        2.0 * rdk * (gi * c + g * ci),
-                                        2.0 * rdk * (gj * c + g * cj),
-                                        2.0 * rdk * (gj * ci + gi * cj + gij * c + g * cij),
-                                    )
-                                };
-                                let endpoint_a = if k == 0 {
-                                    [endpoint_basis[0][k] * c, endpoint_basis[1][k] * c]
-                                } else {
-                                    [
-                                        2.0 * endpoint_basis[0][k] * g * c,
-                                        2.0 * endpoint_basis[1][k] * g * c,
-                                    ]
-                                };
-                                let endpoint_i_a = if k == 0 {
-                                    [endpoint_basis[0][k] * ci, endpoint_basis[1][k] * ci]
-                                } else {
-                                    [
-                                        2.0 * endpoint_basis[0][k] * (gi * c + g * ci),
-                                        2.0 * endpoint_basis[1][k] * (gi * c + g * ci),
-                                    ]
-                                };
-                                let endpoint_j_a = if k == 0 {
-                                    [endpoint_basis[0][k] * cj, endpoint_basis[1][k] * cj]
-                                } else {
-                                    [
-                                        2.0 * endpoint_basis[0][k] * (gj * c + g * cj),
-                                        2.0 * endpoint_basis[1][k] * (gj * c + g * cj),
-                                    ]
-                                };
-                                let endpoint_ij_a = if k == 0 {
-                                    [endpoint_basis[0][k] * cij, endpoint_basis[1][k] * cij]
-                                } else {
-                                    [
-                                        2.0 * endpoint_basis[0][k]
-                                            * (gj * ci + gi * cj + gij * c + g * cij),
-                                        2.0 * endpoint_basis[1][k]
-                                            * (gj * ci + gi * cj + gij * c + g * cij),
-                                    ]
-                                };
+                                // Linear chart: every coefficient factor is the
+                                // basis value times the matching (deformed)
+                                // design entry; no coordinate chain terms.
+                                let dh = rvk * c;
+                                let dhp = rdk * c;
+                                let dh_i = rvk * ci;
+                                let dh_j = rvk * cj;
+                                let dh_ij = rvk * cij;
+                                let dhp_i = rdk * ci;
+                                let dhp_j = rdk * cj;
+                                let dhp_ij = rdk * cij;
+                                let endpoint_a = [e_k[0] * c, e_k[1] * c];
+                                let endpoint_i_a = [e_k[0] * ci, e_k[1] * ci];
+                                let endpoint_j_a = [e_k[0] * cj, e_k[1] * cj];
+                                let endpoint_ij_a = [e_k[0] * cij, e_k[1] * cij];
                                 let grad = dh_i * h_j + h_i * dh_j + dh * h_ij + h * dh_ij
                                     - dhp_ij * inv_hp
                                     + hp_ij * dhp * inv_hp_sq
@@ -1507,28 +1224,26 @@ impl TransformationNormalFamily {
 
         struct PsiPairDirectionalAccum {
             pub(crate) hvp: Array1<f64>,
-            pub(crate) gamma: Vec<f64>,
-            pub(crate) gamma_i: Vec<f64>,
-            pub(crate) gamma_j: Vec<f64>,
-            pub(crate) gamma_ij: Vec<f64>,
-            pub(crate) gamma_dot: Vec<f64>,
-            pub(crate) gamma_i_dot: Vec<f64>,
-            pub(crate) gamma_j_dot: Vec<f64>,
-            pub(crate) gamma_ij_dot: Vec<f64>,
+            pub(crate) alpha_i: Vec<f64>,
+            pub(crate) alpha_j: Vec<f64>,
+            pub(crate) alpha_ij: Vec<f64>,
+            pub(crate) alpha_dot: Vec<f64>,
+            pub(crate) alpha_i_dot: Vec<f64>,
+            pub(crate) alpha_j_dot: Vec<f64>,
+            pub(crate) alpha_ij_dot: Vec<f64>,
         }
 
         impl PsiPairDirectionalAccum {
             pub(crate) fn new(p_total: usize, p_resp: usize) -> Self {
                 Self {
                     hvp: Array1::<f64>::zeros(p_total),
-                    gamma: vec![0.0; p_resp],
-                    gamma_i: vec![0.0; p_resp],
-                    gamma_j: vec![0.0; p_resp],
-                    gamma_ij: vec![0.0; p_resp],
-                    gamma_dot: vec![0.0; p_resp],
-                    gamma_i_dot: vec![0.0; p_resp],
-                    gamma_j_dot: vec![0.0; p_resp],
-                    gamma_ij_dot: vec![0.0; p_resp],
+                    alpha_i: vec![0.0; p_resp],
+                    alpha_j: vec![0.0; p_resp],
+                    alpha_ij: vec![0.0; p_resp],
+                    alpha_dot: vec![0.0; p_resp],
+                    alpha_i_dot: vec![0.0; p_resp],
+                    alpha_j_dot: vec![0.0; p_resp],
+                    alpha_ij_dot: vec![0.0; p_resp],
                 }
             }
 
@@ -1550,61 +1265,48 @@ impl TransformationNormalFamily {
                     let global_row = row_start + row_idx;
                     let rv = self.response_val_basis.row(global_row);
                     let rd = self.response_deriv_basis.row(global_row);
-                    let gamma_row = cached_gamma.row(row_idx);
 
                     for k in 0..p_resp {
                         let beta_k = beta_mat.row(k);
                         let dir_k = direction_mat.row(k);
-                        acc.gamma[k] = gamma_row[k];
-                        acc.gamma_i[k] = beta_k.dot(&cov_i_row);
-                        acc.gamma_j[k] = beta_k.dot(&cov_j_row);
-                        acc.gamma_ij[k] = beta_k.dot(&cov_ij_row);
-                        acc.gamma_dot[k] = dir_k.dot(&cov_row);
-                        acc.gamma_i_dot[k] = dir_k.dot(&cov_i_row);
-                        acc.gamma_j_dot[k] = dir_k.dot(&cov_j_row);
-                        acc.gamma_ij_dot[k] = dir_k.dot(&cov_ij_row);
+                        acc.alpha_i[k] = beta_k.dot(&cov_i_row);
+                        acc.alpha_j[k] = beta_k.dot(&cov_j_row);
+                        acc.alpha_ij[k] = beta_k.dot(&cov_ij_row);
+                        acc.alpha_dot[k] = dir_k.dot(&cov_row);
+                        acc.alpha_i_dot[k] = dir_k.dot(&cov_i_row);
+                        acc.alpha_j_dot[k] = dir_k.dot(&cov_j_row);
+                        acc.alpha_ij_dot[k] = dir_k.dot(&cov_ij_row);
                     }
 
-                    let h = cached_h[row_idx];
                     let hp = cached_h_prime[row_idx];
-                    let mut h_i = rv[0] * acc.gamma_i[0];
-                    let mut h_j = rv[0] * acc.gamma_j[0];
-                    let mut h_ij = rv[0] * acc.gamma_ij[0];
-                    let mut hp_i = rd[0] * acc.gamma_i[0];
-                    let mut hp_j = rd[0] * acc.gamma_j[0];
-                    let mut hp_ij = rd[0] * acc.gamma_ij[0];
-                    let mut h_dot = rv[0] * acc.gamma_dot[0];
-                    let mut hp_dot = rd[0] * acc.gamma_dot[0];
-                    let mut h_i_dot = rv[0] * acc.gamma_i_dot[0];
-                    let mut h_j_dot = rv[0] * acc.gamma_j_dot[0];
-                    let mut h_ij_dot = rv[0] * acc.gamma_ij_dot[0];
-                    let mut hp_i_dot = rd[0] * acc.gamma_i_dot[0];
-                    let mut hp_j_dot = rd[0] * acc.gamma_j_dot[0];
-                    let mut hp_ij_dot = rd[0] * acc.gamma_ij_dot[0];
-
-                    for k in 1..p_resp {
-                        let g = acc.gamma[k];
-                        let gi = acc.gamma_i[k];
-                        let gj = acc.gamma_j[k];
-                        let gij = acc.gamma_ij[k];
-                        let u = acc.gamma_dot[k];
-                        let ui = acc.gamma_i_dot[k];
-                        let uj = acc.gamma_j_dot[k];
-                        let uij = acc.gamma_ij_dot[k];
-                        h_i += 2.0 * rv[k] * g * gi;
-                        h_j += 2.0 * rv[k] * g * gj;
-                        h_ij += 2.0 * rv[k] * (gj * gi + g * gij);
-                        hp_i += 2.0 * rd[k] * g * gi;
-                        hp_j += 2.0 * rd[k] * g * gj;
-                        hp_ij += 2.0 * rd[k] * (gj * gi + g * gij);
-                        h_dot += 2.0 * rv[k] * g * u;
-                        hp_dot += 2.0 * rd[k] * g * u;
-                        h_i_dot += 2.0 * rv[k] * (u * gi + g * ui);
-                        h_j_dot += 2.0 * rv[k] * (u * gj + g * uj);
-                        h_ij_dot += 2.0 * rv[k] * (uj * gi + gj * ui + u * gij + g * uij);
-                        hp_i_dot += 2.0 * rd[k] * (u * gi + g * ui);
-                        hp_j_dot += 2.0 * rd[k] * (u * gj + g * uj);
-                        hp_ij_dot += 2.0 * rd[k] * (uj * gi + gj * ui + u * gij + g * uij);
+                    // Linear chart: every transform functional is a plain
+                    // basis-weighted sum of the matching coordinate slots.
+                    // The value-level `h`, `h_i`, `h_j`, `h_ij` drop out of
+                    // the directional expression entirely because every
+                    // second-β chart derivative is zero.
+                    let mut hp_i = 0.0;
+                    let mut hp_j = 0.0;
+                    let mut hp_ij = 0.0;
+                    let mut h_dot = 0.0;
+                    let mut hp_dot = 0.0;
+                    let mut h_i_dot = 0.0;
+                    let mut h_j_dot = 0.0;
+                    let mut h_ij_dot = 0.0;
+                    let mut hp_i_dot = 0.0;
+                    let mut hp_j_dot = 0.0;
+                    let mut hp_ij_dot = 0.0;
+                    for k in 0..p_resp {
+                        hp_i += rd[k] * acc.alpha_i[k];
+                        hp_j += rd[k] * acc.alpha_j[k];
+                        hp_ij += rd[k] * acc.alpha_ij[k];
+                        h_dot += rv[k] * acc.alpha_dot[k];
+                        hp_dot += rd[k] * acc.alpha_dot[k];
+                        h_i_dot += rv[k] * acc.alpha_i_dot[k];
+                        h_j_dot += rv[k] * acc.alpha_j_dot[k];
+                        h_ij_dot += rv[k] * acc.alpha_ij_dot[k];
+                        hp_i_dot += rd[k] * acc.alpha_i_dot[k];
+                        hp_j_dot += rd[k] * acc.alpha_j_dot[k];
+                        hp_ij_dot += rd[k] * acc.alpha_ij_dot[k];
                     }
 
                     let inv_hp = 1.0 / hp;
@@ -1622,200 +1324,50 @@ impl TransformationNormalFamily {
                     let mut endpoint_ij_d = [0.0; 2];
                     for e in 0..2 {
                         let basis = endpoint_basis[e];
-                        endpoint_i[e] = basis[0] * acc.gamma_i[0];
-                        endpoint_j[e] = basis[0] * acc.gamma_j[0];
-                        endpoint_ij[e] = basis[0] * acc.gamma_ij[0];
-                        endpoint_d[e] = basis[0] * acc.gamma_dot[0];
-                        endpoint_i_d[e] = basis[0] * acc.gamma_i_dot[0];
-                        endpoint_j_d[e] = basis[0] * acc.gamma_j_dot[0];
-                        endpoint_ij_d[e] = basis[0] * acc.gamma_ij_dot[0];
-                        for k in 1..p_resp {
-                            endpoint_i[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_i[k];
-                            endpoint_j[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_j[k];
-                            endpoint_ij[e] += 2.0
-                                * basis[k]
-                                * (acc.gamma_j[k] * acc.gamma_i[k]
-                                    + acc.gamma[k] * acc.gamma_ij[k]);
-                            endpoint_d[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_dot[k];
-                            endpoint_i_d[e] += 2.0
-                                * basis[k]
-                                * (acc.gamma_dot[k] * acc.gamma_i[k]
-                                    + acc.gamma[k] * acc.gamma_i_dot[k]);
-                            endpoint_j_d[e] += 2.0
-                                * basis[k]
-                                * (acc.gamma_dot[k] * acc.gamma_j[k]
-                                    + acc.gamma[k] * acc.gamma_j_dot[k]);
-                            endpoint_ij_d[e] += 2.0
-                                * basis[k]
-                                * (acc.gamma_j_dot[k] * acc.gamma_i[k]
-                                    + acc.gamma_j[k] * acc.gamma_i_dot[k]
-                                    + acc.gamma_dot[k] * acc.gamma_ij[k]
-                                    + acc.gamma[k] * acc.gamma_ij_dot[k]);
+                        for k in 0..p_resp {
+                            endpoint_i[e] += basis[k] * acc.alpha_i[k];
+                            endpoint_j[e] += basis[k] * acc.alpha_j[k];
+                            endpoint_ij[e] += basis[k] * acc.alpha_ij[k];
+                            endpoint_d[e] += basis[k] * acc.alpha_dot[k];
+                            endpoint_i_d[e] += basis[k] * acc.alpha_i_dot[k];
+                            endpoint_j_d[e] += basis[k] * acc.alpha_j_dot[k];
+                            endpoint_ij_d[e] += basis[k] * acc.alpha_ij_dot[k];
                         }
                     }
 
                     for k in 0..p_resp {
                         let offset = k * p_cov;
                         let (rvk, rdk) = (rv[k], rd[k]);
-                        let (g, gi, gj, gij) = (
-                            acc.gamma[k],
-                            acc.gamma_i[k],
-                            acc.gamma_j[k],
-                            acc.gamma_ij[k],
-                        );
-                        let (u, ui, uj, uij) = (
-                            acc.gamma_dot[k],
-                            acc.gamma_i_dot[k],
-                            acc.gamma_j_dot[k],
-                            acc.gamma_ij_dot[k],
-                        );
+                        let e_k = [endpoint_basis[0][k], endpoint_basis[1][k]];
                         for cidx in 0..p_cov {
                             let c = cov_row[cidx];
                             let ci = cov_i_row[cidx];
                             let cj = cov_j_row[cidx];
                             let cij = cov_ij_row[cidx];
-                            let (
-                                dh,
-                                dhp,
-                                dh_i,
-                                dh_j,
-                                dh_ij,
-                                dhp_i,
-                                dhp_j,
-                                dhp_ij,
-                                ddh,
-                                ddhp,
-                                ddh_i,
-                                ddh_j,
-                                ddh_ij,
-                                ddhp_i,
-                                ddhp_j,
-                                ddhp_ij,
-                            ) = if k == 0 {
-                                (
-                                    rvk * c,
-                                    rdk * c,
-                                    rvk * ci,
-                                    rvk * cj,
-                                    rvk * cij,
-                                    rdk * ci,
-                                    rdk * cj,
-                                    rdk * cij,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                )
-                            } else {
-                                (
-                                    2.0 * rvk * g * c,
-                                    2.0 * rdk * g * c,
-                                    2.0 * rvk * (gi * c + g * ci),
-                                    2.0 * rvk * (gj * c + g * cj),
-                                    2.0 * rvk * (gj * ci + gi * cj + gij * c + g * cij),
-                                    2.0 * rdk * (gi * c + g * ci),
-                                    2.0 * rdk * (gj * c + g * cj),
-                                    2.0 * rdk * (gj * ci + gi * cj + gij * c + g * cij),
-                                    2.0 * rvk * u * c,
-                                    2.0 * rdk * u * c,
-                                    2.0 * rvk * (ui * c + u * ci),
-                                    2.0 * rvk * (uj * c + u * cj),
-                                    2.0 * rvk * (uj * ci + ui * cj + uij * c + u * cij),
-                                    2.0 * rdk * (ui * c + u * ci),
-                                    2.0 * rdk * (uj * c + u * cj),
-                                    2.0 * rdk * (uj * ci + ui * cj + uij * c + u * cij),
-                                )
-                            };
-
-                            let endpoint_a = if k == 0 {
-                                [endpoint_basis[0][k] * c, endpoint_basis[1][k] * c]
-                            } else {
-                                [
-                                    2.0 * endpoint_basis[0][k] * g * c,
-                                    2.0 * endpoint_basis[1][k] * g * c,
-                                ]
-                            };
-                            let endpoint_i_a = if k == 0 {
-                                [endpoint_basis[0][k] * ci, endpoint_basis[1][k] * ci]
-                            } else {
-                                [
-                                    2.0 * endpoint_basis[0][k] * (gi * c + g * ci),
-                                    2.0 * endpoint_basis[1][k] * (gi * c + g * ci),
-                                ]
-                            };
-                            let endpoint_j_a = if k == 0 {
-                                [endpoint_basis[0][k] * cj, endpoint_basis[1][k] * cj]
-                            } else {
-                                [
-                                    2.0 * endpoint_basis[0][k] * (gj * c + g * cj),
-                                    2.0 * endpoint_basis[1][k] * (gj * c + g * cj),
-                                ]
-                            };
-                            let endpoint_ij_a = if k == 0 {
-                                [endpoint_basis[0][k] * cij, endpoint_basis[1][k] * cij]
-                            } else {
-                                [
-                                    2.0 * endpoint_basis[0][k]
-                                        * (gj * ci + gi * cj + gij * c + g * cij),
-                                    2.0 * endpoint_basis[1][k]
-                                        * (gj * ci + gi * cj + gij * c + g * cij),
-                                ]
-                            };
-                            let endpoint_a_d = if k == 0 {
-                                [0.0; 2]
-                            } else {
-                                [
-                                    2.0 * endpoint_basis[0][k] * u * c,
-                                    2.0 * endpoint_basis[1][k] * u * c,
-                                ]
-                            };
-                            let endpoint_i_a_d = if k == 0 {
-                                [0.0; 2]
-                            } else {
-                                [
-                                    2.0 * endpoint_basis[0][k] * (ui * c + u * ci),
-                                    2.0 * endpoint_basis[1][k] * (ui * c + u * ci),
-                                ]
-                            };
-                            let endpoint_j_a_d = if k == 0 {
-                                [0.0; 2]
-                            } else {
-                                [
-                                    2.0 * endpoint_basis[0][k] * (uj * c + u * cj),
-                                    2.0 * endpoint_basis[1][k] * (uj * c + u * cj),
-                                ]
-                            };
-                            let endpoint_ij_a_d = if k == 0 {
-                                [0.0; 2]
-                            } else {
-                                [
-                                    2.0 * endpoint_basis[0][k]
-                                        * (uj * ci + ui * cj + uij * c + u * cij),
-                                    2.0 * endpoint_basis[1][k]
-                                        * (uj * ci + ui * cj + uij * c + u * cij),
-                                ]
-                            };
+                            // Constant coefficient factors; all second-β
+                            // (`dd*`) factors vanish for the linear chart.
+                            let dh = rvk * c;
+                            let dhp = rdk * c;
+                            let dh_i = rvk * ci;
+                            let dh_j = rvk * cj;
+                            let dh_ij = rvk * cij;
+                            let dhp_i = rdk * ci;
+                            let dhp_j = rdk * cj;
+                            let dhp_ij = rdk * cij;
+                            let endpoint_a = [e_k[0] * c, e_k[1] * c];
+                            let endpoint_i_a = [e_k[0] * ci, e_k[1] * ci];
+                            let endpoint_j_a = [e_k[0] * cj, e_k[1] * cj];
+                            let endpoint_ij_a = [e_k[0] * cij, e_k[1] * cij];
                             let n1 = dhp_i * hp_j + hp_i * dhp_j;
-                            let n1_dot =
-                                ddhp_i * hp_j + dhp_i * hp_j_dot + hp_i_dot * dhp_j + hp_i * ddhp_j;
+                            let n1_dot = dhp_i * hp_j_dot + hp_i_dot * dhp_j;
                             let n2_dot =
-                                hp_i_dot * hp_j * dhp + hp_i * hp_j_dot * dhp + hp_i * hp_j * ddhp;
-                            let hv = ddh_i * h_j
-                                + dh_i * h_j_dot
+                                hp_i_dot * hp_j * dhp + hp_i * hp_j_dot * dhp;
+                            let hv = dh_i * h_j_dot
                                 + h_i_dot * dh_j
-                                + h_i * ddh_j
-                                + ddh * h_ij
                                 + dh * h_ij_dot
                                 + h_dot * dh_ij
-                                + h * ddh_ij
-                                - ddhp_ij * inv_hp
                                 + dhp_ij * hp_dot * inv_hp_sq
                                 + hp_ij_dot * dhp * inv_hp_sq
-                                + hp_ij * ddhp * inv_hp_sq
                                 - 2.0 * hp_ij * dhp * hp_dot * inv_hp_cu
                                 + n1_dot * inv_hp_sq
                                 - 2.0 * n1 * hp_dot * inv_hp_cu
@@ -1832,12 +1384,12 @@ impl TransformationNormalFamily {
                                     endpoint_i_d,
                                     endpoint_j_a,
                                     endpoint_j_d,
-                                    endpoint_a_d,
+                                    [0.0; 2],
                                     endpoint_ij_a,
                                     endpoint_ij_d,
-                                    endpoint_i_a_d,
-                                    endpoint_j_a_d,
-                                    endpoint_ij_a_d,
+                                    [0.0; 2],
+                                    [0.0; 2],
+                                    [0.0; 2],
                                 );
                             acc.hvp[offset + cidx] += wi * hv;
                         }
