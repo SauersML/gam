@@ -110,8 +110,8 @@ pub(crate) struct FlexFamilyCoefficientTerms {
     pub(crate) hessian: Array2<f64>,
 }
 
-/// Exact first and same-direction second baseline derivatives of a complete
-/// FLEX row, plus an optional coefficient-direction drift of the first channel.
+/// Exact first and same-direction second family derivatives of a complete FLEX
+/// row, plus an optional coefficient-direction drift of the first channel.
 #[derive(Clone, Debug)]
 pub(crate) struct FlexFamilyDirectionRowTerms {
     pub(crate) first: FlexFamilyCoefficientTerms,
@@ -3573,6 +3573,9 @@ impl SurvivalMarginalSlopeFamily {
     ///
     /// The inner width is the canonical flattened coefficient layout
     /// `time | marginal | logslope | score-warp? | link-dev? | influence?`.
+    /// Consequently `first.gradient` is the complete family-by-coefficient
+    /// mixed-partial row in one evaluation; callers must not redispatch this
+    /// program once per coefficient axis to recover those mixed pairs.
     /// The outer [`Dual2`] owns the supplied family first/second motion. With no
     /// beta direction the row runs as `Dual2<Jet2>`; with one it runs as
     /// `Dual2<Jet3>` and returns the exact directional drift of the first family
