@@ -1907,16 +1907,20 @@ fn solve_newton_direction_with_constraint_set_impl(
             }
         }
     }
-    for row in 0..m {
-        if !is_active[row]
-            && ops.norms[row] > 0.0
-            && ops.scaled_slack(&values_x, row) <= tol_active
-        {
-            active.push(row);
-            is_active[row] = true;
-            log_active_set_transition("initial-boundary-add", 0, active.len(), Some(row));
-        }
-    }
+    // Do NOT eagerly classify every tight operator row as active.  A factored
+    // cone can have tens of thousands of geometrically tight rows at a low-
+    // dimensional face: for CTN, one coefficient row becoming zero makes all
+    // `n` observation rows tight although their span has dimension at most
+    // `p_cov`.  Gathering that entire face and rank-reducing it on every QP
+    // cycle turns a 144-variable solve into minutes of redundant QR work.
+    //
+    // An active-set method only needs tight rows that block the proposed
+    // direction.  Start from the warm working set (possibly empty); the ratio
+    // test below adds the first boundary row whose directional rate would
+    // leave the cone, and the negative-dual test releases rows normally.  This
+    // is the standard feasible active-set invariant and changes neither the
+    // feasible region nor the QP optimum.  Dense constraints retain their
+    // existing eager initialization in the dense solver.
     let mut visited_working_sets: HashSet<Vec<usize>> = HashSet::new();
     record_active_working_set(&mut visited_working_sets, &active, 0);
 
@@ -1992,6 +1996,7 @@ fn solve_newton_direction_with_constraint_set_impl(
 
         let values_d = ops.values(&d)?;
         let mut alpha = 1.0_f64;
+        let mut blocking_row: Option<usize> = None;
         for row in 0..m {
             if is_active[row] || ops.norms[row] <= 0.0 {
                 continue;
@@ -2000,6 +2005,7 @@ fn solve_newton_direction_with_constraint_set_impl(
             let rate = values_d[row] / ops.norms[row];
             if let Some(cand) = boundary_hit_step_fraction(slack, rate, alpha) {
                 alpha = cand;
+                blocking_row = Some(row);
             }
         }
 
@@ -2016,19 +2022,13 @@ fn solve_newton_direction_with_constraint_set_impl(
 
         let mut added_new_active = false;
         let mut working_set_repeated = false;
-        for row in 0..m {
-            if is_active[row] || ops.norms[row] <= 0.0 {
-                continue;
-            }
-            if ops.scaled_slack(&values_x, row) <= tol_active {
-                active.push(row);
-                is_active[row] = true;
-                added_new_active = true;
-                log_active_set_transition("blocking-add", iteration, active.len(), Some(row));
-                working_set_repeated =
-                    !record_active_working_set(&mut visited_working_sets, &active, iteration);
-                break;
-            }
+        if let Some(row) = blocking_row {
+            active.push(row);
+            is_active[row] = true;
+            added_new_active = true;
+            log_active_set_transition("blocking-add", iteration, active.len(), Some(row));
+            working_set_repeated =
+                !record_active_working_set(&mut visited_working_sets, &active, iteration);
         }
         if working_set_repeated {
             break;
@@ -2920,5 +2920,32 @@ mod tests {
         // move them).
         assert!((projected[0] - point[0]).abs() < 1e-8);
         assert!((projected[1] - point[1]).abs() < 1e-8);
+    }
+
+    #[test]
+    fn operator_cone_does_not_materialize_a_whole_tight_face() {
+        // All 4,096 observation rows describe the same half-space.  At the
+        // cone vertex every row is tight, but one warm row completely
+        // describes the working face.  The operator solver must preserve that
+        // compact working set instead of gathering/rank-reducing all 4,096
+        // redundant rows before taking a step (the large-scale CTN cycle-2
+        // stall from #979).
+        let mut psi = Array2::<f64>::zeros((4096, 2));
+        psi.column_mut(0).fill(1.0);
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1], 2)
+            .expect("repeated-row cone");
+        let set = ConstraintSet::KhatriRaoCone(cone);
+        let hessian = Array2::<f64>::eye(4);
+        let rhs = array![0.3_f64, -0.2, -1.0, 0.0];
+        let beta_start = Array1::<f64>::zeros(4);
+
+        let (beta, active) =
+            solve_quadratic_with_constraint_set(&hessian, &rhs, &beta_start, &set, Some(&[0]))
+                .expect("vertex solve");
+
+        assert_eq!(active, vec![0], "redundant tight rows entered the working set");
+        assert!(beta[2].abs() <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL);
+        assert!((beta[0] - 0.3).abs() < 1e-10);
+        assert!((beta[1] + 0.2).abs() < 1e-10);
     }
 }
