@@ -3457,10 +3457,41 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         }
                     }
                     if let Some(joint_active_set) = search_joint_active_set.as_ref() {
-                        accepted_active_face_changed =
-                            search_joint_active_set != active_face_before_step;
-                        cached_active_sets =
-                            scatter_joint_active_set(joint_active_set, &block_constraints);
+                        // The QP reports the face at its full candidate endpoint,
+                        // but globalization may accept only a strict subsegment of
+                        // that feasible chord. Endpoint-only rows are then still
+                        // slack at `states` and cannot own either the next warm
+                        // KKT system or terminal tangent-space evidence. Filter the
+                        // sparse candidate face against the actual accepted beta;
+                        // the active-set ratio test rediscovers a discarded row
+                        // exactly when a later iterate reaches it.
+                        let accepted_beta = flatten_state_betas(&states, specs);
+                        let accepted_joint_active = if let Some(constraints) =
+                            joint_constraints.as_ref()
+                        {
+                            gam_solve::active_set::constraint_set_rows_tight_at_point(
+                                constraints,
+                                &accepted_beta,
+                                joint_active_set,
+                            )
+                            .map_err(|error| {
+                                format!(
+                                    "accepted constrained-Newton face classification failed: {error}"
+                                )
+                            })?
+                        } else {
+                            joint_active_set.clone()
+                        };
+                        let accepted_face = if accepted_joint_active.is_empty() {
+                            None
+                        } else {
+                            Some(accepted_joint_active.clone())
+                        };
+                        accepted_active_face_changed = accepted_face != active_face_before_step;
+                        cached_active_sets = scatter_joint_active_set(
+                            &accepted_joint_active,
+                            &block_constraints,
+                        );
                     }
                     last_joint_math = Some(joint_math);
                     last_accepted_hit_joint_trust_boundary = step_hit_trust_boundary;

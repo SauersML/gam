@@ -23,6 +23,15 @@ use std::collections::HashSet;
 /// solver contract and will spuriously reject valid boundary solutions.
 pub const ACTIVE_SET_PRIMAL_FEASIBILITY_TOL: f64 = 1e-8;
 
+/// Scaled slack tolerance for membership in an active working face.
+///
+/// This is intentionally tighter than the public primal-feasibility contract:
+/// a row may be numerically feasible without being an equality at the current
+/// point. Warm-start and terminal face provenance both use this value so a QP
+/// endpoint row cannot remain active after globalization accepts an interior
+/// subsegment of the endpoint chord.
+pub const ACTIVE_SET_WORKING_FACE_TOL: f64 = 1e-10;
+
 /// Step fraction to the boundary of the solver's *certified numerical feasible
 /// set*. Every active-set exit accepts scaled slack `>=
 /// -ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`; ratio tests must therefore measure the
@@ -1481,7 +1490,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
         );
     }
 
-    let tol_active = 1e-10;
+    let tol_active = ACTIVE_SET_WORKING_FACE_TOL;
     let tol_step = 1e-12;
     let tol_dual = 1e-10;
     let mut x = beta.to_owned();
@@ -1963,6 +1972,43 @@ impl<'a> ConstraintSetOps<'a> {
     }
 }
 
+/// Retain only candidate row ids that are genuinely tight at `beta`.
+///
+/// Active-face provenance is point-local. A constrained QP reports its full
+/// endpoint face, while trust-region globalization may accept a strict
+/// subsegment whose endpoint-only rows are still slack. This helper is the
+/// shared handoff for warm starts and terminal tangent-space evidence: it uses
+/// the carrier's exact row scaling, preserves canonical input order, and never
+/// scans rows outside the sparse candidate face.
+pub fn constraint_set_rows_tight_at_point(
+    set: &ConstraintSet,
+    beta: &Array1<f64>,
+    candidate_rows: &[usize],
+) -> Result<Vec<usize>, EstimationError> {
+    if set.ncols() != beta.len() {
+        crate::bail_invalid_estim!(
+            "active-face point dimension mismatch: set has {} columns, beta has {}",
+            set.ncols(),
+            beta.len()
+        );
+    }
+    let ops = ConstraintSetOps::new(set, 0.0)?;
+    let values = ops.values(beta)?;
+    let mut seen = vec![false; ops.nrows()];
+    let mut tight = Vec::with_capacity(candidate_rows.len().min(beta.len()));
+    for &row in candidate_rows {
+        if row < ops.nrows()
+            && !seen[row]
+            && ops.norms[row] > 0.0
+            && ops.scaled_slack(&values, row) <= ACTIVE_SET_WORKING_FACE_TOL
+        {
+            seen[row] = true;
+            tight.push(row);
+        }
+    }
+    Ok(tight)
+}
+
 /// Project a stationarity residual onto the normal cone of an operator-carried
 /// constraint set without materializing its complete tight face.
 ///
@@ -2240,7 +2286,7 @@ fn solve_newton_direction_with_constraint_set_impl(
         );
     }
 
-    let tol_active = 1e-10;
+    let tol_active = ACTIVE_SET_WORKING_FACE_TOL;
     let tol_step = 1e-12;
     let tol_dual = 1e-10;
     let mut x = beta.to_owned();
@@ -2792,7 +2838,7 @@ mod tests {
     use super::{
         ACTIVE_SET_INTERIOR_SEED_MARGIN, ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintSet,
         ConstraintSetOps, LinearInequalityConstraints, active_set_boundary_hit_step_fraction,
-        compute_constraint_kkt_diagnostics,
+        compute_constraint_kkt_diagnostics, constraint_set_rows_tight_at_point,
         fallback_projected_gradient_direction,
         fallback_projected_gradient_direction_with_constraint_set,
         project_point_strictly_into_feasible_cone,
@@ -2859,6 +2905,9 @@ mod tests {
         let cone = KhatriRaoConeConstraints::new(factor, vec![0], 1)
             .expect("one-dimensional factored half-line");
         let operator = ConstraintSet::KhatriRaoCone(cone);
+        let stale_terminal_face = constraint_set_rows_tight_at_point(&operator, &interior, &[0])
+            .expect("terminal face classification");
+        assert!(stale_terminal_face.is_empty());
         let (operator_solution, operator_active) = solve_quadratic_with_constraint_set(
             &hessian,
             &rhs,
