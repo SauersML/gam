@@ -4322,171 +4322,6 @@ pub(crate) fn residual_in_steady_geometric_descent(
         })
 }
 
-/// Inf-norm of the active-set-projected stationarity residual restricted to the
-/// **range** of the joint penalized Hessian `H_pen = H + S(λ) + ridge·I`.
-///
-/// A penalized smooth whose penalty has a polynomial null space the censored /
-/// location-scale data does not pin down (TP / Bernstein trend directions in a
-/// survival `time_transform` or `log_sigma` channel, gam#553) leaves a residual
-/// that lives entirely in `ker(H_pen)`: along that direction the objective has
-/// neither curvature nor a constraint, so it is a genuinely *free* gauge
-/// direction, not an unresolved KKT defect. The total residual inf-norm then
-/// stays large forever and the phantom-multiplier refusal never clears, aborting
-/// the fit at REML startup even though the iterate is stationary on the entire
-/// identifiable (range) subspace.
-///
-/// The downstream outer IFT trace already removes the null-space component via
-/// the projected pseudo-inverse `U_S·H_proj⁻¹·U_Sᵀ`, so only a *range-space*
-/// residual component can bias the envelope gradient (see the "do NOT
-/// soft-accept" investigation note at the certifier call site). This returns the
-/// range-space inf-norm so the certifier can accept iff that — the only part
-/// that matters for outer correctness — is at tolerance, while a real defect
-/// (residual with mass in the curved subspace) still refuses.
-///
-/// Returns `None` when the penalized Hessian cannot be materialized or
-/// eigendecomposed, or carries no numerical null space — in which case the
-/// caller keeps the strict total-residual refusal (no null space ⇒ range = all).
-/// Per-block inf-norms of the range-space (identified-subspace) component of the
-/// projected stationarity residual (gam#979). Same construction as
-/// [`projected_residual_range_space_inf`] — project the residual onto range(H_pen)
-/// by dropping its ker(H_pen) coordinates — but return the inf-norm restricted to
-/// EACH block's coordinate range instead of one global scalar.
-///
-/// The per-block stationarity gate (`all_block_stationarity_small`) must test the
-/// residual on the IDENTIFIED subspace, not the raw active-set-projected residual.
-/// On the survival I-spline time block the unpenalized affine baseline direction
-/// is a genuine ker(H_pen) gauge mode: the raw per-block residual keeps the full
-/// gradient component along it (large), so the raw gate falsely rejects a solve
-/// that IS stationary on every identifiable direction. The range-projected
-/// per-block residual drops exactly that gauge mass (the outer IFT pseudo-inverse
-/// projects it out anyway, gam#553), so the gate sees the true identified-subspace
-/// stationarity. Returns `None` when there is no null space (range == whole space)
-/// — there the raw per-block residual already IS the range residual, so the caller
-/// keeps its existing gate unchanged.
-#[cfg(test)]
-pub(crate) fn projected_residual_range_space_per_block_inf(
-    projected_residual: &Array1<f64>,
-    joint_hessian_source: &JointHessianSource,
-    ranges: &[(usize, usize)],
-    s_lambdas: &[Array2<f64>],
-    ridge: f64,
-    ridge_policy: RidgePolicy,
-    total_p: usize,
-) -> Option<Vec<f64>> {
-    if total_p == 0 || projected_residual.len() != total_p {
-        return None;
-    }
-    let mut h_joint = materialize_joint_hessian_source(
-        joint_hessian_source,
-        total_p,
-        "penalty-null-space per-block certificate spectrum",
-    )
-    .ok()?;
-    let model_diagonal_ridge = if ridge_policy.accounts_for_objective() && ridge > 0.0 {
-        ridge
-    } else {
-        0.0
-    };
-    add_joint_penalty_to_matrix(&mut h_joint, ranges, s_lambdas, model_diagonal_ridge, None);
-    symmetrize_dense_in_place(&mut h_joint);
-    let (evals, evecs) = FaerEigh::eigh(&h_joint, Side::Lower).ok()?;
-    let max_abs = evals.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
-    if !(max_abs.is_finite() && max_abs > 0.0) {
-        return None;
-    }
-    // Use the same machine-rank boundary as the exact joint-Newton step. A
-    // wider conditioning cutoff would erase a weak but penalty-identified
-    // mode from the KKT residual even though the step can resolve and move it,
-    // allowing an identified-subspace exit to mint false convergence.
-    let cutoff = joint_hessian_numerical_eigenvalue_floor(max_abs, total_p);
-    let nullity = evals.iter().filter(|x| x.abs() <= cutoff).count();
-    if nullity == 0 {
-        return None;
-    }
-    let mut range_component = Array1::<f64>::zeros(total_p);
-    for k in 0..evals.len() {
-        if evals[k].abs() <= cutoff {
-            continue;
-        }
-        let coeff = evecs.column(k).dot(projected_residual);
-        range_component.scaled_add(coeff, &evecs.column(k));
-    }
-    Some(
-        ranges
-            .iter()
-            .map(|&(start, end)| {
-                range_component
-                    .slice(ndarray::s![start..end])
-                    .iter()
-                    .map(|x: &f64| x.abs())
-                    .fold(0.0_f64, f64::max)
-            })
-            .collect(),
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn projected_residual_range_space_inf(
-    projected_residual: &Array1<f64>,
-    joint_hessian_source: &JointHessianSource,
-    ranges: &[(usize, usize)],
-    s_lambdas: &[Array2<f64>],
-    ridge: f64,
-    ridge_policy: RidgePolicy,
-    total_p: usize,
-) -> Option<f64> {
-    if total_p == 0 || projected_residual.len() != total_p {
-        return None;
-    }
-    let mut h_joint = materialize_joint_hessian_source(
-        joint_hessian_source,
-        total_p,
-        "penalty-null-space certificate spectrum",
-    )
-    .ok()?;
-    let model_diagonal_ridge = if ridge_policy.accounts_for_objective() && ridge > 0.0 {
-        ridge
-    } else {
-        0.0
-    };
-    add_joint_penalty_to_matrix(&mut h_joint, ranges, s_lambdas, model_diagonal_ridge, None);
-    symmetrize_dense_in_place(&mut h_joint);
-    let (evals, evecs) = FaerEigh::eigh(&h_joint, Side::Lower).ok()?;
-    let max_abs = evals.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
-    if !(max_abs.is_finite() && max_abs > 0.0) {
-        return None;
-    }
-    // Keep the convergence projection on the exact same eigenspace as the
-    // joint-Newton step: only machine-null curvature is eligible for null-space
-    // relief. Near-singularity remains diagnostic and never changes the model
-    // stratum or discards a positive penalty mode.
-    let cutoff = joint_hessian_numerical_eigenvalue_floor(max_abs, total_p);
-    let nullity = evals.iter().filter(|x| x.abs() <= cutoff).count();
-    if nullity == 0 {
-        // No data-unconstrained null space — the range is the whole space, so
-        // the strict total-residual refusal already governs. Signal "no relief".
-        return None;
-    }
-    // Range-space residual = residual minus its projection onto ker(H_pen).
-    // Equivalently, accumulate the residual's coordinates along every
-    // range-space (|λ| ≥ cutoff) eigenvector. The eigenbasis is orthonormal,
-    // so ‖P_range r‖∞ is read off the reconstructed range component.
-    let mut range_component = Array1::<f64>::zeros(total_p);
-    for k in 0..evals.len() {
-        if evals[k].abs() <= cutoff {
-            continue;
-        }
-        let coeff = evecs.column(k).dot(projected_residual);
-        range_component.scaled_add(coeff, &evecs.column(k));
-    }
-    Some(
-        range_component
-            .iter()
-            .map(|x: &f64| x.abs())
-            .fold(0.0_f64, f64::max),
-    )
-}
-
 #[cfg(test)]
 mod penalized_hessian_rank_tests {
     use super::*;
@@ -4496,13 +4331,12 @@ mod penalized_hessian_rank_tests {
     /// condition `2e14` remains safely inside the exact Newton eigensolver's
     /// machine-rank limit `1 / (sqrt(p) eps) ~= 8.8e14`.
     ///
-    /// The step and every convergence projection must therefore retain the
-    /// same mode. Historically the step used the machine floor while the two
-    /// projectors used `1e-10 * lambda_max`: Newton moved this coefficient, but
-    /// an identified-subspace exit erased its residual and could call the same
-    /// state gauge-converged.
+    /// The Newton step must therefore retain the mode. Historically separate
+    /// convergence projectors used `1e-10 * lambda_max`: Newton moved this
+    /// coefficient, but an exit could erase its residual as gauge. Those
+    /// projectors no longer exist; strict KKT convergence owns acceptance.
     #[test]
-    fn p26_penalty_identified_condition_2e14_mode_is_step_range_not_gauge_979() {
+    fn p26_penalty_identified_condition_2e14_mode_remains_in_newton_step_979() {
         const P: usize = 26;
         const WEAK_CURVATURE: f64 = 5.0e-15;
         const WEAK_INDEX: usize = P - 1;
@@ -4571,33 +4405,5 @@ mod penalized_hessian_rank_tests {
             step.delta,
         );
 
-        let source = JointHessianSource::Dense(h_likelihood);
-        let ridge_policy = RidgePolicy::solver_only();
-        assert!(
-            projected_residual_range_space_inf(
-                &rhs,
-                &source,
-                &ranges,
-                &s_lambdas,
-                0.0,
-                ridge_policy,
-                P,
-            )
-            .is_none(),
-            "full-rank H_pen must not mint scalar null-space convergence relief"
-        );
-        assert!(
-            projected_residual_range_space_per_block_inf(
-                &rhs,
-                &source,
-                &ranges,
-                &s_lambdas,
-                0.0,
-                ridge_policy,
-                P,
-            )
-            .is_none(),
-            "full-rank H_pen must not mint per-block null-space convergence relief"
-        );
     }
 }

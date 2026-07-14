@@ -4100,7 +4100,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // gam#1082 perf: a per-cycle #979 divergence-trace logging block
             // lived here and computed — EVERY inner cycle for the first 40
             // cycles, purely to feed two `log::info!` lines — a FULL O((P·M)³)
-            // eigendecomposition (`projected_residual_range_space_inf`), a
+            // eigendecomposition of the penalized-Hessian range, a
             // penalty-matrix min-eigenvalue, and per-penalty quadratic forms.
             // On any penalized family with a penalty null space (every
             // `select=TRUE` double-penalty tp-smooth model, including the
