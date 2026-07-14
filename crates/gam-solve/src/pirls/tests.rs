@@ -3114,8 +3114,8 @@ mod tests {
 
 #[cfg(test)]
 mod root_cause_tests {
-    use super::*;
     use super::reweight::exact_newton_decrement_sq;
+    use super::*;
     use approx::assert_relative_eq;
     use gam_problem::LogSmoothingParamsView;
     use ndarray::{Array1, Array2, array};
@@ -3156,12 +3156,8 @@ mod root_cause_tests {
     #[test]
     pub(crate) fn exact_decrement_certifies_stiff_numerical_plateau_2316() {
         let beta = Coefficients::new(array![0.0]);
-        let mut state = scalar_working_state(
-            &beta,
-            HessianCurvatureKind::Fisher,
-            1.448_052e-3,
-            428.0,
-        );
+        let mut state =
+            scalar_working_state(&beta, HessianCurvatureKind::Fisher, 1.448_052e-3, 428.0);
         state.hessian = gam_linalg::matrix::SymmetricMatrix::Dense(array![[1.0e8]]);
 
         let decrement_sq = exact_newton_decrement_sq(&state)
@@ -3452,6 +3448,8 @@ mod root_cause_tests {
 
     pub(crate) struct ExactDecrementAtIterationCapModel {
         pub(crate) exact_calls: usize,
+        pub(crate) gradient: f64,
+        pub(crate) candidate_deviance: f64,
     }
 
     impl WorkingModel for ExactDecrementAtIterationCapModel {
@@ -3464,7 +3462,7 @@ mod root_cause_tests {
             beta: &Coefficients,
             curvature: HessianCurvatureKind,
         ) -> Result<WorkingState, EstimationError> {
-            Ok(scalar_working_state(beta, curvature, 5.0e-5, 1.0))
+            Ok(scalar_working_state(beta, curvature, self.gradient, 1.0))
         }
 
         fn update_candidate(
@@ -3475,8 +3473,8 @@ mod root_cause_tests {
             Ok(scalar_working_state(
                 beta,
                 curvature,
-                5.0e-5,
-                1.0 - 1.25e-9,
+                self.gradient,
+                self.candidate_deviance,
             ))
         }
 
@@ -4056,7 +4054,11 @@ mod root_cause_tests {
 
     #[test]
     pub(crate) fn iteration_cap_runs_one_final_exact_decrement_certificate_2316() {
-        let mut model = ExactDecrementAtIterationCapModel { exact_calls: 0 };
+        let mut model = ExactDecrementAtIterationCapModel {
+            exact_calls: 0,
+            gradient: 5.0e-5,
+            candidate_deviance: 1.0 - 1.25e-9,
+        };
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-6,
@@ -4070,13 +4072,40 @@ mod root_cause_tests {
             arrow_schur: None,
         };
 
-        let result = runworking_model_pirls(
-            &mut model,
-            Coefficients::new(array![0.0]),
-            &options,
-            |_| {},
-        )
-        .expect("the exact final-state decrement certifies iteration exhaustion");
+        let result =
+            runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
+                .expect("the exact final-state decrement certifies iteration exhaustion");
+
+        assert_eq!(model.exact_calls, 1);
+        assert_eq!(result.status, PirlsStatus::Converged);
+    }
+
+    #[test]
+    pub(crate) fn soft_stall_gets_one_final_exact_decrement_certificate_2316() {
+        let mut model = ExactDecrementAtIterationCapModel {
+            exact_calls: 0,
+            // Outside strict KKT (1e-6) but inside the 10× soft band.
+            gradient: 5.0e-6,
+            // Force LM rejection so the loop exits through soft acceptance
+            // before the accepted-state exact-decrement check.
+            candidate_deviance: 2.0,
+        };
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 1,
+            convergence_tolerance: 1e-6,
+            adaptive_kkt_tolerance: None,
+            max_step_halving: 1,
+            min_step_size: 0.0,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+            initial_lm_lambda: None,
+            arrow_schur: None,
+        };
+
+        let result =
+            runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
+                .expect("the exact final-state decrement certifies a soft LM stall");
 
         assert_eq!(model.exact_calls, 1);
         assert_eq!(result.status, PirlsStatus::Converged);

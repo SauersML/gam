@@ -1293,8 +1293,7 @@ where
                                 predicted_reduction,
                                 lin,
                                 direction.dot(direction).sqrt(),
-                                0.5
-                                    * penalized_dev_scale
+                                0.5 * penalized_dev_scale
                                     * (state.deviance - accepted_state.deviance),
                                 0.5 * (state.penalty_term - accepted_state.penalty_term),
                                 state.deviance,
@@ -1522,8 +1521,7 @@ where
                                 predicted_reduction,
                                 lin,
                                 direction.dot(direction).sqrt(),
-                                0.5
-                                    * penalized_dev_scale
+                                0.5 * penalized_dev_scale
                                     * (state.deviance - final_state_ref.deviance),
                                 0.5 * (state.penalty_term - final_state_ref.penalty_term),
                             );
@@ -2122,14 +2120,11 @@ where
                 // iterate is β̂ + d. Factorize the BARE (undamped) penalized
                 // Hessian — `state.hessian` carries no LM ridge (the damping
                 // lived only on the throwaway `regularized` clone in the loop).
-                let direction = StableSolver::new()
-                    .factorize(bare_h)
-                    .ok()
-                    .map(|factor| {
-                        let mut d = Array1::<f64>::zeros(state.gradient.len());
-                        solve_direction_with_dense_factor(&factor, &state.gradient, &mut d);
-                        d
-                    });
+                let direction = StableSolver::new().factorize(bare_h).ok().map(|factor| {
+                    let mut d = Array1::<f64>::zeros(state.gradient.len());
+                    solve_direction_with_dense_factor(&factor, &state.gradient, &mut d);
+                    d
+                });
                 if let Some(direction) = direction {
                     let step_finite = direction.iter().all(|v| v.is_finite());
                     // Guard against a runaway step: an exact Newton refinement
@@ -2207,7 +2202,15 @@ where
     // cap then turns the iteration budget into part of the mathematical
     // convergence definition. Recompute from the final accepted state instead;
     // the pre-step LM solve cannot certify this state.
-    let final_exact_decrement_sq = if status.is_failed_max_iterations() && polish_allowed {
+    // A soft stall is diagnostic, not terminal evidence.  It can be produced
+    // by an LM rejection before the accepted-state branch gets a chance to
+    // evaluate the exact decrement, so certify every finite non-converged
+    // checkpoint here rather than only iteration/LM exhaustion.  This also
+    // keeps the live fit-minting contract identical to the serialized-model
+    // contract: only a genuinely certified inner mode is recorded as
+    // `Converged`.
+    let can_still_certify = !status.is_converged() && status != PirlsStatus::Unstable;
+    let final_exact_decrement_sq = if can_still_certify && polish_allowed {
         model
             .exact_unconstrained_decrement_sq(&beta, &state)?
             .or_else(|| exact_newton_decrement_sq(&state))
@@ -2216,9 +2219,7 @@ where
     };
     let final_decrement_threshold = if final_exact_decrement_sq.is_some() {
         let final_dev_scale = model.penalized_deviance_scale()?;
-        kkt_tolerance
-            * kkt_tolerance
-            * (1.0 + penalizedobjective(&state, final_dev_scale).abs())
+        kkt_tolerance * kkt_tolerance * (1.0 + penalizedobjective(&state, final_dev_scale).abs())
     } else {
         0.0
     };
@@ -2234,9 +2235,9 @@ where
             status,
         );
     }
-    if status.is_failed_max_iterations() {
-        // Strict KKT met after the loop bailed: reclassify as a valid
-        // (if non-strictly-converged) minimum. The remaining soft-acceptance
+    if can_still_certify {
+        // Strict KKT is a convergence certificate regardless of which bounded
+        // loop exit led to the final state. The remaining soft-acceptance
         // criteria (near-stationary plateau, boundary saturation, relative
         // band) are checked uniformly through `pirls_soft_acceptance` so the
         // post-loop rescue and the per-iter early-exit stay in lockstep —
@@ -2245,42 +2246,43 @@ where
         // here.
         if state.certifies_kkt(final_projected_grad, kkt_tolerance) {
             log::debug!(
-                "[PIRLS] post-loop rescue: strict KKT after exhaustion \
+                "[PIRLS] final-state certification: strict KKT \
                  (‖g‖={final_projected_grad:.3e})",
             );
-            status = PirlsStatus::StalledAtValidMinimum;
+            status = PirlsStatus::Converged;
         } else if final_exact_decrement_pass {
             log::debug!(
-                "[PIRLS] post-loop rescue: exact decrement after exhaustion \
+                "[PIRLS] final-state certification: exact decrement \
                  (‖g‖={final_projected_grad:.3e}, decrement_sq={:.3e})",
                 final_exact_decrement_sq.unwrap_or(f64::NAN),
             );
             status = PirlsStatus::Converged;
-        } else if pirls_soft_acceptance(
-            &state,
-            final_projected_grad,
-            SoftAcceptProgress::Realized {
-                dev_change: last_deviance_change,
-            },
-            max_abs_eta,
-            options.convergence_tolerance,
-            kkt_tolerance,
-        )
-        // A constrained fit may only be rescued onto a plateau / relative-band /
-        // boundary-saturation soft acceptance when its constraint-KKT residual
-        // is within the SAME degeneracy-aware band the outer gate applies, so
-        // the rescue cannot certify a stalled non-degenerate cone face the outer
-        // gate would reject (#873). Unconstrained fits keep the existing rescue.
-        .filter(|_| {
-            !has_explicit_constraints
-                || constraint_kkt_admits_soft_accept(
-                    options,
-                    beta.as_ref(),
-                    &state.gradient,
-                    kkt_tolerance,
-                )
-        })
-        .is_some()
+        } else if status.is_failed_max_iterations()
+            && pirls_soft_acceptance(
+                &state,
+                final_projected_grad,
+                SoftAcceptProgress::Realized {
+                    dev_change: last_deviance_change,
+                },
+                max_abs_eta,
+                options.convergence_tolerance,
+                kkt_tolerance,
+            )
+            // A constrained fit may only be rescued onto a plateau / relative-band /
+            // boundary-saturation soft acceptance when its constraint-KKT residual
+            // is within the SAME degeneracy-aware band the outer gate applies, so
+            // the rescue cannot certify a stalled non-degenerate cone face the outer
+            // gate would reject (#873). Unconstrained fits keep the existing rescue.
+            .filter(|_| {
+                !has_explicit_constraints
+                    || constraint_kkt_admits_soft_accept(
+                        options,
+                        beta.as_ref(),
+                        &state.gradient,
+                        kkt_tolerance,
+                    )
+            })
+            .is_some()
         {
             log::debug!(
                 "[PIRLS] post-loop rescue on soft acceptance \
