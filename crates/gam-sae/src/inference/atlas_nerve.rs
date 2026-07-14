@@ -1307,8 +1307,9 @@ mod tests {
         let equator = [2, 3, 4, 5];
         let mut faces = Vec::with_capacity(8);
         for position in 0..equator.len() {
-            let a = equator[position];
-            let b = equator[(position + 1) % equator.len()];
+            let endpoints = (equator[position], equator[(position + 1) % equator.len()]);
+            let a = endpoints.0.min(endpoints.1);
+            let b = endpoints.0.max(endpoints.1);
             faces.push(vec![0, a, b]);
             faces.push(vec![1, a, b]);
         }
