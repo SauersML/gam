@@ -1333,6 +1333,7 @@ fn extract_spatial_operator_runtime_caches(
                         input_scale,
                         aniso_log_scales,
                         operator_collocation_points: Some(collocation_points),
+                        radial_reparam,
                         ..
                     },
                 ) => {
@@ -1349,7 +1350,7 @@ fn extract_spatial_operator_runtime_caches(
                             aniso_log_scales.as_deref(),
                             identifiability_transform.as_ref().map(|z| z.view()),
                             2,
-                            None,
+                            radial_reparam.as_ref().map(|v| v.view()),
                             &mut BasisWorkspace::default(),
                         )?;
                     (
