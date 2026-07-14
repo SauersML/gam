@@ -748,7 +748,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         const RESIDUAL_STALL_NO_IMPROVE_CYCLES: usize = 30;
         const RESIDUAL_STALL_MIN_CYCLES: usize = 40;
         const RESIDUAL_STALL_IMPROVEMENT_FACTOR: f64 = 0.9;
-        const RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR: f64 = 50.0;
         // Upper bound on how long a still-descending Φ-merit may VETO the
         // flat-residual stall exit (gam#979 survival marginal-slope hang). The
         // merit-descent veto below (`merit_still_descending_over_window`) was
@@ -994,13 +993,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // `JEFFREYS_COMPLETION_RESIDUAL_BAND × residual_tol`, consumed by the
         // next cycle's dense-spectral step assembly.
         let mut jeffreys_completion_endgame = false;
-        // Plateau streak on |Δobj| ≤ objective_tol. The scale-aware
-        // flatness predicate stays local to this loop; the streak/window
-        // discipline (grow on flat, reset on recovery) is the shared
-        // loop_guard::FlatStreak so it cannot drift from the other
-        // stagnation detectors in the tree (#968).
-        let mut obj_flat_streak =
-            gam_solve::loop_guard::FlatStreak::new(gam_solve::loop_guard::PLATEAU_DEFAULT_WINDOW);
         // Total descent budget across the joint-Newton loop, used by
         // the end-of-loop summary to report `descent_total`.
         let initial_joint_objective: f64 = lastobjective;
@@ -2452,9 +2444,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     last_joint_math = None;
                     last_kkt_refusal_report = None;
                     prev_kkt_norm = None;
-                    obj_flat_streak = gam_solve::loop_guard::FlatStreak::new(
-                        gam_solve::loop_guard::PLATEAU_DEFAULT_WINDOW,
-                    );
                     geometric_tail_history.clear();
                 } else {
                     log::info!(
@@ -3791,171 +3780,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                          early-exit: every trust-region attempt rejected (by any of the model / \
                          likelihood / objective paths) — {} at joint trust radius {:.3e}. Reverted β \
                          + identical Newton system mean the next cycle's step is byte-identical to \
-                         this one's; no descent direction is reachable from this iterate under the \
-                         current local model. {}. Checking identified-subspace stationarity before \
-                         declaring non-convergence.",
+                         this one's; no accepted descent step is reachable from this iterate under the \
+                         current local model. {}. The strict KKT residual has not converged, so \
+                         returning non-converged.",
                         cycle,
                         stall_trigger,
                         joint_trust_radius,
                         last_math_summary,
                     );
-                    // Judge convergence on the IDENTIFIED (range) subspace
-                    // before declaring non-convergence. A fully-rejected stall
-                    // at a collapsed trust radius (every trial rejected at
-                    // ~noise, ΔNLL ≈ 1 ULP) is the PROOF the descent direction
-                    // is gauge-flat: the raw KKT residual (the biobank fit's
-                    // 0.5) lives in the unidentified ker(H_pen) direction (the
-                    // gauge-flat marginal/logslope coupling, same family as the
-                    // c5d327ba4 separation false-positive), which the outer IFT
-                    // pseudo-inverse projects out. Reuse the EXACT machinery the
-                    // normal converged path uses (gam#979 commit 09b584024):
-                    // the active-set-projected stationarity vector
-                    // (`exact_newton_joint_projected_stationarity_vector_from_gradient`)
-                    // restricted to range(H+Sλ) via
-                    // `projected_residual_range_space_inf`. If the identified-
-                    // subspace residual is at tolerance the fit IS at a
-                    // numerically-stationary penalized optimum and must be
-                    // RETURNED converged; only if it is ALSO above tol is this a
-                    // genuine non-convergence. `cached_joint_gradient` was loaded
-                    // at the cycle-entry β, which is exactly the reverted
-                    // `old_beta` here, so the residual is evaluated at the
-                    // returned iterate.
-                    let stall_converged_on_identified_subspace = match cached_joint_gradient
-                        .as_ref()
-                    {
-                        Some(stall_gradient) => {
-                            match exact_newton_joint_projected_stationarity_vector_from_gradient(
-                                stall_gradient,
-                                &states,
-                                specs,
-                                &s_lambdas,
-                                ridge,
-                                options.ridge_policy,
-                                &block_constraints,
-                                Some(cached_active_sets.as_slice()),
-                                joint_penalty_stationarity_score(options, specs, &states).as_ref(),
-                            ) {
-                                Ok(stall_projected_residual_vec) => {
-                                    projected_residual_range_space_inf(
-                                        &stall_projected_residual_vec,
-                                        &joint_hessian_source,
-                                        &ranges,
-                                        &s_lambdas,
-                                        ridge,
-                                        options.ridge_policy,
-                                        total_p,
-                                    )
-                                    .filter(|range_residual| range_residual.is_finite())
-                                    .filter(|range_residual| *range_residual <= last_residual_tol)
-                                }
-                                Err(_) => None,
-                            }
-                        }
-                        None => None,
-                    };
-                    if let Some(stall_range_residual) = stall_converged_on_identified_subspace {
-                        log::info!(
-                            "[PIRLS/joint-Newton convergence] cycle {:>3} | fully-rejected stall \
-                             resolved as identified-subspace KKT convergence (gam#979): every \
-                             trust-region attempt rejected for {} cycles at trust radius {:.3e} \
-                             (objective flat to f64 precision along the proposal — the proof the \
-                             descent direction is gauge-flat), but the range-space \
-                             (identified-subspace) residual {:.3e} ≤ tol {:.3e}; the leftover raw \
-                             residual lives entirely in the unidentified ker(H_pen) gauge mode the \
-                             outer IFT projects out (gam#553). The iterate is at a \
-                             numerically-stationary penalized optimum — returning converged.",
-                            cycle,
-                            consecutive_held_rejected_cycles,
-                            joint_trust_radius,
-                            stall_range_residual,
-                            last_residual_tol,
-                        );
-                        if stall_range_residual.is_finite() {
-                            min_certified_residual =
-                                min_certified_residual.min(stall_range_residual);
-                        }
-                        converged = true;
-                        break;
-                    }
-                    // FULL-RANK FIXED-POINT FALLBACK (gam#979 survival marginal-slope).
-                    //
-                    // The range-space certificate above returns `None` when
-                    // `projected_residual_range_space_inf` finds `nullity == 0`:
-                    // at the REML optimum ρ the penalty `S(λ)` lifts the
-                    // gauge-flat marginal≈logslope alias direction (the n≈133
-                    // heart-failure fit's 0.956-overlap confound) to an
-                    // eigenvalue just ABOVE the `1e-10·λ_max` rank cutoff, so
-                    // H_pen reads numerically full-rank and there is no null
-                    // space to project the residual onto. The previous code then
-                    // declared non-convergence and ABORTED the whole fit — even
-                    // though the iterate is a provably-stationary penalized
-                    // optimum whose residual is floored at a small multiple of
-                    // tol by the near-singular conditioning, NOT by a reachable
-                    // descent direction.
-                    //
-                    // The honest discriminator is the SAME conjunction the
-                    // fully-rejected stall is built on, asserted explicitly so a
-                    // genuine non-convergence (a fit stalled FAR from tol with
-                    // real reducible range-space mass) still exits unconverged:
-                    //   (a) the joint trust radius has collapsed to its `1e-12`
-                    //       floor — no smaller step is representable;
-                    //   (b) `FULLY_REJECTED_STALL_MAX_CYCLES` consecutive cycles
-                    //       (or a byte-identical first-attempt objective) were
-                    //       fully rejected — β reverts identically, so the next
-                    //       step is bit-for-bit the same: a fixed point;
-                    //   (c) the last accepted Newton model was essentially exact
-                    //       (`trust_ratio ≈ 1` and scalar relative model error
-                    //       below `inner_tol`) — the quadratic model has nothing
-                    //       left to reduce.
-                    // Only when all three hold AND the best residual the solve
-                    // actually achieved is within the same `4×residual_tol` band
-                    // the sibling identified-subspace certificates use (lines
-                    // ~4497 / ~4659) AND the objective is flat do we certify. A
-                    // fit stalled at, say, 10×tol with reducible mass fails the
-                    // `best_residual_seen ≤ 4×tol` gate and still aborts.
-                    const FIXED_POINT_TRUST_RADIUS_CEIL: f64 = 1e-9;
-                    let model_exact = last_joint_math
-                        .as_ref()
-                        .map(|math| {
-                            (math.trust_ratio - 1.0).abs() <= 0.5
-                                && math.scalar_model_relative_error() <= inner_tol.max(1e-6)
-                        })
-                        .unwrap_or(false);
-                    let provable_fixed_point = joint_trust_radius <= FIXED_POINT_TRUST_RADIUS_CEIL
-                        && (consecutive_held_rejected_cycles >= FULLY_REJECTED_STALL_MAX_CYCLES
-                            || consecutive_identical_rejected_cycles
-                                >= IDENTICAL_REJECTED_STALL_MAX_CYCLES
-                            || consecutive_all_reject_at_floor_cycles
-                                >= JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES)
-                        && model_exact;
-                    if provable_fixed_point
-                        && last_cycle_obj_change_below_tol
-                        && best_residual_seen.is_finite()
-                        && best_residual_seen <= 4.0 * last_residual_tol
-                    {
-                        log::info!(
-                            "[PIRLS/joint-Newton convergence] cycle {:>3} | fully-rejected stall \
-                             resolved as full-rank fixed-point KKT convergence (gam#979): trust \
-                             radius collapsed to {:.3e} (≤ floor), {} consecutive fully-rejected \
-                             cycles, last Newton model exact (ρ≈1, scalar_relerr small), and the \
-                             objective is flat — a provably-stationary penalized optimum. H_pen reads \
-                             full-rank at the optimal ρ (the gauge-flat alias eigenvalue sits above \
-                             the rank cutoff), so the range-space certificate has no null space to \
-                             project; the best achieved KKT residual {:.3e} ≤ 4×tol {:.3e} is the \
-                             near-singular conditioning floor, not reducible descent — returning \
-                             converged.",
-                            cycle,
-                            joint_trust_radius,
-                            consecutive_held_rejected_cycles,
-                            best_residual_seen,
-                            4.0 * last_residual_tol,
-                        );
-                        if best_residual_seen.is_finite() {
-                            min_certified_residual = min_certified_residual.min(best_residual_seen);
-                        }
-                        converged = true;
-                        break;
-                    }
                     converged = false;
                     break;
                 }
@@ -4233,16 +4065,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             {
                 jeffreys_completion_endgame = true;
             }
-            let block_stationarity_tolerances = block_gradient_norms
-                .iter()
-                .zip(&block_penalty_norms)
-                .map(|(grad_norm, penalty_norm)| inner_tol * (1.0 + grad_norm.max(*penalty_norm)))
-                .collect::<Vec<_>>();
             // Active-set-projected stationarity residual vector (multiplier
-            // mass of every pinned bound row already subtracted). Lifted out of
-            // the per-block norm reduction so the constrained-stationary
-            // certificate below can also test its component in the *range* of
-            // the penalized Hessian (gam#553 penalty-null-space acceptance).
+            // mass of every pinned bound row already subtracted). Keep the full
+            // vector so the constrained-stationary certificate can distinguish
+            // represented active-set multipliers from unresolved KKT mass.
             let projected_residual_vec =
                 exact_newton_joint_projected_stationarity_vector_from_gradient(
                     gradient,
@@ -4271,52 +4097,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     })
                     .collect::<Vec<_>>()
             };
-            // Per-block stationarity must be judged on the IDENTIFIED (range-space)
-            // residual, not the raw active-set-projected residual (gam#979). On the
-            // survival I-spline time block the unpenalized affine baseline direction
-            // is a genuine ker(H_pen) gauge mode: the raw per-block residual keeps
-            // the full gradient component along it (the measured ~28 plateau at λ≈1e7
-            // that the absolute tol can never reach), so the raw gate falsely rejects
-            // a solve that IS stationary on every identifiable direction — the
-            // residual mass it sees is the free gauge the outer IFT projects out
-            // (gam#553). Use the range-projected per-block residual when a penalty
-            // null space exists; fall back to the raw per-block residual when it does
-            // not (there range == whole space, so they coincide and the strict gate
-            // is unchanged for every well-identified family).
-            //
-            // PERF (gam#1082): the range projection eigendecomposes the FULL P·M
-            // joint penalized Hessian — an O((P·M)³) cost. The two certificates
-            // that consume the range-projected gate (the residual-stall and
-            // relative-plateau exits below) only fire under rare preconditions
-            // (`tr_clamped_during_stall` after a long no-improve streak; a latched
-            // objective plateau). Computing the eigh EVERY inner cycle therefore
-            // added a redundant O(p³) eigendecomposition per cycle to every
-            // penalized family carrying a null space (every tp-smooth model) — the
-            // multinomial smooth-by-factor wall-clock regression.
-            //
-            // The eigh is deferred to `range_projected_block_stationarity_small`
-            // (called ONLY inside a certificate branch whose cheap precondition has
-            // already passed via short-circuit `&&`), so on the convergence-tail
-            // it runs at most once per accepted exit rather than once per cycle.
-            let range_projected_block_stationarity_small = || -> bool {
-                projected_residual_range_space_per_block_inf(
-                    &projected_residual_vec,
-                    &joint_hessian_source,
-                    &ranges,
-                    &s_lambdas,
-                    ridge,
-                    options.ridge_policy,
-                    total_p,
-                )
-                .unwrap_or_else(|| block_stationarity_norms.clone())
-                .iter()
-                .zip(&block_stationarity_tolerances)
-                .all(|(norm, tol)| {
-                    norm.is_finite()
-                        && tol.is_finite()
-                        && *norm <= RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR * *tol
-                })
-            };
             // gam#1082 perf: a per-cycle #979 divergence-trace logging block
             // lived here and computed — EVERY inner cycle for the first 40
             // cycles, purely to feed two `log::info!` lines — a FULL O((P·M)³)
@@ -4331,10 +4111,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // was the dominant wall-clock cost (the #1082 overrun the outer
             // rel-cost decouple could not touch, because the cost is
             // per-inner-cycle, not per-outer-iteration). The trace has served
-            // its #979 purpose and is removed from the production hot path; every
-            // convergence-relevant quantity (`residual`, `block_stationarity_norms`,
-            // and the lazily-evaluated range-space gate above) is still computed
-            // where the gate actually consumes it.
+            // its #979 purpose and is removed from the production hot path; the
+            // strict residual and per-block diagnostics remain available without
+            // introducing a second numerical rank decision.
             let near_convergence = residual <= 10.0 * residual_tol;
             // Augmented-objective change: `(quad(new) − Φ_gated(new)) −
             // (quad(old) − Φ_gated(old))`. `lastobjective` is quadratic-only and
@@ -4398,8 +4177,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // into an O(p³)-per-cycle crawl (a dominant face of the #1082
             // multinomial wall-clock overrun: the cost is per-stalled-cycle, not
             // per-outer-iteration). The diagnostic is removed from the hot path;
-            // the inner solve's own stall handling (trust-region clamp,
-            // Newton-decrement and range-space convergence certificates) governs
+            // the inner solve's own stall handling (trust-region clamp and
+            // Newton-decrement certificate) governs
             // termination, and the cheap per-cycle convergence line above already
             // surfaces residual/step/per-block-residual for observability.
 
@@ -4482,68 +4261,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             if joint_inner_kkt_converged(residual, residual_tol) {
                 finish_post_step_convergence!();
             }
-            // Identified-subspace (range-space) KKT certificate.
-            //
-            // The strict certificate above tests the FULL stationarity residual
-            // ‖∇L − Sβ‖∞. On a genuinely rank-deficient penalized inner problem
-            // — a degenerate small-n transformation-normal CTM/Box-Cox fit whose
-            // joint Hessian carries an *unidentified* direction the
-            // canonical-gauge pass cannot attribute to a single block (the same
-            // structural null root-caused for the joint-Newton panic at
-            // `solve_joint_newton_step_on_spectral_range`) — the stationarity
-            // gradient keeps a fixed nonzero component inside ker(H_pen). The
-            // spectral Newton step drops exactly that component (range-restricted
-            // Moore–Penrose step: every null direction hits the `continue` branch
-            // in the accumulation loop), so β converges on the identified
-            // subspace and the step exhausts, yet the FULL residual never reaches
-            // `residual_tol`. The strict test then runs the whole cycle budget
-            // "non-converged" on an iterate that is, in fact, the optimum on the
-            // only identifiable directions.
-            //
-            // The principled certificate is stationarity on range(H_pen): the
-            // residual restricted to the curved (identified) subspace is at
-            // tolerance while the leftover mass is provably confined to
-            // ker(H_pen) — an unidentified direction with neither curvature nor
-            // constraint. That null component is dropped by the spectral step
-            // here and projected out of the KKT residual by the outer IFT
-            // pseudo-inverse `U_S·H_proj⁻¹·U_Sᵀ` before the envelope correction
-            // (see the gam#553 note and `projected_residual_range_space_inf`), so
-            // it cannot bias the outer gradient.
-            //
-            // The remaining requirement is to prove we are AT the
-            // range-restricted optimum rather than mid-descent, so this does not
-            // short-circuit a genuinely nonlinear CTM fit that is still moving β.
-            // There are two independent, equally-rigorous proofs of that, and
-            // EITHER suffices once `range_residual ≤ residual_tol` has fired:
-            //   (a) the full Newton step is exhausted (`step_inf ≤ step_tol`):
-            //       the well-identified case, where the range-restricted step
-            //       collapses to zero and the leftover ker(H_pen) component is
-            //       already dropped by the spectral step, so the FULL step is
-            //       small too; OR
-            //   (b) the objective has stopped changing
-            //       (`objective_change ≤ objective_tol`): the joint objective
-            //       (−loglik + ½βᵀSβ) is a function of the IDENTIFIED coordinates
-            //       ONLY — moving β along an unidentified direction in ker(H_pen)
-            //       = ker(H_L) ∩ ker(S) changes neither the likelihood nor the
-            //       penalty by construction — so a flat objective proves no
-            //       identified-direction descent remains regardless of how large
-            //       the FULL step is.
-            // Proof (b) is the certificate that the constant-scale AFT (#736) and
-            // the degenerate CTM (#733/#734) need: their unidentified cross-block
-            // null (the time_transform polynomial/affine deviation aliased into
-            // threshold/log_sigma) keeps the Levenberg-damped, trust-region-clamped
-            // FULL step perpetually nonzero — `step_inf` never reaches `step_tol`
-            // — even though the identified fit is exactly at its optimum (zero
-            // range-space residual, frozen objective). Tying the certificate ONLY
-            // to the full step (proof (a)) therefore burned the entire 200/84-cycle
-            // budget on an iterate that is already optimal on every identifiable
-            // direction, and the inner solve was rejected by the FULL-residual KKT
-            // check. Adding proof (b) certifies on the identified subspace without
-            // loosening anything for a genuinely-identified fit: there
-            // `projected_residual_range_space_inf` returns `None` (nullity == 0 ⇒
-            // range == whole space), so this branch is dormant and the strict
-            // full-residual path above governs unchanged.
-            //
             // Newton-decrement convergence certificate (gam#1040 / gam#1088).
             //
             // The strict / identified-subspace / constrained certificates all
@@ -4696,147 +4413,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 finish_post_step_convergence!();
             }
 
-            // Gauge-drift identified-subspace KKT certificate (gam#979 large-scale
-            // survival-MS stall). The certificate just below requires EITHER
-            // `step_inf ≤ step_tol` OR `objective_change ≤ objective_tol` as a
-            // precondition before it will even look at the range-projected
-            // residual. On the survival I-spline time block at large scale that
-            // precondition is a Catch-22: the block carries a genuine ker(H_pen)
-            // gauge mode (the unpenalized affine baseline — constant + linear time
-            // trend — that the joint design does not gauge-fix out), so the
-            // constrained QP keeps taking a small but NONZERO step (`step_inf` ~1e-4,
-            // never ≤ step_tol) that drifts the iterate ALONG that near-null
-            // direction, and because the direction has a tiny-but-nonzero curvature
-            // the merit keeps changing by `objective_change` ~0.3 per cycle (never
-            // ≤ objective_tol). Neither precondition is ever met, so the existing
-            // exit cannot fire even though the iterate IS already stationary on the
-            // entire identifiable subspace — the inner solve grinds to its hard
-            // cycle ceiling, the outer rejects the ρ-eval, and the fit times out
-            // (the measured cycles 8→20 trace: residual ~1.19e3, step_inf ~1e-4,
-            // obj_change ~0.34, beta_inf frozen at 2.269).
-            //
-            // The honest stationarity test for that regime drops the
-            // step/objective precondition and instead demands BOTH range-projected
-            // measures be at tolerance simultaneously: the GLOBAL identified-subspace
-            // residual `range_residual ≤ residual_tol` AND every BLOCK's
-            // range-projected stationarity small. The range projection drops exactly
-            // the ker(H_pen) gauge mass (the same mass the outer IFT pseudo-inverse
-            // projects out, gam#553), so when both pass the iterate is the REML
-            // optimum on the identifiable subspace by definition — the residual,
-            // step, and objective drift that remain live purely in the unidentified
-            // null and carry no outer-correctness information. The double
-            // (global + per-block) range gate cannot be satisfied by a genuinely
-            // non-stationary iterate: a real un-converged identifiable direction
-            // shows up in BOTH the global range residual and its block's
-            // range-projected component, so this never accepts a non-optimum on the
-            // identified subspace (it is strictly stronger than the single-gate exit
-            // below, only without the gauge-defeated step/objective precondition).
-            // Cheap precondition gating the O((P·M)³) range-projection eigh
-            // (gam#1082 perf discipline): only attempt this certificate once the
-            // raw residual has stopped improving for a few consecutive cycles —
-            // i.e. the iterate is no longer making descent progress in the
-            // identifiable subspace and the remaining motion is the gauge drift
-            // this exit exists to certify through. A healthy, fast-converging fit
-            // never trips this window (it converges via the strict residual / step
-            // certificates first), so it pays zero extra eigendecompositions; only
-            // a genuinely stalled solve reaches it, where one eigh per cycle on the
-            // short convergence tail is negligible against the alternative of
-            // grinding to the hard cycle ceiling.
-            //
-            // Tolerance (gam#1082): the range-projected residual is read off an
-            // O((P·M)³) eigendecomposition of the joint penalized Hessian and
-            // reconstructed by summing the residual's coordinates along every
-            // range-space eigenvector. On a large joint design (the multinomial
-            // smooth-by-factor fit is ~382-dim, K−1 coupled blocks × one global
-            // smooth + one smooth per group level, each select=TRUE with a
-            // wiggliness AND a null-space-shrinkage penalty) that reconstruction
-            // carries O(p·ε·‖r‖) round-off, so the identified-subspace residual
-            // FLOORS a few × above the (already tiny, `inner_tol·(1+…)`-scaled)
-            // `residual_tol`. Demanding the strict 1× `residual_tol` here is
-            // therefore unreachable for a genuinely range-stationary iterate whose
-            // remaining mass is pure ker(H_pen) gauge drift — exactly the
-            // multinomial regime, where the gauge mode keeps the objective drifting
-            // (so the sibling obj-plateau / step-or-obj exits below never fire) and
-            // the inner solve grinds to `inner_max_cycles`, each cycle paying one
-            // full Newton-step eigh (the #1082 wall-clock blow-up the profile
-            // pins on `WhitenedHessianSpectrum::decompose`). The honest, mature
-            // identified-subspace tolerance is the SAME `4×residual_tol` the
-            // relative-objective-plateau gauge exit below already uses to certify
-            // the identical mathematical condition (range-space stationarity); the
-            // 1× here was an unjustified asymmetry below the eigh-reconstruction
-            // floor. The gauge-drift precondition (raw residual stalled ≥ window
-            // AND per-block range-stationarity) is strictly stronger than the
-            // plateau exit's, so widening the global range tolerance to match it
-            // cannot accept a non-optimum on the identified subspace.
-            const GAUGE_DRIFT_STALL_WINDOW: usize = 3;
-            const RANGE_RESIDUAL_EIGH_FLOOR_FACTOR: f64 = 4.0;
-            if cycles_since_residual_improved >= GAUGE_DRIFT_STALL_WINDOW
-                && let Some(range_residual) = projected_residual_range_space_inf(
-                    &projected_residual_vec,
-                    &joint_hessian_source,
-                    &ranges,
-                    &s_lambdas,
-                    ridge,
-                    options.ridge_policy,
-                    total_p,
-                )
-                && range_residual <= RANGE_RESIDUAL_EIGH_FLOOR_FACTOR * residual_tol
-                && range_projected_block_stationarity_small()
-            {
-                log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | gauge-drift identified-subspace KKT certificate (gam#979): total residual={:.3e} > tol={:.3e}, step_inf={:.3e} (step_tol={:.3e}) and |Δobjective|={:.3e} (obj_tol={:.3e}) both still nonzero from drift along an unidentified ker(H_pen) gauge mode (an unpenalized baseline/gauge direction the joint design does not fix out), but the range-space (identified-subspace) residual={:.3e} ≤ {:.3e} (= {}×tol, the eigh-reconstruction floor) AND every block's range-projected stationarity is at tolerance — the iterate is stationary on the entire identifiable subspace; the remaining residual/step/objective drift lives purely in the gauge null the outer IFT projects out (gam#553).",
-                    cycle,
-                    residual,
-                    residual_tol,
-                    step_inf,
-                    step_tol,
-                    objective_change,
-                    objective_tol,
-                    range_residual,
-                    RANGE_RESIDUAL_EIGH_FLOOR_FACTOR * residual_tol,
-                    RANGE_RESIDUAL_EIGH_FLOOR_FACTOR,
-                );
-                if range_residual.is_finite() {
-                    min_certified_residual = min_certified_residual.min(range_residual);
-                }
-                finish_post_step_convergence!();
-            }
-
-            // Unlike the constrained-stationary path below, this fires on a pure
-            // identifiability null without requiring the `linearized_rel ≥ 0.5`
-            // constraint-multiplier signature, which a structural rank-deficiency
-            // need not produce.
-            if (step_inf <= step_tol || objective_change <= objective_tol)
-                && let Some(range_residual) = projected_residual_range_space_inf(
-                    &projected_residual_vec,
-                    &joint_hessian_source,
-                    &ranges,
-                    &s_lambdas,
-                    ridge,
-                    options.ridge_policy,
-                    total_p,
-                )
-                && range_residual <= residual_tol
-            {
-                log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | identified-subspace KKT certificate: total residual={:.3e} > tol={:.3e} but its range-space (identified-subspace) component={:.3e} ≤ tol={:.3e}, step_inf={:.3e} (step_tol={:.3e}), |Δobjective|={:.3e} (obj_tol={:.3e}); the leftover residual lies in the unidentified penalized-Hessian null space ker(H_pen) (dropped by the range-restricted spectral step and projected out by the outer IFT pseudo-inverse) — the iterate is stationary on the entire identifiable subspace (proof: {}).",
-                    cycle,
-                    residual,
-                    residual_tol,
-                    range_residual,
-                    residual_tol,
-                    step_inf,
-                    step_tol,
-                    objective_change,
-                    objective_tol,
-                    if step_inf <= step_tol {
-                        "full Newton step exhausted"
-                    } else {
-                        "objective frozen on the identified subspace while the unidentified null keeps the full step nonzero"
-                    },
-                );
-                finish_post_step_convergence!();
-            }
             // Noise-floor KKT certificate.
             //
             // Reading the joint stationarity residual ‖∇L(β) − Sβ‖_∞ at finite
@@ -5032,52 +4608,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             cert_residual_factor * residual_tol,
                             objective_change,
                             geometric_tail_bound.unwrap_or(objective_change),
-                            objective_tol,
-                        );
-                        finish_post_step_convergence!();
-                    }
-                    // Penalty-null-space acceptance (gam#553). The phantom-
-                    // multiplier refusal fires when the active-set-projected
-                    // residual is above tolerance, but that residual can be
-                    // confined to `ker(H_pen)` — the polynomial null space of a
-                    // penalized smooth (TP / Bernstein trend) that the censored
-                    // location-scale / custom-family data does not pin down in
-                    // the time_transform / log_sigma channel. Along that
-                    // direction there is neither curvature nor a constraint, so
-                    // it is a genuinely free gauge direction and the iterate is
-                    // stationary on the entire identifiable (range) subspace.
-                    // The downstream outer IFT trace removes exactly this
-                    // null-space component via the projected pseudo-inverse, so
-                    // only a *range-space* residual biases the envelope gradient
-                    // (the precise concern of the "do NOT soft-accept" note
-                    // below). Accept iff the range-space residual is at
-                    // tolerance — preserving outer-gradient correctness while no
-                    // longer aborting a well-posed fit on a data-unconstrained
-                    // null direction.
-                    if let Some(range_residual) = projected_residual_range_space_inf(
-                        &projected_residual_vec,
-                        &joint_hessian_source,
-                        &ranges,
-                        &s_lambdas,
-                        ridge,
-                        options.ridge_policy,
-                        total_p,
-                    ) && range_residual <= cert_residual_factor * residual_tol
-                    {
-                        log::info!(
-                            "[PIRLS/joint-Newton convergence] cycle {:>3} | penalty-null-space certificate (gam#553): \
-                             total projected residual={:.3e} > tol={:.3e} but its range-space (curved-subspace) \
-                             component={:.3e} ≤ {:.1}×tol={:.3e}; the remaining residual lies in the data-unconstrained \
-                             penalty null space ker(H_pen) (a free polynomial-trend gauge direction, not a defect) and is \
-                             projected out of the KKT residual by the outer IFT pseudo-inverse before the envelope \
-                             correction; |Δobjective|={:.3e}, obj_tol={:.3e}",
-                            cycle,
-                            residual,
-                            cert_residual_factor * residual_tol,
-                            range_residual,
-                            cert_residual_factor,
-                            cert_residual_factor * residual_tol,
-                            objective_change,
                             objective_tol,
                         );
                         finish_post_step_convergence!();
@@ -5418,14 +4948,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // Track the best residual seen so far and the number of
             // cycles since any meaningful improvement (≥ 10 % drop). Once
             // the inner has burned at least RESIDUAL_STALL_MIN_CYCLES
-            // without progress, the accepted step kept hitting the
-            // trust-region clamp, AND every block is already inside a
-            // loose stationarity band, return `converged = false` with
-            // the current finite β. The per-block gate is essential for
-            // block-metric trust regions: an aggregate residual plateau
-            // dominated by one near-singular block must not hide an
-            // unresolved marginal block that can still make progress under
-            // its own radius.
+            // without progress and the accepted step kept hitting the
+            // trust-region clamp, return `converged = false` with the current
+            // finite β. A stalled residual above the strict KKT tolerance is
+            // not converted into convergence by a pointwise Hessian rank test.
             if residual.is_finite() {
                 if residual < RESIDUAL_STALL_IMPROVEMENT_FACTOR * best_residual_seen {
                     best_residual_seen = residual;
@@ -5489,66 +5015,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
                 && tr_clamped_during_stall
-                && range_projected_block_stationarity_small()
             {
-                // Penalty-null-space certificate at the STALL exit (gam#1040).
-                // The survival marginal-slope joint block carries free gauge
-                // directions (the #892 flexible-regime warp family) with no
-                // curvature and no constraint: the optimizer drifts along them
-                // with zero objective change, the Newton step never shrinks to
-                // step_tol (nothing pins it), so the constrained-stationary
-                // certificate's step-exhausted precondition is UNSATISFIABLE
-                // and every full-budget solve used to exit here unconverged —
-                // the outer REML then rejects ρ-evaluation after ρ-evaluation
-                // and cycles for hours (#1040: matern/duchon/measure-jet all
-                // time out; binary-MS, which has no such direction, fits in
-                // seconds). Stationarity on the identifiable subspace is the
-                // honest convergence statement: if the projected residual's
-                // component in the RANGE of H_pen is at tolerance, the stalled
-                // mass lives in ker(H_pen) — exactly what the outer IFT
-                // projects out before the envelope correction (gam#553) — and
-                // the iterate is accepted. A residual with genuine range-space
-                // mass (a real defect) still exits unconverged below.
-                if objective_change <= objective_tol
-                    && let Some(range_residual) = projected_residual_range_space_inf(
-                        &projected_residual_vec,
-                        &joint_hessian_source,
-                        &ranges,
-                        &s_lambdas,
-                        ridge,
-                        options.ridge_policy,
-                        total_p,
-                    )
-                    && range_residual <= 4.0 * residual_tol
-                {
-                    log::info!(
-                        "[PIRLS/joint-Newton convergence] cycle {:>3} | residual-stall range-space certificate (gam#1040): \
-                         total projected residual={:.3e} > tol={:.3e} stalled for {} cycles, but its range-space component={:.3e} \
-                         ≤ 4×tol={:.3e} and |Δobjective|={:.3e} ≤ obj_tol={:.3e}; the stalled mass is a free \
-                         ker(H_pen) gauge direction the outer IFT pseudo-inverse projects out — accepting as stationary \
-                         on the identifiable subspace.",
-                        cycle,
-                        residual,
-                        residual_tol,
-                        cycles_since_residual_improved,
-                        range_residual,
-                        4.0 * residual_tol,
-                        objective_change,
-                        objective_tol,
-                    );
-                    // Record the residual this exit actually certified on
-                    // (#1040 inner-report truthfulness): the converged status is
-                    // earned by `range_residual ≤ 4×tol` on the identifiable
-                    // subspace, so the terminal line must report that finite
-                    // certified residual — not the `inf` stall-tracker sentinel,
-                    // which a cycle-1 certificate exit (head KKT non-finite, so
-                    // the head-of-cycle `min` update was skipped) would otherwise
-                    // leave unset, printing `converged=true … best_residual_inf=inf`.
-                    if range_residual.is_finite() {
-                        min_certified_residual = min_certified_residual.min(range_residual);
-                    }
-                    finish_post_step_convergence!();
-                }
                 let last_math_summary = last_joint_math
                     .as_ref()
                     .map(|math| {
@@ -5636,67 +5103,13 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     || superconverged_stationarity)
             {
                 log::info!(
-                    "[JN-EXIT] cycle={cycle} reason=plateau_objective_flat residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} consecutive_flat={} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
-                    obj_flat_streak.streak(),
+                    "[JN-EXIT] cycle={cycle} reason=strict_kkt residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
                 );
                 // This branch certifies on `residual ≤ residual_tol`; record it
                 // so the terminal line reports the finite certified residual
                 // rather than the `inf` stall sentinel (#1040 truthfulness).
                 if residual.is_finite() {
                     min_certified_residual = min_certified_residual.min(residual);
-                }
-                finish_post_step_convergence!();
-            }
-            // Scale-invariant objective-plateau exit (gam#1040). The flatness
-            // predicate is RELATIVE — `objective_tol = inner_tol·(1+|obj|)` —
-            // so it fires identically whether the survival NLL objective is
-            // O(1) or O(1e4); a fixed absolute ε never trips at the ~6e4
-            // magnitude of a marginal-slope survival fit. When the objective
-            // has been relative-flat for the full `FlatStreak` window the
-            // iterate has stopped moving in value. On a genuinely flat REML
-            // valley along the weakly-identified time-wiggle ρ the Newton
-            // step is tiny because the gradient is tiny (not because the
-            // trust region truncated it), so the `tr_clamped_during_stall`
-            // precondition of the residual-stall range-space certificate
-            // above is UNSATISFIED and that exit never fires — the loop used
-            // to grind to `inner_loop_hard_ceiling` every outer eval, which
-            // is the #1040 hang (outer REML rejects ρ after ρ for hours).
-            // The honest convergence statement is identical to the tr-clamped
-            // path: if the projected residual's component in range(H_pen) is
-            // at tolerance, the un-moved mass lives in ker(H_pen) — the free
-            // gauge directions the outer IFT pseudo-inverse projects out
-            // (gam#553) — and the iterate IS the REML optimum on the
-            // identifiable subspace. Report converged.
-            let plateau_verdict = obj_flat_streak.note(objective_change <= objective_tol);
-            if plateau_verdict == gam_solve::loop_guard::LoopVerdict::Plateaued
-                && range_projected_block_stationarity_small()
-                && let Some(range_residual) = projected_residual_range_space_inf(
-                    &projected_residual_vec,
-                    &joint_hessian_source,
-                    &ranges,
-                    &s_lambdas,
-                    ridge,
-                    options.ridge_policy,
-                    total_p,
-                )
-                && range_residual <= 4.0 * residual_tol
-            {
-                log::info!(
-                    "[JN-EXIT] cycle={cycle} reason=relative_objective_plateau (gam#1040): \
-                     |Δobjective|={objective_change:.3e} ≤ obj_tol={objective_tol:.3e} for {} \
-                     consecutive cycles (scale-invariant rel-flat streak); total projected \
-                     residual={residual:.3e} > tol={residual_tol:.3e} but its range-space \
-                     component={range_residual:.3e} ≤ 4×tol={:.3e} — the un-moved mass is a free \
-                     ker(H_pen) gauge direction the outer IFT projects out; accepting as stationary \
-                     on the identifiable subspace.",
-                    obj_flat_streak.streak(),
-                    4.0 * residual_tol,
-                );
-                // Certified on `range_residual ≤ 4×tol`; record it so the
-                // terminal report carries this finite certified residual
-                // instead of the `inf` stall sentinel (#1040 truthfulness).
-                if range_residual.is_finite() {
-                    min_certified_residual = min_certified_residual.min(range_residual);
                 }
                 finish_post_step_convergence!();
             }

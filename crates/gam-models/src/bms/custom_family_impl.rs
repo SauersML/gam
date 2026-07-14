@@ -16,7 +16,10 @@ use super::*;
 fn active_explicit_psi_jeffreys_context(
     h_info: Array2<f64>,
     expected_dim: usize,
-) -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
+) -> Result<
+    Option<gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan>,
+    String,
+> {
     if h_info.dim() != (expected_dim, expected_dim) {
         return Ok(None);
     }
@@ -31,12 +34,13 @@ fn active_explicit_psi_jeffreys_context(
         return Ok(None);
     }
 
-    Ok(Some((z_joint, h_info)))
+    Ok(Some(plan))
 }
 
 #[cfg(test)]
 mod explicit_psi_jeffreys_plan_tests {
     use super::*;
+    use ndarray::array;
 
     #[test]
     fn reduced_plan_gates_explicit_psi_jeffreys_context() {
@@ -53,6 +57,458 @@ mod explicit_psi_jeffreys_plan_tests {
         assert!(active_explicit_psi_jeffreys_context(near_singular, 2)
             .expect("near-singular plan preparation should succeed")
             .is_some());
+    }
+
+    #[test]
+    fn explicit_psi_ab_row_identity_matches_scalar_coefficient_axes() {
+        // Pure algebra witness for the production row pullback.  `R` has the
+        // BMS shape (one nonzero primary row), while J, A, B and the symmetric
+        // third/fourth tensors are deliberately dense so every term fires.
+        let p = 3usize;
+        let r = 2usize;
+        let j = array![[1.0, -0.2, 0.4], [0.3, 0.7, -0.5]];
+        let r_psi = array![[0.6, -0.1, 0.25], [0.0, 0.0, 0.0]];
+        let a = array![[0.8, -0.2, 0.1], [-0.2, 0.5, 0.3], [0.1, 0.3, -0.4]];
+        let b = array![[0.4, 0.15, -0.25], [0.15, -0.3, 0.2], [-0.25, 0.2, 0.7]];
+        let beta = array![0.2, -0.6, 0.9];
+        let mut third = ndarray::Array3::<f64>::zeros((r, r, r));
+        let mut fourth = ndarray::Array4::<f64>::zeros((r, r, r, r));
+        for i in 0..r {
+            for j_idx in 0..r {
+                for k in 0..r {
+                    third[[i, j_idx, k]] =
+                        0.3 + 0.11 * (i + j_idx + k) as f64 + 0.07 * (i * j_idx * k) as f64;
+                    for l in 0..r {
+                        fourth[[i, j_idx, k, l]] = 0.2
+                            - 0.05 * (i + j_idx + k + l) as f64
+                            + 0.03 * (i * j_idx + i * k + i * l + j_idx * k + j_idx * l + k * l)
+                                as f64;
+                    }
+                }
+            }
+        }
+        let d = r_psi.dot(&beta);
+        let c_a = j.dot(&a).dot(&j.t());
+        let c_b = j.dot(&b).dot(&j.t());
+        let c_x = j.dot(&b).dot(&r_psi.t()) + r_psi.dot(&b).dot(&j.t());
+        let third_trace = |c: &Array2<f64>| -> Array1<f64> {
+            let mut out = Array1::<f64>::zeros(r);
+            for i in 0..r {
+                for k in 0..r {
+                    for l in 0..r {
+                        out[i] += third[[i, k, l]] * c[[k, l]];
+                    }
+                }
+            }
+            out
+        };
+        let mut u_c_b_d = Array1::<f64>::zeros(r);
+        for i in 0..r {
+            for k in 0..r {
+                for l in 0..r {
+                    for m in 0..r {
+                        u_c_b_d[i] += fourth[[i, k, l, m]] * c_b[[k, l]] * d[m];
+                    }
+                }
+            }
+        }
+        let primary = third_trace(&(&c_a + &c_x)) + u_c_b_d;
+        let pulled = j.t().dot(&primary) + r_psi.t().dot(&third_trace(&c_b));
+
+        let frobenius = |left: &Array2<f64>, right: &Array2<f64>| -> f64 {
+            left.iter()
+                .zip(right.iter())
+                .map(|(&x, &y)| x * y)
+                .sum()
+        };
+        let mut scalar_axes = Array1::<f64>::zeros(p);
+        for axis in 0..p {
+            let mut e = Array1::<f64>::zeros(p);
+            e[axis] = 1.0;
+            let jv = j.dot(&e);
+            let rv = r_psi.dot(&e);
+            let mut t_jv = Array2::<f64>::zeros((r, r));
+            let mut t_rv = Array2::<f64>::zeros((r, r));
+            let mut u_jv_d = Array2::<f64>::zeros((r, r));
+            for i in 0..r {
+                for k in 0..r {
+                    for l in 0..r {
+                        t_jv[[i, k]] += third[[i, k, l]] * jv[l];
+                        t_rv[[i, k]] += third[[i, k, l]] * rv[l];
+                        for m in 0..r {
+                            u_jv_d[[i, k]] += fourth[[i, k, l, m]] * jv[l] * d[m];
+                        }
+                    }
+                }
+            }
+            let d_h = j.t().dot(&t_jv).dot(&j);
+            let d_psi_h = r_psi.t().dot(&t_jv).dot(&j)
+                + j.t().dot(&t_jv).dot(&r_psi)
+                + j.t().dot(&u_jv_d).dot(&j)
+                + j.t().dot(&t_rv).dot(&j);
+            scalar_axes[axis] = frobenius(&a, &d_h) + frobenius(&b, &d_psi_h);
+        }
+        for axis in 0..p {
+            assert!(
+                (pulled[axis] - scalar_axes[axis]).abs() < 1.0e-12,
+                "A/B row identity axis {axis}: pullback={} scalar-axis={}",
+                pulled[axis],
+                scalar_axes[axis]
+            );
+        }
+    }
+}
+
+impl BernoulliMarginalSlopeFamily {
+    /// Fill `J_row * weight * J_row^T` in primary coordinates from the two
+    /// design-dependent projected rows and the constant identity-tail block.
+    /// This is the row-local inverse of `pullback_primary_vector`: marginal and
+    /// log-slope primaries carry design rows, while h/w primaries map directly
+    /// to their coefficient slots.
+    fn fill_explicit_psi_primary_sandwich(
+        slices: &BlockSlices,
+        primary: &PrimarySlices,
+        tail_pairs: &[(usize, usize)],
+        tail_tail: &[f64],
+        marginal_row: ndarray::ArrayView1<'_, f64>,
+        logslope_row: ndarray::ArrayView1<'_, f64>,
+        marginal_weight_projection: ndarray::ArrayView1<'_, f64>,
+        logslope_weight_projection: ndarray::ArrayView1<'_, f64>,
+        out: &mut [f64],
+    ) {
+        let r = primary.total;
+        debug_assert_eq!(tail_tail.len(), r * r);
+        debug_assert_eq!(out.len(), r * r);
+        out.copy_from_slice(tail_tail);
+
+        let mut qq = 0.0;
+        for (local, &design_value) in marginal_row.iter().enumerate() {
+            qq += design_value * marginal_weight_projection[slices.marginal.start + local];
+        }
+        let mut qg = 0.0;
+        for (local, &design_value) in logslope_row.iter().enumerate() {
+            qg += design_value * marginal_weight_projection[slices.logslope.start + local];
+        }
+        let mut gg = 0.0;
+        for (local, &design_value) in logslope_row.iter().enumerate() {
+            gg += design_value * logslope_weight_projection[slices.logslope.start + local];
+        }
+        out[primary.q * r + primary.q] = qq;
+        out[primary.q * r + primary.logslope] = qg;
+        out[primary.logslope * r + primary.q] = qg;
+        out[primary.logslope * r + primary.logslope] = gg;
+
+        for &(primary_idx, block_idx) in tail_pairs {
+            let q_tail = marginal_weight_projection[block_idx];
+            out[primary.q * r + primary_idx] = q_tail;
+            out[primary_idx * r + primary.q] = q_tail;
+            let g_tail = logslope_weight_projection[block_idx];
+            out[primary.logslope * r + primary_idx] = g_tail;
+            out[primary_idx * r + primary.logslope] = g_tail;
+        }
+    }
+
+    /// Exact coefficient pullback of `D_beta(partial_psi Phi)` from one
+    /// prepared Jeffreys `(A, B)` artifact, without coefficient-axis sweeps.
+    ///
+    /// For a row's primary design `J`, psi-design derivative `R`, third/fourth
+    /// derivative tensors `(T,U)`, and `d = R beta`, the identity is
+    ///
+    /// ```text
+    /// C_A = J A J^T
+    /// C_B = J B J^T
+    /// C_X = J B R^T + R B J^T
+    /// pullback = J^T [T:(C_A+C_X) + U:(C_B,d)] + R^T [T:C_B].
+    /// ```
+    ///
+    /// The coefficient-width work is performed by five chunked matrix products
+    /// per row panel.  Third/fourth row programs are then evaluated once in
+    /// primary space, reusing the authoritative exact-eval cache.
+    fn explicit_psi_jeffreys_mixed_row_pullback(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        axis: &PsiAxisSpec,
+        beta: &Array1<f64>,
+        weights: &gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights,
+    ) -> Result<Array1<f64>, String> {
+        cache
+            .row_primary_hessians
+            .reject_device_cpu_recompute("explicit-psi Jeffreys A/B row pullback")?;
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let total = slices.total;
+        let r = primary.total;
+        if beta.len() != total
+            || weights.beta_information.dim() != (total, total)
+            || weights.mixed_information.dim() != (total, total)
+        {
+            return Err(format!(
+                "BMS explicit-psi Jeffreys pullback shape mismatch: beta={}, A={:?}, B={:?}, total={total}",
+                beta.len(),
+                weights.beta_information.dim(),
+                weights.mixed_information.dim()
+            ));
+        }
+        let (axis_range, expected_primary) = match axis.block_idx {
+            0 => (slices.marginal.clone(), primary.q),
+            1 => (slices.logslope.clone(), primary.logslope),
+            block => {
+                return Err(format!(
+                    "BMS explicit-psi Jeffreys pullback only supports marginal/log-slope axes, got block {block}"
+                ));
+            }
+        };
+        if axis.idx_primary != expected_primary || axis.psi_map.ncols() != axis_range.len() {
+            return Err(format!(
+                "BMS explicit-psi Jeffreys axis mismatch: primary={} expected={}, psi cols={} block width={}",
+                axis.idx_primary,
+                expected_primary,
+                axis.psi_map.ncols(),
+                axis_range.len()
+            ));
+        }
+        let n = self.y.len();
+        if n == 0 {
+            return Ok(Array1::<f64>::zeros(total));
+        }
+
+        self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
+        if !self.effective_flex_active(block_states)? {
+            let third = self.rigid_third_full_cached(block_states, cache, 0)?;
+            ensure_finite_third_full_cache_row(
+                third,
+                "BMS explicit-psi Jeffreys third-cache warm-up",
+            )?;
+            let fourth = self.rigid_fourth_full_cached(block_states, cache, 0)?;
+            ensure_finite_fourth_full_cache_row(
+                fourth,
+                "BMS explicit-psi Jeffreys fourth-cache warm-up",
+            )?;
+        }
+
+        let tail_pairs = Self::primary_tail_block_pairs(slices, primary);
+        let tail_tail = |weight: &Array2<f64>| -> Vec<f64> {
+            let mut out = vec![0.0; r * r];
+            for &(primary_a, block_a) in &tail_pairs {
+                for &(primary_b, block_b) in &tail_pairs {
+                    out[primary_a * r + primary_b] = weight[[block_a, block_b]];
+                }
+            }
+            out
+        };
+        let a_tail_tail = tail_tail(&weights.beta_information);
+        let b_tail_tail = tail_tail(&weights.mixed_information);
+
+        // `d = R beta` is always a scalar multiple of one primary axis.  Keep
+        // the unit-axis fourth contractions fixed and apply the row scalar only
+        // after tracing against C_B.
+        let primary_basis: Vec<Array1<f64>> = (0..r)
+            .map(|index| {
+                let mut basis = Array1::<f64>::zeros(r);
+                basis[index] = 1.0;
+                basis
+            })
+            .collect();
+        let mut psi_primary_basis = Array1::<f64>::zeros(r);
+        psi_primary_basis[axis.idx_primary] = 1.0;
+        let fourth_pairs: Vec<(&Array1<f64>, &Array1<f64>)> = primary_basis
+            .iter()
+            .map(|basis| (basis, &psi_primary_basis))
+            .collect();
+
+        const TARGET_PANEL_BYTES: usize = 8 * 1024 * 1024;
+        let panel_width = 5usize
+            .saturating_mul(total)
+            .saturating_add(slices.marginal.len())
+            .saturating_add(slices.logslope.len())
+            .saturating_add(axis_range.len())
+            .max(1);
+        let rows_per_chunk = (TARGET_PANEL_BYTES / (8 * panel_width)).max(64).min(n);
+        let n_chunks = n.div_ceil(rows_per_chunk);
+        let beta_axis = beta.slice(s![axis_range.clone()]);
+        let a_m_block = weights
+            .beta_information
+            .slice(s![slices.marginal.clone(), ..]);
+        let a_g_block = weights
+            .beta_information
+            .slice(s![slices.logslope.clone(), ..]);
+        let b_m_block = weights
+            .mixed_information
+            .slice(s![slices.marginal.clone(), ..]);
+        let b_g_block = weights
+            .mixed_information
+            .slice(s![slices.logslope.clone(), ..]);
+        let b_axis_block = weights
+            .mixed_information
+            .slice(s![axis_range.clone(), ..]);
+
+        let pulled = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            n_chunks,
+            |chunk_range| -> Result<Array1<f64>, String> {
+                let mut chunk_pullback = Array1::<f64>::zeros(total);
+                for chunk_index in chunk_range {
+                    let start = chunk_index * rows_per_chunk;
+                    let end = (start + rows_per_chunk).min(n);
+                    let rows = start..end;
+                    let marginal_owned;
+                    let marginal = match self.marginal_design.as_dense_ref() {
+                        Some(dense) => dense.slice(s![rows.clone(), ..]),
+                        None => {
+                            marginal_owned = self
+                                .marginal_design
+                                .try_row_chunk(rows.clone())
+                                .map_err(|error| {
+                                    format!(
+                                        "BMS explicit-psi Jeffreys marginal panel failed: {error}"
+                                    )
+                                })?;
+                            marginal_owned.view()
+                        }
+                    };
+                    let logslope_owned;
+                    let logslope = match self.logslope_design.as_dense_ref() {
+                        Some(dense) => dense.slice(s![rows.clone(), ..]),
+                        None => {
+                            logslope_owned = self
+                                .logslope_design
+                                .try_row_chunk(rows.clone())
+                                .map_err(|error| {
+                                    format!(
+                                        "BMS explicit-psi Jeffreys log-slope panel failed: {error}"
+                                    )
+                                })?;
+                            logslope_owned.view()
+                        }
+                    };
+                    let psi = axis.psi_map.row_chunk(rows.clone()).map_err(|error| {
+                        format!("BMS explicit-psi Jeffreys psi panel failed: {error}")
+                    })?;
+                    let (a_m, a_g, b_m, b_g, b_r) = gam_problem::with_nested_parallel(|| {
+                        (
+                            gam_linalg::faer_ndarray::fast_ab(&marginal, &a_m_block),
+                            gam_linalg::faer_ndarray::fast_ab(&logslope, &a_g_block),
+                            gam_linalg::faer_ndarray::fast_ab(&marginal, &b_m_block),
+                            gam_linalg::faer_ndarray::fast_ab(&logslope, &b_g_block),
+                            gam_linalg::faer_ndarray::fast_ab(&psi, &b_axis_block),
+                        )
+                    });
+
+                    let mut gram_a_x = vec![0.0; r * r];
+                    let mut gram_b = vec![0.0; r * r];
+                    for local in 0..(end - start) {
+                        let row = start + local;
+                        let marginal_row = marginal.row(local);
+                        let logslope_row = logslope.row(local);
+                        Self::fill_explicit_psi_primary_sandwich(
+                            slices,
+                            primary,
+                            &tail_pairs,
+                            &a_tail_tail,
+                            marginal_row,
+                            logslope_row,
+                            a_m.row(local),
+                            a_g.row(local),
+                            &mut gram_a_x,
+                        );
+                        Self::fill_explicit_psi_primary_sandwich(
+                            slices,
+                            primary,
+                            &tail_pairs,
+                            &b_tail_tail,
+                            marginal_row,
+                            logslope_row,
+                            b_m.row(local),
+                            b_g.row(local),
+                            &mut gram_b,
+                        );
+
+                        // `cross_primary = J B R^T`; add it to the psi-axis
+                        // column and row to form `C_X`.
+                        let b_r_row = b_r.row(local);
+                        let mut cross_primary = Array1::<f64>::zeros(r);
+                        for (offset, &design_value) in marginal_row.iter().enumerate() {
+                            cross_primary[primary.q] +=
+                                design_value * b_r_row[slices.marginal.start + offset];
+                        }
+                        for (offset, &design_value) in logslope_row.iter().enumerate() {
+                            cross_primary[primary.logslope] +=
+                                design_value * b_r_row[slices.logslope.start + offset];
+                        }
+                        for &(primary_idx, block_idx) in &tail_pairs {
+                            cross_primary[primary_idx] = b_r_row[block_idx];
+                        }
+                        for primary_idx in 0..r {
+                            let value = cross_primary[primary_idx];
+                            gram_a_x[primary_idx * r + axis.idx_primary] += value;
+                            gram_a_x[axis.idx_primary * r + primary_idx] += value;
+                        }
+
+                        let row_ctx = Self::row_ctx(cache, row);
+                        let mut primary_pullback = self
+                            .row_primary_third_trace_gradient_with_moments(
+                                row,
+                                block_states,
+                                cache,
+                                row_ctx,
+                                &gram_a_x,
+                            )?;
+                        let t_cb = self.row_primary_third_trace_gradient_with_moments(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &gram_b,
+                        )?;
+
+                        let psi_row = psi.row(local);
+                        let d_scalar = psi_row.dot(&beta_axis);
+                        if d_scalar != 0.0 {
+                            let fourth = self.row_primary_fourth_contracted_many(
+                                row,
+                                block_states,
+                                cache,
+                                row_ctx,
+                                &fourth_pairs,
+                            )?;
+                            if fourth.len() != r {
+                                return Err(format!(
+                                    "BMS explicit-psi Jeffreys fourth contraction count {} != primary dimension {r}",
+                                    fourth.len()
+                                ));
+                            }
+                            for (primary_idx, contracted) in fourth.iter().enumerate() {
+                                primary_pullback[primary_idx] += d_scalar
+                                    * Self::row_primary_trace_contract(contracted, &gram_b);
+                            }
+                        }
+                        self.pullback_primary_vector_add_into(
+                            row,
+                            slices,
+                            primary,
+                            &primary_pullback,
+                            &mut chunk_pullback,
+                        )?;
+                        let r_scale = t_cb[axis.idx_primary];
+                        if r_scale != 0.0 {
+                            chunk_pullback
+                                .slice_mut(s![axis_range.clone()])
+                                .scaled_add(r_scale, &psi_row);
+                        }
+                    }
+                }
+                Ok(chunk_pullback)
+            },
+            |mut left, right| -> Result<_, String> {
+                left += &right;
+                Ok(left)
+            },
+        )?
+        .unwrap_or_else(|| Array1::<f64>::zeros(total));
+        if pulled.iter().any(|value| !value.is_finite()) {
+            return Err("BMS explicit-psi Jeffreys A/B row pullback is non-finite".to_string());
+        }
+        Ok(pulled)
     }
 }
 
@@ -550,7 +1006,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             // joint Hessian. `None` unless the family uses the Jeffreys term and
             // exposes a dense joint information, so non-Jeffreys families are
             // byte-unchanged.
-            let jeffreys_hphi_ctx: Option<(Array2<f64>, Array2<f64>)> = if self
+            let jeffreys_plan = if self
                 .joint_jeffreys_term_required()
                 && derivative_blocks.iter().any(|block| !block.is_empty())
             {
@@ -604,7 +1060,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 // streams it, else the dense `hessian_psi`. The helper returns `0.0`
                 // when the conditioning gate skips the term, so a clean fit is
                 // byte-unchanged.
-                let firth_pert_info: Option<Array2<f64>> = if jeffreys_hphi_ctx.is_some() {
+                let firth_pert_info: Option<Array2<f64>> = if jeffreys_plan.is_some() {
                     if let Some(op) = terms.hessian_psi_operator.as_ref() {
                         Some(op.mul_mat(&Array2::<f64>::eye(total)))
                     } else if terms.hessian_psi.nrows() == total
@@ -617,15 +1073,25 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 } else {
                     None
                 };
-                if let (Some((z_j, h_joint)), Some(pert_info)) =
-                    (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
+                let firth_weights = match (jeffreys_plan.as_ref(), firth_pert_info.as_ref()) {
+                    (Some(plan), Some(pert_info)) => {
+                        Some(plan.explicit_param_mixed_trace_weights(pert_info)?)
+                    }
+                    _ => None,
+                };
+                if let (Some(weights), Some(pert_info)) =
+                    (firth_weights.as_ref(), firth_pert_info.as_ref())
                 {
-                    let phi_psi =
-                        gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_derivative(
-                            h_joint.view(),
-                            z_j.view(),
-                            pert_info,
-                        )?;
+                    // `B = grad_H Phi`, emitted by the same prepared artifact
+                    // used for the mixed beta pullback below.  This removes the
+                    // second independent eigendecomposition formerly paid by
+                    // the scalar first-derivative helper.
+                    let phi_psi = weights
+                        .mixed_information
+                        .iter()
+                        .zip(pert_info.iter())
+                        .map(|(&weight, &value)| weight * value)
+                        .sum::<f64>();
                     objective_theta[idx] -= phi_psi;
                 }
                 let mut rhs = terms.score_psi.clone();
@@ -639,43 +1105,20 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 // the Firth value `−Φ(β̂)` contributes `−∂_β∂_ψΦ` to it (β̂ moves with
                 // ψ as the length-scale reshapes the design). Dropping it left the
                 // psi DIRECTION `v = −H⁻¹g` short, so the correction-trace channel of
-                // `trace_h_inv_hdot` disagreed with the reference (≈ rel 2e-3). The
-                // per-β-axis mixed second derivative consumes the same family
-                // directional derivatives the `∂_ψH_Φ` curvature term uses; the helper
-                // returns `0.0` under the conditioning gate so a clean fit is
-                // byte-unchanged.
-                if let (Some((z_j, h_joint)), Some(pert_info)) =
-                    (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
-                {
-                    for a_idx in 0..total {
-                        let mut e_a = Array1::<f64>::zeros(total);
-                        e_a[a_idx] = 1.0;
-                        let hdot_a = self
-                            .joint_jeffreys_information_directional_derivative_with_specs(
-                                block_states,
-                                specs,
-                                &e_a,
-                            )?;
-                        let psi_hdot_a = self
-                            .exact_newton_joint_psihessian_directional_derivative(
-                                block_states,
-                                specs,
-                                hyper_layout,
-                                psi_index,
-                                &e_a,
-                            )?;
-                        if let (Some(hdot_a), Some(psi_hdot_a)) = (hdot_a, psi_hdot_a) {
-                            let phi_psi_beta_a =
-                                gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
-                                    h_joint.view(),
-                                    z_j.view(),
-                                    pert_info,
-                                    &hdot_a,
-                                    &psi_hdot_a,
-                                )?;
-                            rhs[a_idx] -= phi_psi_beta_a;
-                        }
-                    }
+                // `trace_h_inv_hdot` disagreed with the reference (≈ rel 2e-3).
+                // The exact A/B row identity performs one cached row pass and
+                // five chunked design projections.  The former implementation
+                // swept all rows twice per coefficient axis (Hdot and psi-Hdot)
+                // and re-eigendecomposed H_info in every scalar contraction.
+                if let Some(weights) = firth_weights.as_ref() {
+                    let phi_psi_beta = self.explicit_psi_jeffreys_mixed_row_pullback(
+                        block_states,
+                        cache,
+                        &axes[psi_index],
+                        &beta,
+                        weights,
+                    )?;
+                    rhs -= &phi_psi_beta;
                 }
                 let v = spectral.solve(&rhs);
                 directions.column_mut(idx).assign(&(-&v));
