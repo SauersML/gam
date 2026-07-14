@@ -554,10 +554,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 .joint_jeffreys_term_required()
                 && derivative_blocks.iter().any(|block| !block.is_empty())
             {
-            match self.joint_jeffreys_information_with_specs(block_states, specs)? {
-                Some(h_info) => active_explicit_psi_jeffreys_context(h_info, total)?,
-                None => None,
-            }
+                match self.joint_jeffreys_information_with_specs(block_states, specs)? {
+                    Some(h_info) => active_explicit_psi_jeffreys_context(h_info, total)?,
+                    None => None,
+                }
             } else {
                 None
             };
