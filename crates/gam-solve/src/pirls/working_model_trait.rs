@@ -52,8 +52,18 @@ pub trait WorkingModel {
         regularized_hessian: &Array2<f64>,
         direction_out: &mut Array1<f64>,
     ) -> Result<(), EstimationError> {
-        debug_assert!(loop_lambda.is_finite() && loop_lambda >= 0.0);
-        debug_assert_eq!(lm_d2.len(), state.gradient.len());
+        if !(loop_lambda.is_finite() && loop_lambda >= 0.0) {
+            crate::bail_invalid_estim!(
+                "PIRLS LM damping must be finite and nonnegative, got {loop_lambda}"
+            );
+        }
+        if lm_d2.len() != state.gradient.len() {
+            crate::bail_invalid_estim!(
+                "PIRLS LM diagonal length {} does not match gradient length {}",
+                lm_d2.len(),
+                state.gradient.len()
+            );
+        }
         solve_newton_direction_dense(regularized_hessian, &state.gradient, direction_out)
     }
 
