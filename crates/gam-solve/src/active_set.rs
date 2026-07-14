@@ -1249,6 +1249,28 @@ fn canonicalize_active_constraint_ids(
     Ok(canonical)
 }
 
+fn gather_linear_constraint_rows(
+    constraints: &LinearInequalityConstraints,
+    rows: &[usize],
+) -> Result<LinearInequalityConstraints, EstimationError> {
+    let p = constraints.a.ncols();
+    let mut a = Array2::<f64>::zeros((rows.len(), p));
+    let mut b = Array1::<f64>::zeros(rows.len());
+    for (out, &row) in rows.iter().enumerate() {
+        if row >= constraints.a.nrows() {
+            crate::bail_invalid_estim!(
+                "active constraint row {} out of bounds for {} rows",
+                row,
+                constraints.a.nrows()
+            );
+        }
+        a.row_mut(out).assign(&constraints.a.row(row));
+        b[out] = constraints.b[row];
+    }
+    LinearInequalityConstraints::new(a, b)
+        .map_err(|error| EstimationError::ParameterConstraintViolation(error.to_string()))
+}
+
 fn fallback_projected_gradient_direction(
     x: &Array1<f64>,
     d_total: &Array1<f64>,
@@ -1261,14 +1283,25 @@ fn fallback_projected_gradient_direction(
         crate::bail_invalid_estim!("projected-gradient fallback dimension mismatch");
     }
 
+    // Project onto the FEASIBLE tangent cone `A_active d >= 0`, not merely
+    // the equality tangent space `A_active d = 0`. A negative multiplier means
+    // descent exists by moving away from that boundary into the cone; equality
+    // projection erases exactly that direction and can mistake a wrong working
+    // face for stationarity. Lawson-Hanson projects the gradient onto the
+    // nonnegative normal cone, so negating the residual is the Euclidean
+    // projection of `-gradient` onto the feasible tangent cone (Moreau).
     let tangent_direction = if working_constraints.a.nrows() == 0 {
         -gradient
     } else {
-        let identity = Array2::<f64>::eye(p);
-        let residual = &working_constraints.b - &working_constraints.a.dot(x);
-        let (direction, _) =
-            solve_kkt_direction(&identity, gradient, &working_constraints.a, Some(&residual))?;
-        direction
+        let Some((stationarity_residual, _multipliers)) =
+            project_stationarity_residual_on_constraint_cone(
+                gradient,
+                &working_constraints.a,
+            )
+        else {
+            return Ok(None);
+        };
+        -stationarity_residual
     };
 
     if !array_is_finite(&tangent_direction) {
@@ -1280,8 +1313,8 @@ fn fallback_projected_gradient_direction(
         .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
     if step_inf <= 1e-12 {
         // The projected-gradient tangent step has collapsed to ~0: the working
-        // set holds the gradient stationary, so no descent direction remains in
-        // the working tangent space. Returning `d_total` as-is is ONLY correct
+        // set holds the gradient in its nonnegative normal cone, so no descent
+        // direction remains in the feasible tangent cone. Returning `d_total` as-is is ONLY correct
         // when the iterate `x = beta_start + d_total` is itself feasible. When
         // `x` is infeasible (an inactive row was violated by an earlier
         // `alpha`-clipped step and never repaired — the KKT solve only closes
@@ -1686,11 +1719,12 @@ fn solve_newton_direction_with_linear_constraints_impl(
         direction_out.assign(&d_total);
         return Ok(());
     }
+    let fallback_working = gather_linear_constraint_rows(constraints, &active)?;
     if let Some((fallback_direction, fallback_active)) = fallback_projected_gradient_direction(
         &x,
         &d_total,
         &g_cur,
-        &compressed_working.constraints,
+        &fallback_working,
         constraints,
     )? {
         if let Some(hint) = active_hint {
@@ -1849,6 +1883,138 @@ impl<'a> ConstraintSetOps<'a> {
             original_active_count: active.len(),
         })
     }
+}
+
+fn canonicalize_constraint_set_active_ids(
+    ops: &ConstraintSetOps<'_>,
+    active: &[usize],
+) -> Result<Vec<usize>, EstimationError> {
+    if active.is_empty() {
+        return Ok(Vec::new());
+    }
+    let compressed = ops.compress_working(active)?;
+    let mut canonical = Vec::with_capacity(compressed.groups.len());
+    for group in &compressed.groups {
+        if let Some(&active_pos) = group.first() {
+            canonical.push(active[active_pos]);
+        }
+    }
+    Ok(canonical)
+}
+
+/// First-order escape from a tolerance-band working-set cycle for an operator
+/// constraint carrier. This is the factored equivalent of
+/// [`fallback_projected_gradient_direction`]: project `-gradient` into the
+/// current face's tangent space, clip it at the first constraint boundary, and
+/// accept only a finite, descending, fully feasible direction.
+///
+/// Keep the returned face sparse. A single coefficient row at zero can make
+/// thousands of Khatri-Rao observation rows tight; rediscovering every tight
+/// row here would recreate the all-face materialization this operator path is
+/// specifically meant to avoid. The old working rows remain tight under the
+/// tangent step, and at most the one ratio-test blocker joins them.
+fn fallback_projected_gradient_direction_with_constraint_set(
+    x: &Array1<f64>,
+    d_total: &Array1<f64>,
+    gradient: &Array1<f64>,
+    working_constraints: &LinearInequalityConstraints,
+    active: &[usize],
+    is_active: &[bool],
+    ops: &ConstraintSetOps<'_>,
+) -> Result<Option<(Array1<f64>, Vec<usize>)>, EstimationError> {
+    let p = gradient.len();
+    if x.len() != p
+        || d_total.len() != p
+        || ops.set.ncols() != p
+        || is_active.len() != ops.nrows()
+    {
+        crate::bail_invalid_estim!("operator projected-gradient fallback dimension mismatch");
+    }
+
+    let tangent_direction = if working_constraints.a.nrows() == 0 {
+        -gradient
+    } else {
+        let Some((stationarity_residual, _multipliers)) =
+            project_stationarity_residual_on_constraint_cone(
+                gradient,
+                &working_constraints.a,
+            )
+        else {
+            return Ok(None);
+        };
+        -stationarity_residual
+    };
+    if !array_is_finite(&tangent_direction) {
+        return Ok(None);
+    }
+
+    let step_inf = tangent_direction
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+    if step_inf <= 1e-12 {
+        let values = ops.values(x)?;
+        let (worst, _) = ops.max_violation(&values);
+        if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+            let Some(projected) = project_point_strictly_into_feasible_constraint_set(x, ops.set)
+                .filter(|candidate| {
+                    ops.values(candidate)
+                        .map(|candidate_values| {
+                            ops.max_violation(&candidate_values).0
+                                <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+                        })
+                        .unwrap_or(false)
+                })
+            else {
+                return Ok(None);
+            };
+            let repair = &projected - x;
+            return Ok(Some((d_total + &repair, Vec::new())));
+        }
+        return Ok(Some((
+            d_total.clone(),
+            canonicalize_constraint_set_active_ids(ops, active)?,
+        )));
+    }
+
+    let directional_derivative = gradient.dot(&tangent_direction);
+    if !directional_derivative.is_finite() || directional_derivative >= 0.0 {
+        return Ok(None);
+    }
+
+    let values_x = ops.values(x)?;
+    let values_direction = ops.values(&tangent_direction)?;
+    let mut alpha = 1.0_f64;
+    let mut blocking_row = None;
+    for row in 0..ops.nrows() {
+        if ops.norms[row] <= 0.0 || is_active[row] {
+            continue;
+        }
+        let slack = ops.scaled_slack(&values_x, row);
+        let rate = values_direction[row] / ops.norms[row];
+        if let Some(candidate) = boundary_hit_step_fraction(slack, rate, alpha) {
+            alpha = candidate;
+            blocking_row = Some(row);
+        }
+    }
+    if !alpha.is_finite() || alpha <= 0.0 {
+        return Ok(None);
+    }
+
+    let fallback_step = tangent_direction * alpha;
+    let new_x = x + &fallback_step;
+    let new_values = ops.values(&new_x)?;
+    if ops.max_violation(&new_values).0 > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+        return Ok(None);
+    }
+
+    let mut next_active = active.to_vec();
+    if let Some(row) = blocking_row
+        && !next_active.contains(&row)
+    {
+        next_active.push(row);
+    }
+    let next_active = canonicalize_constraint_set_active_ids(ops, &next_active)?;
+    Ok(Some((d_total + &fallback_step, next_active)))
 }
 
 fn solve_newton_direction_with_constraint_set_impl(
@@ -2105,6 +2271,25 @@ fn solve_newton_direction_with_constraint_set_impl(
         direction_out.assign(&d_total);
         return Ok(());
     }
+    let fallback_working = ops.gather_unit_rows(&active)?;
+    if let Some((fallback_direction, fallback_active)) =
+        fallback_projected_gradient_direction_with_constraint_set(
+            &x,
+            &d_total,
+            &g_cur,
+            &fallback_working,
+            &active,
+            &is_active,
+            ops,
+        )?
+    {
+        if let Some(hint) = active_hint.as_mut() {
+            hint.clear();
+            hint.extend(fallback_active);
+        }
+        direction_out.assign(&fallback_direction);
+        return Ok(());
+    }
     Err(EstimationError::ParameterConstraintViolation(format!(
         "operator-constrained Newton active-set failed to converge; max scaled violation={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]",
         working_kkt.primal_feasibility,
@@ -2349,7 +2534,9 @@ pub fn solve_quadratic_with_linear_constraints(
 mod tests {
     use super::{
         ACTIVE_SET_INTERIOR_SEED_MARGIN, ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintSet,
-        LinearInequalityConstraints, compute_constraint_kkt_diagnostics, project_point_strictly_into_feasible_cone,
+        ConstraintSetOps, LinearInequalityConstraints, compute_constraint_kkt_diagnostics,
+        fallback_projected_gradient_direction_with_constraint_set,
+        project_point_strictly_into_feasible_cone,
         project_point_strictly_into_feasible_constraint_set,
         project_stationarity_residual_on_constraint_cone,
         rank_reduce_rows_pivoted_qr_with_dependence, scaled_constraint_slack,
@@ -2510,6 +2697,34 @@ mod tests {
 
         assert_relative_eq!(direction[0], 0.1, epsilon = 1e-12);
         assert_eq!(active_hint, vec![0]);
+    }
+
+    #[test]
+    fn projected_gradient_releases_a_boundary_with_negative_multiplier() {
+        // At x=0 under x>=0, gradient=-1 points toward increasing x: the
+        // boundary multiplier from an equality-only KKT projection is negative
+        // and the correct feasible descent direction leaves the face. The old
+        // equality-tangent projection erased this direction and could falsely
+        // call the wrong active face stationary.
+        let x = array![0.0_f64];
+        let d_total = array![0.0_f64];
+        let gradient = array![-1.0_f64];
+        let constraints = LinearInequalityConstraints::new(array![[1.0]], array![0.0])
+            .expect("one-sided bound");
+
+        let (direction, active) = fallback_projected_gradient_direction(
+            &x,
+            &d_total,
+            &gradient,
+            &constraints,
+            &constraints,
+        )
+        .expect("fallback evaluation")
+        .expect("negative-multiplier face must have a feasible descent escape");
+
+        assert_relative_eq!(direction[0], 1.0, epsilon = 1e-12);
+        assert!(gradient.dot(&direction) < 0.0);
+        assert!(active.is_empty(), "descent moves strictly into the cone");
     }
 
     #[test]
@@ -2947,5 +3162,59 @@ mod tests {
         assert!(beta[2].abs() <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL);
         assert!((beta[0] - 0.3).abs() < 1e-10);
         assert!((beta[1] + 0.2).abs() < 1e-10);
+    }
+
+    #[test]
+    fn operator_cycle_escape_is_descending_feasible_and_sparse() {
+        // A Khatri-Rao face can have several observation rows tight at the
+        // same coefficient point even though only one row is needed to hold
+        // the current tangent face. The dense solver already takes this
+        // projected-gradient escape when tolerance-band add/drop transitions
+        // revisit a working set; the operator solver must do the same without
+        // expanding the returned hint to every currently-tight row.
+        let psi = array![[1.0_f64, 0.0], [1.0, 1.0], [1.0, 2.0]];
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1], 2)
+            .expect("cycle-escape cone");
+        let set = ConstraintSet::KhatriRaoCone(cone);
+        let ops = ConstraintSetOps::new(&set, 0.0).expect("operator geometry");
+        let x = Array1::<f64>::zeros(4);
+        let d_total = Array1::<f64>::zeros(4);
+        // Row 0 pins the constant coefficient of the shaped response. The
+        // remaining negative gradient points along its slope coefficient,
+        // which lies in the face tangent and moves all other rows inward.
+        let gradient = array![0.0_f64, 0.0, 0.0, -1.0];
+        let working = ops.gather_unit_rows(&[0]).expect("one-row working face");
+        let mut is_active = vec![false; set.nrows()];
+        is_active[0] = true;
+
+        let (direction, active) = fallback_projected_gradient_direction_with_constraint_set(
+            &x,
+            &d_total,
+            &gradient,
+            &working,
+            &[0],
+            &is_active,
+            &ops,
+        )
+        .expect("operator fallback evaluation")
+        .expect("a certified tangent descent direction must exist");
+
+        assert!(
+            gradient.dot(&direction) < 0.0,
+            "escape must be a strict descent direction"
+        );
+        let candidate = &x + &direction;
+        let (worst, _) = set
+            .max_scaled_violation(candidate.view())
+            .expect("full-set feasibility");
+        assert!(
+            worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
+            "escape must remain feasible on every operator row: {worst:.3e}"
+        );
+        assert_eq!(
+            active,
+            vec![0],
+            "operator escape expanded one sparse face row into all tight rows"
+        );
     }
 }

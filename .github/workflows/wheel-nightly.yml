@@ -59,11 +59,12 @@ jobs:
           # root, so git refuses with "dubious ownership" unless marked safe.
           before-script-linux: |
             git config --global --add safe.directory "$(pwd)"
-            # maturin-action injects a host-side sccache wrapper which is not
-            # present inside this container during the before hook.  Compile
-            # the CLI into the same target tree without that invalid wrapper;
-            # the following wheel build reuses those already-built crates.
-            env -u RUSTC_WRAPPER cargo build --release -p gam-cli
+            # maturin-action configures the GHA sccache backend before entering
+            # the container but normally installs the executable only AFTER
+            # this hook. Install it now so the CLI pre-build gets the same warm
+            # compiler cache as the wheel; both still share one target tree.
+            uv tool install "sccache>=0.10.0"
+            cargo build --release -p gam-cli
             mkdir -p dist
             cp target/release/gam dist/gam
         env:
@@ -89,8 +90,7 @@ jobs:
           # there is no stale-runtime or source-build fallback.
           {
             echo "commit=${GITHUB_SHA}"
-            cd dist
-            sha256sum "$(basename "$WHEEL")" gam
+            (cd dist && sha256sum "$(basename "$WHEEL")" gam)
           } > dist/RUNTIME_PROVENANCE.txt
           gh release upload wheel-latest dist/RUNTIME_PROVENANCE.txt --repo "$GITHUB_REPOSITORY" --clobber
 
