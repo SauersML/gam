@@ -368,15 +368,44 @@ pub fn project_stationarity_residual_on_constraint_cone(
                 projected.assign(residual);
                 break;
             }
+            // A passive NNLS basis cannot contain more independent normal
+            // generators than the ambient coefficient dimension. Crossing
+            // that bound is numerical rank failure, not a least-squares
+            // system that the tall column-pivoted QR below can certify.
+            if passive_rows.len() > p {
+                return None;
+            }
 
             let mut a_passive = Array2::<f64>::zeros((passive_rows.len(), p));
             for (pos, &row) in passive_rows.iter().enumerate() {
                 a_passive.row_mut(pos).assign(&active_a.row(row));
             }
-            let gram = a_passive.dot(&a_passive.t());
-            let rhs = a_passive.dot(residual);
             let mut lambda_passive = Array1::<f64>::zeros(passive_rows.len());
-            solve_dense_system_via_pseudoinverse(&gram, &rhs, &mut lambda_passive).ok()?;
+            // Solve the passive least-squares problem in its original
+            // rectangular coordinates,
+            //
+            //     min_lambda ||A_passive^T lambda - residual||_2,
+            //
+            // rather than forming `A_passive A_passive^T` and taking an SVD
+            // of that normal matrix at every Lawson-Hanson pivot. The old
+            // route squared the condition number and made each face exchange
+            // a fresh cubic SVD; the 93-row issue-979 CTN face spent more than
+            // 70 seconds here after the outer active-set loop had already
+            // detected its repeated working set. Column-pivoted QR solves the
+            // same least-squares subproblem directly, including rank-deficient
+            // passive sets, without normal equations.
+            let design = a_passive.t().to_owned();
+            let mut rhs = Array2::<f64>::zeros((p, 1));
+            rhs.column_mut(0).assign(residual);
+            let design_view = FaerArrayView::new(&design);
+            let rhs_view = FaerArrayView::new(&rhs);
+            let solved = design_view
+                .as_ref()
+                .col_piv_qr()
+                .solve_lstsq(rhs_view.as_ref());
+            for pos in 0..passive_rows.len() {
+                lambda_passive[pos] = solved[(pos, 0)];
+            }
             if !array_is_finite(&lambda_passive) {
                 return None;
             }
