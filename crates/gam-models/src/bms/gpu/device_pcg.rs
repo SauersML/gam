@@ -784,8 +784,8 @@ mod pcg_device_parity_tests {
                 } else {
                     (2.0 / n as f64).sqrt()
                 };
-                marginal[row * p_m + j] = scale
-                    * (std::f64::consts::PI * (row as f64 + 0.5) * j as f64 / n as f64).cos();
+                marginal[row * p_m + j] =
+                    scale * (std::f64::consts::PI * (row as f64 + 0.5) * j as f64 / n as f64).cos();
             }
         }
         let mut logslope = vec![0.0_f64; n * p_g];
@@ -796,8 +796,8 @@ mod pcg_device_parity_tests {
                 } else {
                     (2.0 / n as f64).sqrt()
                 };
-                logslope[row * p_g + j] = scale
-                    * (std::f64::consts::PI * (row as f64 + 0.5) * j as f64 / n as f64).cos();
+                logslope[row * p_g + j] =
+                    scale * (std::f64::consts::PI * (row as f64 + 0.5) * j as f64 / n as f64).cos();
             }
         }
 
@@ -815,8 +815,7 @@ mod pcg_device_parity_tests {
 
         // Keep the SPD fixture certificate CPU-reachable. CUDA availability
         // controls only the device-parity half of this test.
-        let runtime = match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
-        {
+        let runtime = match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
             Ok(Some(runtime)) => runtime,
             Ok(None) => {
                 eprintln!("[pcg_device parity] host SPD oracle passed; no CUDA device");
