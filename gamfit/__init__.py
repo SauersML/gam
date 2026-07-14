@@ -31,6 +31,7 @@ API ``gamfit.fit(df, 'y ~ s(x1) + s(x2)')``.
 See https://github.com/SauersML/gam for the full guide.
 """
 
+import os as _os
 from importlib import metadata as _metadata
 from pathlib import Path
 
@@ -42,9 +43,11 @@ from ._api import (
     build_info,
     conditional_prior_ivae,
     cross_fit_shared_precision_groups,
+    configure_gpu_policy,
     cuda_subprocess_env,
     cuda_subprocess_library_dirs,
     cuda_diagnostics,
+    gpu_policy,
     derive_ivae_aux_scale,
     duchon_basis,
     duchon_function_norm_penalty,
@@ -83,6 +86,19 @@ from ._api import (
     sphere_basis_jet,
     validate_formula,
 )
+
+# Honor an explicit GPU-policy request from the environment before any fit can
+# claim the first-writer-wins policy slot. `GAMFIT_GPU=off` is the no-code-change
+# escape hatch for hosts whose images carry a broken/mismatched libcuda, where
+# the default `auto` policy fails loudly on the probe fault instead of falling
+# back to CPU. Absent or empty means: leave the policy untouched (default auto).
+# An unrecognized value raises at import, consistent with the loud-failure
+# doctrine (a typo silently running on the wrong backend would be worse).
+_GAMFIT_GPU_ENV = _os.environ.get("GAMFIT_GPU", "").strip()
+if _GAMFIT_GPU_ENV:
+    configure_gpu_policy(_GAMFIT_GPU_ENV)
+del _GAMFIT_GPU_ENV
+
 from ._binding import RustExtensionUnavailableError
 from ._warnings import GamInferenceWarning, emit_inference_warnings
 from ._rust import (  # native topology-census instruments

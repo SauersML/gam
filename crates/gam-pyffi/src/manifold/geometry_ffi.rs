@@ -4403,6 +4403,54 @@ fn set_log_level(level: &str) -> PyResult<()> {
     }
 }
 
+/// Set the process-wide GPU execution policy from Python.
+///
+/// Mirrors `gam::gpu::configure_global_policy` one-to-one: `"auto"` (the
+/// default) lets supported, large-enough paths dispatch to a probed CUDA
+/// device, `"off"` pins the process to the CPU kernels without ever probing
+/// the driver, and `"required"` turns an unsupported GPU route into a hard
+/// error. An unrecognized value raises `ValueError`.
+///
+/// The policy is process-global and first-writer-wins (concurrent fits cannot
+/// race policy changes), so call this before the first fit. A call that loses
+/// the race to a DIFFERENT already-locked policy raises `RuntimeError` instead
+/// of silently executing under the other policy; re-asserting the same policy
+/// is a no-op.
+///
+/// `"off"` is the escape hatch for nodes whose images carry a broken or
+/// mismatched `libcuda`: under `"auto"` a present-but-broken driver is a probe
+/// fault, never treated as absence (#2322), so GPU-eligible fits fail loudly;
+/// `"off"` never probes and takes the CPU branch at every dispatch site.
+#[pyfunction]
+fn configure_gpu_policy(policy: &str) -> PyResult<()> {
+    let Some(parsed) = gam::gpu::GpuPolicy::parse(policy) else {
+        return Err(py_value_error(format!(
+            "unrecognized GPU policy {policy:?}; expected one of auto|off|required"
+        )));
+    };
+    gam::gpu::configure_global_policy(parsed);
+    let effective = gam::gpu::global_policy();
+    if effective != parsed {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "GPU policy is already locked to '{}' for this process (first writer wins); \
+             configure_gpu_policy({policy:?}) must be called before the first fit or \
+             any earlier policy configuration",
+            effective.as_str()
+        )));
+    }
+    Ok(())
+}
+
+/// Return the process-wide GPU policy as `"auto"`, `"off"`, or `"required"`.
+///
+/// Reading never claims the first-writer-wins policy slot: the default
+/// `"auto"` is reported until an explicit `configure_gpu_policy(...)` (or a
+/// classic-GAM fit's `config={"gpu": ...}`) locks the policy.
+#[pyfunction]
+fn gpu_policy() -> String {
+    gam::gpu::global_policy().as_str().to_string()
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -4667,6 +4715,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(identifiability_check_json, module)?)?;
     module.add_function(wrap_pyfunction!(set_log_level, module)?)?;
+    module.add_function(wrap_pyfunction!(configure_gpu_policy, module)?)?;
+    module.add_function(wrap_pyfunction!(gpu_policy, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_rows, module)?)?;
     module.add_function(wrap_pyfunction!(survival_chunk_defaults, module)?)?;
     module.add_function(wrap_pyfunction!(survival_chunk_ranges, module)?)?;

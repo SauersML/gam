@@ -212,6 +212,42 @@ def build_info() -> dict[str, Any]:
     return extension_status()
 
 
+def configure_gpu_policy(policy: str) -> None:
+    """Set the process-wide GPU execution policy: ``"auto"`` | ``"off"`` | ``"required"``.
+
+    Mirrors the Rust ``gam::gpu::configure_global_policy`` switch one-to-one
+    and applies to *every* fitting surface in the process — including the
+    manifold-SAE entry points (``sae_manifold_fit``, ``adjudicate_atom_shape``,
+    crosscoder fits), which have no per-call GPU knob of their own. The classic
+    GAM path's ``config={"gpu": ...}`` sets the same process-global policy.
+
+    ``"auto"`` (the default) dispatches supported, large-enough paths to a
+    probed CUDA device; ``"off"`` pins the process to the CPU kernels without
+    ever probing the driver; ``"required"`` turns an unsupported GPU route
+    into a hard error.
+
+    Use ``"off"`` on hosts whose images carry a broken or mismatched
+    ``libcuda``: under ``"auto"`` a present-but-broken driver is a probe
+    *fault* (deliberately never treated as absence), so GPU-eligible fits fail
+    loudly instead of falling back. Setting the ``GAMFIT_GPU`` environment
+    variable before import is equivalent to calling this first.
+
+    The policy is process-global and **first-writer-wins**: call it before the
+    first fit. Raises ``ValueError`` for an unrecognized value and
+    ``RuntimeError`` if a different policy is already locked for the process.
+    """
+    rust_module().configure_gpu_policy(str(policy))
+
+
+def gpu_policy() -> str:
+    """Return the process-wide GPU policy (``"auto"``, ``"off"``, or ``"required"``).
+
+    Reading never locks the first-writer-wins policy slot; the default
+    ``"auto"`` is reported until an explicit configuration claims it.
+    """
+    return str(rust_module().gpu_policy())
+
+
 def cuda_diagnostics() -> dict[str, object]:
     """Return CUDA loader diagnostics without forcing Rust GPU dispatch.
 

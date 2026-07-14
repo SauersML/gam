@@ -12,11 +12,26 @@ configure_global_policy(GpuPolicy::Auto);  // Auto (default) | Off | Required
 
 `cuda_selected()` returns a `Result<bool, GpuError>` at each dispatch point: `Auto` returns `Ok(false)` only for typed absence, `Off` returns `Ok(false)` without probing, and `Required` requires a device. Both Auto and Required preserve probe faults; Required additionally turns typed absence into `RequiredDeviceUnavailable`.
 
-Python callers control this through a single `"gpu"` key in the `config` dict, whose value is one of `"auto"` (default), `"off"`, or `"required"`:
+Python callers have three equivalent controls over the same process-global policy, each taking `"auto"` (default), `"off"`, or `"required"`:
 
 ```python
+# 1. Module-level, applies to every fitting surface in the process — including
+#    the manifold-SAE entry points (sae_manifold_fit, adjudicate_atom_shape,
+#    crosscoder fits), which have no per-call GPU knob. Call before the first fit.
+gamfit.configure_gpu_policy("off")
+gamfit.gpu_policy()   # -> "off" (reading never locks the policy slot)
+
+# 2. The classic GAM path's config key (sets the same process-global policy):
 gamfit.fit(df, "y ~ s(x)", config={"gpu": "auto"})
 ```
+
+```bash
+# 3. Environment variable, honored at import — the no-code-change control for
+#    cluster jobs:
+GAMFIT_GPU=off python my_fit.py
+```
+
+The policy is first-writer-wins: the first explicit configuration in a process sticks, and `configure_gpu_policy` raises `RuntimeError` if a different policy is already locked (re-asserting the same policy is a no-op). `"off"` matters operationally on hosts whose images carry a broken or mismatched `libcuda`: under `"auto"` a present-but-broken driver is a probe *fault* (deliberately never treated as absence), so GPU-eligible paths — e.g. the arrow-Schur inner solve at moderate problem sizes — fail loudly rather than falling back. `"off"` never probes the driver and takes the CPU branch at every dispatch site.
 
 Install `gamfit[cuda]` on Linux x86_64 when you want PyPI's NVIDIA CUDA
 12 runtime libraries in the environment. CPU-only installs can still
