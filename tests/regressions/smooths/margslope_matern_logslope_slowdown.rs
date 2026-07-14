@@ -166,11 +166,11 @@ fn margslope_matern_logslope_timing() {
 }
 
 /// Above-the-cliff profiling repro (#979): centers=12, n=2000 — the regime
-/// where the multi-seed continuation pre-warm *fires* and the binary
-/// marginal-slope fit became intractable (>360s). Asserts the fit completes
-/// well under a generous wall budget — the regression guard for the binary
-/// arm of #979. Invoke directly:
-///   cargo test --release --test bug_hunt_979_margslope_matern_logslope_slowdown \
+/// where the former speculative multi-seed continuation fired and the binary
+/// marginal-slope fit became intractable (>360s). The current engine starts at
+/// the literal automatic-kappa seed and must certify that exact joint model
+/// within the wall budget. Invoke directly:
+///   cargo test --release --test regressions \
 ///       margslope_matern_logslope_above_cliff -- --nocapture
 #[test]
 fn margslope_matern_logslope_above_cliff() {
