@@ -175,8 +175,18 @@ impl BernoulliMarginalSlopeFamily {
         marginal_weight_projection: ndarray::ArrayView1<'_, f64>,
         logslope_weight_projection: ndarray::ArrayView1<'_, f64>,
         out: &mut [f64],
-    ) {
+    ) -> Result<(), String> {
         let r = primary.total;
+        let expected = r.checked_mul(r).ok_or_else(|| {
+            "BMS explicit-psi primary sandwich dimension overflow".to_string()
+        })?;
+        if tail_tail.len() != expected || out.len() != expected {
+            return Err(format!(
+                "BMS explicit-psi primary sandwich requires {expected} cells for primary dimension {r}, got tail={} and output={}",
+                tail_tail.len(),
+                out.len(),
+            ));
+        }
         out.copy_from_slice(tail_tail);
 
         let mut qq = 0.0;
@@ -204,6 +214,7 @@ impl BernoulliMarginalSlopeFamily {
             out[primary.logslope * r + primary_idx] = g_tail;
             out[primary_idx * r + primary.logslope] = g_tail;
         }
+        Ok(())
     }
 
     /// Exact coefficient pullback of `D_beta(partial_psi Phi)` from one
@@ -408,7 +419,7 @@ impl BernoulliMarginalSlopeFamily {
                             a_m.row(local),
                             a_g.row(local),
                             &mut gram_a_x,
-                        );
+                        )?;
                         Self::fill_explicit_psi_primary_sandwich(
                             slices,
                             primary,
@@ -419,7 +430,7 @@ impl BernoulliMarginalSlopeFamily {
                             b_m.row(local),
                             b_g.row(local),
                             &mut gram_b,
-                        );
+                        )?;
 
                         // `cross_primary = J B R^T`; add it to the psi-axis
                         // column and row to form `C_X`.
