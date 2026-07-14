@@ -19,7 +19,8 @@ use crate::fit_orchestration::drivers::{
 };
 use gam_linalg::matrix::{EmbeddedColumnBlock, EmbeddedSquareBlock};
 use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec};
-use ndarray::Array2;
+use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
+use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -73,6 +74,251 @@ pub(crate) trait SpatialPsiBlockTransform {
 pub(crate) struct IdentitySpatialPsiBlockTransform;
 
 impl SpatialPsiBlockTransform for IdentitySpatialPsiBlockTransform {}
+
+/// Exact coefficient-chart transform for spatial design and penalty jets.
+///
+/// `raw_from_current` is the fixed section `T` in `beta_raw = T beta_current`.
+/// Every derivative artifact is moved through the same chart:
+/// `X_psi -> X_psi T` and `S_psi -> T' S_psi T`, including matrix-free first
+/// and second design-derivative actions.
+pub(crate) struct CoefficientSpatialPsiBlockTransform {
+    raw_from_current: Arc<Array2<f64>>,
+}
+
+impl CoefficientSpatialPsiBlockTransform {
+    pub(crate) fn new(raw_from_current: &Array2<f64>) -> Result<Self, String> {
+        if raw_from_current.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "spatial psi coefficient transform contains a non-finite value".to_string(),
+            );
+        }
+        Ok(Self {
+            raw_from_current: Arc::new(raw_from_current.clone()),
+        })
+    }
+}
+
+struct CoefficientTransformedPsiDerivativeOperator {
+    base: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    raw_from_current: Arc<Array2<f64>>,
+}
+
+impl CoefficientTransformedPsiDerivativeOperator {
+    fn current_to_raw(
+        &self,
+        current: &ArrayView1<'_, f64>,
+        context: &str,
+    ) -> Result<Array1<f64>, gam_terms::basis::BasisError> {
+        if current.len() != self.raw_from_current.ncols() {
+            return Err(gam_terms::basis::BasisError::Other(format!(
+                "{context}: current coefficient length {} does not match transform width {}",
+                current.len(),
+                self.raw_from_current.ncols(),
+            )));
+        }
+        Ok(self.raw_from_current.dot(current))
+    }
+
+    fn raw_transpose_to_current(
+        &self,
+        raw: &Array1<f64>,
+        context: &str,
+    ) -> Result<Array1<f64>, gam_terms::basis::BasisError> {
+        if raw.len() != self.raw_from_current.nrows() {
+            return Err(gam_terms::basis::BasisError::Other(format!(
+                "{context}: raw coefficient length {} does not match transform height {}",
+                raw.len(),
+                self.raw_from_current.nrows(),
+            )));
+        }
+        Ok(self.raw_from_current.t().dot(raw))
+    }
+
+    fn transform_rows(
+        &self,
+        raw: Array2<f64>,
+        context: &str,
+    ) -> Result<Array2<f64>, gam_terms::basis::BasisError> {
+        if raw.ncols() != self.raw_from_current.nrows() {
+            return Err(gam_terms::basis::BasisError::Other(format!(
+                "{context}: raw row width {} does not match transform height {}",
+                raw.ncols(),
+                self.raw_from_current.nrows(),
+            )));
+        }
+        Ok(raw.dot(self.raw_from_current.as_ref()))
+    }
+}
+
+impl CustomFamilyPsiDerivativeOperator for CoefficientTransformedPsiDerivativeOperator {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn n_data(&self) -> usize {
+        self.base.n_data()
+    }
+
+    fn p_out(&self) -> usize {
+        self.raw_from_current.ncols()
+    }
+
+    fn transpose_mul(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, gam_terms::basis::BasisError> {
+        let raw = self.base.transpose_mul(axis, v)?;
+        self.raw_transpose_to_current(&raw, "coefficient-transformed psi transpose_mul")
+    }
+
+    fn forward_mul(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, gam_terms::basis::BasisError> {
+        let raw = self.current_to_raw(u, "coefficient-transformed psi forward_mul")?;
+        self.base.forward_mul(axis, &raw.view())
+    }
+
+    fn transpose_mul_second_diag(
+        &self,
+        axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, gam_terms::basis::BasisError> {
+        let raw = self.base.transpose_mul_second_diag(axis, v)?;
+        self.raw_transpose_to_current(
+            &raw,
+            "coefficient-transformed psi transpose_mul_second_diag",
+        )
+    }
+
+    fn transpose_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, gam_terms::basis::BasisError> {
+        let raw = self
+            .base
+            .transpose_mul_second_cross(axis_d, axis_e, v)?;
+        self.raw_transpose_to_current(
+            &raw,
+            "coefficient-transformed psi transpose_mul_second_cross",
+        )
+    }
+
+    fn forward_mul_second_diag(
+        &self,
+        axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, gam_terms::basis::BasisError> {
+        let raw = self.current_to_raw(
+            u,
+            "coefficient-transformed psi forward_mul_second_diag",
+        )?;
+        self.base.forward_mul_second_diag(axis, &raw.view())
+    }
+
+    fn forward_mul_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, gam_terms::basis::BasisError> {
+        let raw = self.current_to_raw(
+            u,
+            "coefficient-transformed psi forward_mul_second_cross",
+        )?;
+        self.base
+            .forward_mul_second_cross(axis_d, axis_e, &raw.view())
+    }
+
+    fn row_chunk_first(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, gam_terms::basis::BasisError> {
+        let raw = self.base.row_chunk_first(axis, rows)?;
+        self.transform_rows(raw, "coefficient-transformed psi row_chunk_first")
+    }
+
+    fn row_vector_first_into(
+        &self,
+        axis: usize,
+        row: usize,
+        mut out: ArrayViewMut1<'_, f64>,
+    ) -> Result<(), gam_terms::basis::BasisError> {
+        if out.len() != self.p_out() {
+            return Err(gam_terms::basis::BasisError::Other(format!(
+                "coefficient-transformed psi row output length {} does not match {}",
+                out.len(),
+                self.p_out(),
+            )));
+        }
+        let mut raw = Array1::<f64>::zeros(self.raw_from_current.nrows());
+        self.base
+            .row_vector_first_into(axis, row, raw.view_mut())?;
+        out.assign(&self.raw_from_current.t().dot(&raw));
+        Ok(())
+    }
+
+    fn row_chunk_second_diag(
+        &self,
+        axis: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, gam_terms::basis::BasisError> {
+        let raw = self.base.row_chunk_second_diag(axis, rows)?;
+        self.transform_rows(
+            raw,
+            "coefficient-transformed psi row_chunk_second_diag",
+        )
+    }
+
+    fn row_chunk_second_cross(
+        &self,
+        axis_d: usize,
+        axis_e: usize,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, gam_terms::basis::BasisError> {
+        let raw = self
+            .base
+            .row_chunk_second_cross(axis_d, axis_e, rows)?;
+        self.transform_rows(
+            raw,
+            "coefficient-transformed psi row_chunk_second_cross",
+        )
+    }
+}
+
+impl SpatialPsiBlockTransform for CoefficientSpatialPsiBlockTransform {
+    fn transform_operator(
+        &self,
+        op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    ) -> Result<Arc<dyn CustomFamilyPsiDerivativeOperator>, String> {
+        if op.p_out() != self.raw_from_current.nrows() {
+            return Err(format!(
+                "spatial psi operator width {} does not match coefficient transform height {}",
+                op.p_out(),
+                self.raw_from_current.nrows(),
+            ));
+        }
+        Ok(Arc::new(CoefficientTransformedPsiDerivativeOperator {
+            base: op,
+            raw_from_current: Arc::clone(&self.raw_from_current),
+        }))
+    }
+
+    fn transform_design(&self, design: Array2<f64>) -> Array2<f64> {
+        design.dot(self.raw_from_current.as_ref())
+    }
+
+    fn transform_penalty(&self, penalty: Array2<f64>) -> Array2<f64> {
+        self.raw_from_current
+            .t()
+            .dot(&penalty.dot(self.raw_from_current.as_ref()))
+    }
+}
 
 pub(crate) fn build_block_spatial_psi_derivatives(
     data: ndarray::ArrayView2<'_, f64>,
@@ -516,5 +762,89 @@ mod tests {
                 .expect("3D anisotropic Matern psi derivatives should be present");
         assert_eq!(derivs.len(), 3);
         assert!(derivs.iter().all(|deriv| deriv.implicit_operator.is_some()));
+
+        let raw_p = resolved_design.design.ncols();
+        let current_p = raw_p - 1;
+        let mut raw_from_current = Array2::<f64>::zeros((raw_p, current_p));
+        for col in 0..current_p {
+            raw_from_current[[col, col]] = 1.0;
+            raw_from_current[[raw_p - 1, col]] = 0.05 * (col + 1) as f64;
+        }
+        let transform = CoefficientSpatialPsiBlockTransform::new(&raw_from_current)
+            .expect("finite coefficient transform");
+        let transformed = build_block_spatial_psi_derivatives_with_transform(
+            data.view(),
+            &resolvedspec,
+            &resolved_design,
+            &transform,
+        )
+        .expect("transformed spatial psi derivatives should build")
+        .expect("transformed spatial psi derivatives should be present");
+
+        for (raw, current) in derivs.iter().zip(transformed.iter()) {
+            let raw_op = raw.implicit_operator.as_ref().expect("raw operator");
+            let current_op = current
+                .implicit_operator
+                .as_ref()
+                .expect("coefficient-transformed operator");
+            assert_eq!(current_op.p_out(), current_p);
+            let axis = raw.implicit_axis;
+            let u = Array1::from_iter((0..current_p).map(|idx| 0.25 + idx as f64));
+            let raw_u = raw_from_current.dot(&u);
+            let expected_forward = raw_op
+                .forward_mul(axis, &raw_u.view())
+                .expect("raw forward action");
+            let actual_forward = current_op
+                .forward_mul(axis, &u.view())
+                .expect("transformed forward action");
+            assert!(
+                actual_forward
+                    .iter()
+                    .zip(expected_forward.iter())
+                    .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
+                "transformed forward action must equal X_psi T u",
+            );
+
+            let rows = 3..9;
+            let expected_rows = raw_op
+                .row_chunk_first(axis, rows.clone())
+                .expect("raw first rows")
+                .dot(&raw_from_current);
+            let actual_rows = current_op
+                .row_chunk_first(axis, rows)
+                .expect("transformed first rows");
+            assert!(
+                actual_rows
+                    .iter()
+                    .zip(expected_rows.iter())
+                    .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
+                "transformed row chunks must equal X_psi[rows] T",
+            );
+
+            for ((raw_index, raw_penalty), (current_index, current_penalty)) in raw
+                .s_psi_components
+                .as_ref()
+                .expect("raw first penalty derivatives")
+                .iter()
+                .zip(
+                    current
+                        .s_psi_components
+                        .as_ref()
+                        .expect("transformed first penalty derivatives"),
+                )
+            {
+                assert_eq!(raw_index, current_index);
+                let expected = raw_from_current
+                    .t()
+                    .dot(&raw_penalty.dot(&raw_from_current));
+                assert!(
+                    current_penalty
+                        .iter()
+                        .zip(expected.iter())
+                        .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12),
+                    "transformed penalty derivative must equal T' S_psi T",
+                );
+            }
+        }
     }
 }
