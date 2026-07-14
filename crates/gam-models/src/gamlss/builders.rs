@@ -2218,27 +2218,18 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         *noise_beta_hint_cell.borrow_mut() = Some(beta);
                     }
                     let family = builder.build_family(&designs[0], &designs[1]);
-                    let psiderivative_blocks = if matches!(eval_mode, EvalMode::ValueOnly) {
-                        // Cost-only line-search probes need only the profiled
-                        // likelihood at the already-realized θ. The ψ
-                        // derivative payloads are O(n) to assemble and are
-                        // consumed solely by the IFT gradient/Hessian path;
-                        // building them for every backtracking probe made the
-                        // Gaussian location-scale path scale with sample size
-                        // even when the optimizer discarded the derivative
-                        // pieces. Pass empty blocks so the shared evaluator
-                        // performs the same fixed-design inner REML solve
-                        // without derivative-only setup work.
-                        (0..specs.len()).map(|_| Vec::new()).collect()
-                    } else {
-                        builder.build_psiderivative_blocks(
-                            data,
-                            &specs[0],
-                            &specs[1],
-                            &designs[0],
-                            &designs[1],
-                        )?
-                    };
+                    let psiderivative_blocks = builder.build_psiderivative_blocks(
+                        data,
+                        &specs[0],
+                        &specs[1],
+                        &designs[0],
+                        &designs[1],
+                    )?;
+                    let hyper_layout = crate::custom_family::CustomFamilyHyperLayout::new(
+                        psiderivative_blocks,
+                        Vec::new(),
+                        theta.slice(s![joint_setup.rho_dim()..]).to_owned(),
+                    )?;
                     let warm_start = hyper_warm_start_cell.borrow().clone();
                     // Forward the κ-staging row set to the family by installing it
                     // on the canonical `outer_score_subsample` option. Inner-PIRLS
@@ -2253,7 +2244,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &blocks,
                         &eval_options,
                         &rho,
-                        &psiderivative_blocks,
+                        &hyper_layout,
                         warm_start.as_ref(),
                         eval_mode,
                     )?;
@@ -2314,6 +2305,11 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &designs[0],
                         &designs[1],
                     )?;
+                    let hyper_layout = crate::custom_family::CustomFamilyHyperLayout::new(
+                        psiderivative_blocks,
+                        Vec::new(),
+                        theta.slice(s![joint_setup.rho_dim()..]).to_owned(),
+                    )?;
                     let warm_start = hyper_warm_start_cell.borrow().clone();
                     let eval_options =
                         crate::outer_subsample::exact_outer_options_for_row_set(options, row_set);
@@ -2322,7 +2318,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &blocks,
                         &eval_options,
                         &rho,
-                        &psiderivative_blocks,
+                        &hyper_layout,
                         warm_start.as_ref(),
                     )?;
                     *hyper_warm_start_cell.borrow_mut() = Some(owned.result.warm_start.clone());
@@ -3429,12 +3425,17 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         String,
     > {
         let (resolvedspec, design, blocks, eta_derivs) = build_realized_blocks(theta)?;
+        let hyper_layout = crate::custom_family::CustomFamilyHyperLayout::new(
+            vec![eta_derivs, Vec::new()],
+            Vec::new(),
+            theta.slice(s![rho_dim..]).to_owned(),
+        )?;
         let eval = evaluate_custom_family_joint_hyper(
             &outer_family,
             &blocks,
             &outer_options,
             &theta.slice(s![0..rho_dim]).to_owned(),
-            &[eta_derivs, Vec::new()],
+            &hyper_layout,
             warm_cache,
             if need_hessian {
                 gam_problem::EvalMode::ValueGradientHessian
@@ -3449,12 +3450,17 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                      warm_cache: Option<&crate::custom_family::CustomFamilyWarmStart>|
      -> Result<crate::custom_family::CustomFamilyJointHyperEfsResult, String> {
         let (_, _, blocks, eta_derivs) = build_realized_blocks(theta)?;
+        let hyper_layout = crate::custom_family::CustomFamilyHyperLayout::new(
+            vec![eta_derivs, Vec::new()],
+            Vec::new(),
+            theta.slice(s![rho_dim..]).to_owned(),
+        )?;
         evaluate_custom_family_joint_hyper_efs(
             &outer_family,
             &blocks,
             &outer_options,
             &theta.slice(s![0..rho_dim]).to_owned(),
-            &[eta_derivs, Vec::new()],
+            &hyper_layout,
             warm_cache,
         )
         .map_err(|e| e.to_string())
