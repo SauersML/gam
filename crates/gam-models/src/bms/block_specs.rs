@@ -2706,13 +2706,23 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 Vec::new()
             };
             let logslope_psi_derivs = if logslope_has_spatial {
-                build_block_spatial_psi_derivatives(data_view, &specs[1], &designs[1])?.ok_or_else(
-                    || {
-                        "bernoulli marginal-slope: logslope block has spatial terms \
-                         but spatial psi derivatives are unavailable"
-                            .to_string()
-                    },
-                )?
+                let built = if let Some(reparam) = logslope_reduced_reparam.as_ref() {
+                    let transform =
+                        CoefficientSpatialPsiBlockTransform::new(&reparam.transform)?;
+                    build_block_spatial_psi_derivatives_with_transform(
+                        data_view,
+                        &specs[1],
+                        &designs[1],
+                        &transform,
+                    )?
+                } else {
+                    build_block_spatial_psi_derivatives(data_view, &specs[1], &designs[1])?
+                };
+                built.ok_or_else(|| {
+                    "bernoulli marginal-slope: logslope block has spatial terms \
+                     but spatial psi derivatives are unavailable"
+                        .to_string()
+                })?
             } else {
                 Vec::new()
             };

@@ -34,7 +34,10 @@ use crate::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
-use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
+use crate::spatial_psi_bridge::{
+    CoefficientSpatialPsiBlockTransform, build_block_spatial_psi_derivatives,
+    build_block_spatial_psi_derivatives_with_transform,
+};
 use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec};
 use crate::wiggle::initializewiggle_knots_from_seed;
 use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
