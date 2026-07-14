@@ -2390,6 +2390,112 @@ pub(crate) fn public_warm_start_compatibility_checks_rho_dimension() {
 }
 
 #[test]
+pub(crate) fn workspace_first_order_terms_are_single_authority_without_direct_replay() {
+    #[derive(Clone)]
+    struct CountingFamily {
+        direct_calls: Arc<AtomicUsize>,
+    }
+
+    impl CustomFamily for CountingFamily {
+        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: Vec::new(),
+            })
+        }
+
+        fn exact_newton_joint_psi_terms(
+            &self,
+            _: &[ParameterBlockState],
+            _: &[ParameterBlockSpec],
+            _: &CustomFamilyHyperLayout,
+            _: usize,
+        ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+            self.direct_calls.fetch_add(1, Ordering::Relaxed);
+            let mut terms = ExactNewtonJointPsiTerms::zeros(1);
+            terms.objective_psi = 99.0;
+            Ok(Some(terms))
+        }
+    }
+
+    struct AuthoritativeWorkspace;
+
+    impl ExactNewtonJointPsiWorkspace for AuthoritativeWorkspace {
+        fn first_order_terms(
+            &self,
+            psi_index: usize,
+        ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+            assert_eq!(psi_index, 0);
+            let mut terms = ExactNewtonJointPsiTerms::zeros(1);
+            terms.objective_psi = 2.0;
+            Ok(Some(terms))
+        }
+
+        fn second_order_terms(
+            &self,
+            _: usize,
+            _: usize,
+        ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+            Err("first-order construction must not request pair terms".to_string())
+        }
+
+        fn hessian_directional_derivative(
+            &self,
+            _: usize,
+            _: &Array1<f64>,
+        ) -> Result<Option<DriftDerivResult>, String> {
+            Err("first-order construction must not request Hessian drift".to_string())
+        }
+    }
+
+    let direct_calls = Arc::new(AtomicUsize::new(0));
+    let family = CountingFamily {
+        direct_calls: Arc::clone(&direct_calls),
+    };
+    let spec = ParameterBlockSpec {
+        name: "workspace-authority".to_string(),
+        design: DesignMatrix::from(array![[1.0]]),
+        offset: array![0.0],
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let state = ParameterBlockState {
+        beta: array![0.0],
+        eta: array![0.0],
+    };
+    let layout = CustomFamilyHyperLayout::new(vec![Vec::new()], vec![0], array![0.0])
+        .expect("one explicit family axis");
+
+    let coords = build_psi_hyper_coords(
+        &family,
+        &[state],
+        &[spec],
+        &layout,
+        &array![0.0],
+        &[],
+        &[0],
+        None,
+        true,
+        Some(Arc::new(AuthoritativeWorkspace)),
+    )
+    .expect("workspace-owned first-order coordinate");
+
+    assert_eq!(coords.len(), 1);
+    assert_eq!(coords[0].a.to_bits(), 2.0_f64.to_bits());
+    assert_eq!(
+        direct_calls.load(Ordering::Relaxed),
+        0,
+        "a workspace-owned term must not be replayed through the direct family hook",
+    );
+}
+
+#[test]
 pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
     #[derive(Clone)]
     struct ZeroFamily;
