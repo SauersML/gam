@@ -6935,12 +6935,11 @@ where
                     });
                 }
             }
-            if let Err(err) = ctx.ensure_theta(theta) {
-                log::warn!(
-                    "[OUTER] n-block exact-joint spatial: ensure_theta failed during gradient evaluation: {err}"
-                );
-                return Ok(OuterEval::infeasible(theta.len()));
-            }
+            ctx.ensure_theta(theta).map_err(|err| {
+                EstimationError::InvalidInput(format!(
+                    "n-block exact-joint spatial design realization failed: {err}"
+                ))
+            })?;
             let design_revision = Some(ctx.cache.design_revision());
             let specs = collect_specs(&ctx.cache);
             let designs = collect_designs(&ctx.cache);
@@ -7016,12 +7015,9 @@ where
                         inner_beta_hint: None,
                     })
                 }
-                Err(err) => {
-                    log::warn!(
-                        "[OUTER] n-block exact-joint spatial: exact evaluation failed: {err}"
-                    );
-                    Ok(OuterEval::infeasible(theta.len()))
-                }
+                Err(err) => Err(EstimationError::RemlOptimizationFailed(format!(
+                    "n-block exact-joint spatial evaluation failed: {err}"
+                ))),
             }
         };
 
@@ -7033,12 +7029,11 @@ where
                 {
                     return Ok(cost);
                 }
-                if let Err(err) = ctx.ensure_theta(theta) {
-                    log::warn!(
-                        "[OUTER] n-block exact-joint spatial: ensure_theta failed during cost evaluation: {err}"
-                    );
-                    return Ok(f64::INFINITY);
-                }
+                ctx.ensure_theta(theta).map_err(|err| {
+                    EstimationError::InvalidInput(format!(
+                        "n-block exact-joint spatial design realization failed: {err}"
+                    ))
+                })?;
                 let design_revision = Some(ctx.cache.design_revision());
                 let specs = collect_specs(&ctx.cache);
                 let designs = collect_designs(&ctx.cache);
@@ -7083,12 +7078,9 @@ where
                         ctx.cache.store_cost_only(theta, cost);
                         Ok(cost)
                     }
-                    Err(err) => {
-                        log::warn!(
-                            "[OUTER] n-block exact-joint spatial: exact cost evaluation failed: {err}"
-                        );
-                        Ok(f64::INFINITY)
-                    }
+                    Err(err) => Err(EstimationError::RemlOptimizationFailed(format!(
+                        "n-block exact-joint spatial cost evaluation failed: {err}"
+                    ))),
                 }
             },
             |ctx: &mut &mut NBlockExactJointState<'_, Mode>, theta: &Array1<f64>| {
