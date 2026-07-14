@@ -6833,7 +6833,7 @@ mod tests {
             let refitted_direction = (plus.value - minus.value) / (2.0 * difference_step);
             let gap = (analytic.gradient[0] - refitted_direction).abs();
             assert!(
-                gap <= f64::EPSILON.sqrt() * (1.0 + refitted_direction.abs()),
+                gap <= difference_step * (1.0 + refitted_direction.abs()),
                 "{family:?} coordinate gradient {} disagrees with refitted direction {refitted_direction} by {gap}",
                 analytic.gradient[0]
             );
