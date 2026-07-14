@@ -90,7 +90,12 @@ from ._rust import (  # native topology-census instruments
     shape_matched_control,
     shape_matched_control_f32,
 )
-from ._shape_census import ShapeControlledCensus, run_shape_controlled_census
+from ._shape_census import (
+    LabelShuffleMarginNull,
+    ShapeControlledCensus,
+    run_label_shuffle_margin_null,
+    run_shape_controlled_census,
+)
 from ._compare import compare_models
 from ._linear_dictionary import LinearDictionaryFit, linear_dictionary_fit
 from ._sparse_dictionary import (
@@ -235,7 +240,10 @@ from . import manifolds  # noqa: F401  expose gamfit.manifolds.Circle, …
 from . import kernels  # noqa: F401  expose gamfit.kernels.sinkhorn_barycenter, …
 from ._basis_descriptors import Fourier, PeriodicHarmonic
 from ._composite_penalty import CompositePenalty
-from ._smooth import Smooth, SmoothSum  # compositional Smooth(latent=..., basis=..., penalty=...)
+from ._smooth import (
+    Smooth,
+    SmoothSum,
+)  # compositional Smooth(latent=..., basis=..., penalty=...)
 from ._penalty_descriptors import (
     ARDPenalty as _ARDPenaltyDescriptor,
     BlockOrthogonalityDescriptor,
@@ -403,9 +411,9 @@ except _metadata.PackageNotFoundError:
 # Names whose implementation lives behind the optional ``torch`` extra. They
 # are loaded lazily while keeping the cold-start import path torch-free.
 _LAZY_TORCH_ATTRS: dict[str, tuple[str, str]] = {
-    "Crosscoder":            ("gamfit.crosscoder",        "Crosscoder"),
-    "PoincareAtoms":         ("gamfit.torch.hyperbolic",  "PoincareAtoms"),
-    "InterchangeSwapDecoder":("gamfit.torch.interchange", "InterchangeSwapDecoder"),
+    "Crosscoder": ("gamfit.crosscoder", "Crosscoder"),
+    "PoincareAtoms": ("gamfit.torch.hyperbolic", "PoincareAtoms"),
+    "InterchangeSwapDecoder": ("gamfit.torch.interchange", "InterchangeSwapDecoder"),
 }
 
 
@@ -425,6 +433,7 @@ def __getattr__(name: str):
     if target is not None:
         module_path, attr = target
         from importlib import import_module
+
         try:
             module = import_module(module_path)
         except ModuleNotFoundError as exc:
