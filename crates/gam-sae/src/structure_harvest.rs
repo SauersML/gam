@@ -3223,7 +3223,6 @@ fn optimize_torus_metric_coordinate(
     weights: ArrayView1<'_, f64>,
     per_axis_order: usize,
     family: TorusMetricFamily,
-    seed: f64,
     lower: f64,
     upper: f64,
 ) -> Result<f64, String> {
@@ -3244,7 +3243,16 @@ fn optimize_torus_metric_coordinate(
         bound_resolution,
     )
     .map_err(|error| format!("torus metric bounds: {error}"))?;
-    let seed_point = Array1::from_vec(vec![seed.clamp(lower, upper)]);
+    // Each metric family starts from the center of its own legal coordinate.
+    // In particular, mapping the flat square-torus winner (tau = 0) into the
+    // embedded coordinate gives beta = 1, exactly the degenerate A -> 1 donut
+    // boundary where the penalty derivative diverges.  Clamping that inherited
+    // seed just inside the box leaves BFGS with an enormous projected direction
+    // and an Armijo model dominated by the boundary kink.  A domain-centered
+    // seed is invariant to the competing family's optimum and stays separated
+    // from both artificial numerical boundaries.
+    let seed = lower + 0.5 * (upper - lower);
+    let seed_point = Array1::from_vec(vec![seed]);
     let objective = FusedObjective::new(evaluate);
     let mut optimizer = Bfgs::new(seed_point, objective)
         .with_bounds(bounds)
@@ -3302,7 +3310,6 @@ fn fit_torus_metric_candidate(
         weights,
         *per_axis_order,
         TorusMetricFamily::Flat,
-        1.0,
         f64::EPSILON,
         1.0,
     )?;
@@ -3329,14 +3336,12 @@ fn fit_torus_metric_candidate(
 
     let embedded_lower = numerical_resolution;
     let embedded_upper = 1.0 - numerical_resolution.sqrt();
-    let embedded_seed = (-flat_tau).exp().clamp(embedded_lower, embedded_upper);
     let embedded_coordinate = optimize_torus_metric_coordinate(
         phi.view(),
         target,
         weights,
         *per_axis_order,
         TorusMetricFamily::EmbeddedDonut,
-        embedded_seed,
         embedded_lower,
         embedded_upper,
     )?;
