@@ -83,13 +83,17 @@ fn assert_near_separation_converges(n: usize, slope: f64, seed: u64) {
          projected outer gradient |g|={gnorm:.3e} ≥ 5.0 ceiling — the FLAT-VALLEY \
          STALL signature from #1762 (reported |g|≈54)"
     );
-    // Generous wall-clock ceiling: the issue reports ~117s at n=3200; a healthy
-    // fit at n=800 is well under a second. 20s is a loose regression guard that
-    // still catches the stall-loop pathology without being timing-flaky in CI.
+    // Stall-loop guard by WORK, not wall-clock (a seconds ceiling is a
+    // calibration-box assumption that flakes on slow shared runners and can
+    // silently pass a real spin on a fast one). The #1762 pathology is the
+    // ARC cost-stall escape loop re-evaluating the outer objective hundreds
+    // of times; a healthy fit at n=800 needs a few dozen outer cost
+    // evaluations. The elapsed time stays printed as a diagnostic.
     assert!(
-        elapsed.as_secs_f64() < 20.0,
-        "near-separated binomial-logit fit (n={n}, slope={slope}) took {:.1}s \
-         (should be ≪1s); the ARC cost-stall escape loop is spinning (#1762)",
+        fit.outer_cost_evals <= 120,
+        "near-separated binomial-logit fit (n={n}, slope={slope}) spent {} outer \
+         cost evaluations ({}s) — the ARC cost-stall escape loop is spinning (#1762)",
+        fit.outer_cost_evals,
         elapsed.as_secs_f64()
     );
 }

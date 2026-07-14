@@ -1268,8 +1268,8 @@ mod tests {
 
     #[test]
     fn fmt_num_at_1e4_uses_scientific() {
-        let s = fmt_num(10000.0);
-        assert!(s.contains('e'), "expected scientific for 1e4, got {s}");
+        // Rust `{:.6e}` prints a bare exponent (no zero padding, no plus).
+        assert_eq!(fmt_num(10000.0), "1.000000e4");
     }
 
     #[test]
@@ -1279,14 +1279,12 @@ mod tests {
 
     #[test]
     fn fmt_num_exactly_0_01_uses_scientific() {
-        let s = fmt_num(0.01);
-        assert!(s.contains('e'), "expected scientific for 0.01, got {s}");
+        assert_eq!(fmt_num(0.01), "1.000000e-2");
     }
 
     #[test]
     fn fmt_num_zero_uses_scientific() {
-        let s = fmt_num(0.0);
-        assert!(s.contains('e'), "expected scientific for 0.0, got {s}");
+        assert_eq!(fmt_num(0.0), "0.000000e0");
     }
 
     // ── render_html smoke test ────────────────────────────────────────────────
