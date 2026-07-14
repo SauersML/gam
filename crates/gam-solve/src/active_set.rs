@@ -2535,6 +2535,7 @@ mod tests {
     use super::{
         ACTIVE_SET_INTERIOR_SEED_MARGIN, ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintSet,
         ConstraintSetOps, LinearInequalityConstraints, compute_constraint_kkt_diagnostics,
+        fallback_projected_gradient_direction,
         fallback_projected_gradient_direction_with_constraint_set,
         project_point_strictly_into_feasible_cone,
         project_point_strictly_into_feasible_constraint_set,
