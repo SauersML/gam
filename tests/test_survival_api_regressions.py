@@ -154,10 +154,13 @@ def test_joint_competing_risks_survival_is_reachable_from_fit(tmp_path) -> None:
             train,
             "Surv(entry, exit, event) ~ age",
             survival_likelihood=likelihood_mode,
-            # Cause-specific penalty blocks are labelled per cause; the engine
-            # rejects unknown labels loudly, so this must name a real block.
+            # Cause-specific penalty blocks are distinct model components. Use
+            # the same prior on both causes so the acceptance fixture does not
+            # manufacture a one-sided hyperparameter rail unrelated to the
+            # prediction path under test.
             precision_hyperpriors={
-                "cause_specific_survival_cause_1_penalty_0": [2.0, 1.0]
+                "cause_specific_survival_cause_1_penalty_0": [2.0, 1.0],
+                "cause_specific_survival_cause_2_penalty_0": [2.0, 1.0],
             },
         )
         pred = model.predict(rows)
@@ -167,9 +170,7 @@ def test_joint_competing_risks_survival_is_reachable_from_fit(tmp_path) -> None:
         assert pred.cif.shape == (2 * 3, pred.times.size)
         assert np.all(np.isfinite(pred.cif))
         assert np.all((pred.cif >= 0.0) & (pred.cif <= 1.0))
-        assert np.all(
-            (pred.overall_survival >= 0.0) & (pred.overall_survival <= 1.0)
-        )
+        assert np.all((pred.overall_survival >= 0.0) & (pred.overall_survival <= 1.0))
 
         replicates = np.asarray(model.sample_replicates(rows, 41, seed=2300))
         streamed = np.concatenate(
@@ -238,11 +239,7 @@ def test_joint_competing_risks_survival_is_reachable_from_fit(tmp_path) -> None:
         eta_lower = np.asarray(interval_pred.eta_lower, dtype=float)
         eta_upper = np.asarray(interval_pred.eta_upper, dtype=float)
         assert (
-            eta.shape
-            == eta_se.shape
-            == eta_lower.shape
-            == eta_upper.shape
-            == (2 * 3,)
+            eta.shape == eta_se.shape == eta_lower.shape == eta_upper.shape == (2 * 3,)
         )
         assert np.all(eta_se >= 0.0)
         assert np.all(eta_lower <= eta)
@@ -255,9 +252,7 @@ def test_joint_competing_risks_survival_is_reachable_from_fit(tmp_path) -> None:
         # explicit spelling must refuse rather than relabeling Vb as Vp.
         for requested_mode in (None, "smoothing"):
             kwargs = (
-                {}
-                if requested_mode is None
-                else {"covariance_mode": requested_mode}
+                {} if requested_mode is None else {"covariance_mode": requested_mode}
             )
             try:
                 model.predict(rows, interval=0.9, **kwargs)
@@ -387,6 +382,8 @@ def test_survival_marginal_slope_fit_returns() -> None:
     try:
         result = result_queue.get_nowait()
     except queue.Empty as exc:
-        raise AssertionError("survival marginal-slope worker returned no result") from exc
+        raise AssertionError(
+            "survival marginal-slope worker returned no result"
+        ) from exc
     assert result == ("ok",), result
     assert time.monotonic() - start < 45.0
