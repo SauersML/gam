@@ -155,7 +155,7 @@ pub(crate) fn run_outer_with_plan(
     if !explicit_initial_rho_owns_single_seed_budget
         && should_screen_seeds(config, the_plan.solver, seeds.len(), seed_budget)
     {
-        seeds = rank_seeds_with_screening(obj, config, context, &seeds);
+        seeds = rank_seeds_with_screening(obj, config, context, &seeds)?;
     }
     log::debug!(
         "[OUTER] {context}: trying generated seeds directly (generated={}, budget={})",

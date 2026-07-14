@@ -203,9 +203,9 @@ pub(crate) fn rank_seeds_with_screening(
     config: &OuterConfig,
     context: &str,
     seeds: &[Array1<f64>],
-) -> Vec<Array1<f64>> {
+) -> Result<Vec<Array1<f64>>, EstimationError> {
     let Some(screening_cap) = config.screening_cap.as_ref() else {
-        return seeds.to_vec();
+        return Ok(seeds.to_vec());
     };
 
     let initial_cap = config.seed_config.screen_max_inner_iterations.max(1);
@@ -287,9 +287,9 @@ pub(crate) fn rank_seeds_with_screening(
                     );
                     Ok(cost)
                 }
-                Err(_) => {
+                Err(error) => {
                     log::info!(
-                        "[STAGE] {context}: seed-screen stage={} seed={}/{} cap={} elapsed={:.3}s rejected (error)",
+                        "[STAGE] {context}: seed-screen stage={} seed={}/{} cap={} elapsed={:.3}s fatal evaluator error",
                         stage,
                         idx + 1,
                         seeds.len(),
@@ -300,7 +300,7 @@ pub(crate) fn rank_seeds_with_screening(
                         },
                         seed_elapsed,
                     );
-                    Err(())
+                    Err(error)
                 }
             }
         },
@@ -340,13 +340,13 @@ pub(crate) fn rank_seeds_with_screening(
         },
     );
 
+    screening_cap.store(previous_cap, Ordering::Relaxed);
+    obj.reset();
+    let cascade_result = cascade_result?;
     let rejected = cascade_result.rejected;
     let final_cap_used = cascade_result.final_cap;
     let stages_consumed = cascade_result.stages_consumed;
     let ranked = cascade_result.ranked_indices;
-
-    screening_cap.store(previous_cap, Ordering::Relaxed);
-    obj.reset();
     log::info!(
         "[OUTER] {context}: seed screening cascade complete elapsed={:.3}s stages_used={} final_cap={} ranked={}/{}",
         cascade_start.elapsed().as_secs_f64(),
@@ -368,7 +368,7 @@ pub(crate) fn rank_seeds_with_screening(
             rejected,
             stages_consumed,
         );
-        return seeds.to_vec();
+        return Ok(seeds.to_vec());
     }
 
     let mut ordered = Vec::with_capacity(seeds.len());
@@ -537,7 +537,7 @@ pub(crate) fn rank_seeds_with_screening(
         rejected,
     );
 
-    ordered
+    Ok(ordered)
 }
 
 /// ρ margin (in log-λ units) within which a smoothing coordinate counts as

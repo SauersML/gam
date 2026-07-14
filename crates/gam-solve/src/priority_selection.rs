@@ -62,7 +62,7 @@ pub(crate) fn rank_indices_with_budget_cascade<E>(
     stages: &[PriorityBudgetStage],
     mut evaluate: impl FnMut(usize, usize, usize) -> Result<f64, E>,
     mut on_stage_complete: impl FnMut(PriorityStageSummary),
-) -> PriorityCascadeResult {
+) -> Result<PriorityCascadeResult, E> {
     assert!(
         !stages.is_empty(),
         "priority-selection cascade requires at least one budget stage"
@@ -80,9 +80,10 @@ pub(crate) fn rank_indices_with_budget_cascade<E>(
                 Ok(score) if score.is_finite() => {
                     ranked.push(PriorityCandidate::new(idx, idx, score, 0));
                 }
-                Ok(_) | Err(_) => {
+                Ok(_) => {
                     rejected += 1;
                 }
+                Err(error) => return Err(error),
             }
         }
         final_cap = budget.cap;
@@ -102,12 +103,12 @@ pub(crate) fn rank_indices_with_budget_cascade<E>(
         .into_iter()
         .map(|row| row.item)
         .collect();
-    PriorityCascadeResult {
+    Ok(PriorityCascadeResult {
         ranked_indices,
         rejected,
         final_cap,
         stages_consumed,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -148,7 +149,8 @@ mod tests {
                 }
             },
             |summary| seen.push((summary.stage, summary.cap, summary.ranked)),
-        );
+        )
+        .expect("the fixture evaluator is infallible");
         assert_eq!(seen, vec![(0, 2, 0), (1, 8, 3)]);
         assert_eq!(out.final_cap, 8);
         assert_eq!(out.stages_consumed, 2);
