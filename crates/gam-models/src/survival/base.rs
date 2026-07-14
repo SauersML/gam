@@ -8,7 +8,8 @@ use gam_linalg::matrix::SymmetricMatrix;
 use gam_problem::{Coefficients, LinearPredictor};
 use gam_row_macros::row_atom;
 use gam_solve::pirls::{
-    LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
+    ConstraintSet, LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState,
+    array1_l2_norm,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, Axis};
 use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, constants, escalate_ridge};
@@ -718,7 +719,7 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         spec: &crate::custom_family::ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         let block = self.blocks.get(block_idx).ok_or_else(|| {
             SurvivalError::CauseSpecificDimensionMismatch {
                 reason: format!(
@@ -742,10 +743,10 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         let rhs = block
             .offset_derivative_exit
             .mapv(|offset| block.derivative_floor - offset);
-        Ok(Some(LinearInequalityConstraints {
+        Ok(Some(ConstraintSet::Dense(LinearInequalityConstraints {
             a: block.x_derivative.clone(),
             b: rhs,
-        }))
+        })))
     }
 
     fn max_feasible_step_size(
@@ -2658,6 +2659,7 @@ impl WorkingModelSurvival {
             let raw = state.gradient.clone();
             let projected = match self.monotonicity_linear_constraints() {
                 Some(constraints) => {
+                    let constraints = ConstraintSet::Dense(constraints);
                     projected_linear_constraint_stationarity_vector(&raw, beta, &constraints, None)
                         .ok_or_else(|| {
                             EstimationError::InvalidInput(

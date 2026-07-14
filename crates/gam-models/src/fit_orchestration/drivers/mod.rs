@@ -50,7 +50,7 @@ use gam_linalg::faer_ndarray::{fast_ab, fast_atb, fast_atv};
 
 use gam_linalg::matrix::{DesignBlock, DesignMatrix, RandomEffectOperator, SymmetricMatrix};
 
-use gam_problem::{ExactNewtonJointPsiTerms, LinearInequalityConstraints};
+use gam_problem::{ConstraintSet, ExactNewtonJointPsiTerms, LinearInequalityConstraints};
 
 use gam_spec::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily,

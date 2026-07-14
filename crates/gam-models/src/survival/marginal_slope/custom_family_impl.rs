@@ -829,24 +829,28 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         assert!(!block_spec.name.is_empty());
         if block_idx == 0 {
-            return self.effective_time_linear_constraints();
+            return Ok(self
+                .effective_time_linear_constraints()?
+                .map(ConstraintSet::Dense));
         }
         if self.score_warp.is_some() && block_idx == 3 {
-            return self
+            return Ok(self
                 .score_warp
                 .as_ref()
                 .map(|runtime| self.score_warp_linear_constraints(runtime))
-                .transpose();
+                .transpose()?
+                .map(ConstraintSet::Dense));
         }
         let link_block_idx = if self.score_warp.is_some() { 4 } else { 3 };
         if self.link_dev.is_some() && block_idx == link_block_idx {
             return Ok(self
                 .link_dev
                 .as_ref()
-                .map(DeviationRuntime::structural_monotonicity_constraints));
+                .map(DeviationRuntime::structural_monotonicity_constraints)
+                .map(ConstraintSet::Dense));
         }
         Ok(None)
     }

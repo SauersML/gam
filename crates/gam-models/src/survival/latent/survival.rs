@@ -18,9 +18,10 @@
 //! formula DSL via `SurvInterval(L, R, event) ~ ...`.
 
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, ExactNewtonJointGradientEvaluation,
-    ExactNewtonJointHessianWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    BlockWorkingSet, BlockwiseFitOptions, ConstraintSet, CustomFamily,
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace, FamilyEvaluation,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas,
 };
 use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use crate::gamlss::{FamilyMetadata, ParameterLink};
@@ -5800,10 +5801,13 @@ impl CustomFamily for LatentSurvivalFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         assert!(!block_spec.name.is_empty());
         if block_idx == Self::BLOCK_TIME {
-            Ok(self.time_linear_constraints.clone())
+            Ok(self
+                .time_linear_constraints
+                .clone()
+                .map(ConstraintSet::Dense))
         } else {
             Ok(None)
         }

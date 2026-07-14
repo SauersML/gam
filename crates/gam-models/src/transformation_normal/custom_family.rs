@@ -321,7 +321,7 @@ impl CustomFamily for TransformationNormalFamily {
         _: &[ParameterBlockState],
         block_index: usize,
         block_spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         assert!(!block_spec.name.is_empty());
         if block_index != 0 {
             return Ok(None);

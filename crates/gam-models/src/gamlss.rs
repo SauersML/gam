@@ -34,7 +34,7 @@ use gam_terms::basis::{ActivePenaltyInfo, BasisOptions, PenaltySource};
 
 use crate::custom_family::{
     AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
-    CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel,
+    ConstraintSet, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel,
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction,
     CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,

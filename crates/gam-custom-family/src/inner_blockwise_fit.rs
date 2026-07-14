@@ -1756,7 +1756,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             Some(&lhs_true_kkt),
                         )
                     } else {
-                        solve_quadratic_with_linear_constraints(
+                        gam_solve::active_set::solve_quadratic_with_constraint_set(
                             &lhs,
                             &rhs_beta,
                             &beta_joint,
@@ -2903,7 +2903,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 if let Some(constraints) = joint_constraints.as_ref() {
                     let trial_beta = &beta_joint + &trial_delta;
                     if check_linear_feasibility(&trial_beta, constraints, 1e-8).is_err() {
-                        match gam_solve::active_set::project_point_strictly_into_feasible_cone(
+                        match gam_solve::active_set::project_point_strictly_into_feasible_constraint_set(
                             &trial_beta,
                             constraints,
                         ) {
@@ -6571,7 +6571,7 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
                     Err(_) => break,
                 }
             } else {
-                match solve_quadratic_with_linear_constraints(
+                match gam_solve::active_set::solve_quadratic_with_constraint_set(
                     &h_dense,
                     &rhs,
                     &beta_joint,

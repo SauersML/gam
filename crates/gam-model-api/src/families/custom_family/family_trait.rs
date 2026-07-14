@@ -22,7 +22,7 @@ use gam_linalg::matrix::DesignMatrix;
 use gam_problem::{
     BlockGeometryDirectionalDerivative, BlockWorkingSet, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactNewtonOuterObjective,
-    ExactOuterDerivativeOrder, LinearInequalityConstraints, ParameterBlockSpec,
+    ConstraintSet, ExactOuterDerivativeOrder, LinearInequalityConstraints, ParameterBlockSpec,
     ParameterBlockState, PseudoLogdetMode,
 };
 use ndarray::{Array1, Array2};
@@ -91,6 +91,7 @@ pub struct BatchedOuterGradientTerms {
 /// `custom_family::ExactNewtonOuterCurvature` path keeps resolving without a
 /// duplicate definition.
 pub use gam_problem::ExactNewtonOuterCurvature;
+pub use gam_problem::{ConstraintSet, KhatriRaoConeConstraints, PlacedConstraintBlock};
 
 /// Shared lifecycle for an unbiased sampled outer-derivative pilot.
 ///
@@ -660,14 +661,17 @@ pub trait CustomFamily {
         Ok(None)
     }
 
-    /// Optional linear inequality constraints for a block update:
-    /// `A * beta_block >= b`.
+    /// Optional inequality constraints for a block update: `A * beta_block
+    /// >= b`, carried either as explicit rows or as a factored cone
+    /// ([`ConstraintSet`]). Small blocks return
+    /// `ConstraintSet::Dense(...)`; a Khatri-Rao tensor block returns the
+    /// factored monotonicity cone so the row set never materializes.
     fn block_linear_constraints(
         &self,
         _: &[ParameterBlockState],
         _: usize,
         block_spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         // Default implementation ignores this parameter.
         assert!(!block_spec.name.is_empty());
         Ok(None)

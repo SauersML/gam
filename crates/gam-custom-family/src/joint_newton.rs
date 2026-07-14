@@ -3471,7 +3471,7 @@ pub(crate) fn compute_kkt_refusal_report(
     ranges: &[(usize, usize)],
     cached_joint_gradient: Option<&Array1<f64>>,
     cached_active_sets: &[Option<Vec<usize>>],
-    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_constraints: &[Option<ConstraintSet>],
     joint_hessian_source: Option<&JointHessianSource>,
     total_p: usize,
     ridge: f64,

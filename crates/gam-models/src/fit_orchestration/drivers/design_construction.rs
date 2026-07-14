@@ -5689,14 +5689,14 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         block_states: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         assert!(!block_states.is_empty(), "block_states must be non-empty");
         assert!(
             !block_spec.name.is_empty(),
             "block spec name must be non-empty",
         );
         expect_block_idx_zero(block_idx, "spatial adaptive exact family", "")?;
-        Ok(self.linear_constraints.clone())
+        Ok(self.linear_constraints.clone().map(ConstraintSet::Dense))
     }
 
     fn exact_newton_joint_psi_terms(

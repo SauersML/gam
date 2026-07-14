@@ -1948,7 +1948,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         block_idx: usize,
         spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         if block_states.len() == usize::MAX
             || block_idx == usize::MAX
             || spec.design.ncols() == usize::MAX
@@ -1959,13 +1959,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             return Ok(self
                 .score_warp
                 .as_ref()
-                .map(DeviationRuntime::structural_monotonicity_constraints));
+                .map(DeviationRuntime::structural_monotonicity_constraints)
+                .map(ConstraintSet::Dense));
         }
         if self.link_block_index().is_some_and(|idx| block_idx == idx) {
             return Ok(self
                 .link_dev
                 .as_ref()
-                .map(DeviationRuntime::structural_monotonicity_constraints));
+                .map(DeviationRuntime::structural_monotonicity_constraints)
+                .map(ConstraintSet::Dense));
         }
         Ok(None)
     }

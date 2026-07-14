@@ -3936,15 +3936,15 @@ impl CustomFamily for OneBlockConstrainedExactFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         assert!(!block_spec.name.is_empty());
         if block_idx != 0 {
             return Ok(None);
         }
-        Ok(Some(LinearInequalityConstraints {
+        Ok(Some(ConstraintSet::Dense(LinearInequalityConstraints {
             a: array![[1.0]],
             b: array![self.lower],
-        }))
+        })))
     }
 }
 

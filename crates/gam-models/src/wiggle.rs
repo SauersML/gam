@@ -240,7 +240,7 @@ pub fn monotone_wiggle_basis_with_derivative_order(
 
 pub(crate) fn monotone_wiggle_nonnegative_constraints(
     beta_dim: usize,
-) -> Option<LinearInequalityConstraints> {
+) -> Option<gam_solve::pirls::ConstraintSet> {
     if beta_dim == 0 {
         return None;
     }
@@ -248,10 +248,12 @@ pub(crate) fn monotone_wiggle_nonnegative_constraints(
     for i in 0..beta_dim {
         a[[i, i]] = 1.0;
     }
-    Some(LinearInequalityConstraints {
-        a,
-        b: Array1::zeros(beta_dim),
-    })
+    Some(gam_solve::pirls::ConstraintSet::Dense(
+        LinearInequalityConstraints {
+            a,
+            b: Array1::zeros(beta_dim),
+        },
+    ))
 }
 
 pub(crate) fn validate_monotone_wiggle_beta_nonnegative<'a>(

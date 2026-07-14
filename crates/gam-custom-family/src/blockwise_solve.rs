@@ -668,26 +668,23 @@ pub(crate) fn stabilize_exact_newton_penalized_lhs_in_place<F: CustomFamily + ?S
 }
 
 pub(crate) fn shift_linear_constraints_to_delta(
-    constraints: &LinearInequalityConstraints,
+    constraints: &ConstraintSet,
     beta: &Array1<f64>,
-) -> Result<LinearInequalityConstraints, String> {
-    if constraints.a.ncols() != beta.len() || constraints.a.nrows() != constraints.b.len() {
+) -> Result<ConstraintSet, String> {
+    if constraints.ncols() != beta.len() {
         return Err(CustomFamilyError::ConstraintViolation {
             reason: "linear constraints: shape mismatch".to_string(),
         }
         .into());
     }
-    Ok(LinearInequalityConstraints {
-        a: constraints.a.clone(),
-        b: &constraints.b - &constraints.a.dot(beta),
-    })
+    constraints.shifted_to_delta(beta.view())
 }
 
 pub(crate) fn collect_block_linear_constraints<F: CustomFamily + ?Sized>(
     family: &F,
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
-) -> Result<Vec<Option<LinearInequalityConstraints>>, String> {
+) -> Result<Vec<Option<ConstraintSet>>, String> {
     let mut constraints = Vec::with_capacity(specs.len());
     for (block_idx, spec) in specs.iter().enumerate() {
         constraints.push(family.block_linear_constraints(states, block_idx, spec)?);
@@ -700,7 +697,7 @@ pub(crate) fn reject_constrained_post_update_repair(
     spec: &ParameterBlockSpec,
     raw_beta: &Array1<f64>,
     updated_beta: &Array1<f64>,
-    constraints: Option<&LinearInequalityConstraints>,
+    constraints: Option<&ConstraintSet>,
 ) -> Result<(), String> {
     let Some(constraints) = constraints else {
         return Ok(());
@@ -716,13 +713,13 @@ pub(crate) fn reject_constrained_post_update_repair(
         }
         .into());
     }
-    if raw_beta.len() != constraints.a.ncols() {
+    if raw_beta.len() != constraints.ncols() {
         return Err(CustomFamilyError::DimensionMismatch {
             reason: format!(
                 "post-update constrained block '{}' (idx {block_idx}) width mismatch: beta={}, constraints={}",
                 spec.name,
                 raw_beta.len(),
-                constraints.a.ncols(),
+                constraints.ncols(),
             ),
         }
         .into());
@@ -761,10 +758,10 @@ pub(crate) fn reject_constrained_post_update_repair(
 }
 
 pub(crate) fn assemble_joint_linear_constraints(
-    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_constraints: &[Option<ConstraintSet>],
     ranges: &[(usize, usize)],
     total_p: usize,
-) -> Result<Option<LinearInequalityConstraints>, String> {
+) -> Result<Option<ConstraintSet>, String> {
     if block_constraints.len() != ranges.len() {
         return Err(CustomFamilyError::DimensionMismatch {
             reason: format!(
@@ -777,42 +774,66 @@ pub(crate) fn assemble_joint_linear_constraints(
     }
     let total_rows = block_constraints
         .iter()
-        .map(|constraints| constraints.as_ref().map_or(0, |c| c.a.nrows()))
+        .map(|constraints| constraints.as_ref().map_or(0, ConstraintSet::nrows))
         .sum::<usize>();
     if total_rows == 0 {
         return Ok(None);
     }
-    let mut a = Array2::<f64>::zeros((total_rows, total_p));
-    let mut b = Array1::<f64>::zeros(total_rows);
-    let mut row_offset = 0usize;
     for (block_idx, constraints_opt) in block_constraints.iter().enumerate() {
         let Some(constraints) = constraints_opt else {
             continue;
         };
         let (start, end) = ranges[block_idx];
-        let block_p = end - start;
-        if constraints.a.ncols() != block_p || constraints.a.nrows() != constraints.b.len() {
+        if constraints.ncols() != end - start {
             return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "joint linear constraint assembly mismatch for block {block_idx}: A is {}x{}, b is {}, block width is {}",
-                constraints.a.nrows(),
-                constraints.a.ncols(),
-                constraints.b.len(),
-                block_p
+                "joint linear constraint assembly mismatch for block {block_idx}: {} constraint columns, block width is {}",
+                constraints.ncols(),
+                end - start
             ) }.into());
         }
-        let rows = constraints.a.nrows();
-        a.slice_mut(s![row_offset..(row_offset + rows), start..end])
-            .assign(&constraints.a);
-        b.slice_mut(s![row_offset..(row_offset + rows)])
-            .assign(&constraints.b);
-        row_offset += rows;
     }
-    Ok(Some(LinearInequalityConstraints { a, b }))
+    let all_dense = block_constraints.iter().all(|constraints| {
+        matches!(constraints, None | Some(ConstraintSet::Dense(_)))
+    });
+    if all_dense {
+        // Explicit-row concatenation, exactly the historical joint system.
+        let mut a = Array2::<f64>::zeros((total_rows, total_p));
+        let mut b = Array1::<f64>::zeros(total_rows);
+        let mut row_offset = 0usize;
+        for (block_idx, constraints_opt) in block_constraints.iter().enumerate() {
+            let Some(ConstraintSet::Dense(constraints)) = constraints_opt else {
+                continue;
+            };
+            let (start, end) = ranges[block_idx];
+            let rows = constraints.a.nrows();
+            a.slice_mut(s![row_offset..(row_offset + rows), start..end])
+                .assign(&constraints.a);
+            b.slice_mut(s![row_offset..(row_offset + rows)])
+                .assign(&constraints.b);
+            row_offset += rows;
+        }
+        return Ok(Some(ConstraintSet::Dense(LinearInequalityConstraints {
+            a,
+            b,
+        })));
+    }
+    // At least one factored member: keep the joint system factored too.
+    let mut placed = Vec::new();
+    for (block_idx, constraints_opt) in block_constraints.iter().enumerate() {
+        let Some(constraints) = constraints_opt else {
+            continue;
+        };
+        placed.push(gam_problem::PlacedConstraintBlock {
+            col_start: ranges[block_idx].0,
+            set: constraints.clone(),
+        });
+    }
+    Ok(Some(ConstraintSet::block_diagonal(placed, total_p)?))
 }
 
 pub(crate) fn flatten_joint_active_set(
     block_active_sets: &[Option<Vec<usize>>],
-    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_constraints: &[Option<ConstraintSet>],
 ) -> Option<Vec<usize>> {
     if block_active_sets.len() != block_constraints.len() {
         return None;
@@ -820,9 +841,7 @@ pub(crate) fn flatten_joint_active_set(
     let mut offset = 0usize;
     let mut joint_active = Vec::new();
     for (active_opt, constraints_opt) in block_active_sets.iter().zip(block_constraints.iter()) {
-        let rows = constraints_opt
-            .as_ref()
-            .map_or(0, |constraints| constraints.a.nrows());
+        let rows = constraints_opt.as_ref().map_or(0, ConstraintSet::nrows);
         if let Some(active) = active_opt {
             joint_active.extend(
                 active
@@ -843,14 +862,12 @@ pub(crate) fn flatten_joint_active_set(
 
 pub(crate) fn scatter_joint_active_set(
     joint_active: &[usize],
-    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_constraints: &[Option<ConstraintSet>],
 ) -> Vec<Option<Vec<usize>>> {
     let mut per_block = Vec::with_capacity(block_constraints.len());
     let mut offset = 0usize;
     for constraints_opt in block_constraints {
-        let rows = constraints_opt
-            .as_ref()
-            .map_or(0, |constraints| constraints.a.nrows());
+        let rows = constraints_opt.as_ref().map_or(0, ConstraintSet::nrows);
         if rows == 0 {
             per_block.push(None);
             continue;
@@ -875,7 +892,7 @@ pub(crate) fn scatter_joint_active_set(
 
 pub(crate) fn augment_active_sets_with_tight_constraint_rows(
     block_active_sets: &mut Vec<Option<Vec<usize>>>,
-    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_constraints: &[Option<ConstraintSet>],
     states: &[ParameterBlockState],
     slack_tol: f64,
 ) -> usize {
@@ -891,12 +908,18 @@ pub(crate) fn augment_active_sets_with_tight_constraint_rows(
         let Some(state) = states.get(b) else {
             continue;
         };
-        if constraints.a.ncols() != state.beta.len() {
+        if constraints.ncols() != state.beta.len() {
             continue;
         }
+        let Ok(values) = constraints.values(state.beta.view()) else {
+            continue;
+        };
         let active = block_active_sets[b].get_or_insert_with(Vec::new);
-        for row in 0..constraints.a.nrows() {
-            let slack = constraints.a.row(row).dot(&state.beta) - constraints.b[row];
+        for row in 0..constraints.nrows() {
+            let Ok(bound) = constraints.bound(row) else {
+                continue;
+            };
+            let slack = values[row] - bound;
             if slack.is_finite() && slack <= tol && !active.contains(&row) {
                 active.push(row);
                 added += 1;
@@ -928,7 +951,7 @@ pub(crate) fn augment_active_sets_with_tight_constraint_rows(
 /// Returns `None` when no block has any active constraints — the caller
 /// can then skip the constraint-aware kernel entirely.
 pub(crate) fn assemble_active_constraint_block(
-    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_constraints: &[Option<ConstraintSet>],
     block_active_sets: &[Option<Vec<usize>>],
     ranges: &[(usize, usize)],
     total_p: usize,
@@ -936,7 +959,7 @@ pub(crate) fn assemble_active_constraint_block(
     if block_constraints.len() != ranges.len() || block_active_sets.len() != ranges.len() {
         return None;
     }
-    let mut active_per_block: Vec<(usize, &[usize], &LinearInequalityConstraints)> = Vec::new();
+    let mut active_per_block: Vec<(usize, &[usize], &ConstraintSet)> = Vec::new();
     let mut total_active = 0usize;
     for (b, (range, (constraints_opt, active_opt))) in ranges
         .iter()
@@ -952,10 +975,10 @@ pub(crate) fn assemble_active_constraint_block(
         if active.is_empty() {
             continue;
         }
-        if constraints.a.ncols() != range.1 - range.0 {
+        if constraints.ncols() != range.1 - range.0 {
             return None;
         }
-        if !active.iter().all(|&r| r < constraints.a.nrows()) {
+        if !active.iter().all(|&r| r < constraints.nrows()) {
             return None;
         }
         total_active += active.len();
@@ -969,9 +992,10 @@ pub(crate) fn assemble_active_constraint_block(
     for (b_idx, active, constraints) in active_per_block {
         let (start, end) = ranges[b_idx];
         let block_p = end - start;
-        for &local_row in active {
+        let gathered = constraints.gather_rows(active).ok()?;
+        for (gathered_row, _) in active.iter().enumerate() {
             for col in 0..block_p {
-                a[[out_row, start + col]] = constraints.a[[local_row, col]];
+                a[[out_row, start + col]] = gathered.a[[gathered_row, col]];
             }
             out_row += 1;
         }
@@ -986,9 +1010,14 @@ pub(crate) struct SimpleLowerBounds {
 }
 
 pub(crate) fn extract_simple_lower_bounds(
-    constraints: &LinearInequalityConstraints,
+    constraints: &ConstraintSet,
     p: usize,
 ) -> Result<Option<SimpleLowerBounds>, String> {
+    let ConstraintSet::Dense(constraints) = constraints else {
+        // A factored cone couples whole covariate rows; it is never a
+        // per-coordinate lower-bound system.
+        return Ok(None);
+    };
     if constraints.a.ncols() != p || constraints.a.nrows() != constraints.b.len() {
         return Err(CustomFamilyError::ConstraintViolation {
             reason: "linear constraints: shape mismatch".to_string(),
@@ -1151,7 +1180,7 @@ pub(crate) struct BlockUpdateContext<'a> {
     pub(crate) block_idx: usize,
     pub(crate) s_lambda: &'a Array2<f64>,
     pub(crate) options: &'a BlockwiseFitOptions,
-    pub(crate) linear_constraints: Option<&'a LinearInequalityConstraints>,
+    pub(crate) linear_constraints: Option<&'a ConstraintSet>,
     pub(crate) cached_active_set: Option<&'a [usize]>,
 }
 
@@ -1249,7 +1278,7 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
                         None,
                     )
                 } else {
-                    solve_quadratic_with_linear_constraints(
+                    gam_solve::active_set::solve_quadratic_with_constraint_set(
                         &lhs,
                         &rhs,
                         &ctx.states[ctx.block_idx].beta,
@@ -1389,14 +1418,15 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                             )
                         })?;
                 let delta_start = Array1::zeros(p);
-                let (delta, active_set) = solve_quadratic_with_linear_constraints(
-                    &lhs_dense,
-                    &rhs_step,
-                    &delta_start,
-                    &delta_constraints,
-                    ctx.cached_active_set,
-                )
-                .map_err(|e| e.to_string())?;
+                let (delta, active_set) =
+                    gam_solve::active_set::solve_quadratic_with_constraint_set(
+                        &lhs_dense,
+                        &rhs_step,
+                        &delta_start,
+                        &delta_constraints,
+                        ctx.cached_active_set,
+                    )
+                    .map_err(|e| e.to_string())?;
                 Ok((&ctx.states[ctx.block_idx].beta + &delta, active_set))
             }
             .map_err(|e| {
@@ -1535,20 +1565,31 @@ impl BlockWorkingSetUpdaterExt for BlockWorkingSet {
 
 pub(crate) fn check_linear_feasibility(
     beta: &Array1<f64>,
-    constraints: &LinearInequalityConstraints,
+    constraints: &ConstraintSet,
     tol: f64,
 ) -> Result<(), String> {
-    if constraints.a.ncols() != beta.len() || constraints.a.nrows() != constraints.b.len() {
+    if constraints.ncols() != beta.len() {
         return Err(CustomFamilyError::ConstraintViolation {
             reason: "linear constraints: shape mismatch".to_string(),
         }
         .into());
     }
-    let slack = constraints.a.dot(beta) - &constraints.b;
+    let values = constraints.values(beta.view()).map_err(|e| {
+        CustomFamilyError::ConstraintViolation {
+            reason: format!("linear constraints: {e}"),
+        }
+        .to_string()
+    })?;
     let mut worst = 0.0_f64;
     let mut worst_idx = 0usize;
-    for (i, &s) in slack.iter().enumerate() {
-        let v = (-s).max(0.0);
+    for i in 0..constraints.nrows() {
+        let bound = constraints.bound(i).map_err(|e| {
+            CustomFamilyError::ConstraintViolation {
+                reason: format!("linear constraints: {e}"),
+            }
+            .to_string()
+        })?;
+        let v = (bound - values[i]).max(0.0);
         if v > worst {
             worst = v;
             worst_idx = i;
@@ -1558,10 +1599,9 @@ pub(crate) fn check_linear_feasibility(
         // #1108 DIAGNOSTIC: pin down whether this infeasible β is PROJECTABLE
         // (→ a wiring bug: the seed bypassed projection) or genuinely outside a
         // hard polytope. Report the worst row's ‖a‖, the scaled violation, the
-        // β magnitude, and the outcome of the exact active-set projections of
+        // β magnitude, and the outcome of the exact active-set projection of
         // THIS β onto these constraints.
-        let a_worst = constraints.a.row(worst_idx);
-        let norm_worst = a_worst.dot(&a_worst).sqrt();
+        let norm_worst = constraints.row_norm(worst_idx).unwrap_or(f64::NAN);
         let scaled_worst = if norm_worst > 0.0 {
             worst / norm_worst
         } else {
@@ -1569,37 +1609,19 @@ pub(crate) fn check_linear_feasibility(
         };
         let beta_inf = beta.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
         let interior_outcome =
-            match gam_solve::active_set::project_point_strictly_into_feasible_cone(
+            match gam_solve::active_set::project_point_strictly_into_feasible_constraint_set(
                 beta,
                 constraints,
             ) {
                 Some(p) => {
-                    let s = constraints.a.dot(&p) - &constraints.b;
-                    let w = s.iter().fold(0.0_f64, |m, &v| m.max((-v).max(0.0)));
-                    format!("strict-interior→worst={w:.3e}")
+                    let w = constraints
+                        .max_scaled_violation(p.view())
+                        .map(|(w, _)| w)
+                        .unwrap_or(f64::NAN);
+                    format!("strict-interior→scaled_worst={w:.3e}")
                 }
                 None => "strict-interior→None".to_string(),
             };
-        let boundary_outcome = {
-            let identity = Array2::<f64>::eye(beta.len());
-            match gam_solve::active_set::solve_quadratic_with_linear_constraints(
-                &identity,
-                beta,
-                beta,
-                constraints,
-                None,
-            ) {
-                Ok((p, _)) => {
-                    let s = constraints.a.dot(&p) - &constraints.b;
-                    let w = s.iter().fold(0.0_f64, |m, &v| m.max((-v).max(0.0)));
-                    format!("boundary→worst={w:.3e}")
-                }
-                Err(e) => format!("boundary→Err({e})"),
-            }
-        };
-        let worst_row_nnz = (0..constraints.a.ncols())
-            .filter(|&c| constraints.a[[worst_idx, c]].abs() > 1e-12)
-            .count();
         let simple_bounds_path = match extract_simple_lower_bounds(constraints, beta.len()) {
             Ok(Some(_)) => "extract_simple_lower_bounds→Some(SIMPLE-BOUNDS PATH)",
             Ok(None) => "extract_simple_lower_bounds→None(general QP)",
@@ -1608,10 +1630,10 @@ pub(crate) fn check_linear_feasibility(
         return Err(CustomFamilyError::ConstraintViolation {
             reason: format!(
                 "infeasible iterate: max(Aβ-b violation)={worst:.3e} at constraint row {worst_idx} \
-                 [#1108 diag: rows={}, worst_row_nnz={worst_row_nnz}, ‖a_row‖={norm_worst:.3e}, \
+                 [#1108 diag: rows={}, ‖a_row‖={norm_worst:.3e}, \
                  scaled_viol={scaled_worst:.3e}, |β|∞={beta_inf:.3e}, {interior_outcome}, \
-                 {boundary_outcome}, {simple_bounds_path}]",
-                constraints.a.nrows()
+                 {simple_bounds_path}]",
+                constraints.nrows()
             ),
         }
         .into());

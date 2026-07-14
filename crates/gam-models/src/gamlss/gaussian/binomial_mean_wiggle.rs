@@ -706,7 +706,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(None);
         }
@@ -1801,7 +1801,9 @@ mod exact_frozen_monotonicity_tests {
         let constraints = family
             .block_linear_constraints(&[], BinomialMeanWiggleFamily::BLOCK_WIGGLE, &spec)
             .expect("frozen constraint construction")
-            .expect("wiggle block must be constrained");
+            .expect("wiggle block must be constrained")
+            .to_dense()
+            .expect("wiggle cone is a small dense system");
         assert_eq!(constraints.a, Array2::<f64>::eye(3));
         assert_eq!(constraints.b, Array1::<f64>::zeros(3));
 

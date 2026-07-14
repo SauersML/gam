@@ -417,7 +417,7 @@ pub(crate) fn synchronized_states_from_flat_beta<
 pub(crate) fn projected_stationarity_inf_norm(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
-    constraints: Option<&LinearInequalityConstraints>,
+    constraints: Option<&ConstraintSet>,
     known_active_rows: Option<&[usize]>,
 ) -> f64 {
     assert_eq!(residual.len(), beta.len());
@@ -437,7 +437,7 @@ pub(crate) fn projected_stationarity_inf_norm(
 pub(crate) fn projected_linear_constraint_stationarity_inf_norm(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
-    constraints: &LinearInequalityConstraints,
+    constraints: &ConstraintSet,
     known_active_rows: Option<&[usize]>,
 ) -> Option<f64> {
     let projected = projected_linear_constraint_stationarity_vector(
@@ -457,21 +457,22 @@ pub(crate) fn projected_linear_constraint_stationarity_inf_norm(
 
 pub(crate) fn linear_constraint_primal_violation(
     beta: &Array1<f64>,
-    constraints: &LinearInequalityConstraints,
+    constraints: &ConstraintSet,
 ) -> Option<f64> {
-    if constraints.a.ncols() != beta.len() || constraints.a.nrows() != constraints.b.len() {
+    if constraints.ncols() != beta.len() {
         return None;
     }
+    let values = constraints.values(beta.view()).ok()?;
     let mut primal_violation = 0.0_f64;
-    for row in 0..constraints.a.nrows() {
-        if constraints.b[row] == f64::NEG_INFINITY {
+    for row in 0..constraints.nrows() {
+        let bound = constraints.bound(row).ok()?;
+        if bound == f64::NEG_INFINITY {
             continue;
         }
-        if !constraints.b[row].is_finite() {
+        if !bound.is_finite() {
             return None;
         }
-        let value = constraints.a.row(row).dot(beta);
-        let slack = value - constraints.b[row];
+        let slack = values[row] - bound;
         if !slack.is_finite() {
             return None;
         }
@@ -483,17 +484,15 @@ pub(crate) fn linear_constraint_primal_violation(
 pub fn projected_linear_constraint_stationarity_vector(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
-    constraints: &LinearInequalityConstraints,
+    constraints: &ConstraintSet,
     known_active_rows: Option<&[usize]>,
 ) -> Option<Array1<f64>> {
     let p = beta.len();
-    if residual.len() != p
-        || constraints.a.ncols() != p
-        || constraints.a.nrows() != constraints.b.len()
-    {
+    if residual.len() != p || constraints.ncols() != p {
         return None;
     }
-    let n_rows = constraints.a.nrows();
+    let n_rows = constraints.nrows();
+    let values = constraints.values(beta.view()).ok()?;
     // Union the slack-detected active rows with the optional QP-supplied
     // hint. Using a boolean membership table preserves a canonical row order
     // (matching the constraint matrix) so the rank-reduction below is
@@ -501,21 +500,21 @@ pub fn projected_linear_constraint_stationarity_vector(
     let mut in_active = vec![false; n_rows];
     if let Some(hint) = known_active_rows {
         for &row in hint {
-            if row < n_rows && constraints.b[row].is_finite() {
+            if row < n_rows && constraints.bound(row).is_ok_and(f64::is_finite) {
                 in_active[row] = true;
             }
         }
     }
     for row in 0..n_rows {
-        if constraints.b[row] == f64::NEG_INFINITY {
+        let bound = constraints.bound(row).ok()?;
+        if bound == f64::NEG_INFINITY {
             continue;
         }
-        if !constraints.b[row].is_finite() {
+        if !bound.is_finite() {
             return None;
         }
-        let a_row = constraints.a.row(row);
-        let value = a_row.dot(beta);
-        let slack = value - constraints.b[row];
+        let value = values[row];
+        let slack = value - bound;
         if !slack.is_finite() {
             return None;
         }
@@ -536,13 +535,16 @@ pub fn projected_linear_constraint_stationarity_vector(
         // (`project_stationarity_residual_on_constraint_cone`) assigns λ = 0 to any
         // candidate carrying no multiplier mass, so a non-binding row cannot
         // spuriously shrink the residual.
-        let scale = value.abs().max(constraints.b[row].abs()).max(1.0);
+        let scale = value.abs().max(bound.abs()).max(1.0);
         let beta_inf = beta
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max)
             .max(1.0);
-        let row_norm1 = a_row.iter().map(|v| v.abs()).sum::<f64>().max(1.0);
+        // ℓ¹ row norm bounded below by the Euclidean norm the carrier exposes;
+        // for the factored cone the Euclidean norm is exact and the ℓ¹ norm is
+        // within √p of it, so the slack band keeps its magnitude semantics.
+        let row_norm1 = constraints.row_norm(row).ok()?.max(1.0);
         // A row that is mathematically binding can appear a small positive
         // distance inside the feasible cone after repeated dense/spectral
         // Newton projections on a flat baseline-hazard valley: the objective is
@@ -567,11 +569,8 @@ pub fn projected_linear_constraint_stationarity_vector(
         return Some(residual.clone());
     }
 
-    let mut a_active = Array2::<f64>::zeros((active_rows.len(), p));
-    for (pos, &row) in active_rows.iter().enumerate() {
-        a_active.row_mut(pos).assign(&constraints.a.row(row));
-    }
-    project_stationarity_residual_on_constraint_cone(residual, &a_active)
+    let gathered = constraints.gather_rows(&active_rows).ok()?;
+    project_stationarity_residual_on_constraint_cone(residual, &gathered.a)
         .map(|(projected, _)| projected)
 }
 
@@ -761,7 +760,7 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     s_lambdas: &[Array2<f64>],
     ridge: f64,
     ridge_policy: RidgePolicy,
-    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_constraints: &[Option<ConstraintSet>],
     block_active_sets: Option<&[Option<Vec<usize>>]>,
     // gam#979: per-coordinate simple lower bounds (`f64::NEG_INFINITY` where
     // unbounded, length = total joint p), from `extract_simple_lower_bounds` on
@@ -952,7 +951,7 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
     s_lambdas: &[Array2<f64>],
     ridge: f64,
     ridge_policy: RidgePolicy,
-    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_constraints: &[Option<ConstraintSet>],
     block_active_sets: Option<&[Option<Vec<usize>>]>,
     // gam#1587/#561: `Σ_t λ_t (M⊗S_t) · β` — the full-width joint penalty's
     // contribution to the penalized stationarity condition, in stacked
@@ -1131,7 +1130,7 @@ pub(crate) fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
     s_lambdas: &[Array2<f64>],
     ridge: f64,
     ridge_policy: RidgePolicy,
-    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_constraints: &[Option<ConstraintSet>],
     block_active_sets: Option<&[Option<Vec<usize>>]>,
     joint_penalty_score: Option<&Array1<f64>>,
 ) -> Result<Option<ProjectedKktResidual>, String> {

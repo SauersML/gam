@@ -1649,14 +1649,17 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         if block_idx == Self::BLOCK_LINK_WIGGLE {
             return Ok(monotone_wiggle_nonnegative_constraints(spec.design.ncols()));
         }
         if block_idx != Self::BLOCK_TIME {
             return Ok(None);
         }
-        Ok(self.time_linear_constraints.clone())
+        Ok(self
+            .time_linear_constraints
+            .clone()
+            .map(ConstraintSet::Dense))
     }
 
     fn max_feasible_step_size(

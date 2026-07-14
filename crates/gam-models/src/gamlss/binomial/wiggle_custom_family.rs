@@ -71,7 +71,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(None);
         }
