@@ -1358,8 +1358,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         regularized_hessian: &Array2<f64>,
         direction_out: &mut Array1<f64>,
     ) -> Result<(), EstimationError> {
+        let stabilizing_floor = lm_d2
+            .iter()
+            .map(|&scale| state.ridge_used + loop_lambda * scale)
+            .fold(f64::INFINITY, f64::min);
         if state.hessian_curvature == HessianCurvatureKind::Fisher
-            && self.penalty.requires_root_solve()
+            && self.penalty.requires_root_solve(stabilizing_floor)
         {
             self.solve_fisher_direction_from_root(state, loop_lambda, lm_d2, direction_out)
         } else {

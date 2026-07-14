@@ -110,14 +110,25 @@ impl PirlsPenalty {
     /// rows, so their squared row norms are exactly the represented positive
     /// eigenvalues.  Diagonal penalties never incur cancellation while being
     /// assembled and therefore retain the direct diagonal/Gram solve.
-    pub(super) fn requires_root_solve(&self) -> bool {
+    pub(super) fn requires_root_solve(&self, stabilizing_floor: f64) -> bool {
         let Self::Dense { e_transformed, .. } = self else {
             return false;
         };
-        let mut min_positive = f64::INFINITY;
-        let mut max_energy = 0.0_f64;
+        let mut min_positive = if stabilizing_floor.is_finite() && stabilizing_floor > 0.0 {
+            stabilizing_floor
+        } else {
+            f64::INFINITY
+        };
+        let mut max_energy = if stabilizing_floor.is_finite() && stabilizing_floor > 0.0 {
+            stabilizing_floor
+        } else {
+            0.0
+        };
         for row in e_transformed.rows() {
             let energy = row.dot(&row);
+            if energy.is_infinite() {
+                return true;
+            }
             if energy > 0.0 && energy.is_finite() {
                 min_positive = min_positive.min(energy);
                 max_energy = max_energy.max(energy);
@@ -274,8 +285,18 @@ mod tests {
             prior_mean_target: Array1::zeros(2),
         };
 
-        assert!(stiff.requires_root_solve());
-        assert!(!ordinary.requires_root_solve());
+        assert!(stiff.requires_root_solve(0.0));
+        assert!(!ordinary.requires_root_solve(0.0));
+
+        let rank_one = PirlsPenalty::Dense {
+            s_transformed: array![[1.0e10, 1.0e10], [1.0e10, 1.0e10]],
+            e_transformed: array![[1.0e5, 1.0e5]],
+            linear_shift: Array1::zeros(2),
+            constant_shift: 0.0,
+            prior_mean_target: Array1::zeros(2),
+        };
+        assert!(rank_one.requires_root_solve(1.0));
+        assert!(!rank_one.requires_root_solve(1.0e4));
     }
 }
 
