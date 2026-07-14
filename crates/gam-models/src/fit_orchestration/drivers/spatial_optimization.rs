@@ -2415,7 +2415,6 @@ fn constant_curvature_kappa_fair_optimum(
         .with_prefer_gradient_only(true)
         .with_disable_fixed_point(true)
         .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
-        .with_continuation_prewarm(false)
         .with_psi_dim(1)
         .with_tolerance(options.tol.max(f64::EPSILON.sqrt()))
         .with_max_iter(options.max_iter.max(1))

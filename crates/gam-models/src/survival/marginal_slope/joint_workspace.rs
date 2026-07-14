@@ -279,16 +279,17 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         &self,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        match self.family.family_hyper_role(&self.hyper_layout, psi_index)? {
-            None => {
-                self.family.psi_terms_inner_with_options(
-                    &self.block_states,
-                    self.hyper_layout.design_derivative_blocks(),
-                    psi_index,
-                    self.cache.as_ref(),
-                    &self.options,
-                )
-            }
+        match self
+            .family
+            .family_hyper_role(&self.hyper_layout, psi_index)?
+        {
+            None => self.family.psi_terms_inner_with_options(
+                &self.block_states,
+                self.hyper_layout.design_derivative_blocks(),
+                psi_index,
+                self.cache.as_ref(),
+                &self.options,
+            ),
             Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => {
                 self.family.sigma_exact_joint_psi_terms_with_options(
                     &self.block_states,
@@ -296,13 +297,13 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                     &self.options,
                 )
             }
-            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
-                .family
-                .rigid_baseline_exact_joint_psi_terms_with_options(
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => {
+                self.family.baseline_exact_joint_psi_terms_with_options(
                     &self.block_states,
                     axis,
                     &self.options,
-                ),
+                )
+            }
         }
     }
 
@@ -380,10 +381,28 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                 Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(other_axis)),
             ) => self
                 .family
-                .rigid_baseline_exact_joint_psisecond_order_terms_with_options(
+                .baseline_exact_joint_psisecond_order_terms_with_options(
                     &self.block_states,
                     axis,
                     other_axis,
+                    &self.options,
+                ),
+            (Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)), None) => self
+                .family
+                .baseline_design_exact_joint_psisecond_order_terms_with_options(
+                    &self.block_states,
+                    self.hyper_layout.design_derivative_blocks(),
+                    axis,
+                    psi_j,
+                    &self.options,
+                ),
+            (None, Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis))) => self
+                .family
+                .baseline_design_exact_joint_psisecond_order_terms_with_options(
+                    &self.block_states,
+                    self.hyper_layout.design_derivative_blocks(),
+                    axis,
+                    psi_i,
                     &self.options,
                 ),
             _ => Err(format!(
@@ -397,7 +416,10 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<gam_problem::DriftDerivResult>, String> {
-        match self.family.family_hyper_role(&self.hyper_layout, psi_index)? {
+        match self
+            .family
+            .family_hyper_role(&self.hyper_layout, psi_index)?
+        {
             None => self
                 .family
                 .psi_hessian_directional_derivative_operator_with_options(
@@ -418,7 +440,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                 .map(|result| result.map(gam_problem::DriftDerivResult::Dense)),
             Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
                 .family
-                .rigid_baseline_exact_joint_psihessian_directional_derivative_with_options(
+                .baseline_exact_joint_psihessian_directional_derivative_with_options(
                     &self.block_states,
                     axis,
                     d_beta_flat,

@@ -442,27 +442,25 @@ fn derivative_energy_factor_spans(
     // exact through degree 2(p − m) + 1.
     let quad_points = degree - order + 1;
     let (nodes, weights) = gauss_legendre(quad_points);
-    let active_spans = spans
+    let active_span_count = spans
         .clone()
         .filter(|&k| knot_vector[k + 1] > knot_vector[k])
         .count();
-    let mut factor = Array2::<f64>::zeros((active_spans * quad_points, output_dim));
+    let mut factor = Array2::<f64>::zeros((active_span_count * quad_points, output_dim));
     let mut row = vec![0.0_f64; out_len];
     let mut workspace = BsplineDerivativeWorkspace::new();
-    let mut factor_row = 0usize;
 
-    for k in spans {
+    for (active_span, k) in spans
+        .filter(|&k| knot_vector[k + 1] > knot_vector[k])
+        .enumerate()
+    {
         let left = knot_vector[k];
         let right = knot_vector[k + 1];
         let width = right - left;
-        if width <= 0.0 {
-            // Validated knots are non-decreasing, so a non-positive width is a
-            // zero-length span with no quadrature mass.
-            continue;
-        }
         let mid = 0.5 * (left + right);
         let half = 0.5 * width;
-        for (node, weight) in nodes.iter().zip(weights.iter()) {
+        for (quadrature_node, (node, weight)) in nodes.iter().zip(weights.iter()).enumerate() {
+            let factor_row = active_span * quad_points + quadrature_node;
             let x = mid + half * node;
             evaluate_bspline_derivative_recurrence_into(
                 order,
@@ -483,10 +481,8 @@ fn derivative_energy_factor_spans(
                 let fi = fold(i);
                 factor[[factor_row, fi]] += root_weight * vi;
             }
-            factor_row += 1;
         }
     }
-    debug_assert_eq!(factor_row, factor.nrows());
     Ok(factor)
 }
 

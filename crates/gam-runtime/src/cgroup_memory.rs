@@ -58,19 +58,6 @@ pub struct CgroupMemoryProbeFailure {
 }
 
 impl CgroupMemoryProbeFailure {
-    #[cfg(any(target_os = "linux", test))]
-    fn new(
-        kind: CgroupMemoryProbeFailureKind,
-        path: impl Into<Box<str>>,
-        detail: impl Into<Box<str>>,
-    ) -> Self {
-        Self {
-            kind,
-            path: path.into(),
-            detail: detail.into(),
-        }
-    }
-
     pub const fn kind(&self) -> CgroupMemoryProbeFailureKind {
         self.kind
     }
@@ -81,15 +68,6 @@ impl CgroupMemoryProbeFailure {
 
     pub fn detail(&self) -> &str {
         &self.detail
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fixture(
-        kind: CgroupMemoryProbeFailureKind,
-        path: impl Into<Box<str>>,
-        detail: impl Into<Box<str>>,
-    ) -> Self {
-        Self::new(kind, path, detail)
     }
 }
 
@@ -121,44 +99,6 @@ pub struct CgroupMemoryAvailability {
 }
 
 impl CgroupMemoryAvailability {
-    #[cfg(any(target_os = "linux", test))]
-    fn from_consistent_counters(
-        binding_path: impl Into<Box<str>>,
-        limit_bytes: u64,
-        current_bytes: u64,
-        inactive_file_bytes: u64,
-        inspected_levels: usize,
-    ) -> Option<Self> {
-        let working_set_bytes = current_bytes.checked_sub(inactive_file_bytes)?;
-        Some(Self {
-            binding_path: binding_path.into(),
-            limit_bytes,
-            current_bytes,
-            inactive_file_bytes,
-            working_set_bytes,
-            available_bytes: limit_bytes.saturating_sub(working_set_bytes),
-            inspected_levels,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fixture(
-        binding_path: impl Into<Box<str>>,
-        limit_bytes: u64,
-        current_bytes: u64,
-        inactive_file_bytes: u64,
-        inspected_levels: usize,
-    ) -> Self {
-        Self::from_consistent_counters(
-            binding_path,
-            limit_bytes,
-            current_bytes,
-            inactive_file_bytes,
-            inspected_levels,
-        )
-        .expect("cgroup test fixture counters must be internally consistent")
-    }
-
     pub fn binding_path(&self) -> &str {
         &self.binding_path
     }
@@ -185,6 +125,48 @@ impl CgroupMemoryAvailability {
 
     pub const fn inspected_levels(&self) -> usize {
         self.inspected_levels
+    }
+}
+
+#[cfg(test)]
+mod test_fixtures {
+    use super::*;
+
+    impl CgroupMemoryProbeFailure {
+        pub(crate) fn fixture(
+            kind: CgroupMemoryProbeFailureKind,
+            path: impl Into<Box<str>>,
+            detail: impl Into<Box<str>>,
+        ) -> Self {
+            Self {
+                kind,
+                path: path.into(),
+                detail: detail.into(),
+            }
+        }
+    }
+
+    impl CgroupMemoryAvailability {
+        pub(crate) fn fixture(
+            binding_path: impl Into<Box<str>>,
+            limit_bytes: u64,
+            current_bytes: u64,
+            inactive_file_bytes: u64,
+            inspected_levels: usize,
+        ) -> Self {
+            let working_set_bytes = current_bytes
+                .checked_sub(inactive_file_bytes)
+                .expect("cgroup test fixture counters must be internally consistent");
+            Self {
+                binding_path: binding_path.into(),
+                limit_bytes,
+                current_bytes,
+                inactive_file_bytes,
+                working_set_bytes,
+                available_bytes: limit_bytes.saturating_sub(working_set_bytes),
+                inspected_levels,
+            }
+        }
     }
 }
 
@@ -253,6 +235,41 @@ mod linux {
     use std::io;
     use std::os::unix::ffi::OsStringExt;
     use std::path::{Component, Path, PathBuf};
+
+    impl CgroupMemoryProbeFailure {
+        fn new(
+            kind: CgroupMemoryProbeFailureKind,
+            path: impl Into<Box<str>>,
+            detail: impl Into<Box<str>>,
+        ) -> Self {
+            Self {
+                kind,
+                path: path.into(),
+                detail: detail.into(),
+            }
+        }
+    }
+
+    impl CgroupMemoryAvailability {
+        fn from_consistent_counters(
+            binding_path: impl Into<Box<str>>,
+            limit_bytes: u64,
+            current_bytes: u64,
+            inactive_file_bytes: u64,
+            inspected_levels: usize,
+        ) -> Option<Self> {
+            let working_set_bytes = current_bytes.checked_sub(inactive_file_bytes)?;
+            Some(Self {
+                binding_path: binding_path.into(),
+                limit_bytes,
+                current_bytes,
+                inactive_file_bytes,
+                working_set_bytes,
+                available_bytes: limit_bytes.saturating_sub(working_set_bytes),
+                inspected_levels,
+            })
+        }
+    }
 
     const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
     const PROC_SELF_MOUNTINFO: &str = "/proc/self/mountinfo";

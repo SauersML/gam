@@ -14,6 +14,56 @@ pub(crate) struct BoundInnerSeed {
     pub(crate) beta: Array1<f64>,
 }
 
+pub(crate) fn outer_theta_bitwise_eq(left: &Array1<f64>, right: &Array1<f64>) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+/// Install cached inner state only at the exact outer coordinate that owns it.
+///
+/// This function is called after a seed-attempt reset and immediately before
+/// the literal seed can be evaluated. Generated multistart candidates never
+/// inherit coefficients from another outer point.
+pub(crate) fn install_matching_initial_inner_seed(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    seed: &Array1<f64>,
+    context: &str,
+) -> Result<(), EstimationError> {
+    let Some(bound) = config.initial_inner_seed.as_ref() else {
+        return Ok(());
+    };
+    if !outer_theta_bitwise_eq(&bound.theta, seed) {
+        return Ok(());
+    }
+    match obj.seed_inner_state(&bound.beta)? {
+        SeedOutcome::Installed => log::info!(
+            "[CACHE] beta-warm context={} theta_dim={} beta_dim={} action=installed",
+            context,
+            bound.theta.len(),
+            bound.beta.len(),
+        ),
+        SeedOutcome::NoSlot => log::warn!(
+            "[CACHE] beta-warm context={} theta_dim={} beta_dim={} action=skip \
+             reason=objective_has_no_inner_beta_slot",
+            context,
+            bound.theta.len(),
+            bound.beta.len(),
+        ),
+        SeedOutcome::Incompatible => log::info!(
+            "[CACHE] beta-warm context={} theta_dim={} beta_dim={} action=rho-only \
+             reason=seed_beta_incompatible_with_inner_state",
+            context,
+            bound.theta.len(),
+            bound.beta.len(),
+        ),
+    }
+    Ok(())
+}
+
 /// Hold terminal evidence at full inner-solve fidelity.
 ///
 /// Search-time REML evaluations may deliberately cap P-IRLS.  A terminal
@@ -518,8 +568,7 @@ impl OuterProblem {
             cache_mirror_sessions: self.cache_mirror_sessions.clone(),
             rho_uncertainty_problem_size: self.rho_uncertainty_problem_size,
             // Populated only by the persistent-cache resume path in `run` after
-            // a warm-start hit decodes a converged outer Hessian; cold by
-            // construction here, like `warm_start_cache_hit`.
+            // a warm-start hit decodes a converged outer Hessian.
             warm_start_outer_hessian: None,
             rho_canonical_keys: self.rho_canonical_keys.clone(),
         }
@@ -667,7 +716,7 @@ impl OuterProblem {
         let key_hex = session.key().to_hex();
         let short_key = &key_hex[..8.min(key_hex.len())];
         let mut had_hit = false;
-        let mut cached_inner_beta: Option<Array1<f64>> = None;
+        let mut cached_inner_seed: Option<BoundInnerSeed> = None;
         if let Some(loaded) = session.try_load_with_source() {
             match classify_cache_entry_for_outer(&loaded, self.n_params) {
                 CacheSeedDecision::ExactFinal {
@@ -684,9 +733,14 @@ impl OuterProblem {
                         prior_obj_display,
                         iterations,
                     );
-                    config.initial_rho = Some(rho);
+                    config.initial_rho = Some(rho.clone());
                     config.screen_initial_rho = false;
-                    cached_inner_beta = (!beta.is_empty()).then(|| Array1::from_vec(beta));
+                    if !beta.is_empty() {
+                        cached_inner_seed = Some(BoundInnerSeed {
+                            theta: rho,
+                            beta: Array1::from_vec(beta),
+                        });
+                    }
                     had_hit = true;
                 }
                 CacheSeedDecision::Seed {
@@ -731,7 +785,7 @@ impl OuterProblem {
                             prior_obj_display,
                             iteration,
                         );
-                        config.initial_rho = Some(rho);
+                        config.initial_rho = Some(rho.clone());
                         config.screen_initial_rho = false;
                         had_hit = true;
                     } else {
@@ -745,7 +799,9 @@ impl OuterProblem {
                         );
                         had_hit = true;
                     }
-                    cached_inner_beta = beta_arr;
+                    if let Some(beta) = beta_arr {
+                        cached_inner_seed = Some(BoundInnerSeed { theta: rho, beta });
+                    }
                 }
                 CacheSeedDecision::Discard {
                     reason: "payload-shape-mismatch",
@@ -781,63 +837,16 @@ impl OuterProblem {
                 self.n_params,
             );
         }
-        // Propagate the warm-start cache-hit signal into the config the runner
-        // sees. On a hit the installed seed (ρ, and since 0.1.204 the inner β)
-        // is already near-optimal, so the continuation pre-warm — which exists
-        // purely to anneal a COLD seed — is redundant and is skipped downstream
-        // (`run_plan::continuation_prewarm_step_budget`). The outer BFGS/Newton
-        // still runs to its REML/KKT certificate, so the optimum is identical.
-        config.warm_start_cache_hit = had_hit;
+        // Preserve the ownership relation between a cached coefficient vector
+        // and the exact outer coordinate that produced it. The runner installs
+        // this seed only after resetting for that bitwise-matching candidate;
+        // it is never replayed at another generated seed.
+        config.initial_inner_seed = cached_inner_seed;
         let mut checkpointing = CheckpointingObjective::new(
             obj,
             Arc::clone(&session),
             config.cache_mirror_sessions.clone(),
         );
-        // Inject the cached inner β (when present) so the family's PIRLS
-        // opens at the prior converged iterate. Families that don't expose
-        // a β slot inherit the trait's no-op default and silently ignore
-        // the hint — that's a ρ-only resume, identical to the pre-β-cache
-        // behavior, but never a regression. Families that DO expose β
-        // (PIRLS-based GAMs, custom-family marginal slope, …) override
-        // `seed_inner_state` to install β before the first eval.
-        if let Some(beta) = cached_inner_beta.as_ref() {
-            match checkpointing.seed_inner_state(beta) {
-                Ok(SeedOutcome::Installed) => log::info!(
-                    "[CACHE] beta-warm key={}.. context={} beta_dim={} action=installed",
-                    short_key,
-                    context,
-                    beta.len(),
-                ),
-                Ok(SeedOutcome::NoSlot) => log::warn!(
-                    "[CACHE] beta-warm key={}.. context={} beta_dim={} action=skip \
-                     reason=objective_has_no_inner_beta_slot",
-                    short_key,
-                    context,
-                    beta.len(),
-                ),
-                Ok(SeedOutcome::Incompatible) => log::info!(
-                    // Not a warning: a row-relaxed cross-fit prefix seed
-                    // (`cache_seed_key`) legitimately carries a β whose length
-                    // reflects the PARENT fold's realized basis rank, which
-                    // differs from this fold's per-block widths. The ρ seed is
-                    // kept (already installed above); cross-length β transfer is
-                    // the gauge-projected FitArtifact channel's job. This is a
-                    // clean ρ-only resume, NOT a regression to full cold start.
-                    "[CACHE] beta-warm key={}.. context={} beta_dim={} action=rho-only \
-                     reason=seed_beta_length_incompatible_with_inner_blocks",
-                    short_key,
-                    context,
-                    beta.len(),
-                ),
-                Err(err) => log::warn!(
-                    "[CACHE] beta-warm key={}.. context={} beta_dim={} action=skip err={}",
-                    short_key,
-                    context,
-                    beta.len(),
-                    err,
-                ),
-            }
-        }
         let result = run_outer(&mut checkpointing, &config, context);
         // Pull the most-recent inner β surfaced by the inner solver so the
         // finalize write encodes the (ρ, β) pair the BFGS optimum was
@@ -2149,7 +2158,6 @@ pub(crate) fn run_outer(
         exact_config.seed_config.max_seeds = 1;
         exact_config.seed_config.seed_budget = 1;
         exact_config.screen_initial_rho = false;
-        exact_config.warm_start_cache_hit = true;
         exact_config.operator_initial_trust_radius = result.operator_trust_radius;
         exact_config.warm_start_outer_hessian = result.final_hessian.clone();
         log::info!(
@@ -2203,7 +2211,6 @@ pub(crate) fn run_outer(
             retry_cfg.seed_config.max_seeds = 1;
             retry_cfg.seed_config.seed_budget = 1;
             retry_cfg.screen_initial_rho = false;
-            retry_cfg.warm_start_cache_hit = true;
             retry_cfg.operator_initial_trust_radius = result.operator_trust_radius;
             retry_cfg.warm_start_outer_hessian = result.final_hessian.clone();
             obj.reset();
@@ -2289,6 +2296,12 @@ fn canonicalize_outer_config(config: &OuterConfig, perm: &[usize]) -> OuterConfi
     canonical.rho_canonical_keys = None;
     if let Some(initial) = config.initial_rho.as_ref() {
         canonical.initial_rho = Some(permute_arr(initial));
+    }
+    if let Some(bound) = config.initial_inner_seed.as_ref() {
+        canonical.initial_inner_seed = Some(BoundInnerSeed {
+            theta: permute_arr(&bound.theta),
+            beta: bound.beta.clone(),
+        });
     }
     if let Some(h) = config.heuristic_lambdas.as_ref() {
         canonical.heuristic_lambdas = Some(permute_vec(h));
@@ -2675,6 +2688,7 @@ pub(crate) fn run_per_atom_efs_if_frontier(
     let topology = crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
 
     obj.reset();
+    install_matching_initial_inner_seed(obj, config, &seed, context)?;
     let result =
         crate::estimate::reml::per_atom_efs::run_per_atom_efs(obj, &seed, &pa_cfg, &topology)?;
     Ok(Some(result.into_outer_result(the_plan)))

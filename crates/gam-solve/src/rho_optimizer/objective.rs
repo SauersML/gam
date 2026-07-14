@@ -25,8 +25,8 @@ pub use gam_problem::{EfsEval, FixedPointCertificateEval, FixedPointCoordinateCe
 ///   pair from disk; if the objective has no β slot it must log loudly
 ///   ("β-bearing checkpoint silently degraded to ρ-only resume") so cache
 ///   provenance is auditable.
-/// - The continuation walk (`prime_outer_seed`) forwards `inner_beta_hint`
-///   from the previous step; if the objective has no β slot the walk
+/// - The typed reactive continuation path forwards `inner_beta_hint` from the
+///   previous solved waypoint; if the objective has no β slot the path
 ///   simply proceeds cold — no log, no error.
 ///
 /// Encoding the distinction in the return type lets each caller branch on
@@ -193,7 +193,8 @@ pub trait OuterObjective {
 
     /// Seed the inner-solver iterate before the first eval, e.g. when the
     /// outer-iterate cache restored a `(ρ, β)` pair from a prior run, or
-    /// when the continuation walk forwards `OuterEval::inner_beta_hint`
+    /// when a typed reactive continuation path forwards
+    /// `OuterEval::inner_beta_hint`
     /// from the previous step.
     ///
     /// Objectives make an explicit choice via the [`SeedOutcome`] return:
@@ -204,23 +205,10 @@ pub trait OuterObjective {
     ///
     /// Callers that need to distinguish "no slot" from "installed" (the
     /// outer cache warm-start path, which logs cache provenance) branch on
-    /// the variant. Callers that don't care (the continuation walk, which
-    /// only proceeds-cold when the hint is unusable) ignore it and only
+    /// the variant. Callers that don't care (the reactive continuation path,
+    /// which only proceeds cold when the hint is unusable) ignore it and only
     /// propagate `Err`.
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError>;
-
-    /// Whether the objective can benefit from continuation pre-warm before
-    /// the first solver eval at a candidate seed.
-    ///
-    /// Pre-warm is only correct for objectives with a real writable inner
-    /// state slot: it evaluates an oversmoothed rho path before the seed and
-    /// forwards non-empty `inner_beta_hint`s between steps. Generic synthetic
-    /// objectives and rho-only cache probes must start at the chosen seed
-    /// directly, otherwise the pre-warm becomes an observable extra eval and
-    /// can clobber seed-dispatch bookkeeping with empty beta seeds.
-    fn allow_continuation_prewarm(&self) -> bool {
-        false
-    }
 
     /// Optional objective-owned hard upper domain for the outer coordinates.
     ///
@@ -661,6 +649,11 @@ pub(crate) struct CheckpointingObjective<'a> {
     /// this the finalize would clobber per-eval checkpoint β state with a
     /// ρ-only payload, reintroducing the cold-β resume failure.
     last_inner_beta: std::sync::Mutex<Option<Array1<f64>>>,
+    /// True only while the typed reactive-domain path evaluates an
+    /// initialization waypoint. Those waypoints are transactional means of
+    /// reaching the literal requested model, not candidate outer iterates, so
+    /// they must never become persistent restart seeds.
+    reactive_waypoint_active: AtomicBool,
 }
 
 impl<'a> CheckpointingObjective<'a> {
@@ -675,6 +668,7 @@ impl<'a> CheckpointingObjective<'a> {
             mirror_sessions,
             eval_counter: AtomicU64::new(0),
             last_inner_beta: std::sync::Mutex::new(None),
+            reactive_waypoint_active: AtomicBool::new(false),
         }
     }
 
@@ -683,6 +677,9 @@ impl<'a> CheckpointingObjective<'a> {
     }
 
     fn note(&self, rho: &Array1<f64>, beta: Option<&Array1<f64>>, cost: f64) {
+        if self.reactive_waypoint_active.load(Ordering::Relaxed) {
+            return;
+        }
         if !cost.is_finite() {
             return;
         }
@@ -775,10 +772,6 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         result
     }
 
-    fn allow_continuation_prewarm(&self) -> bool {
-        self.inner.allow_continuation_prewarm()
-    }
-
     fn terminal_eval_order(&self) -> Option<OuterEvalOrder> {
         self.inner.terminal_eval_order()
     }
@@ -797,21 +790,32 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
     }
 
     fn begin_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
-        self.inner.begin_reactive_domain_waypoint()
+        self.inner.begin_reactive_domain_waypoint()?;
+        self.reactive_waypoint_active
+            .store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     fn commit_reactive_domain_waypoint(
         &mut self,
         rho: &Array1<f64>,
     ) -> Result<(), EstimationError> {
-        self.inner.commit_reactive_domain_waypoint(rho)
+        let result = self.inner.commit_reactive_domain_waypoint(rho);
+        self.reactive_waypoint_active
+            .store(false, Ordering::Relaxed);
+        result
     }
 
     fn rollback_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
-        self.inner.rollback_reactive_domain_waypoint()
+        let result = self.inner.rollback_reactive_domain_waypoint();
+        self.reactive_waypoint_active
+            .store(false, Ordering::Relaxed);
+        result
     }
 
     fn reset(&mut self) {
+        self.reactive_waypoint_active
+            .store(false, Ordering::Relaxed);
         self.inner.reset();
     }
 
@@ -863,10 +867,6 @@ pub struct ClosureObjective<
     /// Analytic evaluator that must install the terminal owned state even when
     /// the selected optimization plan itself used EFS.
     pub(crate) terminal_eval_order: Option<OuterEvalOrder>,
-    /// Whether a seed hook should also opt the objective into generic
-    /// continuation pre-warm. High-dimensional REML keeps the seed hook for
-    /// cache/warm-start replay but declines the expensive rho-anneal pre-pass.
-    pub(crate) continuation_prewarm: bool,
 }
 
 impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> OuterObjective
@@ -955,10 +955,6 @@ where
         }
     }
 
-    fn allow_continuation_prewarm(&self) -> bool {
-        self.continuation_prewarm && self.seed_fn.is_some()
-    }
-
     fn terminal_eval_order(&self) -> Option<OuterEvalOrder> {
         self.terminal_eval_order
     }
@@ -1031,7 +1027,6 @@ where
             screening_proxy_fn: self.screening_proxy_fn,
             seed_fn: Some(seed_fn),
             terminal_eval_order: self.terminal_eval_order,
-            continuation_prewarm: self.continuation_prewarm,
         }
     }
 }
@@ -1368,10 +1363,6 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
         // β is in the coefficient basis, not ρ-coordinate order — forward as-is.
         self.inner.seed_inner_state(beta)
-    }
-
-    fn allow_continuation_prewarm(&self) -> bool {
-        self.inner.allow_continuation_prewarm()
     }
 
     fn reactive_domain_scalar_contract(

@@ -203,69 +203,6 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         }
     }
 
-    /// Runtime-width instantiation of the canonical row program.  This is the
-    /// independent full-primary path used by generic row-program verification;
-    /// production structured lowerings below call the same predictor body with
-    /// fixed probe axes so they never allocate a `p_w^4` tensor.
-    pub(crate) fn eval_runtime<'arena, S: gam_math::jet_scalar::RuntimeJetScalar<'arena>>(
-        &self,
-        row: usize,
-        primaries: &[S],
-    ) -> Result<S, String> {
-        if primaries.len() != self.primary_dimension() {
-            return Err(format!(
-                "binomial wiggle row program primary width {} != {}",
-                primaries.len(),
-                self.primary_dimension()
-            ));
-        }
-        let q = binomial_location_scale_wiggle_predictor_expression(
-            primaries,
-            None,
-            self.beta_w.len(),
-            |column| (2 + column, self.basis_stack(row, column)),
-            |x| gam_math::jet_scalar::RuntimeJetScalar::value(x),
-            |a, b| gam_math::jet_scalar::RuntimeJetScalar::add(a, b),
-            |a, b| gam_math::jet_scalar::RuntimeJetScalar::mul(a, b),
-            |x| gam_math::jet_scalar::RuntimeJetScalar::neg(x),
-            |x, stack| gam_math::jet_scalar::RuntimeJetScalar::compose_unary(x, stack),
-        );
-        let q_value = gam_math::jet_scalar::RuntimeJetScalar::value(&q);
-        let inverse = inverse_link_jet_for_inverse_link(&self.family.link_kind, q_value)
-            .map_err(|e| format!("binomial wiggle row program inverse-link failed: {e}"))?;
-        let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-            self.family.y[row],
-            self.family.weights[row],
-            q_value,
-            inverse.mu,
-            inverse.d1,
-            inverse.d2,
-            inverse.d3,
-            &self.family.link_kind,
-        );
-        let m4 = binomial_neglog_q_fourth_derivative_dispatch(
-            self.family.y[row],
-            self.family.weights[row],
-            q_value,
-            inverse.mu,
-            inverse.d1,
-            inverse.d2,
-            inverse.d3,
-            &self.family.link_kind,
-        )?;
-        let neg_ll = -binomial_location_scale_log_likelihood(
-            self.family.y[row],
-            self.family.weights[row],
-            q_value,
-            &self.family.link_kind,
-            inverse.mu,
-        )?;
-        Ok(gam_math::jet_scalar::RuntimeJetScalar::compose_unary(
-            &q,
-            [neg_ll, m1, m2, m3, m4],
-        ))
-    }
-
     #[inline]
     fn eval_fixed<const K: usize, S: gam_math::jet_scalar::JetScalar<K>>(
         &self,

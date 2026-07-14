@@ -5,8 +5,7 @@ use crate::estimate::evaluation::{
     sas_log_deltaridgeweight,
 };
 use crate::estimate::penalty::{
-    REML_CONTINUATION_PREWARM_RHO_CAP, REML_SECOND_ORDER_RHO_CAP, REML_SEED_SCREENING_RHO_CAP,
-    scaled_covariance,
+    REML_SECOND_ORDER_RHO_CAP, REML_SEED_SCREENING_RHO_CAP, scaled_covariance,
 };
 use crate::estimate::prefit::{
     reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
@@ -766,17 +765,10 @@ where
             let gaussian_identity = matches!(cfg.link_function(), LinkFunction::Identity);
             let n_obs = y_o.len();
             let prefer_gradient_only = k >= REML_SECOND_ORDER_RHO_CAP;
-            let continuation_prewarm = k < REML_CONTINUATION_PREWARM_RHO_CAP;
             if prefer_gradient_only {
                 log::info!(
                     "[OUTER] rho_dim {k} reaches exact REML Hessian budget \
                    ({REML_SECOND_ORDER_RHO_CAP}); routing analytic-gradient quasi-Newton"
-                );
-            }
-            if !continuation_prewarm {
-                log::info!(
-                    "[OUTER] rho_dim {k} reaches continuation-prewarm budget \
-                   ({REML_CONTINUATION_PREWARM_RHO_CAP}); starting optimizer directly from seeds"
                 );
             }
             let problem = OuterProblem::new(k)
@@ -787,7 +779,6 @@ where
                     DeclaredHessianForm::Unavailable
                 })
                 .with_prefer_gradient_only(prefer_gradient_only)
-                .with_continuation_prewarm(continuation_prewarm)
                 .with_barrier(
                     crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
                         fit_linear_constraints.as_ref(),
@@ -1154,24 +1145,16 @@ where
             use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
             let initial_link_kind = cfg.link_kind.clone();
             let prefer_gradient_only = theta_dim >= REML_SECOND_ORDER_RHO_CAP;
-            let continuation_prewarm = theta_dim < REML_CONTINUATION_PREWARM_RHO_CAP;
             if prefer_gradient_only {
                 log::info!(
                     "[OUTER] theta_dim {theta_dim} reaches exact REML Hessian budget \
                    ({REML_SECOND_ORDER_RHO_CAP}); routing analytic-gradient quasi-Newton"
                 );
             }
-            if !continuation_prewarm {
-                log::info!(
-                    "[OUTER] theta_dim {theta_dim} reaches continuation-prewarm budget \
-                   ({REML_CONTINUATION_PREWARM_RHO_CAP}); starting optimizer directly from seeds"
-                );
-            }
             let problem = OuterProblem::new(theta_dim)
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(DeclaredHessianForm::Either)
                 .with_prefer_gradient_only(prefer_gradient_only)
-                .with_continuation_prewarm(continuation_prewarm)
                 .with_psi_dim(mixture_dim + sas_dim)
                 .with_barrier(
                     crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(

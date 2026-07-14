@@ -990,8 +990,11 @@ impl FlexCoefficientJet for Jet2 {
         directional_value: f64,
         directional_gradient: Vec<f64>,
     ) -> Self {
-        debug_assert_eq!(directional_value, 0.0);
-        debug_assert!(directional_gradient.iter().all(|value| *value == 0.0));
+        assert!(
+            directional_value == 0.0
+                && directional_gradient.iter().all(|value| *value == 0.0),
+            "Jet2 cannot erase a coefficient-direction seed; use Jet3"
+        );
         Self::from_parts(value, &gradient, &[])
     }
 

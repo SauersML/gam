@@ -2059,7 +2059,7 @@ pub(crate) fn rho_only_outer_objective_matches_joint_hyper_when_psi_is_empty() {
 /// and outer options that every `outer_laml*_binomial_location_scale_*`
 /// finite-difference test constructs identically apart from `y` and the
 /// two block initial betas.
-pub(crate) fn binomial_location_scale_outer_fixture(
+fn binomial_location_scale_outer_fixture(
     y: Array1<f64>,
     threshold_initial_beta: f64,
     log_sigma_initial_beta: f64,
@@ -3033,7 +3033,7 @@ impl CustomFamily for TwoBlockNaNHessianPseudoLaplaceFamily {
     }
 }
 
-pub(crate) fn make_two_block_specs(n: usize) -> Vec<ParameterBlockSpec> {
+fn make_two_block_specs(n: usize) -> Vec<ParameterBlockSpec> {
     vec![
         ParameterBlockSpec {
             name: "mu".to_string(),
@@ -3425,7 +3425,7 @@ impl CustomFamily for HeterogeneousEtaLengthFamily {
     }
 }
 
-pub(crate) fn make_heterogeneous_eta_specs(n: usize) -> Vec<ParameterBlockSpec> {
+fn make_heterogeneous_eta_specs(n: usize) -> Vec<ParameterBlockSpec> {
     let p0 = 2;
     let p1 = 2;
     vec![

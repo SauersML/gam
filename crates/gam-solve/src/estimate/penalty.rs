@@ -2,14 +2,6 @@ use super::*;
 use gam_problem::dispersion_cov::se_from_covariance;
 
 pub(crate) const REML_SECOND_ORDER_RHO_CAP: usize = 4;
-/// Continuation prewarm is a seed-polishing pass, not part of the REML
-/// objective. It can be useful for tiny rho spaces where one or two warm
-/// solves amortize, but it scales with the number of starts and runs full
-/// inner solves before the real optimizer even begins. Moderate/high-rho
-/// smooths (measure-jet spectral candidates are the motivating profile) start
-/// directly from the seed lattice; the optimizer's own line search owns
-/// globalization.
-pub(crate) const REML_CONTINUATION_PREWARM_RHO_CAP: usize = 4;
 /// Above this rho dimension, startup work must be linear in "one real solve",
 /// not "rank a seed lattice with capped PIRLS solves". The heuristic seed is
 /// deterministic and already centered on the current penalty scale; BFGS/ARC

@@ -418,16 +418,8 @@ impl LocalAtlas {
                 if shared.len() < min_overlap {
                     continue;
                 }
-                let transition = build_transition(
-                    &charts[i],
-                    &patches[i].members,
-                    &charts[j],
-                    &patches[j].members,
-                    i,
-                    j,
-                    overlap_id,
-                    &shared,
-                );
+                let transition =
+                    build_transition(&charts, &patches, i, j, overlap_id, &shared);
                 transitions.push(transition);
                 overlap_id += 1;
             }
@@ -761,20 +753,22 @@ fn build_local_chart(
 
 /// Orthogonal Procrustes transition between two charts on their shared support.
 ///
-/// `members_i` / `members_j` are the (sorted) member lists row-aligned with each
-/// chart's `coords`, so a binary search recovers each shared row's coordinate.
-/// `shared` is a subset of both member lists.
-#[allow(clippy::too_many_arguments)]
+/// The patch indices select both the chart and its row-aligned, sorted member
+/// list from the same atlas. Deriving those coupled inputs here makes it
+/// impossible for callers to pair a chart with another patch's membership.
+/// `shared` is a subset of both selected member lists.
 fn build_transition(
-    chart_i: &LocalChart,
-    members_i: &[usize],
-    chart_j: &LocalChart,
-    members_j: &[usize],
+    charts: &[LocalChart],
+    patches: &[LocalPatch],
     from_patch: usize,
     to_patch: usize,
     overlap_id: usize,
     shared: &[usize],
 ) -> ChartTransition {
+    let chart_i = &charts[from_patch];
+    let chart_j = &charts[to_patch];
+    let members_i = &patches[from_patch].members;
+    let members_j = &patches[to_patch].members;
     let d = chart_i.frame.ncols();
     let s = shared.len();
     // Shared-support coordinates in each chart, (d × s).

@@ -694,7 +694,11 @@ fn validate_spec_accepts_learned_gaussian_shift_sigma() {
         latent_z_policy: LatentZPolicy::default(),
     };
 
-    validate_spec(&spec).expect("learned GaussianShift scale is an explicit family coordinate");
+    let validation = validate_spec(&spec);
+    assert!(
+        validation.is_ok(),
+        "learned GaussianShift scale must be an explicit family coordinate: {validation:?}"
+    );
 }
 
 #[test]
@@ -5305,11 +5309,9 @@ fn make_rigid_baseline_psi_test_family(
     family.offset_entry = Arc::new(geometry.offset_entry.clone());
     family.offset_exit = Arc::new(geometry.offset_exit.clone());
     family.derivative_offset_exit = Arc::new(geometry.derivative_offset_exit.clone());
-    family.family_hyper = SurvivalMarginalSlopeFamilyHyperState::new(
-        Some(Arc::clone(&geometry)),
-        None,
-    )
-    .expect("install rigid baseline family coordinates");
+    family.family_hyper =
+        SurvivalMarginalSlopeFamilyHyperState::new(Some(Arc::clone(&geometry)), None)
+            .expect("install rigid baseline family coordinates");
 
     let family_axes = (0..geometry.theta.len()).collect::<Vec<_>>();
     let layout = crate::custom_family::CustomFamilyHyperLayout::new(
@@ -5319,6 +5321,137 @@ fn make_rigid_baseline_psi_test_family(
     )
     .expect("build typed baseline hyper layout");
     (family, layout)
+}
+
+fn make_flex_baseline_psi_test_fixture() -> (
+    SurvivalMarginalSlopeFamily,
+    Vec<ParameterBlockState>,
+    Vec<ParameterBlockSpec>,
+    crate::custom_family::CustomFamilyHyperLayout,
+) {
+    let score_runtime = test_deviation_runtime();
+    let link_runtime = test_deviation_runtime();
+    let (knots, degree, wiggle_width) = standard_test_time_wiggle();
+    let time_width = 1 + wiggle_width;
+    let age_entry = array![0.25];
+    let age_exit = array![1.15];
+    let baseline_config = crate::survival::construction::SurvivalBaselineConfig {
+        target: crate::survival::construction::SurvivalBaselineTarget::GompertzMakeham,
+        scale: None,
+        shape: Some(0.08),
+        rate: Some(0.22),
+        makeham: Some(0.04),
+    };
+    let geometry = Arc::new(
+        crate::survival::construction::build_survival_marginal_slope_baseline_geometry(
+            &age_entry,
+            &age_exit,
+            &baseline_config,
+        )
+        .expect("build FLEX baseline geometry")
+        .expect("Gompertz-Makeham has a nonlinear baseline chart"),
+    );
+    let mut entry_design = Array2::zeros((1, time_width));
+    let mut exit_design = Array2::zeros((1, time_width));
+    let mut derivative_design = Array2::zeros((1, time_width));
+    entry_design[[0, 0]] = 0.25;
+    exit_design[[0, 0]] = 0.45;
+    derivative_design[[0, 0]] = 0.15;
+    let marginal_design = array![[0.30]];
+    let logslope_design = array![[0.40]];
+    let family_hyper =
+        SurvivalMarginalSlopeFamilyHyperState::new(Some(Arc::clone(&geometry)), None)
+            .expect("install FLEX baseline family coordinates");
+    let family = SurvivalMarginalSlopeFamily {
+        n: 1,
+        event: Arc::new(array![1.0]),
+        weights: Arc::new(array![0.9]),
+        z: Arc::new(array![0.2].insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: None,
+        family_hyper,
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(entry_design),
+        design_exit: DesignMatrix::from(exit_design.clone()),
+        design_derivative_exit: DesignMatrix::from(derivative_design),
+        offset_entry: Arc::new(geometry.offset_entry.clone()),
+        offset_exit: Arc::new(geometry.offset_exit.clone()),
+        derivative_offset_exit: Arc::new(geometry.derivative_offset_exit.clone()),
+        marginal_design: DesignMatrix::from(marginal_design.clone()),
+        logslope_layout: DesignMatrix::from(logslope_design.clone()).into(),
+        score_warp: Some(score_runtime.clone()),
+        link_dev: Some(link_runtime.clone()),
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: Some(knots),
+        time_wiggle_degree: Some(degree),
+        time_wiggle_ncols: wiggle_width,
+        intercept_warm_starts: None,
+        auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+    };
+
+    let mut beta_time = Array1::zeros(time_width);
+    beta_time[0] = 0.10;
+    for local in 0..wiggle_width {
+        beta_time[1 + local] = 0.006 + 0.002 * local as f64;
+    }
+    let beta_marginal = array![0.12];
+    let beta_logslope = array![0.20];
+    let beta_score =
+        Array1::from_iter((0..score_runtime.basis_dim()).map(|axis| 0.004 * (1.0 + axis as f64)));
+    let beta_link =
+        Array1::from_iter((0..link_runtime.basis_dim()).map(|axis| -0.003 + 0.001 * axis as f64));
+    let states = vec![
+        ParameterBlockState {
+            eta: exit_design.dot(&beta_time) + geometry.offset_exit.clone(),
+            beta: beta_time,
+        },
+        ParameterBlockState {
+            eta: marginal_design.dot(&beta_marginal),
+            beta: beta_marginal,
+        },
+        ParameterBlockState {
+            eta: logslope_design.dot(&beta_logslope),
+            beta: beta_logslope,
+        },
+        ParameterBlockState {
+            beta: beta_score,
+            eta: Array1::zeros(1),
+        },
+        ParameterBlockState {
+            beta: beta_link,
+            eta: Array1::zeros(1),
+        },
+    ];
+    let derivative_blocks = vec![
+        Vec::new(),
+        vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+            None,
+            array![[0.17]],
+            Array2::zeros((1, 1)),
+            None,
+            None,
+            None,
+            None,
+        )],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ];
+    let mut values = vec![0.0];
+    values.extend(geometry.theta.iter().copied());
+    let layout = crate::custom_family::CustomFamilyHyperLayout::new(
+        derivative_blocks,
+        (0..geometry.theta.len()).collect(),
+        Array1::from_vec(values),
+    )
+    .expect("build FLEX baseline/design hyper layout");
+    let specs = states
+        .iter()
+        .map(|state| dummy_blockspec(state.beta.len()))
+        .collect();
+    (family, states, specs, layout)
 }
 
 fn assert_psi_first_terms_match(
@@ -5411,13 +5544,7 @@ fn rigid_baseline_dispatch_matches_direct_and_owned_workspace_without_fd() {
     let axis = 0;
     let other_axis = usize::from(hyper_layout.len() > 1);
     let direct_pair = family
-        .exact_newton_joint_psisecond_order_terms(
-            &states,
-            &specs,
-            &hyper_layout,
-            axis,
-            other_axis,
-        )
+        .exact_newton_joint_psisecond_order_terms(&states, &specs, &hyper_layout, axis, other_axis)
         .expect("direct rigid baseline pair terms")
         .expect("direct rigid baseline pair terms available");
     let owned_pair = workspace
@@ -5448,6 +5575,98 @@ fn rigid_baseline_dispatch_matches_direct_and_owned_workspace_without_fd() {
         rel_diff_array2_survival(&direct_drift, &owned_drift) < 1e-13,
         "baseline Hessian drift direct/workspace mismatch",
     );
+}
+
+#[test]
+fn flex_timewiggle_baseline_public_workspace_owns_family_and_design_pairs_without_fd() {
+    let (family, states, specs, hyper_layout) = make_flex_baseline_psi_test_fixture();
+    assert!(family.flex_active());
+    assert!(family.flex_timewiggle_active());
+    assert!(family.score_warp.is_some());
+    assert!(family.link_dev.is_some());
+    let slices = block_slices(&family, &states);
+    let dimension = slices.total;
+    let workspace = family
+        .exact_newton_joint_psi_workspace_with_options(
+            &states,
+            &specs,
+            &hyper_layout,
+            &BlockwiseFitOptions::default(),
+        )
+        .expect("construct FLEX baseline workspace")
+        .expect("FLEX baseline workspace is available");
+    let design_axis = 0;
+    let baseline_axis = hyper_layout.design_axis_count();
+    let other_baseline_axis = baseline_axis + 1;
+
+    let first = workspace
+        .first_order_terms(baseline_axis)
+        .expect("FLEX baseline first callback")
+        .expect("FLEX baseline first terms are present");
+    assert_eq!(first.score_psi.len(), dimension);
+    let first_hessian = first
+        .hessian_psi_operator
+        .as_ref()
+        .expect("FLEX baseline first Hessian operator")
+        .to_dense();
+    assert_eq!(first_hessian.dim(), (dimension, dimension));
+    assert!(first.score_psi.iter().all(|value| value.is_finite()));
+    assert!(first_hessian.iter().all(|value| value.is_finite()));
+
+    let baseline_pair = workspace
+        .second_order_terms(baseline_axis, other_baseline_axis)
+        .expect("FLEX baseline-pair callback")
+        .expect("FLEX baseline-pair terms are present");
+    assert_eq!(baseline_pair.score_psi_psi.len(), dimension);
+    let baseline_pair_hessian = baseline_pair
+        .hessian_psi_psi_operator
+        .as_ref()
+        .expect("FLEX baseline-pair Hessian operator")
+        .to_dense();
+    assert_eq!(baseline_pair_hessian.dim(), (dimension, dimension));
+    assert!(
+        baseline_pair
+            .score_psi_psi
+            .iter()
+            .all(|value| value.is_finite())
+    );
+
+    let beta_direction =
+        Array1::from_iter((0..dimension).map(|axis| -0.025 + 0.006 * (axis % 7) as f64));
+    let drift = workspace
+        .hessian_directional_derivative(baseline_axis, &beta_direction)
+        .expect("FLEX baseline Hessian-drift callback")
+        .expect("FLEX baseline Hessian drift is present");
+    let gam_problem::DriftDerivResult::Dense(drift) = drift else {
+        panic!("FLEX baseline workspace drift must preserve the dense exact carrier");
+    };
+    assert_eq!(drift.dim(), (dimension, dimension));
+    assert!(drift.iter().all(|value| value.is_finite()));
+    assert!(drift.iter().any(|value| *value != 0.0));
+
+    // This is the large-scale family×design seam: the global design axis is a
+    // real DesignPenalty manifest entry, not a coefficient direction.  The
+    // workspace must route it through X_psi beta + X_psi Jet3 seeding and
+    // return the complete fixed-beta pair.
+    let mixed = workspace
+        .second_order_terms(baseline_axis, design_axis)
+        .expect("FLEX baseline-by-design callback")
+        .expect("FLEX baseline-by-design terms are present");
+    assert_eq!(mixed.score_psi_psi.len(), dimension);
+    assert!(mixed.objective_psi_psi.is_finite());
+    assert!(mixed.score_psi_psi.iter().all(|value| value.is_finite()));
+    assert!(
+        mixed.score_psi_psi.iter().any(|value| value.abs() > 1e-12),
+        "active FLEX/timewiggle baseline-by-design score must not collapse to zero"
+    );
+    let mixed_hessian = mixed
+        .hessian_psi_psi_operator
+        .as_ref()
+        .expect("FLEX baseline-by-design Hessian operator")
+        .to_dense();
+    assert_eq!(mixed_hessian.dim(), (dimension, dimension));
+    assert!(mixed_hessian.iter().all(|value| value.is_finite()));
+    assert!(mixed_hessian.iter().any(|value| *value != 0.0));
 }
 
 /// Derivative blocks with a single ψ on the marginal block (block_idx=1).

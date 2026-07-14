@@ -412,27 +412,6 @@ pub(crate) fn psi_derivative_location(
     None
 }
 
-pub(crate) fn is_sigma_aux_index(
-    gaussian_frailty_sd: Option<f64>,
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-    psi_index: usize,
-) -> bool {
-    let total = derivative_blocks.iter().map(Vec::len).sum::<usize>();
-    if gaussian_frailty_sd.is_none() || total == 0 || psi_index != total - 1 {
-        return false;
-    }
-    let Some((block_idx, local_idx)) = psi_derivative_location(derivative_blocks, psi_index) else {
-        return false;
-    };
-    let deriv = &derivative_blocks[block_idx][local_idx];
-    deriv.penalty_index.is_none()
-        && deriv.x_psi.is_empty()
-        && deriv.s_psi.is_empty()
-        && deriv.s_psi_components.is_none()
-        && deriv.x_psi_psi.is_none()
-        && deriv.s_psi_psi.is_none()
-}
-
 /// Predicate used by every marginal-slope family's persistent-warm-start
 /// fingerprint guard: the caller's parameter blocks must each have row count
 /// matching the family's `n`, and the list must be non-empty.

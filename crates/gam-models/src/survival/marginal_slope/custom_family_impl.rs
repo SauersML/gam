@@ -725,13 +725,12 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             (
                 Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)),
                 Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(other_axis)),
-            ) => self
-                .baseline_exact_joint_psisecond_order_terms_with_options(
-                    block_states,
-                    axis,
-                    other_axis,
-                    &BlockwiseFitOptions::default(),
-                ),
+            ) => self.baseline_exact_joint_psisecond_order_terms_with_options(
+                block_states,
+                axis,
+                other_axis,
+                &BlockwiseFitOptions::default(),
+            ),
             (Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)), None) => self
                 .baseline_design_exact_joint_psisecond_order_terms_with_options(
                     block_states,
@@ -763,13 +762,12 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         match self.family_hyper_role(hyper_layout, psi_index)? {
-            None => self
-                .psi_hessian_directional_derivative(
-                    block_states,
-                    hyper_layout.design_derivative_blocks(),
-                    psi_index,
-                    d_beta_flat,
-                ),
+            None => self.psi_hessian_directional_derivative(
+                block_states,
+                hyper_layout.design_derivative_blocks(),
+                psi_index,
+                d_beta_flat,
+            ),
             Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => {
                 self.sigma_exact_joint_psihessian_directional_derivative(block_states, d_beta_flat)
             }

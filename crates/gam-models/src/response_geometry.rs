@@ -487,7 +487,6 @@ pub fn fit_shared_tangent_reml(
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Dense)
             .with_disable_fixed_point(true)
-            .with_continuation_prewarm(false)
             .with_objective_scale(Some(
                 prepared
                     .effective_observations

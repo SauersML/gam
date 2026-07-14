@@ -4292,37 +4292,6 @@ fn sturm_sign_changes_at(chain: &[Vec<Interval>], x: f64) -> Option<usize> {
     Some(changes)
 }
 
-/// Test-only whole-half-line oracle. Production certifies the declared finite
-/// smoothing domain with [`sturm_root_count_in`].
-#[cfg(test)]
-fn sturm_sign_changes_at_pos_inf(chain: &[Vec<Interval>]) -> Option<usize> {
-    let mut prev = 0i32;
-    let mut changes = 0usize;
-    for poly in chain {
-        let s = interval_sign(*poly.last().unwrap())?;
-        if s != 0 {
-            if prev != 0 && s != prev {
-                changes += 1;
-            }
-            prev = s;
-        }
-    }
-    Some(changes)
-}
-
-/// Test-only count of distinct real roots on `(lo, +∞)`, used by the pinned
-/// polynomial oracle below rather than by the finite-domain optimizer.
-#[cfg(test)]
-fn sturm_root_count_above(p: &[Interval], lo: f64) -> Option<usize> {
-    let chain = build_sturm_chain(p)?;
-    if chain.len() == 1 && chain[0].len() <= 1 {
-        return Some(0);
-    }
-    let sc_lo = sturm_sign_changes_at(&chain, lo)?;
-    let sc_inf = sturm_sign_changes_at_pos_inf(&chain)?;
-    Some(sc_lo.saturating_sub(sc_inf))
-}
-
 /// Certified number of distinct real roots of `P` on the OPEN interval
 /// `(lo, hi)` (both finite).
 fn sturm_root_count_in(p: &[Interval], lo: f64, hi: f64) -> Option<usize> {
@@ -6149,6 +6118,35 @@ mod tests {
     /// Interval polynomial (ascending powers) from exact `f64` coefficients.
     fn pinned_poly(coeffs: &[f64]) -> Vec<Interval> {
         coeffs.iter().map(|&c| ipoint(c)).collect()
+    }
+
+    /// Whole-half-line oracle for pinned polynomials. Production certifies the
+    /// declared finite smoothing domain with [`sturm_root_count_in`].
+    fn sturm_sign_changes_at_pos_inf(chain: &[Vec<Interval>]) -> Option<usize> {
+        let mut prev = 0i32;
+        let mut changes = 0usize;
+        for poly in chain {
+            let s = interval_sign(*poly.last().unwrap())?;
+            if s != 0 {
+                if prev != 0 && s != prev {
+                    changes += 1;
+                }
+                prev = s;
+            }
+        }
+        Some(changes)
+    }
+
+    /// Count distinct real roots on `(lo, +∞)` for the pinned-polynomial
+    /// tests below.
+    fn sturm_root_count_above(p: &[Interval], lo: f64) -> Option<usize> {
+        let chain = build_sturm_chain(p)?;
+        if chain.len() == 1 && chain[0].len() <= 1 {
+            return Some(0);
+        }
+        let sc_lo = sturm_sign_changes_at(&chain, lo)?;
+        let sc_inf = sturm_sign_changes_at_pos_inf(&chain)?;
+        Some(sc_lo.saturating_sub(sc_inf))
     }
 
     /// SPEC-18 forbids grid/sign-scan oracles. The Sturm certificate is checked

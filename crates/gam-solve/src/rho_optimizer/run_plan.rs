@@ -195,29 +195,6 @@ pub(crate) fn run_outer_with_plan(
     // the more-penalized basin in the non-Gaussian multi-start keep-best.
     let rho_dim = layout.rho_dim();
     let mut started_seeds = 0usize;
-    let continuation_prewarm_budget =
-        continuation_prewarm_step_budget(config, cap, seeds.len(), seed_budget);
-    if config.warm_start_cache_hit {
-        log::info!(
-            "[OUTER] {context}: continuation pre-warm skipped: warm-start cache hit \
-             (seed already near-optimal); proceeding straight to BFGS/Newton certificate"
-        );
-    } else if continuation_prewarm_budget < crate::estimate::reml::continuation::PATH_BUDGET {
-        let p_coefficients = config
-            .rho_uncertainty_problem_size
-            .p_coefficients
-            .unwrap_or(0);
-        log::info!(
-            "[OUTER] {context}: bounded continuation pre-warm budget to {} rho-step(s) \
-             for seed_count={} seed_budget={} rho_dim={} p_coefficients={}",
-            continuation_prewarm_budget,
-            seeds.len(),
-            seed_budget,
-            cap.n_params,
-            p_coefficients,
-        );
-    }
-    let mut continuation_prewarm_suppressed_after: Option<String> = None;
     // Structured mirror of `rejection_reasons` used for honest seed
     // accounting + structural early-exit. Populated lazily at the top of
     // each iteration from any reasons accumulated during the previous
@@ -340,7 +317,7 @@ pub(crate) fn run_outer_with_plan(
             }
             Some(Err(err)) => {
                 // A hard anchor-construction failure is not a feasibility gate:
-                // fall through to the cascade exactly as a refused pre-warm does.
+                // fall through to the ordinary seed cascade.
                 log::warn!(
                     "[OUTER] {context}: curvature-homotopy entry seed {seed_idx} errored ({err}); \
                      deferring to seed cascade"
@@ -354,8 +331,8 @@ pub(crate) fn run_outer_with_plan(
             // A refused walk is NEVER a feasibility gate. By contract the walk
             // leaves the term at the full `η = 1` basis (a degenerate anchor or
             // a detected branch bifurcation), so the NORMAL seed cascade below
-            // — `accept_seed_without_outer_iterations`, the continuation
-            // pre-warm, and the direct solve at `seed` — takes over from the
+            // — `accept_seed_without_outer_iterations` and the direct solve at
+            // `seed` — takes over from the
             // pristine cold state. Rejecting the seed here instead emptied the
             // candidate set for objectives WITHOUT a continuation path (#1095:
             // a periodic K=1 circle whose walk "buys nothing" and refuses on a
@@ -370,6 +347,7 @@ pub(crate) fn run_outer_with_plan(
             );
             obj.reset();
         }
+        install_matching_initial_inner_seed(obj, config, seed, context)?;
         if let Some(seed_cost) = obj.accept_seed_without_outer_iterations(seed)? {
             started_seeds += 1;
             let candidate = OuterResult::new(seed.clone(), seed_cost, 0, true, *the_plan);
@@ -438,24 +416,6 @@ pub(crate) fn run_outer_with_plan(
                 }
             }
         }
-        // Magic-by-default continuation pre-warm. On hard fits this
-        // walks ρ from an oversmoothing ρ₀ down to `seed`, leaving the
-        // objective's inner state warm at `seed`. On easy fits (ρ₀
-        // collapses to seed inside the bounds box) this is a single
-        // pre-screen comparison with no inner call, no allocation. A
-        // failure here means continuation could not even *reach* the
-        // seed; route the underlying InnerFailure through the same
-        // SeedRejection accounting any other pre-validation rejection
-        // would take, then continue to the next seed.
-        //
-        // The pre-warm is a warm-start for gradient-bearing PIRLS-inner
-        // REML objectives: it walks ρ via `eval_with_order(_, ValueAndGradient)`
-        // and carries the converged inner β forward through each step's
-        // `inner_beta_hint`. A reactive-domain objective enters the explicit
-        // path only after the exact real-objective probe above returned a
-        // non-finite criterion; already-finite seeds never allocate or drive it.
-        let enter_via_continuation_path =
-            obj.allow_continuation_prewarm() || continuation_path.is_some();
         // Reactive domain entry (SAE-manifold dense K>=2 joint fit): DRIVE the
         // coupled `ContinuationPath` homotopy explicitly. Each step installs
         // the objective-owned scalar state and evaluates its matching log-ρ
@@ -604,82 +564,6 @@ pub(crate) fn run_outer_with_plan(
                     log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
                     rejection_reasons.push((seed_idx, "domain-entry", msg));
                     continue 'seed_attempts;
-                }
-            }
-        }
-        if continuation_path.is_none()
-            && enter_via_continuation_path
-            && continuation_prewarm_budget > 0
-        {
-            if let Some(reason) = continuation_prewarm_suppressed_after.as_ref() {
-                log::info!(
-                    "[OUTER] {context}: skipping continuation pre-warm for seed {seed_idx} \
-                     after earlier non-structural pre-warm failure ({reason}); direct seed eval \
-                     will judge this candidate"
-                );
-            } else {
-                let prewarm_start = std::time::Instant::now();
-                match crate::estimate::reml::continuation::prime_outer_seed_with_budget(
-                    obj,
-                    seed,
-                    &bounds_template.1,
-                    continuation_prewarm_budget,
-                ) {
-                    Ok(summary) => {
-                        // Skip the log line on collapse — that's the
-                        // zero-overhead easy-fit case and a log per seed would
-                        // be noise. Anything else is a real anneal worth
-                        // surfacing so large-scale runs are diagnosable.
-                        if !summary.collapsed {
-                            log::info!(
-                                "[OUTER] {context}: continuation pre-warm seed {seed_idx} steps={} elapsed={:.3}s",
-                                summary.steps_accepted,
-                                prewarm_start.elapsed().as_secs_f64(),
-                            );
-                        }
-                    }
-                    Err(cf) if cf.is_structural() => {
-                        // The pre-warm surfaced a structural defect of the seed's
-                        // joint design (rank/alias deficiency or a genuine
-                        // active-set KKT bug). This block runs only for
-                        // Objectives without an active reactive-domain path.
-                        // An active path was already driven and exact-verified
-                        // above, so it cannot enter this generic pre-warm block.
-                        // Legacy contract: a cold solve
-                        // at the seed ρ* would hit the same defect, so disqualify the
-                        // seed and route the failure through the same structural
-                        // accounting any other pre-validation rejection takes.
-                        let msg = format!(
-                            "continuation pre-warm refused before seed eval: {}",
-                            cf.message()
-                        );
-                        log::warn!(
-                            "[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}"
-                        );
-                        rejection_reasons.push((seed_idx, "validation", msg));
-                        continue 'seed_attempts;
-                    }
-                    Err(cf) => {
-                        // Non-structural pre-warm failure: the continuation walk
-                        // could not complete from the heavily-oversmoothed ρ₀
-                        // (e.g. an ill-conditioned constraint KKT residual at
-                        // λ₀ ≫ λ*, a likelihood domain miss at that start, or a
-                        // stuck/budget-exhausted path). That is a property of the
-                        // warm-start schedule, NOT of the seed ρ* itself — which
-                        // the cold seed eval below judges on its own merits. The
-                        // pre-warm is a warm-start optimization, never a
-                        // feasibility gate (cf. #236, #500): a refusal here must
-                        // not disqualify a seed that would solve cold. Reset to a
-                        // clean baseline and fall through to the cold seed eval.
-                        log::warn!(
-                            "[OUTER] {context}: continuation pre-warm for seed {seed_idx} did not \
-                             complete ({}); direct seed eval will judge this candidate and remaining \
-                             seeds will skip the pre-warm",
-                            cf.message()
-                        );
-                        obj.reset();
-                        continuation_prewarm_suppressed_after = Some(cf.message());
-                    }
                 }
             }
         }
@@ -1485,21 +1369,17 @@ pub(crate) fn run_outer_with_plan(
                     // This scalar normalization is safe for every finite seed:
                     // it changes only the line-search path, not the stationary
                     // point. Dense transferred curvature stays gated on true warm
-                    // starts, because it is local to the parent fit. Two warm-start
-                    // mechanisms both pin `initial_rho`: the in-process / disk
-                    // persistent cache (which also flips `warm_start_cache_hit`)
-                    // and the biobank cross-fit beta projection, which sets
-                    // `initial_rho` to the transferred rho but leaves
-                    // `warm_start_cache_hit` false. Cover both by testing seed
-                    // identity against `initial_rho`. The scalar scale is clamped
+                    // starts, because it is local to the parent fit. Every
+                    // warm-start mechanism pins `initial_rho`, so seed identity
+                    // is the complete authority for transferred curvature. The
+                    // scalar scale is clamped
                     // to the same `[1e-3, 1e3]` band the optimizer applies to its
                     // own BB estimate so a pathological seed gradient cannot
                     // produce a degenerate metric.
-                    let is_warm_seed = config.warm_start_cache_hit
-                        || config
-                            .initial_rho
-                            .as_ref()
-                            .is_some_and(|initial| initial == seed);
+                    let is_warm_seed = config
+                        .initial_rho
+                        .as_ref()
+                        .is_some_and(|initial| outer_theta_bitwise_eq(initial, seed));
                     let mut installed_initial_metric = false;
                     if is_warm_seed {
                         // Prefer the converged outer curvature transferred from

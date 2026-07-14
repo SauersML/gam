@@ -400,9 +400,6 @@ impl OuterObjective for SaeSupportOuterObjective {
         Ok(SeedOutcome::NoSlot)
     }
 
-    fn allow_continuation_prewarm(&self) -> bool {
-        false
-    }
 }
 
 /// Select topology-grouped smoothing strengths through the shared generic
@@ -444,7 +441,6 @@ pub fn run_sae_support_outer(
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_prefer_gradient_only(true)
         .with_disable_fixed_point(true)
-        .with_continuation_prewarm(false)
         .with_initial_rho(initial_rho)
         .with_max_iter(request.max_outer_iter.max(1));
     let outer = problem.run(&mut objective, SUPPORT_LAML_CONTEXT)?;

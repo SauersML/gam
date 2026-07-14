@@ -1498,7 +1498,6 @@ fn closure_objective_delegates() {
         screening_proxy_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
-        continuation_prewarm: true,
     };
     assert_eq!(obj.capability().n_params, 1);
     assert_eq!(obj.eval_cost(&Array1::zeros(1)).unwrap(), 1.0);
@@ -1598,7 +1597,6 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
         screening_proxy_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
-        continuation_prewarm: true,
     }
     .with_seed_inner_state(|state: &mut Vec<f64>, beta: &Array1<f64>| {
         state.extend(beta.iter().copied());
@@ -1667,7 +1665,6 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
-        continuation_prewarm: true,
     };
     let mut bridge = OuterFixedPointBridge {
         obj: &mut obj,
@@ -1747,7 +1744,6 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         screening_proxy_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
-        continuation_prewarm: true,
     };
     let mut bridge = OuterFixedPointBridge {
         obj: &mut obj,
