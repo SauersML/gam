@@ -1029,12 +1029,13 @@ mod generic_scalar_q_tests {
         const K: usize = 5;
         let values = [0.35, -0.4, 1.2, 0.18, 0.07];
         let direction = [0.3, -0.2, 0.15, -0.4, 0.25];
-        let h0 = oneseed_family_variable(values[0], 0, direction[0], 0.11, -0.03);
-        let h1 = oneseed_family_variable(values[1], 1, direction[1], -0.08, 0.02);
-        let d_raw = oneseed_family_variable(values[2], 2, direction[2], 0.05, -0.01);
+        let h0 = oneseed_family_variable::<K>(values[0], 0, direction[0], 0.11, -0.03);
+        let h1 = oneseed_family_variable::<K>(values[1], 1, direction[1], -0.08, 0.02);
+        let d_raw =
+            oneseed_family_variable::<K>(values[2], 2, direction[2], 0.05, -0.01);
         let beta = [
-            oneseed_family_variable(values[3], 3, direction[3], 0.0, 0.0),
-            oneseed_family_variable(values[4], 4, direction[4], 0.0, 0.0),
+            oneseed_family_variable::<K>(values[3], 3, direction[3], 0.0, 0.0),
+            oneseed_family_variable::<K>(values[4], 4, direction[4], 0.0, 0.0),
         ];
         let entry_derivatives = analytic_basis_derivatives(values[0]);
         let exit_derivatives = analytic_basis_derivatives(values[1]);

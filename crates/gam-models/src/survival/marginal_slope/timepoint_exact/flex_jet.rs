@@ -3799,8 +3799,6 @@ mod moment_engine_tests {
     use crate::cubic_cell_kernel::{DenestedCubicCell, reduce_sextic_moments};
     use crate::marginal_slope_shared::eval_coeff4_at;
     use gam_math::nested_dual::Dual22;
-    use gam_math::jet_scalar::{Order2, filtered_implicit_solve_scalar};
-    use gam_math::jet_tower::Tower2;
     use std::hint::black_box;
     use std::time::Instant;
 

@@ -1356,6 +1356,7 @@ fn oracle_rigid_family(
         z: Arc::new(z_col),
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
         derivative_guard: 1e-8,
         design_entry: DesignMatrix::from(design_entry),
         design_exit: DesignMatrix::from(design_exit),
@@ -6113,11 +6114,17 @@ fn survival_psi_workspace_hessian_directional_derivative_is_operator_and_matches
         )
         .expect("dense drift")
         .expect("dense drift available");
+    let hyper_layout = crate::custom_family::CustomFamilyHyperLayout::new(
+        derivative_blocks,
+        Vec::new(),
+        Array1::zeros(1),
+    )
+    .expect("build typed design-hyper layout");
     let workspace = family
         .exact_newton_joint_psi_workspace_with_options(
             &states,
             &specs,
-            &derivative_blocks,
+            &hyper_layout,
             &BlockwiseFitOptions::default(),
         )
         .expect("workspace")
