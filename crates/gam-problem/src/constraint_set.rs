@@ -111,6 +111,32 @@ impl KhatriRaoConeConstraints {
         self.p_left
     }
 
+    /// One coupled response-row slot as a standalone cone over a single
+    /// `p_cov` coefficient block. The covariate factor remains shared by
+    /// [`Arc`]; only the small row-norm vector and this slot's optional bounds
+    /// are copied. This is the exact block decomposition of an identity-Hessian
+    /// projection, not a reduced-data approximation.
+    pub fn single_coupled_slot(&self, slot: usize) -> Result<Self, String> {
+        if slot >= self.coupled_rows.len() {
+            return Err(format!(
+                "KhatriRaoConeConstraints: coupled slot {slot} out of range ({} slots)",
+                self.coupled_rows.len()
+            ));
+        }
+        let n = self.factor.nrows();
+        let bounds = self.bounds.as_ref().map(|all| {
+            all.slice(ndarray::s![slot * n..(slot + 1) * n])
+                .to_owned()
+        });
+        Ok(Self {
+            factor: Arc::clone(&self.factor),
+            factor_row_norms: self.factor_row_norms.clone(),
+            coupled_rows: vec![0],
+            p_left: 1,
+            bounds,
+        })
+    }
+
     pub fn nrows(&self) -> usize {
         self.coupled_rows.len() * self.factor.nrows()
     }

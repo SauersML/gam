@@ -1941,6 +1941,100 @@ pub fn project_stationarity_residual_on_constraint_set(
     if beta.len() != p || set.ncols() != p {
         return None;
     }
+    match set {
+        ConstraintSet::KhatriRaoCone(cone)
+            if cone.p_left() != 1 || cone.coupled_rows() != &[0] =>
+        {
+            // Each coupled response row occupies a disjoint `p_cov` slice,
+            // and the projection Hessian is identity. The global projection is
+            // therefore the exact direct sum of small row projections. Solving
+            // all response rows in one `p_left*p_cov` KKT system needlessly
+            // pays cubic global algebra at the all-tight CTN vertex.
+            let p_cov = cone.factor().ncols();
+            let n = cone.factor().nrows();
+            let mut projected = residual.clone();
+            let mut active = Vec::new();
+            for (slot, &coefficient_row) in cone.coupled_rows().iter().enumerate() {
+                let start = coefficient_row * p_cov;
+                let end = start + p_cov;
+                let local_residual = residual.slice(s![start..end]).to_owned();
+                let local_beta = beta.slice(s![start..end]).to_owned();
+                let local_set = ConstraintSet::KhatriRaoCone(
+                    cone.single_coupled_slot(slot).ok()?,
+                );
+                let row_start = slot * n;
+                let row_end = row_start + n;
+                let local_seed: Vec<usize> = seed_active
+                    .iter()
+                    .copied()
+                    .filter(|&row| row >= row_start && row < row_end)
+                    .map(|row| row - row_start)
+                    .collect();
+                let (local_projected, local_active) =
+                    project_stationarity_residual_on_constraint_set(
+                        &local_residual,
+                        &local_beta,
+                        &local_set,
+                        &local_seed,
+                    )?;
+                projected
+                    .slice_mut(s![start..end])
+                    .assign(&local_projected);
+                active.extend(local_active.into_iter().map(|row| row_start + row));
+            }
+            Some((projected, active))
+        }
+        ConstraintSet::BlockDiagonal { blocks, .. } => {
+            // The same direct-sum identity applies to explicitly placed blocks;
+            // columns outside all blocks are unconstrained and retain their
+            // original residual components.
+            let mut projected = residual.clone();
+            let mut active = Vec::new();
+            let mut row_offset = 0usize;
+            for block in blocks {
+                let width = block.set.ncols();
+                let start = block.col_start;
+                let end = start + width;
+                let local_residual = residual.slice(s![start..end]).to_owned();
+                let local_beta = beta.slice(s![start..end]).to_owned();
+                let row_end = row_offset + block.set.nrows();
+                let local_seed: Vec<usize> = seed_active
+                    .iter()
+                    .copied()
+                    .filter(|&row| row >= row_offset && row < row_end)
+                    .map(|row| row - row_offset)
+                    .collect();
+                let (local_projected, local_active) =
+                    project_stationarity_residual_on_constraint_set(
+                        &local_residual,
+                        &local_beta,
+                        &block.set,
+                        &local_seed,
+                    )?;
+                projected
+                    .slice_mut(s![start..end])
+                    .assign(&local_projected);
+                active.extend(local_active.into_iter().map(|row| row_offset + row));
+                row_offset = row_end;
+            }
+            Some((projected, active))
+        }
+        _ => project_stationarity_residual_on_constraint_set_undivided(
+            residual,
+            beta,
+            set,
+            seed_active,
+        ),
+    }
+}
+
+fn project_stationarity_residual_on_constraint_set_undivided(
+    residual: &Array1<f64>,
+    beta: &Array1<f64>,
+    set: &ConstraintSet,
+    seed_active: &[usize],
+) -> Option<(Array1<f64>, Vec<usize>)> {
+    let p = residual.len();
     let ops = ConstraintSetOps::tangent_face(set, beta).ok()?;
     let mut active = Vec::with_capacity(seed_active.len().min(p));
     for &row in seed_active {
@@ -3198,6 +3292,30 @@ mod tests {
         let (worst, _) = set.max_scaled_violation(beta_op.view()).expect("violation");
         assert!(worst <= 1e-8, "operator answer infeasible: {worst:.3e}");
         assert_eq!(values.len(), 8);
+    }
+
+    #[test]
+    fn separable_khatri_rao_tangent_projection_matches_dense_oracle() {
+        let cone = small_cone();
+        let set = ConstraintSet::KhatriRaoCone(cone.clone());
+        let dense = cone.to_dense().expect("dense projection oracle");
+        let beta = Array1::<f64>::zeros(set.ncols());
+        let residual = array![0.4_f64, -0.2, 1.1, -0.7, -0.9, 0.8];
+
+        let (operator_projected, _) =
+            project_stationarity_residual_on_constraint_set(&residual, &beta, &set, &[])
+                .expect("separable operator projection");
+        let (dense_projected, _) =
+            project_stationarity_residual_on_constraint_cone(&residual, &dense.a)
+                .expect("dense cone projection");
+
+        for index in 0..residual.len() {
+            assert_relative_eq!(
+                operator_projected[index],
+                dense_projected[index],
+                epsilon = 1e-8
+            );
+        }
     }
 
     #[test]
