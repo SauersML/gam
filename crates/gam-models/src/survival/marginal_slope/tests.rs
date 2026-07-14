@@ -4266,10 +4266,14 @@ fn time_constraints_use_exact_derivative_guard_rows() {
         stacked_design: None,
         stacked_offset: None,
     };
-    let constraints = family
+    let constraints = match family
         .block_linear_constraints(&[], 0, &spec)
         .expect("constraint lookup")
-        .expect("time constraints");
+        .expect("time constraints")
+    {
+        gam_problem::ConstraintSet::Dense(dense) => dense,
+        other => panic!("time-block constraints must be dense rows, got {other:?}"),
+    };
     let row_scale = 2.0_f64.sqrt();
     let expected_a = array![
         [1.0 / row_scale, 1.0 / row_scale],
@@ -4343,10 +4347,14 @@ fn time_block_constraints_synthesize_qd1_rows_when_stored_constraints_missing() 
         stacked_offset: None,
     };
 
-    let constraints = family
+    let constraints = match family
         .block_linear_constraints(&[], 0, &spec)
         .expect("synthesized constraints")
-        .expect("qd1 row");
+        .expect("qd1 row")
+    {
+        gam_problem::ConstraintSet::Dense(dense) => dense,
+        other => panic!("synthesized qd1 constraints must be dense rows, got {other:?}"),
+    };
     assert_eq!(constraints.a, array![[1.0, 0.0]]);
     assert_eq!(constraints.b, array![0.0]);
 }
