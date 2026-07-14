@@ -169,6 +169,44 @@ class LargeScaleRunnerTests(unittest.TestCase):
         )
         self.assertTrue(getattr(args, "emit_routing_log", False))
 
+    def test_prepare_ctn_subparser_requires_explicit_artifact_boundaries(self) -> None:
+        parser = _RUNNER.build_parser()
+        args = parser.parse_args(
+            [
+                "prepare-ctn",
+                "--prep-dir",
+                "/tmp/raw-prepared",
+                "--out-dir",
+                "/tmp/ctn-prepared",
+            ]
+        )
+        self.assertEqual(args.prep_dir, Path("/tmp/raw-prepared"))
+        self.assertEqual(args.out_dir, Path("/tmp/ctn-prepared"))
+
+    def test_default_marginal_slope_lanes_share_one_ctn_contract(self) -> None:
+        cfg = _RUNNER.load_config(_RUNNER.DEFAULT_CONFIG)
+        shared = _RUNNER.shared_ctn_spec(cfg)
+        consumers = [spec for spec in _RUNNER.build_method_specs(cfg) if spec.marginal_slope]
+        self.assertEqual(len(consumers), 3)
+        self.assertEqual(shared.pc_count, 16)
+        self.assertEqual(shared.centers, 24)
+        self.assertEqual(shared.z_column, "pgs_ctn_z")
+        self.assertEqual(
+            {(spec.pc_count, spec.centers, spec.z_column) for spec in consumers},
+            {(16, 24, "pgs_ctn_z")},
+        )
+
+    def test_run_method_refuses_raw_cohort_without_shared_ctn_artifact(self) -> None:
+        spec = _RUNNER.shared_ctn_spec(_RUNNER.load_config(_RUNNER.DEFAULT_CONFIG))
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            train = root / "train.csv"
+            heldout = root / "heldout.csv"
+            _write_csv(train, [{"pgs_raw": 0.1, "pc1_std": 0.0}])
+            _write_csv(heldout, [{"pgs_raw": -0.1, "pc1_std": 0.2}])
+            with self.assertRaisesRegex(RuntimeError, "shared CTN preprocessing artifact"):
+                _RUNNER.require_shared_ctn_columns(spec, train, heldout)
+
     def test_add_standardized_columns_returns_replayable_training_statistics(self) -> None:
         train_rows: list[dict[str, object]] = []
         test_rows: list[dict[str, object]] = []

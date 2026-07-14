@@ -12,14 +12,14 @@ on:
           - smoke
           - full
   schedule:
-    # Hourly short run; skip 07:00 UTC to avoid colliding with the daily extended run.
+    # Hourly smoke run; skip 07:00 UTC to avoid colliding with the daily full run.
     - cron: "0 0-6,8-23 * * *"
-    # Daily extended run at 02:00 America/Chicago (CDT) — runs without the 50-min job cap.
+    # Daily full run at 02:00 America/Chicago (CDT); every job remains bounded to 50 minutes.
     - cron: "0 7 * * *"
 
 concurrency:
-  group: large-scale-${{ github.ref }}
-  cancel-in-progress: false
+  group: large-scale-${{ github.ref }}-${{ github.event_name == 'schedule' && github.event.schedule == '0 7 * * *' && 'full' || inputs.scale || 'smoke' }}
+  cancel-in-progress: true
 
 permissions:
   actions: read
@@ -77,7 +77,7 @@ jobs:
           path: bench/large_scale/prepared
           key: ${{ steps.cache_key.outputs.cache_key }}
 
-      - name: Prepare full cohort
+      - name: Prepare cohort
         if: ${{ steps.prep_cache.outputs.cache-hit != 'true' }}
         shell: bash
         run: |
@@ -169,10 +169,63 @@ jobs:
             target/release/_rust*.so
           if-no-files-found: error
 
+  preprocess-ctn:
+    needs:
+      - prepare
+      - bootstrap-runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      BENCH_CMD_TIMEOUT_SEC: ${{ needs.prepare.outputs.scale == 'full' && '2400' || '300' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install preprocessing dependencies
+        shell: bash
+        run: python3 -m pip install numpy
+
+      - name: Download prepared cohort
+        uses: actions/download-artifact@v4
+        with:
+          name: large-scale-prepared
+          path: bench/large_scale/prepared
+
+      - name: Download prebuilt gam binary
+        uses: actions/download-artifact@v4
+        with:
+          name: large-scale-gam-binary
+          path: bench/large_scale/bin
+
+      - name: Fit and score shared Duchon CTN
+        shell: bash
+        env:
+          GAM_RUST_BINARY: ${{ github.workspace }}/bench/large_scale/bin/gam
+        run: |
+          set -euo pipefail
+          chmod +x "${GAM_RUST_BINARY}"
+          python3 bench/large_scale/runner.py prepare-ctn \
+            --config bench/large_scale/large_scale.yml \
+            --prep-dir bench/large_scale/prepared \
+            --out-dir bench/large_scale/ctn-prepared
+
+      - name: Upload shared CTN cohort
+        uses: actions/upload-artifact@v4
+        with:
+          name: large-scale-ctn-prepared
+          path: bench/large_scale/ctn-prepared
+          if-no-files-found: error
+
   benchmark:
     needs:
       - prepare
       - bootstrap-runtime
+      - preprocess-ctn
     runs-on: ubuntu-latest
     timeout-minutes: 50
     strategy:
@@ -198,11 +251,11 @@ jobs:
         shell: bash
         run: python3 -m pip install numpy pandas lifelines
 
-      - name: Download prepared cohort
+      - name: Download shared CTN cohort
         uses: actions/download-artifact@v4
         with:
-          name: large-scale-prepared
-          path: bench/large_scale/prepared
+          name: large-scale-ctn-prepared
+          path: bench/large_scale/ctn-prepared
 
       - name: Download prebuilt gam binary and Python extension
         uses: actions/download-artifact@v4
@@ -246,7 +299,7 @@ jobs:
           mkdir -p bench/large_scale/results bench/large_scale/runs/${{ matrix.name }}
           python3 bench/large_scale/runner.py run-method \
             --config bench/large_scale/large_scale.yml \
-            --prep-dir bench/large_scale/prepared \
+            --prep-dir bench/large_scale/ctn-prepared \
             --method "${{ matrix.name }}" \
             --out-dir "bench/large_scale/runs/${{ matrix.name }}" \
             --out-json "bench/large_scale/results/${{ matrix.name }}.json"

@@ -905,10 +905,10 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     # Predict-time PC clamping. Why this is needed even with the stratified
     # fit subsample:
     #
-    # The Duchon-order-1 basis has a polynomial nullspace of order 1 (linear
-    # in PCs). Outside the convex hull of the fit-time PCs the fitted surface
-    # extrapolates linearly *without bound* — the radial basis kernels decay
-    # but the linear nullspace term grows. The stratified subsample
+    # The configured order-0 Duchon basis has a constant polynomial nullspace,
+    # but its fitted radial surface is still only supported by the fit-time PC
+    # cloud. Outside that cloud, high-dimensional extrapolation can be extreme.
+    # The stratified subsample
     # guarantees coverage of the per-axis PC extremes so the train/test PC
     # envelopes match per axis, but a row could still sit outside the
     # multi-axis hull (e.g. extreme on PC1 *and* PC4 simultaneously when no
@@ -1041,6 +1041,83 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     _write_rows_like(train_aug_path, train_aug)
     _write_rows_like(test_aug_path, test_aug)
     return train_aug_path, test_aug_path, diagnostics
+
+
+def shared_ctn_spec(cfg: dict[str, Any]) -> MethodSpec:
+    specs = [spec for spec in build_method_specs(cfg) if spec.marginal_slope]
+    if not specs:
+        raise RuntimeError("large-scale configuration has no marginal-slope lane for shared CTN")
+    contracts = {
+        (int(spec.pc_count), int(spec.centers or 24), spec.z_column)
+        for spec in specs
+    }
+    if len(contracts) != 1:
+        raise RuntimeError(
+            "all marginal-slope lanes must share one CTN contract "
+            f"(pc_count, centers, z_column); got {sorted(contracts)}"
+        )
+    return specs[0]
+
+
+def require_shared_ctn_columns(spec: MethodSpec, train_csv: Path, test_csv: Path) -> None:
+    required = PGS_CTN_Z_COLUMN
+    for label, path in (("train", train_csv), ("heldout", test_csv)):
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            fieldnames = csv.DictReader(fh).fieldnames or []
+        if required not in fieldnames:
+            raise RuntimeError(
+                f"{spec.name} requires the shared CTN preprocessing artifact; "
+                f"{label} CSV {path} is missing {required}"
+            )
+
+
+def do_prepare_ctn(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    spec = shared_ctn_spec(cfg)
+    rust_bin_raw = os.environ.get("GAM_RUST_BINARY")
+    if not rust_bin_raw:
+        raise RuntimeError("prepare-ctn requires GAM_RUST_BINARY to name the immutable CLI artifact")
+    rust_bin = Path(rust_bin_raw).resolve()
+    if not rust_bin.is_file():
+        raise RuntimeError(f"prepare-ctn GAM_RUST_BINARY does not exist: {rust_bin}")
+
+    prep_dir = args.prep_dir.resolve()
+    out_dir = args.out_dir.resolve()
+    run_dir = out_dir / "shared_ctn"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    source_train = prep_dir / "disease_train.csv"
+    source_test = prep_dir / "disease_test.csv"
+    started = time.perf_counter()
+    train_aug, test_aug, diagnostics = fit_conditional_pgs_ctn_for_marginal_slope(
+        rust_bin=rust_bin,
+        spec=spec,
+        train_csv=source_train,
+        test_csv=source_test,
+        out_dir=run_dir,
+        centers=int(spec.centers or 24),
+    )
+    elapsed = time.perf_counter() - started
+    for dataset in ("disease", "survival"):
+        shutil.copy2(train_aug, out_dir / f"{dataset}_train.csv")
+        shutil.copy2(test_aug, out_dir / f"{dataset}_test.csv")
+    if (prep_dir / "prep_metadata.json").exists():
+        shutil.copy2(prep_dir / "prep_metadata.json", out_dir / "prep_metadata.json")
+    metadata = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "status": "ok",
+        "elapsed_sec": elapsed,
+        "pc_count": int(spec.pc_count),
+        "centers": int(spec.centers or 24),
+        "z_column": PGS_CTN_Z_COLUMN,
+        "consumer_methods": [
+            item.name for item in build_method_specs(cfg) if item.marginal_slope
+        ],
+        "diagnostics": diagnostics,
+    }
+    dump_json(out_dir / "ctn_metadata.json", metadata)
+    print("\n".join(diagnostics), file=sys.stderr, flush=True)
+    print(f"Wrote shared CTN artifact to {out_dir} in {elapsed:.3f}s")
+    return 0
 
 
 def logistic(x: np.ndarray) -> np.ndarray:
@@ -1937,17 +2014,9 @@ def run_rust_marginal_slope_classification(
         scorewarp_knots=spec.logslope_linkwiggle_knots,
     )
     print("\n".join(preflight.lines), file=sys.stderr, flush=True)
-    ctn_t0 = time.perf_counter()
-    ctn_train_csv, ctn_test_csv, ctn_diagnostics = fit_conditional_pgs_ctn_for_marginal_slope(
-        rust_bin=rust_bin,
-        spec=spec,
-        train_csv=train_csv,
-        test_csv=test_csv,
-        out_dir=out_dir,
-        centers=centers,
-    )
-    ctn_fit_sec = time.perf_counter() - ctn_t0
-    print("\n".join(ctn_diagnostics), file=sys.stderr, flush=True)
+    require_shared_ctn_columns(spec, train_csv, test_csv)
+    ctn_train_csv = train_csv
+    ctn_test_csv = test_csv
     mean_formula, logslope_formula = rust_marginal_slope_formula_classification(spec, centers)
     z_column = spec.z_column or PGS_CTN_Z_COLUMN
     if z_column != PGS_CTN_Z_COLUMN:
@@ -1968,7 +2037,7 @@ def run_rust_marginal_slope_classification(
     t0 = time.perf_counter()
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
     disease_fit_sec = time.perf_counter() - t0
-    fit_sec = ctn_fit_sec + disease_fit_sec
+    fit_sec = disease_fit_sec
     if rc != 0:
         raise RuntimeError(err.strip() or out.strip() or f"{spec.name} marginal-slope fit failed")
     pred_cmd = [str(rust_bin), "predict", str(model_path), str(ctn_test_csv), "--out", str(pred_path)]
@@ -1984,7 +2053,7 @@ def run_rust_marginal_slope_classification(
     metrics = classification_metrics(y_test, pred, float(np.mean(y_train)))
     return {
         "fit_sec": fit_sec,
-        "ctn_fit_sec": ctn_fit_sec,
+        "shared_ctn_preprocessed": True,
         "disease_fit_sec": disease_fit_sec,
         "predict_sec": predict_sec,
         "metrics": metrics,
@@ -2144,7 +2213,6 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
     train_rows_raw = read_csv_rows(train_csv)
     test_rows_raw = read_csv_rows(test_csv)
     centers = int(spec.centers or 24)
-    ctn_fit_sec = 0.0
     logslope_formula = None
     fit_csv = train_csv
     prediction_rows_raw = test_rows_raw
@@ -2159,20 +2227,10 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
             scorewarp_knots=spec.logslope_linkwiggle_knots,
         )
         print("\n".join(preflight.lines), file=sys.stderr, flush=True)
-        ctn_t0 = time.perf_counter()
-        ctn_train_csv, ctn_test_csv, ctn_diagnostics = fit_conditional_pgs_ctn_for_marginal_slope(
-            rust_bin=rust_bin,
-            spec=spec,
-            train_csv=train_csv,
-            test_csv=test_csv,
-            out_dir=out_dir,
-            centers=centers,
-        )
-        ctn_fit_sec = time.perf_counter() - ctn_t0
-        print("\n".join(ctn_diagnostics), file=sys.stderr, flush=True)
-        fit_csv = ctn_train_csv
-        train_metric_rows_raw = read_csv_rows(ctn_train_csv)
-        prediction_rows_raw = read_csv_rows(ctn_test_csv)
+        require_shared_ctn_columns(spec, train_csv, test_csv)
+        fit_csv = train_csv
+        train_metric_rows_raw = train_rows_raw
+        prediction_rows_raw = test_rows_raw
         fit_formula, logslope_formula = rust_survival_marginal_slope_formula_parts(spec, centers)
     else:
         fit_formula = rust_survival_formula(spec)
@@ -2225,7 +2283,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
         t0 = time.perf_counter()
         rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
         survival_fit_sec = time.perf_counter() - t0
-        fit_sec = ctn_fit_sec + survival_fit_sec
+        fit_sec = survival_fit_sec
         if rc != 0:
             raise RuntimeError(err.strip() or out.strip() or f"{spec.name} fit failed")
         pred_cmd = [
@@ -2270,7 +2328,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
     )
     return {
         "fit_sec": fit_sec,
-        "ctn_fit_sec": ctn_fit_sec,
+        "shared_ctn_preprocessed": likelihood_mode == "marginal-slope",
         "survival_fit_sec": survival_fit_sec,
         "predict_sec": predict_sec,
         "metrics": metrics,
@@ -2479,6 +2537,12 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--target-n", type=int, default=None)
     prep.add_argument("--smoke-target-n", type=int, default=None)
     prep.set_defaults(func=do_prepare)
+
+    prep_ctn = sub.add_parser("prepare-ctn")
+    prep_ctn.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    prep_ctn.add_argument("--prep-dir", type=Path, required=True)
+    prep_ctn.add_argument("--out-dir", type=Path, required=True)
+    prep_ctn.set_defaults(func=do_prepare_ctn)
 
     matrix = sub.add_parser("matrix")
     matrix.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
