@@ -1030,16 +1030,22 @@ impl WarmStartStore {
     }
 
     fn metadata_index_upsert(&self, meta_path: &Path, bin_path: &Path) -> Result<(), StoreError> {
+        // An overwrite may preserve both file lengths and the filesystem's
+        // observable mtime (coarse timestamps or two replacements in one
+        // clock tick). Invalidate the path before reading it: otherwise
+        // `read_meta_indexed` can pair the previous checksum/objective with the
+        // newly promoted payload and the next lookup will delete the valid pair
+        // as corrupt. The writer is the authoritative mutation signal; no
+        // filesystem heuristic is needed here.
+        if let Ok(mut index) = self.index.lock() {
+            index.by_meta_path.remove(meta_path);
+            if let Some(parent) = meta_path.parent() {
+                index.by_key_dir.remove(parent);
+            }
+        }
         let meta_md = fs::metadata(meta_path)?;
         let bin_md = fs::metadata(bin_path)?;
         self.read_meta_indexed(meta_path, &meta_md, &bin_md)?;
-        // A fresh entry just landed in this key dir, so any cached listing for
-        // the dir is stale. Drop it; the next scan rebuilds and re-caches.
-        if let Some(parent) = meta_path.parent()
-            && let Ok(mut index) = self.index.lock()
-        {
-            index.by_key_dir.remove(parent);
-        }
         Ok(())
     }
 

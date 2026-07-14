@@ -660,6 +660,7 @@ pub struct ByteLruCache<K: Eq + Hash + Clone, V> {
     /// Per-shard entry budget, if any (`0` disables caching, as before).
     shard_entries: Option<usize>,
     max_bytes: usize,
+    governor: MemoryGovernor,
 }
 
 struct ByteLruInner<K, V> {
@@ -698,6 +699,20 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
     }
 
     fn build(max_bytes: usize, max_entries: Option<usize>, shard_count: usize) -> Self {
+        Self::build_with_governor(
+            max_bytes,
+            max_entries,
+            shard_count,
+            MemoryGovernor::global().clone(),
+        )
+    }
+
+    fn build_with_governor(
+        max_bytes: usize,
+        max_entries: Option<usize>,
+        shard_count: usize,
+        governor: MemoryGovernor,
+    ) -> Self {
         let shard_count = shard_count.max(1);
         // Split the global budgets across shards, rounding up so the aggregate
         // capacity never falls below the requested budget. With a single shard
@@ -726,6 +741,7 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
             shard_bytes,
             shard_entries,
             max_bytes,
+            governor,
         }
     }
 
@@ -794,11 +810,13 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
             }
         }
 
-        let reservation =
-            match MemoryGovernor::global().try_reserve(charge, "ByteLruCache resident entry") {
-                Ok(reservation) => reservation,
-                Err(_) => return,
-            };
+        let reservation = match self
+            .governor
+            .try_reserve(charge, "ByteLruCache resident entry")
+        {
+            Ok(reservation) => reservation,
+            Err(_) => return,
+        };
         g.map.insert(key.clone(), (value, charge, reservation));
         g.order.push_back(key);
         g.resident_bytes = g.resident_bytes.saturating_add(charge);
@@ -958,6 +976,15 @@ impl<T: std::fmt::Debug> std::fmt::Debug for RayonSafeOnce<T> {
 mod byte_lru_tests {
     use super::*;
 
+    fn cache_test_governor(budget_bytes: usize) -> MemoryGovernor {
+        let available_bytes = (budget_bytes as u128 * GOVERNOR_BUDGET_DENOMINATOR)
+            .div_ceil(GOVERNOR_BUDGET_NUMERATOR);
+        MemoryGovernor::with_detected_availability(MemoryAvailability::from_observation(
+            u64::try_from(available_bytes).expect("test cache budget must fit in u64"),
+            CgroupMemoryObservation::NotPresent,
+        ))
+    }
+
     /// Fixed-charge value so byte-budget arithmetic in the tests is exact.
     #[derive(Clone, PartialEq, Debug)]
     struct Payload(u64);
@@ -970,7 +997,8 @@ mod byte_lru_tests {
     #[test]
     fn single_shard_round_trips_and_evicts_by_bytes() {
         // 3 entries' worth of budget; a single shard preserves strict global LRU.
-        let cache: ByteLruCache<u64, Payload> = ByteLruCache::new(24);
+        let cache: ByteLruCache<u64, Payload> =
+            ByteLruCache::build_with_governor(24, None, 1, cache_test_governor(24));
         for k in 0..3 {
             cache.insert(k, Payload(k));
         }
@@ -1004,7 +1032,12 @@ mod byte_lru_tests {
         // budget (shard_bytes * shard_count, rounded up).
         let shard_count = 8usize;
         let max_bytes = 8 * 64; // 64 entries' worth, 8 per shard on average.
-        let cache: ByteLruCache<u64, Payload> = ByteLruCache::new_sharded(max_bytes, shard_count);
+        let cache: ByteLruCache<u64, Payload> = ByteLruCache::build_with_governor(
+            max_bytes,
+            None,
+            shard_count,
+            cache_test_governor(max_bytes),
+        );
         for k in 0..64u64 {
             cache.insert(k, Payload(k));
         }
