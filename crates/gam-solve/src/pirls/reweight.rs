@@ -1484,11 +1484,30 @@ where
                         let should_check_exact_nd =
                             numerical_plateau && !exact_decrement_checked_at_plateau;
                         exact_decrement_checked_at_plateau = numerical_plateau;
-                        let exact_nd_pass = should_check_exact_nd
+                        let exact_decrement_sq = if should_check_exact_nd
                             && !has_explicit_constraints
                             && options.arrow_schur.is_none()
-                            && exact_newton_decrement_sq(final_state_ref)
-                                .is_some_and(|decrement_sq| decrement_sq <= nd_threshold);
+                        {
+                            exact_newton_decrement_sq(final_state_ref)
+                        } else {
+                            None
+                        };
+                        let exact_nd_pass = exact_decrement_sq
+                            .is_some_and(|decrement_sq| decrement_sq <= nd_threshold);
+                        if should_check_exact_nd {
+                            log::info!(
+                                "[PIRLS exact-decrement] applicable={} decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} relative_gradient={:.6e} dimension_scale={:.6e} natural_scale={:.6e} objective={:.6e}",
+                                !has_explicit_constraints && options.arrow_schur.is_none(),
+                                exact_decrement_sq.unwrap_or(f64::NAN),
+                                nd_threshold,
+                                exact_nd_pass,
+                                convergence_grad_norm,
+                                final_state_ref.relative_gradient_norm(convergence_grad_norm),
+                                final_state_ref.kkt_dimension_scale(),
+                                final_state_ref.gradient_natural_scale,
+                                final_state_ref.penalized_objective(),
+                            );
+                        }
 
                         // Strict KKT: scale-invariant under EITHER the
                         // dimension-based bound ‖g‖ < τ·√n·max(1,√p) OR the
