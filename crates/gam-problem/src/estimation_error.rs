@@ -408,6 +408,13 @@ pub enum EstimationError {
     #[error("REML smoothing optimization failed to converge: {0}")]
     RemlOptimizationFailed(String),
 
+    #[error("Fatal outer-objective evaluation failure ({context}): {source}")]
+    OuterObjectiveEvaluationFailed {
+        context: String,
+        #[source]
+        source: Box<EstimationError>,
+    },
+
     #[error(
         "Outer smoothing-parameter optimization did not certify a stationary optimum \
          ({context}): {reason} after {iterations} outer iteration(s); final objective \
@@ -577,6 +584,32 @@ impl core::fmt::Debug for EstimationError {
 }
 
 impl EstimationError {
+    /// Preserve a thrown outer-objective failure across seed, solver, and
+    /// fallback-plan orchestration. Trial-domain refusals must be represented
+    /// as a finite API outcome (`+inf` / `OuterEval::infeasible`); an `Err`
+    /// means the evaluation artifact itself could not be constructed and must
+    /// never be retried as another numerical point.
+    pub fn fatal_outer_evaluation(
+        context: impl Into<String>,
+        source: EstimationError,
+    ) -> Self {
+        if matches!(
+            &source,
+            EstimationError::OuterObjectiveEvaluationFailed { .. }
+        ) {
+            source
+        } else {
+            EstimationError::OuterObjectiveEvaluationFailed {
+                context: context.into(),
+                source: Box::new(source),
+            }
+        }
+    }
+
+    pub fn is_fatal_outer_evaluation(&self) -> bool {
+        matches!(self, EstimationError::OuterObjectiveEvaluationFailed { .. })
+    }
+
     /// Classifies inner-solve failures that the outer REML loop should
     /// treat as a soft retreat (return +inf cost / infeasible outer-eval)
     /// rather than propagate as a hard error.
@@ -674,6 +707,24 @@ mod tests {
         assert!(
             !EstimationError::RemlOptimizationFailed("outer fail".to_string())
                 .is_inner_solve_retreat()
+        );
+    }
+
+    #[test]
+    fn fatal_outer_evaluation_is_typed_and_idempotent() {
+        let error = EstimationError::fatal_outer_evaluation(
+            "seed screening",
+            EstimationError::InvalidInput("frame mismatch".to_string()),
+        );
+        assert!(error.is_fatal_outer_evaluation());
+        assert!(error.to_string().contains("frame mismatch"));
+
+        let nested = EstimationError::fatal_outer_evaluation("fallback plan", error);
+        assert!(nested.is_fatal_outer_evaluation());
+        assert_eq!(
+            nested.to_string().matches("Fatal outer-objective").count(),
+            1,
+            "fatal provenance must not be re-wrapped at every orchestration layer"
         );
     }
 
