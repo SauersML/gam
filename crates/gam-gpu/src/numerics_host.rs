@@ -417,7 +417,16 @@ mod probit_parity_tests {
     #[test]
     fn log_ndtr_curvature_keeps_unit_left_tail_and_matches_mills_derivative() {
         let (_, lambda, curvature) = log_ndtr_mills_curvature(-1.0e100);
-        assert_eq!(lambda, 1.0e100);
+        // Deep-left Mills tracks |x| to rounding: the value is assembled from
+        // a short transcendental chain (x/sqrt2, erfcx, reciprocal), so exact
+        // bit equality with 1e100 is one spurious ulp away on some hosts
+        // (a real A10 box measured 1.0000000000000002e100). The contract is
+        // "λ(-1e100) = 1e100 up to a few ulps", not a bit pattern.
+        let ulp = 1.0e100_f64.next_up() - 1.0e100;
+        assert!(
+            (lambda - 1.0e100).abs() <= 4.0 * ulp,
+            "deep-left Mills must track |x| to rounding: lambda={lambda:e}"
+        );
         assert_eq!(curvature, 1.0);
         assert_eq!(log_ndtr_mills_curvature(f64::INFINITY), (0.0, 0.0, 0.0));
         assert_eq!(
