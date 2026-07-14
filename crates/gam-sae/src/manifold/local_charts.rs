@@ -94,14 +94,25 @@ const CHART_RANK_FLOOR_FRAC: f64 = 1.0e-8;
 /// consumers that want a sharper geometric threshold.
 const CHART_INJECTIVITY_FLOOR_FRAC: f64 = 1.0e-6;
 
-/// A Procrustes transition is CERTIFIED (its sign enters the exact cocycle) only
-/// when the cross-covariance `M = C_to C_fromᵀ` is well conditioned: its smallest
-/// singular value clears this fraction of its largest. A near-singular `M` means
-/// the shared support does not span all `d` chart directions, so the alignment —
-/// and hence `det R` — is ambiguous; such an edge is retained as geometry but
-/// marked [`TransitionConfidence::Degenerate`] and kept out of the sign cocycle,
-/// mirroring the analytic-vs-fitted split in [`super::chart_atlas`].
+/// A transition's Procrustes ALIGNMENT is well posed only when the cross-covariance
+/// `M = C_to C_fromᵀ` is well conditioned: its smallest singular value clears this
+/// fraction of its largest. A near-singular `M` means the shared support does not
+/// span all `d` chart directions, so the rotation that best fits the overlap point
+/// cloud is ambiguous in the unspanned direction. Such an edge is retained as
+/// geometry but marked [`TransitionConfidence::Degenerate`] and kept out of the
+/// sign cocycle, mirroring the analytic-vs-fitted split in [`super::chart_atlas`].
 const TRANSITION_CONDITION_FLOOR_FRAC: f64 = 1.0e-6;
+
+/// A transition's ORIENTATION is `sgn det(F_toᵀ F_from)`, and that is meaningful
+/// only while the chart change is a local diffeomorphism, i.e. while the two
+/// tangent planes are not orthogonal. `|det(F_toᵀ F_from)| = ∏_k cos θ_k` over the
+/// principal angles between the frames, so the determinant vanishes exactly when
+/// some chart direction of one patch is invisible to the other. `1e-6` is the
+/// numerical "the planes are not orthogonal" floor (overlapping patches on a
+/// manifold sit far above it — the sphere/Möbius/cylinder fixtures run at `|det|`
+/// of order `0.5` to `1`), below which the edge is [`TransitionConfidence::Degenerate`]
+/// and contributes no sign.
+const FRAME_OVERLAP_DETERMINANT_FLOOR: f64 = 1.0e-6;
 
 /// Coverage multiplier for the number of farthest-point patch centers, `⌈c·√n⌉`.
 /// `√n` is the standard covering-number scaling for a fixed-radius net; `2`
@@ -128,7 +139,10 @@ pub struct LocalAtlasConfig {
     pub intrinsic_dim: usize,
     /// Number of farthest-point patch centers.
     pub patch_count: usize,
-    /// Number of nearest rows in each patch (including its center).
+    /// Upper bound on the number of nearest rows in each patch (including its
+    /// center). A patch that cannot certify a tangent chart at this size is shrunk
+    /// toward `2(d + 1)`, the over-determination floor, so the realized
+    /// [`LocalPatch::members`] length may be smaller.
     pub patch_size: usize,
     /// Minimum shared rows for two patches to register a transition. Must be at
     /// least `d + 1` so the `d`-dimensional Procrustes alignment is
@@ -172,8 +186,9 @@ pub enum LocalChartError {
     NonFiniteAmbient { row: usize, col: usize, value: f64 },
     /// The chart dimension exceeds what any neighborhood could span.
     IntrinsicDimTooLarge { intrinsic_dim: usize, ambient_dim: usize },
-    /// The `d`-th captured singular value did not clear the rank floor: the
-    /// neighborhood spans fewer than `d` directions.
+    /// The `d`-th captured singular value did not clear the rank floor at ANY
+    /// admissible neighborhood size: the neighborhood spans fewer than `d`
+    /// directions however far it is shrunk.
     DegeneratePatch {
         center: usize,
         intrinsic_dim: usize,
@@ -181,7 +196,8 @@ pub enum LocalChartError {
         leading_singular: f64,
     },
     /// The chart projection collapses two distinct neighborhood rows onto (nearly)
-    /// the same coordinate — it is not injective on its own support.
+    /// the same coordinate — it is not injective on its own support — and stayed
+    /// non-injective down to the smallest admissible neighborhood.
     NonInjectiveChart {
         center: usize,
         min_projected_sq_distance: f64,
@@ -260,6 +276,9 @@ pub struct ChartCertificate {
 }
 
 /// The combinatorial patch: a center row and the sorted neighborhood it charts.
+///
+/// `members` is the largest prefix of the center's distance order that certified a
+/// tangent chart, so its length is at most [`LocalAtlasConfig::patch_size`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalPatch {
     /// The farthest-point center row of this patch.
