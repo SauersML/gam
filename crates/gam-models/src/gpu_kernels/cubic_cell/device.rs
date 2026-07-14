@@ -441,6 +441,8 @@ mod tests {
                     "cell {i} must classify Ok (status={:?})",
                     status[i]
                 );
+                let branch = classify_cell_for_gpu(cells_gpu[i])
+                    .expect("device parity fixture cell must classify");
                 let row = &host_moments[i * stride..(i + 1) * stride];
                 let cpu_state = evaluate_cell_derivative_moments_uncached(cpu_cell, max_degree)
                     .expect("cpu reference");
@@ -479,7 +481,7 @@ mod tests {
                         abs <= 1e-12 || rel <= rel_tol,
                         "device parity drift at branch={:?} degree={max_degree} cell={i} k={k} \
                          gpu={got:.17e} cpu={want:.17e} abs={abs:.3e} rel={rel:.3e} > rel_tol={rel_tol:.3e}",
-                        branches[i]
+                        branch
                     );
                 }
             }
