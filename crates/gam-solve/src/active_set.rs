@@ -1885,23 +1885,6 @@ impl<'a> ConstraintSetOps<'a> {
     }
 }
 
-fn canonicalize_constraint_set_active_ids(
-    ops: &ConstraintSetOps<'_>,
-    active: &[usize],
-) -> Result<Vec<usize>, EstimationError> {
-    if active.is_empty() {
-        return Ok(Vec::new());
-    }
-    let compressed = ops.compress_working(active)?;
-    let mut canonical = Vec::with_capacity(compressed.groups.len());
-    for group in &compressed.groups {
-        if let Some(&active_pos) = group.first() {
-            canonical.push(active[active_pos]);
-        }
-    }
-    Ok(canonical)
-}
-
 /// Project a stationarity residual onto the normal cone of an operator-carried
 /// constraint set without materializing its complete tight face.
 ///
