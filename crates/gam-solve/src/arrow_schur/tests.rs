@@ -2426,7 +2426,11 @@ pub(crate) fn device_seam_declines_without_gpu_and_matches_cpu() {
 
     // The seam helpers both decline when no device is present.
     assert!(try_device_arrow_direct(&sys, 0.0, 0.0, &options).is_none());
-    assert!(maybe_inject_gpu_schur_matvec(&sys, 0.0, 0.0, &options).is_none());
+    assert!(
+        maybe_inject_gpu_schur_matvec(&sys, 0.0, 0.0, &options)
+            .expect("GPU runtime resolution must not fault on the CPU host")
+            .is_none()
+    );
 
     // The public core entry therefore equals the direct CPU artifacts solve.
     let (dt_core, db_core, diag) =

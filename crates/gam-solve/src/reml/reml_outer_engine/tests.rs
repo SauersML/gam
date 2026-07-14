@@ -1216,7 +1216,7 @@ pub(crate) fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
         op: family_operator,
     };
 
-    let mut solution = InnerSolution {
+    let solution = InnerSolution {
         log_likelihood: -1.25,
         penalty_quadratic: 0.4,
         hessian_op: hop,
@@ -2057,7 +2057,7 @@ pub(crate) fn operator_hessian_matches_dense_with_operator_drifts_and_extended_g
         x_transformed: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x)),
     };
 
-    let solution = InnerSolution {
+    let mut solution = InnerSolution {
         log_likelihood: -2.3,
         penalty_quadratic: 0.6,
         hessian_op: hop.clone(),

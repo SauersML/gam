@@ -287,8 +287,8 @@ fn evidence_matvec_utilization_loop() {
     let budget = 32usize * 64usize; // SCHUR_SLQ_LOGDET_PROBES × LANCZOS_STEPS
 
     let matvec = match build_framed_resident_evidence_matvec(&sys, ridge_t, ridge_beta, budget) {
-        Some(mv) => mv,
-        None => {
+        Ok(Some(mv)) => mv,
+        Ok(None) => {
             // Distinguish "no device" (clean skip) from "device present but the
             // builder declined for a floor-clearing framed system" (a real bug):
             // the probe runs on any device regardless of the offload floor.
@@ -298,6 +298,9 @@ fn evidence_matvec_utilization_loop() {
                  framed system clearing the offload floor (n={n}, k={border_dim})"
             );
             return;
+        }
+        Err(failure) => {
+            panic!("#1017: resident evidence matvec build faulted: {failure:?}")
         }
     };
     let apply = &matvec;
