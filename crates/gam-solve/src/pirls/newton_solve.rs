@@ -560,6 +560,128 @@ pub(super) fn solve_newton_direction_dense(
     ))
 }
 
+/// Solve `(A' A) direction = -gradient` without ever assembling `A' A`.
+/// Householder QR sees condition `kappa(A)`, whereas Cholesky of the rounded
+/// Gram sees `kappa(A)^2` and can lose weak but identifiable directions.
+pub(super) fn solve_newton_direction_from_root(
+    root: &Array2<f64>,
+    gradient: &Array1<f64>,
+    direction_out: &mut Array1<f64>,
+) -> Result<(), EstimationError> {
+    let p = root.ncols();
+    if root.nrows() < p || gradient.len() != p {
+        crate::bail_invalid_estim!(
+            "PIRLS square-root solve dimension mismatch: root={}x{}, gradient={}",
+            root.nrows(),
+            p,
+            gradient.len()
+        );
+    }
+    let (_, r) = root
+        .qr()
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
+    if r.nrows() != p || r.ncols() != p {
+        crate::bail_invalid_estim!(
+            "PIRLS square-root QR produced non-square R={}x{} for p={p}",
+            r.nrows(),
+            r.ncols()
+        );
+    }
+
+    // R' y = -g, followed by R direction = y.  Explicit triangular
+    // substitution avoids constructing the Gram or an inverse at either step.
+    let mut intermediate = Array1::<f64>::zeros(p);
+    for i in 0..p {
+        let mut value = -gradient[i];
+        for k in 0..i {
+            value -= r[[k, i]] * intermediate[k];
+        }
+        let diagonal = r[[i, i]];
+        if !(diagonal.is_finite() && diagonal != 0.0) {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
+        intermediate[i] = value / diagonal;
+    }
+    if direction_out.len() != p {
+        *direction_out = Array1::zeros(p);
+    }
+    for reverse in 0..p {
+        let i = p - 1 - reverse;
+        let mut value = intermediate[i];
+        for k in (i + 1)..p {
+            value -= r[[i, k]] * direction_out[k];
+        }
+        direction_out[i] = value / r[[i, i]];
+    }
+
+    // Normwise backward-error certificate evaluated through A itself.  The
+    // denominator is ||A'||_inf ||A||_inf ||d||_inf + ||g||_inf, so this tests
+    // the computed direction rather than the cancellation-prone rounded Gram.
+    let root_direction = root.dot(direction_out);
+    let mut residual = root.t().dot(&root_direction);
+    residual += gradient;
+    let residual_inf = inf_norm(residual.iter().copied());
+    let root_inf = root
+        .rows()
+        .into_iter()
+        .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
+        .fold(0.0_f64, f64::max);
+    let root_transpose_inf = root
+        .columns()
+        .into_iter()
+        .map(|column| column.iter().map(|value| value.abs()).sum::<f64>())
+        .fold(0.0_f64, f64::max);
+    let direction_inf = inf_norm(direction_out.iter().copied());
+    let gradient_inf = inf_norm(gradient.iter().copied());
+    let scale = root_transpose_inf * root_inf * direction_inf + gradient_inf;
+    let backward_error = if scale > 0.0 {
+        residual_inf / scale
+    } else {
+        residual_inf
+    };
+    let tolerance = 256.0 * f64::EPSILON * root.nrows().max(p) as f64;
+    if !backward_error.is_finite() || backward_error > tolerance {
+        crate::bail_invalid_estim!(
+            "PIRLS square-root Newton direction failed its backward-error certificate: \
+             error {backward_error:.3e} exceeds {tolerance:.3e}"
+        );
+    }
+    if !array_is_finite(direction_out) {
+        crate::bail_invalid_estim!("PIRLS square-root Newton direction is non-finite");
+    }
+    log::info!(
+        "[STAGE] PIRLS dense newton solve backend=CPU p={} rows={} route=\"Householder QR of PSD root\" backward_error={:.3e}",
+        p,
+        root.nrows(),
+        backward_error,
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod square_root_solve_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn qr_root_solve_preserves_a_weak_rotated_direction() {
+        // The first two rows have squared-energy ratio 1e10.  Forming A'A
+        // subtracts nearly equal O(1e10) entries to recover the weak [1,-1]
+        // direction; QR acts on A and keeps that direction directly.
+        let root = array![[1.0e5, 1.0e5], [1.0, -1.0], [1.0e-3, 0.0], [0.0, 1.0e-3]];
+        let expected = array![1.0, -1.0];
+        let gradient = -root.t().dot(&root.dot(&expected));
+        let mut actual = Array1::<f64>::zeros(2);
+
+        solve_newton_direction_from_root(&root, &gradient, &mut actual).expect("square-root solve");
+
+        assert!((actual[0] - expected[0]).abs() < 1.0e-9);
+        assert!((actual[1] - expected[1]).abs() < 1.0e-9);
+    }
+}
+
 /// Solve the Newton direction implicitly via PCG against an operator-form
 /// Hessian. Bypasses materialization of the `p × p` Hessian when at least one
 /// penalty is operator-form and `p` is large enough that the implicit-matvec

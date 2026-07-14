@@ -273,6 +273,144 @@ impl<'a> GamWorkingModel<'a> {
         Ok(factor)
     }
 
+    fn write_scaled_dense_design(
+        design: &Array2<f64>,
+        weights: &Array1<f64>,
+        out: &mut Array2<f64>,
+    ) -> Result<(), EstimationError> {
+        if design.nrows() != weights.len()
+            || out.nrows() < design.nrows()
+            || out.ncols() != design.ncols()
+        {
+            crate::bail_invalid_estim!(
+                "PIRLS square-root design shape mismatch: design={}x{}, weights={}, root={}x{}",
+                design.nrows(),
+                design.ncols(),
+                weights.len(),
+                out.nrows(),
+                out.ncols()
+            );
+        }
+        for i in 0..design.nrows() {
+            let weight = weights[i];
+            if !(weight.is_finite() && weight >= 0.0) {
+                crate::bail_invalid_estim!(
+                    "Fisher square-root solve requires finite nonnegative weight, got {weight} at row {i}"
+                );
+            }
+            let scale = weight.sqrt();
+            for j in 0..design.ncols() {
+                out[[i, j]] = scale * design[[i, j]];
+            }
+        }
+        Ok(())
+    }
+
+    fn write_fisher_design_root(&self, out: &mut Array2<f64>) -> Result<(), EstimationError> {
+        if let Some(factor) = self.firth_design_factor.as_ref() {
+            return Self::write_scaled_dense_design(
+                &factor.x_dense,
+                &self.lasthessian_weights,
+                out,
+            );
+        }
+        match &self.coordinate_design {
+            WorkingCoordinateDesign::TransformedExplicit {
+                x_transformed,
+                x_csr,
+            } => {
+                if let Some(dense) = x_transformed.as_dense() {
+                    Self::write_scaled_dense_design(dense, &self.lasthessian_weights, out)
+                } else if let Some(csr) = x_csr.as_ref() {
+                    let view = csr.as_ref();
+                    for i in 0..csr.nrows() {
+                        let weight = self.lasthessian_weights[i];
+                        if !(weight.is_finite() && weight >= 0.0) {
+                            crate::bail_invalid_estim!(
+                                "Fisher square-root solve requires finite nonnegative weight, got {weight} at row {i}"
+                            );
+                        }
+                        let scale = weight.sqrt();
+                        for (&column, &value) in view
+                            .col_idx_of_row_raw(i)
+                            .iter()
+                            .zip(view.val_of_row(i).iter())
+                        {
+                            out[[i, column.unbound()]] = scale * value;
+                        }
+                    }
+                    Ok(())
+                } else {
+                    let dense = x_transformed
+                        .try_to_dense_arc("PIRLS square-root solve requires the transformed design")
+                        .map_err(EstimationError::InvalidInput)?;
+                    Self::write_scaled_dense_design(dense.as_ref(), &self.lasthessian_weights, out)
+                }
+            }
+            WorkingCoordinateDesign::TransformedImplicit { transform } => {
+                let n = self.x_original.nrows();
+                let p = self.x_original.ncols();
+                let _reservation = gam_runtime::resource::MemoryGovernor::global()
+                    .try_reserve_dense_f64(
+                        n,
+                        p,
+                        "PIRLS implicit transformed design for square-root solve",
+                    )
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+                let original = self
+                    .x_original
+                    .try_to_dense_arc(
+                        "PIRLS square-root solve requires the original implicit design",
+                    )
+                    .map_err(EstimationError::InvalidInput)?;
+                let transformed = fast_ab(original.as_ref(), &transform.materialize_dense());
+                Self::write_scaled_dense_design(&transformed, &self.lasthessian_weights, out)
+            }
+            WorkingCoordinateDesign::OriginalSparseNative => crate::bail_invalid_estim!(
+                "dense square-root solve reached a sparse-native coordinate design"
+            ),
+        }
+    }
+
+    fn solve_fisher_direction_from_root(
+        &self,
+        state: &WorkingState,
+        loop_lambda: f64,
+        lm_d2: &Array1<f64>,
+        direction_out: &mut Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        let n = self.lasthessian_weights.len();
+        let p = state.gradient.len();
+        let penalty_rows = self.penalty.rank();
+        let rows = n
+            .checked_add(penalty_rows)
+            .and_then(|value| value.checked_add(p))
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "PIRLS square-root row count overflowed usize".to_string(),
+                )
+            })?;
+        // Peak live storage is the root, faer's QR factor, and the temporary Q
+        // produced by the shared QR adapter.  Charge all three atomically.
+        let _reservation = gam_runtime::resource::MemoryGovernor::global()
+            .try_reserve_dense_f64_copies(rows, p, 3, "PIRLS Householder QR square-root solve")
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+        let mut root = Array2::<f64>::zeros((rows, p).f());
+        self.write_fisher_design_root(&mut root)?;
+        self.penalty.write_root_rows(&mut root, n);
+        let diagonal_start = n + penalty_rows;
+        for j in 0..p {
+            let energy = state.ridge_used + loop_lambda * lm_d2[j];
+            if !(energy.is_finite() && energy > 0.0) {
+                crate::bail_invalid_estim!(
+                    "PIRLS square-root LM diagonal must be finite and positive, got {energy} at coefficient {j}"
+                );
+            }
+            root[[diagonal_start + j, j]] = energy.sqrt();
+        }
+        solve_newton_direction_from_root(&root, &state.gradient, direction_out)
+    }
+
     /// Convert the working model into its final state for outer REML consumption.
     ///
     /// The `finalweights` field is set to `lasthessian_weights`, which are the
@@ -1052,18 +1190,13 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         }
 
         let z = &self.lastz;
-        // Fused single-pass: compute weighted_residual = (eta - z) * w
-        // and working_residual = eta - z simultaneously, avoiding two
-        // separate O(n) passes and an intermediate copy.
+        // Single-pass score residual: W(eta - z).
         ndarray::Zip::from(&mut self.workspace.weighted_residual)
-            .and(&mut self.workspace.working_residual)
             .and(&self.workspace.eta_buf)
             .and(z)
             .and(&self.lastweights)
-            .par_for_each(|wr, r, &eta, &zi, &wi| {
-                let residual = eta - zi;
-                *r = residual;
-                *wr = residual * wi;
+            .par_for_each(|wr, &eta, &zi, &wi| {
+                *wr = (eta - zi) * wi;
             });
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
         // Score norm ||X' (weighted residual)||_2 — captured before adding the
@@ -1210,5 +1343,22 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
 
     fn supports_observed_information_curvature(&self) -> bool {
         self.supports_observed_hessian_curvature()
+    }
+
+    fn solve_unconstrained_direction(
+        &mut self,
+        state: &WorkingState,
+        loop_lambda: f64,
+        lm_d2: &Array1<f64>,
+        regularized_hessian: &Array2<f64>,
+        direction_out: &mut Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        if state.hessian_curvature == HessianCurvatureKind::Fisher
+            && self.penalty.requires_root_solve()
+        {
+            self.solve_fisher_direction_from_root(state, loop_lambda, lm_d2, direction_out)
+        } else {
+            solve_newton_direction_dense(regularized_hessian, &state.gradient, direction_out)
+        }
     }
 }

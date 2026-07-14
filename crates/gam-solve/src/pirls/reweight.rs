@@ -996,7 +996,13 @@ where
                         }
                     }
                 } else {
-                    solve_newton_direction_dense(dense_reg, &state.gradient, &mut newton_direction)
+                    model.solve_unconstrained_direction(
+                        &state,
+                        loop_lambda,
+                        &lm_d2,
+                        dense_reg,
+                        &mut newton_direction,
+                    )
                 }
             } {
                 Ok(()) => &newton_direction,

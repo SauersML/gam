@@ -11,8 +11,8 @@ pub(crate) use crate::estimate::EstimationError;
 pub(crate) use crate::estimate::reml::{FirthDenseOperator, FirthDesignFactor};
 
 pub(crate) use gam_linalg::faer_ndarray::{
-    FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor, array1_to_col_matmut, fast_ab,
-    fast_av, fast_av_into,
+    FaerCholesky, FaerEigh, FaerLinalgError, FaerQr, FaerSymmetricFactor, array1_to_col_matmut,
+    fast_ab, fast_av, fast_av_into,
 };
 
 pub(crate) use gam_linalg::sparse_exact::{factorize_sparse_spd, solve_sparse_spd};

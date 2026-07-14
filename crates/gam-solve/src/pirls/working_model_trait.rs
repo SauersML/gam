@@ -40,6 +40,22 @@ pub trait WorkingModel {
         false
     }
 
+    /// Solve the unconstrained LM system in the model's native numerical
+    /// representation.  Generic working models own only an assembled Hessian;
+    /// concrete models that retain a better-conditioned square root can
+    /// override this atom without changing constraints or trust-region logic.
+    fn solve_unconstrained_direction(
+        &mut self,
+        state: &WorkingState,
+        loop_lambda: f64,
+        lm_d2: &Array1<f64>,
+        regularized_hessian: &Array2<f64>,
+        direction_out: &mut Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        let _ = (loop_lambda, lm_d2);
+        solve_newton_direction_dense(regularized_hessian, &state.gradient, direction_out)
+    }
+
     /// Dispersion factor `k` the inner working weight carries but the reported
     /// deviance (`state.deviance` / `CandidateScreen::deviance`) does not, so the
     /// LM gain-ratio / stall-detection objective must be

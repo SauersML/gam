@@ -101,6 +101,50 @@ impl PirlsPenalty {
         }
     }
 
+    /// Whether assembling `S = E' E` has squared the penalty-root condition
+    /// number far enough to discard more than half of binary64's significant
+    /// digits.  Above `1/sqrt(eps)` in row energy, a Cholesky solve of the Gram
+    /// is numerically a different problem from a QR solve of its PSD root.
+    ///
+    /// Reparameterized dense penalties store mutually orthogonal spectral-root
+    /// rows, so their squared row norms are exactly the represented positive
+    /// eigenvalues.  Diagonal penalties never incur cancellation while being
+    /// assembled and therefore retain the direct diagonal/Gram solve.
+    pub(super) fn requires_root_solve(&self) -> bool {
+        let Self::Dense { e_transformed, .. } = self else {
+            return false;
+        };
+        let mut min_positive = f64::INFINITY;
+        let mut max_energy = 0.0_f64;
+        for row in e_transformed.rows() {
+            let energy = row.dot(&row);
+            if energy > 0.0 && energy.is_finite() {
+                min_positive = min_positive.min(energy);
+                max_energy = max_energy.max(energy);
+            }
+        }
+        min_positive.is_finite() && max_energy / min_positive > f64::EPSILON.sqrt().recip()
+    }
+
+    pub(super) fn write_root_rows(&self, out: &mut Array2<f64>, first_row: usize) {
+        match self {
+            Self::Dense { e_transformed, .. } => {
+                let end = first_row + e_transformed.nrows();
+                out.slice_mut(ndarray::s![first_row..end, ..])
+                    .assign(e_transformed);
+            }
+            Self::Diagonal {
+                diag,
+                positive_indices,
+                ..
+            } => {
+                for (local_row, &coefficient) in positive_indices.iter().enumerate() {
+                    out[[first_row + local_row, coefficient]] = diag[coefficient].sqrt();
+                }
+            }
+        }
+    }
+
     pub(super) fn add_to_hessian(&self, hessian: &mut Array2<f64>) {
         match self {
             Self::Dense { s_transformed, .. } => {
@@ -211,6 +255,27 @@ mod tests {
 
         assert_eq!(penalty.shifted_quadratic(&beta), 4.0);
         assert_eq!(penalty.shifted_gradient(&beta), array![2.0, -2.0]);
+    }
+
+    #[test]
+    fn root_solve_gate_is_derived_from_gram_precision_loss() {
+        let stiff = PirlsPenalty::Dense {
+            s_transformed: array![[1.0e10, 0.0], [0.0, 1.0]],
+            e_transformed: array![[1.0e5, 0.0], [0.0, 1.0]],
+            linear_shift: Array1::zeros(2),
+            constant_shift: 0.0,
+            prior_mean_target: Array1::zeros(2),
+        };
+        let ordinary = PirlsPenalty::Dense {
+            s_transformed: array![[1.0e6, 0.0], [0.0, 1.0]],
+            e_transformed: array![[1.0e3, 0.0], [0.0, 1.0]],
+            linear_shift: Array1::zeros(2),
+            constant_shift: 0.0,
+            prior_mean_target: Array1::zeros(2),
+        };
+
+        assert!(stiff.requires_root_solve());
+        assert!(!ordinary.requires_root_solve());
     }
 }
 

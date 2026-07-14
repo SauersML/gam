@@ -14,8 +14,7 @@ pub struct PirlsWorkspace {
     pub final_aug_matrix: Array2<f64>, // (<= p + erows) x p
     // Stage 5 RHS buffers
     pub rhs_full: Array1<f64>, // length <= p + erows
-    // Gradient check helpers
-    pub working_residual: Array1<f64>,
+    // Gradient helper
     pub weighted_residual: Array1<f64>,
     // Step-halving direction (XΔβ)
     pub delta_eta: Array1<f64>,
@@ -70,7 +69,6 @@ impl PirlsWorkspace {
             scaled_matrix: Array2::zeros((0, 0).f()),
             final_aug_matrix: Array2::zeros((0, 0).f()),
             rhs_full: Array1::zeros(0),
-            working_residual: Array1::zeros(n),
             weighted_residual: Array1::zeros(n),
             delta_eta: Array1::zeros(n),
             vec_buf_p: Array1::zeros(p),
