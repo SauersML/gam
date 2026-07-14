@@ -1564,7 +1564,7 @@ mod tests {
         let mut w = Vec::with_capacity(n);
         for i in 0..n {
             let xi = -2.0 + 4.0 * (i as f64) / ((n - 1) as f64);
-            let wi = if xi < 0.0 { 1.0 } else { 9.0 };
+            let wi: f64 = if xi < 0.0 { 1.0 } else { 9.0 };
             let u1 = next_unit().max(1e-12);
             let u2 = next_unit();
             let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
