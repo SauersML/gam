@@ -23,13 +23,13 @@ name: Rolling wheel (warm-start artifact)
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
-# A rolling release has one writer. Superseded SHAs must not keep compiling or
-# race a newer build and overwrite its exact provenance with stale artifacts.
-# The warm compiler cache keeps replacement builds short enough that the newest
-# main commit remains the only useful unit of work.
+# Main has one newest-writer lane, so superseded automatic builds are canceled.
+# An explicitly dispatched validation ref gets its own lane: main churn cannot
+# starve a proof build, and that branch never writes the rolling release.
 concurrency:
-  group: rolling-main-runtime
+  group: runtime-${{ github.event_name == 'push' && 'main' || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -71,7 +71,19 @@ jobs:
           CARGO_PROFILE_RELEASE_LTO: "off"
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
-      - name: Pin to rolling wheel-latest release
+      - name: Seal exact runtime provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/gamfit-*.whl)
+          test -x dist/gam
+          {
+            echo "commit=${GITHUB_SHA}"
+            (cd dist && sha256sum "$(basename "$WHEEL")" gam)
+          } > dist/RUNTIME_PROVENANCE.txt
+
+      - name: Pin newest main runtime to rolling release
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -81,15 +93,7 @@ jobs:
             gh release create wheel-latest --repo "$GITHUB_REPOSITORY" --prerelease \
               --title "Rolling main wheel" \
               --notes "Continuously replaced by the newest green-main build. Not a versioned release."
-          test -x dist/gam
           gh release upload wheel-latest "$WHEEL" dist/gam --repo "$GITHUB_REPOSITORY" --clobber
-          # One closed provenance contract for both executable artifacts.
-          # Consumers require the exact commit and verify every listed hash;
-          # there is no stale-runtime or source-build fallback.
-          {
-            echo "commit=${GITHUB_SHA}"
-            (cd dist && sha256sum "$(basename "$WHEEL")" gam)
-          } > dist/RUNTIME_PROVENANCE.txt
           gh release upload wheel-latest dist/RUNTIME_PROVENANCE.txt --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Also keep it as a run artifact

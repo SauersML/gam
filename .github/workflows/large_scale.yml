@@ -124,10 +124,11 @@ jobs:
           python-version: "3.11"
 
       - name: Download exact warm runtime
-        # The rolling manylinux build publishes the CLI and Python extension
-        # from one source tree. Require this workflow's exact SHA and both
-        # hashes: a missing/stale artifact fails immediately, never falls back
-        # to a 24-minute in-workflow rebuild or mixes two estimator versions.
+        # Resolve the successful runtime-producing run by this exact commit,
+        # then download its immutable run artifact. The rolling release is only
+        # a convenience alias and is not an estimator input: main churn cannot
+        # make this workflow consume a stale or newer executable. A missing
+        # exact artifact fails immediately; there is no source-build fallback.
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -135,10 +136,16 @@ jobs:
           set -euo pipefail
           rm -rf dist
           mkdir -p dist target/release
-          gh release download wheel-latest --repo "$GITHUB_REPOSITORY" \
-            --pattern 'gamfit-*.whl' \
-            --pattern gam \
-            --pattern RUNTIME_PROVENANCE.txt \
+          runtime_run_id=$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow wheel-nightly.yml \
+            --commit "$GITHUB_SHA" \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          test -n "$runtime_run_id"
+          gh run download "$runtime_run_id" --repo "$GITHUB_REPOSITORY" \
+            --name "gamfit-runtime-${GITHUB_SHA}" \
             --dir dist
           grep -Fx "commit=${GITHUB_SHA}" dist/RUNTIME_PROVENANCE.txt
           (
