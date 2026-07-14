@@ -5837,8 +5837,7 @@ fn sparse_dictionary_reconstruct_ffi<'py>(
 }
 
 #[pyfunction(signature = (
-    atom_basis,
-    atom_dim,
+    geometry_plans,
     decoder_blocks,
     coords,
     assignments,
@@ -5846,17 +5845,14 @@ fn sparse_dictionary_reconstruct_ffi<'py>(
 ))]
 fn sae_manifold_reconstruct_ffi<'py>(
     py: Python<'py>,
-    atom_basis: Vec<String>,
-    atom_dim: Vec<usize>,
+    geometry_plans: &Bound<'py, PyAny>,
     decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
     coords: Vec<PyReadonlyArray2<'py, f64>>,
     assignments: PyReadonlyArray2<'py, f64>,
     p_out: usize,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let basis_kinds = atom_basis
-        .iter()
-        .map(|name| sae_atom_basis_kind_from_str(name))
-        .collect::<Vec<_>>();
+    let geometry_plans =
+        sae_geometry_plans_from_py("sae_manifold_reconstruct", geometry_plans)?;
     let decoder_values = decoder_blocks
         .iter()
         .map(|block| block.as_array().to_owned())
@@ -5876,8 +5872,7 @@ fn sae_manifold_reconstruct_ffi<'py>(
             .map(|coord| coord.view())
             .collect::<Vec<_>>();
         gam::terms::sae::manifold::reconstruct_persisted_atom_set(
-            &basis_kinds,
-            &atom_dim,
+            &geometry_plans,
             &decoder_views,
             &coord_views,
             assignment_values.view(),

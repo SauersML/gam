@@ -535,6 +535,14 @@ create_exception!(
 /// no `err.to_string()` flattening, no Python-side regex reclassification.
 pub(crate) fn estimation_error_to_pyerr(err: EstimationError) -> PyErr {
     let message = err.to_string();
+    estimation_error_to_pyerr_with_message(err, message)
+}
+
+/// Select the Python exception from the innermost typed cause while retaining
+/// the complete outer message. `OuterObjectiveEvaluationFailed` records which
+/// orchestration boundary observed a fatal evaluator failure; it does not
+/// replace the source error's public class identity.
+fn estimation_error_to_pyerr_with_message(err: EstimationError, message: String) -> PyErr {
     match err {
         EstimationError::BasisError(_) => BasisError::new_err(message),
         EstimationError::LinearSystemSolveFailed(_) => LinearSystemSolveError::new_err(message),
@@ -579,6 +587,9 @@ pub(crate) fn estimation_error_to_pyerr(err: EstimationError) -> PyErr {
             HessianNotPositiveDefiniteError::new_err(message)
         }
         EstimationError::RemlOptimizationFailed(_) => RemlConvergenceError::new_err(message),
+        EstimationError::OuterObjectiveEvaluationFailed { source, .. } => {
+            estimation_error_to_pyerr_with_message(*source, message)
+        }
         EstimationError::GradientUnavailable { .. } => GradientUnavailableError::new_err(message),
         EstimationError::LayoutError(_) => LayoutError::new_err(message),
         EstimationError::ModelOverparameterized { .. } => {
