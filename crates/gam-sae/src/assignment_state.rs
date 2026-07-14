@@ -382,6 +382,30 @@ impl SaeAssignmentState {
         &self.atom_coord_meta[atom].manifold
     }
 
+    /// Effective per-axis periodicity for one atom, including a retraction
+    /// override attached to an otherwise Euclidean coordinate block.
+    ///
+    /// `LatentManifold::Euclidean` is dimension-generic and therefore reports a
+    /// single topology axis. The assignment state owns the concrete atom
+    /// dimension, so every sparse-coordinate consumer must obtain its topology
+    /// here rather than index the raw manifold descriptor directly.
+    pub fn atom_axis_periods(&self, atom: usize) -> Vec<Option<f64>> {
+        let meta = &self.atom_coord_meta[atom];
+        let periods = if meta.manifold.is_euclidean() {
+            meta.retraction.axis_periods(meta.latent_dim)
+        } else {
+            meta.manifold.axis_periods()
+        };
+        assert_eq!(
+            periods.len(),
+            meta.latent_dim,
+            "SaeAssignmentState atom {atom} axis-period count {} != latent dimension {}",
+            periods.len(),
+            meta.latent_dim,
+        );
+        periods
+    }
+
     /// Coordinate block for one active support slot.
     pub fn coords_for_slot(&self, row: usize, slot: usize) -> &[f64] {
         let start: usize = self.indices[row][..slot]
@@ -408,11 +432,15 @@ impl SaeAssignmentState {
             let atom = self.indices[row][slot] as usize;
             let meta = &self.atom_coord_meta[atom];
             let end = cursor + meta.latent_dim;
-            let current = Array1::from_vec(self.coords[row][cursor..end].to_vec());
+            let mut current = Array1::from_vec(self.coords[row][cursor..end].to_vec());
             let step = Array1::from_vec(delta[cursor..end].to_vec());
-            let retracted = meta.manifold.retract(current.view(), step.view());
+            if meta.retraction.is_all_euclidean() {
+                current = meta.manifold.retract(current.view(), step.view());
+            } else {
+                meta.retraction.retract(&mut current.view_mut(), step.view());
+            }
             self.coords[row][cursor..end]
-                .copy_from_slice(retracted.as_slice().expect("retraction is contiguous"));
+                .copy_from_slice(current.as_slice().expect("retraction is contiguous"));
             cursor = end;
         }
         Ok(())
@@ -861,6 +889,47 @@ mod tests {
         )
         .expect_err("duplicate support must fail");
         assert!(duplicate.contains("duplicate atom"));
+    }
+
+    #[test]
+    fn sparse_atom_geometry_owns_dimension_and_retraction_override() {
+        let specs = vec![
+            SaeAssignmentAtomSpec::euclidean(2),
+            SaeAssignmentAtomSpec {
+                latent_dim: 1,
+                id_mode: LatentIdMode::None,
+                manifold: LatentManifold::Euclidean,
+                retraction: LatentRetractionRegistry::new(
+                    gam_problem::riemannian_retraction::RetractionKind::Circle,
+                ),
+                latent_id: 17,
+            },
+        ];
+        let mut state = SaeAssignmentState::from_topk_support_heterogeneous(
+            1,
+            2,
+            2,
+            specs,
+            vec![vec![0, 1]],
+            vec![vec![0.0, 0.0]],
+            vec![vec![1.0, -2.0, std::f64::consts::PI - 0.25]],
+        )
+        .expect("heterogeneous state builds");
+
+        assert_eq!(state.atom_axis_periods(0), vec![None, None]);
+        assert_eq!(
+            state.atom_axis_periods(1),
+            vec![Some(2.0 * std::f64::consts::PI)],
+        );
+        state
+            .apply_row_coord_step(0, &[0.5, 1.0, 0.5])
+            .expect("coordinate step retracts");
+        assert_eq!(state.coords_for_slot(0, 0), &[1.5, -1.0]);
+        assert!(
+            (state.coords_for_slot(0, 1)[0] - (-std::f64::consts::PI + 0.25)).abs()
+                < 1.0e-15,
+            "explicit circle retraction must wrap the Euclidean-declared atom",
+        );
     }
 
     #[test]

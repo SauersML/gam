@@ -504,7 +504,7 @@ mod tests {
         .with_basis_second_jet(evaluator)
     }
 
-    /// Two-group heterogeneous support fixture (K = 2 atoms > P = 2 response
+    /// Two-group heterogeneous support fixture (K = 2 atoms > P = 1 response
     /// cells) whose smoothing selection is the exact regime the outer criterion
     /// desync afflicts. The target leaves a genuine residual so the penalized
     /// deviance and every per-group penalty energy are strictly positive.

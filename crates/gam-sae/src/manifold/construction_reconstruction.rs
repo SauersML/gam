@@ -123,60 +123,6 @@ mod ard_edf_certificate_tests {
     }
 }
 
-fn persisted_atom_basis_values(
-    kind: &SaeAtomBasisKind,
-    coords: ArrayView2<'_, f64>,
-    decoder_width: usize,
-    latent_dim: usize,
-    atom_idx: usize,
-) -> Result<Array2<f64>, String> {
-    match kind {
-        SaeAtomBasisKind::Periodic => {
-            if decoder_width == 0 || decoder_width % 2 == 0 {
-                return Err(format!(
-                    "reconstruct_persisted_atom_set: periodic atom {atom_idx} decoder width \
-                     must be odd and positive; got {decoder_width}"
-                ));
-            }
-            if coords.ncols() == 0 {
-                return Err(format!(
-                    "reconstruct_persisted_atom_set: periodic atom {atom_idx} needs at least \
-                     one coordinate column"
-                ));
-            }
-            if latent_dim != 1 {
-                return Err(format!(
-                    "reconstruct_persisted_atom_set: periodic atom {atom_idx} expects \
-                     latent_dim=1, got {latent_dim}"
-                ));
-            }
-            let evaluator = PeriodicHarmonicEvaluator::new(decoder_width)?;
-            let (phi, _jet) = evaluator.evaluate(coords.slice(s![.., 0..1]))?;
-            Ok(phi)
-        }
-        SaeAtomBasisKind::Sphere => {
-            if decoder_width != 7 {
-                return Err(format!(
-                    "reconstruct_persisted_atom_set: sphere atom {atom_idx} decoder width \
-                     must be 7, got {decoder_width}"
-                ));
-            }
-            if latent_dim != 2 {
-                return Err(format!(
-                    "reconstruct_persisted_atom_set: sphere atom {atom_idx} expects \
-                     latent_dim=2, got {latent_dim}"
-                ));
-            }
-            let (phi, _jet) = SphereChartEvaluator.evaluate(coords)?;
-            Ok(phi)
-        }
-        other => Err(format!(
-            "reconstruct_persisted_atom_set: atom {atom_idx} basis {other:?} is not a \
-             centers-free analytic persisted basis; rebuild a SaeManifoldTerm for this topology"
-        )),
-    }
-}
-
 /// Reconstruct a persisted SAE-manifold atom set from frozen coordinates,
 /// assignment masses, and decoder blocks.
 ///
@@ -186,19 +132,17 @@ fn persisted_atom_basis_values(
 /// basis evaluation, GEMM, and weighted atom sum here prevents the Python facade
 /// from becoming a second decoder implementation.
 pub fn reconstruct_persisted_atom_set(
-    basis_kinds: &[SaeAtomBasisKind],
-    atom_dims: &[usize],
+    geometry_plans: &[SaeAtomGeometryPlan],
     decoder_blocks: &[ArrayView2<'_, f64>],
     coords: &[ArrayView2<'_, f64>],
     assignments: ArrayView2<'_, f64>,
     p_out: usize,
 ) -> Result<Array2<f64>, String> {
-    let k_atoms = basis_kinds.len();
-    if atom_dims.len() != k_atoms || decoder_blocks.len() != k_atoms || coords.len() != k_atoms {
+    let k_atoms = geometry_plans.len();
+    if decoder_blocks.len() != k_atoms || coords.len() != k_atoms {
         return Err(format!(
-            "reconstruct_persisted_atom_set: metadata lengths must all equal K={k_atoms} \
-             (atom_dims={}, decoder_blocks={}, coords={})",
-            atom_dims.len(),
+            "reconstruct_persisted_atom_set: decoder and coordinate counts must equal \
+             geometry-plan count K={k_atoms} (decoder_blocks={}, coords={})",
             decoder_blocks.len(),
             coords.len()
         ));
@@ -215,28 +159,32 @@ pub fn reconstruct_persisted_atom_set(
     }
     let mut out = Array2::<f64>::zeros((n_rows, p_out));
     for atom_idx in 0..k_atoms {
+        let plan = &geometry_plans[atom_idx];
+        let basis_width = plan.basis_size()?;
         let decoder = decoder_blocks[atom_idx];
-        let (basis_width, decoder_p) = decoder.dim();
-        if decoder_p != p_out {
+        if decoder.dim() != (basis_width, p_out) {
             return Err(format!(
-                "reconstruct_persisted_atom_set: atom {atom_idx} decoder output width \
-                 {decoder_p} != p_out {p_out}"
+                "reconstruct_persisted_atom_set: atom {atom_idx} decoder shape {:?} must \
+                 equal plan-derived ({basis_width}, {p_out})",
+                decoder.dim()
             ));
         }
         let atom_coords = coords[atom_idx];
         if atom_coords.nrows() != n_rows {
             return Err(format!(
                 "reconstruct_persisted_atom_set: atom {atom_idx} coords rows {} != {n_rows}",
-                atom_coords.nrows()
+                 atom_coords.nrows()
             ));
         }
-        let phi = persisted_atom_basis_values(
-            &basis_kinds[atom_idx],
-            atom_coords,
-            basis_width,
-            atom_dims[atom_idx],
-            atom_idx,
-        )?;
+        if atom_coords.ncols() != plan.latent_dim() {
+            return Err(format!(
+                "reconstruct_persisted_atom_set: atom {atom_idx} coordinate width {} must \
+                 equal plan latent_dim {}",
+                atom_coords.ncols(),
+                plan.latent_dim()
+            ));
+        }
+        let (phi, _) = plan.build_evaluator()?.evaluate(atom_coords)?;
         if phi.dim() != (n_rows, basis_width) {
             return Err(format!(
                 "reconstruct_persisted_atom_set: atom {atom_idx} basis {:?} != ({n_rows}, {basis_width})",
@@ -914,9 +862,9 @@ impl SaeManifoldTerm {
 mod persisted_reconstruct_tests {
     use super::*;
 
-    // Exercises `reconstruct_persisted_atom_set` (and, transitively,
-    // `persisted_atom_basis_values`): a stateless K=1 periodic-atom round trip that
-    // must equal `a_i · (Φ(t_i) · B)` computed directly from the same evaluator.
+    // Exercises `reconstruct_persisted_atom_set`: a stateless K=1 periodic-atom
+    // round trip that must equal `a_i · (Φ(t_i) · B)` computed directly from the
+    // exact evaluator declared by the persisted geometry plan.
     #[test]
     fn reconstruct_persisted_periodic_atom_matches_direct_decode() {
         let n_rows = 4usize;
@@ -927,9 +875,15 @@ mod persisted_reconstruct_tests {
             Array2::from_shape_vec((width, p_out), vec![0.5, -0.2, 0.3, 0.9, -0.4, 0.1]).unwrap();
         let assignments = Array2::from_shape_vec((n_rows, 1), vec![1.0, 0.5, 0.8, 0.2]).unwrap();
 
+        let plan = SaeAtomGeometryPlan::new(
+            SaeAtomBasisKind::Periodic,
+            1,
+            SaeBasisResolution::PeriodicHarmonics { order: 1 },
+            SaeReferenceMetricPlan::UnitCircle,
+        )
+        .unwrap();
         let out = reconstruct_persisted_atom_set(
-            &[SaeAtomBasisKind::Periodic],
-            &[1usize],
+            &[plan],
             &[decoder.view()],
             &[coords.view()],
             assignments.view(),

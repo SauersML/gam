@@ -40,7 +40,8 @@ const POINCARE_REFERENCE_CURVATURE: f64 = -1.0;
 /// This enum records the user-facing topology choice so downstream diagnostics
 /// and Python wrappers can round-trip whether the atom was a Duchon patch,
 /// periodic curve, sphere, or a caller-supplied precomputed basis.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SaeAtomBasisKind {
     Duchon,
     Periodic,

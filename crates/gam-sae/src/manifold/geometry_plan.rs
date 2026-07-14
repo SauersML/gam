@@ -7,9 +7,11 @@
 //! former parallel `(kind, harmonic_order, basis_width)` scalars.
 
 use super::*;
+use serde::{Deserialize, Serialize};
 
 /// Basis-native resolution of one analytic atom family.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SaeBasisResolution {
     PeriodicHarmonics {
         order: usize,
@@ -49,7 +51,8 @@ pub enum SaeBasisResolution {
 }
 
 /// Reference geometry whose function-space seminorm the atom stores.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SaeReferenceMetricPlan {
     UnitCircle,
     SphereChart,
@@ -80,12 +83,39 @@ pub enum SaeReferenceMetricPlan {
 }
 
 /// Complete persisted analytic geometry plan for one atom.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SaeAtomGeometryPlanWire")]
 pub struct SaeAtomGeometryPlan {
     kind: SaeAtomBasisKind,
     latent_dim: usize,
     resolution: SaeBasisResolution,
     reference_metric: SaeReferenceMetricPlan,
+}
+
+/// Deserialization proxy for [`SaeAtomGeometryPlan`]. The persisted wire carries
+/// every semantic component, but it is never allowed to initialize the private
+/// fields directly: `TryFrom` routes the tuple back through [`SaeAtomGeometryPlan::new`]
+/// so a saved artifact cannot bypass topology/resolution/metric validation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaeAtomGeometryPlanWire {
+    kind: SaeAtomBasisKind,
+    latent_dim: usize,
+    resolution: SaeBasisResolution,
+    reference_metric: SaeReferenceMetricPlan,
+}
+
+impl TryFrom<SaeAtomGeometryPlanWire> for SaeAtomGeometryPlan {
+    type Error = String;
+
+    fn try_from(wire: SaeAtomGeometryPlanWire) -> Result<Self, Self::Error> {
+        Self::new(
+            wire.kind,
+            wire.latent_dim,
+            wire.resolution,
+            wire.reference_metric,
+        )
+    }
 }
 
 impl SaeAtomGeometryPlan {
