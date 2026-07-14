@@ -2,6 +2,7 @@
 //! numerical-robustness tests for the custom-family blockwise carrier.
 
 use super::*;
+use gam_solve::active_set::solve_quadratic_with_linear_constraints;
 
 /// gam#1088 fixture. A coupled two-block family whose joint Hessian carries
 /// a `NaN` curvature entry — the degenerate-curvature signature seen in the

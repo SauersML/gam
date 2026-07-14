@@ -39,9 +39,7 @@ pub(crate) use crate::custom_family_persistent_warm_start::{
     capture_fit_artifact, consume_fit_artifact, load_persistent_custom_family_warm_start,
     store_persistent_custom_family_warm_start, update_custom_outer_inner_cap_from_warm_start,
 };
-pub(crate) use gam_solve::active_set::{
-    project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
-};
+pub(crate) use gam_solve::active_set::project_stationarity_residual_on_constraint_cone;
 pub(crate) use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 pub(crate) use gam_solve::estimate::reml::reml_outer_engine::{
     BlockCoupledOperator, CompositeHyperOperator, DenseSpectralOperator, DispersionHandling,
