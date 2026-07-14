@@ -75,6 +75,86 @@ impl PolyaGamma {
     }
 }
 
+/// Exact cumulative distribution function of the untilted `PG(1, 0)` law,
+/// `P(X <= x)` for `X ~ PG(1, 0)`.
+///
+/// This is the analytic companion to [`PolyaGamma::draw`] at tilt `c = 0`: an
+/// exact, Monte-Carlo-free reference that lets sampler correctness be gated on
+/// distribution *shape* (KS/DKW), not just the first two moments. Moment-only
+/// gates pass for any sampler whose mean and variance happen to match, so a
+/// shape error slips through; a CDF gate does not.
+///
+/// # Derivation
+///
+/// `PG(1, 0)` has the Jacobi (theta) density
+///
+/// ```text
+/// f(x) = Σ_{k>=0} (-1)^k (2k+1) / sqrt(2π x³) · exp(-(2k+1)² / (8x)),   x > 0.
+/// ```
+///
+/// Integrating term by term uses the exact identity
+///
+/// ```text
+/// d/dx [ 4 Φ(-(k+1/2) / sqrt(x)) ] = (2k+1)/sqrt(2π x³) · exp(-(2k+1)²/(8x)),
+/// ```
+///
+/// (with `Φ` the standard normal CDF and `2k+1 = 2(k+1/2)`), so, since
+/// `F(0) = 0`, the **small-argument** representation is
+///
+/// ```text
+/// F(x) = Σ_{k>=0} (-1)^k · 4 Φ(-(k+1/2) / sqrt(x)).
+/// ```
+///
+/// The theta transformation of the same law gives the **large-argument**
+/// representation
+///
+/// ```text
+/// F(x) = 1 - Σ_{k>=0} (-1)^k · (2 / (π (k+1/2))) · exp(-2π² (k+1/2)² x).
+/// ```
+///
+/// Each series is alternating and converges geometrically on the side named;
+/// the two agree at the crossover `x = 1/(2π)` (a continuity check the tests
+/// pin). The mean of the large-argument density integrates to exactly `1/4`,
+/// which is `E[PG(1,0)]`, fixing the overall normalization.
+///
+/// The small-argument branch is written with `sqrt(x)` — **not** `sqrt(2x)`.
+/// The `sqrt(2x)` form evaluates `F(2x)` instead of `F(x)`; it disagrees with
+/// the large branch at the crossover (`0.735` vs `0.419`) and with a direct
+/// definition-based `PG(1,0)` sampler for every `x <= 1/(2π)`.
+pub fn pg1_untilted_cdf(x: f64) -> f64 {
+    use gam_math::probability::normal_cdf;
+    if x <= 0.0 {
+        return 0.0;
+    }
+
+    let mut sum = 0.0;
+    let mut n = 0usize;
+    if x <= 1.0 / (2.0 * std::f64::consts::PI) {
+        loop {
+            let k = n as f64 + 0.5;
+            let term = 4.0 * normal_cdf(-k / x.sqrt());
+            sum += if n % 2 == 0 { term } else { -term };
+            if term <= f64::EPSILON {
+                break;
+            }
+            n += 1;
+        }
+        sum.clamp(0.0, 1.0)
+    } else {
+        loop {
+            let k = n as f64 + 0.5;
+            let term = 2.0 / (std::f64::consts::PI * k)
+                * (-2.0 * std::f64::consts::PI.powi(2) * k * k * x).exp();
+            sum += if n % 2 == 0 { term } else { -term };
+            if term <= f64::EPSILON {
+                break;
+            }
+            n += 1;
+        }
+        (1.0 - sum).clamp(0.0, 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,40 +224,48 @@ mod tests {
         }
     }
 
-    /// Exact `PG(1, 0)` CDF, evaluated from the two alternating Jacobi-series
-    /// representations on the side where each converges geometrically. If
-    /// `X ~ PG(1, 0)`, then `4X ~ J*(1, 0)`.
-    fn pg10_cdf(x: f64) -> f64 {
+    /// Independent, definition-based `PG(1, 0)` CDF used to pin the analytic
+    /// [`pg1_untilted_cdf`] at grid points. `PG(1, 0)` is the infinite
+    /// convolution `X = (1 / 2π²) Σ_k E_k / (k - 1/2)²` with `E_k ~ Exp(1)`;
+    /// its density has the closed form below, and Simpson quadrature of that
+    /// density is an oracle that shares no code with the series representation
+    /// under test. This is deliberately *not* the production series: it exists
+    /// so a transcription error in either representation (e.g. the historical
+    /// `sqrt(2x)` factor-2 bug) cannot hide behind a self-consistent series.
+    fn pg10_cdf_quadrature_reference(x: f64) -> f64 {
         if x <= 0.0 {
             return 0.0;
         }
-
-        let mut sum = 0.0;
-        let mut n = 0usize;
-        if x <= 1.0 / (2.0 * std::f64::consts::PI) {
+        // f(t) = Σ_k (-1)^k (2k+1)/sqrt(2π t³) exp(-(2k+1)²/(8t)).
+        let density = |t: f64| -> f64 {
+            if t <= 0.0 {
+                return 0.0;
+            }
+            let mut sum = 0.0;
+            let mut k = 0usize;
             loop {
-                let k = n as f64 + 0.5;
-                let term = 4.0 * gam_math::probability::normal_cdf(-k / (2.0 * x).sqrt());
-                sum += if n.is_multiple_of(2) { term } else { -term };
-                if term <= f64::EPSILON {
+                let a = (2 * k + 1) as f64;
+                let term =
+                    a / (2.0 * std::f64::consts::PI * t.powi(3)).sqrt() * (-a * a / (8.0 * t)).exp();
+                sum += if k % 2 == 0 { term } else { -term };
+                if term <= 1e-18 {
                     break;
                 }
-                n += 1;
+                k += 1;
             }
-            sum.clamp(0.0, 1.0)
-        } else {
-            loop {
-                let k = n as f64 + 0.5;
-                let term = 2.0 / (std::f64::consts::PI * k)
-                    * (-2.0 * std::f64::consts::PI.powi(2) * k * k * x).exp();
-                sum += if n.is_multiple_of(2) { term } else { -term };
-                if term <= f64::EPSILON {
-                    break;
-                }
-                n += 1;
-            }
-            (1.0 - sum).clamp(0.0, 1.0)
+            sum
+        };
+        // Composite Simpson on [eps, x]; the density → 0 super-exponentially at
+        // 0, so a small positive floor carries no measurable mass.
+        let steps = 4_000usize;
+        let lo = 1e-6_f64.min(x * 0.5);
+        let h = (x - lo) / steps as f64;
+        let mut acc = density(lo) + density(x);
+        for i in 1..steps {
+            let t = lo + i as f64 * h;
+            acc += if i % 2 == 1 { 4.0 } else { 2.0 } * density(t);
         }
+        (acc * h / 3.0).clamp(0.0, 1.0)
     }
 
     #[test]
@@ -193,7 +281,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &sample)| {
-                let cdf = pg10_cdf(sample);
+                let cdf = pg1_untilted_cdf(sample);
                 let empirical_below = i as f64 / n;
                 let empirical_through = (i + 1) as f64 / n;
                 (cdf - empirical_below)
@@ -210,6 +298,62 @@ mod tests {
             statistic <= critical,
             "PG(1,0) one-sample KS statistic {statistic} exceeds DKW critical value {critical}",
         );
+    }
+
+    /// Pin the analytic CDF against an independent, code-disjoint quadrature
+    /// oracle on BOTH series branches. This is the direct regression for the
+    /// `sqrt(2x)` factor-2 bug: the buggy small-x branch returned `F(2x)`, so
+    /// e.g. `F(0.10)` read `0.526` instead of `0.227` — a `0.30` error the KS
+    /// test above also catches, pinned here without Monte-Carlo noise.
+    #[test]
+    fn pg1_untilted_cdf_matches_independent_quadrature_on_both_branches() {
+        let crossover = 1.0 / (2.0 * std::f64::consts::PI);
+        // Small-x branch (x <= crossover) and large-x branch (x > crossover).
+        for &x in &[0.02_f64, 0.05, 0.08, 0.12, 0.15, 0.20, 0.30, 0.50, 1.0, 2.0] {
+            let analytic = pg1_untilted_cdf(x);
+            let reference = pg10_cdf_quadrature_reference(x);
+            let branch = if x <= crossover { "small" } else { "large" };
+            assert!(
+                (analytic - reference).abs() < 2e-4,
+                "{branch}-branch CDF at x={x}: analytic {analytic:.6}, quadrature {reference:.6}",
+            );
+        }
+    }
+
+    /// A valid CDF built from two series must be continuous where they are
+    /// stitched. The factor-2 bug made the small branch evaluate `F(2x)`, so
+    /// the two branches disagreed by ~0.32 at the crossover — a discontinuity
+    /// this test forbids directly.
+    #[test]
+    fn pg1_untilted_cdf_is_continuous_at_the_series_crossover() {
+        let crossover = 1.0 / (2.0 * std::f64::consts::PI);
+        let below = pg1_untilted_cdf(crossover - 1e-9);
+        let above = pg1_untilted_cdf(crossover + 1e-9);
+        assert!(
+            (below - above).abs() < 1e-6,
+            "CDF discontinuous across the small/large series crossover: \
+             below {below:.9}, above {above:.9}",
+        );
+    }
+
+    /// Basic CDF sanity: monotone non-decreasing, in `[0, 1]`, `F(0)=0`, and
+    /// `F(x) → 1`. A branch that silently evaluated a scaled argument would
+    /// still be monotone, so this complements (does not replace) the pinned
+    /// per-point checks above.
+    #[test]
+    fn pg1_untilted_cdf_is_a_monotone_probability() {
+        assert_eq!(pg1_untilted_cdf(0.0), 0.0);
+        assert_eq!(pg1_untilted_cdf(-1.0), 0.0);
+        let mut prev = 0.0;
+        let mut x = 1e-3;
+        while x < 8.0 {
+            let f = pg1_untilted_cdf(x);
+            assert!((0.0..=1.0).contains(&f), "CDF out of [0,1] at x={x}: {f}");
+            assert!(f >= prev - 1e-12, "CDF decreased at x={x}: {prev} -> {f}");
+            prev = f;
+            x += 1e-3;
+        }
+        assert!(pg1_untilted_cdf(50.0) > 1.0 - 1e-9, "right tail must reach 1");
     }
 
     #[test]
