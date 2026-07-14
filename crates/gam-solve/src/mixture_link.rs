@@ -3129,7 +3129,7 @@ mod tests {
             .expect("finite SAS center");
         let phi0 = normal_pdf(0.0);
         let expected_epsilon_d1 = -2.0 * phi0 / (SAS_U_CLAMP * SAS_U_CLAMP);
-        assert_eq!(out.d2mu_dparams2, Array2::zeros((2, 2)));
+        assert_eq!(out.d2mu_dparams2, Array2::<f64>::zeros((2, 2)));
         assert_eq!(out.d2d1_dparams2[[0, 1]], out.d2d1_dparams2[[1, 0]]);
         assert!((out.d2d1_dparams2[[0, 0]] - expected_epsilon_d1).abs() < 1.0e-15);
         assert!((out.d2d1_dparams2[[1, 1]] - phi0).abs() < 1.0e-15);

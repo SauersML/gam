@@ -1551,7 +1551,7 @@ fn closure_terminal_order_overrides_efs_finalization() {
         .with_terminal_eval_order(OuterEvalOrder::ValueAndGradient);
     let efs_plan = OuterPlan {
         solver: Solver::Efs,
-        hessian_source: HessianSource::None,
+        hessian_source: HessianSource::EfsFixedPoint,
     };
 
     obj.finalize_outer_result(&array![0.0], &efs_plan)
