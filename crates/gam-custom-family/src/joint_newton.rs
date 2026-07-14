@@ -1250,6 +1250,45 @@ pub(crate) fn active_face_logdet_with_ridge_policy(
     Ok(logdet + logdet_correction)
 }
 
+/// Rebuild `log|S(lambda)|_+` on the same active-face tangent used for the
+/// coefficient-Hessian determinant. Returning `None` preserves the existing
+/// full-curvature convention when the active rows fully pin coefficient space.
+pub(crate) fn active_face_penalty_logdet(
+    specs: &[ParameterBlockSpec],
+    ranges: &[(usize, usize)],
+    block_log_lambdas: &[Array1<f64>],
+    active_constraints: &ActiveLinearConstraintBlock,
+    ridge: f64,
+) -> Result<Option<f64>, String> {
+    let ActiveConstraintTangentGeometry::Tangent(z) =
+        active_constraint_tangent_geometry(&active_constraints.a)?
+    else {
+        return Ok(None);
+    };
+    let mut tangent_components = Vec::new();
+    let mut lambdas = Vec::new();
+    for (b, spec) in specs.iter().enumerate() {
+        let (start, end) = ranges[b];
+        let z_block = z.slice(ndarray::s![start..end, ..]);
+        let block_lambdas = exact_lambdas_from_log_strengths(
+            &block_log_lambdas[b],
+            &format!("active-face penalty logdet block {b} log strength"),
+        )?;
+        for (penalty, &lambda) in spec.penalties.iter().zip(block_lambdas.iter()) {
+            tangent_components.push(z_block.t().dot(&penalty.to_dense()).dot(&z_block));
+            lambdas.push(lambda);
+        }
+    }
+    if tangent_components.is_empty() {
+        return Ok(Some(0.0));
+    }
+    let penalty =
+        PenaltyPseudologdet::from_components(&tangent_components, &lambdas, ridge).map_err(
+            |error| format!("active-face penalty pseudo-logdet failed: {error}"),
+        )?;
+    Ok(Some(penalty.value()))
+}
+
 pub(crate) fn blockwise_logdet_terms_with_workspace<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
@@ -1483,6 +1522,22 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
         let (s_lambda, block_logdet) = block_term?;
         s_lambdas.push(s_lambda);
         penalty_logdet_s_total += block_logdet;
+    }
+    if include_logdet_s
+        && let Some(active) = active_constraints
+        && let Some(tangent_logdet) = active_face_penalty_logdet(
+            specs,
+            &ranges,
+            block_log_lambdas,
+            active,
+            if options.ridge_policy.accounts_for_objective() {
+                effective_solverridge(options.ridge_floor)
+            } else {
+                0.0
+            },
+        )?
+    {
+        penalty_logdet_s_total = tangent_logdet;
     }
     if !include_logdet_h {
         return Ok((0.0, penalty_logdet_s_total));

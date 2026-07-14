@@ -1848,6 +1848,34 @@ pub(crate) fn active_face_logdet_ignores_constraint_normal_indefiniteness() {
         (logdet - expected).abs() < 1e-12,
         "active-face logdet={logdet}, expected={expected}",
     );
+
+    let spec = ParameterBlockSpec {
+        name: "active-face-penalty".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::eye(2))),
+        offset: Array1::zeros(2),
+        penalties: vec![PenaltyMatrix::Dense(array![[2.0, 0.0], [0.0, 3.0]])],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(Array1::zeros(2)),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let penalty_logdet = active_face_penalty_logdet(
+        &[spec],
+        &[(0, 2)],
+        &[array![0.0]],
+        &active,
+        0.0,
+    )
+    .expect("active-face penalty determinant should decompose")
+    .expect("the tangent is non-empty");
+    assert!(
+        (penalty_logdet - 3.0_f64.ln()).abs() < 1e-12,
+        "active-face penalty logdet={penalty_logdet}, expected={}",
+        3.0_f64.ln(),
+    );
 }
 
 #[test]
