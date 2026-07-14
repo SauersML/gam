@@ -3994,6 +3994,201 @@ impl<'a> RemlState<'a> {
         Ok(Some(Array1::from_elem(k, result.rho.clamp(lo, hi))))
     }
 
+    /// #2312 analytic seed candidate: one Gauss–Seidel sweep of exact
+    /// per-block global 1-D solves of the fixed-dispersion Gaussian working
+    /// REML landscape.
+    ///
+    /// For each penalized block `k` (others frozen at their current λ), the
+    /// criterion along `ρ_k = log λ_k` decomposes exactly over the
+    /// generalized eigenmodes of `(S_k, H_k)`, `H_k = XᵀWX + Σ_{j≠k} λ_j S_j`:
+    /// `V(ρ) = Σ_i [c_i σ(u_i) + ½ softplus(−u_i)] + const` with
+    /// `u_i = ρ + log s_i` and evidence `c_i = z_i²/(2σ̂²)` from the
+    /// `H_k`-whitened response. [`crate::rho_optimizer::RhoModeSpectrum`]
+    /// then yields the certified global 1-D argmin (interior minimum or the
+    /// λ→∞ boundary), which strictly generalizes the one-mode
+    /// moment-matched surrogates above to the full per-block spectrum.
+    ///
+    /// Honesty: with overlapping penalty blocks the penalty
+    /// pseudo-determinant is nonseparable in λ_k, and σ² is held at the
+    /// base-fit plug-in rather than profiled, so the sweep is a PROPOSAL —
+    /// the caller admits it only when the true coupled REML cost strictly
+    /// improves, exactly like the other analytic candidates.
+    pub(crate) fn analytic_landscape_gauss_seidel_rho(
+        &self,
+        base: &Array1<f64>,
+        bounds: (f64, f64),
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        if !reml_is_gaussian_identity(&self.config.likelihood) {
+            return Ok(None);
+        }
+        if self.linear_constraints.is_some()
+            || self.coefficient_lower_bounds.is_some()
+            || self.runtime_mixture_link_state.is_some()
+            || self.runtime_sas_link_state.is_some()
+        {
+            return Ok(None);
+        }
+        let k = self.canonical_penalties.len();
+        if k == 0 || base.len() < k {
+            return Ok(None);
+        }
+        if !matches!(self.x, DesignMatrix::Dense(_)) {
+            return Ok(None);
+        }
+        let x_dense = self
+            .x
+            .try_to_dense_by_chunks("gaussian_landscape_gauss_seidel_seed")
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        let p = self.p;
+        if x_dense.ncols() != p {
+            return Ok(None);
+        }
+        let (lo, hi) = if bounds.0 <= bounds.1 {
+            bounds
+        } else {
+            (bounds.1, bounds.0)
+        };
+
+        // Weighted Gram and RHS for the working model.
+        let weights = self.weights.to_owned();
+        let mut y_eff = self.y.to_owned();
+        if self.offset.len() == y_eff.len() {
+            y_eff -= &self.offset;
+        }
+        let n = x_dense.nrows();
+        if weights.len() != n || y_eff.len() != n {
+            return Ok(None);
+        }
+        let mut xw = x_dense.clone();
+        for (mut row, &w) in xw.rows_mut().into_iter().zip(weights.iter()) {
+            row *= w;
+        }
+        let xtwx = x_dense.t().dot(&xw);
+        let wy = &weights * &y_eff;
+        let xtwy = x_dense.t().dot(&wy);
+
+        let embed = |pen_idx: usize, lambda: f64, target: &mut Array2<f64>| {
+            self.canonical_penalties[pen_idx].accumulate_weighted(target, lambda);
+        };
+        let lambda_at = |rho: &Array1<f64>, j: usize| rho[j].clamp(lo, hi).exp();
+
+        // Plug-in dispersion at the base point: σ̂² = RSS_w / (n_eff − edf),
+        // with H = XᵀWX + Σ λ_j S_j and edf = tr(H⁻¹ XᵀWX).
+        let mut h_base = xtwx.clone();
+        for j in 0..k {
+            embed(j, lambda_at(base, j), &mut h_base);
+        }
+        let (h_evals, h_evecs) = match h_base.eigh(Side::Lower) {
+            Ok(pair) => pair,
+            Err(_) => return Ok(None),
+        };
+        let h_floor = h_evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)).abs()
+            * f64::EPSILON
+            * p as f64;
+        if h_evals.iter().any(|&e| !(e.is_finite() && e > h_floor)) {
+            return Ok(None);
+        }
+        let apply_spectral = |evals: &Array1<f64>,
+                              evecs: &Array2<f64>,
+                              power: f64,
+                              rhs: &Array1<f64>| {
+            let mut coords = evecs.t().dot(rhs);
+            for (c, &e) in coords.iter_mut().zip(evals.iter()) {
+                *c *= e.powf(power);
+            }
+            evecs.dot(&coords)
+        };
+        let beta = apply_spectral(&h_evals, &h_evecs, -1.0, &xtwy);
+        let fitted = x_dense.dot(&beta);
+        let mut rss_w = 0.0_f64;
+        let mut n_eff = 0.0_f64;
+        for i in 0..n {
+            let r = y_eff[i] - fitted[i];
+            rss_w += weights[i] * r * r;
+            if weights[i] > 0.0 {
+                n_eff += 1.0;
+            }
+        }
+        // edf = tr(H⁻¹ XᵀWX) via the spectral factor of H.
+        let mut edf = 0.0_f64;
+        for col in 0..p {
+            let u = h_evecs.column(col);
+            let quad = u.dot(&xtwx.dot(&u));
+            edf += quad / h_evals[col];
+        }
+        let dof = (n_eff - edf).max(1.0);
+        let sigma2 = (rss_w / dof).max(f64::MIN_POSITIVE);
+
+        // One Gauss–Seidel sweep of exact 1-D solves.
+        let mut rho = base.clone();
+        for coord in 0..k {
+            rho[coord] = rho[coord].clamp(lo, hi);
+        }
+        for kk in 0..k {
+            let mut h_k = xtwx.clone();
+            for j in 0..k {
+                if j != kk {
+                    embed(j, lambda_at(&rho, j), &mut h_k);
+                }
+            }
+            // Small spectral floor: H_k can be singular when XᵀWX is
+            // rank-deficient on this block's null directions.
+            let (hk_evals, hk_evecs) = match h_k.eigh(Side::Lower) {
+                Ok(pair) => pair,
+                Err(_) => return Ok(None),
+            };
+            let scale = hk_evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+            let floor = (scale * 1e-12).max(f64::MIN_POSITIVE);
+            let hk_evals = hk_evals.mapv(|e| e.max(floor));
+
+            // Whitened penalty A = H_k^{-1/2} S_k H_k^{-1/2}.
+            let mut s_k = Array2::<f64>::zeros((p, p));
+            embed(kk, 1.0, &mut s_k);
+            let mut half = hk_evecs.clone();
+            for (mut col, &e) in half.columns_mut().into_iter().zip(hk_evals.iter()) {
+                col *= 1.0 / e.sqrt();
+            }
+            // half = U D^{-1/2}; H^{-1/2} = half · Uᵀ.
+            let hmhalf = half.dot(&hk_evecs.t());
+            let a = hmhalf.dot(&s_k).dot(&hmhalf);
+            let sym_a = 0.5 * (&a + &a.t());
+            let (a_evals, a_evecs) = match sym_a.eigh(Side::Lower) {
+                Ok(pair) => pair,
+                Err(_) => return Ok(None),
+            };
+            let m = self.canonical_penalties[kk].positive_eigenvalues.len().min(p);
+            if m == 0 {
+                continue;
+            }
+            // Ascending eigenvalues: the top m are the penalized modes.
+            let z_white = a_evecs.t().dot(&hmhalf.dot(&xtwy));
+            let mut s_modes = Vec::with_capacity(m);
+            let mut c_modes = Vec::with_capacity(m);
+            for idx in (p - m)..p {
+                let s_i = a_evals[idx];
+                if !(s_i.is_finite() && s_i > 0.0) {
+                    continue;
+                }
+                let z = z_white[idx];
+                s_modes.push(s_i);
+                c_modes.push((z * z) / (2.0 * sigma2));
+            }
+            if s_modes.is_empty() {
+                continue;
+            }
+            let Ok(spectrum) = crate::rho_optimizer::RhoModeSpectrum::new(s_modes, c_modes)
+            else {
+                continue;
+            };
+            let certificate = spectrum.certificate();
+            rho[kk] = match certificate.global_minimum {
+                crate::rho_optimizer::RhoGlobalMinimum::Interior(r) => r.clamp(lo, hi),
+                crate::rho_optimizer::RhoGlobalMinimum::LambdaInfinity => hi,
+            };
+        }
+        Ok(Some(rho))
+    }
+
     /// Returns the effective Hessian and the ridge value used (if any).
     /// Uses the same Hessian matrix in both cost and gradient calculations.
     ///
