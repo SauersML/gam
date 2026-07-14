@@ -23,6 +23,26 @@ use std::collections::HashSet;
 /// solver contract and will spuriously reject valid boundary solutions.
 pub const ACTIVE_SET_PRIMAL_FEASIBILITY_TOL: f64 = 1e-8;
 
+/// Step fraction to the boundary of the solver's *certified numerical feasible
+/// set*. Every active-set exit accepts scaled slack `>=
+/// -ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`; ratio tests must therefore measure the
+/// remaining distance to that same boundary, not to exact zero. Using raw
+/// slack makes a point that is feasible to machine precision but happens to
+/// sit at `-O(eps)` produce an exact zero step, so a valid tangent escape is
+/// refused before the final feasibility certificate can inspect it (#979).
+#[inline]
+fn active_set_boundary_hit_step_fraction(
+    scaled_slack: f64,
+    scaled_directional_change: f64,
+    current_step_limit: f64,
+) -> Option<f64> {
+    boundary_hit_step_fraction(
+        scaled_slack + ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
+        scaled_directional_change,
+        current_step_limit,
+    )
+}
+
 /// Stationarity tolerance for the strong-KKT acceptance gate: the projected
 /// (working-set) gradient residual ‖∇L − Aᵀλ‖∞, either absolute or relative to
 /// `max(1, ‖∇L‖∞)`, must fall below this to certify a constrained stationary
@@ -1365,7 +1385,9 @@ fn fallback_projected_gradient_direction(
         let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
         let slack = (constraints.a.row(i).dot(x) - constraints.b[i]) * inv;
         let ai_d = constraints.a.row(i).dot(&tangent_direction) * inv;
-        if let Some(candidate) = boundary_hit_step_fraction(slack, ai_d, alpha) {
+        if let Some(candidate) =
+            active_set_boundary_hit_step_fraction(slack, ai_d, alpha)
+        {
             alpha = candidate;
         }
     }
@@ -1616,7 +1638,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
             let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
             let slack = (constraints.a.row(i).dot(&x) - constraints.b[i]) * inv;
             let ai_d = constraints.a.row(i).dot(&d) * inv;
-            if let Some(cand) = boundary_hit_step_fraction(slack, ai_d, alpha) {
+            if let Some(cand) = active_set_boundary_hit_step_fraction(slack, ai_d, alpha) {
                 alpha = cand;
             }
         }
@@ -2157,7 +2179,7 @@ fn fallback_projected_gradient_direction_with_constraint_set(
         }
         let slack = ops.scaled_slack(&values_x, row);
         let rate = values_direction[row] / ops.norms[row];
-        if let Some(candidate) = boundary_hit_step_fraction(slack, rate, alpha) {
+        if let Some(candidate) = active_set_boundary_hit_step_fraction(slack, rate, alpha) {
             alpha = candidate;
             blocking_row = Some(row);
         }
@@ -2332,7 +2354,7 @@ fn solve_newton_direction_with_constraint_set_impl(
             }
             let slack = ops.scaled_slack(&values_x, row);
             let rate = values_d[row] / ops.norms[row];
-            if let Some(cand) = boundary_hit_step_fraction(slack, rate, alpha) {
+            if let Some(cand) = active_set_boundary_hit_step_fraction(slack, rate, alpha) {
                 alpha = cand;
                 blocking_row = Some(row);
             }
@@ -2741,7 +2763,8 @@ pub fn solve_quadratic_with_linear_constraints(
 mod tests {
     use super::{
         ACTIVE_SET_INTERIOR_SEED_MARGIN, ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintSet,
-        ConstraintSetOps, LinearInequalityConstraints, compute_constraint_kkt_diagnostics,
+        ConstraintSetOps, LinearInequalityConstraints, active_set_boundary_hit_step_fraction,
+        compute_constraint_kkt_diagnostics,
         fallback_projected_gradient_direction,
         fallback_projected_gradient_direction_with_constraint_set,
         project_point_strictly_into_feasible_cone,
@@ -2766,6 +2789,18 @@ mod tests {
         assert!(record_active_working_set(&mut visited, &[3, 1], &x0, 0));
         assert!(record_active_working_set(&mut visited, &[1, 3], &x1, 1));
         assert!(!record_active_working_set(&mut visited, &[3, 1], &x1, 2));
+    }
+
+    #[test]
+    fn boundary_ratio_uses_the_same_feasibility_contract_as_the_exit_gate() {
+        let slack = -2.5e-15_f64;
+        let rate = -1.0_f64;
+        let alpha = active_set_boundary_hit_step_fraction(slack, rate, 1.0)
+            .expect("machine-epsilon feasible point has positive numerical slack budget");
+
+        assert!(alpha > 0.0);
+        let terminal_slack = slack + alpha * rate;
+        assert!(terminal_slack >= -ACTIVE_SET_PRIMAL_FEASIBILITY_TOL * (1.0 + 1e-12));
     }
 
     /// A `β = 0` seed sits on the boundary of EVERY row of a homogeneous
