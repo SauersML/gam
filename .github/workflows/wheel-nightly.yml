@@ -59,7 +59,11 @@ jobs:
           # root, so git refuses with "dubious ownership" unless marked safe.
           before-script-linux: |
             git config --global --add safe.directory "$(pwd)"
-            cargo build --release -p gam-cli
+            # maturin-action injects a host-side sccache wrapper which is not
+            # present inside this container during the before hook.  Compile
+            # the CLI into the same target tree without that invalid wrapper;
+            # the following wheel build reuses those already-built crates.
+            env -u RUSTC_WRAPPER cargo build --release -p gam-cli
             mkdir -p dist
             cp target/release/gam dist/gam
         env:
