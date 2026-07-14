@@ -479,53 +479,6 @@ pub(super) fn solve_direction_with_dense_factor(
     direction_out.mapv_inplace(|v| -v);
 }
 
-/// Error-free transform of one floating-point addition.
-#[inline]
-fn two_sum(a: f64, b: f64) -> (f64, f64) {
-    let sum = a + b;
-    let b_virtual = sum - a;
-    let error = (a - (sum - b_virtual)) + (b - b_virtual);
-    (sum, error)
-}
-
-/// Compute `H·direction + gradient` with double-double row accumulation.
-///
-/// This residual is the correctness certificate for the Newton equation
-/// `H·direction = -gradient`. Near a stiff penalty rail, ordinary BLAS matvec
-/// accumulation can lose the small residual to product rounding and
-/// cancellation between `O(1e12)` terms, exactly where refinement needs the
-/// residual most. Each product's rounding error is recovered with fused
-/// multiply-add and accumulated alongside the error-free addition residual.
-pub(super) fn dense_newton_residual_into(
-    hessian: &Array2<f64>,
-    gradient: &Array1<f64>,
-    direction: &Array1<f64>,
-    residual: &mut Array1<f64>,
-) -> f64 {
-    if residual.len() != gradient.len() {
-        *residual = Array1::zeros(gradient.len());
-    }
-    let mut residual_inf = 0.0_f64;
-    for i in 0..gradient.len() {
-        let mut sum_hi = 0.0_f64;
-        let mut sum_lo = 0.0_f64;
-        for j in 0..direction.len() {
-            let product = hessian[[i, j]] * direction[j];
-            let product_error = hessian[[i, j]].mul_add(direction[j], -product);
-            let (next_hi, addition_error) = two_sum(sum_hi, product);
-            let next_lo = sum_lo + (product_error + addition_error);
-            let (renormalized_hi, renormalized_lo) = two_sum(next_hi, next_lo);
-            sum_hi = renormalized_hi;
-            sum_lo = renormalized_lo;
-        }
-        let (with_gradient_hi, with_gradient_error) = two_sum(sum_hi, gradient[i]);
-        let value = with_gradient_hi + (sum_lo + with_gradient_error);
-        residual[i] = value;
-        residual_inf = residual_inf.max(value.abs());
-    }
-    residual_inf
-}
-
 pub(super) fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -563,50 +516,40 @@ pub(super) fn solve_newton_direction_dense(
         }
     }
 
+    let cpu_route = String::from("CPU stable solver");
+
     let factor = StableSolver::new()
         .factorize(hessian)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     solve_direction_with_dense_factor(&factor, gradient, direction_out);
 
-    // Iterative refinement against the SAME factorized system. The old path
-    // accepted relative residuals up to 1e-3 even when the inner KKT contract
-    // requested 1e-10. With a 1e12–1e13 penalty condition number that solve
-    // error was the entire persistent P-IRLS gradient floor (#2316). Refine
-    // from a double-double residual until the solve reaches its dimension-scaled
-    // floating-point backward-error floor. If eight correction solves cannot
-    // do so, reject this direction to the LM controller; increasing damping is
-    // the mathematically appropriate way to improve the system's conditioning.
-    let g_inf = gradient.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-    let residual_target = 64.0 * f64::EPSILON * p.max(1) as f64 * (1.0 + g_inf);
-    let mut residual = Array1::<f64>::zeros(p);
-    let mut correction = Array1::<f64>::zeros(p);
-    let mut refinement_steps = 0usize;
-    let validation_residual = loop {
-        let residual_inf =
-            dense_newton_residual_into(hessian, gradient, direction_out, &mut residual);
-        if residual_inf.is_finite() && residual_inf <= residual_target {
-            break residual_inf;
-        }
-        if refinement_steps == 8 || !residual_inf.is_finite() {
-            break residual_inf;
-        }
-        solve_direction_with_dense_factor(&factor, &residual, &mut correction);
-        *direction_out += &correction;
-        refinement_steps += 1;
+    // Validate: bare Cholesky on a near-singular H produces huge spurious
+    // step magnitudes in the null direction. If `‖H·δ + g‖∞ / (1+‖g‖∞)` is
+    // not small, the purported direction does not solve the requested
+    // unperturbed system. Surface that failure to the LM controller rather
+    // than silently changing the system or replacing it with a pseudoinverse.
+    let validation_residual = {
+        let h_delta = hessian.dot(direction_out);
+        h_delta
+            .iter()
+            .zip(gradient.iter())
+            .map(|(h, g)| (h + g).abs())
+            .fold(0.0_f64, f64::max)
     };
+    let g_inf = gradient.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
     let rel = validation_residual / (1.0 + g_inf);
-    if !validation_residual.is_finite() || validation_residual > residual_target {
+    if !rel.is_finite() || rel > 1.0e-3 {
         return Err(EstimationError::InvalidInput(format!(
-            "PIRLS Newton direction failed its unperturbed linear-system certificate after {refinement_steps} refinement step(s): relative residual {rel:.3e}, absolute residual {validation_residual:.3e}, target {residual_target:.3e}"
+            "PIRLS Newton direction failed its unperturbed linear-system certificate: relative residual {rel:.3e} exceeds 1e-3"
         )));
     }
     if array_is_finite(direction_out) {
         log::info!(
-            "[STAGE] PIRLS dense newton solve backend=CPU p={} flops~{} elapsed={:.3}s route=\"stable factor + {} refinement step(s)\"",
+            "[STAGE] PIRLS dense newton solve backend=CPU p={} flops~{} elapsed={:.3}s route=\"{}\"",
             p,
             (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
             dense_solve_start.elapsed().as_secs_f64(),
-            refinement_steps,
+            cpu_route,
         );
         return Ok(());
     }

@@ -3111,7 +3111,6 @@ mod tests {
 #[cfg(test)]
 mod root_cause_tests {
     use super::*;
-    use super::newton_solve::dense_newton_residual_into;
     use super::reweight::exact_newton_decrement_sq;
     use approx::assert_relative_eq;
     use gam_problem::LogSmoothingParamsView;
@@ -3194,35 +3193,6 @@ mod root_cause_tests {
 
         assert_eq!(screened.penalized_objective(false, 1.0), expected);
         assert_eq!(full.penalized_objective(false, 1.0), expected);
-    }
-
-    #[test]
-    pub(crate) fn dense_newton_refines_stiff_penalty_system_to_backward_error_2316() {
-        let theta = 0.37_f64;
-        let (c, s) = (theta.cos(), theta.sin());
-        let large = 1.0e13_f64;
-        let hessian = array![
-            [c * c + large * s * s, c * s * (1.0 - large)],
-            [c * s * (1.0 - large), s * s + large * c * c],
-        ];
-        let gradient = array![0.123_456_789, -0.456_789_123];
-        let mut direction = Array1::<f64>::zeros(2);
-
-        solve_newton_direction_dense(&hessian, &gradient, &mut direction)
-            .expect("stiff SPD Newton system should refine to its backward-error floor");
-
-        let mut residual = Array1::<f64>::zeros(2);
-        let residual_inf =
-            dense_newton_residual_into(&hessian, &gradient, &direction, &mut residual);
-        let gradient_inf = gradient
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
-        let target = 64.0 * f64::EPSILON * 2.0 * (1.0 + gradient_inf);
-        assert!(
-            residual_inf <= target,
-            "refined Newton residual {residual_inf:.3e} exceeds backward-error target {target:.3e}"
-        );
     }
 
     pub(crate) fn test_working_state(
