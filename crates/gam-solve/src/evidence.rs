@@ -6320,7 +6320,7 @@ mod tests {
 
     #[test]
     fn ring_parameter_map_weights_component_motion_by_predictive_mass_2324() {
-        let raw_coordinate_step = 4.6e-8;
+        let raw_coordinate_step: f64 = 4.6e-8;
         let (next_y, next_x) = raw_coordinate_step.sin_cos();
         let previous = RingMixtureState {
             weights: array![0.25, 0.75],
