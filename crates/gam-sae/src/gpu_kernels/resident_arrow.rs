@@ -776,14 +776,12 @@ pub fn arrow_blocks_from_materialized_tower(
     inv_tau: f64,
     curvature: ArrowCurvature,
 ) -> Result<ArrowBlocks, String> {
-    let channels =
-        crate::gpu_kernels::sae_rowjet::execute_softmax_row_jet_tile(rows, inv_tau, SaeRowJetPath::Cpu)?;
-    let (n, q, p, n_beta) = (
-        channels.n_rows,
-        channels.q,
-        channels.p,
-        channels.n_beta,
-    );
+    let channels = crate::gpu_kernels::sae_rowjet::execute_softmax_row_jet_tile(
+        rows,
+        inv_tau,
+        SaeRowJetPath::Cpu,
+    )?;
+    let (n, q, p, n_beta) = (channels.n_rows, channels.q, channels.p, channels.n_beta);
     if residual.len() != n * p {
         return Err(format!(
             "materialized-tower reference residual length {} != rows*p = {}",
