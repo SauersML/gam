@@ -6191,23 +6191,25 @@ mod tests {
         }
     }
 
-    /// The grid-free promise: two stationary points closer than ANY former grid
-    /// cell are still each isolated. Pinned
+    /// Two stationary points closer than a former grid cell must never be
+    /// merged into a false one-root certificate. Pinned
     /// `(λ−1)(λ−1.25) = λ²−2.25λ+1.25` has a 0.25 root gap (below the old
     /// 0.625-wide cell), and every coefficient/root/split is an exact dyadic
-    /// f64. The Sturm chain must count BOTH over `(0,∞)` and, split at the
-    /// midpoint, place exactly one on each side. No scan, no sampling.
+    /// f64. The whole-half-line chain counts both roots. The outward-interval
+    /// Euclidean remainder loses coefficient correlation at the midpoint, so
+    /// the bounded count must refuse rather than use a saturating subtraction
+    /// to manufacture a count. No scan or sampling is involved.
     #[test]
-    fn sturm_certificate_isolates_two_close_roots() {
+    fn sturm_certificate_refuses_undecidable_close_root_split() {
         let poly = pinned_poly(&[1.25, -2.25, 1.0]); // roots 1.00 and 1.25
         let total = sturm_root_count_above(&poly, 0.0).expect("decidable");
         assert_eq!(total, 2, "both close roots must be counted, got {total}");
 
         let mid = 1.125;
-        let below = sturm_root_count_in(&poly, 0.0, mid).expect("decidable");
-        let above = sturm_root_count_above(&poly, mid).expect("decidable");
-        assert_eq!(below, 1, "exactly one root below the midpoint, got {below}");
-        assert_eq!(above, 1, "exactly one root above the midpoint, got {above}");
+        assert!(
+            sturm_root_count_in(&poly, 0.0, mid).is_none(),
+            "correlation-losing interval remainder must refuse the close-root split"
+        );
     }
 
     /// The certified Sturm count must equal the branch-and-bound bracket count on
