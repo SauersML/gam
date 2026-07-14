@@ -350,7 +350,7 @@ impl<'a> GamWorkingModel<'a> {
             WorkingCoordinateDesign::TransformedImplicit { transform } => {
                 let n = self.x_original.nrows();
                 let p = self.x_original.ncols();
-                let _reservation = gam_runtime::resource::MemoryGovernor::global()
+                let implicit_design_reservation = gam_runtime::resource::MemoryGovernor::global()
                     .try_reserve_dense_f64(
                         n,
                         p,
@@ -364,7 +364,10 @@ impl<'a> GamWorkingModel<'a> {
                     )
                     .map_err(EstimationError::InvalidInput)?;
                 let transformed = fast_ab(original.as_ref(), &transform.materialize_dense());
-                Self::write_scaled_dense_design(&transformed, &self.lasthessian_weights, out)
+                let result =
+                    Self::write_scaled_dense_design(&transformed, &self.lasthessian_weights, out);
+                drop(implicit_design_reservation);
+                result
             }
             WorkingCoordinateDesign::OriginalSparseNative => crate::bail_invalid_estim!(
                 "dense square-root solve reached a sparse-native coordinate design"
@@ -392,7 +395,7 @@ impl<'a> GamWorkingModel<'a> {
             })?;
         // Peak live storage is the root, faer's QR factor, and the temporary Q
         // produced by the shared QR adapter.  Charge all three atomically.
-        let _reservation = gam_runtime::resource::MemoryGovernor::global()
+        let root_qr_reservation = gam_runtime::resource::MemoryGovernor::global()
             .try_reserve_dense_f64_copies(rows, p, 3, "PIRLS Householder QR square-root solve")
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
         let mut root = Array2::<f64>::zeros((rows, p).f());
@@ -408,7 +411,9 @@ impl<'a> GamWorkingModel<'a> {
             }
             root[[diagonal_start + j, j]] = energy.sqrt();
         }
-        solve_newton_direction_from_root(&root, &state.gradient, direction_out)
+        let result = solve_newton_direction_from_root(&root, &state.gradient, direction_out);
+        drop(root_qr_reservation);
+        result
     }
 
     /// Convert the working model into its final state for outer REML consumption.

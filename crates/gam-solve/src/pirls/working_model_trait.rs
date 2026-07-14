@@ -52,7 +52,8 @@ pub trait WorkingModel {
         regularized_hessian: &Array2<f64>,
         direction_out: &mut Array1<f64>,
     ) -> Result<(), EstimationError> {
-        let _ = (loop_lambda, lm_d2);
+        debug_assert!(loop_lambda.is_finite() && loop_lambda >= 0.0);
+        debug_assert_eq!(lm_d2.len(), state.gradient.len());
         solve_newton_direction_dense(regularized_hessian, &state.gradient, direction_out)
     }
 
