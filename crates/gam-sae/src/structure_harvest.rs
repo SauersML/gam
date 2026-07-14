@@ -4380,6 +4380,31 @@ pub fn discover_primary_atom_topologies(
                     coords[[row, col]] = fit.coords[[row, col]];
                 }
             }
+            let grown_torus_geometry = if fit_kind == SaeAtomBasisKind::Torus {
+                let per_axis_order = n_torus_harmonics.ok_or_else(|| {
+                    format!(
+                        "discover_primary_atom_topologies: torus winner without selected resolution for auto atom {atom_idx}"
+                    )
+                })?;
+                let grown_spec = TopologyCandidateSpec::new(
+                    AutoTopologyKind::Torus,
+                    SaeAtomGeometryPlan::new(
+                        SaeAtomBasisKind::Torus,
+                        2,
+                        SaeBasisResolution::TorusHarmonics { per_axis_order },
+                        SaeReferenceMetricPlan::FlatRectangularTorus { tau: 0.0 },
+                    )?,
+                    fit.manifold.clone(),
+                    fit.coords.clone(),
+                )?;
+                Some(
+                    fit_torus_metric_candidate(&grown_spec, target, weights.view())?
+                        .fit_handle
+                        .geometry,
+                )
+            } else {
+                None
+            };
             let geometry = match &fit_kind {
                 SaeAtomBasisKind::Periodic => SaeAtomGeometryPlan::new(
                     SaeAtomBasisKind::Periodic,
@@ -4393,18 +4418,11 @@ pub fn discover_primary_atom_topologies(
                     },
                     SaeReferenceMetricPlan::UnitCircle,
                 )?,
-                SaeAtomBasisKind::Torus => SaeAtomGeometryPlan::new(
-                    SaeAtomBasisKind::Torus,
-                    2,
-                    SaeBasisResolution::TorusHarmonics {
-                        per_axis_order: n_torus_harmonics.ok_or_else(|| {
-                            format!(
-                                "discover_primary_atom_topologies: torus winner without selected resolution for auto atom {atom_idx}"
-                            )
-                        })?,
-                    },
-                    fit.geometry.reference_metric().clone(),
-                )?,
+                SaeAtomBasisKind::Torus => grown_torus_geometry.ok_or_else(|| {
+                    format!(
+                        "discover_primary_atom_topologies: torus winner metric refit was not produced for auto atom {atom_idx}"
+                    )
+                })?,
                 SaeAtomBasisKind::KleinBottle => SaeAtomGeometryPlan::klein_bottle(
                     n_torus_harmonics.ok_or_else(|| {
                         format!(
