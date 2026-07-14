@@ -2482,6 +2482,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
             let mut search_delta = delta.clone();
             let search_joint_active_set: Option<Vec<usize>> = joint_active_set.clone();
+            // A constrained Newton step can discover a different critical cone.
+            // Residual/objective-rate samples collected on the previous active
+            // face are not evidence about stationarity on the new face: the KKT
+            // projection itself changes when the active rows change. Remember the
+            // accepted transition so the post-step convergence machinery can
+            // start its plateau/descent evidence from this face only (gam#979).
+            let active_face_before_step =
+                flatten_joint_active_set(&cached_active_sets, &block_constraints);
+            let mut accepted_active_face_changed = false;
             let mut tried_preconditioned_descent = false;
             // Dogleg Cauchy leg (gam#826/#808). Compute the unconstrained Cauchy
             // point of the penalized (Firth-augmented) quadratic model ONCE per
@@ -3486,6 +3495,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         }
                     }
                     if let Some(joint_active_set) = search_joint_active_set.as_ref() {
+                        accepted_active_face_changed =
+                            search_joint_active_set != active_face_before_step;
                         cached_active_sets =
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
@@ -3933,6 +3944,35 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 None
             };
             let residual_gradient = jeffreys_augmented_gradient.as_ref().unwrap_or(gradient);
+            if accepted_active_face_changed {
+                // The accepted QP step changed the critical cone. In particular,
+                // the Duchon CTN separator can enlarge the face substantially
+                // (the issue-979 4,800-row replay changed 94 -> 274 rows). The
+                // projected residual then jumps because it is a different KKT
+                // system, while the preceding objective/residual samples describe
+                // the old face. Feeding those samples to the constrained-
+                // stationary or slow-rate guards creates a false plateau and
+                // refuses the very first iterate on the newly discovered face.
+                //
+                // Reset every cross-cycle progress statistic whose inference
+                // assumes a fixed stationarity system. This does not accept an
+                // iterate or loosen a tolerance: the current residual is computed
+                // below on the new face and must build fresh evidence and satisfy
+                // the unchanged KKT certificate.
+                min_certified_residual = f64::INFINITY;
+                best_residual_seen = f64::INFINITY;
+                cycles_since_residual_improved = 0;
+                residual_descent_history.clear();
+                tr_clamped_during_stall = false;
+                residual_rate_history.clear();
+                merit_window.clear();
+                geometric_tail_history.clear();
+                last_kkt_refusal_report = None;
+                log::info!(
+                    "[PIRLS/joint-Newton active-face] cycle {} | accepted critical-cone transition; reset fixed-face convergence histories and require a fresh KKT certificate",
+                    cycle,
+                );
+            }
             let residual = exact_newton_joint_stationarity_inf_norm_from_gradient(
                 residual_gradient,
                 &states,
