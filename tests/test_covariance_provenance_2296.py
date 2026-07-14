@@ -91,7 +91,7 @@ def test_default_uncertainty_refuses_when_corrected_covariance_is_unavailable() 
     )
 
     with pytest.raises(gamfit.GamError) as partial_dependence_raised:
-        model.partial_dependence("s(x)", {"x": x}, grid=grid["x"])
+        model.partial_dependence("s(x, k=8)", {"x": x}, grid=grid["x"])
     assert type(partial_dependence_raised.value) is gamfit.GamError
     assert str(partial_dependence_raised.value) == (
         "partial_dependence requires smoothing-corrected covariance; refit before "
@@ -155,17 +155,16 @@ def test_single_cause_survival_interval_refuses_corrected_and_labels_conditional
         new_data,
         interval=0.9,
         covariance_mode="conditional",
-        return_type="dict",
     )
-    assert conditional["covariance_source"] == "conditional"
-    survival_se = np.asarray(conditional["survival_se"], dtype=float)
+    assert conditional.covariance_source == "conditional"
+    survival_se = np.asarray(conditional.survival_se, dtype=float)
     assert survival_se.shape[0] == 2
     assert np.all(np.isfinite(survival_se))
 
     # A point-only survival prediction consults no coefficient covariance and
     # must not claim one.
-    plain = model.predict(new_data, return_type="dict")
-    assert plain["covariance_source"] is None
+    plain = model.predict(new_data)
+    assert plain.covariance_source is None
 
 
 def test_spline_scan_interval_refuses_corrected_and_labels_conditional() -> None:
@@ -175,14 +174,16 @@ def test_spline_scan_interval_refuses_corrected_and_labels_conditional() -> None
     silently returning the conditional band under an invented scan-specific
     label; the conditional request must be labeled ``"conditional"``."""
     rng = np.random.default_rng(22960)
-    n = 4000  # large 1-D Gaussian smooth routes onto the exact O(n) scan path
-    x = np.sort(rng.uniform(-1.0, 1.0, n))
-    y = np.sin(3.0 * x) + rng.normal(0.0, 0.25, n)
-    model = gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family="gaussian")
-    summary = model.summary()
-    if "spline-scan" not in str(getattr(summary, "model_class", "")):
-        pytest.skip("fit did not route onto the exact spline-scan path")
-    grid = {"x": np.linspace(-0.9, 0.9, 7)}
+    n = 200
+    x = np.sort(rng.uniform(0.0, 1.0, n))
+    y = np.sin(2.5 * np.pi * x) + 0.4 * x + rng.normal(0.0, 0.1, n)
+    # The ps-basis single-smooth Gaussian form routes onto the exact O(n)
+    # scan path (same recipe as the #2302 persistence acceptance).
+    model = gamfit.fit(
+        {"x": x, "y": y},
+        'y ~ s(x, bs="ps", degree=3, penalty_order=2, double_penalty=False)',
+    )
+    grid = {"x": np.linspace(0.05, 0.95, 7)}
 
     with pytest.raises(gamfit.GamError) as refusal:
         model.predict(grid, interval=0.9, return_type="dict")

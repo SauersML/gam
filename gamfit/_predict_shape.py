@@ -148,11 +148,19 @@ def shape_predict_response(
         training_table_kind=training_table_kind,
         restore=restore,
     )
-    return _attach_covariance_provenance(shaped, parsed.get("covariance_source"))
+    shaped = _attach_covariance_provenance(
+        shaped, "covariance_source", parsed.get("covariance_source")
+    )
+    # #2296: a curved-link posterior-mean POINT integrates the conditional
+    # posterior even when the band is smoothing-corrected — a separate,
+    # result-owned fact carried under its own key.
+    return _attach_covariance_provenance(
+        shaped, "point_covariance_source", parsed.get("point_covariance_source")
+    )
 
 
-def _attach_covariance_provenance(result: Any, source: Any) -> Any:
-    """Expose the Rust interval covariance source on public Python results.
+def _attach_covariance_provenance(result: Any, key: str, source: Any) -> Any:
+    """Expose a Rust covariance-provenance tag on public Python results.
 
     The source is prediction metadata, not a row-valued numeric column. Dict
     results therefore receive a scalar key, while pandas stores it in the
@@ -164,11 +172,11 @@ def _attach_covariance_provenance(result: Any, source: Any) -> Any:
         return result
     covariance_source = str(source)
     if isinstance(result, dict):
-        result["covariance_source"] = covariance_source
+        result[key] = covariance_source
         return result
     attrs = getattr(result, "attrs", None)
     if isinstance(attrs, dict):
-        attrs["covariance_source"] = covariance_source
+        attrs[key] = covariance_source
     return result
 
 

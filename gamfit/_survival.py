@@ -178,6 +178,11 @@ class SurvivalPrediction:
     row_ids: Sequence[str] | None = None
     survival_se: Any | None = None
     eta_se: Any | None = None
+    #: Exact coefficient-covariance definition behind ``survival_se`` /
+    #: ``eta_se`` (#2296): ``"conditional"`` or ``"smoothing-corrected"``,
+    #: owned by the engine result — never an echo of the request. ``None``
+    #: when the prediction carries no uncertainty surfaces.
+    covariance_source: str | None = None
 
     def _coerce_times(self, times: Any) -> Any:
         return rust_module().survival_coerce_times(times)

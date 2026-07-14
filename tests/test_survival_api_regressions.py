@@ -154,8 +154,10 @@ def test_joint_competing_risks_survival_is_reachable_from_fit(tmp_path) -> None:
             train,
             "Surv(entry, exit, event) ~ age",
             survival_likelihood=likelihood_mode,
+            # Cause-specific penalty blocks are labelled per cause; the engine
+            # rejects unknown labels loudly, so this must name a real block.
             precision_hyperpriors={
-                "cause_specific_survival_penalty_0": [2.0, 1.0]
+                "cause_specific_survival_cause_1_penalty_0": [2.0, 1.0]
             },
         )
         pred = model.predict(rows)
