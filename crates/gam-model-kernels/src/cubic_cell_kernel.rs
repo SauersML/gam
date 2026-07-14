@@ -923,28 +923,6 @@ pub enum ExactCellBranch {
     Sextic,
 }
 
-/// Auto-tune the per-cell affine/non-affine branch tolerance from the cell's
-/// own coefficient magnitudes.
-///
-/// The legacy `branch_cell` compared the normalized cubic coefficients
-/// `(k2, k3)` against a single global constant.  That constant is calibrated
-/// for cells whose anchor coefficients `(c0, c1)` are O(1).  When the anchor
-/// dominates — e.g. a tail cell with `|c0|, |c1| >> 1` — a relative criterion
-/// against the anchor magnitude is more numerically meaningful than the bare
-/// global threshold, because the affine contribution to `eta` already absorbs
-/// any difference at the chosen scale.
-///
-/// The returned tolerance is always at least [`NORMALIZED_CELL_BRANCH_TOL`],
-/// so cells with O(1) anchors recover bit-identical classification with the
-/// legacy code path.  This preserves numerical equivalence for the
-/// established `cubic_cell_kernel` tests, including the
-/// `tuned_branch_tolerance_matches_legacy_non_affine_transport_grid` grid.
-#[inline]
-fn effective_branch_tol(cell: DenestedCubicCell) -> f64 {
-    let anchor_scale = cell.c0.abs().max(cell.c1.abs()).max(1.0);
-    NORMALIZED_CELL_BRANCH_TOL * anchor_scale
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DenestedCubicCell {
     pub left: f64,
@@ -3077,7 +3055,6 @@ pub fn normalized_non_affine_coefficients(
 #[inline]
 pub fn branch_cell(cell: DenestedCubicCell) -> Result<ExactCellBranch, String> {
     validate_cell_inputs(cell)?;
-    let tol = effective_branch_tol(cell);
     if !cell.left.is_finite() || !cell.right.is_finite() {
         if cell.c2 == 0.0 && cell.c3 == 0.0 {
             return Ok(ExactCellBranch::Affine);
@@ -3088,12 +3065,17 @@ pub fn branch_cell(cell: DenestedCubicCell) -> Result<ExactCellBranch, String> {
         ))
         .into());
     }
-    let (k2, k3) = normalized_non_affine_coefficients(
+    let (_, k3) = normalized_non_affine_coefficients(
         cell.left, cell.right, cell.c0, cell.c1, cell.c2, cell.c3,
     )?;
-    if k2.abs() <= tol && k3.abs() <= tol {
+    // The affine evaluator is an exact closed form for c2=c3=0, not an
+    // approximation scheme.  In particular, scaling an "affine" tolerance by
+    // |c0| or |c1| can make material curvature disappear when the row
+    // intercept is large.  Keep the tolerance only for choosing the numerical
+    // degree of an already-non-affine finite cell.
+    if cell.c2 == 0.0 && cell.c3 == 0.0 {
         Ok(ExactCellBranch::Affine)
-    } else if k3.abs() <= tol {
+    } else if k3.abs() <= NORMALIZED_CELL_BRANCH_TOL {
         Ok(ExactCellBranch::Quartic)
     } else {
         Ok(ExactCellBranch::Sextic)
@@ -4830,6 +4812,24 @@ mod tests {
             assert!(evaluate_cell_moments_uncached(cell, 3).is_err());
             assert!(tail_cell_cache_key(cell, 3).is_none());
         }
+    }
+
+    #[test]
+    fn large_affine_anchor_cannot_hide_finite_cell_curvature_2321() {
+        let cell = DenestedCubicCell {
+            left: -1.0,
+            right: 1.0,
+            c0: 1.0e8,
+            c1: -2.0e7,
+            c2: -7.895_512e-3,
+            c3: -2.973_499e-3,
+        };
+
+        assert_eq!(branch_cell(cell).unwrap(), ExactCellBranch::Sextic);
+        assert_ne!(
+            evaluate_cell_moments_uncached(cell, 9).unwrap().branch,
+            ExactCellBranch::Affine
+        );
     }
 
     #[test]

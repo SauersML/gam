@@ -67,11 +67,9 @@ fn is_finite_coefficient_block(cell: GpuDenestedCubicCell) -> bool {
 
 #[inline]
 fn is_affine_quadcubic_zero(cell: GpuDenestedCubicCell) -> bool {
-    // Match the CPU dispatcher's tolerance for "semi-infinite cell must be
-    // affine" exactly so host and device agree byte-for-byte on which tails
-    // are accepted.
-    use crate::cubic_cell_kernel::NORMALIZED_CELL_BRANCH_TOL;
-    cell.c2.abs() <= NORMALIZED_CELL_BRANCH_TOL && cell.c3.abs() <= NORMALIZED_CELL_BRANCH_TOL
+    // The closed-form tail evaluator is exact only for a structurally affine
+    // cell. Match the CPU dispatcher exactly; never erase tail curvature.
+    cell.c2 == 0.0 && cell.c3 == 0.0
 }
 
 #[cfg(test)]
@@ -105,10 +103,21 @@ mod tests {
     }
 
     #[test]
-    fn finite_affine_when_curvature_below_branch_tol() {
-        // c2, c3 well below the normalized branch tolerance.
+    fn semi_infinite_with_tiny_curvature_is_rejected() {
+        let c = cell(f64::NEG_INFINITY, 0.0, 0.1, 0.2, 5.0e-11, 0.0);
+        assert_eq!(
+            classify_cell_for_gpu(c),
+            Err(CubicCellMomentStatus::NonAffineInfiniteInterval)
+        );
+    }
+
+    #[test]
+    fn finite_tiny_curvature_still_routes_to_non_affine_finite() {
         let c = cell(-1.0, 1.0, 0.2, 0.3, 1e-14, 1e-14);
-        assert_eq!(classify_cell_for_gpu(c), Ok(GpuCellBranchTag::Affine));
+        assert_eq!(
+            classify_cell_for_gpu(c),
+            Ok(GpuCellBranchTag::NonAffineFinite)
+        );
     }
 
     #[test]

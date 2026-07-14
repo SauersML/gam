@@ -3620,6 +3620,20 @@ mod row_kernel_tests {
         }
 
         #[test]
+        fn full_flex_r20_exact_cache_admits_material_finite_cell_curvature_2321() {
+            let (family, states) = make_flex_parity_family(256, 8, 6);
+            let cache = family
+                .build_exact_eval_cache(&states)
+                .expect("the full-FLEX host cache must preserve non-affine finite cells");
+
+            assert_eq!(cache.primary.total, 20);
+            assert!(
+                cache.row_cell_moments.is_some(),
+                "the production r20 fixture must materialize its exact row-cell cache"
+            );
+        }
+
+        #[test]
         fn generated_cuda_row_kernel_r33_matches_canonical_cpu_lowering_932() {
             gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Required);
             assert_eq!(
