@@ -1037,8 +1037,11 @@ fn selected_gpu_consumers_cannot_retry_on_cpu_932() {
     assert!(axis_source.contains("launch_bms_flex_row_joint_gradient(device_state)"));
     assert!(workspace_source.contains("selected_device_joint_gradient_from_cache"));
     assert!(workspace_source.contains("device_joint_gradient:"));
+    // The workspace struct definition (with the once-cached device joint
+    // gradient field's full type) moved to row_kernel.rs; the usage seams
+    // above stay in custom_family_impl.rs.
     assert!(
-        workspace_source
+        include_str!("row_kernel.rs")
             .contains("OnceLock<Result<Arc<ExactNewtonJointGradientEvaluation>, String>>")
     );
     assert!(cache_source.contains("reject_device_cpu_recompute"));
