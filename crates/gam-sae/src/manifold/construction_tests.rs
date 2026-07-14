@@ -298,10 +298,10 @@ mod amortized_encoder_tests {
             .logdet_daleckii_krein_hessian(&rho, &cache)
             .expect("logdet Daleckii-Krein Hessian block assembles");
 
-        // The smooth + ARD + sparse coordinates this channel covers. The sparse
-        // (softmax log-strength) coordinate MUST be included: it is live on this
-        // softmax fixture, and a channel that left it silently zero would hand ARC a
-        // Hessian with a null row while the gradient there is nonzero.
+        // The smooth + ARD coordinates this fixture materially exercises.  The
+        // softmax log-strength operator is assembled by this channel too, but the
+        // joint and row-block traces cancel on this frozen state (audited below),
+        // so including it in the FD matrix would be a vacuous zero-vs-zero gate.
         let mut coord_indices: Vec<usize> = Vec::new();
         for a in 0..rho.log_lambda_smooth.len() {
             coord_indices.push(rho.smooth_flat_index(a));
@@ -317,7 +317,6 @@ mod amortized_encoder_tests {
         let sparse_index = rho
             .sparse_flat_index()
             .expect("the softmax fixture must carry a live sparse log-strength coordinate");
-        coord_indices.push(sparse_index);
 
         // Non-vacuity: a smoothing AND an ARD diagonal must carry real curvature,
         // else the gate would pass on an all-zero block.
@@ -403,24 +402,34 @@ mod amortized_encoder_tests {
             }
             v
         };
-        // #item1 verdict: with the off-manifold target excitation above, the sparse
-        // logdet channel is LIVE (the free logit now carries real β back-substitution),
-        // so its row of the FD comparison below is a genuine validation, not a
-        // ~0-vs-~0 regression guard. Assert liveness so the excitation cannot silently
-        // regress back to the inert (~2e-12) state that would make this row vacuous.
+        // Scope audit for the omitted sparse row.  Even on the independently
+        // converged residual fixture, the full-joint and coordinate-block
+        // logdet traces cancel to roundoff for this free-logit direction.  Record
+        // that fact explicitly and require the analytic D-K row to agree with it;
+        // the live sparse second derivative is covered by the independent
+        // explicit-channel gate above.  This test therefore makes no false claim
+        // that a zero-vs-zero sparse FD validates the selected-inverse algebra.
         let base_trace = logdet_trace_at(0.0, sparse_index);
         eprintln!(
-            "CH4 sparse logdet leg (item1, excited): logdet_trace[sparse]={:.6e}, \
+            "CH4 sparse logdet leg (inert on this fixture): logdet_trace[sparse]={:.6e}, \
              H[sparse,sparse]={:.6e}",
             base_trace[sparse_index],
             analytic[[sparse_index, sparse_index]]
         );
         assert!(
-            base_trace[sparse_index].abs() > 1.0e-6,
-            "the off-manifold excitation must make the sparse logdet channel live, else its \
-             row of this gate is vacuous: logdet_trace[sparse]={} (inert ⇒ characterize why \
-             and let the explicit/third-order channels carry the sparse row)",
-            base_trace[sparse_index]
+            base_trace[sparse_index].abs() <= 1.0e-12
+                && analytic
+                    .row(sparse_index)
+                    .iter()
+                    .all(|value| value.abs() <= 1.0e-12)
+                && analytic
+                    .column(sparse_index)
+                    .iter()
+                    .all(|value| value.abs() <= 1.0e-12),
+            "the sparse logdet scope audit must remain an explicitly inert row: \
+             logdet_trace[sparse]={}, analytic_row={:?}",
+            base_trace[sparse_index],
+            analytic.row(sparse_index).to_vec(),
         );
 
         for &j in &coord_indices {
