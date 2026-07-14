@@ -458,8 +458,8 @@ pub(crate) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>
         penalty_value: inner.penalty_value,
         cycles: inner.cycles,
         converged: inner.converged,
-        block_logdet_h: inner.block_logdet_h,
-        block_logdet_s: inner.block_logdet_s,
+        block_logdet_h: Some(inner.block_logdet_h),
+        block_logdet_s: Some(inner.block_logdet_s),
         joint_workspace: None,
         // Persistent warm-start records don't carry the KKT-residual or
         // active-constraint diagnostics (they're not serialized on disk;
@@ -500,17 +500,18 @@ pub(crate) fn persistent_block_inner_summary(
     warm_start: &ConstrainedWarmStart,
 ) -> Option<PersistentBlockInnerSummary> {
     warm_start.cached_inner.as_ref().and_then(|cached| {
-        (cached.log_likelihood.is_finite()
-            && cached.penalty_value.is_finite()
-            && cached.block_logdet_h.is_finite()
-            && cached.block_logdet_s.is_finite())
-        .then_some(PersistentBlockInnerSummary {
+        let block_logdet_h = cached.block_logdet_h.filter(|value| value.is_finite())?;
+        let block_logdet_s = cached.block_logdet_s.filter(|value| value.is_finite())?;
+        if !cached.log_likelihood.is_finite() || !cached.penalty_value.is_finite() {
+            return None;
+        }
+        Some(PersistentBlockInnerSummary {
             log_likelihood: cached.log_likelihood,
             penalty_value: cached.penalty_value,
             cycles: cached.cycles,
             converged: cached.converged,
-            block_logdet_h: cached.block_logdet_h,
-            block_logdet_s: cached.block_logdet_s,
+            block_logdet_h,
+            block_logdet_s,
         })
     })
 }

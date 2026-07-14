@@ -103,11 +103,15 @@ pub(crate) fn inner_penalized_objective(
     context: &str,
 ) -> Result<f64, String> {
     let reml_term = if include_logdet_h {
-        0.5 * inner.block_logdet_h
+        0.5 * inner.block_logdet_h.ok_or_else(|| {
+            format!("{context}: certified Hessian logdet is unavailable")
+        })?
     } else {
         0.0
     } - if include_logdet_s {
-        0.5 * inner.block_logdet_s
+        0.5 * inner.block_logdet_s.ok_or_else(|| {
+            format!("{context}: certified penalty logdet is unavailable")
+        })?
     } else {
         0.0
     };
@@ -123,13 +127,19 @@ pub(crate) fn nonconverged_outer_efs_result(
     inner: &BlockwiseInnerResult,
     rho: &Array1<f64>,
     theta_dim: usize,
-    include_logdet_h: bool,
-    include_logdet_s: bool,
     context: &str,
 ) -> Result<(gam_problem::EfsEval, ConstrainedWarmStart, bool), String> {
     Ok((
         gam_problem::EfsEval {
-            cost: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
+            // A non-converged coefficient iterate is not a Laplace mode, so no
+            // determinant exists. This finite scalar is diagnostic only; the
+            // returned `false` makes the outer optimizer reject the sample.
+            cost: checked_penalizedobjective(
+                inner.log_likelihood,
+                inner.penalty_value,
+                0.0,
+                context,
+            )?,
             steps: vec![0.0; theta_dim],
             beta: None,
             psi_gradient: None,

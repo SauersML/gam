@@ -374,6 +374,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         if warm_start_matches_block_log_lambdas(seed, block_log_lambdas)
             && let Some(cached) = seed.cached_inner.as_ref()
             && cached.converged
+            && cached.block_logdet_h.is_some_and(f64::is_finite)
+            && cached.block_logdet_s.is_some_and(f64::is_finite)
             && seed
                 .block_beta
                 .iter()
@@ -438,11 +440,17 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 }
             }
             if cached_mode_acceptable {
+                let block_logdet_h = cached.block_logdet_h.ok_or_else(|| {
+                    "certified cached inner mode is missing its Hessian logdet".to_string()
+                })?;
+                let block_logdet_s = cached.block_logdet_s.ok_or_else(|| {
+                    "certified cached inner mode is missing its penalty logdet".to_string()
+                })?;
                 log::info!(
                     "[PIRLS/joint-Newton warm-start] reused cached same-rho inner mode | cycles={} logdet_h={:.6e} logdet_s={:.6e}",
                     cached.cycles,
-                    cached.block_logdet_h,
-                    cached.block_logdet_s,
+                    block_logdet_h,
+                    block_logdet_s,
                 );
                 return Ok(BlockwiseInnerResult {
                     block_states: states,
@@ -5485,8 +5493,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 penalty_value,
                 cycles: cycles_done,
                 converged,
-                block_logdet_h,
-                block_logdet_s,
+                block_logdet_h: Some(block_logdet_h),
+                block_logdet_s: Some(block_logdet_s),
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
                 kkt_residual: Some(kkt_residual),
@@ -5658,16 +5666,21 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 )
                 .map(std::sync::Arc::new)
             };
-            let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
-                family,
-                specs,
-                &mut states,
-                block_log_lambdas,
-                options,
-                cached_joint_workspace.clone(),
-                None,
-                active_constraints.as_deref(),
-            )?;
+            let (block_logdet_h, block_logdet_s) = if converged {
+                let (h, s) = blockwise_logdet_terms_with_workspace(
+                    family,
+                    specs,
+                    &mut states,
+                    block_log_lambdas,
+                    options,
+                    cached_joint_workspace.clone(),
+                    None,
+                    active_constraints.as_deref(),
+                )?;
+                (Some(h), Some(s))
+            } else {
+                (None, None)
+            };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 terminal_working_sets: cached_eval
@@ -5723,16 +5736,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 )
                 .map(std::sync::Arc::new)
             };
-            let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
-                family,
-                specs,
-                &mut states,
-                block_log_lambdas,
-                options,
-                cached_joint_workspace.clone(),
-                None,
-                active_constraints.as_deref(),
-            )?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 terminal_working_sets: cached_eval
@@ -5743,8 +5746,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 penalty_value,
                 cycles: cycles_done,
                 converged: false,
-                block_logdet_h,
-                block_logdet_s,
+                block_logdet_h: None,
+                block_logdet_s: None,
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
                 kkt_residual: None,
@@ -6738,16 +6741,21 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
         )
         .map(std::sync::Arc::new)
     };
-    let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
-        family,
-        specs,
-        &mut states,
-        block_log_lambdas,
-        options,
-        certified_workspace.clone(),
-        None,
-        active_constraints.as_deref(),
-    )?;
+    let (block_logdet_h, block_logdet_s) = if converged {
+        let (h, s) = blockwise_logdet_terms_with_workspace(
+            family,
+            specs,
+            &mut states,
+            block_log_lambdas,
+            options,
+            certified_workspace.clone(),
+            None,
+            active_constraints.as_deref(),
+        )?;
+        (Some(h), Some(s))
+    } else {
+        (None, None)
+    };
     let kkt_residual = if converged {
         match exact_newton_joint_gradient_from_eval(cached_eval, specs, &states)? {
             Some(gradient) => {

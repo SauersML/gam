@@ -1026,7 +1026,15 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             reason: format!("{error}; no fit was assembled"),
         })?;
         let reml_term = if options.use_remlobjective {
-            0.5 * (inner.block_logdet_h - inner.block_logdet_s)
+            let logdet_h = inner.block_logdet_h.ok_or_else(|| CustomFamilyError::Optimization {
+                context: "fit_custom_family no-smoothing inner solve",
+                reason: "certified inner mode is missing its Hessian logdet".to_string(),
+            })?;
+            let logdet_s = inner.block_logdet_s.ok_or_else(|| CustomFamilyError::Optimization {
+                context: "fit_custom_family no-smoothing inner solve",
+                reason: "certified inner mode is missing its penalty logdet".to_string(),
+            })?;
+            0.5 * (logdet_h - logdet_s)
         } else {
             0.0
         };

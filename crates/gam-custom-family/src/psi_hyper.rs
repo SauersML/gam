@@ -3143,8 +3143,6 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
             &inner,
             rho_current,
             theta_dim,
-            include_logdet_h,
-            include_logdet_s,
             "custom-family joint-hyper EFS non-converged inner solve",
         )
         .map_err(CustomFamilyError::from)?;

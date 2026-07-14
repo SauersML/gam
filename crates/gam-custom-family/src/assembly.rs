@@ -1458,7 +1458,7 @@ pub(crate) fn joint_outer_evaluate(
     )?;
     if !objective.is_finite() {
         log::warn!(
-            "joint outer evaluation produced non-finite objective: log_likelihood={} penalty_value={} block_logdet_h={} block_logdet_s={} include_logdet_h={} include_logdet_s={} rho_curvature_scale={}",
+            "joint outer evaluation produced non-finite objective: log_likelihood={} penalty_value={} block_logdet_h={:?} block_logdet_s={:?} include_logdet_h={} include_logdet_s={} rho_curvature_scale={}",
             inner.log_likelihood,
             inner.penalty_value,
             inner.block_logdet_h,
@@ -1893,8 +1893,6 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
             &inner,
             rho,
             rho.len(),
-            include_logdet_h,
-            include_logdet_s,
             "custom-family EFS non-converged inner solve",
         )?;
         return Ok((eval, warm, converged, inner));
@@ -2464,8 +2462,10 @@ pub struct BlockwiseInnerResult {
     pub penalty_value: f64,
     pub cycles: usize,
     pub converged: bool,
-    pub block_logdet_h: f64,
-    pub block_logdet_s: f64,
+    /// Laplace Hessian log-determinant, defined only at a certified inner mode.
+    pub block_logdet_h: Option<f64>,
+    /// Penalty pseudo-logdeterminant, defined only at a certified inner mode.
+    pub block_logdet_s: Option<f64>,
     /// Cached assembled penalty matrices S(ρ) = Σ_k exp(ρ_k) S_k per block.
     /// Avoids redundant re-assembly in the outer objective evaluation.
     pub s_lambdas: Vec<Array2<f64>>,
@@ -2520,8 +2520,8 @@ pub(crate) struct CachedInnerMode {
     pub(crate) penalty_value: f64,
     pub(crate) cycles: usize,
     pub(crate) converged: bool,
-    pub(crate) block_logdet_h: f64,
-    pub(crate) block_logdet_s: f64,
+    pub(crate) block_logdet_h: Option<f64>,
+    pub(crate) block_logdet_s: Option<f64>,
     pub(crate) joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     pub(crate) kkt_residual: Option<ProjectedKktResidual>,
     pub(crate) active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
