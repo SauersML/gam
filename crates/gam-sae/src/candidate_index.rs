@@ -537,7 +537,8 @@ impl SaeCandidateIndex {
                 // wrong side of its hyperplane) to reach the nearest neighbour
                 // bucket — standard multi-probe LSH, biggest recall win.
                 let flip_bit = lowest_margin_bit(&margins);
-                let neighbour = sig ^ (1u64 << flip_bit);
+                let neighbour =
+                    canonical_signature(sig ^ (1u64 << flip_bit), bank.nrows());
                 if let Some(ids) = table.get(&neighbour) {
                     seen.extend(ids.iter().copied());
                 }
@@ -1123,6 +1124,23 @@ fn normalize_in_place(v: &mut Array1<f64>) {
 
 /// Pack the sign bits of `bank · s` into a `u64` signature. `bank` is
 /// `(bits, sketch_dim)`; `bits ≤ 64` (enforced by config-derived bit widths).
+/// Canonicalize a sign signature under global sign flip.
+///
+/// The routing metric is the SIGN-FREE subspace alignment `‖U_kᵀd‖/‖d‖`, but a
+/// raw sign signature is not sign-free: `sig(−s)` is the bitwise complement of
+/// `sig(s)`, so a query anti-aligned with a bucketed representative lands in
+/// the complementary bucket and misses DETERMINISTICALLY (caught by the
+/// phase-sweep regression at the negative axis phases: `d = −u` never found
+/// `u`'s bucket). Folding each signature onto the lexicographic minimum of
+/// {sig, ¬sig} makes the hash antipodally invariant — exactly the invariance
+/// the metric has — at the cost of one bit of table discrimination (bucket
+/// occupancy doubles), which the exact alignment rescore absorbs.
+fn canonical_signature(sig: u64, bits: usize) -> u64 {
+    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let complement = (!sig) & mask;
+    sig.min(complement)
+}
+
 fn sign_signature(bank: &Array2<f64>, s: ArrayView1<f64>) -> u64 {
     let mut sig = 0u64;
     for r in 0..bank.nrows() {
@@ -1132,7 +1150,7 @@ fn sign_signature(bank: &Array2<f64>, s: ArrayView1<f64>) -> u64 {
             sig |= 1u64 << r;
         }
     }
-    sig
+    canonical_signature(sig, bank.nrows())
 }
 
 /// Signature plus per-bit signed margins (the dot products), used by multi-probe
@@ -1148,7 +1166,7 @@ fn sign_signature_with_margins(bank: &Array2<f64>, s: ArrayView1<f64>) -> (u64, 
         }
         margins.push(dot);
     }
-    (sig, margins)
+    (canonical_signature(sig, bank.nrows()), margins)
 }
 
 /// Index of the bit whose hyperplane the query sits closest to (smallest `|dot|`)
@@ -1472,8 +1490,9 @@ mod tests {
         }
         assert!(
             axis_misses.is_empty(),
-            "axis-phase queries collide with their own bucketed representative \
-             by construction and must never miss: {axis_misses:?}"
+            "axis-phase queries (±u, ±w) collide with their own bucketed \
+             representative by construction under the antipodally-canonical \
+             signature and must never miss: {axis_misses:?}"
         );
         let recall = hits as f64 / total as f64;
         assert!(
