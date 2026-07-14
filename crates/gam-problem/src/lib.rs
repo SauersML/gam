@@ -100,7 +100,7 @@ pub use identifiability_audit::{
     AliasedPair, BlockIdentity, DroppedColumn, IdentifiabilityAudit, MapUniquenessError,
 };
 pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
-pub use constraint_set::{ConstraintSet, KhatriRaoConeConstraints};
+pub use constraint_set::{ConstraintSet, KhatriRaoConeConstraints, PlacedConstraintBlock};
 pub use linear_constraints::LinearInequalityConstraints;
 pub use log_strength::{
     IndexedLogStrengthDomainError, LOG_STRENGTH_MAX, LOG_STRENGTH_MIN, LogStrengthDomainError,

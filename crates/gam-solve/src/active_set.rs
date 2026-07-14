@@ -2127,7 +2127,7 @@ pub fn project_point_strictly_into_feasible_constraint_set(
 ) -> Option<Array1<f64>> {
     match set {
         ConstraintSet::Dense(dense) => project_point_strictly_into_feasible_cone(point, dense),
-        ConstraintSet::KhatriRaoCone(_) => {
+        _ => {
             let repair_guard = FeasibilityRepairGuard::enter()?;
             let p = point.len();
             if set.ncols() != p {
@@ -2192,7 +2192,7 @@ pub fn solve_quadratic_with_constraint_set(
         ConstraintSet::Dense(dense) => {
             solve_quadratic_with_linear_constraints(hessian, rhs, beta_start, dense, warm_active_set)
         }
-        ConstraintSet::KhatriRaoCone(_) => {
+        _ => {
             if hessian.ncols() != hessian.nrows()
                 || rhs.len() != hessian.nrows()
                 || beta_start.len() != hessian.nrows()

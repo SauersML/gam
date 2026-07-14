@@ -45,6 +45,10 @@ pub struct KhatriRaoConeConstraints {
     coupled_rows: Vec<usize>,
     /// Total number of coefficient rows in the block reshape.
     p_left: usize,
+    /// Per-row right-hand sides. The homogeneous cone has `b ≡ 0`; a
+    /// delta-coordinate solve (`β = β₀ + δ`) shifts them to `−(rowᵀβ₀)`.
+    /// Bounds are `O(nrows)` — cheap even when the matrix is not.
+    bounds: Option<Array1<f64>>,
 }
 
 impl KhatriRaoConeConstraints {
@@ -90,6 +94,7 @@ impl KhatriRaoConeConstraints {
             factor_row_norms,
             coupled_rows,
             p_left,
+            bounds: None,
         })
     }
 
@@ -160,21 +165,30 @@ impl KhatriRaoConeConstraints {
         Ok(self.factor_row_norms[i])
     }
 
+    /// Per-row right-hand side (`0` for the homogeneous cone, shifted values
+    /// after [`ConstraintSet::shifted_to_delta`]).
+    pub fn bound(&self, row: usize) -> Result<f64, String> {
+        self.split_row_id(row)?;
+        Ok(self.bounds.as_ref().map_or(0.0, |bounds| bounds[row]))
+    }
+
     /// Materialize the requested rows as a dense system (active-set KKT use;
-    /// the id order of `rows` is preserved). Rows come out RAW (un-normalized)
-    /// with `b = 0`, matching the raw dense construction path; callers that
-    /// need geometric tolerances canonicalize the gathered system.
+    /// the id order of `rows` is preserved). Rows come out RAW (un-normalized),
+    /// matching the raw dense construction path; callers that need geometric
+    /// tolerances canonicalize the gathered system.
     pub fn gather_rows(&self, rows: &[usize]) -> Result<LinearInequalityConstraints, String> {
         let p_cov = self.factor.ncols();
         let mut a = Array2::<f64>::zeros((rows.len(), self.ncols()));
+        let mut b = Array1::<f64>::zeros(rows.len());
         for (out_row, &row) in rows.iter().enumerate() {
             let (slot, i) = self.split_row_id(row)?;
             let k = self.coupled_rows[slot];
             a.row_mut(out_row)
                 .slice_mut(ndarray::s![k * p_cov..(k + 1) * p_cov])
                 .assign(&self.factor.row(i));
+            b[out_row] = self.bound(row)?;
         }
-        LinearInequalityConstraints::new(a, Array1::zeros(rows.len()))
+        LinearInequalityConstraints::new(a, b)
     }
 
     /// Exact dense equivalent of the ENTIRE cone. Test/oracle use only — this
@@ -185,20 +199,86 @@ impl KhatriRaoConeConstraints {
     }
 }
 
+/// One block of a [`ConstraintSet::BlockDiagonal`] composition: an inner set
+/// acting on the coefficient columns `[col_start, col_start + set.ncols())` of
+/// the joint vector.
+#[derive(Clone, Debug)]
+pub struct PlacedConstraintBlock {
+    pub col_start: usize,
+    pub set: ConstraintSet,
+}
+
 /// Closed union of the constraint carriers the blockwise solvers accept.
 #[derive(Clone, Debug)]
 pub enum ConstraintSet {
     /// Explicit rows, exactly as today.
     Dense(LinearInequalityConstraints),
-    /// Factored Khatri-Rao nonnegativity cone (`b ≡ 0`).
+    /// Factored Khatri-Rao nonnegativity cone.
     KhatriRaoCone(KhatriRaoConeConstraints),
+    /// Block-diagonal composition over disjoint column ranges of a joint
+    /// coefficient vector (the multi-block joint-Newton assembly). Row ids
+    /// are the concatenation of the member row ids in order.
+    BlockDiagonal {
+        blocks: Vec<PlacedConstraintBlock>,
+        total_cols: usize,
+    },
 }
 
 impl ConstraintSet {
+    /// Validated block-diagonal composition: member column ranges must lie
+    /// inside the joint width and must not overlap.
+    pub fn block_diagonal(
+        blocks: Vec<PlacedConstraintBlock>,
+        total_cols: usize,
+    ) -> Result<Self, String> {
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(blocks.len());
+        for block in &blocks {
+            let end = block.col_start + block.set.ncols();
+            if end > total_cols {
+                return Err(format!(
+                    "ConstraintSet::block_diagonal: block columns {}..{} exceed joint width {}",
+                    block.col_start, end, total_cols
+                ));
+            }
+            ranges.push((block.col_start, end));
+        }
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            if pair[1].0 < pair[0].1 {
+                return Err(format!(
+                    "ConstraintSet::block_diagonal: overlapping column ranges {:?} and {:?}",
+                    pair[0], pair[1]
+                ));
+            }
+        }
+        Ok(ConstraintSet::BlockDiagonal { blocks, total_cols })
+    }
+
+    /// Locate the member block owning a joint row id.
+    fn block_for_row<'a>(
+        blocks: &'a [PlacedConstraintBlock],
+        row: usize,
+    ) -> Result<(&'a PlacedConstraintBlock, usize), String> {
+        let mut offset = 0usize;
+        for block in blocks {
+            let rows = block.set.nrows();
+            if row < offset + rows {
+                return Ok((block, row - offset));
+            }
+            offset += rows;
+        }
+        Err(format!(
+            "ConstraintSet: row {row} out of range ({offset} rows)"
+        ))
+    }
+
     pub fn nrows(&self) -> usize {
         match self {
             ConstraintSet::Dense(dense) => dense.a.nrows(),
             ConstraintSet::KhatriRaoCone(cone) => cone.nrows(),
+            ConstraintSet::BlockDiagonal { blocks, .. } => {
+                blocks.iter().map(|block| block.set.nrows()).sum()
+            }
         }
     }
 
@@ -206,6 +286,7 @@ impl ConstraintSet {
         match self {
             ConstraintSet::Dense(dense) => dense.a.ncols(),
             ConstraintSet::KhatriRaoCone(cone) => cone.ncols(),
+            ConstraintSet::BlockDiagonal { total_cols, .. } => *total_cols,
         }
     }
 
@@ -223,10 +304,32 @@ impl ConstraintSet {
                 Ok(dense.a.dot(&beta))
             }
             ConstraintSet::KhatriRaoCone(cone) => cone.values(beta),
+            ConstraintSet::BlockDiagonal { blocks, total_cols } => {
+                if beta.len() != *total_cols {
+                    return Err(format!(
+                        "ConstraintSet: beta length {} != {}",
+                        beta.len(),
+                        total_cols
+                    ));
+                }
+                let mut out = Array1::<f64>::zeros(self.nrows());
+                let mut offset = 0usize;
+                for block in blocks {
+                    let width = block.set.ncols();
+                    let local = beta.slice(ndarray::s![
+                        block.col_start..block.col_start + width
+                    ]);
+                    let values = block.set.values(local)?;
+                    let rows = values.len();
+                    out.slice_mut(ndarray::s![offset..offset + rows]).assign(&values);
+                    offset += rows;
+                }
+                Ok(out)
+            }
         }
     }
 
-    /// Right-hand sides (`b` dense; identically zero for the cone).
+    /// Right-hand sides (`b` dense; cone bounds are zero unless delta-shifted).
     pub fn bound(&self, row: usize) -> Result<f64, String> {
         match self {
             ConstraintSet::Dense(dense) => {
@@ -237,8 +340,10 @@ impl ConstraintSet {
                     )
                 })
             }
-            ConstraintSet::KhatriRaoCone(cone) => {
-                cone.split_row_id(row).map(|_| 0.0)
+            ConstraintSet::KhatriRaoCone(cone) => cone.bound(row),
+            ConstraintSet::BlockDiagonal { blocks, .. } => {
+                let (block, local) = Self::block_for_row(blocks, row)?;
+                block.set.bound(local)
             }
         }
     }
@@ -256,6 +361,48 @@ impl ConstraintSet {
                 Ok(r.dot(&r).sqrt())
             }
             ConstraintSet::KhatriRaoCone(cone) => cone.row_norm(row),
+            ConstraintSet::BlockDiagonal { blocks, .. } => {
+                let (block, local) = Self::block_for_row(blocks, row)?;
+                block.set.row_norm(local)
+            }
+        }
+    }
+
+    /// The same constraint system expressed in delta coordinates around
+    /// `beta`: `A(β + δ) ≥ b  ⇔  Aδ ≥ b − Aβ`. The matrix carrier is shared;
+    /// only the `O(nrows)` bounds change.
+    pub fn shifted_to_delta(&self, beta: ArrayView1<'_, f64>) -> Result<Self, String> {
+        let values = self.values(beta)?;
+        match self {
+            ConstraintSet::Dense(dense) => Ok(ConstraintSet::Dense(
+                LinearInequalityConstraints::new(dense.a.clone(), &dense.b - &values)?,
+            )),
+            ConstraintSet::KhatriRaoCone(cone) => {
+                let mut shifted = cone.clone();
+                let base = shifted
+                    .bounds
+                    .take()
+                    .unwrap_or_else(|| Array1::zeros(values.len()));
+                shifted.bounds = Some(&base - &values);
+                Ok(ConstraintSet::KhatriRaoCone(shifted))
+            }
+            ConstraintSet::BlockDiagonal { blocks, total_cols } => {
+                let mut shifted_blocks = Vec::with_capacity(blocks.len());
+                for block in blocks {
+                    let width = block.set.ncols();
+                    let local = beta.slice(ndarray::s![
+                        block.col_start..block.col_start + width
+                    ]);
+                    shifted_blocks.push(PlacedConstraintBlock {
+                        col_start: block.col_start,
+                        set: block.set.shifted_to_delta(local)?,
+                    });
+                }
+                Ok(ConstraintSet::BlockDiagonal {
+                    blocks: shifted_blocks,
+                    total_cols: *total_cols,
+                })
+            }
         }
     }
 
@@ -344,6 +491,21 @@ impl ConstraintSet {
                 LinearInequalityConstraints::new(a, b)
             }
             ConstraintSet::KhatriRaoCone(cone) => cone.gather_rows(rows),
+            ConstraintSet::BlockDiagonal { blocks, total_cols } => {
+                let mut a = Array2::<f64>::zeros((rows.len(), *total_cols));
+                let mut b = Array1::<f64>::zeros(rows.len());
+                for (out_row, &row) in rows.iter().enumerate() {
+                    let (block, local) = Self::block_for_row(blocks, row)?;
+                    let gathered = block.set.gather_rows(&[local])?;
+                    a.row_mut(out_row)
+                        .slice_mut(ndarray::s![
+                            block.col_start..block.col_start + block.set.ncols()
+                        ])
+                        .assign(&gathered.a.row(0));
+                    b[out_row] = gathered.b[0];
+                }
+                LinearInequalityConstraints::new(a, b)
+            }
         }
     }
 
@@ -351,7 +513,10 @@ impl ConstraintSet {
     pub fn to_dense(&self) -> Result<LinearInequalityConstraints, String> {
         match self {
             ConstraintSet::Dense(dense) => Ok(dense.clone()),
-            ConstraintSet::KhatriRaoCone(cone) => cone.to_dense(),
+            _ => {
+                let all: Vec<usize> = (0..self.nrows()).collect();
+                self.gather_rows(&all)
+            }
         }
     }
 }
@@ -482,6 +647,93 @@ mod tests {
         assert!(KhatriRaoConeConstraints::new(psi.clone(), vec![3], 3).is_err());
         assert!(KhatriRaoConeConstraints::new(psi.clone(), vec![1, 1], 3).is_err());
         assert!(KhatriRaoConeConstraints::new(psi, vec![], 3).is_err());
+    }
+
+    #[test]
+    fn shifted_to_delta_matches_dense_shift() {
+        let cone = cone_fixture();
+        let set = ConstraintSet::KhatriRaoCone(cone);
+        let beta = beta_fixture();
+        let shifted = set.shifted_to_delta(beta.view()).expect("shift");
+        // Oracle: dense shift b' = b − Aβ.
+        let dense = set.to_dense().expect("dense");
+        let expected_b = &dense.b - &dense.a.dot(&beta);
+        for row in 0..set.nrows() {
+            assert!(
+                (shifted.bound(row).expect("bound") - expected_b[row]).abs() < 1e-14,
+                "shifted bound mismatch at row {row}"
+            );
+        }
+        // The delta system at δ = 0 has slack equal to the original at β.
+        let zero = Array1::<f64>::zeros(set.ncols());
+        let (viol_delta, row_delta) = shifted
+            .max_scaled_violation(zero.view())
+            .expect("delta violation");
+        let (viol_orig, row_orig) = set.max_scaled_violation(beta.view()).expect("violation");
+        assert!((viol_delta - viol_orig).abs() < 1e-14);
+        assert_eq!(row_delta, row_orig);
+    }
+
+    #[test]
+    fn block_diagonal_composes_ids_bounds_and_values() {
+        // Block 0: dense 2-row system on columns 0..2; block 1: cone on 2..8.
+        let dense = LinearInequalityConstraints::new(
+            array![[1.0_f64, 0.0], [0.0, -2.0]],
+            array![0.5_f64, -1.0],
+        )
+        .expect("dense block");
+        let cone = cone_fixture();
+        let joint = ConstraintSet::block_diagonal(
+            vec![
+                PlacedConstraintBlock {
+                    col_start: 0,
+                    set: ConstraintSet::Dense(dense.clone()),
+                },
+                PlacedConstraintBlock {
+                    col_start: 2,
+                    set: ConstraintSet::KhatriRaoCone(cone.clone()),
+                },
+            ],
+            8,
+        )
+        .expect("joint");
+        assert_eq!(joint.nrows(), 2 + 6);
+        assert_eq!(joint.ncols(), 8);
+        let mut beta = Array1::<f64>::zeros(8);
+        beta[0] = 2.0;
+        beta[1] = 1.0;
+        beta.slice_mut(ndarray::s![2..8]).assign(&beta_fixture());
+        let values = joint.values(beta.view()).expect("values");
+        assert!((values[0] - 2.0).abs() < 1e-15);
+        assert!((values[1] + 2.0).abs() < 1e-15);
+        let cone_values = cone.values(beta_fixture().view()).expect("cone values");
+        for (idx, &cv) in cone_values.iter().enumerate() {
+            assert!((values[2 + idx] - cv).abs() < 1e-15);
+        }
+        assert_eq!(joint.bound(0).expect("b0"), 0.5);
+        assert_eq!(joint.bound(2).expect("b2"), 0.0);
+        // Gathered joint row 3 (= cone row 1) occupies columns 2 + [2..4).
+        let gathered = joint.gather_rows(&[3]).expect("gather");
+        assert_eq!(gathered.a.ncols(), 8);
+        assert_eq!(gathered.a[[0, 4]], 2.0);
+        assert_eq!(gathered.a[[0, 5]], -1.0);
+        // Overlapping ranges are rejected.
+        assert!(
+            ConstraintSet::block_diagonal(
+                vec![
+                    PlacedConstraintBlock {
+                        col_start: 0,
+                        set: ConstraintSet::Dense(dense.clone()),
+                    },
+                    PlacedConstraintBlock {
+                        col_start: 1,
+                        set: ConstraintSet::Dense(dense),
+                    },
+                ],
+                8,
+            )
+            .is_err()
+        );
     }
 
     #[test]
