@@ -156,6 +156,30 @@ pub trait AtomFrameSketch {
     /// [`AtomFrameSketch::sketch_dim`].
     fn atom_sketch(&self, atom_id: usize) -> Array1<f64>;
 
+    /// ALL bucket representatives for atom `atom_id` (each of length
+    /// [`AtomFrameSketch::sketch_dim`]).
+    ///
+    /// A single representative point cannot cover an atom whose range is a
+    /// genuine SUBSPACE: an on-manifold query direction sweeps the whole
+    /// r-plane, and cosine-LSH collision decays with the query→representative
+    /// angle, which reaches `arccos(1/√r)` (45° at r = 2, 54.7° at r = 3) even
+    /// for a PERFECT on-atom query. Bucketing only the dominant column made
+    /// the miss probability deterministic in the query's phase — measured as
+    /// an 11.4% routing miss on planted K=1024 circle atoms — because every
+    /// table shares the same lone representative, so more tables cannot
+    /// recover it. Bucketing one representative PER FRAME COLUMN bounds the
+    /// worst-case angle to the nearest bucketed point by `arccos(1/√r)` with
+    /// equality only on the diagonal, restoring the per-table collision the
+    /// table count was sized for. Build cost grows by the factor r (bucket
+    /// entries only); queries are unchanged and the exact alignment rescore
+    /// already owns ranking.
+    ///
+    /// The default covers implementors whose range is genuinely
+    /// one-directional: the single [`AtomFrameSketch::atom_sketch`].
+    fn atom_bucket_sketches(&self, atom_id: usize) -> Vec<Array1<f64>> {
+        vec![self.atom_sketch(atom_id)]
+    }
+
     /// Sketch of a query *direction* `d` (length [`AtomFrameSketch::output_dim`])
     /// as seen through atom `atom_id`'s frame: the direction's component inside
     /// the atom's column-space, mapped into sketch coordinates. Used at query
@@ -301,6 +325,24 @@ impl AtomFrameSketch for RandomProjectionFrameSketch {
         s
     }
 
+    fn atom_bucket_sketches(&self, atom_id: usize) -> Vec<Array1<f64>> {
+        let frame = &self.frames[atom_id];
+        if frame.ncols() == 0 {
+            return vec![self.atom_sketch(atom_id)];
+        }
+        // One bucket representative per orthonormal frame column: an
+        // on-manifold query direction is then within arccos(1/√r) of some
+        // bucketed point instead of up to 90° from the lone dominant column
+        // (see the trait doc — the deterministic phase-miss fix).
+        (0..frame.ncols())
+            .map(|col| {
+                let mut sk = mat_vec(&self.projection, frame.column(col));
+                normalize_in_place(&mut sk);
+                sk
+            })
+            .collect()
+    }
+
     fn project_direction(&self, atom_id: usize, direction: ArrayView1<f64>) -> Array1<f64> {
         let comp = self.in_range_component(atom_id, direction);
         mat_vec(&self.projection, comp.view())
@@ -435,16 +477,28 @@ impl SaeCandidateIndex {
             (0..config.num_tables).map(|_| HashMap::new()).collect();
 
         for atom_id in 0..num_atoms {
-            let s = sketch.atom_sketch(atom_id);
-            if s.len() != sketch_dim {
+            let bucket_sketches = sketch.atom_bucket_sketches(atom_id);
+            if bucket_sketches.is_empty() {
                 return Err(format!(
-                    "SaeCandidateIndex: atom {atom_id} sketch length {} != sketch_dim {sketch_dim}",
-                    s.len()
+                    "SaeCandidateIndex: atom {atom_id} produced no bucket representatives"
                 ));
             }
-            for (table, bank) in tables.iter_mut().zip(hyperplanes.iter()) {
-                let sig = sign_signature(bank, s.view());
-                table.entry(sig).or_default().push(atom_id);
+            for s in &bucket_sketches {
+                if s.len() != sketch_dim {
+                    return Err(format!(
+                        "SaeCandidateIndex: atom {atom_id} sketch length {} != sketch_dim {sketch_dim}",
+                        s.len()
+                    ));
+                }
+                for (table, bank) in tables.iter_mut().zip(hyperplanes.iter()) {
+                    let sig = sign_signature(bank, s.view());
+                    let bucket = table.entry(sig).or_default();
+                    // Distinct representatives of one atom can share a bucket;
+                    // store the id once so occupancy statistics stay honest.
+                    if bucket.last() != Some(&atom_id) {
+                        bucket.push(atom_id);
+                    }
+                }
             }
         }
 
@@ -1347,6 +1401,85 @@ mod tests {
             report.total_planted - recovered,
             report.misses.len(),
             "miss list must account for every unrecovered planted atom"
+        );
+    }
+
+    /// Regression for the deterministic phase-miss (#2283 hardware-gate
+    /// finding): rank-2 atoms bucketed only under their DOMINANT frame column
+    /// missed on-plane queries whose phase leans on the second column — an
+    /// 11.4% routing miss at K=1024 that no table count could recover because
+    /// every table shared the same lone representative. With one bucket entry
+    /// per frame column, every exact in-plane query is within 45° of a
+    /// bucketed representative, and the axis phases (the old deterministic
+    /// misses) collide by construction.
+    #[test]
+    fn rank2_atoms_are_gathered_at_every_phase() {
+        let k = 256usize;
+        let p = 48usize;
+        let mut rng = StdRng::seed_from_u64(2283);
+        let mut blocks = Vec::with_capacity(k);
+        for _ in 0..k {
+            // Two independent Gaussian columns; the sketch orthonormalizes.
+            let a = unit_vec(&mut rng, p);
+            let b = unit_vec(&mut rng, p);
+            let mut block = Array2::<f64>::zeros((p, 2));
+            block.column_mut(0).assign(&a);
+            block.column_mut(1).assign(&b);
+            blocks.push(block);
+        }
+        let sketch_dim = 24usize;
+        let sketch =
+            RandomProjectionFrameSketch::from_decoder_blocks(&blocks, sketch_dim, 99).unwrap();
+        let cfg = IndexConfig::auto(sketch_dim, k, 99);
+        let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
+        let budget = auto_candidate_budget(k);
+
+        let phases = 32usize;
+        let atoms = 16usize;
+        let mut total = 0usize;
+        let mut hits = 0usize;
+        let mut axis_misses: Vec<(usize, usize)> = Vec::new();
+        for atom in (0..k).step_by(k / atoms) {
+            // Query in the atom's own orthonormal frame so alignment is
+            // exactly 1 at every phase. Gram-Schmidt the two raw columns —
+            // the same construction the sketch uses for its frames.
+            let mut u = blocks[atom].column(0).to_owned();
+            let un = vec_norm(u.view());
+            u.mapv_inplace(|x| x / un);
+            let mut w = blocks[atom].column(1).to_owned();
+            let proj: f64 = w.iter().zip(u.iter()).map(|(&a, &b)| a * b).sum();
+            for (wi, &ui) in w.iter_mut().zip(u.iter()) {
+                *wi -= proj * ui;
+            }
+            let wn = vec_norm(w.view());
+            w.mapv_inplace(|x| x / wn);
+
+            for ph in 0..phases {
+                let angle = 2.0 * std::f64::consts::PI * (ph as f64) / (phases as f64);
+                let mut d = Array1::<f64>::zeros(p);
+                for i in 0..p {
+                    d[i] = angle.cos() * u[i] + angle.sin() * w[i];
+                }
+                let proposal = index.propose(&sketch, d.view(), budget, cfg.multiprobe);
+                total += 1;
+                let gathered = proposal.proposed.contains(&atom);
+                if gathered {
+                    hits += 1;
+                } else if ph % (phases / 4) == 0 {
+                    axis_misses.push((atom, ph));
+                }
+            }
+        }
+        assert!(
+            axis_misses.is_empty(),
+            "axis-phase queries collide with their own bucketed representative \
+             by construction and must never miss: {axis_misses:?}"
+        );
+        let recall = hits as f64 / total as f64;
+        assert!(
+            recall >= 0.99,
+            "on-plane phase-swept gather recall {recall:.4} ({hits}/{total}) \
+             below 0.99 — the multi-representative bucketing regressed"
         );
     }
 
