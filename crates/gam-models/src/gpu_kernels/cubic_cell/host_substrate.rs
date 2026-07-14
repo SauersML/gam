@@ -51,10 +51,9 @@ mod tests {
         CubicCellDerivativeMomentHostView, GpuCellBranchTag, GpuDenestedCubicCell,
     };
 
-    /// Row-major moments + per-cell status, the same layout the device
-    /// kernel writes. Production callers consume only the status (see
-    /// [`build_host_cell_status`]); this batch shape is the parity oracle
-    /// the moment-emitting unit tests compare to the CPU evaluator.
+    /// Row-major moments + per-cell status, matching the layout the device
+    /// kernel writes. This batch is the private parity oracle compared with the
+    /// independent CPU evaluator.
     struct HostMomentBatch {
         pub moments: Vec<f64>,
         pub status: Vec<u8>,
