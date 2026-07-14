@@ -102,7 +102,18 @@ def normalize_table(data: Any) -> tuple[list[str], Any, str]:
     ):
         from ._binding import rust_module
 
-        return headers, rust_module().encoded_table_from_arrow(headers, data), kind
+        # A pandas index is row identity, never a model variable. Pandas 3's
+        # Arrow C stream materializes a non-RangeIndex as an extra schema field,
+        # while `data.columns` correctly excludes it. Canonicalize row identity
+        # before export so the Arrow schema is exactly the declared data-column
+        # schema. `drop=True` preserves every data column and pandas' copy-on-write
+        # frame keeps this a metadata operation rather than a numeric-table copy.
+        arrow_source = data.reset_index(drop=True) if kind == "pandas" else data
+        return (
+            headers,
+            rust_module().encoded_table_from_arrow(headers, arrow_source),
+            kind,
+        )
 
     categorical = categorical_dtype_columns(data, kind, columns=columns)
     numeric_positions = [

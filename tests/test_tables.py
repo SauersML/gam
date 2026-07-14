@@ -66,6 +66,22 @@ def test_normalize_table_rejects_zero_row_mapping() -> None:
         normalize_table({"x": [], "y": []})
 
 
+def test_normalize_pandas_arrow_stream_excludes_row_index() -> None:
+    pd = pytest.importorskip("pandas")
+
+    frame = pd.DataFrame(
+        {"x": [1.0, 2.0, 3.0], "y": [4.0, 5.0, 6.0]},
+        index=[11, 17, 29],
+    )
+    headers, rows, kind = normalize_table(frame)
+
+    assert kind == "pandas"
+    assert headers == ["x", "y"]
+    assert rows.headers == headers
+    assert rows.shape == (3, 2)
+    assert list(rows) == [["1.0", "4.0"], ["2.0", "5.0"], ["3.0", "6.0"]]
+
+
 def test_restore_output_table_rejects_unknown_return_type() -> None:
     with pytest.raises(ValueError, match="unsupported return_type 'arrowish'"):
         restore_output_table(
