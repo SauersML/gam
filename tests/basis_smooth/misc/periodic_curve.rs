@@ -193,7 +193,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
     // constraint transform it is identically zero — an unidentified λ that
     // makes the outer REML objective flat and prevents convergence. The builder
     // therefore emits only the wiggliness penalty (see bspline_build.rs).
-    assert_eq!(design.smooth.terms[0].penalties_local.len(), 1);
+    assert_eq!(design.smooth.terms[0].active_penalties.len(), 1);
 
     let built = build_bspline_basis_1d(
         x.view(),

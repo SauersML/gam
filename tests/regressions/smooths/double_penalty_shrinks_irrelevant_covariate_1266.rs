@@ -54,7 +54,7 @@ fn irrelevant_covariate_dataset(seed: u64, n: usize) -> gam::data::EncodedDatase
 
 /// Per-term EDF for the smooth whose name contains `needle`, computed exactly as
 /// the model summary does: walk the random-effect ranges then the smooth terms,
-/// advancing the penalty cursor by each term's local penalty count, and call
+/// advancing the penalty cursor by each term's active penalty count, and call
 /// `per_term_edf(coeff_range, penalty_cursor, k)` on the matching term.
 fn smooth_term_edf(fit: &FitResult, needle: &str) -> f64 {
     let FitResult::Standard(std_fit) = fit else {
@@ -69,7 +69,7 @@ fn smooth_term_edf(fit: &FitResult, needle: &str) -> f64 {
         penalty_cursor += 1;
     }
     for term in &design.smooth.terms {
-        let k = term.penalties_local.len();
+        let k = term.active_penalties.len();
         if term.name.contains(needle) {
             return unified.per_term_edf(term.coeff_range.clone(), penalty_cursor, k);
         }

@@ -103,9 +103,14 @@ fn factor_by_double_penalty_ridge_is_per_level_in_constrained_chart() {
         .terms
         .iter()
         .filter(|t| {
-            t.penaltyinfo_local
+            t.active_penalties
                 .iter()
-                .any(|i| matches!(i.source, PenaltySource::DoublePenaltyNullspace))
+                .any(|penalty| {
+                    matches!(
+                        &penalty.info.source,
+                        PenaltySource::DoublePenaltyNullspace
+                    )
+                })
         })
         .collect();
 
@@ -125,20 +130,15 @@ fn factor_by_double_penalty_ridge_is_per_level_in_constrained_chart() {
     // ridge where its support does not overlap the co-located primary, so the
     // product is large.
     for (t_idx, term) in level_terms.iter().enumerate() {
-        let primaries: Vec<&Array2<f64>> = term
-            .penalties_local
-            .iter()
-            .zip(term.penaltyinfo_local.iter())
-            .filter(|(_, i)| matches!(i.source, PenaltySource::Primary))
-            .map(|(s, _)| s)
-            .collect();
-        let ridges: Vec<&Array2<f64>> = term
-            .penalties_local
-            .iter()
-            .zip(term.penaltyinfo_local.iter())
-            .filter(|(_, i)| matches!(i.source, PenaltySource::DoublePenaltyNullspace))
-            .map(|(s, _)| s)
-            .collect();
+        let mut primaries: Vec<&Array2<f64>> = Vec::new();
+        let mut ridges: Vec<&Array2<f64>> = Vec::new();
+        for penalty in &term.active_penalties {
+            match &penalty.info.source {
+                PenaltySource::Primary => primaries.push(&penalty.matrix),
+                PenaltySource::DoublePenaltyNullspace => ridges.push(&penalty.matrix),
+                _ => {}
+            }
+        }
         assert!(
             !primaries.is_empty() && !ridges.is_empty(),
             "per-level term {t_idx} must carry both a Primary bending block and a ridge; \

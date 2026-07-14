@@ -56,33 +56,38 @@ fn t2_uses_separable_penalty_decomposition_not_te_marginal_alias() {
     let t2_term = &t2.design.smooth.terms[0];
 
     assert_eq!(
-        te_term.penalties_local.len(),
+        te_term.active_penalties.len(),
         2,
         "te has one penalty per margin"
     );
     assert_eq!(
-        t2_term.penalties_local.len(),
+        t2_term.active_penalties.len(),
         3,
         "2D t2 with one marginal penalty per axis has range-null, null-range, and range-range components"
     );
     assert_ne!(
-        te_term.penalties_local.len(),
-        t2_term.penalties_local.len(),
+        te_term.active_penalties.len(),
+        t2_term.active_penalties.len(),
         "t2 must not be a te penalty alias"
     );
 
     assert!(
         te_term
-            .penaltyinfo_local
+            .active_penalties
             .iter()
-            .all(|info| matches!(info.source, PenaltySource::TensorMarginal { .. })),
+            .all(|penalty| {
+                matches!(
+                    &penalty.info.source,
+                    PenaltySource::TensorMarginal { .. }
+                )
+            }),
         "te penalties should retain marginal Kronecker-sum sources"
     );
 
     let mut separable_components = t2_term
-        .penaltyinfo_local
+        .active_penalties
         .iter()
-        .map(|info| match &info.source {
+        .map(|penalty| match &penalty.info.source {
             PenaltySource::TensorSeparable { penalized_margins } => penalized_margins.clone(),
             other => panic!("unexpected t2 penalty source: {other:?}"),
         })
@@ -97,9 +102,11 @@ fn t2_uses_separable_penalty_decomposition_not_te_marginal_alias() {
     let t2_width = t2_term.coeff_range.len();
     assert!(
         t2_term
-            .penalties_local
+            .active_penalties
             .iter()
-            .all(|s| s.nrows() == t2_width && s.ncols() == t2_width),
+            .all(|penalty| {
+                penalty.matrix.nrows() == t2_width && penalty.matrix.ncols() == t2_width
+            }),
         "every active t2 penalty must live in the transformed term coefficient space"
     );
 }

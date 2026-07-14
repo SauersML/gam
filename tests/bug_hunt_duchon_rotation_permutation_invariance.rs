@@ -107,7 +107,7 @@ fn fit_and_predict_formula(
     }
     let mut edf = f64::NAN;
     for term in &design.smooth.terms {
-        let k = term.penalties_local.len();
+        let k = term.active_penalties.len();
         edf = unified.per_term_edf(term.coeff_range.clone(), penalty_cursor, k);
         penalty_cursor += k;
     }

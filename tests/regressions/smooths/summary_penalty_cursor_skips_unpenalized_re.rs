@@ -148,7 +148,7 @@ fn summary_penalty_cursor_matches_actual_penalty_layout() {
     // per-block traces and `per_term_edf` would return 0 (#1883).
     let mut penalty_cursor = summary_cursor_skips;
     for term in &design.smooth.terms {
-        let k = term.penalties_local.len();
+        let k = term.active_penalties.len();
         assert!(
             penalty_cursor + k <= design.penaltyinfo.len(),
             "smooth term '{}' penalty window [{penalty_cursor}..{}] runs past the \

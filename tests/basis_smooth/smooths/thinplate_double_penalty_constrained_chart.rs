@@ -14,7 +14,7 @@
 //! with `null(Zᵀ S_bend Z)` and carries shrinkage mass onto penalized (kernel)
 //! directions — the #1266/#1476 flat-collapse / EDF mis-allocation class.
 //!
-//! Contract pinned on the realized constrained `penalties_local`: the ridge and
+//! Contract pinned on the realized constrained `active_penalties`: the ridge and
 //! the bending penalty penalize COMPLEMENTARY subspaces, so `ridge·bending ≈ 0`
 //! and the ridge's principal direction earns ~zero bending energy. The raw-
 //! restricted ridge violates both.
@@ -83,17 +83,14 @@ fn thin_plate_double_penalty_ridge_lives_in_constrained_null_space() {
 
     let mut bending = Array2::<f64>::zeros((width, width));
     let mut ridge: Option<Array2<f64>> = None;
-    for (s, info) in term
-        .penalties_local
-        .iter()
-        .zip(term.penaltyinfo_local.iter())
-    {
+    for penalty in &term.active_penalties {
+        let s = &penalty.matrix;
         assert_eq!(
             (s.nrows(), s.ncols()),
             (width, width),
             "{formula}: every penalty must live in the constrained term chart"
         );
-        match info.source {
+        match &penalty.info.source {
             PenaltySource::DoublePenaltyNullspace => {
                 assert!(ridge.is_none(), "{formula}: expected a single ridge");
                 ridge = Some(s.clone());
