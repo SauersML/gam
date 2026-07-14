@@ -2,9 +2,6 @@
 
 use super::*;
 
-/// Per-matrix byte budget for the construction-time identifiability preflight.
-const PREFLIGHT_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: SurvivalMarginalSlopeTermSpec,
@@ -158,12 +155,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             "survival marginal-slope logslope block",
         )
         .map_err(|error| error.to_string())?;
-    let raw_logslope_design_for_layout = logslope_design.design.clone();
     let common_logslope_offset = &spec.logslope_offset + baseline_slope;
-    let raw_logslope_layout = logslope_topology.materialize_identity(
-        raw_logslope_design_for_layout.clone(),
-        &common_logslope_offset,
-    )?;
     if logslope_topology.is_per_score() && logslope_topology.score_count() != spec.z.ncols() {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
@@ -174,178 +166,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         }
         .into());
     }
-    let origin_logslope_beta =
-        Array1::<f64>::zeros(raw_logslope_layout.coefficient_design().ncols());
-    let origin_slopes =
-        raw_logslope_layout.physical_values(spec.z.ncols(), origin_logslope_beta.view())?;
-
-    // Phase-4b parametric identifiability pre-flight (observability-only).
-    //
-    // Runs `compile_survival_parametric_designs` on the three SMGS
-    // parametric blocks (time, marginal, logslope) with a structural
-    // identity row Hessian to detect cross-block aliasing in the
-    // (q₀, q₁, q′₁, g) row primary state BEFORE the pilot or outer
-    // Newton starts. The drops_by_block tuple is logged at INFO so the
-    // user sees an immediate, actionable diagnostic when the joint
-    // parametric design carries redundant directions — strictly tighter
-    // and more structured than the post-construction
-    // `audit_identifiability` fatal gate (which sees only the official
-    // per-block design, not the full (entry, exit, derivative_exit)
-    // triplet that lives in the family primary operator).
-    //
-    // Why observability-only here (not applied): the family's
-    // `evaluate_blockwise_exact_newton` row-Hessian assembly
-    // (`syr_row_into_view` / `row_outer_into_view`) asserts that the
-    // captured `marginal_design` / `logslope_design` widths equal the
-    // workspace slice widths. Threading the compiled (V-transformed)
-    // designs through `make_family` and the downstream PIRLS workspace
-    // requires width-consistent updates across the >2 000-line
-    // `evaluate_blockwise_exact_newton` family of methods that is
-    // currently outside this pre-flight's scope. The
-    // `canonicalize_for_identifiability` fail-closed gate covers the
-    // resulting unsafe-reduce path; this pre-flight gives the user
-    // earlier visibility into the same diagnostic. When the family
-    // contract is updated to accept compiled designs (a follow-up
-    // commit), replace the `log::info!` below with a call to
-    // `apply_survival_parametric_compile_to_designs` and re-route
-    // `make_family` to the compiled triplet — that is the one-line
-    // promotion from observability-only to active reduction.
-    if n < 1_000 {
-        log::debug!(
-            "[smgs phase-4b preflight] skipped for tiny fit n={n}; \
-             budget-sensitive tiny survival fits use the raw parametric design"
-        );
-    } else {
-        use crate::survival::marginal_slope::identifiability::{
-            SurvivalRowHessian, compile_survival_parametric_designs,
-        };
-        let n_rows = spec.time_block.design_entry.nrows();
-        let preflight = (|| -> Result<(), String> {
-            // The preflight densifies five operator-backed designs
-            // simultaneously to run the parametric cross-block compile.
-            // Without a per-matrix cap, a tensor-product time block at
-            // n=320 000 (e.g. 68 age knots × 8 timewiggle knots) materializes
-            // to ~1.4 GiB per matrix and OOMs the host before the
-            // observability-only diagnostic ever produces a verdict. Cap each
-            // matrix at the strict-mode single-materialization budget
-            // (`ResourcePolicy::analytic_operator_required`); when any block
-            // exceeds it the closure returns `Err` and the surrounding
-            // `warn!`-on-fail handler skips the preflight just like any other
-            // densification refusal — the downstream
-            // `canonicalize_for_identifiability` audit remains the source of
-            // truth for the same diagnostic.
-            let mut dq0 = spec
-                .time_block
-                .design_entry
-                .try_to_dense_by_chunks_budgeted(
-                    "smgs phase-4b preflight time_entry",
-                    PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
-                )?;
-            let mut dq1 = spec
-                .time_block
-                .design_exit
-                .try_to_dense_by_chunks_budgeted(
-                    "smgs phase-4b preflight time_exit",
-                    PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
-                )?;
-            let mut dqd1 = spec
-                .time_block
-                .design_derivative_exit
-                .try_to_dense_by_chunks_budgeted(
-                    "smgs phase-4b preflight time_deriv",
-                    PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
-                )?;
-            let m_dq = marginal_design.design.try_to_dense_by_chunks_budgeted(
-                "smgs phase-4b preflight marginal",
-                PREFLIGHT_MATERIALIZATION_BUDGET_BYTES,
-            )?;
-            let m_dqd1 = ndarray::Array2::<f64>::zeros(m_dq.dim());
-            // Channel-aware per-subject Fisher Gram (T8). Pilot primary
-            // state at β=0: q0 = offset_entry + marginal_offset, q1 =
-            // offset_exit + marginal_offset, qd1 = derivative_offset_exit,
-            // g = logslope_offset. The marginal predictor enters BOTH the
-            // entry and exit channels (see `row_dynamic_q_values`, which adds
-            // `block_states[1].eta` to q0 and q1 alike); at β=0 that predictor
-            // is `marginal_offset`. All offsets are available before the inner
-            // Newton, so the pilot-H is fully determined at preflight time
-            // without waiting for a converged β.
-            let mut q0_pf = spec.time_block.offset_entry.clone();
-            let mut q1_pf = spec.time_block.offset_exit.clone();
-            for i in 0..n_rows {
-                q0_pf[i] += spec.marginal_offset[i];
-                q1_pf[i] += spec.marginal_offset[i];
-            }
-            let qd1_pf = spec.time_block.derivative_offset_exit.clone();
-            // Replace the zero placeholder timewiggle tail columns with the
-            // analytic basis-derived time Jacobian at the β=0 pilot state, so
-            // the compiler sees the real time block instead of a structural
-            // zero (see `overwrite_timewiggle_time_slots_at_pilot`).
-            if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
-                overwrite_timewiggle_time_slots_at_pilot(
-                    &mut dq0, &mut dq1, &mut dqd1, timewiggle, &q0_pf, &q1_pf, &qd1_pf,
-                )?;
-            }
-            let row_hess = SurvivalRowHessian::from_pilot_primary_state(
-                &q0_pf,
-                &q1_pf,
-                &qd1_pf,
-                &origin_slopes,
-                &spec.z,
-                &score_covariance,
-                &spec.weights,
-                &spec.event_target,
-                spec.derivative_guard,
-                probit_scale,
-            )?;
-            let compiled = compile_survival_parametric_designs(
-                dq0,
-                dq1,
-                dqd1,
-                m_dq,
-                m_dqd1,
-                raw_logslope_layout.clone(),
-                &row_hess,
-            )?;
-            let (dt, dm, dg) = compiled.drops_by_block;
-            if dt + dm + dg > 0 {
-                log::info!(
-                    "[smgs phase-4b preflight] cross-block parametric alias detected: \
-                     time_drops={} marginal_drops={} logslope_drops={} \
-                     (V_time={}→{}, V_marginal={}→{}, V_logslope={}→{}). \
-                     Currently observability-only; canonicalize_for_identifiability \
-                     fail-closes downstream if the alias also surfaces in the per-block \
-                     audit.",
-                    dt,
-                    dm,
-                    dg,
-                    spec.time_block.design_exit.ncols(),
-                    compiled.v_time.ncols(),
-                    marginal_design.design.ncols(),
-                    compiled.v_marginal.ncols(),
-                    logslope_design.design.ncols(),
-                    compiled.v_logslope.ncols(),
-                );
-            } else {
-                log::debug!(
-                    "[smgs phase-4b preflight] parametric joint design is rank-clean: \
-                     no cross-block aliasing in (q0, q1, qd1, g) primary state \
-                     (raw widths time={} marginal={} logslope={})",
-                    spec.time_block.design_exit.ncols(),
-                    marginal_design.design.ncols(),
-                    logslope_design.design.ncols(),
-                );
-            }
-            Ok(())
-        })();
-        if let Err(reason) = preflight {
-            // Pre-flight is observability-only; an internal error here
-            // (e.g. densification budget exceeded) does NOT abort the
-            // fit — the downstream audit / fail-closed gate remains
-            // the source of truth.
-            log::warn!("[smgs phase-4b preflight] skipped: {reason}",);
-        }
-    }
-
     let time_penalties_len = spec.time_block.penalties.len();
     let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
     // Cross-block W metric: build the survival rigid pooled-probit pilot η
@@ -805,810 +625,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let z = Arc::new(spec.z.clone());
     let derivative_guard = spec.derivative_guard;
 
-    // Phase-4b V+M-exact active cutover: when the parametric joint
-    // design carries cross-block aliasing in the (q₀, q₁, q′₁, g) row
-    // primary state, build the channel-aware Gram (K^H, K^S) via
-    // `build_primary_grams_gpu_or_cpu`, compile a global T via
-    // `compile_from_raw_grams`, and apply it through
-    // `apply_compiled_map_to_designs`. The inner Newton then operates
-    // on a rank-clean reparameterised joint design; at fit result the
-    // joint β is lifted via `T · θ` back to raw width so predict-time
-    // consumes raw β unchanged.
-    //
-    // When no aliasing is detected (all compiled block widths equal
-    // their raw widths) the cutover is a no-op: raw designs / penalties
-    // propagate forward and `smgs_lift_v` stays None.
-    // Recompile-after-first-PIRLS-accept context. Captured inside the
-    // cutover branch so we can re-run `compile_survival_parametric_designs_per_term`
-    // against a data-adaptive row Hessian built at the converged β, then
-    // compare drops_by_block against the structural-H pass. If they differ,
-    // the structural compile mis-classified at least one direction (the
-    // "pilot-curvature trap") and the user is warned with the diff.
-    // The recompile uses `block_states[i].eta` (the converged η for the
-    // marginal / logslope blocks) when rebuilding q0/q1/qd1/g at the
-    // accepted β. Since η already absorbs the per-row offset
-    // (η = Xβ + offset), the recompile does not separately consume
-    // `marginal_offset` / `logslope_offset` — they are not carried in
-    // this context.
-    struct SmgsRecompileAfterAcceptContext {
-        dq0: ndarray::Array2<f64>,
-        dq1: ndarray::Array2<f64>,
-        dqd1: ndarray::Array2<f64>,
-        m_dq: ndarray::Array2<f64>,
-        m_dqd1: ndarray::Array2<f64>,
-        logslope_layout: LogslopeLayout,
-        time_partition: Vec<std::ops::Range<usize>>,
-        marginal_partition: Vec<std::ops::Range<usize>>,
-        logslope_partition: Vec<std::ops::Range<usize>>,
-        offset_entry: Array1<f64>,
-        offset_exit: Array1<f64>,
-        derivative_offset_exit: Array1<f64>,
-        z: Array2<f64>,
-        covariance: MarginalSlopeCovariance,
-        weights: Array1<f64>,
-        event: Array1<f64>,
-        derivative_guard: f64,
-        probit_scale: f64,
-        drops_by_block_initial: (usize, usize, usize),
-        // #979: true when the cutover engaged the W-orthogonal PARTIAL
-        // reduced-logslope reparam (effective Schur Gram) rather than the
-        // full per-term compiler. In that case the post-accept recompile —
-        // which re-runs the FULL per-term compiler — collapses the logslope
-        // channel WHOLESALE by construction, so its drops legitimately differ
-        // from the partial structural drops and must NOT be flagged as a
-        // pilot-curvature trap (that comparison is apples-to-oranges).
-        used_partial_logslope_reduction: bool,
-        /// Protect the time block from reduction on recompile — set when the
-        /// time block carries a monotone time-wiggle basis (a fixed nonlinear
-        /// functional basis that cannot be linearly reparameterised).
-        protect_time: bool,
-    }
-    type SmgsCutoverTuple = (
-        gam_linalg::matrix::DesignMatrix,
-        gam_linalg::matrix::DesignMatrix,
-        gam_linalg::matrix::DesignMatrix,
-        gam_terms::smooth::TermCollectionDesign,
-        gam_terms::smooth::TermCollectionDesign,
-        LogslopeLayout,
-        Option<gam_solve::gauge::Gauge>,
-        Option<Vec<crate::custom_family::PenaltyMatrix>>,
-        Option<Vec<crate::custom_family::PenaltyMatrix>>,
-        Option<Vec<crate::custom_family::PenaltyMatrix>>,
-        Option<SmgsRecompileAfterAcceptContext>,
-    );
-    let (
-        design_entry,
-        design_exit,
-        design_derivative_exit,
-        marginal_design,
-        logslope_design,
-        post_cutover_logslope_layout,
-        smgs_lift_v,
-        time_penalties_vm,
-        marginal_penalties_vm,
-        logslope_penalties_vm,
-        recompile_after_accept,
-    ): SmgsCutoverTuple = if n < 1_000 {
-        log::debug!(
-            "[smgs phase-4b active] skipped for tiny fit n={n}; \
-             budget-sensitive tiny survival fits use the raw parametric design"
-        );
-        (
-            spec.time_block.design_entry.clone(),
-            spec.time_block.design_exit.clone(),
-            spec.time_block.design_derivative_exit.clone(),
-            marginal_design.clone(),
-            logslope_design.clone(),
-            raw_logslope_layout.clone(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-    } else {
-        use crate::survival::marginal_slope::identifiability::{
-            CompiledSurvivalDesignsVMExact, apply_compiled_map_to_designs,
-            extract_term_partition_from_penalty_ranges,
-        };
-        use gam_solve::gauge::Gauge;
-        // Recompile context, populated when the closed-form compile
-        // succeeds. The post-solve recompile-after-accept hook consumes
-        // this to rebuild row Hessians at the converged β.
-        let mut recompile_ctx: Option<SmgsRecompileAfterAcceptContext> = None;
-        // Try the active cutover via the closed-form compiled-map path.
-        // Failure (e.g. densification budget, FullyAliased, linalg error)
-        // propagates as Err and skips phase-4b; observability preflight
-        // and downstream canonicalize_for_identifiability still gate
-        // on the audit.
-        let attempt = (|| -> Result<Option<(CompiledSurvivalDesignsVMExact, Gauge)>, String> {
-            let n_rows = spec.time_block.design_entry.nrows();
-            let p_time = spec.time_block.design_entry.ncols();
-            let p_marg = marginal_design.design.ncols();
-            let p_log = logslope_design.design.ncols();
-            // Single-term partition for the time block: SMGS's time
-            // penalty list is over the full time β (one composite
-            // smoothness penalty), so a single-term partition is
-            // correct here.
-            let time_partition: Vec<std::ops::Range<usize>> = std::iter::once(0..p_time).collect();
-            let marg_penalty_ranges: Vec<_> = marginal_design
-                .penalties
-                .iter()
-                .map(|p| p.col_range.clone())
-                .collect();
-            let log_penalty_ranges: Vec<_> = logslope_design
-                .penalties
-                .iter()
-                .map(|p| p.col_range.clone())
-                .collect();
-            let marginal_partition =
-                extract_term_partition_from_penalty_ranges(p_marg, &marg_penalty_ranges);
-            let logslope_partition =
-                extract_term_partition_from_penalty_ranges(p_log, &log_penalty_ranges);
-            // Densify the operator-side designs once. Cap each densification
-            // at the strict-mode single-materialization budget so a
-            // tensor-product time block at large n does not OOM the host
-            // before the closure can return Err — phase-4b is gracefully
-            // skipped via the surrounding `warn!`-on-fail match, leaving the
-            // downstream `canonicalize_for_identifiability` audit as the
-            // gate.
-            const ACTIVE_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-            let mut dq0 = spec
-                .time_block
-                .design_entry
-                .try_to_dense_by_chunks_budgeted(
-                    "smgs phase-4b active: time_entry",
-                    ACTIVE_MATERIALIZATION_BUDGET_BYTES,
-                )?;
-            let mut dq1 = spec
-                .time_block
-                .design_exit
-                .try_to_dense_by_chunks_budgeted(
-                    "smgs phase-4b active: time_exit",
-                    ACTIVE_MATERIALIZATION_BUDGET_BYTES,
-                )?;
-            let mut dqd1 = spec
-                .time_block
-                .design_derivative_exit
-                .try_to_dense_by_chunks_budgeted(
-                    "smgs phase-4b active: time_deriv",
-                    ACTIVE_MATERIALIZATION_BUDGET_BYTES,
-                )?;
-            let m_dq = marginal_design.design.try_to_dense_by_chunks_budgeted(
-                "smgs phase-4b active: marginal",
-                ACTIVE_MATERIALIZATION_BUDGET_BYTES,
-            )?;
-            let m_dqd1 = ndarray::Array2::<f64>::zeros(m_dq.dim());
-            let g_dg = logslope_design.design.try_to_dense_by_chunks_budgeted(
-                "smgs phase-4b active: logslope",
-                ACTIVE_MATERIALIZATION_BUDGET_BYTES,
-            )?;
-            // Pilot primary state for the timewiggle Jacobian overwrite
-            // below (offset-only β=0 state: q0 = offset_entry +
-            // marginal_offset, q1 = offset_exit + marginal_offset, qd1 =
-            // derivative_offset_exit, g = logslope_offset). The #808
-            // reduction itself uses the RAW stacked design + the
-            // operating-point row metric `cross_block_pilot_w`, so it does
-            // NOT depend on this pilot primary state; the state is only
-            // needed to evaluate the timewiggle basis geometry when the base
-            // time basis is disabled (`timewiggle(...)`), so the offset-only
-            // state is sufficient and guard-safe.
-            let mut q0_pilot = spec.time_block.offset_entry.clone();
-            let mut q1_pilot = spec.time_block.offset_exit.clone();
-            let qd1_pilot = spec.time_block.derivative_offset_exit.clone();
-            let slopes_pilot = origin_slopes.clone();
-            for i in 0..n_rows {
-                q0_pilot[i] += spec.marginal_offset[i];
-                q1_pilot[i] += spec.marginal_offset[i];
-            }
-            // Replace the zero placeholder timewiggle tail columns with the
-            // analytic basis-derived time Jacobian at the pilot state.
-            // Without this, the time-channel slots are structurally zero
-            // when `timewiggle(...)` disables the base time basis, and the
-            // raw stacked design's time block is degenerate.
-            if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
-                overwrite_timewiggle_time_slots_at_pilot(
-                    &mut dq0, &mut dq1, &mut dqd1, timewiggle, &q0_pilot, &q1_pilot, &qd1_pilot,
-                )?;
-            }
-
-            // Closed-form Gram path on the RAW STACKED design (#808).
-            //
-            // History: the 4-channel `build_primary_grams_gpu_or_cpu` view
-            // (marginal→q0/q1, logslope→g) has a structural Gram that is
-            // block-diagonal *by channel*, so marginal⊥logslope structurally
-            // and the overlap is invisible (build-1, no drops). The η₁
-            // row-Jacobian view (build-2) row-scales the SHARED matern basis
-            // by DIFFERENT per-row factors (marginal: c(g); logslope:
-            // q1·c1(g)+s_f·z) which are NOT proportional across rows, so it
-            // *breaks* the raw collinearity and the Gram comes back FULL RANK
-            // (DIAG: W-rank=26/26, alias_dirs=0, despite g_pilot moving to
-            // [0.31,0.54]) — also no drops.
-            //
-            // The alias is a collinearity of the RAW columns: marginal and
-            // logslope share the same `matern(PC1,PC2,PC3)` basis evaluated on
-            // the same PCs, so the raw stacked design `[time_exit | marginal |
-            // logslope]` is genuinely W-rank-deficient (the preflight,
-            // `joint_training_design_preflight`, measures exactly this: rank
-            // 19/26, 7 alias dirs, dominant cols logslope[0,3] +
-            // marginal[1,2,4,5,6]). Detect + reduce in THAT metric: build the
-            // Gram on the raw stacked design weighted by the operating-point
-            // IRLS row metric `cross_block_pilot_w` (the metric the inner
-            // penalised Hessian's near-singularity, cond≈5.8e6, actually
-            // tracks; reduces to the preflight's unweighted SVD when weights
-            // are uniform and the pilot is flat). `compile_from_raw_grams`
-            // then resolves the overlap with cross-block carry (R terms —
-            // keep time+marginal high-priority, reparameterise logslope as the
-            // W-orthogonal complement; NOT the falsified v2 whole-block
-            // deletion). Sound: the raw marginal≈logslope collinearity is a
-            // genuine confound (same PC-surface direction represented in both
-            // the mean and the log-slope channel; the inner cannot separate
-            // them → near-singular H_pen), and cross-block carry is the
-            // standard identifiability resolution, here at the operating-point
-            // W rather than at β=0.
-            {
-                use gam_identifiability::families::compiler::{
-                    BlockOrder as IdBlockOrder, compile_from_raw_grams_protected,
-                };
-                let closed_form = (|| -> Result<
-                    Option<(
-                        gam_identifiability::families::compiler::CompiledMap,
-                        (usize, usize, usize),
-                        // #979: used_partial_logslope_reduction (see struct doc)
-                        bool,
-                    )>,
-                    String,
-                > {
-                    let p_total_raw = p_time + p_marg + p_log;
-                    let raw_ranges = vec![
-                        0..p_time,
-                        p_time..(p_time + p_marg),
-                        (p_time + p_marg)..p_total_raw,
-                    ];
-                    if cross_block_pilot_w.len() != n_rows {
-                        return Err(format!(
-                            "raw-stack Gram: cross_block_pilot_w len {} != n_rows {}",
-                            cross_block_pilot_w.len(),
-                            n_rows
-                        ));
-                    }
-                    // Raw stacked exit-channel design `[time_exit | marginal |
-                    // logslope]` — the same column layout the preflight SVDs.
-                    // `dq1` is the time exit design (overwrite_timewiggle already
-                    // filled its analytic tail at the pilot state above).
-                    let mut j_raw = ndarray::Array2::<f64>::zeros((n_rows, p_total_raw));
-                    for i in 0..n_rows {
-                        for j in 0..p_time {
-                            j_raw[[i, j]] = dq1[[i, j]];
-                        }
-                        for j in 0..p_marg {
-                            j_raw[[i, p_time + j]] = m_dq[[i, j]];
-                        }
-                        for j in 0..p_log {
-                            j_raw[[i, p_time + p_marg + j]] = g_dg[[i, j]];
-                        }
-                    }
-                    // K^S = Xᵀ X (structural — sees the raw marginal≈logslope
-                    // collinearity), K^H = Xᵀ diag(w) X (operating-point W metric).
-                    let gram_struct = gam_linalg::faer_ndarray::fast_ata(&j_raw);
-                    let gram_h = fast_xt_diag_x(&j_raw, &cross_block_pilot_w);
-                    // #808 diagnostic: W-metric thin-SVD of the raw stacked design
-                    // (mirrors `joint_training_design_preflight`) so we can see
-                    // directly whether the reduction metric is rank-deficient (and
-                    // by how much) before compile runs.
-                    if log::log_enabled!(log::Level::Info) {
-                        use gam_linalg::faer_ndarray::FaerSvd;
-                        let mut jw = j_raw.clone();
-                        for i in 0..n_rows {
-                            let s = cross_block_pilot_w[i].max(0.0).sqrt();
-                            for j in 0..p_total_raw {
-                                jw[[i, j]] *= s;
-                            }
-                        }
-                        if let Ok((_u, sigma, _vt)) = jw.svd(false, false) {
-                            let smax = sigma.iter().copied().fold(0.0_f64, f64::max);
-                            let tol_dbg = smax
-                                * (n_rows.max(p_total_raw) as f64)
-                                * 16.0
-                                * f64::EPSILON;
-                            let n_alias = sigma.iter().filter(|&&s| s <= tol_dbg).count();
-                            let smin = sigma.iter().copied().fold(f64::INFINITY, f64::min);
-                            let g_range = {
-                                let mut lo = f64::INFINITY;
-                                let mut hi = f64::NEG_INFINITY;
-                                for &g in slopes_pilot.iter() {
-                                    lo = lo.min(g);
-                                    hi = hi.max(g);
-                                }
-                                (lo, hi)
-                            };
-                            log::info!(
-                                "[smgs phase-4b rawstack-gram DIAG] sigma_max={smax:.4e} sigma_min={smin:.4e} \
-                                 tol={tol_dbg:.4e} W-rank={}/{} alias_dirs={n_alias} g_pilot=[{:.3e},{:.3e}]",
-                                p_total_raw - n_alias,
-                                p_total_raw,
-                                g_range.0,
-                                g_range.1,
-                            );
-                        }
-                    }
-                    // The monotone time-wiggle time block is a fixed nonlinear
-                    // functional basis, not a plain linear design: its
-                    // `SmsTimewiggleTimeJacobian` recomputes the full-width
-                    // wiggle basis on every evaluation and cannot be expressed
-                    // on a linearly reduced time design. Protect it from the
-                    // compiled-map reduction so it stays at raw width (its own
-                    // wiggle penalty nullspace regularises its conditioning);
-                    // marginal/logslope still reduce against the full time
-                    // anchor. Without this, a time reduction (11→9 here) leaves
-                    // the Jacobian writing `p_tw` wiggle columns into a narrower
-                    // `p_time`-wide buffer — an out-of-bounds panic.
-                    let time_is_timewiggle = spec.timewiggle_block.is_some();
-                    let map = compile_from_raw_grams_protected(
-                        &gram_h,
-                        &gram_struct,
-                        &raw_ranges,
-                        &[
-                            IdBlockOrder::Time,
-                            IdBlockOrder::Marginal,
-                            IdBlockOrder::Logslope,
-                        ],
-                        &[time_is_timewiggle, false, false],
-                    )
-                    .map_err(|e| format!("compile_from_raw_grams: {e}"))?;
-                    if map.raw_from_compiled.shape()[0] != p_total_raw {
-                        return Err(format!(
-                            "T raw width {} != expected {}",
-                            map.raw_from_compiled.shape()[0],
-                            p_total_raw
-                        ));
-                    }
-                    if !map.raw_from_compiled.iter().all(|v| v.is_finite()) {
-                        return Err("T contains non-finite entries".to_string());
-                    }
-                    let w_time = map.compiled_block_ranges[0].len();
-                    let w_marg = map.compiled_block_ranges[1].len();
-                    let w_log = map.compiled_block_ranges[2].len();
-                    // #808 root guard: rawstack reduction is only a valid
-                    // identifiability cleanup when it preserves the physical
-                    // model channels. Clustered-PC SMGS can make the raw
-                    // marginal/logslope columns identical even though the full
-                    // nonlinear η-Jacobian still distinguishes them. Applying
-                    // the map in that case zeroes the entire lower-priority
-                    // logslope block and deletes the model's slope channel,
-                    // turning a conditioning problem into a misspecified fit.
-                    //
-                    // Keep non-destructive partial reductions: they remove
-                    // redundant raw coordinates while retaining at least one
-                    // degree of freedom in each required channel. Reject only
-                    // maps that collapse a required channel to zero width.
-                    if let Some(channel) = smgs_deleted_required_channel_reason(
-                        p_time, p_marg, p_log, w_time, w_marg, w_log,
-                    ) {
-                        // #741: the η₁-only rawstack W-metric collapsed a whole
-                        // required channel. That metric is only the η₁-channel
-                        // row curvature; the true survival row Hessian is 4×4 in
-                        // (q₀,q₁,qd₁,g) and chains DIFFERENTLY into each block, so
-                        // marginal/logslope that look identical in η₁ are kept
-                        // distinct by the full driver. Before falling back to the
-                        // unreduced (rank-deficient) raw design, retry the
-                        // reduction with the full row-Hessian per-term compiler.
-                        // If it preserves every required channel, the η₁ collapse
-                        // was a FALSE alias — emit its CompiledMap so Newton runs
-                        // in the correct identifiable quotient (the closed-form
-                        // fast path engages). Only when the full row Hessian ALSO
-                        // deletes the channel is the alias real → unreduced design.
-                        use crate::survival::marginal_slope::identifiability::{
-                            SurvivalRowHessian, compile_survival_parametric_designs_per_term,
-                            compiled_map_from_per_term,
-                        };
-                        let full_row_hess = (|| -> Result<
-                            Option<(
-                                gam_identifiability::families::compiler::CompiledMap,
-                                (usize, usize, usize),
-                                // #979: used_partial_logslope_reduction (see struct doc)
-                                bool,
-                            )>,
-                            String,
-                        > {
-                            let row_hess = SurvivalRowHessian::from_pilot_primary_state(
-                                &q0_pilot,
-                                &q1_pilot,
-                                &qd1_pilot,
-                                &slopes_pilot,
-                                &spec.z,
-                                &score_covariance,
-                                &spec.weights,
-                                &spec.event_target,
-                                derivative_guard,
-                                probit_scale,
-                            )?;
-                            let per_term = compile_survival_parametric_designs_per_term(
-                                dq0.clone(),
-                                dq1.clone(),
-                                dqd1.clone(),
-                                &time_partition,
-                                m_dq.clone(),
-                                m_dqd1.clone(),
-                                &marginal_partition,
-                                raw_logslope_layout.clone(),
-                                &logslope_partition,
-                                &row_hess,
-                                spec.timewiggle_block.is_some(),
-                            )?;
-                            let map = compiled_map_from_per_term(&per_term);
-                            let fw_time = map.compiled_block_ranges[0].len();
-                            let fw_marg = map.compiled_block_ranges[1].len();
-                            let fw_log = map.compiled_block_ranges[2].len();
-                            if let Some(real) = smgs_deleted_required_channel_reason(
-                                p_time, p_marg, p_log, fw_time, fw_marg, fw_log,
-                            ) {
-                                // #979 residual phantom-null path. The full 4×4
-                                // row-Hessian quotient ALSO collapses a required
-                                // channel: the effective metric is genuinely
-                                // rank-deficient here. Historically this fell back
-                                // to the UNREDUCED design + Jeffreys, leaving a
-                                // quadratically-flat near-null direction in the
-                                // joint penalized Hessian — the inner solve could
-                                // not certify stationarity, so the fit could not
-                                // converge and reported non-stationarity honestly.
-                                //
-                                // Instead, MEASURE before deciding. Assemble the
-                                // joint penalized Hessian M = JᵀHJ + S and the
-                                // joint score g at the pilot, eigendecompose, and
-                                // for every near-null direction v measure the
-                                // gradient residual r = |vᵀg|. Accept the
-                                // channel-collapsing reduction (projecting that
-                                // direction away) ONLY when every near-null
-                                // direction is an empirical phantom — r ≤ λ·step,
-                                // i.e. the optimizer would converge it in under one
-                                // trust step, so projecting it changes neither the
-                                // optimum nor hides non-stationarity. If any
-                                // near-null direction carries real non-stationarity
-                                // (r > λ·step, e.g. a near-separating pull), or the
-                                // collapsed channel is the spatial TIME block, we
-                                // refuse to project and keep the conservative
-                                // unreduced + Jeffreys fallback (non-stationarity
-                                // is then reported honestly). This is the gate that prevents the
-                                // reward-hacking failure mode of silently deleting
-                                // a direction the model genuinely needs — exactly
-                                // the regression a naive nullspace-shrink caused on
-                                // the n ≥ 1000 spatial path.
-                                //
-                                // #979 ROOT-CAUSE FIX (preferred over the gate
-                                // below): when the COLLAPSED channel is logslope,
-                                // first try a W-orthogonal PARTIAL reduced-logslope
-                                // reparam — the proven-correct BMS construction
-                                // (`bms::block_specs::reduced_logslope_transform_effective`)
-                                // ported into survival's per-row 4×4 Hessian metric
-                                // (`survival_reduced_logslope_transform_effective`).
-                                // The full per-term compiler deletes the WHOLE
-                                // logslope channel because its priority-ordered RRQR
-                                // attributes every shared marginal↔logslope direction
-                                // to the lowest-priority logslope block. The effective
-                                // Schur Gram instead removes from logslope ONLY the
-                                // directions W-explained by the marginal span, KEEPS
-                                // the `r` surviving directions, and leaves marginal/
-                                // time untouched. The joint penalised Hessian
-                                // M = JᵀHJ + S is then full-rank BY CONSTRUCTION — the
-                                // 2e14 marginal↔logslope phantom null is gone, the
-                                // inner joint-Newton certifies on its own, so the
-                                // fit converges without any backstop.
-                                // Only the logslope confound is eligible here (the
-                                // spatial time block is protected by the gate below).
-                                if real == "logslope" {
-                                    use crate::survival::marginal_slope::identifiability::{
-                                        survival_block_diagonal_logslope_map,
-                                        survival_reduced_logslope_transform_effective,
-                                    };
-                                    use crate::bms::block_specs::ReducedLogslopeOutcome;
-                                    match survival_reduced_logslope_transform_effective(
-                                        m_dq.view(),
-                                        &raw_logslope_layout,
-                                        &row_hess,
-                                    ) {
-                                        Ok(ReducedLogslopeOutcome::Reduced(t_log)) => {
-                                            let wl = t_log.ncols();
-                                            let bd_map = survival_block_diagonal_logslope_map(
-                                                p_time, p_marg, &t_log,
-                                            );
-                                            log::info!(
-                                                "[smgs phase-4b compiled-map] #979: full row-Hessian \
-                                                 collapses the logslope channel ({p_log}→0), but the \
-                                                 W-orthogonal effective Schur Gram keeps {wl}/{p_log} \
-                                                 surviving logslope directions; engaging the BMS-style \
-                                                 PARTIAL reduced-logslope reparam (marginal/time pass \
-                                                 through unchanged) so the joint penalised Hessian is \
-                                                 full-rank by construction — phantom null removed, \
-                                                 inner solve certifies on its own",
-                                            );
-                                            return Ok(Some((bd_map, (p_time, p_marg, wl), true)));
-                                        }
-                                        Ok(ReducedLogslopeOutcome::FullRank) => {
-                                            // No effective confound to remove; fall
-                                            // through to the measured-phantom gate.
-                                        }
-                                        Ok(ReducedLogslopeOutcome::FullyConfounded) => {
-                                            // The ENTIRE effective logslope image is
-                                            // W-explained by the marginal span — the
-                                            // block is unidentified (#2245 finding 45
-                                            // sibling). Deleting the whole channel is
-                                            // the deliberate handling here: the gate
-                                            // below performs exactly that projection,
-                                            // now reached explicitly rather than via a
-                                            // signal shared with the full-rank case.
-                                            log::info!(
-                                                "[smgs phase-4b compiled-map] #979: the effective \
-                                                 Schur Gram keeps 0/{p_log} logslope directions — \
-                                                 the block is fully confounded with the marginal \
-                                                 surface; deferring to the measured-phantom gate \
-                                                 to delete the unidentified channel",
-                                            );
-                                        }
-                                        Err(reason) => {
-                                            log::warn!(
-                                                "[smgs phase-4b compiled-map] #979 partial \
-                                                 reduced-logslope reparam unavailable ({reason}); \
-                                                 falling back to the measured-phantom gate",
-                                            );
-                                        }
-                                    }
-                                }
-                                let gate = (|| -> Result<bool, String> {
-                                    // Protect the spatial/time path: only the
-                                    // marginal↔logslope confound is eligible for
-                                    // measured projection here.
-                                    if real == "time" {
-                                        return Ok(false);
-                                    }
-                                    let time_pen = dense_block_penalty_from_dense_list(
-                                        &spec.time_block.penalties,
-                                        p_time,
-                                    )?;
-                                    let marg_pen = dense_block_penalty_from_blockwise(
-                                        &marginal_design.penalties,
-                                        p_marg,
-                                    )?;
-                                    let log_pen = dense_block_penalty_from_blockwise(
-                                        &logslope_design.penalties,
-                                        p_log,
-                                    )?;
-                                    let s_total = assemble_unit_block_penalty(
-                                        p_time, p_marg, p_log, &time_pen, &marg_pen, &log_pen,
-                                    )?;
-                                    let report = survival_kkt_refusal_report_at_pilot(
-                                        SurvivalEffectiveDesigns {
-                                            dq0: &dq0,
-                                            dq1: &dq1,
-                                            dqd1: &dqd1,
-                                            m_dq: &m_dq,
-                                            m_dqd1: &m_dqd1,
-                                            logslope_layout: &raw_logslope_layout,
-                                        },
-                                        &row_hess,
-                                        SurvivalPilotRows {
-                                            q0: &q0_pilot,
-                                            q1: &q1_pilot,
-                                            qd1: &qd1_pilot,
-                                            slopes: &slopes_pilot,
-                                            z: &spec.z,
-                                            covariance: &score_covariance,
-                                            weights: &spec.weights,
-                                            event: &spec.event_target,
-                                        },
-                                        SurvivalLinkParams {
-                                            derivative_guard,
-                                            probit_scale,
-                                        },
-                                        &s_total,
-                                        KKT_PHANTOM_TRUST_RADIUS,
-                                    )?;
-                                    log::info!(
-                                        "[smgs phase-4b kkt-refusal] channel={real} {}",
-                                        report.summary(),
-                                    );
-                                    Ok(report.all_near_null_are_phantom())
-                                })();
-                                match gate {
-                                    Ok(true) => {
-                                        log::info!(
-                                            "[smgs phase-4b compiled-map] #979: full row-Hessian \
-                                             collapses channel {real} (time {p_time}→{fw_time}, \
-                                             marginal {p_marg}→{fw_marg}, logslope {p_log}→{fw_log}), \
-                                             but the joint penalized Hessian's near-null \
-                                             direction(s) are MEASURED phantoms (gradient residual \
-                                             ≤ λ·step); engaging the channel-reduced quotient so \
-                                             the phantom null direction is projected out — \
-                                             inner solve certifies on its own",
-                                        );
-                                        Ok(Some((map, (fw_time, fw_marg, fw_log), false)))
-                                    }
-                                    Ok(false) => {
-                                        log::warn!(
-                                            "[smgs phase-4b compiled-map] full row-Hessian compile \
-                                             also deletes channel {real} (time {p_time}→{fw_time}, \
-                                             marginal {p_marg}→{fw_marg}, logslope {p_log}→{fw_log}); \
-                                             the near-null direction carries real non-stationarity \
-                                             (or is the spatial time block) — refusing to project; \
-                                             using the unreduced design and leaving the near-null \
-                                             direction to Jeffreys conditioning",
-                                        );
-                                        Ok(None)
-                                    }
-                                    Err(reason) => {
-                                        log::warn!(
-                                            "[smgs phase-4b compiled-map] KKT-refusal measurement \
-                                             failed ({reason}); conservatively using the unreduced \
-                                             design for channel {real}",
-                                        );
-                                        Ok(None)
-                                    }
-                                }
-                            } else {
-                                log::info!(
-                                    "[smgs phase-4b compiled-map] #741: η₁-only metric falsely \
-                                     collapsed channel {channel}; full 4×4 row-Hessian quotient \
-                                     keeps all channels (time {p_time}→{fw_time}, \
-                                     marginal {p_marg}→{fw_marg}, logslope {p_log}→{fw_log}); \
-                                     engaging closed-form fast path on the correct quotient",
-                                );
-                                Ok(Some((map, (fw_time, fw_marg, fw_log), false)))
-                            }
-                        })();
-                        match full_row_hess {
-                            Ok(some) => Ok(some),
-                            Err(reason) => {
-                                log::warn!(
-                                    "[smgs phase-4b compiled-map] full row-Hessian retry failed \
-                                     ({reason}); rawstack metric collapsed channel {channel} — \
-                                     using the unreduced design and leaving the near-null \
-                                     direction to Jeffreys conditioning",
-                                );
-                                Ok(None)
-                            }
-                        }
-                    } else {
-                        Ok(Some((map, (w_time, w_marg, w_log), false)))
-                    }
-                })();
-                match closed_form {
-                    Ok(Some((map, (wt, wm, wl), used_partial_logslope_reduction))) => {
-                        let drops = (
-                            p_time.saturating_sub(wt),
-                            p_marg.saturating_sub(wm),
-                            p_log.saturating_sub(wl),
-                        );
-                        // Populate the post-accept recompile context.
-                        // The recompile hook rebuilds from the densified
-                        // matrices at converged β; the initial drops field
-                        // is purely diagnostic.
-                        recompile_ctx = Some(SmgsRecompileAfterAcceptContext {
-                            dq0: dq0.clone(),
-                            dq1: dq1.clone(),
-                            dqd1: dqd1.clone(),
-                            m_dq: m_dq.clone(),
-                            m_dqd1: m_dqd1.clone(),
-                            logslope_layout: raw_logslope_layout.clone(),
-                            time_partition: time_partition.clone(),
-                            marginal_partition: marginal_partition.clone(),
-                            logslope_partition: logslope_partition.clone(),
-                            offset_entry: spec.time_block.offset_entry.clone(),
-                            offset_exit: spec.time_block.offset_exit.clone(),
-                            derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
-                            z: spec.z.clone(),
-                            covariance: score_covariance.clone(),
-                            weights: spec.weights.clone(),
-                            event: spec.event_target.clone(),
-                            derivative_guard,
-                            probit_scale,
-                            drops_by_block_initial: drops,
-                            used_partial_logslope_reduction,
-                            protect_time: spec.timewiggle_block.is_some(),
-                        });
-                        if drops.0 + drops.1 + drops.2 == 0 {
-                            log::info!(
-                                "[smgs phase-4b compiled-map] compile_from_raw_grams ok with no drops \
-                                 (time {p_time}→{wt}, marginal {p_marg}→{wm}, logslope {p_log}→{wl}); \
-                                 production path = compiled_map, skipping apply"
-                            );
-                            return Ok(None);
-                        }
-                        log::info!(
-                            "[smgs phase-4b compiled-map] applying CompiledMap T: \
-                             time {p_time}→{wt}, marginal {p_marg}→{wm}, logslope {p_log}→{wl} \
-                             (drops time={}, marginal={}, logslope={}); \
-                             production path = compiled_map",
-                            drops.0,
-                            drops.1,
-                            drops.2,
-                        );
-                        let time_pens_bw: Vec<gam_terms::smooth::BlockwisePenalty> = spec
-                            .time_block
-                            .penalties
-                            .iter()
-                            .map(|p| gam_terms::smooth::BlockwisePenalty::new(0..p_time, p.clone()))
-                            .collect();
-                        let applied: CompiledSurvivalDesignsVMExact =
-                            apply_compiled_map_to_designs(
-                                &map,
-                                spec.time_block.design_entry.clone(),
-                                spec.time_block.design_exit.clone(),
-                                spec.time_block.design_derivative_exit.clone(),
-                                marginal_design.design.clone(),
-                                logslope_design.design.clone(),
-                                &time_pens_bw,
-                                &marginal_design.penalties,
-                                &logslope_design.penalties,
-                            )?;
-                        let ordering = [
-                            IdBlockOrder::Time,
-                            IdBlockOrder::Marginal,
-                            IdBlockOrder::Logslope,
-                        ];
-                        let lift = Gauge::from_compiled_map(&map, &ordering);
-                        return Ok(Some((applied, lift)));
-                    }
-                    Ok(None) => {
-                        return Ok(None);
-                    }
-                    Err(reason) => {
-                        return Err(format!("closed-form path unavailable: {reason}"));
-                    }
-                }
-            }
-        })();
-        match attempt {
-            Ok(Some((applied, lift))) => {
-                // V+M-exact compiled .design swapped into clones of the
-                // raw TermCollectionDesigns. The TermCollectionDesign's
-                // .penalties field stays raw (Vec<BlockwisePenalty>) for
-                // predict-time consumers; the V+M-exact full-width
-                // pulled-back penalties travel via the side bindings
-                // `*_penalties_vm` and are wired into the per-block
-                // `ParameterBlockSpec.penalties` inside `build_blocks`.
-                //
-                // Other TermCollectionDesign metadata stays at raw width
-                // — it's consumed post-fit, by which point β has been
-                // lifted back to raw via `T · θ`.
-                let mut marg_out = marginal_design.clone();
-                marg_out.design = applied.marginal_design;
-                let mut log_out = logslope_design.clone();
-                let compiled_logslope_layout = logslope_topology.materialize(
-                    raw_logslope_design_for_layout.clone(),
-                    applied.logslope_current_from_raw.clone(),
-                    &common_logslope_offset,
-                )?;
-                log_out.design = compiled_logslope_layout.coefficient_design().clone();
-                (
-                    applied.time_design_entry,
-                    applied.time_design_exit,
-                    applied.time_design_derivative_exit,
-                    marg_out,
-                    log_out,
-                    compiled_logslope_layout,
-                    Some(lift),
-                    Some(applied.time_penalties),
-                    Some(applied.marginal_penalties),
-                    Some(applied.logslope_penalties),
-                    recompile_ctx,
-                )
-            }
-            Ok(None) => (
-                spec.time_block.design_entry.clone(),
-                spec.time_block.design_exit.clone(),
-                spec.time_block.design_derivative_exit.clone(),
-                marginal_design.clone(),
-                logslope_design.clone(),
-                raw_logslope_layout.clone(),
-                None,
-                None,
-                None,
-                None,
-                recompile_ctx,
-            ),
-            Err(reason) => return Err(format!("[smgs phase-4b active] {reason}")),
-        }
-    };
+    let design_entry = spec.time_block.design_entry.clone();
+    let design_exit = spec.time_block.design_exit.clone();
+    let design_derivative_exit = spec.time_block.design_derivative_exit.clone();
     let offset_entry = Arc::new(spec.time_block.offset_entry.clone());
     let offset_exit = Arc::new(spec.time_block.offset_exit.clone());
     let derivative_offset_exit = Arc::new(spec.time_block.derivative_offset_exit.clone());
@@ -1711,8 +730,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let make_family = |marginal_design: &TermCollectionDesign,
                        logslope_design: &TermCollectionDesign,
                        theta: &Array1<f64>,
-                       flex: FlexActivation,
-                       coords: BlockDesignCoords|
+                       flex: FlexActivation|
      -> Result<SurvivalMarginalSlopeFamily, String> {
         let family_hyper = family_hyper_from_theta(theta)?;
         let sigma = sigma_from_theta(theta)?;
@@ -1741,11 +759,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             FlexActivation::OffForRigidPilot => None,
             FlexActivation::On => influence_absorber_residualized.clone(),
         };
-        let logslope_layout = match coords {
-            BlockDesignCoords::PostCutover => post_cutover_logslope_layout.clone(),
-            BlockDesignCoords::RematerializedRaw => logslope_topology
-                .materialize_identity(logslope_design.design.clone(), &common_logslope_offset)?,
-        };
+        let logslope_layout = logslope_topology
+            .materialize_identity(logslope_design.design.clone(), &common_logslope_offset)?;
         logslope_layout.validate_for(spec.z.ncols())?;
         Ok(SurvivalMarginalSlopeFamily {
             n,
@@ -1780,15 +795,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let build_blocks = |rho: &Array1<f64>,
                         marginal_design: &TermCollectionDesign,
                         logslope_design: &TermCollectionDesign,
-                        flex: FlexActivation,
-                        coords: BlockDesignCoords|
+                        flex: FlexActivation|
      -> Result<Vec<ParameterBlockSpec>, String> {
         let hints = hints.borrow();
-        let block_logslope_layout = match coords {
-            BlockDesignCoords::PostCutover => post_cutover_logslope_layout.clone(),
-            BlockDesignCoords::RematerializedRaw => logslope_topology
-                .materialize_identity(logslope_design.design.clone(), &common_logslope_offset)?,
-        };
+        let block_logslope_layout = logslope_topology
+            .materialize_identity(logslope_design.design.clone(), &common_logslope_offset)?;
         block_logslope_layout.validate_for(spec.z.ncols())?;
         let mut cursor = 0usize;
         let rho_time = rho
@@ -1885,57 +896,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 score_covariance.clone(),
             )?,
         ];
-        // V+M-exact cutover: when the active cutover fired, the
-        // `*_penalties_vm` side bindings carry per-block-width Dense
-        // penalty matrices pulled back through each block's OWN diagonal
-        // reparameterisation V_b (V_bᵀ S_b V_b), sized
-        // `w_b_compiled × w_b_compiled`. They substitute for each block's
-        // raw-width Blockwise penalties so the inner solver sees the exact
-        // compiled-coord penalties. The penalty count is invariant under the
-        // pullback so cursor accounting based on `design.penalties.len()` (raw
-        // widths) still matches. The cross-block residualisation R_{a→b} is
-        // carried by the residualised compiled *design* columns, not the
-        // penalty, so each block's penalty stays per-block-width — matching the
-        // `ParameterBlockSpec` p_b × p_b validation contract.
-        //
-        // These pulled-back penalties are valid ONLY against the compiled
-        // designs they were derived from. The `coords` tag — set by each call
-        // site, not inferred from a width coincidence — says whether the
-        // designs handed to this call ARE those compiled designs:
-        //
-        //   * `PostCutover`: the construction-site designs the `_vm` were
-        //     pulled back through. Install them, and assert width agreement —
-        //     a mismatch here means the compiled designs and compiled penalties
-        //     have desynced (a construction-site wiring bug), which we surface
-        //     loudly rather than letting `validate_blockspecs` reject it later
-        //     with a less actionable message.
-        //   * `RematerializedRaw`: the κ-probe re-materialises *raw*-width
-        //     marginal/logslope designs from the boot specs and routes them
-        //     here. The raw design-derived penalties already installed by
-        //     `build_*_blockspec` are authoritative; installing the compiled
-        //     `_vm` here is the #788 shape mismatch (and, when widths happen to
-        //     coincide with no column drop but `V≠I`, a silent `Vᵀ S V`-on-raw
-        //     corruption). Keep the raw penalties.
-        if coords == BlockDesignCoords::PostCutover {
-            for (block_idx, pens_vm) in [
-                (0usize, &time_penalties_vm),
-                (1, &marginal_penalties_vm),
-                (2, &logslope_penalties_vm),
-            ] {
-                if let Some(pens) = pens_vm {
-                    let w = blocks[block_idx].design.ncols();
-                    if !pens.iter().all(|p| p.shape() == (w, w)) {
-                        return Err(format!(
-                            "survival marginal-slope: compiled V+M penalty/design width desync at \
-                             block {block_idx} (compiled design width {w}, penalty shapes {:?}); \
-                             the post-cutover compiled designs and `*_penalties_vm` must agree",
-                            pens.iter().map(|p| p.shape()).collect::<Vec<_>>()
-                        ));
-                    }
-                    blocks[block_idx].penalties = pens.clone();
-                }
-            }
-        }
         if let Some(prepared) = score_warp_active {
             let rho_h = rho
                 .slice(s![cursor..cursor + prepared.block.penalties.len()])
@@ -2120,16 +1080,12 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             &marginal_design,
             &logslope_design,
             FlexActivation::OffForRigidPilot,
-            // Construction-site designs: the post-cutover compiled marginal/
-            // logslope designs the `*_penalties_vm` were pulled back through.
-            BlockDesignCoords::PostCutover,
         )?;
         let rigid_family = make_family(
             &marginal_design,
             &logslope_design,
             &initial_hyper_theta,
             FlexActivation::OffForRigidPilot,
-            BlockDesignCoords::PostCutover,
         )?;
         let mut pilot_options = options.clone();
         // The pilot is only a warm start. Avoid production covariance assembly
@@ -2252,14 +1208,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         &marginal_design,
         &logslope_design,
         FlexActivation::On,
-        // Construction-site designs: the post-cutover compiled marginal/
-        // logslope designs the `*_penalties_vm` were pulled back through.
-        BlockDesignCoords::PostCutover,
     )?;
     // Validate the assembled block specs at the construction boundary so any
-    // design/penalty width inconsistency (e.g. a compiled-map penalty that
-    // does not match its block's reduced compiled width) surfaces here as a
-    // clean typed error string. Without this, the inconsistency would only be
+    // design/penalty width inconsistency surfaces here as a clean typed error
+    // string. Without this, the inconsistency would only be
     // caught by the internal `assert_valid_blockspecs` invariant guards inside
     // the capability-query hooks (`outer_hyper_hessian_dense_available`, …)
     // reached from `custom_family_outer_derivatives` below, firing a bare
@@ -2273,7 +1225,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         &logslope_design,
         &initial_hyper_theta,
         FlexActivation::On,
-        BlockDesignCoords::PostCutover,
     )?;
     let (joint_gradient, joint_hessian) =
         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
@@ -2401,22 +1352,17 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 theta.len(),
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            // Outer κ-probe / eval: `designs` are re-materialised RAW-width
-            // designs from the boot specs, so the compiled `*_penalties_vm` do
-            // not apply — keep the raw design-derived penalties (#788).
             let blocks = build_blocks(
                 &rho,
                 &designs[0],
                 &designs[1],
                 FlexActivation::On,
-                BlockDesignCoords::RematerializedRaw,
             )?;
             let family = make_family(
                 &designs[0],
                 &designs[1],
                 theta,
                 FlexActivation::On,
-                BlockDesignCoords::RematerializedRaw,
             )?;
             let fit = match provenance {
                 SpatialFitProvenance::NoOuterOptimization => inner_fit(&family, &blocks, options)?,
@@ -2471,15 +1417,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 row_set_rows,
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            // Outer κ-probe / eval: `designs` are re-materialised RAW-width
-            // designs from the boot specs, so the compiled `*_penalties_vm` do
-            // not apply — keep the raw design-derived penalties (#788).
             let blocks = build_blocks(
                 &rho,
                 &designs[0],
                 &designs[1],
                 FlexActivation::On,
-                BlockDesignCoords::RematerializedRaw,
             )?;
             if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
                 let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
@@ -2508,7 +1450,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 &designs[1],
                 theta,
                 FlexActivation::On,
-                BlockDesignCoords::RematerializedRaw,
             )?;
             let hyper_layout = get_hyper_layout(theta, specs, designs)?;
             let eval_id = outer_eval_counter.get();
@@ -2571,15 +1512,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 theta.len(),
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            // Outer κ-probe / eval: `designs` are re-materialised RAW-width
-            // designs from the boot specs, so the compiled `*_penalties_vm` do
-            // not apply — keep the raw design-derived penalties (#788).
             let blocks = build_blocks(
                 &rho,
                 &designs[0],
                 &designs[1],
                 FlexActivation::On,
-                BlockDesignCoords::RematerializedRaw,
             )?;
             if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
                 let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
@@ -2599,7 +1536,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 &designs[1],
                 theta,
                 FlexActivation::On,
-                BlockDesignCoords::RematerializedRaw,
             )?;
             let hyper_layout = get_hyper_layout(theta, specs, designs)?;
             let eval_id = outer_eval_counter.get();
@@ -2643,7 +1579,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // Log the outer-solve outcome on BOTH paths: the inner-solve non-convergence
     // abort (#979/#1040) returns Err before the success log below, so without
     // this the failure stage would be invisible to a `log` backend.
-    let mut solved = match solved {
+    let solved = match solved {
         Ok(s) => s,
         Err(e) => {
             log::warn!(
@@ -2659,202 +1595,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         solved.fit.outer_iterations,
         solved.fit.inner_cycles,
     );
-    // Recompile-after-first-PIRLS-accept refinement (math-agent review).
-    //
-    // The initial cutover compile used a structural identity row Hessian,
-    // which catches column-level cross-block aliases but misses the
-    // "pilot-curvature trap": directions that look identifiable under
-    // identity H but collapse under the actual β-converged H (or, less
-    // commonly, the reverse). Now that the outer/PIRLS has accepted a
-    // non-trivial β, rebuild the row Hessian from the row primary state
-    // at the converged β, re-run `compile_survival_parametric_designs_per_term`,
-    // and compare drops_by_block. If the two compiles disagree, log a
-    // warning surfacing the diff — the structural compile is still load-
-    // bearing for predict-time consumers (it owns the T-lift the inner
-    // Newton actually used), so we don't silently re-fit; the warning is
-    // the actionable diagnostic the math agent asked for. Re-fitting once
-    // with the new compile would require rebuilding all of the captured
-    // post-cutover bindings (designs, make_family, build_blocks, the
-    // outer solve closures), which is outside the surgical scope of this
-    // hook; the diagnostic is the principled stop here.
-    if n < 1_000 {
-        log::debug!(
-            "[smgs phase-4b recompile-after-accept] skipped for tiny fit n={n}; \
-             diagnostic-only post-convergence recompile is reserved for larger fits"
-        );
-    } else if let Some(ref ctx) = recompile_after_accept {
-        let recompile_started = std::time::Instant::now();
-        // Lift compiled β → raw β when the cutover fired. Otherwise the
-        // block_states already carry raw-width β.
-        let n_lift = smgs_lift_v.as_ref().map(|l| l.n_blocks()).unwrap_or(0);
-        let raw_core_betas: Vec<Array1<f64>> = if let Some(ref lift) = smgs_lift_v {
-            let compiled_betas: Vec<Array1<f64>> = solved
-                .fit
-                .block_states
-                .iter()
-                .take(n_lift)
-                .map(|s| s.beta.clone())
-                .collect();
-            lift.lift_block_betas(&compiled_betas)
-        } else {
-            solved
-                .fit
-                .block_states
-                .iter()
-                .take(3)
-                .map(|state| state.beta.clone())
-                .collect()
-        };
-        let recompile_result = (|| -> Result<(usize, usize, usize), String> {
-            use crate::survival::marginal_slope::identifiability::{
-                SurvivalRowHessian, compile_survival_parametric_designs_per_term,
-            };
-            let beta_time = raw_core_betas
-                .first()
-                .ok_or_else(|| "no time block β available".to_string())?;
-            let beta_logslope = raw_core_betas
-                .get(2)
-                .ok_or_else(|| "no logslope block β available".to_string())?;
-            if beta_time.len() != ctx.dq0.ncols() {
-                return Err(format!(
-                    "raw time β width {} != raw design width {}",
-                    beta_time.len(),
-                    ctx.dq0.ncols()
-                ));
-            }
-            let n_rows = ctx.dq0.nrows();
-            // Marginal η is lift-invariant. Physical logslope channels are not
-            // a scalar η: evaluate them from the raw coefficient vector through
-            // the canonical layout below.
-            let marginal_eta = solved
-                .fit
-                .block_states
-                .get(1)
-                .map(|s| s.eta.clone())
-                .ok_or_else(|| "no marginal block_state".to_string())?;
-            if marginal_eta.len() != n_rows {
-                return Err(format!(
-                    "block_state eta length mismatch: marginal={}, n_rows={}",
-                    marginal_eta.len(),
-                    n_rows
-                ));
-            }
-            let time_q0 = ctx.dq0.dot(beta_time);
-            let time_q1 = ctx.dq1.dot(beta_time);
-            let time_qd1 = ctx.dqd1.dot(beta_time);
-            let mut q0 = Array1::<f64>::zeros(n_rows);
-            let mut q1 = Array1::<f64>::zeros(n_rows);
-            let mut qd1 = Array1::<f64>::zeros(n_rows);
-            for i in 0..n_rows {
-                q0[i] = time_q0[i] + ctx.offset_entry[i] + marginal_eta[i];
-                q1[i] = time_q1[i] + ctx.offset_exit[i] + marginal_eta[i];
-                qd1[i] = time_qd1[i] + ctx.derivative_offset_exit[i];
-            }
-            let slopes = ctx
-                .logslope_layout
-                .physical_values(ctx.z.ncols(), beta_logslope.view())?;
-            let row_hess = SurvivalRowHessian::from_pilot_primary_state(
-                &q0,
-                &q1,
-                &qd1,
-                &slopes,
-                &ctx.z,
-                &ctx.covariance,
-                &ctx.weights,
-                &ctx.event,
-                ctx.derivative_guard,
-                ctx.probit_scale,
-            )?;
-            let compiled = compile_survival_parametric_designs_per_term(
-                ctx.dq0.clone(),
-                ctx.dq1.clone(),
-                ctx.dqd1.clone(),
-                &ctx.time_partition,
-                ctx.m_dq.clone(),
-                ctx.m_dqd1.clone(),
-                &ctx.marginal_partition,
-                ctx.logslope_layout.clone(),
-                &ctx.logslope_partition,
-                &row_hess,
-                ctx.protect_time,
-            )?;
-            Ok(compiled.drops_by_block)
-        })();
-        match recompile_result {
-            Ok(drops_post) if ctx.used_partial_logslope_reduction => {
-                // #979: the cutover used the W-orthogonal PARTIAL
-                // reduced-logslope reparam, whose structural drops come from
-                // the effective Schur Gram (keep `wl` surviving directions).
-                // The recompile above re-runs the FULL per-term compiler, which
-                // by construction collapses the WHOLE logslope channel — that
-                // is exactly the over-collapse the partial reparam routes
-                // around, so a logslope-drop difference here is EXPECTED and
-                // healthy, not a pilot-curvature trap. Confirm the full
-                // compiler still over-collapses logslope at converged β (the
-                // confound persists, so the partial reparam was the right
-                // call) and log it at info without crying wolf.
-                let confound_persists = drops_post.2 > ctx.drops_by_block_initial.2;
-                log::info!(
-                    "[smgs phase-4b recompile-after-accept] #979 partial reduced-logslope \
-                     reparam: structural drops=(time={}, marginal={}, logslope={}); full per-term \
-                     recompile at converged β drops=(time={}, marginal={}, logslope={}) — the \
-                     full compiler {} over-collapses logslope, as expected for the partial \
-                     reparam (no pilot-curvature trap); elapsed={:.3}s",
-                    ctx.drops_by_block_initial.0,
-                    ctx.drops_by_block_initial.1,
-                    ctx.drops_by_block_initial.2,
-                    drops_post.0,
-                    drops_post.1,
-                    drops_post.2,
-                    if confound_persists {
-                        "still"
-                    } else {
-                        "no longer"
-                    },
-                    recompile_started.elapsed().as_secs_f64(),
-                );
-            }
-            Ok(drops_post) => {
-                if drops_post == ctx.drops_by_block_initial {
-                    log::debug!(
-                        "[smgs phase-4b recompile-after-accept] drops match structural pass \
-                         (time={}, marginal={}, logslope={}); elapsed={:.3}s",
-                        drops_post.0,
-                        drops_post.1,
-                        drops_post.2,
-                        recompile_started.elapsed().as_secs_f64(),
-                    );
-                } else {
-                    // Re-fit ONCE would consume the new compile here. The
-                    // surgical scope of this hook stops at the diagnostic;
-                    // surface the diff at WARN so it cannot be missed.
-                    log::warn!(
-                        "[smgs phase-4b recompile-after-accept] drops_by_block differs at \
-                         converged β: structural=(time={}, marginal={}, logslope={}) vs \
-                         data-adaptive=(time={}, marginal={}, logslope={}); pilot-curvature \
-                         trap detected — current fit reflects the structural compile. A \
-                         single re-fit with the data-adaptive compile is the next step; \
-                         file an issue with this log line if observed in production. \
-                         elapsed={:.3}s",
-                        ctx.drops_by_block_initial.0,
-                        ctx.drops_by_block_initial.1,
-                        ctx.drops_by_block_initial.2,
-                        drops_post.0,
-                        drops_post.1,
-                        drops_post.2,
-                        recompile_started.elapsed().as_secs_f64(),
-                    );
-                }
-            }
-            Err(reason) => {
-                log::warn!(
-                    "[smgs phase-4b recompile-after-accept] skipped: {reason}; elapsed={:.3}s",
-                    recompile_started.elapsed().as_secs_f64(),
-                );
-            }
-        }
-    }
-
     let certified_theta = solved
         .certified_outer
         .as_ref()
@@ -2870,7 +1610,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             &solved.designs[1],
             certified_theta,
             FlexActivation::On,
-            BlockDesignCoords::RematerializedRaw,
         )?;
         let selected_baseline = match (
             &spec.baseline_hyper,
@@ -2898,110 +1637,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             final_family.offset_channel_geometry(&solved.fit.block_states)?;
         (residuals, curvatures, selected_baseline)
     };
-
-    // Phase-4b V+M-exact result-time lift. When the active cutover
-    // fired, the inner Newton produced θ at *compiled* width across the
-    // time/marginal/logslope blocks. Predict-time consumers expect β at
-    // the original raw width: `Gauge::lift_block_betas` concatenates the
-    // per-block compiled θs, multiplies by the full triangular T
-    // (V's on the diagonal, `−R_{a→b}` off-diagonals), and splits the
-    // result at raw-block boundaries. The corresponding η is
-    // numerically invariant under the lift (η = X_raw · β_raw =
-    // X_raw · T · θ = X_compiled · θ) so we leave it alone. When the
-    // cutover did NOT fire (smgs_lift_v is None), β is already at raw
-    // width and the lift is a no-op. Flex blocks (score_warp_dev,
-    // link_dev) at indices ≥ 3 are not part of the parametric T; the
-    // gauge is extended with identity blocks over their widths so the
-    // joint covariance lift below sees them pass through unchanged.
-    if let Some(ref lift) = smgs_lift_v {
-        let n_lift = lift.n_blocks();
-        // Flex-block widths BEFORE the β lift (identical after — flex
-        // blocks are never compiled), used to extend the gauge so joint
-        // (compiled+flex)-width matrices lift in one sandwich.
-        let flex_widths: Vec<usize> = solved
-            .fit
-            .blocks
-            .iter()
-            .skip(n_lift)
-            .map(|b| b.beta.len())
-            .collect();
-        let compiled_betas: Vec<Array1<f64>> = solved
-            .fit
-            .block_states
-            .iter()
-            .take(n_lift)
-            .map(|s| s.beta.clone())
-            .collect();
-        let lifted = lift.lift_block_betas(&compiled_betas);
-        for ((state, block), beta) in solved
-            .fit
-            .block_states
-            .iter_mut()
-            .take(n_lift)
-            .zip(solved.fit.blocks.iter_mut().take(n_lift))
-            .zip(lifted.into_iter())
-        {
-            state.beta = beta.clone();
-            block.beta = beta;
-        }
-        let mut off = 0usize;
-        let total: usize = solved.fit.blocks.iter().map(|b| b.beta.len()).sum();
-        let mut flat = Array1::<f64>::zeros(total);
-        for block in &solved.fit.blocks {
-            let p = block.beta.len();
-            flat.slice_mut(ndarray::s![off..off + p])
-                .assign(&block.beta);
-            off += p;
-        }
-        solved.fit.beta = flat;
-
-        // Push coefficient covariance into the raw reporting frame and retain
-        // precision in the active frame with the SAME affine gauge used for
-        // beta (#741, #933, #2301). A rectangular T has no raw-space precision:
-        // T H T' would be a singular covariance-style congruence, not the
-        // optimizer's quadratic form. Saved ALO instead uses J_raw T against
-        // the unchanged active H. The joint matrices span compiled parametric
-        // blocks followed by raw flex blocks, so the gauge is extended with
-        // identity over the flex widths.
-        let joint_gauge = lift.extend_with_identity(&flex_widths);
-        let lift_joint_covariance = |name: &str,
-                                     matrix: Array2<f64>|
-         -> Result<Array2<f64>, String> {
-            let active = joint_gauge.reduced_total();
-            if matrix.dim() != (active, active) {
-                return Err(format!(
-                    "survival marginal-slope {name} is {}x{}; exact result gauge requires {active}x{active} active coordinates before its {}-coefficient raw lift",
-                    matrix.nrows(),
-                    matrix.ncols(),
-                    joint_gauge.raw_total(),
-                ));
-            }
-            Ok(joint_gauge.lift_covariance(&matrix))
-        };
-        solved.fit.covariance_conditional = solved
-            .fit
-            .covariance_conditional
-            .take()
-            .map(|covariance| lift_joint_covariance("covariance_conditional", covariance))
-            .transpose()?;
-        solved.fit.covariance_corrected = solved
-            .fit
-            .covariance_corrected
-            .take()
-            .map(|covariance| lift_joint_covariance("covariance_corrected", covariance))
-            .transpose()?;
-        if let Some(mut geometry) = solved.fit.geometry.take() {
-            geometry.coefficient_gauge = geometry
-                .coefficient_gauge
-                .left_compose(&joint_gauge)
-                .map_err(|reason| {
-                    format!(
-                        "survival marginal-slope active geometry cannot compose with its exact raw result gauge: {reason}"
-                    )
-                })?;
-            solved.fit.geometry = Some(geometry);
-        }
-    }
 
     let mut resolved_specs = solved.resolved_specs;
     let designs = solved.designs;
