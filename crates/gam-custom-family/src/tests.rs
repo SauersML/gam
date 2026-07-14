@@ -2919,6 +2919,91 @@ pub(crate) fn default_custom_family_exact_hessian_hooks_assemble_diagonal_workin
     assert_eq!(d2h, expected_d2h);
 }
 
+#[derive(Clone)]
+struct OwnedTerminalWorkingSetFamily {
+    uncoupled: bool,
+}
+
+impl CustomFamily for OwnedTerminalWorkingSetFamily {
+    fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        Err("terminal Hessian materialization must not re-evaluate the family".to_string())
+    }
+
+    fn likelihood_blocks_uncoupled(&self) -> bool {
+        self.uncoupled
+    }
+}
+
+#[test]
+fn owned_uncoupled_terminal_working_sets_materialize_exact_joint_hessian() {
+    let dense_spec = default_diagonal_exact_hook_spec();
+    let exact_spec = ParameterBlockSpec {
+        name: "owned_exact".to_string(),
+        design: DesignMatrix::from(array![[1.0], [1.0], [1.0]]),
+        offset: Array1::zeros(3),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let specs = vec![dense_spec.clone(), exact_spec];
+    let states = vec![
+        ParameterBlockState {
+            beta: array![0.2, -0.1],
+            eta: Array1::zeros(3),
+        },
+        ParameterBlockState {
+            beta: array![0.0],
+            eta: Array1::zeros(3),
+        },
+    ];
+    let weights = array![2.0, 0.5, 3.0];
+    let working_sets = vec![
+        BlockWorkingSet::Diagonal {
+            working_response: Array1::zeros(3),
+            working_weights: weights.clone(),
+        },
+        BlockWorkingSet::ExactNewton {
+            gradient: array![0.0],
+            hessian: SymmetricMatrix::Dense(array![[7.0]]),
+        },
+    ];
+    let family = OwnedTerminalWorkingSetFamily { uncoupled: true };
+    let hessian = materialize_owned_terminal_unpenalized_hessian(
+        &family,
+        &specs,
+        &states,
+        None,
+        Some(&working_sets),
+        "owned terminal test",
+    )
+    .expect("uncoupled terminal working sets are an exact curvature authority");
+    let dense_expected = dense_spec
+        .design
+        .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&weights).unwrap())
+        .unwrap();
+    let mut expected = Array2::<f64>::zeros((3, 3));
+    expected.slice_mut(s![0..2, 0..2]).assign(&dense_expected);
+    expected[[2, 2]] = 7.0;
+    assert_eq!(hessian, expected);
+
+    let coupled = OwnedTerminalWorkingSetFamily { uncoupled: false };
+    let error = materialize_owned_terminal_unpenalized_hessian(
+        &coupled,
+        &specs,
+        &states,
+        None,
+        Some(&working_sets),
+        "owned terminal test",
+    )
+    .expect_err("coupled likelihoods must retain their joint workspace");
+    assert!(error.contains("coupled 2-block likelihood"), "{error}");
+}
+
 #[test]
 pub(crate) fn default_custom_family_exact_hessian_hooks_drive_profiled_outer_hessian() {
     let mut spec = default_diagonal_exact_hook_spec();

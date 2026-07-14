@@ -1240,6 +1240,130 @@ pub(crate) fn penalized_hessian_from_owned_mode(
     Ok(h)
 }
 
+/// Materialize the unpenalized coefficient Hessian owned by a certified
+/// terminal mode without re-evaluating the likelihood.
+///
+/// A coupled likelihood has exactly one admissible authority: its retained
+/// joint workspace.  For a likelihood that explicitly declares its blocks
+/// uncoupled, the terminal per-block working sets are an equally exact
+/// authority and assemble a block-diagonal joint Hessian.  Keeping those two
+/// cases explicit prevents final result assembly from either calling a
+/// stateful family a second time or silently dropping cross-block curvature.
+pub(crate) fn materialize_owned_terminal_unpenalized_hessian<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    workspace: Option<&Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    working_sets: Option<&[BlockWorkingSet]>,
+    context: &str,
+) -> Result<Array2<f64>, String> {
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
+    if let Some(workspace) = workspace {
+        let source = exact_newton_joint_hessian_source_from_workspace(
+            workspace,
+            total,
+            MaterializationIntent::LogdetFactorization,
+            context,
+        )?
+        .ok_or_else(|| {
+            format!(
+                "{context}: the certified terminal workspace did not expose its exact returned-beta Hessian"
+            )
+        })?;
+        return materialize_joint_hessian_source(&source, total, context);
+    }
+
+    let working_sets = working_sets.ok_or_else(|| {
+        format!(
+            "{context}: the certified terminal mode retained neither a joint Hessian workspace nor per-block working sets"
+        )
+    })?;
+    if working_sets.len() != specs.len() {
+        return Err(format!(
+            "{context}: the certified terminal mode retained {} working sets for {} parameter blocks",
+            working_sets.len(),
+            specs.len(),
+        ));
+    }
+    if states.len() != specs.len() {
+        return Err(format!(
+            "{context}: the certified terminal mode retained {} block states for {} parameter blocks",
+            states.len(),
+            specs.len(),
+        ));
+    }
+    if specs.len() > 1 && !family.likelihood_blocks_uncoupled() {
+        return Err(format!(
+            "{context}: a coupled {}-block likelihood cannot derive its joint Hessian from block working sets; the certified terminal mode must retain a joint workspace",
+            specs.len(),
+        ));
+    }
+
+    let mut hessian = Array2::<f64>::zeros((total, total));
+    for (block_idx, ((spec, state), work)) in specs
+        .iter()
+        .zip(states.iter())
+        .zip(working_sets.iter())
+        .enumerate()
+    {
+        let (start, end) = ranges[block_idx];
+        let width = end - start;
+        if state.beta.len() != width {
+            return Err(format!(
+                "{context}: block {block_idx} terminal beta has length {}, expected {width}",
+                state.beta.len(),
+            ));
+        }
+        let block_hessian = match work {
+            BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            } => {
+                let expected_rows = spec.solver_design().nrows();
+                if working_response.len() != expected_rows
+                    || working_weights.len() != expected_rows
+                    || state.eta.len() != expected_rows
+                {
+                    return Err(format!(
+                        "{context}: block {block_idx} diagonal terminal evidence has response/weight/eta lengths {}/{}/{}, expected {expected_rows}",
+                        working_response.len(),
+                        working_weights.len(),
+                        state.eta.len(),
+                    ));
+                }
+                with_block_geometry(family, states, spec, block_idx, |design, _| {
+                    let weights = certify_finite_working_weights(working_weights)?;
+                    let (xtwx, _) = weighted_normal_equations(design, weights, None)?;
+                    Ok(xtwx)
+                })?
+            }
+            BlockWorkingSet::ExactNewton { hessian, .. } => {
+                if hessian.nrows() != width || hessian.ncols() != width {
+                    return Err(format!(
+                        "{context}: block {block_idx} exact terminal Hessian has shape {}x{}, expected {width}x{width}",
+                        hessian.nrows(),
+                        hessian.ncols(),
+                    ));
+                }
+                hessian.to_dense()
+            }
+        };
+        if block_hessian.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "{context}: block {block_idx} terminal Hessian contains non-finite values"
+            ));
+        }
+        hessian
+            .slice_mut(ndarray::s![start..end, start..end])
+            .assign(&block_hessian);
+    }
+    symmetrize_dense_in_place(&mut hessian);
+    Ok(hessian)
+}
+
 pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],

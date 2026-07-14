@@ -1738,34 +1738,21 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         certified_outer.iterations(),
     )?;
 
-    // The inner evaluator retains the exact returned-beta likelihood/Jeffreys
-    // Hessian workspace. Require it and materialize from that owned state: a
-    // family callback here would be a second evaluation and could silently
-    // change a stateful augmentation or coefficient basin.
-    let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let workspace = inner.joint_workspace.as_ref().ok_or_else(|| {
-        CustomFamilyError::Optimization {
-            context: "fit_custom_family terminal curvature ownership",
-            reason: "the certified terminal mode did not retain its returned-beta Hessian workspace"
-                .to_string(),
-        }
-    })?;
-    let hessian_source = exact_newton_joint_hessian_source_from_workspace(
-        workspace,
-        total_p,
-        MaterializationIntent::LogdetFactorization,
+    // Consume the exact returned-beta authority retained by the inner solve.
+    // Coupled paths own a joint workspace; explicitly uncoupled paths own
+    // terminal block working sets. Neither path re-evaluates the likelihood.
+    let hessian = materialize_owned_terminal_unpenalized_hessian(
+        family,
+        specs,
+        &inner.block_states,
+        inner.joint_workspace.as_ref(),
+        inner.terminal_working_sets.as_deref(),
         "custom-family certified terminal Hessian",
-    )?
-    .ok_or_else(|| CustomFamilyError::Optimization {
+    )
+    .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family terminal curvature ownership",
-        reason: "the certified terminal mode workspace did not expose its exact returned-beta Hessian"
-            .to_string(),
+        reason,
     })?;
-    let hessian = materialize_joint_hessian_source(
-        &hessian_source,
-        total_p,
-        "custom-family certified terminal Hessian materialization",
-    )?;
     let penalized_hessian = penalized_hessian_from_owned_mode(
         specs,
         &per_block,
@@ -2133,31 +2120,18 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         outer_iterations,
     )?;
 
-    let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let workspace = inner.joint_workspace.as_ref().ok_or_else(|| {
-        CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas_from_owned_mode curvature identity",
-            reason:
-                "the selected mode did not retain its certified returned-beta Hessian workspace"
-                    .to_string(),
-        }
-    })?;
-    let hessian_source = exact_newton_joint_hessian_source_from_workspace(
-        workspace,
-        total_p,
-        MaterializationIntent::LogdetFactorization,
+    let hessian = materialize_owned_terminal_unpenalized_hessian(
+        family,
+        specs,
+        &inner.block_states,
+        inner.joint_workspace.as_ref(),
+        inner.terminal_working_sets.as_deref(),
         "selected-mode final Hessian",
-    )?
-    .ok_or_else(|| CustomFamilyError::Optimization {
+    )
+    .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family_fixed_log_lambdas_from_owned_mode curvature identity",
-        reason: "the selected mode workspace did not expose its exact returned-beta Hessian"
-            .to_string(),
+        reason,
     })?;
-    let hessian = materialize_joint_hessian_source(
-        &hessian_source,
-        total_p,
-        "selected-mode final Hessian materialization",
-    )?;
 
     let covariance_conditional = compute_joint_covariance_required(
         family,
