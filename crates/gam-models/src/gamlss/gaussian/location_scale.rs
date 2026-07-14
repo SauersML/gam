@@ -1454,7 +1454,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         self.exact_newton_joint_psi_terms_for_specs(
             block_states,
             specs,
-            hyper_layout.design_derivative_blocks(),
+            hyper_layout,
             psi_index,
         )
     }
@@ -1474,7 +1474,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         self.exact_newton_joint_psisecond_order_terms_for_specs(
             block_states,
             specs,
-            hyper_layout.design_derivative_blocks(),
+            hyper_layout,
             psi_i,
             psi_j,
         )
@@ -1495,7 +1495,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         self.exact_newton_joint_psihessian_directional_derivative_for_specs(
             block_states,
             specs,
-            hyper_layout.design_derivative_blocks(),
+            hyper_layout,
             psi_index,
             d_beta_flat,
         )
