@@ -1606,7 +1606,7 @@ impl SaeManifoldTerm {
         // ACCUMULATES the same `grams`/`n_eff` chunk-by-chunk (basis_values is not
         // persisted there) and calls the SAME core — so the criterion is identical.
         let mut grams = self.empty_decoder_gram_accumulator();
-        self.accumulate_decoder_gram(&mut grams);
+        self.accumulate_decoder_gram(&mut grams)?;
         let n_eff = self.per_atom_effective_sample_size();
         self.rank_dof_from_grams(&grams, &n_eff, rho, dispersion_r)
     }
@@ -4982,7 +4982,8 @@ impl SaeManifoldTerm {
             rho,
             self.row_loss_weights.as_deref(),
         )?;
-        let smoothness = penalty_scale * self.decoder_smoothness_value(&rho.lambda_smooth_vec()?);
+        let smoothness =
+            penalty_scale * self.decoder_smoothness_value(&rho.lambda_smooth_vec()?)?;
         let ard = self.ard_value(rho)?;
         Ok(SaeManifoldLoss {
             data_fit,
@@ -5346,7 +5347,10 @@ impl SaeManifoldTerm {
         Ok(total)
     }
 
-    pub(crate) fn decoder_smoothness_value(&self, lambda_smooth: &[f64]) -> f64 {
+    pub(crate) fn decoder_smoothness_value(
+        &self,
+        lambda_smooth: &[f64],
+    ) -> Result<f64, String> {
         // Smoothness penalty value is `0.5·λ·Σ_oc B[:,oc]ᵀ S B[:,oc]`. Form the
         // `S·B` matrix product once per atom (O(M²·p)) and reduce against `B`
         // with a single O(M·p) Hadamard sum, instead of the previous
@@ -5357,7 +5361,8 @@ impl SaeManifoldTerm {
         // Per-atom `S_k · B_k` products are independent across atoms, so they ride
         // the multi-GPU batched smoothness GEMM (uniform-shape groups tiled across
         // every device); `symmetrize = false` because the quadratic form only sees
-        // the symmetric part of `S` regardless. Exact CPU fallback per atom.
+        // the symmetric part of `S` regardless. Device-free and sub-threshold
+        // groups use the exact CPU products; admitted device failures propagate.
         let sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
             .atoms
             .iter()
@@ -5368,18 +5373,21 @@ impl SaeManifoldTerm {
                 )
             })
             .collect();
-        let sb_all = batched_smooth_sb(&sb_inputs, false);
+        let sb_all = batched_smooth_sb(&sb_inputs, false)?;
         let mut acc = 0.0;
         for (atom_idx, (atom, sb)) in self.atoms.iter().zip(sb_all.iter()).enumerate() {
             acc += 0.5 * lambda_smooth[atom_idx] * (&atom.decoder_coefficients * sb).sum();
         }
-        acc
+        Ok(acc)
     }
 
     /// Per-atom decoder-smoothness values (#1556): entry `k` is
     /// `0.5·λ_smooth[k]·<B_k, S_k B_k>` (sum = [`Self::decoder_smoothness_value`]).
     /// This is the explicit `∂loss.smoothness/∂log λ_smooth[k]` gradient entry.
-    pub(crate) fn decoder_smoothness_value_per_atom(&self, lambda_smooth: &[f64]) -> Vec<f64> {
+    pub(crate) fn decoder_smoothness_value_per_atom(
+        &self,
+        lambda_smooth: &[f64],
+    ) -> Result<Vec<f64>, String> {
         let sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
             .atoms
             .iter()
@@ -5390,13 +5398,13 @@ impl SaeManifoldTerm {
                 )
             })
             .collect();
-        let sb_all = batched_smooth_sb(&sb_inputs, false);
+        let sb_all = batched_smooth_sb(&sb_inputs, false)?;
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
         for (atom_idx, (atom, sb)) in self.atoms.iter().zip(sb_all.iter()).enumerate() {
             per_atom[atom_idx] =
                 0.5 * lambda_smooth[atom_idx] * (&atom.decoder_coefficients * sb).sum();
         }
-        per_atom
+        Ok(per_atom)
     }
 
     pub(crate) fn ard_value(&self, rho: &SaeManifoldRho) -> Result<f64, String> {

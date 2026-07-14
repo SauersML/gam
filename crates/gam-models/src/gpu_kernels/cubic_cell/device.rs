@@ -48,11 +48,10 @@ use cudarc::driver::{CudaContext, CudaModule, CudaStream};
 pub(crate) fn try_device_moments_resident(
     view: &CubicCellDerivativeMomentHostView<'_>,
 ) -> Result<Option<CubicCellDerivativeMomentOutput>, GpuError> {
-    let backend = match CubicCellGpuBackend::probe() {
-        Ok(b) => b,
-        Err(GpuError::DriverLibraryUnavailable { .. }) => return Ok(None),
-        Err(other) => return Err(other),
+    let Some(_) = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())? else {
+        return Ok(None);
     };
+    let backend = CubicCellGpuBackend::probe()?;
     backend.dispatch_device_resident(view).map(Some)
 }
 

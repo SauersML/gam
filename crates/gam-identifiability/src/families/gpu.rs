@@ -50,7 +50,7 @@ pub const fn packed_index(c: usize, d: usize) -> usize {
 
 /// Try to build the primary-state Gram bundle on the GPU. `Ok(None)` means
 /// CUDA is disabled or genuinely absent under the configured policy; probe
-/// faults remain typed errors.
+/// and admitted execution faults remain typed errors.
 pub fn try_primary_state_gram_cuda(
     channel_blocks: &[Vec<Option<Array2<f64>>>],
     h_packed: &Array2<f64>,

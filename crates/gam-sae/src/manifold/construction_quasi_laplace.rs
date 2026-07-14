@@ -376,7 +376,7 @@ impl SaeManifoldTerm {
             // it loudly rather than hiding a re-admitted co-collapse.
             let residual = self.reconstruction_residual(target, rho)?;
             let mut grams = self.empty_decoder_gram_accumulator();
-            self.accumulate_decoder_gram(&mut grams);
+            self.accumulate_decoder_gram(&mut grams)?;
             let n_eff = self.per_atom_effective_sample_size();
             let dispersion_lower_bound =
                 self.reconstruction_dispersion_lower_bound(&loss, Some(residual.view()))?;
@@ -2639,7 +2639,7 @@ impl SaeManifoldTerm {
             full_chunk.row_loss_weights = Some(weights[0..n_total].to_vec());
         }
         if let Some(inputs) = rank_inputs.as_deref_mut() {
-            full_chunk.accumulate_decoder_gram(&mut inputs.grams);
+            full_chunk.accumulate_decoder_gram(&mut inputs.grams)?;
             let assignments = full_chunk.assignment.assignments();
             for atom in 0..inputs.n_eff.len() {
                 let support = SupportMeasure::from_assignment_matrix(assignments.view(), atom)
@@ -2811,7 +2811,7 @@ impl SaeManifoldTerm {
                 chunk.row_loss_weights = Some(w[start..end].to_vec());
             }
             if let Some(ri) = rank_inputs.as_deref_mut() {
-                chunk.accumulate_decoder_gram(&mut ri.grams);
+                chunk.accumulate_decoder_gram(&mut ri.grams)?;
                 let asg = chunk.assignment.assignments();
                 for k in 0..ri.n_eff.len() {
                     let support = SupportMeasure::from_assignment_matrix(asg.view(), k)
@@ -2848,9 +2848,11 @@ impl SaeManifoldTerm {
     /// per-atom denominator of atom `k`'s λ_smooth Fellner-Schall update. The sum
     /// over atoms is `βᵀ(⊕_k S_k ⊗ I_p)β`, the un-scaled total penalty energy.
     /// `S_k` is symmetrised defensively (as the assembler does); the per-atom
-    /// `½(S+Sᵀ)·B_k` GEMMs ride the multi-GPU batched smoothness GEMM with an
-    /// exact per-atom CPU fallback.
-    pub(crate) fn decoder_smoothness_quadratic_form_per_atom(&self) -> Vec<f64> {
+    /// `½(S+Sᵀ)·B_k` GEMMs ride the multi-GPU batched smoothness GEMM. Device-free
+    /// and sub-threshold groups use exact CPU products; admitted failures propagate.
+    pub(crate) fn decoder_smoothness_quadratic_form_per_atom(
+        &self,
+    ) -> Result<Vec<f64>, String> {
         let sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
             .atoms
             .iter()
@@ -2861,12 +2863,12 @@ impl SaeManifoldTerm {
                 )
             })
             .collect();
-        let sb_all = batched_smooth_sb(&sb_inputs, true);
+        let sb_all = batched_smooth_sb(&sb_inputs, true)?;
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
         for (atom_idx, (atom, sb)) in self.atoms.iter().zip(sb_all.iter()).enumerate() {
             per_atom[atom_idx] = (&atom.decoder_coefficients * sb).sum();
         }
-        per_atom
+        Ok(per_atom)
     }
 
     /// Per-atom effective penalized dof of the decoder smoothness penalty

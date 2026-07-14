@@ -131,7 +131,8 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
     // μ_k(c)=c²μ_k(1).
     let saved = term.atoms[0].decoder_coefficients.clone();
     let mut grams = term.empty_decoder_gram_accumulator();
-    term.accumulate_decoder_gram(&mut grams);
+    term.accumulate_decoder_gram(&mut grams)
+        .expect("decoder-Gram accumulation must preserve CUDA failures");
     let n_eff: f64 = term
         .assignment
         .assignments()
@@ -427,7 +428,8 @@ fn rank_charge_dense_streaming_parity() {
 
     // Dense per-atom Grams + N_eff (what per_atom_realised_rank_dof builds).
     let mut dense_grams = term.empty_decoder_gram_accumulator();
-    term.accumulate_decoder_gram(&mut dense_grams);
+    term.accumulate_decoder_gram(&mut dense_grams)
+        .expect("decoder-Gram accumulation must preserve CUDA failures");
     let dense_n_eff: Vec<f64> = (0..term.k_atoms())
         .map(|k| {
             term.assignment
@@ -528,7 +530,8 @@ fn rank_charge_shared_primitive_parity() {
 
     // Free-fn d_eff from the SAME atom's gram/decoder/N_eff — must be bit-identical.
     let mut grams = term.empty_decoder_gram_accumulator();
-    term.accumulate_decoder_gram(&mut grams);
+    term.accumulate_decoder_gram(&mut grams)
+        .expect("decoder-Gram accumulation must preserve CUDA failures");
     let n_eff: f64 = term
         .assignment
         .assignments()
@@ -672,7 +675,8 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
     drop((loss, cache));
 
     let mut grams = term.empty_decoder_gram_accumulator();
-    term.accumulate_decoder_gram(&mut grams);
+    term.accumulate_decoder_gram(&mut grams)
+        .expect("decoder-Gram accumulation must preserve CUDA failures");
     let n_eff: f64 = term
         .assignment
         .assignments()

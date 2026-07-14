@@ -108,7 +108,11 @@ mod amortized_encoder_tests {
         let (term, _target, rho) = small_two_atom_periodic_term();
         let n_params = rho.to_flat().len();
         let lambda = rho.lambda_smooth_vec().unwrap();
-        let frozen_smoothness: f64 = term.decoder_smoothness_value_per_atom(&lambda).iter().sum();
+        let frozen_smoothness: f64 = term
+            .decoder_smoothness_value_per_atom(&lambda)
+            .expect("smoothness evaluation must preserve CUDA failures")
+            .iter()
+            .sum();
 
         let analytic = term
             .outer_explicit_smoothness_ard_hessian(&rho, frozen_smoothness)
@@ -136,7 +140,9 @@ mod amortized_encoder_tests {
                 let r = rho.from_flat(flat.view()).unwrap();
                 let mut v = Array1::<f64>::zeros(n_params);
                 let lam = r.lambda_smooth_vec().unwrap();
-                let se = term.decoder_smoothness_value_per_atom(&lam);
+                let se = term
+                    .decoder_smoothness_value_per_atom(&lam)
+                    .expect("smoothness evaluation must preserve CUDA failures");
                 let s: f64 = se.iter().sum();
                 for a in 0..r.log_lambda_smooth.len() {
                     v[r.smooth_flat_index(a)] = if s.abs() > 0.0 {

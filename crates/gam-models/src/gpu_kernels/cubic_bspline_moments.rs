@@ -1727,38 +1727,31 @@ pub struct TetrahedralMomentInputs<'a> {
 }
 
 /// Device-side dispatcher for the CM-P3 tetrahedral path. Mirrors the
-/// `Ok(None)` fallback pattern used by `try_device_moments` in
-/// `src/gpu/cubic_cell/device.rs`: returns `Ok(None)` when there is no
-/// usable CUDA runtime (caller should fall back to a CPU evaluator or the
-/// hex path), `Ok(Some(_))` on a successful launch, and `Err(_)` on a
-/// genuine driver / NVRTC / shape failure.
+/// `Ok(None)` availability pattern used by `try_device_moments` in
+/// `src/gpu/cubic_cell/device.rs`: returns `Ok(None)` only when configured
+/// policy permits CPU and CUDA is genuinely absent, `Ok(Some(_))` on a
+/// successful launch, and `Err(_)` on probe, driver, NVRTC, or shape failure.
 #[cfg(target_os = "linux")]
 pub fn try_device_tetrahedral_moments(
     inputs: &TetrahedralMomentInputs<'_>,
 ) -> Result<Option<DeviceCubicMomentTable>, GpuError> {
-    let backend = match CubicMomentBackend::probe() {
-        Ok(b) => b,
-        Err(GpuError::DriverLibraryUnavailable { .. }) => return Ok(None),
-        Err(other) => return Err(other),
+    let Some(_) = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())? else {
+        return Ok(None);
     };
+    let backend = CubicMomentBackend::probe()?;
     build_tetrahedral_moments_device(backend, inputs).map(Some)
 }
 
-/// Non-Linux stub for the dispatcher. Always returns `Ok(None)`; the
-/// caller must have a CPU evaluator already since the hex path's
-/// `build_hex_tensor_moments_device` returns `Err(DriverLibraryUnavailable)`
-/// here. The asymmetry is intentional: the hex path is the historic API
-/// and changing its return shape would ripple into every existing call
-/// site; the tetrahedral path is new and adopts the modern Ok(None) shape
-/// from the start (matching task #21's explicit charter language).
+/// Non-Linux dispatcher. `Auto` and `Off` resolve to `Ok(None)`; `Required`
+/// returns the typed required-device error produced by runtime resolution.
 #[cfg(not(target_os = "linux"))]
 pub fn try_device_tetrahedral_moments(
     inputs: &TetrahedralMomentInputs<'_>,
 ) -> Result<Option<DeviceCubicMomentTable>, GpuError> {
-    // Non-Linux hosts have no CUDA backend; the dispatcher always reports
-    // "fallback" via Ok(None). We still validate the inputs so a malformed
-    // caller surfaces the same error on every platform, and so the
-    // `inputs` parameter is genuinely consumed (no `_`-prefixed silencer).
+    let _runtime =
+        gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())?;
+    // Auto/Off on a non-Linux host reaches this validation before reporting
+    // typed device absence as Ok(None).
     inputs.cells.validate()?;
     if inputs.cells.d < 3 {
         gam_gpu::gpu_bail!(

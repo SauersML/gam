@@ -788,7 +788,9 @@ impl SaeManifoldTerm {
         // per-atom split). Its sum is the λ-scaled penalty energy; renormalize to
         // `loss.smoothness` so the total matches the criterion's reported energy
         // bit-for-bit (folding in any minibatch `penalty_scale` baked into it).
-        let mut smooth_explicit = self.decoder_smoothness_value_per_atom(&lambda_smooth_vec);
+        let mut smooth_explicit = self
+            .decoder_smoothness_value_per_atom(&lambda_smooth_vec)
+            .map_err(OuterGradientError::internal)?;
         let smooth_explicit_sum: f64 = smooth_explicit.iter().sum();
         if smooth_explicit_sum.abs() > 0.0 {
             let renorm = loss.smoothness / smooth_explicit_sum;
@@ -1053,7 +1055,7 @@ impl SaeManifoldTerm {
 
         // Decoder-smoothness penalty energy with its Occam renormalization.
         let lambda_smooth = rho.lambda_smooth_vec()?;
-        let smooth_energy = self.decoder_smoothness_value_per_atom(&lambda_smooth);
+        let smooth_energy = self.decoder_smoothness_value_per_atom(&lambda_smooth)?;
         let energy_sum: f64 = smooth_energy.iter().sum();
         let k_smooth = rho.log_lambda_smooth.len();
         if energy_sum.abs() > 0.0 {

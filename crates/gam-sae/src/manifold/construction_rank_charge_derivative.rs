@@ -64,7 +64,7 @@ impl SaeManifoldTerm {
         let residual = self.reconstruction_residual(target, rho)?;
         let dispersion = self.reconstruction_dispersion(loss, cache, rho, Some(residual.view()))?;
         let mut grams = self.empty_decoder_gram_accumulator();
-        self.accumulate_decoder_gram(&mut grams);
+        self.accumulate_decoder_gram(&mut grams)?;
         let n_eff = self.per_atom_effective_sample_size();
         let lambda = rho.lambda_smooth_vec()?;
         let p = self.output_dim() as f64;
@@ -251,7 +251,7 @@ impl SaeManifoldTerm {
         let dispersion =
             self.reconstruction_dispersion(loss, cache, rho, Some(residual.view()))?;
         let mut grams = self.empty_decoder_gram_accumulator();
-        self.accumulate_decoder_gram(&mut grams);
+        self.accumulate_decoder_gram(&mut grams)?;
         let n_eff = self.per_atom_effective_sample_size();
         let lambda = rho.lambda_smooth_vec()?;
         let p = self.output_dim() as f64;

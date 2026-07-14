@@ -322,8 +322,9 @@ impl SaeManifoldTerm {
         // Per-atom smoothness-gradient GEMMs `½(S_k+S_kᵀ)·B_k` are independent
         // across atoms; batch them across ALL GPUs (uniform-shape tiles) and
         // scale by `lambda_smooth` below. `symmetrize = true` reproduces the
-        // per-atom symmetrised `scaled_s/λ` used by the Kronecker op. Exact CPU
-        // fallback per atom keeps the result bit-for-bit with the all-CPU path.
+        // per-atom symmetrised `scaled_s/λ` used by the Kronecker op. Device-free
+        // and sub-threshold groups use exact CPU products; admitted failures
+        // propagate.
         let sym_sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
             .atoms
             .iter()
@@ -334,7 +335,7 @@ impl SaeManifoldTerm {
                 )
             })
             .collect();
-        let sym_sb_all = batched_smooth_sb(&sym_sb_inputs, true);
+        let sym_sb_all = batched_smooth_sb(&sym_sb_inputs, true)?;
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let m = atom.basis_size();
             let off = beta_offsets[atom_idx];

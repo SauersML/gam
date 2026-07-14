@@ -45,6 +45,10 @@ use gam_math::jet_scalar::{
     OneSeed, Order2, RuntimeJetScalar,
 };
 use gam_math::jet_tower::Tower2;
+use crate::survival::marginal_slope::timewiggle_geometry::{
+    TimewiggleBasisDerivativeRows, TimewiggleQBaseValues,
+    timewiggle_q_from_basis_derivative_rows,
+};
 
 /// Canonical value/gradient/Hessian timepoint channels consumed by the
 /// contracted row expression.
@@ -2076,7 +2080,9 @@ fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> O
 /// The caller pre-seeds `b_jet` (the slope `g` primary), `du[u]` (the unit
 /// per-primary jets), `template` (a zero jet shaped at the right order/`p`), and
 /// `q_jet` (the complete time-quantile jet, including both coefficient and
-/// family-owned directions), and
+/// family-owned directions), plus `scale_ratio_jet` (the current probit scale
+/// divided by the f64 scale already baked into the cached coefficient packs),
+/// and
 /// supplies the OBSERVED-channel jets `rho_jet`/`tau_jet` (the `h`/`w`/`infl`
 /// linear channels added to `eta`/`chi`; pass zero jets for a pure `g` model,
 /// where the full `(a,b)` observed-coeff pack already carries every `g` order).
@@ -2094,6 +2100,7 @@ fn flex_timepoint_inputs_generic<J: FlexJet + MomentTerm>(
     primary_g: usize,
     infl: Option<usize>,
     q_jet: &J,
+    scale_ratio_jet: &J,
     z_obs: f64,
     o_infl: f64,
     obs_coeff: [f64; 4],
@@ -2115,7 +2122,17 @@ fn flex_timepoint_inputs_generic<J: FlexJet + MomentTerm>(
     // one third of the Jet3 lift work and half of the Jet2 lift work. (A
     // hardcoded 2 left the Jet3/Jet4 mixed intercept derivatives one iteration
     // short — `eta_uv` converged but `eta_uv_dir` did not; gam#932.)
-    let residual = |a: &J| calibration_residual_jet(a, b_jet, primary_g, du, q_jet, cells);
+    let residual = |a: &J| {
+        calibration_residual_jet(
+            a,
+            b_jet,
+            primary_g,
+            du,
+            q_jet,
+            scale_ratio_jet,
+            cells,
+        )
+    };
     let a_jet = lift_intercept_flex(template, a0, 1.0 / d_check, J::ORDER, residual);
 
     // Observed eta/chi: the OBSERVED cell coefficient `c_k(a, {θ_u})` and its
@@ -2128,8 +2145,14 @@ fn flex_timepoint_inputs_generic<J: FlexJet + MomentTerm>(
     // the (a,b)-only `observed_coeff_component_jet` + frozen-scalar channels.
     // `eta = Σ_k c_k·z_obs^k + o_infl (+ the infl primary's unit partial)`.
     let da = tangent_jet(&a_jet);
-    let eta_coeff = cell_coeff_jets(&a_jet, obs_coeff, obs_fixed, primary_g, &da, du);
-    let chi_coeff = cell_chi_poly_jets(&a_jet, obs_fixed, primary_g, &da, du);
+    let eta_coeff_base = cell_coeff_jets(&a_jet, obs_coeff, obs_fixed, primary_g, &da, du);
+    let chi_coeff_base = cell_chi_poly_jets(&a_jet, obs_fixed, primary_g, &da, du);
+    let eta_coeff = std::array::from_fn(|coefficient| {
+        eta_coeff_base[coefficient].mul(scale_ratio_jet)
+    });
+    let chi_coeff = std::array::from_fn(|coefficient| {
+        chi_coeff_base[coefficient].mul(scale_ratio_jet)
+    });
     let mut eta = add_const(&eval_coeff_jet_at(&eta_coeff, z_obs), o_infl);
     if let Some(infl_axis) = infl {
         // ∂η₁/∂o_infl = 1: the absorbed-influence offset shifts η₁ additively
@@ -2144,8 +2167,13 @@ fn flex_timepoint_inputs_generic<J: FlexJet + MomentTerm>(
     // moving-edge jets through `(a_jet, b_jet)`.
     let mut d = const_jet_like(template, 0.0);
     for cell in cells {
-        let c_pos = cell_coeff_jets(&a_jet, cell.base_pos_coeffs, cell.fixed, primary_g, &da, du);
-        let chi_jets = cell_chi_poly_jets(&a_jet, cell.fixed, primary_g, &da, du);
+        let c_pos_base =
+            cell_coeff_jets(&a_jet, cell.base_pos_coeffs, cell.fixed, primary_g, &da, du);
+        let chi_jets_base = cell_chi_poly_jets(&a_jet, cell.fixed, primary_g, &da, du);
+        let c_pos =
+            std::array::from_fn(|coefficient| c_pos_base[coefficient].mul(scale_ratio_jet));
+        let chi_jets =
+            std::array::from_fn(|coefficient| chi_jets_base[coefficient].mul(scale_ratio_jet));
         let edge_l = cell_edge_jet(&a_jet, b_jet, cell.left_edge, cell.cell_left);
         let edge_r = cell_edge_jet(&a_jet, b_jet, cell.right_edge, cell.cell_right);
         d = d.add(&flex_timepoint_d_cell(
@@ -2256,7 +2284,7 @@ fn lift_intercept_flex<J: FlexJet>(
 /// The per-row calibration residual jet `R(A)` for [`lift_intercept_flex`],
 /// summed over a timepoint's cells: `Σ_cells INV_TWO_PI·Σ_k tangent(c_posₖ(A))·
 /// Mₖ(A)` plus the q-marginal self-term carried by the complete generic `q_jet`
-/// (the
+/// and the complete generic probit `scale_ratio_jet` (the
 /// historical `f_u[q] += φ(q)` boundary term of the calibration). The cells are
 /// supplied as `(base_pos_coeffs, fixed, edges, finiteness, numeric_moments)` so
 /// the coefficient jets and moment jets are rebuilt at the current iterate `A`.
@@ -2266,6 +2294,7 @@ fn calibration_residual_jet<J: FlexJet + MomentTerm>(
     g_axis: usize,
     du: &[J],
     q_jet: &J,
+    scale_ratio_jet: &J,
     cells: &[CalibrationCellJetInputs<'_>],
 ) -> J {
     let da = tangent_jet(a_jet);
@@ -2273,7 +2302,10 @@ fn calibration_residual_jet<J: FlexJet + MomentTerm>(
     let mut r = const_jet_like(a_jet, 0.0);
     for cell in cells {
         // Positive cell coefficients as jets in (A, primaries).
-        let c_pos = cell_coeff_jets(a_jet, cell.base_pos_coeffs, cell.fixed, g_axis, &da, du);
+        let c_pos_base =
+            cell_coeff_jets(a_jet, cell.base_pos_coeffs, cell.fixed, g_axis, &da, du);
+        let c_pos =
+            std::array::from_fn(|coefficient| c_pos_base[coefficient].mul(scale_ratio_jet));
         // Moving edge jets: Crossing edges move with A/b, Fixed edges are static.
         let edge_l = cell_edge_jet(a_jet, b_jet, cell.left_edge, cell.cell_left);
         let edge_r = cell_edge_jet(a_jet, b_jet, cell.right_edge, cell.cell_right);
@@ -2749,6 +2781,7 @@ impl SurvivalMarginalSlopeFamily {
             primary.g,
             primary.infl,
             &q_jet,
+            &const_jet_like(&template, 1.0),
             z_obs,
             o_infl,
             obs_coeff,
@@ -2817,6 +2850,7 @@ impl SurvivalMarginalSlopeFamily {
             primary.g,
             primary.infl,
             &q_jet,
+            &const_jet_like(&template, 1.0),
             z_obs,
             o_infl,
             obs_coeff,
@@ -2884,6 +2918,7 @@ impl SurvivalMarginalSlopeFamily {
                     primary.g,
                     primary.infl,
                     &q_jet,
+                    &const_jet_like(&template, 1.0),
                     z_obs,
                     o_infl,
                     obs_coeff,
@@ -2953,6 +2988,7 @@ impl SurvivalMarginalSlopeFamily {
             primary.g,
             primary.infl,
             &q_jet,
+            &const_jet_like(&template, 1.0),
             z_obs,
             0.0,
             obs_coeff,
@@ -2965,6 +3001,631 @@ impl SurvivalMarginalSlopeFamily {
             chi_uv_uv: chi.eps_del.h.clone(),
             d_uv_uv: d.eps_del.h.clone(),
         })
+    }
+}
+
+struct FlexFamilyCoefficientJets<J> {
+    template: Dual2<J>,
+    q0: Dual2<J>,
+    q1: Dual2<J>,
+    qd1: Dual2<J>,
+    g: Dual2<J>,
+    scale_ratio: Dual2<J>,
+    du: Vec<Dual2<J>>,
+    o_infl: f64,
+}
+
+fn add_coefficient_row(
+    gradient: &mut [f64],
+    range: &std::ops::Range<usize>,
+    row: ndarray::ArrayView1<'_, f64>,
+    channel: &str,
+) -> Result<(), String> {
+    if range.len() != row.len() {
+        return Err(format!(
+            "survival marginal-slope FLEX family {channel} coefficient row width {} != flattened range width {}",
+            row.len(),
+            range.len(),
+        ));
+    }
+    for (axis, value) in range.clone().zip(row.iter().copied()) {
+        gradient[axis] += value;
+    }
+    Ok(())
+}
+
+fn lifted_coefficient_affine<J: FlexCoefficientJet>(
+    value: f64,
+    gradient: Vec<f64>,
+    beta_direction: Option<&Array1<f64>>,
+    family_first: f64,
+    family_second: f64,
+) -> Dual2<J> {
+    let dimension = gradient.len();
+    let directional_value = beta_direction.map_or(0.0, |direction| {
+        gradient
+            .iter()
+            .zip(direction.iter())
+            .map(|(&coefficient, &step)| coefficient * step)
+            .sum()
+    });
+    Dual2 {
+        v: J::affine(value, gradient, directional_value),
+        g: J::constant(family_first, dimension),
+        h: J::constant(family_second, dimension),
+    }
+}
+
+fn one_hot_coefficient_gradient(dimension: usize, axis: usize) -> Vec<f64> {
+    let mut gradient = vec![0.0; dimension];
+    gradient[axis] = 1.0;
+    gradient
+}
+
+impl SurvivalMarginalSlopeFamily {
+    fn validate_flex_family_coefficient_state(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        slices: &BlockSlices,
+        first: FlexFamilyRowDirection,
+        second: FlexFamilyRowDirection,
+        beta_direction: Option<&Array1<f64>>,
+    ) -> Result<(), String> {
+        if row >= self.n {
+            return Err(format!(
+                "survival marginal-slope FLEX family row {row} is out of range for n={}",
+                self.n
+            ));
+        }
+        let directions = [
+            first.entry,
+            first.exit,
+            first.derivative_exit,
+            first.probit_scale,
+            second.entry,
+            second.exit,
+            second.derivative_exit,
+            second.probit_scale,
+        ];
+        if directions.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "survival marginal-slope FLEX family row directions must be finite".to_string(),
+            );
+        }
+        if let Some(direction) = beta_direction {
+            if direction.len() != slices.total {
+                return Err(format!(
+                    "survival marginal-slope FLEX family beta direction length {} != flattened coefficient width {}",
+                    direction.len(),
+                    slices.total,
+                ));
+            }
+            if direction.iter().any(|value| !value.is_finite()) {
+                return Err(
+                    "survival marginal-slope FLEX family beta direction must be finite".to_string(),
+                );
+            }
+        }
+
+        let mut expected = vec![
+            ("time", slices.time.clone()),
+            ("marginal", slices.marginal.clone()),
+            ("logslope", slices.logslope.clone()),
+        ];
+        if let Some(range) = slices.score_warp.as_ref() {
+            expected.push(("score warp", range.clone()));
+        }
+        if let Some(range) = slices.link_dev.as_ref() {
+            expected.push(("link deviation", range.clone()));
+        }
+        if let Some(range) = slices.influence.as_ref() {
+            expected.push(("influence", range.clone()));
+        }
+        if block_states.len() != expected.len() {
+            return Err(format!(
+                "survival marginal-slope FLEX family coefficient map expects {} block states, got {}",
+                expected.len(),
+                block_states.len(),
+            ));
+        }
+        for (block, (name, range)) in block_states.iter().zip(expected.iter()).enumerate() {
+            if block.beta.len() != range.len() {
+                return Err(format!(
+                    "survival marginal-slope FLEX family {name} block {block} beta width {} != layout width {}",
+                    block.beta.len(),
+                    range.len(),
+                ));
+            }
+        }
+        for (block, name) in [(0usize, "time"), (1, "marginal"), (2, "logslope")] {
+            if block_states[block].eta.len() <= row {
+                return Err(format!(
+                    "survival marginal-slope FLEX family {name} block eta length {} does not contain row {row}",
+                    block_states[block].eta.len(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn build_flex_family_coefficient_jets<J: FlexCoefficientJet>(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &FlexPrimarySlices,
+        slices: &BlockSlices,
+        first: FlexFamilyRowDirection,
+        second: FlexFamilyRowDirection,
+        beta_direction: Option<&Array1<f64>>,
+    ) -> Result<FlexFamilyCoefficientJets<J>, String> {
+        let dimension = slices.total;
+        let q_values = self.row_dynamic_q_values(row, block_states)?;
+        let time_entry_chunk = self
+            .design_entry
+            .try_row_chunk(row..row + 1)
+            .map_err(|error| format!("FLEX family design_entry row: {error}"))?;
+        let time_exit_chunk = self
+            .design_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|error| format!("FLEX family design_exit row: {error}"))?;
+        let time_derivative_chunk = self
+            .design_derivative_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|error| format!("FLEX family design_derivative_exit row: {error}"))?;
+        let marginal_chunk = self
+            .marginal_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|error| format!("FLEX family marginal_design row: {error}"))?;
+        let logslope_chunk = self
+            .logslope_layout
+            .coefficient_design()
+            .try_row_chunk(row..row + 1)
+            .map_err(|error| format!("FLEX family logslope design row: {error}"))?;
+        let entry_row = time_entry_chunk.row(0);
+        let exit_row = time_exit_chunk.row(0);
+        let derivative_row = time_derivative_chunk.row(0);
+        let marginal_row = marginal_chunk.row(0);
+        let logslope_row = logslope_chunk.row(0);
+
+        let mut q0_gradient = vec![0.0; dimension];
+        let mut q1_gradient = vec![0.0; dimension];
+        let mut qd1_gradient = vec![0.0; dimension];
+        let (q0, q1, qd1) = if self.flex_timewiggle_active() {
+            let time_tail = self.time_wiggle_range();
+            let base_width = time_tail.start;
+            let base_range = slices.time.start..slices.time.start + base_width;
+            add_coefficient_row(
+                &mut q0_gradient,
+                &base_range,
+                entry_row.slice(s![..base_width]),
+                "timewiggle entry base",
+            )?;
+            add_coefficient_row(
+                &mut q1_gradient,
+                &base_range,
+                exit_row.slice(s![..base_width]),
+                "timewiggle exit base",
+            )?;
+            add_coefficient_row(
+                &mut qd1_gradient,
+                &base_range,
+                derivative_row.slice(s![..base_width]),
+                "timewiggle derivative base",
+            )?;
+            add_coefficient_row(
+                &mut q0_gradient,
+                &slices.marginal,
+                marginal_row,
+                "timewiggle entry marginal",
+            )?;
+            add_coefficient_row(
+                &mut q1_gradient,
+                &slices.marginal,
+                marginal_chunk.row(0),
+                "timewiggle exit marginal",
+            )?;
+
+            let beta_time = &block_states[0].beta;
+            let beta_time_base = beta_time.slice(s![..base_width]);
+            let beta_time_wiggle = beta_time.slice(s![time_tail.clone()]);
+            let h0 = entry_row.slice(s![..base_width]).dot(&beta_time_base)
+                + self.offset_entry[row]
+                + block_states[1].eta[row];
+            let h1 = exit_row.slice(s![..base_width]).dot(&beta_time_base)
+                + self.offset_exit[row]
+                + block_states[1].eta[row];
+            let d_raw = derivative_row
+                .slice(s![..base_width])
+                .dot(&beta_time_base)
+                + self.derivative_offset_exit[row];
+            let h0_jet = lifted_coefficient_affine::<J>(
+                h0,
+                q0_gradient,
+                beta_direction,
+                first.entry,
+                second.entry,
+            );
+            let h1_jet = lifted_coefficient_affine::<J>(
+                h1,
+                q1_gradient,
+                beta_direction,
+                first.exit,
+                second.exit,
+            );
+            let d_raw_jet = lifted_coefficient_affine::<J>(
+                d_raw,
+                qd1_gradient,
+                beta_direction,
+                first.derivative_exit,
+                second.derivative_exit,
+            );
+            let beta_wiggle_jets: Vec<Dual2<J>> = time_tail
+                .clone()
+                .map(|local_axis| {
+                    lifted_coefficient_affine::<J>(
+                        beta_time[local_axis],
+                        one_hot_coefficient_gradient(
+                            dimension,
+                            slices.time.start + local_axis,
+                        ),
+                        beta_direction,
+                        0.0,
+                        0.0,
+                    )
+                })
+                .collect();
+            let (entry_geometry, entry_basis_d5) = self
+                .time_wiggle_geometry_with_basis_d5(
+                    Array1::from_vec(vec![h0]).view(),
+                    beta_time_wiggle,
+                )?
+                .ok_or_else(|| {
+                    "FLEX family timewiggle entry geometry is unavailable".to_string()
+                })?;
+            let (exit_geometry, exit_basis_d5) = self
+                .time_wiggle_geometry_with_basis_d5(
+                    Array1::from_vec(vec![h1]).view(),
+                    beta_time.slice(s![time_tail]),
+                )?
+                .ok_or_else(|| "FLEX family timewiggle exit geometry is unavailable".to_string())?;
+            let entry_basis =
+                TimewiggleBasisDerivativeRows::from_geometry(&entry_geometry, &entry_basis_d5, 0);
+            let exit_basis =
+                TimewiggleBasisDerivativeRows::from_geometry(&exit_geometry, &exit_basis_d5, 0);
+            let q = timewiggle_q_from_basis_derivative_rows(
+                &h0_jet,
+                &h1_jet,
+                &d_raw_jet,
+                &beta_wiggle_jets,
+                &entry_basis,
+                &exit_basis,
+                TimewiggleQBaseValues {
+                    q0: q_values.q0,
+                    q1: q_values.q1,
+                    dq1_dh1: exit_geometry.dq_dq0[0],
+                },
+            )?;
+            if q.q0.value().to_bits() != q_values.q0.to_bits()
+                || q.q1.value().to_bits() != q_values.q1.to_bits()
+                || q.qd1.value().to_bits() != q_values.qd1.to_bits()
+            {
+                return Err(
+                    "FLEX family generic timewiggle q values drifted from the current f64 row"
+                        .to_string(),
+                );
+            }
+            (q.q0, q.q1, q.qd1)
+        } else {
+            add_coefficient_row(
+                &mut q0_gradient,
+                &slices.time,
+                entry_row,
+                "entry time",
+            )?;
+            add_coefficient_row(&mut q1_gradient, &slices.time, exit_row, "exit time")?;
+            add_coefficient_row(
+                &mut qd1_gradient,
+                &slices.time,
+                derivative_row,
+                "derivative time",
+            )?;
+            add_coefficient_row(
+                &mut q0_gradient,
+                &slices.marginal,
+                marginal_row,
+                "entry marginal",
+            )?;
+            add_coefficient_row(
+                &mut q1_gradient,
+                &slices.marginal,
+                marginal_chunk.row(0),
+                "exit marginal",
+            )?;
+            (
+                lifted_coefficient_affine::<J>(
+                    q_values.q0,
+                    q0_gradient,
+                    beta_direction,
+                    first.entry,
+                    second.entry,
+                ),
+                lifted_coefficient_affine::<J>(
+                    q_values.q1,
+                    q1_gradient,
+                    beta_direction,
+                    first.exit,
+                    second.exit,
+                ),
+                lifted_coefficient_affine::<J>(
+                    q_values.qd1,
+                    qd1_gradient,
+                    beta_direction,
+                    first.derivative_exit,
+                    second.derivative_exit,
+                ),
+            )
+        };
+
+        let mut g_gradient = vec![0.0; dimension];
+        add_coefficient_row(
+            &mut g_gradient,
+            &slices.logslope,
+            logslope_row,
+            "logslope",
+        )?;
+        let g = lifted_coefficient_affine::<J>(
+            block_states[2].eta[row],
+            g_gradient,
+            beta_direction,
+            0.0,
+            0.0,
+        );
+        let zero = || lifted_coefficient_affine::<J>(0.0, vec![0.0; dimension], None, 0.0, 0.0);
+        let template = zero();
+        let mut du = vec![template.clone(); primary.total];
+        du[primary.q0] = tangent_jet(&q0);
+        du[primary.q1] = tangent_jet(&q1);
+        du[primary.qd1] = tangent_jet(&qd1);
+        du[primary.g] = tangent_jet(&g);
+
+        if let (Some(primary_range), Some(coefficient_range), Some(beta_h)) = (
+            primary.h.as_ref(),
+            slices.score_warp.as_ref(),
+            self.flex_score_beta(block_states)?,
+        ) {
+            if primary_range.len() != coefficient_range.len() {
+                return Err(
+                    "FLEX family score-warp primary/coefficient widths differ".to_string(),
+                );
+            }
+            for local_axis in 0..primary_range.len() {
+                let coefficient_axis = coefficient_range.start + local_axis;
+                let coefficient = lifted_coefficient_affine::<J>(
+                    beta_h[local_axis],
+                    one_hot_coefficient_gradient(dimension, coefficient_axis),
+                    beta_direction,
+                    0.0,
+                    0.0,
+                );
+                du[primary_range.start + local_axis] = tangent_jet(&coefficient);
+            }
+        }
+        if let (Some(primary_range), Some(coefficient_range), Some(beta_w)) = (
+            primary.w.as_ref(),
+            slices.link_dev.as_ref(),
+            self.flex_link_beta(block_states)?,
+        ) {
+            if primary_range.len() != coefficient_range.len() {
+                return Err(
+                    "FLEX family link-deviation primary/coefficient widths differ".to_string(),
+                );
+            }
+            for local_axis in 0..primary_range.len() {
+                let coefficient_axis = coefficient_range.start + local_axis;
+                let coefficient = lifted_coefficient_affine::<J>(
+                    beta_w[local_axis],
+                    one_hot_coefficient_gradient(dimension, coefficient_axis),
+                    beta_direction,
+                    0.0,
+                    0.0,
+                );
+                du[primary_range.start + local_axis] = tangent_jet(&coefficient);
+            }
+        }
+
+        let o_infl = self.influence_index_offset(row, block_states)?;
+        if let (Some(primary_axis), Some(coefficient_range), Some(influence)) = (
+            primary.infl,
+            slices.influence.as_ref(),
+            self.influence_absorber.as_ref(),
+        ) {
+            let mut influence_gradient = vec![0.0; dimension];
+            add_coefficient_row(
+                &mut influence_gradient,
+                coefficient_range,
+                influence.row(row),
+                "influence",
+            )?;
+            let influence_jet = lifted_coefficient_affine::<J>(
+                o_infl,
+                influence_gradient,
+                beta_direction,
+                0.0,
+                0.0,
+            );
+            du[primary_axis] = tangent_jet(&influence_jet);
+        }
+
+        let probit_scale = self.probit_frailty_scale();
+        if !probit_scale.is_finite() || probit_scale <= 0.0 {
+            return Err(format!(
+                "survival marginal-slope FLEX family probit scale must be finite and positive, got {probit_scale}"
+            ));
+        }
+        let scale_ratio = Dual2 {
+            v: J::constant(1.0, dimension),
+            g: J::constant(first.probit_scale / probit_scale, dimension),
+            h: J::constant(second.probit_scale / probit_scale, dimension),
+        };
+        Ok(FlexFamilyCoefficientJets {
+            template,
+            q0,
+            q1,
+            qd1,
+            g,
+            scale_ratio,
+            du,
+            o_infl,
+        })
+    }
+
+    fn flex_family_direction_row_terms_generic<J: FlexCoefficientJet>(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        first: FlexFamilyRowDirection,
+        second: FlexFamilyRowDirection,
+        beta_direction: Option<&Array1<f64>>,
+    ) -> Result<FlexFamilyDirectionRowTerms, String> {
+        self.ensure_scalar_flex_exact_score_geometry("FLEX family-direction row program")?;
+        let primary = flex_primary_slices(self);
+        let slices = block_slices(self, block_states);
+        self.validate_flex_family_coefficient_state(
+            row,
+            block_states,
+            &slices,
+            first,
+            second,
+            beta_direction,
+        )?;
+        let jets = self.build_flex_family_coefficient_jets::<J>(
+            row,
+            block_states,
+            &primary,
+            &slices,
+            first,
+            second,
+            beta_direction,
+        )?;
+        if survival_derivative_guard_violated(jets.qd1.value(), self.derivative_guard) {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival marginal-slope monotonicity violated at row {row}: qd1={:.3e} < guard={:.3e}",
+                    jets.qd1.value(),
+                    self.derivative_guard,
+                ),
+            }
+            .into());
+        }
+
+        let g_value = jets.g.value();
+        let beta_h = self.flex_score_beta(block_states)?;
+        let beta_w = self.flex_link_beta(block_states)?;
+        let (a0, _) = self.solve_row_survival_intercept_with_slot(
+            jets.q0.value(),
+            g_value,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Entry)),
+        )?;
+        let (a1, _) = self.solve_row_survival_intercept_with_slot(
+            jets.q1.value(),
+            g_value,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Exit)),
+        )?;
+        let entry_cached = self.build_cached_partition(&primary, a0, g_value, beta_h, beta_w)?;
+        let exit_cached = self.build_cached_partition(&primary, a1, g_value, beta_h, beta_w)?;
+        let evaluate_timepoint =
+            |q: &Dual2<J>, a: f64, cached: &CachedPartitionCells| -> Result<_, String> {
+                let d_check = self.evaluate_survival_denom_d(a, g_value, beta_h, beta_w)?;
+                let (obs_coeff, obs_fixed) =
+                    observed_fixed_for(self, &primary, row, a, g_value, beta_h, beta_w)?;
+                let cells = cells_from_cached(cached);
+                flex_timepoint_inputs_generic(
+                    &jets.template,
+                    &jets.g,
+                    &jets.du,
+                    a,
+                    d_check,
+                    primary.g,
+                    primary.infl,
+                    q,
+                    &jets.scale_ratio,
+                    self.observed_score_projection(row),
+                    jets.o_infl,
+                    obs_coeff,
+                    &obs_fixed,
+                    &cells,
+                )
+            };
+        let (eta0, _, _) = evaluate_timepoint(&jets.q0, a0, &entry_cached)?;
+        let (eta1, chi1, d1) = evaluate_timepoint(&jets.q1, a1, &exit_cached)?;
+        if !chi1.value().is_finite() || chi1.value() <= 0.0 {
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope row {row} produced non-positive observed chi1={:.3e}",
+                    chi1.value(),
+                ),
+            }
+            .into());
+        }
+        let output = flex_row_nll(
+            &eta0,
+            &eta1,
+            &chi1,
+            &d1,
+            &jets.q1,
+            &jets.qd1,
+            surv_stack(eta0.value())?,
+            surv_stack(eta1.value())?,
+            self.weights[row],
+            self.event[row],
+        );
+        Ok(FlexFamilyDirectionRowTerms {
+            first: output.g.owned_base_terms(),
+            second: output.h.owned_base_terms(),
+            beta_drift: output.g.owned_directional_terms(),
+        })
+    }
+
+    /// Evaluate one complete FLEX row under one arbitrary family direction.
+    ///
+    /// The inner width is the canonical flattened coefficient layout
+    /// `time | marginal | logslope | score-warp? | link-dev? | influence?`.
+    /// The outer [`Dual2`] owns the supplied family first/second motion. With no
+    /// beta direction the row runs as `Dual2<Jet2>`; with one it runs as
+    /// `Dual2<Jet3>` and returns the exact directional drift of the first family
+    /// value/score/Hessian channel. Baseline offsets, nonlinear time wiggle,
+    /// learned probit scale, calibration, moving moments, and the row likelihood
+    /// are all evaluated by this one program.
+    pub(crate) fn flex_family_direction_row_terms(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        first: FlexFamilyRowDirection,
+        second: FlexFamilyRowDirection,
+        beta_direction: Option<&Array1<f64>>,
+    ) -> Result<FlexFamilyDirectionRowTerms, String> {
+        if beta_direction.is_some() {
+            self.flex_family_direction_row_terms_generic::<Jet3>(
+                row,
+                block_states,
+                first,
+                second,
+                beta_direction,
+            )
+        } else {
+            self.flex_family_direction_row_terms_generic::<Jet2>(
+                row,
+                block_states,
+                first,
+                second,
+                None,
+            )
+        }
     }
 }
 
@@ -3052,7 +3713,16 @@ mod moment_engine_tests {
             g: Jet2::from_parts(1.0, &[0.0], &[]),
             h: zero,
         };
-        let residual = calibration_residual_jet(&template, &template, 0, &[], &q_jet, &[]);
+        let scale_ratio = const_jet_like(&template, 1.0);
+        let residual = calibration_residual_jet(
+            &template,
+            &template,
+            0,
+            &[],
+            &q_jet,
+            &scale_ratio,
+            &[],
+        );
         let phi = crate::probability::normal_pdf(q);
         let expected = [
             -phi,
@@ -4536,6 +5206,7 @@ mod moment_engine_tests {
                 primary.g,
                 primary.infl,
                 &q4,
+                &const_jet_like(&tpl4, 1.0),
                 z_obs,
                 o_infl,
                 obs_coeff,
@@ -4572,6 +5243,7 @@ mod moment_engine_tests {
                 primary.g,
                 primary.infl,
                 &q2,
+                &const_jet_like(&tpl2, 1.0),
                 z_obs,
                 o_infl,
                 obs_coeff,
@@ -4806,8 +5478,19 @@ mod moment_engine_tests {
                 .map(|u| Jet4::primary(0.0, u, p, dir1[u], dir2[u]))
                 .collect();
             let q_jet4 = add_const(&du4[primary.q1], q1);
+            let scale_ratio4 = const_jet_like(&template4, 1.0);
             let residual_probe =
-                |a: &Jet4| calibration_residual_jet(a, &b_jet4, primary.g, &du4, &q_jet4, &cells);
+                |a: &Jet4| {
+                    calibration_residual_jet(
+                        a,
+                        &b_jet4,
+                        primary.g,
+                        &du4,
+                        &q_jet4,
+                        &scale_ratio4,
+                        &cells,
+                    )
+                };
             let a_jet_probe = lift_intercept_flex(&template4, a1, 1.0 / d_check, 4, residual_probe);
             let jet_a_uvuv = a_jet_probe.eps_del.h[primary.q1 * p + primary.q1];
 
@@ -4863,6 +5546,7 @@ mod moment_engine_tests {
             primary.g,
             primary.infl,
             &q_jet4,
+            &const_jet_like(&template4, 1.0),
             z_obs,
             o_infl,
             obs_coeff,

@@ -3150,7 +3150,9 @@ impl SaeManifoldOuterObjective {
         // `λ_smooth` too high on frame-active fits.
         let k_smooth = rho.log_lambda_smooth.len();
         let lambda_smooth_vec = rho.lambda_smooth_vec()?;
-        let quad_per_atom = self.term.decoder_smoothness_quadratic_form_per_atom();
+        let quad_per_atom = self
+            .term
+            .decoder_smoothness_quadratic_form_per_atom()?;
         // #2080: reuse the SAME shared (probes, S⁻¹·probes) bundle taken once above
         // for the ARD trace. When present, the smoothness EDF is the matrix-free
         // tr(S⁻¹·M_k) off that bundle (no dense `beta_inv`); otherwise (dense-
@@ -4720,10 +4722,9 @@ pub(crate) fn sae_manifold_newton_directional_decrease(
 ///     device with [`crate::gpu::pool::scatter_batched`] and runs one
 ///     `try_fast_abt_strided_batched` per device tile (computing
 ///     `S_k · B_k = S_k · (B_kᵀ)ᵀ`),
-///   * falls back, atom-by-atom, to the exact ndarray `S_k.dot(B_k)` whenever no
-///     GPU runtime is present, the pool returns `None`, or a tile's batched GEMM
-///     declines. The result is bit-for-bit identical to the all-CPU path (f64
-///     throughout, same accumulation order per product).
+///   * uses the exact ndarray `S_k.dot(B_k)` when no GPU is admitted; once a
+///     runtime is admitted, pool or batched-GEMM failures are propagated rather
+///     than disguised as CPU eligibility.
 ///
 /// Returns one `S_k · B_k` matrix per atom, in atom order. `symmetrize`
 /// pre-symmetrises each `S_k` (the assembly path needs `½(S+Sᵀ)`); the value /
@@ -4732,7 +4733,7 @@ pub(crate) fn sae_manifold_newton_directional_decrease(
 pub(crate) fn batched_smooth_sb(
     sb_inputs: &[(ArrayView2<'_, f64>, ArrayView2<'_, f64>)],
     symmetrize: bool,
-) -> Vec<Array2<f64>> {
+) -> Result<Vec<Array2<f64>>, String> {
     let n_atoms = sb_inputs.len();
     // Materialise the (optionally symmetrised) S factors once; the GPU tile and
     // the CPU fallback both read these, so a single pass keeps the two routes
@@ -4755,8 +4756,8 @@ pub(crate) fn batched_smooth_sb(
         })
         .collect();
 
-    // Exact CPU fallback for a single atom, reused by both the no-GPU route and
-    // per-tile decline.
+    // Exact CPU product for a single atom, reused by the no-GPU route and groups
+    // that are structurally ineligible for batching.
     let cpu_one = |idx: usize| -> Array2<f64> { s_mats[idx].dot(&sb_inputs[idx].1) };
 
     // Size gate BEFORE the device probe (startup-tax ordering fix): each device
@@ -4766,7 +4767,7 @@ pub(crate) fn batched_smooth_sb(
     // `MIN_CALIBRATABLE_GEMM_FLOPS`, so when even the LARGEST group in
     // aggregate is under the floor, every tile on every device would decline
     // and each atom would take `cpu_one` — the exact result this early return
-    // produces without calling `GpuRuntime::global()` (whose first call creates
+    // produces without resolving `GpuRuntime` (whose first resolution creates
     // a CUDA primary context on every GPU). Shapes with an admissible group
     // probe and scatter exactly as before.
     {
@@ -4780,13 +4781,15 @@ pub(crate) fn batched_smooth_sb(
         }
         let max_group = group_flops.values().copied().max().unwrap_or(0);
         if max_group < crate::gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS {
-            return (0..n_atoms).map(cpu_one).collect();
+            return Ok((0..n_atoms).map(cpu_one).collect());
         }
     }
 
-    let rt = match crate::gpu::device_runtime::GpuRuntime::global() {
+    let rt = match crate::gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .map_err(|error| format!("decoder-smoothness CUDA admission failed: {error}"))?
+    {
         Some(rt) => rt,
-        None => return (0..n_atoms).map(cpu_one).collect(),
+        None => return Ok((0..n_atoms).map(cpu_one).collect()),
     };
 
     // Group atom indices by uniform (m, p) shape; only same-shape groups can ride
@@ -4860,24 +4863,28 @@ pub(crate) fn batched_smooth_sb(
                 for (idx, mat) in sink {
                     out[idx] = Some(mat);
                 }
-                // Any member a tile silently skipped (cannot happen with the
-                // contract, but keep the result total) falls back to CPU.
+                // A successful scatter must produce every member exactly once.
                 for &idx in &members {
                     if out[idx].is_none() {
-                        out[idx] = Some(cpu_one(idx));
+                        return Err(format!(
+                            "decoder-smoothness device scatter omitted atom {idx}"
+                        ));
                     }
                 }
             }
             None => {
-                for &idx in &members {
-                    out[idx] = Some(cpu_one(idx));
-                }
+                return Err(format!(
+                    "decoder-smoothness device scatter declined admitted group m={m}, p={p}, atoms={}",
+                    members.len()
+                ));
             }
         }
     }
     out.into_iter()
         .enumerate()
-        .map(|(idx, slot)| slot.unwrap_or_else(|| cpu_one(idx)))
+        .map(|(idx, slot)| {
+            slot.ok_or_else(|| format!("decoder-smoothness result missing atom {idx}"))
+        })
         .collect()
 }
 

@@ -5418,7 +5418,7 @@ impl SaeManifoldTerm {
             return Ok(());
         }
         let mut grams = self.empty_decoder_gram_accumulator();
-        self.accumulate_decoder_gram(&mut grams);
+        self.accumulate_decoder_gram(&mut grams)?;
         // Phase 1 (parallel, READ-ONLY): each atom's rank-revealing eigendecomp
         // depends ONLY on its own data Gram + its own (immutable) atom state, so
         // the per-atom column-map plan `Q_k` is computed independently and
@@ -5789,7 +5789,7 @@ impl SaeManifoldTerm {
         // while never retaining an `(N × M_k)` design.
         {
             let mut grams = self.empty_decoder_gram_accumulator();
-            self.accumulate_decoder_gram(&mut grams);
+            self.accumulate_decoder_gram(&mut grams)?;
             self.finalize_decoder_identifiability_audit(&grams, self.n_obs())?;
         }
         // #2027 — COLD-START disjoint decoder placement. The joint Newton solve
@@ -7214,7 +7214,10 @@ impl SaeManifoldTerm {
     /// structure, so it adds no rank information), so accumulating `Φ` weighted
     /// by the per-row assignment exactly reproduces the data-fit decoder block
     /// curvature `G_k` that `assemble_arrow_schur` installs.
-    pub(crate) fn accumulate_decoder_gram(&self, grams: &mut [Array2<f64>]) {
+    pub(crate) fn accumulate_decoder_gram(
+        &self,
+        grams: &mut [Array2<f64>],
+    ) -> Result<(), String> {
         let n = self.n_obs();
         let assignments = self.assignment.assignments();
         // Each atom's Gram `G_k = Φ_kᵀ diag(a_k²) Φ_k` is an independent
@@ -7225,9 +7228,9 @@ impl SaeManifoldTerm {
         //
         // Spread the atoms across EVERY device via `gpu::pool::scatter_batched`;
         // each device tile computes its atoms' Grams through the size-gated
-        // `try_fast_xt_diag_x` shim. Atoms whose device path declines (no
-        // runtime, sub-threshold size, or backend miss) drop to the exact CPU
-        // rank-1 accumulation, so the result matches the all-CPU path.
+        // `try_fast_xt_diag_x` shim. A device-free or wholly sub-threshold shape
+        // uses exact CPU rank-1 accumulation; after admission, a device decline
+        // or backend failure is returned to the caller.
         let weights: Vec<Array1<f64>> = (0..self.atoms.len())
             .map(|atom_idx| {
                 let col = assignments.column(atom_idx);
@@ -7268,7 +7271,7 @@ impl SaeManifoldTerm {
         // `MIN_CALIBRATABLE_GEMM_FLOPS` — so when even the LARGEST per-atom
         // Gram is under the floor, every device attempt would decline and the
         // scatter would reproduce the CPU path exactly. Take the CPU path
-        // directly without calling `GpuRuntime::global()` (whose first call
+        // directly without resolving `GpuRuntime` (whose first resolution
         // creates a CUDA primary context on every GPU). Shapes with at least
         // one admissible atom probe and scatter exactly as before.
         let max_atom_gram_flops: u128 = self
@@ -7280,11 +7283,13 @@ impl SaeManifoldTerm {
             })
             .max()
             .unwrap_or(0);
-        let rt = if max_atom_gram_flops < crate::gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS
+        let rt = if max_atom_gram_flops
+            < crate::gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS
         {
             None
         } else {
-            crate::gpu::device_runtime::GpuRuntime::global()
+            crate::gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+                .map_err(|error| format!("decoder-Gram CUDA admission failed: {error}"))?
         };
         match rt {
             None => {
@@ -7298,8 +7303,8 @@ impl SaeManifoldTerm {
             Some(rt) => {
                 // Device tiles produce each owned atom's Gram into a side channel
                 // keyed by atom index; splice them back into `grams` (with `+=`
-                // accumulation) after the scatter. Atoms the device declines are
-                // marked so the CPU fallback runs for exactly those.
+                // accumulation) after the scatter. A declined atom is recorded
+                // so the admitted route can fail without laundering it as CPU work.
                 let mut items: Vec<usize> = (0..self.atoms.len())
                     .filter(|&i| self.atoms[i].basis_size() > 0)
                     .collect();
@@ -7333,21 +7338,23 @@ impl SaeManifoldTerm {
                         {
                             grams[atom_idx] += &g;
                         }
-                        for atom_idx in declined.into_inner().expect("declined mutex poisoned") {
-                            cpu_one(atom_idx, &mut grams[atom_idx]);
+                        let declined = declined.into_inner().expect("declined mutex poisoned");
+                        if !declined.is_empty() {
+                            return Err(format!(
+                                "decoder-Gram device path declined admitted atoms {declined:?}"
+                            ));
                         }
                     }
                     None => {
-                        for atom_idx in 0..self.atoms.len() {
-                            if self.atoms[atom_idx].basis_size() == 0 {
-                                continue;
-                            }
-                            cpu_one(atom_idx, &mut grams[atom_idx]);
-                        }
+                        return Err(
+                            "decoder-Gram device scatter declined after CUDA admission"
+                                .to_string(),
+                        );
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Decide rank-deficiency of each accumulated decoder Gram and surface the
@@ -7738,7 +7745,7 @@ impl SaeManifoldTerm {
                 let (logits, coords, _z_chunk) = chunk_init(start, end)?;
                 let chunk =
                     self.materialize_chunk(logits, coords, self.chunk_frozen_logits(start, end))?;
-                chunk.accumulate_decoder_gram(&mut grams);
+                chunk.accumulate_decoder_gram(&mut grams)?;
                 start = end;
             }
             self.finalize_decoder_identifiability_audit(&grams, n_total)?;

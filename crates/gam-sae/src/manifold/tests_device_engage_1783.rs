@@ -334,33 +334,43 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
     // the final runtime gate, upload one resident frame, and consume it in the
     // actual InexactPCG inner solve. CPU CI keeps the routing assertions above.
     #[cfg(target_os = "linux")]
-    if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
-        let started = std::time::Instant::now();
-        let max_q = sys.row_dims.iter().copied().max().unwrap_or(0);
-        let ainv_per_trial_bytes = sys.rows.len() * max_q * max_q * std::mem::size_of::<f64>();
-        let frame = gam_solve::arrow_schur::prepare_sae_resident_frame(&sys, &options, None)
-            .expect("live CUDA runtime must admit the production resident frame");
-        let mut device_options = options.clone();
-        device_options.sae_resident_frame = Some(frame);
-        let (_delta_t, _delta_beta, diagnostics) =
-            gam_solve::arrow_schur::solve_with_lm_escalation_inner(&sys, 0.0, 0.0, &device_options)
+    match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+        Ok(None) => {}
+        Err(error) => panic!("#1017 CUDA admission failed: {error}"),
+        Ok(Some(_)) => {
+            let started = std::time::Instant::now();
+            let max_q = sys.row_dims.iter().copied().max().unwrap_or(0);
+            let ainv_per_trial_bytes =
+                sys.rows.len() * max_q * max_q * std::mem::size_of::<f64>();
+            let frame = gam_solve::arrow_schur::prepare_sae_resident_frame(&sys, &options, None)
+                .expect("live CUDA runtime must admit the production resident frame");
+            let mut device_options = options.clone();
+            device_options.sae_resident_frame = Some(frame);
+            let (_delta_t, _delta_beta, diagnostics) =
+                gam_solve::arrow_schur::solve_with_lm_escalation_inner(
+                    &sys,
+                    0.0,
+                    0.0,
+                    &device_options,
+                )
                 .expect("resident InexactPCG production solve");
-        assert!(
-            diagnostics.used_device_arrow,
-            "production A100 solve must report genuine device execution"
-        );
-        eprintln!(
-            "#1017 A100 resident solve telemetry: used_device_arrow={} elapsed_ms={:.3} \
-             pcg_iterations={} matvec_calls={} ridge_escalations={} \
-             resident_upload_once_bytes={} per_trial_ainv_upload_bytes={} {}",
-            diagnostics.used_device_arrow,
-            started.elapsed().as_secs_f64() * 1.0e3,
-            diagnostics.iterations,
-            diagnostics.matvec_calls,
-            diagnostics.ridge_escalations,
-            operand_report.total_bytes,
-            ainv_per_trial_bytes,
-            operand_report,
-        );
+            assert!(
+                diagnostics.used_device_arrow,
+                "production A100 solve must report genuine device execution"
+            );
+            eprintln!(
+                "#1017 A100 resident solve telemetry: used_device_arrow={} elapsed_ms={:.3} \
+                 pcg_iterations={} matvec_calls={} ridge_escalations={} \
+                 resident_upload_once_bytes={} per_trial_ainv_upload_bytes={} {}",
+                diagnostics.used_device_arrow,
+                started.elapsed().as_secs_f64() * 1.0e3,
+                diagnostics.iterations,
+                diagnostics.matvec_calls,
+                diagnostics.ridge_escalations,
+                operand_report.total_bytes,
+                ainv_per_trial_bytes,
+                operand_report,
+            );
+        }
     }
 }

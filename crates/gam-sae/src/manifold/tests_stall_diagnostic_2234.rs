@@ -85,6 +85,7 @@ fn logdet_audit_point(
         .map_err(|error| error.to_string())?;
     let raw_smoothness_sum: f64 = term
         .decoder_smoothness_value_per_atom(&rho.lambda_smooth_vec().unwrap())
+        .expect("smoothness evaluation must preserve CUDA failures")
         .iter()
         .sum();
     let smooth_renorm = if raw_smoothness_sum.abs() > 0.0 {
