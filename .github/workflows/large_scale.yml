@@ -117,47 +117,38 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # #1458: full history so build.rs author gate resolves real last editor, not HEAD
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build gam binary
+      - name: Download exact warm runtime
+        # The rolling manylinux build publishes the CLI and Python extension
+        # from one source tree. Require this workflow's exact SHA and both
+        # hashes: a missing/stale artifact fails immediately, never falls back
+        # to a 24-minute in-workflow rebuild or mixes two estimator versions.
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cargo build --release -p gam-cli
-          ls -l target/release/gam
-
-      - name: Build gamfit._rust Python extension
-        # bench/large_scale/runner.py loads `gamfit._rust` via
-        # bench/_rust_loader.py for survival_* and classification_*
-        # helpers (e.g. _survival_score_grid, survival_concordance,
-        # classification_metrics). Without this step the runner aborts the
-        # shard with `RuntimeError: gamfit Rust extension is not built`
-        # the moment any survival/classification method is exercised.
-        # Build via `maturin build` (not `develop`, which requires an
-        # active virtualenv the hosted runner does not provide), then
-        # extract `_rust*.so` from the wheel and stage it next to the
-        # `gam` binary so the benchmark job ships both through the same
-        # shared artifact.
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m pip install --upgrade pip
-          python3 -m pip install --upgrade 'maturin>=1.7,<2'
           rm -rf dist
-          maturin build --release -i python3 -o dist
+          mkdir -p dist target/release
+          gh release download wheel-latest --repo "$GITHUB_REPOSITORY" \
+            --pattern 'gamfit-*.whl' \
+            --pattern gam \
+            --pattern RUNTIME_PROVENANCE.txt \
+            --dir dist
+          grep -Fx "commit=${GITHUB_SHA}" dist/RUNTIME_PROVENANCE.txt
+          (
+            cd dist
+            tail -n +2 RUNTIME_PROVENANCE.txt | sha256sum --check --strict
+          )
+          cp dist/gam target/release/gam
+          chmod +x target/release/gam
           python3 .github/scripts/workflow_tasks.py extract_maturin_wheel target/release
+          ls -l target/release/gam
           ls -l target/release/_rust*.so
 
       - name: Upload gam binary and Python extension

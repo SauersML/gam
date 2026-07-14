@@ -1,10 +1,9 @@
 name: Rolling wheel (warm-start artifact)
 
 # Permanent warm-start: every push to main rebuilds the x86_64 manylinux wheel
-# and pins it to the rolling `wheel-latest` prerelease. Compute boxes (MSI,
-# cloud GPU nodes, laptops) download it in seconds instead of paying a 30-40
-# minute cold cargo build, and only fall back to building locally when this
-# workflow is red or they need an unpushed change:
+# plus CLI and pins both to the rolling `wheel-latest` prerelease. Compute boxes
+# and validation workflows download one verified runtime in seconds instead of
+# paying a cold cargo build:
 #
 #   gh release download wheel-latest --repo SauersML/gam -p 'gamfit-*.whl' -D dist/
 #   pip install --force-reinstall dist/gamfit-*.whl
@@ -58,7 +57,11 @@ jobs:
           # build.rs queries git history (author guard); inside the manylinux
           # container the repo is owned by the runner uid while git runs as
           # root, so git refuses with "dubious ownership" unless marked safe.
-          before-script-linux: git config --global --add safe.directory "$(pwd)"
+          before-script-linux: |
+            git config --global --add safe.directory "$(pwd)"
+            cargo build --release -p gam-cli
+            mkdir -p dist
+            cp target/release/gam dist/gam
         env:
           # Iteration profile — same knobs as the MSI warm builder: 2-4x faster
           # rebuilds for ~10% runtime. Numerics are unaffected.
@@ -75,14 +78,24 @@ jobs:
             gh release create wheel-latest --repo "$GITHUB_REPOSITORY" --prerelease \
               --title "Rolling main wheel" \
               --notes "Continuously replaced by the newest green-main build. Not a versioned release."
-          gh release upload wheel-latest "$WHEEL" --repo "$GITHUB_REPOSITORY" --clobber
-          # Record provenance so consumers can verify what they downloaded.
-          echo "${GITHUB_SHA} $(sha256sum "$WHEEL")" > dist/WHEEL_PROVENANCE.txt
-          gh release upload wheel-latest dist/WHEEL_PROVENANCE.txt --repo "$GITHUB_REPOSITORY" --clobber
+          test -x dist/gam
+          gh release upload wheel-latest "$WHEEL" dist/gam --repo "$GITHUB_REPOSITORY" --clobber
+          # One closed provenance contract for both executable artifacts.
+          # Consumers require the exact commit and verify every listed hash;
+          # there is no stale-runtime or source-build fallback.
+          {
+            echo "commit=${GITHUB_SHA}"
+            cd dist
+            sha256sum "$(basename "$WHEEL")" gam
+          } > dist/RUNTIME_PROVENANCE.txt
+          gh release upload wheel-latest dist/RUNTIME_PROVENANCE.txt --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Also keep it as a run artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gamfit-wheel-${{ github.sha }}
-          path: dist/gamfit-*.whl
+          name: gamfit-runtime-${{ github.sha }}
+          path: |
+            dist/gamfit-*.whl
+            dist/gam
+            dist/RUNTIME_PROVENANCE.txt
           retention-days: 14
