@@ -1,16 +1,15 @@
-//! Host-resident implementation of the cubic-cell derivative-moment substrate.
+//! Test oracle for the cubic-cell derivative-moment substrate.
 //!
-//! The host implementation is the CPU-fallback path and the *parity reference*
-//! for the GPU kernel: it produces the same row-major `[n_cells,
-//! max_degree+1]` moment layout the device kernel writes. Callers that pick
-//! `CubicCellMomentResidency::Host` get a real result on every platform; the
-//! `Device` residency variant lands with the NVRTC kernel wiring on Linux.
+//! This module is compiled only by the parent module's test configuration. It
+//! produces the same row-major `[n_cells, max_degree+1]` moment layout as the
+//! device kernel, without creating a production CPU fallback for a selected
+//! device route.
 //!
 //! The host path defers all heavy math to the existing CPU evaluator
 //! `crate::cubic_cell_kernel::evaluate_cell_derivative_moments_uncached`.
 //! This module's only jobs are:
 //!
-//! 1. validate the host view (lengths, supported degree, mode),
+//! 1. validate the host view (lengths and supported degree),
 //! 2. per-cell: respect the caller-supplied branch tag *if* it agrees with
 //!    the host classifier (mismatches degrade the cell to a status code
 //!    instead of silently producing different math),
@@ -18,26 +17,39 @@
 //! 4. record one status code per cell so the caller can react to per-cell
 //!    failures without having to re-run the CPU classifier.
 //!
-//! The production substrate's host path returns only the per-cell status
-//! codes (see [`build_host_cell_status`]); production consumers (BMS
-//! row-primary Hessian, survival-flex row evaluator) read the verdict but
-//! never the moments themselves. The moment-emitting reference path
-//! (`build_host_moments` + `HostMomentBatch`) lives in the test module below
-//! as a comparison oracle for the device kernel's row-major moment buffer.
+//! [`build_host_cell_status`] supports the parent module's validation tests;
+//! the moment-emitting path below is the numerical parity oracle.
 
 use crate::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_derivative_moments_uncached};
 use crate::gpu_kernels::cubic_cell::branch::classify_cell_for_gpu;
 use crate::gpu_kernels::cubic_cell::{
     CubicCellDerivativeMomentHostView, CubicCellMomentStatus, GpuCellBranchTag,
+    MAX_SUPPORTED_DEGREE,
 };
 
-/// Classify each cell with the host classifier and return the per-cell
-/// status vector — the only payload production callers (the substrate's
-/// `Host` residency output, and the survival-flex row evaluator) consume on
-/// the CPU path.
+fn validate_host_view(view: &CubicCellDerivativeMomentHostView<'_>) -> Result<(), String> {
+    if view.cells.len() != view.branches.len() {
+        return Err(format!(
+            "host cubic-cell oracle: cells.len()={} != branches.len()={}",
+            view.cells.len(),
+            view.branches.len()
+        ));
+    }
+    if view.max_degree > MAX_SUPPORTED_DEGREE {
+        return Err(format!(
+            "host cubic-cell oracle: max_degree={} exceeds MAX_SUPPORTED_DEGREE={}",
+            view.max_degree, MAX_SUPPORTED_DEGREE
+        ));
+    }
+    Ok(())
+}
+
+/// Classify each cell with the host classifier and return the per-cell status
+/// vector used by the parent module's shape and classification tests.
 pub(crate) fn build_host_cell_status(
     view: &CubicCellDerivativeMomentHostView<'_>,
 ) -> Result<Vec<u8>, String> {
+    validate_host_view(view)?;
     let n_cells = view.cells.len();
     let mut status = vec![CubicCellMomentStatus::Ok as u8; n_cells];
 
@@ -96,8 +108,7 @@ mod tests {
     use super::*;
     use crate::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_derivative_moments_uncached};
     use crate::gpu_kernels::cubic_cell::{
-        CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuCellBranchTag,
-        GpuDenestedCubicCell,
+        CubicCellDerivativeMomentHostView, GpuCellBranchTag, GpuDenestedCubicCell,
     };
 
     /// Row-major moments + per-cell status, the same layout the device
@@ -117,6 +128,7 @@ mod tests {
     pub(super) fn build_host_moments(
         view: &CubicCellDerivativeMomentHostView<'_>,
     ) -> Result<HostMomentBatch, String> {
+        validate_host_view(view)?;
         let n_cells = view.cells.len();
         let stride = view.max_degree + 1;
         let mut moments = vec![0.0_f64; n_cells.saturating_mul(stride)];
@@ -221,7 +233,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 9,
-            residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");
         assert_eq!(out.status[0], CubicCellMomentStatus::Ok as u8);
@@ -244,7 +255,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 21,
-            residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");
         assert_eq!(out.status[0], CubicCellMomentStatus::Ok as u8);
@@ -267,7 +277,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 15,
-            residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");
         assert_eq!(out.status[0], CubicCellMomentStatus::Ok as u8);
@@ -290,7 +299,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 9,
-            residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");
         assert_eq!(out.status[0], CubicCellMomentStatus::Ok as u8);
@@ -312,7 +320,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 9,
-            residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");
         assert_eq!(out.status[0], CubicCellMomentStatus::InvalidInterval as u8);
@@ -399,7 +406,6 @@ mod tests {
                 cells: &cells_gpu,
                 branches: &branches,
                 max_degree,
-                residency: CubicCellMomentResidency::Host,
             };
             let out = build_host_moments(&view).expect("host substrate");
             assert_eq!(out.stride, max_degree + 1);
@@ -437,7 +443,6 @@ mod tests {
             cells: std::slice::from_ref(&gpu),
             branches: &branches,
             max_degree: 9,
-            residency: CubicCellMomentResidency::Host,
         };
         let out = build_host_moments(&view).expect("host substrate");
         assert_eq!(out.status[0], CubicCellMomentStatus::InvalidInterval as u8);

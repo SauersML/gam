@@ -27,8 +27,7 @@
 //! * [`branch`] — host-side branch classifier; mirrors
 //!   `cubic_cell_kernel::branch_cell` + the semi-infinite tail logic of
 //!   `evaluate_cell_state_dispatched`.
-//! * [`host_substrate`] — CPU-resident implementation. Works on every
-//!   platform and is the parity reference for the device kernel.
+//! * `tests_host_substrate` — test-only CPU oracle for device-kernel parity.
 //! * [`kernel_src`] — NVRTC-compilable CUDA C++ source as Rust string
 //!   constants (D9 / D15 / D21 specializations).
 //! * [`device`] — Linux+CUDA dispatcher that compiles, launches, and

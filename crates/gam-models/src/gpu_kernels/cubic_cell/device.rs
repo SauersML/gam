@@ -37,29 +37,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaStream};
 
-/// Linux-only: launch the Stage-1 dispatcher and return the moments
-/// buffer in device memory (`CudaSlice<f64>`). Caller may pass the
-/// returned slice directly to any kernel launch on the same default
-/// stream (e.g. `bms_flex_row_kernel`). Returns `Ok(None)` when no CUDA
-/// runtime is available (the caller treats the requested device route as
-/// unavailable; this API does not substitute host execution).
-/// Returns `Err` on a genuine driver / NVRTC / shape failure that the
-/// caller must surface.
+/// Linux-only: launch the Stage-1 dispatcher and return the moments buffer in
+/// device memory (`CudaSlice<f64>`). The caller reaches this boundary only
+/// after selecting device execution, so backend absence and driver/NVRTC/shape
+/// failures are all typed errors; this function never substitutes host work.
 #[cfg(target_os = "linux")]
-pub(crate) fn try_device_moments_resident(
+pub(crate) fn build_device_moments_resident(
     view: &CubicCellDerivativeMomentHostView<'_>,
-) -> Result<Option<CubicCellDerivativeMomentOutput>, GpuError> {
-    let Some(_) = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())? else {
-        return Ok(None);
-    };
+) -> Result<CubicCellDerivativeMomentOutput, GpuError> {
     let backend = CubicCellGpuBackend::probe()?;
-    backend.dispatch_device_resident(view).map(Some)
+    backend.dispatch_device_resident(view)
 }
 
 /// Process-wide cubic-cell GPU backend. Mirrors the
 /// `BmsFlexGpuBackend` / `SurvivalFlexGpuBackend` shape so future
 /// device-residency residencies can swap in without churn. Linux-only:
-/// non-Linux builds skip [`try_device_moments_resident`] at the call
+/// non-Linux builds skip [`build_device_moments_resident`] at the call
 /// site (`super::try_build_cubic_cell_derivative_moments`) via
 /// `#[cfg(target_os = "linux")]`, so this backend is never referenced.
 #[cfg(target_os = "linux")]
@@ -309,7 +302,7 @@ impl CubicCellGpuBackend {
             }
         }
         drop(d_status);
-        Ok(CubicCellDerivativeMomentOutput::Device {
+        Ok(CubicCellDerivativeMomentOutput {
             d_moments,
             status: status_host,
             stride,
@@ -322,9 +315,8 @@ impl CubicCellGpuBackend {
 mod tests {
     use super::*;
     use crate::gpu_kernels::cubic_cell::{
-        CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
-        CubicCellMomentResidency, CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell,
-        try_build_cubic_cell_derivative_moments,
+        CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
+        GpuCellBranchTag, GpuDenestedCubicCell, try_build_cubic_cell_derivative_moments,
     };
     use gam_gpu::device_runtime::GpuRuntime;
     use gam_gpu::gpu_error::GpuError;
@@ -458,22 +450,15 @@ mod tests {
                 cells: &cells_gpu,
                 branches: &branches,
                 max_degree,
-                residency: CubicCellMomentResidency::Device,
             };
-            let out = try_build_cubic_cell_derivative_moments(view)
+            let CubicCellDerivativeMomentOutput {
+                d_moments,
+                status,
+                stride,
+                n_cells,
+            } = try_build_cubic_cell_derivative_moments(view)
                 .expect("device-residency dispatch must succeed with CUDA")
                 .expect("non-empty input must yield output");
-            let (d_moments, status, stride, n_cells) = match out {
-                CubicCellDerivativeMomentOutput::Device {
-                    d_moments,
-                    status,
-                    stride,
-                    n_cells,
-                } => (d_moments, status, stride, n_cells),
-                CubicCellDerivativeMomentOutput::Host { .. } => panic!(
-                    "device residency must produce CubicCellDerivativeMomentOutput::Device on a CUDA host"
-                ),
-            };
             assert_eq!(stride, max_degree + 1);
             assert_eq!(n_cells, cpu_cells.len());
             assert_eq!(status.len(), cpu_cells.len());

@@ -1707,7 +1707,7 @@ impl BernoulliMarginalSlopeFamily {
         let cell_moments_device: Option<cudarc::driver::CudaSlice<f64>> = if build_device_moments {
             use crate::gpu_kernels::cubic_cell::{
                 CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
-                CubicCellMomentResidency, try_build_cubic_cell_derivative_moments,
+                try_build_cubic_cell_derivative_moments,
             };
             // Sanity: the per-row loop must have produced exactly one
             // entry per cell index.
@@ -1723,50 +1723,38 @@ impl BernoulliMarginalSlopeFamily {
                 cells: &gpu_cells,
                 branches: &gpu_branches,
                 max_degree: crate::bms::gpu::row::MOMENT_STRIDE - 1,
-                residency: CubicCellMomentResidency::Device,
             };
-            let output = try_build_cubic_cell_derivative_moments(view)
+            let CubicCellDerivativeMomentOutput {
+                d_moments,
+                status,
+                stride,
+                n_cells,
+            } = try_build_cubic_cell_derivative_moments(view)
                 .map_err(|err| format!("bms_flex_row device-moment build failed: {err}"))?
                 .ok_or_else(|| "bms_flex_row device-moment build returned no output".to_string())?;
-            match output {
-                CubicCellDerivativeMomentOutput::Device {
-                    d_moments,
-                    status,
-                    stride,
-                    n_cells,
-                } => {
-                    if stride != crate::bms::gpu::row::MOMENT_STRIDE || n_cells != total_cells_us {
-                        return Err(format!(
-                            "bms_flex_row device-moment substrate returned bad shape: \
-                             stride={stride} n_cells={n_cells} expected stride={} cells={}",
-                            crate::bms::gpu::row::MOMENT_STRIDE,
-                            total_cells_us
-                        ));
-                    }
-                    let refused = status
-                        .iter()
-                        .filter(|&&s| {
-                            s != crate::gpu_kernels::cubic_cell::CubicCellMomentStatus::Ok as u8
-                        })
-                        .count();
-                    if refused > 0 {
-                        return Err(format!(
-                            "bms_flex_row device-moment kernel refused {refused}/{} cell(s)",
-                            status.len()
-                        ));
-                    }
-                    // The runtime path keeps the device buffer alive on the
-                    // owned bundle and lets the launcher feed it straight into
-                    // the row kernel.
-                    Some(d_moments)
-                }
-                #[cfg(test)]
-                CubicCellDerivativeMomentOutput::Host { .. } => {
-                    return Err(
-                        "bms_flex_row device-moment build downgraded to host residency".to_string(),
-                    );
-                }
+            if stride != crate::bms::gpu::row::MOMENT_STRIDE || n_cells != total_cells_us {
+                return Err(format!(
+                    "bms_flex_row device-moment substrate returned bad shape: \
+                     stride={stride} n_cells={n_cells} expected stride={} cells={}",
+                    crate::bms::gpu::row::MOMENT_STRIDE,
+                    total_cells_us
+                ));
             }
+            let refused = status
+                .iter()
+                .filter(|&&s| {
+                    s != crate::gpu_kernels::cubic_cell::CubicCellMomentStatus::Ok as u8
+                })
+                .count();
+            if refused > 0 {
+                return Err(format!(
+                    "bms_flex_row device-moment kernel refused {refused}/{} cell(s)",
+                    status.len()
+                ));
+            }
+            // The runtime path keeps the device buffer alive on the owned
+            // bundle and lets the launcher feed it straight into the row kernel.
+            Some(d_moments)
         } else {
             None
         };
