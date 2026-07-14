@@ -2482,22 +2482,3 @@ pub(crate) fn time_wiggle_basis_ncols(knots: &Array1<f64>, degree: usize) -> Res
     let h0 = Array1::from_vec(vec![probe]);
     Ok(monotone_wiggle_basis_with_derivative_order(h0.view(), knots, degree, 0)?.ncols())
 }
-
-pub(crate) fn smgs_deleted_required_channel_reason(
-    p_time: usize,
-    p_marginal: usize,
-    p_logslope: usize,
-    w_time: usize,
-    w_marginal: usize,
-    w_logslope: usize,
-) -> Option<&'static str> {
-    if p_time > 0 && w_time == 0 {
-        Some("time")
-    } else if p_marginal > 0 && w_marginal == 0 {
-        Some("marginal")
-    } else if p_logslope > 0 && w_logslope == 0 {
-        Some("logslope")
-    } else {
-        None
-    }
-}

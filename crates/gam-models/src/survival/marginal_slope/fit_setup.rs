@@ -5,69 +5,6 @@
 
 use super::*;
 
-/// Overwrite the timewiggle tail columns of the dense time-channel
-/// primary-Jacobian slots with their analytic value at the β=0 pilot primary
-/// state, in place.
-///
-/// When `timewiggle(...)` is active the workflow disables the base time basis
-/// and appends the wiggle coefficient slots as **zero placeholder** columns
-/// (the design width is a coefficient-layout convention, not the Jacobian).
-/// Feeding those zeros into the identifiability compiler makes the whole time
-/// block look structurally zero ("block 0 fully aliased") — a bad-Jacobian
-/// artifact, not a real alias. The true primary-channel derivative of the time
-/// channels w.r.t. wiggle coefficient `j`, at the linearisation point β=0, is
-/// the monotone-wiggle basis value at the pilot coordinate:
-///
-/// ```text
-///   ∂q0  / ∂β_tw[j] = B_j(h0)          h0    = q0_pilot  = offset_entry
-///   ∂q1  / ∂β_tw[j] = B_j(h1)          h1    = q1_pilot  = offset_exit + marginal_offset
-///   ∂qd1 / ∂β_tw[j] = B'_j(h1)·d_raw   d_raw = qd1_pilot = derivative_offset_exit
-/// ```
-///
-/// Base columns (`j < p_base`) reduce to the raw design at β=0 (dq/dh = 1,
-/// d²q/dh² = 0) and are left untouched. The logslope-curvature factor `c_i` is
-/// **not** applied here; it enters the Fisher Gram through
-/// [`SurvivalRowHessian`], matching the raw-design convention for base columns.
-pub(crate) fn overwrite_timewiggle_time_slots_at_pilot(
-    dq0: &mut Array2<f64>,
-    dq1: &mut Array2<f64>,
-    dqd1: &mut Array2<f64>,
-    timewiggle: &TimeWiggleBlockInput,
-    h0: &Array1<f64>,
-    h1: &Array1<f64>,
-    d_raw: &Array1<f64>,
-) -> Result<(), String> {
-    let p_tw = timewiggle.ncols;
-    if p_tw == 0 {
-        return Ok(());
-    }
-    let p_time = dq0.ncols();
-    let p_base = p_time.saturating_sub(p_tw);
-    let n = dq0.nrows();
-    let knots = &timewiggle.knots;
-    let degree = timewiggle.degree;
-    let b0 = monotone_wiggle_basis_with_derivative_order(h0.view(), knots, degree, 0)?;
-    let b1 = monotone_wiggle_basis_with_derivative_order(h1.view(), knots, degree, 0)?;
-    let b1d = monotone_wiggle_basis_with_derivative_order(h1.view(), knots, degree, 1)?;
-    if b0.ncols() != p_tw || b1.ncols() != p_tw || b1d.ncols() != p_tw {
-        return Err(format!(
-            "overwrite_timewiggle_time_slots_at_pilot: basis width B/B/B'={}/{}/{} != p_tw={p_tw}",
-            b0.ncols(),
-            b1.ncols(),
-            b1d.ncols(),
-        ));
-    }
-    for i in 0..n {
-        for j in 0..p_tw {
-            let col = p_base + j;
-            dq0[[i, col]] = b0[[i, j]];
-            dq1[[i, col]] = b1[[i, j]];
-            dqd1[[i, col]] = b1d[[i, j]] * d_raw[i];
-        }
-    }
-    Ok(())
-}
-
 // ── Building block specs ──────────────────────────────────────────────
 
 pub(crate) fn build_time_blockspec(
@@ -942,42 +879,6 @@ pub(crate) fn pooled_survival_baseline(
 pub(crate) enum FlexActivation {
     OffForRigidPilot,
     On,
-}
-
-/// Which coordinate system the `marginal`/`logslope` designs handed to
-/// `build_blocks` live in — and therefore whether the side-bound V+M-exact
-/// pulled-back penalties (`*_penalties_vm`) apply.
-///
-/// The V+M-exact cutover compiles the marginal/logslope designs into a reduced
-/// (column-dropped, reparameterised) coordinate system and pulls each block's
-/// penalty back through that block's own `V_b` to a matching compiled-width
-/// `Vᵀ S V`. Those pulled-back penalties are valid **only** against the
-/// compiled designs they were derived from. Two distinct callers reach
-/// `build_blocks` with structurally different designs:
-///
-/// * [`BlockDesignCoords::PostCutover`] — the construction-site calls (rigid
-///   warm-start pilot, initial derivative probe) pass the post-cutover designs
-///   the `*_penalties_vm` were pulled back through. The compiled penalties are
-///   authoritative here and must replace the raw-width penalties that
-///   `build_*_blockspec` derives from `TermCollectionDesign.penalties` (which
-///   the cutover intentionally leaves at raw width for predict-time consumers).
-/// * [`BlockDesignCoords::RematerializedRaw`] — the outer spatial-length-scale
-///   optimizer re-materialises *raw*-width marginal/logslope designs from the
-///   boot `TermCollectionSpec`s on every κ probe and routes them here. The raw
-///   design-derived penalties are authoritative; the compiled `*_penalties_vm`
-///   are at the wrong width/parametrisation and must NOT be installed (doing so
-///   is the #788 `block i penalty 0 must be NxN, got KxK` shape mismatch — and,
-///   in the no-column-drop-but-`V≠I` case where widths happen to coincide, a
-///   silent installation of a `Vᵀ S V` penalty onto a raw design).
-///
-/// Distinguishing by an explicit, named coordinate tag — rather than guessing
-/// from a `penalty.shape() == design.shape()` width coincidence — makes the
-/// provenance an auditable property of each call site and lets the compiled
-/// path assert width agreement loudly instead of relying on it holding.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum BlockDesignCoords {
-    PostCutover,
-    RematerializedRaw,
 }
 
 /// One block in the joint training-row design layout consumed by

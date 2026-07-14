@@ -71,25 +71,6 @@ fn survival_pilot_irls_row_metric_rejects_length_mismatch() {
     }
 }
 
-#[test]
-fn smgs_rawstack_reduction_rejects_required_channel_deletion() {
-    assert_eq!(
-        super::smgs_deleted_required_channel_reason(12, 7, 7, 12, 7, 0),
-        Some("logslope"),
-        "the #808 clustered-PC rawstack map must not delete the log-slope channel"
-    );
-    assert_eq!(
-        super::smgs_deleted_required_channel_reason(12, 7, 7, 12, 6, 7),
-        None,
-        "partial reductions that preserve all physical channels remain valid"
-    );
-    assert_eq!(
-        super::smgs_deleted_required_channel_reason(12, 7, 7, 0, 7, 7),
-        Some("time"),
-        "the baseline/time channel is also required"
-    );
-}
-
 fn empty_termspec() -> TermCollectionSpec {
     TermCollectionSpec {
         linear_terms: vec![],
