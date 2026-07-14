@@ -296,9 +296,13 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                     &self.options,
                 )
             }
-            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => Err(format!(
-                "survival marginal-slope baseline family axis {axis} has no installed exact first-order row calculus"
-            )),
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
+                .family
+                .rigid_baseline_exact_joint_psi_terms_with_options(
+                    &self.block_states,
+                    axis,
+                    &self.options,
+                ),
         }
     }
 
@@ -371,6 +375,17 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                     &self.block_states,
                     &self.options,
                 ),
+            (
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)),
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(other_axis)),
+            ) => self
+                .family
+                .rigid_baseline_exact_joint_psisecond_order_terms_with_options(
+                    &self.block_states,
+                    axis,
+                    other_axis,
+                    &self.options,
+                ),
             _ => Err(format!(
                 "survival marginal-slope family-touching pair ({psi_i}, {psi_j}) has no installed exact second-order row calculus"
             )),
@@ -401,9 +416,15 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                     &self.options,
                 )
                 .map(|result| result.map(gam_problem::DriftDerivResult::Dense)),
-            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => Err(format!(
-                "survival marginal-slope baseline family axis {axis} has no installed exact beta-Hessian drift calculus"
-            )),
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
+                .family
+                .rigid_baseline_exact_joint_psihessian_directional_derivative_with_options(
+                    &self.block_states,
+                    axis,
+                    d_beta_flat,
+                    &self.options,
+                )
+                .map(|result| result.map(gam_problem::DriftDerivResult::Dense)),
         }
     }
 }

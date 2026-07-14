@@ -196,11 +196,9 @@ fn run() -> Result<(), String> {
             admitted.device_min_score_elems.div_ceil(k.max(1)),
         ));
     }
-    if args.gpu_policy == gam_gpu::GpuPolicy::Required && gam_gpu::GpuRuntime::global().is_none() {
-        return Err(
-            "--gpu required but no CUDA runtime is available on this host; run on the A100 box"
-                .to_string(),
-        );
+    if args.gpu_policy == gam_gpu::GpuPolicy::Required {
+        gam_gpu::GpuRuntime::require()
+            .map_err(|error| format!("--gpu required but CUDA admission failed: {error}"))?;
     }
 
     let z = planted_activations(args.rows, args.p);

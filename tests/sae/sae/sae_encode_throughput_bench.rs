@@ -506,7 +506,9 @@ fn sae_encode_throughput_decision_gate() {
     // and the decision MUST be the exact comparison between that measured device
     // rate and the 100k rows/sec/GPU target — no resident-solve component proxy
     // and no CPU×constant projection.
-    let device_present = GpuRuntime::global().map(|r| r.device_count()).unwrap_or(0) > 0;
+    let device_present = GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in encode benchmark: {error}"))
+        .is_some_and(|runtime| runtime.device_count() > 0);
     let mut decision = if device_present {
         EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::DeviceNotEngaged)
     } else {

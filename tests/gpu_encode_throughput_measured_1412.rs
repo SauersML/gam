@@ -32,7 +32,9 @@ use gam::gpu::linalg_dispatch::ResidentDesignGram;
 use ndarray::{Array1, Array2};
 
 fn device_present() -> bool {
-    GpuRuntime::global().map(|r| r.device_count()).unwrap_or(0) > 0
+    GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in throughput test: {error}"))
+        .is_some_and(|runtime| runtime.device_count() > 0)
 }
 
 /// Same deterministic LCG fixture the measurement uses, so the parity check

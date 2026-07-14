@@ -89,7 +89,8 @@ fn spd_block(d: usize, rng: &mut u64) -> Array2<f64> {
 }
 
 fn main() {
-    let rt = gam::gpu::device_runtime::GpuRuntime::global();
+    let rt = gam::gpu::device_runtime::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in throughput benchmark: {error}"));
     let dev_count = rt.map(|r| r.device_count()).unwrap_or(0);
     if dev_count == 0 {
         println!("THROUGHPUT_1412 NO_GPU_RUNTIME — skipped (no CUDA device visible)");

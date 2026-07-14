@@ -43,6 +43,12 @@ use gam::solver::arrow_schur::{
 use gam::solver::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
 use ndarray::Array2;
 
+fn gpu_available_or_fail() -> bool {
+    GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in #1551 test: {error}"))
+        .is_some()
+}
+
 /// Build a production-shaped framed SAE arrow system: few rows, wide factored
 /// border (`k >= DEVICE_LOOP_MIN_P`), modest per-row depth `d` — the LLM/SAE
 /// shape the device-offload policy admits. Mirrors the in-crate framed device
@@ -360,7 +366,7 @@ fn sae_direct_mode_routing_reachable_and_non_regressing_1551() {
     // default()` returns the same verdict the live seam would. cg_iters is
     // derived EXACTLY as the seam derives it from the Direct options. With every
     // shape gate satisfied, the ONLY thing that declines the device on this host
-    // is `GpuRuntime::global()` being absent (CPU-only) — i.e. on a CUDA host
+    // is typed GPU absence (CPU-only) — i.e. on a CUDA host
     // this same fixture is SELECTED for the device (the on-GPU engagement test
     // below asserts it then runs).
     let seam_options = direct_options();
@@ -385,7 +391,7 @@ fn sae_direct_mode_routing_reachable_and_non_regressing_1551() {
         cg_iters,
     );
 
-    if GpuRuntime::global().is_some() {
+    if gpu_available_or_fail() {
         // A GPU host would route the production solve to the (currently faulting)
         // device kernel; that on-GPU assertion is the ignored test below. Here we
         // only need a device-ABSENT host to exercise the routing + CPU non-
@@ -404,7 +410,7 @@ fn sae_direct_mode_routing_reachable_and_non_regressing_1551() {
         .expect("CPU dense reference solve must succeed");
 
     // Production entry on the device-frame system. On a device-absent host the
-    // #1551 device branch declines (`GpuRuntime::global()` is None) and the solve
+    // #1551 device branch declines on typed runtime absence and the solve
     // is the bit-identical CPU Direct path.
     let (delta_t, delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
@@ -486,12 +492,12 @@ fn sae_direct_mode_routing_reachable_and_non_regressing_1551() {
 /// `framed_sae_device_pcg_matches_cpu_when_cuda_admits` (framed) PASS on a Tesla
 /// V100 (sm_70). So the on-GPU gate is now a real committed test.
 ///
-/// Skips cleanly on CPU-only hosts (`GpuRuntime::global()` is None): the device
+/// Skips cleanly on CPU-only hosts (typed runtime absence): the device
 /// branch declines there and `used_device_arrow` would be false — that case is
 /// already pinned by `sae_direct_mode_routing_reachable_and_non_regressing_1551`.
 #[test]
 fn sae_direct_mode_device_engages_on_gpu_1551() {
-    if GpuRuntime::global().is_none() {
+    if !gpu_available_or_fail() {
         eprintln!(
             "[owed_1551] no CUDA runtime present; the on-GPU engagement assertion is the \
              GPU-gated remainder. CPU routing is pinned by the always-on gate above."

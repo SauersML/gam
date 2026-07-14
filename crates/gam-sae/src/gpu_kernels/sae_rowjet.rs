@@ -711,17 +711,24 @@ pub fn plan_softmax_row_jets(
 
     #[cfg(target_os = "linux")]
     {
-        let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            if mode == gam_gpu::GpuPolicy::Required {
-                return Err(
-                    "complete SAE row jet requires CUDA, but no runtime was admitted".to_string(),
-                );
+        let runtime = match mode {
+            gam_gpu::GpuPolicy::Required => gam_gpu::device_runtime::GpuRuntime::require()
+                .map_err(|error| format!("complete SAE row jet requires CUDA: {error}"))?,
+            gam_gpu::GpuPolicy::Auto => {
+                let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::resolve(mode)
+                    .map_err(|error| {
+                        format!("complete SAE row-jet CUDA admission failed: {error}")
+                    })?
+                else {
+                    return Ok(SaeRowJetExecutionPlan {
+                        path: SaeRowJetPath::Cpu,
+                        tile_rows: 1,
+                        ledger,
+                    });
+                };
+                runtime
             }
-            return Ok(SaeRowJetExecutionPlan {
-                path: SaeRowJetPath::Cpu,
-                tile_rows: 1,
-                ledger,
-            });
+            gam_gpu::GpuPolicy::Off => unreachable!("Off returns before CUDA resolution"),
         };
         if mode == gam_gpu::GpuPolicy::Auto && total_rows < runtime.policy.row_kernel_min_n {
             return Ok(SaeRowJetExecutionPlan {
@@ -1664,8 +1671,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn complete_device_matches_cpu_every_channel_when_admitted_2304() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            return;
+        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(error) => panic!("complete row-jet CUDA admission failed: {error}"),
         }
         // A 37-row smoke fixture launches each kernel for too little time to
         // establish that the admitted production path actually occupies the

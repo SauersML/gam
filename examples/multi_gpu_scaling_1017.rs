@@ -39,7 +39,8 @@ fn main() {
         .map(|_| Array1::from_shape_fn(N, |_| lcg(&mut rng).abs()))
         .collect();
 
-    let rt = gam::gpu::device_runtime::GpuRuntime::global();
+    let rt = gam::gpu::device_runtime::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in multi-GPU benchmark: {error}"));
     let dev_count = rt.map(|r| r.device_count()).unwrap_or(0);
     println!("MULTIGPU device_count={dev_count}");
     if dev_count == 0 {

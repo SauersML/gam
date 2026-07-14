@@ -22,7 +22,9 @@ fn close(a: f64, b: f64, tol: f64) -> bool {
 fn assert_present_or_no_runtime(declined: bool, op: &str) {
     if declined {
         assert!(
-            gam::gpu::device_runtime::GpuRuntime::global().is_none(),
+            gam::gpu::device_runtime::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+                .unwrap_or_else(|error| panic!("GPU probe fault in parity decline: {error}"))
+                .is_none(),
             "GPU {op} declined (returned None) on a host WITH a CUDA runtime present, \
              despite a fixture sized to clear the 1e8 dispatch FLOP floor. A \
              runtime-present decline on a floor-clearing workload is a real \
@@ -39,7 +41,10 @@ fn gpu_paths_match_cpu_to_1e8_on_floor_clearing_matrices() {
     // CPU-only host there is nothing to validate (the helpers would return None for
     // lack of a device, not for lack of work) — skip cleanly without the heavy
     // allocations so CPU CI stays fast and light.
-    if gam::gpu::device_runtime::GpuRuntime::global().is_none() {
+    if gam::gpu::device_runtime::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in matrix parity test: {error}"))
+        .is_none()
+    {
         eprintln!("SKIP gpu_paths_match_cpu_to_1e8_on_floor_clearing_matrices: no CUDA runtime");
         return;
     }

@@ -1,6 +1,6 @@
 # GPU Acceleration
 
-CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, the runtime lazily probes for a usable CUDA device on first use (`GpuRuntime::global()`) and dispatches to the GPU when one is present, falling back to CPU when it is not. There is no manual device flag — the policy decides, the probe finds the hardware.
+CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, `GpuRuntime::resolve(GpuPolicy::Auto)` lazily probes for a usable CUDA device and dispatches to it when present. Typed hardware absence (unsupported platform, no driver, or no device) selects CPU; a present-but-broken driver, missing runtime dependency, or initialization fault remains an error and never masquerades as absence. There is no manual device flag — the policy decides, the probe finds the hardware.
 
 The runtime policy is set through `crate::gpu::configure_global_policy`:
 
@@ -10,7 +10,7 @@ use gam::gpu::{configure_global_policy, GpuPolicy};
 configure_global_policy(GpuPolicy::Auto);  // Auto (default) | Off | Required
 ```
 
-`cuda_selected()` resolves the policy at each dispatch point: `Auto` returns `GpuRuntime::is_available()` (the probe), `Off` selects CPU, and `Required` requires GPU (propagating any GPU error instead of falling back).
+`cuda_selected()` returns a `Result<bool, GpuError>` at each dispatch point: `Auto` returns `Ok(false)` only for typed absence, `Off` returns `Ok(false)` without probing, and `Required` requires a device. Both Auto and Required preserve probe faults; Required additionally turns typed absence into `RequiredDeviceUnavailable`.
 
 Python callers control this through a single `"gpu"` key in the `config` dict, whose value is one of `"auto"` (default), `"off"`, or `"required"`:
 
@@ -42,7 +42,7 @@ writes the symmetric row Hessian back to host-pinned storage.
 
 ## Dispatch
 
-CUDA is not behind a Cargo feature gate in this crate; `cudarc` is linked with `fallback-dynamic-loading`, and `GpuRuntime::global()` probes lazily at runtime whether a CUDA device is available. The probe also discovers every usable CUDA device into a pool (`crates/gam-gpu/src/pool.rs`, `scatter_batched` / `balanced_partition`), so multi-GPU work is fanned across devices by score.
+CUDA is not behind a Cargo feature gate in this crate; `cudarc` is linked with `fallback-dynamic-loading`, and the typed `GpuRuntime::availability()` cache probes lazily at runtime whether CUDA is available, absent, or faulted. The probe also discovers every usable CUDA device into a pool (`crates/gam-gpu/src/pool.rs`, `scatter_batched` / `balanced_partition`), so multi-GPU work is fanned across devices by score.
 
 ```toml
 cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }

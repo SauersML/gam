@@ -3574,10 +3574,14 @@ mod row_kernel_tests {
             }
             #[cfg(target_os = "linux")]
             {
-                let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-                    eprintln!("[bms_flex_row parity] no CUDA runtime");
-                    return;
-                };
+                match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        eprintln!("[bms_flex_row parity] no CUDA device");
+                        return;
+                    }
+                    Err(error) => panic!("[bms_flex_row parity] CUDA probe failed: {error}"),
+                }
                 let gpu = super::super::launch_bms_flex_row_kernel(owned.as_borrowed())
                     .expect("CUDA-selected canonical parity launch must succeed");
                 let check = |channel: &str, index: usize, cpu: f64, device: f64| {
@@ -3620,7 +3624,7 @@ mod row_kernel_tests {
                 gam_gpu::GpuPolicy::Required,
                 "fresh-process r=33 parity must claim Required before runtime discovery"
             );
-            gam_gpu::device_runtime::GpuRuntime::global_or_fail(gam_gpu::GpuPolicy::Required)
+            gam_gpu::device_runtime::GpuRuntime::require()
                 .expect("#932 mandatory r=33 CUDA runtime");
             // Cubic deviation runtimes with the third-order smoothness null
             // space removed expose `num_internal_knots + 2` live controls.
@@ -3642,6 +3646,17 @@ mod tests {
     use std::hint::black_box;
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
+
+    fn cuda_runtime_for_test(test_name: &str) -> Option<&'static gam_gpu::device_runtime::GpuRuntime> {
+        match gam_gpu::device_runtime::GpuRuntime::resolve(GpuPolicy::Auto) {
+            Ok(Some(runtime)) => Some(runtime),
+            Ok(None) => {
+                eprintln!("[{test_name}] no CUDA device — skipping");
+                None
+            }
+            Err(error) => panic!("[{test_name}] CUDA probe failed: {error}"),
+        }
+    }
 
     fn assert_array1_close_932(label: &str, expected: &Array1<f64>, actual: &Array1<f64>) {
         assert_eq!(expected.len(), actual.len(), "{label}: length mismatch");
@@ -3666,7 +3681,7 @@ mod tests {
             GpuPolicy::Required,
             "fresh-process acceptance test must claim Required before any competing policy"
         );
-        gam_gpu::device_runtime::GpuRuntime::global_or_fail(GpuPolicy::Required)
+        gam_gpu::device_runtime::GpuRuntime::require()
             .expect("#932 mandatory CUDA runtime");
 
         let (family, states) = row_kernel_tests::parity_415::make_flex_parity_family(256, 8, 6);
@@ -3836,7 +3851,7 @@ mod tests {
 
         configure_global_policy(GpuPolicy::Required);
         assert_eq!(gam_gpu::global_policy(), GpuPolicy::Required);
-        gam_gpu::device_runtime::GpuRuntime::global_or_fail(GpuPolicy::Required)
+        gam_gpu::device_runtime::GpuRuntime::require()
             .expect("#932 full-row release measurement requires CUDA");
 
         let (family, states) = row_kernel_tests::parity_415::make_flex_parity_family(N, 8, 6);
@@ -4864,7 +4879,7 @@ mod tests {
             GpuPolicy::Required,
             "fresh-process r=33 consumer parity must claim Required before runtime discovery"
         );
-        gam_gpu::device_runtime::GpuRuntime::global_or_fail(GpuPolicy::Required)
+        gam_gpu::device_runtime::GpuRuntime::require()
             .expect("#932 mandatory r=33 consumer CUDA runtime");
         let n = 3_usize;
         let p_h_dim = 16_usize;
@@ -4964,7 +4979,7 @@ mod tests {
 
         // Allocate a DeviceResidentRowHess by hand using the HVP backend's
         // stream + module so we don't need to drive the full BMS row kernel.
-        // Past the GpuRuntime::global() Some-gate above: a probe/upload failure
+        // Past the lossless Auto-resolution gate above: a probe/upload failure
         // here is a real device fault on a CUDA host, not a no-CUDA skip. Fail
         // loud (the device-PCG skip-pass class, eee12f6b2) — the old arms
         // returned and the test passed while exercising nothing.
@@ -5128,7 +5143,7 @@ mod tests {
             }
         }
 
-        // Past the GpuRuntime::global() Some-gate: a probe/upload failure here is a
+        // Past the lossless Auto-resolution gate: a probe/upload failure here is a
         // real device fault on a CUDA host, not a no-CUDA skip — fail loud
         // (device-PCG skip-pass class, eee12f6b2).
         let backend = HvpKernelBackend::probe()
@@ -5280,7 +5295,7 @@ mod tests {
                 &v,
             );
 
-            // Past the GpuRuntime::global() Some-gate: probe/upload failures are
+            // Past the lossless Auto-resolution gate: probe/upload failures are
             // real device faults on a CUDA host — fail loud (device-PCG class).
             let backend = HvpKernelBackend::probe().expect(
                 "[bms_flex_row hvp_into_device parity] backend probe must succeed on CUDA host",
@@ -5683,7 +5698,7 @@ mod tests {
 
             // Build a transient device-resident storage and launch the
             // dense-block kernel.
-            // Past the GpuRuntime::global() Some-gate: probe/upload failures are
+            // Past the lossless Auto-resolution gate: probe/upload failures are
             // real device faults on a CUDA host — fail loud (device-PCG class).
             let backend = HvpKernelBackend::probe().expect(
                 "[bms_flex_row dense_block parity] backend probe must succeed on CUDA host",

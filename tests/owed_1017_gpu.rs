@@ -1,5 +1,5 @@
 //! #1017 GPU regression guard: GPU acceleration must work in the PRODUCTION
-//! PROBE-FIRST flow (`GpuRuntime::global()` runs the probe before any handle is
+//! PROBE-FIRST flow (typed runtime resolution runs before any handle is
 //! created). Skips cleanly on CPU-only hosts (CI), runs on any CUDA GPU.
 //!
 //! This guards the runtime/context-init fixes (gam GPU was entirely dead on a
@@ -63,7 +63,10 @@ fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
 fn gpu_probe_first_handle_wide_border_solve_and_device_fit_converge_1017() {
     // PROBE FIRST — the production order. Touching the global runtime runs the
     // probe; on a CPU-only host it is None and we skip.
-    if GpuRuntime::global().is_none() {
+    if GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in #1017 gate: {error}"))
+        .is_none()
+    {
         eprintln!("[owed_1017_gpu] no CUDA runtime present; skipping on CPU-only host");
         return;
     }

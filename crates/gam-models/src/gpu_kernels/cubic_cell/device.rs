@@ -362,9 +362,15 @@ mod tests {
         use crate::cubic_cell_kernel::{
             DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
         };
-        if GpuRuntime::global().is_none() {
-            eprintln!("[cubic_cell device-residency parity] no CUDA runtime — skipping");
-            return;
+        match GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                eprintln!("[cubic_cell device-residency parity] no CUDA device — skipping");
+                return;
+            }
+            Err(error) => {
+                panic!("[cubic_cell device-residency parity] CUDA probe failed: {error}")
+            }
         }
         // One cell per branch, plus a sextic NonAffineFinite stressor.
         let cpu_cells = vec![

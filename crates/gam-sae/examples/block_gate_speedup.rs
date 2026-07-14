@@ -68,6 +68,17 @@ fn run() -> Result<(), String> {
     }
     let (rows, decoder) = fixture(m, g, b, p);
 
+    match gam_gpu::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            println!("[block-gate speedup] no CUDA device; hardware benchmark skipped");
+            return Ok(());
+        }
+        Err(error) => return Err(format!("CUDA admission failed: {error}")),
+    }
+    gam_gpu::GpuRuntime::require()
+        .map_err(|error| format!("CUDA was admitted but Required resolution failed: {error}"))?;
+
     match route_blocks_required(rows.view(), decoder.view(), b, k, gam_gpu::GpuPolicy::Auto) {
         Ok((warm_route, warm_path, warm_bytes)) => {
             println!(
@@ -109,25 +120,14 @@ fn run() -> Result<(), String> {
     );
 
     let device_start = Instant::now();
-    let required = route_blocks_required(
+    let (routed, path, dtoh) = route_blocks_required(
         rows.view(),
         decoder.view(),
         b,
         k,
         gam_gpu::GpuPolicy::Required,
-    );
-    let (routed, path, dtoh) = match required {
-        Ok(value) => value,
-        Err(err) => {
-            if gam_gpu::GpuRuntime::global().is_none() {
-                println!("[block-gate speedup] no CUDA runtime; CPU {cpu_secs:.4}s");
-                return Ok(());
-            }
-            return Err(format!(
-                "GpuPolicy::Required failed despite a CUDA runtime: {err}"
-            ));
-        }
-    };
+    )
+    .map_err(|error| format!("GpuPolicy::Required route failed: {error}"))?;
     let device_secs = device_start.elapsed().as_secs_f64();
     if path != BlockRoutePath::Device {
         return Err(format!(

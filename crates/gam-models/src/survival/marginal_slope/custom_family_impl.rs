@@ -692,9 +692,12 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => {
                 self.sigma_exact_joint_psi_terms(block_states, specs)
             }
-            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => Err(format!(
-                "survival marginal-slope baseline family axis {axis} has no installed exact first-order row calculus"
-            )),
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
+                .rigid_baseline_exact_joint_psi_terms_with_options(
+                    block_states,
+                    axis,
+                    &BlockwiseFitOptions::default(),
+                ),
         }
     }
 
@@ -719,6 +722,16 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma),
                 Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma),
             ) => self.sigma_exact_joint_psisecond_order_terms(block_states),
+            (
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)),
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(other_axis)),
+            ) => self
+                .rigid_baseline_exact_joint_psisecond_order_terms_with_options(
+                    block_states,
+                    axis,
+                    other_axis,
+                    &BlockwiseFitOptions::default(),
+                ),
             _ => Err(format!(
                 "survival marginal-slope family-touching pair ({psi_i}, {psi_j}) has no installed exact second-order row calculus"
             )),
@@ -744,9 +757,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => {
                 self.sigma_exact_joint_psihessian_directional_derivative(block_states, d_beta_flat)
             }
-            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => Err(format!(
-                "survival marginal-slope baseline family axis {axis} has no installed exact beta-Hessian drift calculus"
-            )),
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
+                .rigid_baseline_exact_joint_psihessian_directional_derivative_with_options(
+                    block_states,
+                    axis,
+                    d_beta_flat,
+                    &BlockwiseFitOptions::default(),
+                ),
         }
     }
 

@@ -1,17 +1,15 @@
 use gam::gpu::device_runtime::GpuRuntime;
 
 #[test]
-fn gpu_runtime_global_is_deterministic_and_idempotent() {
-    let first_call =
-        std::panic::catch_unwind(|| GpuRuntime::global().map(|rt| rt.selected_device().ordinal));
-    let second_call =
-        std::panic::catch_unwind(|| GpuRuntime::global().map(|rt| rt.selected_device().ordinal));
-    let third_call =
-        std::panic::catch_unwind(|| GpuRuntime::global().map(|rt| rt.selected_device().ordinal));
-
-    let first = first_call.ok().flatten();
-    let second = second_call.ok().flatten();
-    let third = third_call.ok().flatten();
+fn gpu_runtime_resolution_is_deterministic_and_idempotent() {
+    let resolve = || {
+        GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+            .unwrap_or_else(|error| panic!("GPU probe fault in idempotence test: {error}"))
+            .map(|runtime| runtime.selected_device().ordinal)
+    };
+    let first = resolve();
+    let second = resolve();
+    let third = resolve();
 
     assert_eq!(
         first, second,

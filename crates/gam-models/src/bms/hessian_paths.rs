@@ -1101,8 +1101,7 @@ pub(super) fn require_selected_cuda_gram_result<T>(
 ///
 /// This is the biobank-scale lever: the BMS rigid fit's dominant work is the
 /// repeated chunked `Xᵀ diag(w) X` Gram over `n ≈ 356k` rows. When a CUDA
-/// device is present (runtime auto-probe — the same `GpuRuntime::global()`
-/// gate the manifold / arrow-Schur dense paths use, NO flag, NO env var) and
+/// device is enabled and present under the process-wide GPU policy, and
 /// the per-chunk reduction work clears the device flop floor
 /// (`xtwx_target_is_gpu`, keyed on `(rows, cols)`), the symmetric crossprod is
 /// dispatched to cuBLAS f64 GEMM via [`gam_gpu::blas::xt_diag_x_cuda`].
@@ -1121,7 +1120,10 @@ fn try_gpu_xt_diag_x<S: ndarray::Data<Elem = f64>>(
             weights.len()
         ));
     }
-    let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
+    let Some(runtime) =
+        gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+            .map_err(String::from)?
+    else {
         return Ok(None);
     };
     // The chunk is a materialized dense row block here (the caller already
@@ -1179,7 +1181,10 @@ fn try_gpu_xt_diag_y<SX: ndarray::Data<Elem = f64>, SY: ndarray::Data<Elem = f64
             weights.len()
         ));
     }
-    let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
+    let Some(runtime) =
+        gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+            .map_err(String::from)?
+    else {
         return Ok(None);
     };
     if !runtime.policy().xtwy_target_is_gpu(rows, p_x, q, true) {

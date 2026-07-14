@@ -1027,8 +1027,10 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         use crate::gpu_kernels::survival_rowjet::survival_rigid_row_vgh_device_selected;
 
         let n = self.family.n;
-        if !survival_rigid_row_vgh_device_selected(n) {
-            return None;
+        match survival_rigid_row_vgh_device_selected(n) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
         }
 
         #[cfg(target_os = "linux")]

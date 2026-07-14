@@ -1318,7 +1318,10 @@ impl BernoulliMarginalSlopeFamily {
         //    upload. Hosts without a runtime (and every non-Linux build)
         //    populate the host buffer directly.
         #[cfg(target_os = "linux")]
-        let build_device_moments = gam_gpu::device_runtime::GpuRuntime::global().is_some();
+        let build_device_moments =
+            gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+                .map_err(String::from)?
+                .is_some();
         #[cfg(not(target_os = "linux"))]
         let build_device_moments = false;
 

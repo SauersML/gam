@@ -410,7 +410,10 @@ impl BernoulliMarginalSlopeFamily {
             let y_rows = {
                 #[cfg(target_os = "linux")]
                 {
-                    if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
+                    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+                        .map_err(String::from)?
+                        .is_some()
+                    {
                         crate::bms::gpu::flex::require_selected_gpu_result(
                             "host-pin row-Hessian matvec",
                             row_hessian_ops::launch_row_hessian_matvec(
@@ -538,7 +541,12 @@ impl BernoulliMarginalSlopeFamily {
                         let y_rows = {
                             #[cfg(target_os = "linux")]
                             {
-                                if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
+                                if gam_gpu::device_runtime::GpuRuntime::resolve(
+                                    gam_gpu::global_policy(),
+                                )
+                                .map_err(String::from)?
+                                .is_some()
+                                {
                                     crate::bms::gpu::flex::require_selected_gpu_result(
                                         "tiled row-Hessian matvec",
                                         row_hessian_ops::launch_row_hessian_matvec(
@@ -757,7 +765,12 @@ impl BernoulliMarginalSlopeFamily {
                             let y_rows = {
                                 #[cfg(target_os = "linux")]
                                 {
-                                    if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
+                                    if gam_gpu::device_runtime::GpuRuntime::resolve(
+                                        gam_gpu::global_policy(),
+                                    )
+                                    .map_err(String::from)?
+                                    .is_some()
+                                    {
                                         crate::bms::gpu::flex::require_selected_gpu_result(
                                             "batched tiled row-Hessian matvec",
                                             row_hessian_ops::launch_row_hessian_matvec(
@@ -907,7 +920,10 @@ impl BernoulliMarginalSlopeFamily {
             let d_rows = {
                 #[cfg(target_os = "linux")]
                 {
-                    if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
+                    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+                        .map_err(String::from)?
+                        .is_some()
+                    {
                         crate::bms::gpu::flex::require_selected_gpu_result(
                             "host-pin row-Hessian diagonal",
                             row_hessian_ops::launch_row_hessian_diag(
@@ -1035,7 +1051,12 @@ impl BernoulliMarginalSlopeFamily {
                         let d_rows = {
                             #[cfg(target_os = "linux")]
                             {
-                                if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
+                                if gam_gpu::device_runtime::GpuRuntime::resolve(
+                                    gam_gpu::global_policy(),
+                                )
+                                .map_err(String::from)?
+                                .is_some()
+                                {
                                     crate::bms::gpu::flex::require_selected_gpu_result(
                                         "tiled row-Hessian diagonal",
                                         row_hessian_ops::launch_row_hessian_diag(

@@ -51,7 +51,7 @@ fn gpu_solver_matches_cpu_to_numeric_tolerance_on_small_input() {
     let cpu_sol = cpu_cholesky_solve(&h, &rhs);
 
     // `cholesky_solve_gpu` requires a CUDA runtime (`iterative_refinement_cholesky_solve`
-    // returns Err when `GpuRuntime::global()` is None) and otherwise routes a dense
+    // returns Err on typed runtime absence) and otherwise routes a dense
     // SPD solve through `cuda::cholesky_solve` — which has NO batch/size floor, so a
     // 3×3 system runs on device whenever a runtime is present. Therefore:
     //   * no runtime  → Err is a legitimate CPU-only skip,
@@ -63,7 +63,11 @@ fn gpu_solver_matches_cpu_to_numeric_tolerance_on_small_input() {
         Ok((sol, _)) => sol,
         Err(err) => {
             assert!(
-                gam::gpu::device_runtime::GpuRuntime::global().is_none(),
+                gam::gpu::device_runtime::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+                    .unwrap_or_else(|error| {
+                        panic!("GPU probe fault in Cholesky parity test: {error}")
+                    })
+                    .is_none(),
                 "GPU Cholesky solve returned Err on a host WITH a CUDA runtime present: \
                  {err}. A 3×3 SPD solve has no dispatch floor, so a runtime-present \
                  decline is a real device-kernel fault, not a legitimate skip."

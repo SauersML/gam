@@ -50,9 +50,13 @@ const DEVICE_ROW_THRESHOLD: usize = 100_000;
 /// ordinary row-kernel schedule; once a real device is admitted, subsequent
 /// compile/launch failures remain errors and are never hidden by a retry.
 #[inline]
-#[must_use]
-pub(crate) fn survival_rigid_row_vgh_device_selected(n_rows: usize) -> bool {
-    n_rows >= DEVICE_ROW_THRESHOLD && gam_gpu::device_runtime::GpuRuntime::global().is_some()
+pub(crate) fn survival_rigid_row_vgh_device_selected(n_rows: usize) -> Result<bool, String> {
+    if n_rows < DEVICE_ROW_THRESHOLD {
+        return Ok(false);
+    }
+    gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .map(|runtime| runtime.is_some())
+        .map_err(String::from)
 }
 
 /// Execute an already-admitted production V/G/H batch on CUDA.
@@ -62,10 +66,8 @@ pub(crate) fn survival_rigid_row_vgh(
     rows: &[SurvivalRowInputs],
     probit_scale: f64,
 ) -> Result<SurvivalRowVghChannels, String> {
-    assert!(
-        survival_rigid_row_vgh_device_selected(rows.len()),
-        "survival VGH CUDA execution requires an admitted batch",
-    );
+    gam_gpu::device_runtime::GpuRuntime::require()
+        .map_err(|error| format!("survival VGH CUDA execution requires a device: {error}"))?;
     device::survival_rigid_row_vgh_device(rows, probit_scale)
         .map_err(|error| format!("survival VGH device execution failed: {error}"))
 }
@@ -347,6 +349,17 @@ mod tests {
     use crate::survival::marginal_slope::row_kernel::RigidRowInputs;
     use gam_math::nested_dual::JetField;
 
+    fn cuda_runtime_for_test(test_name: &str) -> Option<&'static gam_gpu::device_runtime::GpuRuntime> {
+        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(runtime)) => Some(runtime),
+            Ok(None) => {
+                eprintln!("[{test_name}] no CUDA device — skipping");
+                None
+            }
+            Err(error) => panic!("[{test_name}] CUDA probe failed: {error}"),
+        }
+    }
+
     #[inline]
     fn rigid_cpu_row_inputs(
         row: usize,
@@ -491,14 +504,18 @@ mod tests {
     #[test]
     fn admitted_dispatch_and_device_path_match_cpu_vgh() {
         let rows = fixture(DEVICE_ROW_THRESHOLD + 1024);
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+        if cuda_runtime_for_test("admitted_dispatch_and_device_path_match_cpu_vgh").is_none() {
             assert!(
-                !survival_rigid_row_vgh_device_selected(rows.len()),
+                !survival_rigid_row_vgh_device_selected(rows.len())
+                    .expect("configured GPU resolution must remain lossless"),
                 "CPU-only Linux must not admit the CUDA row path",
             );
             return;
         }
-        assert!(survival_rigid_row_vgh_device_selected(rows.len()));
+        assert!(
+            survival_rigid_row_vgh_device_selected(rows.len())
+                .expect("configured GPU resolution must remain lossless")
+        );
         let cpu = survival_rigid_row_vgh_cpu(&rows, 0.7);
         let dispatched = survival_rigid_row_vgh(&rows, 0.7).expect("admitted CUDA VGH batch");
         assert_channel_parity("dispatched value", &cpu.value, &dispatched.value);
@@ -515,8 +532,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn device_only_vgh_matches_cpu_in_edge_regimes() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            eprintln!("CUDA runtime unavailable; skipping direct survival VGH device parity");
+        if cuda_runtime_for_test("device_only_vgh_matches_cpu_in_edge_regimes").is_none() {
             return;
         }
         let rows = edge_fixture();
@@ -538,8 +554,7 @@ mod tests {
     fn measure_device_vgh_end_to_end_932() {
         use std::time::{Duration, Instant};
 
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            eprintln!("CUDA runtime unavailable; skipping survival VGH throughput measurement");
+        if cuda_runtime_for_test("measure_device_vgh_end_to_end_932").is_none() {
             return;
         }
         const ROWS: usize = 1_000_000;

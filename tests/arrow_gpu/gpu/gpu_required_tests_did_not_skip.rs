@@ -10,17 +10,22 @@
 //! reports all-green while exercising nothing. This test enforces that
 //! guarantee by asserting:
 //!
-//!   `GpuRuntime::global().is_some() → cuda_selected()`
+//!   `GpuRuntime::resolve(Auto).is_some() → cuda_selected()`
 //!
-//! On CPU-only hosts `GpuRuntime::global()` returns `None`, so the
+//! On CPU-only hosts Auto resolves typed absence, so the
 //! assertion is vacuously true and the test passes without noise.
 
 #[test]
 fn gpu_required_tests_did_not_skip() {
-    let runtime_present = gam::gpu::device_runtime::GpuRuntime::global().is_some();
+    let runtime_present = gam::gpu::device_runtime::GpuRuntime::resolve(
+        gam::gpu::GpuPolicy::Auto,
+    )
+    .unwrap_or_else(|error| panic!("GPU probe fault in ship-gate test: {error}"))
+    .is_some();
     if runtime_present {
         assert!(
-            gam::gpu::cuda_selected(),
+            gam::gpu::cuda_selected()
+                .unwrap_or_else(|error| panic!("GPU selection fault in ship-gate test: {error}")),
             "A CUDA runtime is available on this host but the unified GPU policy did \
              not select CUDA. Every GPU-gated test emitted a SKIP line and silently \
              passed without exercising any GPU code."

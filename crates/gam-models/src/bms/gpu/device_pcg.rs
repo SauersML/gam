@@ -145,8 +145,8 @@ mod pcg_device {
             static BACKEND: OnceLock<Result<PcgBackend, String>> = OnceLock::new();
             BACKEND
                 .get_or_init(|| {
-                    let runtime = gam_gpu::device_runtime::GpuRuntime::global()
-                        .ok_or_else(|| "pcg backend: no CUDA runtime available".to_string())?;
+                    let runtime = gam_gpu::device_runtime::GpuRuntime::require()
+                        .map_err(String::from)?;
                     let ctx = gam_gpu::device_runtime::cuda_context_for(
                         runtime.selected_device().ordinal,
                     )
@@ -726,9 +726,14 @@ mod pcg_device_parity_tests {
 
     #[test]
     fn pcg_device_matches_dense_oracle_at_n64_r20_p44() {
-        let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            eprintln!("[pcg_device parity] no CUDA runtime — skipping");
-            return;
+        let runtime = match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+        {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => {
+                eprintln!("[pcg_device parity] no CUDA device — skipping");
+                return;
+            }
+            Err(error) => panic!("[pcg_device parity] CUDA probe failed: {error}"),
         };
         let n = 64_usize;
         let p_m = 14_usize;
@@ -807,9 +812,7 @@ mod pcg_device_parity_tests {
         // kernels will use when `run_pcg_against_row_hessian_device` probes
         // its own backend. Going through the public runtime APIs keeps the
         // test independent of any private kernel-backend symbols.
-        let runtime = gam_gpu::device_runtime::GpuRuntime::global()
-            .expect("runtime must exist when probe succeeded above");
-        // Past the GpuRuntime::global() Some-gate above: a context-creation or
+        // Past the lossless Auto-resolution gate above: a context-creation or
         // HtoD-upload failure here is a real device fault on a CUDA host, not a
         // no-CUDA skip — fail loud (device-PCG skip-pass class, eee12f6b2). The old
         // arms returned, so a context/upload fault on a GPU host passed silently.

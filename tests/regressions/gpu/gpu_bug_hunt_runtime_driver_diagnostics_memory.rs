@@ -8,58 +8,69 @@ use std::thread;
 fn gpu_runtime_probe_reports_no_device_or_driver_as_structured_error_instead_of_none() {
     let probe = GpuRuntime::probe();
     assert!(
-        probe.is_ok()
-            || matches!(
-                probe,
-                Err(gam::gpu::GpuError::DriverLibraryUnavailable { .. }
+        matches!(
+            probe,
+            Ok(gam::gpu::GpuAvailability::Available(_)
+                | gam::gpu::GpuAvailability::Absent(_))
+                | Err(gam::gpu::GpuError::DriverLibraryLoadFailed { .. }
+                    | gam::gpu::GpuError::RuntimeDependencyUnavailable { .. }
                     | gam::gpu::GpuError::DriverCallFailed { .. })
-            ),
-        "GpuRuntime::probe should return a runtime or a typed CUDA probe failure, not panic or collapse unavailable hardware into Ok(None)"
+        ),
+        "GpuRuntime::probe must return typed availability or a typed probe fault"
     );
 }
 
 #[test]
 fn gpu_policy_auto_falls_back_to_cpu_when_runtime_is_unavailable_and_sets_cpu_reason() {
+    let availability = GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in policy test: {error}"));
     let decision = gpu::decide(
         GpuKernel::DenseMatvec,
         GpuEligibility::from_flags(true, true),
-    );
-    assert!(
-        !decision.use_gpu,
-        "gpu=auto should fall back to CPU when runtime has no usable device even if kernel support is compiled"
-    );
-    assert!(
-        decision.reason.contains("cpu"),
-        "fallback decision should expose a cpu_reason-style marker so callers can report why CPU was selected"
-    );
+    )
+    .unwrap_or_else(|error| panic!("GPU decision fault in policy test: {error}"));
+    if availability.is_none() {
+        assert!(!decision.use_gpu, "typed absence under Auto must select CPU");
+        assert!(decision.reason.contains("cpu"));
+    } else {
+        assert!(decision.use_gpu, "available eligible runtime must select GPU");
+    }
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn gpu_device_info_device_count_matches_underlying_driver_count() {
-    if !gam::gpu::driver::cuda_driver_library_present() {
+    if !gam::gpu::driver::cuda_driver_available()
+        .unwrap_or_else(|error| panic!("CUDA driver load fault: {error}"))
+    {
         assert!(
             matches!(
                 GpuRuntime::probe(),
-                Err(gam::gpu::GpuError::DriverLibraryUnavailable { ref reason })
-                    if reason == "libcuda unavailable"
+                Ok(gam::gpu::GpuAvailability::Absent(
+                    gam::gpu::GpuAbsence::DriverUnavailable { .. }
+                ))
             ),
             "missing libcuda should be reported before touching cudarc device-count paths"
         );
         return;
     }
 
-    let runtime = GpuRuntime::probe().expect("runtime probe should not fail").expect(
-        "runtime probe should return a runtime snapshot even when device_count is zero so count can be reported",
-    );
-    let device_count =
-        i32::try_from(runtime.devices.len()).expect("device vec length should fit i32");
+    let availability = GpuRuntime::probe().expect("runtime probe should not fault");
     let raw_count = cudarc::driver::CudaContext::device_count()
         .expect("driver device count should be queryable once probe succeeded");
-    assert_eq!(
-        device_count, raw_count,
-        "GpuDeviceInfo count should match the underlying CUDA driver-reported device count"
-    );
+    match availability {
+        gam::gpu::GpuAvailability::Available(runtime) => assert_eq!(
+            i32::try_from(runtime.devices.len()).expect("device vec length should fit i32"),
+            raw_count,
+            "GpuDeviceInfo count should match the driver count"
+        ),
+        gam::gpu::GpuAvailability::Absent(gam::gpu::GpuAbsence::NoDevice { .. }) => {
+            assert_eq!(raw_count, 0)
+        }
+        gam::gpu::GpuAvailability::Absent(other) => {
+            panic!("driver was loadable but probe reported unexpected absence: {other}")
+        }
+    }
 }
 
 #[test]
@@ -114,7 +125,9 @@ fn concurrent_runtime_probe_is_idempotent_without_race_or_double_init() {
     let mut handles = Vec::new();
     for _ in 0..8 {
         handles.push(thread::spawn(|| {
-            GpuRuntime::global().map(|rt| rt.device.ordinal)
+            GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+                .unwrap_or_else(|error| panic!("concurrent GPU probe fault: {error}"))
+                .map(|runtime| runtime.device.ordinal)
         }));
     }
     let ordinals: Vec<Option<usize>> = handles
@@ -127,14 +140,6 @@ fn concurrent_runtime_probe_is_idempotent_without_race_or_double_init() {
         "concurrent global probes should all observe the same initialized runtime snapshot"
     );
 
-    let direct_probe = GpuRuntime::probe();
-    assert!(
-        direct_probe.is_ok()
-            || matches!(
-                direct_probe,
-                Err(gam::gpu::GpuError::DriverLibraryUnavailable { .. }
-                    | gam::gpu::GpuError::DriverCallFailed { .. })
-            ),
-        "direct probe after concurrent global initialization should remain idempotent and typed"
-    );
+    GpuRuntime::probe()
+        .unwrap_or_else(|error| panic!("direct probe after cached resolution faulted: {error}"));
 }

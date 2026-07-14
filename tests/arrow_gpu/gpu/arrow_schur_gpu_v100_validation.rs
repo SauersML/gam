@@ -51,7 +51,12 @@ macro_rules! skip_without_cuda {
         }
         #[cfg(target_os = "linux")]
         {
-            if gam::gpu::device_runtime::GpuRuntime::global().is_none() {
+            if gam::gpu::device_runtime::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+                .unwrap_or_else(|error| {
+                    panic!("GPU probe fault in V100 validation gate: {error}")
+                })
+                .is_none()
+            {
                 eprintln!(
                     "[{label}] no CUDA runtime — skipping device validation",
                     label = $label

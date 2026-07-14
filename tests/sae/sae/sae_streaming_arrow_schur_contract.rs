@@ -357,7 +357,11 @@ fn gpu_reduced_beta_solve_matches_cpu_when_available() {
             // run — a real fault, not a no-CUDA skip. Fail loud unless this is a
             // genuinely CPU-only host (device-PCG skip-pass class, eee12f6b2).
             assert!(
-                gam::gpu::device_runtime::GpuRuntime::global().is_none(),
+                gam::gpu::device_runtime::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+                    .unwrap_or_else(|error| {
+                        panic!("GPU probe fault in streaming Arrow-Schur test: {error}")
+                    })
+                    .is_none(),
                 "[sae_streaming/gpu_parity] reduced-β GPU PCG returned Unavailable on a \
                  floor-clearing fixture (k=512, iters=200) with a CUDA runtime present — \
                  the device path declined a workload it must run"

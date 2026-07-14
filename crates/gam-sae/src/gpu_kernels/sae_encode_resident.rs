@@ -59,6 +59,7 @@ use ndarray::ArrayView1;
 
 use crate::encode::{AtlasConfig, AtomEncodeAtlas, KANTOROVICH_THRESHOLD, euclidean_patch_degree};
 use crate::manifold::SaeManifoldAtom;
+use gam_gpu::gpu_error::GpuError;
 use gam_gpu::policy::{EncodeDecisionBlocked, EncodeDeploymentDecision};
 
 /// One `EuclideanPatch` atom's frozen encode data, flattened for a device
@@ -1235,25 +1236,29 @@ pub const DEVICE_ROW_THRESHOLD: usize = 4_096;
 /// returned [`EncodePath`] reports which path ran honestly (`device_encode_engaged`).
 /// Both paths run the SAME numeric core (Jacobi eigensolve, monomial jets), so
 /// when the device runs its result matches the CPU oracle to eigen round-off.
-#[must_use]
 pub fn sae_certified_encode_batch(
     dev: &EncodeAtomDevice,
     targets: &[Vec<f64>],
     amplitudes: &[f64],
-) -> (Vec<DeviceEncodeRow>, EncodePath) {
+) -> Result<(Vec<DeviceEncodeRow>, EncodePath), GpuError> {
     #[cfg(target_os = "linux")]
     {
-        if targets.len() >= DEVICE_ROW_THRESHOLD {
-            if let Ok(out) = device::sae_certified_encode_device(dev, targets, amplitudes) {
-                return (out, EncodePath::Device);
+        let policy = gam_gpu::global_policy();
+        if policy == gam_gpu::GpuPolicy::Required || targets.len() >= DEVICE_ROW_THRESHOLD {
+            let runtime = match policy {
+                gam_gpu::GpuPolicy::Required => Some(gam_gpu::GpuRuntime::require()?),
+                _ => gam_gpu::GpuRuntime::resolve(policy)?,
+            };
+            if runtime.is_some() {
+                let out = device::sae_certified_encode_device(dev, targets, amplitudes)?;
+                return Ok((out, EncodePath::Device));
             }
-            // Fall through to CPU on any device error (accelerator, not oracle).
         }
     }
-    (
+    Ok((
         emulate_certified_encode_batch(dev, targets, amplitudes),
         EncodePath::Cpu,
-    )
+    ))
 }
 
 /// Measured throughput of the device-resident **exact per-row certified encode**
@@ -1314,18 +1319,17 @@ impl DeviceEncodeThroughput {
 ///   (`path == Cpu`); the rate is real but it is NOT a device measurement, so the
 ///   decision is `Undetermined` — the surrogate stays neither justified nor
 ///   refuted. This is the honest "needs GPU hardware" outcome.
-#[must_use]
 pub fn measure_device_encode_throughput(
     dev: &EncodeAtomDevice,
     targets: &[Vec<f64>],
     amplitudes: &[f64],
-) -> DeviceEncodeThroughput {
+) -> Result<DeviceEncodeThroughput, GpuError> {
     let n = targets.len();
     // Warm run (device module load / PTX cache / first-touch allocations) is not
     // timed, mirroring the resident-solve and full-path benchmarks.
-    drop(sae_certified_encode_batch(dev, targets, amplitudes));
+    drop(sae_certified_encode_batch(dev, targets, amplitudes)?);
     let start = Instant::now();
-    let (_out, path) = sae_certified_encode_batch(dev, targets, amplitudes);
+    let (_out, path) = sae_certified_encode_batch(dev, targets, amplitudes)?;
     let elapsed = start.elapsed();
     let encode_secs = elapsed.as_secs_f64();
     let rows_per_sec = if n > 0 && encode_secs > 0.0 {
@@ -1345,9 +1349,8 @@ pub fn measure_device_encode_throughput(
     //
     // In either case the anti-green-wash contract is the same: an emulator rate
     // can never declare the surrogate unneeded or justified.
-    let device_available = gam_gpu::device_runtime::GpuRuntime::global()
-        .map(|rt| rt.device_count() > 0)
-        .unwrap_or(false);
+    let device_available = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())?
+        .is_some_and(|runtime| runtime.device_count() > 0);
     let decision = if engaged {
         EncodeDeploymentDecision::from_device_measurement(true, rows_per_sec)
     } else if device_available && n >= DEVICE_ROW_THRESHOLD {
@@ -1355,13 +1358,13 @@ pub fn measure_device_encode_throughput(
     } else {
         EncodeDeploymentDecision::blocked(EncodeDecisionBlocked::NoDevice)
     };
-    DeviceEncodeThroughput {
+    Ok(DeviceEncodeThroughput {
         n_rows: n,
         encode_secs,
         rows_per_sec,
         path,
         decision,
-    }
+    })
 }
 
 #[cfg(target_os = "linux")]

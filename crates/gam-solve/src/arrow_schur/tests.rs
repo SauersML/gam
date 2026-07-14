@@ -4,6 +4,12 @@ use super::*;
 use approx::assert_abs_diff_eq;
 use ndarray::array;
 
+fn gpu_available_or_fail() -> bool {
+    gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in Arrow-Schur test: {error}"))
+        .is_some()
+}
+
 /// #1995: compact SAE rows hand `block_gemm_subtract` dense scratch matrices
 /// whose nonzeros occupy only the active top-k beta columns. The CPU fallback
 /// must produce the same Schur update as a dense GEMM while doing work only on
@@ -2343,7 +2349,7 @@ pub(crate) fn device_dispatch_predicate_gates_on_work_not_rows() {
 /// options (`pcg.max_iterations.min(trust_region.max_iterations)`) — fires for
 /// the SAE LLM shape (n~2000 rows × k~2048 border × d~8 frame depth) while
 /// staying off for tiny shapes where launch latency dominates. The gate's
-/// device-presence short-circuit (`GpuRuntime::global()?`) makes the helper
+/// typed device-absence short-circuit makes the helper
 /// itself return `None` on a CPU-only host, so the routing logic is asserted
 /// through the predicate it consults (the device==CPU 1e-10 numeric parity is
 /// asserted by the box harness).
@@ -2409,7 +2415,7 @@ pub(crate) fn matrix_free_sae_gate_uses_work_predicate_not_dense_floor() {
 /// and the result equals the direct CPU artifacts solve bit-for-bit.
 #[test]
 pub(crate) fn device_seam_declines_without_gpu_and_matches_cpu() {
-    if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
+    if gpu_available_or_fail() {
         // On a CUDA host the device may legitimately serve the step; this
         // host-only invariant does not apply. The box harness asserts the
         // device==CPU 1e-10 parity instead.
@@ -3469,7 +3475,7 @@ pub(crate) fn sae_direct_inner_solve_engages_device_and_matches_cpu_1551() {
     let artifacts = solve_arrow_newton_step_artifacts(&sys, ridge_t, ridge_beta, &options)
         .expect("SAE Direct artifacts solve");
 
-    if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+    if !gpu_available_or_fail() {
         // No CUDA device: the seam must have declined and run the CPU path. The
         // step must NOT be flagged device-served. (Parity below still holds.)
         assert!(
@@ -3564,7 +3570,7 @@ pub(crate) fn sae_inexact_pcg_inner_solve_engages_device_and_matches_cpu_1551() 
     let artifacts = solve_arrow_newton_step_artifacts(&sys, ridge_t, ridge_beta, &options)
         .expect("SAE InexactPCG artifacts solve");
 
-    if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+    if !gpu_available_or_fail() {
         assert!(
             !artifacts.pcg_diagnostics.used_device_arrow,
             "no CUDA device present, yet the InexactPCG step was flagged device-served"
@@ -3642,7 +3648,7 @@ pub(crate) fn device_arrow_and_host_procedural_matvec_flags_are_mutually_exclusi
     // Exercise the explicit InexactPCG entry (the one that injects a host
     // procedural matvec via `maybe_inject_gpu_schur_matvec`) and the Direct entry
     // through the public core.
-    let on_cuda = gam_gpu::device_runtime::GpuRuntime::global().is_some();
+    let on_cuda = gpu_available_or_fail();
     let mut inexact_used_device = false;
     for options in [
         ArrowSolveOptions::inexact_pcg(),

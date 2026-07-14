@@ -105,7 +105,10 @@ fn complete_sae_rowjet_gpu_parity_2304() {
     assert!(cpu.beta_mixed.iter().any(|value| *value != 0.0));
 
     #[cfg(target_os = "linux")]
-    if gam::gpu::GpuRuntime::global().is_some() {
+    if gam::gpu::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in row-jet parity test: {error}"))
+        .is_some()
+    {
         let device = execute_softmax_row_jet_tile(&rows, 1.0 / 0.7, SaeRowJetPath::Device)
             .expect("admitted CUDA device must run; no host retry is permitted");
         let maximum = maximum_channel_error(&cpu, &device);

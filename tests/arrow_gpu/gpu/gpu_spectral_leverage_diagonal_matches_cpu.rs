@@ -38,7 +38,11 @@ fn gpu_spectral_leverage_diagonal_matches_cpu_when_available() {
         // legitimate skip (the device-PCG skip-pass class, eee12f6b2). The old
         // bare `return` asserted nothing and passed silently on a GPU host.
         assert!(
-            gam::gpu::device_runtime::GpuRuntime::global().is_none(),
+            gam::gpu::device_runtime::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+                .unwrap_or_else(|error| {
+                    panic!("GPU probe fault in spectral-leverage parity test: {error}")
+                })
+                .is_none(),
             "GPU spectral-leverage diagonal declined (returned None) on a host WITH a \
              CUDA runtime present, despite a fixture sized to clear the XtDiagX floor \
              — a real device/dispatch fault, not a no-CUDA skip."

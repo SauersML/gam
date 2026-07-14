@@ -59,9 +59,6 @@ use gam_linalg::triangular::{back_substitution_lower_transpose, cholesky_solve_v
 
 use crate::polya_gamma::PolyaGamma;
 
-#[cfg(target_os = "linux")]
-use gam_gpu::gpu_error::GpuError;
-
 // ────────────────────────────────────────────────────────────────────────
 // Public types
 // ────────────────────────────────────────────────────────────────────────
@@ -491,24 +488,22 @@ pub fn draw_batch_cpu(input: &PolyaGammaBatchInput<'_>) -> Result<Array1<f64>, S
     Ok(out)
 }
 
-/// Top-level entry point: dispatches to GPU when available, otherwise CPU.
+/// Top-level entry point: dispatches to GPU when enabled and available,
+/// otherwise CPU.
 /// Both paths are deterministic for a fixed seed. The CPU path delegates to
 /// the upstream sampler while the CUDA path is independently validated against
-/// it in distribution.
+/// it in distribution. CUDA probe and execution faults are returned; only a
+/// lossless `Ok(None)` availability result selects the CPU implementation.
 pub fn draw_batch(input: PolyaGammaBatchInput<'_>) -> Result<Array1<f64>, String> {
     input.validate()?;
 
     #[cfg(target_os = "linux")]
     {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
-            match linux_cuda::draw_batch_gpu(&input) {
-                Ok(v) => return Ok(v),
-                Err(GpuError::NoDeviceKernel { .. }) => {
-                    // No device kernel for this path on this build: fall
-                    // through to the CPU reference.
-                }
-                Err(other) => return Err(String::from(other)),
-            }
+        if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+            .map_err(String::from)?
+            .is_some()
+        {
+            return linux_cuda::draw_batch_gpu(&input).map_err(String::from);
         }
     }
 
@@ -1282,6 +1277,18 @@ extern "C" __global__ void normal_kernel(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn cuda_runtime_for_test(test_name: &str) -> Option<&'static gam_gpu::device_runtime::GpuRuntime> {
+        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(runtime)) => Some(runtime),
+            Ok(None) => {
+                eprintln!("[{test_name}] no CUDA device on host — skipping");
+                None
+            }
+            Err(error) => panic!("[{test_name}] CUDA probe failed: {error}"),
+        }
+    }
+
     fn theoretical_mean(b: f64, c: f64) -> f64 {
         pg_mean(b, c)
     }
@@ -1690,8 +1697,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn polya_gamma_hill_climb_pg1_50x() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            eprintln!("[polya_gamma_hill_climb_pg1_50x] no CUDA runtime on host — skipping");
+        if cuda_runtime_for_test("polya_gamma_hill_climb_pg1_50x").is_none() {
             return;
         }
         let n = 200_000usize;
@@ -1707,7 +1713,7 @@ mod tests {
         {
             let warm_shapes = Array1::<u32>::from_elem(16, 1);
             let warm_tilts = Array1::<f64>::zeros(16);
-            draw_batch(PolyaGammaBatchInput {
+            linux_cuda::draw_batch_gpu(&PolyaGammaBatchInput {
                 shapes: warm_shapes.view(),
                 tilts: warm_tilts.view(),
                 seed,
@@ -1716,7 +1722,7 @@ mod tests {
         }
 
         let t_gpu_start = std::time::Instant::now();
-        draw_batch(PolyaGammaBatchInput {
+        linux_cuda::draw_batch_gpu(&PolyaGammaBatchInput {
             shapes: shapes.view(),
             tilts: tilts.view(),
             seed,
@@ -1751,8 +1757,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn polya_gamma_hill_climb_mixed_nb_20x() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            eprintln!("[polya_gamma_hill_climb_mixed_nb_20x] no CUDA runtime on host — skipping");
+        if cuda_runtime_for_test("polya_gamma_hill_climb_mixed_nb_20x").is_none() {
             return;
         }
         let n = 200_000usize;
@@ -1768,7 +1773,7 @@ mod tests {
         // Warm
         let warm_shapes = Array1::<u32>::from_elem(16, 250);
         let warm_tilts = Array1::<f64>::zeros(16);
-        draw_batch(PolyaGammaBatchInput {
+        linux_cuda::draw_batch_gpu(&PolyaGammaBatchInput {
             shapes: warm_shapes.view(),
             tilts: warm_tilts.view(),
             seed,
@@ -1776,7 +1781,7 @@ mod tests {
         .expect("warm");
 
         let t_gpu = std::time::Instant::now();
-        draw_batch(PolyaGammaBatchInput {
+        linux_cuda::draw_batch_gpu(&PolyaGammaBatchInput {
             shapes: shapes.view(),
             tilts: tilts.view(),
             seed,
@@ -1809,14 +1814,14 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn pg1_gpu_matches_cpu_oracle_when_runtime_available() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+        if cuda_runtime_for_test("pg1_gpu_matches_cpu_oracle_when_runtime_available").is_none() {
             return;
         }
         let sample_count = 4_096usize;
         let shapes = Array1::<u32>::from_elem(sample_count, 1);
         for &tilt in &[0.0_f64, 1.5, 4.0] {
             let tilts = Array1::<f64>::from_elem(sample_count, tilt);
-            let mut gpu = draw_batch(PolyaGammaBatchInput {
+            let mut gpu = linux_cuda::draw_batch_gpu(&PolyaGammaBatchInput {
                 shapes: shapes.view(),
                 tilts: tilts.view(),
                 seed: PgSeed(0x9E37_79B9_7F4A_7C15 ^ tilt.to_bits()),

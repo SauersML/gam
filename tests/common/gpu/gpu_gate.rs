@@ -48,7 +48,9 @@ pub enum GpuGate {
 ///
 /// If `cuda_selected()` is true, returns `GpuGate::Run` with no output.
 pub fn gpu_gate(test_name: &str) -> GpuGate {
-    if cuda_selected() {
+    if cuda_selected()
+        .unwrap_or_else(|error| panic!("GPU probe fault while gating {test_name}: {error}"))
+    {
         GpuGate::Run
     } else {
         eprintln!("SKIP {test_name}: cuda not selected");

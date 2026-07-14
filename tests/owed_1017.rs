@@ -44,6 +44,12 @@ use gam::solver::gpu_kernels::arrow_schur::{
 };
 use ndarray::{Array1, Array2};
 
+fn gpu_available_or_fail() -> bool {
+    GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in #1017 test: {error}"))
+        .is_some()
+}
+
 /// Build a small well-conditioned dense Direct-mode arrow system, mirroring the
 /// in-crate `dense_direct_system` fixture so the CPU solve is deterministic and
 /// PD at zero ridge.
@@ -118,7 +124,7 @@ fn escalation_entry_routes_through_core_seam_not_cpu_only_artifacts() {
     // CUDA host the device may legitimately serve the step, so this decline
     // invariant only applies when no runtime is present (the box harness
     // asserts the device==CPU 1e-10 numeric parity instead).
-    if GpuRuntime::global().is_none() {
+    if !gpu_available_or_fail() {
         assert!(
             !diag_esc.used_device_arrow,
             "no device present, so the inner solve must not be flagged device-served"
@@ -469,7 +475,7 @@ fn phase3_step_readback_matches_independent_dense_solve() {
 fn phase3_resident_frame_declines_on_device_absent_host() {
     let sys = dense_direct_system(6, 2, 4);
     let frame = ResidentArrowFrameHandle::new(&sys, 1e-3, 2e-3);
-    if GpuRuntime::global().is_none() {
+    if !gpu_available_or_fail() {
         assert!(
             frame.is_err(),
             "on a device-absent host the resident frame must decline construction \

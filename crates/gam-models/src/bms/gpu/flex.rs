@@ -16,21 +16,24 @@ use cudarc::driver::CudaModule;
 /// Decide whether the GPU row-primary Hessian path is eligible for this
 /// fit's `(n, r)`. Always-`use_gpu=false` for `r == 0` (no flex jets to
 /// process) and below the runtime row-kernel threshold.
-#[must_use]
-pub fn row_primary_hessian_decision(n: usize, r: usize) -> GpuDecision {
-    let large_enough = gam_gpu::device_runtime::GpuRuntime::global()
-        .map(|runtime| n >= runtime.policy().row_kernel_min_n && r > 0)
-        .unwrap_or(false);
-    decide(
+pub fn row_primary_hessian_decision(n: usize, r: usize) -> Result<GpuDecision, GpuError> {
+    let large_enough = if r == 0 {
+        false
+    } else {
+        gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())?
+            .map(|runtime| n >= runtime.policy().row_kernel_min_n)
+            .unwrap_or(false)
+    };
+    Ok(decide(
         GpuKernel::MarginalSlopeRows,
         gam_gpu::GpuEligibility::from_flags(BmsFlexGpuBackend::compiled(), large_enough),
-    )
+    ))
 }
 
 /// Same as [`row_primary_hessian_decision`] but turns
 /// `gpu=required`-without-support into an `Err` string at the call site.
 pub fn require_row_primary_hessian_supported(n: usize, r: usize) -> Result<GpuDecision, String> {
-    let decision = row_primary_hessian_decision(n, r);
+    let decision = row_primary_hessian_decision(n, r).map_err(String::from)?;
     decision.clone().log();
     decision.require_supported()?;
     Ok(decision)
@@ -198,7 +201,8 @@ mod bms_flex_gpu_tests {
 
     #[test]
     pub(crate) fn bms_flex_gpu_policy_decision_is_explicit() {
-        let decision = row_primary_hessian_decision(50_000, 4);
+        let decision = row_primary_hessian_decision(50_000, 4)
+            .expect("GPU policy resolution must be lossless");
         assert_eq!(decision.kernel, GpuKernel::MarginalSlopeRows);
     }
 
@@ -220,9 +224,14 @@ mod bms_flex_gpu_tests {
     /// usable device so the test still passes on the CI/mac builders.
     #[test]
     pub(crate) fn bms_flex_gpu_context_initialises_when_device_present() {
-        let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            eprintln!("[bms_flex_gpu test] no CUDA runtime — skipping device-side init smoketest");
-            return;
+        let runtime = match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+        {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => {
+                eprintln!("[bms_flex_gpu test] no CUDA device — skipping device-side init smoketest");
+                return;
+            }
+            Err(error) => panic!("[bms_flex_gpu test] CUDA probe failed: {error}"),
         };
         eprintln!(
             "[bms_flex_gpu test] runtime selected device ordinal={}",

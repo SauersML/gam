@@ -266,6 +266,8 @@ pub enum CompilerError {
     FullyAliased { block_idx: usize, reason: String },
     /// A linear-algebra step failed (Gram solve, eigendecomposition, QR).
     LinalgFailure(String),
+    /// CUDA was configured for this compile, but probing the runtime failed.
+    GpuFailure(String),
 }
 
 impl std::fmt::Display for CompilerError {
@@ -277,6 +279,7 @@ impl std::fmt::Display for CompilerError {
                 write!(f, "block {block_idx} fully aliased: {reason}")
             }
             CompilerError::LinalgFailure(msg) => write!(f, "linalg failure: {msg}"),
+            CompilerError::GpuFailure(msg) => write!(f, "GPU failure: {msg}"),
         }
     }
 }
@@ -1182,7 +1185,9 @@ pub fn build_primary_grams_gpu_or_cpu(
                 &gpu_blocks,
                 &h_packed,
                 raw_block_ranges,
-            ) {
+            )
+            .map_err(|error| CompilerError::GpuFailure(error.to_string()))?
+            {
                 log::info!("[identifiability_compile] gram path = gpu");
                 return Ok((bundle.gram_h, bundle.gram_struct));
             }

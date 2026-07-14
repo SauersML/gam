@@ -250,7 +250,7 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
                     // offload to that device. A missing context or bind failure
                     // is intentionally consumed without escalation — the shims
                     // no-op back to CPU and the math is unchanged. Off Linux
-                    // `GpuRuntime::global()` is always `None`, so this branch
+                    // runtime resolution is always absent, so this branch
                     // is unreachable and the bind is omitted entirely.
                     #[cfg(target_os = "linux")]
                     {

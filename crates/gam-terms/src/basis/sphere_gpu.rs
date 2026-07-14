@@ -668,21 +668,27 @@ pub const fn sphere_gpu_compiled() -> bool {
 ///   * device memory budget admits at least one `(ld × m)` design at
 ///     `ld = ((n + 31) / 32) * 32`.
 #[must_use]
-pub fn sphere_kernel_decision(n: usize, m: usize, lmax: usize) -> GpuDecision {
-    let large_enough = if let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::global() {
-        let ld = ((n + 31) / 32) * 32;
-        let needed_bytes = ld
-            .saturating_mul(m)
-            .saturating_mul(std::mem::size_of::<f64>());
-        let budget = runtime.memory_budget_bytes;
-        n.saturating_mul(m) >= 1_000_000 && lmax <= 200 && needed_bytes <= budget
-    } else {
-        false
+pub fn sphere_kernel_decision(
+    n: usize,
+    m: usize,
+    lmax: usize,
+) -> Result<GpuDecision, GpuError> {
+    let large_enough = match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())?
+    {
+        Some(runtime) => {
+            let ld = ((n + 31) / 32) * 32;
+            let needed_bytes = ld
+                .saturating_mul(m)
+                .saturating_mul(std::mem::size_of::<f64>());
+            let budget = runtime.memory_budget_bytes;
+            n.saturating_mul(m) >= 1_000_000 && lmax <= 200 && needed_bytes <= budget
+        }
+        None => false,
     };
-    decide(
+    Ok(decide(
         GpuKernel::SpatialKernelOperator,
         gam_gpu::GpuEligibility::from_flags(sphere_gpu_compiled(), large_enough),
-    )
+    ))
 }
 
 /// Map a truncated `SphereWahbaKernel` variant onto the device kernel kind +
@@ -740,7 +746,10 @@ pub fn try_build_truncated_kernel_matrix_gpu(
     if n == 0 || m == 0 || lmax == 0 {
         return None;
     }
-    let decision = sphere_kernel_decision(n, m, lmax as usize);
+    let decision = match sphere_kernel_decision(n, m, lmax as usize) {
+        Ok(decision) => decision,
+        Err(error) => return Some(Err(error)),
+    };
     if !decision.use_gpu {
         // Either backend-not-compiled, runtime-unavailable, or below the
         // device-work threshold. Quiet CPU route, taken before any device call.
@@ -1599,6 +1608,17 @@ mod sphere_gpu_tests {
         Array2::from_shape_vec((n_lat * n_lon, 2), rows).unwrap()
     }
 
+    fn cuda_available_for_test(label: &str) -> bool {
+        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                eprintln!("[sphere_gpu test] no CUDA device — skipping {label}");
+                false
+            }
+            Err(error) => panic!("[sphere_gpu test] CUDA resolution failed for {label}: {error}"),
+        }
+    }
+
     #[test]
     fn sum_finite_guard_accepts_finite_rejects_nonfinite() {
         // The admitted device path guards its output with `!out.sum().is_finite()`
@@ -1848,10 +1868,9 @@ mod sphere_gpu_tests {
     /// a small grid. Skips cleanly on hosts with no CUDA runtime.
     #[test]
     fn sphere_gpu_raw_kernel_parity_vs_cpu_truncated() {
-        let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            eprintln!("[sphere_gpu test] no CUDA runtime — skipping raw-kernel parity");
+        if !cuda_available_for_test("raw-kernel parity") {
             return;
-        };
+        }
         // Past the runtime Some-gate: a probe failure is a real device fault on a
         // CUDA host — fail loud (device-PCG skip-pass class, eee12f6b2).
         SphereGpuBackend::probe()
@@ -1919,10 +1938,9 @@ mod sphere_gpu_tests {
     /// raw-kernel parity at ≤ 1e-9 implies full-design + fit parity.
     #[test]
     fn sphere_gpu_end_to_end_dispatch_parity_vs_cpu_truncated() {
-        let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            eprintln!("[sphere_gpu test] no CUDA runtime — skipping end-to-end dispatch parity");
+        if !cuda_available_for_test("end-to-end dispatch parity") {
             return;
-        };
+        }
         // Past the runtime Some-gate: a backend probe failure is a real device
         // fault on a CUDA host, not a no-CUDA skip — fail loud (device-PCG
         // skip-pass class, eee12f6b2) instead of masking it as a pass.
@@ -1947,7 +1965,8 @@ mod sphere_gpu_tests {
         // The device MUST be admitted for this shape, otherwise this test would
         // silently exercise the CPU path on both sides and prove nothing about
         // engagement. Fail loud if the dispatch decision declines the GPU.
-        let decision = sphere_kernel_decision(n, m, lmax as usize);
+        let decision = sphere_kernel_decision(n, m, lmax as usize)
+            .expect("GPU decision must preserve CUDA resolution faults");
         assert!(
             decision.use_gpu,
             "expected GPU dispatch for (n={n}, m={m}, lmax={lmax}); decision said CPU \
@@ -2022,10 +2041,9 @@ mod sphere_gpu_tests {
     /// (raw kernel) · Z evaluated on host.
     #[test]
     fn sphere_gpu_householder_parity_vs_raw_dot_z() {
-        let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            eprintln!("[sphere_gpu test] no CUDA runtime — skipping householder parity");
+        if !cuda_available_for_test("householder parity") {
             return;
-        };
+        }
         // Past the runtime Some-gate: a probe failure is a real device fault on a
         // CUDA host — fail loud (device-PCG skip-pass class, eee12f6b2).
         SphereGpuBackend::probe()
@@ -2092,10 +2110,9 @@ mod sphere_gpu_tests {
     /// Skips silently when no CUDA runtime is available.
     #[test]
     fn sphere_gpu_kernel_matrix_hill_climb_20x_vs_cpu() {
-        let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            eprintln!("[sphere_gpu hill-climb] no CUDA runtime — skipping");
+        if !cuda_available_for_test("kernel-matrix hill climb") {
             return;
-        };
+        }
         // A CUDA runtime is present, so a probe failure is a real device/
         // dispatch fault — fail the gate loudly rather than skip-passing.
         SphereGpuBackend::probe()
@@ -2178,10 +2195,9 @@ mod sphere_gpu_tests {
     /// kernel build dominates PIRLS.
     #[test]
     fn sphere_gpu_end_to_end_fit_hill_climb_10x_vs_cpu() {
-        let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            eprintln!("[sphere_gpu hill-climb fit] no CUDA runtime — skipping");
+        if !cuda_available_for_test("end-to-end fit hill climb") {
             return;
-        };
+        }
         // A CUDA runtime is present, so a probe failure is a real device/
         // dispatch fault — fail the gate loudly rather than skip-passing.
         SphereGpuBackend::probe()
@@ -2281,13 +2297,9 @@ mod sphere_gpu_tests {
         use faer::Side;
         use gam_linalg::faer_ndarray::FaerCholesky;
 
-        let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            eprintln!(
-                "[sphere gpu parity] no CUDA runtime — skipping device parity \
-                 (CPU oracle exercised by sibling tests)"
-            );
+        if !cuda_available_for_test("end-to-end fit parity") {
             return;
-        };
+        }
         // Past the runtime Some-gate: a probe failure is a real device fault on a
         // CUDA host — fail loud (device-PCG skip-pass class, eee12f6b2).
         SphereGpuBackend::probe()

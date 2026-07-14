@@ -97,12 +97,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         route_plan.device_min_score_elems,
     );
     if args.gpu_policy == gam_gpu::GpuPolicy::Required {
-        if gam_gpu::GpuRuntime::global().is_none() {
-            return Err(
-                "--gpu required but no CUDA runtime is available on this host (run on the A100 box)"
-                    .into(),
-            );
-        }
+        gam_gpu::GpuRuntime::require()
+            .map_err(|error| format!("--gpu required but CUDA admission failed: {error}"))?;
         if !route_plan.device_admitted {
             return Err(format!(
                 "--gpu required but minibatch {} x K {} = {} score elems is below the device \

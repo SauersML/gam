@@ -281,11 +281,7 @@ impl RowOpsBackend {
         static BACKEND: OnceLock<Result<RowOpsBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
-                let runtime = gam_gpu::device_runtime::GpuRuntime::global().ok_or_else(|| {
-                    GpuError::DriverLibraryUnavailable {
-                        reason: "row_hessian_ops backend: no CUDA runtime available".to_string(),
-                    }
-                })?;
+                let runtime = gam_gpu::device_runtime::GpuRuntime::require()?;
                 let ctx = gam_gpu::device_runtime::cuda_context_for(
                     runtime.selected_device().ordinal,
                 )
@@ -612,10 +608,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn row_hessian_kernels_match_cpu_oracle_when_cuda_available() {
-        let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            eprintln!("[row_hessian_ops parity] no CUDA runtime — skipping CUDA parity");
-            return;
-        };
+        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                eprintln!("[row_hessian_ops parity] no CUDA device — skipping CUDA parity");
+                return;
+            }
+            Err(error) => panic!("[row_hessian_ops parity] CUDA probe failed: {error}"),
+        }
         let n_rows = 4;
         let r = 33;
         let (h_rows, v_rows) = make_fixture(n_rows, r);

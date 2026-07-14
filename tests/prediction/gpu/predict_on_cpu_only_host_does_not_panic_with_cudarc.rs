@@ -10,10 +10,10 @@
 //!
 //! The fix landed in `GpuRuntime::probe`: every cudarc driver entry point
 //! is now gated on gam's own `libloading` driver probe returning `true`, and
-//! `GpuRuntime::global()` lazily caches a `None` outcome so subsequent
+//! the typed runtime cache preserves an `Absent` outcome so subsequent
 //! predict-path dispatch calls take the CPU fast path. This test pins the
 //! contract by:
-//!   1. exercising `GpuRuntime::is_available()` and the public dispatch
+//!   1. exercising typed Auto resolution and the public dispatch
 //!      `decide()` decision from the predict-relevant kernels (DenseMatvec,
 //!      DenseMatMul, RowReduction);
 //!   2. fitting a tiny GAM and running the predict-path design rebuild
@@ -22,7 +22,7 @@
 //!
 //! On a host with a working CUDA driver the test still passes; the
 //! assertions only require that calls do not panic and that the GPU
-//! dispatch decision is consistent with `GpuRuntime::is_available()`.
+//! dispatch decision is consistent with typed runtime availability.
 
 use csv::StringRecord;
 use gam::gpu::{self, GpuEligibility, GpuKernel};
@@ -64,37 +64,39 @@ fn predict_after_load_on_cpu_only_host_does_not_panic_with_cudarc() {
     };
 
     // GPU dispatch decision: the predict-path kernels must not panic even
-    // when `GpuRuntime::global()` returns `None` (the CPU-only path). The
+    // when Auto resolution returns typed absence (the CPU-only path). The
     // probe must have completed exactly once via gam's own libcuda
     // preflight guard — any regression there would surface as a
     // `cudarc::panic_no_lib_found` unwind escaping `catch_unwind` below.
     #[cfg(target_os = "linux")]
     {
-        if !gam::gpu::driver::cuda_driver_library_present() {
+        if !gam::gpu::driver::cuda_driver_available()
+            .unwrap_or_else(|error| panic!("CUDA driver load fault: {error}"))
+        {
             let direct_probe = gam::gpu::device_runtime::GpuRuntime::probe();
             assert!(
                 matches!(
                     direct_probe,
-                    Err(gam::gpu::GpuError::DriverLibraryUnavailable { ref reason })
-                        if reason == "libcuda unavailable"
+                    Ok(gam::gpu::GpuAvailability::Absent(
+                        gam::gpu::GpuAbsence::DriverUnavailable { .. }
+                    ))
                 ),
-                "absent libcuda must be surfaced as a concise driver probe failure before any cudarc driver entry point is invoked"
+                "absent libcuda must remain typed absence before dispatch"
             );
         }
     }
 
-    let probe = std::panic::catch_unwind(gam::gpu::device_runtime::GpuRuntime::is_available)
-        .expect("GpuRuntime::is_available must not panic on a CPU-only host");
+    let probe = gam::gpu::device_runtime::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+        .unwrap_or_else(|error| panic!("GPU probe fault in prediction test: {error}"))
+        .is_some();
 
     for kernel in [
         GpuKernel::DenseMatvec,
         GpuKernel::DenseTransposeMatvec,
         GpuKernel::DenseXtWX,
     ] {
-        let decision = std::panic::catch_unwind(|| {
-            gpu::decide(kernel, GpuEligibility::from_flags(true, true))
-        })
-        .expect("gpu::decide must not panic on a CPU-only host");
+        let decision = gpu::decide(kernel, GpuEligibility::from_flags(true, true))
+            .unwrap_or_else(|error| panic!("GPU decision fault in prediction test: {error}"));
         if !probe {
             assert!(
                 !decision.use_gpu,
