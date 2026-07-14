@@ -43,13 +43,6 @@ def _fit_circle(n: int = 200, noise: float = 0.15, seed: int = 0, n_iter: int = 
     return fit, x
 
 
-def _n_harmonics_or_none(basis_kinds, n_harmonics):
-    return [
-        int(h) if kind == "periodic" and h > 0 else None
-        for kind, h in zip(basis_kinds, n_harmonics)
-    ]
-
-
 def test_certify_external_round_trips_a_genuinely_converged_native_fit():
     fit, x = _fit_circle(seed=5)
 
@@ -62,11 +55,7 @@ def test_certify_external_round_trips_a_genuinely_converged_native_fit():
     decoder_blocks = [np.asarray(block, dtype=float) for block in fit.decoder_blocks]
     t_init = [np.asarray(block, dtype=float) for block in fit.coords]
     a_init = np.asarray(fit.low_level_logits, dtype=float)
-    duchon_centers = [
-        None if center is None else np.asarray(center, dtype=float)
-        for center in fit.duchon_centers
-    ]
-    n_harmonics = _n_harmonics_or_none(fit.basis_kinds, fit.n_harmonics)
+    geometry_plans = list(fit.geometry_plans)
 
     assert fit.selected_log_lambda_smooth is not None, (
         "a converged fit must expose its selected log_lambda_smooth"
@@ -82,15 +71,12 @@ def test_certify_external_round_trips_a_genuinely_converged_native_fit():
 
     report = gamfit.sae_manifold_certify_external(
         X=x,
-        atom_basis=list(fit.basis_kinds),
-        d_atom=[int(v) for v in fit.atom_dims],
+        geometry_plans=geometry_plans,
         decoder_blocks=decoder_blocks,
         t_init=t_init,
         a_init=a_init,
         log_lambda_smooth=log_lambda_smooth,
         log_ard=log_ard,
-        duchon_centers=duchon_centers,
-        n_harmonics=n_harmonics,
         assignment=fit.assignment,
         alpha=float(fit.alpha),
         tau=float(fit.tau),
@@ -157,18 +143,12 @@ def test_certify_external_returns_typed_nonfit_for_perturbed_state():
     decoder_blocks[0].flat[0] += 0.25
     report = gamfit.sae_manifold_certify_external(
         X=x,
-        atom_basis=list(fit.basis_kinds),
-        d_atom=[int(v) for v in fit.atom_dims],
+        geometry_plans=list(fit.geometry_plans),
         decoder_blocks=decoder_blocks,
         t_init=[np.asarray(block, dtype=float) for block in fit.coords],
         a_init=np.asarray(fit.low_level_logits, dtype=float),
         log_lambda_smooth=[float(v) for v in fit.selected_log_lambda_smooth],
         log_ard=[[float(v) for v in atom] for atom in fit.selected_log_ard],
-        duchon_centers=[
-            None if center is None else np.asarray(center, dtype=float)
-            for center in fit.duchon_centers
-        ],
-        n_harmonics=_n_harmonics_or_none(fit.basis_kinds, fit.n_harmonics),
         assignment=fit.assignment,
         alpha=float(fit.alpha),
         tau=float(fit.tau),
@@ -203,11 +183,10 @@ def test_certify_external_requires_matching_per_atom_metadata_lengths():
     with pytest.raises(ValueError):
         gamfit.sae_manifold_certify_external(
             X=x,
-            # Two atom-basis names, one decoder block: a deliberate
+            # Two geometry plans, one decoder block: a deliberate
             # per-atom-metadata length mismatch that must be a clean error,
             # not a panic or a silently-wrong certificate.
-            atom_basis=["periodic", "periodic"],
-            d_atom=[int(v) for v in fit.atom_dims] * 2,
+            geometry_plans=list(fit.geometry_plans) * 2,
             decoder_blocks=decoder_blocks,
             t_init=t_init,
             a_init=a_init,

@@ -74,12 +74,9 @@ fn sae_manifold_fit_minimal<'py>(
     })
     .map_err(py_value_error)?;
     let SaeMinimalSeedReport {
-        atom_basis,
-        effective_atom_dim,
-        atom_centers,
+        geometry_plans,
         basis_values,
         basis_jacobian,
-        basis_sizes,
         decoder_coefficients,
         smooth_penalties,
         initial_logits,
@@ -92,12 +89,9 @@ fn sae_manifold_fit_minimal<'py>(
     let result_dict = sae_manifold_fit_inner(
         py,
         z_view,
-        &atom_basis,
-        effective_atom_dim,
-        &atom_centers,
+        &geometry_plans,
         basis_values.view(),
         basis_jacobian.view(),
-        basis_sizes.clone(),
         decoder_coefficients.view(),
         smooth_penalties.view(),
         initial_logits.view(),
@@ -775,10 +769,28 @@ fn sae_manifold_fit_model<'py>(
     Ok(Py::new(py, crate::ManifoldSaeCore::from_payload(payload)?)?.into_any())
 }
 
+/// Parse the strict canonical geometry-plan wire. Deserialization re-enters the
+/// validated `SaeAtomGeometryPlan` constructor; no former parallel metadata or
+/// decoder-width inference is accepted at this boundary.
+fn sae_geometry_plans_from_py(
+    context: &str,
+    geometry_plans: &Bound<'_, PyAny>,
+) -> PyResult<Vec<SaeAtomGeometryPlan>> {
+    let value = crate::manifold::manifold_sae_coercion::py_any_to_json_value(geometry_plans)?;
+    let plans: Vec<SaeAtomGeometryPlan> = serde_json::from_value(value)
+        .map_err(|error| py_value_error(format!("{context}: invalid geometry_plans: {error}")))?;
+    if plans.is_empty() {
+        return Err(py_value_error(format!(
+            "{context}: geometry_plans must contain at least one plan"
+        )));
+    }
+    Ok(plans)
+}
+
 /// Out-of-sample inference: same Newton driver as the fit path, with the
-/// trained decoder blocks held frozen across iterations. `decoder_blocks` is
-/// a per-atom list of `(M_k, p)` arrays; `duchon_centers` is `Some` only for
-/// non-periodic atoms; `n_harmonics_list` is `Some` only for periodic atoms.
+/// trained decoder blocks held frozen across iterations. `geometry_plans`
+/// carries the complete immutable topology, resolution, reference metric, and
+/// derived width for every `(M_k, p)` decoder block.
 ///
 /// This array-level entry is the full-support (`K<=P`) specialization. A fitted
 /// overcomplete TopK model owns support-native OOS through
@@ -796,12 +808,8 @@ fn sae_manifold_fit_model<'py>(
 // seeding, inference, projection, and reporting live in gam-sae.
 fn sae_oos_request_from_arrays(
     x_view: ndarray::ArrayView2<'_, f64>,
-    atom_basis: Vec<String>,
-    atom_dim: Vec<usize>,
+    geometry_plans: &[SaeAtomGeometryPlan],
     decoder_blocks: &[ndarray::ArrayView2<'_, f64>],
-    duchon_centers: &[Option<Array2<f64>>],
-    n_harmonics_list: Vec<Option<usize>>,
-    basis_size_list: Vec<usize>,
     alpha: f64,
     tau: f64,
     assignment_kind: String,
@@ -818,15 +826,11 @@ fn sae_oos_request_from_arrays(
     log_ard: Option<Vec<Vec<f64>>>,
     learnable_alpha: bool,
 ) -> Result<gam::terms::sae::manifold::SaeOosRequest, String> {
-    let k_atoms = atom_basis.len();
-    if atom_dim.len() != k_atoms
-        || decoder_blocks.len() != k_atoms
-        || duchon_centers.len() != k_atoms
-        || n_harmonics_list.len() != k_atoms
-        || basis_size_list.len() != k_atoms
-    {
+    let k_atoms = geometry_plans.len();
+    if decoder_blocks.len() != k_atoms {
         return Err(format!(
-            "sae_manifold_predict_oos: per-atom metadata lengths must equal K={k_atoms}"
+            "sae_manifold_predict_oos: decoder count {} must equal geometry-plan count K={k_atoms}",
+            decoder_blocks.len()
         ));
     }
     if assignment_kind == "topk" && k_atoms > x_view.ncols() {
@@ -868,21 +872,9 @@ fn sae_oos_request_from_arrays(
             );
         }
     };
-    let basis_kinds = atom_basis
-        .iter()
-        .map(|name| sae_atom_basis_kind_from_str(name))
-        .collect::<Vec<_>>();
-    let stored_n_harmonics = n_harmonics_list
-        .iter()
-        .map(|order| order.unwrap_or(0))
-        .collect::<Vec<_>>();
     let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
-        &basis_kinds,
-        &atom_dim,
+        geometry_plans,
         decoder_blocks,
-        duchon_centers,
-        &stored_n_harmonics,
-        &basis_size_list,
     )?;
     let hybrid_linear_images = match hybrid_linear_images {
         Some(images) => images,
@@ -927,7 +919,7 @@ fn sae_oos_report_to_pydict<'py>(
     for atom in report.atoms {
         let atom_dict = PyDict::new(py);
         atom_dict.set_item("decoder_B", atom.decoder.into_pyarray(py))?;
-        atom_dict.set_item("basis_kind", sae_atom_basis_kind_name(atom.basis_kind()))?;
+        atom_dict.set_item("basis_kind", sae_atom_basis_kind_name(&atom.basis_kind))?;
         atom_dict.set_item("basis_centers", py.None())?;
         atom_dict.set_item("on_atom_coords_t", atom.coords.into_pyarray(py))?;
         atom_dict.set_item("assignments_z", atom.assignments.into_pyarray(py))?;
@@ -964,12 +956,8 @@ fn sae_oos_report_to_pydict<'py>(
 /// calls the typed gam-sae entry, and serializes its report (#2236).
 #[pyfunction(signature = (
     x_new,
-    atom_basis,
-    atom_dim,
+    geometry_plans,
     decoder_blocks,
-    duchon_centers,
-    n_harmonics_list,
-    basis_size_list,
     alpha,
     tau,
     assignment_kind,
@@ -989,12 +977,8 @@ fn sae_oos_report_to_pydict<'py>(
 fn sae_manifold_predict_oos<'py>(
     py: Python<'py>,
     x_new: PyReadonlyArray2<'py, f64>,
-    atom_basis: Vec<String>,
-    atom_dim: Vec<usize>,
+    geometry_plans: &Bound<'py, PyAny>,
     decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
-    duchon_centers: Vec<Option<PyReadonlyArray2<'py, f64>>>,
-    n_harmonics_list: Vec<Option<usize>>,
-    basis_size_list: Vec<usize>,
     alpha: f64,
     tau: f64,
     assignment_kind: String,
@@ -1019,12 +1003,9 @@ fn sae_manifold_predict_oos<'py>(
     log_ard: Option<Vec<Vec<f64>>>,
     learnable_alpha: bool,
 ) -> PyResult<Py<PyDict>> {
+    let geometry_plans = sae_geometry_plans_from_py("sae_manifold_predict_oos", geometry_plans)?;
     let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
         decoder_blocks.iter().map(|b| b.as_array()).collect();
-    let duchon_owned: Vec<Option<Array2<f64>>> = duchon_centers
-        .iter()
-        .map(|o| o.as_ref().map(|a| a.as_array().to_owned()))
-        .collect();
     let initial_logits_view = initial_logits.as_ref().map(|a| a.as_array());
     let initial_coords_view = initial_coords.as_ref().map(|a| a.as_array());
     let hybrid_owned = hybrid_linear_images.map(|images| {
@@ -1043,12 +1024,8 @@ fn sae_manifold_predict_oos<'py>(
     });
     let request = sae_oos_request_from_arrays(
         x_new.as_array(),
-        atom_basis,
-        atom_dim,
+        &geometry_plans,
         &decoder_views,
-        &duchon_owned,
-        n_harmonics_list,
-        basis_size_list,
         alpha,
         tau,
         assignment_kind,
@@ -1098,12 +1075,8 @@ fn sae_manifold_predict_oos<'py>(
 /// `audited_stationary` and zero optimization iterations.
 #[pyfunction(signature = (
     z,
-    atom_basis,
-    atom_dim,
+    geometry_plans,
     decoder_blocks,
-    duchon_centers,
-    n_harmonics_list,
-    basis_size_list,
     initial_coords,
     initial_logits,
     alpha,
@@ -1132,12 +1105,8 @@ fn sae_manifold_predict_oos<'py>(
 fn sae_manifold_certify_external<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
-    atom_basis: Vec<String>,
-    atom_dim: Vec<usize>,
+    geometry_plans: &Bound<'py, PyAny>,
     decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
-    duchon_centers: Vec<Option<PyReadonlyArray2<'py, f64>>>,
-    n_harmonics_list: Vec<Option<usize>>,
-    basis_size_list: Vec<usize>,
     initial_coords: Vec<PyReadonlyArray2<'py, f64>>,
     initial_logits: PyReadonlyArray2<'py, f64>,
     alpha: f64,
@@ -1164,22 +1133,20 @@ fn sae_manifold_certify_external<'py>(
     fisher_factor_kind: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
+    let geometry_plans =
+        sae_geometry_plans_from_py("sae_manifold_certify_external", geometry_plans)?;
     let z_view = z.as_array();
     let (n_obs, p_out) = z_view.dim();
-    let k_atoms = atom_basis.len();
+    let k_atoms = geometry_plans.len();
     if assignment_kind == "topk" && k_atoms > p_out {
         return Err(py_value_error(format!(
             "sae_manifold_certify_external: overcomplete hard TopK certification requires canonical support indices and heterogeneous compact coordinates; dense logits are invalid at K={k_atoms} > P={p_out}"
         )));
     }
-    if atom_dim.len() != k_atoms
-        || decoder_blocks.len() != k_atoms
-        || duchon_centers.len() != k_atoms
-        || n_harmonics_list.len() != k_atoms
-        || basis_size_list.len() != k_atoms
-    {
+    if decoder_blocks.len() != k_atoms {
         return Err(py_value_error(format!(
-            "sae_manifold_certify_external: per-atom metadata lengths must equal K={k_atoms}"
+            "sae_manifold_certify_external: decoder count {} must equal geometry-plan count K={k_atoms}",
+            decoder_blocks.len()
         )));
     }
 
@@ -1201,29 +1168,13 @@ fn sae_manifold_certify_external<'py>(
         }
     };
 
-    let atom_centers: Vec<Option<Array2<f64>>> = duchon_centers
-        .iter()
-        .map(|o| o.as_ref().map(|a| a.as_array().to_owned()))
-        .collect();
-    let basis_kinds = atom_basis
-        .iter()
-        .map(|name| sae_atom_basis_kind_from_str(name))
-        .collect::<Vec<_>>();
     let decoder_views = decoder_blocks
         .iter()
         .map(|block| block.as_array())
         .collect::<Vec<_>>();
-    let stored_n_harmonics = n_harmonics_list
-        .iter()
-        .map(|order| order.unwrap_or(0))
-        .collect::<Vec<_>>();
     let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
-        &basis_kinds,
-        &atom_dim,
+        &geometry_plans,
         &decoder_views,
-        &atom_centers,
-        &stored_n_harmonics,
-        &basis_size_list,
     )
     .map_err(py_value_error)?;
 
@@ -1273,10 +1224,22 @@ fn sae_manifold_certify_external<'py>(
         Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
         None => None,
     };
-    let max_atom_dim = atom_dim.iter().copied().max().ok_or_else(|| {
-        py_value_error("sae_manifold_certify_external: atom_dim is empty".to_string())
-    })?;
-    let total_basis: usize = basis_size_list.iter().copied().sum();
+    let max_atom_dim = geometry_plans
+        .iter()
+        .map(SaeAtomGeometryPlan::latent_dim)
+        .max()
+        .ok_or_else(|| {
+            py_value_error("sae_manifold_certify_external: geometry_plans is empty".to_string())
+        })?;
+    let total_basis = geometry_plans
+        .iter()
+        .map(SaeAtomGeometryPlan::basis_size)
+        .try_fold(0usize, |total, width| {
+            total.checked_add(width?).ok_or_else(|| {
+                "sae_manifold_certify_external: total basis width overflowed".to_string()
+            })
+        })
+        .map_err(py_value_error)?;
     let mut latent_blocks = serde_json::Map::new();
     latent_blocks.insert(
         "t".into(),
@@ -1358,7 +1321,6 @@ fn sae_manifold_certify_external<'py>(
     // workspace and an extraction risked colliding with that churn. The same
     // reasoning applies here on the pyffi side; keep this block in sync with
     // `sae_manifold_fit_inner`'s tail if that payload shape changes.
-    let seed_refine_random_state = 0u64;
     let fisher_mass_residual = fisher_mass_residual_owned
         .as_ref()
         .map(|values| values.view());
@@ -1582,22 +1544,14 @@ fn sae_manifold_certify_external<'py>(
         "certificates",
         certificate_ledger_dict(py, &certificate_ledger)?,
     )?;
-    let fitted_atom_plans = sae_fitted_atom_plans(&term, &atom_centers, seed_refine_random_state)
-        .map_err(py_value_error)?;
-    let atom_plans_py = PyList::empty(py);
-    for plan in fitted_atom_plans {
-        let entry = PyDict::new(py);
-        entry.set_item("kind", sae_atom_basis_kind_name(&plan.kind))?;
-        entry.set_item("latent_dim", plan.latent_dim)?;
-        entry.set_item("n_harmonics", plan.n_harmonics)?;
-        entry.set_item("basis_size", plan.basis_size)?;
-        match plan.duchon_centers {
-            Some(centers) => entry.set_item("duchon_centers", centers.into_pyarray(py))?,
-            None => entry.set_item("duchon_centers", py.None())?,
-        }
-        atom_plans_py.append(entry)?;
-    }
-    out.set_item("atom_plans", atom_plans_py)?;
+    let geometry_plans = sae_fitted_atom_plans(&term)
+        .map_err(py_value_error)?
+        .into_iter()
+        .map(|plan| plan.into_geometry())
+        .collect::<Vec<_>>();
+    let geometry_value = serde_json::to_value(geometry_plans)
+        .map_err(|error| py_value_error(format!("failed to serialize geometry plans: {error}")))?;
+    out.set_item("geometry_plans", json_value_to_py(py, geometry_value)?)?;
 
     out.set_item("chosen_k", k_atoms)?;
     out.set_item("oos_projection_top1", top_k == Some(1))?;
@@ -1657,12 +1611,8 @@ fn steer_delta_from_arrays(
     t_to: ndarray::ArrayView1<'_, f64>,
     n_obs: usize,
     p_out: usize,
-    atom_basis: &[String],
-    atom_dim: &[usize],
+    geometry_plans: &[SaeAtomGeometryPlan],
     decoder_blocks: &[ndarray::ArrayView2<'_, f64>],
-    duchon_centers: &[Option<Array2<f64>>],
-    n_harmonics_list: &[Option<usize>],
-    basis_size_list: &[usize],
     coords: &[ndarray::ArrayView2<'_, f64>],
     logits: ndarray::ArrayView2<'_, f64>,
     assignment_kind: &str,
@@ -1696,12 +1646,8 @@ fn steer_delta_from_arrays(
         amplitude,
         t_from,
         t_to,
-        atom_basis,
-        atom_dim,
+        geometry_plans,
         decoder_blocks,
-        duchon_centers,
-        n_harmonics_list,
-        basis_size_list,
         coords,
         logits,
         assignment_kind,
@@ -1724,12 +1670,8 @@ fn steer_delta_with_metric_from_arrays(
     amplitude: f64,
     t_from: ndarray::ArrayView1<'_, f64>,
     t_to: ndarray::ArrayView1<'_, f64>,
-    atom_basis: &[String],
-    atom_dim: &[usize],
+    geometry_plans: &[SaeAtomGeometryPlan],
     decoder_blocks: &[ndarray::ArrayView2<'_, f64>],
-    duchon_centers: &[Option<Array2<f64>>],
-    n_harmonics_list: &[Option<usize>],
-    basis_size_list: &[usize],
     coords: &[ndarray::ArrayView2<'_, f64>],
     logits: ndarray::ArrayView2<'_, f64>,
     assignment_kind: &str,
@@ -1741,19 +1683,10 @@ fn steer_delta_with_metric_from_arrays(
 ) -> PyResult<gam::inference::steering::SteerPlan> {
     // Assignment tokens are strict: compatibility aliases are rejected.
     let assignment_kind = canonicalize_assignment_kind(assignment_kind).map_err(py_value_error)?;
-    let k_atoms = atom_basis.len();
-    // Guard the per-atom metadata lengths before indexing them into the atom
-    // specs below; every other precondition (positive dims, atom_k range, coord /
-    // logit shapes, positive alpha/tau) is validated inside the engine entry.
-    if atom_dim.len() != k_atoms
-        || decoder_blocks.len() != k_atoms
-        || duchon_centers.len() != k_atoms
-        || n_harmonics_list.len() != k_atoms
-        || basis_size_list.len() != k_atoms
-        || coords.len() != k_atoms
-    {
+    let k_atoms = geometry_plans.len();
+    if decoder_blocks.len() != k_atoms || coords.len() != k_atoms {
         return Err(py_value_error(format!(
-            "sae_steer_delta: per-atom metadata lengths must equal K={k_atoms}"
+            "sae_steer_delta: decoder and coordinate counts must equal geometry-plan count K={k_atoms}"
         )));
     }
     let assignment = match assignment_kind.as_str() {
@@ -1779,21 +1712,9 @@ fn steer_delta_with_metric_from_arrays(
     // rebuild contract `sae_manifold_predict_oos` marshals into, so the steer term
     // and the OOS term are rebuilt by one engine path (`run_sae_manifold_steer`,
     // #2236) rather than a duplicated pyffi rebuild.
-    let basis_kinds = atom_basis
-        .iter()
-        .map(|name| sae_atom_basis_kind_from_str(name))
-        .collect::<Vec<_>>();
-    let stored_n_harmonics = n_harmonics_list
-        .iter()
-        .map(|order| order.unwrap_or(0))
-        .collect::<Vec<_>>();
     let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
-        &basis_kinds,
-        atom_dim,
+        geometry_plans,
         decoder_blocks,
-        duchon_centers,
-        &stored_n_harmonics,
-        basis_size_list,
     )
     .map_err(py_value_error)?;
     let coord_blocks: Vec<Array2<f64>> = coords.iter().map(|block| block.to_owned()).collect();
@@ -1827,12 +1748,8 @@ struct SteerToTargetArraysRequest<'a> {
     config: gam::inference::steering::TargetDoseConfig,
     t_from: ndarray::ArrayView1<'a, f64>,
     t_to: ndarray::ArrayView1<'a, f64>,
-    atom_basis: &'a [String],
-    atom_dim: &'a [usize],
+    geometry_plans: &'a [SaeAtomGeometryPlan],
     decoder_blocks: &'a [ndarray::ArrayView2<'a, f64>],
-    duchon_centers: &'a [Option<Array2<f64>>],
-    n_harmonics_list: &'a [Option<usize>],
-    basis_size_list: &'a [usize],
     coords: &'a [ndarray::ArrayView2<'a, f64>],
     logits: ndarray::ArrayView2<'a, f64>,
     assignment_kind: &'a str,
@@ -1903,12 +1820,8 @@ fn steer_to_target_from_arrays(
         config,
         t_from,
         t_to,
-        atom_basis,
-        atom_dim,
+        geometry_plans,
         decoder_blocks,
-        duchon_centers,
-        n_harmonics_list,
-        basis_size_list,
         coords,
         logits,
         assignment_kind,
@@ -1919,16 +1832,10 @@ fn steer_to_target_from_arrays(
         fisher_metric,
     } = request;
     let assignment_kind = canonicalize_assignment_kind(assignment_kind).map_err(py_value_error)?;
-    let k_atoms = atom_basis.len();
-    if atom_dim.len() != k_atoms
-        || decoder_blocks.len() != k_atoms
-        || duchon_centers.len() != k_atoms
-        || n_harmonics_list.len() != k_atoms
-        || basis_size_list.len() != k_atoms
-        || coords.len() != k_atoms
-    {
+    let k_atoms = geometry_plans.len();
+    if decoder_blocks.len() != k_atoms || coords.len() != k_atoms {
         return Err(py_value_error(format!(
-            "sae_steer_to_target: per-atom metadata lengths must equal K={k_atoms}"
+            "sae_steer_to_target: decoder and coordinate counts must equal geometry-plan count K={k_atoms}"
         )));
     }
     let assignment = match assignment_kind.as_str() {
@@ -1949,21 +1856,9 @@ fn steer_to_target_from_arrays(
             )));
         }
     };
-    let basis_kinds = atom_basis
-        .iter()
-        .map(|name| sae_atom_basis_kind_from_str(name))
-        .collect::<Vec<_>>();
-    let stored_n_harmonics = n_harmonics_list
-        .iter()
-        .map(|order| order.unwrap_or(0))
-        .collect::<Vec<_>>();
     let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
-        &basis_kinds,
-        atom_dim,
+        geometry_plans,
         decoder_blocks,
-        duchon_centers,
-        &stored_n_harmonics,
-        basis_size_list,
     )
     .map_err(py_value_error)?;
     let coord_blocks: Vec<Array2<f64>> = coords.iter().map(|block| block.to_owned()).collect();
@@ -2084,12 +1979,8 @@ fn steer_plan_to_pydict(
     t_to,
     n_obs,
     p_out,
-    atom_basis,
-    atom_dim,
+    geometry_plans,
     decoder_blocks,
-    duchon_centers,
-    n_harmonics_list,
-    basis_size_list,
     coords,
     logits,
     assignment_kind,
@@ -2111,12 +2002,8 @@ fn sae_steer_delta<'py>(
     t_to: PyReadonlyArray1<'py, f64>,
     n_obs: usize,
     p_out: usize,
-    atom_basis: Vec<String>,
-    atom_dim: Vec<usize>,
+    geometry_plans: &Bound<'py, PyAny>,
     decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
-    duchon_centers: Vec<Option<PyReadonlyArray2<'py, f64>>>,
-    n_harmonics_list: Vec<Option<usize>>,
-    basis_size_list: Vec<usize>,
     coords: Vec<PyReadonlyArray2<'py, f64>>,
     logits: PyReadonlyArray2<'py, f64>,
     assignment_kind: String,
@@ -2129,14 +2016,11 @@ fn sae_steer_delta<'py>(
     fisher_provenance: Option<String>,
     fisher_factor_kind: Option<String>,
 ) -> PyResult<Py<PyDict>> {
+    let geometry_plans = sae_geometry_plans_from_py("sae_steer_delta", geometry_plans)?;
     let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
         decoder_blocks.iter().map(|b| b.as_array()).collect();
     let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
         coords.iter().map(|c| c.as_array()).collect();
-    let duchon_owned: Vec<Option<Array2<f64>>> = duchon_centers
-        .iter()
-        .map(|o| o.as_ref().map(|a| a.as_array().to_owned()))
-        .collect();
     let fisher_view = fisher_factors.as_ref().map(|f| f.as_array());
     let fisher_mass_view = fisher_mass_residual.as_ref().map(|mass| mass.as_array());
     let plan = steer_delta_from_arrays(
@@ -2147,12 +2031,8 @@ fn sae_steer_delta<'py>(
         t_to.as_array(),
         n_obs,
         p_out,
-        &atom_basis,
-        &atom_dim,
+        &geometry_plans,
         &decoder_views,
-        &duchon_owned,
-        &n_harmonics_list,
-        &basis_size_list,
         &coord_views,
         logits.as_array(),
         &assignment_kind,

@@ -263,8 +263,7 @@ def sae_manifold_fit(
 
 def sae_manifold_certify_external(
     X: Any,
-    atom_basis: Sequence[str],
-    d_atom: Any,
+    geometry_plans: Sequence[Mapping[str, Any]],
     decoder_blocks: Sequence[Any],
     t_init: Sequence[Any],
     a_init: Any,
@@ -273,8 +272,6 @@ def sae_manifold_certify_external(
     *,
     tier0_mean: Any = None,
     tier0_scale: Any = None,
-    duchon_centers: Sequence[Any | None] | None = None,
-    n_harmonics: Sequence[int | None] | None = None,
     assignment: str = "softmax",
     alpha: float = 1.0,
     tau: float = 0.5,
@@ -316,24 +313,24 @@ def sae_manifold_certify_external(
     inner/outer residual diagnostics, and no fit or structure certificate.
     Python only converts containers; validation, audit, and certification are
     native-owned.
+
+    ``geometry_plans`` is the canonical, typed per-atom geometry declaration.
+    Each mapping carries the atom kind, latent dimension, basis-native
+    resolution, and reference metric. Native Rust validates that declaration
+    and derives each decoder width from it; no parallel geometry metadata is
+    accepted by this entry.
     """
     x = _matrix(X)
-    k_atoms = len(atom_basis)
     fisher, fisher_residual, fisher_provenance, fisher_factor_kind = _fisher_arrays(
         fisher_factors
     )
-    centers = duchon_centers if duchon_centers is not None else [None] * k_atoms
-    harmonics = n_harmonics if n_harmonics is not None else [None] * k_atoms
-    dims = _atom_dimensions(d_atom)
-    dims = dims * k_atoms if len(dims) == 1 else dims
     return rust_module().sae_manifold_certify_external(
         x,
-        list(atom_basis),
-        dims,
-        [np.ascontiguousarray(np.asarray(block, dtype=np.float64)) for block in decoder_blocks],
-        [None if c is None else _matrix(c) for c in centers],
-        [None if h is None else int(h) for h in harmonics],
-        [int(np.asarray(block, dtype=np.float64).shape[0]) for block in decoder_blocks],
+        [dict(plan) for plan in geometry_plans],
+        [
+            np.ascontiguousarray(np.asarray(block, dtype=np.float64))
+            for block in decoder_blocks
+        ],
         [_matrix(t) for t in t_init],
         _matrix(a_init),
         float(alpha),

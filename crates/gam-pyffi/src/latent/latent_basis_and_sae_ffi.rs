@@ -1814,12 +1814,9 @@ fn structured_residual_pass_diagnostics_dict<'py>(
 fn sae_manifold_fit_inner<'py>(
     py: Python<'py>,
     z_view: ArrayView2<'_, f64>,
-    atom_basis: &[String],
-    atom_dim: Vec<usize>,
-    atom_centers: &[Option<Array2<f64>>],
+    geometry_plans: &[SaeAtomGeometryPlan],
     basis_values: ArrayView3<'_, f64>,
     basis_jacobian: ArrayView4<'_, f64>,
-    basis_sizes: Vec<usize>,
     decoder_coefficients: ArrayView3<'_, f64>,
     smooth_penalties: ArrayView3<'_, f64>,
     initial_logits: ArrayView2<'_, f64>,
@@ -1874,15 +1871,23 @@ fn sae_manifold_fit_inner<'py>(
         None => None,
     };
     let (n_obs, p_out) = z_view.dim();
-    let max_atom_dim = atom_dim
+    let max_atom_dim = geometry_plans
         .iter()
-        .copied()
+        .map(SaeAtomGeometryPlan::latent_dim)
         .max()
-        .ok_or_else(|| py_value_error("sae_manifold_fit: atom_dim is empty".to_string()))?;
+        .ok_or_else(|| py_value_error("sae_manifold_fit: geometry_plans is empty".to_string()))?;
     // Registry descriptor parsing remains boundary marshalling because the JSON
     // descriptor builder lives above gam-sae. Every seed decision after this
     // point is owned by the typed gam-sae entry.
-    let total_basis: usize = basis_sizes.iter().copied().sum();
+    let total_basis = geometry_plans
+        .iter()
+        .map(SaeAtomGeometryPlan::basis_size)
+        .try_fold(0usize, |total, width| {
+            total
+                .checked_add(width?)
+                .ok_or_else(|| "sae_manifold_fit: total basis width overflowed".to_string())
+        })
+        .map_err(py_value_error)?;
     let mut latent_blocks = serde_json::Map::new();
     latent_blocks.insert(
         "t".into(),
@@ -1918,12 +1923,9 @@ fn sae_manifold_fit_inner<'py>(
     };
     let seed = build_sae_fit_seed(SaeFitSeedRequest {
         target: z_view,
-        atom_basis,
-        atom_dim: &atom_dim,
-        atom_centers,
+        geometry_plans,
         basis_values,
         basis_jacobian,
-        basis_sizes: &basis_sizes,
         decoder_coefficients,
         smooth_penalties,
         initial_logits,
@@ -2330,22 +2332,14 @@ fn sae_manifold_fit_inner<'py>(
         "certificates",
         certificate_ledger_dict(py, &certificate_ledger)?,
     )?;
-    let fitted_atom_plans = sae_fitted_atom_plans(&term, atom_centers, seed_refine_random_state)
-        .map_err(py_value_error)?;
-    let atom_plans_py = PyList::empty(py);
-    for plan in fitted_atom_plans {
-        let entry = PyDict::new(py);
-        entry.set_item("kind", sae_atom_basis_kind_name(&plan.kind))?;
-        entry.set_item("latent_dim", plan.latent_dim)?;
-        entry.set_item("n_harmonics", plan.n_harmonics)?;
-        entry.set_item("basis_size", plan.basis_size)?;
-        match plan.duchon_centers {
-            Some(centers) => entry.set_item("duchon_centers", centers.into_pyarray(py))?,
-            None => entry.set_item("duchon_centers", py.None())?,
-        }
-        atom_plans_py.append(entry)?;
-    }
-    out.set_item("atom_plans", atom_plans_py)?;
+    let geometry_plans = sae_fitted_atom_plans(&term)
+        .map_err(py_value_error)?
+        .into_iter()
+        .map(|plan| plan.into_geometry())
+        .collect::<Vec<_>>();
+    let geometry_value = serde_json::to_value(geometry_plans)
+        .map_err(|error| py_value_error(format!("failed to serialize geometry plans: {error}")))?;
+    out.set_item("geometry_plans", json_value_to_py(py, geometry_value)?)?;
 
     // Contract keys the python `ManifoldSAE.from_payload` boundary reads
     // unconditionally (tightened in 23db2c80a, which rejected stale payload

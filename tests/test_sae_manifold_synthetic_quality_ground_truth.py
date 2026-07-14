@@ -66,6 +66,15 @@ def _oracle_periodic_decoder() -> list[np.ndarray]:
     return [block0, block1]
 
 
+def _periodic_geometry_plan(order: int) -> dict[str, object]:
+    return {
+        "kind": "periodic",
+        "latent_dim": 1,
+        "resolution": {"kind": "periodic_harmonics", "order": order},
+        "reference_metric": {"kind": "unit_circle"},
+    }
+
+
 def _planted_one_hot_periodic(
     n: int,
     *,
@@ -114,12 +123,8 @@ def test_oos_fixed_decoder_recovers_one_hot_oracle_assignments() -> None:
     decoder = _oracle_periodic_decoder()
     payload = rust_module().sae_manifold_predict_oos(
         np.ascontiguousarray(x),
-        ["periodic", "periodic"],
-        [1, 1],
+        [_periodic_geometry_plan(1), _periodic_geometry_plan(1)],
         [np.ascontiguousarray(block) for block in decoder],
-        [None, None],
-        [1, 1],
-        [3, 3],
         alpha=1.0,
         tau=0.25,
         assignment_kind="softmax",
