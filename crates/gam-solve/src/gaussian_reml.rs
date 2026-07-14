@@ -1623,21 +1623,32 @@ pub fn gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(
         );
     }
     let shared_nu = (d as f64) * (per_output_nu as f64);
-    let residual = y.to_owned() - &fit.fitted;
-    let penalty_times_coefficients = dense_ab(penalty, fit.coefficients.view());
-    let mut pooled_deviance = 0.0_f64;
-    for output in 0..d {
-        for row in 0..n {
-            let value = residual[[row, output]];
-            pooled_deviance += weight[row] * value * value;
-        }
-        pooled_deviance += fit.lambda
-            * fit
-                .coefficients
-                .column(output)
-                .dot(&penalty_times_coefficients.column(output));
+    // Use the deviance represented by the forward fit itself.  Reconstructing
+    // the mathematically equivalent quantity as RSS + lambda * beta' S beta
+    // follows a different floating-point path from the modal subtraction used
+    // by `gaussian_reml_multi_shared_dispersion_closed_form`.  On a nearly
+    // interpolating chart the two paths lose different low bits, making this
+    // gradient disagree with value probes even though both formulas are exact
+    // over the reals.  A nested metric optimizer then follows the mismatched
+    // derivative until every Armijo step is rejected.  The shared forward fit
+    // stores its single profiled dispersion in every output slot, so recover
+    // the authoritative pooled deviance from that state instead.
+    let shared_sigma2 = fit.sigma2[0];
+    if fit
+        .sigma2
+        .iter()
+        .any(|sigma2| sigma2.to_bits() != shared_sigma2.to_bits())
+    {
+        crate::bail_invalid_estim!(
+            "shared-dispersion REML penalty gradient requires one shared forward dispersion"
+        );
     }
-    pooled_deviance = pooled_deviance.max(MIN_DEVIANCE);
+    let pooled_deviance = shared_sigma2 * shared_nu;
+    if !(pooled_deviance.is_finite() && pooled_deviance > 0.0) {
+        crate::bail_invalid_estim!(
+            "shared-dispersion REML penalty gradient requires positive forward deviance"
+        );
+    }
 
     let inverse_hessian = gaussian_reml_inverse_hessian_from_cache(&fit.cache, fit.lambda)?;
     let penalty_pseudoinverse = gaussian_reml_penalty_pseudoinverse_from_cache(&fit.cache);
