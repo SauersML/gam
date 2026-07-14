@@ -899,6 +899,14 @@ impl SaeSupportSparseTerm {
             )
             .map_err(|error| format!("SaeSupportSparseTerm::coordinate_sweep: {error}"))?;
             let directional = rhs_vector.dot(&delta);
+            let raw_gradient_max = rhs_vector
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f64, f64::max);
+            let delta_max = delta
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f64, f64::max);
             if !directional.is_finite() || directional < 0.0 {
                 return Err(format!(
                     "SaeSupportSparseTerm::coordinate_sweep: trust-region step is not a finite descent direction (rhs_dot_delta={directional})"
@@ -915,6 +923,10 @@ impl SaeSupportSparseTerm {
             }
             let old_coords = self.assignment.coords_row(row).to_vec();
             let mut accepted = None;
+            let mut best_gap = f64::INFINITY;
+            let mut best_step = 0.0_f64;
+            let mut best_objective_delta = f64::NAN;
+            let mut best_armijo_bound = f64::NAN;
             for halving in 0..=24 {
                 self.assignment.set_row_coords(row, &old_coords)?;
                 let step = 2.0_f64.powi(-(halving as i32));
@@ -967,9 +979,15 @@ impl SaeSupportSparseTerm {
                     }
                 }
                 let objective_delta = objective_delta.sum();
-                if objective_delta.is_finite()
-                    && objective_delta <= -1.0e-4 * step * directional
-                {
+                let armijo_bound = -1.0e-4 * step * directional;
+                let gap = objective_delta - armijo_bound;
+                if gap.is_finite() && gap < best_gap {
+                    best_gap = gap;
+                    best_step = step;
+                    best_objective_delta = objective_delta;
+                    best_armijo_bound = armijo_bound;
+                }
+                if objective_delta.is_finite() && objective_delta <= armijo_bound {
                     accepted = Some(step);
                     break;
                 }
@@ -983,7 +1001,11 @@ impl SaeSupportSparseTerm {
                 None => {
                     self.assignment.set_row_coords(row, &old_coords)?;
                     return Err(format!(
-                        "SaeSupportSparseTerm::coordinate_sweep: row {row} has a raw descent direction but manifold line search found no decreasing step"
+                        "SaeSupportSparseTerm::coordinate_sweep: row {row} has a raw descent direction but manifold line search found no decreasing step \
+                         (raw KKT max={raw_gradient_max:.17e}, rhs_dot_delta={directional:.17e}, \
+                         delta_max={delta_max:.17e}, best_step={best_step:.17e}, \
+                         best_objective_delta={best_objective_delta:.17e}, \
+                         best_armijo_bound={best_armijo_bound:.17e}, gap={best_gap:.17e})"
                     ));
                 }
             }
