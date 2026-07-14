@@ -58,7 +58,7 @@ use faer::Side;
 use ndarray::{Array1, Array2, s};
 use rayon::prelude::*;
 
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
+use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, FaerSvd};
 
 /// Check whether penalty ranges decompose into independent exact blocks.
 ///
@@ -271,7 +271,25 @@ impl PenaltyPseudologdet {
             let structural_rank =
                 structural_rank_from_canonical_penalties(penalties, lambdas, p_total)?;
             let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
-            Self::from_assembled_with_rank_hint(s_total, ridge_hint, Some(structural_rank))
+            // #2299/#2316-adjacent: the hinted split must see the spectrum at
+            // ROOT scale (stacked scaled square roots), not the assembled
+            // matrix's squared conditioning — see
+            // `eigensystem_from_scaled_roots`.
+            let components: Vec<(f64, ndarray::ArrayView2<'_, f64>, std::ops::Range<usize>)> =
+                penalties
+                    .iter()
+                    .enumerate()
+                    .map(|(k, cp)| {
+                        let lambda = if k < lambdas.len() { lambdas[k] } else { 0.0 };
+                        (lambda, cp.local.view(), cp.col_range.clone())
+                    })
+                    .collect();
+            Self::from_scaled_components_with_rank_hint(
+                &s_total,
+                &components,
+                ridge_hint,
+                Some(structural_rank),
+            )
         }
     }
 
@@ -294,6 +312,9 @@ impl PenaltyPseudologdet {
             pub(crate) end: usize,
             pub(crate) local: Array2<f64>,
             pub(crate) structural_local: Array2<f64>,
+            /// `(penalty index, λ)` of every component summed into `local`,
+            /// so the hinted split can be computed at root scale.
+            pub(crate) parts: Vec<(usize, f64)>,
         }
 
         // Group penalties by their exact block range.
@@ -310,6 +331,7 @@ impl PenaltyPseudologdet {
                 if lambda > 0.0 {
                     bd.structural_local.scaled_add(1.0, &cp.local);
                 }
+                bd.parts.push((k, lambda));
             } else {
                 let bd = cp.block_dim();
                 let mut local = Array2::<f64>::zeros((bd, bd));
@@ -323,6 +345,7 @@ impl PenaltyPseudologdet {
                     end: r.end,
                     local,
                     structural_local,
+                    parts: vec![(k, lambda)],
                 });
             }
         }
@@ -365,8 +388,19 @@ impl PenaltyPseudologdet {
         let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
         let process_block = |bd: &BlockData| -> Result<BlockResult, String> {
             let structural_rank = structural_rank_from_assembled(&bd.structural_local)?;
-            let block_pld = Self::from_assembled_with_rank_hint(
-                bd.local.clone(),
+            // Root-scale spectrum for the hinted split (see
+            // `eigensystem_from_scaled_roots`): the assembled block's eigh
+            // cannot resolve a structurally-positive mode once the block's λ
+            // ratio exceeds ~1/ε, and mid-optimization probes do reach that.
+            let block_width = bd.end - bd.start;
+            let components: Vec<(f64, ndarray::ArrayView2<'_, f64>, std::ops::Range<usize>)> = bd
+                .parts
+                .iter()
+                .map(|&(k, lambda)| (lambda, penalties[k].local.view(), 0..block_width))
+                .collect();
+            let block_pld = Self::from_scaled_components_with_rank_hint(
+                &bd.local,
+                &components,
                 ridge_hint,
                 Some(structural_rank),
             )?;
@@ -570,7 +604,23 @@ impl PenaltyPseudologdet {
             }
         }
         let structural_rank = structural_rank_from_assembled(&structural_total)?;
-        Self::from_assembled_with_rank_hint(s_total, ridge_hint, Some(structural_rank))
+        // Root-scale spectrum for the hinted split (see
+        // `eigensystem_from_scaled_roots`).
+        let components: Vec<(f64, ndarray::ArrayView2<'_, f64>, std::ops::Range<usize>)> =
+            s_k_matrices
+                .iter()
+                .enumerate()
+                .map(|(k, s_k)| {
+                    let lambda = if k < lambdas.len() { lambdas[k] } else { 0.0 };
+                    (lambda, s_k.view(), 0..p_dim)
+                })
+                .collect();
+        Self::from_scaled_components_with_rank_hint(
+            &s_total,
+            &components,
+            ridge_hint,
+            Some(structural_rank),
+        )
     }
 
     /// Build from a pre-assembled penalty matrix.
@@ -631,7 +681,164 @@ impl PenaltyPseudologdet {
         let (evals, evecs) = s_total
             .eigh(Side::Lower)
             .map_err(|e| format!("PenaltyPseudologdet eigendecomposition failed: {e}"))?;
+        Self::from_eigensystem(&s_total, evals, evecs, ridge, rank_hint)
+    }
 
+    /// Eigensystem of `Σ_k λ_k S_k (+ ridge·I)` computed from the STACKED
+    /// SCALED SQUARE ROOTS, never from the assembled weighted matrix.
+    ///
+    /// Forming `Σ λ_k S_k` and eigendecomposing it squares the conditioning:
+    /// a structurally-positive mode whose singular value is a factor `t`
+    /// below the dominant scale becomes an eigenvalue a factor `t²` below it,
+    /// and once `t² < ε` the eigh result for that mode is pure roundoff — it
+    /// can come out NEGATIVE, which the structural rank hint then rejects and
+    /// a mid-optimization outer evaluation dies (observed as
+    /// "structural rank hint selected non-positive eigenvalue -8e-5" on a
+    /// plain `y ~ s(x)` fit whose bend/shrinkage λ ratio crossed ~1e16 during
+    /// an ARC probe). Stacking the per-component scaled roots
+    /// `A = [√λ_1·C_1; …; √λ_K·C_K; √r·I]` with `S_k = C_kᵀC_k` and taking
+    /// singular values keeps every mode at its ROOT scale: the same mode is
+    /// visible until `t < ε`, i.e. down to weighted-eigenvalue ratios of
+    /// ~1e-32 — beyond any λ ratio the optimizer can express. Eigenvalues are
+    /// `σ_i²` and eigenvectors are the right singular vectors, so the result
+    /// plugs into the same [`Self::from_eigensystem`] tail.
+    ///
+    /// Each component root is taken from the eigh of its UNIT matrix (a
+    /// λ-free, well-scaled problem thresholded on its own spectrum), placed
+    /// into the stacked matrix at `col_range`.
+    fn eigensystem_from_scaled_roots(
+        components: &[(f64, ndarray::ArrayView2<'_, f64>, std::ops::Range<usize>)],
+        ridge: Option<f64>,
+        p_dim: usize,
+    ) -> Result<(Array1<f64>, Array2<f64>), String> {
+        // Collect scaled root rows.
+        let mut rows: Vec<Array1<f64>> = Vec::new();
+        for (lambda, local, col_range) in components {
+            if !(lambda.is_finite() && *lambda >= 0.0) {
+                return Err(format!(
+                    "PenaltyPseudologdet scaled-root eigensystem requires finite λ ≥ 0, got {lambda}"
+                ));
+            }
+            if *lambda == 0.0 {
+                continue;
+            }
+            let bd = local.nrows();
+            if local.ncols() != bd || col_range.len() != bd || col_range.end > p_dim {
+                return Err(format!(
+                    "PenaltyPseudologdet component block {bd}x{} does not fit col_range {col_range:?} in dimension {p_dim}",
+                    local.ncols()
+                ));
+            }
+            let (unit_evals, unit_evecs) = local.eigh(Side::Lower).map_err(|e| {
+                format!("PenaltyPseudologdet component eigendecomposition failed: {e}")
+            })?;
+            let unit_threshold = super::reml_outer_engine::positive_eigenvalue_threshold(
+                unit_evals.as_slice().unwrap(),
+            );
+            for (idx, &ev) in unit_evals.iter().enumerate() {
+                if ev > unit_threshold {
+                    let scale = (lambda * ev).sqrt();
+                    let mut row = Array1::<f64>::zeros(p_dim);
+                    for (li, gi) in col_range.clone().enumerate() {
+                        row[gi] = scale * unit_evecs[[li, idx]];
+                    }
+                    rows.push(row);
+                }
+            }
+        }
+        if let Some(r) = ridge
+            && r > 0.0
+        {
+            let scale = r.sqrt();
+            for i in 0..p_dim {
+                let mut row = Array1::<f64>::zeros(p_dim);
+                row[i] = scale;
+                rows.push(row);
+            }
+        }
+        // Pad with zero rows so the thin SVD's right factor spans all of ℝᵖ
+        // (zero rows change neither the singular values nor the right
+        // singular vectors).
+        while rows.len() < p_dim {
+            rows.push(Array1::<f64>::zeros(p_dim));
+        }
+        let mut stacked = Array2::<f64>::zeros((rows.len(), p_dim));
+        for (i, row) in rows.iter().enumerate() {
+            stacked.row_mut(i).assign(row);
+        }
+        let (_, singular, vt) = stacked.svd(false, true).map_err(|_| {
+            "PenaltyPseudologdet stacked-root SVD did not converge".to_string()
+        })?;
+        let vt = vt.ok_or_else(|| {
+            "PenaltyPseudologdet stacked-root SVD returned no right factor".to_string()
+        })?;
+        if vt.nrows() < p_dim || singular.len() < p_dim {
+            return Err(format!(
+                "PenaltyPseudologdet stacked-root SVD returned a thin right factor ({}x{}, {} singular values) for dimension {p_dim}",
+                vt.nrows(),
+                vt.ncols(),
+                singular.len()
+            ));
+        }
+        // Singular values are descending; from_eigensystem expects ascending
+        // eigenvalues with matching eigenvector columns.
+        let mut evals = Array1::<f64>::zeros(p_dim);
+        let mut evecs = Array2::<f64>::zeros((p_dim, p_dim));
+        for j in 0..p_dim {
+            let src = p_dim - 1 - j;
+            let sv = singular[src];
+            evals[j] = sv * sv;
+            for row in 0..p_dim {
+                evecs[[row, j]] = vt[[src, row]];
+            }
+        }
+        Ok((evals, evecs))
+    }
+
+    /// Build with a structural rank hint from the weighted components
+    /// themselves, computing the spectrum via the stacked scaled square
+    /// roots (see [`Self::eigensystem_from_scaled_roots`] for why the
+    /// assembled-matrix eigh is not accurate enough for the hinted split).
+    ///
+    /// `s_total` must be the assembled `Σ λ_k S_k (+ ridge·I)` over the same
+    /// components; it feeds only the full-rank Cholesky value fast path.
+    pub(crate) fn from_scaled_components_with_rank_hint(
+        s_total: &Array2<f64>,
+        components: &[(f64, ndarray::ArrayView2<'_, f64>, std::ops::Range<usize>)],
+        ridge: Option<f64>,
+        rank_hint: Option<usize>,
+    ) -> Result<Self, String> {
+        let p_dim = s_total.nrows();
+        if p_dim == 0 {
+            return Ok(Self {
+                w_factor: Array2::zeros((0, 0)),
+                u_null: None,
+                inv_evals_sq: Array1::zeros(0),
+                rank: 0,
+                value: 0.0,
+                block_spans: Vec::new(),
+            });
+        }
+        let (evals, evecs) = Self::eigensystem_from_scaled_roots(components, ridge, p_dim)?;
+        Self::from_eigensystem(s_total, evals, evecs, ridge, rank_hint)
+    }
+
+    /// Assemble the pseudo-logdet from a precomputed eigensystem of
+    /// `s_total` (ascending eigenvalues, matching eigenvector columns).
+    ///
+    /// `s_total` itself is retained only for the full-rank Cholesky
+    /// log-determinant precision fast path; the positive/null split and the
+    /// W-factor come entirely from `(evals, evecs)`, so a caller with a
+    /// MORE accurate eigensystem than `eigh(s_total)` (see
+    /// [`Self::from_scaled_components_with_rank_hint`]) plugs it in here.
+    fn from_eigensystem(
+        s_total: &Array2<f64>,
+        evals: Array1<f64>,
+        evecs: Array2<f64>,
+        ridge: Option<f64>,
+        rank_hint: Option<usize>,
+    ) -> Result<Self, String> {
+        let p_dim = s_total.nrows();
         // Compute the null-vs-active boundary purely from the spectrum.
         //
         //   ridge = None:  boundary = positive_eigenvalue_threshold(evals)
@@ -1917,5 +2124,62 @@ mod tests {
             overlapping.value(),
             assembled.value()
         );
+    }
+
+    /// Regression for the mid-optimization abort
+    /// "structural rank hint selected non-positive eigenvalue" on plain
+    /// `s(x)` fits: two penalties overlapping on one block (bend + full-block
+    /// shrinkage, the double-penalty layout) with an extreme λ ratio. The
+    /// assembled matrix's eigh sees the small component's genuine modes at
+    /// SQUARED relative scale (λ ratio 1e26 → eigenvalue ratio below ε) and
+    /// returns roundoff of either sign, so the hinted split either aborted
+    /// the outer evaluation or silently mislabeled coercive modes. The
+    /// stacked scaled-root spectrum keeps every mode at root scale, so the
+    /// construction must succeed with the full structural rank and the EXACT
+    /// closed-form value on this diagonal example.
+    #[test]
+    fn overlapping_extreme_lambda_ratio_keeps_structural_modes_exactly() {
+        let p = 6usize;
+        let mut s_bend = Array2::<f64>::zeros((p, p));
+        for i in 0..4 {
+            s_bend[[i, i]] = 1.0;
+        }
+        let mut s_shrink = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            s_shrink[[i, i]] = 1.0;
+        }
+
+        for &(l_bend, l_shrink) in &[
+            (1e13_f64, 1e-13_f64),
+            (1e-14, 1e12),
+            (1e10, 1e-18),
+        ] {
+            let pld = PenaltyPseudologdet::from_components(
+                &[s_bend.clone(), s_shrink.clone()],
+                &[l_bend, l_shrink],
+                0.0,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "overlapping penalties with λ ratio {:.1e} must stay evaluable \
+                     (outer probes reach these ratios): {e}",
+                    l_bend / l_shrink
+                )
+            });
+            assert_eq!(
+                pld.rank(),
+                p,
+                "every structural mode keeps its coercivity at λ ratio {:.1e}",
+                l_bend / l_shrink
+            );
+            let expected: f64 =
+                4.0 * (l_bend + l_shrink).ln() + 2.0 * l_shrink.ln();
+            assert!(
+                (pld.value() - expected).abs() <= 1e-9 * expected.abs().max(1.0),
+                "exact diagonal pseudologdet at λ ratio {:.1e}: got {}, expected {expected}",
+                l_bend / l_shrink,
+                pld.value(),
+            );
+        }
     }
 }
