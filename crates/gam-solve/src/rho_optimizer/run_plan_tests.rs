@@ -2534,6 +2534,48 @@ fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
     assert!(published.converged);
 }
 
+/// A run of infeasible cubic trials cannot justify halting at an incumbent
+/// whose synchronized reduced Hessian proves negative curvature. That pattern
+/// is a domain-wall encounter during saddle escape, not a separating optimum;
+/// ARC must retain control so increasing sigma can shrink the escape step.
+#[test]
+fn arc_infeasible_stall_refuses_cached_strict_saddle_2316() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit);
+    let seed = array![0.0, 0.0];
+    guard.observe_second_order_seed(&seed, 10.0, 5.0e-2, Some(false));
+
+    let infeasible = array![-8.0, -8.0];
+    for probe in 0..9 {
+        assert!(
+            matches!(
+                guard.observe_infeasible(&infeasible),
+                CostStallVerdict::Continue
+            ),
+            "strict-saddle infeasible probe {probe} must return control to ARC"
+        );
+    }
+}
+
+#[test]
+fn reduced_hessian_psd_keeps_weak_bound_direction_in_critical_cone_2316() {
+    let lower = array![0.0, -2.0];
+    let upper = array![2.0, 2.0];
+    let point = array![0.0, 0.0];
+    let hessian = array![[-1.0, 0.0], [0.0, 2.0]];
+
+    assert_eq!(
+        reduced_hessian_psd_at_point(&point, &array![0.0, 0.0], &hessian, Some((&lower, &upper)),),
+        Some(false),
+        "a zero-multiplier lower-bound axis remains in the critical cone"
+    );
+    assert_eq!(
+        reduced_hessian_psd_at_point(&point, &array![1.0, 0.0], &hessian, Some((&lower, &upper))),
+        Some(true),
+        "strict complementarity removes the bound-normal direction"
+    );
+}
+
 #[test]
 fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
     let seed = array![0.0];

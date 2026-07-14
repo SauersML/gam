@@ -868,13 +868,37 @@ pub(crate) fn run_outer_with_plan(
                         .threshold(seed_eval.cost, arc_seed_grad_norm)
                         .max(COST_STALL_PROJECTED_GRAD_FLOOR);
 
+                    // Build the exact seed Hessian before enrolling the seed in
+                    // the stall guard. The guard must know whether its incumbent
+                    // is a second-order point: repeated infeasible trials cannot
+                    // justify halting at a certified strict saddle.
+                    let seed_hessian = build_bridge_hessian_for_source(
+                        hessian_source,
+                        seed_eval.hessian,
+                        OUTER_HVP_MATERIALIZE_MAX_DIM,
+                    )
+                    .map_err(|err| match err {
+                        ObjectiveEvalError::Recoverable { message }
+                        | ObjectiveEvalError::Fatal { message } => {
+                            EstimationError::RemlOptimizationFailed(message)
+                        }
+                    })?;
+                    let seed_hessian_psd = seed_hessian.as_ref().and_then(|dense| {
+                        reduced_hessian_psd_at_point(
+                            &seed,
+                            &seed_eval.gradient,
+                            dense,
+                            Some((lo, hi)),
+                        )
+                    });
+
                     let mut cost_stall_guard = CostStallGuard::new(
                         cost_stall_rel_tol,
                         ARC_COST_STALL_WINDOW,
                         cost_stall_grad_threshold,
                         cost_stall_exit.clone(),
                     );
-                    cost_stall_guard.observe_seed(
+                    cost_stall_guard.observe_second_order_seed(
                         &seed,
                         seed_eval.cost,
                         projected_gradient_norm(
@@ -882,6 +906,7 @@ pub(crate) fn run_outer_with_plan(
                             &seed_eval.gradient,
                             Some(&(lo.clone(), hi.clone())),
                         ),
+                        seed_hessian_psd,
                     );
 
                     let objective = OuterSecondOrderBridge {
@@ -898,26 +923,9 @@ pub(crate) fn run_outer_with_plan(
                         cost_stall_bounds: Some((lo.clone(), hi.clone())),
                     };
 
-                    // Build the opt seed sample from the precomputed
-                    // outer evaluation. The Hessian translation goes
-                    // through `build_bridge_hessian_for_source` so the
-                    // analytic-route contract (no None Hessian on
-                    // `HessianSource::Analytic`) applies at seed time
-                    // too, not just inside the bridge's live path.
-                    let seed_hessian = build_bridge_hessian_for_source(
-                        hessian_source,
-                        seed_eval.hessian.clone(),
-                        OUTER_HVP_MATERIALIZE_MAX_DIM,
-                    )
-                    .map_err(|err| match err {
-                        ObjectiveEvalError::Recoverable { message }
-                        | ObjectiveEvalError::Fatal { message } => {
-                            EstimationError::RemlOptimizationFailed(message)
-                        }
-                    })?;
                     let initial_sample = SecondOrderSample {
                         value: seed_eval.cost,
-                        gradient: seed_eval.gradient.clone(),
+                        gradient: seed_eval.gradient,
                         hessian: seed_hessian,
                     };
 

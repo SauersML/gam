@@ -340,6 +340,10 @@ pub(crate) struct CostStallGuard {
     best_value: f64,
     best_rho: Option<Array1<f64>>,
     best_grad_norm: f64,
+    /// Reduced-Hessian verdict synchronized with `best_rho`. `Some(false)`
+    /// means the incumbent is a certified strict saddle and therefore cannot
+    /// justify an infeasible-neighbourhood stall.
+    best_hessian_psd: Option<bool>,
     no_improve_streak: usize,
     /// Consecutive infeasible (non-finite cost) outer trials since the last
     /// finite observation. On a near-separable multinomial fit ARC repeatedly
@@ -384,6 +388,7 @@ impl CostStallGuard {
             best_value: f64::INFINITY,
             best_rho: None,
             best_grad_norm: f64::INFINITY,
+            best_hessian_psd: None,
             no_improve_streak: 0,
             infeasible_streak: 0,
             accepted_iters: 0,
@@ -468,6 +473,12 @@ impl CostStallGuard {
         Some((noise_floor / probe_radius).min(FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP))
     }
 
+    fn certified_grad_bound(&self) -> f64 {
+        let score_bound = flat_valley_converged_grad_bound(self.best_value);
+        let noise_bound = self.probe_noise_grad_bound().unwrap_or(0.0);
+        self.grad_threshold.max(score_bound).max(noise_bound)
+    }
+
     /// Register a precomputed feasible seed that the optimizer consumes from
     /// its internal cache instead of routing through the bridge. ARC's
     /// `with_initial_sample` path does exactly that: the first finite
@@ -476,12 +487,33 @@ impl CostStallGuard {
     /// infeasible-trial stall path has no finite best iterate to halt back to
     /// when the next few ARC probes run into the λ→0 separating region.
     pub(crate) fn observe_seed(&mut self, rho: &Array1<f64>, value: f64, grad_norm: f64) {
+        self.observe_seed_with_curvature(rho, value, grad_norm, None);
+    }
+
+    pub(crate) fn observe_second_order_seed(
+        &mut self,
+        rho: &Array1<f64>,
+        value: f64,
+        grad_norm: f64,
+        hessian_psd: Option<bool>,
+    ) {
+        self.observe_seed_with_curvature(rho, value, grad_norm, hessian_psd);
+    }
+
+    fn observe_seed_with_curvature(
+        &mut self,
+        rho: &Array1<f64>,
+        value: f64,
+        grad_norm: f64,
+        hessian_psd: Option<bool>,
+    ) {
         if !value.is_finite() {
             return;
         }
         self.best_value = value;
         self.best_rho = Some(rho.clone());
         self.best_grad_norm = grad_norm;
+        self.best_hessian_psd = hessian_psd;
         self.no_improve_streak = 0;
         self.infeasible_streak = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
@@ -522,6 +554,28 @@ impl CostStallGuard {
         grad_norm: f64,
         inner_converged: bool,
     ) -> CostStallVerdict {
+        self.observe_with_curvature(rho, value, grad_norm, inner_converged, None)
+    }
+
+    pub(crate) fn observe_second_order(
+        &mut self,
+        rho: &Array1<f64>,
+        value: f64,
+        grad_norm: f64,
+        inner_converged: bool,
+        hessian_psd: Option<bool>,
+    ) -> CostStallVerdict {
+        self.observe_with_curvature(rho, value, grad_norm, inner_converged, hessian_psd)
+    }
+
+    fn observe_with_curvature(
+        &mut self,
+        rho: &Array1<f64>,
+        value: f64,
+        grad_norm: f64,
+        inner_converged: bool,
+        hessian_psd: Option<bool>,
+    ) -> CostStallVerdict {
         if !value.is_finite() {
             // A non-finite accepted objective is the inner-solver's problem,
             // not a stall; reset so a later real descent is not falsely
@@ -556,6 +610,7 @@ impl CostStallGuard {
             self.best_value = value;
             self.best_rho = Some(rho.clone());
             self.best_grad_norm = grad_norm;
+            self.best_hessian_psd = hessian_psd;
             // Keep the shared exit cell tracking the best feasible iterate so the
             // ARC budget-exhaustion path can recover it instead of the optimizer's
             // last (possibly degenerate-corner) iterate (#1371).
@@ -621,6 +676,20 @@ impl CostStallGuard {
         if self.infeasible_streak < self.window {
             return CostStallVerdict::Continue;
         }
+        if self.best_hessian_psd == Some(false) {
+            // A strict saddle has a certified local escape direction. An
+            // infeasible run only says ARC's current cubic step crossed the
+            // profiled objective's domain wall; it cannot turn that saddle
+            // into a terminal checkpoint. Clear the local run so ARC can raise
+            // sigma, shrink the step, and exploit the known negative curvature.
+            self.infeasible_streak = 0;
+            self.no_improve_streak = 0;
+            log::warn!(
+                "[OUTER] ARC infeasible-probe run reached a strict-saddle incumbent; \
+                 refusing the stall and returning control to cubic regularization"
+            );
+            return CostStallVerdict::Continue;
+        }
         // Halt back to the best feasible iterate. Its projected gradient decides
         // converged-vs-flat-valley exactly as the finite stall path does.
         self.publish_stall(rho, self.best_value, self.best_grad_norm)
@@ -650,6 +719,23 @@ impl CostStallGuard {
         grad_norm: f64,
         inner_converged: bool,
     ) -> CostStallVerdict {
+        self.observe_second_order_constrained_stationary(
+            rho,
+            value,
+            grad_norm,
+            inner_converged,
+            None,
+        )
+    }
+
+    pub(crate) fn observe_second_order_constrained_stationary(
+        &mut self,
+        rho: &Array1<f64>,
+        value: f64,
+        grad_norm: f64,
+        inner_converged: bool,
+        hessian_psd: Option<bool>,
+    ) -> CostStallVerdict {
         if !value.is_finite() {
             return CostStallVerdict::Continue;
         }
@@ -660,7 +746,13 @@ impl CostStallGuard {
             // it through the ordinary finite-path observer, which (with
             // `inner_converged = false`) refuses to record it as best and keeps
             // the optimizer descending toward an honest, converged iterate.
-            return self.observe(rho, value, grad_norm, inner_converged);
+            return self.observe_with_curvature(
+                rho,
+                value,
+                grad_norm,
+                inner_converged,
+                hessian_psd,
+            );
         }
         // A lower-bound separation probe is the certificate-bearing optimum ONLY
         // when it does not REGRESS the best feasible iterate already seen. In the
@@ -684,13 +776,20 @@ impl CostStallGuard {
             // ordinary (non-improving) observation so `best_rho`/`best_grad_norm`
             // are preserved and the stall logic halts back to that incumbent
             // rather than to this corner.
-            return self.observe(rho, value, grad_norm, inner_converged);
+            return self.observe_with_curvature(
+                rho,
+                value,
+                grad_norm,
+                inner_converged,
+                hessian_psd,
+            );
         }
         self.infeasible_streak = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
         self.best_value = value;
         self.best_rho = Some(rho.clone());
         self.best_grad_norm = grad_norm;
+        self.best_hessian_psd = hessian_psd;
         self.no_improve_streak = self.window;
         self.publish_stall(rho, value, grad_norm)
     }
@@ -1759,18 +1858,20 @@ impl OuterSecondOrderBridge<'_> {
     /// direction with a persistent out-of-bounds ∂V/∂ρ is KKT-stationary even
     /// though its raw gradient never vanishes. A trial that beats the best cost
     /// resets the streak, so genuine descent never trips the halt.
-    fn observe_cost_stall(&mut self, x: &Array1<f64>, eval: &OuterEval) {
+    fn observe_cost_stall(
+        &mut self,
+        x: &Array1<f64>,
+        cost: f64,
+        gradient: &Array1<f64>,
+        hessian_psd: Option<bool>,
+    ) {
         let bounds = self.cost_stall_bounds.clone();
         let separation_bound_stationary = {
             let Some(guard) = self.cost_stall.as_ref() else {
                 return;
             };
-            lower_bound_outward_active_count(
-                x,
-                &eval.gradient,
-                bounds.as_ref(),
-                guard.grad_threshold,
-            ) >= LOWER_BOUND_SEPARATION_ACTIVE_MIN
+            lower_bound_outward_active_count(x, gradient, bounds.as_ref(), guard.grad_threshold)
+                >= LOWER_BOUND_SEPARATION_ACTIVE_MIN
         };
         // #1426: inner-PIRLS convergence flag for the solve behind this eval (see
         // the matching read in the first-order bridge). A non-converged inner
@@ -1780,7 +1881,7 @@ impl OuterSecondOrderBridge<'_> {
         let Some(guard) = self.cost_stall.as_mut() else {
             return;
         };
-        let projected_g_norm = projected_gradient_norm(x, &eval.gradient, bounds.as_ref());
+        let projected_g_norm = projected_gradient_norm(x, gradient, bounds.as_ref());
         let verdict = if separation_bound_stationary {
             // #1426: certify the constrained-stationary fast-path with the REAL
             // bound-projected gradient norm, not a hardcoded 0.0. The projection
@@ -1793,9 +1894,15 @@ impl OuterSecondOrderBridge<'_> {
             // ridge of #1426 — keeps that interior mass in ‖g_proj‖, so
             // `publish_stall` honestly returns FlatValleyStall / converged=false
             // instead of shipping the overfit silently behind a fake zero.
-            guard.observe_constrained_stationary(x, eval.cost, projected_g_norm, inner_converged)
+            guard.observe_second_order_constrained_stationary(
+                x,
+                cost,
+                projected_g_norm,
+                inner_converged,
+                hessian_psd,
+            )
         } else {
-            guard.observe(x, eval.cost, projected_g_norm, inner_converged)
+            guard.observe_second_order(x, cost, projected_g_norm, inner_converged, hessian_psd)
         };
         match verdict {
             CostStallVerdict::Continue => {}
@@ -1836,7 +1943,7 @@ impl OuterSecondOrderBridge<'_> {
                     guard.rel_tol,
                     guard.window,
                     guard.best_grad_norm,
-                    guard.grad_threshold,
+                    guard.certified_grad_bound(),
                     guard.best_value,
                 );
                 guard.defer_finite_second_order_stall();
@@ -1892,11 +1999,12 @@ impl OuterSecondOrderBridge<'_> {
                 log::warn!(
                     "[OUTER] ARC infeasible-probe stall: {} consecutive infeasible λ→0 trials \
                      after the best feasible iterate. Its stored projected gradient is small \
-                     (|g|={:.3e} <= {:.3e}), but no synchronized Hessian is available here; \
-                     halting only as a NON-CONVERGED checkpoint (value={:.6e}).",
+                     (|g|={:.3e} <= {:.3e}) and its synchronized reduced Hessian does not \
+                     certify negative curvature; halting only as a NON-CONVERGED checkpoint \
+                     (value={:.6e}).",
                     guard.window,
                     guard.best_grad_norm,
-                    guard.grad_threshold,
+                    guard.certified_grad_bound(),
                     guard.best_value,
                 );
                 guard.revoke_published_convergence();
@@ -2021,16 +2129,26 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                 .collect::<Vec<_>>()
                 .join(","),
         );
-        // Observe finite cost progress, but never let this first-order guard
-        // halt a second-order route. ARC must receive this exact sample so its
-        // projected-gradient + reduced-Hessian gate can either certify a mode
-        // or exploit negative curvature (#979).
-        self.observe_cost_stall(x, &eval);
         let hessian = build_bridge_hessian_for_source(
             self.hessian_source,
             eval.hessian,
             self.materialize_operator_max_dim,
         )?;
+        let hessian_psd = hessian.as_ref().and_then(|dense| {
+            reduced_hessian_psd_at_point(
+                x,
+                &eval.gradient,
+                dense,
+                self.cost_stall_bounds
+                    .as_ref()
+                    .map(|(lower, upper)| (lower, upper)),
+            )
+        });
+        // Observe finite cost progress, but never let this first-order guard
+        // halt a second-order route. ARC must receive this exact sample so its
+        // projected-gradient + reduced-Hessian gate can either certify a mode
+        // or exploit negative curvature (#979).
+        self.observe_cost_stall(x, eval.cost, &eval.gradient, hessian_psd);
         Ok(SecondOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -2279,6 +2397,43 @@ pub(crate) fn projected_gradient_norm(
         .map(|v| v * v)
         .sum::<f64>()
         .sqrt()
+}
+
+/// Apply the same strict-complementarity critical-cone reduction used by the
+/// optimizer, then adjudicate second-order stationarity with the final outer
+/// certificate's PSD rule. This keeps the infeasible-stall guard from treating
+/// an interior (or weak-bound) strict saddle as a terminal neighbourhood.
+pub(crate) fn reduced_hessian_psd_at_point(
+    x: &Array1<f64>,
+    gradient: &Array1<f64>,
+    hessian: &Array2<f64>,
+    bounds: Option<(&Array1<f64>, &Array1<f64>)>,
+) -> Option<bool> {
+    let n = x.len();
+    if gradient.len() != n || hessian.nrows() != n || hessian.ncols() != n {
+        return None;
+    }
+    if bounds.is_some_and(|(lower, upper)| lower.len() != n || upper.len() != n) {
+        return None;
+    }
+    let free: Vec<usize> = (0..n)
+        .filter(|&index| {
+            let Some((lower, upper)) = bounds else {
+                return true;
+            };
+            let fixed = lower[index] == upper[index];
+            let strict_lower = x[index] <= lower[index] + 1.0e-10 && gradient[index] > 0.0;
+            let strict_upper = x[index] >= upper[index] - 1.0e-10 && gradient[index] < 0.0;
+            !(fixed || strict_lower || strict_upper)
+        })
+        .collect();
+    if free.is_empty() {
+        return Some(true);
+    }
+    let reduced = Array2::from_shape_fn((free.len(), free.len()), |(row, column)| {
+        hessian[[free[row], free[column]]]
+    });
+    certificate_hessian_is_psd(&reduced)
 }
 
 #[cfg(test)]
