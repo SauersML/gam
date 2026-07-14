@@ -99,6 +99,11 @@ fn fresh_processes_replay_saved_scan_for_predict_and_report() {
             .arg("--out")
             .arg(&prediction_path)
             .arg("--uncertainty")
+            // #2296: the scan posterior variance is conditional on the
+            // profiled smoothing parameter; the default corrected request is
+            // an honest typed refusal on scan models.
+            .arg("--covariance-mode")
+            .arg("conditional")
             .arg("--level")
             .arg("0.9"),
         "gam predict",

@@ -63,7 +63,11 @@ def _grid() -> pd.DataFrame:
 def test_scan_predict_emits_observation_interval_columns(formula: str) -> None:
     model = gamfit.fit(_make_data(), formula)
     out = model.predict(
-        _grid(), interval=0.95, observation_interval=True, return_type="dict"
+        _grid(),
+        interval=0.95,
+        covariance_mode="conditional",
+        observation_interval=True,
+        return_type="dict",
     )
     cols = set(out)
     assert "observation_lower" in cols, (
@@ -85,7 +89,11 @@ def test_scan_observation_band_strictly_wider_by_sigma2(formula: str) -> None:
     noise = 0.25
     model = gamfit.fit(_make_data(noise=noise), formula)
     out = model.predict(
-        _grid(), interval=0.95, observation_interval=True, return_type="dict"
+        _grid(),
+        interval=0.95,
+        covariance_mode="conditional",
+        observation_interval=True,
+        return_type="dict",
     )
     mean = np.asarray(out["mean"], dtype=float)
     mlo = np.asarray(out["mean_lower"], dtype=float)
@@ -145,7 +153,11 @@ def test_scan_observation_interval_covers_about_95pct(formula: str) -> None:
     model = gamfit.fit(train, formula)
     test = _make_data(seed=8, n=600, noise=noise)
     out = model.predict(
-        test[["x"]], interval=0.95, observation_interval=True, return_type="dict"
+        test[["x"]],
+        interval=0.95,
+        covariance_mode="conditional",
+        observation_interval=True,
+        return_type="dict",
     )
     olo = np.asarray(out["observation_lower"], dtype=float)
     ohi = np.asarray(out["observation_upper"], dtype=float)
@@ -161,9 +173,15 @@ def test_scan_confidence_interval_unchanged_when_observation_requested() -> None
     # mean point or the mean credible band — it only ADDS the two columns.
     formula = _SCAN_FORMULAS[0]
     model = gamfit.fit(_make_data(), formula)
-    base = model.predict(_grid(), interval=0.95, return_type="dict")
+    base = model.predict(
+        _grid(), interval=0.95, covariance_mode="conditional", return_type="dict"
+    )
     both = model.predict(
-        _grid(), interval=0.95, observation_interval=True, return_type="dict"
+        _grid(),
+        interval=0.95,
+        covariance_mode="conditional",
+        observation_interval=True,
+        return_type="dict",
     )
     for key in ("mean", "mean_lower", "mean_upper"):
         np.testing.assert_allclose(

@@ -167,7 +167,10 @@ def test_scan_predict_point_and_interval_still_work():
     posterior intervals both work and bracket the mean."""
     df = _dataset()
     model = _fit_scan(df, degree=5, penalty_order=3)
-    out = model.predict(df, interval=0.9)
+    # #2296: the scan posterior variance is conditional on the profiled
+    # smoothing parameter, so the interval must be requested as conditional —
+    # the (default) smoothing-corrected request is an honest typed refusal.
+    out = model.predict(df, interval=0.9, covariance_mode="conditional")
     mean = np.asarray(out["mean"])
     lower = np.asarray(out["mean_lower"])
     upper = np.asarray(out["mean_upper"])
@@ -207,6 +210,7 @@ def test_scan_predictions_intervals_and_summary_replay_exactly_after_save_load(t
     bands_before = model.predict(
         query,
         interval=0.9,
+        covariance_mode="conditional",
         observation_interval=True,
         return_type="dict",
     )
@@ -227,6 +231,7 @@ def test_scan_predictions_intervals_and_summary_replay_exactly_after_save_load(t
     bands_after = reloaded.predict(
         query,
         interval=0.9,
+        covariance_mode="conditional",
         observation_interval=True,
         return_type="dict",
     )

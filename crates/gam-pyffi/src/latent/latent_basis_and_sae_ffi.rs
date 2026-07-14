@@ -1152,6 +1152,10 @@ fn predict_multinomial_intervals_pyfunc<'py>(
     out.set_item("prob_se", intervals.standard_error.into_pyarray(py))?;
     out.set_item("mean_lower", intervals.mean_lower.into_pyarray(py))?;
     out.set_item("mean_upper", intervals.mean_upper.into_pyarray(py))?;
+    // #2296: multinomial fits persist only the conditional joint-Laplace
+    // covariance; label the band with the definition actually integrated so
+    // the uncertainty is never presented as smoothing-corrected.
+    out.set_item("covariance_source", "conditional")?;
     Ok(out.unbind())
 }
 
