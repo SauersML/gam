@@ -15,7 +15,6 @@ mod gaussian_location_scale_sinusoidal_scale_recovery;
 mod group_random_effect_sparse_exact_smoothing_correction;
 mod input_loc_matern;
 mod margslope_duchon_slowdown;
-mod margslope_matern_logslope_slowdown;
 mod matern_2d_default_collapse_1357;
 mod matern_2d_kappa_nonconvergence;
 mod matern_aniso_input_loc;
