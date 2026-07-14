@@ -22,6 +22,18 @@ use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
 
 use ndarray::array;
 
+fn rigid_test_design_hyper_layout(
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+) -> crate::custom_family::CustomFamilyHyperLayout {
+    let axis_count: usize = derivative_blocks.iter().map(Vec::len).sum();
+    crate::custom_family::CustomFamilyHyperLayout::new(
+        derivative_blocks.to_vec(),
+        Vec::new(),
+        Array1::zeros(axis_count),
+    )
+    .expect("rigid BMS test design-hyper layout")
+}
+
 /// Standard normal PDF's own derivative stack (as opposed to
 /// [`unary_derivatives_normal_cdf`]'s CDF stack). No production row path
 /// differentiates the bare PDF; this oracle test does.
@@ -2087,6 +2099,7 @@ fn bernoulli_psi_workspace_with_options_threads_subsample_to_first_order() {
             None,
         )],
     ];
+    let hyper_layout = rigid_test_design_hyper_layout(&derivative_blocks);
 
     // Build a half-mask of even rows (factor = 2.0).
     let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
@@ -2109,7 +2122,7 @@ fn bernoulli_psi_workspace_with_options_threads_subsample_to_first_order() {
         .exact_newton_joint_psi_workspace_with_options(
             &states,
             &specs,
-            &derivative_blocks,
+            &hyper_layout,
             &opts_half,
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "workspace with options", e))
@@ -2147,7 +2160,7 @@ fn bernoulli_psi_workspace_with_options_threads_subsample_to_first_order() {
         .exact_newton_joint_psi_workspace_with_options(
             &states,
             &specs,
-            &derivative_blocks,
+            &hyper_layout,
             &BlockwiseFitOptions::default(),
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "workspace full", e))
@@ -3611,7 +3624,9 @@ fn validate_spec_accepts_learnable_gaussian_shift_sigma() {
         array![1.0, 1.0, 1.0],
         array![-1.0, 0.0, 1.0],
     );
-    spec.frailty = FrailtySpec::GaussianShift { sigma_fixed: None };
+    spec.frailty = FrailtySpec::GaussianShift {
+        scale: FrailtyScale::Learned { initial_sigma: 0.5 },
+    };
 
     validate_spec(data.view(), &spec).unwrap_or_else(|e| {
         panic!(
@@ -7824,6 +7839,7 @@ fn flexible_family_exposes_exact_newton_workspaces() {
         dummy_blockspec(block_states[3].beta.len(), n),
     ];
     let derivative_blocks = vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let hyper_layout = rigid_test_design_hyper_layout(&derivative_blocks);
 
     assert!(
         family
@@ -7833,7 +7849,7 @@ fn flexible_family_exposes_exact_newton_workspaces() {
     );
     assert!(
         family
-            .exact_newton_joint_psi_workspace(&block_states, &specs, &derivative_blocks)
+            .exact_newton_joint_psi_workspace(&block_states, &specs, &hyper_layout)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "flex psi workspace", e))
             .is_some()
     );
