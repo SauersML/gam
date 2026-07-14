@@ -3172,6 +3172,51 @@ fn torus_metric_penalty_and_coordinate_derivative(
     }
 }
 
+fn evaluate_torus_metric_profile(
+    phi: ArrayView2<'_, f64>,
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    per_axis_order: usize,
+    family: TorusMetricFamily,
+    coordinate: f64,
+) -> Result<FirstOrderSample, ObjectiveEvalError> {
+    let (penalty, penalty_derivative, _) =
+        torus_metric_penalty_and_coordinate_derivative(per_axis_order, family, coordinate)
+            .map_err(ObjectiveEvalError::fatal)?;
+    let fit = gaussian_reml_multi_shared_dispersion_closed_form(
+        phi,
+        target,
+        penalty.view(),
+        Some(weights),
+        None,
+    )
+    .map_err(|error| ObjectiveEvalError::fatal(format!("torus metric REML: {error}")))?;
+    let penalty_gradient = gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(
+        phi,
+        target,
+        penalty.view(),
+        Some(weights),
+        &fit,
+    )
+    .map_err(|error| {
+        ObjectiveEvalError::fatal(format!("torus metric REML gradient: {error}"))
+    })?;
+    let coordinate_gradient = penalty_gradient
+        .iter()
+        .zip(penalty_derivative.iter())
+        .map(|(left, right)| left * right)
+        .sum::<f64>();
+    if !coordinate_gradient.is_finite() {
+        return Err(ObjectiveEvalError::fatal(
+            "torus metric REML coordinate gradient is non-finite",
+        ));
+    }
+    Ok(FirstOrderSample {
+        value: fit.reml_score,
+        gradient: Array1::from_vec(vec![coordinate_gradient]),
+    })
+}
+
 fn optimize_torus_metric_coordinate(
     phi: ArrayView2<'_, f64>,
     target: ArrayView2<'_, f64>,
@@ -3183,41 +3228,14 @@ fn optimize_torus_metric_coordinate(
     upper: f64,
 ) -> Result<f64, String> {
     let evaluate = |point: &Array1<f64>| -> Result<FirstOrderSample, ObjectiveEvalError> {
-        let (penalty, penalty_derivative, _) =
-            torus_metric_penalty_and_coordinate_derivative(per_axis_order, family, point[0])
-                .map_err(ObjectiveEvalError::fatal)?;
-        let fit = gaussian_reml_multi_shared_dispersion_closed_form(
+        evaluate_torus_metric_profile(
             phi,
             target,
-            penalty.view(),
-            Some(weights),
-            None,
+            weights,
+            per_axis_order,
+            family,
+            point[0],
         )
-        .map_err(|error| ObjectiveEvalError::fatal(format!("torus metric REML: {error}")))?;
-        let penalty_gradient = gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(
-            phi,
-            target,
-            penalty.view(),
-            Some(weights),
-            &fit,
-        )
-        .map_err(|error| {
-            ObjectiveEvalError::fatal(format!("torus metric REML gradient: {error}"))
-        })?;
-        let coordinate_gradient = penalty_gradient
-            .iter()
-            .zip(penalty_derivative.iter())
-            .map(|(left, right)| left * right)
-            .sum::<f64>();
-        if !coordinate_gradient.is_finite() {
-            return Err(ObjectiveEvalError::fatal(
-                "torus metric REML coordinate gradient is non-finite",
-            ));
-        }
-        Ok(FirstOrderSample {
-            value: fit.reml_score,
-            gradient: Array1::from_vec(vec![coordinate_gradient]),
-        })
     };
     let bound_resolution = f64::EPSILON.sqrt();
     let bounds = Bounds::new(
@@ -3230,21 +3248,31 @@ fn optimize_torus_metric_coordinate(
     let objective = FusedObjective::new(evaluate);
     let mut optimizer = Bfgs::new(seed_point, objective)
         .with_bounds(bounds)
-        // Profiled REML is smooth but can be flat to working precision when
-        // the metric change is nearly absorbed by the optimized global
-        // smoothing strength. The robust profile is still deterministic; it
-        // uses opt's safeguarded cost-decreasing steps on precisely this
-        // roundoff-flat geometry instead of requiring an unattainable Wolfe
-        // curvature decrease from a one-dimensional profile.
-        .with_profile(Profile::Robust)
+        .with_profile(Profile::Deterministic)
         .with_max_iterations(
             MaxIterations::new(f64::MANTISSA_DIGITS as usize)
                 .map_err(|error| format!("torus metric iteration budget: {error}"))?,
         )
         .with_gradient_tolerance(GradientTolerance::relative_to_cost(bound_resolution));
     let solution = optimizer.run().map_err(|error| {
+        let diagnostic = [lower, seed.clamp(lower, upper), upper].map(|coordinate| {
+            match evaluate_torus_metric_profile(
+                phi,
+                target,
+                weights,
+                per_axis_order,
+                family,
+                coordinate,
+            ) {
+                Ok(sample) => format!(
+                    "({coordinate}, value={}, gradient={})",
+                    sample.value, sample.gradient[0]
+                ),
+                Err(eval_error) => format!("({coordinate}, error={eval_error})"),
+            }
+        });
         format!(
-            "{family:?} torus reference-metric optimization did not converge: {error}"
+            "{family:?} torus reference-metric optimization did not converge: {error}; boundary/seed profile={diagnostic:?}"
         )
     })?;
     let coordinate = solution.final_point[0];
@@ -6771,6 +6799,45 @@ mod tests {
                 target[[row, col]] += ((row + 3 * col + 1) as f64).cos() / n as f64;
             }
         }
+        let weights = Array1::<f64>::ones(n);
+        let difference_step = f64::EPSILON.cbrt();
+        for family in [TorusMetricFamily::Flat, TorusMetricFamily::EmbeddedDonut] {
+            let coordinate = 0.5;
+            let analytic = evaluate_torus_metric_profile(
+                bundle.basis_values.view(),
+                target.view(),
+                weights.view(),
+                2,
+                family,
+                coordinate,
+            )
+            .unwrap();
+            let plus = evaluate_torus_metric_profile(
+                bundle.basis_values.view(),
+                target.view(),
+                weights.view(),
+                2,
+                family,
+                coordinate + difference_step,
+            )
+            .unwrap();
+            let minus = evaluate_torus_metric_profile(
+                bundle.basis_values.view(),
+                target.view(),
+                weights.view(),
+                2,
+                family,
+                coordinate - difference_step,
+            )
+            .unwrap();
+            let refitted_direction = (plus.value - minus.value) / (2.0 * difference_step);
+            let gap = (analytic.gradient[0] - refitted_direction).abs();
+            assert!(
+                gap <= f64::EPSILON.sqrt() * (1.0 + refitted_direction.abs()),
+                "{family:?} coordinate gradient {} disagrees with refitted direction {refitted_direction} by {gap}",
+                analytic.gradient[0]
+            );
+        }
         let spec = TopologyCandidateSpec::new(
             AutoTopologyKind::Torus,
             geometry,
@@ -6781,7 +6848,7 @@ mod tests {
             coords,
         )
         .unwrap();
-        let fit = fit_topology_candidate(&spec, target.view(), Array1::ones(n).view())
+        let fit = fit_topology_candidate(&spec, target.view(), weights.view())
             .expect("torus metric family must reach a converged evidence winner")
             .fit_handle;
         match fit.geometry.reference_metric() {
