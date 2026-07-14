@@ -302,14 +302,42 @@ impl ArdAxisPrior {
             },
             Some(p) => {
                 let kappa = std::f64::consts::TAU / p;
-                let (sin, cos) = (kappa * t).sin_cos();
-                let one_minus_cos = 1.0 - cos;
+                let phase = kappa * t;
+                let (sin, cos) = phase.sin_cos();
+                // `1 - cos(phase)` rounds to zero for nonzero
+                // |phase| < sqrt(EPSILON). The half-angle identity preserves
+                // the quadratic energy all the way to the subnormal range.
+                let sin_half = (0.5 * phase).sin();
+                let one_minus_cos = 2.0 * sin_half * sin_half;
                 Self {
                     value: (alpha / (kappa * kappa)) * one_minus_cos,
                     grad: (alpha / kappa) * sin,
                     hess: alpha * cos,
                     sq_equiv: (2.0 / (kappa * kappa)) * one_minus_cos,
                 }
+            }
+        }
+    }
+
+    /// Stable signed energy change `V(to) - V(from)`.
+    ///
+    /// Line searches need the change itself, which can be many orders of
+    /// magnitude smaller than either endpoint energy near a stationary point.
+    /// Subtracting two calls to [`Self::eval`] would erase that signal. These
+    /// difference identities evaluate the increment directly for both supported
+    /// geometries and remain valid across a periodic branch cut.
+    pub(crate) fn value_delta(alpha: f64, from: f64, to: f64, period: Option<f64>) -> f64 {
+        let delta = to - from;
+        match period {
+            None => alpha * delta * (from + 0.5 * delta),
+            Some(p) => {
+                let kappa = std::f64::consts::TAU / p;
+                let midpoint = from + 0.5 * delta;
+                let midpoint_phase = kappa * midpoint;
+                let half_delta_phase = 0.5 * kappa * delta;
+                (2.0 * alpha / (kappa * kappa))
+                    * midpoint_phase.sin()
+                    * half_delta_phase.sin()
             }
         }
     }

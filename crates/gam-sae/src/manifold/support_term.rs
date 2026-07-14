@@ -8,6 +8,7 @@
 
 use crate::assignment::AssignmentMode;
 use crate::assignment_state::{SaeAssignmentAtomSpec, SaeAssignmentState};
+use gam_linalg::utils::KahanSum;
 use ndarray::{Array1, Array2, ArrayView2};
 use std::ops::Range;
 use std::sync::Arc;
@@ -874,7 +875,6 @@ impl SaeSupportSparseTerm {
             let residual = &target.row(row) - &fitted;
             let mut rhs_vector = jacobian.dot(&residual);
             let mut gram = jacobian.dot(&jacobian.t());
-            let mut old_prior = 0.0;
             let mut prior_cursor = 0usize;
             for (slot, &atom) in self.assignment.support_indices(row).iter().enumerate() {
                 let atom = atom as usize;
@@ -885,7 +885,6 @@ impl SaeSupportSparseTerm {
                         self.assignment.coords_for_slot(row, slot)[axis],
                         periods[axis],
                     );
-                    old_prior += prior.value;
                     rhs_vector[prior_cursor] -= prior.grad;
                     gram[[prior_cursor, prior_cursor]] += prior.psd_majorizer_hess();
                     prior_cursor += 1;
@@ -913,8 +912,6 @@ impl SaeSupportSparseTerm {
                 continue;
             }
             let old_coords = self.assignment.coords_row(row).to_vec();
-            let old_loss =
-                0.5 * residual.iter().map(|value| value * value).sum::<f64>() + old_prior;
             let mut accepted = None;
             for halving in 0..=24 {
                 self.assignment.set_row_coords(row, &old_coords)?;
@@ -922,26 +919,38 @@ impl SaeSupportSparseTerm {
                 let trial_delta = delta.iter().map(|value| step * value).collect::<Vec<_>>();
                 self.assignment.apply_row_coord_step(row, &trial_delta)?;
                 let trial_fitted = self.reconstruct_row(row)?;
-                let mut trial_loss = 0.5
-                    * target
-                        .row(row)
-                        .iter()
-                        .zip(trial_fitted.iter())
-                        .map(|(truth, fit)| (truth - fit).powi(2))
-                        .sum::<f64>();
+                // Evaluate f(trial) - f(old) directly. Near stationarity the
+                // decrease is O(||g||^2), so subtracting two O(1) objective
+                // values loses the Armijo signal at exactly sqrt(EPSILON).
+                // For r = y-f and prediction change d, the data-loss increment
+                // is -r'd + 1/2 d'd; the prior authority supplies equally stable
+                // per-axis energy increments. Kahan accumulation preserves their
+                // first-order cancellation in a wide output/coordinate block.
+                let mut objective_delta = KahanSum::default();
+                for output in 0..self.output_dim {
+                    let fitted_delta = trial_fitted[output] - fitted[output];
+                    objective_delta.add(
+                        fitted_delta.mul_add(0.5 * fitted_delta - residual[output], 0.0),
+                    );
+                }
+                let mut coord_cursor = 0usize;
                 for (slot, &atom) in self.assignment.support_indices(row).iter().enumerate() {
                     let atom = atom as usize;
                     let periods = self.assignment.atom_axis_periods(atom);
                     for axis in 0..self.assignment.atom_coord_dim(atom) {
-                        trial_loss += ArdAxisPrior::eval(
+                        objective_delta.add(ArdAxisPrior::value_delta(
                             ard_precisions[atom][axis],
+                            old_coords[coord_cursor],
                             self.assignment.coords_for_slot(row, slot)[axis],
                             periods[axis],
-                        )
-                        .value;
+                        ));
+                        coord_cursor += 1;
                     }
                 }
-                if trial_loss.is_finite() && trial_loss <= old_loss - 1.0e-4 * step * directional {
+                let objective_delta = objective_delta.sum();
+                if objective_delta.is_finite()
+                    && objective_delta <= -1.0e-4 * step * directional
+                {
                     accepted = Some(step);
                     break;
                 }

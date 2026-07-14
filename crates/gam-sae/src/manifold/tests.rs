@@ -621,6 +621,41 @@ pub(crate) fn ard_axis_prior_value_grad_fd_consistent() {
     }
 }
 
+/// Prior energy and line-search increments must remain resolved below the
+/// `sqrt(EPSILON)` scale. This is the regime where subtracting endpoint energies
+/// falsely turns a nonzero Newton decrease into zero.
+#[test]
+pub(crate) fn ard_axis_prior_tiny_energy_and_increment_are_resolved() {
+    let alpha = 1.7_f64;
+    let tiny = 1.0e-12;
+    let periodic = ArdAxisPrior::eval(alpha, tiny, Some(std::f64::consts::TAU));
+    let quadratic_limit = 0.5 * alpha * tiny * tiny;
+    assert!(periodic.value > 0.0, "nonzero periodic energy must not round to zero");
+    assert!(
+        (periodic.value - quadratic_limit).abs() <= 1.0e-15 * quadratic_limit,
+        "tiny periodic energy must retain its quadratic limit"
+    );
+
+    for &period in &[None, Some(std::f64::consts::TAU)] {
+        let from = 0.7_f64;
+        let to = from + tiny;
+        let delta = ArdAxisPrior::value_delta(alpha, from, to, period);
+        let first_order = ArdAxisPrior::eval(alpha, from, period).grad * (to - from);
+        assert!(delta.is_finite() && delta > 0.0);
+        assert!(
+            (delta - first_order).abs() <= 2.0e-12 * first_order.abs(),
+            "stable prior increment {delta:.17e} must agree with its local derivative {first_order:.17e}"
+        );
+    }
+
+    let period = 1.0_f64;
+    let across_cut = ArdAxisPrior::value_delta(alpha, period - tiny, tiny, Some(period));
+    assert!(
+        across_cut.abs() <= 1.0e-4 * alpha * tiny * tiny,
+        "equivalent points across the periodic cut must have the same energy"
+    );
+}
+
 /// The manifold → per-axis periodicity map must classify every topology's
 /// d=1 (and product) axes correctly: line=non-periodic, circle=periodic,
 /// torus=per-axis periodic, sphere chart=(non-periodic lat, periodic lon),
