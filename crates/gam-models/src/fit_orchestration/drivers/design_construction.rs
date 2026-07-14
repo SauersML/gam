@@ -2051,6 +2051,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let clamp_theta = |theta: &Array1<f64>| -> Array1<f64> {
         Array1::from_shape_fn(theta.len(), |i| theta[i].clamp(eps_lower[i], eps_upper[i]))
     };
+    let realize_hyper_layout = |theta: &Array1<f64>| {
+        gam_custom_family::CustomFamilyHyperLayout::new(
+            derivative_blocks.clone(),
+            Vec::new(),
+            theta.slice(s![rho_dim..]).to_owned(),
+        )
+        .map_err(EstimationError::InvalidInput)
+    };
     let analytic_outer_hessian_available =
         gam_custom_family::joint_exact_analytic_outer_hessian_available()
             && base_family
@@ -2137,6 +2145,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 
         let family_eval =
             base_family.with_adaptive_params(decoded.adaptive_params, zero_quadratic.clone());
+        let hyper_layout = realize_hyper_layout(theta)?;
         let need_hessian = matches!(
             order,
             gam_solve::rho_optimizer::OuterEvalOrder::ValueGradientHessian
@@ -2146,7 +2155,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             std::slice::from_ref(&blockspec),
             &outer_opts,
             &decoded.rho,
-            &derivative_blocks,
+            &hyper_layout,
             st.warm_cache.as_ref(),
             if need_hessian {
                 gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
@@ -2230,12 +2239,13 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             } = decode_theta(&theta)?;
             let family_eval =
                 base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
+            let hyper_layout = realize_hyper_layout(&theta)?;
             let owned = evaluate_custom_family_joint_hyper_owned(
                 &family_eval,
                 std::slice::from_ref(&blockspec),
                 &outer_opts,
                 &rho,
-                &derivative_blocks,
+                &hyper_layout,
                 st.warm_cache.as_ref(),
                 gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
             )
@@ -2283,12 +2293,13 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             } = decode_theta(&theta)?;
             let family_eval =
                 base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
+            let hyper_layout = realize_hyper_layout(&theta)?;
             let owned = evaluate_custom_family_joint_hyper_efs_owned(
                 &family_eval,
                 std::slice::from_ref(&blockspec),
                 &outer_opts,
                 &rho,
-                &derivative_blocks,
+                &hyper_layout,
                 st.warm_cache.as_ref(),
             )
             .map_err(|e| {
@@ -2327,12 +2338,13 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             } = decode_theta(&theta)?;
             let family_eval =
                 base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
+            let hyper_layout = realize_hyper_layout(&theta)?;
             let owned = evaluate_custom_family_joint_hyper_owned(
                 &family_eval,
                 std::slice::from_ref(&blockspec),
                 &outer_opts,
                 &rho,
-                &derivative_blocks,
+                &hyper_layout,
                 st.warm_cache.as_ref(),
                 gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
             )
