@@ -757,15 +757,22 @@ impl SaeSupportSparseTerm {
         let (eigenvalues, eigenvectors) = symmetric
             .eigh(Side::Lower)
             .map_err(|error| format!("{context}: eigendecomposition failed: {error}"))?;
-        let scale = eigenvalues.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-        let tolerance = f64::EPSILON.sqrt() * scale * m.max(1) as f64;
+        let scale = eigenvalues
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let tolerance = f64::EPSILON * scale * m.max(1) as f64;
         if eigenvalues.iter().any(|value| *value < -tolerance) {
             return Err(format!(
                 "{context}: normal equation is not positive semidefinite"
             ));
         }
         let projected = eigenvectors.t().dot(rhs);
-        let rhs_scale = rhs.iter().fold(1.0_f64, |acc, value| acc.max(value.abs()));
+        let rhs_scale = rhs
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let rhs_tolerance = f64::EPSILON * rhs_scale * m.max(1) as f64;
         let mut scaled = Array2::<f64>::zeros(projected.dim());
         for mode in 0..m {
             if eigenvalues[mode] > tolerance {
@@ -775,7 +782,7 @@ impl SaeSupportSparseTerm {
             } else if projected
                 .row(mode)
                 .iter()
-                .any(|value| value.abs() > tolerance * rhs_scale)
+                .any(|value| value.abs() > rhs_tolerance)
             {
                 return Err(format!(
                     "{context}: RHS has a component in the normal-equation null space"
@@ -884,21 +891,12 @@ impl SaeSupportSparseTerm {
                     prior_cursor += 1;
                 }
             }
-            let rhs = rhs_vector
-                .clone()
-                .into_shape_with_order((q, 1))
-                .map_err(|error| format!("SaeSupportSparseTerm::coordinate_sweep: {error}"))?;
-            let mut delta = Self::solve_psd_minimum_norm(
-                &gram,
-                &rhs,
-                "SaeSupportSparseTerm::coordinate_sweep",
-            )?
-            .column(0)
-            .to_owned();
-            let norm = delta.iter().map(|value| value * value).sum::<f64>().sqrt();
-            if norm > trust_radius {
-                delta.mapv_inplace(|value| value * trust_radius / norm);
-            }
+            let delta = gam_linalg::psd_trust_region::solve_psd_trust_region(
+                gram.view(),
+                rhs_vector.view(),
+                trust_radius,
+            )
+            .map_err(|error| format!("SaeSupportSparseTerm::coordinate_sweep: {error}"))?;
             let directional = rhs_vector.dot(&delta);
             if directional <= f64::EPSILON {
                 continue;
