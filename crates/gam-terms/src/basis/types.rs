@@ -1373,8 +1373,8 @@ pub enum BasisMetadata {
         length_scale: f64,
         periodic: Option<Vec<Option<f64>>>,
         identifiability_transform: Option<Array2<f64>>,
-        /// Per-column standard deviations used for input standardization (d > 1).
-        input_scales: Option<Vec<f64>>,
+        /// Uniform coordinate scale used for isotropic input standardization.
+        input_scale: crate::IsotropicScale,
         /// Wood-TPRS radial reparameterization carried into prediction so the
         /// rotated radial basis at predict-time matches fit-time exactly. `None`
         /// in the lazy/streaming path which retains the original basis.
@@ -1413,7 +1413,7 @@ pub enum BasisMetadata {
     /// frozen by the global identifiability pipeline (#532 pattern).
     MeasureJet {
         centers: Array2<f64>,
-        input_scales: Option<Vec<f64>>,
+        input_scale: crate::IsotropicScale,
         length_scale: f64,
         eps_band: Vec<f64>,
         order_s: f64,
@@ -1438,8 +1438,8 @@ pub enum BasisMetadata {
         nu: MaternNu,
         include_intercept: bool,
         identifiability_transform: Option<Array2<f64>>,
-        /// Per-column standard deviations used for input standardization (d > 1).
-        input_scales: Option<Vec<f64>>,
+        /// Uniform coordinate scale used for isotropic input standardization.
+        input_scale: crate::IsotropicScale,
         /// Per-axis anisotropy log-scales η_a for geometric anisotropy.
         /// When Some, distance is r = √(Σ_a exp(2η_a) · (x_a - c_a)²).
         aniso_log_scales: Option<Vec<f64>>,
@@ -1451,8 +1451,8 @@ pub enum BasisMetadata {
         power: f64,
         nullspace_order: DuchonNullspaceOrder,
         identifiability_transform: Option<Array2<f64>>,
-        /// Per-column standard deviations used for input standardization (d > 1).
-        input_scales: Option<Vec<f64>>,
+        /// Uniform coordinate scale used for isotropic input standardization.
+        input_scale: crate::IsotropicScale,
         /// Per-axis anisotropy log-scales η_a, stored for prediction.
         aniso_log_scales: Option<Vec<f64>>,
         /// Support points used to build the active lower-order operator

@@ -58,7 +58,7 @@ use std::path::Path;
 /// Do NOT bump for purely additive `Option<T>` fields that the save-time
 /// invariant (`validate_for_persistence`) does not yet require. Those are
 /// forward-compatible.
-pub const MODEL_PAYLOAD_VERSION: u32 = 12;
+pub const MODEL_PAYLOAD_VERSION: u32 = 13;
 
 /// Exact topology required to replay a saved survival location-scale fit.
 /// This is a required v11 payload field: `None` is explicit for every other
@@ -3861,7 +3861,7 @@ impl FittedModel {
             let SmoothBasisSpec::MeasureJet {
                 feature_cols,
                 spec: mj,
-                input_scales,
+                input_scale,
             } = &term.basis
             else {
                 continue;
@@ -3977,9 +3977,9 @@ impl FittedModel {
                 MeasureJetExtrapolationSpectrum::PerLevel(&lambda_phys)
             };
             // Query rows in the frozen geometry's coordinates: select the
-            // term's axes and replay the per-axis standardization exactly as
-            // the build dispatch does (divide by σ_a when input_scales is
-            // Some; the persisted centers are already post-standardization).
+            // term's axes and replay the uniform standardization exactly as
+            // the build dispatch does; persisted centers are already in that
+            // standardized frame.
             let mut queries = Array2::<f64>::zeros((data.nrows(), feature_cols.len()));
             for (j, &col) in feature_cols.iter().enumerate() {
                 if col >= data.ncols() {
@@ -3994,21 +3994,13 @@ impl FittedModel {
                 }
                 queries.column_mut(j).assign(&data.column(col));
             }
-            if let Some(scales) = input_scales {
-                if scales.len() != feature_cols.len() {
-                    return Err(FittedModelError::SchemaMismatch {
-                        reason: format!(
-                            "measure-jet term '{}': {} input scales for {} axes",
-                            term.name,
-                            scales.len(),
-                            feature_cols.len()
-                        ),
-                    });
-                }
-                for (j, &scale) in scales.iter().enumerate() {
-                    queries.column_mut(j).mapv_inplace(|v| v / scale);
-                }
-            }
+            let scale = (*input_scale).ok_or_else(|| FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "measure-jet term '{}' is missing its frozen isotropic input scale",
+                    term.name
+                ),
+            })?;
+            scale.standardize(&mut queries);
             let support = gam_terms::basis::measure_jet_support_curve(
                 queries.view(),
                 centers.view(),

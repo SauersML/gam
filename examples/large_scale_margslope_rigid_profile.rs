@@ -127,7 +127,7 @@ fn duchon_pc_smooth_rigid(name: &str) -> SmoothTermSpec {
                 periodic: None,
                 boundary: Default::default(),
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,

@@ -1857,7 +1857,7 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
                     // configuration whose `∂²X/∂ψ²` diagonal was gated to zero.
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -2088,7 +2088,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
                     identifiability: Default::default(),
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,

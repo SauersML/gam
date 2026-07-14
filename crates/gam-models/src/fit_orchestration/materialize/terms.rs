@@ -120,7 +120,7 @@ fn spatial_center_strategy_mut(
         B::ThinPlate {
             feature_cols,
             spec,
-            input_scales: _,
+            input_scale: _,
         } => {
             let cols = feature_cols.clone();
             Some((&mut spec.center_strategy, cols))
@@ -128,7 +128,7 @@ fn spatial_center_strategy_mut(
         B::Duchon {
             feature_cols,
             spec,
-            input_scales: _,
+            input_scale: _,
         } => {
             let cols = feature_cols.clone();
             Some((&mut spec.center_strategy, cols))
@@ -140,7 +140,7 @@ fn spatial_center_strategy_mut(
         B::MeasureJet {
             feature_cols,
             spec,
-            input_scales: _,
+            input_scale: _,
         } => {
             let cols = feature_cols.clone();
             Some((&mut spec.center_strategy, cols))

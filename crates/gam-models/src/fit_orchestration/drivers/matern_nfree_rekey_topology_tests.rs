@@ -87,7 +87,7 @@ mod matern_nfree_rekey_topology_tests {
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,

@@ -53,7 +53,7 @@ fn duchon_pc_term(name: &str, d: usize, centers: usize, power: usize) -> SmoothT
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
                 boundary: Default::default(),
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,

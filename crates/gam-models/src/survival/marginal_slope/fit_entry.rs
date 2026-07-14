@@ -504,7 +504,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         &baseline_upper_theta,
         learned_log_sigma_coordinate,
         kappa_options_effective,
-    );
+    )
+    .map_err(|error| error.to_string())?;
 
     let hints = RefCell::new(ThetaHints::default());
     // #808 operating-point warm start for the logslope block. The inner

@@ -734,7 +734,7 @@ pub(crate) fn build_survival_two_block_exact_joint_setup(
     log_sigmaspec: &TermCollectionSpec,
     rho0: Array1<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> ExactJointHyperSetup {
+) -> Result<ExactJointHyperSetup, gam_terms::basis::BasisError> {
     // Survival location-scale uses the shared engine directly: the rho seed is
     // already assembled by the caller (penalty + link-wiggle layout), and the
     // two linear predictors (threshold, log sigma) supply the per-block

@@ -217,7 +217,7 @@ fn support_domination_variance_monotone() {
     };
 
     // Two queries in the SAME raw coordinate space the build used (the build
-    // consumes `data` verbatim — input_scales = None). The near query sits on
+    // consumes `data` verbatim — input_scale = None). The near query sits on
     // the strand mid-line; the far query is pushed far off the web so its
     // Gaussian support mass is nowhere larger at any scale.
     let mut queries = Array2::<f64>::zeros((2, 2));

@@ -311,7 +311,7 @@ pub(crate) fn joint_setup(
     baseline_upper_theta: &[f64],
     learned_log_sigma_coordinate: Option<(f64, f64, f64)>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> ExactJointHyperSetup {
+) -> Result<ExactJointHyperSetup, gam_terms::basis::BasisError> {
     let (marginal_terms, logslope_terms) = if kappa_options.enabled {
         (
             spatial_length_scale_term_indices(marginalspec),
@@ -346,13 +346,13 @@ pub(crate) fn joint_setup(
         &marginal_terms,
         kappa_options,
     )
-    .reseed_from_data(data, marginalspec, &marginal_terms, kappa_options);
+    .reseed_from_data(data, marginalspec, &marginal_terms, kappa_options)?;
     let logslope_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
         logslopespec,
         &logslope_terms,
         kappa_options,
     )
-    .reseed_from_data(data, logslopespec, &logslope_terms, kappa_options);
+    .reseed_from_data(data, logslopespec, &logslope_terms, kappa_options)?;
     let mut values = empty_kappa.as_array().to_vec();
     values.extend(marginal_kappa.as_array().iter());
     values.extend(logslope_kappa.as_array().iter());
@@ -370,14 +370,14 @@ pub(crate) fn joint_setup(
         &marginal_terms,
         &marginal_dims,
         kappa_options,
-    );
+    )?;
     let logslope_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
         data,
         logslopespec,
         &logslope_terms,
         &logslope_dims,
         kappa_options,
-    );
+    )?;
     let mut lower_vals = Vec::with_capacity(dims.iter().sum());
     lower_vals.extend(marginal_lower.as_array().iter());
     lower_vals.extend(logslope_lower.as_array().iter());
@@ -389,14 +389,14 @@ pub(crate) fn joint_setup(
         &marginal_terms,
         &marginal_dims,
         kappa_options,
-    );
+    )?;
     let logslope_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
         data,
         logslopespec,
         &logslope_terms,
         &logslope_dims,
         kappa_options,
-    );
+    )?;
     let mut upper_vals = Vec::with_capacity(dims.iter().sum());
     upper_vals.extend(marginal_upper.as_array().iter());
     upper_vals.extend(logslope_upper.as_array().iter());
@@ -430,13 +430,13 @@ pub(crate) fn joint_setup(
         upper.push(log_sigma_upper);
     }
     if !auxiliary0.is_empty() {
-        setup.with_auxiliary(
+        Ok(setup.with_auxiliary(
             Array1::from_vec(auxiliary0),
             Array1::from_vec(lower),
             Array1::from_vec(upper),
-        )
+        ))
     } else {
-        setup
+        Ok(setup)
     }
 }
 

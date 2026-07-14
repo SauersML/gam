@@ -156,9 +156,9 @@ fn spec_1d(aniso: bool) -> TermCollectionSpec {
                     boundary: OneDimensionalBoundary::Open,
                 },
                 // PRODUCTION geometry: None lets the 1-D axis auto-standardize
-                // (#1214/#1215), the real default-fit path. An input_scales:[1.0]
+                // (#1214/#1215), the real default-fit path. An input_scale:[1.0]
                 // pin would be a gamed gate masking the open geometry gap.
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,

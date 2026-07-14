@@ -1019,7 +1019,7 @@ pub(crate) fn build_matern_basis_seeded(
             nu: spec.nu,
             include_intercept: spec.include_intercept,
             identifiability_transform,
-            input_scales: None,
+            input_scale: crate::IsotropicScale::ONE,
             aniso_log_scales: aniso,
         },
         kronecker_factored: None,

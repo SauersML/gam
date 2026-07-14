@@ -185,7 +185,7 @@ pub enum DimensionfulBasisParameter {
     DomainEndpoints,
     Periods,
     Centers,
-    InputStandardDeviations,
+    IsotropicInputScale,
     LengthScale,
     MeasureJetScaleBand,
     MeasureJetCoordinateNoise,
@@ -243,7 +243,7 @@ pub struct BasisScaleContract {
 /// Realized Euclidean input frame returned to the spatial constructors.
 pub(super) struct NormalizedEuclideanFrame {
     pub coordinates: Array2<f64>,
-    pub input_scales: Option<Vec<f64>>,
+    pub input_scale: crate::IsotropicScale,
     pub length_scale: Option<f64>,
 }
 
@@ -294,14 +294,14 @@ impl BasisScaleContract {
 
     /// Standardize a Euclidean spatial input using this family's declared
     /// original-unit/replay law.  This is the sole construction path for the
-    /// ThinPlate, Matérn, Duchon, and MeasureJet `input_scales` fields.
+    /// ThinPlate, Matérn, Duchon, and MeasureJet `input_scale` fields.
     pub(super) fn normalize_euclidean_frame(
         &self,
         mut coordinates: Array2<f64>,
-        stored_scales: Option<&[f64]>,
+        stored_scale: Option<crate::IsotropicScale>,
         length_scale: Option<f64>,
     ) -> Result<NormalizedEuclideanFrame, BasisError> {
-        let replay = stored_scales.is_some();
+        let replay = stored_scale.is_some();
         let replay_range_is_already_realized = match self.input_frame {
             InputFrameNormalization::AutoStandardizedOriginalUnits => false,
             InputFrameNormalization::AutoStandardizedFreshOriginalReplayRealized => true,
@@ -315,36 +315,29 @@ impl BasisScaleContract {
                 )));
             }
         };
-        let scales = match stored_scales {
-            Some(scales) => {
-                validate_input_scale_vector(scales, coordinates.ncols(), self.family)?;
-                Some(scales.to_vec())
-            }
-            None => compute_spatial_input_scales(coordinates.view()),
+        let input_scale = match stored_scale {
+            Some(scale) => scale,
+            None => estimate_isotropic_scale(coordinates.view())?,
         };
 
-        let transformed_length = if let Some(scales) = scales.as_deref() {
-            apply_input_standardization(&mut coordinates, scales);
-            if replay_range_is_already_realized && replay {
-                length_scale
-            } else if replay_range_is_already_realized {
-                length_scale.map(|ell| {
-                    if ell > 0.0 {
-                        compensate_length_scale_for_standardization(ell, scales)
-                    } else {
-                        ell
-                    }
-                })
-            } else {
-                length_scale.map(|ell| compensate_length_scale_for_standardization(ell, scales))
-            }
-        } else {
+        input_scale.standardize(&mut coordinates);
+        let transformed_length = if replay_range_is_already_realized && replay {
             length_scale
+        } else if replay_range_is_already_realized {
+            length_scale.map(|ell| {
+                if ell > 0.0 {
+                    input_scale.to_standardized_units(ell)
+                } else {
+                    ell
+                }
+            })
+        } else {
+            length_scale.map(|ell| input_scale.to_standardized_units(ell))
         };
 
         Ok(NormalizedEuclideanFrame {
             coordinates,
-            input_scales: scales,
+            input_scale,
             length_scale: transformed_length,
         })
     }
@@ -407,7 +400,7 @@ fn spatial_parameters(
 ) -> Vec<DimensionfulParameterScale> {
     let mut parameters = vec![
         scale(1, DimensionfulBasisParameter::Centers),
-        scale(1, DimensionfulBasisParameter::InputStandardDeviations),
+        scale(1, DimensionfulBasisParameter::IsotropicInputScale),
     ];
     if include_length {
         parameters.push(scale(1, DimensionfulBasisParameter::LengthScale));
@@ -645,22 +638,22 @@ impl SmoothBasisSpec {
             SmoothBasisSpec::FactorSmooth { .. } => Ok(()),
             SmoothBasisSpec::ThinPlate {
                 feature_cols,
-                input_scales,
+                input_scale: _,
                 ..
             }
             | SmoothBasisSpec::Matern {
                 feature_cols,
-                input_scales,
+                input_scale: _,
                 ..
             }
             | SmoothBasisSpec::MeasureJet {
                 feature_cols,
-                input_scales,
+                input_scale: _,
                 ..
             }
             | SmoothBasisSpec::Duchon {
                 feature_cols,
-                input_scales,
+                input_scale: _,
                 ..
             } => {
                 if feature_cols.is_empty() {
@@ -668,9 +661,6 @@ impl SmoothBasisSpec {
                         "basis {:?} requires at least one coordinate axis",
                         contract.family
                     )));
-                }
-                if let Some(scales) = input_scales {
-                    validate_input_scale_vector(scales, feature_cols.len(), contract.family)?;
                 }
                 Ok(())
             }
@@ -697,30 +687,6 @@ impl SmoothBasisSpec {
             }
         }
     }
-}
-
-fn validate_input_scale_vector(
-    scales: &[f64],
-    expected: usize,
-    family: BasisScaleFamily,
-) -> Result<(), BasisError> {
-    if scales.len() != expected {
-        return Err(BasisError::DimensionMismatch(format!(
-            "basis {family:?} has {} stored input scales for {expected} coordinate axes",
-            scales.len()
-        )));
-    }
-    if let Some((axis, value)) = scales
-        .iter()
-        .copied()
-        .enumerate()
-        .find(|(_, value)| !value.is_finite() || *value <= 0.0)
-    {
-        return Err(BasisError::InvalidInput(format!(
-            "basis {family:?} input scale at axis {axis} must be positive and finite, got {value}"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -859,7 +825,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::None,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             SmoothBasisSpec::Sphere {
                 feature_cols: vec![0, 1],
@@ -885,12 +851,12 @@ mod tests {
                     identifiability: MaternIdentifiability::None,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             SmoothBasisSpec::MeasureJet {
                 feature_cols: vec![0, 1],
                 spec: MeasureJetBasisSpec::default(),
-                input_scales: None,
+                input_scale: None,
             },
             SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1],
@@ -906,7 +872,7 @@ mod tests {
                     boundary: OneDimensionalBoundary::Open,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1],
@@ -922,7 +888,7 @@ mod tests {
                     boundary: OneDimensionalBoundary::Open,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             SmoothBasisSpec::Pca {
                 feature_cols: vec![0, 1],
@@ -1577,7 +1543,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::None,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             BasisScaleFamily::Matern => SmoothBasisSpec::Matern {
                 feature_cols: vec![0, 1],
@@ -1591,7 +1557,7 @@ mod tests {
                     identifiability: MaternIdentifiability::None,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             BasisScaleFamily::MeasureJet => SmoothBasisSpec::MeasureJet {
                 feature_cols: vec![0, 1],
@@ -1608,7 +1574,7 @@ mod tests {
                     identifiability: MeasureJetIdentifiability::CenterSumToZero,
                     frozen_quadrature: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             BasisScaleFamily::PureDuchon | BasisScaleFamily::HybridDuchon => {
                 SmoothBasisSpec::Duchon {
@@ -1630,7 +1596,7 @@ mod tests {
                         boundary: OneDimensionalBoundary::Open,
                         radial_reparam: None,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 }
             }
             BasisScaleFamily::ByVariableNumeric
@@ -1691,16 +1657,45 @@ mod tests {
     }
 
     #[test]
-    fn malformed_frozen_scale_vectors_are_rejected_before_indexing_2315() {
-        let mut basis = zoo_basis(BasisScaleFamily::Matern);
-        for invalid in [vec![1.0], vec![1.0, 0.0], vec![1.0, f64::NAN]] {
-            match &mut basis {
-                SmoothBasisSpec::Matern { input_scales, .. } => {
-                    *input_scales = Some(invalid);
-                }
-                other => panic!("family lookup returned {other:?} instead of Matérn"),
-            }
-            assert!(basis.validate_scale_configuration().is_err());
-        }
+    fn legacy_or_vector_isotropic_scale_wire_states_are_refused_2319() {
+        let basis = zoo_basis(BasisScaleFamily::Matern);
+        let mut legacy = serde_json::to_value(&basis).unwrap();
+        let fields = legacy
+            .get_mut("Matern")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        fields.remove("input_scale");
+        fields.insert(
+            "input_scales".to_string(),
+            serde_json::json!([1.0, 2.0]),
+        );
+        assert!(serde_json::from_value::<SmoothBasisSpec>(legacy).is_err());
+
+        let mut vector = serde_json::to_value(&basis).unwrap();
+        vector
+            .get_mut("Matern")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .insert("input_scale".to_string(), serde_json::json!([1.0, 1.0]));
+        assert!(serde_json::from_value::<SmoothBasisSpec>(vector).is_err());
+    }
+
+    #[test]
+    fn frozen_spatial_spec_requires_the_realized_scalar_frame_2319() {
+        let frozen = TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern".to_string(),
+                basis: zoo_basis(BasisScaleFamily::Matern),
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        };
+
+        let error = frozen
+            .validate_frozen("model payload")
+            .expect_err("an unresolved isotropic frame is not frozen");
+        assert!(error.contains("Matern input_scale is missing"), "{error}");
     }
 }

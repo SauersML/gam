@@ -5,10 +5,7 @@ use coefficient_transforms::{
 
 pub use error::SmoothError;
 
-use input_standardization::{
-    apply_input_standardization, compensate_length_scale_for_standardization,
-    compute_spatial_input_scales,
-};
+use input_standardization::estimate_isotropic_scale;
 
 use shape_constraints::{
     bspline_first_derivative_control_spans, shape_lower_bounds_local, shape_order_and_sign,
@@ -296,6 +293,7 @@ pub enum BySmoothKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SmoothBasisSpec {
     /// Row-gated wrapper used for mgcv-style ``by=`` smooths.
     ///
@@ -348,11 +346,9 @@ pub enum SmoothBasisSpec {
     ThinPlate {
         feature_cols: Vec<usize>,
         spec: ThinPlateBasisSpec,
-        /// Per-column standard deviations used to standardize input dimensions
-        /// before kernel evaluation when d > 1. `None` means no standardization
-        /// (either d == 1 or explicitly disabled).
-        #[serde(default)]
-        input_scales: Option<Vec<f64>>,
+        /// Uniform coordinate scale estimated on a fresh build and persisted
+        /// for exact frozen replay.
+        input_scale: Option<crate::IsotropicScale>,
     },
     Sphere {
         feature_cols: Vec<usize>,
@@ -370,8 +366,7 @@ pub enum SmoothBasisSpec {
     Matern {
         feature_cols: Vec<usize>,
         spec: MaternBasisSpec,
-        #[serde(default)]
-        input_scales: Option<Vec<f64>>,
+        input_scale: Option<crate::IsotropicScale>,
     },
     /// Measure-jet spline smooth: multiscale local-jet-residual energy of the
     /// empirical measure (centers as μ-quadrature, masses as μ-weights — no
@@ -381,14 +376,12 @@ pub enum SmoothBasisSpec {
     MeasureJet {
         feature_cols: Vec<usize>,
         spec: MeasureJetBasisSpec,
-        #[serde(default)]
-        input_scales: Option<Vec<f64>>,
+        input_scale: Option<crate::IsotropicScale>,
     },
     Duchon {
         feature_cols: Vec<usize>,
         spec: DuchonBasisSpec,
-        #[serde(default)]
-        input_scales: Option<Vec<f64>>,
+        input_scale: Option<crate::IsotropicScale>,
     },
     Pca {
         feature_cols: Vec<usize>,
@@ -1459,7 +1452,16 @@ impl TermCollectionSpec {
                         .into());
                     }
                 }
-                SmoothBasisSpec::ThinPlate { spec, .. } => {
+                SmoothBasisSpec::ThinPlate {
+                    spec, input_scale, ..
+                } => {
+                    if input_scale.is_none() {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: ThinPlate input_scale is missing",
+                            st.name
+                        ))
+                        .into());
+                    }
                     if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
                         return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: ThinPlate centers must be UserProvided",
@@ -1511,7 +1513,16 @@ impl TermCollectionSpec {
                         .into());
                     }
                 }
-                SmoothBasisSpec::MeasureJet { spec, .. } => {
+                SmoothBasisSpec::MeasureJet {
+                    spec, input_scale, ..
+                } => {
+                    if input_scale.is_none() {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: MeasureJet input_scale is missing",
+                            st.name
+                        ))
+                        .into());
+                    }
                     let centers = match &spec.center_strategy {
                         CenterStrategy::UserProvided(centers) => centers,
                         _ => {
@@ -1656,7 +1667,16 @@ impl TermCollectionSpec {
                         }
                     }
                 }
-                SmoothBasisSpec::Matern { spec, .. } => {
+                SmoothBasisSpec::Matern {
+                    spec, input_scale, ..
+                } => {
+                    if input_scale.is_none() {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: Matern input_scale is missing",
+                            st.name
+                        ))
+                        .into());
+                    }
                     if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
                         return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: Matern centers must be UserProvided",
@@ -1676,7 +1696,16 @@ impl TermCollectionSpec {
                         .into());
                     }
                 }
-                SmoothBasisSpec::Duchon { spec, .. } => {
+                SmoothBasisSpec::Duchon {
+                    spec, input_scale, ..
+                } => {
+                    if input_scale.is_none() {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: Duchon input_scale is missing",
+                            st.name
+                        ))
+                        .into());
+                    }
                     if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
                         return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: Duchon centers must be UserProvided",
@@ -2709,9 +2738,8 @@ pub struct SpatialLogKappaCoords {
 }
 
 /// Which end of the ψ bound the shared `aniso_bounds_from_data` helper is
-/// computing. The lower end uses `-max_length_scale.ln()` as the pure-Duchon
-/// fallback and the `.0` element of `spatial_term_psi_bounds`; the upper end
-/// uses `-min_length_scale.ln()` and `.1`. Everything else is identical.
+/// computing. The lower end consumes the `.0` element of
+/// `spatial_term_psi_bounds`; the upper end consumes `.1`.
 #[derive(Clone, Copy)]
 pub enum AnisoBoundEnd {
     Lower,
@@ -2734,7 +2762,7 @@ impl SpatialLogKappaCoords {
         }
     }
 
-    /// Isotropic initialization (backward-compatible path).
+    /// Isotropic initialization.
     pub fn from_length_scales(
         spec: &TermCollectionSpec,
         term_indices: &[usize],
@@ -2764,11 +2792,9 @@ impl SpatialLogKappaCoords {
 
     /// Anisotropic-aware initialization.
     ///
-    /// Initialization strategy (per math team recommendation): standardize the
-    /// knot cloud axiswise, then run the existing isotropic κ initializer in
-    /// the standardized space. This reuses the trusted isotropic initializer
-    /// and gives initial η_a = −ln(σ_a) + mean(ln(σ_a)), which satisfies
-    /// Ση_a = 0 by construction.
+    /// The input frame is uniformly standardized by `IsotropicScale`; it never
+    /// manufactures an axis preference. Genuine axis contrasts come only from
+    /// the term's explicit, centered `aniso_log_scales` state.
     ///
     /// For each term, checks whether it has `aniso_log_scales` set on its basis spec.
     /// - If isotropic (no aniso_log_scales, or 1-D): 1 entry = −ln(length_scale).
@@ -2777,8 +2803,6 @@ impl SpatialLogKappaCoords {
     ///   aniso_log_scales (which sum to zero). Multi-dimensional terms without
     ///   explicit anisotropy stay scalar here so the seed dimensionality matches
     ///   `spatial_dims_per_term`.
-    /// - If pure Duchon anisotropic: d - 1 free entries store the leading η_a
-    ///   values directly; the final axis is reconstructed to keep Ση_a = 0.
     pub fn from_length_scales_aniso(
         spec: &TermCollectionSpec,
         term_indices: &[usize],
@@ -2849,15 +2873,15 @@ impl SpatialLogKappaCoords {
         spec: &TermCollectionSpec,
         term_indices: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Self {
+    ) -> Result<Self, BasisError> {
         let mut values = Array1::<f64>::zeros(term_indices.len());
         for (slot, &term_idx) in term_indices.iter().enumerate() {
-            values[slot] = spatial_term_psi_bounds(data, spec, term_idx, options).0;
+            values[slot] = spatial_term_psi_bounds(data, spec, term_idx, options)?.0;
         }
-        Self {
+        Ok(Self {
             values,
             dims_per_term: vec![1; term_indices.len()],
-        }
+        })
     }
 
     /// Isotropic upper bounds derived from per-term data geometry.
@@ -2866,15 +2890,15 @@ impl SpatialLogKappaCoords {
         spec: &TermCollectionSpec,
         term_indices: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Self {
+    ) -> Result<Self, BasisError> {
         let mut values = Array1::<f64>::zeros(term_indices.len());
         for (slot, &term_idx) in term_indices.iter().enumerate() {
-            values[slot] = spatial_term_psi_bounds(data, spec, term_idx, options).1;
+            values[slot] = spatial_term_psi_bounds(data, spec, term_idx, options)?.1;
         }
-        Self {
+        Ok(Self {
             values,
             dims_per_term: vec![1; term_indices.len()],
-        }
+        })
     }
 
     /// Anisotropic-aware lower bounds derived from per-term data geometry.
@@ -2885,21 +2909,13 @@ impl SpatialLogKappaCoords {
     /// shrink anisotropy that is already consistent with the current
     /// `length_scale`.
     ///
-    /// Pure Duchon anisotropy is structurally different: its stored
-    /// coordinates are (d-1) free η_a values representing log axis-scale
-    /// ratios, NOT log-κ. For those terms the κ-range geometry bound is
-    /// over-restrictive (η_a = ±5 is normal, but that corresponds to 7+
-    /// orders of magnitude in κ-space and would be rejected by the data
-    /// window). Fall back to the options window `[-ln(max_ls), -ln(min_ls)]`
-    /// for those coordinates — that's the same bound the pre-data-geometry
-    /// code used, which is calibrated to allow legitimate anisotropy.
     pub fn lower_bounds_aniso_from_data(
         data: ArrayView2<'_, f64>,
         spec: &TermCollectionSpec,
         term_indices: &[usize],
         dims_per_term: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Self {
+    ) -> Result<Self, BasisError> {
         Self::aniso_bounds_from_data(
             data,
             spec,
@@ -2919,7 +2935,7 @@ impl SpatialLogKappaCoords {
         term_indices: &[usize],
         dims_per_term: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Self {
+    ) -> Result<Self, BasisError> {
         Self::aniso_bounds_from_data(
             data,
             spec,
@@ -2930,11 +2946,9 @@ impl SpatialLogKappaCoords {
         )
     }
 
-    /// Shared implementation for the lower/upper aniso bounds. The bound end
-    /// only changes which options scale (`max_length_scale` vs
-    /// `min_length_scale`) becomes the pure-Duchon fallback bound and which
-    /// element of the `(lo, hi)` data-geometry tuple is consumed; the
-    /// per-term cursor walk and aniso-offset handling are identical.
+    /// Shared implementation for the lower/upper anisotropic bounds. The bound
+    /// end selects one element of the typed `(lo, hi)` data-geometry result;
+    /// the per-term cursor walk and anisotropy-offset handling are identical.
     fn aniso_bounds_from_data(
         data: ArrayView2<'_, f64>,
         spec: &TermCollectionSpec,
@@ -2942,7 +2956,7 @@ impl SpatialLogKappaCoords {
         dims_per_term: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
         end: AnisoBoundEnd,
-    ) -> Self {
+    ) -> Result<Self, BasisError> {
         assert_eq!(term_indices.len(), dims_per_term.len());
         let total: usize = dims_per_term.iter().sum();
         let mut values = Array1::<f64>::zeros(total);
@@ -2975,7 +2989,7 @@ impl SpatialLogKappaCoords {
                 continue;
             }
             let psi_bound = {
-                let (lo, hi) = spatial_term_psi_bounds(data, spec, term_idx, options);
+                let (lo, hi) = spatial_term_psi_bounds(data, spec, term_idx, options)?;
                 match end {
                     AnisoBoundEnd::Lower => lo,
                     AnisoBoundEnd::Upper => hi,
@@ -2994,10 +3008,10 @@ impl SpatialLogKappaCoords {
             }
             cursor += d;
         }
-        Self {
+        Ok(Self {
             values,
             dims_per_term: dims_per_term.to_vec(),
-        }
+        })
     }
 
     /// Rewrite any ψ entries whose originating term lacks an explicit
@@ -3014,7 +3028,7 @@ impl SpatialLogKappaCoords {
         spec: &TermCollectionSpec,
         term_indices: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Self {
+    ) -> Result<Self, BasisError> {
         assert_eq!(term_indices.len(), self.dims_per_term.len());
         let mut cursor = 0;
         for (slot, &term_idx) in term_indices.iter().enumerate() {
@@ -3032,7 +3046,7 @@ impl SpatialLogKappaCoords {
                 cursor += d;
                 continue;
             }
-            let Some(psi_bar_new) = spatial_term_psi_seed(data, spec, term_idx, options) else {
+            let Some(psi_bar_new) = spatial_term_psi_seed(data, spec, term_idx, options)? else {
                 cursor += d;
                 continue;
             };
@@ -3046,7 +3060,7 @@ impl SpatialLogKappaCoords {
             }
             cursor += d;
         }
-        self
+        Ok(self)
     }
 
     /// Project ψ values into `[lower, upper]` element-wise. Used after
@@ -3763,59 +3777,62 @@ pub const KERNEL_RANGE_MIN_DIAMETER_FRACTION: f64 = 2.0;
 /// capped here to keep the basis geometry well-conditioned.
 pub const KERNEL_RANGE_MAX_SPACING_MULTIPLE: f64 = 1e2;
 
-fn spatial_term_stored_input_scales(term: &SmoothTermSpec) -> Option<Vec<f64>> {
+fn spatial_term_stored_input_scale(term: &SmoothTermSpec) -> Option<crate::IsotropicScale> {
     match &term.basis {
-        SmoothBasisSpec::ThinPlate { input_scales, .. }
-        | SmoothBasisSpec::Matern { input_scales, .. }
-        | SmoothBasisSpec::Duchon { input_scales, .. } => input_scales.clone(),
+        SmoothBasisSpec::ThinPlate { input_scale, .. }
+        | SmoothBasisSpec::Matern { input_scale, .. }
+        | SmoothBasisSpec::Duchon { input_scale, .. } => *input_scale,
         _ => None,
     }
 }
 
-fn spatial_term_realized_input_scales(
+fn spatial_term_realized_input_scale(
     data: ArrayView2<'_, f64>,
     term: &SmoothTermSpec,
-) -> Option<Vec<f64>> {
+) -> Result<crate::IsotropicScale, BasisError> {
     let (feature_cols, stored) = match &term.basis {
         SmoothBasisSpec::ThinPlate {
             feature_cols,
-            input_scales,
+            input_scale,
             ..
         }
         | SmoothBasisSpec::Matern {
             feature_cols,
-            input_scales,
+            input_scale,
             ..
         }
         | SmoothBasisSpec::Duchon {
             feature_cols,
-            input_scales,
+            input_scale,
             ..
-        } => (feature_cols, input_scales),
-        _ => return None,
+        } => (feature_cols, input_scale),
+        _ => {
+            return Err(BasisError::InvalidInput(format!(
+                "term '{}' does not have an isotropic Euclidean input frame",
+                term.name
+            )));
+        }
     };
-    if let Some(scales) = stored {
-        return Some(scales.clone());
+    if let Some(scale) = stored {
+        return Ok(*scale);
     }
-    let x = select_columns(data, feature_cols).ok()?;
-    compute_spatial_input_scales(x.view())
+    let x = select_columns(data, feature_cols)?;
+    estimate_isotropic_scale(x.view())
 }
 
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
 ///
-/// When geometry is unavailable (e.g., fewer than 2 distinct points), falls
-/// back to the scalar `options.min_length_scale` / `options.max_length_scale`
-/// window so the outer optimizer never sees NaN bounds.
-///
 /// The returned window is intersected with the options window so user-set
-/// `min_length_scale` / `max_length_scale` remain hard limits.
+/// `min_length_scale` / `max_length_scale` remain hard limits. Degenerate
+/// geometry or an empty intersection is a typed error: changing to a generic
+/// options window would silently optimize in a different coordinate chart.
 pub fn spatial_term_psi_bounds(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
     term_idx: usize,
     options: &SpatialLengthScaleOptimizationOptions,
-) -> (f64, f64) {
-    let fallback = (
+) -> Result<(f64, f64), BasisError> {
+    let options_window = (
         -options.max_length_scale.ln(),
         -options.min_length_scale.ln(),
     );
@@ -3824,11 +3841,14 @@ pub fn spatial_term_psi_bounds(
     // path's `constant_curvature_kappa_bounds` branch so the isotropic
     // (non-aniso) seed clamp projects κ into the right interval.
     if constant_curvature_term_spec(spec, term_idx).is_some() {
-        return constant_curvature_kappa_bounds(data, spec, term_idx);
+        return Ok(constant_curvature_kappa_bounds(data, spec, term_idx));
     }
-    let Some(term) = spec.smooth_terms.get(term_idx) else {
-        return fallback;
-    };
+    let term = spec.smooth_terms.get(term_idx).ok_or_else(|| {
+        BasisError::InvalidInput(format!(
+            "spatial term index {term_idx} is out of bounds for {} smooth terms",
+            spec.smooth_terms.len()
+        ))
+    })?;
     // Prefer resolved centers (post-fit) since they live in the same standardized
     // space the kernel actually sees. Centers are capped at `default_num_centers`
     // (<=2000), so exact pairwise bounds are cheap (<4M ops). If centers are
@@ -3842,39 +3862,40 @@ pub fn spatial_term_psi_bounds(
     // spec already carries calibrated η_a at setup time (e.g., warm-start
     // or refit paths); for fresh optimization η_a starts at 0 and y = x.
     let aniso = get_spatial_aniso_log_scales(spec, term_idx);
-    let (r_bounds, input_scales) = match spatial_term_center_strategy(term) {
+    let stored_input_scale = spatial_term_stored_input_scale(term);
+    let input_scale = spatial_term_realized_input_scale(data, term)?;
+    let r_bounds = match spatial_term_center_strategy(term) {
         Some(CenterStrategy::UserProvided(centers)) if centers.nrows() >= 2 => {
+            let mut centers_in_frame = centers.clone();
+            if stored_input_scale.is_none() {
+                input_scale.standardize(&mut centers_in_frame);
+            }
             let bounds = match aniso.as_deref() {
-                Some(eta) if eta.len() == centers.ncols() => {
-                    let y = points_in_aniso_y_space(centers.view(), eta);
+                Some(eta) if eta.len() == centers_in_frame.ncols() => {
+                    let y = points_in_aniso_y_space(centers_in_frame.view(), eta);
                     pairwise_distance_bounds(y.view())
                 }
-                _ => pairwise_distance_bounds(centers.view()),
+                _ => pairwise_distance_bounds(centers_in_frame.view()),
             };
-            // Frozen centers live in the standardized kernel frame. The
-            // persisted input scales are therefore part of the coordinate map
-            // back to the original-unit length-scale chart. An unresolved
-            // user-provided center set has no stored scales and is already in
-            // the spec's original-coordinate chart.
-            (bounds, spatial_term_stored_input_scales(term))
+            bounds
         }
         _ => {
-            let input_scales = spatial_term_realized_input_scales(data, term);
-            let bounds = standardized_spatial_term_data(data, term)
-                .ok()
-                .and_then(|x| match aniso.as_deref() {
-                    Some(eta) if eta.len() == x.ncols() => {
-                        let y = points_in_aniso_y_space(x.view(), eta);
-                        pairwise_distance_bounds_sampled(y.view())
-                    }
-                    _ => pairwise_distance_bounds_sampled(x.view()),
-                });
-            (bounds, input_scales)
+            let x = standardized_spatial_term_data(data, term)?;
+            match aniso.as_deref() {
+                Some(eta) if eta.len() == x.ncols() => {
+                    let y = points_in_aniso_y_space(x.view(), eta);
+                    pairwise_distance_bounds_sampled(y.view())
+                }
+                _ => pairwise_distance_bounds_sampled(x.view()),
+            }
         }
     };
-    let Some((r_min, r_max)) = r_bounds else {
-        return fallback;
-    };
+    let (r_min, r_max) = r_bounds.ok_or_else(|| {
+        BasisError::InvalidInput(format!(
+            "term '{}' has no positive finite pairwise-distance range",
+            term.name
+        ))
+    })?;
     // Length scales substantially larger than the data diameter make radial
     // TPS/Matern columns nearly collinear with their polynomial nullspace.
     // The nullspace already carries constant/linear low-frequency structure,
@@ -3891,11 +3912,8 @@ pub fn spatial_term_psi_bounds(
     // original-coordinate user options. Previously these standardized κ bounds
     // were written directly into the spec; the basis builder then divided ℓ by
     // σ_geom again, making the realized endpoint too long by 1/σ_geom.
-    let inverse_sigma_geom = input_scales
-        .as_deref()
-        .map(|scales| compensate_length_scale_for_standardization(1.0, scales))
-        .unwrap_or(1.0);
-    let psi_chart_offset = inverse_sigma_geom.ln();
+    let inverse_sigma = input_scale.reciprocal();
+    let psi_chart_offset = inverse_sigma.ln();
     let psi_lo_data = (KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max).ln() + psi_chart_offset;
     let psi_hi_data = (KERNEL_RANGE_MAX_SPACING_MULTIPLE / r_min).ln() + psi_chart_offset;
     // #1074: the Matérn-specific length-scale ceiling that used to live here was
@@ -3907,14 +3925,15 @@ pub fn spatial_term_psi_bounds(
     // collapse corner is guarded by the EDF-collapse guard in
     // `spatial_optimization.rs`, which acts on the realized fit, not on a clamp.
     // Intersect with the options window so min/max_length_scale remain hard caps.
-    let psi_lo = psi_lo_data.max(fallback.0);
-    let psi_hi = psi_hi_data.min(fallback.1);
+    let psi_lo = psi_lo_data.max(options_window.0);
+    let psi_hi = psi_hi_data.min(options_window.1);
     if psi_lo >= psi_hi {
-        // Degenerate intersection — fall back to the options window to keep the
-        // outer optimizer from collapsing to a point.
-        return fallback;
+        return Err(BasisError::InvalidInput(format!(
+            "term '{}' has an empty spatial ψ window after intersecting data bounds [{psi_lo_data}, {psi_hi_data}] with configured bounds [{}, {}]",
+            term.name, options_window.0, options_window.1
+        )));
     }
-    (psi_lo, psi_hi)
+    Ok((psi_lo, psi_hi))
 }
 
 #[cfg(test)]
@@ -3940,9 +3959,9 @@ mod spatial_psi_bound_coordinate_tests {
             data[[row, 0]] = dilation * (cos_theta * x - sin_theta * y);
             data[[row, 1]] = dilation * (sin_theta * x + cos_theta * y);
         }
-        let input_scales = compute_spatial_input_scales(data.view()).expect("input scales");
+        let input_scale = estimate_isotropic_scale(data.view()).expect("isotropic input scale");
         let mut centers = data.clone();
-        apply_input_standardization(&mut centers, &input_scales);
+        input_scale.standardize(&mut centers);
         let spec = TermCollectionSpec {
             linear_terms: Vec::new(),
             random_effect_terms: Vec::new(),
@@ -3960,7 +3979,7 @@ mod spatial_psi_bound_coordinate_tests {
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
                     },
-                    input_scales: Some(input_scales),
+                    input_scale: Some(input_scale),
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -3972,6 +3991,7 @@ mod spatial_psi_bound_coordinate_tests {
             0,
             &SpatialLengthScaleOptimizationOptions::default(),
         )
+        .expect("finite spatial ψ bounds")
     }
 
     fn assert_close(left: f64, right: f64) {
@@ -4004,12 +4024,12 @@ pub fn spatial_term_psi_seed(
     spec: &TermCollectionSpec,
     term_idx: usize,
     options: &SpatialLengthScaleOptimizationOptions,
-) -> Option<f64> {
+) -> Result<Option<f64>, BasisError> {
     if get_spatial_length_scale(spec, term_idx).is_some() {
-        return None; // user/spec-provided length_scale wins
+        return Ok(None); // user/spec-provided length_scale wins
     }
-    let (psi_lo, psi_hi) = spatial_term_psi_bounds(data, spec, term_idx, options);
-    Some(0.5 * (psi_lo + psi_hi))
+    let (psi_lo, psi_hi) = spatial_term_psi_bounds(data, spec, term_idx, options)?;
+    Ok(Some(0.5 * (psi_lo + psi_hi)))
 }
 
 pub fn spatial_term_psi_to_length_scale_and_aniso(psi: &[f64]) -> (Option<f64>, Option<Vec<f64>>) {
@@ -4588,7 +4608,7 @@ pub struct JointSpatialCenterGroupKey {
     strategy_kind: CenterStrategyKind,
     strategy_aux: usize,
     requested_num_centers: usize,
-    input_scale_bits: Option<Vec<u64>>,
+    input_scale_bits: Option<u64>,
 }
 
 pub fn spatial_term_min_center_count(term: &SmoothTermSpec) -> usize {
@@ -4609,22 +4629,22 @@ pub fn spatial_term_min_center_count(term: &SmoothTermSpec) -> usize {
 }
 
 pub fn spatial_term_group_key(term: &SmoothTermSpec) -> Option<JointSpatialCenterGroupKey> {
-    let (feature_cols, strategy, input_scales) = match &term.basis {
+    let (feature_cols, strategy, input_scale) = match &term.basis {
         SmoothBasisSpec::ThinPlate {
             feature_cols,
             spec,
-            input_scales,
-        } => (feature_cols, &spec.center_strategy, input_scales.as_ref()),
+            input_scale,
+        } => (feature_cols, &spec.center_strategy, *input_scale),
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
-            input_scales,
-        } => (feature_cols, &spec.center_strategy, input_scales.as_ref()),
+            input_scale,
+        } => (feature_cols, &spec.center_strategy, *input_scale),
         SmoothBasisSpec::Duchon {
             feature_cols,
             spec,
-            input_scales,
-        } => (feature_cols, &spec.center_strategy, input_scales.as_ref()),
+            input_scale,
+        } => (feature_cols, &spec.center_strategy, *input_scale),
         _ => return None,
     };
     let strategy_kind = center_strategy_kind(strategy);
@@ -4643,8 +4663,7 @@ pub fn spatial_term_group_key(term: &SmoothTermSpec) -> Option<JointSpatialCente
         strategy_kind,
         strategy_aux,
         requested_num_centers: strategy.planned_num_centers(feature_cols.len()),
-        input_scale_bits: input_scales
-            .map(|values| values.iter().map(|value| value.to_bits()).collect()),
+        input_scale_bits: input_scale.map(crate::IsotropicScale::to_bits),
     })
 }
 
@@ -4685,32 +4704,30 @@ pub fn standardized_spatial_term_data(
     data: ArrayView2<'_, f64>,
     term: &SmoothTermSpec,
 ) -> Result<Array2<f64>, BasisError> {
-    let (feature_cols, input_scales) = match &term.basis {
+    let (feature_cols, input_scale) = match &term.basis {
         SmoothBasisSpec::ThinPlate {
             feature_cols,
-            input_scales,
+            input_scale,
             ..
         }
         | SmoothBasisSpec::Matern {
             feature_cols,
-            input_scales,
+            input_scale,
             ..
         }
         | SmoothBasisSpec::Duchon {
             feature_cols,
-            input_scales,
+            input_scale,
             ..
-        } => (feature_cols, input_scales.as_ref()),
+        } => (feature_cols, *input_scale),
         _ => {
             crate::bail_invalid_basis!("term '{}' is not a spatial smooth", term.name);
         }
     };
     let mut x = select_columns(data, feature_cols)?;
-    if let Some(scales) = input_scales {
-        apply_input_standardization(&mut x, scales);
-    } else if let Some(scales) = compute_spatial_input_scales(x.view()) {
-        apply_input_standardization(&mut x, &scales);
-    }
+    input_scale
+        .map_or_else(|| estimate_isotropic_scale(x.view()), Ok)?
+        .standardize(&mut x);
     Ok(x)
 }
 
@@ -5346,14 +5363,14 @@ pub fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> 
             length_scale,
             periodic,
             identifiability_transform: None,
-            input_scales,
+            input_scale,
             radial_reparam,
         } => BasisMetadata::ThinPlate {
             centers,
             length_scale,
             periodic,
             identifiability_transform: Some(Array2::eye(raw_cols)),
-            input_scales,
+            input_scale,
             radial_reparam,
         },
         BasisMetadata::Duchon {
@@ -5363,7 +5380,7 @@ pub fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> 
             power,
             nullspace_order,
             identifiability_transform: None,
-            input_scales,
+            input_scale,
             aniso_log_scales,
             operator_collocation_points,
             radial_reparam,
@@ -5374,7 +5391,7 @@ pub fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> 
             power,
             nullspace_order,
             identifiability_transform: Some(Array2::eye(raw_cols)),
-            input_scales,
+            input_scale,
             aniso_log_scales,
             operator_collocation_points,
             radial_reparam,
@@ -5394,7 +5411,7 @@ pub fn matern_operator_penalty_triplet_from_metadata(
         include_intercept,
         identifiability_transform,
         aniso_log_scales,
-        input_scales,
+        input_scale,
         ..
     } = metadata
     else {
@@ -5402,19 +5419,16 @@ pub fn matern_operator_penalty_triplet_from_metadata(
     };
     // The metadata records `length_scale` in *original* (un-standardized) data
     // coordinates, while `centers` live in the *standardized* coordinate frame
-    // (per-axis division by `input_scales`). The realized design built the
-    // kernel against those standardized centers using the σ_geom-compensated
-    // effective length scale `length_scale / σ_geom`. The collocation operators
+    // (uniform division by `input_scale`). The realized design built the
+    // kernel against those standardized centers using the compensated
+    // effective length scale `length_scale / input_scale`. The collocation operators
     // here are evaluated on the same standardized centers, so they must use the
     // SAME effective length scale — otherwise the penalty regularizes a
     // different RKHS range than the design lives in, leaving rough coefficient
     // directions effectively unpenalized. That mismatch is benign in 1-D
     // (no standardization) but produces a catastrophic out-of-sample blow-up in
-    // d ≥ 2 where σ_geom ≠ 1 (#706).
-    let penalty_length_scale = match input_scales.as_deref() {
-        Some(scales) => compensate_length_scale_for_standardization(*length_scale, scales),
-        None => *length_scale,
-    };
+    // every dimension where the input scale differs from one (#706).
+    let penalty_length_scale = input_scale.to_standardized_units(*length_scale);
     matern_operator_penalty_triplet_at_length_scale(
         centers.view(),
         periodic.as_deref(),
@@ -5428,7 +5442,7 @@ pub fn matern_operator_penalty_triplet_from_metadata(
 
 /// Build the canonical Matérn operator-penalty triplet (mass / tension /
 /// stiffness) at an explicit **effective** length scale — i.e. the
-/// σ_geom-compensated, standardized-frame scale the design's kernel was built
+/// isotropic-scale-compensated, standardized-frame scale the design's kernel was built
 /// against (NOT the original-coordinate `length_scale` stored in metadata).
 ///
 /// This is the SINGLE source of truth for the Matérn penalty topology. Two
@@ -8540,7 +8554,7 @@ pub fn build_single_local_smooth_term(
         SmoothBasisSpec::ThinPlate {
             feature_cols,
             spec,
-            input_scales,
+            input_scale,
         } => {
             if term.shape != ShapeConstraint::None {
                 if feature_cols.len() != 1 {
@@ -8554,11 +8568,11 @@ pub fn build_single_local_smooth_term(
             }
             let frame = term.basis.scale_contract().normalize_euclidean_frame(
                 select_columns(data, feature_cols)?,
-                input_scales.as_deref(),
+                *input_scale,
                 Some(spec.length_scale),
             )?;
             let x = frame.coordinates;
-            let scales = frame.input_scales;
+            let realized_input_scale = frame.input_scale;
             let length_scale_eff = frame
                 .length_scale
                 .expect("ThinPlate declares a required length-scale coordinate");
@@ -8573,7 +8587,7 @@ pub fn build_single_local_smooth_term(
             let mut result = build_thin_plate_basis(x.view(), &spec_local).map_err(|err| {
                 rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec)
             })?;
-            // Inject input scales into metadata; also restore the user's
+            // Inject the input scale into metadata; also restore the user's
             // original length_scale (not the σ_geom-compensated one) so a
             // metadata-driven rebuild that re-applies compensation does not
             // double-divide. The build may auto-promote to Duchon when
@@ -8582,15 +8596,15 @@ pub fn build_single_local_smooth_term(
             // round-trips through the same standardized data path.
             match &mut result.metadata {
                 BasisMetadata::ThinPlate {
-                    input_scales: ms,
+                    input_scale: metadata_scale,
                     length_scale,
                     ..
                 } => {
-                    *ms = scales;
+                    *metadata_scale = realized_input_scale;
                     *length_scale = spec.length_scale;
                 }
                 BasisMetadata::Duchon {
-                    input_scales: ms,
+                    input_scale: metadata_scale,
                     length_scale,
                     ..
                 } => {
@@ -8616,15 +8630,11 @@ pub fn build_single_local_smooth_term(
                     // we must store the UN-compensated value `promotion_length_scale
                     // · σ_geom`. `compensate(1.0, σ) = 1/σ_geom`, so divide the
                     // realized scale by it to multiply back through σ_geom. With no
-                    // standardization (`scales == None`) replay does not compensate,
-                    // so the realized value is kept verbatim.
-                    if let (Some(s), Some(realized)) = (scales.as_ref(), *length_scale) {
-                        let inv_sigma_geom = compensate_length_scale_for_standardization(1.0, s);
-                        if inv_sigma_geom.is_finite() && inv_sigma_geom > 0.0 {
-                            *length_scale = Some(realized / inv_sigma_geom);
-                        }
+                    // standardization. Restore original units before freezing.
+                    if let Some(realized) = *length_scale {
+                        *length_scale = Some(realized * realized_input_scale.get());
                     }
-                    *ms = scales;
+                    *metadata_scale = realized_input_scale;
                 }
                 _ => {}
             }
@@ -8661,7 +8671,7 @@ pub fn build_single_local_smooth_term(
         SmoothBasisSpec::MeasureJet {
             feature_cols,
             spec,
-            input_scales,
+            input_scale,
         } => {
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
@@ -8675,11 +8685,11 @@ pub fn build_single_local_smooth_term(
             // while a frozen MeasureJet range is already in its realized frame.
             let frame = term.basis.scale_contract().normalize_euclidean_frame(
                 select_columns(data, feature_cols)?,
-                input_scales.as_deref(),
+                *input_scale,
                 Some(spec.length_scale),
             )?;
             let x = frame.coordinates;
-            let scales = frame.input_scales;
+            let realized_input_scale = frame.input_scale;
             let length_scale_eff = frame
                 .length_scale
                 .expect("MeasureJet declares a required length-scale coordinate");
@@ -8687,17 +8697,18 @@ pub fn build_single_local_smooth_term(
             spec_local.length_scale = length_scale_eff;
             let mut result = build_measure_jet_basis(x.view(), &spec_local)?;
             if let BasisMetadata::MeasureJet {
-                input_scales: ms, ..
+                input_scale: metadata_scale,
+                ..
             } = &mut result.metadata
             {
-                *ms = scales;
+                *metadata_scale = realized_input_scale;
             }
             result
         }
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
-            input_scales,
+            input_scale,
         } => {
             if term.shape != ShapeConstraint::None {
                 if feature_cols.len() != 1 {
@@ -8717,11 +8728,11 @@ pub fn build_single_local_smooth_term(
             })?;
             let frame = term.basis.scale_contract().normalize_euclidean_frame(
                 select_columns(data, feature_cols)?,
-                input_scales.as_deref(),
+                *input_scale,
                 Some(original_length_scale),
             )?;
             let x = frame.coordinates;
-            let scales = frame.input_scales;
+            let realized_input_scale = frame.input_scale;
             let length_scale_eff = frame
                 .length_scale
                 .expect("Matérn declares a required length-scale coordinate");
@@ -8729,12 +8740,12 @@ pub fn build_single_local_smooth_term(
             spec_local.length_scale.set_resolved(length_scale_eff);
             let mut result = build_matern_basiswithworkspace(x.view(), &spec_local, workspace)?;
             if let BasisMetadata::Matern {
-                input_scales,
+                input_scale: metadata_scale,
                 length_scale,
                 ..
             } = &mut result.metadata
             {
-                *input_scales = scales;
+                *metadata_scale = realized_input_scale;
                 *length_scale = original_length_scale;
             }
             result
@@ -8742,7 +8753,7 @@ pub fn build_single_local_smooth_term(
         SmoothBasisSpec::Duchon {
             feature_cols,
             spec,
-            input_scales,
+            input_scale,
         } => {
             if term.shape != ShapeConstraint::None {
                 if feature_cols.len() != 1 {
@@ -8756,11 +8767,11 @@ pub fn build_single_local_smooth_term(
             }
             let frame = term.basis.scale_contract().normalize_euclidean_frame(
                 select_columns(data, feature_cols)?,
-                input_scales.as_deref(),
+                *input_scale,
                 spec.length_scale,
             )?;
             let x = frame.coordinates;
-            let scales = frame.input_scales;
+            let realized_input_scale = frame.input_scale;
             let length_scale_eff = frame.length_scale;
             let mut spec_local = spec.clone();
             spec_local.length_scale = length_scale_eff;
@@ -8776,31 +8787,25 @@ pub fn build_single_local_smooth_term(
             // diverged across the wrap, f(0) ≠ f(2π)). Rescale by the same
             // 1/σ applied to the data so training and predict share one
             // periodic geometry.
-            if let (Some(s), crate::basis::OneDimensionalBoundary::Cyclic { start, end }) =
-                (scales.as_ref(), spec_local.boundary.clone())
-                && s.len() == 1
-                && s[0] > 0.0
+            if let crate::basis::OneDimensionalBoundary::Cyclic { start, end } =
+                spec_local.boundary.clone()
             {
                 spec_local.boundary = crate::basis::OneDimensionalBoundary::Cyclic {
-                    start: start / s[0],
-                    end: end / s[0],
+                    start: realized_input_scale.to_standardized_units(start),
+                    end: realized_input_scale.to_standardized_units(end),
                 };
             }
             // The SAME original-units-vs-standardized-frame reasoning applies
             // to `spec.periodic` (the per-axis period vector the position API
             // and mixed-periodicity tensor paths use): each declared period is
             // in original covariate units and must be divided by that axis's
-            // σ_a, or the wrap folds standardized coordinates against an
+            // uniform input scale, or the wrap folds standardized coordinates against an
             // original-unit period (the #1074 seam failure, previously fixed
             // only for the 1-D `boundary` spelling above).
-            if let (Some(s), Some(periods)) = (scales.as_ref(), spec_local.periodic.as_mut())
-                && s.len() == periods.len()
-            {
-                for (axis_period, &sigma) in periods.iter_mut().zip(s.iter()) {
-                    if sigma > 0.0
-                        && let Some(p) = axis_period.as_mut()
-                    {
-                        *p /= sigma;
+            if let Some(periods) = spec_local.periodic.as_mut() {
+                for axis_period in periods {
+                    if let Some(period) = axis_period.as_mut() {
+                        *period = realized_input_scale.to_standardized_units(*period);
                     }
                 }
             }
@@ -8812,19 +8817,19 @@ pub fn build_single_local_smooth_term(
             }
             let mut result = build_duchon_basiswithworkspace(x.view(), &spec_local, workspace)?;
             if let BasisMetadata::Duchon {
-                input_scales,
+                input_scale: metadata_scale,
                 length_scale,
                 periodic,
                 ..
             } = &mut result.metadata
             {
-                *input_scales = scales;
+                *metadata_scale = realized_input_scale;
                 *length_scale = spec.length_scale;
                 // Same convention as `length_scale`: metadata (and hence the
                 // frozen replay spec design_freezing copies it into) always
                 // stores the period in ORIGINAL covariate units, and the
                 // standardization rescale above recomputes the standardized
-                // period fresh from `input_scales` on EVERY build — fresh fit
+                // period fresh from `input_scale` on EVERY build — fresh fit
                 // and frozen replay alike — so the compensation stays
                 // idempotent with no fit-vs-replay branch. Leaving the
                 // builder-resolved (standardized-frame) period here would

@@ -19,7 +19,7 @@
 //!   the *raw* covariate magnitude and the `ψ = log κ = −log ℓ` REML optimizer
 //!   ran in raw covariate units, landing in a scale-dependent basin (a bimodal
 //!   step across `|a| ⋛ 1`, ~2e-2 drift, #1215). 1-D spatial inputs were never
-//!   standardized (`compute_spatial_input_scales` bailed at `d ≤ 1`), so the raw
+//!   standardized (the old spatial scale estimator bailed at `d ≤ 1`), so the raw
 //!   magnitude leaked into the optimizer. Fix: standardize the single covariate
 //!   axis to unit spread the same way `d > 1` axes already are, so the kernel
 //!   and its `ψ`-optimizer operate in scale-free coordinates
@@ -280,10 +280,7 @@ fn tp_basis_is_exactly_translation_invariant() {
         build_thin_plate_basis,
     };
     use gam::faer_ndarray::FaerCholesky;
-    use gam::smooth::input_standardization::{
-        apply_input_standardization, compensate_length_scale_for_standardization,
-        compute_spatial_input_scales,
-    };
+    use gam::smooth::input_standardization::estimate_isotropic_scale;
     init_parallelism();
     let n = 400;
     let probes: Vec<f64> = (0..15).map(|i| 0.05 + 0.90 * (i as f64) / 14.0).collect();
@@ -302,16 +299,9 @@ fn tp_basis_is_exactly_translation_invariant() {
         let y = ndarray::Array1::from_vec(ys);
 
         let user_ls = 1.0_f64;
-        let scales = compute_spatial_input_scales(x_train.view());
-        let (length_scale, scales_vec) = if let Some(s) = &scales {
-            apply_input_standardization(&mut x_train, s);
-            (
-                compensate_length_scale_for_standardization(user_ls, s),
-                Some(s.clone()),
-            )
-        } else {
-            (user_ls, None)
-        };
+        let input_scale = estimate_isotropic_scale(x_train.view()).expect("isotropic scale");
+        input_scale.standardize(&mut x_train);
+        let length_scale = input_scale.to_standardized_units(user_ls);
 
         let train_spec = ThinPlateBasisSpec {
             center_strategy: CenterStrategy::EqualMass { num_centers: 10 },
@@ -348,9 +338,7 @@ fn tp_basis_is_exactly_translation_invariant() {
         for (i, &v) in probes.iter().enumerate() {
             grid[[i, 0]] = v + b;
         }
-        if let Some(s) = &scales_vec {
-            apply_input_standardization(&mut grid, s);
-        }
+        input_scale.standardize(&mut grid);
         let test_spec = ThinPlateBasisSpec {
             center_strategy: CenterStrategy::UserProvided(fit_centers),
             periodic: None,

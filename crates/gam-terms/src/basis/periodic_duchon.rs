@@ -934,7 +934,7 @@ pub(crate) fn build_periodic_duchon_basis_1d(
             power: spec.power,
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
-            input_scales: None,
+            input_scale: crate::IsotropicScale::ONE,
             aniso_log_scales: None,
             operator_collocation_points: None,
             radial_reparam: None,
@@ -1173,7 +1173,7 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
             // SAME order-`m` additive kernel (gam#1423).
             nullspace_order: spec.nullspace_order,
             identifiability_transform,
-            input_scales: None,
+            input_scale: crate::IsotropicScale::ONE,
             aniso_log_scales: None,
             operator_collocation_points: None,
             radial_reparam: None,

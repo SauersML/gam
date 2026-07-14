@@ -90,7 +90,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
                 // to unit spread (#1214/#1215) — the real default-fit path. The
                 // n-independence fast path must fire here. An earlier
                 // `Some(vec![1.0])` pin was a gamed gate that masked the open gap.
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -111,13 +111,15 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("lower isotropic-scale bounds");
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
         data.view(),
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("upper isotropic-scale bounds");
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     const JOINT_RHO_BOUND: f64 = 12.0;
     let setup = ExactJointHyperSetup::new(
@@ -517,7 +519,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
                     operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None, // PRODUCTION standardized geometry.
+                input_scale: None, // PRODUCTION standardized geometry.
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -538,13 +540,15 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("lower isotropic-scale bounds");
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
         data.view(),
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("upper isotropic-scale bounds");
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     const JOINT_RHO_BOUND: f64 = 12.0;
     let setup = ExactJointHyperSetup::new(

@@ -37,7 +37,7 @@ fn matern_smooth(name: &str, centers: usize) -> SmoothTermSpec {
                 identifiability: MaternIdentifiability::default(),
                 aniso_log_scales: None,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,

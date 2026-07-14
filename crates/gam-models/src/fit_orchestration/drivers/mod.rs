@@ -57,11 +57,6 @@ use gam_spec::{
     SasLinkState, StandardLink,
 };
 
-use gam_terms::smooth::input_standardization::{
-    apply_input_standardization, compensate_length_scale_for_standardization,
-    compensate_optional_length_scale_for_standardization,
-};
-
 use gam_terms::smooth::penalty_priors::{
     realize_keyed_penalty_block_gamma_priors, realize_penalty_block_gamma_priors,
 };

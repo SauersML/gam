@@ -164,7 +164,7 @@ fn duchon_aniso_pc_spec(name: &str, pc_dim: usize, k_centers: usize) -> TermColl
                     periodic: None,
                     boundary: gam::basis::OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,

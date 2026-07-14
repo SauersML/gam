@@ -1292,21 +1292,17 @@ fn extract_spatial_operator_runtime_caches(
                         include_intercept,
                         identifiability_transform,
                         aniso_log_scales,
-                        input_scales,
+                        input_scale,
                         ..
                     },
                 ) => {
-                    // Match the σ_geom-compensated effective length scale the
+                    // Match the isotropic-scale-compensated effective length scale the
                     // design (and shipped penalties) use against the standardized
                     // centers; the raw metadata length_scale lives in original
                     // coordinates and would put this overlay on a different kernel
                     // range than the penalties it scales (#706).
-                    let collocation_length_scale = match input_scales.as_deref() {
-                        Some(scales) => {
-                            compensate_length_scale_for_standardization(*length_scale, scales)
-                        }
-                        None => *length_scale,
-                    };
+                    let collocation_length_scale =
+                        input_scale.to_standardized_units(*length_scale);
                     let ops = build_matern_collocation_operator_matrices(
                         centers.view(),
                         None,
@@ -1334,19 +1330,14 @@ fn extract_spatial_operator_runtime_caches(
                         power,
                         nullspace_order,
                         identifiability_transform,
-                        input_scales,
+                        input_scale,
                         aniso_log_scales,
                         operator_collocation_points: Some(collocation_points),
                         ..
                     },
                 ) => {
-                    let collocation_length_scale = match (length_scale, input_scales.as_deref()) {
-                        (Some(ls), Some(scales)) => {
-                            Some(compensate_length_scale_for_standardization(*ls, scales))
-                        }
-                        (Some(ls), None) => Some(*ls),
-                        (None, _) => None,
-                    };
+                    let collocation_length_scale = (*length_scale)
+                        .map(|length| input_scale.to_standardized_units(length));
                     let ops =
                         gam_terms::basis::build_duchon_collocation_operator_matriceswithworkspace(
                             centers.view(),
@@ -7226,16 +7217,20 @@ fn blended_pilot_axis_contrasts(
     pilot_data: ArrayView2<'_, f64>,
     term: &SmoothTermSpec,
     centers: ArrayView2<'_, f64>,
-) -> Option<Vec<f64>> {
+) -> Result<Option<Vec<f64>>, BasisError> {
     let d = centers.ncols();
     if d <= 1 {
-        return None;
+        return Ok(None);
     }
     let center_eta = initial_aniso_contrasts(centers);
-    let data_eta = standardized_spatial_term_data(pilot_data, term)
-        .ok()
-        .and_then(|x| finite_centered_axis_contrasts(&initial_aniso_contrasts(x.view()), d));
-    let center_eta = finite_centered_axis_contrasts(&center_eta, d)?;
+    let standardized_data = standardized_spatial_term_data(pilot_data, term)?;
+    let data_eta = finite_centered_axis_contrasts(
+        &initial_aniso_contrasts(standardized_data.view()),
+        d,
+    );
+    let Some(center_eta) = finite_centered_axis_contrasts(&center_eta, d) else {
+        return Ok(None);
+    };
     let blended = match data_eta {
         Some(data_eta) => center_eta
             .iter()
@@ -7244,7 +7239,7 @@ fn blended_pilot_axis_contrasts(
             .collect::<Vec<_>>(),
         None => center_eta,
     };
-    finite_centered_axis_contrasts(&blended, d)
+    Ok(finite_centered_axis_contrasts(&blended, d))
 }
 
 fn apply_pilot_spatial_psi_reseed(
@@ -7260,7 +7255,9 @@ fn apply_pilot_spatial_psi_reseed(
     } else {
         SpatialLogKappaCoords::from_length_scales(spec, spatial_terms, kappa_options)
     };
-    let log_kappa0 = log_kappa0.reseed_from_data(pilot_data, spec, spatial_terms, kappa_options);
+    let log_kappa0 = log_kappa0
+        .reseed_from_data(pilot_data, spec, spatial_terms, kappa_options)
+        .map_err(EstimationError::BasisError)?;
     let log_kappa_lower = if use_aniso {
         SpatialLogKappaCoords::lower_bounds_aniso_from_data(
             pilot_data,
@@ -7276,7 +7273,8 @@ fn apply_pilot_spatial_psi_reseed(
             spatial_terms,
             kappa_options,
         )
-    };
+    }
+    .map_err(EstimationError::BasisError)?;
     let log_kappa_upper = if use_aniso {
         SpatialLogKappaCoords::upper_bounds_aniso_from_data(
             pilot_data,
@@ -7292,7 +7290,8 @@ fn apply_pilot_spatial_psi_reseed(
             spatial_terms,
             kappa_options,
         )
-    };
+    }
+    .map_err(EstimationError::BasisError)?;
     log_kappa0
         .clamp_to_bounds(&log_kappa_lower, &log_kappa_upper)
         .apply_tospec(spec, spatial_terms)
@@ -7304,13 +7303,13 @@ pub(crate) fn apply_spatial_anisotropy_pilot_initializer(
     spatial_terms: &[usize],
     target_size: usize,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> usize {
+) -> Result<usize, EstimationError> {
     if target_size == 0 || data.nrows() <= target_size.saturating_mul(2) || spatial_terms.is_empty()
     {
-        return 0;
+        return Ok(0);
     }
     if !has_aniso_terms(spec, spatial_terms) {
-        return 0;
+        return Ok(0);
     }
     let indices = stratified_spatial_subsample(data, spec, target_size);
     let pilot_data = sampled_rows(data, &indices);
@@ -7319,7 +7318,7 @@ pub(crate) fn apply_spatial_anisotropy_pilot_initializer(
     const GEOMETRY_UPDATES: usize = 2;
 
     for pass in 0..GEOMETRY_UPDATES {
-        let planned_terms = match plan_joint_spatial_centers_for_term_blocks(
+        let planned_terms = plan_joint_spatial_centers_for_term_blocks(
             pilot_data.view(),
             &[working.smooth_terms.clone()],
         )
@@ -7329,15 +7328,8 @@ pub(crate) fn apply_spatial_anisotropy_pilot_initializer(
                     "pilot geometry initializer produced no smooth-term block".to_string(),
                 )
             })
-        }) {
-            Ok(terms) => terms,
-            Err(err) => {
-                log::warn!(
-                    "[spatial-kappa] pilot geometry initializer skipped after center planning failed: {err}"
-                );
-                return updated_terms;
-            }
-        };
+        })
+        .map_err(EstimationError::BasisError)?;
 
         for &term_idx in spatial_terms {
             let Some(current_eta) = get_spatial_aniso_log_scales(&working, term_idx) else {
@@ -7355,31 +7347,25 @@ pub(crate) fn apply_spatial_anisotropy_pilot_initializer(
             let Some(centers) = spatial_term_user_centers(planned_term) else {
                 continue;
             };
-            let Some(eta) = blended_pilot_axis_contrasts(pilot_data.view(), planned_term, centers)
+            let Some(eta) = blended_pilot_axis_contrasts(
+                pilot_data.view(),
+                planned_term,
+                centers,
+            )
+            .map_err(EstimationError::BasisError)?
             else {
                 continue;
             };
-            if set_spatial_aniso_log_scales(&mut working, term_idx, eta).is_ok() {
-                updated_terms += usize::from(pass == 0);
-            }
+            set_spatial_aniso_log_scales(&mut working, term_idx, eta)?;
+            updated_terms += usize::from(pass == 0);
         }
 
-        match apply_pilot_spatial_psi_reseed(
+        working = apply_pilot_spatial_psi_reseed(
             pilot_data.view(),
             &working,
             spatial_terms,
             kappa_options,
-        ) {
-            Ok(updated) => {
-                working = updated;
-            }
-            Err(err) => {
-                log::warn!(
-                    "[spatial-kappa] pilot geometry ψ reseed skipped after deterministic initializer error: {err}"
-                );
-                break;
-            }
-        }
+        )?;
     }
 
     if updated_terms > 0 {
@@ -7390,7 +7376,7 @@ pub(crate) fn apply_spatial_anisotropy_pilot_initializer(
         );
         *spec = working;
     }
-    updated_terms
+    Ok(updated_terms)
 }
 
 pub(crate) fn spatial_length_scale_term_indices(spec: &TermCollectionSpec) -> Vec<usize> {
@@ -7767,11 +7753,11 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
-            input_scales,
+            input_scale,
         } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
+            if let Some(scale) = input_scale {
+                scale.standardize(&mut x);
             }
             // #1122: the realized Matérn design always carries the operator
             // {mass, tension, stiffness} penalty triplet (`build_term` overrides
@@ -7794,11 +7780,11 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         SmoothBasisSpec::MeasureJet {
             feature_cols,
             spec,
-            input_scales,
+            input_scale,
         } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
+            if let Some(scale) = input_scale {
+                scale.standardize(&mut x);
             }
             build_measure_jet_basis_psi_derivatives(x.view(), spec)
                 .map_err(EstimationError::from)?

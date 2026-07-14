@@ -140,7 +140,7 @@ fn local_synth_copd_like_duchon_rejects_inadmissible_explicit_power() {
                 periodic: None,
                 boundary: OneDimensionalBoundary::Open,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,

@@ -1292,7 +1292,8 @@ mod runaway_tests {
             Some(2.5),
             &[0.4],
             &SpatialLengthScaleOptimizationOptions::default(),
-        );
+        )
+        .expect("empty spatial geometry is valid");
 
         assert_eq!(
             setup.rho_dim(),
@@ -2012,14 +2013,16 @@ pub fn fit_bernoulli_marginal_slope_terms(
             &marginal_terms,
             effective_kappa_options.pilot_subsample_threshold,
             &effective_kappa_options,
-        );
+        )
+        .map_err(|error| error.to_string())?;
         let logslope_updates = apply_spatial_anisotropy_pilot_initializer(
             data_view,
             &mut spec.logslopespec,
             &logslope_terms,
             effective_kappa_options.pilot_subsample_threshold,
             &effective_kappa_options,
-        );
+        )
+        .map_err(|error| error.to_string())?;
         effective_kappa_options.enabled = false;
         log::info!(
             "[BMS spatial] n={} flex=true pilot_geometry_updates={} iterative_spatial_outer=false reason=large-flex-spatial-pilot",
@@ -2489,7 +2492,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
         absorber_rho0,
         &extra_rho0,
         &effective_kappa_options,
-    );
+    )
+    .map_err(|error| error.to_string())?;
     let setup = if sigma_learnable {
         setup.with_auxiliary(
             Array1::from_vec(vec![initial_sigma.expect("learnable sigma seed").ln()]),

@@ -2501,7 +2501,7 @@ pub fn build_smooth_basis(
                         .map_err(|e| e.to_string())?,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             })
         }
         "sphere" | "s2" | "sos" => {
@@ -2817,7 +2817,7 @@ pub fn build_smooth_basis(
                     identifiability: MeasureJetIdentifiability::CenterSumToZero,
                     frozen_quadrature: None,
                 },
-                input_scales: None,
+                input_scale: None,
             })
         }
         "matern" => {
@@ -2946,7 +2946,7 @@ pub fn build_smooth_basis(
                     // step then pins that decision into the FrozenTransform so the
                     // κ-optimizer's rebuilds keep the count invariant (gam#787/#860).
                 },
-                input_scales: None,
+                input_scale: None,
             })
         }
         "duchon" | "ds" => {
@@ -3186,7 +3186,7 @@ pub fn build_smooth_basis(
                     boundary,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             })
         }
         "tensor" | "te" | "ti" | "t2" => {
@@ -3720,7 +3720,7 @@ fn promote_thin_plate_for_scale_dimensions(basis: &mut SmoothBasisSpec) {
     let SmoothBasisSpec::ThinPlate {
         feature_cols,
         spec,
-        input_scales,
+        input_scale,
     } = &*basis
     else {
         return;
@@ -3760,13 +3760,13 @@ fn promote_thin_plate_for_scale_dimensions(basis: &mut SmoothBasisSpec) {
         radial_reparam: None,
     };
     let feature_cols = feature_cols.clone();
-    let input_scales = input_scales.clone();
+    let input_scale = *input_scale;
     // All borrows of `*basis` (the `&*basis` destructure above) end with the
     // clones on the two preceding lines, so the reassignment is sound.
     *basis = SmoothBasisSpec::Duchon {
         feature_cols,
         spec: duchon_spec,
-        input_scales,
+        input_scale,
     };
 }
 

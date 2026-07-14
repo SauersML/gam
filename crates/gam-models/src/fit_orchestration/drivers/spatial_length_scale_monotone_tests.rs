@@ -132,7 +132,7 @@ mod spatial_length_scale_monotone_tests {
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -164,7 +164,8 @@ mod spatial_length_scale_monotone_tests {
         )
         .expect("center-resolution endpoint");
         let (psi_long_bound, psi_short_bound) =
-            spatial_term_psi_bounds(data.view(), &resolved, 0, &kappa_options);
+            spatial_term_psi_bounds(data.view(), &resolved, 0, &kappa_options)
+                .expect("finite isotropic-scale bounds");
         let psi_long = (-companion_length_scale.ln()).clamp(psi_long_bound, psi_short_bound);
         let long_endpoint = (-psi_long).exp();
         let (selected_spec, _) = select_isotropic_matern_range_basin(
@@ -237,7 +238,7 @@ mod spatial_length_scale_monotone_tests {
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -291,7 +292,7 @@ mod spatial_length_scale_monotone_tests {
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,

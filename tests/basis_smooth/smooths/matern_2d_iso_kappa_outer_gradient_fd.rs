@@ -285,7 +285,7 @@ fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: Some(vec![0.0, 0.0]),
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,

@@ -152,7 +152,7 @@ fn iso_kappa_fd_variant_driver(
                 identifiability: MaternIdentifiability::CenterSumToZero,
                 aniso_log_scales: None,
             },
-            input_scales: None,
+            input_scale: None,
         }
     } else {
         SmoothBasisSpec::Duchon {
@@ -169,7 +169,7 @@ fn iso_kappa_fd_variant_driver(
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
                 boundary: OneDimensionalBoundary::Open,
             },
-            input_scales: None,
+            input_scale: None,
         }
     };
     let spec = TermCollectionSpec {
@@ -513,7 +513,7 @@ fn iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic() {
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -598,14 +598,14 @@ fn iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic() {
             }
             if let Some(t) = frozen_design.smooth.terms.get(ti) {
                 if let gam_terms::basis::BasisMetadata::Matern {
-                    centers, input_scales, length_scale, ..
+                    centers, input_scale, length_scale, ..
                 } = &t.metadata
                 {
                     let csum: f64 = centers.iter().map(|v| v.abs()).sum();
                     let c00 = centers.get((0, 0)).copied().unwrap_or(f64::NAN);
                     let c01 = centers.get((0, 1)).copied().unwrap_or(f64::NAN);
                     eprintln!(
-                        "[FINGERPRINT] HARNESS meta.Matern length_scale={length_scale:.10} input_scales={input_scales:?} centers_abs_sum={csum:.10e} c[0,0]={c00:.10} c[0,1]={c01:.10}"
+                        "[FINGERPRINT] HARNESS meta.Matern length_scale={length_scale:.10} input_scale={input_scale:?} centers_abs_sum={csum:.10e} c[0,0]={c00:.10} c[0,1]={c01:.10}"
                     );
                 }
             }
@@ -925,7 +925,7 @@ fn build_duchon_probit_setup() -> DuchonProbitSetup {
                     operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -1106,7 +1106,7 @@ fn iso_kappa_duchon_dx_dpsi_matches_fd() {
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,

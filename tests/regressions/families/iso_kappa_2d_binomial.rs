@@ -81,7 +81,7 @@ fn matern_2d_spec(num_centers: usize) -> TermCollectionSpec {
                     // Isotropic κ path (the #1066 subject): aniso_log_scales = None.
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,

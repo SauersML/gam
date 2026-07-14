@@ -257,7 +257,7 @@ fn survival_static_spatial_psi_blocks_match_shared_engine() {
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: Some(vec![0.0, 0.0]),
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,

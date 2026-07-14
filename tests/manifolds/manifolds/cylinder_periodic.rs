@@ -91,7 +91,7 @@ fn radial_periodic_smooth_uses_ghost_centers_but_freezes_original_centers() {
                     identifiability: MaternIdentifiability::None,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,

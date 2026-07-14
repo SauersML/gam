@@ -24,9 +24,7 @@
 //! construction — exactly the production invariant — so any gap is a genuine
 //! `X_τ` error.
 
-use gam::smooth::input_standardization::{
-    apply_input_standardization, compensate_length_scale_for_standardization,
-};
+use gam::smooth::input_standardization::estimate_isotropic_scale;
 use gam::terms::basis::{
     BasisMetadata, CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu,
     build_matern_basis, build_matern_basis_log_kappa_derivatives,
@@ -38,8 +36,8 @@ use rand_distr::{Distribution, Uniform};
 
 fn sample_cloud(n: usize, seed: u64) -> Array2<f64> {
     let mut rng = StdRng::seed_from_u64(seed);
-    // Deliberately anisotropic spread so the per-axis σ differ — this exercises
-    // the standardization compensation chain that the merge gate's 2-D fit hits.
+    // Deliberately anisotropic spread so the scalar RMS spread exercises the
+    // standardization compensation chain that the merge gate's 2-D fit hits.
     let ux = Uniform::new(0.0, 1.0).expect("uniform");
     let uy = Uniform::new(-2.0, 3.0).expect("uniform");
     let mut data = Array2::<f64>::zeros((n, 2));
@@ -70,22 +68,14 @@ fn frozen_frame_design_derivative_max_error(
     let length_scale = 1.0 / kappa;
 
     // 1) Standardize the inputs exactly as the production isotropic-κ arm does
-    //    (spatial_optimization.rs lines 70-73): apply per-column σ scaling and
-    //    compensate the user length-scale by σ_geom.
-    let scales: Vec<f64> = (0..data.ncols())
-        .map(|j| {
-            let col = data.column(j);
-            let n = col.len() as f64;
-            let mean = col.sum() / n;
-            let var = col.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
-            var.sqrt().max(1e-12)
-        })
-        .collect();
+    //    (spatial_optimization.rs): apply one isotropic scale and compensate
+    //    the user length-scale by the same scalar.
+    let input_scale = estimate_isotropic_scale(data).expect("isotropic scale");
     let mut xs = data.to_owned();
-    apply_input_standardization(&mut xs, &scales);
-    let ls_eff = compensate_length_scale_for_standardization(length_scale, &scales);
+    input_scale.standardize(&mut xs);
+    let ls_eff = input_scale.to_standardized_units(length_scale);
     // The bootstrap κ₀ the geometry is frozen at (may differ from the eval κ).
-    let ls_freeze_eff = compensate_length_scale_for_standardization((-freeze_rho).exp(), &scales);
+    let ls_freeze_eff = input_scale.to_standardized_units((-freeze_rho).exp());
 
     // 2) Cold build with the production seed: Auto(FarthestPoint) centers so the
     //    rank reduction fires, nu/double_penalty as requested. Cold-build at the
@@ -141,9 +131,9 @@ fn frozen_frame_design_derivative_max_error(
     let h = 1e-6;
     let value_at = |r: f64| -> Array2<f64> {
         let ls_r = (-r).exp();
-        // The frozen frame compensates by σ_geom too — reproduce it so the FD
+        // The frozen frame compensates by the input scale too — reproduce it so the FD
         // and the analytic derivative live in identical coordinates.
-        let ls_r_eff = compensate_length_scale_for_standardization(ls_r, &scales);
+        let ls_r_eff = input_scale.to_standardized_units(ls_r);
         let mut s = frozen.clone();
         s.length_scale.set_resolved(ls_r_eff);
         build_matern_basis(xs.view(), &s)

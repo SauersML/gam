@@ -310,7 +310,7 @@ fn measure_jet_extrapolation_variance_for_fit(
         let SmoothBasisSpec::MeasureJet {
             feature_cols,
             spec,
-            input_scales,
+            input_scale,
         } = &term.basis
         else {
             continue;
@@ -371,10 +371,8 @@ fn measure_jet_extrapolation_variance_for_fit(
         for (j, &col) in feature_cols.iter().enumerate() {
             queries.column_mut(j).assign(&raw.column(col));
         }
-        if let Some(scales) = input_scales {
-            for (j, &scale) in scales.iter().enumerate() {
-                queries.column_mut(j).mapv_inplace(|v| v / scale);
-            }
+        if let Some(scale) = input_scale {
+            scale.standardize(&mut queries);
         }
         let support = gam::basis::measure_jet_support_curve(
             queries.view(),
@@ -432,14 +430,14 @@ fn measure_jet_web_quality_contracts() {
     // with.
     // Dig the frozen measure-jet term out of the resolved collection: the
     // freeze step must have pinned nodes, masses, band, and support anchors.
-    let (spec, scales) = jet_fit
+    let (spec, input_scale) = jet_fit
         .resolvedspec
         .smooth_terms
         .iter()
         .find_map(|st| match &st.basis {
             gam::smooth::SmoothBasisSpec::MeasureJet {
-                spec, input_scales, ..
-            } => Some((spec.clone(), input_scales.clone())),
+                spec, input_scale, ..
+            } => Some((spec.clone(), *input_scale)),
             _ => None,
         })
         .expect("fitted model carries a measure-jet term");
@@ -460,11 +458,8 @@ fn measure_jet_web_quality_contracts() {
         queries[(0, k)] = on_web[k];
         queries[(1, k)] = 5.0;
     }
-    if let Some(s) = &scales {
-        for k in 0..AMBIENT_D {
-            queries[(0, k)] /= s[k];
-            queries[(1, k)] /= s[k];
-        }
+    if let Some(scale) = input_scale {
+        scale.standardize(&mut queries);
     }
     let curves = gam::basis::measure_jet_support_curve(
         queries.view(),
@@ -689,7 +684,7 @@ fn measure_jet_eiv_input_variance_matches_fitted_surface_2225() {
     let SmoothBasisSpec::MeasureJet {
         feature_cols,
         spec,
-        input_scales,
+        input_scale,
     } = &term.basis
     else {
         unreachable!("filtered to MeasureJet above")
@@ -753,7 +748,7 @@ fn measure_jet_eiv_input_variance_matches_fitted_surface_2225() {
         // Standardized query for the term axes (frozen input scales).
         let mut q_std = Array1::<f64>::zeros(feature_cols.len());
         for (a, &col) in feature_cols.iter().enumerate() {
-            let scale = input_scales.as_ref().map_or(1.0, |s| s[a]);
+            let scale = (*input_scale).map_or(1.0, |scale| scale.get());
             q_std[a] = raw[[qi, col]] / scale;
         }
         let grad = gam::basis::measure_jet_ambient_gradient(
@@ -767,7 +762,7 @@ fn measure_jet_eiv_input_variance_matches_fitted_surface_2225() {
         .expect("analytic ambient gradient");
 
         for (a, &col) in feature_cols.iter().enumerate() {
-            let scale = input_scales.as_ref().map_or(1.0, |s| s[a]);
+            let scale = (*input_scale).map_or(1.0, |scale| scale.get());
             let eta_p = eta_at(Some((qi, col, h)));
             let eta_m = eta_at(Some((qi, col, -h)));
             // ∂η/∂x_std = scale · ∂η/∂x_raw (the design standardizes the axis).

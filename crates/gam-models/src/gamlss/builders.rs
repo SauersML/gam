@@ -174,7 +174,7 @@ pub(crate) fn build_two_block_exact_joint_setup(
     extra_rho0: &[f64],
     rho0_override: Option<&Array1<f64>>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> ExactJointHyperSetup {
+) -> Result<ExactJointHyperSetup, gam_terms::basis::BasisError> {
     // GAMLSS-specific part: assemble the rho seed in [mean | noise | extra]
     // penalty order, honoring a caller override when it matches the layout.
     let rho_dim = mean_penalties + noise_penalties + extra_rho0.len();
@@ -1994,7 +1994,8 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 extra_rho0.as_slice().unwrap_or(&[]),
                 None,
                 kappa_options,
-            );
+            )
+            .map_err(|error| error.to_string())?;
             let mean_terms = spatial_length_scale_term_indices(builder.meanspec());
             let noise_terms = spatial_length_scale_term_indices(builder.noisespec());
             let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
@@ -3208,21 +3209,24 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     let dims_per_term = spatial_dims_per_term(pilot_spec, &spatial_terms);
     let log_kappa0 =
         SpatialLogKappaCoords::from_length_scales_aniso(pilot_spec, &spatial_terms, kappa_options)
-            .reseed_from_data(data, pilot_spec, &spatial_terms, kappa_options);
+            .reseed_from_data(data, pilot_spec, &spatial_terms, kappa_options)
+            .map_err(|error| error.to_string())?;
     let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
         data,
         pilot_spec,
         &spatial_terms,
         &dims_per_term,
         kappa_options,
-    );
+    )
+    .map_err(|error| error.to_string())?;
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
         data,
         pilot_spec,
         &spatial_terms,
         &dims_per_term,
         kappa_options,
-    );
+    )
+    .map_err(|error| error.to_string())?;
     // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
 

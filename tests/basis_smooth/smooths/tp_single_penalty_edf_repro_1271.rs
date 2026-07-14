@@ -84,7 +84,7 @@ fn tp_spec(double_penalty: bool) -> TermCollectionSpec {
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: gam::terms::smooth::ShapeConstraint::None,
             joint_null_rotation: None,

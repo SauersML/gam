@@ -56,7 +56,7 @@ pub(crate) fn build_location_scale_exact_joint_setup(
     blocks: &[&TermCollectionSpec],
     rho0: Array1<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> ExactJointHyperSetup {
+) -> Result<ExactJointHyperSetup, gam_terms::basis::BasisError> {
     let rho_lower = Array1::<f64>::from_elem(rho0.len(), -EXACT_JOINT_RHO_BOUND);
     let rho_upper = Array1::<f64>::from_elem(rho0.len(), EXACT_JOINT_RHO_BOUND);
 
@@ -75,7 +75,7 @@ pub(crate) fn build_location_scale_exact_joint_setup(
         // length_scale.
         let kappa =
             SpatialLogKappaCoords::from_length_scales_aniso(spec, &term_indices, kappa_options)
-                .reseed_from_data(data, spec, &term_indices, kappa_options);
+                .reseed_from_data(data, spec, &term_indices, kappa_options)?;
         let dims = kappa.dims_per_term().to_vec();
 
         let lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
@@ -84,14 +84,14 @@ pub(crate) fn build_location_scale_exact_joint_setup(
             &term_indices,
             &dims,
             kappa_options,
-        );
+        )?;
         let upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
             data,
             spec,
             &term_indices,
             &dims,
             kappa_options,
-        );
+        )?;
 
         all_values.extend(kappa.as_array().iter());
         lower_vals.extend(lower.as_array().iter());
@@ -108,14 +108,14 @@ pub(crate) fn build_location_scale_exact_joint_setup(
     // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
 
-    ExactJointHyperSetup::new(
+    Ok(ExactJointHyperSetup::new(
         rho0,
         rho_lower,
         rho_upper,
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -148,7 +148,7 @@ mod tests {
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -168,7 +168,8 @@ mod tests {
         let term_indices = spatial_length_scale_term_indices(spec);
         let kappa =
             SpatialLogKappaCoords::from_length_scales_aniso(spec, &term_indices, kappa_options)
-                .reseed_from_data(data, spec, &term_indices, kappa_options);
+                .reseed_from_data(data, spec, &term_indices, kappa_options)
+                .expect("reference isotropic-scale geometry");
         let dims = kappa.dims_per_term().to_vec();
         let lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
             data,
@@ -176,14 +177,16 @@ mod tests {
             &term_indices,
             &dims,
             kappa_options,
-        );
+        )
+        .expect("reference lower spatial bounds");
         let upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
             data,
             spec,
             &term_indices,
             &dims,
             kappa_options,
-        );
+        )
+        .expect("reference upper spatial bounds");
         // Mirror the engine's seed projection so the reference seed is comparable
         // post-clamp coordinate-for-coordinate.
         let kappa = kappa.clamp_to_bounds(&lower, &upper);
@@ -236,7 +239,8 @@ mod tests {
             &[&block_a, &block_b],
             rho0.clone(),
             &kappa_options,
-        );
+        )
+        .expect("two-block isotropic-scale geometry");
 
         let rho_dim = rho0.len();
         assert_eq!(

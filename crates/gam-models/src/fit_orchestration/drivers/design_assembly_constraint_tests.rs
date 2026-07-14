@@ -231,7 +231,7 @@ fn remap_feature_columns_rewrites_every_index_bearing_field() {
                         identifiability: SpatialIdentifiability::default(),
                         radial_reparam: None,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -981,7 +981,7 @@ fn smooth_design_assembles_terms_and_penalties() {
                     identifiability: SpatialIdentifiability::default(),
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -1040,7 +1040,7 @@ fn build_smooth_design_rejectsmultiaxis_spatial_shape_constraints() {
                 identifiability: SpatialIdentifiability::default(),
                 radial_reparam: None,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::MonotoneIncreasing,
         joint_null_rotation: None,
@@ -1074,7 +1074,7 @@ fn build_smooth_design_rejects_uncertified_monotone_thin_plate_1d() {
                 identifiability: SpatialIdentifiability::default(),
                 radial_reparam: None,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::MonotoneIncreasing,
         joint_null_rotation: None,
@@ -1115,7 +1115,7 @@ fn build_smooth_design_auto_promotes_thin_plate_below_canonical_polynomial_dimen
                 identifiability: SpatialIdentifiability::default(),
                 radial_reparam: None,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
@@ -1169,7 +1169,7 @@ fn freeze_term_collection_handles_thin_plate_auto_promotion_to_duchon() {
                     identifiability: SpatialIdentifiability::default(),
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -1231,7 +1231,7 @@ fn build_smooth_design_rejects_uncertified_monotone_matern_1d() {
                 identifiability: MaternIdentifiability::CenterSumToZero,
                 aniso_log_scales: None,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::MonotoneIncreasing,
         joint_null_rotation: None,
@@ -1266,7 +1266,7 @@ fn build_smooth_design_rejects_uncertified_monotone_duchon_1d() {
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
                 boundary: OneDimensionalBoundary::Open,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::MonotoneIncreasing,
         joint_null_rotation: None,
@@ -1444,7 +1444,7 @@ fn term_collection_design_combines_linear_and_smooth() {
                     identifiability: SpatialIdentifiability::default(),
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -1492,7 +1492,7 @@ fn spatial_smooth_columns_do_not_duplicate_global_intercept() {
                     identifiability: SpatialIdentifiability::default(),
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -1551,7 +1551,7 @@ fn spatial_smooth_drops_matching_linear_trend_columns() {
                     identifiability: SpatialIdentifiability::default(),
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -1615,7 +1615,7 @@ fn spatial_option5_is_orthogonal_to_parametric_block() {
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -1691,7 +1691,7 @@ fn thin_plate_default_identifiability_centers_against_intercept_only_without_lin
                         identifiability: SpatialIdentifiability::OrthogonalToParametric,
                         radial_reparam: None,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -1761,7 +1761,7 @@ fn spatial_option5_does_not_overconstrain_on_nonoverlapping_linear_terms() {
                         identifiability: SpatialIdentifiability::OrthogonalToParametric,
                         radial_reparam: None,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -1778,7 +1778,7 @@ fn spatial_option5_does_not_overconstrain_on_nonoverlapping_linear_terms() {
                         identifiability: SpatialIdentifiability::OrthogonalToParametric,
                         radial_reparam: None,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -1871,7 +1871,7 @@ fn standalone_tps_keeps_centered_linear_nullspace() {
                 identifiability: SpatialIdentifiability::OrthogonalToParametric,
                 radial_reparam: None,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
@@ -1912,7 +1912,7 @@ fn spatial_parametric_ownership_projects_only_explicit_linear_axes() {
                 identifiability: SpatialIdentifiability::OrthogonalToParametric,
                 radial_reparam: None,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
@@ -1988,7 +1988,7 @@ fn hierarchical_smooth_ownership_is_order_independent_for_bspline_and_duchon() {
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
                 boundary: OneDimensionalBoundary::Open,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
@@ -2104,7 +2104,7 @@ fn freeze_roundtrip_preserves_hierarchical_smooth_transforms() {
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
                         boundary: OneDimensionalBoundary::Open,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -2201,7 +2201,7 @@ fn spatial_option5_preserves_lazy_thin_plate_terms_at_large_scale() {
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -2255,7 +2255,7 @@ fn spatial_frozen_transform_rebuild_is_exact_on_trainingrows() {
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -2294,7 +2294,7 @@ fn spatial_frozen_transform_rebuild_is_exact_on_trainingrows() {
                     identifiability: SpatialIdentifiability::FrozenTransform { transform: z },
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -2354,7 +2354,7 @@ fn frozen_spatial_replay_preserves_standardized_length_scale_compensation() {
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -2379,7 +2379,7 @@ fn frozen_spatial_replay_preserves_standardized_length_scale_compensation() {
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -2406,7 +2406,7 @@ fn frozen_spatial_replay_preserves_standardized_length_scale_compensation() {
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -2477,7 +2477,7 @@ fn matern_smooth_buildswith_double_penalty_in_high_dim() {
                 identifiability: MaternIdentifiability::CenterSumToZero,
                 aniso_log_scales: None,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
@@ -2534,7 +2534,7 @@ fn duchon_linear_nullspace_builds_and_reports_nullspace_dim() {
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
                 boundary: OneDimensionalBoundary::Open,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
@@ -2574,7 +2574,7 @@ fn joint_duchon_orderzero_raw_smooth_build_preserves_unconstrained_basis() {
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
                 boundary: OneDimensionalBoundary::Open,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
@@ -2626,7 +2626,7 @@ fn term_collection_joint_duchon_carries_frozen_transform_into_metadata() {
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -2678,7 +2678,7 @@ fn frozen_joint_maternspec_rebuild_keeps_adaptive_cache_in_sync() {
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -3348,7 +3348,7 @@ fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -3494,7 +3494,7 @@ fn staged_exact_joint_outer_reoptimizes_and_certifies_the_full_row_measure() {
                 // coordinates; an isotropic term's seeded range is fixed here.
                 aniso_log_scales: Some(vec![0.0, 0.0]),
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
@@ -3687,7 +3687,7 @@ fn exact_joint_two_block_spatial_length_scale_freezes_matern_centers() {
                 identifiability: MaternIdentifiability::CenterSumToZero,
                 aniso_log_scales: Some(vec![0.0, 0.0]),
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
@@ -3797,7 +3797,7 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: Some(vec![0.2, -0.2]),
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -3994,7 +3994,7 @@ fn iso_kappa_fd_variant_driver(
                 identifiability: MaternIdentifiability::CenterSumToZero,
                 aniso_log_scales: None,
             },
-            input_scales: None,
+            input_scale: None,
         }
     } else {
         SmoothBasisSpec::Duchon {
@@ -4011,7 +4011,7 @@ fn iso_kappa_fd_variant_driver(
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
                 boundary: OneDimensionalBoundary::Open,
             },
-            input_scales: None,
+            input_scale: None,
         }
     };
     let spec = TermCollectionSpec {
@@ -4285,7 +4285,7 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
                     operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -4321,13 +4321,15 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("lower isotropic-scale bounds");
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
         data.view(),
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("upper isotropic-scale bounds");
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     let setup = ExactJointHyperSetup::new(
         Array1::<f64>::zeros(rho_dim), // log λ seed (λ = 1)
@@ -4412,7 +4414,7 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
 /// frame bug. The two evaluators are byte-identical except that one carries
 /// the tensor — the only thing the test varies is the lane.
 ///
-/// Runs on PRODUCTION geometry (`input_scales: None`, #1215 1-D standardization
+/// Runs on PRODUCTION geometry (`input_scale: None`, #1215 1-D standardization
 /// to unit spread). The per-ψ amplitude normalization (#1216) is what makes the
 /// Chebyshev tail certify on the wide standardized window so the n-free tensor
 /// actually attaches here (`assert!(attached)`).
@@ -4458,7 +4460,7 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
                     operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -4495,13 +4497,15 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("lower isotropic-scale bounds");
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
         data.view(),
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("upper isotropic-scale bounds");
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     const JOINT_RHO_BOUND: f64 = 12.0;
     let setup = ExactJointHyperSetup::new(
@@ -4814,7 +4818,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
                 // to unit spread (#1214/#1215) — the real default-fit path. The
                 // n-independence fast path must fire here. An earlier
                 // `Some(vec![1.0])` pin was a gamed gate that masked the open gap.
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -4838,13 +4842,15 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("lower isotropic-scale bounds");
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
         data.view(),
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("upper isotropic-scale bounds");
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     const JOINT_RHO_BOUND: f64 = 12.0;
     let setup = ExactJointHyperSetup::new(
@@ -5168,7 +5174,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
                 // to unit spread (#1214/#1215) — the real default-fit path. The
                 // n-independence fast path must fire here. An earlier
                 // `Some(vec![1.0])` pin was a gamed gate that masked the open gap.
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -5189,13 +5195,15 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("lower isotropic-scale bounds");
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
         data.view(),
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("upper isotropic-scale bounds");
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     const JOINT_RHO_BOUND: f64 = 12.0;
     let setup = ExactJointHyperSetup::new(
@@ -5596,7 +5604,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
                     operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None, // PRODUCTION standardized geometry.
+                input_scale: None, // PRODUCTION standardized geometry.
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -5617,13 +5625,15 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("lower isotropic-scale bounds");
     let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
         data.view(),
         &frozen,
         &spatial_terms,
         &kappa_options,
-    );
+    )
+    .expect("upper isotropic-scale bounds");
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     const JOINT_RHO_BOUND: f64 = 12.0;
     let setup = ExactJointHyperSetup::new(
@@ -6076,7 +6086,7 @@ fn build_duchon_probit_setup() -> DuchonProbitSetup {
                     operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -6451,7 +6461,7 @@ fn iso_kappa_duchon_dx_dpsi_matches_fd() {
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -6606,7 +6616,7 @@ fn joint_build_and_freeze_shares_auto_spatial_centers_across_blocks() {
                 identifiability: MaternIdentifiability::CenterSumToZero,
                 aniso_log_scales: None,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
@@ -6854,7 +6864,7 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: Some(vec![0.15, -0.15]),
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -6994,7 +7004,7 @@ fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
                 identifiability: MaternIdentifiability::CenterSumToZero,
                 aniso_log_scales: Some(vec![0.0, 0.0]),
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,
@@ -7136,7 +7146,7 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -7342,7 +7352,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -7553,7 +7563,7 @@ fn exact_matern_log_kappa_derivative_uses_feature_columns_only() {
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -7619,7 +7629,7 @@ fn exact_thin_plate_log_kappa_derivative_uses_feature_columns_only() {
                     identifiability: SpatialIdentifiability::default(),
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -7731,7 +7741,7 @@ fn exact_duchon_log_kappa_derivative_uses_feature_columns_only() {
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -7843,7 +7853,7 @@ fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -7901,7 +7911,7 @@ fn spatial_length_scale_optimization_runs_binomial_logit_matern_with_exact_laml_
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -7997,7 +8007,7 @@ fn duchon_terms_participate_in_kappa_optimization() {
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -8081,7 +8091,7 @@ fn pure_duchon_scale_dimensions_seed_geometry_but_enroll_no_hyper_axis() {
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -8124,7 +8134,7 @@ fn thin_plate_terms_anchor_length_scale_and_enroll_no_kappa_axis() {
                     identifiability: SpatialIdentifiability::default(),
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -8167,7 +8177,7 @@ fn pure_duchon_from_length_scales_aniso_is_isotropic_single_psi() {
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -8216,7 +8226,7 @@ fn explicit_duchon_aniso_length_scale_is_locked_kappa() {
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -8257,7 +8267,7 @@ fn from_length_scales_aniso_keeps_nonaniso_spatial_terms_scalar() {
                         identifiability: MaternIdentifiability::None,
                         aniso_log_scales: Some(vec![0.3, -0.3]),
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -8280,7 +8290,7 @@ fn from_length_scales_aniso_keeps_nonaniso_spatial_terms_scalar() {
                         identifiability: MaternIdentifiability::None,
                         aniso_log_scales: None,
                     },
-                    input_scales: None,
+                    input_scale: None,
                 },
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
@@ -8328,7 +8338,7 @@ fn aniso_bounds_clamp_preserves_in_range_global_length_scale_and_eta() {
                     identifiability: MaternIdentifiability::None,
                     aniso_log_scales: Some(vec![3.0, -3.0]),
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -8351,14 +8361,16 @@ fn aniso_bounds_clamp_preserves_in_range_global_length_scale_and_eta() {
         &spatial_terms,
         &dims_per_term,
         &options,
-    );
+    )
+    .expect("lower anisotropic spatial bounds");
     let upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
         data.view(),
         &spec,
         &spatial_terms,
         &dims_per_term,
         &options,
-    );
+    )
+    .expect("upper anisotropic spatial bounds");
 
     let projected = seed.clone().clamp_to_bounds(&lower, &upper);
     assert_eq!(projected.as_array(), seed.as_array());
@@ -8409,7 +8421,7 @@ fn pure_duchon_aniso_fit_optimizes_without_introducing_hybrid_scale() {
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
                     boundary: OneDimensionalBoundary::Open,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -8477,7 +8489,7 @@ fn spatial_anisotropy_pilot_initializer_seeds_geometry_without_fit() {
                     identifiability: MaternIdentifiability::None,
                     aniso_log_scales: Some(vec![0.0, 0.0]),
                 },
-                input_scales: Some(vec![1.0, 1.0]),
+                input_scale: Some(gam_terms::IsotropicScale::ONE),
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -8490,7 +8502,8 @@ fn spatial_anisotropy_pilot_initializer_seeds_geometry_without_fit() {
         &spatial_terms,
         8,
         &SpatialLengthScaleOptimizationOptions::default(),
-    );
+    )
+    .expect("pilot anisotropy initialization");
 
     assert_eq!(updated, 1);
     match &spec.smooth_terms[0].basis {

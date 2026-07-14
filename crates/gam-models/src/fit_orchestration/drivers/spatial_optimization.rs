@@ -28,14 +28,13 @@ fn try_build_spatial_term_log_kappa_derivative(
         SmoothBasisSpec::ThinPlate {
             feature_cols,
             spec,
-            input_scales,
+            input_scale,
         } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
             let mut spec_local = spec.clone();
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-                spec_local.length_scale =
-                    compensate_length_scale_for_standardization(spec.length_scale, s);
+            if let Some(scale) = input_scale {
+                scale.standardize(&mut x);
+                spec_local.length_scale = scale.to_standardized_units(spec.length_scale);
             }
             build_thin_plate_basis_log_kappa_derivatives(x.view(), &spec_local)
                 .map_err(EstimationError::from)?
@@ -63,21 +62,21 @@ fn try_build_spatial_term_log_kappa_derivative(
         SmoothBasisSpec::Matern {
             feature_cols,
             spec,
-            input_scales,
+            input_scale,
         } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
             let mut spec_local = spec.clone();
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
+            if let Some(scale) = input_scale {
+                scale.standardize(&mut x);
                 let length_scale = spec.length_scale.resolved().ok_or_else(|| {
                     EstimationError::InvalidInput(
                         "Matérn Auto length_scale reached derivative construction unresolved"
                             .to_string(),
                     )
                 })?;
-                spec_local.length_scale.set_resolved(
-                    compensate_length_scale_for_standardization(length_scale, s),
-                );
+                spec_local
+                    .length_scale
+                    .set_resolved(scale.to_standardized_units(length_scale));
             }
             // The realized Matérn DESIGN penalty is ALWAYS the operator-collocation
             // {mass, tension, stiffness} triplet — the term-collection assembler
@@ -100,14 +99,15 @@ fn try_build_spatial_term_log_kappa_derivative(
         SmoothBasisSpec::Duchon {
             feature_cols,
             spec,
-            input_scales,
+            input_scale,
         } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
             let mut spec_local = spec.clone();
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-                spec_local.length_scale =
-                    compensate_optional_length_scale_for_standardization(spec.length_scale, s);
+            if let Some(scale) = input_scale {
+                scale.standardize(&mut x);
+                spec_local.length_scale = spec
+                    .length_scale
+                    .map(|length| scale.to_standardized_units(length));
             }
             let BasisMetadata::Duchon {
                 centers,
@@ -2549,8 +2549,9 @@ fn try_exact_joint_spatial_length_scale_optimization(
     };
     // If the user/spec did not set a length_scale, re-seed ψ at the midpoint
     // of the data-derived window instead of the arbitrary options fallback.
-    let mut log_kappa0 =
-        log_kappa0.reseed_from_data(data, resolvedspec, spatial_terms, kappa_options);
+    let mut log_kappa0 = log_kappa0
+        .reseed_from_data(data, resolvedspec, spatial_terms, kappa_options)
+        .map_err(EstimationError::BasisError)?;
     // Constant curvature is selected once, continuously, before the baseline
     // fit. The full joint solve therefore profiles only nuisance ρ (and any
     // non-curvature spatial coordinates) at that certified κ. User-pinned and
@@ -2582,7 +2583,8 @@ fn try_exact_joint_spatial_length_scale_optimization(
             spatial_terms,
             kappa_options,
         )
-    };
+    }
+    .map_err(EstimationError::BasisError)?;
     let log_kappa_upper = if use_aniso {
         SpatialLogKappaCoords::upper_bounds_aniso_from_data(
             data,
@@ -2598,7 +2600,8 @@ fn try_exact_joint_spatial_length_scale_optimization(
             spatial_terms,
             kappa_options,
         )
-    };
+    }
+    .map_err(EstimationError::BasisError)?;
     let mut log_kappa_lower = log_kappa_lower;
     let mut log_kappa_upper = log_kappa_upper;
     for &(slot, kappa) in &cc_profiled_values {
@@ -4496,12 +4499,12 @@ fn wrap_local_build_as_realization(
 }
 
 /// Extract the κ-invariant pieces of a freshly-built spatial basis — center
-/// cloud (in standardized coords) and `input_scales` — and bake them into a
+/// cloud (in standardized coords) and `input_scale` — and bake them into a
 /// `SmoothTermSpec` whose `center_strategy` becomes `UserProvided` and whose
-/// `input_scales` is `Some`. Subsequent rebuilds driven from this cached spec
+/// `input_scale` is `Some`. Subsequent rebuilds driven from this cached spec
 /// will short-circuit `select_centers_by_strategy` (KMeans / FarthestPoint /
-/// EqualMass cluster searches over n×d data) and `compute_spatial_input_scales`
-/// (per-axis variance over n rows), leaving only the κ-dependent kernel
+/// EqualMass cluster searches over n×d data) and isotropic scale estimation,
+/// leaving only the κ-dependent kernel
 /// values and basis assembly. Returns `None` for non-spatial families or when
 /// the metadata does not yet expose the required pieces (for instance when a
 /// ThinPlate request was auto-promoted to Duchon during the build).
@@ -4514,22 +4517,18 @@ fn freeze_geometry_from_metadata(
         (
             SmoothBasisSpec::Matern {
                 spec,
-                input_scales: spec_scales,
+                input_scale: spec_scale,
                 ..
             },
             BasisMetadata::Matern {
                 centers,
-                input_scales: meta_scales,
+                input_scale: metadata_scale,
                 identifiability_transform,
                 ..
             },
         ) => {
             spec.center_strategy = CenterStrategy::UserProvided(centers.clone());
-            if spec_scales.is_none()
-                && let Some(s) = meta_scales.clone()
-            {
-                *spec_scales = Some(s);
-            }
+            *spec_scale = Some(*metadata_scale);
             // Freeze the cold-build coefficient chart. Double-penalty topology
             // is structural (the explicit intercept only), so no numerical
             // nullspace decision needs to be carried across κ trials.
@@ -4541,41 +4540,33 @@ fn freeze_geometry_from_metadata(
         (
             SmoothBasisSpec::Duchon {
                 spec,
-                input_scales: spec_scales,
+                input_scale: spec_scale,
                 ..
             },
             BasisMetadata::Duchon {
                 centers,
-                input_scales: meta_scales,
+                input_scale: metadata_scale,
                 ..
             },
         ) => {
             spec.center_strategy = CenterStrategy::UserProvided(centers.clone());
-            if spec_scales.is_none()
-                && let Some(s) = meta_scales.clone()
-            {
-                *spec_scales = Some(s);
-            }
+            *spec_scale = Some(*metadata_scale);
             Some(frozen)
         }
         (
             SmoothBasisSpec::ThinPlate {
                 spec,
-                input_scales: spec_scales,
+                input_scale: spec_scale,
                 ..
             },
             BasisMetadata::ThinPlate {
                 centers,
-                input_scales: meta_scales,
+                input_scale: metadata_scale,
                 ..
             },
         ) => {
             spec.center_strategy = CenterStrategy::UserProvided(centers.clone());
-            if spec_scales.is_none()
-                && let Some(s) = meta_scales.clone()
-            {
-                *spec_scales = Some(s);
-            }
+            *spec_scale = Some(*metadata_scale);
             Some(frozen)
         }
         // Family mismatch (e.g. ThinPlate auto-promotion to Duchon) leaves the
@@ -4824,13 +4815,13 @@ struct FrozenTermCollectionIncrementalRealizer<'d> {
     ///
     /// On the first κ-driven rebuild of term `i`, this slot is populated with a
     /// `SmoothTermSpec` whose κ-invariant geometry — center cloud (as
-    /// `CenterStrategy::UserProvided`) and `input_scales` — has been frozen
+    /// `CenterStrategy::UserProvided`) and `input_scale` — has been frozen
     /// out of the realized basis metadata. Subsequent
     /// `apply_log_kappa_to_term` calls reuse this spec, mutating only the
     /// κ / aniso fields. This short-circuits `select_centers_by_strategy`
     /// (KMeans / FarthestPoint / EqualMass cluster searches over the n×d data
-    /// matrix) and `compute_spatial_input_scales` (per-axis variance pass
-    /// over n rows) on every BFGS κ-eval, leaving the kernel-value pass and
+    /// matrix) and isotropic scale estimation over n rows on every BFGS
+    /// κ-eval, leaving the kernel-value pass and
     /// basis assembly as the only work.
     spatial_realization_geometry: Vec<Option<SmoothTermSpec>>,
     /// Monotonic counter incremented every time `apply_log_kappa` actually
@@ -5123,7 +5114,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 power,
                 nullspace_order,
                 aniso_log_scales,
-                input_scales,
+                input_scale,
                 radial_reparam,
                 ..
             } => {
@@ -5133,16 +5124,12 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 };
                 // Slow-path Duchon realization stores centers/collocation points
                 // in standardized coordinates and compensates the user-facing
-                // length_scale by σ_geom before building penalties. The n-free
+                // length_scale by the scalar input frame before building penalties. The n-free
                 // re-key must use the same effective length scale, or the fast
                 // path pairs G(ψ_new) with an S(ψ_new) from a different
                 // coordinate scale.
-                let effective_ls = match input_scales.as_deref() {
-                    Some(scales) => {
-                        compensate_optional_length_scale_for_standardization(ls_opt, scales)
-                    }
-                    None => ls_opt,
-                };
+                let effective_ls =
+                    ls_opt.map(|length| input_scale.to_standardized_units(length));
                 gam_terms::basis::duchon_penalties_at_length_scale(
                     centers.view(),
                     identifiability_transform.as_ref(),
@@ -5164,22 +5151,19 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 include_intercept,
                 identifiability_transform,
                 aniso_log_scales,
-                input_scales,
+                input_scale,
                 ..
             } => {
                 // `spatial_term_psi_to_length_scale_and_aniso` decodes ψ to a
                 // length scale in ORIGINAL data coordinates — exactly what the
                 // slow-path rebuild writes into `spec.length_scale` before
                 // `matern_operator_penalty_triplet_from_metadata` compensates it
-                // by σ_geom. Compensate identically here so the n-free re-key
+                // by the scalar input frame. Compensate identically here so the n-free re-key
                 // reproduces the slow-path penalty surface byte-for-byte (#706).
                 let ls = ls_opt.ok_or_else(|| {
                     "Matérn n-free penalty re-key requires a finite length-scale".to_string()
                 })?;
-                let effective_ls = match input_scales.as_deref() {
-                    Some(scales) => compensate_length_scale_for_standardization(ls, scales),
-                    None => ls,
-                };
+                let effective_ls = input_scale.to_standardized_units(ls);
                 let aniso_for_penalty = aniso_from_psi.as_deref().or(aniso_log_scales.as_deref());
                 // Route through the SAME canonical operator-triplet builder the
                 // realized design uses (`matern_operator_penalty_triplet_from_
@@ -5311,7 +5295,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 power,
                 nullspace_order,
                 aniso_log_scales,
-                input_scales,
+                input_scale,
                 radial_reparam,
                 ..
             } => {
@@ -5324,12 +5308,8 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                         );
                     }
                 };
-                let effective_ls = match input_scales.as_deref() {
-                    Some(scales) => {
-                        compensate_optional_length_scale_for_standardization(ls_opt, scales)
-                    }
-                    None => ls_opt,
-                };
+                let effective_ls =
+                    ls_opt.map(|length| input_scale.to_standardized_units(length));
                 spec.length_scale = effective_ls;
                 spec.power = *power;
                 spec.nullspace_order = *nullspace_order;
@@ -5374,16 +5354,13 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 include_intercept,
                 identifiability_transform,
                 aniso_log_scales,
-                input_scales,
+                input_scale,
                 ..
             } => {
                 let ls = ls_opt.ok_or_else(|| {
                     "Matérn n-free penalty derivative requires a finite length-scale".to_string()
                 })?;
-                let effective_ls = match input_scales.as_deref() {
-                    Some(scales) => compensate_length_scale_for_standardization(ls, scales),
-                    None => ls,
-                };
+                let effective_ls = input_scale.to_standardized_units(ls);
                 let penalty_centers = gam_terms::basis::expand_periodic_centers(
                     &centers.to_owned(),
                     periodic.as_deref(),
@@ -5540,12 +5517,12 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
 
         // Pick the spec to drive the rebuild. If the per-term geometry cache
         // is populated, it carries already-resolved centers
-        // (`CenterStrategy::UserProvided`) and frozen `input_scales`; reusing
+        // (`CenterStrategy::UserProvided`) and frozen `input_scale`; reusing
         // it short-circuits `select_centers_by_strategy` (KMeans /
         // FarthestPoint / EqualMass cluster searches) and
-        // `compute_spatial_input_scales` (per-axis variance over n rows) in
+        // isotropic scale estimation over n rows in
         // the family builders. Centers in the cached spec live in
-        // standardized coordinates (matching the cached `input_scales`), so
+        // standardized coordinates (matching the cached `input_scale`), so
         // the same standardization + kernel path runs without recomputation
         // of the geometry.
         let geometry_slot = self
@@ -7797,7 +7774,8 @@ fn select_isotropic_matern_range_basin(
             ))
         })?;
         let (psi_long_bound, psi_short_bound) =
-            spatial_term_psi_bounds(data, &resolvedspec, term_idx, kappa_options);
+            spatial_term_psi_bounds(data, &resolvedspec, term_idx, kappa_options)
+                .map_err(EstimationError::BasisError)?;
         let psi_long = (-companion_length_scale.ln()).clamp(psi_long_bound, psi_short_bound);
         let long_length_scale = (-psi_long).exp();
         if !(long_length_scale.is_finite() && long_length_scale > 0.0) {
@@ -7944,7 +7922,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             &spatial_terms,
             pilot_threshold,
             kappa_options,
-        );
+        )?;
     }
 
     // #1376: the geometry-only anisotropy seed (`initial_aniso_contrasts`, from

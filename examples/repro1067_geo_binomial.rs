@@ -119,7 +119,7 @@ fn smooth_term(basis: &str, n_pcs: usize, centers: usize) -> SmoothTermSpec {
                 identifiability: MaternIdentifiability::default(),
                 aniso_log_scales: None,
             },
-            input_scales: None,
+            input_scale: None,
         },
         other => panic!("unknown basis {other} (this repro covers matern only)"),
     };

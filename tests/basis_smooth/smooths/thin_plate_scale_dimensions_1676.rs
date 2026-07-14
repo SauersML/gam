@@ -95,7 +95,7 @@ fn thin_plate_term(d: usize, num_centers: usize) -> TermCollectionSpec {
                     identifiability: SpatialIdentifiability::None,
                     radial_reparam: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,

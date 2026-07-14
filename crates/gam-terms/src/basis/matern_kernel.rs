@@ -415,7 +415,7 @@ pub fn build_thin_plate_basiswithworkspace(
             length_scale: spec.length_scale,
             periodic: spec.periodic.clone(),
             identifiability_transform,
-            input_scales: None,
+            input_scale: crate::IsotropicScale::ONE,
             radial_reparam: radial_reparam_meta,
         },
         kronecker_factored: None,

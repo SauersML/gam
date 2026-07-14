@@ -8,7 +8,7 @@
 //! fits of the same term family (same role, same variables, same basis kind
 //! and the same STRUCTURAL basis parameters — degree, #centers, nullspace
 //! order, …) map to the same [`TermIdentityKey`] even when their realized
-//! `centers` / `input_scales` / `length_scale` differ across folds. That is
+//! `centers` / `input_scale` / `length_scale` differ across folds. That is
 //! precisely what lets the smoothing parameter ρ transfer survive a fold:
 //! "same term, different rows" matches; "3 PCs vs 10 PCs" or "different
 //! #centers" deliberately does NOT.

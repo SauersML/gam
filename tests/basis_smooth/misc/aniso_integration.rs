@@ -69,7 +69,7 @@ fn aniso_matern_recovers_signal_axis() {
                     // Sentinel zeros: will be replaced by knot-cloud initialization.
                     aniso_log_scales: Some(vec![0.0, 0.0]),
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,

@@ -200,7 +200,7 @@ fn estimator_metadata_is_required_and_expectile_tau_is_validated() {
         .remove("estimator");
     assert!(
         serde_json::from_value::<FittedModelPayload>(encoded).is_err(),
-        "v12 must not decode a saved model whose estimator identity is absent"
+        "v13 must not decode a saved model whose estimator identity is absent"
     );
 
     payload.estimator = FittedEstimator::Expectile { tau: 1.0 };

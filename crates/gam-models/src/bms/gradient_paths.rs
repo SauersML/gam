@@ -514,7 +514,7 @@ pub(super) fn joint_setup(
     absorber_rho0: Option<f64>,
     extra_rho0: &[f64],
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> ExactJointHyperSetup {
+) -> Result<ExactJointHyperSetup, gam_terms::basis::BasisError> {
     let marginal_terms = spatial_length_scale_term_indices(marginalspec);
     let logslope_terms = spatial_length_scale_term_indices(logslopespec);
     let rho_dim = marginal_penalties + logslope_penalties + extra_rho0.len();
@@ -539,13 +539,13 @@ pub(super) fn joint_setup(
         &marginal_terms,
         kappa_options,
     )
-    .reseed_from_data(data, marginalspec, &marginal_terms, kappa_options);
+    .reseed_from_data(data, marginalspec, &marginal_terms, kappa_options)?;
     let logslope_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
         logslopespec,
         &logslope_terms,
         kappa_options,
     )
-    .reseed_from_data(data, logslopespec, &logslope_terms, kappa_options);
+    .reseed_from_data(data, logslopespec, &logslope_terms, kappa_options)?;
     let mut values = marginal_kappa.as_array().to_vec();
     values.extend(logslope_kappa.as_array().iter());
     let marginal_dims = marginal_kappa.dims_per_term().to_vec();
@@ -560,14 +560,14 @@ pub(super) fn joint_setup(
         &marginal_terms,
         &marginal_dims,
         kappa_options,
-    );
+    )?;
     let logslope_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
         data,
         logslopespec,
         &logslope_terms,
         &logslope_dims,
         kappa_options,
-    );
+    )?;
     let mut lower_vals = marginal_lower.as_array().to_vec();
     lower_vals.extend(logslope_lower.as_array().iter());
     let log_kappa_lower =
@@ -578,28 +578,28 @@ pub(super) fn joint_setup(
         &marginal_terms,
         &marginal_dims,
         kappa_options,
-    );
+    )?;
     let logslope_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
         data,
         logslopespec,
         &logslope_terms,
         &logslope_dims,
         kappa_options,
-    );
+    )?;
     let mut upper_vals = marginal_upper.as_array().to_vec();
     upper_vals.extend(logslope_upper.as_array().iter());
     let log_kappa_upper = SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), dims);
     // Project seed onto bounds in case a user-provided spec.length_scale falls
     // outside the data-derived ψ window; seed was a hint, not a hard constraint.
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
-    ExactJointHyperSetup::new(
+    Ok(ExactJointHyperSetup::new(
         rho0vec,
         rho_lower,
         rho_upper,
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
-    )
+    ))
 }
 
 #[inline]

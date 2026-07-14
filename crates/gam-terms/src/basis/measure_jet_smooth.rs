@@ -1871,7 +1871,7 @@ pub fn build_measure_jet_basis(
         dropped_penalties: filtered.dropped,
         metadata: BasisMetadata::MeasureJet {
             centers,
-            input_scales: None,
+            input_scale: crate::IsotropicScale::ONE,
             length_scale,
             eps_band,
             // The SPEC's order field, sentinel included: 0.0 marks per-level

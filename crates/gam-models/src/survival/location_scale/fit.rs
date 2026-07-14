@@ -579,7 +579,8 @@ pub(crate) fn fit_survival_location_scale_terms(
         &spec.log_sigmaspec,
         rho0,
         kappa_options,
-    );
+    )
+    .map_err(|error| error.to_string())?;
 
     let time_beta_hint = std::cell::RefCell::new(spec.time_block.initial_beta.clone());
     let threshold_beta_hint = std::cell::RefCell::new(None::<Array1<f64>>);

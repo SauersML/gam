@@ -1968,7 +1968,7 @@ fn with_identifiability_transform(
             length_scale,
             periodic,
             identifiability_transform,
-            input_scales,
+            input_scale,
             radial_reparam,
         } => Ok(BasisMetadata::ThinPlate {
             centers: centers.clone(),
@@ -1978,7 +1978,7 @@ fn with_identifiability_transform(
                 identifiability_transform.as_ref(),
                 transform,
             )?,
-            input_scales: input_scales.clone(),
+            input_scale: *input_scale,
             radial_reparam: radial_reparam.clone(),
         }),
         BasisMetadata::Sphere {
@@ -2015,7 +2015,7 @@ fn with_identifiability_transform(
         }),
         BasisMetadata::MeasureJet {
             centers,
-            input_scales,
+            input_scale,
             length_scale,
             eps_band,
             order_s,
@@ -2030,7 +2030,7 @@ fn with_identifiability_transform(
             sigma_coord,
         } => Ok(BasisMetadata::MeasureJet {
             centers: centers.clone(),
-            input_scales: input_scales.clone(),
+            input_scale: *input_scale,
             length_scale: *length_scale,
             eps_band: eps_band.clone(),
             order_s: *order_s,
@@ -2054,7 +2054,7 @@ fn with_identifiability_transform(
             nu,
             include_intercept,
             identifiability_transform,
-            input_scales,
+            input_scale,
             aniso_log_scales,
         } => Ok(BasisMetadata::Matern {
             centers: centers.clone(),
@@ -2066,7 +2066,7 @@ fn with_identifiability_transform(
                 identifiability_transform.as_ref(),
                 transform,
             )?,
-            input_scales: input_scales.clone(),
+            input_scale: *input_scale,
             aniso_log_scales: aniso_log_scales.clone(),
         }),
         BasisMetadata::Duchon {
@@ -2076,7 +2076,7 @@ fn with_identifiability_transform(
             power,
             nullspace_order,
             identifiability_transform,
-            input_scales,
+            input_scale,
             aniso_log_scales,
             operator_collocation_points,
             radial_reparam,
@@ -2086,7 +2086,7 @@ fn with_identifiability_transform(
             periodic: periodic.clone(),
             power: *power,
             nullspace_order: *nullspace_order,
-            input_scales: input_scales.clone(),
+            input_scale: *input_scale,
             aniso_log_scales: aniso_log_scales.clone(),
             operator_collocation_points: operator_collocation_points.clone(),
             radial_reparam: radial_reparam.clone(),

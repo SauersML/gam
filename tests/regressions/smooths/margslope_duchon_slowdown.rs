@@ -68,7 +68,7 @@ fn duchon2_smooth(name: &str, centers: usize) -> SmoothTermSpec {
                 periodic: None,
                 boundary: OneDimensionalBoundary::Open,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,

@@ -273,7 +273,8 @@ pub fn fit_transformation_normal(
         &covariate_spec,
         &spatial_terms,
         kappa_options,
-    );
+    )
+    .map_err(|error| error.to_string())?;
     let kappa_dims = kappa0.dims_per_term().to_vec();
     let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
         covariate_data,
@@ -281,14 +282,16 @@ pub fn fit_transformation_normal(
         &spatial_terms,
         &kappa_dims,
         kappa_options,
-    );
+    )
+    .map_err(|error| error.to_string())?;
     let kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
         covariate_data,
         &covariate_spec,
         &spatial_terms,
         &kappa_dims,
         kappa_options,
-    );
+    )
+    .map_err(|error| error.to_string())?;
     // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
     let kappa0 = kappa0.clamp_to_bounds(&kappa_lower, &kappa_upper);
 

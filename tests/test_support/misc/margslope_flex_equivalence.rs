@@ -109,7 +109,7 @@ fn pc16_duchon_smooth(name: &str) -> SmoothTermSpec {
                 periodic: None,
                 boundary: gam::basis::OneDimensionalBoundary::Open,
             },
-            input_scales: None,
+            input_scale: None,
         },
         shape: ShapeConstraint::None,
         joint_null_rotation: None,

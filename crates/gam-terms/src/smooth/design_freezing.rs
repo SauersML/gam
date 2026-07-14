@@ -115,7 +115,7 @@ fn freeze_smooth_basis_from_metadata(
         (
             SmoothBasisSpec::ThinPlate {
                 spec: s,
-                input_scales,
+                input_scale,
                 ..
             },
             BasisMetadata::ThinPlate {
@@ -123,7 +123,7 @@ fn freeze_smooth_basis_from_metadata(
                 length_scale,
                 periodic: meta_periodic,
                 identifiability_transform,
-                input_scales: meta_scales,
+                input_scale: metadata_scale,
                 radial_reparam,
             },
         ) => {
@@ -150,7 +150,7 @@ fn freeze_smooth_basis_from_metadata(
             };
             s.radial_reparam = radial_reparam.clone();
             s.periodic = meta_periodic.clone();
-            *input_scales = meta_scales.clone();
+            *input_scale = Some(*metadata_scale);
         }
         (
             SmoothBasisSpec::ThinPlate {
@@ -165,7 +165,7 @@ fn freeze_smooth_basis_from_metadata(
                 power,
                 nullspace_order,
                 identifiability_transform,
-                input_scales: meta_scales,
+                input_scale: metadata_scale,
                 aniso_log_scales: meta_aniso,
                 radial_reparam: meta_radial_reparam,
                 ..
@@ -208,7 +208,7 @@ fn freeze_smooth_basis_from_metadata(
                     boundary: OneDimensionalBoundary::Open,
                     radial_reparam: meta_radial_reparam.clone(),
                 },
-                input_scales: meta_scales.clone(),
+                input_scale: Some(*metadata_scale),
             };
         }
         (
@@ -267,12 +267,12 @@ fn freeze_smooth_basis_from_metadata(
         (
             SmoothBasisSpec::MeasureJet {
                 spec: s,
-                input_scales,
+                input_scale,
                 ..
             },
             BasisMetadata::MeasureJet {
                 centers,
-                input_scales: meta_scales,
+                input_scale: metadata_scale,
                 length_scale,
                 eps_band,
                 order_s,
@@ -316,12 +316,12 @@ fn freeze_smooth_basis_from_metadata(
                 },
                 None => MeasureJetIdentifiability::CenterSumToZero,
             };
-            *input_scales = meta_scales.clone();
+            *input_scale = Some(*metadata_scale);
         }
         (
             SmoothBasisSpec::Matern {
                 spec: s,
-                input_scales,
+                input_scale,
                 ..
             },
             BasisMetadata::Matern {
@@ -331,7 +331,7 @@ fn freeze_smooth_basis_from_metadata(
                 nu,
                 include_intercept,
                 identifiability_transform,
-                input_scales: meta_scales,
+                input_scale: metadata_scale,
                 aniso_log_scales: meta_aniso,
             },
         ) => {
@@ -347,12 +347,12 @@ fn freeze_smooth_basis_from_metadata(
             };
             s.aniso_log_scales = meta_aniso.clone();
             s.periodic = meta_periodic.clone();
-            *input_scales = meta_scales.clone();
+            *input_scale = Some(*metadata_scale);
         }
         (
             SmoothBasisSpec::Duchon {
                 spec: s,
-                input_scales,
+                input_scale,
                 ..
             },
             BasisMetadata::Duchon {
@@ -362,7 +362,7 @@ fn freeze_smooth_basis_from_metadata(
                 power,
                 nullspace_order,
                 identifiability_transform,
-                input_scales: meta_scales,
+                input_scale: metadata_scale,
                 aniso_log_scales: meta_aniso,
                 radial_reparam,
                 ..
@@ -397,7 +397,7 @@ fn freeze_smooth_basis_from_metadata(
             };
             s.aniso_log_scales = meta_aniso.clone();
             s.periodic = meta_periodic.clone();
-            *input_scales = meta_scales.clone();
+            *input_scale = Some(*metadata_scale);
             // #1355: persist the frozen data-metric radial reparam so the
             // predict-time / κ-trial rebuild replays the EXACT fit-time rotated
             // radial basis (a fresh `V` from predict rows would differ).

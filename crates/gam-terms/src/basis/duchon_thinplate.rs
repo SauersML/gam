@@ -623,7 +623,7 @@ fn build_duchon_basis_uncached(
             power: spec.power,
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
-            input_scales: None,
+            input_scale: crate::IsotropicScale::ONE,
             aniso_log_scales: aniso,
             operator_collocation_points,
             radial_reparam: frozen_radial_reparam,

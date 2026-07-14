@@ -4105,7 +4105,7 @@ pub(crate) fn simple_matern_term_collection(
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
                 },
-                input_scales: None,
+                input_scale: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
