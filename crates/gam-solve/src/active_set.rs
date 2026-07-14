@@ -1806,6 +1806,39 @@ impl<'a> ConstraintSetOps<'a> {
         })
     }
 
+    /// Operator view of only the rows that are tight at `beta`. Inactive rows
+    /// do not constrain the tangent cone, so make them vacuous by zeroing both
+    /// their cached norm and bound while retaining the original row indexing.
+    /// This avoids materializing the potentially enormous tight submatrix and
+    /// keeps returned active ids in the parent [`ConstraintSet`] coordinates.
+    fn tangent_face(
+        set: &'a ConstraintSet,
+        beta: &Array1<f64>,
+    ) -> Result<Self, EstimationError> {
+        let mut ops = Self::new(set, 0.0)?;
+        let values = ops.values(beta)?;
+        for row in 0..ops.nrows() {
+            if ops.norms[row] <= 0.0 {
+                if ops.bounds[row] > 0.0 {
+                    crate::bail_invalid_estim!(
+                        "infeasible zero-norm constraint row {} entered tangent-face projection",
+                        row
+                    );
+                }
+                ops.bounds[row] = 0.0;
+                continue;
+            }
+            let is_tight = ops.scaled_slack(&values, row) <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
+            // Tangent directions are homogeneous even when the original
+            // feasible set is affine: a_i^T d >= 0 on a tight row.
+            ops.bounds[row] = 0.0;
+            if !is_tight {
+                ops.norms[row] = 0.0;
+            }
+        }
+        Ok(ops)
+    }
+
     fn nrows(&self) -> usize {
         self.norms.len()
     }
@@ -1866,7 +1899,7 @@ impl<'a> ConstraintSetOps<'a> {
             }
             let inv = 1.0 / norm;
             gathered.a.row_mut(out_row).mapv_inplace(|v| v * inv);
-            gathered.b[out_row] = gathered.b[out_row] * inv + self.scaled_margin;
+            gathered.b[out_row] = self.bounds[row] * inv + self.scaled_margin;
         }
         Ok(gathered)
     }
@@ -1895,11 +1928,9 @@ impl<'a> ConstraintSetOps<'a> {
 /// constraint set without materializing its complete tight face.
 ///
 /// `seed_active` is the QP's sparse face. The negative projected residual is a
-/// candidate feasible-tangent direction. If any omitted tight row cuts that
-/// direction off, add the most violated row and re-project. This separation
-/// loop terminates with the same normal/tangent-cone certificate that a dense
-/// all-tight-row projection QP would compute, while gathering only rows that
-/// carry necessary cone geometry.
+/// candidate feasible-tangent direction. One operator-native active-set solve
+/// discovers any omitted tight blocker with its full-set ratio test, while
+/// gathering only rows that carry necessary cone geometry.
 pub fn project_stationarity_residual_on_constraint_set(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
@@ -1910,61 +1941,44 @@ pub fn project_stationarity_residual_on_constraint_set(
     if beta.len() != p || set.ncols() != p {
         return None;
     }
-    let ops = ConstraintSetOps::new(set, 0.0).ok()?;
-    let values_beta = ops.values(beta).ok()?;
-    let mut active = Vec::with_capacity(seed_active.len().min(p) + p);
-    let mut is_active = vec![false; ops.nrows()];
+    let ops = ConstraintSetOps::tangent_face(set, beta).ok()?;
+    let mut active = Vec::with_capacity(seed_active.len().min(p));
     for &row in seed_active {
-        if row < ops.nrows() && ops.norms[row] > 0.0 && !is_active[row] {
+        if row < ops.nrows() && ops.norms[row] > 0.0 && !active.contains(&row) {
             active.push(row);
-            is_active[row] = true;
         }
     }
 
-    for _ in 0..(p + 8) * 4 {
-        let gathered = ops.gather_unit_rows(&active).ok()?;
-        let projected = if active.is_empty() {
-            residual.clone()
-        } else {
-            project_stationarity_residual_on_constraint_cone(residual, &gathered.a)?.0
-        };
-        if !array_is_finite(&projected) {
-            return None;
-        }
-        let tangent = -&projected;
-        let values_tangent = ops.values(&tangent).ok()?;
-        let mut blocker: Option<(usize, f64)> = None;
-        for row in 0..ops.nrows() {
-            if is_active[row] || ops.norms[row] <= 0.0 {
-                continue;
-            }
-            let slack = ops.scaled_slack(&values_beta, row);
-            if slack > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
-                continue;
-            }
-            let rate = values_tangent[row] / ops.norms[row];
-            let scale = slack.abs().max(rate.abs()).max(1.0);
-            let directional_tol = (64.0 * f64::EPSILON * scale).max(1e-14);
-            if rate >= -directional_tol {
-                continue;
-            }
-            match blocker {
-                None => blocker = Some((row, rate)),
-                Some((best_row, best_rate))
-                    if rate < best_rate || (rate == best_rate && row < best_row) =>
-                {
-                    blocker = Some((row, rate));
-                }
-                _ => {}
-            }
-        }
-        let Some((row, _)) = blocker else {
-            return Some((projected, active));
-        };
-        active.push(row);
-        is_active[row] = true;
+    // Solve the Moreau tangent projection once in the operator-native primal
+    // active set:
+    //
+    //   min_d  1/2 ||d + residual||^2    s.t. A d >= 0.
+    //
+    // The former separator gathered one extra factored row, invoked a complete
+    // dense cone optimizer from the origin, and repeated. That nested a QP per
+    // cut and discarded its face every time. The operator solver already owns
+    // the same full-set ratio test without materializing A; carry `active`
+    // through that single solve instead. Disable its projected-gradient escape
+    // because that escape calls this projection oracle.
+    let identity = Array2::<f64>::eye(p);
+    let origin = Array1::<f64>::zeros(p);
+    let mut tangent_direction = Array1::<f64>::zeros(p);
+    let max_iterations = (p + active.len() + 8) * 4;
+    solve_newton_direction_with_constraint_set_impl(
+        &identity,
+        residual,
+        &origin,
+        &ops,
+        &mut tangent_direction,
+        Some(&mut active),
+        max_iterations,
+        false,
+    )
+    .ok()?;
+    if !array_is_finite(&tangent_direction) {
+        return None;
     }
-    None
+    Some((-tangent_direction, active))
 }
 
 /// First-order escape from a tolerance-band working-set cycle for an operator
@@ -2067,6 +2081,7 @@ fn solve_newton_direction_with_constraint_set_impl(
     direction_out: &mut Array1<f64>,
     mut active_hint: Option<&mut Vec<usize>>,
     max_iterations: usize,
+    allow_projected_gradient_fallback: bool,
 ) -> Result<(), EstimationError> {
     let p = gradient.len();
     if direction_out.len() != p {
@@ -2257,7 +2272,10 @@ fn solve_newton_direction_with_constraint_set_impl(
         // leaves the ordinary active-set loop in control. The trigger is a
         // mathematical no-progress event, not an iteration or wall-clock budget.
         let primal_step_norm = alpha.abs() * step_norm;
-        if added_new_active && primal_step_norm <= tol_step {
+        if allow_projected_gradient_fallback
+            && added_new_active
+            && primal_step_norm <= tol_step
+        {
             if let Some((fallback_direction, fallback_active)) =
                 fallback_projected_gradient_direction_with_constraint_set(
                     &x, &d_total, &g_cur, &active, ops,
@@ -2329,7 +2347,7 @@ fn solve_newton_direction_with_constraint_set_impl(
             || stationarity_rel <= ACTIVE_SET_KKT_STATIONARITY_TOL);
     if worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
         && ((working_kkt.dual_feasibility <= ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL
-            && (kkt_strong_ok || model_descent_ok))
+            && (kkt_strong_ok || (allow_projected_gradient_fallback && model_descent_ok)))
             || degenerate_boundary_ok)
     {
         if let Some(hint) = active_hint.as_mut() {
@@ -2342,6 +2360,17 @@ fn solve_newton_direction_with_constraint_set_impl(
         }
         direction_out.assign(&d_total);
         return Ok(());
+    }
+    if !allow_projected_gradient_fallback {
+        return Err(EstimationError::ParameterConstraintViolation(format!(
+            "operator-constrained active-set did not certify the strict-convex projection QP; max scaled violation={worst:.3e} at row {row}; KKT[primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}, active={}/{}]",
+            working_kkt.primal_feasibility,
+            working_kkt.dual_feasibility,
+            working_kkt.complementarity,
+            working_kkt.stationarity,
+            working_kkt.n_active,
+            working_kkt.n_constraints,
+        )));
     }
     if let Some((fallback_direction, fallback_active)) =
         fallback_projected_gradient_direction_with_constraint_set(
@@ -2398,6 +2427,7 @@ pub fn project_point_strictly_into_feasible_constraint_set(
                 &mut direction,
                 None,
                 max_iterations,
+                true,
             )
             .ok()?;
             let beta = point + &direction;
@@ -2469,6 +2499,7 @@ pub fn solve_quadratic_with_constraint_set(
                 &mut delta,
                 Some(&mut active_hint),
                 max_iterations,
+                true,
             )?;
             let candidate = beta_start + &delta;
             let candidate_values = ops.values(&candidate)?;
@@ -2609,6 +2640,7 @@ mod tests {
         project_point_strictly_into_feasible_cone,
         project_point_strictly_into_feasible_constraint_set,
         project_stationarity_residual_on_constraint_cone,
+        project_stationarity_residual_on_constraint_set,
         rank_reduce_rows_pivoted_qr_with_dependence, scaled_constraint_slack,
         solve_newton_direction_with_linear_constraints_impl, solve_quadratic_with_constraint_set,
         solve_quadratic_with_linear_constraints,
@@ -3308,6 +3340,45 @@ mod tests {
             vec![0],
             "operator escape expanded one sparse face row into all tight rows"
         );
+    }
+
+    #[test]
+    fn operator_tangent_projection_does_not_constrain_interior_rows() {
+        let psi = array![[1.0_f64, 0.0], [1.0, 1.0], [1.0, -1.0]];
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1], 2)
+            .expect("interior tangent cone");
+        let set = ConstraintSet::KhatriRaoCone(cone);
+        // The shaped response row is strictly positive for every observation,
+        // so its tangent cone is the complete coefficient space. A projection
+        // against the original cone at the origin would incorrectly erase the
+        // shaped constant component of this residual.
+        let beta = array![0.0_f64, 0.0, 1.0, 0.0];
+        let residual = array![0.0_f64, 0.0, 1.0, 0.0];
+        let (projected, active) =
+            project_stationarity_residual_on_constraint_set(&residual, &beta, &set, &[])
+                .expect("interior tangent projection");
+
+        for index in 0..residual.len() {
+            assert_relative_eq!(projected[index], residual[index], epsilon = 1e-12);
+        }
+        assert!(active.is_empty(), "interior rows entered the tangent face");
+    }
+
+    #[test]
+    fn operator_tangent_projection_homogenizes_an_affine_boundary() {
+        let set = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(array![[1.0_f64, 0.0]], array![2.0])
+                .expect("affine half-space"),
+        );
+        let beta = array![2.0_f64, 0.0];
+        let residual = array![1.0_f64, -1.0];
+        let (projected, active) =
+            project_stationarity_residual_on_constraint_set(&residual, &beta, &set, &[0])
+                .expect("affine-boundary tangent projection");
+
+        assert_relative_eq!(projected[0], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(projected[1], -1.0, epsilon = 1e-12);
+        assert_eq!(active, vec![0]);
     }
 
     #[test]
