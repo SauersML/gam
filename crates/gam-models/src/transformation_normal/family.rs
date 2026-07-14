@@ -106,7 +106,8 @@ pub struct TransformationNormalFamily {
 #[derive(Clone)]
 pub(crate) struct TransformationNormalRowQuantityCache {
     pub(crate) beta: Arc<Array1<f64>>,
-    pub(crate) gamma: Arc<Array2<f64>>,
+    /// Per-row factored coordinates `α_k(x_i) = ψ_iᵀ A_{k,:}` (`n × p_resp`).
+    pub(crate) alpha: Arc<Array2<f64>>,
     pub(crate) h: Arc<Array1<f64>>,
     pub(crate) h_prime: Arc<Array1<f64>>,
     pub(crate) h_lower: Arc<Array1<f64>>,
@@ -904,17 +905,21 @@ impl TransformationNormalFamily {
             .map_err(|e| format!("SCOP endpoint beta reshape failed: {e}"))?;
         let cov = self.covariate_dense_arc()?;
 
-        // SCOP-CTN: h(y, x) = b(x) + Σ_k γ_k(x)² · I_k(y), with
-        // γ_k(x) = ψ(x)ᵀ Γ_{k,:} and h'(y, x) = Σ_k γ_k(x)² · M_k(y).
-        // Response column 0 is the unconstrained affine/location component
-        // b(x); all remaining response columns are squared shape components.
+        // Direct-α CTN (gam#2306): h(y, x) = α_0(x) + Σ_k α_k(x) · I_k(y),
+        // with α_k(x) = ψ(x)ᵀ A_{k,:} and h'(y, x) = Σ_k α_k(x) · M_k(y).
+        // Response column 0 is the unconstrained affine/location component;
+        // the remaining response columns are the shape coordinates, kept
+        // non-negative at every observation by the factored monotonicity cone
+        // (`block_linear_constraints`), NOT by a squared latent chart. h is
+        // exactly linear in the coefficients, so the function-space penalties
+        // are quadratic in the FINAL function and the likelihood curvature
+        // carries no chart second-derivative terms.
         //
         // The observed value, derivative value, and finite-support endpoints
-        // all depend on the same covariate-side γ_k(x_i).  Compute γ once and
-        // fan it out exactly; the previous path projected β through the same
-        // covariate design three times per row-quantity build.
-        let gamma = fast_abt(cov.as_ref(), &beta_mat);
-        let n = gamma.nrows();
+        // all depend on the same covariate-side α_k(x_i).  Compute α once and
+        // fan it out exactly.
+        let alpha = fast_abt(cov.as_ref(), &beta_mat);
+        let n = alpha.nrows();
         let mut h = Array1::<f64>::zeros(n);
         let mut h_prime = Array1::<f64>::zeros(n);
         let mut h_lower = Array1::<f64>::zeros(n);
@@ -928,23 +933,23 @@ impl TransformationNormalFamily {
             .and(&mut h_lower)
             .and(&mut h_upper)
             .par_for_each(|i, h_i, hp_i, lower_i, upper_i| {
-                let gamma_row = gamma.row(i);
+                let alpha_row = alpha.row(i);
                 let val_row = self.response_val_basis.row(i);
                 let deriv_row = self.response_deriv_basis.row(i);
-                let g0 = gamma_row[0];
+                let a0 = alpha_row[0];
                 let offset_i = self.offset[i];
-                let mut h_acc = val_row[0] * g0 + offset_i + self.response_floor_offset[i];
-                let mut hp_acc = deriv_row[0] * g0 + TRANSFORMATION_MONOTONICITY_EPS;
+                let mut h_acc = val_row[0] * a0 + offset_i + self.response_floor_offset[i];
+                let mut hp_acc = deriv_row[0] * a0 + TRANSFORMATION_MONOTONICITY_EPS;
                 let mut lower_acc =
-                    self.response_lower_basis[0] * g0 + offset_i + self.response_lower_floor_offset;
+                    self.response_lower_basis[0] * a0 + offset_i + self.response_lower_floor_offset;
                 let mut upper_acc =
-                    self.response_upper_basis[0] * g0 + offset_i + self.response_upper_floor_offset;
+                    self.response_upper_basis[0] * a0 + offset_i + self.response_upper_floor_offset;
                 for k in 1..p_resp {
-                    let g_sq = gamma_row[k] * gamma_row[k];
-                    h_acc += val_row[k] * g_sq;
-                    hp_acc += deriv_row[k] * g_sq;
-                    lower_acc += self.response_lower_basis[k] * g_sq;
-                    upper_acc += self.response_upper_basis[k] * g_sq;
+                    let a_k = alpha_row[k];
+                    h_acc += val_row[k] * a_k;
+                    hp_acc += deriv_row[k] * a_k;
+                    lower_acc += self.response_lower_basis[k] * a_k;
+                    upper_acc += self.response_upper_basis[k] * a_k;
                 }
                 *h_i = h_acc;
                 *hp_i = hp_acc;
@@ -1016,7 +1021,7 @@ impl TransformationNormalFamily {
         )?;
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::new(beta.clone()),
-            gamma: Arc::new(gamma),
+            alpha: Arc::new(alpha),
             h: Arc::new(h),
             h_prime: Arc::new(h_prime),
             h_lower: Arc::new(h_lower),

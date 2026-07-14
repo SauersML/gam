@@ -22,7 +22,7 @@ use gam_linalg::matrix::DesignMatrix;
 use gam_problem::{
     BlockGeometryDirectionalDerivative, BlockWorkingSet, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactNewtonOuterObjective,
-    ConstraintSet, ExactOuterDerivativeOrder, LinearInequalityConstraints, ParameterBlockSpec,
+    ExactOuterDerivativeOrder, ParameterBlockSpec,
     ParameterBlockState, PseudoLogdetMode,
 };
 use ndarray::{Array1, Array2};
