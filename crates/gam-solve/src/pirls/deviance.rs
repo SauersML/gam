@@ -1158,14 +1158,7 @@ pub(crate) fn deviance_eta_rows_with_log_measure_scale(
     rows.into_iter().collect()
 }
 
-pub fn calculate_deviance_from_eta(
-    y: ArrayView1<f64>,
-    eta: &Array1<f64>,
-    likelihood: &GlmLikelihoodSpec,
-    inverse_link: &InverseLink,
-    priorweights: ArrayView1<f64>,
-) -> Result<f64, EstimationError> {
-    let rows = deviance_eta_rows(y, eta, likelihood, inverse_link, priorweights)?;
+fn reduce_deviance_rows(rows: &[DevianceEtaRow]) -> Result<f64, EstimationError> {
     let half_values: Vec<f64> = rows.iter().map(|row| row.half_deviance).collect();
     let half = stable_finite_signed_sum(&half_values, "deviance half-sum")?;
     let value = 2.0 * half;
@@ -1174,6 +1167,46 @@ pub fn calculate_deviance_from_eta(
     } else {
         crate::bail_invalid_estim!("deviance reduction exceeded f64 range")
     }
+}
+
+/// Evaluate the conventional deviance and the gradient of its half-deviance
+/// with respect to `eta` from the same certified row atoms.
+///
+/// P-IRLS minimizes `D/2`, so the returned row scores are its exact data-gradient
+/// coordinates.  The output is left untouched unless every row and the stable
+/// deviance reduction certify successfully.
+pub(crate) fn calculate_deviance_and_eta_gradient_into(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+    eta_gradient: &mut Array1<f64>,
+) -> Result<f64, EstimationError> {
+    if eta_gradient.len() != eta.len() {
+        crate::bail_invalid_estim!(
+            "deviance eta-gradient length mismatch: output={}, eta={}",
+            eta_gradient.len(),
+            eta.len(),
+        );
+    }
+    let rows = deviance_eta_rows(y, eta, likelihood, inverse_link, priorweights)?;
+    let deviance = reduce_deviance_rows(&rows)?;
+    for (gradient, row) in eta_gradient.iter_mut().zip(rows.iter()) {
+        *gradient = row.eta_score;
+    }
+    Ok(deviance)
+}
+
+pub fn calculate_deviance_from_eta(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+) -> Result<f64, EstimationError> {
+    let rows = deviance_eta_rows(y, eta, likelihood, inverse_link, priorweights)?;
+    reduce_deviance_rows(&rows)
 }
 
 /// A signed-log weighted average that never forms `weight * value` in the
