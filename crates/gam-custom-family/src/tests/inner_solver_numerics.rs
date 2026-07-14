@@ -4509,6 +4509,33 @@ pub(crate) fn zero_psi_derivative_operator_resolves_to_zero_design_map() {
 }
 
 #[test]
+pub(crate) fn mismatched_implicit_x_psi_operator_cannot_be_reinterpreted_as_zero() {
+    let n = 5usize;
+    let p = 3usize;
+    let deriv = CustomFamilyBlockPsiDerivative {
+        penalty_index: None,
+        x_psi: Array2::<f64>::zeros((0, 0)),
+        s_psi: Array2::<f64>::zeros((0, 0)),
+        s_psi_components: None,
+        s_psi_penalty_components: None,
+        x_psi_psi: None,
+        s_psi_psi: None,
+        s_psi_psi_components: None,
+        s_psi_psi_penalty_components: None,
+        implicit_operator: Some(Arc::new(ZeroPsiDerivativeOperator::new(n, p + 1))),
+        implicit_axis: 0,
+        implicit_group_id: None,
+    };
+    let policy = gam_runtime::resource::ResourcePolicy::permissive_small_data();
+    let error = resolve_custom_family_x_psi_map(&deriv, n, p, 0..n, "reduced-frame", &policy)
+        .expect_err("a raw-width implicit operator must not disappear in a reduced frame");
+    assert!(
+        error.contains("implicit x_psi operator shape (5, 4) does not match (5, 3)"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
 pub(crate) fn rowwise_kronecker_psi_row_chunks_are_window_consistent() {
     let first = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
     let second_diag = array![[0.5, 1.0], [1.5, 2.0], [2.5, 3.0]];

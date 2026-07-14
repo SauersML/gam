@@ -1826,11 +1826,20 @@ pub fn resolve_custom_family_x_psi_map(
         .into());
     }
 
-    // Prefer operator action when dimensions match.
-    if let Some(op) = deriv.implicit_operator.as_ref()
-        && op.n_data() == n
-        && op.p_out() == p
-    {
+    // An explicitly supplied operator is authoritative. A width mismatch is a
+    // coordinate-frame error, not permission to reinterpret the derivative as
+    // the empty/zero sentinel below.
+    if let Some(op) = deriv.implicit_operator.as_ref() {
+        if op.n_data() != n || op.p_out() != p {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "{label}: implicit x_psi operator shape ({}, {}) does not match ({n}, {p})",
+                    op.n_data(),
+                    op.p_out(),
+                ),
+            }
+            .into());
+        }
         return Ok(PsiDesignMap::First {
             action: CustomFamilyPsiDesignAction::from_first_derivative(
                 deriv, n, p, row_range, label,
