@@ -255,7 +255,7 @@ impl RhoModeSpectrum {
             .s
             .iter()
             .zip(&self.c)
-            .filter(|(_, &c)| c > 0.5)
+            .filter(|entry| *entry.1 > 0.5)
             .map(|(&s, &c)| -s.ln() - (2.0 * c - 1.0).ln())
             .collect();
         crossings.sort_by(f64::total_cmp);
