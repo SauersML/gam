@@ -3450,6 +3450,47 @@ mod root_cause_tests {
         }
     }
 
+    pub(crate) struct ExactDecrementAtIterationCapModel {
+        pub(crate) exact_calls: usize,
+    }
+
+    impl WorkingModel for ExactDecrementAtIterationCapModel {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+            self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+        }
+
+        fn update_with_curvature(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(scalar_working_state(beta, curvature, 5.0e-5, 1.0))
+        }
+
+        fn update_candidate(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(scalar_working_state(
+                beta,
+                curvature,
+                5.0e-5,
+                1.0 - 1.25e-9,
+            ))
+        }
+
+        fn exact_unconstrained_decrement_sq(
+            &mut self,
+            beta: &Coefficients,
+            state: &WorkingState,
+        ) -> Result<Option<f64>, EstimationError> {
+            assert_eq!(beta.as_ref().len(), state.gradient.len());
+            self.exact_calls += 1;
+            Ok(Some(0.0))
+        }
+    }
+
     pub(crate) struct LinearObjectivePlateauModel {
         pub(crate) gradient: f64,
     }
@@ -4011,6 +4052,34 @@ mod root_cause_tests {
             PirlsStatus::MaxIterationsReached,
             "projected gradient 5e-5 is well above the near-stationary band and must not be promoted to Converged/Stalled — the candidate step is accepted but the outer iteration counter must run out as MaxIterationsReached, not be silently re-classified"
         );
+    }
+
+    #[test]
+    pub(crate) fn iteration_cap_runs_one_final_exact_decrement_certificate_2316() {
+        let mut model = ExactDecrementAtIterationCapModel { exact_calls: 0 };
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 1,
+            convergence_tolerance: 1e-6,
+            adaptive_kkt_tolerance: None,
+            max_step_halving: 4,
+            min_step_size: 0.0,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+            initial_lm_lambda: None,
+            arrow_schur: None,
+        };
+
+        let result = runworking_model_pirls(
+            &mut model,
+            Coefficients::new(array![0.0]),
+            &options,
+            |_| {},
+        )
+        .expect("the exact final-state decrement certifies iteration exhaustion");
+
+        assert_eq!(model.exact_calls, 1);
+        assert_eq!(result.status, PirlsStatus::StalledAtValidMinimum);
     }
 
     #[test]

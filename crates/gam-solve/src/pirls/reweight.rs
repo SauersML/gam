@@ -2199,6 +2199,41 @@ where
         options.coefficient_lower_bounds.as_ref(),
         options.linear_constraints.as_ref(),
     );
+    // Iteration exhaustion is itself a reason to pay for one final exact
+    // stationarity certificate. The hot-loop check is deliberately armed only
+    // by a floating-point objective plateau, but a stiff system can make
+    // resolvable monotone value progress for every permitted iteration while
+    // its Newton decrement is already machine-small. Refusing to check at the
+    // cap then turns the iteration budget into part of the mathematical
+    // convergence definition. Recompute from the final accepted state instead;
+    // the pre-step LM solve cannot certify this state.
+    let final_exact_decrement_sq = if status.is_failed_max_iterations() && polish_allowed {
+        model
+            .exact_unconstrained_decrement_sq(&beta, &state)?
+            .or_else(|| exact_newton_decrement_sq(&state))
+    } else {
+        None
+    };
+    let final_decrement_threshold = if final_exact_decrement_sq.is_some() {
+        let final_dev_scale = model.penalized_deviance_scale()?;
+        kkt_tolerance
+            * kkt_tolerance
+            * (1.0 + penalizedobjective(&state, final_dev_scale).abs())
+    } else {
+        0.0
+    };
+    let final_exact_decrement_pass = final_exact_decrement_sq
+        .is_some_and(|decrement_sq| decrement_sq <= final_decrement_threshold);
+    if final_exact_decrement_sq.is_some() {
+        log::info!(
+            "[PIRLS final exact-decrement] decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} status_before={:?}",
+            final_exact_decrement_sq.unwrap_or(f64::NAN),
+            final_decrement_threshold,
+            final_exact_decrement_pass,
+            final_projected_grad,
+            status,
+        );
+    }
     if status.is_failed_max_iterations() {
         // Strict KKT met after the loop bailed: reclassify as a valid
         // (if non-strictly-converged) minimum. The remaining soft-acceptance
@@ -2210,8 +2245,15 @@ where
         // here.
         if state.certifies_kkt(final_projected_grad, kkt_tolerance) {
             log::debug!(
-                "[PIRLS] post-loop rescue: strict KKT after MaxIterations \
-                 (‖g‖={final_projected_grad:.3e})"
+                "[PIRLS] post-loop rescue: strict KKT after exhaustion \
+                 (‖g‖={final_projected_grad:.3e})",
+            );
+            status = PirlsStatus::StalledAtValidMinimum;
+        } else if final_exact_decrement_pass {
+            log::debug!(
+                "[PIRLS] post-loop rescue: exact decrement after exhaustion \
+                 (‖g‖={final_projected_grad:.3e}, decrement_sq={:.3e})",
+                final_exact_decrement_sq.unwrap_or(f64::NAN),
             );
             status = PirlsStatus::StalledAtValidMinimum;
         } else if pirls_soft_acceptance(
