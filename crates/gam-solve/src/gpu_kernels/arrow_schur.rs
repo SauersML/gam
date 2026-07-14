@@ -5524,29 +5524,44 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         /// [`solve_sae_matrix_free_pcg_framed`] (framed data present, offload
         /// predicate over the CG budget, live runtime), upload the
         /// ridge-independent operands once with a zero `ainv` placeholder, and
-        /// stash the metadata needed to recompute `ainv` per trial. `None` on any
-        /// decline keeps the per-trial re-flatten path.
-        pub(crate) fn build(sys: &ArrowSchurSystem, cg_iters: usize) -> Option<Self> {
-            let data = sys.device_sae_pcg.as_ref()?;
-            let frame = data.frame.as_ref()?;
+        /// stash the metadata needed to recompute `ainv` per trial. Ordinary
+        /// shape/policy absence is `Ok(None)`; runtime and upload faults retain
+        /// their typed identity.
+        pub(crate) fn build(
+            sys: &ArrowSchurSystem,
+            cg_iters: usize,
+        ) -> Result<Option<Self>, ArrowSchurGpuFailure> {
+            let Some(data) = sys.device_sae_pcg.as_ref() else {
+                return Ok(None);
+            };
+            let Some(frame) = data.frame.as_ref() else {
+                return Ok(None);
+            };
             if sys.k == 0 || data.beta_dim != sys.k {
-                return None;
+                return Ok(None);
             }
-            let runtime = super::resolve_runtime_for_device_path()
-                .unwrap_or_else(|failure| {
-                    panic!("resident SAE frame runtime resolution failed: {failure:?}")
-                })
-                .filter(|rt| {
-                    rt.policy().reduced_schur_matvec_should_offload(
-                        sys.rows.len(),
-                        sys.k,
-                        sys.d,
-                        cg_iters,
-                    )
+            let Some(runtime) = super::resolve_runtime_for_device_path()? else {
+                return Ok(None);
+            };
+            if !runtime.policy().reduced_schur_matvec_should_offload(
+                sys.rows.len(),
+                sys.k,
+                sys.d,
+                cg_iters,
+            ) {
+                return Ok(None);
+            }
+            let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
+                .ok_or_else(|| ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: "resident SAE frame could not bind the admitted CUDA context"
+                        .to_string(),
                 })?;
-            let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)?;
-            let stream = ctx.new_stream().ok()?;
-            let host = super::flatten_frame_host_operands(sys, data, frame).ok()?;
+            let stream = ctx.new_stream().map_err(|error| {
+                ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: format!("resident SAE frame stream creation failed: {error}"),
+                }
+            })?;
+            let host = super::flatten_frame_host_operands(sys, data, frame)?;
             // #1017/#2230 residency measurement: the ridge-independent operand
             // bytes this frame uploads ONCE for the whole LM ridge ladder. The
             // per-trial flatten path re-uploaded this same total on EVERY trial
@@ -5561,8 +5576,8 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 host.max_q
             );
             let zero_ainv = vec![0.0_f64; host.n_rows * host.max_q * host.max_q];
-            let buffers = upload_frame_buffers(&host, &zero_ainv, &stream).ok()?;
-            Some(Self {
+            let buffers = upload_frame_buffers(&host, &zero_ainv, &stream)?;
+            Ok(Some(Self {
                 ctx,
                 stream,
                 buffers: std::sync::Mutex::new(buffers),
@@ -5570,7 +5585,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 max_q: host.max_q,
                 n_rows: host.n_rows,
                 k: host.k,
-            })
+            }))
         }
 
         /// Overwrite the resident per-row `ainv` for a fixed `ridge_t` (the single
@@ -5693,10 +5708,14 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         ridge_t: f64,
         ridge_beta: f64,
         apply_budget: usize,
-    ) -> Option<crate::arrow_schur::GpuSchurMatvec> {
-        let handle = ResidentSaeFrameHandle::build(sys, apply_budget)?;
-        handle.prime_ainv(sys, ridge_t).ok()?;
-        let data = sys.device_sae_pcg.as_ref()?.clone();
+    ) -> Result<Option<crate::arrow_schur::GpuSchurMatvec>, ArrowSchurGpuFailure> {
+        let Some(handle) = ResidentSaeFrameHandle::build(sys, apply_budget)? else {
+            return Ok(None);
+        };
+        handle.prime_ainv(sys, ridge_t)?;
+        let Some(data) = sys.device_sae_pcg.as_ref().cloned() else {
+            return Ok(None);
+        };
         let handle = Arc::new(handle);
         let k = handle.k;
         let closure: crate::arrow_schur::GpuSchurMatvec =
@@ -5742,7 +5761,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                     out_slice[a] += reduced[a];
                 }
             });
-        Some(closure)
+        Ok(Some(closure))
     }
 
     /// #1551 stage-isolating triage seam: run the framed reduced-Schur matvec

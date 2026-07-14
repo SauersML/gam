@@ -2856,22 +2856,22 @@ impl<'a> RemlState<'a> {
             // builder then evaluates the nonzero profiled cross terms from the
             // first-order link drifts and IFT mode responses.
             assembly.rho_ext_pair_fn = Some(Box::new(move |_, _| {
-                super::reml_outer_engine::HyperCoordPair {
+                Ok(super::reml_outer_engine::HyperCoordPair {
                     a: 0.0,
                     g: Array1::zeros(p_dim),
                     b_mat: Array2::zeros((p_dim, p_dim)),
                     b_operator: None,
                     ld_s: 0.0,
-                }
+                })
             }));
             assembly.ext_coord_pair_fn = Some(Box::new(move |_, _| {
-                super::reml_outer_engine::HyperCoordPair {
+                Ok(super::reml_outer_engine::HyperCoordPair {
                     a: 0.0,
                     g: Array1::zeros(p_dim),
                     b_mat: Array2::zeros((p_dim, p_dim)),
                     b_operator: None,
                     ld_s: 0.0,
-                }
+                })
             }));
             assert!(ext_dim > 0);
         }
