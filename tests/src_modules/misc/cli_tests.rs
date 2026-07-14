@@ -43,6 +43,7 @@ use gam::families::survival::construction::{SurvivalBaselineConfig, evaluate_sur
 use gam::families::survival::location_scale::{
     ResidualDistribution, project_onto_linear_constraints,
 };
+use gam::families::survival::lognormal_kernel::FrailtyScale;
 use gam::families::wiggle::{
     buildwiggle_block_input_from_knots, monotone_wiggle_basis_with_derivative_order,
 };
@@ -66,6 +67,7 @@ use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
     build_term_collection_design,
 };
+use gam::solver::gauge::Gauge;
 use gam::term_builder::{
     heuristic_knots_for_column, parse_duchon_order, parse_duchon_power, unique_count_column,
 };
@@ -784,7 +786,7 @@ fn cli_sample_bounded_model_reaches_sampler_config_validation() {
         None,
         None,
         Some(FitGeometry {
-            coefficient_gauge: gam_problem::Gauge::identity(&[2]),
+            coefficient_gauge: Gauge::identity(&[2]),
             penalized_hessian: array![[4.0, 1.0], [1.0, 3.0]].into(),
             working: Some(gam::estimate::WorkingGeometry {
                 weights: array![1.0, 1.0, 1.0],
@@ -1982,7 +1984,7 @@ fn nonlinear_saved_model_with_hessian_only_remains_persistable_and_predictable()
         inference: None,
         fitted_link: FittedLinkState::Standard(None),
         geometry: Some(FitGeometry {
-            coefficient_gauge: gam_problem::Gauge::identity(&[1]),
+            coefficient_gauge: Gauge::identity(&[1]),
             penalized_hessian: array![[2.0]].into(),
             working: None,
         }),
@@ -2903,7 +2905,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
         }),
         fitted_link: FittedLinkState::Standard(Some(StandardLink::Logit)),
         geometry: Some(FitGeometry {
-            coefficient_gauge: gam_problem::Gauge::identity(&[2]),
+            coefficient_gauge: Gauge::identity(&[2]),
             penalized_hessian: hessian.into(),
             working: Some(gam::estimate::WorkingGeometry {
                 weights: working_weights,
@@ -5875,7 +5877,7 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         ModelKind::Survival,
         FittedFamily::LatentSurvival {
             frailty: gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-                sigma_fixed: Some(0.3),
+                scale: FrailtyScale::Fixed { sigma: 0.3 },
                 loading: gam::families::survival::lognormal_kernel::HazardLoading::Full,
             },
         },
@@ -5971,7 +5973,7 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
     let mut binary_payload = model.payload().clone();
     binary_payload.family_state = FittedFamily::LatentBinary {
         frailty: gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-            sigma_fixed: Some(0.3),
+            scale: FrailtyScale::Fixed { sigma: 0.3 },
             loading: gam::families::survival::lognormal_kernel::HazardLoading::Full,
         },
     };
@@ -6001,7 +6003,7 @@ fn explicit_latent_binary_family_requires_matching_saved_likelihood_metadata() {
         ModelKind::Survival,
         FittedFamily::LatentBinary {
             frailty: gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-                sigma_fixed: Some(0.3),
+                scale: FrailtyScale::Fixed { sigma: 0.3 },
                 loading: gam::families::survival::lognormal_kernel::HazardLoading::Full,
             },
         },
@@ -6021,7 +6023,7 @@ fn explicit_latent_survival_family_requires_matching_saved_likelihood_metadata()
         ModelKind::Survival,
         FittedFamily::LatentSurvival {
             frailty: gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-                sigma_fixed: Some(0.3),
+                scale: FrailtyScale::Fixed { sigma: 0.3 },
                 loading: gam::families::survival::lognormal_kernel::HazardLoading::Full,
             },
         },
