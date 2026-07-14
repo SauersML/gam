@@ -2311,6 +2311,21 @@ pub(crate) use gam_problem::diagnostics::KktRefusalDiagnosis;
 /// penalty-rank machinery uses for "structurally zero".
 pub(crate) const KKT_REFUSAL_RANK_TOL: f64 = 1e-10;
 
+/// Machine-resolution floor for an eigenvalue of a `dimension`-wide symmetric
+/// Hessian whose largest absolute eigenvalue is `lambda_max_abs`.
+///
+/// This is the single rank boundary shared by the exact joint-Newton step and
+/// every range-space convergence projection. A mode above this floor carries
+/// numerically resolvable curvature and must remain in the step and in the KKT
+/// residual, even when a much wider conditioning diagnostic such as
+/// [`KKT_REFUSAL_RANK_TOL`] would label it near-singular.
+pub(crate) fn joint_hessian_numerical_eigenvalue_floor(
+    lambda_max_abs: f64,
+    dimension: usize,
+) -> f64 {
+    lambda_max_abs * (dimension as f64).sqrt() * f64::EPSILON
+}
+
 /// Residual band (as a multiple of the KKT residual tolerance) inside which
 /// the inner joint Newton is considered to be in its convergence ENDGAME and
 /// the exact Jeffreys second-order completion is added to the step model
@@ -2527,7 +2542,8 @@ pub(crate) mod whitened_spectrum {
             let whitened_rhs = &d_inv_sqrt * rhs;
             let c = evecs.t().dot(&whitened_rhs);
             let lambda_max_abs = gamma.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-            let numerical_floor = lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
+            let numerical_floor =
+                joint_hessian_numerical_eigenvalue_floor(lambda_max_abs, p);
             let rank_cutoff = rank_tol * lambda_max_abs;
             let null_cutoff = rank_cutoff.max(numerical_floor);
             // gam#979 diagnostic (WARN survives the default INFO filter that
@@ -2695,7 +2711,8 @@ pub(crate) mod whitened_spectrum {
         pub(crate) fn weakly_identified_decrement(&self) -> f64 {
             let p = self.gamma.len();
             // Reconstruct the genuine numerical-rank floor used by `decompose`.
-            let numerical_floor = self.lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
+            let numerical_floor =
+                joint_hessian_numerical_eigenvalue_floor(self.lambda_max_abs, p);
             let mut acc = 0.0_f64;
             for k in 0..p {
                 let abs_gamma = self.gamma[k].abs();
@@ -4376,14 +4393,18 @@ pub(crate) fn projected_residual_range_space_per_block_inf(
     if !(max_abs.is_finite() && max_abs > 0.0) {
         return None;
     }
-    let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
-    let nullity = evals.iter().filter(|x| x.abs() < cutoff).count();
+    // Use the same machine-rank boundary as the exact joint-Newton step. A
+    // wider conditioning cutoff would erase a weak but penalty-identified
+    // mode from the KKT residual even though the step can resolve and move it,
+    // allowing an identified-subspace exit to mint false convergence.
+    let cutoff = joint_hessian_numerical_eigenvalue_floor(max_abs, total_p);
+    let nullity = evals.iter().filter(|x| x.abs() <= cutoff).count();
     if nullity == 0 {
         return None;
     }
     let mut range_component = Array1::<f64>::zeros(total_p);
     for k in 0..evals.len() {
-        if evals[k].abs() < cutoff {
+        if evals[k].abs() <= cutoff {
             continue;
         }
         let coeff = evecs.column(k).dot(projected_residual);
@@ -4433,8 +4454,12 @@ pub(crate) fn projected_residual_range_space_inf(
     if !(max_abs.is_finite() && max_abs > 0.0) {
         return None;
     }
-    let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
-    let nullity = evals.iter().filter(|x| x.abs() < cutoff).count();
+    // Keep the convergence projection on the exact same eigenspace as the
+    // joint-Newton step: only machine-null curvature is eligible for null-space
+    // relief. Near-singularity remains diagnostic and never changes the model
+    // stratum or discards a positive penalty mode.
+    let cutoff = joint_hessian_numerical_eigenvalue_floor(max_abs, total_p);
+    let nullity = evals.iter().filter(|x| x.abs() <= cutoff).count();
     if nullity == 0 {
         // No data-unconstrained null space — the range is the whole space, so
         // the strict total-residual refusal already governs. Signal "no relief".
@@ -4446,7 +4471,7 @@ pub(crate) fn projected_residual_range_space_inf(
     // so ‖P_range r‖∞ is read off the reconstructed range component.
     let mut range_component = Array1::<f64>::zeros(total_p);
     for k in 0..evals.len() {
-        if evals[k].abs() < cutoff {
+        if evals[k].abs() <= cutoff {
             continue;
         }
         let coeff = evecs.column(k).dot(projected_residual);
@@ -4458,4 +4483,119 @@ pub(crate) fn projected_residual_range_space_inf(
             .map(|x: &f64| x.abs())
             .fold(0.0_f64, f64::max),
     )
+}
+
+#[cfg(test)]
+mod penalized_hessian_rank_tests {
+    use super::*;
+
+    /// gam#979: a small positive penalty mode is identified coefficient
+    /// curvature, not a gauge. At the survival marginal-slope width (`p=26`),
+    /// condition `2e14` remains safely inside the exact Newton eigensolver's
+    /// machine-rank limit `1 / (sqrt(p) eps) ~= 8.8e14`.
+    ///
+    /// The step and every convergence projection must therefore retain the
+    /// same mode. Historically the step used the machine floor while the two
+    /// projectors used `1e-10 * lambda_max`: Newton moved this coefficient, but
+    /// an identified-subspace exit erased its residual and could call the same
+    /// state gauge-converged.
+    #[test]
+    fn p26_penalty_identified_condition_2e14_mode_is_step_range_not_gauge_979() {
+        const P: usize = 26;
+        const WEAK_CURVATURE: f64 = 5.0e-15;
+        const WEAK_INDEX: usize = P - 1;
+
+        // Likelihood information identifies the first 25 coordinates. The
+        // final coordinate is identified only by a strictly positive penalty,
+        // so ker(H_lik) intersect ker(S) is empty and H_pen is full rank.
+        let mut h_likelihood = Array2::<f64>::eye(P);
+        h_likelihood[[WEAK_INDEX, WEAK_INDEX]] = 0.0;
+        let mut penalty = Array2::<f64>::zeros((P, P));
+        penalty[[WEAK_INDEX, WEAK_INDEX]] = WEAK_CURVATURE;
+        let ranges = vec![(0, P)];
+        let s_lambdas = vec![penalty.clone()];
+        let mut h_penalized = h_likelihood.clone();
+        add_joint_penalty_to_matrix(
+            &mut h_penalized,
+            &ranges,
+            &s_lambdas,
+            0.0,
+            None,
+        );
+
+        let condition = 1.0 / WEAK_CURVATURE;
+        assert!(
+            (condition / 2.0e14 - 1.0).abs() <= 8.0 * f64::EPSILON,
+            "fixture condition must be 2e14, got {condition:.16e}"
+        );
+
+        let mut rhs = Array1::<f64>::zeros(P);
+        rhs[WEAK_INDEX] = 0.25;
+        let metric = Array1::<f64>::ones(P);
+        let spectrum = whitened_spectrum::WhitenedHessianSpectrum::decompose(
+            &h_penalized,
+            &rhs,
+            &metric,
+            KKT_REFUSAL_RANK_TOL,
+        )
+        .expect("diagonal penalized Hessian must decompose");
+        assert!(
+            WEAK_CURVATURE > spectrum.numerical_floor,
+            "positive penalty mode must be machine-resolvable: weak={WEAK_CURVATURE:.16e}, floor={:.16e}",
+            spectrum.numerical_floor,
+        );
+        assert!(
+            WEAK_CURVATURE <= spectrum.null_cutoff,
+            "fixture must remain inside the old conditioning band: weak={WEAK_CURVATURE:.16e}, cutoff={:.16e}",
+            spectrum.null_cutoff,
+        );
+
+        let step = spectrum.trust_region_step(0.5);
+        assert_eq!(
+            step.nullity, 0,
+            "a machine-resolvable penalty mode is not Newton null space"
+        );
+        assert!(
+            step.delta[WEAK_INDEX] > 0.49,
+            "trust-region Newton must move the weak identified coefficient; delta={:?}",
+            step.delta,
+        );
+        assert!(
+            step.delta
+                .slice(ndarray::s![..WEAK_INDEX])
+                .iter()
+                .all(|value| value.abs() <= 1.0e-12),
+            "the diagonal witness has no step on the zero-RHS strong modes; delta={:?}",
+            step.delta,
+        );
+
+        let source = JointHessianSource::Dense(h_likelihood);
+        let ridge_policy = RidgePolicy::solver_only();
+        assert!(
+            projected_residual_range_space_inf(
+                &rhs,
+                &source,
+                &ranges,
+                &s_lambdas,
+                0.0,
+                ridge_policy,
+                P,
+            )
+            .is_none(),
+            "full-rank H_pen must not mint scalar null-space convergence relief"
+        );
+        assert!(
+            projected_residual_range_space_per_block_inf(
+                &rhs,
+                &source,
+                &ranges,
+                &s_lambdas,
+                0.0,
+                ridge_policy,
+                P,
+            )
+            .is_none(),
+            "full-rank H_pen must not mint per-block null-space convergence relief"
+        );
+    }
 }
