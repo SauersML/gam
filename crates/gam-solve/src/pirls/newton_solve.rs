@@ -585,21 +585,9 @@ pub(super) fn solve_newton_direction_dense(
 /// `A' A` or the cancellation-prone normal-equation right-hand side
 /// `A' residual`. Householder QR sees condition `kappa(A)`, whereas forming
 /// the normal equations squares it and can erase stationarity digits when
-/// large score and penalty components cancel.
-#[cfg(test)]
-pub(super) fn solve_newton_direction_from_root(
-    root: &Array2<f64>,
-    root_residual: &Array1<f64>,
-    direction_out: &mut Array1<f64>,
-) -> Result<f64, EstimationError> {
-    solve_newton_direction_from_root_with_firth_hessian(
-        root,
-        root_residual,
-        None,
-        direction_out,
-    )
-}
-
+/// large score and penalty components cancel. When supplied, `firth_hessian`
+/// converts the Fisher direction to the exact objective direction through the
+/// same QR factor without reconstructing `A' A` or the cancelled score.
 pub(super) fn solve_newton_direction_from_root_with_firth_hessian(
     root: &Array2<f64>,
     root_residual: &Array1<f64>,
@@ -798,6 +786,19 @@ fn correct_fisher_direction_for_firth_hessian_from_root_factor(
 mod square_root_solve_tests {
     use super::*;
     use ndarray::array;
+
+    fn solve_newton_direction_from_root(
+        root: &Array2<f64>,
+        root_residual: &Array1<f64>,
+        direction_out: &mut Array1<f64>,
+    ) -> Result<f64, EstimationError> {
+        solve_newton_direction_from_root_with_firth_hessian(
+            root,
+            root_residual,
+            None,
+            direction_out,
+        )
+    }
 
     #[test]
     fn qr_root_solve_preserves_a_weak_rotated_direction() {

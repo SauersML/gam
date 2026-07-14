@@ -108,8 +108,9 @@ pub trait WorkingModel {
     /// therefore `-dᵀHΦd`.
     fn objective_hessian_quadratic_correction(
         &self,
-        _direction: &Array1<f64>,
+        direction: &Array1<f64>,
     ) -> Result<f64, EstimationError> {
+        assert!(array_is_finite(direction));
         Ok(0.0)
     }
 
