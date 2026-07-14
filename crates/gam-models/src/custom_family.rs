@@ -29,7 +29,7 @@ pub use gam_problem::{CustomFamilyError, ParameterBlockSpec, ParameterBlockState
 // `crate::custom_family::{AdditiveBlockJacobian, …}` paths resolving.
 pub use gam_problem::{
     AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, EvalMode, FamilyChannelHessian,
-    FamilyLinearizationState, PenaltyMatrix, RowScaledJacobian, TensorChannelHessian,
+    FamilyLinearizationState, PenaltyMatrix, RowScaledJacobian,
 };
 
 // Pseudo-log-det mode selector for the custom-family Jeffreys/pseudo-logdet path;

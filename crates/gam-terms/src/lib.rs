@@ -46,6 +46,7 @@ pub mod dictionary;
 pub mod geometry;
 pub mod grid_spline_2d;
 pub mod inference;
+mod isotropic_scale;
 pub mod kronecker;
 pub mod latent;
 pub mod penalty_spec;
@@ -65,6 +66,7 @@ pub mod terms {
 /// (`bail_invalid_estim!`) and call sites can reference `crate::EstimationError`.
 pub use gam_problem::EstimationError;
 pub use penalty_spec::{PenaltySpec, validate_penalty_spec_shape};
+pub use isotropic_scale::{IsotropicScale, IsotropicScaleError};
 
 pub use analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp, AnalyticPenaltyRegistry,

@@ -68,7 +68,7 @@ pub use block_role::BlockRole;
 pub use block_spec::{
     AdditiveBlockJacobian, BlockEffectiveJacobian, BlockGeometryDirectionalDerivative,
     BlockWorkingSet, FamilyChannelHessian, FamilyLinearizationState, GaugeComposedJacobian,
-    ParameterBlockSpec, ParameterBlockState, RowScaledJacobian, TensorChannelHessian,
+    ParameterBlockSpec, ParameterBlockState, RowScaledJacobian,
 };
 pub use coefficient_prior_mean::{CoefficientPriorMean, PriorMeanError};
 pub use custom_family_blockwise::{

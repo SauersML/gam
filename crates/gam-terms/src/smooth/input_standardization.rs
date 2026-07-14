@@ -1,14 +1,7 @@
-//! Per-axis input standardization and length-scale compensation helpers for
-//! the spatial smooth arm.
-//!
-//! Pure numeric helpers relocated verbatim from `smooth.rs` (issue #780
-//! decomposition): per-column variance scales, in-place standardization, the
-//! geometric-mean scale, and the kernel length-scale compensation maps that
-//! keep the Matérn/Duchon/thin-plate range in original coordinates after
-//! standardization. No behavior change — bodies are byte-identical and the
-//! parent re-imports each name so every call site is unchanged.
+//! Isotropic input-scale estimation for Euclidean spatial smooths.
 
-use ndarray::{Array2, ArrayView2};
+use crate::{IsotropicScale, basis::BasisError};
+use ndarray::ArrayView2;
 
 /// Compute an **isotropic** input scale for spatial inputs — a single spread
 /// value applied to every covariate axis.
@@ -26,7 +19,7 @@ use ndarray::{Array2, ArrayView2};
 ///
 /// The scale is the ROOT-MEAN-SQUARE of the per-axis standard deviations,
 /// `σ_iso = √( (1/d)·Σ_a Var(x_a) ) = √(tr(Σ)/d)`, applied identically to every
-/// axis (the returned vector holds `d` copies of `σ_iso`). Because `tr(Σ)` is
+/// axis. Because `tr(Σ)` is
 /// invariant under an orthogonal (rotation/reflection) map of the covariates and
 /// dividing every axis by the SAME scalar is a uniform scaling that commutes with
 /// that map, the standardized geometry is a rigid rotation of the un-rotated one.
@@ -42,72 +35,55 @@ use ndarray::{Array2, ArrayView2};
 /// `d = 1` the RMS reduces to the single axis's `σ`, preserving the #1215 behavior
 /// exactly.
 ///
-/// Returns `None` only when there is no axis or too few rows to estimate a
-/// spread, or when the caller already supplies frozen scales (prediction path).
-pub fn compute_spatial_input_scales(x: ArrayView2<'_, f64>) -> Option<Vec<f64>> {
+/// A scale cannot be inferred from an empty, singleton, non-finite, or
+/// zero-spread cloud. Those are invalid geometries, not an identity-scale
+/// fallback.
+pub fn estimate_isotropic_scale(
+    x: ArrayView2<'_, f64>,
+) -> Result<IsotropicScale, BasisError> {
     let d = x.ncols();
     if d == 0 {
-        return None;
+        return Err(BasisError::InvalidInput(
+            "cannot estimate an isotropic scale without a coordinate axis".to_string(),
+        ));
     }
+    if x.nrows() < 2 {
+        return Err(BasisError::InvalidInput(
+            "cannot estimate an isotropic scale from fewer than two rows".to_string(),
+        ));
+    }
+
+    let mut magnitude = 0.0_f64;
+    for &value in x {
+        if !value.is_finite() {
+            return Err(BasisError::InvalidInput(
+                "cannot estimate an isotropic scale from non-finite coordinates".to_string(),
+            ));
+        }
+        magnitude = magnitude.max(value.abs());
+    }
+    if magnitude == 0.0 {
+        return Err(BasisError::InvalidInput(
+            "cannot estimate an isotropic scale from a zero-spread cloud".to_string(),
+        ));
+    }
+
+    // Normalize first so finite input cannot overflow the variance pass. The
+    // normalization cancels algebraically when the final scale is restored.
     let n = x.nrows() as f64;
-    if n < 2.0 {
-        return None;
-    }
     let mut var_sum = 0.0_f64;
     for j in 0..d {
         let col = x.column(j);
-        let mean = col.sum() / n;
-        let var = col.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let mean = col.iter().map(|&value| value / magnitude).sum::<f64>() / n;
+        let var = col
+            .iter()
+            .map(|&value| (value / magnitude - mean).powi(2))
+            .sum::<f64>()
+            / (n - 1.0);
         var_sum += var;
     }
-    let sigma_iso = (var_sum / d as f64).sqrt().max(1e-12);
-    Some(vec![sigma_iso; d])
-}
-
-/// Apply per-column standardization to a data matrix using precomputed scales.
-pub fn apply_input_standardization(x: &mut Array2<f64>, scales: &[f64]) {
-    for j in 0..x.ncols() {
-        let inv = 1.0 / scales[j];
-        x.column_mut(j).mapv_inplace(|v| v * inv);
-    }
-}
-
-/// Geometric mean of strictly positive scales: `(∏ s_a)^(1/d)`.
-///
-/// Computed via log-sum-divide to avoid overflow / underflow when d is large
-/// or when individual scales are small. The Matérn / Duchon / thin-plate
-/// auto-standardization paths use this to compensate the user's
-/// `length_scale` so the kernel range remains expressed in *original* data
-/// coordinates after per-axis division by σ_a:
-///
-///   ‖x_std − c_std‖ / L_eff with L_eff = L_user / σ_geom
-///
-/// matches `‖x − c‖ / L_user` exactly for uniform σ_a (= σ_geom) and reduces
-/// to the natural anisotropic-Mahalanobis preconditioning when σ_a vary —
-/// the convention σ_geom = (∏σ_a)^(1/d) preserves the kernel volume scale.
-fn geometric_mean_scale(scales: &[f64]) -> f64 {
-    if scales.is_empty() {
-        return 1.0;
-    }
-    let log_mean: f64 = scales.iter().map(|&s| s.ln()).sum::<f64>() / scales.len() as f64;
-    log_mean.exp()
-}
-
-pub fn compensate_length_scale_for_standardization(length_scale: f64, scales: &[f64]) -> f64 {
-    let sigma_geom = geometric_mean_scale(scales);
-    if sigma_geom > 0.0 && sigma_geom.is_finite() {
-        length_scale / sigma_geom
-    } else {
-        length_scale
-    }
-}
-
-/// Apply the original-coordinate range pullback to an optional kernel range.
-/// `None` denotes a scale-free kernel (pure Duchon), not an absent/default
-/// value, and therefore remains `None` under every coordinate change.
-pub fn compensate_optional_length_scale_for_standardization(
-    length_scale: Option<f64>,
-    scales: &[f64],
-) -> Option<f64> {
-    length_scale.map(|ell| compensate_length_scale_for_standardization(ell, scales))
+    let sigma = (var_sum / d as f64).sqrt() * magnitude;
+    IsotropicScale::new(sigma).map_err(|error| {
+        BasisError::InvalidInput(format!("cannot realize isotropic input scale: {error}"))
+    })
 }

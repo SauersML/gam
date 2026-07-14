@@ -2871,8 +2871,8 @@ pub struct AuditDriftSummary {
     pub recovered: Vec<String>,
 }
 
-/// Run the channel-aware audit at `beta_current` using `channel_hessian_at`
-/// to refresh W, and compare the result to the pilot audit.
+/// Run the structural audit at `beta_current`, refreshing each effective
+/// Jacobian from the current family state, and compare it to the pilot audit.
 ///
 /// # Drift threshold (T34)
 ///

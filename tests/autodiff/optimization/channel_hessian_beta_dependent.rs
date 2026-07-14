@@ -1,4 +1,4 @@
-//! Tests for identifiability-audit drift and β-independent channel Hessians.
+//! Tests for identifiability-audit drift.
 //!
 //! Verifies that:
 //!
@@ -7,13 +7,11 @@
 //!    (audit_drift_detection_logs_when_rank_changes).
 //! 2. The drift detection is silent when the rank verdict is stable
 //!    (audit_drift_silent_when_rank_stable).
-//! 3. The TensorChannelHessian (β-independent default path) returns the
-//!    same W regardless of β (gaussian_identity_w_is_beta_independent).
 //!
 //! Architecture: all tests are self-contained — no survival family construction,
 //! no cargo --release, no parallel cargo.
 
-use gam::families::custom_family::{FamilyChannelHessian, ParameterBlockSpec};
+use gam::families::custom_family::ParameterBlockSpec;
 use gam::identifiability::audit::{IdentifiabilityAudit, maybe_log_audit_drift};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
@@ -185,76 +183,5 @@ fn audit_drift_silent_when_rank_stable() {
     assert!(
         summary.recovered.is_empty(),
         "no recovered columns expected when rank is stable"
-    );
-}
-
-// ── β-independent channel Hessian ─────────────────────────────────────────
-
-/// The default `channel_hessian_at` implementation (used by families whose
-/// W is β-independent) must return the same tensor regardless of β.
-///
-/// We construct a `TensorChannelHessian` (the default-impl wrapper) with a
-/// known 2×2 per-subject tensor and verify that two calls with different β
-/// produce identical outputs.
-#[test]
-fn gaussian_identity_w_is_beta_independent() {
-    use gam::families::custom_family::TensorChannelHessian;
-
-    let n = 4;
-    let k = 2;
-
-    // Build a (4, 2, 2) tensor with non-trivial values.
-    let mut h = ndarray::Array3::<f64>::zeros((n, k, k));
-    for i in 0..n {
-        h[[i, 0, 0]] = (i as f64) + 1.0;
-        h[[i, 1, 1]] = (i as f64) + 2.0;
-        h[[i, 0, 1]] = 0.1;
-        h[[i, 1, 0]] = 0.1;
-    }
-
-    let w = TensorChannelHessian { h: h.clone() };
-
-    // Call 1: beta = [0, 0], no scalars.
-    let w_at_0 = w
-        .channel_hessian_at(&[0.0, 0.0], None)
-        .expect("channel_hessian_at beta=0 failed");
-    let tensor_0 = w_at_0.evaluate_full();
-
-    // Call 2: beta = [5.0, -3.0], no scalars (still β-independent).
-    let w_at_b = w
-        .channel_hessian_at(&[5.0, -3.0], None)
-        .expect("channel_hessian_at beta=[5,-3] failed");
-    let tensor_b = w_at_b.evaluate_full();
-
-    // Both must equal the original tensor exactly.
-    let max_diff_0 = h
-        .iter()
-        .zip(tensor_0.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        max_diff_0 < 1e-14,
-        "TensorChannelHessian at beta=0 differs from original: max_diff={max_diff_0}"
-    );
-
-    let max_diff_b = h
-        .iter()
-        .zip(tensor_b.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        max_diff_b < 1e-14,
-        "TensorChannelHessian at beta=[5,-3] differs from original: max_diff={max_diff_b}"
-    );
-
-    // Also verify the two are identical to each other (β-independence).
-    let max_diff_ab = tensor_0
-        .iter()
-        .zip(tensor_b.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        max_diff_ab < 1e-14,
-        "TensorChannelHessian should be identical at different β values; max_diff={max_diff_ab}"
     );
 }

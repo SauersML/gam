@@ -8,6 +8,54 @@ use super::hessian_paths::*;
 use super::row_kernel::*;
 use super::*;
 
+/// Returns the explicit-psi Jeffreys context only when the authoritative
+/// reduced-space plan says that the Jeffreys correction is active.
+///
+/// Keeping this gate ahead of psi information assembly prevents an inactive
+/// correction from materializing derivative operators for every beta axis.
+fn active_explicit_psi_jeffreys_context(
+    h_info: Array2<f64>,
+    expected_dim: usize,
+) -> Result<Option<(Array2<f64>, Array2<f64>)>, String> {
+    if h_info.dim() != (expected_dim, expected_dim) {
+        return Ok(None);
+    }
+
+    let z_joint = Array2::<f64>::eye(expected_dim);
+    let plan =
+        gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+            h_info.view(),
+            z_joint.view(),
+        )?;
+    if !plan.is_active() {
+        return Ok(None);
+    }
+
+    Ok(Some((z_joint, h_info)))
+}
+
+#[cfg(test)]
+mod explicit_psi_jeffreys_plan_tests {
+    use super::*;
+
+    #[test]
+    fn reduced_plan_gates_explicit_psi_jeffreys_context() {
+        let mut well_conditioned = Array2::<f64>::zeros((2, 2));
+        well_conditioned[[0, 0]] = 32.0;
+        well_conditioned[[1, 1]] = 64.0;
+        assert!(active_explicit_psi_jeffreys_context(well_conditioned, 2)
+            .expect("well-conditioned plan preparation should succeed")
+            .is_none());
+
+        let mut near_singular = Array2::<f64>::zeros((2, 2));
+        near_singular[[0, 0]] = 1.0e-10;
+        near_singular[[1, 1]] = 64.0;
+        assert!(active_explicit_psi_jeffreys_context(near_singular, 2)
+            .expect("near-singular plan preparation should succeed")
+            .is_some());
+    }
+}
+
 impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn outer_derivative_pilot_schedule(
         &self,
@@ -506,12 +554,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 .joint_jeffreys_term_required()
                 && derivative_blocks.iter().any(|block| !block.is_empty())
             {
-                match self.joint_jeffreys_information_with_specs(block_states, specs)? {
-                    Some(h_info) if h_info.nrows() == total && h_info.ncols() == total => {
-                        Some((Array2::<f64>::eye(total), h_info))
-                    }
-                    _ => None,
-                }
+            match self.joint_jeffreys_information_with_specs(block_states, specs)? {
+                Some(h_info) => active_explicit_psi_jeffreys_context(h_info, total)?,
+                None => None,
+            }
             } else {
                 None
             };

@@ -264,58 +264,6 @@ impl LogslopeLayout {
         Ok(values)
     }
 
-    /// Stream the physical-channel coefficient Jacobian for a row range.
-    ///
-    /// `out` is row-major in the primary channel: row
-    /// `local_row * score_dim + channel` contains the full current-coordinate
-    /// row `∂g_channel/∂β`. Offsets do not enter these rows. A caller can select
-    /// a contiguous coefficient sub-range without materialising the complete
-    /// `(n × p × K)` tensor.
-    pub(crate) fn fill_primary_jacobian_rows(
-        &self,
-        score_dim: usize,
-        rows: std::ops::Range<usize>,
-        columns: std::ops::Range<usize>,
-        out: &mut Array2<f64>,
-    ) -> Result<(), String> {
-        self.validate_for(score_dim)?;
-        if rows.end < rows.start || rows.end > self.nrows {
-            return Err(format!(
-                "logslope primary-Jacobian row range {:?} is outside 0..{}",
-                rows, self.nrows,
-            ));
-        }
-        if columns.end < columns.start || columns.end > self.current_width {
-            return Err(format!(
-                "logslope primary-Jacobian column range {:?} is outside 0..{}",
-                columns, self.current_width,
-            ));
-        }
-        let chunk = rows.len();
-        if out.dim() != (chunk * score_dim, columns.len()) {
-            return Err(format!(
-                "logslope primary-Jacobian output is {}x{}, expected {}x{}",
-                out.nrows(),
-                out.ncols(),
-                chunk * score_dim,
-                columns.len(),
-            ));
-        }
-        let zero_beta = Array1::<f64>::zeros(self.current_width);
-        let mut workspace = self.row_workspace(score_dim)?;
-        for row in rows.clone() {
-            self.fill_callback_row(row, zero_beta.view(), &mut workspace)?;
-            let local_row = row - rows.start;
-            for channel in 0..score_dim {
-                for (local_col, current_col) in columns.clone().enumerate() {
-                    out[[local_row * score_dim + channel, local_col]] =
-                        workspace.channel_rows[[channel, current_col]];
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn fill_shared_values(
         &self,
         value: f64,
