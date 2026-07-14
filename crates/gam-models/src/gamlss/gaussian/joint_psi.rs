@@ -428,8 +428,11 @@ pub(crate) type GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace =
 #[derive(Clone)]
 pub struct GaussianJointRowScalars {
     pub(crate) obs_weight: Array1<f64>,
+    #[cfg(test)]
     pub(crate) w: Array1<f64>,
+    #[cfg(test)]
     pub(crate) m: Array1<f64>,
+    #[cfg(test)]
     pub(crate) n: Array1<f64>,
     /// Stable `(y - mu) / sigma` at the expansion point.
     pub(crate) standardized_residual: Array1<f64>,
@@ -442,9 +445,11 @@ pub struct GaussianJointRowScalars {
     /// κ' = dκ/dη_ls = κ(1−κ) for the logb link. The static H_{ls,ls} block
     /// carries a κ'·(a−n) term, so κ' threads through every dH directional
     /// weight via the chain rule.
+    #[cfg(test)]
     pub(crate) kappa_prime: Array1<f64>,
     /// κ'' = κ(1−κ)(1−2κ); appears in d²H_{ls,ls} via the second
     /// η-derivative of κ'·(a−n).
+    #[cfg(test)]
     pub(crate) kappa_dprime: Array1<f64>,
 }
 
@@ -909,13 +914,18 @@ pub(crate) fn gaussian_jointrow_scalars(
         .into());
     }
     let mut obs_weight = Array1::<f64>::uninit(nobs);
+    #[cfg(test)]
     let mut w = Array1::<f64>::uninit(nobs);
+    #[cfg(test)]
     let mut m = Array1::<f64>::uninit(nobs);
+    #[cfg(test)]
     let mut n = Array1::<f64>::uninit(nobs);
     let mut standardized_residual = Array1::<f64>::uninit(nobs);
     let mut inv_sigma = Array1::<f64>::uninit(nobs);
     let mut kappa = Array1::<f64>::uninit(nobs);
+    #[cfg(test)]
     let mut kappa_prime = Array1::<f64>::uninit(nobs);
+    #[cfg(test)]
     let mut kappa_dprime = Array1::<f64>::uninit(nobs);
     let ln2pi = (2.0 * std::f64::consts::PI).ln();
     // Compute into an indexed temporary first. Parallel collection preserves
@@ -928,40 +938,55 @@ pub(crate) fn gaussian_jointrow_scalars(
     for (i, row) in certified.into_iter().enumerate() {
         let row = row?;
         obs_weight[i].write(weights[i]);
+        #[cfg(test)]
         w[i].write(row.joint_w);
+        #[cfg(test)]
         m[i].write(row.joint_m);
+        #[cfg(test)]
         n[i].write(row.joint_n);
         standardized_residual[i].write(row.standardized_residual);
         inv_sigma[i].write(row.inv_sigma);
         kappa[i].write(row.kappa);
+        #[cfg(test)]
         kappa_prime[i].write(row.kappa_prime);
+        #[cfg(test)]
         kappa_dprime[i].write(row.kappa_dprime);
     }
     // SAFETY: every `MaybeUninit` slot in each of these arrays was written
     // exactly once in the `for i in 0..nobs` loop above; no slot is read,
     // moved, or dropped before this point.
-    let (obs_weight, w, m, n, standardized_residual, inv_sigma, kappa, kappa_prime, kappa_dprime) = unsafe {
+    let (obs_weight, standardized_residual, inv_sigma, kappa) = unsafe {
         (
             obs_weight.assume_init(),
-            w.assume_init(),
-            m.assume_init(),
-            n.assume_init(),
             standardized_residual.assume_init(),
             inv_sigma.assume_init(),
             kappa.assume_init(),
+        )
+    };
+    #[cfg(test)]
+    let (w, m, n, kappa_prime, kappa_dprime) = unsafe {
+        (
+            w.assume_init(),
+            m.assume_init(),
+            n.assume_init(),
             kappa_prime.assume_init(),
             kappa_dprime.assume_init(),
         )
     };
     Ok(GaussianJointRowScalars {
         obs_weight,
+        #[cfg(test)]
         w,
+        #[cfg(test)]
         m,
+        #[cfg(test)]
         n,
         standardized_residual,
         inv_sigma,
         kappa,
+        #[cfg(test)]
         kappa_prime,
+        #[cfg(test)]
         kappa_dprime,
     })
 }

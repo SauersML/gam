@@ -22,15 +22,6 @@ pub enum SurvivalMarginalSlopeBaselineHyperSpec {
     },
 }
 
-impl SurvivalMarginalSlopeBaselineHyperSpec {
-    pub(crate) fn initial_theta(&self) -> Option<&Array1<f64>> {
-        match self {
-            Self::Linear { .. } => None,
-            Self::Nonlinear { chart } => Some(chart.initial_theta()),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct SurvivalMarginalSlopeTermSpec {
     pub age_entry: Array1<f64>,

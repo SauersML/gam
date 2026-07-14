@@ -41,7 +41,8 @@ use cudarc::driver::{CudaContext, CudaModule, CudaStream};
 /// buffer in device memory (`CudaSlice<f64>`). Caller may pass the
 /// returned slice directly to any kernel launch on the same default
 /// stream (e.g. `bms_flex_row_kernel`). Returns `Ok(None)` when no CUDA
-/// runtime is available (caller should fall back to the host substrate).
+/// runtime is available (the caller treats the requested device route as
+/// unavailable; this API does not substitute host execution).
 /// Returns `Err` on a genuine driver / NVRTC / shape failure that the
 /// caller must surface.
 #[cfg(target_os = "linux")]

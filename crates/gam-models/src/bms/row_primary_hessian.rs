@@ -1760,6 +1760,7 @@ impl BernoulliMarginalSlopeFamily {
                     // the row kernel.
                     Some(d_moments)
                 }
+                #[cfg(test)]
                 CubicCellDerivativeMomentOutput::Host { .. } => {
                     return Err(
                         "bms_flex_row device-moment build downgraded to host residency".to_string(),

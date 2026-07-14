@@ -120,20 +120,6 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
     }
 
     #[inline]
-    fn primary_dimension(&self) -> usize {
-        2 + self.beta_w.len()
-    }
-
-    #[inline]
-    fn basis_stack(&self, row: usize, column: usize) -> [f64; 5] {
-        let mut stack = [0.0; 5];
-        for (order, basis) in self.basis_derivatives.iter().enumerate() {
-            stack[order] = basis[[row, column]];
-        }
-        stack
-    }
-
-    #[inline]
     fn linear_basis_stack(
         &self,
         row: usize,

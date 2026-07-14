@@ -37,11 +37,13 @@
 
 pub(crate) mod branch;
 pub(crate) mod device;
+#[cfg(test)]
 pub(crate) mod host_substrate;
 pub(crate) mod kernel_src;
 
 use gam_gpu::gpu_error::GpuError;
 
+#[cfg(test)]
 pub(crate) use host_substrate::build_host_cell_status;
 
 /// Maximum derivative-moment degree the substrate is built to evaluate.
@@ -87,11 +89,12 @@ pub(crate) enum GpuCellBranchTag {
 pub(crate) enum CubicCellMomentResidency {
     /// Materialize moments into a host `Vec<f64>` (parity reference; works on
     /// every platform).
+    #[cfg(test)]
     Host,
     /// Materialize moments into a device-resident `CudaSlice<f64>` on the
     /// shared cubic-cell context. Linux+CUDA only; on other platforms this
-    /// variant degrades to `Host`-shaped output through the host substrate
-    /// (no silent device claim).
+    /// absence is returned as `None`; callers decide whether the requested
+    /// GPU route is admissible.
     #[cfg(target_os = "linux")]
     Device,
 }
@@ -135,11 +138,11 @@ pub(crate) enum CubicCellDerivativeMomentOutput {
     /// `build_host_moments` directly when needed (e.g. parity tests). The
     /// Device variant below carries the moments because the device kernel
     /// hands them back as a residency-bound buffer.
+    #[cfg(test)]
     Host { status: Vec<u8> },
     /// Device-resident moments on the cubic-cell backend's shared CUDA
-    /// context. Linux-only — non-Linux callers see the `Host` variant even
-    /// when they request `Device` residency. Layout matches `Host` so
-    /// `d_moments` is a row-major `[n_cells, stride]` `CudaSlice<f64>`. The
+    /// context. Linux-only. `d_moments` is a row-major
+    /// `[n_cells, stride]` `CudaSlice<f64>`. The
     /// host-side `status` vector mirrors the per-cell device status so
     /// downstream branching decisions never have to round-trip from the
     /// device.
@@ -154,7 +157,7 @@ pub(crate) enum CubicCellDerivativeMomentOutput {
 
 /// Try to build derivative moments via the substrate.
 ///
-/// * `Host` residency: routes through the CPU classifier and returns
+/// * Test-only `Host` residency: routes through the CPU classifier and returns
 ///   per-cell status only. Production consumers read the verdict and feed
 ///   moments from their own evaluator (LRU cache for BMS row-primary
 ///   Hessian, dedicated host buffer for survival-flex). The full moment
@@ -165,9 +168,9 @@ pub(crate) enum CubicCellDerivativeMomentOutput {
 /// * `Device` residency: on Linux+CUDA with a probed runtime, the device
 ///   dispatcher launches the NVRTC kernel for the NonAffineFinite bucket
 ///   and CPU-evaluates the Affine/AffineTail buckets, packing both back
-///   into a `Device { … }` output for the caller. When the runtime is
-///   unavailable the caller receives a `Host { status }` output instead —
-///   no silent device claim.
+///   into a `Device { … }` output for the caller. An unavailable runtime
+///   returns `None`; a device request is never silently changed into a host
+///   computation.
 ///
 /// Returns `Ok(None)` only when the workload is empty.
 ///
@@ -193,23 +196,14 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
     }
 
     match input.residency {
+        #[cfg(test)]
         CubicCellMomentResidency::Host => {
             let status = build_host_cell_status(&input)
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
             Ok(Some(CubicCellDerivativeMomentOutput::Host { status }))
         }
         #[cfg(target_os = "linux")]
-        CubicCellMomentResidency::Device => {
-            if let Some(device_batch) = device::try_device_moments_resident(&input)? {
-                return Ok(Some(device_batch));
-            }
-            // Non-Linux, or no usable runtime: fall back to the host shape so
-            // the caller has a parity-shaped result instead of a phantom
-            // device claim.
-            let status = build_host_cell_status(&input)
-                .map_err(|reason| GpuError::DriverCallFailed { reason })?;
-            Ok(Some(CubicCellDerivativeMomentOutput::Host { status }))
-        }
+        CubicCellMomentResidency::Device => device::try_device_moments_resident(&input),
     }
 }
 
