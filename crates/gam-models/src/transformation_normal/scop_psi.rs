@@ -89,9 +89,11 @@ impl TransformationNormalFamily {
                 alpha_psi[k] = beta_mat.row(k).dot(&psi_row);
             }
 
+            let mut h_psi = 0.0;
             let mut hp_psi = 0.0;
             let mut endpoint_psi = [0.0; 2];
             for k in 0..p_resp {
+                h_psi += rv[k] * alpha_psi[k];
                 hp_psi += rd[k] * alpha_psi[k];
                 endpoint_psi[0] += endpoint_basis[0][k] * alpha_psi[k];
                 endpoint_psi[1] += endpoint_basis[1][k] * alpha_psi[k];
@@ -255,7 +257,6 @@ impl TransformationNormalFamily {
             // through the deformed design row (`alpha_psi_dir`).
             let mut h_dir = 0.0;
             let mut hp_dir = 0.0;
-            let mut h_psi = 0.0;
             let mut hp_psi = 0.0;
             let mut h_psi_dir = 0.0;
             let mut hp_psi_dir = 0.0;
@@ -265,7 +266,6 @@ impl TransformationNormalFamily {
             for k in 0..p_resp {
                 h_dir += rv[k] * alpha_dir[k];
                 hp_dir += rd[k] * alpha_dir[k];
-                h_psi += rv[k] * alpha_psi[k];
                 hp_psi += rd[k] * alpha_psi[k];
                 h_psi_dir += rv[k] * alpha_psi_dir[k];
                 hp_psi_dir += rd[k] * alpha_psi_dir[k];
