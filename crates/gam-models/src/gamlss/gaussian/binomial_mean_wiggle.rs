@@ -1417,7 +1417,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        hyper_layout: &CustomFamilyHyperLayout,
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
         psi_index: usize,
     ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         if hyper_layout.family_axis_count() != 0 {

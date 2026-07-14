@@ -3791,8 +3791,6 @@ impl SurvivalMarginalSlopeFamily {
 // scalar-FD sanity gate (the last FD-limited seam in the #932 tower). It is an
 // ORACLE only — never used on the production sweep — so it lives beside, not
 // inside, the p-primary jet types.
-#[cfg(test)]
-use gam_math::nested_dual::Dual22;
 use gam_math::nested_dual::{Dual2, JetField};
 
 #[cfg(test)]
@@ -3800,6 +3798,7 @@ mod moment_engine_tests {
     use super::*;
     use crate::cubic_cell_kernel::{DenestedCubicCell, reduce_sextic_moments};
     use crate::marginal_slope_shared::eval_coeff4_at;
+    use gam_math::nested_dual::Dual22;
     use gam_math::jet_scalar::{Order2, filtered_implicit_solve_scalar};
     use gam_math::jet_tower::Tower2;
     use std::hint::black_box;

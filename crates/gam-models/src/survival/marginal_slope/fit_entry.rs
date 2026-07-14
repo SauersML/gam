@@ -52,7 +52,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             scale: FrailtyScale::Fixed { sigma },
         } => (Some(*sigma), None, None),
         FrailtySpec::GaussianShift {
-            scale @ FrailtyScale::Learned { initial_sigma },
+            scale: scale @ FrailtyScale::Learned { initial_sigma },
         } => (
             Some(*initial_sigma),
             Some(*initial_sigma),
