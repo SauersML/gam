@@ -42,19 +42,6 @@ pub fn check_cuda(result: CuResult, name: &str) -> Result<(), GpuError> {
     }
 }
 
-/// Returns whether the platform loader can open a CUDA driver library.
-///
-/// This deliberately uses gam's own `libloading` probe rather than
-/// `cudarc::driver::sys::is_culib_present()`: cudarc 0.19's generated
-/// dynamic-loader helpers are exactly what emit the noisy
-/// `panic_no_lib_found` message when a CPU-only host lacks `libcuda`.
-/// Runtime availability checks need to stay completely outside cudarc until
-/// this function has established that the driver shared library exists.
-#[must_use]
-pub fn cuda_driver_library_present() -> bool {
-    load_library_names(&cuda_library_candidate_names()).is_ok()
-}
-
 /// Bind to a CUDA driver that is ALREADY RESIDENT in this process, if any.
 ///
 /// `RTLD_NOLOAD` makes `dlopen` return a handle only when some other
@@ -86,17 +73,58 @@ fn load_library_names(candidates: &[String]) -> Result<Library, GpuError> {
     if let Some(resident) = already_resident_cuda_driver() {
         return Ok(resident);
     }
+    let mut load_faults = Vec::new();
     for candidate in candidates {
         // SAFETY: Library::new runs the library's loader initializer; we
         // only pass CUDA driver candidates discovered from fixed NVIDIA
         // driver directories or canonical libcuda sonames.
-        if let Ok(library) = unsafe { Library::new(candidate) } {
-            return Ok(library);
+        match unsafe { Library::new(candidate) } {
+            Ok(library) => return Ok(library),
+            Err(error) => {
+                let candidate_present = Path::new(candidate).components().count() > 1
+                    && std::fs::symlink_metadata(candidate).is_ok();
+                if !load_failure_is_candidate_absence(
+                    candidate,
+                    candidate_present,
+                    &error.to_string(),
+                ) {
+                    load_faults.push(format!("{candidate}: {error}"));
+                }
+            }
         }
+    }
+    if !load_faults.is_empty() {
+        return Err(GpuError::DriverLibraryLoadFailed {
+            reason: format!(
+                "CUDA library candidates were found but failed to load: {}",
+                load_faults.join("; ")
+            ),
+        });
     }
     Err(GpuError::DriverLibraryUnavailable {
         reason: format!("could not load any of: {}", candidates.join(", ")),
     })
+}
+
+/// True only when a failed loader attempt proves that the requested candidate
+/// itself is absent. A named object that exists but is corrupt, ABI-incompatible,
+/// or missing a transitive dependency is a load fault. For bare sonames, glibc's
+/// missing-object diagnostic begins with the requested soname; a missing
+/// transitive dependency begins with that dependency instead and is therefore
+/// deliberately not classified as absence.
+fn load_failure_is_candidate_absence(
+    candidate: &str,
+    candidate_present: bool,
+    message: &str,
+) -> bool {
+    if Path::new(candidate).components().count() > 1 {
+        return !candidate_present;
+    }
+    let missing_object = message.starts_with(candidate)
+        && (message.contains("No such file or directory")
+            || message.contains("cannot open shared object file")
+            || message.contains("image not found"));
+    missing_object
 }
 
 fn load_static_cuda_driver_library() -> Result<&'static Library, GpuError> {
@@ -107,15 +135,62 @@ fn load_static_cuda_driver_library() -> Result<&'static Library, GpuError> {
         .map_err(Clone::clone)
 }
 
-pub fn preload_cuda_driver() -> Result<(), String> {
-    static PRELOAD: OnceLock<Result<(), String>> = OnceLock::new();
+pub fn preload_cuda_driver() -> Result<(), GpuError> {
+    static PRELOAD: OnceLock<Result<(), GpuError>> = OnceLock::new();
     PRELOAD
-        .get_or_init(|| {
-            load_static_cuda_driver_library()
-                .map(|_| ())
-                .map_err(|err| err.to_string())
-        })
+        .get_or_init(|| load_static_cuda_driver_library().map(|_| ()))
         .clone()
+}
+
+/// Lossless CUDA-driver presence probe. `Ok(false)` means every candidate was
+/// genuinely absent; loader/ABI/transitive-dependency faults remain `Err`.
+pub fn cuda_driver_available() -> Result<bool, GpuError> {
+    match preload_cuda_driver() {
+        Ok(()) => Ok(true),
+        Err(GpuError::DriverLibraryUnavailable { .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod loader_classification_tests {
+    use super::load_failure_is_candidate_absence;
+
+    #[test]
+    fn missing_bare_soname_is_absence() {
+        assert!(load_failure_is_candidate_absence(
+            "libcuda.so.1",
+            false,
+            "libcuda.so.1: cannot open shared object file: No such file or directory",
+        ));
+    }
+
+    #[test]
+    fn missing_transitive_dependency_is_a_load_fault() {
+        assert!(!load_failure_is_candidate_absence(
+            "libcuda.so.1",
+            false,
+            "libnvidia-fatbinaryloader.so.555: cannot open shared object file: No such file or directory",
+        ));
+    }
+
+    #[test]
+    fn present_but_invalid_absolute_candidate_is_a_load_fault() {
+        assert!(!load_failure_is_candidate_absence(
+            "/opt/cuda/libcuda.so.1",
+            true,
+            "/opt/cuda/libcuda.so.1: invalid ELF header",
+        ));
+    }
+
+    #[test]
+    fn absent_absolute_candidate_is_absence() {
+        assert!(load_failure_is_candidate_absence(
+            "/opt/cuda/libcuda.so.1",
+            false,
+            "/opt/cuda/libcuda.so.1: cannot open shared object file: No such file or directory",
+        ));
+    }
 }
 
 #[cfg(target_os = "linux")]

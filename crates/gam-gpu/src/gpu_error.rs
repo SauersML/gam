@@ -17,6 +17,11 @@ pub enum GpuError {
     /// `libcuda.dylib`) or one of its sibling stubs (cuSOLVER, cuSPARSE)
     /// could not be loaded from any of the searched candidates.
     DriverLibraryUnavailable { reason: String },
+    /// A CUDA driver candidate exists or resolves through the platform loader,
+    /// but `dlopen`/`LoadLibrary` rejected it (invalid ABI, corrupt object,
+    /// missing transitive dependency, or loader-initializer failure). This is
+    /// a broken installation, never ordinary hardware absence.
+    DriverLibraryLoadFailed { reason: String },
     /// The CUDA driver is present, but a mandatory runtime dependency such as
     /// cuBLAS, cuSOLVER, or cuSPARSE is missing. This is an installation fault,
     /// not the ordinary "this host has no CUDA device" absence state.
@@ -52,6 +57,7 @@ impl std::fmt::Display for GpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DriverLibraryUnavailable { reason }
+            | Self::DriverLibraryLoadFailed { reason }
             | Self::RuntimeDependencyUnavailable { reason }
             | Self::DriverSymbolMissing { reason }
             | Self::DriverCallFailed { reason }

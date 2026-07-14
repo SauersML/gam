@@ -490,7 +490,9 @@ pub(super) fn solve_newton_direction_dense(
         *direction_out = Array1::zeros(gradient.len());
     }
 
-    if gam_gpu::cuda_selected() {
+    if gam_gpu::cuda_selected()
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?
+    {
         let rhs = Array2::from_shape_vec((p, 1), gradient.to_vec()).map_err(|e| {
             EstimationError::InvalidInput(format!("CUDA PIRLS RHS layout failed: {e}"))
         })?;

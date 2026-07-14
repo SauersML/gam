@@ -1611,7 +1611,7 @@ pub struct MultiplexedFit {
 /// many color-/qwen-arm fits at once — the cross-fit batch where the 1e5–1e6×
 /// race speedup materialises.
 ///
-/// The GPU runtime singleton (`GpuRuntime::global`) and per-ordinal context
+/// The process-wide typed GPU availability cache and per-ordinal context
 /// cache are warmed by constructing the resident workspaces (each `new` calls
 /// the same probe), so the per-fit calls inside the Rayon scope only *read* the
 /// already-initialised `OnceLock`s — they never trigger a `get_or_init` whose
@@ -2174,7 +2174,11 @@ mod tests {
             // device-PCG skip-pass class, eee12f6b2). Fail loud unless this is a
             // genuinely CPU-only host.
             assert!(
-                gam_gpu::device_runtime::GpuRuntime::global().is_none(),
+                gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+                    .unwrap_or_else(|error| {
+                        panic!("GPU probe fault in resident SAE engagement test: {error}")
+                    })
+                    .is_none(),
                 "device_resident() is false on a host WITH a CUDA runtime present, \
                  despite a floor-clearing fixture (batch=8): the resident device \
                  buffers failed to bind — a real device fault, not a CPU-only skip."

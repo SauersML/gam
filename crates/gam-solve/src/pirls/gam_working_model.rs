@@ -393,7 +393,9 @@ impl<'a> GamWorkingModel<'a> {
                 } else {
                     workspace.hessian_buf.fill(0.0);
                 }
-                if gam_gpu::cuda_selected() {
+                if gam_gpu::cuda_selected()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?
+                {
                     // #1412: keep the n×p design `X` device-resident across the
                     // inner P-IRLS iterates. The Gram is rebuilt once per
                     // Newton/LM iterate with the SAME `X` (only `w` moves), so
@@ -435,7 +437,8 @@ impl<'a> GamWorkingModel<'a> {
                 let gpu_decision = gam_gpu::decide(
                     gam_gpu::GpuKernel::DenseXtWX,
                     gam_gpu::GpuEligibility::BackendNotCompiled,
-                );
+                )
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                 gpu_decision
                     .require_supported()
                     .map_err(EstimationError::InvalidInput)?;

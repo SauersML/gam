@@ -60,6 +60,19 @@ pub enum ArrowSchurGpuFailure {
     },
 }
 
+/// Resolve the configured runtime without conflating probe faults with an
+/// ordinary device decline. The existing GPU failure surface has a diagnostic
+/// string variant, so faults flow through it; only typed Auto/Off absence
+/// remains `Ok(None)` and may become `Unavailable` at a caller-specific gate.
+fn resolve_runtime_for_device_path(
+) -> Result<Option<&'static gam_gpu::GpuRuntime>, ArrowSchurGpuFailure> {
+    gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy()).map_err(|error| {
+        ArrowSchurGpuFailure::SchurFactorFailed {
+            reason: format!("GPU runtime resolution failed: {error}"),
+        }
+    })
+}
+
 /// Relative rounding margin (multiplier on `diag_scale · √ε`) added on top of
 /// the deficit-clearing shift in [`ridge_bump_to_make_pd`].
 ///
@@ -279,7 +292,7 @@ pub fn solve_arrow_newton_step(
         // dependent TRSM+GEMM on each tile's own stream, so no on-stream solve is
         // orphaned. On `Unavailable` (one device, shape below policy, transient)
         // fall through to the single-device fused / Layer-A paths below.
-        if gam_gpu::device_runtime::GpuRuntime::global()
+        if resolve_runtime_for_device_path()?
             .map(gam_gpu::device_runtime::GpuRuntime::device_count)
             .unwrap_or(0)
             > 1
@@ -1613,7 +1626,7 @@ mod cuda {
             return Err(ArrowSchurGpuFailure::Unavailable);
         }
 
-        let runtime = gam_gpu::device_runtime::GpuRuntime::global()
+        let runtime = resolve_runtime_for_device_path()?
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         if runtime.device_count() < 2 {
             return Err(ArrowSchurGpuFailure::Unavailable);
@@ -5195,7 +5208,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         // No offload-policy filter here: the seam exists to validate the kernel on
         // ANY device, including the smallest hand-checkable fixture.
-        let runtime = gam_gpu::device_runtime::GpuRuntime::global()
+        let runtime = super::resolve_runtime_for_device_path()?
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
@@ -5246,7 +5259,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             .frame
             .as_ref()
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let runtime = gam_gpu::device_runtime::GpuRuntime::global()
+        let runtime = super::resolve_runtime_for_device_path()?
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
@@ -5298,7 +5311,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             .frame
             .as_ref()
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let runtime = gam_gpu::device_runtime::GpuRuntime::global()
+        let runtime = super::resolve_runtime_for_device_path()?
             .filter(|rt| {
                 rt.policy().reduced_schur_matvec_should_offload(
                     sys.rows.len(),
@@ -5510,14 +5523,18 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             if sys.k == 0 || data.beta_dim != sys.k {
                 return None;
             }
-            let runtime = gam_gpu::device_runtime::GpuRuntime::global().filter(|rt| {
-                rt.policy().reduced_schur_matvec_should_offload(
-                    sys.rows.len(),
-                    sys.k,
-                    sys.d,
-                    cg_iters,
-                )
-            })?;
+            let runtime = super::resolve_runtime_for_device_path()
+                .unwrap_or_else(|failure| {
+                    panic!("resident SAE frame runtime resolution failed: {failure:?}")
+                })
+                .filter(|rt| {
+                    rt.policy().reduced_schur_matvec_should_offload(
+                        sys.rows.len(),
+                        sys.k,
+                        sys.d,
+                        cg_iters,
+                    )
+                })?;
             let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)?;
             let stream = ctx.new_stream().ok()?;
             let host = super::flatten_frame_host_operands(sys, data, frame).ok()?;
@@ -5757,7 +5774,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         // modest-`d` LLM shapes register the real `n × k × d × cg_iters` arithmetic.
         // Kernels and numerics are untouched; only where the matvec runs changes,
         // and the host falls back to the bit-identical CPU matvec when this declines.
-        let runtime = gam_gpu::device_runtime::GpuRuntime::global()
+        let runtime = super::resolve_runtime_for_device_path()?
             .filter(|rt| {
                 rt.policy().reduced_schur_matvec_should_offload(
                     sys.rows.len(),
@@ -6447,7 +6464,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 .frame
                 .as_ref()
                 .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-            let runtime = gam_gpu::device_runtime::GpuRuntime::global()
+            let runtime = super::resolve_runtime_for_device_path()?
                 .ok_or(ArrowSchurGpuFailure::Unavailable)?;
             let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
                 .ok_or(ArrowSchurGpuFailure::Unavailable)?;
@@ -6482,7 +6499,10 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         /// kernel stage. Skips cleanly off-device.
         #[test]
         fn framed_sae_device_matvec_stage_diff_tiny_1551() {
-            if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+            if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+                .unwrap_or_else(|error| panic!("GPU probe fault in framed matvec test: {error}"))
+                .is_none()
+            {
                 return;
             }
             let p = 3usize;
@@ -6858,7 +6878,11 @@ mod tests {
             // variant is folded into the assert message as the diagnostic.
             Err(failure) => {
                 assert!(
-                    gam_gpu::device_runtime::GpuRuntime::global().is_none(),
+                    gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+                        .unwrap_or_else(|error| {
+                            panic!("GPU probe fault in reduced-beta PCG test: {error}")
+                        })
+                        .is_none(),
                     "#1017: CUDA device present but the device reduced-beta PCG \
                      declined/faulted instead of returning a result (tag: {failure:?}) — \
                      the kernel does not run correctly on GPU"
@@ -7736,7 +7760,11 @@ mod tests {
                 // The exact `ArrowSchurGpuFailure` variant is folded into the assert.
                 Err(failure) => {
                     assert!(
-                        gam_gpu::device_runtime::GpuRuntime::global().is_none(),
+                        gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+                            .unwrap_or_else(|error| {
+                                panic!("GPU probe fault in framed PCG test: {error}")
+                            })
+                            .is_none(),
                         "#1017: CUDA device present but the framed device SAE PCG \
                      declined/faulted instead of returning a result (tag: {failure:?}) — \
                      the kernel does not run correctly on GPU"
@@ -8108,7 +8136,11 @@ mod tests {
                     // (which deliberately ignores the offload floor) means the
                     // framed matvec kernel does not run on GPU.
                     assert!(
-                        gam_gpu::device_runtime::GpuRuntime::global().is_none(),
+                        gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+                            .unwrap_or_else(|error| {
+                                panic!("GPU probe fault in framed matvec parity test: {error}")
+                            })
+                            .is_none(),
                         "#1551: CUDA device present but the framed device matvec \
                          declined/faulted (probe {pi}, tag: {failure:?}) — the kernel \
                          does not run on GPU"
@@ -8146,7 +8178,11 @@ mod tests {
             // the ~1e-13 fp64 GEMV round-off; a structural marshalling bug would
             // be O(1).)
             assert!(
-                gam_gpu::device_runtime::GpuRuntime::global().is_some(),
+                gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+                    .unwrap_or_else(|error| {
+                        panic!("GPU probe fault after framed matvec execution: {error}")
+                    })
+                    .is_some(),
                 "#1551: matvec ran but no GPU runtime — unexpected"
             );
             assert!(worst <= 1e-9, "framed matvec parity worst rel = {worst:e}");

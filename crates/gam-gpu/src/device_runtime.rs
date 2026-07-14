@@ -153,14 +153,17 @@ impl GpuRuntime {
             // via the panic filter + catch_unwind, and the preload check below still runs.
             let primary_ready = cuda_context_for(0).is_some();
             log::trace!("[GPU] probe pre-init primary context + runtime: {primary_ready}");
-            if crate::driver::preload_cuda_driver().is_err() {
-                let reason = "libcuda unavailable";
-                Self::record_cpu_reason(reason);
-                log::info!("[GPU] CUDA acceleration disabled: {reason}");
-                diagnostics::log_cuda_disabled(reason);
-                return Ok(GpuAvailability::Absent(GpuAbsence::DriverUnavailable {
-                    reason: reason.to_string(),
-                }));
+            match crate::driver::preload_cuda_driver() {
+                Ok(()) => {}
+                Err(GpuError::DriverLibraryUnavailable { reason }) => {
+                    Self::record_cpu_reason(reason.clone());
+                    log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                    diagnostics::log_cuda_disabled(&reason);
+                    return Ok(GpuAvailability::Absent(GpuAbsence::DriverUnavailable {
+                        reason,
+                    }));
+                }
+                Err(error) => return Err(error),
             }
 
             // Driver-only environments (e.g. large-scale workbench images that expose
@@ -745,17 +748,16 @@ mod tests {
         // panicking from inside `culib()`; with libcuda the runtime may or
         // may not have a usable device, but the panic-free contract still
         // holds and the dispatch smoke test below exercises it.
-        let culib_present = crate::driver::cuda_driver_library_present();
-        if !culib_present {
-            assert!(
+        match crate::driver::preload_cuda_driver() {
+            Ok(()) => {}
+            Err(GpuError::DriverLibraryUnavailable { .. }) => assert!(
                 matches!(
                     GpuRuntime::availability(),
                     Ok(GpuAvailabilityRef::Absent(GpuAbsence::DriverUnavailable { .. }))
                 ),
-                "is_culib_present()=false but runtime availability was not typed driver absence; \
-                 the probe guard from c10e6636 has regressed and downstream cudarc \
-                 calls will panic"
-            );
+                "typed driver absence must remain absence through runtime availability"
+            ),
+            Err(error) => panic!("a present-but-broken CUDA driver must fail this test: {error}"),
         }
 
         // Every public GPU dispatch must return a value (no panic) when the
