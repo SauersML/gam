@@ -726,15 +726,6 @@ mod pcg_device_parity_tests {
 
     #[test]
     fn pcg_device_matches_dense_oracle_at_n64_r20_p44() {
-        let runtime = match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
-        {
-            Ok(Some(runtime)) => runtime,
-            Ok(None) => {
-                eprintln!("[pcg_device parity] no CUDA device — skipping");
-                return;
-            }
-            Err(error) => panic!("[pcg_device parity] CUDA probe failed: {error}"),
-        };
         let n = 64_usize;
         let p_m = 14_usize;
         let p_g = 12_usize;
@@ -784,15 +775,29 @@ mod pcg_device_parity_tests {
         let mut marginal = vec![0.0_f64; n * p_m];
         for row in 0..n {
             for j in 0..p_m {
-                let seed = (row as f64) * 0.073 + (j as f64) * 0.211 + 0.4;
-                marginal[row * p_m + j] = seed.sin() * 0.8 - (seed * 0.7).cos() * 0.3;
+                // Orthonormal DCT-II columns make the aggregate pullback
+                // full-rank by construction. The former phase-shifted
+                // sinusoids were nearly collinear, so row-wise SPD did not
+                // imply a numerically SPD joint fixture.
+                let scale = if j == 0 {
+                    (n as f64).sqrt().recip()
+                } else {
+                    (2.0 / n as f64).sqrt()
+                };
+                marginal[row * p_m + j] = scale
+                    * (std::f64::consts::PI * (row as f64 + 0.5) * j as f64 / n as f64).cos();
             }
         }
         let mut logslope = vec![0.0_f64; n * p_g];
         for row in 0..n {
             for j in 0..p_g {
-                let seed = (row as f64) * 0.091 + (j as f64) * 0.179 - 0.2;
-                logslope[row * p_g + j] = seed.cos() * 0.7 + (seed * 0.3).sin() * 0.25;
+                let scale = if j == 0 {
+                    (n as f64).sqrt().recip()
+                } else {
+                    (2.0 / n as f64).sqrt()
+                };
+                logslope[row * p_g + j] = scale
+                    * (std::f64::consts::PI * (row as f64 + 0.5) * j as f64 / n as f64).cos();
             }
         }
 
@@ -807,6 +812,18 @@ mod pcg_device_parity_tests {
         let h_dense =
             cpu_dense_joint_hessian(&row_hessians, &marginal, &logslope, &block, &primary, n);
         let x_oracle = cpu_pcg_oracle(&h_dense, &b, 1e-12);
+
+        // Keep the SPD fixture certificate CPU-reachable. CUDA availability
+        // controls only the device-parity half of this test.
+        let runtime = match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+        {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => {
+                eprintln!("[pcg_device parity] host SPD oracle passed; no CUDA device");
+                return;
+            }
+            Err(error) => panic!("[pcg_device parity] CUDA probe failed: {error}"),
+        };
 
         // Grab the same CUDA context + default stream that the bms_flex_row
         // kernels will use when `run_pcg_against_row_hessian_device` probes
