@@ -2255,7 +2255,7 @@ where
                  (‖g‖={final_projected_grad:.3e}, decrement_sq={:.3e})",
                 final_exact_decrement_sq.unwrap_or(f64::NAN),
             );
-            status = PirlsStatus::StalledAtValidMinimum;
+            status = PirlsStatus::Converged;
         } else if pirls_soft_acceptance(
             &state,
             final_projected_grad,

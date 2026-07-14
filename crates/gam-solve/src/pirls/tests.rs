@@ -4079,7 +4079,7 @@ mod root_cause_tests {
         .expect("the exact final-state decrement certifies iteration exhaustion");
 
         assert_eq!(model.exact_calls, 1);
-        assert_eq!(result.status, PirlsStatus::StalledAtValidMinimum);
+        assert_eq!(result.status, PirlsStatus::Converged);
     }
 
     #[test]
