@@ -4,10 +4,10 @@
 //! plus the semi-infinite-tail handling baked into
 //! `evaluate_cell_state_dispatched`. Tagging happens once at the substrate
 //! boundary so the all-branch GPU kernel consumes a canonical branch code
-//! instead of reimplementing the tolerance predicate.
+//! instead of reimplementing the structural polynomial predicate.
 //!
 //! The host classifier and the device kernel use the *same* CPU functions to
-//! decide cell branch, so a future kernel landing cannot drift on tolerance.
+//! decide cell branch, so a future kernel landing cannot drift on degree.
 
 use crate::cubic_cell_kernel::{DenestedCubicCell, ExactCellBranch, branch_cell};
 use crate::gpu_kernels::cubic_cell::{
