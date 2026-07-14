@@ -1008,7 +1008,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     )
                 })?)
             } else {
-                if let Some(workspace) = psi_workspace.as_ref() {
+                let terms = if let Some(workspace) = psi_workspace.as_ref() {
                     workspace.second_order_terms(psi_i, psi_j)
                 } else {
                     family_arc.exact_newton_joint_psisecond_order_terms(
@@ -1018,7 +1018,12 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                         psi_i,
                         psi_j,
                     )
-                }?
+                };
+                terms.map_err(|error| {
+                    format!(
+                        "typed design hyper pair ({psi_i}, {psi_j}) failed during immutable Hessian assembly: {error}"
+                    )
+                })?
             };
 
             let (obj_ll, score_ll, hess_ll, hess_ll_op) = match psi2 {
@@ -1085,7 +1090,12 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                             &pert_first[psi_i],
                             &pert_first[psi_j],
                             &pert_ij,
-                        )?;
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "typed hyper pair ({psi_i}, {psi_j}) Jeffreys second derivative failed: {error}"
+                            )
+                        })?;
                     a -= phi_psi_psi;
                 }
             }

@@ -70,20 +70,16 @@ pub fn pirls_loop_curvature_for(family: PirlsLoopFamilyKind) -> PirlsLoopCurvatu
     }
 }
 
-/// Detect whether CUDA is available under Auto semantics. Typed absence is
-/// `false`; a probe fault fails loudly because this legacy boolean admission
-/// boundary cannot represent an error without misclassifying it as absence.
-pub fn gpu_runtime_available() -> bool {
-    gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
-        .unwrap_or_else(|error| panic!("PIRLS GPU runtime probe failed: {error}"))
-        .is_some()
-}
-
 /// Strict admission shape for the Stage 3.3 PIRLS loop, computed from the
 /// `(response, link)` spec and the active design shape `(n, p)`. Returns
 /// `None` when the family / link is not in the JIT-cached set so the caller
 /// skips both the GPU dispatch and the runtime probe.
-pub fn admission_for(spec: &LikelihoodSpec, n: usize, p: usize) -> Option<PirlsLoopAdmission> {
+pub fn admission_for(
+    spec: &LikelihoodSpec,
+    n: usize,
+    p: usize,
+    gpu_available: bool,
+) -> Option<PirlsLoopAdmission> {
     let family = pirls_loop_family_for(spec)?;
     let curvature = pirls_loop_curvature_for(family);
     Some(PirlsLoopAdmission {
@@ -91,7 +87,7 @@ pub fn admission_for(spec: &LikelihoodSpec, n: usize, p: usize) -> Option<PirlsL
         p,
         family: Some(family),
         curvature,
-        gpu_available: gpu_runtime_available(),
+        gpu_available,
     })
 }
 
@@ -109,8 +105,8 @@ mod linux_impl {
         compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta,
         pirls_data_log_kernel_from_eta,
     };
-    use gam_gpu::cuda_selected;
     use gam_gpu::device_runtime::GpuRuntime;
+    use gam_gpu::gpu_error::GpuError;
     use gam_gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use gam_linalg::matrix::DesignMatrix;
     use gam_linalg::matrix::SymmetricMatrix;
@@ -221,21 +217,14 @@ mod linux_impl {
         likelihood: &gam_problem::GlmLikelihoodSpec,
         n: usize,
         p: usize,
-    ) -> bool {
-        if !cuda_selected()
-            .unwrap_or_else(|error| panic!("PIRLS admission runtime resolution failed: {error}"))
-        {
-            return false;
-        }
-        let Some(admission) = admission_for(&likelihood.spec, n, p) else {
-            return false;
+    ) -> Result<bool, GpuError> {
+        let Some(admission) = admission_for(&likelihood.spec, n, p, true) else {
+            return Ok(false);
         };
-        let Some(runtime) = GpuRuntime::resolve(gam_gpu::global_policy())
-            .unwrap_or_else(|error| panic!("PIRLS admission runtime resolution failed: {error}"))
-        else {
-            return false;
+        let Some(runtime) = GpuRuntime::resolve(gam_gpu::global_policy())? else {
+            return Ok(false);
         };
-        runtime.policy().should_use_gpu_pirls_loop(admission)
+        Ok(runtime.policy().should_use_gpu_pirls_loop(admission))
     }
 
     /// Attempt to run the Stage 3.3 device-resident PIRLS loop for the
@@ -244,17 +233,6 @@ mod linux_impl {
     pub fn try_gpu_pirls_loop_dispatch(
         input: GpuPirlsDispatchInput<'_>,
     ) -> Option<Result<(PirlsResult, WorkingModelPirlsResult), EstimationError>> {
-        // Honor the documented GPU policy: never route to the GPU loop when
-        // the caller has explicitly selected CPU execution.
-        match cuda_selected() {
-            Ok(true) => {}
-            Ok(false) => return None,
-            Err(error) => {
-                return Some(Err(EstimationError::InvalidInput(format!(
-                    "PIRLS GPU runtime resolution failed: {error}"
-                ))));
-            }
-        }
         // Gaussian-identity fits have an exact GPU PLS path (issue #272) and
         // must NOT be routed through the row-kernel PIRLS loop on device.
         // The exact path (try_gpu_gaussian_pls_dispatch) fires before this
@@ -268,7 +246,7 @@ mod linux_impl {
         let n = input.x_original.nrows();
         let p = input.x_original.ncols();
         // Engine-level admission: shape + family + curvature + runtime probe.
-        let admission = admission_for(&input.likelihood.spec, n, p)?;
+        let admission = admission_for(&input.likelihood.spec, n, p, true)?;
         let runtime = match GpuRuntime::resolve(gam_gpu::global_policy()) {
             Ok(Some(runtime)) => runtime,
             Ok(None) => return None,
@@ -763,21 +741,16 @@ mod linux_impl {
     /// Cheap admission gate for the GPU Gaussian-identity exact PLS path.
     /// Returns `true` iff cuda_selected(), runtime available, and the likelihood
     /// is Gaussian-identity.
-    pub fn try_gpu_gaussian_pls_admit(likelihood: &gam_problem::GlmLikelihoodSpec) -> bool {
-        if !gam_gpu::cuda_selected().unwrap_or_else(|error| {
-            panic!("Gaussian PLS admission runtime resolution failed: {error}")
-        }) {
-            return false;
+    pub fn try_gpu_gaussian_pls_admit(
+        likelihood: &gam_problem::GlmLikelihoodSpec,
+    ) -> Result<bool, GpuError> {
+        if !likelihood.spec.is_gaussian_identity() {
+            return Ok(false);
         }
-        if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-            .unwrap_or_else(|error| {
-                panic!("Gaussian PLS admission runtime resolution failed: {error}")
-            })
-            .is_none()
-        {
-            return false;
-        }
-        likelihood.spec.is_gaussian_identity()
+        Ok(
+            gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())?
+                .is_some(),
+        )
     }
 
     /// Attempt to run the exact GPU PLS for Gaussian-identity.
@@ -789,8 +762,14 @@ mod linux_impl {
     pub fn try_gpu_gaussian_pls_dispatch(
         input: GpuGaussianPlsInput<'_>,
     ) -> Option<Result<(PirlsResult, WorkingModelPirlsResult), String>> {
-        if !try_gpu_gaussian_pls_admit(input.likelihood) {
-            return None;
+        match try_gpu_gaussian_pls_admit(input.likelihood) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                return Some(Err(format!(
+                    "Gaussian PLS admission runtime resolution failed: {error}"
+                )));
+            }
         }
         Some(run_gpu_gaussian_pls(input))
     }

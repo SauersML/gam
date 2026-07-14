@@ -228,10 +228,22 @@ where
             no_firth,
             no_constraints,
             dense_x,
-        ) {
+            ) {
             let n_admit = x_dense.nrows();
             let p_admit = x_dense.ncols();
-            if try_gpu_pirls_loop_admit(&config.likelihood, n_admit, p_admit) {
+            let gpu_admitted = match try_gpu_pirls_loop_admit(
+                &config.likelihood,
+                n_admit,
+                p_admit,
+            ) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    return Some(Err(EstimationError::InvalidInput(format!(
+                        "PIRLS GPU admission failed: {error}"
+                    ))));
+                }
+            };
+            if gpu_admitted {
                 let qs_view = qs_arc.as_ref().map(|qs| qs.view());
                 let (s_transformed_view, linear_shift_view, constant_shift_val) =
                     match penalty_active {
