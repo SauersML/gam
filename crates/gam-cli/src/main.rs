@@ -24,15 +24,12 @@ pub(crate) use gam::families::survival::latent::{
 };
 
 pub(crate) use gam::families::scale_design::{
-    build_scale_deviation_operator, build_scale_deviation_transform_design,
-    infer_non_intercept_start_design, scale_transform_from_payload,
+    build_scale_deviation_transform_design,
 };
 
 pub(crate) use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
 };
-
-pub(crate) use gam::generative::sampleobservation_replicates;
 
 pub(crate) use gam::sample::NutsConfig;
 
