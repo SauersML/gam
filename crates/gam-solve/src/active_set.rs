@@ -1992,18 +1992,31 @@ pub fn constraint_set_rows_tight_at_point(
             beta.len()
         );
     }
-    let ops = ConstraintSetOps::new(set, 0.0)?;
-    let values = ops.values(beta)?;
-    let mut seen = vec![false; ops.nrows()];
-    let mut tight = Vec::with_capacity(candidate_rows.len().min(beta.len()));
+    let mut seen = HashSet::with_capacity(candidate_rows.len());
+    let mut unique = Vec::with_capacity(candidate_rows.len());
     for &row in candidate_rows {
-        if row < ops.nrows()
-            && !seen[row]
-            && ops.norms[row] > 0.0
-            && ops.scaled_slack(&values, row) <= ACTIVE_SET_WORKING_FACE_TOL
-        {
-            seen[row] = true;
-            tight.push(row);
+        if row < set.nrows() && seen.insert(row) {
+            unique.push(row);
+        }
+    }
+    if unique.is_empty() {
+        return Ok(Vec::new());
+    }
+    let gathered = set.gather_rows(&unique).map_err(|error| {
+        EstimationError::ParameterConstraintViolation(format!(
+            "active-face candidate-row gather failed: {error}"
+        ))
+    })?;
+    let mut tight = Vec::with_capacity(unique.len());
+    for (position, &row) in unique.iter().enumerate() {
+        let constraint_row = gathered.a.row(position);
+        let norm = constraint_row.dot(&constraint_row).sqrt();
+        if norm > 0.0 {
+            let scaled_slack =
+                (constraint_row.dot(beta) - gathered.b[position]) / norm;
+            if scaled_slack <= ACTIVE_SET_WORKING_FACE_TOL {
+                tight.push(row);
+            }
         }
     }
     Ok(tight)
