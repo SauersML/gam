@@ -116,13 +116,7 @@ fn fresh_processes_replay_saved_scan_for_predict_and_report() {
             .expect("prediction header")
             .iter()
             .collect::<Vec<_>>(),
-        vec![
-            "linear_predictor",
-            "mean",
-            "std_error",
-            "mean_lower",
-            "mean_upper",
-        ]
+        vec!["eta", "mean", "std_error", "mean_lower", "mean_upper"]
     );
     let rows = predictions
         .records()
