@@ -36,15 +36,15 @@
 //!   AffineTail buckets stay on CPU until Stage-2.
 
 pub(crate) mod branch;
+#[cfg(target_os = "linux")]
 pub(crate) mod device;
 #[cfg(test)]
-pub(crate) mod host_substrate;
+#[path = "host_substrate.rs"]
+mod tests_host_substrate;
 pub(crate) mod kernel_src;
 
+#[cfg(target_os = "linux")]
 use gam_gpu::gpu_error::GpuError;
-
-#[cfg(test)]
-pub(crate) use host_substrate::build_host_cell_status;
 
 /// Maximum derivative-moment degree the substrate is built to evaluate.
 ///
@@ -84,21 +84,6 @@ pub(crate) enum GpuCellBranchTag {
     AffineTail,
 }
 
-/// Where the caller wants results materialized.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CubicCellMomentResidency {
-    /// Materialize moments into a host `Vec<f64>` (parity reference; works on
-    /// every platform).
-    #[cfg(test)]
-    Host,
-    /// Materialize moments into a device-resident `CudaSlice<f64>` on the
-    /// shared cubic-cell context. Linux+CUDA only; on other platforms this
-    /// absence is returned as `None`; callers decide whether the requested
-    /// GPU route is admissible.
-    #[cfg(target_os = "linux")]
-    Device,
-}
-
 /// Per-cell status code written by the substrate. Numeric values match the
 /// device kernel's status code emission so the GPU and host paths fill
 /// `Vec<u8>` with the same byte pattern.
@@ -126,54 +111,29 @@ pub(crate) struct CubicCellDerivativeMomentHostView<'a> {
     pub cells: &'a [GpuDenestedCubicCell],
     pub branches: &'a [GpuCellBranchTag],
     pub max_degree: usize,
-    pub residency: CubicCellMomentResidency,
 }
 
-/// Output of `try_build_cubic_cell_derivative_moments`.
+/// Device-resident output of `try_build_cubic_cell_derivative_moments`.
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
-pub(crate) enum CubicCellDerivativeMomentOutput {
-    /// Per-cell substrate status codes from the host (CPU) path. Production
-    /// callers only consume the per-cell classifier verdicts here; the actual
-    /// moments stay on the upstream `HostMomentBatch` and are accessed via
-    /// `build_host_moments` directly when needed (e.g. parity tests). The
-    /// Device variant below carries the moments because the device kernel
-    /// hands them back as a residency-bound buffer.
-    #[cfg(test)]
-    Host { status: Vec<u8> },
-    /// Device-resident moments on the cubic-cell backend's shared CUDA
-    /// context. Linux-only. `d_moments` is a row-major
-    /// `[n_cells, stride]` `CudaSlice<f64>`. The
-    /// host-side `status` vector mirrors the per-cell device status so
-    /// downstream branching decisions never have to round-trip from the
-    /// device.
-    #[cfg(target_os = "linux")]
-    Device {
-        d_moments: cudarc::driver::CudaSlice<f64>,
-        status: Vec<u8>,
-        stride: usize,
-        n_cells: usize,
-    },
+pub(crate) struct CubicCellDerivativeMomentOutput {
+    pub(crate) d_moments: cudarc::driver::CudaSlice<f64>,
+    pub(crate) status: Vec<u8>,
+    pub(crate) stride: usize,
+    pub(crate) n_cells: usize,
 }
 
 /// Try to build derivative moments via the substrate.
 ///
-/// * Test-only `Host` residency: routes through the CPU classifier and returns
-///   per-cell status only. Production consumers read the verdict and feed
-///   moments from their own evaluator (LRU cache for BMS row-primary
-///   Hessian, dedicated host buffer for survival-flex). The full moment
-///   matrix used to be returned here as well, but no production caller
-///   ever read it — the parity reference path that compares CPU moments to
-///   the device kernel now lives next to the host substrate's own unit
-///   tests.
-/// * `Device` residency: on Linux+CUDA with a probed runtime, the device
-///   dispatcher launches the NVRTC kernel for the NonAffineFinite bucket
-///   and CPU-evaluates the Affine/AffineTail buckets, packing both back
-///   into a `Device { … }` output for the caller. An unavailable runtime
-///   returns `None`; a device request is never silently changed into a host
-///   computation.
+/// On Linux+CUDA, the dispatcher launches the NVRTC kernel for the
+/// NonAffineFinite bucket and CPU-classifies the Affine/AffineTail buckets,
+/// packing all accepted rows into one device-resident output. Runtime absence
+/// at this already-selected device boundary is a typed error, never host
+/// substitution.
 ///
 /// Returns `Ok(None)` only when the workload is empty.
 ///
+#[cfg(target_os = "linux")]
 pub(crate) fn try_build_cubic_cell_derivative_moments(
     input: CubicCellDerivativeMomentHostView<'_>,
 ) -> Result<Option<CubicCellDerivativeMomentOutput>, GpuError> {
@@ -195,21 +155,13 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
         return Ok(None);
     }
 
-    match input.residency {
-        #[cfg(test)]
-        CubicCellMomentResidency::Host => {
-            let status = build_host_cell_status(&input)
-                .map_err(|reason| GpuError::DriverCallFailed { reason })?;
-            Ok(Some(CubicCellDerivativeMomentOutput::Host { status }))
-        }
-        #[cfg(target_os = "linux")]
-        CubicCellMomentResidency::Device => device::try_device_moments_resident(&input),
-    }
+    device::build_device_moments_resident(&input).map(Some)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::tests_host_substrate::build_host_cell_status;
 
     fn affine_cell() -> GpuDenestedCubicCell {
         GpuDenestedCubicCell {
@@ -231,47 +183,29 @@ mod tests {
             cells,
             branches,
             max_degree,
-            residency: CubicCellMomentResidency::Host,
         }
     }
 
     #[test]
-    fn host_residency_returns_ok_status_for_valid_cell() {
-        // The public substrate's host residency returns only the per-cell
-        // status codes — production callers (the BMS row-primary Hessian
-        // assembler and the survival-flex row evaluator) consume the
-        // classifier verdict, not the moments. The moment-emitting parity
-        // path lives next to the host substrate's own unit tests; here we
-        // only assert the public entry surface delivers an Ok status for a
-        // valid cell, the contract production callers depend on.
+    fn host_classifier_returns_ok_status_for_valid_cell() {
         let cells = [affine_cell()];
         let branches = [GpuCellBranchTag::Affine];
-        let out = try_build_cubic_cell_derivative_moments(host_view(&cells, &branches, 9))
-            .expect("host substrate succeeds on a valid cell")
-            .expect("non-empty input produces output");
-        let status = match out {
-            CubicCellDerivativeMomentOutput::Host { status } => status,
-            #[cfg(target_os = "linux")]
-            CubicCellDerivativeMomentOutput::Device { .. } => {
-                panic!("host residency request must not yield Device output")
-            }
-        };
+        let status = build_host_cell_status(&host_view(&cells, &branches, 9))
+            .expect("host classifier succeeds on a valid cell");
         assert_eq!(status, vec![CubicCellMomentStatus::Ok as u8]);
     }
 
     #[test]
-    fn empty_input_returns_ok_none() {
-        let out = try_build_cubic_cell_derivative_moments(host_view(&[], &[], 9)).expect("ok");
-        assert!(out.is_none());
+    fn empty_host_classifier_returns_empty_status() {
+        let status = build_host_cell_status(&host_view(&[], &[], 9)).expect("empty view is valid");
+        assert!(status.is_empty());
     }
 
     #[test]
     fn rejects_mismatched_lengths() {
         let cells = [affine_cell()];
         let branches: [GpuCellBranchTag; 0] = [];
-        let err =
-            try_build_cubic_cell_derivative_moments(host_view(&cells, &branches, 9)).unwrap_err();
-        let msg = err.to_string();
+        let msg = build_host_cell_status(&host_view(&cells, &branches, 9)).unwrap_err();
         assert!(msg.contains("cells.len()"), "got: {msg}");
         assert!(msg.contains("branches.len()"), "got: {msg}");
     }
@@ -280,7 +214,7 @@ mod tests {
     fn rejects_degree_above_supported_max() {
         let cells = [affine_cell()];
         let branches = [GpuCellBranchTag::Affine];
-        let err = try_build_cubic_cell_derivative_moments(host_view(
+        let err = build_host_cell_status(&host_view(
             &cells,
             &branches,
             MAX_SUPPORTED_DEGREE + 1,

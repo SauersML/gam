@@ -33,10 +33,6 @@ pub(crate) struct NonWiggleQDirectional {
     pub(crate) delta_q: f64,
     pub(crate) delta_q_t: f64,
     pub(crate) delta_q_ls: f64,
-    #[cfg(test)]
-    pub(crate) delta_q_tl: f64,
-    #[cfg(test)]
-    pub(crate) delta_q_ll: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -96,10 +92,6 @@ pub(crate) fn nonwiggle_q_directional(
         delta_q: q.q_t * d_eta_t + q.q_ls * d_eta_ls,
         delta_q_t: q.q_tl * d_eta_ls,
         delta_q_ls: q.q_tl * d_eta_t + q.q_ll * d_eta_ls,
-        #[cfg(test)]
-        delta_q_tl: q.q_tl_ls * d_eta_ls,
-        #[cfg(test)]
-        delta_q_ll: q.q_tl_ls * d_eta_t + q.q_ll_ls * d_eta_ls,
     }
 }
 

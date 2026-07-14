@@ -151,12 +151,20 @@ pub(crate) fn assert_rel_close(label: &str, actual: f64, expected: f64, tol: f64
     );
 }
 
+pub(crate) struct HandNonWiggleQDirectional {
+    pub(crate) delta_q: f64,
+    pub(crate) delta_q_t: f64,
+    pub(crate) delta_q_ls: f64,
+    pub(crate) delta_q_tl: f64,
+    pub(crate) delta_q_ll: f64,
+}
+
 pub(crate) fn hand_binomial_q_directional(
     q: NonWiggleQDerivs,
     d_eta_t: f64,
     d_eta_ls: f64,
-) -> NonWiggleQDirectional {
-    NonWiggleQDirectional {
+) -> HandNonWiggleQDirectional {
+    HandNonWiggleQDirectional {
         delta_q: q.q_t * d_eta_t + q.q_ls * d_eta_ls,
         delta_q_t: q.q_tl * d_eta_ls,
         delta_q_ls: q.q_tl * d_eta_t + q.q_ll * d_eta_ls,
@@ -1190,7 +1198,8 @@ pub(crate) fn gaussian_joint_psi_firstweights_score_ls_carries_logb_chain_rule_f
     let firstweights = gaussian_joint_psi_firstweights(&rows, &array![0.0], &array![1.0]);
     let sigma = crate::sigma_link::logb_sigma_from_eta_scalar(eta_ls[0]);
     let kappa = 1.0 - crate::sigma_link::LOGB_SIGMA_FLOOR / sigma;
-    let expected = kappa * (weights[0] - rows.n[0]);
+    let standardized_residual = (y[0] - etamu[0]) / sigma;
+    let expected = kappa * (weights[0] - weights[0] * standardized_residual.powi(2));
 
     assert!(
         (firstweights.score_ls[0] - expected).abs() <= 1e-12,
@@ -1380,7 +1389,8 @@ pub(crate) fn gaussian_joint_psisecondweights_eta_ab_term_carries_logb_chain_rul
     );
     let sigma = crate::sigma_link::logb_sigma_from_eta_scalar(eta_ls[0]);
     let kappa = 1.0 - crate::sigma_link::LOGB_SIGMA_FLOOR / sigma;
-    let expected = kappa * (weights[0] - rows.n[0]);
+    let standardized_residual = (y[0] - etamu[0]) / sigma;
+    let expected = kappa * (weights[0] - weights[0] * standardized_residual.powi(2));
 
     assert!(
         (secondweights.objective_psi_psirow[0] - expected).abs() <= 1e-12,
