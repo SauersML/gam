@@ -132,6 +132,7 @@ mod custom_family_impl;
 mod denested_cells;
 mod error;
 mod eval_rigid;
+mod eval_family;
 mod eval_score;
 mod eval_sigma;
 mod family;
