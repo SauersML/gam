@@ -99,65 +99,6 @@ impl KroneckerDesign {
         }
     }
 
-    /// SCOP-CTN forward: compute
-    /// `left[i,0] · γ_0(x_i) + Σ_{k>=1} left[i,k] · γ_k(x_i)²`
-    /// where `γ_k(x_i) = (right · β_mat[k, :])[i]` and
-    /// `β_mat[k, j] = beta[k * p_cov + j]` (row-major reshape into
-    /// `p_resp × p_cov`).
-    ///
-    /// Equivalent to forming `γ_mat = right · β_matᵀ` (shape `n × p_resp`),
-    /// pointwise squaring columns `k>=1`, and contracting against the
-    /// corresponding response basis row. The squaring is post-operator — the
-    /// underlying `right` operator and the row-replicated Khatri-Rao image
-    /// are never materialized. Storage cost matches `forward_mul`: an
-    /// intermediate `n × p_resp` `right_beta` plus the `n` output.
-    pub(crate) fn scop_affine_squared_forward(&self, beta: &Array1<f64>) -> Array1<f64> {
-        match self {
-            KroneckerDesign::KhatriRao { left, right } => {
-                let pa = left.ncols();
-                let pb = right.ncols();
-                let n = left.nrows();
-                assert_eq!(beta.len(), pa * pb);
-                let beta_mat = beta.view().into_shape_with_order((pa, pb)).unwrap();
-                let mut result = Array1::zeros(n);
-                if let Some(right_dense) = right.as_dense_ref() {
-                    // right_beta[i, k] = γ_k(x_i)
-                    let right_beta = fast_abt(right_dense, &beta_mat);
-                    ndarray::Zip::from(&mut result)
-                        .and(left.rows())
-                        .and(right_beta.rows())
-                        .par_for_each(|r, l_row, gamma_row| {
-                            let mut acc = l_row[0] * gamma_row[0];
-                            for k in 1..pa {
-                                let g = gamma_row[k];
-                                acc += l_row[k] * g * g;
-                            }
-                            *r = acc;
-                        });
-                    return result;
-                }
-                // Sparse-right fallback: materialize γ_k column-by-column.
-                let mut gamma_cols = Array2::<f64>::zeros((n, pa));
-                for k in 0..pa {
-                    let cov_part = right.apply(&beta_mat.row(k).to_owned());
-                    gamma_cols.column_mut(k).assign(&cov_part);
-                }
-                ndarray::Zip::from(&mut result)
-                    .and(left.rows())
-                    .and(gamma_cols.rows())
-                    .par_for_each(|r, l_row, gamma_row| {
-                        let mut acc = l_row[0] * gamma_row[0];
-                        for k in 1..pa {
-                            let g = gamma_row[k];
-                            acc += l_row[k] * g * g;
-                        }
-                        *r = acc;
-                    });
-                result
-            }
-        }
-    }
-
     /// Compute `self^T · v` where v is an n-vector.
     /// Returns a (p_a * p_b)-vector.
     pub(crate) fn transpose_mul(&self, v: &Array1<f64>) -> Array1<f64> {
@@ -439,11 +380,11 @@ pub(crate) fn build_tensor_penalties_kronecker(
     let mut shape_resp = Array2::<f64>::eye(p_resp);
     shape_resp[[0, 0]] = 0.0;
 
-    // Covariate roughness is a latent γ prior on the squared monotone shape
-    // rows. The derivative-free location row is the conditional centering
-    // field itself; penalizing it by REML under-corrects broad population
-    // shifts and leaves h(Y|x) calibrated only marginally instead of
-    // conditionally.
+    // Covariate roughness is the exact quadratic function-space penalty on the
+    // direct monotone shape rows. The derivative-free location row is the
+    // conditional centering field itself; penalizing it by REML under-corrects
+    // broad population shifts and leaves h(Y|x) calibrated only marginally
+    // instead of conditionally.
     for s_cov in covariate_penalties {
         let fixed_log_lambda = s_cov.fixed_log_lambda();
         let right = match s_cov {

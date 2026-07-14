@@ -132,13 +132,9 @@ pub(crate) fn build_response_basis(
     // quadratic in the shape coefficients, i.e. compatible with the fixed
     // Gaussian-quadratic REML normalizer.
     //
-    // Scope note (#2306): SCOP finalizes the response coefficients as
-    // α = γ², so this Gram penalizes the roughness of the shape factor γ
-    // (the √α function) rather than the final transformation h(y,x). The true
-    // final-function penalty ½·vec(A)ᵀ(S_{y,m}⊗G_x)vec(A) requires the
-    // direct-α reparameterization (h linear in A); until that lands, the
-    // exact function-space Gram on γ is the correct REML-compatible metric
-    // and supplies the exact per-order S_{y,m} the tensor penalty will reuse.
+    // In the direct-alpha chart (#2306), this Gram enters
+    // `1/2 vec(A)^T (S_{y,m} kron G_x) vec(A)`, so it penalizes the final
+    // represented transformation itself rather than a latent square root.
     //
     // The represented value functions have per-span polynomial degree
     // `value_degree = response_degree + 1`; the `m`-th derivative of a

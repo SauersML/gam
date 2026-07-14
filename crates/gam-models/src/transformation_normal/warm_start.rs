@@ -7,10 +7,10 @@ use super::*;
 /// Compute initial β so that the SCOP-CTN model starts with a positive
 /// derivative and approximately centered transformed response.
 ///
-/// SCOP is nonlinear in the shape rows: `h'=Σ M_k(y)γ_k(x)^2`. A linear joint
-/// least-squares solve fits the wrong parameterization, so the warm start
-/// initializes shape rows to a positive constant derivative scale and then
-/// solves only the location row `b(x)` against the remaining affine target.
+/// Direct-alpha SCOP is affine in the shape rows:
+/// `h'=Σ M_k(y)α_k(x)`. The warm start initializes those rows to a
+/// positive constant derivative scale and then solves only the location row
+/// `b(x)` against the remaining affine target.
 pub(crate) fn compute_warm_start(
     response: &Array1<f64>,
     weights: &Array1<f64>,
@@ -64,14 +64,9 @@ pub(crate) fn compute_warm_start(
         target_hp[i] = inv_tau;
     }
 
-    // β-native SCOP seed. A tempting alternative is to solve a linear
-    // least-squares problem for α_k(x)=γ_k(x)^2 and then project sqrt(α_k)
-    // back into the covariate basis. That is not an invariant transformation:
-    // squaring the projected sqrt field no longer equals the solved α field,
-    // and small projection errors can explode into huge positive I-spline
-    // shape terms. Instead seed the monotone shape rows directly with a
-    // constant positive γ that matches the weighted average derivative target,
-    // then solve only the unconstrained location row in β-space.
+    // Seed the direct monotone shape rows with a constant positive alpha that
+    // matches the weighted average derivative target, then solve only the
+    // unconstrained location row in coefficient space.
     let weight_sum = weights.iter().copied().sum::<f64>();
     if !(weight_sum.is_finite() && weight_sum > 0.0) {
         return Err(TransformationNormalError::DesignDegenerate {
@@ -98,7 +93,7 @@ pub(crate) fn compute_warm_start(
     for k in 1..p_resp {
         beta[k * p_cov] = 1.0;
     }
-    let unit_shape_hp = x_deriv_kron.scop_affine_squared_forward(&beta);
+    let unit_shape_hp = x_deriv_kron.forward_mul(&beta);
     let mean_unit_shape_hp = weights
         .iter()
         .zip(unit_shape_hp.iter())
@@ -113,19 +108,19 @@ pub(crate) fn compute_warm_start(
         }
         .into());
     }
-    let gamma_const = (mean_target_hp / mean_unit_shape_hp).sqrt();
-    if !(gamma_const.is_finite() && gamma_const > 0.0) {
+    let alpha_const = mean_target_hp / mean_unit_shape_hp;
+    if !(alpha_const.is_finite() && alpha_const > 0.0) {
         return Err(TransformationNormalError::NonFinite {
-            reason: format!("SCOP warm start shape scale is not positive finite: {gamma_const}"),
+            reason: format!("SCOP warm start shape scale is not positive finite: {alpha_const}"),
         }
         .into());
     }
     beta.fill(0.0);
     for k in 1..p_resp {
-        beta[k * p_cov] = gamma_const;
+        beta[k * p_cov] = alpha_const;
     }
 
-    let shape_h = x_val_kron.scop_affine_squared_forward(&beta);
+    let shape_h = x_val_kron.forward_mul(&beta);
     let location_target = &target_h - &shape_h;
     let zero_offset = Array1::<f64>::zeros(n);
     let log_lambdas = Array1::<f64>::zeros(covariate_penalties.len());

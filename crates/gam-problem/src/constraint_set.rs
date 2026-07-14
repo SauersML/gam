@@ -23,6 +23,7 @@
 
 use crate::linear_constraints::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, ArrayView1};
+use std::sync::Arc;
 
 /// Nonnegativity cone `(e_k ⊗ ψ_i)ᵀ β ≥ 0` for a row-major Khatri-Rao block.
 ///
@@ -38,7 +39,7 @@ use ndarray::{Array1, Array2, ArrayView1};
 #[derive(Clone, Debug)]
 pub struct KhatriRaoConeConstraints {
     /// Covariate factor `Ψ` (`n × p_cov`).
-    factor: Array2<f64>,
+    factor: Arc<Array2<f64>>,
     /// Euclidean norm of each `Ψ` row (unit-normalization denominators).
     factor_row_norms: Array1<f64>,
     /// Coefficient rows of `A` (indices into `0..p_left`) that carry the cone.
@@ -53,7 +54,7 @@ pub struct KhatriRaoConeConstraints {
 
 impl KhatriRaoConeConstraints {
     pub fn new(
-        factor: Array2<f64>,
+        factor: Arc<Array2<f64>>,
         coupled_rows: Vec<usize>,
         p_left: usize,
     ) -> Result<Self, String> {
@@ -99,7 +100,7 @@ impl KhatriRaoConeConstraints {
     }
 
     pub fn factor(&self) -> &Array2<f64> {
-        &self.factor
+        self.factor.as_ref()
     }
 
     pub fn coupled_rows(&self) -> &[usize] {
@@ -536,7 +537,7 @@ mod tests {
         // Ψ: 3 observations × 2 covariate columns; A is 3 coefficient rows
         // (row 0 = location, rows 1..2 = shape) × 2 columns.
         let psi = array![[1.0_f64, 0.5], [2.0, -1.0], [0.0, 3.0]];
-        KhatriRaoConeConstraints::new(psi, vec![1, 2], 3).expect("cone fixture")
+        KhatriRaoConeConstraints::new(Arc::new(psi), vec![1, 2], 3).expect("cone fixture")
     }
 
     fn beta_fixture() -> Array1<f64> {
@@ -644,9 +645,11 @@ mod tests {
     #[test]
     fn constructor_rejects_bad_coupled_rows() {
         let psi = array![[1.0_f64, 0.0], [0.0, 1.0]];
-        assert!(KhatriRaoConeConstraints::new(psi.clone(), vec![3], 3).is_err());
-        assert!(KhatriRaoConeConstraints::new(psi.clone(), vec![1, 1], 3).is_err());
-        assert!(KhatriRaoConeConstraints::new(psi, vec![], 3).is_err());
+        assert!(KhatriRaoConeConstraints::new(Arc::new(psi.clone()), vec![3], 3).is_err());
+        assert!(
+            KhatriRaoConeConstraints::new(Arc::new(psi.clone()), vec![1, 1], 3).is_err()
+        );
+        assert!(KhatriRaoConeConstraints::new(Arc::new(psi), vec![], 3).is_err());
     }
 
     #[test]
@@ -742,7 +745,7 @@ mod tests {
         // skipped by violation and ratio sweeps (norm 0), matching the dense
         // canonicalization contract for zero rows with b ≤ 0.
         let psi = array![[0.0_f64, 0.0], [1.0, 1.0]];
-        let cone = KhatriRaoConeConstraints::new(psi, vec![1], 2).expect("cone");
+        let cone = KhatriRaoConeConstraints::new(Arc::new(psi), vec![1], 2).expect("cone");
         let set = ConstraintSet::KhatriRaoCone(cone);
         let beta = array![0.0_f64, 0.0, -5.0, 4.0];
         // Slot 0: values (0, −1). Row 0 vacuous; row 1 violated by 1/√2.

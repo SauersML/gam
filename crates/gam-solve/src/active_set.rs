@@ -2800,7 +2800,8 @@ mod tests {
             [1.0, 1.3],
             [1.0, 0.8],
         ];
-        KhatriRaoConeConstraints::new(psi, vec![1, 2], 3).expect("small cone")
+        KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1, 2], 3)
+            .expect("small cone")
     }
 
     /// Deterministic PD Hessian with off-diagonal coupling so active-set

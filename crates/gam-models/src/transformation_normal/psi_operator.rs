@@ -1037,11 +1037,10 @@ impl TransformationNormalPsiWorkspace {
                 }
 
                 let mut acc = PsiAllAxesAccum::new(n_psi, p_total);
-                let mut gamma = vec![0.0; p_resp];
                 let mut h_factor = vec![0.0; p_resp];
                 let mut hp_factor = vec![0.0; p_resp];
                 let mut endpoint_factor = vec![[0.0_f64; 2]; p_resp];
-                let mut gamma_psi = vec![0.0; p_resp];
+                let mut alpha_psi = vec![0.0; p_resp];
                 let mut hpsi_cov_factor = vec![0.0; p_resp];
                 let mut hppsi_cov_factor = vec![0.0; p_resp];
                 let mut hpsi_psi_factor = vec![0.0; p_resp];
@@ -1061,23 +1060,14 @@ impl TransformationNormalPsiWorkspace {
                     let inv_hp = 1.0 / hp;
                     let inv_hp_sq = inv_hp * inv_hp;
                     let q = &endpoint_q[i];
-                    let gamma_row = row.alpha.row(i);
-
                     for k in 0..p_resp {
-                        gamma[k] = gamma_row[k];
-                    }
-
-                    h_factor[0] = rv[0];
-                    hp_factor[0] = rd[0];
-                    for k in 1..p_resp {
-                        h_factor[k] = 2.0 * rv[k] * gamma[k];
-                        hp_factor[k] = 2.0 * rd[k] * gamma[k];
+                        h_factor[k] = rv[k];
+                        hp_factor[k] = rd[k];
                     }
                     for e in 0..2 {
                         let basis = endpoint_basis[e];
-                        endpoint_factor[0][e] = basis[0];
-                        for k in 1..p_resp {
-                            endpoint_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                        for k in 0..p_resp {
+                            endpoint_factor[k][e] = basis[k];
                         }
                     }
 
@@ -1085,25 +1075,23 @@ impl TransformationNormalPsiWorkspace {
                         let psi_row = cov_psi_chunks[axis_idx].row(local_i);
 
                         for k in 0..p_resp {
-                            gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
+                            alpha_psi[k] = beta_mat.row(k).dot(&psi_row);
                         }
 
-                        let mut h_psi = rv[0] * gamma_psi[0];
-                        let mut hp_psi = rd[0] * gamma_psi[0];
-                        for k in 1..p_resp {
-                            h_psi += 2.0 * rv[k] * gamma[k] * gamma_psi[k];
-                            hp_psi += 2.0 * rd[k] * gamma[k] * gamma_psi[k];
+                        let mut h_psi = 0.0;
+                        let mut hp_psi = 0.0;
+                        for k in 0..p_resp {
+                            h_psi += rv[k] * alpha_psi[k];
+                            hp_psi += rd[k] * alpha_psi[k];
                         }
 
                         for e in 0..2 {
                             let basis = endpoint_basis[e];
-                            endpoint_psi[e] = basis[0] * gamma_psi[0];
-                            endpoint_psi_psi_factor[0][e] = basis[0];
-                            endpoint_psi_cov_factor[0][e] = 0.0;
-                            for k in 1..p_resp {
-                                endpoint_psi[e] += 2.0 * basis[k] * gamma[k] * gamma_psi[k];
-                                endpoint_psi_cov_factor[k][e] = 2.0 * basis[k] * gamma_psi[k];
-                                endpoint_psi_psi_factor[k][e] = 2.0 * basis[k] * gamma[k];
+                            endpoint_psi[e] = 0.0;
+                            for k in 0..p_resp {
+                                endpoint_psi[e] += basis[k] * alpha_psi[k];
+                                endpoint_psi_cov_factor[k][e] = 0.0;
+                                endpoint_psi_psi_factor[k][e] = basis[k];
                             }
                         }
 
@@ -1112,15 +1100,11 @@ impl TransformationNormalPsiWorkspace {
                                 - hp_psi * inv_hp
                                 + endpoint_chain_first(q, endpoint_psi));
 
-                        hpsi_psi_factor[0] = rv[0];
-                        hppsi_psi_factor[0] = rd[0];
-                        hpsi_cov_factor[0] = 0.0;
-                        hppsi_cov_factor[0] = 0.0;
-                        for k in 1..p_resp {
-                            hpsi_cov_factor[k] = 2.0 * rv[k] * gamma_psi[k];
-                            hppsi_cov_factor[k] = 2.0 * rd[k] * gamma_psi[k];
-                            hpsi_psi_factor[k] = 2.0 * rv[k] * gamma[k];
-                            hppsi_psi_factor[k] = 2.0 * rd[k] * gamma[k];
+                        for k in 0..p_resp {
+                            hpsi_cov_factor[k] = 0.0;
+                            hppsi_cov_factor[k] = 0.0;
+                            hpsi_psi_factor[k] = rv[k];
+                            hppsi_psi_factor[k] = rd[k];
                         }
 
                         let score_axis = &mut acc.score_psi[axis_idx];

@@ -1684,13 +1684,13 @@ fn compute_saved_transformation_normal_alo(
         )));
     }
     let geometry = require_saved_geometry(model, class, parameter_dimension)?;
-    let mut gamma = Array2::<f64>::zeros((n, response_dimension));
+    let mut alpha = Array2::<f64>::zeros((n, response_dimension));
     for component in 0..response_dimension {
         let start = component * covariate_dimension;
         let beta_component = beta
             .slice(s![start..start + covariate_dimension])
             .to_owned();
-        gamma
+        alpha
             .column_mut(component)
             .assign(&covariate_design.dot(&beta_component));
     }
@@ -1709,7 +1709,7 @@ fn compute_saved_transformation_normal_alo(
     for row in 0..n {
         let response_value_row = response_value_basis.row(row);
         let response_derivative_row = response_derivative_basis.row(row);
-        let gamma_row = gamma.row(row);
+        let alpha_row = alpha.row(row);
         let geometry = transformation_normal_alo_row_geometry(TransformationNormalAloRowInput {
             response_value_basis: response_value_row
                 .as_slice()
@@ -1719,7 +1719,7 @@ fn compute_saved_transformation_normal_alo(
                 .expect("response derivative row contiguous"),
             response_lower_basis: lower_basis_slice,
             response_upper_basis: upper_basis_slice,
-            gamma: gamma_row.as_slice().expect("gamma row contiguous"),
+            alpha: alpha_row.as_slice().expect("alpha row contiguous"),
             additive_offset: additive_offset[row],
             response_floor_offset: TRANSFORMATION_MONOTONICITY_EPS
                 * (observations.response[row] - response_median),
@@ -1734,7 +1734,7 @@ fn compute_saved_transformation_normal_alo(
         })?;
         observed_hessians.push(geometry.observed_hessian);
         scores.push(geometry.nll_score);
-        coordinate_values.push(gamma_row.to_owned());
+        coordinate_values.push(alpha_row.to_owned());
     }
     let coordinate_designs = (0..response_dimension)
         .map(|_| covariate_design.clone())

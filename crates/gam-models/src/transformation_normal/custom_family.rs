@@ -1,5 +1,5 @@
 use super::*;
-use gam_problem::ConstraintSet;
+use gam_problem::{ConstraintSet, KhatriRaoConeConstraints};
 
 // ---------------------------------------------------------------------------
 // CustomFamily implementation
@@ -309,11 +309,10 @@ impl CustomFamily for TransformationNormalFamily {
             }
             .into());
         }
-        // SCOP encodes monotonicity as
-        //   h'(y, x) = epsilon + sum_k M_k(y) * gamma_k(x)^2.
-        // With nonnegative M-spline derivative basis rows, every finite beta is
-        // interior-feasible. A derivative-grid fraction-to-boundary scan is pure
-        // overhead and was the dominant CTN large-scale line-search cost.
+        // Feasibility is owned by the factored Khatri-Rao cone returned from
+        // `block_linear_constraints`. The active-set solve computes a feasible
+        // delta before globalization, so a second derivative-grid scan here
+        // would repeat the same cone work on every line-search attempt.
         Ok(None)
     }
 
@@ -327,10 +326,31 @@ impl CustomFamily for TransformationNormalFamily {
         if block_index != 0 {
             return Ok(None);
         }
-        // The CTN tensor design is intentionally factored. Strict monotonicity
-        // is encoded structurally as `h' = ε + Σ M_r γ_r²`, so there are no
-        // dense active-set constraints to expose here.
-        Ok(None)
+        // Direct-alpha CTN is linear in the coefficient matrix A. The response
+        // derivative basis is non-negative, so global monotonicity on the
+        // realized covariate rows is exactly the factored cone
+        //
+        //     alpha_k(x_i) = psi_i^T A[k,:] >= 0,
+        //     i = 1..n, k = 1..p_resp-1.
+        //
+        // Row zero is the unconstrained location field. Keep the cone factored:
+        // materializing n*(p_resp-1) by p_resp*p_cov would turn the large-scale
+        // CTN preprocessor into a multi-gigabyte dense constraint matrix.
+        let p_resp = self.response_val_basis.ncols();
+        if p_resp <= 1 {
+            return Ok(None);
+        }
+        let factor = self.covariate_dense_arc()?;
+        let cone =
+            KhatriRaoConeConstraints::new(factor, (1..p_resp).collect(), p_resp)?;
+        if cone.ncols() != block_spec.design.ncols() {
+            return Err(format!(
+                "CTN factored monotonicity cone width {} != coefficient block width {}",
+                cone.ncols(),
+                block_spec.design.ncols(),
+            ));
+        }
+        Ok(Some(ConstraintSet::KhatriRaoCone(cone)))
     }
 
     fn exact_newton_hessian_directional_derivative(

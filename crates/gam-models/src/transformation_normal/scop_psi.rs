@@ -2524,7 +2524,6 @@ impl TransformationNormalFamily {
         // thread.
         struct Scratch {
             pub(crate) out: Array2<f64>,
-            pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_dir: Vec<f64>,
             pub(crate) gamma_psi: Vec<f64>,
             pub(crate) gamma_psi_dir: Vec<f64>,
@@ -2549,7 +2548,6 @@ impl TransformationNormalFamily {
         }
         let init_scratch = || Scratch {
             out: Array2::<f64>::zeros((p_total, p_total)),
-            gamma: vec![0.0; p_resp],
             gamma_dir: vec![0.0; p_resp],
             gamma_psi: vec![0.0; p_resp],
             gamma_psi_dir: vec![0.0; p_resp],
@@ -2576,7 +2574,6 @@ impl TransformationNormalFamily {
         let process_row = |scratch: &mut Scratch, i: usize| {
             let Scratch {
                 out,
-                gamma,
                 gamma_dir,
                 gamma_psi,
                 gamma_psi_dir,
@@ -2610,10 +2607,7 @@ impl TransformationNormalFamily {
             let inv_hp_cu = inv_hp_sq * inv_hp;
             let inv_hp_qu = inv_hp_sq * inv_hp_sq;
 
-            // Reset endpoint/factor buffers whose index 0 is never written
-            // explicitly below — original code relied on `vec![0.0; …]`
-            // zero-init for those slots. The four `gamma` Vecs are fully
-            // overwritten in the loop just below, so they don't need filling.
+            // Reset the row scratch before writing the direct-alpha factors.
             endpoint_factor.fill([0.0; 2]);
             endpoint_factor_dir.fill([0.0; 2]);
             endpoint_psi_cov_factor.fill([0.0; 2]);
@@ -2633,25 +2627,22 @@ impl TransformationNormalFamily {
             hpsi_psi_factor_dir.fill(0.0);
             hppsi_psi_factor_dir.fill(0.0);
             for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
                 gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
                 gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
                 gamma_psi_dir[k] = dir_mat.row(k).dot(&psi_row);
             }
 
-            let mut h_dir = rv[0] * gamma_dir[0];
-            let mut hp_dir = rd[0] * gamma_dir[0];
-            let mut hp_psi = rd[0] * gamma_psi[0];
-            let mut h_psi_dir = rv[0] * gamma_psi_dir[0];
-            let mut hp_psi_dir = rd[0] * gamma_psi_dir[0];
-            for k in 1..p_resp {
-                h_dir += 2.0 * rv[k] * gamma[k] * gamma_dir[k];
-                hp_dir += 2.0 * rd[k] * gamma[k] * gamma_dir[k];
-                hp_psi += 2.0 * rd[k] * gamma[k] * gamma_psi[k];
-                h_psi_dir +=
-                    2.0 * rv[k] * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
-                hp_psi_dir +=
-                    2.0 * rd[k] * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
+            let mut h_dir = 0.0;
+            let mut hp_dir = 0.0;
+            let mut hp_psi = 0.0;
+            let mut h_psi_dir = 0.0;
+            let mut hp_psi_dir = 0.0;
+            for k in 0..p_resp {
+                h_dir += rv[k] * gamma_dir[k];
+                hp_dir += rd[k] * gamma_dir[k];
+                hp_psi += rd[k] * gamma_psi[k];
+                h_psi_dir += rv[k] * gamma_psi_dir[k];
+                hp_psi_dir += rd[k] * gamma_psi_dir[k];
             }
             let q = row_quantities.endpoint_q[i];
             let mut endpoint_psi = [0.0; 2];
@@ -2659,51 +2650,39 @@ impl TransformationNormalFamily {
             let mut endpoint_psi_dir = [0.0; 2];
             for e in 0..2 {
                 let basis = endpoint_basis[e];
-                endpoint_psi[e] = basis[0] * gamma_psi[0];
-                endpoint_dir[e] = basis[0] * gamma_dir[0];
-                endpoint_psi_dir[e] = basis[0] * gamma_psi_dir[0];
-                endpoint_factor[0][e] = basis[0];
-                endpoint_psi_psi_factor[0][e] = basis[0];
-                for k in 1..p_resp {
-                    endpoint_psi[e] += 2.0 * basis[k] * gamma[k] * gamma_psi[k];
-                    endpoint_dir[e] += 2.0 * basis[k] * gamma[k] * gamma_dir[k];
-                    endpoint_psi_dir[e] += 2.0
-                        * basis[k]
-                        * (gamma_dir[k] * gamma_psi[k] + gamma[k] * gamma_psi_dir[k]);
-                    endpoint_factor[k][e] = 2.0 * basis[k] * gamma[k];
-                    endpoint_factor_dir[k][e] = 2.0 * basis[k] * gamma_dir[k];
-                    endpoint_psi_cov_factor[k][e] = 2.0 * basis[k] * gamma_psi[k];
-                    endpoint_psi_psi_factor[k][e] = 2.0 * basis[k] * gamma[k];
-                    endpoint_psi_cov_factor_dir[k][e] = 2.0 * basis[k] * gamma_psi_dir[k];
-                    endpoint_psi_psi_factor_dir[k][e] = 2.0 * basis[k] * gamma_dir[k];
+                for k in 0..p_resp {
+                    endpoint_psi[e] += basis[k] * gamma_psi[k];
+                    endpoint_dir[e] += basis[k] * gamma_dir[k];
+                    endpoint_psi_dir[e] += basis[k] * gamma_psi_dir[k];
+                    endpoint_factor[k][e] = basis[k];
+                    endpoint_factor_dir[k][e] = 0.0;
+                    endpoint_psi_cov_factor[k][e] = 0.0;
+                    endpoint_psi_psi_factor[k][e] = basis[k];
+                    endpoint_psi_cov_factor_dir[k][e] = 0.0;
+                    endpoint_psi_psi_factor_dir[k][e] = 0.0;
                 }
             }
             let d_inv_hp = -hp_dir * inv_hp_sq;
             let d_inv_hp_sq = -2.0 * hp_dir * inv_hp_cu;
             let d_inv_hp_cu = -3.0 * hp_dir * inv_hp_qu;
 
-            h_factor[0] = rv[0];
-            hp_factor[0] = rd[0];
-            hpsi_psi_factor[0] = rv[0];
-            hppsi_psi_factor[0] = rd[0];
-            for k in 1..p_resp {
-                h_factor[k] = 2.0 * rv[k] * gamma[k];
-                hp_factor[k] = 2.0 * rd[k] * gamma[k];
-                h_factor_dir[k] = 2.0 * rv[k] * gamma_dir[k];
-                hp_factor_dir[k] = 2.0 * rd[k] * gamma_dir[k];
-                hpsi_cov_factor[k] = 2.0 * rv[k] * gamma_psi[k];
-                hppsi_cov_factor[k] = 2.0 * rd[k] * gamma_psi[k];
-                hpsi_psi_factor[k] = 2.0 * rv[k] * gamma[k];
-                hppsi_psi_factor[k] = 2.0 * rd[k] * gamma[k];
-                hpsi_cov_factor_dir[k] = 2.0 * rv[k] * gamma_psi_dir[k];
-                hppsi_cov_factor_dir[k] = 2.0 * rd[k] * gamma_psi_dir[k];
-                hpsi_psi_factor_dir[k] = 2.0 * rv[k] * gamma_dir[k];
-                hppsi_psi_factor_dir[k] = 2.0 * rd[k] * gamma_dir[k];
+            for k in 0..p_resp {
+                h_factor[k] = rv[k];
+                hp_factor[k] = rd[k];
+                h_factor_dir[k] = 0.0;
+                hp_factor_dir[k] = 0.0;
+                hpsi_cov_factor[k] = 0.0;
+                hppsi_cov_factor[k] = 0.0;
+                hpsi_psi_factor[k] = rv[k];
+                hppsi_psi_factor[k] = rd[k];
+                hpsi_cov_factor_dir[k] = 0.0;
+                hppsi_cov_factor_dir[k] = 0.0;
+                hpsi_psi_factor_dir[k] = 0.0;
+                hppsi_psi_factor_dir[k] = 0.0;
             }
 
             for k in 0..p_resp {
                 for l in 0..p_resp {
-                    let same_shape = k == l && k > 0;
                     for c in 0..p_cov {
                         let row_idx = k * p_cov + c;
                         let h_a = h_factor[k] * cov_row[c];
@@ -2732,18 +2711,7 @@ impl TransformationNormalFamily {
                                 + hpsi_psi_factor_dir[l] * psi_row[d];
                             let hppsi_b_dir = hppsi_cov_factor_dir[l] * cov_row[d]
                                 + hppsi_psi_factor_dir[l] * psi_row[d];
-                            let (h_ab, hp_ab, hpsi_ab, hppsi_ab) = if same_shape {
-                                (
-                                    2.0 * rv[k] * cov_row[c] * cov_row[d],
-                                    2.0 * rd[k] * cov_row[c] * cov_row[d],
-                                    2.0 * rv[k]
-                                        * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
-                                    2.0 * rd[k]
-                                        * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
-                                )
-                            } else {
-                                (0.0, 0.0, 0.0, 0.0)
-                            };
+                            let (h_ab, hp_ab, hpsi_ab, hppsi_ab) = (0.0, 0.0, 0.0, 0.0);
                             let endpoint_a = [
                                 endpoint_factor[k][0] * cov_row[c],
                                 endpoint_factor[k][1] * cov_row[c],
@@ -2784,22 +2752,7 @@ impl TransformationNormalFamily {
                                 endpoint_psi_cov_factor_dir[l][1] * cov_row[d]
                                     + endpoint_psi_psi_factor_dir[l][1] * psi_row[d],
                             ];
-                            let (endpoint_ab, endpoint_psi_ab) = if same_shape {
-                                (
-                                    [
-                                        2.0 * endpoint_basis[0][k] * cov_row[c] * cov_row[d],
-                                        2.0 * endpoint_basis[1][k] * cov_row[c] * cov_row[d],
-                                    ],
-                                    [
-                                        2.0 * endpoint_basis[0][k]
-                                            * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
-                                        2.0 * endpoint_basis[1][k]
-                                            * (psi_row[d] * cov_row[c] + psi_row[c] * cov_row[d]),
-                                    ],
-                                )
-                            } else {
-                                ([0.0; 2], [0.0; 2])
-                            };
+                            let (endpoint_ab, endpoint_psi_ab) = ([0.0; 2], [0.0; 2]);
                             let numerator = hppsi_a * hp_b + hp_a * hppsi_b;
                             let numerator_dir = hppsi_a_dir * hp_b
                                 + hppsi_a * hp_b_dir
@@ -2940,7 +2893,6 @@ impl TransformationNormalFamily {
 
         struct PsiDhTraceAccum {
             pub(crate) value: f64,
-            pub(crate) gamma: Vec<f64>,
             pub(crate) gamma_dir: Vec<f64>,
             pub(crate) gamma_psi: Vec<f64>,
             pub(crate) gamma_psi_dir: Vec<f64>,
@@ -2971,7 +2923,6 @@ impl TransformationNormalFamily {
                 let projected_len = p_resp * rank;
                 Self {
                     value: 0.0,
-                    gamma: vec![0.0; p_resp],
                     gamma_dir: vec![0.0; p_resp],
                     gamma_psi: vec![0.0; p_resp],
                     gamma_psi_dir: vec![0.0; p_resp],
@@ -3091,7 +3042,6 @@ impl TransformationNormalFamily {
                     let q = row_quantities.endpoint_q[i];
 
                     for k in 0..p_resp {
-                        acc.gamma[k] = beta_mat.row(k).dot(&cov_row);
                         acc.gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
                         acc.gamma_psi[k] = beta_mat.row(k).dot(&psi_row);
                         acc.gamma_psi_dir[k] = dir_mat.row(k).dot(&psi_row);
@@ -3110,23 +3060,17 @@ impl TransformationNormalFamily {
                             .expect("projected CTN psi-factor row should be contiguous"),
                     );
 
-                    let mut hp_psi = rd[0] * acc.gamma_psi[0];
-                    let mut h_dir = rv[0] * acc.gamma_dir[0];
-                    let mut hp_dir = rd[0] * acc.gamma_dir[0];
-                    let mut h_psi_dir = rv[0] * acc.gamma_psi_dir[0];
-                    let mut hp_psi_dir = rd[0] * acc.gamma_psi_dir[0];
-                    for k in 1..p_resp {
-                        hp_psi += 2.0 * rd[k] * acc.gamma[k] * acc.gamma_psi[k];
-                        h_dir += 2.0 * rv[k] * acc.gamma[k] * acc.gamma_dir[k];
-                        hp_dir += 2.0 * rd[k] * acc.gamma[k] * acc.gamma_dir[k];
-                        h_psi_dir += 2.0
-                            * rv[k]
-                            * (acc.gamma_dir[k] * acc.gamma_psi[k]
-                                + acc.gamma[k] * acc.gamma_psi_dir[k]);
-                        hp_psi_dir += 2.0
-                            * rd[k]
-                            * (acc.gamma_dir[k] * acc.gamma_psi[k]
-                                + acc.gamma[k] * acc.gamma_psi_dir[k]);
+                    let mut hp_psi = 0.0;
+                    let mut h_dir = 0.0;
+                    let mut hp_dir = 0.0;
+                    let mut h_psi_dir = 0.0;
+                    let mut hp_psi_dir = 0.0;
+                    for k in 0..p_resp {
+                        hp_psi += rd[k] * acc.gamma_psi[k];
+                        h_dir += rv[k] * acc.gamma_dir[k];
+                        hp_dir += rd[k] * acc.gamma_dir[k];
+                        h_psi_dir += rv[k] * acc.gamma_psi_dir[k];
+                        hp_psi_dir += rd[k] * acc.gamma_psi_dir[k];
                     }
                     let d_inv_hp = -hp_dir * inv_hp_sq;
                     let d_inv_hp_sq = -2.0 * hp_dir * inv_hp_cu;
@@ -3137,75 +3081,46 @@ impl TransformationNormalFamily {
                     let mut endpoint_psi_dir = [0.0_f64; 2];
                     for e in 0..2 {
                         let basis = endpoint_basis[e];
-                        endpoint_psi[e] = basis[0] * acc.gamma_psi[0];
-                        endpoint_dir[e] = basis[0] * acc.gamma_dir[0];
-                        endpoint_psi_dir[e] = basis[0] * acc.gamma_psi_dir[0];
-                        for k in 1..p_resp {
-                            endpoint_psi[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_psi[k];
-                            endpoint_dir[e] += 2.0 * basis[k] * acc.gamma[k] * acc.gamma_dir[k];
-                            endpoint_psi_dir[e] += 2.0
-                                * basis[k]
-                                * (acc.gamma_dir[k] * acc.gamma_psi[k]
-                                    + acc.gamma[k] * acc.gamma_psi_dir[k]);
+                        for k in 0..p_resp {
+                            endpoint_psi[e] += basis[k] * acc.gamma_psi[k];
+                            endpoint_dir[e] += basis[k] * acc.gamma_dir[k];
+                            endpoint_psi_dir[e] += basis[k] * acc.gamma_psi_dir[k];
                         }
                     }
 
                     for col in 0..rank {
-                        acc.h_f[col] = rv[0] * acc.gamma_f[col];
-                        acc.hp_f[col] = rd[0] * acc.gamma_f[col];
+                        acc.h_f[col] = 0.0;
+                        acc.hp_f[col] = 0.0;
                         acc.h_f_dir[col] = 0.0;
                         acc.hp_f_dir[col] = 0.0;
                         acc.h_ff[col] = 0.0;
                         acc.hp_ff[col] = 0.0;
-                        acc.hpsi_f[col] = rv[0] * acc.gamma_psi_f[col];
-                        acc.hppsi_f[col] = rd[0] * acc.gamma_psi_f[col];
+                        acc.hpsi_f[col] = 0.0;
+                        acc.hppsi_f[col] = 0.0;
                         acc.hpsi_f_dir[col] = 0.0;
                         acc.hppsi_f_dir[col] = 0.0;
                         acc.hpsi_ff[col] = 0.0;
                         acc.hppsi_ff[col] = 0.0;
-                        acc.endpoint_f[col] = [
-                            endpoint_basis[0][0] * acc.gamma_f[col],
-                            endpoint_basis[1][0] * acc.gamma_f[col],
-                        ];
+                        acc.endpoint_f[col] = [0.0; 2];
                         acc.endpoint_f_dir[col] = [0.0; 2];
                         acc.endpoint_ff[col] = [0.0; 2];
-                        acc.endpoint_psi_f[col] = [
-                            endpoint_basis[0][0] * acc.gamma_psi_f[col],
-                            endpoint_basis[1][0] * acc.gamma_psi_f[col],
-                        ];
+                        acc.endpoint_psi_f[col] = [0.0; 2];
                         acc.endpoint_psi_f_dir[col] = [0.0; 2];
                         acc.endpoint_psi_ff[col] = [0.0; 2];
                     }
-                    for k in 1..p_resp {
-                        let g = acc.gamma[k];
-                        let gd = acc.gamma_dir[k];
-                        let gp = acc.gamma_psi[k];
-                        let gpd = acc.gamma_psi_dir[k];
+                    for k in 0..p_resp {
                         for col in 0..rank {
                             let idx = k * rank + col;
                             let gf = acc.gamma_f[idx];
                             let gpf = acc.gamma_psi_f[idx];
-                            acc.h_f[col] += 2.0 * rv[k] * g * gf;
-                            acc.hp_f[col] += 2.0 * rd[k] * g * gf;
-                            acc.h_f_dir[col] += 2.0 * rv[k] * gd * gf;
-                            acc.hp_f_dir[col] += 2.0 * rd[k] * gd * gf;
-                            acc.h_ff[col] += 2.0 * rv[k] * gf * gf;
-                            acc.hp_ff[col] += 2.0 * rd[k] * gf * gf;
-                            acc.hpsi_f[col] += 2.0 * rv[k] * (gf * gp + g * gpf);
-                            acc.hppsi_f[col] += 2.0 * rd[k] * (gf * gp + g * gpf);
-                            acc.hpsi_f_dir[col] += 2.0 * rv[k] * (gf * gpd + gd * gpf);
-                            acc.hppsi_f_dir[col] += 2.0 * rd[k] * (gf * gpd + gd * gpf);
-                            acc.hpsi_ff[col] += 4.0 * rv[k] * gf * gpf;
-                            acc.hppsi_ff[col] += 4.0 * rd[k] * gf * gpf;
+                            acc.h_f[col] += rv[k] * gf;
+                            acc.hp_f[col] += rd[k] * gf;
+                            acc.hpsi_f[col] += rv[k] * gpf;
+                            acc.hppsi_f[col] += rd[k] * gpf;
                             for e in 0..2 {
                                 let basis = endpoint_basis[e];
-                                acc.endpoint_f[col][e] += 2.0 * basis[k] * g * gf;
-                                acc.endpoint_f_dir[col][e] += 2.0 * basis[k] * gd * gf;
-                                acc.endpoint_ff[col][e] += 2.0 * basis[k] * gf * gf;
-                                acc.endpoint_psi_f[col][e] += 2.0 * basis[k] * (gf * gp + g * gpf);
-                                acc.endpoint_psi_f_dir[col][e] +=
-                                    2.0 * basis[k] * (gf * gpd + gd * gpf);
-                                acc.endpoint_psi_ff[col][e] += 4.0 * basis[k] * gf * gpf;
+                                acc.endpoint_f[col][e] += basis[k] * gf;
+                                acc.endpoint_psi_f[col][e] += basis[k] * gpf;
                             }
                         }
                     }

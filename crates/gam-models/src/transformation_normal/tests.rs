@@ -430,7 +430,7 @@ fn toy_family_and_derivatives_with_penalty_mode(
     .expect("toy transformation family");
     let derivative_blocks =
         vec![build_tensor_psi_derivatives(&family, &cov_derivs).expect("tensor psi derivs")];
-    // Positive γ across the response axis with mild covariate variation so
+    // Positive alpha across the response axis with mild covariate variation so
     // h' = (M ⊗_row B_cov)·β stays strictly positive on every row (M-splines
     // are non-negative; the toy covariate design is positive-valued).
     let mut beta_vec = Vec::with_capacity(p_total);
@@ -474,20 +474,67 @@ pub(crate) fn toy_family_and_derivatives(
 }
 
 #[test]
+pub(crate) fn direct_alpha_ctn_exposes_exact_factored_monotonicity_cone() {
+    let (family, _, state, spec) = toy_family_and_derivatives(&array![0.15, -0.10]);
+    let constraints = family
+        .block_linear_constraints(std::slice::from_ref(&state), 0, &spec)
+        .expect("CTN monotonicity constraints build")
+        .expect("direct-alpha CTN must constrain its shape rows");
+    let gam_problem::ConstraintSet::KhatriRaoCone(cone) = constraints else {
+        panic!("direct-alpha CTN must keep the large cone factored");
+    };
+
+    let p_resp = family.response_val_basis.ncols();
+    let p_cov = family.covariate_design.ncols();
+    assert_eq!(cone.p_left(), p_resp);
+    assert_eq!(cone.coupled_rows(), &(1..p_resp).collect::<Vec<_>>());
+    assert_eq!(cone.ncols(), spec.design.ncols());
+    assert_eq!(cone.nrows(), family.n_obs() * (p_resp - 1));
+    assert_eq!(cone.factor().nrows(), family.n_obs());
+    assert_eq!(cone.factor().ncols(), p_cov);
+    assert!(
+        cone.values(state.beta.view())
+            .expect("feasible toy alpha values")
+            .iter()
+            .all(|value| *value > 0.0),
+        "the production warm-start shape field must be strictly feasible"
+    );
+
+    let mut location_only = Array1::<f64>::zeros(spec.design.ncols());
+    location_only[0] = -100.0;
+    assert!(
+        cone.values(location_only.view())
+            .expect("unconstrained location values")
+            .iter()
+            .all(|value| *value == 0.0),
+        "response row zero is the unconstrained location field"
+    );
+
+    let mut invalid_shape = Array1::<f64>::zeros(spec.design.ncols());
+    invalid_shape[p_cov] = -1.0;
+    assert!(
+        cone.values(invalid_shape.view())
+            .expect("invalid shape values")
+            .iter()
+            .any(|value| *value < 0.0),
+        "a negative realized shape field must violate the cone"
+    );
+}
+
+#[test]
 pub(crate) fn ctn_row_quantity_cache_matches_direct_formulas() {
     let psi = array![0.15, -0.10];
     let (family, _, state, _) = toy_family_and_derivatives(&psi);
     let row = family
         .row_quantities(&state.beta)
         .expect("toy row quantities");
-    // SCOP-CTN forward: h = X_val · γ²-affine + offset + ε(y−median),
-    // h' = X_deriv · γ²-affine + ε.
-    let direct_h = family.x_val_kron.scop_affine_squared_forward(&state.beta)
+    // Direct-alpha SCOP-CTN is affine in the coefficient block.
+    let direct_h = family.x_val_kron.forward_mul(&state.beta)
         + family.offset.as_ref()
         + family.response_floor_offset.as_ref();
     let direct_h_prime = family
         .x_deriv_kron
-        .scop_affine_squared_forward(&state.beta)
+        .forward_mul(&state.beta)
         .mapv(|hp| hp + TRANSFORMATION_MONOTONICITY_EPS);
     let weights = family.weights.as_ref();
 
@@ -519,21 +566,21 @@ pub(crate) fn ctn_row_quantity_cache_matches_direct_formulas() {
         .expect("toy covariate rows");
     let mut h_lower = Array1::<f64>::zeros(cov.nrows());
     let mut h_upper = Array1::<f64>::zeros(cov.nrows());
-    let mut gamma = vec![0.0; p_resp];
+    let mut alpha = vec![0.0; p_resp];
     for i in 0..cov.nrows() {
         let cov_row = cov.row(i);
         for k in 0..p_resp {
-            gamma[k] = beta_mat.row(k).dot(&cov_row);
+            alpha[k] = beta_mat.row(k).dot(&cov_row);
         }
-        let mut lower = family.response_lower_basis[0] * gamma[0]
+        let mut lower = family.response_lower_basis[0] * alpha[0]
             + family.offset[i]
             + family.response_lower_floor_offset;
-        let mut upper = family.response_upper_basis[0] * gamma[0]
+        let mut upper = family.response_upper_basis[0] * alpha[0]
             + family.offset[i]
             + family.response_upper_floor_offset;
         for k in 1..p_resp {
-            lower += family.response_lower_basis[k] * gamma[k] * gamma[k];
-            upper += family.response_upper_basis[k] * gamma[k] * gamma[k];
+            lower += family.response_lower_basis[k] * alpha[k];
+            upper += family.response_upper_basis[k] * alpha[k];
         }
         h_lower[i] = lower;
         h_upper[i] = upper;

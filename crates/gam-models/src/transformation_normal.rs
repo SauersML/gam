@@ -6,21 +6,21 @@
 //!
 //! The response-direction basis is `[1, I_1(y), ..., I_K(y)]`, tensored with an
 //! arbitrary covariate design operator. Column 0 is an unconstrained location
-//! component `b(x)`. The I-spline columns are shape components with squared
-//! covariate-side coefficients, giving the SCOP representation
-//! `h(y, x) = b(x) + ε·(y−median_y) + Σ_k I_k(y) γ_k(x)^2` and
-//! `h'(y, x) = ε + Σ_k M_k(y) γ_k(x)^2`. Monotonicity is structural:
+//! component `b(x)`. The I-spline columns are direct non-negative shape
+//! functions `α_k(x)`, giving the SCOP representation
+//! `h(y, x) = b(x) + ε·(y−median_y) + Σ_k I_k(y) α_k(x)` and
+//! `h'(y, x) = ε + Σ_k M_k(y) α_k(x)`. Monotonicity is exact:
 //! the fixed derivative floor `ε` keeps the change-of-variables log-density
 //! away from the `log(0)` singularity, while the non-negative M-spline basis
-//! and squared covariate-side coefficients supply the learned shape.
+//! and the factored Khatri-Rao cone `α_k(x_i) >= 0` supply the learned shape.
 //!
 //! The log-likelihood per observation is the finite-support normalized
 //! change-of-variables density for a standard normal target:
 //!
 //!   ℓ_i = -½ h_i² + log(h'_i) - log(Φ(h_U(x_i)) - Φ(h_L(x_i)))
 //!
-//! where `h_i = b(x_i) + ε·(y_i−median_y) + Σ_k I_k(y_i) γ_k(x_i)^2`
-//! and `h'_i = ε + Σ_k M_k(y_i) γ_k(x_i)^2`. The endpoint normalizer is
+//! where `h_i = b(x_i) + ε·(y_i−median_y) + Σ_k I_k(y_i) α_k(x_i)`
+//! and `h'_i = ε + Σ_k M_k(y_i) α_k(x_i)`. The endpoint normalizer is
 //! required because the I-spline response basis saturates at finite support
 //! values rather than mapping onto the full real line.
 
