@@ -2477,16 +2477,21 @@ fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
         .block_linear_constraints(&block_states, 2, &dummy_spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "link constraint lookup", e))
         .expect("link constraints");
-    assert_eq!(constraints.a.ncols(), link_dim);
-    assert_eq!(constraints.b.len(), constraints.a.nrows());
+    assert_eq!(constraints.ncols(), link_dim);
+    let constraint_rows = constraints.nrows();
     assert!(
-        constraints.a.nrows() >= link_dim,
+        constraint_rows >= link_dim,
         "anchored link constraints should be expressed in raw derivative-control rows"
     );
+    let bounds = Array1::from_iter((0..constraint_rows).map(|row| {
+        constraints
+            .bound(row)
+            .unwrap_or_else(|e| panic!("link constraint bound {row} failed: {e}"))
+    }));
     assert_eq!(
-        constraints.b,
+        bounds,
         Array1::<f64>::from_elem(
-            constraints.a.nrows(),
+            constraint_rows,
             prepared.runtime.monotonicity_eps() - 1.0
         )
     );
@@ -2666,16 +2671,21 @@ fn score_warp_block_exposes_structural_derivative_lower_bounds() {
         .block_linear_constraints(&block_states, 2, &dummy_spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "constraint lookup", e))
         .expect("score-warp constraints");
-    assert_eq!(constraints.a.ncols(), score_dim);
-    assert_eq!(constraints.b.len(), constraints.a.nrows());
+    assert_eq!(constraints.ncols(), score_dim);
+    let constraint_rows = constraints.nrows();
     assert!(
-        constraints.a.nrows() >= score_dim,
+        constraint_rows >= score_dim,
         "anchored score-warp constraints should be expressed in raw derivative-control rows"
     );
+    let bounds = Array1::from_iter((0..constraint_rows).map(|row| {
+        constraints
+            .bound(row)
+            .unwrap_or_else(|e| panic!("score-warp constraint bound {row} failed: {e}"))
+    }));
     assert_eq!(
-        constraints.b,
+        bounds,
         Array1::<f64>::from_elem(
-            constraints.a.nrows(),
+            constraint_rows,
             prepared.runtime.monotonicity_eps() - 1.0
         )
     );
