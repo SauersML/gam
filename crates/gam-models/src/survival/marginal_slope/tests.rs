@@ -6347,6 +6347,7 @@ fn flex_no_wiggle_test_block_states(
     ]
 }
 
+#[test]
 fn survival_jointhessian_flex_no_wiggle_operator_subsample_full_equals_unsampled() {
     use crate::outer_subsample::OuterScoreSubsample;
     let n = 40usize;
