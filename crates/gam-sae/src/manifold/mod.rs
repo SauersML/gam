@@ -203,6 +203,7 @@ mod crosscoder_fit;
 mod curl;
 pub mod curve_promotion;
 mod derivative_oracle;
+pub mod dormant_certificate;
 mod dual;
 mod evaluator_rebuild;
 mod fisher_metric;
