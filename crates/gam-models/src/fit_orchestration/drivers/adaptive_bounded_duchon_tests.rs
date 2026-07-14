@@ -1921,12 +1921,25 @@ mod adaptive_bounded_duchon_tests {
                 ValidatedFixedQuadraticHessian::zero(baseline.design.design.ncols())
                     .expect("zero fixed quadratic Hessian"),
             );
+            let hyper_layout = gam_problem::CustomFamilyHyperLayout::new(
+                derivative_blocks.clone(),
+                Vec::new(),
+                array![
+                    (1e-12_f64).ln(),
+                    log_lambda_g,
+                    (1e-12_f64).ln(),
+                    eps_0.ln(),
+                    eps_g.ln(),
+                    eps_c.ln(),
+                ],
+            )
+            .expect("six-axis adaptive profile layout");
             evaluate_custom_family_joint_hyper(
                 &family,
                 std::slice::from_ref(&blockspec),
                 &outer_opts,
                 &Array1::zeros(0),
-                &derivative_blocks,
+                &hyper_layout,
                 None,
                 gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient,
             )

@@ -18,7 +18,9 @@ use super::exact_kernel::{
     transformed_link_cubic as exact_transformed_link_cubic,
 };
 
-use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
+use crate::custom_family::{
+    CustomFamily, CustomFamilyBlockPsiDerivative, ExactOuterDerivativeOrder,
+};
 
 use ndarray::array;
 

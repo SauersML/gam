@@ -344,7 +344,7 @@ mod tests {
                 assert_eq!(
                     out.status[i],
                     CubicCellMomentStatus::Ok,
-                    "cell {i} status was {} at degree={max_degree}",
+                    "cell {i} status was {:?} at degree={max_degree}",
                     out.status[i]
                 );
                 let row = &out.moments[i * out.stride..(i + 1) * out.stride];

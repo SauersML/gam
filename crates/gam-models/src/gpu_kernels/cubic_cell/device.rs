@@ -438,7 +438,7 @@ mod tests {
                 assert_eq!(
                     status[i],
                     CubicCellMomentStatus::Ok,
-                    "cell {i} must classify Ok (status={})",
+                    "cell {i} must classify Ok (status={:?})",
                     status[i]
                 );
                 let row = &host_moments[i * stride..(i + 1) * stride];
