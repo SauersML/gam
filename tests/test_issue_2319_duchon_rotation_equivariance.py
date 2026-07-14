@@ -45,8 +45,8 @@ def test_duchon_fit_is_rotation_equivariant_in_one_scalar_frame_2319() -> None:
     fit = gamfit.fit(train, "y ~ duchon(x, z)", family="gaussian")
     fit_rot = gamfit.fit(train_rot, "y ~ duchon(x, z)", family="gaussian")
 
-    mean = np.asarray(fit.predict(pred)["mean"], dtype=float)
-    mean_rot = np.asarray(fit_rot.predict(pred_rot)["mean"], dtype=float)
+    mean = np.asarray(fit.predict(pred), dtype=float)
+    mean_rot = np.asarray(fit_rot.predict(pred_rot), dtype=float)
     signal_range = float(np.ptp(mean))
     assert signal_range > 1.0
     prediction_defect = float(np.max(np.abs(mean - mean_rot)) / signal_range)
