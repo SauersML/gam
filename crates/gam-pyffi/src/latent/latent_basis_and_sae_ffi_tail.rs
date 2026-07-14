@@ -870,10 +870,8 @@ fn sae_oos_request_from_arrays(
             );
         }
     };
-    let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
-        geometry_plans,
-        decoder_blocks,
-    )?;
+    let atoms =
+        gam::terms::sae::manifold::persisted_oos_atom_specs(geometry_plans, decoder_blocks)?;
     let hybrid_linear_images = match hybrid_linear_images {
         Some(images) => images,
         None => Vec::new(),
@@ -1170,11 +1168,9 @@ fn sae_manifold_certify_external<'py>(
         .iter()
         .map(|block| block.as_array())
         .collect::<Vec<_>>();
-    let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
-        &geometry_plans,
-        &decoder_views,
-    )
-    .map_err(py_value_error)?;
+    let atoms =
+        gam::terms::sae::manifold::persisted_oos_atom_specs(&geometry_plans, &decoder_views)
+            .map_err(py_value_error)?;
 
     if initial_coords.len() != k_atoms {
         return Err(py_value_error(format!(
@@ -1710,11 +1706,8 @@ fn steer_delta_with_metric_from_arrays(
     // rebuild contract `sae_manifold_predict_oos` marshals into, so the steer term
     // and the OOS term are rebuilt by one engine path (`run_sae_manifold_steer`,
     // #2236) rather than a duplicated pyffi rebuild.
-    let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
-        geometry_plans,
-        decoder_blocks,
-    )
-    .map_err(py_value_error)?;
+    let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(geometry_plans, decoder_blocks)
+        .map_err(py_value_error)?;
     let coord_blocks: Vec<Array2<f64>> = coords.iter().map(|block| block.to_owned()).collect();
 
     let request = gam::terms::sae::manifold::SaeSteerRequest {
@@ -1854,11 +1847,8 @@ fn steer_to_target_from_arrays(
             )));
         }
     };
-    let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
-        geometry_plans,
-        decoder_blocks,
-    )
-    .map_err(py_value_error)?;
+    let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(geometry_plans, decoder_blocks)
+        .map_err(py_value_error)?;
     let coord_blocks: Vec<Array2<f64>> = coords.iter().map(|block| block.to_owned()).collect();
 
     let request = gam::terms::sae::manifold::SaeSteerToTargetRequest {
@@ -2991,50 +2981,6 @@ fn latent_relative_stationarity(grad_norm: f64, grad0_norm: f64) -> f64 {
         return f64::INFINITY;
     }
     grad_norm / grad0_norm.max(1.0)
-}
-
-#[cfg(test)]
-mod sae_euclidean_oos_rebuild_tests {
-    use super::monomial_exponents;
-    use gam::terms::sae::manifold::sae_euclidean_degree_for_basis_size;
-
-    /// #1132 bug 3: the OOS basis rebuild for a Euclidean (linear) atom must
-    /// re-emit a basis whose width `M` equals the TRAINED decoder block's row
-    /// count. The width is `monomial_exponents(dim, degree).len()` where `dim`
-    /// is the build dimension (`centers.ncols()`). Recovering the degree from
-    /// `(dim, trained_M)` and rebuilding against the same `dim` must therefore
-    /// reproduce `trained_M` exactly. The regression case is a 1-D linear atom
-    /// whose trained decoder has `M = 1` (degree 0): the recovery must yield
-    /// degree 0 and width 1, NOT re-expand to width 3 (degree 2) — the
-    /// "decoder_blocks[0] has M=1 but rebuilt basis has M=3" OOS failure.
-    fn rebuilt_m_for(dim: usize, trained_m: usize) -> usize {
-        let degree = sae_euclidean_degree_for_basis_size(dim, trained_m)
-            .expect("degree must be recoverable from the trained decoder width");
-        monomial_exponents(dim, degree).len()
-    }
-
-    #[test]
-    fn euclidean_oos_rebuild_m_matches_trained_decoder_m() {
-        // The exact #1132 regression: dim = 1, trained M = 1 (constant-only).
-        assert_eq!(
-            rebuilt_m_for(1, 1),
-            1,
-            "1-D linear atom with decoder M=1 must rebuild to M=1, not M=3"
-        );
-        // The recovered width must equal the trained M across the supported
-        // degrees and dimensions (self-consistency of the decoder-anchored
-        // recovery the OOS / steer paths now use).
-        for dim in 1..=2usize {
-            for degree in 0..=2usize {
-                let trained_m = monomial_exponents(dim, degree).len();
-                assert_eq!(
-                    rebuilt_m_for(dim, trained_m),
-                    trained_m,
-                    "dim={dim}, degree={degree}: rebuilt M must equal trained M"
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]

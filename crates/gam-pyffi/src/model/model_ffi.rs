@@ -126,7 +126,9 @@ fn parse_covariance_mode(
     };
     match text.trim().to_ascii_lowercase().as_str() {
         "conditional" => Ok(Some(gam_predict::InferenceCovarianceMode::Conditional)),
-        "smoothing" => Ok(Some(gam_predict::InferenceCovarianceMode::SmoothingCorrected)),
+        "smoothing" => Ok(Some(
+            gam_predict::InferenceCovarianceMode::SmoothingCorrected,
+        )),
         other => Err(format!(
             "covariance_mode must be one of \"conditional\" or \"smoothing\"; \
              got \"{other}\""
@@ -1353,18 +1355,8 @@ fn competing_risks_prediction_payload_from_json(py: Python<'_>, raw: &str) -> Py
     set_optional_competing_risks_matrix(py, &out, "hazard_upper", object.get("hazard_upper"))?;
     set_optional_competing_risks_matrix(py, &out, "survival", object.get("survival"))?;
     set_optional_competing_risks_matrix(py, &out, "survival_se", object.get("survival_se"))?;
-    set_optional_competing_risks_matrix(
-        py,
-        &out,
-        "survival_lower",
-        object.get("survival_lower"),
-    )?;
-    set_optional_competing_risks_matrix(
-        py,
-        &out,
-        "survival_upper",
-        object.get("survival_upper"),
-    )?;
+    set_optional_competing_risks_matrix(py, &out, "survival_lower", object.get("survival_lower"))?;
+    set_optional_competing_risks_matrix(py, &out, "survival_upper", object.get("survival_upper"))?;
     set_optional_competing_risks_matrix(
         py,
         &out,
@@ -7317,8 +7309,8 @@ impl SigmaEffMode {
 #[cfg(test)]
 mod prediction_payload_tests {
     use super::{
-        parse_covariance_mode, PredictionPayload, SurvivalPredictionJsonPayload,
-        SurvivalPredictionPayload,
+        PredictionPayload, SurvivalPredictionJsonPayload, SurvivalPredictionPayload,
+        parse_covariance_mode,
     };
     use gam_predict::{InferenceCovarianceMode, PredictUncertaintyOptions};
     use std::collections::BTreeMap;
@@ -7357,7 +7349,9 @@ mod prediction_payload_tests {
 
         let value = serde_json::to_value(payload).expect("serialize prediction payload");
         assert_eq!(
-            value.get("covariance_source").and_then(|item| item.as_str()),
+            value
+                .get("covariance_source")
+                .and_then(|item| item.as_str()),
             Some("smoothing-corrected")
         );
     }
@@ -7391,6 +7385,7 @@ mod prediction_payload_tests {
             // rather than crash the parse.
             survival_se: Some(vec![vec![0.01, f64::NAN], vec![0.02, f64::NAN]]),
             eta_se: Some(vec![0.1, f64::INFINITY]),
+            covariance_source: Some("smoothing-corrected".to_string()),
         };
 
         let json = serde_json::to_string(&payload).expect("serialize must succeed");

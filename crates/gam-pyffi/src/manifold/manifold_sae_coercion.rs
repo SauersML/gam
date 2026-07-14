@@ -9,11 +9,11 @@
 use crate::manifold::manifold_sae_payload::{
     AtomPayload, CrosscoderPayload, ManifoldSaePayload, SCHEMA_TAG,
 };
+use gam::terms::sae::manifold::{SaeAtomGeometryPlan, sae_atom_basis_kind_name};
 use ndarray::{Array2, Array3, ArrayView2};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use serde_json::Value;
-use gam::terms::sae::manifold::{sae_atom_basis_kind_name, SaeAtomGeometryPlan};
 
 // The strict token schema (basis/topology vocabulary, assignment tables,
 // harmonic validation, chart periods) lives in the library
@@ -409,11 +409,7 @@ pub(crate) fn build_manifold_sae_payload(
         .iter()
         .map(|a| v_arr2(vget(a, "decoder_B")?))
         .collect::<Result<_, _>>()?;
-    for (index, (plan, decoder)) in geometry_plans
-        .iter()
-        .zip(&decoder_blocks)
-        .enumerate()
-    {
+    for (index, (plan, decoder)) in geometry_plans.iter().zip(&decoder_blocks).enumerate() {
         let expected = plan.basis_size()?;
         if decoder.len() != expected {
             return Err(format!(
@@ -575,7 +571,7 @@ mod manifold_sae_coercion_tests {
     use super::*;
     use gam::terms::sae::atom_schema::{
         basis_kind_for_topology, basis_to_topology, canonical_topology,
-        coordinate_periods_for_basis,
+        coordinate_periods_for_basis, topologies_for_bases, topology_for_bases,
     };
     use ndarray::array;
 
