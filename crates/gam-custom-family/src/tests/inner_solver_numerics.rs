@@ -4163,6 +4163,42 @@ pub(crate) fn projected_stationarity_inf_norm_projects_coupled_linear_kkt_multip
 }
 
 #[test]
+pub(crate) fn projected_stationarity_uses_the_qp_face_without_expanding_tight_rows() {
+    // A cone vertex can make every observation inequality tight while the QP's
+    // authoritative normal face contains one row. Reconstructing from slack
+    // would materialize all 4,096 duplicates and feed them to the NNLS
+    // projection; face provenance must keep the residual calculation sparse.
+    let mut a = Array2::<f64>::zeros((4096, 2));
+    a.column_mut(0).fill(1.0);
+    let constraints = ConstraintSet::Dense(
+        LinearInequalityConstraints::new(a, Array1::zeros(4096))
+            .expect("repeated tight constraints"),
+    );
+    let beta = array![0.0_f64, 0.0];
+    let residual = array![2.0_f64, -3.0];
+
+    let projected = projected_linear_constraint_stationarity_vector(
+        &residual,
+        &beta,
+        &constraints,
+        Some(&[0]),
+    )
+    .expect("authoritative face projection");
+    assert_relative_eq!(projected[0], 0.0_f64, epsilon = 1e-10);
+    assert_relative_eq!(projected[1], -3.0_f64, epsilon = 1e-12);
+
+    let explicitly_free = projected_linear_constraint_stationarity_vector(
+        &residual,
+        &beta,
+        &constraints,
+        Some(&[]),
+    )
+    .expect("authoritative empty face");
+    assert_relative_eq!(explicitly_free[0], 2.0_f64, epsilon = 1e-12);
+    assert_relative_eq!(explicitly_free[1], -3.0_f64, epsilon = 1e-12);
+}
+
+#[test]
 pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constraints() {
     let spec = ParameterBlockSpec {
         name: "coupled".to_string(),

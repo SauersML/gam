@@ -405,15 +405,19 @@ pub(crate) fn synchronized_states_from_flat_beta<
 /// component before taking the inf-norm. Axis-aligned lower bounds are just a
 /// special case; coupled derivative-guard rows must use the same KKT geometry.
 ///
-/// `known_active_rows`, when provided, seeds the working set with the QP
-/// solver's authoritative active rows. Trust-region damping and finite
+/// `known_active_rows`, when provided, is the QP solver's authoritative active
+/// face. Trust-region damping and finite
 /// precision can leave the committed β with row slacks slightly above the slack
 /// tolerance even though the QP identified the row as binding; slack-based
 /// detection alone then misses the row and leaves its Lagrange-multiplier mass
-/// in the projected residual. Seeding from the QP's active set is exact; the
-/// non-negative-multiplier iteration below then removes any seeded row whose
-/// least-squares multiplier turns out to be strictly negative, so the union
-/// of (QP active) ∪ (slack-detected) never declares false convergence.
+/// in the projected residual. Conversely, unioning the authoritative face with
+/// every slack-tight row destroys the factored-cone contract: one zero CTN
+/// coefficient row makes all `n` observation rows tight although the QP needs
+/// only a small working face, so the residual checker materializes thousands of
+/// redundant rows and sends them through an `O(m²)` NNLS iteration bound. Slack
+/// discovery is therefore used only when the caller has no QP face provenance.
+/// The non-negative-multiplier projection still rejects every supplied row with
+/// the wrong multiplier sign.
 pub(crate) fn projected_stationarity_inf_norm(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
@@ -493,10 +497,9 @@ pub fn projected_linear_constraint_stationarity_vector(
     }
     let n_rows = constraints.nrows();
     let values = constraints.values(beta.view()).ok()?;
-    // Union the slack-detected active rows with the optional QP-supplied
-    // hint. Using a boolean membership table preserves a canonical row order
-    // (matching the constraint matrix) so the rank-reduction below is
-    // deterministic across calls.
+    // A supplied QP face is authoritative, including `Some(&[])`. When no face
+    // provenance exists, discover candidates from slack. Using a boolean
+    // membership table preserves canonical row order in either case.
     let mut in_active = vec![false; n_rows];
     if let Some(hint) = known_active_rows {
         for &row in hint {
@@ -505,63 +508,62 @@ pub fn projected_linear_constraint_stationarity_vector(
             }
         }
     }
-    for row in 0..n_rows {
-        let bound = constraints.bound(row).ok()?;
-        if bound == f64::NEG_INFINITY {
-            continue;
-        }
-        if !bound.is_finite() {
-            return None;
-        }
-        let value = values[row];
-        let slack = value - bound;
-        if !slack.is_finite() {
-            return None;
-        }
-        if in_active[row] {
-            continue;
-        }
-        // Active-row inclusion band for the stationarity-residual cone projection.
-        // A constraint binding at the constrained optimum carries a Lagrange
-        // multiplier whose mass IS the stationarity residual (`r = A_activeᵀ λ`,
-        // λ >= 0); to project it out, every genuinely tight row must be a candidate.
-        // The constrained QP only reports rows it drove tight during a
-        // non-degenerate step, so monotone derivative-guard rows tight at the
-        // optimum but never explicitly stepped sit just above the old `1e-6·scale`
-        // band, get excluded, and leave the multiplier unresolved — tripping the
-        // `active_set_incomplete` refusal on an exactly constrained-stationary
-        // iterate (gam#797 survival time block). Widen the band so every near-tight
-        // row is a CANDIDATE; over-inclusion is safe because the downstream NNLS
-        // (`project_stationarity_residual_on_constraint_cone`) assigns λ = 0 to any
-        // candidate carrying no multiplier mass, so a non-binding row cannot
-        // spuriously shrink the residual.
-        let scale = value.abs().max(bound.abs()).max(1.0);
-        let beta_inf = beta
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0_f64, f64::max)
-            .max(1.0);
-        // ℓ¹ row norm bounded below by the Euclidean norm the carrier exposes;
-        // for the factored cone the Euclidean norm is exact and the ℓ¹ norm is
-        // within √p of it, so the slack band keeps its magnitude semantics.
-        let row_norm1 = constraints.row_norm(row).ok()?.max(1.0);
-        // A row that is mathematically binding can appear a small positive
-        // distance inside the feasible cone after repeated dense/spectral
-        // Newton projections on a flat baseline-hazard valley: the objective is
-        // insensitive along that direction, so round-off in the derivative-basis
-        // coordinates dominates the true slack.  The active-set QP reports only
-        // rows it explicitly pivoted on, so the KKT residual projection must also
-        // recover these numerically-pinned rows from primal slack.  Use a
-        // coefficient-space slack band, scaled by the row norm and coefficient
-        // magnitude, not just by `Aβ` (which is exactly zero for monotone
-        // derivative constraints with `b=0`).  Over-inclusion is safe because the
-        // downstream nonnegative cone projection assigns λ=0 to rows that do not
-        // carry multiplier mass; under-inclusion leaves a genuine multiplier in
-        // the residual and falsely reports `active_set_incomplete` (#1793/#1040).
-        let coordinate_slack_tol = 5e-3 * row_norm1 * beta_inf + 1e-8;
-        let active_tol = (1e-3 * scale + 1e-8).max(coordinate_slack_tol);
-        if slack <= active_tol {
-            in_active[row] = true;
+    if known_active_rows.is_none() {
+        for row in 0..n_rows {
+            let bound = constraints.bound(row).ok()?;
+            if bound == f64::NEG_INFINITY {
+                continue;
+            }
+            if !bound.is_finite() {
+                return None;
+            }
+            let value = values[row];
+            let slack = value - bound;
+            if !slack.is_finite() {
+                return None;
+            }
+            // Active-row inclusion band for the stationarity-residual cone projection.
+            // A constraint binding at the constrained optimum carries a Lagrange
+            // multiplier whose mass IS the stationarity residual (`r = A_activeᵀ λ`,
+            // λ >= 0); to project it out, every genuinely tight row must be a candidate.
+            // The constrained QP only reports rows it drove tight during a
+            // non-degenerate step, so monotone derivative-guard rows tight at the
+            // optimum but never explicitly stepped sit just above the old `1e-6·scale`
+            // band, get excluded, and leave the multiplier unresolved — tripping the
+            // `active_set_incomplete` refusal on an exactly constrained-stationary
+            // iterate (gam#797 survival time block). Widen the band so every near-tight
+            // row is a CANDIDATE; over-inclusion is safe because the downstream NNLS
+            // (`project_stationarity_residual_on_constraint_cone`) assigns λ = 0 to any
+            // candidate carrying no multiplier mass, so a non-binding row cannot
+            // spuriously shrink the residual.
+            let scale = value.abs().max(bound.abs()).max(1.0);
+            let beta_inf = beta
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            // ℓ¹ row norm bounded below by the Euclidean norm the carrier exposes;
+            // for the factored cone the Euclidean norm is exact and the ℓ¹ norm is
+            // within √p of it, so the slack band keeps its magnitude semantics.
+            let row_norm1 = constraints.row_norm(row).ok()?.max(1.0);
+            // A row that is mathematically binding can appear a small positive
+            // distance inside the feasible cone after repeated dense/spectral
+            // Newton projections on a flat baseline-hazard valley: the objective is
+            // insensitive along that direction, so round-off in the derivative-basis
+            // coordinates dominates the true slack.  The active-set QP reports only
+            // rows it explicitly pivoted on, so the KKT residual projection must also
+            // recover these numerically-pinned rows from primal slack.  Use a
+            // coefficient-space slack band, scaled by the row norm and coefficient
+            // magnitude, not just by `Aβ` (which is exactly zero for monotone
+            // derivative constraints with `b=0`).  Over-inclusion is safe because the
+            // downstream nonnegative cone projection assigns λ=0 to rows that do not
+            // carry multiplier mass; under-inclusion leaves a genuine multiplier in
+            // the residual and falsely reports `active_set_incomplete` (#1793/#1040).
+            let coordinate_slack_tol = 5e-3 * row_norm1 * beta_inf + 1e-8;
+            let active_tol = (1e-3 * scale + 1e-8).max(coordinate_slack_tol);
+            if slack <= active_tol {
+                in_active[row] = true;
+            }
         }
     }
     let active_rows: Vec<usize> = (0..n_rows).filter(|&row| in_active[row]).collect();
