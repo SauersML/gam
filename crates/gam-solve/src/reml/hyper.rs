@@ -900,9 +900,13 @@ impl<'a> RemlState<'a> {
         firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
         x_tau_dense_list: std::sync::Arc<Vec<Option<Array2<f64>>>>,
         x_tau_tau_dense: std::sync::Arc<Vec<Vec<Option<Array2<f64>>>>>,
-    ) -> Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync> {
+    ) -> Box<
+        dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+    > {
         Box::new(
-            move |i: usize, j: usize| -> super::reml_outer_engine::HyperCoordPair {
+            move |i: usize,
+                  j: usize|
+                  -> super::reml_outer_engine::HyperCoordPairResult {
                 let ld_s_ij = pld.tau_hessian_component(
                     &s_tau_list[i],
                     &s_tau_list[j],
@@ -916,7 +920,7 @@ impl<'a> RemlState<'a> {
                 let x_tau_tau_beta = match x_tau_tau[i][j].as_ref() {
                     Some(term) => {
                         Self::tau_tau_design_forward_mul_in_basis(term, &basis, beta_eval.as_ref())
-                            .expect("valid X_tau_tau beta product")
+                            .map_err(|error| error.to_string())?
                     }
                     None => Array1::<f64>::zeros(u.len()),
                 };
@@ -937,7 +941,7 @@ impl<'a> RemlState<'a> {
                 let term1 = match x_tau_tau[i][j].as_ref() {
                     Some(term) => {
                         Self::tau_tau_design_transpose_mul_in_basis(term, &basis, u.as_ref())
-                            .expect("valid X_tau_tau^T u product")
+                            .map_err(|error| error.to_string())?
                     }
                     None => Array1::<f64>::zeros(p_dim),
                 };
@@ -946,10 +950,10 @@ impl<'a> RemlState<'a> {
                     &basis,
                     &(w_diag.as_ref() * x_tau_i_beta),
                 )
-                .expect("valid X_tau_j^T W X_tau_i beta product");
+                .map_err(|error| error.to_string())?;
                 let term3 =
                     Self::tau_design_transpose_mul_in_basis(x_tau_i, &basis, &w_x_tau_j_beta)
-                        .expect("valid X_tau_i^T W X_tau_j beta product");
+                        .map_err(|error| error.to_string())?;
                 let c_x_tau_i_beta = c_array.as_ref() * x_tau_i_beta;
                 let term4 = x_design.transpose_vector_multiply(&(&c_x_tau_i_beta * x_tau_j_beta));
                 let term5 = if x_tau_tau[i][j].is_some() {
@@ -1038,13 +1042,13 @@ impl<'a> RemlState<'a> {
                     }
                 };
 
-                super::reml_outer_engine::HyperCoordPair {
+                Ok(super::reml_outer_engine::HyperCoordPair {
                     a: a_ij + a_firth,
                     g: &g_firth - &g_ij,
                     b_mat: Array2::<f64>::zeros((0, 0)),
                     b_operator: Some(std::sync::Arc::from(b_operator)),
                     ld_s: ld_s_ij,
-                }
+                })
             },
         )
     }
@@ -1058,9 +1062,13 @@ impl<'a> RemlState<'a> {
         a_k_tau_j_mats: std::sync::Arc<Vec<Vec<Option<Array2<f64>>>>>,
         beta_eval: std::sync::Arc<Array1<f64>>,
         p_dim: usize,
-    ) -> Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync> {
+    ) -> Box<
+        dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+    > {
         Box::new(
-            move |k: usize, j: usize| -> super::reml_outer_engine::HyperCoordPair {
+            move |k: usize,
+                  j: usize|
+                  -> super::reml_outer_engine::HyperCoordPairResult {
                 let s_tau_j = s_tau_list.get(j);
                 let a_k_tau_j = a_k_tau_j_mats
                     .get(j)
@@ -1087,13 +1095,13 @@ impl<'a> RemlState<'a> {
                     .cloned()
                     .unwrap_or_else(|| Array2::<f64>::zeros((p_dim, p_dim)));
 
-                super::reml_outer_engine::HyperCoordPair {
+                Ok(super::reml_outer_engine::HyperCoordPair {
                     a: a_kj,
                     g: g_kj,
                     b_mat: b_kj,
                     b_operator: None,
                     ld_s: ld_s_kj,
-                }
+                })
             },
         )
     }
@@ -1207,8 +1215,12 @@ impl<'a> RemlState<'a> {
     ) -> Result<
         (
             Vec<super::reml_outer_engine::HyperCoord>,
-            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
-            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
+            Box<
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+            >,
+            Box<
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+            >,
             Option<super::reml_outer_engine::FixedDriftDerivFn>,
         ),
         EstimationError,
@@ -1227,11 +1239,11 @@ impl<'a> RemlState<'a> {
                  dense design materialization too large; falling back to rho-only REML"
             );
             let identity_pair: Box<
-                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync,
-            > = Box::new(|_, _| super::reml_outer_engine::HyperCoordPair::zero());
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+            > = Box::new(|_, _| Ok(super::reml_outer_engine::HyperCoordPair::zero()));
             let identity_pair2: Box<
-                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync,
-            > = Box::new(|_, _| super::reml_outer_engine::HyperCoordPair::zero());
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+            > = Box::new(|_, _| Ok(super::reml_outer_engine::HyperCoordPair::zero()));
             return Ok((Vec::new(), identity_pair, identity_pair2, None));
         }
         let backend_label;
@@ -2391,8 +2403,12 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<
         (
-            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
-            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
+            Box<
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+            >,
+            Box<
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+            >,
         ),
         EstimationError,
     > {
@@ -2403,22 +2419,28 @@ impl<'a> RemlState<'a> {
             Array1::from_vec(gam_problem::checked_exp_log_strengths(rho.iter().copied())?);
 
         if p_dim == 0 {
-            let tau_tau_pair_fn =
-                move |_: usize, _: usize| super::reml_outer_engine::HyperCoordPair {
+            let tau_tau_pair_fn = move |_: usize,
+                                         _: usize|
+                  -> super::reml_outer_engine::HyperCoordPairResult {
+                Ok(super::reml_outer_engine::HyperCoordPair {
                     a: 0.0,
                     g: Array1::zeros(p_dim),
                     b_mat: Array2::zeros((p_dim, p_dim)),
                     b_operator: None,
                     ld_s: 0.0,
-                };
-            let rho_tau_pair_fn =
-                move |_: usize, _: usize| super::reml_outer_engine::HyperCoordPair {
+                })
+            };
+            let rho_tau_pair_fn = move |_: usize,
+                                         _: usize|
+                  -> super::reml_outer_engine::HyperCoordPairResult {
+                Ok(super::reml_outer_engine::HyperCoordPair {
                     a: 0.0,
                     g: Array1::zeros(p_dim),
                     b_mat: Array2::zeros((p_dim, p_dim)),
                     b_operator: None,
                     ld_s: 0.0,
-                };
+                })
+            };
             return Ok((Box::new(tau_tau_pair_fn), Box::new(rho_tau_pair_fn)));
         }
 
@@ -2568,8 +2590,12 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<
         (
-            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
-            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
+            Box<
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+            >,
+            Box<
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+            >,
         ),
         EstimationError,
     > {
@@ -2611,8 +2637,12 @@ impl<'a> RemlState<'a> {
         hyper_dirs: &[DirectionalHyperParam],
     ) -> Result<
         (
-            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
-            Box<dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPair + Send + Sync>,
+            Box<
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+            >,
+            Box<
+                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+            >,
         ),
         EstimationError,
     > {

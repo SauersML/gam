@@ -652,16 +652,19 @@ pub fn build_framed_resident_evidence_matvec(
     ridge_t: f64,
     ridge_beta: f64,
     apply_budget: usize,
-) -> Option<crate::arrow_schur::GpuSchurMatvec> {
+) -> Result<Option<crate::arrow_schur::GpuSchurMatvec>, ArrowSchurGpuFailure> {
     #[cfg(not(target_os = "linux"))]
     {
         // No CUDA runtime exists off Linux. Refuse the same degenerate
         // requests the Linux path would (mirroring the stubs above), then
         // report that no resident evidence matvec is available.
         if sys.k == 0 || !ridge_t.is_finite() || !ridge_beta.is_finite() || apply_budget == 0 {
-            return None;
+            return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                reason: "resident evidence matvec received degenerate dimensions or ridge"
+                    .to_string(),
+            });
         }
-        None
+        Ok(None)
     }
     #[cfg(target_os = "linux")]
     {
@@ -1041,24 +1044,30 @@ pub trait SaeResidentFrame {
 pub fn build_sae_resident_frame(
     sys: &ArrowSchurSystem,
     cg_iters: usize,
-) -> Result<std::sync::Arc<dyn SaeResidentFrame + Send + Sync>, ArrowSchurGpuFailure> {
+) -> Result<
+    Option<std::sync::Arc<dyn SaeResidentFrame + Send + Sync>>,
+    ArrowSchurGpuFailure,
+> {
     // Target-independent admission: a zero-K system has no reduced-Schur block
     // to keep resident, and a zero CG budget can never consume the frame — both
     // decline on every host, keeping the per-trial flatten the single fallback
     // (on CUDA hosts this also spares a doomed device build attempt).
     if sys.k == 0 || cg_iters == 0 {
-        return Err(ArrowSchurGpuFailure::Unavailable);
+        return Ok(None);
     }
     #[cfg(target_os = "linux")]
     {
-        cuda::ResidentSaeFrameHandle::build(sys, cg_iters)
-            .map(|h| std::sync::Arc::new(h) as std::sync::Arc<dyn SaeResidentFrame + Send + Sync>)
-            .ok_or(ArrowSchurGpuFailure::Unavailable)
+        cuda::ResidentSaeFrameHandle::build(sys, cg_iters).map(|handle| {
+            handle.map(|frame| {
+                std::sync::Arc::new(frame)
+                    as std::sync::Arc<dyn SaeResidentFrame + Send + Sync>
+            })
+        })
     }
     // Non-CUDA host: there is no device to build a frame on.
     #[cfg(not(target_os = "linux"))]
     {
-        Err(ArrowSchurGpuFailure::Unavailable)
+        Ok(None)
     }
 }
 
