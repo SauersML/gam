@@ -385,9 +385,145 @@ impl SaeManifoldTerm {
             AssignmentMode::OrderedBetaBernoulli { .. }
         )
         .then(|| Array1::<f64>::zeros(n * k_atoms));
-        // #932 complete schedule: softmax rows are built in memory-ledgered
-        // CPU/CUDA tiles through one bounded look-ahead window; non-softmax
-        // gates use their distinct dynamic row program.
+        if matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
+            // #2304 resident path for the residual-curvature blocks (1a)+(1b):
+            // the raw second/mixed jets are contracted on device (when the plan
+            // admits it) against the metric-applied √w-scaled residual and the
+            // direction's (t, β) coefficients — the packed channel tensors are
+            // never materialized. Blocks (2)-(3) below are logit/coord-space
+            // prior curvatures with no channel tensors involved and stay on
+            // the host.
+            {
+                let mut probe_assignments = Array1::<f64>::zeros(k_atoms);
+                let probe_for_row = |row: usize| -> Result<Vec<f64>, String> {
+                    self.assignment.try_assignments_row_into(
+                        row,
+                        probe_assignments.as_slice_mut().ok_or_else(|| {
+                            "apply_exact_hessian_minus_b: assignment scratch is not contiguous"
+                                .to_string()
+                        })?,
+                    )?;
+                    fitted.fill(0.0);
+                    let active_atoms = self
+                        .last_row_layout
+                        .as_ref()
+                        .map(|layout| layout.active_atoms[row].as_slice());
+                    for k in 0..k_atoms {
+                        if active_atoms.is_some_and(|active| active.binary_search(&k).is_err()) {
+                            continue;
+                        }
+                        self.atoms[k].fill_decoded_row(row, &mut decoded);
+                        let a_k = probe_assignments[k];
+                        for out_col in 0..p {
+                            fitted[out_col] += a_k * decoded[out_col];
+                        }
+                    }
+                    let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
+                    for out_col in 0..p {
+                        error[out_col] = sqrt_row_w * (fitted[out_col] - target[[row, out_col]]);
+                    }
+                    Ok(match self.row_metric.as_ref() {
+                        Some(metric) if whitens => metric.apply_metric_row(row, error.view()),
+                        _ => error.to_vec(),
+                    })
+                };
+                let v_t_for_row = |row: usize, q: usize| -> Result<Vec<f64>, String> {
+                    let base = cache.row_offsets[row];
+                    Ok((0..q).map(|c| v.t[base + c]).collect())
+                };
+                let v_beta_row: Vec<f64> =
+                    border.iter().map(|channel| v.beta[channel.index]).collect();
+                let out_ref = &mut out;
+                self.contracted_softmax_bilinear_hvp(
+                    cache,
+                    &second_jets,
+                    &border,
+                    probe_for_row,
+                    v_t_for_row,
+                    &v_beta_row,
+                    |row, _q, t_row, beta_row| {
+                        let base = cache.row_offsets[row];
+                        for (a, &value) in t_row.iter().enumerate() {
+                            out_ref.t[base + a] += value;
+                        }
+                        for (channel, &value) in border.iter().zip(beta_row) {
+                            out_ref.beta[channel.index] += value;
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+            // (2) softmax entropy-minus-majorizer and (3) periodic-ARD deltas,
+            // per row with the layout rebuilt from the cache (no jets needed).
+            for row in 0..n {
+                let q = cache.row_dims[row];
+                let base = cache.row_offsets[row];
+                self.assignment.try_assignments_row_into(
+                    row,
+                    assignments.as_slice_mut().ok_or_else(|| {
+                        "apply_exact_hessian_minus_b: assignment scratch is not contiguous"
+                            .to_string()
+                    })?,
+                )?;
+                let vars = self.row_vars_for_cache_row(row, cache)?;
+                let v_t: Vec<f64> = (0..q).map(|c| v.t[base + c]).collect();
+                let w_row = row_loss_w.map_or(1.0, |w| w[row]);
+                if let Some((_penalty, scale)) = softmax_delta.as_ref() {
+                    let assignment_dim = self.assignment.assignment_coord_dim();
+                    let a_soft = assignments
+                        .as_slice()
+                        .expect("softmax assignments row must be contiguous");
+                    let m = softmax_majorizer_log_mean(a_soft);
+                    for (a, va) in vars.iter().enumerate() {
+                        let SaeLocalRowVar::Logit { atom: ka } = *va else {
+                            continue;
+                        };
+                        if ka >= assignment_dim {
+                            continue;
+                        }
+                        let mut acc = 0.0_f64;
+                        for (b, vb) in vars.iter().enumerate() {
+                            let SaeLocalRowVar::Logit { atom: kb } = *vb else {
+                                continue;
+                            };
+                            if kb >= assignment_dim {
+                                continue;
+                            }
+                            let h_entropy =
+                                softmax_dense_entropy_hessian_entry(a_soft, ka, kb, m, *scale);
+                            let delta = if ka == kb {
+                                h_entropy
+                                    - active_softmax_gershgorin_majorizer_entry(
+                                        a_soft, ka, m, *scale,
+                                    )
+                            } else {
+                                h_entropy
+                            };
+                            acc += w_row * delta * v_t[b];
+                        }
+                        out.t[base + a] += acc;
+                    }
+                }
+                for (a, va) in vars.iter().enumerate() {
+                    let SaeLocalRowVar::Coord { atom, axis } = *va else {
+                        continue;
+                    };
+                    if rho.log_ard[atom].is_empty() {
+                        continue;
+                    }
+                    let alpha = ard_precisions[atom][axis];
+                    let t_val = self.assignment.coords[atom].row(row)[axis];
+                    let prior = ArdAxisPrior::eval(alpha, t_val, ard_axis_periods[atom][axis]);
+                    let neg = prior.negative_hessian_remainder();
+                    if neg != 0.0 {
+                        out.t[base + a] += w_row * neg * v_t[a];
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        // #932 complete schedule: non-softmax gates use their distinct dynamic
+        // row program through the bounded look-ahead window.
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
@@ -468,64 +604,10 @@ impl SaeManifoldTerm {
                 }
             }
 
-            // (2) softmax: ΔC_logit = (H_entropy − D) over the free logits, where
-            // `D = diag(Σ_j|H_kj|)` is the Gershgorin majorizer the assembled `B`
-            // wrote into the logit block (#1419). Adding `H_entropy − D` recovers the
-            // EXACT entropy curvature `A = B + ΔC`, so the solver's exact-Hessian
-            // correction differentiates the SAME operator the assembly installed.
-            if let Some((_penalty, scale)) = softmax_delta.as_ref() {
-                let assignment_dim = self.assignment.assignment_coord_dim();
-                // #1410: the correction only contracts the ACTIVE logit slots
-                // (`jets.vars` carries the row's `≤ top_k` active atoms on the
-                // compact layout), so build only the active sub-block of
-                // `ΔC = H_entropy − D` ENTRY-WISE rather than materialising the
-                // full `K×K` `row_dense_hessian` / `row_psd_majorizer` matrices per
-                // row (an `O(K²)`-per-row allocation that defeated the compact
-                // contract at the LLM shape). `D` is diagonal, so it subtracts only
-                // on `ka == kb`; the off-diagonal `H_entropy` entries come from the
-                // shared `(a, l, m)` algebra. The softmax row `a_soft` is the one
-                // irreducible `O(K)` term, computed once per row.
-                // #1557 — reuse this iteration's `assignments` (bit-identical).
-                let a_soft = assignments
-                    .as_slice()
-                    .expect("softmax assignments row must be contiguous");
-                let m = softmax_majorizer_log_mean(a_soft);
-                // #991 — the assembled `B` wrote the design-weighted majorizer
-                // `w_row·D` into the logit block (see the assembly), and the exact
-                // prior curvature is `w_row·H_entropy`, so this dropped-curvature
-                // correction `ΔC = A − B = w_row·(H_entropy − D)` carries the SAME
-                // `w_row`. The prior is weighted directly, not via the √w data seam.
-                let w_row = row_loss_w.map_or(1.0, |w| w[row]);
-                for (a, va) in jets.vars.iter().enumerate() {
-                    let SaeLocalRowVar::Logit { atom: ka } = *va else {
-                        continue;
-                    };
-                    if ka >= assignment_dim {
-                        continue;
-                    }
-                    let mut acc = 0.0_f64;
-                    for (b, vb) in jets.vars.iter().enumerate() {
-                        let SaeLocalRowVar::Logit { atom: kb } = *vb else {
-                            continue;
-                        };
-                        if kb >= assignment_dim {
-                            continue;
-                        }
-                        let h_entropy =
-                            softmax_dense_entropy_hessian_entry(a_soft, ka, kb, m, *scale);
-                        // `D` is the diagonal Gershgorin majorizer (#1419), so it
-                        // contributes only on the diagonal `ka == kb`.
-                        let delta = if ka == kb {
-                            h_entropy
-                                - active_softmax_gershgorin_majorizer_entry(a_soft, ka, m, *scale)
-                        } else {
-                            h_entropy
-                        };
-                        acc += w_row * delta * v_t[b];
-                    }
-                    out.t[base + a] += acc;
-                }
-            }
+            // (2) softmax entropy-minus-majorizer: softmax gates return through
+            // the resident contracted branch above (#1419 algebra preserved
+            // there verbatim, including the #1410 active-slot contraction and
+            // the #991 `w_row` convention), so no softmax delta arises here.
 
             // (3) periodic ARD: ΔC_coord = (V'' − max(V'',0)) = min(V'',0), diagonal.
             // The assembly writes the mean-one design-weighted majorizer
@@ -1099,8 +1181,7 @@ impl SaeManifoldTerm {
                 let normalizer_second = match period {
                     None => 0.0,
                     Some(p) => {
-                        let log_eta =
-                            log_alpha + 2.0 * (p.ln() - std::f64::consts::TAU.ln());
+                        let log_eta = log_alpha + 2.0 * (p.ln() - std::f64::consts::TAU.ln());
                         n_eff
                             * gam_math::special::bessel_i0_centered_second_log_derivative_from_log_abs(
                                 log_eta,
@@ -1261,8 +1342,7 @@ impl SaeManifoldTerm {
         let frames_active = self.frames_active();
         let (beta_offsets, beta_out_dim): (Vec<usize>, Box<dyn Fn(usize) -> usize>) =
             if frames_active {
-                let ranks: Vec<usize> =
-                    self.atoms.iter().map(|a| a.border_frame_rank()).collect();
+                let ranks: Vec<usize> = self.atoms.iter().map(|a| a.border_frame_rank()).collect();
                 (
                     self.factored_beta_offsets(),
                     Box::new(move |kk: usize| ranks[kk]),

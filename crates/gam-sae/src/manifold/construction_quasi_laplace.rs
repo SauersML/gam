@@ -2850,9 +2850,7 @@ impl SaeManifoldTerm {
     /// `S_k` is symmetrised defensively (as the assembler does); the per-atom
     /// `½(S+Sᵀ)·B_k` GEMMs ride the multi-GPU batched smoothness GEMM. Device-free
     /// and sub-threshold groups use exact CPU products; admitted failures propagate.
-    pub(crate) fn decoder_smoothness_quadratic_form_per_atom(
-        &self,
-    ) -> Result<Vec<f64>, String> {
+    pub(crate) fn decoder_smoothness_quadratic_form_per_atom(&self) -> Result<Vec<f64>, String> {
         let sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
             .atoms
             .iter()
@@ -4083,10 +4081,8 @@ impl SaeManifoldTerm {
                 for channel in 0..r {
                     let mut acc = 0.0_f64;
                     for nu in 0..m {
-                        let s_sym =
-                            0.5
-                                * (atom.smooth_penalty()[[mu, nu]]
-                                    + atom.smooth_penalty()[[nu, mu]]);
+                        let s_sym = 0.5
+                            * (atom.smooth_penalty()[[mu, nu]] + atom.smooth_penalty()[[nu, mu]]);
                         acc += s_sym * coeffs[[nu, channel]];
                     }
                     beta[off + mu * r + channel] = lambda * acc;
@@ -4173,6 +4169,58 @@ impl SaeManifoldTerm {
         let second_jets = self.atom_second_jets()?;
         let border = self.border_channels_for_cache(cache)?;
         let whiten = self.whiten_logdet_row_jets();
+        if matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
+            // #2304 resident path: the packed channel tensors are reduced in
+            // place (on device when the plan admits it) and only the per-row
+            // t/β coefficients return.
+            //
+            // The probe is `−½·√w·Z̃` on the block's columns, zero elsewhere
+            // (the −½ applied at emit time). With a whitening metric, the
+            // historical consumer whitened BOTH the jets and this vector to
+            // rank space and dotted there; `⟨Uᵀa, Uᵀv⟩ = ⟨a, U(Uᵀv)⟩`
+            // exactly, so the metric folds into the probe as `M_n v` and the
+            // raw jets are contracted directly.
+            let probe_for_row = |row: usize| -> Result<Vec<f64>, String> {
+                let sqrt_w = self
+                    .row_loss_weights
+                    .as_deref()
+                    .map_or(1.0, |w| w[row].sqrt());
+                let v: Vec<f64> = (0..p)
+                    .map(|col| {
+                        if col_range.contains(&col) {
+                            sqrt_w * target[[row, col]]
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                if whiten {
+                    let metric = self.row_metric.as_ref().ok_or_else(|| {
+                        "crosscoder_block_ift_rhs: whitening metric absent".to_string()
+                    })?;
+                    Ok(metric.apply_metric_row(row, ndarray::aview1(&v)))
+                } else {
+                    Ok(v)
+                }
+            };
+            self.contracted_softmax_linear_rhs(
+                cache,
+                &second_jets,
+                &border,
+                probe_for_row,
+                |row, q, t_row, beta_row| {
+                    let base = cache.row_offsets[row];
+                    for (var_idx, &value) in t_row.iter().enumerate().take(q) {
+                        t[base + var_idx] = -0.5 * value;
+                    }
+                    for (channel, &value) in border.iter().zip(beta_row) {
+                        beta[channel.index] += -0.5 * value;
+                    }
+                    Ok(())
+                },
+            )?;
+            return Ok(SaeArrowVector { t, beta });
+        }
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
@@ -4193,9 +4241,9 @@ impl SaeManifoldTerm {
             if whiten {
                 self.apply_whiten_to_logdet_row_jets(row, &mut jets)?;
             }
-            // `−½·√w·Z̃` on the block's columns, zero elsewhere; whitened by the
-            // SAME row metric the jets carry so the product reconstructs
-            // `−½·w·Jᵀ M Z̃^{(ℓ)}` (the jets already hold one `√w`/`Uᵀ` factor).
+            // The non-softmax rank-space dot: jets are whitened to `Uᵀ·`
+            // channels, so the vector is whitened the same way (never
+            // `M_n v` here — that fold belongs to the contracted path above).
             let sqrt_w = self
                 .row_loss_weights
                 .as_deref()
