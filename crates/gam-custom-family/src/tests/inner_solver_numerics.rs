@@ -4199,6 +4199,25 @@ pub(crate) fn projected_stationarity_uses_the_qp_face_without_expanding_tight_ro
 }
 
 #[test]
+pub(crate) fn scatter_preserves_an_authoritative_empty_face_for_constrained_blocks() {
+    let first = ConstraintSet::Dense(
+        LinearInequalityConstraints::new(Array2::eye(2), Array1::zeros(2))
+            .expect("first constraint block"),
+    );
+    let last = ConstraintSet::Dense(
+        LinearInequalityConstraints::new(array![[1.0_f64]], array![0.0_f64])
+            .expect("last constraint block"),
+    );
+    let constraints = vec![Some(first), None, Some(last)];
+
+    let empty = scatter_joint_active_set(&[], &constraints);
+    assert_eq!(empty, vec![Some(Vec::new()), None, Some(Vec::new())]);
+
+    let active = scatter_joint_active_set(&[1, 2], &constraints);
+    assert_eq!(active, vec![Some(vec![1]), None, Some(vec![0])]);
+}
+
+#[test]
 pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constraints() {
     let spec = ParameterBlockSpec {
         name: "coupled".to_string(),

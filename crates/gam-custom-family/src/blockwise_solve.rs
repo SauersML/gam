@@ -887,60 +887,11 @@ pub(crate) fn scatter_joint_active_set(
             .map(|idx| idx - offset)
             .collect::<Vec<_>>();
         offset += rows;
-        if local.is_empty() {
-            per_block.push(None);
-            continue;
-        }
         local.sort_unstable();
         local.dedup();
         per_block.push(Some(local));
     }
     per_block
-}
-
-pub(crate) fn augment_active_sets_with_tight_constraint_rows(
-    block_active_sets: &mut Vec<Option<Vec<usize>>>,
-    block_constraints: &[Option<ConstraintSet>],
-    states: &[ParameterBlockState],
-    slack_tol: f64,
-) -> usize {
-    if block_active_sets.len() != block_constraints.len() {
-        block_active_sets.resize(block_constraints.len(), None);
-    }
-    let mut added = 0usize;
-    let tol = slack_tol.max(0.0);
-    for (b, constraints_opt) in block_constraints.iter().enumerate() {
-        let Some(constraints) = constraints_opt else {
-            continue;
-        };
-        let Some(state) = states.get(b) else {
-            continue;
-        };
-        if constraints.ncols() != state.beta.len() {
-            continue;
-        }
-        let Ok(values) = constraints.values(state.beta.view()) else {
-            continue;
-        };
-        let active = block_active_sets[b].get_or_insert_with(Vec::new);
-        for row in 0..constraints.nrows() {
-            let Ok(bound) = constraints.bound(row) else {
-                continue;
-            };
-            let slack = values[row] - bound;
-            if slack.is_finite() && slack <= tol && !active.contains(&row) {
-                active.push(row);
-                added += 1;
-            }
-        }
-        if active.is_empty() {
-            block_active_sets[b] = None;
-        } else {
-            active.sort_unstable();
-            active.dedup();
-        }
-    }
-    added
 }
 
 /// Assemble the **active rows** of the joint linear inequality constraint
