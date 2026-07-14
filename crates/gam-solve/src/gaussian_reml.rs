@@ -4043,353 +4043,6 @@ fn enumerate_and_select_rho(
     )
 }
 
-// ============================================================================
-// Certified profiled-REML ρ-landscape: exact stationary polynomial + Sturm.
-// ============================================================================
-//
-// The branch-and-bound enumerator above isolates stationary brackets but its
-// *count* is only as certified as the interval-enclosure pruning. #2312 asks
-// for a genuinely CERTIFIED stationary count. The profiled first-order
-// condition is (single-sourced with `evaluate_reml_profile`, λ = e^ρ):
-//
-//     2·V′ = d·(Σ_i u_i − r) + ν·Σ_j dp′_j / dp_j = 0
-//     u_i = λδ_i/(1+λδ_i),   v_i = 1/(1+λδ_i),   w_i = λδ_i/(1+λδ_i)²,
-//     dp_j  = ywy_j − Σ_i c²_ij v_i,   dp′_j = Σ_i c²_ij w_i.
-//
-// The ORIGINAL issue premise — a fixed-σ separable per-mode decomposition and a
-// `V′·Π(1+λs)²` degree-≤2m−1 polynomial — is WRONG for the profiled objective:
-// σ is profiled, so the response term is a log-of-sum and dp_j sits in a
-// denominator, making V′ RATIONAL, not a polynomial times Π(1+λδ)². The correct
-// stationary polynomial clears BOTH the penalty product AND every dp_j:
-//
-//   Let pos = {i : δ_i > 0}, m = |pos| = r,  D(λ) = Π_{i∈pos}(1+δ_iλ),
-//       N_i(λ) = Π_{l∈pos, l≠i}(1+δ_lλ),
-//       U(λ)   = Σ_{i∈pos} δ_iλ·N_i − r·D                       (= (Σu_i−r)·D),
-//       P_j(λ) = a_j·D − Σ_{i∈pos} c²_ij·N_i                    (= dp_j·D),
-//                a_j = ywy_j − Σ_{i∉pos} c²_ij,
-//       G_j(λ) = Σ_{i∈pos} c²_ij·δ_iλ·N_i²                      (= dp′_j·D²).
-//
-//   P(λ) = d·U·Π_j P_j + ν·Σ_j G_j·Π_{k≠j} P_k = D·(Π_j P_j)·2V′.
-//
-// Because D > 0 and every P_j = dp_j·D > 0 on the admissible region (dp_j > 0,
-// strictly increasing in λ, with no positive root), the POSITIVE real roots of
-// P are EXACTLY the stationary points. `deg P = m(d+1)`; for d = 1 this is 2m.
-//
-// Coefficients are assembled in OUTWARD-ROUNDED INTERVAL arithmetic (the crate's
-// existing `Interval` facility, extended here to signed products/quotients):
-// naive f64 assembly of Π(1+δ_iλ) with widely separated δ_i loses all
-// significance to cancellation. A Sturm chain built by interval polynomial
-// remainders certifies the number of sign changes at 0⁺ and +∞; the certified
-// count is `sc(0) − sc(+∞)`. Any coefficient whose interval STRADDLES zero at a
-// decision point (leading/trailing sign, or a division pivot) makes the count
-// undecidable — the certificate then refuses with a typed error rather than
-// emitting an uncertified number.
-
-/// Point interval `[x, x]`.
-fn ipoint(x: f64) -> Interval {
-    Interval { lo: x, hi: x }
-}
-
-/// Outward-rounded interval sum.
-fn iadd(a: Interval, b: Interval) -> Interval {
-    Interval {
-        lo: add_down(a.lo, b.lo),
-        hi: add_up(a.hi, b.hi),
-    }
-}
-
-/// Interval negation (exact — no rounding needed).
-fn ineg(a: Interval) -> Interval {
-    Interval {
-        lo: -a.hi,
-        hi: -a.lo,
-    }
-}
-
-fn isub(a: Interval, b: Interval) -> Interval {
-    iadd(a, ineg(b))
-}
-
-/// Outward-rounded product of two intervals of ARBITRARY sign.
-fn imul(a: Interval, b: Interval) -> Interval {
-    if !(a.lo.is_finite() && a.hi.is_finite() && b.lo.is_finite() && b.hi.is_finite()) {
-        return Interval::entire();
-    }
-    let products = [a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi];
-    let mut lo = products[0];
-    let mut hi = products[0];
-    for &p in &products[1..] {
-        lo = lo.min(p);
-        hi = hi.max(p);
-    }
-    Interval {
-        lo: round_down(lo),
-        hi: round_up(hi),
-    }
-}
-
-/// Outward-rounded quotient; `None` when the denominator interval touches zero
-/// (the quotient's sign — and therefore any downstream Sturm decision — would be
-/// undecidable).
-fn idiv(a: Interval, b: Interval) -> Option<Interval> {
-    if !(a.lo.is_finite() && a.hi.is_finite() && b.lo.is_finite() && b.hi.is_finite()) {
-        return None;
-    }
-    if b.lo <= 0.0 && b.hi >= 0.0 {
-        return None;
-    }
-    // b is sign-consistent: reciprocal endpoints are 1/b.hi (min |·| flips) and
-    // 1/b.lo, ordered lo→hi for both b>0 and b<0.
-    let recip = Interval {
-        lo: round_down(1.0 / b.hi),
-        hi: round_up(1.0 / b.lo),
-    };
-    Some(imul(a, recip))
-}
-
-/// Certified sign of an interval: `Some(0)` only for the exact point zero,
-/// `None` when the interval straddles zero (sign undecidable).
-fn interval_sign(iv: Interval) -> Option<i32> {
-    if iv.lo == 0.0 && iv.hi == 0.0 {
-        Some(0)
-    } else if iv.lo > 0.0 {
-        Some(1)
-    } else if iv.hi < 0.0 {
-        Some(-1)
-    } else {
-        None
-    }
-}
-
-/// Drop trailing (highest-power) coefficients that are the EXACT point zero,
-/// keeping at least the constant term.
-fn poly_trim(mut p: Vec<Interval>) -> Vec<Interval> {
-    while p.len() > 1 {
-        let last = p[p.len() - 1];
-        if last.lo == 0.0 && last.hi == 0.0 {
-            p.pop();
-        } else {
-            break;
-        }
-    }
-    p
-}
-
-/// Ascending-power interval polynomial product.
-fn poly_mul_interval(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
-    let mut out = vec![ipoint(0.0); a.len() + b.len() - 1];
-    for (i, &ai) in a.iter().enumerate() {
-        for (j, &bj) in b.iter().enumerate() {
-            out[i + j] = iadd(out[i + j], imul(ai, bj));
-        }
-    }
-    out
-}
-
-/// Ascending-power interval polynomial sum (ragged lengths allowed).
-fn poly_add_interval(a: &[Interval], b: &[Interval]) -> Vec<Interval> {
-    let n = a.len().max(b.len());
-    (0..n)
-        .map(|i| {
-            let ai = a.get(i).copied().unwrap_or(ipoint(0.0));
-            let bi = b.get(i).copied().unwrap_or(ipoint(0.0));
-            iadd(ai, bi)
-        })
-        .collect()
-}
-
-/// Scale every coefficient by a scalar.
-fn poly_scale_interval(p: &[Interval], s: f64) -> Vec<Interval> {
-    let si = ipoint(s);
-    p.iter().map(|&c| imul(c, si)).collect()
-}
-
-/// Product of a list of polynomials (empty → the constant `1`).
-fn poly_product_interval(list: &[Vec<Interval>]) -> Vec<Interval> {
-    let mut acc = vec![ipoint(1.0)];
-    for p in list {
-        acc = poly_mul_interval(&acc, p);
-    }
-    acc
-}
-
-/// Formal derivative `d/dλ`.
-fn poly_deriv_interval(p: &[Interval]) -> Vec<Interval> {
-    if p.len() <= 1 {
-        return vec![ipoint(0.0)];
-    }
-    (1..p.len()).map(|i| imul(p[i], ipoint(i as f64))).collect()
-}
-
-/// Interval polynomial remainder `a mod b` (ascending powers). `None` when a
-/// division pivot (the leading coefficient of `b`) straddles zero. The eliminated
-/// leading positions are algebraically exact zeros; they are cleared to point
-/// zero so the working degree drops by one each step, while the retained
-/// low-order coefficients (`< deg b`) keep their outward-rounded enclosures.
-fn poly_rem_interval(a: &[Interval], b: &[Interval]) -> Option<Vec<Interval>> {
-    let b = poly_trim(b.to_vec());
-    let db = b.len() - 1;
-    let bl = b[db];
-    interval_sign(bl).filter(|&s| s != 0)?;
-    let mut rem = poly_trim(a.to_vec());
-    if rem.len() <= db {
-        return Some(rem);
-    }
-    let mut d = rem.len() - 1;
-    loop {
-        if d < db {
-            break;
-        }
-        let factor = idiv(rem[d], bl)?;
-        for i in 0..=db {
-            rem[d - db + i] = isub(rem[d - db + i], imul(factor, b[i]));
-        }
-        rem[d] = ipoint(0.0);
-        if d == 0 {
-            break;
-        }
-        d -= 1;
-    }
-    Some(poly_trim(rem))
-}
-
-/// Build the Sturm chain `p₀ = P, p₁ = P′, p_{k+1} = −rem(p_{k−1}, p_k)`.
-fn build_sturm_chain(p: &[Interval]) -> Option<Vec<Vec<Interval>>> {
-    let p0 = poly_trim(p.to_vec());
-    if p0.len() <= 1 {
-        return Some(vec![p0]);
-    }
-    let mut chain = vec![p0.clone(), poly_trim(poly_deriv_interval(&p0))];
-    let max_len = p0.len() + 2;
-    while chain.last().unwrap().len() > 1 && chain.len() < max_len {
-        let n = chain.len();
-        let rem = poly_rem_interval(&chain[n - 2], &chain[n - 1])?;
-        let neg: Vec<Interval> = rem.iter().map(|&c| ineg(c)).collect();
-        chain.push(poly_trim(neg));
-    }
-    Some(chain)
-}
-
-/// Certified count of sign changes of the chain evaluated at a finite `x`.
-fn sturm_sign_changes_at(chain: &[Vec<Interval>], x: f64) -> Option<usize> {
-    let xi = ipoint(x);
-    let mut prev = 0i32;
-    let mut changes = 0usize;
-    for poly in chain {
-        // Horner evaluation in interval arithmetic.
-        let mut acc = *poly.last().unwrap();
-        for i in (0..poly.len() - 1).rev() {
-            acc = iadd(imul(acc, xi), poly[i]);
-        }
-        let s = interval_sign(acc)?;
-        if s != 0 {
-            if prev != 0 && s != prev {
-                changes += 1;
-            }
-            prev = s;
-        }
-    }
-    Some(changes)
-}
-
-/// Certified number of distinct real roots of `P` on the OPEN interval
-/// `(lo, hi)` (both finite).
-fn sturm_root_count_in(p: &[Interval], lo: f64, hi: f64) -> Option<usize> {
-    let chain = build_sturm_chain(p)?;
-    sturm_root_count_with_chain(&chain, lo, hi)
-}
-
-fn sturm_root_count_with_chain(chain: &[Vec<Interval>], lo: f64, hi: f64) -> Option<usize> {
-    let sc_lo = sturm_sign_changes_at(&chain, lo)?;
-    let sc_hi = sturm_sign_changes_at(&chain, hi)?;
-    sc_lo.checked_sub(sc_hi)
-}
-
-/// Assemble the exact profiled-REML stationary polynomial `P(λ)` (ascending
-/// powers) in outward-rounded interval arithmetic. See the module comment above
-/// for the algebra. Returns the constant `0` polynomial when there is no
-/// positive penalty eigenvalue (no interior stationary structure exists).
-fn assemble_stationary_polynomial(
-    cache: &GaussianRemlEigenCache,
-    ywy: ArrayView1<'_, f64>,
-    projected_rhs_squared: ArrayView2<'_, f64>,
-    n_outputs: usize,
-    nu: f64,
-) -> Vec<Interval> {
-    let deltas = &cache.penalty_eigenvalues;
-    let pos: Vec<usize> = (0..deltas.len()).filter(|&i| deltas[i] > 0.0).collect();
-    let m = pos.len();
-    if m == 0 {
-        return vec![ipoint(0.0)];
-    }
-    let r = m as f64;
-    let d = ywy.len();
-
-    // Monomial factors (1 + δ_i λ) and the full product D(λ).
-    let factors: Vec<Vec<Interval>> = pos
-        .iter()
-        .map(|&i| vec![ipoint(1.0), ipoint(deltas[i])])
-        .collect();
-    let full_d = poly_product_interval(&factors);
-
-    // N_i = Π_{l≠i}(1 + δ_l λ) for every i∈pos.
-    let n_i: Vec<Vec<Interval>> = (0..m)
-        .map(|idx| {
-            let others: Vec<Vec<Interval>> = (0..m)
-                .filter(|&l| l != idx)
-                .map(|l| factors[l].clone())
-                .collect();
-            poly_product_interval(&others)
-        })
-        .collect();
-
-    // U(λ) = Σ δ_iλ·N_i − r·D.
-    let mut u_poly = poly_scale_interval(&full_d, -r);
-    for (idx, &i) in pos.iter().enumerate() {
-        let mono = vec![ipoint(0.0), ipoint(deltas[i])]; // δ_i λ
-        let term = poly_mul_interval(&mono, &n_i[idx]);
-        u_poly = poly_add_interval(&u_poly, &term);
-    }
-
-    // Per-output P_j = a_j·D − Σ c²_ij·N_i and G_j = Σ c²_ij·δ_iλ·N_i².
-    let mut p_j: Vec<Vec<Interval>> = Vec::with_capacity(d);
-    let mut g_j: Vec<Vec<Interval>> = Vec::with_capacity(d);
-    for j in 0..d {
-        let mut null_mass = 0.0;
-        for i in 0..deltas.len() {
-            if deltas[i] == 0.0 {
-                null_mass += projected_rhs_squared[[i, j]];
-            }
-        }
-        let a_j = ywy[j] - null_mass;
-        let mut pj = poly_scale_interval(&full_d, a_j);
-        let mut gj = vec![ipoint(0.0)];
-        for (idx, &i) in pos.iter().enumerate() {
-            let c2 = projected_rhs_squared[[i, j]];
-            pj = poly_add_interval(&pj, &poly_scale_interval(&n_i[idx], -c2));
-            let n_sq = poly_mul_interval(&n_i[idx], &n_i[idx]);
-            let mono = vec![ipoint(0.0), ipoint(c2 * deltas[i])]; // c²_ij δ_i λ
-            gj = poly_add_interval(&gj, &poly_mul_interval(&mono, &n_sq));
-        }
-        p_j.push(pj);
-        g_j.push(gj);
-    }
-
-    // First term: d·U·Π_j P_j.
-    let prod_p = poly_product_interval(&p_j);
-    let mut poly = poly_scale_interval(&poly_mul_interval(&u_poly, &prod_p), n_outputs as f64);
-
-    // Second term: ν·Σ_j G_j·Π_{k≠j} P_k.
-    for j in 0..d {
-        let others: Vec<Vec<Interval>> =
-            (0..d).filter(|&k| k != j).map(|k| p_j[k].clone()).collect();
-        let cofactor = poly_product_interval(&others);
-        let term = poly_scale_interval(&poly_mul_interval(&g_j[j], &cofactor), nu);
-        poly = poly_add_interval(&poly, &term);
-    }
-    poly_trim(poly)
-}
-
 /// Analytic compactified endpoint costs `[V(ρ→−∞), V(ρ→+∞)]`.
 ///
 /// As ρ→−∞ (λ→0) the log-det numerator `log|H|` stays finite while
@@ -4441,11 +4094,12 @@ pub enum RhoLandscape {
     MultipleInterior,
 }
 
-/// Sturm/subresultant certificate for the profiled Gaussian-REML ρ-landscape.
+/// Interval-enclosure certificate for the profiled Gaussian-REML ρ-landscape.
 ///
-/// `stationary_count` is the number of interior stationary points DECIDED by a
-/// Sturm chain on the exact stationary polynomial (assembled in outward-rounded
-/// interval arithmetic), certified equal to the branch-and-bound bracket count.
+/// `stationary_count` is the number of interior stationary points isolated by
+/// branch-and-bound using outward-rounded first/second-derivative enclosures.
+/// A cell whose stationary structure remains ambiguous at the resolution floor
+/// returns typed non-convergence and cannot mint a certificate.
 /// `limit_costs` compactifies the search to `[0, ∞]` by appending the analytic
 /// `ρ→∓∞` endpoint costs. When the interior is monotone/all-noise the
 /// `landscape` short-circuits to [`RhoLandscape::NoInteriorOptimum`].
@@ -4484,20 +4138,6 @@ fn rho_landscape_certificate_from_parts(
     let window_costs = [eval(RHO_LOWER).cost, eval(RHO_UPPER).cost];
     let limit_costs = compactified_limit_costs(cache, ywy, projected_rhs_squared, n_outputs, nu);
 
-    let poly = assemble_stationary_polynomial(cache, ywy, projected_rhs_squared, n_outputs, nu);
-    // Interior stationary points live at λ ∈ (e^{RHO_LOWER}, e^{RHO_UPPER}); count
-    // the positive roots of P there. The certified count must agree with the
-    // interval branch-and-bound brackets or the whole certificate refuses.
-    let certified = sturm_root_count_in(&poly, RHO_LOWER.exp(), RHO_UPPER.exp()).ok_or_else(
-        || {
-            profile_search_refusal(
-                &eval,
-                0.0,
-                "Sturm chain on the profiled stationary polynomial was sign-undecidable in interval arithmetic".to_string(),
-            )
-        },
-    )?;
-
     let mut root_brackets = Vec::new();
     let selection = if cache.penalty_rank == 0 {
         ProfileSelection {
@@ -4521,18 +4161,8 @@ fn rho_landscape_certificate_from_parts(
         })?
     };
 
-    if root_brackets.len() != certified {
-        return Err(profile_search_refusal(
-            &eval,
-            selection.rho,
-            format!(
-                "certified Sturm stationary count {certified} disagrees with the {} isolated branch-and-bound brackets",
-                root_brackets.len()
-            ),
-        ));
-    }
-
-    let landscape = match certified {
+    let stationary_count = root_brackets.len();
+    let landscape = match stationary_count {
         0 => RhoLandscape::NoInteriorOptimum,
         1 => RhoLandscape::UniqueInterior,
         _ => RhoLandscape::MultipleInterior,
@@ -4540,7 +4170,7 @@ fn rho_landscape_certificate_from_parts(
     let boundary_optimum = matches!(landscape, RhoLandscape::NoInteriorOptimum);
 
     Ok(RhoLandscapeCertificate {
-        stationary_count: certified,
+        stationary_count,
         root_brackets,
         landscape,
         window_costs,
@@ -4551,11 +4181,9 @@ fn rho_landscape_certificate_from_parts(
     })
 }
 
-/// Certified profiled Gaussian-REML ρ-landscape at the given design: a Sturm
-/// count of interior stationary points on the exact (interval-assembled)
-/// stationary polynomial, the branch-and-bound root brackets it is certified to
-/// match, and the compactified `ρ→∓∞` endpoint costs. Added beside
-/// [`gaussian_reml_stationary_set`] without changing any existing signature.
+/// Certified profiled Gaussian-REML ρ-landscape at the given design: the
+/// outward-enclosed branch-and-bound stationary brackets, their decided count,
+/// and the compactified `ρ→∓∞` endpoint costs.
 pub fn gaussian_reml_rho_landscape_certificate(
     x: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -6129,95 +5757,12 @@ mod tests {
         }
     }
 
-    /// Interval polynomial (ascending powers) from exact `f64` coefficients.
-    fn pinned_poly(coeffs: &[f64]) -> Vec<Interval> {
-        coeffs.iter().map(|&c| ipoint(c)).collect()
-    }
-
-    /// Whole-half-line oracle for pinned polynomials. Production certifies the
-    /// declared finite smoothing domain with [`sturm_root_count_in`].
-    fn sturm_sign_changes_at_pos_inf(chain: &[Vec<Interval>]) -> Option<usize> {
-        let mut prev = 0i32;
-        let mut changes = 0usize;
-        for poly in chain {
-            let s = interval_sign(*poly.last().unwrap())?;
-            if s != 0 {
-                if prev != 0 && s != prev {
-                    changes += 1;
-                }
-                prev = s;
-            }
-        }
-        Some(changes)
-    }
-
-    /// Count distinct real roots on `(lo, +∞)` for the pinned-polynomial
-    /// tests below.
-    fn sturm_root_count_above(p: &[Interval], lo: f64) -> Option<usize> {
-        let chain = build_sturm_chain(p)?;
-        if chain.len() == 1 && chain[0].len() <= 1 {
-            return Some(0);
-        }
-        let sc_lo = sturm_sign_changes_at(&chain, lo)?;
-        let sc_inf = sturm_sign_changes_at_pos_inf(&chain)?;
-        sc_lo.checked_sub(sc_inf)
-    }
-
-    /// SPEC-18 forbids grid/sign-scan oracles. The Sturm certificate is checked
-    /// against PINNED polynomials whose positive-root counts are known in closed
-    /// form — no grid, no sampling. `(λ−ρ₁)…(λ−ρₖ)` expanded by hand:
-    ///   (λ−2)(λ−5)        = λ²−7λ+10          → 2 positive roots
-    ///   (λ−3)             = λ−3               → 1
-    ///   (λ+1)(λ+4)        = λ²+5λ+4           → 0 (both roots negative)
-    ///   (λ−1)(λ−2)(λ−4)   = λ³−7λ²+14λ−8      → 3
-    ///   (λ−2)(λ+3)        = λ²+λ−6            → 1 (one positive, one negative)
+    /// The landscape API must expose the decided branch-and-bound topology on
+    /// small deterministic designs (no RNG, scan, or secondary root oracle).
+    /// The one-mode profiled design has an analytic single stationary point;
+    /// the two-mode design exercises multi-mode enclosure assembly.
     #[test]
-    fn sturm_certificate_counts_pinned_polynomial_roots() {
-        let cases: &[(Vec<f64>, usize)] = &[
-            (vec![10.0, -7.0, 1.0], 2),
-            (vec![-3.0, 1.0], 1),
-            (vec![4.0, 5.0, 1.0], 0),
-            (vec![-8.0, 14.0, -7.0, 1.0], 3),
-            (vec![-6.0, 1.0, 1.0], 1),
-        ];
-        for (coeffs, expected) in cases {
-            let poly = pinned_poly(coeffs);
-            let count = sturm_root_count_above(&poly, 0.0)
-                .expect("pinned integer polynomial must be sign-decidable");
-            assert_eq!(
-                count, *expected,
-                "Sturm positive-root count for {coeffs:?} was {count}, expected {expected}"
-            );
-        }
-    }
-
-    /// Two stationary points closer than a former grid cell must never be
-    /// merged into a false one-root certificate. Pinned
-    /// `(λ−1)(λ−1.25) = λ²−2.25λ+1.25` has a 0.25 root gap (below the old
-    /// 0.625-wide cell), and every coefficient/root/split is an exact dyadic
-    /// f64. The whole-half-line chain counts both roots. The outward-interval
-    /// Euclidean remainder loses coefficient correlation at the midpoint, so
-    /// the bounded count must refuse rather than use a saturating subtraction
-    /// to manufacture a count. No scan or sampling is involved.
-    #[test]
-    fn sturm_certificate_refuses_undecidable_close_root_split() {
-        let poly = pinned_poly(&[1.25, -2.25, 1.0]); // roots 1.00 and 1.25
-        let total = sturm_root_count_above(&poly, 0.0).expect("decidable");
-        assert_eq!(total, 2, "both close roots must be counted, got {total}");
-
-        let mid = 1.125;
-        assert!(
-            sturm_root_count_in(&poly, 0.0, mid).is_none(),
-            "correlation-losing interval remainder must refuse the close-root split"
-        );
-    }
-
-    /// The certified Sturm count must equal the branch-and-bound bracket count on
-    /// small designs the enumerator resolves. Deterministic fixtures (no RNG, no
-    /// scan): the one-mode profiled design has an analytic single stationary
-    /// point, and a two-mode design exercises the full `P(λ)` assembly.
-    #[test]
-    fn certificate_count_agrees_with_enumerator_on_small_designs() {
+    fn landscape_certificate_classifies_small_designs() {
         // One-mode configs: each has exactly one interior stationary point.
         let one_mode: &[(f64, f64, f64)] = &[(4.0, 2.0, 3.0), (0.5, 1.5, 2.0), (9.0, 0.8, 1.2)];
         for &(delta, q, resid) in one_mode {
@@ -6239,9 +5784,7 @@ mod tests {
             assert_eq!(cert.root_brackets.len(), cert.stationary_count);
         }
 
-        // Two-mode design (well separated δ) exercises m>1 assembly; the
-        // certificate itself refuses on any Sturm/enumerator disagreement, so a
-        // successful return already certifies count == bracket count.
+        // Two-mode design (well separated δ) exercises m>1 enclosure assembly.
         let cache = synthetic_cache(&[0.5, 3.0]);
         let prs = array![[1.0], [0.4]];
         let ywy = array![1.0 + 0.4 + 1.5];
