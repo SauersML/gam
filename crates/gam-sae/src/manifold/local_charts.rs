@@ -61,9 +61,12 @@
 //! # Determinism
 //!
 //! Fleet law: no RNG anywhere. Centers are farthest-point (first-wins ties),
-//! neighborhoods are nearest-by-distance (index tie-break), patch members and
-//! shared supports are sorted by row index, and every eigen/SVD is faer's
-//! deterministic solver. Same input ⇒ bit-identical atlas run-to-run.
+//! neighborhoods are prefixes of a TOTAL distance order (distance, then row index —
+//! so the ordering does not depend on the sort's stability), patch members and
+//! shared supports are sorted by row index, chart frames are put in a canonical sign
+//! gauge rather than inheriting the solver's arbitrary singular-vector signs, and
+//! every eigen/SVD is faer's deterministic solver. No hashing, no parallel reduction,
+//! no float-order ambiguity: same input ⇒ bit-identical atlas run-to-run.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::collections::BTreeMap;
@@ -916,32 +919,52 @@ fn build_transition(
         }
     }
 
-    // Orthogonal Procrustes: minimize ‖C_to − R C_from‖_F over R ∈ O(d).
-    // M = C_to C_fromᵀ (d × d); SVD M = U S Vᵀ; R = U Vᵀ (reflections ALLOWED, so
-    // det R records a genuine handedness flip).
+    // ORIENTATION: the exact transition Jacobian. On the overlap the chart change is
+    //     c_to = F_toᵀ(μ_from − μ_to) + A · c_from + O(curvature),   A = F_toᵀ F_from,
+    // so the handedness relation of the two charts is sgn det A, with
+    // |det A| = ∏_k cos θ_k over the principal angles between the tangent planes.
+    // This is a property of the two FRAMES: unlike a Procrustes fit to the shared
+    // point cloud, it does not degrade when the overlap is small or elongated (where
+    // a reflection fits the points exactly as well as a rotation, at the same
+    // residual, and the fitted det is a coin flip).
+    let a_mat = frame_overlap(&chart_j.frame, &chart_i.frame);
+    let det_a = determinant(&a_mat);
+    let sign: i8 = if det_a >= 0.0 { 1 } else { -1 };
+    let frame_nondegenerate = det_a.abs() > FRAME_OVERLAP_DETERMINANT_FLOOR;
+
+    // ALIGNMENT: orthogonal Procrustes, minimize ‖C_to − R C_from‖_F over the
+    // handedness class {R ∈ O(d) : det R = sign}. M = C_to C_fromᵀ (d × d);
+    // SVD M = U S Vᵀ; the free optimum is U Vᵀ, and the constrained optimum flips the
+    // LAST (weakest) singular direction when the free one lands in the wrong class:
+    // R = U diag(1, …, 1, ±1) Vᵀ. So det R = sign by construction, and reflections are
+    // recorded rather than forced to +1.
     let m_mat = c_to.dot(&c_from.t());
-    let (rotation, sign, confidence) = match m_mat.svd(true, true) {
+    let (rotation, confidence) = match m_mat.svd(true, true) {
         Ok((Some(u), sv, Some(vt))) => {
-            let r = u.dot(&vt);
-            let sign_val: i8 = if determinant(&r) >= 0.0 { 1 } else { -1 };
+            let mut r = u.dot(&vt);
+            if (determinant(&r) >= 0.0) != (sign >= 0) {
+                let mut flipped = u;
+                let last = d - 1;
+                for row in 0..d {
+                    flipped[[row, last]] = -flipped[[row, last]];
+                }
+                r = flipped.dot(&vt);
+            }
             let leading = sv.first().copied().unwrap_or(0.0);
-            let smallest = sv.get(d.saturating_sub(1)).copied().unwrap_or(0.0);
-            let confidence = if leading > 0.0
-                && smallest > TRANSITION_CONDITION_FLOOR_FRAC * leading
-            {
+            let smallest = sv.get(d - 1).copied().unwrap_or(0.0);
+            let well_posed =
+                leading > 0.0 && smallest > TRANSITION_CONDITION_FLOOR_FRAC * leading;
+            let confidence = if well_posed && frame_nondegenerate {
                 TransitionConfidence::Certified
             } else {
                 TransitionConfidence::Degenerate
             };
-            (r, sign_val, confidence)
+            (r, confidence)
         }
-        // A failed / rank-empty SVD leaves the alignment unresolved: identity
-        // rotation, degenerate confidence (excluded from the sign cocycle).
-        _ => (
-            Array2::<f64>::eye(d),
-            1,
-            TransitionConfidence::Degenerate,
-        ),
+        // A failed / rank-empty SVD leaves the alignment unresolved: the identity of
+        // the right handedness class, degenerate confidence (excluded from the sign
+        // cocycle).
+        _ => (signed_identity(d, sign), TransitionConfidence::Degenerate),
     };
 
     // Residual ‖C_to − R C_from‖_F / ‖C_to‖_F.
@@ -978,6 +1001,24 @@ fn build_transition(
         residual,
         confidence,
     }
+}
+
+/// The `d × d` frame overlap `F_toᵀ F_from` — the exact Jacobian of the chart
+/// transition `c_from ↦ c_to` on the two patches' common tangent plane. Its entries
+/// are the pairwise inner products of the two orthonormal chart frames, its singular
+/// values are the cosines of the principal angles between the tangent planes, and
+/// its determinant's sign is the charts' handedness relation.
+fn frame_overlap(frame_to: &Array2<f64>, frame_from: &Array2<f64>) -> Array2<f64> {
+    frame_to.t().dot(frame_from)
+}
+
+/// The `d × d` identity of the handedness class `sign`: `diag(1, …, 1, sign)`.
+fn signed_identity(d: usize, sign: i8) -> Array2<f64> {
+    let mut m = Array2::<f64>::eye(d);
+    if sign < 0 && d > 0 {
+        m[[d - 1, d - 1]] = -1.0;
+    }
+    m
 }
 
 /// General square-matrix multiply `A · B`.
