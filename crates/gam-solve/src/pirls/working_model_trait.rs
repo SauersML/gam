@@ -42,7 +42,8 @@ pub trait WorkingModel {
 
     /// Dispersion factor `k` the inner working weight carries but the reported
     /// deviance (`state.deviance` / `CandidateScreen::deviance`) does not, so the
-    /// LM gain-ratio / stall-detection objective must be `k·deviance + penalty`
+    /// LM gain-ratio / stall-detection objective must be
+    /// `½(k·deviance + penalty)`
     /// to stay consistent with the `k`-scaled gradient and Hessian the step is
     /// built from. `1.0` for families whose weight carries no such factor (the
     /// solver objective is already self-consistent there). See
@@ -70,7 +71,7 @@ pub enum CandidateEvaluation {
 }
 
 impl CandidateEvaluation {
-    /// The penalized objective `dev_scale·deviance + penalty` (minus the Firth
+    /// The penalized objective `½(dev_scale·deviance + penalty)` (minus the Firth
     /// Jeffreys term when active). `dev_scale` is the family dispersion factor
     /// `k` (see `WorkingModel::penalized_deviance_scale`): the trial's deviance
     /// must be scaled by the SAME `k` the accepted state's is, so the LM
@@ -78,11 +79,11 @@ impl CandidateEvaluation {
     #[inline]
     pub(crate) fn penalized_objective(&self, firth_bias_reduction: bool, dev_scale: f64) -> f64 {
         match self {
-            Self::Screen(s) => dev_scale * s.deviance + s.penalty_term,
+            Self::Screen(s) => 0.5 * (dev_scale * s.deviance + s.penalty_term),
             Self::Full(state) => {
-                let mut value = dev_scale * state.deviance + state.penalty_term;
+                let mut value = 0.5 * (dev_scale * state.deviance + state.penalty_term);
                 if firth_bias_reduction && let Some(j) = state.jeffreys_logdet() {
-                    value -= 2.0 * j;
+                    value -= j;
                 }
                 value
             }

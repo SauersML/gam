@@ -242,9 +242,9 @@ pub struct WorkingModelPirlsResult {
     /// predicted reduction and the inner Newton may benefit from
     /// shorter steps.
     pub final_accept_rho: Option<f64>,
-    /// Minimum penalized deviance (`state.deviance + state.penalty_term`)
+    /// Minimum penalized objective (`½(state.deviance + state.penalty_term)`)
     /// observed across all iterations whose state was computed during the
-    /// inner P-IRLS loop. Penalized deviance is monotonically decreasing
+    /// inner P-IRLS loop. The penalized objective is monotonically decreasing
     /// along any descent path the inner solver takes, so this minimum is a
     /// principled seed-screening proxy that remains meaningful even when the
     /// solver hit its iteration cap before reaching the mode. `f64::INFINITY`
@@ -479,9 +479,9 @@ pub struct PirlsResult {
     /// cold artifacts (for example `x_transformed`) rehydrated before exact
     /// bundle construction.
     pub cache_compacted: bool,
-    /// Minimum penalized deviance observed across the inner P-IRLS loop.
+    /// Minimum penalized objective observed across the inner P-IRLS loop.
     /// Mirrors `WorkingModelPirlsResult::min_penalized_deviance`. Used as the
-    /// seed-screening ranking proxy: penalized deviance descends monotonically
+    /// seed-screening ranking proxy: the penalized objective descends monotonically
     /// along any inner descent path, so the per-seed minimum tells the outer
     /// cascade "how good a fit this rho's neighbourhood can support" even
     /// when the inner solver was capped before reaching the mode.

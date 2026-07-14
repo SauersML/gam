@@ -91,7 +91,7 @@ pub(crate) use super::*;
 #[cfg(test)]
 mod tests {
     use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
-    use super::reweight::madsen_lm_accept_factor;
+    use super::reweight::{exact_newton_decrement_sq, madsen_lm_accept_factor};
     use super::{
         DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily,
@@ -3243,6 +3243,52 @@ mod root_cause_tests {
             hessian_curvature: curvature,
             gradient_natural_scale: 0.0,
         }
+    }
+
+    #[test]
+    pub(crate) fn exact_decrement_certifies_stiff_numerical_plateau_2316() {
+        let beta = Coefficients::new(array![0.0]);
+        let mut state = scalar_working_state(
+            &beta,
+            HessianCurvatureKind::Fisher,
+            1.448_052e-3,
+            428.0,
+        );
+        state.hessian = gam_linalg::matrix::SymmetricMatrix::Dense(array![[1.0e8]]);
+
+        let decrement_sq = exact_newton_decrement_sq(&state)
+            .expect("a finite positive-definite Hessian has an exact decrement");
+        let threshold = 1.0e-6_f64.powi(2) * (1.0 + state.penalized_objective().abs());
+
+        assert!(decrement_sq <= threshold);
+        assert_relative_eq!(
+            decrement_sq,
+            1.448_052e-3_f64.powi(2) / 1.0e8,
+            epsilon = 1.0e-28
+        );
+        // The old damped resolvent bound used ridge_used.max(1e-12) as a
+        // lower eigenvalue bound. At the observed λ≈1e5 it inflated this
+        // decisive decrement by 1e17 and therefore could never certify.
+        let obsolete_bound = decrement_sq * (1.0 + 1.0e5 / 1.0e-12);
+        assert!(obsolete_bound > threshold);
+    }
+
+    #[test]
+    pub(crate) fn lm_gain_value_matches_working_state_objective_2316() {
+        let beta = Coefficients::new(array![0.0]);
+        let mut state = scalar_working_state(&beta, HessianCurvatureKind::Fisher, 0.0, 8.0);
+        state.penalty_term = 2.0;
+        let expected = state.penalized_objective();
+
+        let screened = CandidateEvaluation::Screen(CandidateScreen {
+            deviance: state.deviance,
+            penalty_term: state.penalty_term,
+            arithmetic_finite: true,
+        });
+        let full = CandidateEvaluation::Full(state);
+
+        assert_eq!(screened.penalized_objective(false, 1.0), expected);
+        assert_eq!(full.penalized_objective(false, 1.0), expected);
     }
 
     pub(crate) fn test_working_state(

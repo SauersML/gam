@@ -65,6 +65,39 @@ pub(super) fn madsen_lm_accept_factor(rho: f64) -> f64 {
     (1.0 - cube).clamp(1.0 / 3.0, 2.0)
 }
 
+/// Exact squared Newton decrement `gᵀH⁻¹g` for the bare penalized Hessian.
+///
+/// The ordinary in-loop bound derives this quantity from the damped LM step.
+/// That bound is intentionally conservative, but becomes vacuous when the
+/// statistical Hessian is extremely stiff and the LM damping is large: using
+/// the generic stabilization floor as a lower eigenvalue bound can inflate a
+/// machine-small decrement by many orders of magnitude. At a numerical
+/// objective plateau we pay for one bare factorization and certify the actual
+/// local quadratic geometry instead. Failure to factorize is not a
+/// certificate; callers simply continue the iteration.
+pub(super) fn exact_newton_decrement_sq(state: &WorkingState) -> Option<f64> {
+    if !state.gradient.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let mut solution = Array1::<f64>::zeros(state.gradient.len());
+    match &state.hessian {
+        gam_linalg::matrix::SymmetricMatrix::Dense(hessian) => {
+            if !hessian.iter().all(|value| value.is_finite()) {
+                return None;
+            }
+            let factor = StableSolver::new().factorize(hessian).ok()?;
+            solve_direction_with_dense_factor(&factor, &state.gradient, &mut solution);
+            solution.mapv_inplace(|value| -value);
+        }
+        gam_linalg::matrix::SymmetricMatrix::Sparse(hessian) => {
+            let factor = factorize_sparse_spd(hessian).ok()?;
+            solve_sparse_spd_into(&factor, &state.gradient, &mut solution).ok()?;
+        }
+    }
+    let decrement_sq = state.gradient.dot(&solution);
+    (decrement_sq.is_finite() && decrement_sq >= 0.0).then_some(decrement_sq)
+}
+
 /// Whether a constrained iterate `(beta, gradient)` sits within the SAME
 /// degeneracy-aware constraint-KKT acceptance band the outer REML startup gate
 /// (`enforce_constraint_kkt`) applies, and so may be soft-accepted as a valid
@@ -448,6 +481,9 @@ where
         .as_ref()
         .map(|_| Vec::new());
     let mut consecutive_fisher_fallbacks = 0usize;
+    // Exact bare-Hessian decrement factorization is paid at most once per
+    // contiguous numerical plateau. Meaningful objective progress rearms it.
+    let mut exact_decrement_checked_at_plateau = false;
     // AA(1) state — engages only while `force_fisher_for_rest == true`. The
     // initial allocations stay None until the first Fisher-regime iteration,
     // so this is free when PIRLS stays on the observed-information Newton
@@ -476,19 +512,19 @@ where
     // `dev_scale` is the family's dispersion factor `k` (Gamma shape, Tweedie /
     // fixed-φ Gaussian 1/φ, else 1): the inner gradient and Hessian are built
     // from the `k`-scaled working weight, so the objective value must be
-    // `k·deviance + penalty` for the gain ratio (actual ÷ predicted reduction)
+    // `½(k·deviance + penalty)` for the gain ratio (actual ÷ predicted reduction)
     // and the accept test to compare like with like. Using the bare (unscaled)
     // deviance while the step targets `k·D + penalty` freezes the Gamma smooth
     // at heavily-penalized ρ (issue #2128).
     let penalizedobjective = |state: &WorkingState, dev_scale: f64| {
-        let mut value = dev_scale * state.deviance + state.penalty_term;
+        let mut value = 0.5 * (dev_scale * state.deviance + state.penalty_term);
         if options.firth_bias_reduction
             && let Some(jeffreys_logdet) = state.jeffreys_logdet()
         {
             // Jeffreys/Firth adds the identifiable-subspace Jeffreys term
             // Φ to the log-likelihood,
             // so the PIRLS deviance is reduced by 2 * Φ.
-            value -= 2.0 * jeffreys_logdet;
+            value -= jeffreys_logdet;
         }
         value
     };
@@ -1436,6 +1472,24 @@ where
                         let newton_decrement_sq_upper = (-lin).max(0.0) * nd_correction;
                         let nd_threshold = kkt_tolerance * kkt_tolerance * f_scale;
                         let nd_pass = newton_decrement_sq_upper <= nd_threshold;
+                        // Once realized progress is below the objective's
+                        // floating-point noise floor, the damped resolvent bound
+                        // above can be arbitrarily loose even though the exact
+                        // bare-Hessian decrement is decisive. Compute that exact
+                        // certificate once at the plateau. This is restricted to
+                        // unconstrained coefficient geometry: constrained KKT
+                        // points and Arrow-Schur joint states require their own
+                        // projected/block decrement, so the raw beta Hessian is
+                        // not a valid certificate for them.
+                        let numerical_plateau = actual_reduction.abs() <= noise_floor;
+                        let should_check_exact_nd =
+                            numerical_plateau && !exact_decrement_checked_at_plateau;
+                        exact_decrement_checked_at_plateau = numerical_plateau;
+                        let exact_nd_pass = should_check_exact_nd
+                            && !has_explicit_constraints
+                            && options.arrow_schur.is_none()
+                            && exact_newton_decrement_sq(final_state_ref)
+                                .is_some_and(|decrement_sq| decrement_sq <= nd_threshold);
 
                         // Strict KKT: scale-invariant under EITHER the
                         // dimension-based bound ‖g‖ < τ·√n·max(1,√p) OR the
@@ -1446,6 +1500,7 @@ where
                         // is intrinsically large but H⁻¹g is already tiny.
                         if final_state_ref.certifies_kkt(convergence_grad_norm, kkt_tolerance)
                             || nd_pass
+                            || exact_nd_pass
                         {
                             status = PirlsStatus::Converged;
                             break 'pirls_loop;
