@@ -1938,7 +1938,8 @@ mod device {
                 .arg(out);
             // SAFETY: the loaded kernel's argument ABI matches this builder,
             // and `grid(total)` covers only the `total` allocated outputs.
-            unsafe { launch.launch(grid(total)?) }.gpu_ctx(label)
+            unsafe { launch.launch(grid(total)?) }.gpu_ctx(label)?;
+            Ok(())
         };
         launch_rowmat(
             &staged.decoded_dev,
