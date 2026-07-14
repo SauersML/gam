@@ -1404,29 +1404,32 @@ fn log_active_set_transition(
     );
 }
 
-/// Record the current working set; returns `false` when this exact set was
-/// already visited. Both the entering and leaving rules above are
-/// lowest-index (Bland), so a repeat cannot be a true simplex cycle — it is
-/// tolerance-band oscillation (a row added by the slack band and dropped by a
-/// noise-level negative dual, repeatedly). The caller breaks to the post-loop
-/// KKT exit gate, which inspects the iterate's full KKT residuals and either
-/// accepts via the projected-gradient fallback or returns an explicit error —
-/// never a silent acceptance, and no longer a hard seed-killing error on an
-/// otherwise numerically-converged iterate (#1025).
+/// Record the complete active-set state; returns `false` only when both the
+/// canonical row ids and the primal point are bit-identical to a prior state.
+/// A working set may legitimately recur after the primal iterate moved (leave
+/// a face, descend, then re-enter it), so row ids alone are not a cycle witness.
+/// The former row-only key sent such productive revisits to the projected-
+/// gradient escape, which is exactly the issue-979 CTN trace: the 91-row face
+/// recurred at a different coefficient point and the main QP was abandoned.
+/// An identical `(face, x)` state is a genuine tolerance-band cycle and still
+/// routes to the post-loop KKT gate. `to_bits` makes the decision deterministic
+/// and admits no approximate/wall-clock notion of repetition.
 fn record_active_working_set(
-    visited: &mut HashSet<Vec<usize>>,
+    visited: &mut HashSet<(Vec<usize>, Vec<u64>)>,
     active: &[usize],
+    x: &Array1<f64>,
     iteration: usize,
 ) -> bool {
-    let mut key = active.to_vec();
-    key.sort_unstable();
-    if visited.insert(key.clone()) {
+    let mut active_key = active.to_vec();
+    active_key.sort_unstable();
+    let point_key = x.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+    if visited.insert((active_key.clone(), point_key)) {
         return true;
     }
     log::debug!(
-        "[active-set/QP] iter={iteration} repeated working set ({} rows); \
+        "[active-set/QP] iter={iteration} repeated working set at the identical primal point ({} rows); \
          deferring to the post-loop KKT exit gate",
-        key.len()
+        active_key.len()
     );
     false
 }
@@ -1508,8 +1511,8 @@ fn solve_newton_direction_with_linear_constraints_impl(
             log_active_set_transition("initial-boundary-add", 0, active.len(), Some(i));
         }
     }
-    let mut visited_working_sets: HashSet<Vec<usize>> = HashSet::new();
-    record_active_working_set(&mut visited_working_sets, &active, 0);
+    let mut visited_working_sets: HashSet<(Vec<usize>, Vec<u64>)> = HashSet::new();
+    record_active_working_set(&mut visited_working_sets, &active, &x, 0);
 
     for iteration in 0..max_iterations {
         let compressed_working = compress_active_working_set(&x, constraints, &active)?;
@@ -1546,7 +1549,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
                     active.len(),
                     Some(worst_row),
                 );
-                if !record_active_working_set(&mut visited_working_sets, &active, iteration) {
+                if !record_active_working_set(&mut visited_working_sets, &active, &x, iteration) {
                     break;
                 }
                 continue;
@@ -1581,7 +1584,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
                     active.len(),
                     Some(idx),
                 );
-                if !record_active_working_set(&mut visited_working_sets, &active, iteration) {
+                if !record_active_working_set(&mut visited_working_sets, &active, &x, iteration) {
                     break;
                 }
                 continue;
@@ -1641,7 +1644,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 added_new_active = true;
                 log_active_set_transition("blocking-add", iteration, active.len(), Some(i));
                 working_set_repeated =
-                    !record_active_working_set(&mut visited_working_sets, &active, iteration);
+                    !record_active_working_set(&mut visited_working_sets, &active, &x, iteration);
                 break;
             }
         }
@@ -2247,8 +2250,8 @@ fn solve_newton_direction_with_constraint_set_impl(
     // is the standard feasible active-set invariant and changes neither the
     // feasible region nor the QP optimum.  Dense constraints retain their
     // existing eager initialization in the dense solver.
-    let mut visited_working_sets: HashSet<Vec<usize>> = HashSet::new();
-    record_active_working_set(&mut visited_working_sets, &active, 0);
+    let mut visited_working_sets: HashSet<(Vec<usize>, Vec<u64>)> = HashSet::new();
+    record_active_working_set(&mut visited_working_sets, &active, &x, 0);
 
     for iteration in 0..max_iterations {
         let compressed_working = ops.compress_working(&active)?;
@@ -2275,7 +2278,7 @@ fn solve_newton_direction_with_constraint_set_impl(
                     active.len(),
                     Some(worst_row),
                 );
-                if !record_active_working_set(&mut visited_working_sets, &active, iteration) {
+                if !record_active_working_set(&mut visited_working_sets, &active, &x, iteration) {
                     break;
                 }
                 continue;
@@ -2302,7 +2305,7 @@ fn solve_newton_direction_with_constraint_set_impl(
                     active.len(),
                     Some(idx),
                 );
-                if !record_active_working_set(&mut visited_working_sets, &active, iteration) {
+                if !record_active_working_set(&mut visited_working_sets, &active, &x, iteration) {
                     break;
                 }
                 continue;
@@ -2354,7 +2357,7 @@ fn solve_newton_direction_with_constraint_set_impl(
             added_new_active = true;
             log_active_set_transition("blocking-add", iteration, active.len(), Some(row));
             working_set_repeated =
-                !record_active_working_set(&mut visited_working_sets, &active, iteration);
+                !record_active_working_set(&mut visited_working_sets, &active, &x, iteration);
         }
         if working_set_repeated {
             break;
@@ -2745,13 +2748,25 @@ mod tests {
         project_point_strictly_into_feasible_constraint_set,
         project_stationarity_residual_on_constraint_cone,
         project_stationarity_residual_on_constraint_set,
-        rank_reduce_rows_pivoted_qr_with_dependence, scaled_constraint_slack,
+        rank_reduce_rows_pivoted_qr_with_dependence, record_active_working_set,
+        scaled_constraint_slack,
         solve_newton_direction_with_linear_constraints_impl, solve_quadratic_with_constraint_set,
         solve_quadratic_with_linear_constraints,
     };
     use approx::assert_relative_eq;
     use gam_problem::KhatriRaoConeConstraints;
     use ndarray::{Array1, Array2, array};
+
+    #[test]
+    fn working_set_cycle_detection_requires_the_same_primal_point() {
+        let mut visited = std::collections::HashSet::new();
+        let x0 = array![0.0_f64, 1.0];
+        let x1 = array![0.5_f64, 1.0];
+
+        assert!(record_active_working_set(&mut visited, &[3, 1], &x0, 0));
+        assert!(record_active_working_set(&mut visited, &[1, 3], &x1, 1));
+        assert!(!record_active_working_set(&mut visited, &[3, 1], &x1, 2));
+    }
 
     /// A `β = 0` seed sits on the boundary of EVERY row of a homogeneous
     /// (`b = 0`) convex/concave second-difference cone — it is the cone vertex.
