@@ -619,26 +619,38 @@ mod laziness_gate_tests {
         );
     }
 
+    /// The resolution counter is process-global and the test binary runs in
+    /// parallel: on a real GPU box dozens of concurrent tests legitimately
+    /// enter `availability()` between any two reads (this is exactly how the
+    /// exact `before + 1` form of these gates failed on hardware while
+    /// staying green on quiet CPU-only runners — #2313's hardware-only
+    /// coverage class). Calling the gate `N` times and bounding the delta
+    /// makes the control-flow property immune to that traffic: a gate that
+    /// probes contributes ≥ N calls; one that never probes contributes 0,
+    /// and unrelated concurrent traffic is orders of magnitude below N.
+    const COUNTER_PROBE_CALLS: u64 = 4096;
+
     #[test]
     fn gpu_sized_dense_work_falls_through_to_resolution() {
         let before = GpuRuntime::resolution_call_count();
-        // Above any plausible floor: must consult the runtime exactly once, i.e.
-        // the gate does not change behaviour for genuinely GPU-sized problems.
-        // The returned handle is irrelevant here (None on CPU-only boxes);
-        // the observable is the consultation count below.
-        let runtime = GpuRuntime::resolve_if_dense_work_exceeds_floor(
-            super::super::GpuPolicy::Auto,
-            u128::MAX,
-        )
-        .expect("a probe fault must fail this gate instead of looking absent");
+        // Above any plausible floor: every call must consult the runtime,
+        // i.e. the gate does not change behaviour for genuinely GPU-sized
+        // problems. The returned handle is irrelevant here (None on CPU-only
+        // boxes); the observable is the consultation count below.
+        for _ in 0..COUNTER_PROBE_CALLS {
+            let runtime = GpuRuntime::resolve_if_dense_work_exceeds_floor(
+                super::super::GpuPolicy::Auto,
+                u128::MAX,
+            )
+            .expect("a probe fault must fail this gate instead of looking absent");
+            assert!(
+                runtime.is_none_or(|runtime| !runtime.devices.is_empty()),
+                "an available runtime must expose at least one usable device"
+            );
+        }
         assert!(
-            runtime.is_none_or(|runtime| !runtime.devices.is_empty()),
-            "an available runtime must expose at least one usable device"
-        );
-        assert_eq!(
-            GpuRuntime::resolution_call_count(),
-            before + 1,
-            "GPU-sized work must fall through to availability resolution"
+            GpuRuntime::resolution_call_count() - before >= COUNTER_PROBE_CALLS,
+            "GPU-sized work must fall through to availability resolution on every call"
         );
     }
 
@@ -650,26 +662,40 @@ mod laziness_gate_tests {
         // refusal can never block work some calibrated policy would dispatch.
         let floor = GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS;
         let before = GpuRuntime::resolution_call_count();
+        for _ in 0..COUNTER_PROBE_CALLS {
+            assert!(
+                GpuRuntime::resolve_if_dense_work_exceeds_floor(
+                    super::super::GpuPolicy::Auto,
+                    floor - 1,
+                )
+                .expect("the below-floor gate cannot probe or fail")
+                .is_none()
+            );
+        }
+        let below_floor_delta = GpuRuntime::resolution_call_count() - before;
         assert!(
-            GpuRuntime::resolve_if_dense_work_exceeds_floor(
+            below_floor_delta < COUNTER_PROBE_CALLS,
+            "below-floor work must never probe the runtime: {below_floor_delta} \
+             resolution entries during {COUNTER_PROBE_CALLS} below-floor calls"
+        );
+        // At the floor the gate must consult the runtime (fall through) on
+        // every call.
+        let at_floor_before = GpuRuntime::resolution_call_count();
+        for _ in 0..COUNTER_PROBE_CALLS {
+            let runtime = GpuRuntime::resolve_if_dense_work_exceeds_floor(
                 super::super::GpuPolicy::Auto,
-                floor - 1,
+                floor,
             )
-            .expect("the below-floor gate cannot probe or fail")
-            .is_none()
-        );
-        assert_eq!(GpuRuntime::resolution_call_count(), before);
-        // At the floor the gate must consult the runtime (fall through).
-        let runtime = GpuRuntime::resolve_if_dense_work_exceeds_floor(
-            super::super::GpuPolicy::Auto,
-            floor,
-        )
-        .expect("a probe fault must fail the boundary gate instead of looking absent");
+            .expect("a probe fault must fail the boundary gate instead of looking absent");
+            assert!(
+                runtime.is_none_or(|runtime| !runtime.devices.is_empty()),
+                "a successful floor-boundary probe must expose at least one usable device"
+            );
+        }
         assert!(
-            runtime.is_none_or(|runtime| !runtime.devices.is_empty()),
-            "a successful floor-boundary probe must expose at least one usable device"
+            GpuRuntime::resolution_call_count() - at_floor_before >= COUNTER_PROBE_CALLS,
+            "floor-boundary work must fall through to availability resolution on every call"
         );
-        assert_eq!(GpuRuntime::resolution_call_count(), before + 1);
     }
 }
 
