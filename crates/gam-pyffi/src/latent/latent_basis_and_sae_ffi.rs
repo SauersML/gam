@@ -1909,6 +1909,11 @@ fn sae_manifold_fit_inner<'py>(
     .map_err(py_value_error)?;
 
     let assignment = SaeFitAssignmentKind::from_tag(&assignment_kind).map_err(py_value_error)?;
+    let gpu_policy = gam::gpu::GpuPolicy::parse(gpu_policy).ok_or_else(|| {
+        py_value_error(format!(
+            "sae_manifold_fit gpu must be 'auto', 'off', or 'required'; got {gpu_policy:?}"
+        ))
+    })?;
     let temperature_schedule =
         gumbel_temperature_schedule_from_pydict(gumbel_schedule).map_err(py_value_error)?;
     let fisher_metric = match fisher_u {
@@ -1953,6 +1958,7 @@ fn sae_manifold_fit_inner<'py>(
         fit_config: gam::terms::sae::manifold::SaeFitConfig {
             separation_barrier_strength_override,
             ordered_beta_bernoulli_alpha_override: None,
+            gpu_policy,
         },
         temperature_schedule,
         fisher_metric,

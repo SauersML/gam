@@ -179,7 +179,9 @@ impl SaeManifoldTerm {
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?
             .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        let options = plan.solve_options_for_border_dim(sys.k);
+        let options = plan
+            .solve_options_for_border_dim(sys.k)
+            .with_gpu_policy(self.gpu_policy);
         solve_with_lm_escalation_inner(&sys, ridge_ext_coord, ridge_beta, &options)
             .map(|(delta_t, delta_beta, _diag)| (delta_t, delta_beta))
     }
@@ -3753,10 +3755,7 @@ impl SaeManifoldTerm {
             .iter()
             .map(|&a| self.atoms[a].basis_kind().clone())
             .collect();
-        let dims: Vec<usize> = atoms
-            .iter()
-            .map(|&a| self.atoms[a].latent_dim())
-            .collect();
+        let dims: Vec<usize> = atoms.iter().map(|&a| self.atoms[a].latent_dim()).collect();
         // `pc_pair_offset` rotates the residual-PC assignment so a co-collapse
         // multi-start RETRY (offset = retry index) reads a disjoint principal
         // subspace from the previous attempt; the per-atom breach arm passes 0
@@ -4553,10 +4552,7 @@ impl SaeManifoldTerm {
             //    residual's leading structure (one-atom PCA seed on the residual
             //    left by prior atoms).
             let dim = self.atoms[atom].latent_dim();
-            let is_periodic = matches!(
-                self.atoms[atom].basis_kind(),
-                SaeAtomBasisKind::Periodic
-            );
+            let is_periodic = matches!(self.atoms[atom].basis_kind(), SaeAtomBasisKind::Periodic);
             let isa_plane = if dim > 0 && is_periodic {
                 next_isa_plane.next()
             } else {
@@ -6021,7 +6017,9 @@ impl SaeManifoldTerm {
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?
                 .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
-            let mut solve_options = plan.solve_options_for_border_dim(sys.k);
+            let mut solve_options = plan
+                .solve_options_for_border_dim(sys.k)
+                .with_gpu_policy(self.gpu_policy);
             // #2228 — gauge-fix the inner Newton STEP on the reduced β border.
             //
             // The closed-form chart gauge (circle/torus phase, patch
@@ -7221,10 +7219,7 @@ impl SaeManifoldTerm {
     /// structure, so it adds no rank information), so accumulating `Φ` weighted
     /// by the per-row assignment exactly reproduces the data-fit decoder block
     /// curvature `G_k` that `assemble_arrow_schur` installs.
-    pub(crate) fn accumulate_decoder_gram(
-        &self,
-        grams: &mut [Array2<f64>],
-    ) -> Result<(), String> {
+    pub(crate) fn accumulate_decoder_gram(&self, grams: &mut [Array2<f64>]) -> Result<(), String> {
         let n = self.n_obs();
         let assignments = self.assignment.assignments();
         // Each atom's Gram `G_k = Φ_kᵀ diag(a_k²) Φ_k` is an independent
@@ -7290,12 +7285,11 @@ impl SaeManifoldTerm {
             })
             .max()
             .unwrap_or(0);
-        let rt = if max_atom_gram_flops
-            < crate::gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS
+        let rt = if max_atom_gram_flops < crate::gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS
         {
             None
         } else {
-            crate::gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+            crate::gpu::device_runtime::GpuRuntime::resolve(self.gpu_policy)
                 .map_err(|error| format!("decoder-Gram CUDA admission failed: {error}"))?
         };
         match rt {
@@ -7354,8 +7348,7 @@ impl SaeManifoldTerm {
                     }
                     None => {
                         return Err(
-                            "decoder-Gram device scatter declined after CUDA admission"
-                                .to_string(),
+                            "decoder-Gram device scatter declined after CUDA admission".to_string()
                         );
                     }
                 }
@@ -7781,6 +7774,7 @@ impl SaeManifoldTerm {
             self.streaming_gates_frozen = true;
             // ── Pass 1: accumulate the global reduced Schur over β online. ──
             let options = ArrowSolveOptions::automatic(border_dim)
+                .with_gpu_policy(self.gpu_policy)
                 .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
             let mut s_acc = Array2::<f64>::zeros((border_dim, border_dim));
             let mut rhs_acc = Array1::<f64>::zeros(border_dim);

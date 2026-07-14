@@ -52,11 +52,9 @@ pub(crate) fn device_failure_as_arrow_error(
                 reason: format!("{context}: per-row block requires ridge bump {bump:e}"),
             }
         }
-        ArrowSchurGpuFailure::SchurFactorFailed { reason } => {
-            ArrowSchurError::SchurFactorFailed {
-                reason: format!("{context}: {reason}"),
-            }
-        }
+        ArrowSchurGpuFailure::SchurFactorFailed { reason } => ArrowSchurError::SchurFactorFailed {
+            reason: format!("{context}: {reason}"),
+        },
         ArrowSchurGpuFailure::Unavailable => ArrowSchurError::SchurFactorFailed {
             reason: format!("{context}: device execution became unavailable after admission"),
         },
@@ -135,6 +133,7 @@ pub fn solve_arrow_newton_step_with_options(
             0.0,
             options.evidence_policy.factors_undamped_evidence(),
             &backend,
+            options.gpu_policy,
         )?;
         (
             ArrowUndampedFactors::Owned(undamped.factors),
@@ -156,7 +155,7 @@ pub fn solve_arrow_newton_step_with_options(
         };
         let evidence_schur = pin_evidence_beta_schur(
             sys,
-            build_dense_schur_direct(sys, evidence_htt_factors, 0.0, &backend)?,
+            build_dense_schur_direct(sys, evidence_htt_factors, 0.0, &backend, options.gpu_policy)?,
         );
         let DenseReducedSchurFactorization {
             factor: evidence_schur_factor,
@@ -263,6 +262,7 @@ pub fn probe_undamped_evidence_row_factors(
         0.0,
         options.evidence_policy.factors_undamped_evidence(),
         &CpuBatchedBlockSolver,
+        options.gpu_policy,
     )
     .map(|_| ())
 }
@@ -321,8 +321,7 @@ pub fn solve_arrow_newton_step_core(
     // and inject it through a cloned options so the existing InexactPCG branch
     // consumes it. On any device decline the original (CPU) options are used
     // unchanged, so results are bit-identical.
-    if let Some(device_options) =
-        maybe_inject_gpu_schur_matvec(sys, ridge_t, ridge_beta, options)?
+    if let Some(device_options) = maybe_inject_gpu_schur_matvec(sys, ridge_t, ridge_beta, options)?
     {
         return solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, &device_options).map(
             |step| {
@@ -409,7 +408,7 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
     }
     // Require a live device before assembling the GPU matvec backend; the
     // runtime handle itself is not needed here, only its presence.
-    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+    if gam_gpu::device_runtime::GpuRuntime::resolve(options.gpu_policy)
         .map_err(|error| ArrowSchurError::SchurFactorFailed {
             reason: format!("Arrow-Schur GPU runtime resolution failed: {error}"),
         })?
@@ -417,12 +416,11 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
     {
         return Ok(None);
     }
-    let matvec = crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(
-        sys,
-        ridge_t,
-        ridge_beta,
-    )
-    .map_err(|failure| device_failure_as_arrow_error("Arrow-Schur matvec build", failure))?;
+    let matvec =
+        crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta)
+            .map_err(|failure| {
+                device_failure_as_arrow_error("Arrow-Schur matvec build", failure)
+            })?;
     let mut device_options = options.clone();
     device_options.gpu_matvec = Some(matvec);
     Ok(Some(device_options))
@@ -495,7 +493,7 @@ pub(crate) fn try_device_arrow_direct(
     {
         return None;
     }
-    let runtime = match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy()) {
+    let runtime = match gam_gpu::device_runtime::GpuRuntime::resolve(options.gpu_policy) {
         Ok(Some(runtime)) => runtime,
         Ok(None) => return None,
         Err(error) => {
@@ -660,7 +658,7 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
         );
         return None;
     }
-    match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy()) {
+    match gam_gpu::device_runtime::GpuRuntime::resolve(options.gpu_policy) {
         Ok(Some(_)) => {}
         Ok(None) => {
             trace_decline!("typed CUDA absence under the configured policy");
@@ -807,17 +805,16 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
                 // per-apply host round-trip); when it declines the shape/device
                 // the byte-identical CPU resident row-factor lane is staged
                 // instead.
-                let device_matvec =
-                    match crate::arrow_schur::maybe_build_evidence_gpu_matvec(
-                        sys,
-                        ridge_t,
-                        ridge_beta,
-                        options,
-                        (SCHUR_SLQ_LOGDET_PROBES * SCHUR_SLQ_LOGDET_LANCZOS_STEPS).max(1),
-                    ) {
-                        Ok(matvec) => matvec,
-                        Err(error) => return Some(Err(error)),
-                    };
+                let device_matvec = match crate::arrow_schur::maybe_build_evidence_gpu_matvec(
+                    sys,
+                    ridge_t,
+                    ridge_beta,
+                    options,
+                    (SCHUR_SLQ_LOGDET_PROBES * SCHUR_SLQ_LOGDET_LANCZOS_STEPS).max(1),
+                ) {
+                    Ok(matvec) => matvec,
+                    Err(error) => return Some(Err(error)),
+                };
                 let gpu_matvec = options.gpu_matvec.as_ref().or(device_matvec.as_ref());
                 let resident = if gpu_matvec.is_none() {
                     SaeResidentReducedSchur::build(sys, htt_factors, backend)
@@ -859,7 +856,13 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
                 // `solve_dense_reduced_system` (the exact CPU Direct reduce) so the
                 // emitted factor — and therefore the log-det — is bit-identical to
                 // the non-device path.
-                let schur = match build_dense_schur_direct(sys, htt_factors, ridge_beta, backend) {
+                let schur = match build_dense_schur_direct(
+                    sys,
+                    htt_factors,
+                    ridge_beta,
+                    backend,
+                    options.gpu_policy,
+                ) {
                     Ok(schur) => schur,
                     Err(err) => return Some(Err(err)),
                 };
@@ -921,10 +924,8 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
 fn build_resident_base_frame_if_admitted(
     sys: &ArrowSchurSystem,
     options: &ArrowSolveOptions,
-) -> Result<
-    Option<crate::gpu_kernels::arrow_schur::ResidentBaseArrowFrameHandle>,
-    ArrowSchurError,
-> {
+) -> Result<Option<crate::gpu_kernels::arrow_schur::ResidentBaseArrowFrameHandle>, ArrowSchurError>
+{
     if options.mode != ArrowSolverMode::Direct {
         return Ok(None);
     }
@@ -936,7 +937,7 @@ fn build_resident_base_frame_if_admitted(
     {
         return Ok(None);
     }
-    if matches!(gam_gpu::global_policy(), gam_gpu::GpuPolicy::Off) {
+    if matches!(options.gpu_policy, gam_gpu::GpuPolicy::Off) {
         return Ok(None);
     }
     // Same size gate as `try_device_arrow_direct`, BEFORE runtime resolution,
@@ -949,9 +950,11 @@ fn build_resident_base_frame_if_admitted(
     {
         return Ok(None);
     }
-    let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-        .map_err(|error| ArrowSchurError::SchurFactorFailed {
-            reason: format!("Arrow-Schur resident-frame runtime resolution failed: {error}"),
+    let Some(runtime) =
+        gam_gpu::device_runtime::GpuRuntime::resolve(options.gpu_policy).map_err(|error| {
+            ArrowSchurError::SchurFactorFailed {
+                reason: format!("Arrow-Schur resident-frame runtime resolution failed: {error}"),
+            }
         })?
     else {
         return Ok(None);
@@ -1606,10 +1609,17 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
     ridge_t: f64,
     evidence_factorization: bool,
     backend: &B,
+    gpu_policy: gam_gpu::GpuPolicy,
 ) -> Result<ArrowBlockFactorization, ArrowSchurError> {
     let Some(deflation) = sys.row_gauge_deflation.as_ref() else {
         return Ok(ArrowBlockFactorization {
-            factors: backend.factor_blocks(&sys.rows, ridge_t, sys.d, evidence_factorization)?,
+            factors: backend.factor_blocks_with_policy(
+                &sys.rows,
+                ridge_t,
+                sys.d,
+                evidence_factorization,
+                gpu_policy,
+            )?,
             gauge_deflated_directions: 0,
             deflated_row_directions: Vec::new(),
             deflation_row_spectra: Vec::new(),
@@ -2255,7 +2265,8 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
     // 1. BA point elimination: per-row Cholesky factors of
     // (H_tt^(i) + ridge_t · I).  `factor_blocks` reads the actual row
     // dimension from `row.htt.nrows()` so heterogeneous systems work.
-    let htt_factors = factor_blocks_for_system(sys, ridge_t, false, &backend)?.factors;
+    let htt_factors =
+        factor_blocks_for_system(sys, ridge_t, false, &backend, options.gpu_policy)?.factors;
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
@@ -2301,7 +2312,13 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             ) {
                 return device_step;
             }
-            let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend)?;
+            let schur = build_dense_schur_direct(
+                sys,
+                &htt_factors,
+                ridge_beta,
+                &backend,
+                options.gpu_policy,
+            )?;
             let schur = if beta_gauge_active {
                 pin_evidence_beta_schur(sys, schur)
             } else {
@@ -2351,7 +2368,13 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             (db, sf, diag)
         }
         ArrowSolverMode::SqrtBA => {
-            let schur = build_dense_schur_sqrt_ba(sys, &htt_factors, ridge_beta, &backend)?;
+            let schur = build_dense_schur_sqrt_ba(
+                sys,
+                &htt_factors,
+                ridge_beta,
+                &backend,
+                options.gpu_policy,
+            )?;
             let schur = if beta_gauge_active {
                 pin_evidence_beta_schur(sys, schur)
             } else {
@@ -2587,12 +2610,14 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
         ridge_beta: f64,
         newton_schur_tikhonov_rel_floor: Option<f64>,
         backend: &'a B,
+        gpu_policy: gam_gpu::GpuPolicy,
     ) -> Result<Self, ArrowSchurError>
     where
         B: Sync,
     {
-        let htt_factors = backend.factor_blocks(&sys.rows, ridge_t, sys.d, false)?;
-        let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, backend)?;
+        let htt_factors =
+            backend.factor_blocks_with_policy(&sys.rows, ridge_t, sys.d, false, gpu_policy)?;
+        let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, backend, gpu_policy)?;
         let schur_factor = factor_dense_reduced_schur(
             &schur,
             ReducedSchurPolicy::newton(newton_schur_tikhonov_rel_floor),
@@ -2899,6 +2924,7 @@ pub(crate) fn solve_arrow_newton_step_cross_row(
         ridge_beta,
         options.newton_schur_tikhonov_rel_floor,
         &backend,
+        options.gpu_policy,
     )?;
 
     let n = sys.rows.len();

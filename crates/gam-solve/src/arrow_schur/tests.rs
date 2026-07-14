@@ -10,6 +10,14 @@ fn gpu_available_or_fail() -> bool {
         .is_some()
 }
 
+#[test]
+fn arrow_solve_options_own_gpu_policy_2322() {
+    let off = ArrowSolveOptions::direct().with_gpu_policy(gam_gpu::GpuPolicy::Off);
+    let required = ArrowSolveOptions::direct().with_gpu_policy(gam_gpu::GpuPolicy::Required);
+    assert_eq!(off.gpu_policy, gam_gpu::GpuPolicy::Off);
+    assert_eq!(required.gpu_policy, gam_gpu::GpuPolicy::Required);
+}
+
 /// #1995: compact SAE rows hand `block_gemm_subtract` dense scratch matrices
 /// whose nonzeros occupy only the active top-k beta columns. The CPU fallback
 /// must produce the same Schur update as a dense GEMM while doing work only on
@@ -2560,15 +2568,22 @@ pub(crate) fn cross_row_preconditioner_build_honors_pd_floor_1795() {
     // spectral floor unit-deflates the collapsed direction relative to λ_max=3.
     sys.hbb = array![[1.0_f64, 2.0], [2.0, 1.0]];
 
-    let unfloored = ArrowBlockDiagInverse::build(&sys, 0.0, 0.0, None, &backend);
+    let unfloored =
+        ArrowBlockDiagInverse::build(&sys, 0.0, 0.0, None, &backend, gam_gpu::GpuPolicy::Auto);
     assert!(
         matches!(unfloored, Err(ArrowSchurError::SchurFactorFailed { .. })),
         "un-floored cross-row preconditioner must surface the non-PD Schur"
     );
 
-    let floored =
-        ArrowBlockDiagInverse::build(&sys, 0.0, 0.0, Some(SPECTRAL_DEFLATION_REL_FLOOR), &backend)
-            .expect("cross-row preconditioner must honor the spectral PD-floor");
+    let floored = ArrowBlockDiagInverse::build(
+        &sys,
+        0.0,
+        0.0,
+        Some(SPECTRAL_DEFLATION_REL_FLOOR),
+        &backend,
+        gam_gpu::GpuPolicy::Auto,
+    )
+    .expect("cross-row preconditioner must honor the spectral PD-floor");
 
     let rhs_t = Array1::<f64>::zeros(sys.row_offsets[sys.rows.len()]);
     let rhs_beta = array![0.25_f64, -0.5];
@@ -2778,11 +2793,25 @@ pub(crate) fn parallel_dense_schur_reduction_deterministic_and_matches_sequentia
 
         // (a) Determinism: two independent parallel reductions are bit-identical.
         let mut s_a = seed();
-        reduce_row_schur_contributions(&sys, &htt_factors, &backend, kind, &mut s_a)
-            .expect("parallel reduction a");
+        reduce_row_schur_contributions(
+            &sys,
+            &htt_factors,
+            &backend,
+            kind,
+            &mut s_a,
+            gam_gpu::GpuPolicy::Auto,
+        )
+        .expect("parallel reduction a");
         let mut s_b = seed();
-        reduce_row_schur_contributions(&sys, &htt_factors, &backend, kind, &mut s_b)
-            .expect("parallel reduction b");
+        reduce_row_schur_contributions(
+            &sys,
+            &htt_factors,
+            &backend,
+            kind,
+            &mut s_b,
+            gam_gpu::GpuPolicy::Auto,
+        )
+        .expect("parallel reduction b");
         for a in 0..k {
             for b in 0..k {
                 assert_eq!(
@@ -3087,8 +3116,15 @@ pub(crate) fn parallel_block_diag_inverse_apply_deterministic_and_solves() {
     let backend = CpuBatchedBlockSolver;
     let ridge_t = 1e-4;
     let ridge_beta = 1e-5;
-    let precond = ArrowBlockDiagInverse::build(&sys, ridge_t, ridge_beta, None, &backend)
-        .expect("block-diagonal inverse must build");
+    let precond = ArrowBlockDiagInverse::build(
+        &sys,
+        ridge_t,
+        ridge_beta,
+        None,
+        &backend,
+        gam_gpu::GpuPolicy::Auto,
+    )
+    .expect("block-diagonal inverse must build");
     let total_dt = sys.row_offsets[n];
     let r_t = Array1::from_iter((0..total_dt).map(|i| 0.15 * (i as f64).sin() + 0.02));
     let r_beta = Array1::from_iter((0..k).map(|a| 0.25 * (a as f64).cos() - 0.05));
@@ -4746,8 +4782,9 @@ pub(crate) fn build_dense_schur_direct_refuses_oversize_border_1017() {
         .factor_blocks(&sys.rows, 0.0, d, false)
         .expect("SPD per-row blocks must factor");
 
-    let err = build_dense_schur_direct(&sys, &htt_factors, 1e-6, &backend)
-        .expect_err("oversize border must be refused, not allocated");
+    let err =
+        build_dense_schur_direct(&sys, &htt_factors, 1e-6, &backend, gam_gpu::GpuPolicy::Auto)
+            .expect_err("oversize border must be refused, not allocated");
     match err {
         ArrowSchurError::SchurFactorFailed { reason } => {
             assert!(
@@ -4758,8 +4795,9 @@ pub(crate) fn build_dense_schur_direct_refuses_oversize_border_1017() {
         other => panic!("expected SchurFactorFailed for oversize border, got {other:?}"),
     }
 
-    let err = build_dense_schur_sqrt_ba(&sys, &htt_factors, 1e-6, &backend)
-        .expect_err("oversize square-root BA border must be refused, not allocated");
+    let err =
+        build_dense_schur_sqrt_ba(&sys, &htt_factors, 1e-6, &backend, gam_gpu::GpuPolicy::Auto)
+            .expect_err("oversize square-root BA border must be refused, not allocated");
     match err {
         ArrowSchurError::SchurFactorFailed { reason } => {
             assert!(
@@ -4945,8 +4983,14 @@ fn slq_reduced_schur_log_det_matches_dense_evidence() {
 
     // Exact dense reduced-Schur log|S| — the O(k²) assembly + O(k³) Cholesky the
     // matrix-free primitive avoids.
-    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
-        .expect("dense reduced Schur must build for the well-conditioned fixture");
+    let schur = build_dense_schur_direct(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        gam_gpu::GpuPolicy::Auto,
+    )
+    .expect("dense reduced Schur must build for the well-conditioned fixture");
     let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
     let exact_logdet: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
 
@@ -5057,8 +5101,14 @@ fn matrix_free_arrow_evidence_surrogate_none_matches_slq_some_builds_and_reuses(
             options.evidence_policy.factors_undamped_evidence(),
         )
         .expect("SPD per-row blocks must factor");
-    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
-        .expect("dense reduced Schur must build");
+    let schur = build_dense_schur_direct(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        gam_gpu::GpuPolicy::Auto,
+    )
+    .expect("dense reduced Schur must build");
     let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
     let exact_logdet: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
 
@@ -5184,8 +5234,14 @@ fn rational_reduced_schur_log_det_matches_dense_evidence() {
 
     // Exact dense reduced-Schur log|S| and top eigenvalue — the O(k²) assembly
     // the matrix-free surrogate avoids, kept here only as the test oracle.
-    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
-        .expect("dense reduced Schur must build for the well-conditioned fixture");
+    let schur = build_dense_schur_direct(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        gam_gpu::GpuPolicy::Auto,
+    )
+    .expect("dense reduced Schur must build for the well-conditioned fixture");
     let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
     let exact_logdet: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
     let true_lambda_max = dense_top_eigenvalue(&schur);
@@ -5365,8 +5421,14 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
     let htt_factors = backend
         .factor_blocks(&sys.rows, 0.0, d, false)
         .expect("SPD per-row blocks must factor");
-    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
-        .expect("dense reduced Schur must build");
+    let schur = build_dense_schur_direct(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        gam_gpu::GpuPolicy::Auto,
+    )
+    .expect("dense reduced Schur must build");
     let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
     let exact_logdet: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
 
@@ -5527,8 +5589,14 @@ fn hutchinson_reduced_schur_inverse_trace_matches_dense() {
     let htt_factors = backend
         .factor_blocks(&sys.rows, 0.0, d, false)
         .expect("SPD per-row blocks must factor");
-    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
-        .expect("dense reduced Schur must build");
+    let schur = build_dense_schur_direct(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        gam_gpu::GpuPolicy::Auto,
+    )
+    .expect("dense reduced Schur must build");
     let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
     let exact_tr_inv = dense_trace_inverse(&l);
 
@@ -5630,8 +5698,14 @@ fn reduced_schur_inverse_apply_matches_dense_solve() {
     let htt_factors = backend
         .factor_blocks(&sys.rows, 0.0, d, false)
         .expect("SPD per-row blocks must factor");
-    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
-        .expect("dense reduced Schur must build");
+    let schur = build_dense_schur_direct(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        gam_gpu::GpuPolicy::Auto,
+    )
+    .expect("dense reduced Schur must build");
     let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
 
     // Fixed Rademacher rhs (deterministic, no eigensolver needed).

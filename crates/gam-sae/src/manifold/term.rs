@@ -593,6 +593,9 @@ pub struct SaeManifoldTerm {
     /// the FFI through [`SaeManifoldTerm::set_fit_config`]. Carried across clones
     /// (persisted configuration, like the assignment mode).
     pub(crate) separation_barrier_strength_override: Option<f64>,
+    /// Device routing is part of the fit's identity, never process-global
+    /// mutable state. `Off` guarantees that this term reaches no CUDA probe.
+    pub(crate) gpu_policy: gam_gpu::GpuPolicy,
     /// #2023 — persisted per-fit opt-in for the dead-atom DATA-ROW reseed
     /// (default false). Set from the FFI via the typed `data_row_reseed` kwarg —
     /// no env lever. Carried across clones.
@@ -654,9 +657,8 @@ pub struct SaeManifoldTerm {
 
 /// Per-fit SAE configuration consumed by the Python/FFI layer. Build it, then
 /// apply it with [`SaeManifoldTerm::set_fit_config`]. A `None` field selects the
-/// corresponding canonical data-derived or assignment-mode default. Both fields
-/// are the source of truth for their axis when `Some`, so concurrent fits remain
-/// fully isolated.
+/// corresponding canonical data-derived or assignment-mode default. Every field
+/// is fit-owned, so concurrent fits remain fully isolated.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SaeFitConfig {
     /// Per-fit separation-barrier strength `μ_C`. `Some` bypasses the #1610
@@ -665,6 +667,8 @@ pub struct SaeFitConfig {
     /// Per-fit truncated-ordered Beta--Bernoulli concentration `α`. `Some` bypasses the mode's own
     /// `α` / learnable schedule.
     pub ordered_beta_bernoulli_alpha_override: Option<f64>,
+    /// Backend selection for this fit and every nested arrow-Schur solve.
+    pub gpu_policy: gam_gpu::GpuPolicy,
 }
 
 impl Clone for SaeManifoldTerm {
@@ -713,6 +717,7 @@ impl Clone for SaeManifoldTerm {
             // #1777 — persisted per-fit config, carried across clones like the
             // assignment mode so a cloned term keeps the same barrier override.
             separation_barrier_strength_override: self.separation_barrier_strength_override,
+            gpu_policy: self.gpu_policy,
             data_row_reseed: self.data_row_reseed,
             guards_enabled: self.guards_enabled,
             // Rung-2 behavioral identity is persisted configuration (like the

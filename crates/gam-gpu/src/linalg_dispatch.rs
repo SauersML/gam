@@ -269,7 +269,18 @@ impl DispatchOp {
 #[inline]
 #[must_use]
 pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
-    let selected_policy = super::global_policy();
+    route_through_gpu_with_policy(op, super::global_policy())
+}
+
+/// Per-request counterpart of [`route_through_gpu`]. This is the device seam
+/// for solvers whose policy is part of an immutable fit request rather than the
+/// legacy process-wide configuration.
+#[inline]
+#[must_use]
+pub fn route_through_gpu_with_policy(
+    op: DispatchOp,
+    selected_policy: GpuPolicy,
+) -> Option<&'static GpuRuntime> {
     // Size gate BEFORE the device probe (startup-tax ordering fix): an op no
     // reachable Auto policy could admit must not resolve availability — the first
     // call creates a CUDA primary context on every GPU. Ops that
@@ -418,6 +429,16 @@ pub fn try_fast_abt_strided_batched(
     a: ArrayView3<'_, f64>,
     b: ArrayView3<'_, f64>,
 ) -> Option<Array3<f64>> {
+    try_fast_abt_strided_batched_with_policy(a, b, super::global_policy())
+}
+
+#[inline]
+#[must_use]
+pub fn try_fast_abt_strided_batched_with_policy(
+    a: ArrayView3<'_, f64>,
+    b: ArrayView3<'_, f64>,
+    gpu_policy: GpuPolicy,
+) -> Option<Array3<f64>> {
     let (batch, m, k) = a.dim();
     let (batch_b, n, k_b) = b.dim();
     if batch != batch_b || k != k_b {
@@ -438,7 +459,8 @@ pub fn try_fast_abt_strided_batched(
     }
     #[cfg(target_os = "linux")]
     {
-        let runtime = route_through_gpu(DispatchOp::BatchedGemm { batch, m, n, k })?;
+        let runtime =
+            route_through_gpu_with_policy(DispatchOp::BatchedGemm { batch, m, n, k }, gpu_policy)?;
         if should_split_batch(batch) {
             if let Some(out) = scatter_abt_strided_batched(runtime, a, b, m, n) {
                 return Some(out);
@@ -1093,6 +1115,15 @@ pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {
 #[inline]
 #[must_use]
 pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Option<()> {
+    try_cholesky_batched_lower_inplace_with_policy(matrices, super::global_policy())
+}
+
+#[inline]
+#[must_use]
+pub fn try_cholesky_batched_lower_inplace_with_policy(
+    matrices: &mut [Array2<f64>],
+    gpu_policy: GpuPolicy,
+) -> Option<()> {
     let first = match matrices.first() {
         Some(first) => first,
         None => return decline_gpu("batched Cholesky factorization", "the batch is empty"),
@@ -1120,8 +1151,11 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
     #[cfg(target_os = "linux")]
     {
         let batch = matrices.len();
-        let runtime = route_through_gpu(DispatchOp::SmallDenseBatchedPotrf { p, batch })
-            .or_else(|| route_through_gpu(DispatchOp::Potrf { p, batch }))?;
+        let runtime = route_through_gpu_with_policy(
+            DispatchOp::SmallDenseBatchedPotrf { p, batch },
+            gpu_policy,
+        )
+        .or_else(|| route_through_gpu_with_policy(DispatchOp::Potrf { p, batch }, gpu_policy))?;
         if should_split_batch(batch) {
             // `matrices` is already the per-item slice, so the batch dimension
             // tiles directly onto `scatter_batched`: each device factors its own

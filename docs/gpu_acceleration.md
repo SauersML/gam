@@ -1,6 +1,6 @@
 # GPU Acceleration
 
-CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, `GpuRuntime::resolve(GpuPolicy::Auto)` lazily probes for a usable CUDA device and dispatches to it when present. Typed hardware absence (unsupported platform, no driver, or no device) selects CPU; a present-but-broken driver, missing runtime dependency, or initialization fault remains an error and never masquerades as absence. There is no manual device flag — the policy decides, the probe finds the hardware.
+CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, `GpuRuntime::resolve(GpuPolicy::Auto)` lazily probes for a usable CUDA device and dispatches to it when present. Typed hardware absence (unsupported platform, no driver, or no device) selects CPU; a present-but-broken driver, missing runtime dependency, or initialization fault remains an error and never masquerades as absence. The policy decides whether a probe is permitted; the probe finds the hardware.
 
 The runtime policy is set through `crate::gpu::configure_global_policy`:
 
@@ -17,6 +17,20 @@ Python callers control this through a single `"gpu"` key in the `config` dict, w
 ```python
 gamfit.fit(df, "y ~ s(x)", config={"gpu": "auto"})
 ```
+
+Manifold-SAE fits own the policy per fit, including every nested arrow-Schur
+solve and evidence evaluation:
+
+```python
+gamfit.sae_manifold_fit(X, K=8, gpu="off")
+```
+
+`gpu="off"` takes the exact CPU route before any CUDA runtime probe. This is
+the correct choice on a CPU allocation whose image happens to expose a broken
+or mismatched `libcuda`. It does not reclassify that driver fault as hardware
+absence. Because the policy is stored on the SAE term and passed through solve
+options, concurrent SAE fits may choose different policies without mutating
+process-global state.
 
 Install `gamfit[cuda]` on Linux x86_64 when you want PyPI's NVIDIA CUDA
 12 runtime libraries in the environment. CPU-only installs can still

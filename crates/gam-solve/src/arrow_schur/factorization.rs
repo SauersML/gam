@@ -52,6 +52,7 @@ pub(crate) fn try_factor_blocks_batched(
     ridge_t: f64,
     d: usize,
     evidence_factorization: bool,
+    gpu_policy: gam_gpu::GpuPolicy,
 ) -> Result<Option<ArrowFactorSlab>, ArrowSchurError> {
     if d == 0 || rows.is_empty() {
         return Ok(None);
@@ -81,7 +82,7 @@ pub(crate) fn try_factor_blocks_batched(
         return Ok(None);
     }
     // No device → let the CPU path own the work (it is the exact fallback).
-    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+    if gam_gpu::device_runtime::GpuRuntime::resolve(gpu_policy)
         .map_err(|error| ArrowSchurError::SchurFactorFailed {
             reason: format!("batched Arrow-Schur GPU runtime resolution failed: {error}"),
         })?
@@ -103,7 +104,8 @@ pub(crate) fn try_factor_blocks_batched(
     // Batched lower Cholesky over ALL usable GPUs. `None` ⇒ either no device
     // accepted the workload or some block was not PD at the base ridge; either
     // way the per-row CPU path must own escalation.
-    let Some(()) = gam_gpu::try_cholesky_batched_lower_inplace(&mut blocks) else {
+    let Some(()) = gam_gpu::try_cholesky_batched_lower_inplace_with_policy(&mut blocks, gpu_policy)
+    else {
         return Ok(None);
     };
 

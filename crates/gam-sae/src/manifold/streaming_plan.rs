@@ -182,6 +182,7 @@ pub fn sae_streaming_plan_for_shape(
     k_atoms: usize,
     d_max: usize,
     border_dim: usize,
+    gpu_policy: gam_gpu::GpuPolicy,
 ) -> Result<SaeStreamingPlan, String> {
     // Size gate BEFORE any CUDA probe (startup-tax fix, #1017 ordering): decide
     // admission against `min(host budget, conservative device-pool floor)`
@@ -234,7 +235,7 @@ pub fn sae_streaming_plan_for_shape(
         ));
     }
     let (budget, chunk_window, host_available) =
-        match crate::gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        match crate::gpu::device_runtime::GpuRuntime::resolve(gpu_policy)
             .map_err(|error| format!("SAE streaming-plan CUDA admission failed: {error}"))?
         {
             Some(rt) if rt.device_count() > 0 => {
@@ -531,7 +532,7 @@ mod cpu_sized_plan_laziness_tests {
         // The profiled small-fit shape class: N=700 rows, K=6 atoms, a few
         // dozen basis columns, d_max=2, border ≈ K·d ≈ 144. Working set is a
         // couple of MiB — direct-admitted under ANY budget.
-        let plan = sae_streaming_plan_for_shape(700, 60, 6, 2, 144)
+        let plan = sae_streaming_plan_for_shape(700, 60, 6, 2, 144, gam_gpu::GpuPolicy::Auto)
             .expect("CPU-sized plan must not require CUDA resolution");
         assert!(
             plan.direct_admitted,
@@ -555,7 +556,7 @@ mod cpu_sized_plan_laziness_tests {
         let before = GpuRuntime::resolution_call_count();
         // The plan itself is irrelevant here; the test asserts the side effect
         // that computing it consulted the device budget.
-        sae_streaming_plan_for_shape(2_000_000, 4_096, 512, 8, 32_768)
+        sae_streaming_plan_for_shape(2_000_000, 4_096, 512, 8, 32_768, gam_gpu::GpuPolicy::Auto)
             .expect("oversized plan must preserve a successful CUDA resolution");
         assert!(
             GpuRuntime::resolution_call_count() > before,
@@ -569,7 +570,7 @@ mod cpu_sized_plan_laziness_tests {
         // The early-returned plan must record the honest host in-core budget
         // (downstream gates like the #2080 escalation ledger compare against
         // it), not the 64 MiB pessimistic decision floor.
-        let plan = sae_streaming_plan_for_shape(700, 60, 6, 2, 144)
+        let plan = sae_streaming_plan_for_shape(700, 60, 6, 2, 144, gam_gpu::GpuPolicy::Auto)
             .expect("CPU-sized plan must not require CUDA resolution");
         let (host_budget, _) = sae_host_in_core_budget_bytes();
         assert_eq!(

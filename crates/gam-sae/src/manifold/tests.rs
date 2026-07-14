@@ -630,7 +630,10 @@ pub(crate) fn ard_axis_prior_tiny_energy_and_increment_are_resolved() {
     let tiny = 1.0e-12;
     let periodic = ArdAxisPrior::eval(alpha, tiny, Some(std::f64::consts::TAU));
     let quadratic_limit = 0.5 * alpha * tiny * tiny;
-    assert!(periodic.value > 0.0, "nonzero periodic energy must not round to zero");
+    assert!(
+        periodic.value > 0.0,
+        "nonzero periodic energy must not round to zero"
+    );
     assert!(
         (periodic.value - quadratic_limit).abs() <= 1.0e-15 * quadratic_limit,
         "tiny periodic energy must retain its quadratic limit"
@@ -2092,10 +2095,12 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha()
     term_a.set_fit_config(SaeFitConfig {
         separation_barrier_strength_override: Some(0.1),
         ordered_beta_bernoulli_alpha_override: Some(0.2),
+        gpu_policy: gam_gpu::GpuPolicy::Off,
     });
     term_b.set_fit_config(SaeFitConfig {
         separation_barrier_strength_override: Some(3.0),
         ordered_beta_bernoulli_alpha_override: Some(5.0),
+        gpu_policy: gam_gpu::GpuPolicy::Required,
     });
 
     // Round-trips through the config accessor.
@@ -2107,6 +2112,8 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha()
         term_b.fit_config().separation_barrier_strength_override,
         Some(3.0)
     );
+    assert_eq!(term_a.fit_config().gpu_policy, gam_gpu::GpuPolicy::Off);
+    assert_eq!(term_b.fit_config().gpu_policy, gam_gpu::GpuPolicy::Required);
 
     // ordered Beta--Bernoulli-α: the per-fit override is the resolved α (bypassing the mode schedule),
     // and the two terms resolve different α values.
@@ -2179,6 +2186,7 @@ pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
                     term.set_fit_config(SaeFitConfig {
                         separation_barrier_strength_override: Some(mu),
                         ordered_beta_bernoulli_alpha_override: None,
+                        gpu_policy: gam_gpu::GpuPolicy::Off,
                     });
                     // Hammer the barrier-strength read while the sibling thread
                     // hammers its own with a different μ. The per-fit field is

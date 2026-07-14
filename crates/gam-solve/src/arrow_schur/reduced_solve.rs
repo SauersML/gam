@@ -110,6 +110,7 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     backend: &B,
     kind: SchurReductionKind,
     schur: &mut Array2<f64>,
+    gpu_policy: gam_gpu::GpuPolicy,
 ) -> Result<(), ArrowSchurError> {
     let n = sys.rows.len();
     let k = sys.k;
@@ -130,28 +131,28 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     let tiles = if assembly_work < gam_gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS {
         None
     } else {
-        gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        gam_gpu::device_runtime::GpuRuntime::resolve(gpu_policy)
             .map_err(|error| ArrowSchurError::SchurFactorFailed {
                 reason: format!("GPU runtime resolution failed during Schur reduction: {error}"),
             })?
             .and_then(|rt| {
-            let tiles = gam_gpu::pool::balanced_partition(rt, n);
-            // Engage the device stacked-GEMM reduction when a MULTI-GPU pool can
-            // overlap tiles, OR — the single-GPU gap this closes — when the one
-            // stacked `(total_d×k)ᵀ(total_d×k)` GEMM clears the runtime's own
-            // `gemm_min_flops`, so `try_fast_atb_on_ordinal` will actually offload
-            // it instead of declining back to CPU. This reduction is the dense
-            // build's O(n·d·k²) cost (measured on an H100 as ~28% of the fit in
-            // `block_gemm_subtract`), and on a single GPU it previously always ran
-            // on the CPU because the tile path required `len() > 1` — the device
-            // sat idle. `assembly_work` IS the stacked GEMM's flop count (2·k²·Σd),
-            // so this is exactly `try_fast_atb`'s own offload predicate; below the
-            // GEMM floor the launch/staging tax loses to the CPU, so we keep the
-            // deterministic CPU rayon fold there. Small K (e.g. K=8) never clears
-            // the floor and stays on the CPU — magic-by-default crossover, no flag.
-            let engage = tiles.len() > 1 || assembly_work >= rt.policy().gemm_min_flops as u128;
-            (engage && !tiles.is_empty()).then_some(tiles)
-        })
+                let tiles = gam_gpu::pool::balanced_partition(rt, n);
+                // Engage the device stacked-GEMM reduction when a MULTI-GPU pool can
+                // overlap tiles, OR — the single-GPU gap this closes — when the one
+                // stacked `(total_d×k)ᵀ(total_d×k)` GEMM clears the runtime's own
+                // `gemm_min_flops`, so `try_fast_atb_on_ordinal` will actually offload
+                // it instead of declining back to CPU. This reduction is the dense
+                // build's O(n·d·k²) cost (measured on an H100 as ~28% of the fit in
+                // `block_gemm_subtract`), and on a single GPU it previously always ran
+                // on the CPU because the tile path required `len() > 1` — the device
+                // sat idle. `assembly_work` IS the stacked GEMM's flop count (2·k²·Σd),
+                // so this is exactly `try_fast_atb`'s own offload predicate; below the
+                // GEMM floor the launch/staging tax loses to the CPU, so we keep the
+                // deterministic CPU rayon fold there. Small K (e.g. K=8) never clears
+                // the floor and stays on the CPU — magic-by-default crossover, no flag.
+                let engage = tiles.len() > 1 || assembly_work >= rt.policy().gemm_min_flops as u128;
+                (engage && !tiles.is_empty()).then_some(tiles)
+            })
     };
 
     let Some(tiles) = tiles else {
@@ -296,6 +297,7 @@ pub(crate) fn build_dense_schur_direct<B: BatchedBlockSolver + Sync>(
     htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
     backend: &B,
+    gpu_policy: gam_gpu::GpuPolicy,
 ) -> Result<Array2<f64>, ArrowSchurError> {
     let k = sys.k;
     // Materialise H_ββ via the BetaPenaltyOp trait (#296): DensePenaltyOp
@@ -336,6 +338,7 @@ pub(crate) fn build_dense_schur_direct<B: BatchedBlockSolver + Sync>(
         backend,
         SchurReductionKind::Direct,
         &mut schur,
+        gpu_policy,
     )?;
     symmetrize_upper_from_lower(&mut schur);
     Ok(schur)
@@ -346,6 +349,7 @@ pub(crate) fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver + Sync>(
     htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
     backend: &B,
+    gpu_policy: gam_gpu::GpuPolicy,
 ) -> Result<Array2<f64>, ArrowSchurError> {
     let k = sys.k;
     // Materialise H_ββ via the BetaPenaltyOp trait (#296).
@@ -381,6 +385,7 @@ pub(crate) fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver + Sync>(
         backend,
         SchurReductionKind::SqrtBa,
         &mut schur,
+        gpu_policy,
     )?;
     symmetrize_upper_from_lower(&mut schur);
     Ok(schur)
@@ -1036,7 +1041,7 @@ pub fn solve_streaming_reduced_beta(
         // CPU `solve_dense_reduced_system`, which then drives the same proximal
         // ridge escalation. A genuine device PD failure is non-recoverable for
         // this attempt's `schur`, so we let the CPU path re-confirm and escalate.
-        if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        if gam_gpu::device_runtime::GpuRuntime::resolve(options.gpu_policy)
             .map_err(|error| ArrowSchurError::SchurFactorFailed {
                 reason: format!("GPU runtime resolution failed before reduced solve: {error}"),
             })?
@@ -1644,10 +1649,15 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     // ρ-dependent Occam reward). `Strict` / `PositiveDefinite` keep the plain SPD
     // estimator — they never form an undamped evidence with nulls.
     match evidence_policy {
-        ArrowEvidencePolicy::UnitDeflation { relative_floor } => {
-            slq_logdet_unit_deflated(k, |v| op.apply(v), num_probes, lanczos_steps, seed, relative_floor)
-                .as_logdet()
-        }
+        ArrowEvidencePolicy::UnitDeflation { relative_floor } => slq_logdet_unit_deflated(
+            k,
+            |v| op.apply(v),
+            num_probes,
+            lanczos_steps,
+            seed,
+            relative_floor,
+        )
+        .as_logdet(),
         ArrowEvidencePolicy::Strict | ArrowEvidencePolicy::PositiveDefinite => {
             slq_logdet(k, |v| op.apply(v), num_probes, lanczos_steps, seed)
         }
@@ -1682,6 +1692,7 @@ pub fn matrix_free_arrow_evidence_log_det(
         ridge_t,
         options.evidence_policy.factors_undamped_evidence(),
         &backend,
+        options.gpu_policy,
     )?;
     let htt_factors = factorization.factors;
     let mut log_det_tt = 0.0_f64;
@@ -1768,7 +1779,7 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
     ) {
         return Ok(None);
     }
-    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+    if gam_gpu::device_runtime::GpuRuntime::resolve(options.gpu_policy)
         .map_err(|error| ArrowSchurError::SchurFactorFailed {
             reason: format!("evidence GPU runtime resolution failed: {error}"),
         })?
@@ -1940,6 +1951,7 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
         ridge_t,
         options.evidence_policy.factors_undamped_evidence(),
         &backend,
+        options.gpu_policy,
     )?;
     let htt_factors = factorization.factors;
     let mut log_det_tt = 0.0_f64;
@@ -5520,19 +5532,9 @@ pub(crate) fn cholesky_lower(a: &Array2<f64>) -> Result<Array2<f64>, String> {
         ));
     }
 
-    // Only clone for the device attempt when a GPU is actually selected;
-    // `try_cholesky_lower_inplace` returns `None` on every CPU-only host, so the
-    // former unconditional `k×k` clone (≈32 MB at the SAE border) was pure waste
-    // on the CPU path that now dominates. `cuda_selected()` is a cheap policy +
-    // runtime-presence probe.
-    if gam_gpu::cuda_selected().map_err(|error| error.to_string())? {
-        let mut maybe_device = a.clone();
-        if gam_gpu::try_cholesky_lower_inplace(&mut maybe_device).is_some() {
-            return Ok(maybe_device);
-        }
-    }
-
-    // CPU fast path (#1017): at the SAE border width the reduced Schur is a
+    // CPU factorization seam (#1017): device routing happens explicitly in the
+    // arrow-Schur solve before reaching this reference/fallback primitive. At
+    // the SAE border width the reduced Schur is a
     // dense `k×k` (k≈2k–4k) whose scalar triple-loop factorization is O(k³/3)
     // and neither blocked nor SIMD-vectorized — the dominant per-Newton-step
     // cost on a CPU-only host. faer's blocked LLT computes the SAME `A = L Lᵀ`

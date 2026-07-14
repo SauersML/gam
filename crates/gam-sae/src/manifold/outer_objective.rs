@@ -3150,9 +3150,7 @@ impl SaeManifoldOuterObjective {
         // `λ_smooth` too high on frame-active fits.
         let k_smooth = rho.log_lambda_smooth.len();
         let lambda_smooth_vec = rho.lambda_smooth_vec()?;
-        let quad_per_atom = self
-            .term
-            .decoder_smoothness_quadratic_form_per_atom()?;
+        let quad_per_atom = self.term.decoder_smoothness_quadratic_form_per_atom()?;
         // #2080: reuse the SAME shared (probes, S⁻¹·probes) bundle taken once above
         // for the ARD trace. When present, the smoothness EDF is the matrix-free
         // tr(S⁻¹·M_k) off that bundle (no dense `beta_inv`); otherwise (dense-
@@ -3176,9 +3174,7 @@ impl SaeManifoldOuterObjective {
             let coordinate = rho.smooth_flat_index(atom_idx);
             let lambda_k = lambda_smooth_vec[atom_idx];
             let rank_k = (self.term.atoms[atom_idx].border_frame_rank() as f64)
-                * (SaeManifoldTerm::symmetric_rank(
-                    self.term.atoms[atom_idx].smooth_penalty(),
-                )?
+                * (SaeManifoldTerm::symmetric_rank(self.term.atoms[atom_idx].smooth_penalty())?
                     as f64);
             let quad_k = quad_per_atom[atom_idx];
             let eff_dof_k = eff_dof_per_atom[atom_idx];
@@ -4729,6 +4725,7 @@ pub(crate) fn sae_manifold_newton_directional_decrease(
 pub(crate) fn batched_smooth_sb(
     sb_inputs: &[(ArrayView2<'_, f64>, ArrayView2<'_, f64>)],
     symmetrize: bool,
+    gpu_policy: gam_gpu::GpuPolicy,
 ) -> Result<Vec<Array2<f64>>, String> {
     let n_atoms = sb_inputs.len();
     // Materialise the (optionally symmetrised) S factors once; the GPU tile and
@@ -4781,7 +4778,7 @@ pub(crate) fn batched_smooth_sb(
         }
     }
 
-    let rt = match crate::gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+    let rt = match crate::gpu::device_runtime::GpuRuntime::resolve(gpu_policy)
         .map_err(|error| format!("decoder-smoothness CUDA admission failed: {error}"))?
     {
         Some(rt) => rt,
@@ -4842,7 +4839,11 @@ pub(crate) fn batched_smooth_sb(
                     }
                 }
             }
-            let prod = crate::gpu::try_fast_abt_strided_batched(a.view(), bt.view())?;
+            let prod = crate::gpu::try_fast_abt_strided_batched_with_policy(
+                a.view(),
+                bt.view(),
+                gpu_policy,
+            )?;
             let mut sink = tile_results.lock().expect("tile_results mutex poisoned");
             for (t, &idx) in slice.iter().enumerate() {
                 sink.push((idx, prod.slice(s![t, .., ..]).to_owned()));
