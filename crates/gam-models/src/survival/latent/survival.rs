@@ -6077,10 +6077,13 @@ impl CustomFamily for LatentBinaryFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         assert!(!block_spec.name.is_empty());
         if block_idx == Self::BLOCK_TIME {
-            Ok(self.time_linear_constraints.clone())
+            Ok(self
+                .time_linear_constraints
+                .clone()
+                .map(ConstraintSet::Dense))
         } else {
             Ok(None)
         }

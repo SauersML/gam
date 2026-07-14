@@ -70,7 +70,6 @@ pub(crate) use gam_linalg::matrix::{
 pub(crate) use gam_problem::{
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
 };
-pub(crate) use gam_solve::pirls::LinearInequalityConstraints;
 pub(crate) use gam_terms::basis::initializewiggle_knots_from_seed;
 pub(crate) use gam_terms::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
