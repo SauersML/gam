@@ -1,65 +1,31 @@
-//! Repro + regression for #1040: the **survival** marginal-slope outer loop
-//! used to fail to converge within any practical wall-clock budget for every
-//! basis (matern / duchon / measure-jet all timed out at 400–600 s on a small
-//! n=1500, centers=10 problem), while the **binary** marginal-slope on the same
-//! bases / sizes converged in ~1–2 s.
+//! Exact survival counterpart to the binary #979 Matérn marginal/log-slope
+//! regression. The public formula omits `length_scale` in both channels, so
+//! this must enter the joint automatic-κ optimizer rather than the cheaper
+//! fixed-geometry route.
 //!
-//! The discriminating fact in the report was: the inner PIRLS/joint-Newton
-//! solve converged cleanly every cycle (`KKT/certificate-converged`) but the
-//! INNER joint-Newton loop ground to its `inner_loop_hard_ceiling` on the flat
-//! baseline-hazard λ valley, so the outer REML rejected ρ after ρ for hours.
-//! The cure landed across several commits: a relative-objective-plateau exit
-//! that fires on the O(1e4) survival NLL scale (a fixed absolute ε never trips)
-//! together with the range(H_pen)-projected stationarity certificate — the
-//! un-moved mass is a free ker(H_pen) gauge direction the outer IFT projects
-//! out (gam#553), so the iterate IS the REML optimum on the identifiable
-//! subspace and the loop reports `converged=true` instead of hanging.
+//! The fixture deliberately uses the smallest requested spatial shape
+//! (`centers=4`, no FLEX/time-wiggle family axes) and deterministic censored
+//! data. Its contracts are semantic rather than tolerance patches:
+//!   * a returned fit is the sealed SPEC-20 convergence certificate;
+//!   * both returned term manifests must retain typed `Auto` ownership and a
+//!     finite resolved scale, proving the automatic-κ route survived planning,
+//!     optimization, and result freezing;
+//!   * all fitted coefficients are finite.
 //!
-//! This test rebuilds the issue's *structural shape* — `Surv(time, event) ~
-//! matern(PC1, PC2, centers)`, `survival_likelihood="marginal-slope"`,
-//! `z_column`, and a matern log-slope surface — on synthetic right-censored
-//! data at a tractable size (small n / centers to stay RAM- and CI-safe), and
-//! asserts the survival-MS fit:
-//!   * converges (a minted fit is the sealed convergence certificate, SPEC 20)
-//!     — the load-bearing #1040 guard,
-//!   * returns at all rather than hanging unbounded (a wall-clock backstop that
-//!     fails a gross slowdown faster than the job ceiling; unlike the binary
-//!     marginal-slope arm, the exact per-cell quadrature makes even a converged
-//!     survival fit at this size run on the order of ~10^3 s, so the backstop
-//!     brackets that runtime instead of asserting a "seconds" parity it can
-//!     never hit — see `WALL_BUDGET_S`),
-//!   * with every coefficient finite.
-//!
-//! It is the missing survival counterpart to the binary
-//! `margslope_matern_logslope_timing` regression in
-//! `bug_hunt_979_margslope_matern_logslope_slowdown.rs`.
+//! Runtime is printed as `[979-SURVIVAL]` telemetry. The invoking workflow owns
+//! the wall-clock timeout, so a hang is killed externally instead of being
+//! disguised by an in-process threshold that cannot interrupt a blocked fit.
 
 use csv::StringRecord;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam::terms::basis::MaternLengthScale;
+use gam::terms::smooth::{SmoothBasisSpec, TermCollectionSpec};
 use std::time::Instant;
 
-const N: usize = 600;
-const CENTERS: usize = 6;
-/// Wall-clock backstop that fails a genuine hang *faster* than the job-level
-/// 240-minute timeout, without flaking on the real converged runtime.
-///
-/// #1040 was a *convergence* bug — the outer REML loop never reached its
-/// stopping criterion — so the load-bearing guard is that the fit mints at all
-/// (fit existence is the sealed convergence proof, SPEC 20), not the clock. The clock cannot itself classify converged-vs-hang here: the
-/// survival marginal-slope objective is an exact per-cell density integral
-/// (∫ φ(z) Φ(η(z)) dz on a 384-node Gauss-Legendre rule, per non-affine
-/// partition cell, per row, per inner cycle), so even a cleanly converged fit
-/// at this small n/centers runs on the order of ~10³ s — squarely inside the
-/// 400–600 s window the original hang was observed to time out in. A tight
-/// "finishes in seconds" cap (the binary marginal-slope arm's regime) was never
-/// reachable on this arm and would only ever red-flag the heavy-but-correct
-/// quadrature. The honest separator is: a true hang never returns (the 240 min
-/// job ceiling trips) or fails to mint a fit; a converged fit
-/// returns in ~10³ s. This cap brackets that converged runtime with a wide
-/// margin so it only fires on a gross, qualitatively-different slowdown.
-const WALL_BUDGET_S: f64 = 3600.0;
+const N: usize = 96;
+const CENTERS: usize = 4;
 
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
