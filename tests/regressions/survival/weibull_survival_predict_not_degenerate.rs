@@ -27,7 +27,9 @@ use std::process::Command;
 
 use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
-use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{
+    SurvivalPredictRequest, SurvivalPredictionCovarianceMode, predict_survival,
+};
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
 use gam::test_support::cli_harness::run_or_panic;
@@ -158,7 +160,7 @@ fn weibull_survival_predict_surface_is_not_degenerate_unit_survival() {
         with_uncertainty: false,
         estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
-    let result = predict_survival(request).expect("library Weibull survival predict");
+    let result = predict_survival(request, SurvivalPredictionCovarianceMode::Conditional).expect("library Weibull survival predict");
 
     assert_eq!(result.survival.nrows(), 1, "expected one prediction row");
     assert_eq!(

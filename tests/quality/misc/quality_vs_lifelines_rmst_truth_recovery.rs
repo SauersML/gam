@@ -33,7 +33,9 @@ use std::process::Command;
 
 use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
-use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{
+    SurvivalPredictRequest, SurvivalPredictionCovarianceMode, predict_survival,
+};
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
 use gam::test_support::cli_harness::run_or_panic;
@@ -155,7 +157,7 @@ fn gam_rmst(model: &FittedModel, dataset: &EncodedDataset, grid: &[f64], tau: f6
         with_uncertainty: false,
         estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
-    let result = predict_survival(request).expect("RMST capability: predict survival surface");
+    let result = predict_survival(request, SurvivalPredictionCovarianceMode::Conditional).expect("RMST capability: predict survival surface");
     let rmst = result
         .restricted_mean_survival_time(tau)
         .expect("restricted_mean_survival_time must return an RMST vector");

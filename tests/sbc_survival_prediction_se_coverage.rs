@@ -36,7 +36,8 @@ use std::process::Command;
 use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
 use gam::families::survival::predict::{
-    SurvivalPredictEstimand, SurvivalPredictRequest, predict_survival,
+    SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
+    predict_survival,
 };
 use gam::inference::model::FittedModel;
 use gam::test_support::cli_harness::run_or_panic;
@@ -190,7 +191,7 @@ fn survival_posterior_mean_se_covers_true_survival_probability_at_nominal() {
             with_uncertainty: true,
             estimand: SurvivalPredictEstimand::PosteriorMean,
         };
-        let result = predict_survival(request).unwrap_or_else(|e| {
+        let result = predict_survival(request, SurvivalPredictionCovarianceMode::Conditional).unwrap_or_else(|e| {
             panic!("posterior-mean survival predict failed (rep {rep}): {e:?}")
         });
         let s_hat = result.survival[[0, 0]];
@@ -368,7 +369,7 @@ fn survival_location_scale_delta_method_se_covers_true_survival_probability_at_n
             with_uncertainty: true,
             estimand: SurvivalPredictEstimand::Plugin,
         };
-        let result = predict_survival(request).unwrap_or_else(|e| {
+        let result = predict_survival(request, SurvivalPredictionCovarianceMode::Conditional).unwrap_or_else(|e| {
             panic!("location-scale delta-method survival predict failed (rep {rep}): {e:?}")
         });
         let s_hat = result.survival[[0, 0]];

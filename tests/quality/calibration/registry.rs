@@ -436,6 +436,7 @@ fn survival_payload_field_audits(payload: &SurvivalPredictResult) -> Vec<FieldAu
         likelihood_mode,
         survival_se,
         eta_se,
+        covariance_source,
     } = payload;
     std::hint::black_box((
         times,
@@ -446,6 +447,7 @@ fn survival_payload_field_audits(payload: &SurvivalPredictResult) -> Vec<FieldAu
         likelihood_mode,
         survival_se,
         eta_se,
+        covariance_source,
     ));
     vec![
         // Point surfaces: the plug-in/posterior-mean curves themselves carry
@@ -458,6 +460,10 @@ fn survival_payload_field_audits(payload: &SurvivalPredictResult) -> Vec<FieldAu
         FieldAudit::point("likelihood_mode"),
         FieldAudit::audited("survival_se", "survival_posterior_mean_se"),
         FieldAudit::audited("eta_se", "survival_posterior_mean_se"),
+        // Result-owned provenance tag (#2296): names the covariance definition
+        // behind the SEs; it is metadata about the audited SE fields, not an
+        // uncertainty surface of its own.
+        FieldAudit::point("covariance_source"),
     ]
 }
 
@@ -475,6 +481,9 @@ fn survival_probe() -> SurvivalPredictResult {
         likelihood_mode: SurvivalLikelihoodMode::Weibull,
         survival_se: Some(one2),
         eta_se: Some(one1),
+        covariance_source: Some(
+            gam::families::survival::predict::SurvivalPredictionCovarianceMode::Conditional,
+        ),
     }
 }
 

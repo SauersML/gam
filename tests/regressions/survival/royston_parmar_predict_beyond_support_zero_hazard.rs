@@ -34,7 +34,9 @@ use std::process::Command;
 
 use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
-use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{
+    SurvivalPredictRequest, SurvivalPredictionCovarianceMode, predict_survival,
+};
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
 use gam::test_support::cli_harness::run_or_panic;
@@ -159,7 +161,7 @@ fn royston_parmar_saved_predict_at_grid_top_does_not_fail() {
     };
 
     // The core regression: predict must NOT abort with `eta_t=0` at the grid top.
-    let result = predict_survival(request)
+    let result = predict_survival(request, SurvivalPredictionCovarianceMode::Conditional)
         .expect("RP saved predict must succeed at the default grid top (#1564)");
 
     assert_eq!(

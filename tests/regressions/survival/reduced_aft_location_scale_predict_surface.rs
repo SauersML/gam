@@ -29,7 +29,9 @@ use std::process::Command;
 
 use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
-use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{
+    SurvivalPredictRequest, SurvivalPredictionCovarianceMode, predict_survival,
+};
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
 use ndarray::Array1;
@@ -150,7 +152,7 @@ fn predict_surface(model: &FittedModel, dataset: &EncodedDataset, grid: &[f64]) 
         with_uncertainty: false,
         estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
-    let result = predict_survival(request)
+    let result = predict_survival(request, SurvivalPredictionCovarianceMode::Conditional)
         .expect("reduced-AFT location-scale survival predict must succeed");
     result.survival.row(0).to_vec()
 }

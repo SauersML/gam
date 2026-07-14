@@ -32,7 +32,9 @@ use std::process::Command;
 
 use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
-use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{
+    SurvivalPredictRequest, SurvivalPredictionCovarianceMode, predict_survival,
+};
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
 use gam::test_support::cli_harness::run_or_panic;
@@ -200,7 +202,7 @@ fn weibull_saved_baseline_scale_recovered_from_anchor_not_stale_beta0() {
         with_uncertainty: false,
         estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
-    let result = predict_survival(request).expect("library Weibull survival predict");
+    let result = predict_survival(request, SurvivalPredictionCovarianceMode::Conditional).expect("library Weibull survival predict");
     let surv: Vec<f64> = result.survival.row(0).to_vec();
     assert!(
         surv.iter().all(|s| s.is_finite() && *s > 0.0 && *s <= 1.0),

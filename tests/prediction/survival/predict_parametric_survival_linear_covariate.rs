@@ -30,7 +30,9 @@ use std::process::Command;
 
 use csv::StringRecord;
 use gam::encode_recordswith_inferred_schema;
-use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
+use gam::families::survival::predict::{
+    SurvivalPredictRequest, SurvivalPredictionCovarianceMode, predict_survival,
+};
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::FittedModel;
 use gam::test_support::cli_harness::run_or_panic;
@@ -134,7 +136,7 @@ fn predict_surface(model: &FittedModel, dataset: &EncodedDataset, grid: &[f64]) 
         with_uncertainty: false,
         estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
-    let result = predict_survival(request).expect(
+    let result = predict_survival(request, SurvivalPredictionCovarianceMode::Conditional).expect(
         "parametric Surv(...) ~ x must build a survival prediction design and predict (#898)",
     );
     result.survival.row(0).to_vec()
