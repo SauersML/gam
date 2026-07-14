@@ -273,6 +273,12 @@ struct SummaryPayload {
     covariance_kind: Option<String>,
     covariance_n: Option<usize>,
     covariance_flat: Option<Vec<f64>>,
+    /// Exact covariance definition behind the coefficient `std_error` column
+    /// (#2296): `"conditional"` or `"smoothing-corrected"`, recorded from the
+    /// definition-consistent pair the summary actually consumed. `None` when
+    /// the fit carries no coefficient standard errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coefficient_se_source: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -314,6 +320,12 @@ struct PredictionPayload {
     /// Omitted for point-only and conformal predictions.
     #[serde(skip_serializing_if = "Option::is_none")]
     covariance_source: Option<String>,
+    /// Exact covariance definition used to integrate a posterior-mean POINT
+    /// prediction (#2296) — conditional by definition on curved links, and a
+    /// separate fact from the band's `covariance_source`. Omitted when the
+    /// point is a plug-in that consulted no coefficient covariance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_covariance_source: Option<String>,
 }
 
 /// Typed wire payload for NUTS posterior draws.
@@ -401,6 +413,12 @@ struct SurvivalPredictionPayload {
         with = "crate::finite_safe_json::opt_vec"
     )]
     eta_se: Option<Vec<f64>>,
+    /// Exact coefficient-covariance definition behind `survival_se`/`eta_se`
+    /// (`"conditional"` or `"smoothing-corrected"`), owned by the engine
+    /// result — never an echo of the request (#2296). `None` when no
+    /// uncertainty was computed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covariance_source: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -423,6 +441,8 @@ struct SurvivalPredictionJsonPayload {
     survival_se: Option<Vec<Vec<f64>>>,
     #[serde(default, with = "crate::finite_safe_json::opt_vec")]
     eta_se: Option<Vec<f64>>,
+    #[serde(default)]
+    covariance_source: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1253,6 +1273,10 @@ fn survival_prediction_payload_from_json(py: Python<'_>, raw: &str) -> PyResult<
     set_survival_prediction_array1(py, &out, "linear_predictor", linear_predictor.clone())?;
     set_survival_prediction_matrix(py, &out, "survival_se", payload.survival_se)?;
     set_survival_prediction_array1(py, &out, "eta_se", payload.eta_se.unwrap_or_default())?;
+    match payload.covariance_source {
+        Some(source) => out.set_item("covariance_source", source)?,
+        None => out.set_item("covariance_source", py.None())?,
+    }
 
     let columns = payload.columns.unwrap_or_default();
     let parameter_names = columns.keys().cloned().collect::<Vec<_>>();
@@ -7328,6 +7352,7 @@ mod prediction_payload_tests {
             family: "identity".to_string(),
             interval_method: None,
             covariance_source: Some("smoothing-corrected".to_string()),
+            point_covariance_source: Some("conditional".to_string()),
         };
 
         let value = serde_json::to_value(payload).expect("serialize prediction payload");

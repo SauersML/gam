@@ -974,7 +974,9 @@ pub(crate) fn run_predict_unified(
     };
 
     // --- Compute prediction ---
-    let (eta, mean, se_opt, mean_lo, mean_hi) = if args.uncertainty && nonlinear {
+    // Result-owned covariance provenance (#2296): each arm records what the
+    // evaluator reports it actually used, never the CLI request.
+    let (eta, mean, se_opt, mean_lo, mean_hi, point_covariance, uncertainty_covariance) = if args.uncertainty && nonlinear {
         // Curved inverse link + interval: the point prediction is a property of
         // the model + inputs, never of whether an interval was requested (#398,
         // #1787). The default (no-interval) path reports the posterior mean
@@ -993,6 +995,8 @@ pub(crate) fn run_predict_unified(
         let pm = predictor
             .predict_posterior_mean(pred_input, &fit_for_predict, &pm_options)
             .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
+        let point_covariance = Some(pm.point_covariance_source);
+        let uncertainty_covariance = pm.uncertainty_covariance_source;
         (
             pm.eta,
             pm.mean,
@@ -1010,6 +1014,8 @@ pub(crate) fn run_predict_unified(
             })?),
             pm.mean_lower,
             pm.mean_upper,
+            point_covariance,
+            uncertainty_covariance,
         )
     } else if args.uncertainty {
         // Linear/identity link: plug-in `link⁻¹(η̂)` equals the posterior mean,
@@ -1035,6 +1041,7 @@ pub(crate) fn run_predict_unified(
         let pred = predictor
             .predict_full_uncertainty(pred_input, &fit_for_predict, &options)
             .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
+        let uncertainty_covariance = Some(pred.covariance_source);
         (
             pred.eta,
             pred.mean,
@@ -1044,6 +1051,9 @@ pub(crate) fn run_predict_unified(
             Some(pred.mean_standard_error),
             Some(pred.mean_lower),
             Some(pred.mean_upper),
+            // Linear-link plug-in point consults no coefficient covariance.
+            None,
+            uncertainty_covariance,
         )
     } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
         // Point-only curved-link prediction still needs the posterior mean
@@ -1061,13 +1071,14 @@ pub(crate) fn run_predict_unified(
         let pm = predictor
             .predict_posterior_mean(pred_input, &fit_for_predict, &pm_options)
             .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
-        (pm.eta, pm.mean, None, None, None)
+        let point_covariance = Some(pm.point_covariance_source);
+        (pm.eta, pm.mean, None, None, None, point_covariance, None)
     } else {
         let pred = predictor
             .predict_plugin_response(pred_input)
             .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
 
-        (pred.eta, pred.mean, None, None, None)
+        (pred.eta, pred.mean, None, None, None, None, None)
     };
 
     // --- Write CSV output ---
@@ -1104,7 +1115,7 @@ pub(crate) fn run_predict_unified(
         "wrote predictions: {} (rows={}){}",
         args.out.display(),
         mean.len(),
-        covariance_provenance_note(args, nonlinear || args.uncertainty)
+        covariance_provenance_note(point_covariance, uncertainty_covariance)
     );
     Ok(())
 }
@@ -1179,6 +1190,16 @@ pub(crate) fn run_predict_spline_scan(
     let col = *col_map.get(column).ok_or_else(|| {
         format!("prediction data is missing the model's feature column '{column}'")
     })?;
+    if args.uncertainty && args.covariance_mode == CovarianceModeArg::Corrected {
+        return Err(format!(
+            "{} uncertainty carries only the conditional-on-\u{3bb}\u{302} posterior \
+             variance; a smoothing-corrected (Vp) band is not persisted for this \
+             model class, and substituting the conditional band under a corrected \
+             request would silently under-report uncertainty (#2296). Pass \
+             --covariance-mode conditional to accept conditional intervals.",
+            "exact spline-scan"
+        ));
+    }
     let n = data.nrows();
     let mut mean = Array1::<f64>::zeros(n);
     let mut se = Array1::<f64>::zeros(n);
@@ -1206,9 +1227,13 @@ pub(crate) fn run_predict_spline_scan(
         mean_hi.as_ref().map(|a| a.view()),
     )?;
     cli_out!(
-        "wrote predictions: {} (rows={})",
+        "wrote predictions: {} (rows={}){}",
         args.out.display(),
-        mean.len()
+        mean.len(),
+        covariance_provenance_note(
+            None,
+            args.uncertainty.then_some(InferenceCovarianceMode::Conditional),
+        )
     );
     Ok(())
 }
@@ -1238,6 +1263,16 @@ pub(crate) fn run_predict_residual_cascade(
             })
         })
         .collect::<Result<_, _>>()?;
+    if args.uncertainty && args.covariance_mode == CovarianceModeArg::Corrected {
+        return Err(
+            "residual-cascade uncertainty carries only the conditional-on-\u{3bb}\u{302} \
+             posterior variance; a smoothing-corrected (Vp) band is not persisted for \
+             this model class, and substituting the conditional band under a corrected \
+             request would silently under-report uncertainty (#2296). Pass \
+             --covariance-mode conditional to accept conditional intervals."
+                .to_string(),
+        );
+    }
     let n = data.nrows();
     let mut mean = Array1::<f64>::zeros(n);
     let mut se = Array1::<f64>::zeros(n);
@@ -1269,9 +1304,13 @@ pub(crate) fn run_predict_residual_cascade(
         mean_hi.as_ref().map(|a| a.view()),
     )?;
     cli_out!(
-        "wrote predictions: {} (rows={})",
+        "wrote predictions: {} (rows={}){}",
         args.out.display(),
-        mean.len()
+        mean.len(),
+        covariance_provenance_note(
+            None,
+            args.uncertainty.then_some(InferenceCovarianceMode::Conditional),
+        )
     );
     Ok(())
 }
@@ -2001,7 +2040,17 @@ pub(crate) fn run_predict_saved_latent_window_impl(
         "wrote predictions: {} (rows={}){}",
         args.out.display(),
         mean.len(),
-        covariance_provenance_note(args, need_covariance)
+        // The CLI resolved this mode against the saved matrices itself
+        // (`prediction_backend_from_model` hard-errors when the requested
+        // definition is absent), so on success the resolved source equals the
+        // request. Both the posterior-mean point and the band use the same
+        // backend here.
+        covariance_provenance_note(
+            (args.mode == PredictModeArg::PosteriorMean && need_covariance)
+                .then(|| infer_covariance_mode(args.covariance_mode)),
+            (args.uncertainty && need_covariance)
+                .then(|| infer_covariance_mode(args.covariance_mode)),
+        )
     );
     Ok(())
 }
@@ -2434,7 +2483,15 @@ pub(crate) fn run_predict_survival(
             "wrote predictions: {} (rows={}){}",
             args.out.display(),
             mean.len(),
-            covariance_provenance_note(args, include_survival_location_scale_intervals)
+            // Resolved by `covariance_from_model` (hard error when the
+            // requested definition is absent), consumed for both the
+            // posterior-mean point and the SE/bounds surfaces.
+            covariance_provenance_note(
+                (args.mode == PredictModeArg::PosteriorMean)
+                    .then(|| infer_covariance_mode(args.covariance_mode)),
+                include_survival_location_scale_intervals
+                    .then(|| infer_covariance_mode(args.covariance_mode)),
+            )
         );
         return Ok(());
     }
@@ -2559,8 +2616,10 @@ pub(crate) fn run_predict_survival(
             args.out.display(),
             mean.len(),
             covariance_provenance_note(
-                args,
-                args.mode == PredictModeArg::PosteriorMean || args.uncertainty
+                (args.mode == PredictModeArg::PosteriorMean)
+                    .then(|| infer_covariance_mode(args.covariance_mode)),
+                (args.mode == PredictModeArg::PosteriorMean || args.uncertainty)
+                    .then(|| infer_covariance_mode(args.covariance_mode)),
             )
         );
         return Ok(());
@@ -2705,8 +2764,10 @@ pub(crate) fn run_predict_survival(
         args.out.display(),
         mean.len(),
         covariance_provenance_note(
-            args,
-            args.mode == PredictModeArg::PosteriorMean || args.uncertainty
+            (args.mode == PredictModeArg::PosteriorMean)
+                .then(|| infer_covariance_mode(args.covariance_mode)),
+            (args.mode == PredictModeArg::PosteriorMean || args.uncertainty)
+                .then(|| infer_covariance_mode(args.covariance_mode)),
         )
     );
     Ok(())

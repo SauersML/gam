@@ -1453,6 +1453,52 @@ impl FitConvergenceEvidence {
     }
 }
 
+/// Exact coefficient-covariance definition (#2296).
+///
+/// This is the canonical vocabulary for "which covariance was used": the
+/// conditional-on-λ̂ Bayesian `Vb`, the smoothing-parameter-corrected `Vp`
+/// (`Vb + J·Var(ρ̂)·Jᵀ`), or the frequentist sandwich `Ve`. Any surface that
+/// reports coefficient uncertainty must carry one of these values resolved
+/// from the matrices it actually consumed, never from the caller's request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CoefficientCovarianceDefinition {
+    /// Conditional Bayesian covariance with smoothing parameters fixed (`Vb`).
+    Conditional,
+    /// Bayesian covariance including smoothing-parameter uncertainty (`Vp`).
+    SmoothingCorrected,
+    /// Frequentist sandwich covariance (`Ve`).
+    FrequentistSandwich,
+}
+
+impl CoefficientCovarianceDefinition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conditional => "conditional",
+            Self::SmoothingCorrected => "smoothing-corrected",
+            Self::FrequentistSandwich => "frequentist-sandwich",
+        }
+    }
+}
+
+impl std::fmt::Display for CoefficientCovarianceDefinition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A definition-consistent coefficient-uncertainty view (#2296): standard
+/// errors and (optional) covariance from the SAME definition, tagged with
+/// that definition. Produced by
+/// [`UnifiedFitResult::display_coefficient_uncertainty`].
+#[derive(Clone, Copy, Debug)]
+pub struct DisplayCoefficientUncertainty<'a> {
+    pub definition: CoefficientCovarianceDefinition,
+    pub standard_errors: &'a Array1<f64>,
+    /// The covariance matrix of the same definition, when the fit persists
+    /// it. `None` here never falls back to another definition's matrix.
+    pub covariance: Option<&'a Array2<f64>>,
+}
+
 /// Unified fit result for all model types (standard GAM, GAMLSS, survival).
 ///
 /// Standard models have a single block; GAMLSS and survival models have
@@ -2524,6 +2570,33 @@ impl UnifiedFitResult {
         self.inference
             .as_ref()
             .and_then(|inf| inf.beta_standard_errors_corrected.as_ref())
+    }
+
+    /// Corrected-preferred, definition-consistent coefficient uncertainty for
+    /// summary/report display surfaces (#2296).
+    ///
+    /// Returns the smoothing-corrected standard errors (with the corrected
+    /// covariance, when persisted) if the fit carries them, else the
+    /// conditional pair. Standard errors and covariance are NEVER mixed
+    /// across definitions: if the preferred definition has SEs but no matrix,
+    /// the matrix slot is `None` rather than a different definition's matrix.
+    /// The returned [`CoefficientCovarianceDefinition`] names what was
+    /// actually selected so presenters serialize result-owned provenance —
+    /// a display policy or request is never evidence of what was used.
+    pub fn display_coefficient_uncertainty(&self) -> Option<DisplayCoefficientUncertainty<'_>> {
+        if let Some(standard_errors) = self.beta_standard_errors_corrected() {
+            return Some(DisplayCoefficientUncertainty {
+                definition: CoefficientCovarianceDefinition::SmoothingCorrected,
+                standard_errors,
+                covariance: self.beta_covariance_corrected(),
+            });
+        }
+        self.beta_standard_errors()
+            .map(|standard_errors| DisplayCoefficientUncertainty {
+                definition: CoefficientCovarianceDefinition::Conditional,
+                standard_errors,
+                covariance: self.beta_covariance(),
+            })
     }
 
     /// Get the O(n⁻¹) bias-correction vector b̂ = H⁻¹ S(λ̂) β̂ in the

@@ -109,3 +109,135 @@ def test_default_uncertainty_refuses_when_corrected_covariance_is_unavailable() 
         np.asarray(conditional.std_error, dtype=float),
         np.zeros(3),
     )
+
+def _weibull_survival_frame(seed: int = 2296, n: int = 400):
+    rng = np.random.default_rng(seed)
+    x = rng.uniform(0.0, 1.0, n)
+    scale = np.exp(0.5 + 1.0 * x)
+    event_time = scale * rng.weibull(1.3, n)
+    censor_time = rng.exponential(6.0, n)
+    observed = np.minimum(event_time, censor_time)
+    event = (event_time <= censor_time).astype(float)
+    return {"time": observed, "event": event, "x": x}
+
+
+def test_single_cause_survival_interval_refuses_corrected_and_labels_conditional() -> None:
+    """#2296 close gate (survival): the single-cause survival interval honors
+    ``covariance_mode`` exactly. Location-scale fits persist no
+    smoothing-corrected covariance, so the DEFAULT (required-corrected)
+    interval request and the explicit ``"smoothing"`` request both refuse —
+    they must never quietly return the narrower conditional-``Vb`` band — and
+    the explicit conditional request succeeds with result-owned provenance in
+    the returned payload."""
+    df = _weibull_survival_frame()
+    model = gamfit.fit(
+        df,
+        "Surv(time, event) ~ x",
+        survival_likelihood="location-scale",
+    )
+    new_data = {"time": np.array([2.0, 2.0]), "event": np.array([1.0, 1.0]),
+                "x": np.array([0.2, 0.8])}
+
+    with pytest.raises(gamfit.GamError) as default_refusal:
+        model.predict(new_data, interval=0.9, return_type="dict")
+    assert "smoothing-corrected" in str(default_refusal.value)
+
+    with pytest.raises(gamfit.GamError) as smoothing_refusal:
+        model.predict(
+            new_data,
+            interval=0.9,
+            covariance_mode="smoothing",
+            return_type="dict",
+        )
+    assert "smoothing-corrected" in str(smoothing_refusal.value)
+
+    conditional = model.predict(
+        new_data,
+        interval=0.9,
+        covariance_mode="conditional",
+        return_type="dict",
+    )
+    assert conditional["covariance_source"] == "conditional"
+    survival_se = np.asarray(conditional["survival_se"], dtype=float)
+    assert survival_se.shape[0] == 2
+    assert np.all(np.isfinite(survival_se))
+
+    # A point-only survival prediction consults no coefficient covariance and
+    # must not claim one.
+    plain = model.predict(new_data, return_type="dict")
+    assert plain["covariance_source"] is None
+
+
+def test_spline_scan_interval_refuses_corrected_and_labels_conditional() -> None:
+    """#2296 close gate (specialized Python route): the exact O(n) spline-scan
+    posterior variance is conditional on the profiled smoothing parameter. A
+    corrected interval request (including the default) must refuse instead of
+    silently returning the conditional band under an invented scan-specific
+    label; the conditional request must be labeled ``"conditional"``."""
+    rng = np.random.default_rng(22960)
+    n = 4000  # large 1-D Gaussian smooth routes onto the exact O(n) scan path
+    x = np.sort(rng.uniform(-1.0, 1.0, n))
+    y = np.sin(3.0 * x) + rng.normal(0.0, 0.25, n)
+    model = gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family="gaussian")
+    summary = model.summary()
+    if "spline-scan" not in str(getattr(summary, "model_class", "")):
+        pytest.skip("fit did not route onto the exact spline-scan path")
+    grid = {"x": np.linspace(-0.9, 0.9, 7)}
+
+    with pytest.raises(gamfit.GamError) as refusal:
+        model.predict(grid, interval=0.9, return_type="dict")
+    assert "conditional" in str(refusal.value)
+
+    conditional = model.predict(
+        grid,
+        interval=0.9,
+        covariance_mode="conditional",
+        return_type="dict",
+    )
+    assert conditional["covariance_source"] == "conditional"
+    assert "spline-scan-posterior" not in str(conditional.get("covariance_source"))
+
+
+def test_curved_link_interval_reports_point_and_band_sources_separately() -> None:
+    """#2296 close gate (curved-link dual source): a binomial posterior-mean
+    point integrates the CONDITIONAL posterior by definition, even when the
+    band is smoothing-corrected — two facts one tag cannot represent. The
+    payload must carry both, each owned by the evaluator result."""
+    rng = np.random.default_rng(22961)
+    n = 220
+    x = rng.uniform(-1.0, 1.0, n)
+    eta = 0.4 + 1.6 * np.sin(2.2 * x)
+    y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
+    model = gamfit.fit({"x": x, "y": y}, "y ~ s(x, k=8)", family="binomial")
+    grid = {"x": np.linspace(-0.8, 0.8, 9)}
+
+    smoothing = model.predict(grid, interval=0.9, return_type="dict")
+    assert smoothing["covariance_source"] == "smoothing-corrected"
+    assert smoothing["point_covariance_source"] == "conditional"
+
+    conditional = model.predict(
+        grid,
+        interval=0.9,
+        covariance_mode="conditional",
+        return_type="dict",
+    )
+    assert conditional["covariance_source"] == "conditional"
+    assert conditional["point_covariance_source"] == "conditional"
+
+
+def test_summary_reports_definition_consistent_se_source() -> None:
+    """#2296 close gate (summary provenance): the summary's SE column, the
+    exported covariance, and their labels must come from ONE covariance
+    definition, recorded on the payload."""
+    x = np.linspace(-1.0, 1.0, 96)
+    y = 0.3 + 0.9 * x + 1.2 * np.sin(2.4 * x) + 0.1 * np.cos(9.0 * x)
+    model = gamfit.fit({"x": x, "y": y}, "y ~ s(x, k=10)", family="gaussian")
+    summary = model.summary()
+    se_source = summary["coefficient_se_source"]
+    assert se_source in ("conditional", "smoothing-corrected")
+    kind = summary.covariance_kind
+    if kind is not None:
+        assert kind == se_source, (
+            "summary paired a covariance matrix from one definition with SEs "
+            f"from another: covariance_kind={kind!r}, se source={se_source!r}"
+        )

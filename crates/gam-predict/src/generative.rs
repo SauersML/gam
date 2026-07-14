@@ -262,15 +262,18 @@ fn single_cause_window_spec(
     model: &FittedModel,
     request: &SavedGenerativeInput<'_>,
 ) -> Result<GenerativeSpec, SavedGenerativeError> {
-    let exit = predict_survival(plugin_survival_request(
-        model,
-        request.data.view(),
-        request.col_map,
-        request.training_headers,
-        request.offset,
-        request.offset_noise,
-        None,
-    ))
+    let exit = predict_survival(
+        plugin_survival_request(
+            model,
+            request.data.view(),
+            request.col_map,
+            request.training_headers,
+            request.offset,
+            request.offset_noise,
+            None,
+        ),
+        SurvivalPredictionCovarianceMode::Conditional,
+    )
     .map_err(|error| SavedGenerativeError::Evaluation {
         reason: format!("saved survival exit probability: {error}"),
     })?;
@@ -294,15 +297,18 @@ fn single_cause_window_spec(
         let grid = entry_times.slice(s![start..end]).to_vec();
         let offset = request.offset.slice(s![start..end]).to_owned();
         let offset_noise = request.offset_noise.slice(s![start..end]).to_owned();
-        let chunk = predict_survival(plugin_survival_request(
-            model,
-            request.data.slice(s![start..end, ..]),
-            request.col_map,
-            request.training_headers,
-            &offset,
-            &offset_noise,
-            Some(&grid),
-        ))
+        let chunk = predict_survival(
+            plugin_survival_request(
+                model,
+                request.data.slice(s![start..end, ..]),
+                request.col_map,
+                request.training_headers,
+                &offset,
+                &offset_noise,
+                Some(&grid),
+            ),
+            SurvivalPredictionCovarianceMode::Conditional,
+        )
         .map_err(|error| SavedGenerativeError::Evaluation {
             reason: format!("saved survival entry probability rows {start}..{end}: {error}"),
         })?;

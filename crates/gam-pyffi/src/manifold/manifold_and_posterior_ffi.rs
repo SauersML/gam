@@ -1310,10 +1310,10 @@ fn summary_smooth_terms(
     // truncation keeps a wiggle mode where β̂≈0 and reports the term
     // non-significant even though its linear effect is real (#2142). The
     // conditional covariance is the correct hypothesis-test object; `Vc` is for
-    // prediction/credible bands.
-    let cov_forwald = fit
-        .beta_covariance()
-        .or_else(|| fit.beta_covariance_corrected());
+    // prediction/credible bands — and it is NEVER a substitute here: silently
+    // swapping it in changes the Wald p-values (#2296). When the conditional
+    // matrix is absent the smooth test is simply not reported.
+    let cov_forwald = fit.beta_covariance();
     // Wood (2013) design-whitening metric for the Wald smooth test (#2142).
     // Prefer the fit's exact weighted Gram `X'WX` when the inference block
     // survived; on the persisted summary path (inference dropped) reconstruct
@@ -1614,6 +1614,7 @@ fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> Summar
         covariance_kind: None,
         covariance_n: None,
         covariance_flat: None,
+        coefficient_se_source: None,
         // Scan-routed (O(n) 1D spline) models carry no `curv(...)` curvature
         // smooths, so there are no curvature estimands to report.
         curvature_estimands: Vec::new(),
@@ -1629,16 +1630,19 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     }
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     let smooth_terms = summary_smooth_terms(&model, &fit);
-    let standard_errors = fit
-        .beta_standard_errors_corrected()
-        .or_else(|| fit.beta_standard_errors());
-    let covariance = fit
-        .beta_covariance_corrected()
-        .map(|cov| ("corrected".to_string(), cov))
-        .or_else(|| {
-            fit.beta_covariance()
-                .map(|cov| ("conditional".to_string(), cov))
-        });
+    // Definition-consistent coefficient uncertainty (#2296): the SE column,
+    // the exported covariance matrix, and their labels all come from ONE
+    // covariance definition. Independently selected `corrected.or(conditional)`
+    // fields could pair corrected SEs with a conditional matrix (or vice
+    // versa) on fits that persist only one half of a definition.
+    let display_uncertainty = fit.display_coefficient_uncertainty();
+    let standard_errors = display_uncertainty
+        .as_ref()
+        .map(|view| view.standard_errors);
+    let covariance = display_uncertainty.as_ref().and_then(|view| {
+        view.covariance
+            .map(|cov| (view.definition.as_str().to_string(), cov))
+    });
     let coefficients = fit
         .beta
         .iter()
@@ -1681,6 +1685,8 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         covariance_kind: covariance.as_ref().map(|(kind, _)| kind.clone()),
         covariance_n: covariance.as_ref().map(|(_, cov)| cov.nrows()),
         covariance_flat: covariance.map(|(_, cov)| cov.iter().copied().collect()),
+        coefficient_se_source: display_uncertainty
+            .map(|view| view.definition.as_str().to_string()),
     };
     serde_json::to_string(&payload).map_err(|err| format!("failed to serialize summary: {err}"))
 }
@@ -2006,9 +2012,11 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
         return scan_report_html(&model, &scan);
     }
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    // Definition-consistent SE column (#2296): corrected-preferred, never an
+    // unlabeled mix of covariance definitions.
     let standard_errors = fit
-        .beta_standard_errors_corrected()
-        .or_else(|| fit.beta_standard_errors());
+        .display_coefficient_uncertainty()
+        .map(|view| view.standard_errors);
     let coefficients = fit
         .beta
         .iter()
@@ -5720,7 +5728,8 @@ fn predict_survival_result(
     options: &PyPredictOptions,
 ) -> Result<gam::families::survival::predict::SurvivalPredictResult, String> {
     use gam::families::survival::predict::{
-        SurvivalPredictEstimand, SurvivalPredictRequest, predict_survival,
+        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
+        predict_survival,
     };
 
     let col_map = dataset.column_map();
@@ -5753,7 +5762,27 @@ fn predict_survival_result(
         with_uncertainty: options.interval.is_some(),
         estimand: SurvivalPredictEstimand::PosteriorMean,
     };
-    Ok(predict_survival(request)?)
+    // #2296: the user's covariance_mode governs single-cause survival
+    // uncertainty exactly as it does the competing-risks path. The default
+    // (None -> smoothing-corrected) is a REQUIRED request: when the saved fit
+    // carries no corrected covariance the engine refuses instead of silently
+    // narrowing the bands to conditional Vb. Posterior-mean points without an
+    // interval integrate the conditional posterior, as in the CR wrapper.
+    let covariance_mode = if options.interval.is_some() {
+        match parse_covariance_mode(options.covariance_mode.as_deref())?
+            .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
+        {
+            gam_predict::InferenceCovarianceMode::Conditional => {
+                SurvivalPredictionCovarianceMode::Conditional
+            }
+            gam_predict::InferenceCovarianceMode::SmoothingCorrected => {
+                SurvivalPredictionCovarianceMode::SmoothingCorrected
+            }
+        }
+    } else {
+        SurvivalPredictionCovarianceMode::Conditional
+    };
+    Ok(predict_survival(request, covariance_mode)?)
 }
 
 fn serialize_survival_prediction_payload(
@@ -5854,6 +5883,11 @@ fn serialize_survival_prediction_payload(
         columns,
         survival_se: survival_se_rows,
         eta_se: eta_se_vec,
+        // Result-owned provenance (#2296): serialized from what the engine
+        // actually used, never echoed from the request.
+        covariance_source: result
+            .covariance_source
+            .map(|source| source.as_str().to_string()),
     };
     serde_json::to_string(&survival_payload)
         .map_err(|err| format!("failed to serialize survival prediction payload: {err}"))

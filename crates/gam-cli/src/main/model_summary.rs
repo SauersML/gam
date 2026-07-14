@@ -17,14 +17,21 @@ pub(crate) fn build_model_summary(
     weights: ArrayView1<'_, f64>,
 ) -> Result<ModelSummary, String> {
     const CONTINUOUS_ORDER_EPS: f64 = 1e-12;
-    let se = fit
-        .beta_standard_errors_corrected()
-        .or(fit.beta_standard_errors());
+    // Definition-consistent SE pair (#2296): corrected-preferred, with the
+    // exact definition recorded on the summary so the displayed SEs are never
+    // an unlabeled mix of covariance definitions.
+    let display_uncertainty = fit.display_coefficient_uncertainty();
+    let se = display_uncertainty
+        .as_ref()
+        .map(|view| view.standard_errors);
     // Conditional Bayesian covariance `Vb = H⁻¹·φ̂` (mgcv's `Vp`) for the Wald
     // smooth test — NOT the smoothing-corrected `Vc`, whose λ̂-uncertainty
     // inflates the wiggle directions and flips the whitened eigenvalue ordering
-    // for near-linear terms (#2142). `Vc` is for prediction/credible bands.
-    let cov_forwald = fit.beta_covariance().or(fit.beta_covariance_corrected());
+    // for near-linear terms (#2142). `Vc` is for prediction/credible bands,
+    // and it is NEVER a substitute here: silently swapping it in changes the
+    // Wald p-values (#2296), so when the conditional matrix is absent the
+    // smooth test is simply not reported.
+    let cov_forwald = fit.beta_covariance();
     // Wood (2013) design-whitening metric for the Wald smooth test (#2142):
     // the exact weighted Gram `X'WX` when the inference block is present, else
     // the unweighted `X'X` from the summary design (here the real training
@@ -316,6 +323,7 @@ pub(crate) fn build_model_summary(
         reml_score: Some(fit.reml_score),
         parametric_terms,
         smooth_terms,
+        coefficient_se_source: display_uncertainty.map(|view| view.definition),
     })
 }
 
@@ -398,26 +406,37 @@ pub(crate) fn infer_covariance_mode(mode: CovarianceModeArg) -> InferenceCovaria
     }
 }
 
-/// Provenance suffix for CLI predict output (#2296): `--covariance-mode
-/// corrected` now hard-errors rather than silently downgrading to `Vb` when
-/// the fit lacks the smoothing-corrected covariance (see
-/// `InferenceCovarianceMode::SmoothingCorrected` / `select_uncertainty_backend`
-/// in `gam-predict`), so any prediction that reaches this point and actually
-/// consulted a coefficient covariance used exactly the requested source.
-/// Surface that source in the CLI's "wrote predictions" line so the user does
-/// not have to trust an unlabeled band — mirrors the `covariance_source`
-/// field the Python FFI already attaches to its prediction payload
-/// (`geometry_ffi::predict_dataset_impl`). Empty when the prediction never
-/// consulted a covariance definition (no interval, no curved-link posterior
-/// mean).
-pub(crate) fn covariance_provenance_note(args: &PredictArgs, covariance_consulted: bool) -> String {
-    if covariance_consulted {
-        format!(
-            " [covariance={}]",
-            infer_covariance_mode(args.covariance_mode).as_str()
-        )
-    } else {
-        String::new()
+/// Render the covariance-provenance suffix for `gam predict` from
+/// RESULT-OWNED sources (#2296): what the evaluator actually consumed for the
+/// point estimate and for the attached uncertainty. A request is never
+/// evidence — callers must pass the sources reported by the prediction
+/// result (or the mode they themselves resolved against the saved matrices,
+/// where the CLI owns the selection and absence is a hard error).
+///
+/// Curved-link point predictions integrate the conditional posterior by
+/// definition while the band may be smoothing-corrected; when the two
+/// definitions differ the note names both, because one tag cannot represent
+/// two sources.
+pub(crate) fn covariance_provenance_note(
+    point: Option<InferenceCovarianceMode>,
+    uncertainty: Option<InferenceCovarianceMode>,
+) -> String {
+    match (point, uncertainty) {
+        (None, None) => String::new(),
+        (Some(source), None) | (None, Some(source)) => {
+            format!(" [covariance={}]", source.as_str())
+        }
+        (Some(point_source), Some(uncertainty_source)) => {
+            if point_source == uncertainty_source {
+                format!(" [covariance={}]", point_source.as_str())
+            } else {
+                format!(
+                    " [point-covariance={} uncertainty-covariance={}]",
+                    point_source.as_str(),
+                    uncertainty_source.as_str()
+                )
+            }
+        }
     }
 }
 

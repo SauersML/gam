@@ -263,6 +263,11 @@ pub struct SurvivalPredictResult {
     /// exit time.  Length `n`.  Populated under the same conditions as
     /// `survival_se`.
     pub eta_se: Option<Array1<f64>>,
+    /// Exact coefficient-covariance definition behind `survival_se`/`eta_se`.
+    /// Result-owned provenance (#2296): presenters must serialize this, never
+    /// the requested mode. `None` iff the result carries no uncertainty
+    /// surfaces.
+    pub covariance_source: Option<SurvivalPredictionCovarianceMode>,
 }
 
 /// Exact plug-in survival probability over each requested latent-hazard window.
@@ -872,22 +877,24 @@ fn posterior_standard_error_vectors(
 
 fn predict_survival_posterior_mean(
     req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let (posterior_mean, active_covariance) = survival_prediction_posterior_factor(
-        req.model,
-        SurvivalPredictionCovarianceMode::Conditional,
+    let (posterior_mean, active_covariance) =
+        survival_prediction_posterior_factor(req.model, covariance_mode)?;
+    let mut result = predict_survival(
+        SurvivalPredictRequest {
+            model: req.model,
+            data: req.data,
+            col_map: req.col_map,
+            training_headers: req.training_headers,
+            primary_offset: req.primary_offset,
+            noise_offset: req.noise_offset,
+            time_grid: req.time_grid,
+            with_uncertainty: false,
+            estimand: SurvivalPredictEstimand::Plugin,
+        },
+        covariance_mode,
     )?;
-    let mut result = predict_survival(SurvivalPredictRequest {
-        model: req.model,
-        data: req.data,
-        col_map: req.col_map,
-        training_headers: req.training_headers,
-        primary_offset: req.primary_offset,
-        noise_offset: req.noise_offset,
-        time_grid: req.time_grid,
-        with_uncertainty: false,
-        estimand: SurvivalPredictEstimand::Plugin,
-    })?;
     let (n_rows, n_times) = result.survival.dim();
     let mut survival_mean = Array2::<f64>::zeros((n_rows, n_times));
     let mut survival_second = Array2::<f64>::zeros((n_rows, n_times));
@@ -898,17 +905,20 @@ fn predict_survival_posterior_mean(
 
     for_each_survival_posterior_node(&posterior_mean, &active_covariance, |node, weight| {
         let draw_model = saved_model_with_survival_coefficients(req.model, node)?;
-        let draw = predict_survival(SurvivalPredictRequest {
-            model: &draw_model,
-            data: req.data,
-            col_map: req.col_map,
-            training_headers: req.training_headers,
-            primary_offset: req.primary_offset,
-            noise_offset: req.noise_offset,
-            time_grid: req.time_grid,
-            with_uncertainty: false,
-            estimand: SurvivalPredictEstimand::Plugin,
-        })?;
+        let draw = predict_survival(
+            SurvivalPredictRequest {
+                model: &draw_model,
+                data: req.data,
+                col_map: req.col_map,
+                training_headers: req.training_headers,
+                primary_offset: req.primary_offset,
+                noise_offset: req.noise_offset,
+                time_grid: req.time_grid,
+                with_uncertainty: false,
+                estimand: SurvivalPredictEstimand::Plugin,
+            },
+            covariance_mode,
+        )?;
         if draw.survival.dim() != (n_rows, n_times)
             || draw.hazard.dim() != (n_rows, n_times)
             || draw.cumulative_hazard.dim() != (n_rows, n_times)
@@ -978,6 +988,7 @@ fn predict_survival_posterior_mean(
                 .sqrt()
         })
     });
+    result.covariance_source = req.with_uncertainty.then_some(covariance_mode);
     Ok(result)
 }
 
@@ -1603,9 +1614,10 @@ pub struct CompetingRisksPredictResult {
 /// FFI wraps it with JSON serialization.
 pub fn predict_survival(
     req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
     if req.estimand == SurvivalPredictEstimand::PosteriorMean {
-        return predict_survival_posterior_mean(req);
+        return predict_survival_posterior_mean(req, covariance_mode);
     }
     let SurvivalPredictRequest {
         model,
@@ -1708,6 +1720,7 @@ pub fn predict_survival(
             data,
             time_grid,
             with_uncertainty,
+            covariance_mode,
         )
         .map_err(SurvivalPredictError::from);
     }
@@ -2014,6 +2027,7 @@ pub fn predict_survival(
         likelihood_mode: saved_likelihood_mode,
         survival_se: None,
         eta_se: None,
+        covariance_source: None,
     })
 }
 
@@ -3177,6 +3191,7 @@ fn predict_survival_location_scale_batch(
     data: ArrayView2<'_, f64>,
     time_grid: Option<&[f64]>,
     with_uncertainty: bool,
+    covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<SurvivalPredictResult, String> {
     use crate::survival::construction::evaluate_survival_time_basis_row;
     use crate::survival::location_scale::{
@@ -3481,12 +3496,27 @@ fn predict_survival_location_scale_batch(
         Option<Array1<f64>>,
         Option<Array1<f64>>,
     ) = if with_uncertainty {
-        let cov = saved_fit.beta_covariance().ok_or_else(|| {
-            "survival location-scale uncertainty: saved fit is missing the \
-             posterior covariance; refit with the current CLI / library to \
-             populate beta_covariance"
-                .to_string()
-        })?;
+        // #2296: resolve the requested covariance definition exactly. A
+        // smoothing-corrected request must never be satisfied with the
+        // conditional matrix; location-scale fits do not persist a corrected
+        // covariance today, so that request is a typed refusal, not a
+        // silently narrower band.
+        let cov = match select_survival_prediction_covariance(
+            saved_fit.beta_covariance(),
+            saved_fit.beta_covariance_corrected(),
+            covariance_mode,
+        ) {
+            Ok(cov) => cov,
+            Err(SurvivalPredictError::PosteriorCovariance { reason })
+                if covariance_mode == SurvivalPredictionCovarianceMode::Conditional =>
+            {
+                return Err(format!(
+                    "survival location-scale uncertainty: {reason}; refit with the \
+                     current CLI / library to populate beta_covariance"
+                ));
+            }
+            Err(err) => return Err(String::from(err)),
+        };
         let unc = predict_survival_location_scalewith_uncertainty(
             &pred_input,
             &saved_fit,
@@ -3678,6 +3708,7 @@ fn predict_survival_location_scale_batch(
         likelihood_mode: saved_likelihood_mode,
         survival_se,
         eta_se: eta_se_per_row,
+        covariance_source: with_uncertainty.then_some(covariance_mode),
     })
 }
 

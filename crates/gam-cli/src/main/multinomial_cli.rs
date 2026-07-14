@@ -206,6 +206,19 @@ pub(crate) fn run_predict_multinomial(args: &PredictArgs) -> Result<(), String> 
         .transpose()?;
 
     let (probs, prob_se) = if args.uncertainty {
+        // #2296: multinomial fits persist only the conditional joint-Laplace
+        // coefficient covariance. A smoothing-corrected request (the global
+        // default) must refuse rather than silently deliver the narrower
+        // conditional band under a corrected label.
+        if args.covariance_mode == CovarianceModeArg::Corrected {
+            return Err(
+                "multinomial uncertainty carries only the conditional-on-\u{3bb}\u{302} \
+                 joint-Laplace covariance; a smoothing-corrected (Vp) band is not \
+                 persisted for multinomial fits (#2296). Pass --covariance-mode \
+                 conditional to accept conditional standard errors."
+                    .to_string(),
+            );
+        }
         let (probs, prob_se) = predict_multinomial_formula_with_se(&saved, &ds)
             .map_err(|e| format!("multinomial predict failed: {e}"))?;
         (probs, Some(prob_se))
@@ -220,10 +233,14 @@ pub(crate) fn run_predict_multinomial(args: &PredictArgs) -> Result<(), String> 
         prepend_id_column_to_prediction_csv(&args.out, id_column, values)?;
     }
     cli_out!(
-        "wrote predictions: {} (rows={}, classes={})",
+        "wrote predictions: {} (rows={}, classes={}){}",
         args.out.display(),
         probs.nrows(),
         saved.class_levels.len(),
+        covariance_provenance_note(
+            None,
+            args.uncertainty.then_some(InferenceCovarianceMode::Conditional),
+        )
     );
     Ok(())
 }

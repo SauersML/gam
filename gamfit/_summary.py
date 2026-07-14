@@ -40,6 +40,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "covariance_kind",
     "covariance_n",
     "covariance_flat",
+    "coefficient_se_source",
     "group_metadata",
     "deployment_extensions",
 )
@@ -190,8 +191,10 @@ class Summary:
         :meth:`Model.smooth_significance(data) <gamfit.Model.smooth_significance>`,
         which runs the per-term constrained refits the saved-model summary cannot.
     covariance_kind : str or None
-        ``"corrected"`` or ``"conditional"`` depending on which posterior
-        covariance variant was returned.
+        ``"smoothing-corrected"`` or ``"conditional"`` depending on which
+        posterior covariance variant was returned. The kind, the ``std_error``
+        column, and ``covariance_flat`` always come from the SAME covariance
+        definition (#2296); see ``coefficient_se_source``.
     covariance_n : int or None
         Side length of the coefficient covariance matrix.
     covariance_flat : list of float or None
@@ -236,6 +239,10 @@ class Summary:
     covariance_kind: str | None = None
     covariance_n: int | None = None
     covariance_flat: list[float] | None = None
+    #: Exact covariance definition behind the coefficient ``std_error`` column
+    #: (#2296): ``"conditional"`` or ``"smoothing-corrected"``, recorded from
+    #: the definition-consistent pair the engine summary actually consumed.
+    coefficient_se_source: str | None = None
     group_metadata: dict[str, Any] | None = None
     deployment_extensions: list[dict[str, Any]] = field(default_factory=list)
     extras: dict[str, Any] = field(default_factory=dict)

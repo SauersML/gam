@@ -7932,7 +7932,7 @@ fn predict_array_impl(
         return Err("predict_array does not support survival prediction payloads".to_string());
     }
     let options = parse_predict_options(options_json)?;
-    let columns = predict_columns(&model, dataset, &options)?;
+    let (columns, _provenance) = predict_columns(&model, dataset, &options)?;
     // Parity with `predict()` (#1537): with no interval requested, return the
     // single response-scale `mean` column as an `(n, 1)` array — the Python
     // wrapper ravels it to the documented 1-D response-scale prediction vector.
@@ -7960,21 +7960,7 @@ fn predict_dataset_impl(
     if matches!(model_class, PredictModelClass::Survival) {
         return predict_table_survival(model, &dataset, &options);
     }
-    let columns = predict_columns(model, dataset, &options)?;
-    let covariance_source = if options.interval.is_some() {
-        if model.payload().spline_scan.is_some() {
-            Some("spline-scan-posterior".to_string())
-        } else {
-            Some(
-                parse_covariance_mode(options.covariance_mode.as_deref())?
-                    .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
-                    .as_str()
-                    .to_string(),
-            )
-        }
-    } else {
-        None
-    };
+    let (columns, provenance) = predict_columns(model, dataset, &options)?;
     serde_json::to_string(&PredictionPayload {
         columns,
         model_class: prediction_model_class_label(model),
@@ -7983,21 +7969,58 @@ fn predict_dataset_impl(
         // predictive band (or no interval at all); the jackknife+ provenance
         // tag is only attached by the dedicated full-conformal predict entry.
         interval_method: None,
-        covariance_source,
+        // Result-owned provenance (#2296): both fields come from what the
+        // evaluator reports it consumed, never from the request string. The
+        // curved-link posterior-mean point is conditional by definition even
+        // when the band is smoothing-corrected, so the two are separate tags.
+        covariance_source: provenance
+            .uncertainty
+            .map(|source| source.as_str().to_string()),
+        point_covariance_source: provenance
+            .point
+            .map(|source| source.as_str().to_string()),
     })
     .map_err(|err| format!("failed to serialize prediction payload: {err}"))
+}
+
+/// Result-owned covariance provenance for a `predict_columns` call (#2296):
+/// what the evaluator actually consumed for the point estimate and for the
+/// attached SE/band. Presenters serialize these values; the request string is
+/// never evidence.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PredictColumnsCovarianceProvenance {
+    pub(crate) point: Option<gam_predict::InferenceCovarianceMode>,
+    pub(crate) uncertainty: Option<gam_predict::InferenceCovarianceMode>,
 }
 
 fn predict_columns(
     model: &FittedModel,
     dataset: EncodedDataset,
     options: &PyPredictOptions,
-) -> Result<BTreeMap<String, Vec<f64>>, String> {
+) -> Result<(BTreeMap<String, Vec<f64>>, PredictColumnsCovarianceProvenance), String> {
     let col_map = dataset.column_map();
     // Spline-scan saved model (#1030/#1034): replay the exact Gaussian bridge
     // per row (identity link, η == mean). No design reconstruction, no
     // predictor. SE/intervals come from the exact posterior variance.
     if let Some((feature_column, fit)) = model.saved_spline_scan().map_err(String::from)? {
+        // #2296: the scan bridge's exact posterior variance is conditional on
+        // the profiled smoothing parameter. A smoothing-corrected request
+        // (including the default) must refuse rather than silently deliver
+        // conditional bands under a corrected policy; the provenance below is
+        // therefore always `conditional`, never an ad hoc scan-specific label.
+        if options.interval.is_some()
+            && parse_covariance_mode(options.covariance_mode.as_deref())?
+                .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
+                == gam_predict::InferenceCovarianceMode::SmoothingCorrected
+        {
+            return Err(
+                "exact spline-scan uncertainty carries only the conditional-on-\u{3bb}\u{302} \
+                 posterior variance; a smoothing-corrected (Vp) band is not persisted for \
+                 scan fits (#2296). Pass covariance_mode=\"conditional\" to accept \
+                 conditional intervals."
+                    .to_string(),
+            );
+        }
         let col = *col_map.get(feature_column).ok_or_else(|| {
             format!("prediction data is missing the model's feature column '{feature_column}'")
         })?;
@@ -8041,7 +8064,15 @@ fn predict_columns(
             columns.insert("mean_lower".to_string(), lower);
             columns.insert("mean_upper".to_string(), upper);
         }
-        return Ok(columns);
+        return Ok((
+            columns,
+            PredictColumnsCovarianceProvenance {
+                point: None,
+                uncertainty: options
+                    .interval
+                    .map(|_| gam_predict::InferenceCovarianceMode::Conditional),
+            },
+        ));
     }
     let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
     let offset_noise =
@@ -8109,6 +8140,7 @@ fn predict_columns(
     // boundary to linear_predictor / std_error, and effective_variance is
     // dropped (== std_error ** 2). The internal Rust fields keep their
     // theoretic names because they describe the math object.
+    let mut provenance = PredictColumnsCovarianceProvenance::default();
     match (options.interval, uses_posterior_mean) {
         (Some(confidence_level), true) => {
             // Curved inverse link + interval: the canonical posterior-mean path
@@ -8133,6 +8165,10 @@ fn predict_columns(
                 .map_err(|err| {
                     format!("posterior-mean prediction with uncertainty failed: {err}")
                 })?;
+            provenance = PredictColumnsCovarianceProvenance {
+                point: Some(prediction.point_covariance_source),
+                uncertainty: prediction.uncertainty_covariance_source,
+            };
             let (mean_lower, mean_upper) = prediction
                 .mean_lower
                 .zip(prediction.mean_upper)
@@ -8199,6 +8235,12 @@ fn predict_columns(
             let prediction = predictor
                 .predict_full_uncertainty(&predict_input, &fit, &uncertainty_options)
                 .map_err(|err| format!("prediction with uncertainty failed: {err}"))?;
+            provenance = PredictColumnsCovarianceProvenance {
+                // The linear-link plug-in point consults no coefficient
+                // covariance; only the band does.
+                point: None,
+                uncertainty: Some(prediction.covariance_source),
+            };
             columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
             columns.insert("mean".to_string(), prediction.mean.to_vec());
             // Response-scale SE beside the response-scale mean/band (#1536):
@@ -8228,6 +8270,10 @@ fn predict_columns(
                     &gam_predict::PosteriorMeanOptions::point_only(),
                 )
                 .map_err(|err| format!("posterior-mean prediction failed: {err}"))?;
+            provenance = PredictColumnsCovarianceProvenance {
+                point: Some(prediction.point_covariance_source),
+                uncertainty: None,
+            };
             columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
             columns.insert("mean".to_string(), prediction.mean.to_vec());
         }
@@ -8257,7 +8303,7 @@ fn predict_columns(
         columns.insert("noise_scale".to_string(), noise_scale.to_vec());
     }
 
-    Ok(columns)
+    Ok((columns, provenance))
 }
 
 /// Build the held-out calibration fold needed by the conformal calibrator: a
@@ -8444,6 +8490,7 @@ fn predict_encoded_table_conformal_impl(
             "split-conformal (distribution-free, finite-sample marginal coverage)".to_string(),
         ),
         covariance_source: None,
+        point_covariance_source: None,
     })
     .map_err(|err| format!("failed to serialize conformal prediction payload: {err}"))
 }
@@ -8563,6 +8610,7 @@ fn predict_encoded_table_jackknife_plus_impl(
             (2.0 * conformal_level - 1.0).max(0.0) * 100.0
         )),
         covariance_source: None,
+        point_covariance_source: None,
     })
     .map_err(|err| format!("failed to serialize jackknife+ prediction payload: {err}"))
 }
@@ -8693,6 +8741,7 @@ fn predict_encoded_table_full_conformal_impl(
             conformal_level * 100.0
         )),
         covariance_source: None,
+        point_covariance_source: None,
     })
     .map_err(|err| format!("failed to serialize full-conformal prediction payload: {err}"))
 }

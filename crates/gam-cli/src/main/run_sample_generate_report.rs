@@ -562,9 +562,12 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         .and_then(|u| u.edf_total())
         .unwrap_or_else(|| fit.edf_total().unwrap_or(0.0));
 
-    let beta_se = fit
-        .beta_standard_errors_corrected()
-        .or(fit.beta_standard_errors());
+    // Definition-consistent SE column (#2296): corrected-preferred, but never
+    // an unlabeled mix of covariance definitions.
+    let display_uncertainty = fit.display_coefficient_uncertainty();
+    let beta_se = display_uncertainty
+        .as_ref()
+        .map(|view| view.standard_errors);
 
     let coefficients: Vec<report::CoefficientRow> = fit
         .beta

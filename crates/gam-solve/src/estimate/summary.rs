@@ -51,6 +51,11 @@ pub struct ModelSummary {
     pub reml_score: Option<f64>,
     pub parametric_terms: Vec<ParametricTermSummary>,
     pub smooth_terms: Vec<SmoothTermSummary>,
+    /// Exact covariance definition behind the coefficient standard errors
+    /// (#2296). Result-owned: recorded from the pair the builder actually
+    /// consumed, never from a display policy. `None` when the fit carries no
+    /// coefficient standard errors at all.
+    pub coefficient_se_source: Option<crate::model_types::CoefficientCovarianceDefinition>,
 }
 
 /// Convert optimizer-scale lambdas into physical lambdas for raw operator penalties.
@@ -370,6 +375,9 @@ impl fmt::Display for ModelSummary {
             .map(|v| format!("{v:.4}"))
             .unwrap_or_else(|| "NA".to_string());
         writeln!(f, "Deviance Explained: {dev_txt} | REML Score: {reml_txt}")?;
+        if let Some(source) = self.coefficient_se_source {
+            writeln!(f, "Coefficient SE Covariance: {source}")?;
+        }
         writeln!(f)?;
 
         writeln!(f, "Parametric Terms:")?;
