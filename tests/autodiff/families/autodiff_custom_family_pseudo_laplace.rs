@@ -3,12 +3,28 @@ use gam::custom_family::{
     ParameterBlockState, PenaltyMatrix,
 };
 use gam::families::custom_family::{
-    CustomFamilyBlockPsiDerivative, ExactNewtonOuterObjective, evaluate_custom_family_joint_hyper,
+    CustomFamilyBlockPsiDerivative, CustomFamilyHyperLayout, ExactNewtonOuterObjective, evaluate_custom_family_joint_hyper,
 };
 use gam::matrix::SymmetricMatrix;
 use gam_problem::ExactNewtonJointPsiTerms;
 use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative};
+
+/// Wrap raw per-block design psi derivatives into the typed
+/// [`CustomFamilyHyperLayout`] the joint-hyper evaluation now consumes
+/// (design axes only; no family-local axes).
+fn design_hyper_layout(
+    design_derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+) -> CustomFamilyHyperLayout {
+    let axis_count: usize = design_derivative_blocks.iter().map(Vec::len).sum();
+    CustomFamilyHyperLayout::new(
+        design_derivative_blocks,
+        Vec::new(),
+        Array1::zeros(axis_count),
+    )
+    .expect("test design-hyper layout must satisfy the typed axis contract")
+}
+
 
 #[derive(Clone)]
 struct ScalarPseudoLaplaceRhoFamily {
@@ -131,7 +147,7 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         assert_eq!(
@@ -140,7 +156,7 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
             "psi terms: states/specs aligned"
         );
         assert_eq!(
-            derivative_blocks.len(),
+            hyper_layout.design_derivative_blocks().len(),
             block_states.len(),
             "psi terms: derivs/states aligned"
         );
@@ -215,7 +231,7 @@ fn exact_newton_pseudo_laplace_rhogradient_matches_num_dual_band() {
             std::slice::from_ref(&spec),
             &options,
             &array![rho],
-            &derivative_blocks,
+            &design_hyper_layout(derivative_blocks.clone()),
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )
@@ -289,7 +305,7 @@ fn exact_newton_pseudo_laplace_psigradient_matches_num_dual_band() {
             std::slice::from_ref(&spec),
             &options,
             &Array1::zeros(0),
-            &derivative_blocks,
+            &design_hyper_layout(derivative_blocks.clone()),
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )
@@ -386,7 +402,7 @@ fn pseudo_laplace_objective_keeps_full_logdet_term_1395() {
             std::slice::from_ref(&spec),
             &options,
             &Array1::zeros(0),
-            &derivative_blocks,
+            &design_hyper_layout(derivative_blocks.clone()),
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )

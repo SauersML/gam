@@ -8,13 +8,29 @@ use gam::custom_family::{
     ParameterBlockState, PenaltyMatrix,
 };
 use gam::families::custom_family::{
-    CustomFamilyBlockPsiDerivative, evaluate_custom_family_joint_hyper,
+    CustomFamilyBlockPsiDerivative, CustomFamilyHyperLayout, evaluate_custom_family_joint_hyper,
 };
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
-use gam::pirls::LinearInequalityConstraints;
+use gam::pirls::{ConstraintSet, LinearInequalityConstraints};
 use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative};
 use std::marker::PhantomData;
+
+/// Wrap raw per-block design psi derivatives into the typed
+/// [`CustomFamilyHyperLayout`] the joint-hyper evaluation now consumes
+/// (design axes only; no family-local axes).
+fn design_hyper_layout(
+    design_derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+) -> CustomFamilyHyperLayout {
+    let axis_count: usize = design_derivative_blocks.iter().map(Vec::len).sum();
+    CustomFamilyHyperLayout::new(
+        design_derivative_blocks,
+        Vec::new(),
+        Array1::zeros(axis_count),
+    )
+    .expect("test design-hyper layout must satisfy the typed axis contract")
+}
+
 
 fn stateless_ad_output<T>(freeze: bool, output: T) -> Vec<T> {
     match freeze {
@@ -312,17 +328,17 @@ impl CustomFamily for LowerBoundConstrainedExactFamily {
         block_states: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         if block_states.len() != 1 || block_spec.name.is_empty() {
             return Err("expected one named parameter block".to_string());
         }
         if block_idx != 0 {
             return Ok(None);
         }
-        Ok(Some(LinearInequalityConstraints {
+        Ok(Some(ConstraintSet::Dense(LinearInequalityConstraints {
             a: array![[1.0]],
             b: array![self.lower],
-        }))
+        })))
     }
 }
 
@@ -463,7 +479,7 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
             &specs,
             &options,
             &array![rho],
-            &derivative_blocks,
+            &design_hyper_layout(derivative_blocks.clone()),
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )
@@ -537,7 +553,7 @@ fn exact_joint_quadratic_lamlgradient_respects_active_constraint_tangent_space()
             &specs,
             &options,
             &array![rho],
-            &derivative_blocks,
+            &design_hyper_layout(derivative_blocks.clone()),
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )
@@ -632,7 +648,7 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
             &specs,
             &options,
             &array![rho],
-            &derivative_blocks,
+            &design_hyper_layout(derivative_blocks.clone()),
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )
@@ -725,7 +741,7 @@ fn exact_joint_quadratic_lamlhessian_matches_gradient_finite_difference() {
             &specs,
             &options,
             &array![rho],
-            &derivative_blocks,
+            &design_hyper_layout(derivative_blocks.clone()),
             None,
             gam::families::custom_family::EvalMode::ValueGradientHessian,
         )
@@ -742,7 +758,7 @@ fn exact_joint_quadratic_lamlhessian_matches_gradient_finite_difference() {
             &specs,
             &options,
             &array![rho + step],
-            &derivative_blocks,
+            &design_hyper_layout(derivative_blocks.clone()),
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )
@@ -753,7 +769,7 @@ fn exact_joint_quadratic_lamlhessian_matches_gradient_finite_difference() {
             &specs,
             &options,
             &array![rho - step],
-            &derivative_blocks,
+            &design_hyper_layout(derivative_blocks.clone()),
             None,
             gam::families::custom_family::EvalMode::ValueAndGradient,
         )

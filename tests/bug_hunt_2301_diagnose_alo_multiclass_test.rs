@@ -192,7 +192,8 @@ fn encode_numeric_dataset(headers: &[&str], rows: &[Vec<f64>]) -> (Array2<f64>, 
         .collect();
     let dataset =
         encode_recordswith_inferred_schema(header_owned, records).expect("encode ALO dataset");
-    (dataset.values, dataset.column_map())
+    let column_map = dataset.column_map();
+    (dataset.values, column_map)
 }
 
 /// Dense coordinate-0 design of `model` on `data` — the same covariate design
