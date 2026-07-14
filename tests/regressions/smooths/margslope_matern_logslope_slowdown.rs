@@ -37,7 +37,11 @@ fn matern_smooth(name: &str, centers: usize) -> SmoothTermSpec {
                     num_centers: centers,
                 },
                 periodic: None,
-                length_scale: gam::terms::basis::MaternLengthScale::fixed(1.0),
+                // Formula-equivalent omitted scale.  #979 is specifically the
+                // automatic-kappa route; using `Fixed(1.0)` here silently
+                // bypasses the joint spatial optimizer and measures a
+                // different estimator.
+                length_scale: gam::terms::basis::MaternLengthScale::auto(),
                 nu: MaternNu::ThreeHalves,
                 include_intercept: false,
                 double_penalty: false,
