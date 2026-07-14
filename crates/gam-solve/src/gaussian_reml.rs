@@ -1609,6 +1609,11 @@ pub fn gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(
     let n = x.nrows();
     let p = x.ncols();
     let d = y.ncols();
+    if d == 0 {
+        crate::bail_invalid_estim!(
+            "shared-dispersion REML penalty gradient requires at least one response column"
+        );
+    }
     let weight = gaussian_reml_weights(n, weights)?;
     let n_effective = effective_observation_count(weight.view());
     let per_output_nu = n_effective.checked_sub(fit.cache.nullity).ok_or_else(|| {
