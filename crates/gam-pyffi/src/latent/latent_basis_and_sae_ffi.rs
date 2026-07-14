@@ -1864,6 +1864,7 @@ fn sae_manifold_fit_inner<'py>(
     row_loss_weights: Option<ArrayView1<'_, f64>>,
     // Per-fit separation barrier. `None` selects the native data-derived default.
     separation_barrier_strength_override: Option<f64>,
+    gpu_policy: gam::gpu::GpuPolicy,
     promote_from_residual: bool,
     // Explicit composable stages (#2267). The public default is the direct fit;
     // structure search and each structured-residual likelihood refit are opt-in.
@@ -1909,11 +1910,6 @@ fn sae_manifold_fit_inner<'py>(
     .map_err(py_value_error)?;
 
     let assignment = SaeFitAssignmentKind::from_tag(&assignment_kind).map_err(py_value_error)?;
-    let gpu_policy = gam::gpu::GpuPolicy::parse(gpu_policy).ok_or_else(|| {
-        py_value_error(format!(
-            "sae_manifold_fit gpu must be 'auto', 'off', or 'required'; got {gpu_policy:?}"
-        ))
-    })?;
     let temperature_schedule =
         gumbel_temperature_schedule_from_pydict(gumbel_schedule).map_err(py_value_error)?;
     let fisher_metric = match fisher_u {
@@ -2885,9 +2881,9 @@ fn sae_incoherence_report_dict<'py>(
 /// Exposed to Python as a read-only diagnostic so callers (and the LLM-scale
 /// streaming demo) can inspect the exact dispatch decision and chunk size the
 /// fit will follow for a given `(n_obs, total_basis, k_atoms, d_max)` without
-/// running it. It carries no tunable knobs — the plan is fully derived from the
-/// problem size and the `GpuRuntime` memory budget.
-#[pyfunction(signature = (n_obs, total_basis, k_atoms, d_max, border_dim = None))]
+/// running it. The only execution-policy input is `gpu`; all memory thresholds
+/// and chunk sizes remain derived from the problem shape and selected runtime.
+#[pyfunction(signature = (n_obs, total_basis, k_atoms, d_max, border_dim = None, gpu = "auto"))]
 fn sae_streaming_plan(
     py: Python<'_>,
     n_obs: usize,
@@ -2895,14 +2891,21 @@ fn sae_streaming_plan(
     k_atoms: usize,
     d_max: usize,
     border_dim: Option<usize>,
+    gpu: &str,
 ) -> PyResult<Py<PyDict>> {
     let border_dim = border_dim.unwrap_or(total_basis);
+    let gpu_policy = gam::gpu::GpuPolicy::parse(gpu).ok_or_else(|| {
+        py_value_error(format!(
+            "sae_streaming_plan gpu must be 'auto', 'off', or 'required'; got {gpu:?}"
+        ))
+    })?;
     let plan = gam::terms::sae::manifold::sae_streaming_plan_for_shape(
         n_obs,
         total_basis,
         k_atoms,
         d_max,
         border_dim,
+        gpu_policy,
     )
     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
     let out = PyDict::new(py);

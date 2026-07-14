@@ -50,6 +50,7 @@ fn sae_manifold_fit_minimal<'py>(
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
     // Per-fit separation-barrier configuration. `None` selects the native default.
     separation_barrier_strength_override: Option<f64>,
+    gpu_policy: gam::gpu::GpuPolicy,
     promote_from_residual: bool,
     // Bundled-pipeline stage toggles (#2267) forwarded to `sae_manifold_fit_inner`.
     run_structure_search: bool,
@@ -121,6 +122,7 @@ fn sae_manifold_fit_minimal<'py>(
         fisher_factor_kind.as_deref(),
         row_w,
         separation_barrier_strength_override,
+        gpu_policy,
         promote_from_residual,
         run_structure_search,
         structured_residual_passes,
@@ -491,6 +493,11 @@ fn sae_manifold_fit_model<'py>(
 ) -> PyResult<PyObject> {
     let sparsity_strength =
         sparsity_strength.unwrap_or(gam::terms::sae::manifold::DEFAULT_SAE_SPARSITY_STRENGTH);
+    let gpu_policy = gam::gpu::GpuPolicy::parse(gpu_policy).ok_or_else(|| {
+        py_value_error(format!(
+            "sae_manifold_fit gpu must be 'auto', 'off', or 'required'; got {gpu_policy:?}"
+        ))
+    })?;
     if k_atoms == 0 {
         return Err(py_value_error(
             "sae_manifold_fit requires K >= 1".to_string(),
@@ -685,6 +692,7 @@ fn sae_manifold_fit_model<'py>(
         fisher_factor_kind.clone(),
         row_loss_weights,
         separation_barrier_strength_override,
+        gpu_policy,
         promote_from_residual,
         run_structure_search,
         structured_residual_passes,
