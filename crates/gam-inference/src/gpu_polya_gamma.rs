@@ -1552,6 +1552,45 @@ mod tests {
         }
     }
 
+    /// #2320: gate the XORWOW-driven CPU exact-PG(1) path on distribution
+    /// *shape* against the analytic `PG(1, 0)` CDF, not just moments or a
+    /// second sampler. A one-sample DKW bound against exact truth catches a
+    /// shape error even if a sibling sampler shared it.
+    #[test]
+    fn pg1_cpu_oracle_matches_exact_untilted_cdf() {
+        let sample_count = 20_000usize;
+        let mut samples: Vec<f64> = (0..sample_count)
+            .map(|i| {
+                let mut st = XorwowState::new(0x2320_C0DE, i as u64);
+                pg1_draw_cpu_oracle(&mut st, 0.0)
+            })
+            .collect();
+        samples.sort_by(f64::total_cmp);
+
+        let n = sample_count as f64;
+        let statistic = samples
+            .iter()
+            .enumerate()
+            .map(|(i, &sample)| {
+                let cdf = crate::polya_gamma::pg1_untilted_cdf(sample);
+                let empirical_below = i as f64 / n;
+                let empirical_through = (i + 1) as f64 / n;
+                (cdf - empirical_below)
+                    .abs()
+                    .max((empirical_through - cdf).abs())
+            })
+            .fold(0.0_f64, f64::max);
+
+        // Dvoretzky–Kiefer–Wolfowitz: P(D_n > eps) <= 2 exp(-2 n eps²), at a
+        // one-in-a-million false-rejection bound.
+        let false_rejection_probability = 1e-6_f64;
+        let critical = (-(false_rejection_probability / 2.0).ln() / (2.0 * n)).sqrt();
+        assert!(
+            statistic <= critical,
+            "CPU exact-PG(1,0) oracle KS statistic {statistic} exceeds DKW critical value {critical}",
+        );
+    }
+
     #[test]
     fn pg_convolution_identity_at_small_b() {
         // PG(b, c) =_d sum_{j=1..b} PG(1, c) for integer b. We compare two
