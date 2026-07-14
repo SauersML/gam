@@ -6171,14 +6171,14 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
     );
 
     // Bit-identical cached contents vs the independent reference.
-    let fields: [(&Array1<f64>, &Array1<f64>); 7] = [
+    let fields: [(&Array1<f64>, &Array1<f64>); 4] = [
         (&hit.obs_weight, &reference.obs_weight),
-        (&hit.w, &reference.w),
-        (&hit.m, &reference.m),
-        (&hit.n, &reference.n),
+        (
+            &hit.standardized_residual,
+            &reference.standardized_residual,
+        ),
+        (&hit.inv_sigma, &reference.inv_sigma),
         (&hit.kappa, &reference.kappa),
-        (&hit.kappa_prime, &reference.kappa_prime),
-        (&hit.kappa_dprime, &reference.kappa_dprime),
     ];
     for (got, want) in fields {
         for (a, b) in got.iter().zip(want.iter()) {
@@ -6223,7 +6223,11 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
     );
     let recomputed_collide = gaussian_jointrow_scalars(&y, &etamu, &eta_ls_interior, &weights)
         .expect("collide reference");
-    for (a, b) in collide.w.iter().zip(recomputed_collide.w.iter()) {
+    for (a, b) in collide
+        .standardized_residual
+        .iter()
+        .zip(recomputed_collide.standardized_residual.iter())
+    {
         assert_eq!(
             a.to_bits(),
             b.to_bits(),

@@ -834,7 +834,6 @@ pub(crate) struct GaussianDiagonalRowKernel {
     pub(crate) inv_sigma: f64,
     pub(crate) kappa: f64,
     pub(crate) kappa_prime: f64,
-    pub(crate) kappa_dprime: f64,
 }
 
 #[inline]
@@ -875,7 +874,6 @@ pub(crate) fn gaussian_diagonal_row_kernel(
             inv_sigma: 0.0,
             kappa: 0.0,
             kappa_prime: 0.0,
-            kappa_dprime: 0.0,
         });
     }
 
@@ -998,7 +996,6 @@ pub(crate) fn gaussian_diagonal_row_kernel(
         .into());
     }
     let kappa_prime = kappa * (1.0 - kappa);
-    let kappa_dprime = kappa_prime * (1.0 - 2.0 * kappa);
 
     Ok(GaussianDiagonalRowKernel {
         log_likelihood,
@@ -1012,7 +1009,6 @@ pub(crate) fn gaussian_diagonal_row_kernel(
         inv_sigma,
         kappa,
         kappa_prime,
-        kappa_dprime,
     })
 }
 

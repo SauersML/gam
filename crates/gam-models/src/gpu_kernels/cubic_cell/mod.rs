@@ -100,6 +100,7 @@ pub(crate) enum CubicCellMomentStatus {
     /// Evaluator produced a non-finite moment (q overflow on a pathological
     /// cell). The row is zeroed; this is the GPU-side counterpart to a CPU
     /// `Err`.
+    #[cfg(test)]
     NonFiniteEvaluation = 4,
 }
 
