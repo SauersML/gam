@@ -67,9 +67,7 @@ pub(crate) struct GpuDenestedCubicCell {
     pub c3: f64,
 }
 
-/// Branch classification for a single cell. The device dispatcher buckets
-/// cells by tag and launches one specialized kernel per branch to avoid
-/// warp divergence.
+/// Canonical branch classification encoded for the all-branch device kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GpuCellBranchTag {
     /// `c_2 = c_3 = 0` and the interval is finite — closed-form `T_n`

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaStream};
 
-/// Linux-only: launch the Stage-1 dispatcher and return the moments buffer in
+/// Linux-only: launch the device dispatcher and return the moments buffer in
 /// device memory (`CudaSlice<f64>`). The caller reaches this boundary only
 /// after selecting device execution, so backend absence and driver/NVRTC/shape
 /// failures are all typed errors; this function never substitutes host work.
@@ -298,7 +298,7 @@ mod tests {
     use super::*;
     use crate::gpu_kernels::cubic_cell::{
         CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
-        GpuCellBranchTag, GpuDenestedCubicCell, try_build_cubic_cell_derivative_moments,
+        GpuDenestedCubicCell, try_build_cubic_cell_derivative_moments,
     };
     use gam_gpu::device_runtime::GpuRuntime;
     use gam_gpu::gpu_error::GpuError;

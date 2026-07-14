@@ -2,9 +2,9 @@
 //!
 //! The classifier mirrors `crate::cubic_cell_kernel::branch_cell`
 //! plus the semi-infinite-tail handling baked into
-//! `evaluate_cell_state_dispatched`. Tagging happens once on the host so the
-//! GPU dispatcher can launch a per-branch specialized kernel without warp
-//! divergence on the classification predicate.
+//! `evaluate_cell_state_dispatched`. Tagging happens once at the substrate
+//! boundary so the all-branch GPU kernel consumes a canonical branch code
+//! instead of reimplementing the tolerance predicate.
 //!
 //! The host classifier and the device kernel use the *same* CPU functions to
 //! decide cell branch, so a future kernel landing cannot drift on tolerance.
