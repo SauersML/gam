@@ -7807,6 +7807,133 @@ pub fn ensure_by_variable_specs_match(
     }
 }
 
+/// Choose a deterministic orthonormal basis for a subspace from its projector.
+///
+/// Eigenvectors belonging to a repeated eigenvalue are defined only up to an
+/// arbitrary orthogonal rotation.  That freedom is harmless when consumers use
+/// the whole projector `ZZ^T`, but it changes model semantics when each column
+/// receives its own smoothing parameter.  We remove the eigensolver gauge by
+/// repeatedly projecting coefficient coordinate axes into the subspace and
+/// selecting the largest residual (with stable lowest-index tie breaking).
+/// The result depends only on the subspace projector and the declared
+/// coefficient chart, never on the orientation returned by an eigensolver.
+fn canonical_nullspace_directions(z: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
+    let (coefficient_dim, nullity) = z.dim();
+    if nullity == 0 {
+        return Ok(Array2::zeros((coefficient_dim, 0)));
+    }
+    if coefficient_dim < nullity || z.iter().any(|value| !value.is_finite()) {
+        crate::bail_invalid_basis!(
+            "null-space basis must be finite with rows >= columns, got {}x{}",
+            coefficient_dim,
+            nullity
+        );
+    }
+
+    let tolerance = 128.0 * f64::EPSILON * coefficient_dim.max(1) as f64;
+    let mut canonical = Array2::<f64>::zeros((coefficient_dim, nullity));
+    for accepted in 0..nullity {
+        let mut best_coordinate = usize::MAX;
+        let mut best_norm = 0.0_f64;
+        let mut best = Array1::<f64>::zeros(coefficient_dim);
+
+        for coordinate in 0..coefficient_dim {
+            // `P e_j = Z (Z^T e_j)` without materializing the full projector.
+            let mut candidate = Array1::<f64>::zeros(coefficient_dim);
+            for row in 0..coefficient_dim {
+                candidate[row] = (0..nullity)
+                    .map(|axis| z[[row, axis]] * z[[coordinate, axis]])
+                    .sum();
+            }
+            // Two-pass modified Gram--Schmidt keeps the selected directions
+            // orthogonal even when successive projected coordinates are close.
+            for _ in 0..2 {
+                for axis in 0..accepted {
+                    let direction = canonical.column(axis);
+                    let projection = direction.dot(&candidate);
+                    candidate.scaled_add(-projection, &direction);
+                }
+            }
+            let norm = candidate.dot(&candidate).sqrt();
+            let tie_band = tolerance * best_norm.max(1.0);
+            if best_coordinate == usize::MAX || norm > best_norm + tie_band {
+                best_coordinate = coordinate;
+                best_norm = norm;
+                best = candidate;
+            }
+        }
+
+        if best_coordinate == usize::MAX || best_norm <= tolerance {
+            crate::bail_invalid_basis!(
+                "null-space projector exposed only {} of {} independent directions",
+                accepted,
+                nullity
+            );
+        }
+        best.mapv_inplace(|value| value / best_norm);
+        // Fix the remaining sign gauge for reproducible metadata/debug output.
+        let sign_anchor = best
+            .iter()
+            .enumerate()
+            .max_by(|(left_index, left), (right_index, right)| {
+                left.abs()
+                    .partial_cmp(&right.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .map(|(_, value)| *value)
+            .unwrap_or(1.0);
+        if sign_anchor < 0.0 {
+            best.mapv_inplace(|value| -value);
+        }
+        canonical.column_mut(accepted).assign(&best);
+    }
+    Ok(canonical)
+}
+
+#[cfg(test)]
+mod canonical_nullspace_direction_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn per_axis_null_penalties_are_invariant_to_eigensolver_gauge_2315() {
+        let inv_sqrt_two = 0.5_f64.sqrt();
+        let z = array![
+            [inv_sqrt_two, 0.0],
+            [inv_sqrt_two, 0.0],
+            [0.0, 1.0],
+            [0.0, 0.0]
+        ];
+        let rotation = array![[0.6, -0.8], [0.8, 0.6]];
+        let rotated = z.dot(&rotation);
+        let reference = canonical_nullspace_directions(&z).expect("canonical null basis");
+        let actual =
+            canonical_nullspace_directions(&rotated).expect("rotated canonical null basis");
+        for axis in 0..reference.ncols() {
+            let reference_penalty = reference
+                .column(axis)
+                .to_owned()
+                .insert_axis(Axis(1))
+                .dot(&reference.column(axis).insert_axis(Axis(0)));
+            let actual_penalty = actual
+                .column(axis)
+                .to_owned()
+                .insert_axis(Axis(1))
+                .dot(&actual.column(axis).insert_axis(Axis(0)));
+            let max_error = reference_penalty
+                .iter()
+                .zip(actual_penalty.iter())
+                .map(|(left, right)| (left - right).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_error <= 256.0 * f64::EPSILON,
+                "axis {axis} changed by {max_error:e}"
+            );
+        }
+    }
+}
+
 /// Build a factor-smooth interaction basis (`bs="fs"`/`"sz"`/`"re"`).
 ///
 /// A factor smooth replicates a shared marginal smooth in the continuous
@@ -8094,7 +8221,7 @@ pub fn build_factor_smooth(
     // single *combined* null penalty (one λ for intercept+slope together) cannot
     // express the typically very different intercept and slope variances, which
     // is the residual forecast gap. We mirror mgcv exactly: for each orthonormal
-    // null direction `z_k` of the marginal wiggliness penalty add
+    // canonical null direction `z_k` of the marginal wiggliness penalty, add
     // `I_L ⊗ (z_k z_kᵀ)` as its own penalty. The marginal's combined double
     // penalty was disabled above, so the null space is penalized once, per
     // dimension. With linear data REML drives the curvature λ up and degrades
@@ -8110,6 +8237,7 @@ pub fn build_factor_smooth(
             .map(|penalty| &penalty.null_eigenvectors)
         && z.nrows() == p
     {
+        let z = canonical_nullspace_directions(z)?;
         for k in 0..z.ncols() {
             // Rank-1 marginal penalty `z_k z_kᵀ`, replicated block-diagonally
             // across levels into `I_L ⊗ (z_k z_kᵀ)`. Its own λ is one shared
@@ -8474,12 +8602,13 @@ pub fn build_single_local_smooth_term(
             // under its own shared variance; we mirror that here while keeping
             // the zero-sum reparameterization, so the constraint (and the
             // identifiability of `sz` vs `fs`) is preserved. For each orthonormal
-            // null direction `z_k` of the marginal penalty, add the rank-1
-            // marginal penalty `z_k z_kᵀ` mapped into the SAME `(I + 11ᵀ)`
+            // canonical null direction `z_k` of the marginal penalty, add the
+            // rank-1 marginal penalty `z_k z_kᵀ` mapped into the SAME `(I + 11ᵀ)`
             // sum-to-zero contrast space, each carrying its own `λ`.
             if let Some(z) = inner_null_eigenvectors.as_ref()
                 && z.nrows() == p
             {
+                let z = canonical_nullspace_directions(z)?;
                 for k in 0..z.ncols() {
                     let zk = z.column(k);
                     let mut p_k = Array2::<f64>::zeros((p, p));
