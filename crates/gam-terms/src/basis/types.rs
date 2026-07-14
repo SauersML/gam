@@ -298,19 +298,20 @@ impl BSplineBoundaryConditions {
             && matches!(self.right, BSplineEndpointBoundaryCondition::Free)
     }
 
-    /// Whether exactly one endpoint fixes the function's absolute level.
+    /// Whether either endpoint fixes the function's absolute level.
     ///
-    /// A one-sided anchor replaces the global intercept as the level-setting
-    /// constraint. Centering that same smooth to zero would impose a second,
-    /// incompatible level constraint and exclude every non-zero-mean anchored
-    /// function from the model space.
-    pub const fn has_one_sided_anchor(&self) -> bool {
-        let left = matches!(self.left, BSplineEndpointBoundaryCondition::Anchored { .. });
-        let right = matches!(
-            self.right,
-            BSplineEndpointBoundaryCondition::Anchored { .. }
-        );
-        left != right
+    /// An anchored endpoint (one *or* both sides) replaces the global intercept
+    /// as the level-setting constraint: the fitted function itself, not only a
+    /// centered deviation, must obey the endpoint pin. Centering that same
+    /// smooth to zero would impose a second, incompatible level constraint and
+    /// exclude every non-zero-mean anchored function from the model space, and a
+    /// free global intercept would float the whole curve off its pin. A
+    /// *two*-sided anchor fixes the level even more strongly than a one-sided
+    /// one, so it must be treated identically here — the earlier XOR (exactly
+    /// one endpoint) silently dropped both pins for the two-sided case (#2297).
+    pub const fn has_anchor(&self) -> bool {
+        matches!(self.left, BSplineEndpointBoundaryCondition::Anchored { .. })
+            || matches!(self.right, BSplineEndpointBoundaryCondition::Anchored { .. })
     }
 
     /// Whether either endpoint carries an inhomogeneous value constraint.

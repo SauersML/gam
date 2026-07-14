@@ -2313,14 +2313,16 @@ pub fn build_smooth_basis(
                 } else {
                     parse_bspline_boundary_conditions(options).map_err(|e| e.to_string())?
                 };
-            // A one-sided anchor is already the model's level-setting gauge:
-            // term-design construction suppresses the global intercept so the
-            // fitted function itself, rather than only a centered deviation,
-            // obeys the endpoint pin. Applying the ordinary sum-to-zero chart
-            // as well would force the entire anchored function to have sample
-            // mean zero. In #1867 that made a positive anchored bump
-            // mathematically unrecoverable before REML was even evaluated.
-            let identifiability = if boundary_conditions.has_one_sided_anchor() {
+            // An anchored endpoint (one *or* both sides) is already the model's
+            // level-setting gauge: term-design construction suppresses the
+            // global intercept so the fitted function itself, rather than only a
+            // centered deviation, obeys the endpoint pin. Applying the ordinary
+            // sum-to-zero chart as well would force the entire anchored function
+            // to have sample mean zero. In #1867 that made a positive one-sided
+            // anchored bump mathematically unrecoverable before REML was even
+            // evaluated; for a two-sided anchor it additionally strips the
+            // interior level the two pins bracket (#2297).
+            let identifiability = if boundary_conditions.has_anchor() {
                 BSplineIdentifiability::None
             } else {
                 BSplineIdentifiability::default()

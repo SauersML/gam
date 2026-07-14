@@ -40,7 +40,7 @@ pub use self::structure_analysis::{
 // the entry points the staying gam-models drivers still call (via their
 // `use gam_terms::smooth::*` glob): `build_term_collection_design` (public API),
 // `build_term_collection_design_inner` (the joint-build variants that stay in
-// gam-models), and `term_collection_has_one_sided_anchored_bspline`
+// gam-models), and `term_collection_has_anchored_bspline`
 // (`spatial_optimization.rs`).
 mod term_design;
 pub use term_design::{
@@ -48,7 +48,7 @@ pub use term_design::{
     build_term_collection_derivative_design, build_term_collection_design,
     build_term_collection_design_inner, build_term_collection_design_with_policy,
     orthogonality_relative_residual_for_design, smooth_intrinsic_parametric_feature_cols,
-    term_collection_has_nonzero_anchor, term_collection_has_one_sided_anchored_bspline,
+    term_collection_has_anchored_bspline, term_collection_has_nonzero_anchor,
 };
 
 // Spec→spec freezer relocated DOWN from gam-models `fit_orchestration/drivers/

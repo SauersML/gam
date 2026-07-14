@@ -83,8 +83,8 @@ fn freeze_smooth_basis_from_metadata(
             // longer happen. We therefore KEEP the original
             // `boundary_conditions`: they are the single source of truth the
             // intercept-suppression decision reads
-            // (`term_collection_has_one_sided_anchored_bspline`), and a
-            // one-sided anchored smooth suppresses the global intercept at fit
+            // (`term_collection_has_anchored_bspline`), and an anchored smooth
+            // (one *or* two sided) suppresses the global intercept at fit
             // time (#1238). Clearing them here flipped that decision at predict
             // and re-added a spurious intercept column → save→load→predict
             // 21-vs-22 design mismatch (#1265). Boundary conditions are left
