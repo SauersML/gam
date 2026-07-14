@@ -2964,7 +2964,6 @@ mod tests {
             &lower_bounds,
             &mut direction,
             Some(&mut active_hint),
-            None,
         )
         .expect("lower-bound active-set solve should succeed");
 
@@ -2974,83 +2973,34 @@ mod tests {
         assert!(active_hint.is_empty());
     }
 
-    /// gam#979: when a caller reflects negative-curvature modes to keep the QP
-    /// step bounded (survival joint-Newton), the freed step `d` is far-field, so
-    /// the second-order release multiplier `(H·d)_i` is untrustworthy and can flip
-    /// a first-order-optimal bound loose — released spuriously, then re-added on
-    /// the next outer re-linearization (the active-set zigzag that ground the
-    /// n=3000 survival marginal-slope fit for 30 cycles). Passing the pre-
-    /// reflection Hessian via `kkt_hessian` flags the reflection, so the release is
-    /// judged on the reflection-invariant FIRST-ORDER multiplier `λ_i = g_i`.
-    ///
-    /// Here coord 1 is pinned (β₁ at its lower bound, d₁=0) with a first-order-
-    /// optimal reduced gradient g₁ = 1 > 0. On the reflected path (`Some(kkt)`) the
-    /// first-order test KEEPS it regardless of the far-field `(H·d)₁`; on the
-    /// unreflected path (`None`) the exact `λ₁ = g₁ + (H_step·d)₁ = 1 + 3·(−1) =
-    /// −2 < 0` releases it (β₁ overshoots to 4.0) — the historical behavior the
-    /// unreflected callers keep byte-for-byte.
+    /// gam#979: the free solve and active-bound multiplier must come from one
+    /// quadratic model. Here the bare gradient on coordinate 1 is positive, but
+    /// coupling to the free coordinate makes the full multiplier negative, so the
+    /// bound must be released. Dropping `H d` keeps it active; using a different
+    /// Hessian can release/re-add it forever. The exact convex-model KKT solve has
+    /// the unconstrained minimizer `d=(-7,4)`, which is feasible and stationary.
     #[test]
-    pub(crate) fn lower_bound_release_uses_true_curvature_not_reflected_step_979() {
-        // Step Hessian (stands in for the reflected, PD model used for the step).
-        let h_step = array![[2.0, 3.0], [3.0, 5.0]];
-        // Pre-reflection Hessian: its presence flags the reflected path (the
-        // release then uses the first-order g₁, so these entries are not consulted
-        // for the decision — only for the diagnostic log).
-        let h_kkt = array![[2.0, 0.5], [0.5, -3.0]];
+    pub(crate) fn lower_bound_release_uses_the_step_models_full_multiplier_979() {
+        let hessian = array![[2.0, 3.0], [3.0, 5.0]];
         let gradient = array![2.0, 1.0];
         let beta = array![0.0, 0.0];
         let lower_bounds = array![f64::NEG_INFINITY, 0.0];
-
-        // Reflected path: first-order λ₁ = g₁ = 1 > 0, so the bound is KEPT.
-        // β₁ stays pinned at its lower bound (no zigzag).
-        let mut dir_fixed = Array1::zeros(2);
-        let mut active_fixed = vec![1];
+        let mut direction = Array1::zeros(2);
+        let mut active = vec![1];
         solve_newton_directionwith_lower_bounds(
-            &h_step,
+            &hessian,
             &gradient,
             &beta,
             &lower_bounds,
-            &mut dir_fixed,
-            Some(&mut active_fixed),
-            Some(&h_kkt),
+            &mut direction,
+            Some(&mut active),
         )
-        .expect("true-curvature bounded solve should succeed");
-        assert_eq!(
-            active_fixed,
-            vec![1],
-            "true-curvature release must KEEP the genuinely-binding bound active"
-        );
-        assert!(
-            (beta[1] + dir_fixed[1]).abs() < 1e-12,
-            "coord 1 must stay pinned at its lower bound; got {}",
-            beta[1] + dir_fixed[1]
-        );
-
-        // WITHOUT it (kkt=None ⇒ the release test uses the STEP Hessian, the old
-        // behavior): λ₁ = 1 + 3·(−1) = −2 < 0, so the bound is released
-        // spuriously and coord 1 flies off to 4.0 — the overshoot the outer loop
-        // then has to walk back, cycle after cycle.
-        let mut dir_bug = Array1::zeros(2);
-        let mut active_bug = vec![1];
-        solve_newton_directionwith_lower_bounds(
-            &h_step,
-            &gradient,
-            &beta,
-            &lower_bounds,
-            &mut dir_bug,
-            Some(&mut active_bug),
-            None,
-        )
-        .expect("step-curvature bounded solve should succeed");
-        assert!(
-            active_bug.is_empty(),
-            "sanity: with the step Hessian the bound is (wrongly) released"
-        );
-        assert!(
-            (beta[1] + dir_bug[1]) > 1.0,
-            "sanity: the spuriously-freed coord overshoots its bound; got {}",
-            beta[1] + dir_bug[1]
-        );
+        .expect("consistent convex-model QP should succeed");
+        assert!(active.is_empty());
+        assert_relative_eq!(direction[0], -7.0, epsilon = 1e-12);
+        assert_relative_eq!(direction[1], 4.0, epsilon = 1e-12);
+        let stationarity = &gradient + &hessian.dot(&direction);
+        assert!(stationarity.iter().all(|value| value.abs() < 1e-12));
     }
 
     #[test]
@@ -3064,7 +3014,7 @@ mod tests {
         let hd = array![0.0, 0.0, 0.0];
         let active_idx = vec![0, 1, 2];
         assert_eq!(
-            select_active_set_release(&gradient, &hd, &active_idx, false, false),
+            select_active_set_release(&gradient, &hd, &active_idx, false),
             Some(1)
         );
     }
@@ -3081,7 +3031,7 @@ mod tests {
         let hd = array![0.0, 0.0, 0.0];
         let active_idx = vec![0, 1, 2];
         assert_eq!(
-            select_active_set_release(&gradient, &hd, &active_idx, true, false),
+            select_active_set_release(&gradient, &hd, &active_idx, true),
             Some(0)
         );
     }
@@ -3098,7 +3048,7 @@ mod tests {
         let hd = array![lambda_noise - g]; // λ = g + hd = lambda_noise
         let active_idx = vec![0];
         assert_eq!(
-            select_active_set_release(&gradient, &hd, &active_idx, true, false),
+            select_active_set_release(&gradient, &hd, &active_idx, true),
             None,
             "round-off-level multiplier must not trigger Bland's release"
         );
@@ -3108,7 +3058,7 @@ mod tests {
         let lambda_real = -128.0 * f64::EPSILON * g;
         let hd = array![lambda_real - g];
         assert_eq!(
-            select_active_set_release(&gradient, &hd, &active_idx, true, false),
+            select_active_set_release(&gradient, &hd, &active_idx, true),
             Some(0)
         );
     }
@@ -3121,58 +3071,12 @@ mod tests {
         let hd = array![0.0, 0.0, 0.0];
         let active_idx = vec![0, 1, 2];
         assert_eq!(
-            select_active_set_release(&gradient, &hd, &active_idx, false, false),
+            select_active_set_release(&gradient, &hd, &active_idx, false),
             None
         );
         assert_eq!(
-            select_active_set_release(&gradient, &hd, &active_idx, true, false),
+            select_active_set_release(&gradient, &hd, &active_idx, true),
             None
-        );
-    }
-
-    /// gam#979: on a negative-curvature-reflected step the freed-block Newton
-    /// step `d` is far-field along the reflected modes, so the second-order
-    /// release term `(H·d)_i` is not model-trustworthy. A bound that is
-    /// FIRST-ORDER optimal (`g_i ≥ 0`) must be KEPT even when the far-field
-    /// `(H·d)_i` drives the full multiplier `g_i + (H·d)_i` negative — otherwise
-    /// the freed coefficient overshoots (β∞ ≈ 26 on the n=3000 marginal-slope
-    /// fit) and the active set zigzags across outer cycles. The reflected path
-    /// judges dual feasibility on the reflection-invariant first-order `g_i`.
-    #[test]
-    pub(crate) fn select_active_set_release_reflected_uses_first_order_multiplier_979() {
-        let gradient = array![1.0]; // g_0 = 1 ≥ 0 ⇒ first-order optimal ⇒ keep
-        let hd = array![-3.0]; // far-field second-order term (fictitious length)
-        let active_idx = vec![0];
-
-        // Reflected path (worst-violation): first-order g_0 = 1 > 0 ⇒ KEEP.
-        assert_eq!(
-            select_active_set_release(&gradient, &hd, &active_idx, false, true),
-            None,
-            "reflected release must judge on first-order g_i and KEEP a first-order-optimal bound"
-        );
-        // Reflected path (Bland's): same first-order verdict ⇒ KEEP.
-        assert_eq!(
-            select_active_set_release(&gradient, &hd, &active_idx, true, true),
-            None,
-            "Bland's variant must also KEEP on the reflected first-order test"
-        );
-
-        // Non-reflected path (exact λ = g + Hd = 1 − 3 = −2 < 0) ⇒ RELEASE.
-        // Byte-identical to the historical behavior for callers that do not
-        // reflect their step Hessian.
-        assert_eq!(
-            select_active_set_release(&gradient, &hd, &active_idx, false, false),
-            Some(0),
-            "the non-reflected exact multiplier is unchanged"
-        );
-
-        // The fix is conservative, NOT release-blocking: a genuinely first-order-
-        // infeasible bound (g_0 < 0) still releases on the reflected path.
-        let gradient_neg = array![-0.5];
-        assert_eq!(
-            select_active_set_release(&gradient_neg, &hd, &active_idx, false, true),
-            Some(0),
-            "a first-order-infeasible bound (g_i < 0) must still release on the reflected path"
         );
     }
 
@@ -3192,7 +3096,6 @@ mod tests {
             &lower_bounds,
             &mut direction,
             Some(&mut active_hint),
-            None,
         )
         .expect("stale warm lower-bound hint should be releasable");
 
@@ -3618,7 +3521,6 @@ mod root_cause_tests {
             &lower_bounds,
             &mut direction,
             Some(&mut active_hint),
-            None,
         )
         .expect("solve should succeed");
 

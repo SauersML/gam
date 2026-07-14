@@ -1126,13 +1126,6 @@ pub(crate) fn solve_quadratic_with_simple_lower_bounds(
     beta_start: &Array1<f64>,
     bounds: &SimpleLowerBounds,
     active_rows: Option<&[usize]>,
-    // Reflection flag for the KKT release test (gam#979). When the caller passes
-    // a `lhs` that was negative-curvature-reflected to bound the step, supply the
-    // original (pre-reflection) Hessian here; its presence makes the bound solver
-    // judge dual feasibility on the reflection-invariant first-order multiplier
-    // `g_i` (the far-field reflected step makes the second-order term untrust-
-    // worthy). `None` ⇒ exact `g_i + (H·d)_i` (byte-identical to prior behavior).
-    kkt_hessian: Option<&Array2<f64>>,
 ) -> Result<(Array1<f64>, Vec<usize>), String> {
     let gradient = lhs.dot(beta_start) - rhs;
     let mut delta = Array1::zeros(beta_start.len());
@@ -1144,7 +1137,6 @@ pub(crate) fn solve_quadratic_with_simple_lower_bounds(
         &bounds.lower_bounds,
         &mut delta,
         Some(&mut active_coeffs),
-        kkt_hessian,
     )
     .map_err(|e| format!("lower-bound Newton solve failed: {e}"))?;
     let mut beta_new = beta_start + &delta;
@@ -1273,9 +1265,6 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
                         &ctx.states[ctx.block_idx].beta,
                         bounds,
                         ctx.cached_active_set,
-                        // PSD weighted-normal-equations Hessian (X'WX+S), not
-                        // reflected: same matrix for step and KKT test (gam#979).
-                        None,
                     )
                 } else {
                     gam_solve::active_set::solve_quadratic_with_constraint_set(
@@ -1404,9 +1393,6 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                     &ctx.states[ctx.block_idx].beta,
                     bounds,
                     ctx.cached_active_set,
-                    // Ridge-stabilized penalized Hessian, not curvature-reflected:
-                    // same matrix for step and KKT test (gam#979).
-                    None,
                 )
             } else {
                 let delta_constraints =
