@@ -974,12 +974,21 @@ mod tests {
     }
 
     fn assert_matrix_close(actual: &Array2<f64>, expected: &Array2<f64>, tolerance: f64) {
+        assert_matrix_close_with_context(actual, expected, tolerance, "matrix");
+    }
+
+    fn assert_matrix_close_with_context(
+        actual: &Array2<f64>,
+        expected: &Array2<f64>,
+        tolerance: f64,
+        context: &str,
+    ) {
         assert_eq!(actual.dim(), expected.dim());
         for ((row, col), &target) in expected.indexed_iter() {
             let observed = actual[[row, col]];
             assert!(
                 (observed - target).abs() <= tolerance * (1.0 + target.abs()),
-                "matrix[{row},{col}] differs: observed={observed:.16e}, target={target:.16e}"
+                "{context}: matrix[{row},{col}] differs: observed={observed:.16e}, target={target:.16e}; actual={actual:?}; expected={expected:?}"
             );
         }
     }
@@ -1014,11 +1023,13 @@ mod tests {
         actual: &LocalSmoothTermBuild,
         expected: &LocalSmoothTermBuild,
         tolerance: f64,
+        context: &str,
     ) {
-        assert_matrix_close(
+        assert_matrix_close_with_context(
             &actual.design.to_dense(),
             &expected.design.to_dense(),
             tolerance,
+            &format!("{context} design"),
         );
         assert_eq!(
             actual.active_penalties.len(),
@@ -1032,7 +1043,12 @@ mod tests {
             assert_eq!(observed.info.source, target.info.source);
             assert_eq!(observed.info.effective_rank, target.info.effective_rank);
             assert_eq!(observed.nullity, target.nullity);
-            assert_matrix_close(&observed.matrix, &target.matrix, tolerance);
+            assert_matrix_close_with_context(
+                &observed.matrix,
+                &target.matrix,
+                tolerance,
+                &format!("{context} penalty source {:?}", target.info.source),
+            );
         }
     }
 
@@ -1267,7 +1283,12 @@ mod tests {
                 let mut scaled = data.clone();
                 scaled.column_mut(0).mapv_inplace(|value| factor * value);
                 let actual = build_local(&scaled, wrapper_basis(family, factor));
-                assert_local_geometry_close(&actual, &reference, 2e-8);
+                assert_local_geometry_close(
+                    &actual,
+                    &reference,
+                    2e-8,
+                    &format!("{family:?} factor={factor:e}"),
+                );
             }
         }
 
@@ -1651,7 +1672,12 @@ mod tests {
             for factor in [1e-9_f64, 1.0, 1e9] {
                 let scaled = data.mapv(|value| factor * value);
                 let actual = build_local(&scaled, euclidean_basis(family, factor));
-                assert_local_geometry_close(&actual, &reference, 3e-7);
+                assert_local_geometry_close(
+                    &actual,
+                    &reference,
+                    3e-7,
+                    &format!("{family:?} factor={factor:e}"),
+                );
             }
         }
     }
