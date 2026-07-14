@@ -546,17 +546,6 @@ fn csv_mean_at(path: &std::path::Path, row_idx: usize) -> f64 {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "mean should parse", e))
 }
 
-fn csv_sigma_at(path: &std::path::Path, row_idx: usize) -> f64 {
-    let mut rdr = csv::Reader::from_path(path).expect("open prediction csv");
-    let rows = rdr
-        .deserialize::<BTreeMap<String, String>>()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse prediction csv", e));
-    rows[row_idx]["sigma"]
-        .parse::<f64>()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "sigma should parse", e))
-}
-
 fn write_binomial_location_scale_train_csv(path: &std::path::Path) {
     fs::write(
             path,
