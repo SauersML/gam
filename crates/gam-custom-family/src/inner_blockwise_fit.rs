@@ -2639,6 +2639,30 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // a feasible, within-trust QP step (see the gated bypass below).
                 let mut qp_feasible_bypass = false;
                 let mut block_step_norms = if let Some(spectrum) = joint_spectrum.as_ref() {
+                    // POSITIVE-DEFINITE CONSTRAINED PATH (gam#979 CTN).
+                    //
+                    // `search_delta` is the authoritative active-set QP Newton
+                    // step. When the true penalized Hessian has no negative
+                    // curvature, the reflected QP matrix is identical to that
+                    // Hessian, so replacing this step with an unconstrained
+                    // More-Sorensen step changes both the critical cone and the
+                    // local quadratic problem. That replacement used to happen
+                    // whenever the QP step exceeded the trust radius. On the
+                    // 4,800-row Duchon CTN it converted a feasible O(1e-2) QP
+                    // proposal into an O(1e-4) projected step, repeatedly changed
+                    // the active face, and left the KKT residual near 20--30.
+                    //
+                    // Global scaling by one alpha is the correct globalization
+                    // for this case. Both beta and beta + search_delta are cone-
+                    // feasible, so every point on their convex segment remains
+                    // feasible. The QP objective is convex and no larger at its
+                    // minimizer than at zero, so the same segment is descending.
+                    // Use one alpha across every block (per-block clipping would
+                    // change direction and can leave the cone). The ordinary
+                    // family feasibility limiter still runs below for any
+                    // additional nonlinear constraint not represented by the QP.
+                    let positive_definite_constrained_qp = search_joint_active_set.is_some()
+                        && !spectrum.has_resolvable_negative_curvature();
                     // CONSTRAINED-PATH REFLECTED-QP RESCUE (gam#979 n3000 grind).
                     //
                     // On the constrained path `search_delta` is the *reflected*
@@ -2684,7 +2708,26 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             // same Err downstream and shrinks the radius.
                             Err(_) => false,
                         };
-                    if constrained_alpha_would_crush {
+                    if positive_definite_constrained_qp {
+                        trial_delta = search_delta.clone();
+                        let qp_norms = joint_trust_region_block_metric_norms(
+                            &trial_delta,
+                            &ranges,
+                            &joint_trust_metric_diag,
+                        );
+                        let alpha_trust = qp_norms
+                            .iter()
+                            .zip(joint_block_trust_radii.iter())
+                            .filter(|(norm, _)| norm.is_finite() && **norm > 0.0)
+                            .map(|(norm, radius)| (radius / norm).min(1.0))
+                            .fold(1.0_f64, f64::min);
+                        if alpha_trust.is_finite() && alpha_trust < 1.0 {
+                            trial_delta.mapv_inplace(|value| value * alpha_trust);
+                            qp_norms.iter().map(|norm| norm * alpha_trust).collect()
+                        } else {
+                            qp_norms
+                        }
+                    } else if constrained_alpha_would_crush {
                         qp_feasible_bypass = true;
                         trial_delta = spectrum.trust_region_step(joint_trust_radius).delta;
                         joint_trust_region_block_metric_norms(
