@@ -1,4 +1,4 @@
-"""Generate the canonical v5 ``ManifoldSAE`` serialization fixtures (#2091).
+"""Generate the canonical v6 ``ManifoldSAE`` serialization fixtures (#2091).
 
 The fixtures pin the JSON contract owned by Rust's ``ManifoldSaePayload``. The
 representative payload exercises every optional surface: mixed atom topologies,
@@ -6,7 +6,7 @@ TopK routing, a smooth-gate threshold, output-Fisher steering state, the selecte
 ``ρ*`` fields, and every diagnostic/certificate report block.
 
 The fitted model is the Rust-owned ``ManifoldSAE`` PyO3 class. Accordingly this
-generator builds the JSON-compatible v5 payload
+generator builds the JSON-compatible v6 payload
 directly, so fixture generation needs neither a fit nor a compiled extension.
 
 The covariance fixture persists the compact per-channel factors consumed by the
@@ -47,17 +47,16 @@ def _trust_atom(seed: float) -> dict[str, Any]:
 
 
 def build_payload() -> dict[str, Any]:
-    """Build a representative canonical v5 payload.
+    """Build a representative canonical v6 payload.
 
     Shapes: N=5 rows, p=4 channels, K=3 atoms.
       atom 0: periodic, M0=5 (H=2 -> 2H+1), d0=1  (carries coords_u_arc + band)
-      atom 1: euclidean, M1=3, d1=2
+      atom 1: linear,    M1=3, d1=2
       atom 2: duchon,    M2=4, d2=2               (carries duchon centers)
     """
     N, p = 5, 4
     m = [5, 3, 4]
     d = [1, 2, 2]
-    kinds = ["periodic", "euclidean", "duchon"]
 
     decoder_blocks = [_arange(m[k], p, start=1.0 + k) for k in range(3)]
     coords = [_arange(N, d[k], start=0.1 * (k + 1), step=0.3) for k in range(3)]
@@ -82,7 +81,6 @@ def build_payload() -> dict[str, Any]:
             func_ev = None
         atoms.append(
             {
-                "basis": kinds[k],
                 "decoder_coefficients": decoder_blocks[k].tolist(),
                 "assignments": per_atom_assign[k].tolist(),
                 "coords": coords[k].tolist(),
@@ -109,7 +107,34 @@ def build_payload() -> dict[str, Any]:
         "atoms": [_trust_atom(float(k)) for k in range(3)],
     }
 
-    duchon_centers = [None, None, _arange(4, 2, step=0.5)]
+    duchon_centers = _arange(4, 2, step=0.5)
+    geometry_plans = [
+        {
+            "kind": "periodic",
+            "latent_dim": 1,
+            "resolution": {"kind": "periodic_harmonics", "order": 2},
+            "reference_metric": {"kind": "unit_circle"},
+        },
+        {
+            "kind": "linear",
+            "latent_dim": 2,
+            "resolution": {"kind": "polynomial", "degree": 1},
+            "reference_metric": {"kind": "euclidean_polynomial"},
+        },
+        {
+            "kind": "duchon",
+            "latent_dim": 2,
+            "resolution": {
+                "kind": "duchon_coordinates",
+                "centers": {
+                    "v": 1,
+                    "dim": list(duchon_centers.shape),
+                    "data": duchon_centers.ravel().tolist(),
+                },
+            },
+            "reference_metric": {"kind": "euclidean_duchon"},
+        },
+    ]
 
     # Fisher steering shard (r=2) — the field acceptance bullet 2 wants owned.
     r = 2
@@ -119,10 +144,8 @@ def build_payload() -> dict[str, Any]:
     selected_log_ard = [np.array([0.1]), np.array([0.2, -0.3]), np.array([0.4, 0.5])]
 
     return {
-        "schema": "gamfit.ManifoldSAE/v5",
+        "schema": "gamfit.ManifoldSAE/v6",
         "atoms": atoms,
-        "atom_topology": "mixed",
-        "atom_topologies": ["circle", "euclidean", "euclidean"],
         "assignment": "topk",
         "assignment_label": "topk",
         "primitive_names": ["circle_0", "line_1", "duchon_2"],
@@ -130,7 +153,7 @@ def build_payload() -> dict[str, Any]:
         "assignments": assignments.tolist(),
         "coords": [c.tolist() for c in coords],
         "decoder_blocks": [b.tolist() for b in decoder_blocks],
-        "basis_specs": ["periodic:H2", "euclidean:3", "duchon:4"],
+        "geometry_plans": geometry_plans,
         "penalized_loss_score": -37.5,
         "penalized_quasi_laplace_criterion": 41.25,
         "reconstruction_r2": 0.8123,
@@ -138,13 +161,6 @@ def build_payload() -> dict[str, Any]:
         "tier0_scale": _arange(p, start=1.0, step=0.2).tolist(),
         "logits": logits.tolist(),
         "diagnostics": diagnostics,
-        "basis_kinds": list(kinds),
-        "atom_dims": list(d),
-        "basis_sizes": list(m),
-        "n_harmonics": [2, 0, 0],
-        "duchon_centers": [
-            None if center is None else center.tolist() for center in duchon_centers
-        ],
         "crosscoder": None,
         "oos_projection_top1": True,
         "alpha": 0.75,

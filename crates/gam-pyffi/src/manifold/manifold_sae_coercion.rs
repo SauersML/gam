@@ -13,15 +13,14 @@ use ndarray::{Array2, Array3, ArrayView2};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use serde_json::Value;
+use gam::terms::sae::manifold::{sae_atom_basis_kind_name, SaeAtomGeometryPlan};
 
 // The strict token schema (basis/topology vocabulary, assignment tables,
 // harmonic validation, chart periods) lives in the library
 // (`gam_sae::atom_schema`) so the CLI, Rust users, and this binding share one
 // vocabulary.
 pub(crate) use gam::terms::sae::atom_schema::canonical_assignment_kind;
-use gam::terms::sae::atom_schema::{
-    flat_block_assignment, topologies_for_bases, topology_for_bases, validated_n_harmonics,
-};
+use gam::terms::sae::atom_schema::flat_block_assignment;
 
 /// Column mean `x.mean(axis=0)` -> `(P,)` — the training-mean centering vector
 /// used by the native fitted-artifact builder. `n == 0` yields zeros.
@@ -149,34 +148,6 @@ pub(crate) fn sae_flat_block_assignment(gating: &str) -> PyResult<String> {
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
-/// Restore the `linear_block` label a flat-block fit reports as the generic
-/// `linear`: for each atom the caller
-/// DECLARED as `linear_block` AND that the fit left at topology
-/// `linear` (K unchanged), relabel its `basis_kinds` entry and topology to
-/// `linear_block`. `basis_specs` (the fitted kinds) is intentionally not patched;
-/// only the public `basis_kinds` / `atom_topologies` labels change. No-op
-/// when `bases` is empty, length-mismatched (an evidence-gated K change), or
-/// declares no block; positions the fit RETYPED keep their discovered topology.
-pub(crate) fn preserve_linear_block_labels(
-    basis_kinds: &mut [String],
-    atom_topologies: &mut [String],
-    bases: &[String],
-) {
-    if bases.is_empty() || bases.len() != atom_topologies.len() {
-        return;
-    }
-    let want: Vec<bool> = bases.iter().map(|b| b == "linear_block").collect();
-    if !want.iter().any(|&w| w) {
-        return;
-    }
-    for i in 0..atom_topologies.len() {
-        if want[i] && atom_topologies[i] == "linear" {
-            atom_topologies[i] = "linear_block".to_string();
-            basis_kinds[i] = "linear_block".to_string();
-        }
-    }
-}
-
 /// Stable ascending reorder of a periodic atom's shape band by its single
 /// coordinate column:
 ///
@@ -277,9 +248,6 @@ pub(crate) struct FitConfig {
     pub(crate) fisher_provenance: Option<String>,
     /// Required operator status for the retained factor stack (#2249).
     pub(crate) fisher_factor_kind: Option<String>,
-    /// The caller's declared per-atom bases, used by
-    /// [`preserve_linear_block_labels`]. `None`/empty leaves the fitted labels.
-    pub(crate) declared_bases: Option<Vec<String>>,
 }
 
 // --- typed serde_json::Value accessors for the raw solver payload -------------
@@ -395,25 +363,25 @@ fn shape_band_for_kind(
 
 /// Build a [`ManifoldSaePayload`] (the flat `to_dict` schema) directly from the
 /// native raw fit payload (as a `serde_json::Value`), the
-/// training mean, and [`FitConfig`]. Fisher retention and `linear_block`
-/// relabeling happen in this same builder, with no parallel Python schema.
+/// training mean, and [`FitConfig`]. The fitted geometry plans are parsed back
+/// through their validating constructor before entering the persisted schema.
 pub(crate) fn build_manifold_sae_payload(
     raw: &Value,
     training_mean: Vec<f64>,
     cfg: &FitConfig,
 ) -> Result<ManifoldSaePayload, String> {
-    let plans = vget(raw, "atom_plans")?
-        .as_array()
-        .ok_or("atom_plans is not a list")?;
+    let geometry_plans: Vec<SaeAtomGeometryPlan> =
+        serde_json::from_value(vget(raw, "geometry_plans")?.clone())
+            .map_err(|error| format!("invalid geometry_plans payload: {error}"))?;
     let atoms = vget(raw, "atoms")?
         .as_array()
         .ok_or("atoms is not a list")?;
     let k = atoms.len();
     // #977 variable-K contract (mirror from_payload's ingest asserts).
-    if plans.len() != k {
+    if geometry_plans.len() != k {
         return Err(format!(
-            "variable-K boundary: {k} atoms but {} atom_plans",
-            plans.len()
+            "variable-K boundary: {k} atoms but {} geometry_plans",
+            geometry_plans.len()
         ));
     }
     let chosen_k = vi64(raw, "chosen_k")?;
@@ -433,43 +401,42 @@ pub(crate) fn build_manifold_sae_payload(
         }
     }
 
-    let kinds: Vec<String> = plans
+    let kinds: Vec<String> = geometry_plans
         .iter()
-        .map(|p| vstr(p, "kind"))
-        .collect::<Result<_, _>>()?;
-    let dims: Vec<i64> = plans
-        .iter()
-        .map(|p| vi64(p, "latent_dim"))
-        .collect::<Result<_, _>>()?;
-    let sizes: Vec<i64> = plans
-        .iter()
-        .map(|p| vi64(p, "basis_size"))
-        .collect::<Result<_, _>>()?;
-    let raw_nharm: Vec<i64> = plans
-        .iter()
-        .map(|p| vi64(p, "n_harmonics"))
-        .collect::<Result<_, _>>()?;
+        .map(|plan| sae_atom_basis_kind_name(plan.kind()))
+        .collect();
     let decoder_blocks: Vec<Vec<Vec<f64>>> = atoms
         .iter()
         .map(|a| v_arr2(vget(a, "decoder_B")?))
         .collect::<Result<_, _>>()?;
-    let widths: Vec<i64> = decoder_blocks.iter().map(|b| b.len() as i64).collect();
-    let n_harmonics = validated_n_harmonics(&kinds, &raw_nharm, &widths)?;
+    for (index, (plan, decoder)) in geometry_plans
+        .iter()
+        .zip(&decoder_blocks)
+        .enumerate()
+    {
+        let expected = plan.basis_size()?;
+        if decoder.len() != expected {
+            return Err(format!(
+                "decoder_blocks[{index}] has {} rows, but geometry_plans[{index}] derives width {expected}",
+                decoder.len()
+            ));
+        }
+    }
     let coords: Vec<Vec<Vec<f64>>> = atoms
         .iter()
         .map(|a| v_arr2(vget(a, "on_atom_coords_t")?))
-        .collect::<Result<_, _>>()?;
-    let duchon_centers: Vec<Option<Vec<Vec<f64>>>> = plans
-        .iter()
-        .map(|p| match vopt(p, "duchon_centers") {
-            None => Ok(None),
-            Some(v) => v_arr2(v).map(Some),
-        })
         .collect::<Result<_, _>>()?;
     let score = penalized_loss_score(raw)?;
 
     let mut atom_payloads = Vec::with_capacity(k);
     for (idx, a) in atoms.iter().enumerate() {
+        let reported_kind = vstr(a, "basis_kind")?;
+        if reported_kind != kinds[idx] {
+            return Err(format!(
+                "atoms[{idx}].basis_kind {reported_kind:?} disagrees with geometry_plans[{idx}] kind {:?}",
+                kinds[idx]
+            ));
+        }
         let decoder_coefficients = decoder_blocks[idx].clone();
         // Per-atom gate column = column idx of the top-level assignments_z.
         let assignments_col: Vec<f64> = assignments.iter().map(|row| row[idx]).collect();
@@ -492,7 +459,6 @@ pub(crate) fn build_manifold_sae_payload(
         let (sb_coords, sb_mean, sb_sd) =
             shape_band_for_kind(&kinds[idx], sb_coords, sb_mean, sb_sd)?;
         atom_payloads.push(AtomPayload {
-            basis: vstr(a, "basis_kind")?,
             decoder_coefficients,
             assignments: assignments_col,
             coords: coords[idx].clone(),
@@ -511,15 +477,6 @@ pub(crate) fn build_manifold_sae_payload(
     primitive_names.push("rust_module.sae_manifold_fit_model".to_string());
     primitive_names.extend(cfg.penalties.iter().cloned());
 
-    // `basis_specs` keeps the fitted kinds; public labels may be restored to
-    // `linear_block` for a flat-block fit.
-    let mut basis_kinds = kinds.clone();
-    let mut atom_topologies = topologies_for_bases(&kinds)?;
-    if let Some(bases) = cfg.declared_bases.as_deref() {
-        preserve_linear_block_labels(&mut basis_kinds, &mut atom_topologies, bases);
-    }
-    let atom_topology = topology_for_bases(&basis_kinds)?
-        .ok_or_else(|| "converged SAE payload contains no atoms".to_string())?;
     let metric_provenance = vstr(raw, "metric_provenance")?;
     let tier0_scale = vopt(raw, "tier0_scale").map(v_arr1).transpose()?;
     let fisher_mass_residual = vopt(raw, "fisher_mass_residual").map(v_arr1).transpose()?;
@@ -548,8 +505,6 @@ pub(crate) fn build_manifold_sae_payload(
 
     Ok(ManifoldSaePayload {
         schema: SCHEMA_TAG.to_string(),
-        atom_topology,
-        atom_topologies,
         assignment: cfg.assignment.clone(),
         assignment_label: cfg.assignment_label.clone(),
         alpha: cfg.alpha,
@@ -568,12 +523,7 @@ pub(crate) fn build_manifold_sae_payload(
         penalized_quasi_laplace_criterion: vf64(raw, "penalized_quasi_laplace_criterion")?,
         reconstruction_r2: vf64(raw, "reconstruction_r2")?,
         primitive_names,
-        // basis_specs = fitted kinds (unpatched); basis_kinds = post-relabel.
-        basis_specs: kinds,
-        basis_kinds,
-        atom_dims: dims,
-        basis_sizes: sizes,
-        n_harmonics,
+        geometry_plans,
         training_mean,
         tier0_scale,
         fitted: v_arr2(vget(raw, "fitted")?)?,
@@ -581,7 +531,6 @@ pub(crate) fn build_manifold_sae_payload(
         low_level_logits: logits,
         coords,
         decoder_blocks,
-        duchon_centers,
         crosscoder,
         atoms: atom_payloads,
         diagnostics: vget(raw, "diagnostics")?.clone(),
@@ -616,7 +565,7 @@ pub(crate) fn build_manifold_sae_payload(
         selected_log_ard,
         structured_residual_diagnostics,
         // #2235 — termination ledger carried straight from the raw fit payload
-        // into the persisted v5 artifact.
+        // into the persisted v6 artifact.
         termination: report("termination"),
     })
 }
@@ -787,46 +736,6 @@ mod manifold_sae_coercion_tests {
         assert!(
             periodic_shape_band_reorder(Some(coords), Some(array![[1.0], [2.0]]), None).is_err()
         );
-    }
-
-    #[test]
-    fn preserve_linear_block_relabels_declared_linear() {
-        let mut basis_kinds = vec!["linear".to_string(), "periodic".to_string()];
-        let mut topos = vec!["linear".to_string(), "circle".to_string()];
-        let bases = vec!["linear_block".to_string(), "periodic".to_string()];
-        preserve_linear_block_labels(&mut basis_kinds, &mut topos, &bases);
-        // Declared-block + fitted-linear atom relabels; the periodic atom is left.
-        assert_eq!(
-            basis_kinds,
-            vec!["linear_block".to_string(), "periodic".to_string()]
-        );
-        assert_eq!(
-            topos,
-            vec!["linear_block".to_string(), "circle".to_string()]
-        );
-    }
-
-    #[test]
-    fn preserve_linear_block_noops() {
-        // No block declared -> unchanged.
-        let mut bk = vec!["linear".to_string()];
-        let mut tp = vec!["linear".to_string()];
-        preserve_linear_block_labels(&mut bk, &mut tp, &["linear".to_string()]);
-        assert_eq!(bk, vec!["linear".to_string()]);
-        // Declared block but the fit RETYPED to a non-linear topology -> keep it.
-        let mut bk2 = vec!["periodic".to_string()];
-        let mut tp2 = vec!["circle".to_string()];
-        preserve_linear_block_labels(&mut bk2, &mut tp2, &["linear_block".to_string()]);
-        assert_eq!(bk2, vec!["periodic".to_string()]);
-        // Length mismatch (evidence-gated K change) -> unchanged.
-        let mut bk3 = vec!["linear".to_string()];
-        let mut tp3 = vec!["linear".to_string()];
-        preserve_linear_block_labels(
-            &mut bk3,
-            &mut tp3,
-            &["linear_block".to_string(), "linear_block".to_string()],
-        );
-        assert_eq!(bk3, vec!["linear".to_string()]);
     }
 
     #[test]

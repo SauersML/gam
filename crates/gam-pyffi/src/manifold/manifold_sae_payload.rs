@@ -1,9 +1,10 @@
 //! Rust-owned serde schema for the fitted `ManifoldSAE` model artifact (#2091).
 //!
 //! The fitted SAE-manifold model is serialized to a JSON payload tagged
-//! `"gamfit.ManifoldSAE/v5"` schema. Version 5 is deliberately breaking: it
-//! persists the Tier-0 column scale required to replay the exact standardized
-//! optimization frame instead of retaining only physical decoder blocks.
+//! `"gamfit.ManifoldSAE/v6"` schema. Version 6 is deliberately breaking: it
+//! persists each atom's constructor-validated geometry plan as the sole source
+//! of topology, chart dimension, analytic resolution, basis width, center set,
+//! and reference metric.
 //! Historically the schema lived only in the Python dataclass
 //! `gamfit/_sae_manifold.py::ManifoldSAE`
 //! (`to_dict` / `from_dict`), so a field-name / default / None-handling change
@@ -29,9 +30,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use gam::terms::sae::manifold::SaeAtomGeometryPlan;
+
 /// The on-disk schema tag. `from_json` rejects any other value, matching the
 /// Python `from_dict` guard.
-pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v5";
+pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v6";
 
 /// Per-atom payload (`atoms[k]`), one per `SaeManifoldAtomFit`.
 ///
@@ -39,7 +42,6 @@ pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v5";
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AtomPayload {
-    pub(crate) basis: String,
     /// Physical decoder `B_k`, including the atom's fitted radial scale. There
     /// is no separate hidden amplitude coordinate; persisted predictions read
     /// this decoder directly.
@@ -84,8 +86,6 @@ pub(crate) struct ManifoldSaePayload {
     pub(crate) schema: String,
 
     // --- A. scalar config -------------------------------------------------
-    pub(crate) atom_topology: String,
-    pub(crate) atom_topologies: Vec<String>,
     pub(crate) assignment: String,
     pub(crate) assignment_label: String,
     pub(crate) alpha: f64,
@@ -107,13 +107,9 @@ pub(crate) struct ManifoldSaePayload {
     pub(crate) penalized_quasi_laplace_criterion: f64,
     pub(crate) reconstruction_r2: f64,
 
-    // --- B. string / int lists --------------------------------------------
+    // --- B. immutable atom geometry ---------------------------------------
     pub(crate) primitive_names: Vec<String>,
-    pub(crate) basis_specs: Vec<String>,
-    pub(crate) basis_kinds: Vec<String>,
-    pub(crate) atom_dims: Vec<i64>,
-    pub(crate) basis_sizes: Vec<i64>,
-    pub(crate) n_harmonics: Vec<i64>,
+    pub(crate) geometry_plans: Vec<SaeAtomGeometryPlan>,
 
     // --- C. dense numeric -------------------------------------------------
     pub(crate) training_mean: Vec<f64>,
@@ -126,7 +122,6 @@ pub(crate) struct ManifoldSaePayload {
     pub(crate) low_level_logits: Vec<Vec<f64>>,
     pub(crate) coords: Vec<Vec<Vec<f64>>>,
     pub(crate) decoder_blocks: Vec<Vec<Vec<f64>>>,
-    pub(crate) duchon_centers: Vec<Option<Vec<Vec<f64>>>>,
 
     // --- manifold crosscoder layout (#2231 Inc D) ------------------------
     /// Required key in v5; null for a plain SAE.
@@ -163,7 +158,7 @@ pub(crate) struct ManifoldSaePayload {
     pub(crate) selected_log_lambda_smooth: Option<Vec<f64>>,
     pub(crate) selected_log_ard: Option<Vec<Vec<f64>>>,
 
-    // --- runtime diagnostics persisted by v5 -----------------------------
+    // --- runtime diagnostics persisted by v6 -----------------------------
     pub(crate) structured_residual_diagnostics: Vec<Value>,
     /// #2235 — the outer-ρ termination verdict/ledger the fit emitted
     /// (`{"verdict", "evals", "evals_since_improvement", "wall_seconds"}`). Like
@@ -174,8 +169,6 @@ pub(crate) struct ManifoldSaePayload {
 impl ManifoldSaePayload {
     const REQUIRED_FIELDS: &'static [&'static str] = &[
         "schema",
-        "atom_topology",
-        "atom_topologies",
         "assignment",
         "assignment_label",
         "alpha",
@@ -194,11 +187,7 @@ impl ManifoldSaePayload {
         "penalized_quasi_laplace_criterion",
         "reconstruction_r2",
         "primitive_names",
-        "basis_specs",
-        "basis_kinds",
-        "atom_dims",
-        "basis_sizes",
-        "n_harmonics",
+        "geometry_plans",
         "training_mean",
         "tier0_scale",
         "fitted",
@@ -206,7 +195,6 @@ impl ManifoldSaePayload {
         "logits",
         "coords",
         "decoder_blocks",
-        "duchon_centers",
         "crosscoder",
         "atoms",
         "diagnostics",
@@ -235,7 +223,6 @@ impl ManifoldSaePayload {
     ];
 
     const REQUIRED_ATOM_FIELDS: &'static [&'static str] = &[
-        "basis",
         "decoder_coefficients",
         "assignments",
         "coords",
@@ -249,7 +236,7 @@ impl ManifoldSaePayload {
         "functional_evidence",
     ];
 
-    /// Parse the exact v5 artifact schema. Missing optional-valued fields are
+    /// Parse the exact v6 artifact schema. Missing optional-valued fields are
     /// still errors: `null` is the explicit absence representation.
     pub(crate) fn from_json(json: &str) -> Result<Self, String> {
         let value: Value =
@@ -309,67 +296,85 @@ impl ManifoldSaePayload {
                     .to_string(),
             );
         }
-        let k = payload.basis_kinds.len();
-        for (index, basis) in payload.basis_kinds.iter().enumerate() {
-            gam::terms::sae::atom_schema::validate_fitted_basis_kind(basis)
-                .map_err(|error| format!("ManifoldSAE.from_json: basis_kinds[{index}]: {error}"))?;
+        let k = payload.geometry_plans.len();
+        if k == 0 {
+            return Err("ManifoldSAE.from_json: geometry_plans must be non-empty".to_string());
         }
         if payload.atoms.len() != k
-            || payload.atom_topologies.len() != k
-            || payload.atom_dims.len() != k
-            || payload.basis_sizes.len() != k
-            || payload.n_harmonics.len() != k
             || payload.coords.len() != k
             || payload.decoder_blocks.len() != k
-            || payload.duchon_centers.len() != k
         {
             return Err(format!(
-                "ManifoldSAE.from_json: per-atom field lengths must all equal K={k}"
+                "ManifoldSAE.from_json: atoms, coords, and decoder_blocks must all have geometry-plan count K={k}"
             ));
         }
-        for (index, atom) in payload.atoms.iter().enumerate() {
-            if atom.basis != payload.basis_kinds[index] {
+        let n_obs = payload.assignments.len();
+        let p_out = payload.training_mean.len();
+        if n_obs == 0 || p_out == 0 {
+            return Err(
+                "ManifoldSAE.from_json: persisted training frame must be non-empty".to_string(),
+            );
+        }
+        if !payload.training_mean.iter().all(|value| value.is_finite()) {
+            return Err("ManifoldSAE.from_json: training_mean must be finite".to_string());
+        }
+        for (field, rows, width) in [
+            ("assignments", &payload.assignments, k),
+            ("logits", &payload.low_level_logits, k),
+            ("fitted", &payload.fitted, p_out),
+        ] {
+            if rows.len() != n_obs
+                || rows
+                    .iter()
+                    .any(|row| row.len() != width || !row.iter().all(|value| value.is_finite()))
+            {
                 return Err(format!(
-                    "ManifoldSAE.from_json: atoms[{index}].basis {:?} does not match basis_kinds[{index}] {:?}",
-                    atom.basis, payload.basis_kinds[index]
+                    "ManifoldSAE.from_json: {field} must be a finite ({n_obs}, {width}) matrix"
                 ));
             }
         }
-        let expected_topologies =
-            gam::terms::sae::atom_schema::topologies_for_bases(&payload.basis_kinds)
-                .map_err(|error| format!("ManifoldSAE.from_json: {error}"))?;
-        if payload.atom_topologies != expected_topologies {
-            return Err(format!(
-                "ManifoldSAE.from_json: atom_topologies {:?} do not match basis_kinds {:?}",
-                payload.atom_topologies, payload.basis_kinds
-            ));
-        }
-        let expected_topology =
-            gam::terms::sae::atom_schema::topology_for_bases(&payload.basis_kinds)
-                .map_err(|error| format!("ManifoldSAE.from_json: {error}"))?
-                .ok_or_else(|| "ManifoldSAE.from_json: fitted artifact has no atoms".to_string())?;
-        if payload.atom_topology != expected_topology {
-            return Err(format!(
-                "ManifoldSAE.from_json: atom_topology {:?} does not match resolved topology {:?}",
-                payload.atom_topology, expected_topology
-            ));
-        }
-        let decoder_widths = payload
-            .decoder_blocks
-            .iter()
-            .enumerate()
-            .map(|(index, block)| {
-                i64::try_from(block.len()).map_err(|_| {
-                    format!("ManifoldSAE.from_json: decoder_blocks[{index}] width exceeds i64")
+        for (index, plan) in payload.geometry_plans.iter().enumerate() {
+            let latent_dim = plan.latent_dim();
+            let basis_size = plan
+                .basis_size()
+                .map_err(|error| format!("ManifoldSAE.from_json: geometry_plans[{index}]: {error}"))?;
+            let coords = &payload.coords[index];
+            if coords.len() != n_obs
+                || coords.iter().any(|row| {
+                    row.len() != latent_dim || !row.iter().all(|value| value.is_finite())
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        gam::terms::sae::atom_schema::validated_n_harmonics(
-            &payload.basis_kinds,
-            &payload.n_harmonics,
-            &decoder_widths,
-        )
-        .map_err(|error| format!("ManifoldSAE.from_json: {error}"))?;
+            {
+                return Err(format!(
+                    "ManifoldSAE.from_json: coords[{index}] must be a finite ({n_obs}, {latent_dim}) matrix"
+                ));
+            }
+            let decoder = &payload.decoder_blocks[index];
+            if decoder.len() != basis_size
+                || decoder
+                    .iter()
+                    .any(|row| row.len() != p_out || !row.iter().all(|value| value.is_finite()))
+            {
+                return Err(format!(
+                    "ManifoldSAE.from_json: decoder_blocks[{index}] must be a finite ({basis_size}, {p_out}) matrix derived from geometry_plans[{index}]"
+                ));
+            }
+            let atom = &payload.atoms[index];
+            if atom.assignments.len() != n_obs
+                || !atom.assignments.iter().all(|value| value.is_finite())
+                || atom.coords.len() != n_obs
+                || atom.coords.iter().any(|row| {
+                    row.len() != latent_dim || !row.iter().all(|value| value.is_finite())
+                })
+                || atom.decoder_coefficients.len() != basis_size
+                || atom.decoder_coefficients.iter().any(|row| {
+                    row.len() != p_out || !row.iter().all(|value| value.is_finite())
+                })
+            {
+                return Err(format!(
+                    "ManifoldSAE.from_json: atoms[{index}] numeric shapes must agree with its ({n_obs}, {latent_dim}, {basis_size}, {p_out}) geometry plan"
+                ));
+            }
+        }
         Ok(payload)
     }
 
@@ -445,7 +450,7 @@ mod manifold_sae_payload_serde_tests {
     }
 
     #[test]
-    fn crosscoder_layout_and_reports_round_trip_in_v5() {
+    fn crosscoder_layout_and_reports_round_trip_in_v6() {
         let mut payload = load_value("golden_full.json");
         payload.as_object_mut().unwrap().insert(
             "crosscoder".to_string(),
@@ -492,12 +497,12 @@ mod manifold_sae_payload_serde_tests {
     }
 
     #[test]
-    fn removed_basis_and_assignment_aliases_are_rejected() {
-        let mut basis_alias = load_value("golden_full.json");
-        basis_alias["basis_kinds"][0] = Value::String("circle".to_string());
-        let error = roundtrip_json(&serde_json::to_string(&basis_alias).unwrap()).unwrap_err();
+    fn invalid_geometry_tuple_and_assignment_alias_are_rejected() {
+        let mut invalid_geometry = load_value("golden_full.json");
+        invalid_geometry["geometry_plans"][0]["latent_dim"] = Value::from(2);
+        let error = roundtrip_json(&serde_json::to_string(&invalid_geometry).unwrap()).unwrap_err();
         assert!(
-            error.contains("basis_kinds[0]") && error.contains("not canonical"),
+            error.contains("invalid atom geometry tuple"),
             "{error}"
         );
 

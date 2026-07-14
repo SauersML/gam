@@ -1664,9 +1664,10 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: fit.deviance,
         log_likelihood: Some(fit.log_likelihood),
-        // Observation count comes from the rebuilt training design; it does
-        // not depend on whether the terminal solver exposed diagonal IRLS rows.
-        n_obs: Some(design.design.nrows()),
+        // Report an observation count only when the fitted result retained the
+        // exact working response. A summary must not manufacture N from an
+        // unrelated representative design.
+        n_obs: fit.working_response().map(|response| response.len()),
         reml_score,
         raw_reml_score,
         null_space_logdet: fit.artifacts.null_space_logdet,
@@ -6614,13 +6615,14 @@ fn manifold_sae_hybrid_linear_images(
 #[pyclass(module = "gamfit._rust", name = "AtomCore")]
 pub(crate) struct AtomCore {
     inner: crate::manifold::manifold_sae_payload::AtomPayload,
+    basis: String,
 }
 
 #[pymethods]
 impl AtomCore {
     #[getter]
     fn basis(&self) -> String {
-        self.inner.basis.clone()
+        self.basis.clone()
     }
     #[getter]
     fn decoder_coefficients<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
@@ -6717,23 +6719,25 @@ impl ManifoldSaeCore {
         })
     }
 
-    /// Translate the artifact's strict non-negative integer harmonic field into
-    /// the optional wire representation consumed by the common array marshaller.
-    /// Topology interpretation belongs exclusively to
-    /// `gam_sae::manifold::persisted_oos_atom_specs`.
-    fn persisted_harmonic_orders(&self) -> PyResult<Vec<Option<usize>>> {
+    fn basis_kind_names(&self) -> Vec<String> {
         self.inner
-            .n_harmonics
+            .geometry_plans
             .iter()
-            .enumerate()
-            .map(|(atom, &order)| {
-                usize::try_from(order).map(Some).map_err(|_| {
-                    py_value_error(format!(
-                        "ManifoldSAE: n_harmonics[{atom}] must be non-negative; got {order}"
-                    ))
-                })
-            })
+            .map(|plan| sae_atom_basis_kind_name(plan.kind()))
             .collect()
+    }
+
+    fn atom_topology_names(&self) -> PyResult<Vec<String>> {
+        gam::terms::sae::atom_schema::topologies_for_bases(&self.basis_kind_names())
+            .map_err(py_value_error)
+    }
+
+    fn atom_topology_name(&self) -> PyResult<String> {
+        gam::terms::sae::atom_schema::topology_for_bases(&self.basis_kind_names())
+            .map_err(py_value_error)?
+            .ok_or_else(|| {
+                py_value_error("ManifoldSAE geometry_plans must be non-empty".to_string())
+            })
     }
 
     fn description_length_report(
@@ -6807,29 +6811,13 @@ impl ManifoldSaeCore {
             .iter()
             .map(|b| manifold_sae_owned2(b))
             .collect::<PyResult<_>>()?;
-        let duchon_owned: Vec<Option<Array2<f64>>> = inner
-            .duchon_centers
-            .iter()
-            .map(|c| c.as_ref().map(|m| manifold_sae_owned2(m)).transpose())
-            .collect::<PyResult<_>>()?;
-        let atom_dim: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
-        let basis_sizes: Vec<usize> = inner
-            .basis_sizes
-            .iter()
-            .map(|&s| s.max(0) as usize)
-            .collect();
-        let n_harm = self.persisted_harmonic_orders()?;
         let hybrid = manifold_sae_hybrid_linear_images(&inner.hybrid_split)?;
         let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
             decoder_owned.iter().map(|a| a.view()).collect();
         let request = sae_oos_request_from_arrays(
             x_new.as_array(),
-            inner.basis_kinds.clone(),
-            atom_dim,
+            &inner.geometry_plans,
             &decoder_views,
-            &duchon_owned,
-            n_harm,
-            basis_sizes,
             inner.alpha,
             inner.tau,
             inner.assignment.clone(),
@@ -6890,7 +6878,7 @@ impl ManifoldSaeCore {
         Self::from_json(py, &payload_json)
     }
 
-    /// Re-serialize the complete v5 artifact as a Python dict.
+    /// Re-serialize the complete v6 artifact as a Python dict.
     fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
         let json_str = self.inner.to_json().map_err(py_value_error)?;
         let value: serde_json::Value =
@@ -6909,18 +6897,18 @@ impl ManifoldSaeCore {
             .map_err(|error| py_value_error(format!("ManifoldSAE.save: {error}")))
     }
 
-    fn __repr__(&self) -> String {
+    fn __repr__(&self) -> PyResult<String> {
         let n_rows = self.inner.fitted.len();
         let p_out = self.inner.fitted.first().map_or(0, Vec::len);
-        format!(
+        Ok(format!(
             "ManifoldSAE(K={}, n={}, p={}, topology={:?}, assignment={:?}, r2={:.3})",
             self.inner.atoms.len(),
             n_rows,
             p_out,
-            self.inner.atom_topology,
+            self.atom_topology_name()?,
             self.inner.assignment,
             self.inner.reconstruction_r2,
-        )
+        ))
     }
 
     /// Fit-level code length from the native manifold-SAE description-length
@@ -6950,12 +6938,18 @@ impl ManifoldSaeCore {
         let (avg_active_atoms, mean_assignment_mass) =
             manifold_assignment_summary_from_array(assignments.view(), 1.0e-8)
                 .map_err(py_value_error)?;
-        let common_dim = self.inner.atom_dims.first().copied().filter(|first| {
-            self.inner
-                .atom_dims
-                .iter()
-                .all(|dimension| dimension == first)
-        });
+        let atom_dims = self
+            .inner
+            .geometry_plans
+            .iter()
+            .map(SaeAtomGeometryPlan::latent_dim)
+            .collect::<Vec<_>>();
+        let common_dim = atom_dims
+            .first()
+            .copied()
+            .filter(|first| atom_dims.iter().all(|dimension| dimension == first));
+        let atom_topologies = self.atom_topology_names()?;
+        let atom_topology = self.atom_topology_name()?;
 
         let active_dims = self
             .inner
@@ -6981,9 +6975,9 @@ impl ManifoldSaeCore {
         out.set_item("description_length", description_py)?;
         out.set_item("K", self.inner.atoms.len())?;
         out.set_item("d_atom", common_dim)?;
-        out.set_item("atom_dims", self.inner.atom_dims.clone())?;
-        out.set_item("atom_topology", self.inner.atom_topology.clone())?;
-        out.set_item("atom_topologies", self.inner.atom_topologies.clone())?;
+        out.set_item("atom_dims", atom_dims)?;
+        out.set_item("atom_topology", atom_topology)?;
+        out.set_item("atom_topologies", atom_topologies)?;
         out.set_item("assignment", self.inner.assignment.clone())?;
         out.set_item("alpha", self.inner.alpha)?;
         out.set_item("learnable_alpha", self.inner.learnable_alpha)?;
@@ -7016,12 +7010,6 @@ impl ManifoldSaeCore {
     /// pyfunction uses, so the output is bitwise-identical to the dataclass path.
     fn reconstruct_training<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let inner = &self.inner;
-        let basis_kinds: Vec<SaeAtomBasisKind> = inner
-            .basis_kinds
-            .iter()
-            .map(|name| sae_atom_basis_kind_from_str(name))
-            .collect();
-        let atom_dims: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
         let decoder_owned: Vec<Array2<f64>> = inner
             .decoder_blocks
             .iter()
@@ -7045,8 +7033,7 @@ impl ManifoldSaeCore {
         let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
             coord_owned.iter().map(|a| a.view()).collect();
         let out = gam::terms::sae::manifold::reconstruct_persisted_atom_set(
-            &basis_kinds,
-            &atom_dims,
+            &inner.geometry_plans,
             &decoder_views,
             &coord_views,
             assignments.view(),
@@ -7072,12 +7059,6 @@ impl ManifoldSaeCore {
         codes: PyReadonlyArray2<'py, f64>,
     ) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let inner = &self.inner;
-        let basis_kinds: Vec<SaeAtomBasisKind> = inner
-            .basis_kinds
-            .iter()
-            .map(|name| sae_atom_basis_kind_from_str(name))
-            .collect();
-        let atom_dims: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
         let decoder_owned: Vec<Array2<f64>> = inner
             .decoder_blocks
             .iter()
@@ -7098,8 +7079,7 @@ impl ManifoldSaeCore {
         let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
             coord_owned.iter().map(|a| a.view()).collect();
         let out = gam::terms::sae::manifold::reconstruct_persisted_atom_set(
-            &basis_kinds,
-            &atom_dims,
+            &inner.geometry_plans,
             &decoder_views,
             &coord_views,
             codes.as_array(),
@@ -7136,8 +7116,6 @@ impl ManifoldSaeCore {
         };
         let mut dictionary = Array2::<f64>::zeros((k_atoms, p_out));
         for k in 0..k_atoms {
-            let kind = sae_atom_basis_kind_from_str(&inner.basis_kinds[k]);
-            let atom_dim = inner.atom_dims[k].max(0) as usize;
             let decoder = manifold_sae_owned2(&inner.decoder_blocks[k])?;
             let coords = manifold_sae_owned2(&inner.coords[k])?;
             let n_rows = coords.nrows();
@@ -7150,8 +7128,7 @@ impl ManifoldSaeCore {
             let decoder_view = decoder.view();
             let coords_view = coords.view();
             let decoded = gam::terms::sae::manifold::reconstruct_persisted_atom_set(
-                std::slice::from_ref(&kind),
-                std::slice::from_ref(&atom_dim),
+                std::slice::from_ref(&inner.geometry_plans[k]),
                 std::slice::from_ref(&decoder_view),
                 std::slice::from_ref(&coords_view),
                 assignments.view(),
@@ -7173,8 +7150,8 @@ impl ManifoldSaeCore {
     /// `steer_delta_from_arrays` rebuild the `sae_steer_delta` pyfunction uses, so
     /// the Fisher shard is NOT re-marshalled across the FFI boundary per call
     /// (acceptance bullet 2) and the returned plan is bitwise-identical to the
-    /// dataclass path. Mirrors the Python steer's exact `n_harmonics` gate
-    /// (`periodic`/`torus` only) so the rebuilt basis matches the trained design.
+    /// dataclass path. The persisted geometry plans rebuild the exact fitted
+    /// evaluator and reference metric for every atom.
     #[pyo3(signature = (atom_k, metric_row, amplitude, t_from, t_to))]
     fn steer<'py>(
         &self,
@@ -7196,19 +7173,7 @@ impl ManifoldSaeCore {
             .iter()
             .map(|c| manifold_sae_owned2(c))
             .collect::<PyResult<_>>()?;
-        let duchon_owned: Vec<Option<Array2<f64>>> = inner
-            .duchon_centers
-            .iter()
-            .map(|c| c.as_ref().map(|m| manifold_sae_owned2(m)).transpose())
-            .collect::<PyResult<_>>()?;
         let logits_owned = manifold_sae_owned2(&inner.low_level_logits)?;
-        let atom_dim: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
-        let basis_sizes: Vec<usize> = inner
-            .basis_sizes
-            .iter()
-            .map(|&s| s.max(0) as usize)
-            .collect();
-        let n_harm = self.persisted_harmonic_orders()?;
         let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
             decoder_owned.iter().map(|a| a.view()).collect();
         let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
@@ -7229,12 +7194,8 @@ impl ManifoldSaeCore {
             amplitude,
             t_from.as_array(),
             t_to.as_array(),
-            &inner.basis_kinds,
-            &atom_dim,
+            &inner.geometry_plans,
             &decoder_views,
-            &duchon_owned,
-            &n_harm,
-            &basis_sizes,
             &coord_views,
             logits_owned.view(),
             inner.assignment.as_str(),
@@ -7290,19 +7251,7 @@ impl ManifoldSaeCore {
             .iter()
             .map(|c| manifold_sae_owned2(c))
             .collect::<PyResult<_>>()?;
-        let duchon_owned: Vec<Option<Array2<f64>>> = inner
-            .duchon_centers
-            .iter()
-            .map(|c| c.as_ref().map(|m| manifold_sae_owned2(m)).transpose())
-            .collect::<PyResult<_>>()?;
         let logits_owned = manifold_sae_owned2(&inner.low_level_logits)?;
-        let atom_dim: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
-        let basis_sizes: Vec<usize> = inner
-            .basis_sizes
-            .iter()
-            .map(|&s| s.max(0) as usize)
-            .collect();
-        let n_harm = self.persisted_harmonic_orders()?;
         let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
             decoder_owned.iter().map(|a| a.view()).collect();
         let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
@@ -7398,12 +7347,8 @@ impl ManifoldSaeCore {
                 config,
                 t_from: t_from.view(),
                 t_to: t_to.view(),
-                atom_basis: &inner.basis_kinds,
-                atom_dim: &atom_dim,
+                geometry_plans: &inner.geometry_plans,
                 decoder_blocks: &decoder_views,
-                duchon_centers: &duchon_owned,
-                n_harmonics_list: &n_harm,
-                basis_size_list: &basis_sizes,
                 coords: &coord_views,
                 logits: logits_owned.view(),
                 assignment_kind: inner.assignment.as_str(),
@@ -7588,26 +7533,22 @@ impl ManifoldSaeCore {
     #[getter]
     fn atoms<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for atom in &self.inner.atoms {
+        for (atom, plan) in self.inner.atoms.iter().zip(&self.inner.geometry_plans) {
             list.append(Py::new(
                 py,
                 AtomCore {
                     inner: atom.clone(),
+                    basis: sae_atom_basis_kind_name(plan.kind()),
                 },
             )?)?;
         }
         Ok(list)
     }
     #[getter]
-    fn duchon_centers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let list = PyList::empty(py);
-        for center in &self.inner.duchon_centers {
-            match center {
-                None => list.append(py.None())?,
-                Some(m) => list.append(manifold_sae_vec2(py, m)?)?,
-            }
-        }
-        Ok(list)
+    fn geometry_plans(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let value = serde_json::to_value(&self.inner.geometry_plans)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        json_value_to_py(py, value)
     }
     #[getter]
     fn fisher_factors<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray3<f64>>>> {
@@ -7726,8 +7667,8 @@ impl ManifoldSaeCore {
         self.inner.schema.clone()
     }
     #[getter]
-    fn atom_topology(&self) -> String {
-        self.inner.atom_topology.clone()
+    fn atom_topology(&self) -> PyResult<String> {
+        self.atom_topology_name()
     }
     #[getter]
     fn assignment(&self) -> String {
@@ -7826,34 +7767,35 @@ impl ManifoldSaeCore {
         self.inner.atoms.len()
     }
 
-    // --- string / int list getters ---------------------------------------
+    // --- geometry-derived list getters -----------------------------------
     #[getter]
-    fn atom_topologies(&self) -> Vec<String> {
-        self.inner.atom_topologies.clone()
+    fn atom_topologies(&self) -> PyResult<Vec<String>> {
+        self.atom_topology_names()
     }
     #[getter]
     fn primitive_names(&self) -> Vec<String> {
         self.inner.primitive_names.clone()
     }
     #[getter]
-    fn basis_specs(&self) -> Vec<String> {
-        self.inner.basis_specs.clone()
-    }
-    #[getter]
     fn basis_kinds(&self) -> Vec<String> {
-        self.inner.basis_kinds.clone()
+        self.basis_kind_names()
     }
     #[getter]
-    fn atom_dims(&self) -> Vec<i64> {
-        self.inner.atom_dims.clone()
+    fn atom_dims(&self) -> Vec<usize> {
+        self.inner
+            .geometry_plans
+            .iter()
+            .map(SaeAtomGeometryPlan::latent_dim)
+            .collect()
     }
     #[getter]
-    fn basis_sizes(&self) -> Vec<i64> {
-        self.inner.basis_sizes.clone()
-    }
-    #[getter]
-    fn n_harmonics(&self) -> Vec<i64> {
-        self.inner.n_harmonics.clone()
+    fn basis_sizes(&self) -> PyResult<Vec<usize>> {
+        self.inner
+            .geometry_plans
+            .iter()
+            .map(SaeAtomGeometryPlan::basis_size)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(py_value_error)
     }
 
     // --- diagnostic / certificate report-block getters -------------------

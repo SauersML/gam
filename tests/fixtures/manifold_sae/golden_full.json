@@ -29,11 +29,6 @@
       1.28
     ]
   ],
-  "atom_dims": [
-    1,
-    2,
-    2
-  ],
   "atom_inference": [
     {
       "atom_index": 0,
@@ -54,12 +49,6 @@
       }
     }
   ],
-  "atom_topologies": [
-    "circle",
-    "euclidean",
-    "euclidean"
-  ],
-  "atom_topology": "mixed",
   "atom_two_lens": {
     "coupling": [
       0.05,
@@ -82,7 +71,6 @@
         0.38,
         0.49
       ],
-      "basis": "periodic",
       "coords": [
         [
           0.1
@@ -252,7 +240,6 @@
         0.43000000000000005,
         0.54
       ],
-      "basis": "euclidean",
       "coords": [
         [
           0.2,
@@ -312,7 +299,6 @@
         0.48000000000000004,
         0.5900000000000001
       ],
-      "basis": "duchon",
       "coords": [
         [
           0.30000000000000004,
@@ -369,21 +355,6 @@
       "shape_band_mean": null,
       "shape_band_sd": null
     }
-  ],
-  "basis_kinds": [
-    "periodic",
-    "euclidean",
-    "duchon"
-  ],
-  "basis_sizes": [
-    5,
-    3,
-    4
-  ],
-  "basis_specs": [
-    "periodic:H2",
-    "euclidean:3",
-    "duchon:4"
   ],
   "certificates": {
     "claims": {
@@ -603,28 +574,6 @@
     ]
   },
   "dispersion": 1.07,
-  "duchon_centers": [
-    null,
-    null,
-    [
-      [
-        0.0,
-        0.5
-      ],
-      [
-        1.0,
-        1.5
-      ],
-      [
-        2.0,
-        2.7
-      ],
-      [
-        3.0,
-        3.5
-      ]
-    ]
-  ],
   "fisher_factors": [
     [
       [
@@ -822,10 +771,44 @@
   ],
   "max_iter": 42,
   "metric_provenance": "OutputFisherDownstream",
-  "n_harmonics": [
-    2,
-    0,
-    0
+  "geometry_plans": [
+    {
+      "kind": "periodic",
+      "latent_dim": 1,
+      "reference_metric": {
+        "kind": "unit_circle"
+      },
+      "resolution": {
+        "kind": "periodic_harmonics",
+        "order": 2
+      }
+    },
+    {
+      "kind": "linear",
+      "latent_dim": 2,
+      "reference_metric": {
+        "kind": "euclidean_polynomial"
+      },
+      "resolution": {
+        "degree": 1,
+        "kind": "polynomial"
+      }
+    },
+    {
+      "kind": "duchon",
+      "latent_dim": 2,
+      "reference_metric": {
+        "kind": "euclidean_duchon"
+      },
+      "resolution": {
+        "centers": {
+          "data": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5],
+          "dim": [4, 2],
+          "v": 1
+        },
+        "kind": "duchon_coordinates"
+      }
+    }
   ],
   "oos_projection_top1": true,
   "penalized_quasi_laplace_criterion": 41.25,
@@ -841,7 +824,7 @@
     "generators": [],
     "group_signature": "SO(2)"
   },
-  "schema": "gamfit.ManifoldSAE/v5",
+  "schema": "gamfit.ManifoldSAE/v6",
   "selected_log_ard": [
     [
       0.1

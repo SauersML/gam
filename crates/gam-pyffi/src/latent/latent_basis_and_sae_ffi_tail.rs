@@ -527,7 +527,6 @@ fn sae_manifold_fit_model<'py>(
         gam::terms::sae::atom_schema::validate_seed_basis_kind(basis).map_err(py_value_error)?;
     }
     let atom_basis = basis_seed.clone();
-    let declared_bases = has_declared_bases.then(|| basis_seed.clone());
     if let (Some(topology), true) = (atom_topology.as_deref(), has_declared_bases) {
         let resolved = gam::terms::sae::atom_schema::topology_for_bases(&atom_basis)
             .map_err(py_value_error)?
@@ -758,7 +757,6 @@ fn sae_manifold_fit_model<'py>(
         fisher_factors: fisher_nested,
         fisher_provenance,
         fisher_factor_kind,
-        declared_bases,
     };
     let payload = crate::manifold::manifold_sae_coercion::build_manifold_sae_payload(
         &raw,
