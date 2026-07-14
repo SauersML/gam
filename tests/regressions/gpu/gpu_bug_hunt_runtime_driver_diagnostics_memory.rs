@@ -5,19 +5,12 @@ use ndarray::{Array2, array};
 use std::thread;
 
 #[test]
-fn gpu_runtime_probe_reports_no_device_or_driver_as_structured_error_instead_of_none() {
-    let probe = GpuRuntime::probe();
-    assert!(
-        matches!(
-            probe,
-            Ok(gam::gpu::GpuAvailability::Available(_)
-                | gam::gpu::GpuAvailability::Absent(_))
-                | Err(gam::gpu::GpuError::DriverLibraryLoadFailed { .. }
-                    | gam::gpu::GpuError::RuntimeDependencyUnavailable { .. }
-                    | gam::gpu::GpuError::DriverCallFailed { .. })
-        ),
-        "GpuRuntime::probe must return typed availability or a typed probe fault"
-    );
+fn gpu_runtime_probe_returns_typed_availability_without_fault() {
+    match GpuRuntime::probe() {
+        Ok(gam::gpu::GpuAvailability::Available(_)
+        | gam::gpu::GpuAvailability::Absent(_)) => {}
+        Err(error) => panic!("GpuRuntime::probe faulted instead of returning availability: {error}"),
+    }
 }
 
 #[test]

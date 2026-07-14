@@ -1514,7 +1514,11 @@ fn sae_manifold_certify_external<'py>(
     out.set_item("assignment_prior", assignment_kind)?;
     out.set_item(
         "solver_plan",
-        sae_streaming_plan_to_pydict(py, term.streaming_plan())?,
+        sae_streaming_plan_to_pydict(
+            py,
+            term.streaming_plan()
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
+        )?,
     )?;
     out.set_item(
         "diagnostics",

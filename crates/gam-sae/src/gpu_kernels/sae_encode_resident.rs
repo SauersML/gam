@@ -1241,18 +1241,23 @@ pub fn sae_certified_encode_batch(
     targets: &[Vec<f64>],
     amplitudes: &[f64],
 ) -> Result<(Vec<DeviceEncodeRow>, EncodePath), GpuError> {
-    #[cfg(target_os = "linux")]
-    {
-        let policy = gam_gpu::global_policy();
-        if policy == gam_gpu::GpuPolicy::Required || targets.len() >= DEVICE_ROW_THRESHOLD {
-            let runtime = match policy {
-                gam_gpu::GpuPolicy::Required => Some(gam_gpu::GpuRuntime::require()?),
-                _ => gam_gpu::GpuRuntime::resolve(policy)?,
-            };
-            if runtime.is_some() {
+    let policy = gam_gpu::global_policy();
+    if policy == gam_gpu::GpuPolicy::Required || targets.len() >= DEVICE_ROW_THRESHOLD {
+        let runtime = match policy {
+            gam_gpu::GpuPolicy::Required => Some(gam_gpu::GpuRuntime::require()?),
+            _ => gam_gpu::GpuRuntime::resolve(policy)?,
+        };
+        if runtime.is_some() {
+            #[cfg(target_os = "linux")]
+            {
                 let out = device::sae_certified_encode_device(dev, targets, amplitudes)?;
                 return Ok((out, EncodePath::Device));
             }
+
+            #[cfg(not(target_os = "linux"))]
+            return Err(gam_gpu::gpu_err!(
+                "sae certified encode admitted CUDA on an unsupported platform"
+            ));
         }
     }
     Ok((

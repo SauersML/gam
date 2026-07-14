@@ -782,18 +782,19 @@ mod tests {
         let rhs = Array2::<f64>::zeros((3, 1));
         let solve_outcome = crate::solver::cholesky_solve_gpu(h.view(), rhs.view());
         let factor_outcome = crate::solver::cholesky_lower_gpu(h.view());
-        if matches!(
-            GpuRuntime::availability(),
-            Ok(GpuAvailabilityRef::Absent(_))
-        ) {
-            assert!(
-                solve_outcome.is_err(),
-                "cholesky_solve_gpu must Err when runtime is unavailable"
-            );
-            assert!(
-                factor_outcome.is_err(),
-                "cholesky_lower_gpu must Err when runtime is unavailable"
-            );
+        match GpuRuntime::availability() {
+            Ok(GpuAvailabilityRef::Absent(_)) => {
+                assert!(
+                    solve_outcome.is_err(),
+                    "cholesky_solve_gpu must Err when runtime is unavailable"
+                );
+                assert!(
+                    factor_outcome.is_err(),
+                    "cholesky_lower_gpu must Err when runtime is unavailable"
+                );
+            }
+            Ok(GpuAvailabilityRef::Available(_)) => {}
+            Err(error) => panic!("GPU probe fault must fail this dispatch smoke test: {error}"),
         }
 
         // NOTE: the weighted-crossprod GPU dispatcher with CPU fallback

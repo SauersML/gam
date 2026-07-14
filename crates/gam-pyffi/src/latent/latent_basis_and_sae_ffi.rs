@@ -2233,7 +2233,11 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("assignment_prior", assignment_kind)?;
     out.set_item(
         "solver_plan",
-        sae_streaming_plan_to_pydict(py, term.streaming_plan())?,
+        sae_streaming_plan_to_pydict(
+            py,
+            term.streaming_plan()
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
+        )?,
     )?;
     out.set_item(
         "diagnostics",
@@ -2895,7 +2899,8 @@ fn sae_streaming_plan(
         k_atoms,
         d_max,
         border_dim,
-    );
+    )
+    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
     let out = PyDict::new(py);
     out.set_item("streaming", plan.streaming)?;
     out.set_item("chunk_size", plan.chunk_size)?;

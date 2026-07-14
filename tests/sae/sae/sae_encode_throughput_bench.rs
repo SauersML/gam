@@ -519,7 +519,8 @@ fn sae_encode_throughput_decision_gate() {
         let device_config = AtlasConfig::default();
         let dev = EncodeAtomDevice::from_atom_atlas(&atom, &atlas.atoms[0], &device_config)
             .expect("device encode fixture must lower to device form");
-        let tput = measure_device_encode_throughput(&dev, &rows, &amplitudes);
+        let tput = measure_device_encode_throughput(&dev, &rows, &amplitudes)
+            .expect("device encode benchmark must preserve CUDA failures");
         decision = tput.decision;
         println!(
             "DEVICE-FULL-ENCODE n={} path={:?} measured_rows_per_sec={:.0} \
@@ -527,7 +528,8 @@ fn sae_encode_throughput_decision_gate() {
             tput.n_rows, tput.path, tput.rows_per_sec
         );
 
-        let (batch, path) = sae_certified_encode_batch(&dev, &rows, &amplitudes);
+        let (batch, path) = sae_certified_encode_batch(&dev, &rows, &amplitudes)
+            .expect("device encode validation must preserve CUDA failures");
         assert_eq!(
             path, tput.path,
             "timed encode path and validation encode path must agree; otherwise the device \
