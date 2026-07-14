@@ -860,6 +860,7 @@ impl SaeSupportSparseTerm {
             let q = self.assignment.coords_row(row).len();
             let mut fitted = Array1::<f64>::zeros(self.output_dim);
             let mut jacobian = Array2::<f64>::zeros((q, self.output_dim));
+            let mut active_evals = Vec::with_capacity(self.assignment.support_indices(row).len());
             let mut cursor = 0;
             for slot in 0..self.assignment.support_indices(row).len() {
                 let active = self.evaluate_active(row, slot)?;
@@ -871,6 +872,7 @@ impl SaeSupportSparseTerm {
                         .assign(&active.jacobian.row(axis));
                 }
                 cursor += d;
+                active_evals.push(active);
             }
             let residual = &target.row(row) - &fitted;
             let mut rhs_vector = jacobian.dot(&residual);
@@ -918,7 +920,6 @@ impl SaeSupportSparseTerm {
                 let step = 2.0_f64.powi(-(halving as i32));
                 let trial_delta = delta.iter().map(|value| step * value).collect::<Vec<_>>();
                 self.assignment.apply_row_coord_step(row, &trial_delta)?;
-                let trial_fitted = self.reconstruct_row(row)?;
                 // Evaluate f(trial) - f(old) directly. Near stationarity the
                 // decrease is O(||g||^2), so subtracting two O(1) objective
                 // values loses the Armijo signal at exactly sqrt(EPSILON).
@@ -927,8 +928,26 @@ impl SaeSupportSparseTerm {
                 // per-axis energy increments. Kahan accumulation preserves their
                 // first-order cancellation in a wide output/coordinate block.
                 let mut objective_delta = KahanSum::default();
-                for output in 0..self.output_dim {
-                    let fitted_delta = trial_fitted[output] - fitted[output];
+                let mut fitted_delta = vec![KahanSum::default(); self.output_dim];
+                for (slot, old_active) in active_evals.iter().enumerate() {
+                    let atom = self.assignment.support_indices(row)[slot] as usize;
+                    let trial_active = self.evaluate_active(row, slot)?;
+                    for basis in 0..old_active.phi.len() {
+                        // Subtract basis values before multiplying by decoder
+                        // coefficients. This cancels shared constant/intercept
+                        // components before rounding, instead of subtracting two
+                        // already-decoded O(1) predictions to recover an O(step)
+                        // difference.
+                        let phi_delta = trial_active.phi[basis] - old_active.phi[basis];
+                        for output in 0..self.output_dim {
+                            fitted_delta[output].add(
+                                phi_delta * self.atoms[atom].decoder_coefficients[[basis, output]],
+                            );
+                        }
+                    }
+                }
+                for (output, delta_sum) in fitted_delta.into_iter().enumerate() {
+                    let fitted_delta = delta_sum.sum();
                     objective_delta.add(
                         fitted_delta.mul_add(0.5 * fitted_delta - residual[output], 0.0),
                     );
