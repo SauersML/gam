@@ -831,8 +831,15 @@ pub fn reml_laml_evaluate(
                 HUTCHINSON_ADAPTIVE_REL_TOL,
                 HUTCHINSON_ADAPTIVE_TAU_REL,
             ) {
-                Ok(evidence) => Some(evidence.traces.to_vec()),
-                Err(_) => None,
+                // Honest-evidence policy (#2313 hardware gate finding): the
+                // adaptive estimator reports `converged` and its standard
+                // errors precisely so consumers can act — and a p=2000, d=8
+                // workload measured on a real A10 hits the 128-probe cap
+                // with the SE criterion unmet. A non-converged trace is a
+                // silently high-variance outer gradient; route it to the
+                // CPU stochastic fallback below instead of consuming it.
+                Ok(evidence) if evidence.converged => Some(evidence.traces.to_vec()),
+                Ok(_) | Err(_) => None,
             }
         } else {
             None
