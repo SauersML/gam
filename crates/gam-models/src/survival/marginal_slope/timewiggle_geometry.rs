@@ -232,7 +232,7 @@ impl SurvivalMarginalSlopeFamily {
     /// Full geometry plus the per-coefficient fifth basis derivative retained
     /// for the generic scalar q program. The public current-geometry wrapper
     /// discards `basis_d5` after aggregating it, preserving its existing type.
-    fn time_wiggle_geometry_with_basis_d5(
+    pub(crate) fn time_wiggle_geometry_with_basis_d5(
         &self,
         h0: ndarray::ArrayView1<'_, f64>,
         beta_w: ndarray::ArrayView1<'_, f64>,
