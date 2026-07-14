@@ -2348,8 +2348,8 @@ pub fn solve_quadratic_with_linear_constraints(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_SET_INTERIOR_SEED_MARGIN, ConstraintSet, LinearInequalityConstraints,
-        compute_constraint_kkt_diagnostics, project_point_strictly_into_feasible_cone,
+        ACTIVE_SET_INTERIOR_SEED_MARGIN, ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintSet,
+        LinearInequalityConstraints, compute_constraint_kkt_diagnostics, project_point_strictly_into_feasible_cone,
         project_point_strictly_into_feasible_constraint_set,
         project_stationarity_residual_on_constraint_cone,
         rank_reduce_rows_pivoted_qr_with_dependence, scaled_constraint_slack,
