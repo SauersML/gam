@@ -2058,7 +2058,7 @@ fn project_stationarity_residual_on_constraint_set_undivided(
     let origin = Array1::<f64>::zeros(p);
     let mut tangent_direction = Array1::<f64>::zeros(p);
     let max_iterations = (p + active.len() + 8) * 4;
-    solve_newton_direction_with_constraint_set_impl(
+    if let Err(error) = solve_newton_direction_with_constraint_set_impl(
         &identity,
         residual,
         &origin,
@@ -2067,8 +2067,18 @@ fn project_stationarity_residual_on_constraint_set_undivided(
         Some(&mut active),
         max_iterations,
         false,
-    )
-    .ok()?;
+    ) {
+        log::warn!(
+            "factored tangent-cone projection QP failed \
+             (p={p}, rows={}, seed_active_rows={}, residual_inf={:.6e}): {error}",
+            ops.nrows(),
+            seed_active.len(),
+            residual
+                .iter()
+                .fold(0.0_f64, |scale, value| scale.max(value.abs())),
+        );
+        return None;
+    }
     if !array_is_finite(&tangent_direction) {
         return None;
     }
