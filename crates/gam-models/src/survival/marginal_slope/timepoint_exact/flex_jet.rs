@@ -954,7 +954,7 @@ impl FlexJet for Jet3 {
 ///
 /// `Jet2` owns the coefficient value/score/Hessian channels. `Jet3` adds one
 /// nilpotent coefficient direction whose epsilon part is the exact directional
-/// drift of those same channels. The outer baseline coordinate is supplied by
+/// drift of those same channels. The outer family coordinate is supplied by
 /// `Dual2<J>` and is intentionally absent from this constructor.
 trait FlexCoefficientJet: FlexJet {
     fn affine(
@@ -965,12 +965,7 @@ trait FlexCoefficientJet: FlexJet {
     ) -> Self;
 
     fn constant(value: f64, dimension: usize) -> Self {
-        Self::affine(
-            value,
-            vec![0.0; dimension],
-            0.0,
-            vec![0.0; dimension],
-        )
+        Self::affine(value, vec![0.0; dimension], 0.0, vec![0.0; dimension])
     }
 
     fn owned_base_terms(&self) -> FlexFamilyCoefficientTerms;
@@ -3088,12 +3083,7 @@ fn lifted_coefficient_affine<J: FlexCoefficientJet>(
         Some(FlexCoefficientRowDirection::Design { .. }) => 0.0,
     };
     Dual2 {
-        v: J::affine(
-            value,
-            gradient,
-            directional_value,
-            directional_gradient,
-        ),
+        v: J::affine(value, gradient, directional_value, directional_gradient),
         g: J::constant(family_first, dimension),
         h: J::constant(family_second, dimension),
     }
@@ -3158,9 +3148,20 @@ impl SurvivalMarginalSlopeFamily {
                 beta,
                 coefficient_range,
             }) => {
-                if !matches!(block, 1 | 2) {
+                if !matches!(*block, 1 | 2) {
                     return Err(format!(
                         "survival marginal-slope FLEX family design direction supports marginal/logslope blocks 1 or 2, got block {block}"
+                    ));
+                }
+                let expected_range = if *block == 1 {
+                    &slices.marginal
+                } else {
+                    &slices.logslope
+                };
+                if coefficient_range != expected_range {
+                    return Err(format!(
+                        "survival marginal-slope FLEX family design direction block {block} range {:?} != canonical {:?}",
+                        coefficient_range, expected_range,
                     ));
                 }
                 if derivative_row.len() != coefficient_range.len()
@@ -3463,16 +3464,8 @@ impl SurvivalMarginalSlopeFamily {
             0.0,
             0.0,
         );
-        let zero = || {
-            lifted_coefficient_affine::<J>(
-                0.0,
-                vec![0.0; dimension],
-                None,
-                false,
-                0.0,
-                0.0,
-            )
-        };
+        let zero =
+            || lifted_coefficient_affine::<J>(0.0, vec![0.0; dimension], None, false, 0.0, 0.0);
         let template = zero();
         let mut du = vec![template.clone(); primary.total];
         du[primary.q0] = tangent_jet(&q0);
@@ -3698,8 +3691,10 @@ impl SurvivalMarginalSlopeFamily {
     /// The inner width is the canonical flattened coefficient layout
     /// `time | marginal | logslope | score-warp? | link-dev? | influence?`.
     /// Consequently `first.gradient` is the complete family-by-coefficient
-    /// mixed-partial row in one evaluation; callers must not redispatch this
-    /// program once per coefficient axis to recover those mixed pairs.
+    /// mixed-partial row in one evaluation.  This is distinct from a
+    /// family-by-design-hyper partial: the latter must use
+    /// [`Self::flex_family_design_direction_row_terms`] so `X_psi beta` and
+    /// the `X_psi` pullback drift are both represented.
     /// The outer [`Dual2`] owns the supplied family first/second motion. With no
     /// beta direction the row runs as `Dual2<Jet2>`; with one it runs as
     /// `Dual2<Jet3>` and returns the exact directional drift of the first family
@@ -5660,7 +5655,7 @@ mod moment_engine_tests {
         };
         assert_same(&order2.first, &order3.first, "first");
         assert_same(&order2.second, &order3.second, "second");
-        let drift = order3.beta_drift.expect("nonzero Jet3 beta drift");
+        let drift = order3.directional.expect("nonzero Jet3 beta drift");
         let expected_value = order2.first.gradient.dot(&direction);
         let tolerance =
             |actual: f64, expected: f64| 1.0e-10 * (1.0 + actual.abs().max(expected.abs()));
@@ -5682,6 +5677,48 @@ mod moment_engine_tests {
         }
         assert!(drift.hessian.iter().all(|value| value.is_finite()));
         assert!(drift.hessian.iter().any(|value| *value != 0.0));
+
+        // A design direction is not a beta direction: its epsilon seed owns
+        // both X_psi beta and X_psi.  With the fixture's scalar marginal
+        // design this gives two independent analytic identities, including
+        // the pullback-map contribution to the marginal score.
+        let x = family.marginal_design.to_dense()[[0, 0]];
+        let x_psi = 0.17;
+        let beta = states[1].beta[0];
+        let design = family
+            .flex_family_design_direction_row_terms(
+                0,
+                &states,
+                first,
+                second,
+                1,
+                &Array1::from(vec![x_psi]),
+            )
+            .expect("Dual2<Jet3> family-by-design row");
+        assert_same(&order2.first, &design.first, "design first base");
+        assert_same(&order2.second, &design.second, "design second base");
+        let design_drift = design.directional.expect("nonzero design drift");
+        let marginal_axis = slices.marginal.start;
+        let h_psi = x_psi * beta;
+        let expected_design_objective = order2.first.gradient[marginal_axis] * h_psi / x;
+        assert!(
+            (design_drift.objective - expected_design_objective).abs()
+                <= tolerance(design_drift.objective, expected_design_objective),
+            "family-by-design objective {} != analytic {}",
+            design_drift.objective,
+            expected_design_objective,
+        );
+        let expected_design_score = x_psi * order2.first.gradient[marginal_axis] / x
+            + h_psi * order2.first.hessian[[marginal_axis, marginal_axis]] / x;
+        assert!(
+            (design_drift.gradient[marginal_axis] - expected_design_score).abs()
+                <= tolerance(design_drift.gradient[marginal_axis], expected_design_score,),
+            "family-by-design marginal score {} != analytic pullback {}",
+            design_drift.gradient[marginal_axis],
+            expected_design_score,
+        );
+        assert!(design_drift.hessian.iter().all(|value| value.is_finite()));
+        assert!(design_drift.hessian.iter().any(|value| *value != 0.0));
     }
 
     /// `flex_timepoint_inputs_generic` at Jet4 must match a scalar finite difference
