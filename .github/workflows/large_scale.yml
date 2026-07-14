@@ -2,6 +2,15 @@ name: Large-scale
 
 on:
   workflow_dispatch:
+    inputs:
+      scale:
+        description: Cohort scale to validate
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - full
   schedule:
     # Hourly short run; skip 07:00 UTC to avoid colliding with the daily extended run.
     - cron: "0 0-6,8-23 * * *"
@@ -19,10 +28,11 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event.schedule == '0 7 * * *' && 4320 || 50 }}
+    timeout-minutes: 50
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       cache_key: ${{ steps.cache_key.outputs.cache_key }}
+      scale: ${{ steps.scale.outputs.scale }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,12 +48,26 @@ jobs:
         shell: bash
         run: python3 -m pip install numpy
 
+      - name: Resolve cohort scale
+        id: scale
+        shell: bash
+        run: |
+          set -euo pipefail
+          scale=smoke
+          if [[ "${{ github.event_name }}" == "schedule" && "${{ github.event.schedule }}" == "0 7 * * *" ]]; then
+            scale=full
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            scale="${{ inputs.scale }}"
+          fi
+          echo "scale=${scale}" >> "${GITHUB_OUTPUT}"
+          echo "Large-scale cohort mode: ${scale}"
+
       - name: Compute cache key
         id: cache_key
         shell: bash
         run: |
           set -euo pipefail
-          key="large-scale-${{ runner.os }}-${{ hashFiles('bench/large_scale/runner.py', 'bench/large_scale/large_scale.yml', '.github/workflows/large_scale.yml', 'Cargo.toml') }}"
+          key="large-scale-${{ steps.scale.outputs.scale }}-${{ runner.os }}-${{ hashFiles('bench/large_scale/runner.py', 'bench/large_scale/large_scale.yml', '.github/workflows/large_scale.yml', 'Cargo.toml') }}"
           echo "cache_key=${key}" >> "${GITHUB_OUTPUT}"
 
       - name: Restore prepared cohort cache
@@ -58,7 +82,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 bench/large_scale/runner.py prepare --config bench/large_scale/large_scale.yml --out-dir bench/large_scale/prepared
+          if [[ "${{ steps.scale.outputs.scale }}" == "smoke" ]]; then
+            python3 bench/large_scale/runner.py prepare --smoke --config bench/large_scale/large_scale.yml --out-dir bench/large_scale/prepared
+          else
+            python3 bench/large_scale/runner.py prepare --config bench/large_scale/large_scale.yml --out-dir bench/large_scale/prepared
+          fi
 
       - name: Save prepared cohort cache
         if: ${{ steps.prep_cache.outputs.cache-hit != 'true' }}
@@ -85,7 +113,7 @@ jobs:
   bootstrap-runtime:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event.schedule == '0 7 * * *' && 4320 || 50 }}
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -146,16 +174,15 @@ jobs:
       - prepare
       - bootstrap-runtime
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event.schedule == '0 7 * * *' && 4320 || 50 }}
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
-      # A benchmark intended to detect #979 must never recreate its unbounded
-      # subprocess hang. The daily run may use a longer job envelope for all
-      # shards, but every individual fit/predict keeps the same deterministic
-      # 40-minute mission bound and emits a typed timeout artifact on failure.
-      BENCH_CMD_TIMEOUT_SEC: "2400"
+      # Smoke runs are the development signal and must fail fast. The daily
+      # 400k cohort retains the wider mission envelope, but no job can outlive
+      # the workflow's fixed 50-minute bound.
+      BENCH_CMD_TIMEOUT_SEC: ${{ needs.prepare.outputs.scale == 'full' && '2400' || '300' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -237,7 +264,7 @@ jobs:
   aggregate:
     needs: benchmark
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event.schedule == '0 7 * * *' && 4320 || 50 }}
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -35,7 +35,7 @@ class LargeScaleRunnerTests(unittest.TestCase):
         )
         self.assertEqual(text, "progress\n[1s] ok  next done\n")
 
-    def test_default_large_scale_matrix_keeps_400k_binomial_marginal_slope_lane(self) -> None:
+    def test_default_large_scale_matrix_keeps_both_400k_binomial_marginal_slope_lanes(self) -> None:
         cfg = _RUNNER.load_config(_RUNNER.DEFAULT_CONFIG)
 
         self.assertEqual(int(cfg["target_n"]), 400000)
@@ -52,49 +52,24 @@ class LargeScaleRunnerTests(unittest.TestCase):
         ]
         self.assertEqual(
             len(marginal_slope_disease),
-            1,
-            "expected exactly one disease + Rust + binomial + marginal-slope lane in the "
+            2,
+            "expected rigid and warped disease + Rust + binomial + marginal-slope lanes in the "
             "default large-scale matrix; found "
             f"{[s.name for s in marginal_slope_disease]}",
         )
-        lane = marginal_slope_disease[0]
-
-        self.assertEqual(lane.spatial_basis, "duchon")
-        self.assertEqual(lane.pc_count, 16, f"{lane.name} must run on 16 PCs")
-        self.assertTrue(lane.scale_dimensions, f"{lane.name} must enable per-axis scales")
-        self.assertEqual(lane.z_column, "pgs_ctn_z", f"{lane.name} must read CTN z column")
-
-        self.assertIsNotNone(
-            lane.mean_linkwiggle_knots,
-            f"{lane.name} must enable mean linkwiggle (production calibration)",
-        )
-        self.assertGreaterEqual(int(lane.mean_linkwiggle_knots), 1)
-        self.assertIsNotNone(
-            lane.logslope_linkwiggle_knots,
-            f"{lane.name} must enable score-warp linkwiggle on the logslope side",
-        )
-        self.assertGreaterEqual(int(lane.logslope_linkwiggle_knots), 1)
-
-        self.assertIsNotNone(
-            lane.max_centers,
-            f"{lane.name} must declare a max-centers cap for large scale",
-        )
-        self.assertLessEqual(
-            int(lane.centers),
-            int(lane.max_centers),
-            f"{lane.name} centers={lane.centers} exceeds its own max_centers cap "
-            f"{lane.max_centers}",
-        )
-
-        capped_at_large_scale_n = _RUNNER.effective_marginal_slope_centers(
-            lane, train_rows=int(cfg["target_n"])
-        )
-        self.assertLessEqual(
-            capped_at_large_scale_n,
-            int(lane.max_centers),
-            f"{lane.name} effective centers at n={cfg['target_n']} ({capped_at_large_scale_n}) "
-            f"must not exceed max_centers cap {lane.max_centers}",
-        )
+        lanes = {lane.name: lane for lane in marginal_slope_disease}
+        rigid = lanes["rust_margslope_aniso_duchon16d_rigid"]
+        warped = lanes["rust_margslope_aniso_duchon16d_linkwiggle_scorewarp_fast"]
+        for lane in (rigid, warped):
+            self.assertEqual(lane.spatial_basis, "duchon")
+            self.assertEqual(lane.pc_count, 16, f"{lane.name} must run on 16 PCs")
+            self.assertTrue(lane.scale_dimensions, f"{lane.name} must enable per-axis scales")
+            self.assertEqual(lane.z_column, "pgs_ctn_z", f"{lane.name} must read CTN z column")
+            self.assertEqual(lane.centers, 24)
+        self.assertIsNone(rigid.mean_linkwiggle_knots)
+        self.assertIsNone(rigid.logslope_linkwiggle_knots)
+        self.assertEqual(warped.mean_linkwiggle_knots, 8)
+        self.assertEqual(warped.logslope_linkwiggle_knots, 8)
 
     def test_marginal_slope_formula_supports_linkwiggle_and_scorewarp(self) -> None:
         spec = _RUNNER.MethodSpec(
@@ -118,21 +93,6 @@ class LargeScaleRunnerTests(unittest.TestCase):
         self.assertNotIn("pgs_ctn_z", mean_formula)
         self.assertIn("linkwiggle(internal_knots=8)", mean_formula)
         self.assertIn("linkwiggle(internal_knots=7)", logslope_formula)
-
-    def test_effective_marginal_slope_centers_caps_large_scale_and_wiggle_modes(self) -> None:
-        spec = _RUNNER.MethodSpec(
-            name="margslope_variant",
-            dataset="disease",
-            backend="rust_gam",
-            family="binomial",
-            spatial_basis="duchon",
-            centers=50,
-            marginal_slope=True,
-            logslope_linkwiggle_knots=8,
-            max_centers=30,
-        )
-        self.assertEqual(_RUNNER.effective_marginal_slope_centers(spec, train_rows=10000), 22)
-        self.assertEqual(_RUNNER.effective_marginal_slope_centers(spec, train_rows=400000), 22)
 
     def test_large_scale_preflight_rejects_unsafe_dense_duchon_width_before_allocation(self) -> None:
         report = _RUNNER.preflight_marginal_slope_large_scale(

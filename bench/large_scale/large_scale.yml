@@ -22,8 +22,7 @@
       "include_sigma": false,
       "marginal_slope": true,
       "scale_dimensions": true,
-      "z_column": "pgs_ctn_z",
-      "max_centers": 32
+      "z_column": "pgs_ctn_z"
     },
     {
       "name": "rust_margslope_aniso_duchon16d_linkwiggle_scorewarp_fast",
@@ -37,8 +36,7 @@
       "scale_dimensions": true,
       "z_column": "pgs_ctn_z",
       "mean_linkwiggle_knots": 8,
-      "logslope_linkwiggle_knots": 8,
-      "max_centers": 32
+      "logslope_linkwiggle_knots": 8
     },
     {
       "name": "rust_survival_margslope_aniso_duchon16d_gm_linkwiggle_scorewarp_timewiggle_fast",
@@ -54,8 +52,7 @@
       "z_column": "pgs_ctn_z",
       "mean_linkwiggle_knots": 8,
       "logslope_linkwiggle_knots": 8,
-      "timewiggle_knots": 8,
-      "max_centers": 32
+      "timewiggle_knots": 8
     }
   ]
 }

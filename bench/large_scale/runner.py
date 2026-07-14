@@ -330,7 +330,6 @@ class MethodSpec:
     mean_linkwiggle_knots: int | None = None
     logslope_linkwiggle_knots: int | None = None
     timewiggle_knots: int | None = None
-    max_centers: int | None = None
 
 
 @dataclass(frozen=True)
@@ -544,8 +543,6 @@ def validate_method_spec(spec: MethodSpec) -> None:
         )
     if spec.marginal_slope and not spec.scale_dimensions:
         raise RuntimeError(f"method '{spec.name}' must set scale_dimensions=true")
-    if spec.max_centers is not None and spec.max_centers <= 0:
-        raise RuntimeError(f"method '{spec.name}' requires max_centers > 0")
     for key, value in (
         ("mean_linkwiggle_knots", spec.mean_linkwiggle_knots),
         ("logslope_linkwiggle_knots", spec.logslope_linkwiggle_knots),
@@ -1845,11 +1842,6 @@ def build_method_specs(cfg: dict[str, Any]) -> list[MethodSpec]:
                 if item.get("timewiggle_knots") is not None
                 else None
             ),
-            max_centers=(
-                int(item["max_centers"])
-                if item.get("max_centers") is not None
-                else None
-            ),
         )
         validate_method_spec(spec)
         out.append(spec)
@@ -1859,26 +1851,6 @@ def build_method_specs(cfg: dict[str, Any]) -> list[MethodSpec]:
 def count_csv_rows(path: Path) -> int:
     with path.open("r", encoding="utf-8", newline="") as fh:
         return max(sum(1 for _ in fh) - 1, 0)
-
-
-def effective_marginal_slope_centers(
-    spec: MethodSpec,
-    *,
-    train_rows: int | None = None,
-) -> int:
-    if train_rows is not None and train_rows <= 0:
-        raise RuntimeError("train_rows must be positive when provided")
-    requested = int(spec.centers or 24)
-    if spec.max_centers is None:
-        return requested
-    scorewarp_width = int(spec.logslope_linkwiggle_knots or 0)
-    capped = int(spec.max_centers) - scorewarp_width
-    if capped <= 0:
-        raise RuntimeError(
-            f"method '{spec.name}' max_centers={spec.max_centers} leaves no room "
-            f"after score-warp knots={scorewarp_width}"
-        )
-    return min(requested, capped)
 
 
 def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
@@ -1956,7 +1928,7 @@ def run_rust_marginal_slope_classification(
     """Run 16D marginal-slope Duchon classification with optional anisotropy."""
     rust_bin = load_or_build_rust_binary()
     train_rows = count_csv_rows(train_csv)
-    centers = effective_marginal_slope_centers(spec, train_rows=train_rows)
+    centers = int(spec.centers or 24)
     preflight = preflight_marginal_slope_large_scale(
         n_train=train_rows,
         d_pc=int(spec.pc_count),
@@ -2178,7 +2150,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
     prediction_rows_raw = test_rows_raw
     train_metric_rows_raw = train_rows_raw
     if likelihood_mode == "marginal-slope":
-        centers = effective_marginal_slope_centers(spec, train_rows=len(train_rows_raw))
+        centers = int(spec.centers or 24)
         preflight = preflight_marginal_slope_large_scale(
             n_train=len(train_rows_raw),
             d_pc=int(spec.pc_count),
