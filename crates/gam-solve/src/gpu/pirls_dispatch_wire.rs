@@ -1126,6 +1126,6 @@ mod tests {
             ResponseFamily::Binomial,
             InverseLink::Mixture(mixture_state),
         );
-        assert!(admission_for(&spec, 80_000, 44).is_none());
+        assert!(admission_for(&spec, 80_000, 44, true).is_none());
     }
 }

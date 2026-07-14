@@ -1216,7 +1216,7 @@ pub(crate) fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
         op: family_operator,
     };
 
-    let solution = InnerSolution {
+    let mut solution = InnerSolution {
         log_likelihood: -1.25,
         penalty_quadratic: 0.4,
         hessian_op: hop,
@@ -2147,6 +2147,40 @@ pub(crate) fn operator_hessian_matches_dense_with_operator_drifts_and_extended_g
             dense_hvp[i]
         );
     }
+
+    // Pair construction is allowed to fail (for example, an immutable family
+    // workspace can reject a malformed second-order row). Both Hessian
+    // representations must return that evidence instead of panicking inside
+    // an infallible callback.
+    solution.ext_coord_pair_fn = Some(Arc::new(|ii, jj| {
+        Err(format!("pair-workspace-refusal ({ii}, {jj})"))
+    }));
+    let dense_error = compute_outer_hessian(
+        &solution,
+        &rho,
+        &lambdas,
+        solution.hessian_op.as_ref(),
+        solution.deriv_provider.as_ref(),
+        None,
+    )
+    .expect_err("dense Hessian assembly must preserve pair callback failure");
+    assert_eq!(dense_error, "pair-workspace-refusal (0, 0)");
+
+    let kernel = solution
+        .deriv_provider
+        .outer_hessian_derivative_kernel()
+        .expect("operator derivative kernel");
+    let operator_error = build_outer_hessian_operator(
+        &solution,
+        &lambdas,
+        solution.deriv_provider.as_ref(),
+        kernel,
+        None,
+        None,
+    )
+    .err()
+    .expect("operator Hessian assembly must preserve pair callback failure");
+    assert_eq!(operator_error, "pair-workspace-refusal (0, 0)");
 }
 
 /// #740: the operator built with a direction-contracted ψψ hook (which
