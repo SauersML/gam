@@ -6080,8 +6080,16 @@ impl SaeManifoldTerm {
             // recomputes `ainv` for each ridge trial as before. No factor or
             // numerical block crosses the accepted-iterate boundary.
             let existing_resident_frame = self.arrow_assembly_workspace.resident_frame.take();
-            let resident_frame =
-                prepare_sae_resident_frame(&sys, &solve_options, existing_resident_frame);
+            let resident_frame = prepare_sae_resident_frame(
+                &sys,
+                &solve_options,
+                existing_resident_frame,
+            )
+            .map_err(|error| {
+                format!(
+                    "SaeManifoldTerm::run_joint_fit_arrow_schur: resident GPU frame preparation failed: {error}"
+                )
+            })?;
             solve_options.sae_resident_frame = resident_frame;
             self.arrow_assembly_workspace.resident_frame = solve_options.sae_resident_frame.clone();
             // Inner Newton step with principled LM-style ridge escalation. The

@@ -921,9 +921,12 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
 fn build_resident_base_frame_if_admitted(
     sys: &ArrowSchurSystem,
     options: &ArrowSolveOptions,
-) -> Option<crate::gpu_kernels::arrow_schur::ResidentBaseArrowFrameHandle> {
+) -> Result<
+    Option<crate::gpu_kernels::arrow_schur::ResidentBaseArrowFrameHandle>,
+    ArrowSchurError,
+> {
     if options.mode != ArrowSolverMode::Direct {
-        return None;
+        return Ok(None);
     }
     if !sys.cross_row_penalties.is_empty()
         || options.streaming_chunk_size.is_some()
@@ -931,10 +934,10 @@ fn build_resident_base_frame_if_admitted(
         || sys.htbeta_matvec.is_some()
         || sys.penalty_op.is_some()
     {
-        return None;
+        return Ok(None);
     }
     if matches!(gam_gpu::global_policy(), gam_gpu::GpuPolicy::Off) {
-        return None;
+        return Ok(None);
     }
     // Same size gate as `try_device_arrow_direct`, BEFORE runtime resolution,
     // so a below-threshold shape never creates a CUDA primary context.
@@ -944,19 +947,24 @@ fn build_resident_base_frame_if_admitted(
         || sys.k < gam_gpu::GpuDispatchPolicy::DEVICE_LOOP_MIN_P
         || dense_work < gam_gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS
     {
-        return None;
+        return Ok(None);
     }
-    let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-        .unwrap_or_else(|error| panic!("Arrow-Schur diagnostic runtime resolution failed: {error}"))?;
+    let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .map_err(|error| ArrowSchurError::SchurFactorFailed {
+            reason: format!("Arrow-Schur resident-frame runtime resolution failed: {error}"),
+        })?
+    else {
+        return Ok(None);
+    };
     if !runtime
         .policy()
         .dense_hessian_work_target_is_gpu(sys.rows.len(), sys.k)
     {
-        return None;
+        return Ok(None);
     }
-    // The frame's own upload re-checks admission and rejects matrix-free systems;
-    // a decline here (transient device-unavailable) simply keeps the per-trial path.
-    crate::gpu_kernels::arrow_schur::ResidentBaseArrowFrameHandle::new(sys).ok()
+    crate::gpu_kernels::arrow_schur::ResidentBaseArrowFrameHandle::new(sys)
+        .map(Some)
+        .map_err(|failure| device_failure_as_arrow_error("resident base-frame build", failure))
 }
 
 /// #1017: build a device-resident framed SAE frame for the LM ridge ladder, or
@@ -981,27 +989,31 @@ fn build_resident_base_frame_if_admitted(
 fn build_resident_sae_frame_if_admitted(
     sys: &ArrowSchurSystem,
     options: &ArrowSolveOptions,
-) -> Option<std::sync::Arc<dyn crate::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>> {
+) -> Result<
+    Option<std::sync::Arc<dyn crate::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>>,
+    ArrowSchurError,
+> {
     if !matches!(
         options.mode,
         ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG
     ) {
-        return None;
+        return Ok(None);
     }
-    let data = sys.device_sae_pcg.as_ref()?;
+    let Some(data) = sys.device_sae_pcg.as_ref() else {
+        return Ok(None);
+    };
     if data.frame.is_none() {
-        return None;
+        return Ok(None);
     }
     if !sys.cross_row_penalties.is_empty() || options.streaming_chunk_size.is_some() {
-        return None;
+        return Ok(None);
     }
     let cg_iters = options
         .pcg
         .max_iterations
         .min(options.trust_region.max_iterations);
-    // `Err(Unavailable)` is the device layer's decline signal; the per-trial
-    // re-flatten path is the caller's fallback, so decline maps to `None` here.
-    crate::gpu_kernels::arrow_schur::build_sae_resident_frame(sys, cg_iters).ok()
+    crate::gpu_kernels::arrow_schur::build_sae_resident_frame(sys, cg_iters)
+        .map_err(|failure| device_failure_as_arrow_error("resident SAE frame build", failure))
 }
 
 /// Refresh an allocation-resident SAE frame for a newly assembled nonlinear
@@ -1018,7 +1030,10 @@ pub fn prepare_sae_resident_frame(
     existing: Option<
         std::sync::Arc<dyn crate::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>,
     >,
-) -> Option<std::sync::Arc<dyn crate::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>> {
+) -> Result<
+    Option<std::sync::Arc<dyn crate::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>>,
+    ArrowSchurError,
+> {
     if !matches!(
         options.mode,
         ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG
@@ -1029,11 +1044,18 @@ pub fn prepare_sae_resident_frame(
         || !sys.cross_row_penalties.is_empty()
         || options.streaming_chunk_size.is_some()
     {
-        return None;
+        return Ok(None);
     }
     if let Some(frame) = existing {
-        if frame.refresh(sys).is_ok() {
-            return Some(frame);
+        match frame.refresh(sys) {
+            Ok(()) => return Ok(Some(frame)),
+            Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::Unavailable) => {}
+            Err(failure) => {
+                return Err(device_failure_as_arrow_error(
+                    "resident SAE frame refresh",
+                    failure,
+                ));
+            }
         }
     }
     build_resident_sae_frame_if_admitted(sys, options)
@@ -1077,7 +1099,7 @@ pub fn solve_with_lm_escalation_inner(
     // re-uploading the whole system each escalation. `None` keeps the exact
     // per-trial re-upload path unchanged (Off, non-Direct, matrix-free, or below
     // the device threshold).
-    let mut resident_frame = build_resident_base_frame_if_admitted(sys, options);
+    let mut resident_frame = build_resident_base_frame_if_admitted(sys, options)?;
     // #1017: the matrix-free SAE-PCG system is exactly the shape the dense base
     // frame above declines, so it re-flattened every device operand each trial.
     // Give it a device-resident frame that reuses the ridge-independent buffers
@@ -1093,11 +1115,12 @@ pub fn solve_with_lm_escalation_inner(
         // ridge ladder. Keep that exact handle for every trial.
         std::borrow::Cow::Borrowed(options)
     } else {
-        match resident_frame
-            .is_none()
-            .then(|| build_resident_sae_frame_if_admitted(sys, options))
-            .flatten()
-        {
+        let candidate = if resident_frame.is_none() {
+            build_resident_sae_frame_if_admitted(sys, options)?
+        } else {
+            None
+        };
+        match candidate {
             Some(frame) => {
                 let mut owned = options.clone();
                 owned.sae_resident_frame = Some(frame);

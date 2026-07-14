@@ -1962,7 +1962,7 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
         .map(|s| s.cfg.num_probes.saturating_mul(s.cfg.cg_max_iters))
         .unwrap_or_else(|| slq_num_probes.saturating_mul(slq_lanczos_steps));
     let device_matvec =
-        maybe_build_evidence_gpu_matvec(sys, ridge_t, ridge_beta, options, cfg_apply_budget);
+        maybe_build_evidence_gpu_matvec(sys, ridge_t, ridge_beta, options, cfg_apply_budget)?;
     let gpu_matvec: Option<&GpuSchurMatvec> =
         options.gpu_matvec.as_ref().or(device_matvec.as_ref());
     let resident = if gpu_matvec.is_none() {

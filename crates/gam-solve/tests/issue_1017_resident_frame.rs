@@ -168,10 +168,12 @@ fn nonlinear_prepare_keeps_frame_identity_and_refreshes_current_content_1017() {
     let options = ArrowSolveOptions::direct();
 
     let prepared = prepare_sae_resident_frame(&sys, &options, Some(Arc::clone(&frame)))
+        .expect("compatible frame refresh must not fail")
         .expect("compatible frame refreshes in place");
     assert!(Arc::ptr_eq(&prepared, &frame));
     sys.rows[0].htt[[0, 0]] = 7.0;
     let prepared_again = prepare_sae_resident_frame(&sys, &options, Some(prepared))
+        .expect("second compatible frame refresh must not fail")
         .expect("same allocation refreshes for the next iterate");
     assert!(Arc::ptr_eq(&prepared_again, &frame));
     assert_eq!(
