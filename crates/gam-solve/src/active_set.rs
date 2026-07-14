@@ -1860,6 +1860,7 @@ fn solve_newton_direction_with_constraint_set_impl(
     mut active_hint: Option<&mut Vec<usize>>,
     max_iterations: usize,
 ) -> Result<(), EstimationError> {
+    let operator_solve_started = std::time::Instant::now();
     let p = gradient.len();
     if direction_out.len() != p {
         *direction_out = Array1::zeros(p);
@@ -1925,7 +1926,20 @@ fn solve_newton_direction_with_constraint_set_impl(
     record_active_working_set(&mut visited_working_sets, &active, 0);
 
     for iteration in 0..max_iterations {
+        let compress_started = std::time::Instant::now();
         let compressed_working = ops.compress_working(&active)?;
+        let compress_elapsed = compress_started.elapsed();
+        if iteration == 0 || compress_elapsed.as_secs_f64() >= 0.25 {
+            log::warn!(
+                "[#979 operator-QP trace] iter={} rows={} active={} rank={} compress_s={:.6} total_s={:.6}",
+                iteration,
+                m,
+                active.len(),
+                compressed_working.constraints.a.nrows(),
+                compress_elapsed.as_secs_f64(),
+                operator_solve_started.elapsed().as_secs_f64(),
+            );
+        }
         let mut residualw = Array1::<f64>::zeros(compressed_working.constraints.a.nrows());
         for r in 0..compressed_working.constraints.a.nrows() {
             residualw[r] = compressed_working.constraints.b[r]
@@ -2029,6 +2043,18 @@ fn solve_newton_direction_with_constraint_set_impl(
             log_active_set_transition("blocking-add", iteration, active.len(), Some(row));
             working_set_repeated =
                 !record_active_working_set(&mut visited_working_sets, &active, iteration);
+        }
+        if operator_solve_started.elapsed().as_secs_f64() >= 1.0
+            && (iteration < 8 || (iteration + 1) % 16 == 0)
+        {
+            log::warn!(
+                "[#979 operator-QP trace] iter={} event=step alpha={:.6e} blocker={} active={} total_s={:.6}",
+                iteration,
+                alpha,
+                blocking_row.map_or(usize::MAX, |row| row),
+                active.len(),
+                operator_solve_started.elapsed().as_secs_f64(),
+            );
         }
         if working_set_repeated {
             break;
@@ -2202,7 +2228,15 @@ pub fn solve_quadratic_with_constraint_set(
                     "operator-constrained quadratic solve: system dimension mismatch"
                 );
             }
+            let operator_qp_started = std::time::Instant::now();
             let ops = ConstraintSetOps::new(set, 0.0)?;
+            log::warn!(
+                "[#979 operator-QP trace] event=entry rows={} cols={} warm={} ops_s={:.6}",
+                set.nrows(),
+                set.ncols(),
+                warm_active_set.map_or(0, |active| active.len()),
+                operator_qp_started.elapsed().as_secs_f64(),
+            );
             let gradient = hessian.dot(beta_start) - rhs;
             let mut delta = Array1::<f64>::zeros(beta_start.len());
             let mut active_hint =
@@ -2217,6 +2251,11 @@ pub fn solve_quadratic_with_constraint_set(
                 Some(&mut active_hint),
                 max_iterations,
             )?;
+            log::warn!(
+                "[#979 operator-QP trace] event=exit active={} total_s={:.6}",
+                active_hint.len(),
+                operator_qp_started.elapsed().as_secs_f64(),
+            );
             let candidate = beta_start + &delta;
             let candidate_values = ops.values(&candidate)?;
             let (worst, _) = ops.max_violation(&candidate_values);
