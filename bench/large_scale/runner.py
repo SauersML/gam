@@ -288,15 +288,6 @@ LARGE_SCALE_DUCHON16D_POWER = 9
 LARGE_SCALE_DUCHON16D_LENGTH_SCALE = 1.0
 PGS_RAW_COLUMN = "pgs_raw"
 PGS_CTN_Z_COLUMN = "pgs_ctn_z"
-PGS_CTN_FIT_SUBSAMPLE_N = 5000
-# At large-scale n=320k the fixed 5000-row subsample only covers ~1.6% of the
-# 16D continuous PC distribution, which left CTN-z with kurt≈3733 (CI run
-# 25338491995). Local n=16k with the same 5000 covers ~31% and got kurt≈7.7.
-# Scale K with sqrt(n_train) — keeps O(K^2) cost manageable while ~4×-ing
-# the per-cell coverage at large scale.
-PGS_CTN_FIT_SUBSAMPLE_N_LARGE_SCALE = 20000
-PGS_CTN_FIT_SUBSAMPLE_LARGE_SCALE_THRESHOLD = 50000
-PGS_CTN_FIT_SUBSAMPLE_SEED = 20260430
 PGS_CTN_DIAGNOSTIC_MIN_N = 40
 PGS_CTN_DIAGNOSTIC_MAX_ABS_MEAN = 0.30
 PGS_CTN_DIAGNOSTIC_MIN_VAR = 0.50
@@ -809,169 +800,25 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         )
 
     ctn_model_path = out_dir / f"{spec.name}.pgs_ctn.model.json"
-    ctn_fit_input_path = out_dir / f"{spec.name}.pgs_ctn.fit_input.csv"
     ctn_train_input_path = out_dir / f"{spec.name}.pgs_ctn.train_input.csv"
     ctn_test_input_path = out_dir / f"{spec.name}.pgs_ctn.test_input.csv"
     ctn_train_score_path = out_dir / f"{spec.name}.pgs_ctn.train_score.csv"
     ctn_test_score_path = out_dir / f"{spec.name}.pgs_ctn.test_score.csv"
     formula = _ctn_formula(spec.pc_count, centers)
     ctn_columns = [PGS_RAW_COLUMN, *_pc_std_columns(spec.pc_count)]
-    # Why this isn't a uniform random subsample any more:
-    #
-    # Previously: pick N=5000 rows uniformly at random, fit CTN on those,
-    # predict z on the full 320k train + 80k test. The Duchon basis we use
-    # for the conditional-CDF surface has a polynomial nullspace (order=0
-    # in 16D ⇒ 1-dim constant nullspace), which is well-behaved at infinity
-    # but the radial basis functions themselves still don't have well-defined
-    # extrapolation outside the basis-support region. With 320k rows the
-    # most extreme PC values sit at the 1/320,000 ≈ 3e-6 quantile; with a
-    # 5000-row uniform subsample they're at the 1/5,000 ≈ 2e-4 quantile —
-    # **64× further into the tail** in the full data than in any uniform
-    # subsample. Predict-time rows beyond the fit-time PC envelope get
-    # linearly extrapolated, which sends the conditional CDF estimate to
-    # ~0 or ~1 spuriously, and `z = Φ⁻¹(F)` then blows up: at large-scale
-    # scale we measured `sd(z) ≈ 1.88`, `skew(z) ≈ 209`,
-    # `excess_kurt(z) ≈ 19711` — a few-row tail of |z| ~ 20+ that the
-    # downstream marginal-slope BFGS gradient cannot escape from in the
-    # CI 50-min budget.
-    #
-    # Fix: stratified subsample that *guarantees* the per-PC extremes are
-    # in the CTN fit set. For each `pc{i}_std` column we take the K rows
-    # with smallest values and the K rows with largest values, so the
-    # fitted basis envelope matches the prediction envelope on every
-    # axis. The remaining budget is filled uniformly at random. The total
-    # subsample size stays close to `PGS_CTN_FIT_SUBSAMPLE_N` (slightly
-    # larger when many rows are in multiple per-axis extremes; we dedupe).
-    # Pick the CTN fit subsample size adaptively. At large scale we use
-    # PGS_CTN_FIT_SUBSAMPLE_N_LARGE_SCALE to give the CTN basis enough coverage
-    # of the 16D continuous PC distribution (the 5000-row default leaves
-    # ~1.6% coverage at n=320k vs ~31% at n=16k local; kurt(z) drops from
-    # ~3700 toward ~10 with 4× more rows in fit).
-    effective_subsample_n = (
-        PGS_CTN_FIT_SUBSAMPLE_N_LARGE_SCALE
-        if len(train_rows) > PGS_CTN_FIT_SUBSAMPLE_LARGE_SCALE_THRESHOLD
-        else PGS_CTN_FIT_SUBSAMPLE_N
-    )
-    if len(train_rows) > effective_subsample_n:
-        rng = np.random.default_rng(PGS_CTN_FIT_SUBSAMPLE_SEED)
-        pc_cols = _pc_std_columns(spec.pc_count)
-        # Cap per-axis-keep at a small fixed number, NOT (SUBSAMPLE_N // 4 //
-        # n_pcs). Why: with the prior formula at SUBSAMPLE_N=5000, pc_count=16
-        # we forced 78 rows from each end of every PC. At local n=16k this
-        # picks rows at the 0.49% quantile, which the CTN can fit cleanly
-        # (kurt(z) ≈ 7.7 in test runs). At large-scale n=320k the SAME 78 rows
-        # land at the 0.024% quantile — 20× further into the tail — so the
-        # CTN training distribution is dominated by extreme outliers and the
-        # fitted basis cannot generalize to interior PCs (CI run 25338491995
-        # observed kurt(z) ≈ 3733, skew ≈ 65 on the bernoulli margslope
-        # heldout split, vs ≈ 7.7 locally).
-        #
-        # Fixed cap of 20 per axis-end keeps the forced-extreme contribution
-        # to ~640 rows out of 5000 (13%, vs the prior 50%). Coverage of the
-        # per-axis envelope is still guaranteed; the predict-time CTN clamp
-        # (5a306369) catches any predict rows beyond that envelope.
-        per_axis_keep = max(2, min(20, effective_subsample_n // (16 * max(len(pc_cols), 1))))
-        forced_idx: set[int] = set()
-        for col in pc_cols:
-            values = np.array([float(row[col]) for row in train_rows], dtype=float)
-            order = np.argsort(values, kind="stable")
-            for i in order[:per_axis_keep]:
-                forced_idx.add(int(i))
-            for i in order[-per_axis_keep:]:
-                forced_idx.add(int(i))
-        random_budget = max(0, effective_subsample_n - len(forced_idx))
-        if random_budget > 0:
-            available = np.array(
-                sorted(set(range(len(train_rows))) - forced_idx),
-                dtype=np.int64,
-            )
-            if available.size > random_budget:
-                random_pick = rng.choice(available, size=random_budget, replace=False)
-                forced_idx.update(int(i) for i in random_pick)
-            else:
-                forced_idx.update(int(i) for i in available)
-        idx_list = sorted(forced_idx)
-        rng.shuffle(idx_list)
-        ctn_fit_rows = [train_rows[i] for i in idx_list]
-        print(
-            f"[CTN subsample] {len(ctn_fit_rows)} rows total: "
-            f"{2 * per_axis_keep * len(pc_cols)} per-axis-extremes (max), "
-            f"rest uniform random; covers full PC envelope on every axis",
-            file=sys.stderr,
-            flush=True,
-        )
-    else:
-        ctn_fit_rows = train_rows
-    # Predict-time PC clamping. Why this is needed even with the stratified
-    # fit subsample:
-    #
-    # The configured order-0 Duchon basis has a constant polynomial nullspace,
-    # but its fitted radial surface is still only supported by the fit-time PC
-    # cloud. Outside that cloud, high-dimensional extrapolation can be extreme.
-    # The stratified subsample
-    # guarantees coverage of the per-axis PC extremes so the train/test PC
-    # envelopes match per axis, but a row could still sit outside the
-    # multi-axis hull (e.g. extreme on PC1 *and* PC4 simultaneously when no
-    # fit row is). For CTN preprocessing we only need
-    # `Φ⁻¹(F(pgs|PCs)) ≈ standard normal`; we have no scientific need to
-    # extrapolate F outside the fit-time PC support, so it is safe — and
-    # standard practice in GAM prediction — to clamp out-of-range PC values
-    # to the fit envelope. Rows inside the box are unaffected; rows outside
-    # are answered with the model's value at the nearest boundary instead of
-    # an unbounded linear extrapolation. PGS_RAW is the response and is
-    # never clamped here.
-    pc_cols_for_clamp = _pc_std_columns(spec.pc_count)
-    fit_pc_min: dict[str, float] = {}
-    fit_pc_max: dict[str, float] = {}
-    for col in pc_cols_for_clamp:
-        vals = np.array([float(row[col]) for row in ctn_fit_rows], dtype=float)
-        fit_pc_min[col] = float(np.min(vals))
-        fit_pc_max[col] = float(np.max(vals))
-
-    def _clamped_rows(rows: list[dict[str, str]]) -> tuple[list[dict[str, str]], dict[str, int]]:
-        clamp_counts: dict[str, int] = {col: 0 for col in pc_cols_for_clamp}
-        out_rows: list[dict[str, str]] = []
-        for row in rows:
-            new_row = {key: row[key] for key in ctn_columns}
-            for col in pc_cols_for_clamp:
-                v = float(row[col])
-                lo = fit_pc_min[col]
-                hi = fit_pc_max[col]
-                if v < lo:
-                    new_row[col] = repr(lo)
-                    clamp_counts[col] += 1
-                elif v > hi:
-                    new_row[col] = repr(hi)
-                    clamp_counts[col] += 1
-                else:
-                    new_row[col] = row[col]
-            out_rows.append(new_row)
-        return out_rows, clamp_counts
-
-    train_clamped, train_clamp_counts = _clamped_rows(train_rows)
-    test_clamped, test_clamp_counts = _clamped_rows(test_rows)
-    total_train_clamped = sum(train_clamp_counts.values())
-    total_test_clamped = sum(test_clamp_counts.values())
-    print(
-        f"[CTN clamp] fit-time PC envelope clamps "
-        f"train={total_train_clamped} test={total_test_clamped} "
-        f"(per-axis: train={train_clamp_counts} test={test_clamp_counts})",
-        file=sys.stderr,
-        flush=True,
-    )
-    write_csv_rows(
-        ctn_fit_input_path,
-        [{key: row[key] for key in ctn_columns} for row in ctn_fit_rows],
-        ctn_columns,
-    )
+    # The CTN is part of the declared estimator, not an approximate feature
+    # engineering prepass. Fit it on every training row and score the untouched
+    # training/heldout covariates. The former 5k/20k subsample plus coordinate-
+    # wise PC clamping changed both the fit measure and prediction inputs; it
+    # also created the extreme-tail behavior it was later trying to mask.
     write_csv_rows(
         ctn_train_input_path,
-        train_clamped,
+        train_rows,
         ctn_columns,
     )
     write_csv_rows(
         ctn_test_input_path,
-        test_clamped,
+        test_rows,
         ctn_columns,
     )
     fit_cmd = [
@@ -980,7 +827,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         "--transformation-normal",
         "--out",
         str(ctn_model_path),
-        str(ctn_fit_input_path),
+        str(ctn_train_input_path),
         formula,
     ]
     rc, out, err = run_cmd_stream(fit_cmd, cwd=ROOT)
@@ -1021,13 +868,8 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         f"conditional PGS CTN formula: {formula}",
         "conditional PGS CTN fit uses isotropic joint-PC Duchon geometry (no scale dimensions)",
         f"conditional PGS CTN fit is phenotype-blind and train-only; downstream z column: {PGS_CTN_Z_COLUMN}",
-        f"conditional PGS CTN fit subsample: {len(ctn_fit_rows)} of {len(train_rows)} train rows (cap {effective_subsample_n})",
-        (
-            f"conditional PGS CTN predict-time PC clamping: "
-            f"train={total_train_clamped} test={total_test_clamped} "
-            f"clamp events to fit envelope "
-            f"({2 * len(pc_cols_for_clamp)} bounds = per-axis min/max from {len(ctn_fit_rows)} fit rows)"
-        ),
+        f"conditional PGS CTN exact fit measure: all {len(train_rows)} training rows",
+        "conditional PGS CTN scoring uses untouched training and heldout covariates",
     ]
     diagnostics.extend(
         _z_moment_report(train_aug, z_column=PGS_CTN_Z_COLUMN, pc_columns=pc_cols, split_label="train")
