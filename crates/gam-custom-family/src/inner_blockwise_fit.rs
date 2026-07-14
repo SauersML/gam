@@ -27,27 +27,28 @@ impl ExactJointModeCurvatureCertificate {
     }
 }
 
-/// Exact Newton candidate on a certified, locally fixed inequality face.
+/// Reduced-space Newton candidate on a certified current inequality face.
 ///
 /// The global constrained step uses a convex model to discover the active
 /// face. Once that face is known, convexifying the Hessian in ambient
 /// coefficient space is mathematically wrong: curvature normal to the face is
 /// inaccessible, and reflecting it can perturb the tangent Newton equation.
-/// This routine instead solves the exact reduced system
+/// This routine instead works in the reduced system
 ///
 ///     (Z' H Z) delta_z = Z' r,   delta = Z delta_z,
 ///
-/// where `Z` spans `null(A_active)`. The candidate is returned only when the
-/// reduced Hessian is strictly positive definite, the complete constraint set
-/// remains feasible, and the quadratic gradient has a nonnegative active-face
-/// multiplier representation. Otherwise face discovery retains ownership.
-fn certified_exact_face_newton_candidate(
+/// where `Z` spans `null(A_active)`. Negative tangent curvature is reflected
+/// only as a globalization direction and the step is truncated at the first
+/// inactive blocker. When reduced curvature is positive and no blocker is
+/// crossed, the returned step is the exact fixed-face Newton step and also
+/// requires a nonnegative multiplier certificate.
+fn certified_reduced_face_newton_candidate(
     exact_hessian: &Array2<f64>,
     rhs: &Array1<f64>,
     beta: &Array1<f64>,
     constraints: &ConstraintSet,
     active_rows: &[usize],
-) -> Result<Option<Array1<f64>>, String> {
+) -> Result<Option<(Array1<f64>, Vec<usize>, bool)>, String> {
     let p = beta.len();
     if active_rows.is_empty()
         || rhs.len() != p
@@ -78,53 +79,129 @@ fn certified_exact_face_newton_candidate(
     let positive_floor = KKT_REFUSAL_RANK_TOL * curvature_scale;
     if eigenvalues
         .iter()
-        .any(|value| !value.is_finite() || *value <= positive_floor)
+        .any(|value| !value.is_finite() || value.abs() <= positive_floor)
     {
         return Ok(None);
     }
+    let exact_positive_curvature = eigenvalues.iter().all(|value| *value > positive_floor);
     let reduced_rhs = tangent.t().dot(rhs);
     let mut spectral_step = eigenvectors.t().dot(&reduced_rhs);
     for (coefficient, eigenvalue) in spectral_step.iter_mut().zip(eigenvalues.iter()) {
-        *coefficient /= *eigenvalue;
+        // Away from a local mode, reflect negative curvature only in the
+        // accessible tangent. This is a strict-descent modified-Newton
+        // globalization, not an estimator change; as soon as the reduced
+        // Hessian is positive it becomes the exact Newton equation above.
+        *coefficient /= eigenvalue.abs();
     }
-    let delta = tangent.dot(&eigenvectors.dot(&spectral_step));
+    let mut delta = tangent.dot(&eigenvectors.dot(&spectral_step));
     if delta.iter().any(|value| !value.is_finite()) {
         return Ok(None);
     }
-    let candidate = beta + &delta;
-    if check_linear_feasibility(
-        &candidate,
-        constraints,
-        gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
-    )
-    .is_err()
-    {
+    let directional_descent = rhs.dot(&delta);
+    if !(directional_descent.is_finite() && directional_descent > 0.0) {
         return Ok(None);
     }
 
-    // The reduced solve certifies tangent stationarity. Certify the other KKT
-    // half as well: its remaining quadratic gradient must be representable by
-    // nonnegative multipliers on this face. The shared cone projector owns
-    // dependent-row compression and multiplier signs.
-    let quadratic_gradient = exact_hessian.dot(&delta) - rhs;
-    let Some((projected, _multipliers)) =
-        project_stationarity_residual_on_constraint_cone(&quadratic_gradient, &gathered.a)
-    else {
-        return Ok(None);
-    };
-    let residual_inf = projected
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0_f64, f64::max);
-    let gradient_scale = quadratic_gradient
-        .iter()
-        .chain(rhs.iter())
-        .map(|value| value.abs())
-        .fold(1.0_f64, f64::max);
-    if residual_inf > 1e-8 * gradient_scale {
+    // The tangent step can meet a previously inactive inequality. Truncate at
+    // the first certified numerical boundary and carry that blocker into the
+    // next face instead of discarding the whole reduced-space direction and
+    // returning to an ambient-convex crawl.
+    let values_beta = constraints
+        .values(beta.view())
+        .map_err(|error| format!("exact active-face value evaluation failed: {error}"))?;
+    let values_delta = constraints
+        .values(delta.view())
+        .map_err(|error| format!("exact active-face direction evaluation failed: {error}"))?;
+    let mut alpha = 1.0_f64;
+    let mut blocking_row = None;
+    for row in 0..constraints.nrows() {
+        if active_rows.contains(&row) {
+            continue;
+        }
+        let norm = constraints
+            .row_norm(row)
+            .map_err(|error| format!("exact active-face row norm failed: {error}"))?;
+        if !(norm.is_finite() && norm > 0.0) {
+            continue;
+        }
+        let bound = constraints
+            .bound(row)
+            .map_err(|error| format!("exact active-face row bound failed: {error}"))?;
+        if bound == f64::NEG_INFINITY {
+            continue;
+        }
+        let scaled_slack = (values_beta[row] - bound) / norm;
+        let scaled_rate = values_delta[row] / norm;
+        if scaled_rate < 0.0 {
+            let fraction = (scaled_slack
+                + gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL)
+                / -scaled_rate;
+            if fraction.is_finite() && fraction >= 0.0 && fraction < alpha {
+                alpha = fraction;
+                blocking_row = Some(row);
+            }
+        }
+    }
+    if !(alpha.is_finite() && alpha > 0.0) {
         return Ok(None);
     }
-    Ok(Some(candidate))
+    if alpha < 1.0 {
+        alpha *= 1.0 - 1e-12;
+        delta *= alpha;
+    }
+    let candidate = beta + &delta;
+    let candidate_values = constraints
+        .values(candidate.view())
+        .map_err(|error| format!("reduced active-face candidate evaluation failed: {error}"))?;
+    for row in 0..constraints.nrows() {
+        let norm = constraints
+            .row_norm(row)
+            .map_err(|error| format!("reduced active-face candidate row norm failed: {error}"))?;
+        if !(norm.is_finite() && norm > 0.0) {
+            continue;
+        }
+        let bound = constraints
+            .bound(row)
+            .map_err(|error| format!("reduced active-face candidate bound failed: {error}"))?;
+        if bound != f64::NEG_INFINITY
+            && (candidate_values[row] - bound) / norm
+                < -gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+        {
+            return Ok(None);
+        }
+    }
+
+    let exact_newton = exact_positive_curvature && alpha >= 1.0;
+    if exact_newton {
+        // The full reduced Newton solve certifies tangent stationarity. Certify
+        // the other KKT half as well: its remaining quadratic gradient must be
+        // representable by nonnegative multipliers on this face.
+        let quadratic_gradient = exact_hessian.dot(&delta) - rhs;
+        let Some((projected, _multipliers)) =
+            project_stationarity_residual_on_constraint_cone(&quadratic_gradient, &gathered.a)
+        else {
+            return Ok(None);
+        };
+        let residual_inf = projected
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let gradient_scale = quadratic_gradient
+            .iter()
+            .chain(rhs.iter())
+            .map(|value| value.abs())
+            .fold(1.0_f64, f64::max);
+        if residual_inf > 1e-8 * gradient_scale {
+            return Ok(None);
+        }
+    }
+    let mut next_active = active_rows.to_vec();
+    if let Some(row) = blocking_row
+        && !next_active.contains(&row)
+    {
+        next_active.push(row);
+    }
+    Ok(Some((candidate, next_active, exact_newton)))
 }
 
 #[cfg(test)]
@@ -146,7 +223,7 @@ mod exact_face_newton_tests {
             LinearInequalityConstraints::new(array![[1.0_f64, 0.0]], array![0.0])
                 .expect("x>=0 half-space"),
         );
-        let candidate = certified_exact_face_newton_candidate(
+        let (candidate, active, exact) = certified_reduced_face_newton_candidate(
             &hessian,
             &rhs,
             &beta,
@@ -155,8 +232,41 @@ mod exact_face_newton_tests {
         )
         .expect("exact face classification")
         .expect("positive reduced curvature and nonnegative multiplier");
+        assert_eq!(active, vec![0]);
+        assert!(exact);
         assert!(candidate[0].abs() <= 1e-12);
         assert!((candidate[1] - 1.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn reduced_face_globalization_reflects_only_tangent_and_adds_first_blocker() {
+        // x>=0 is the current face. The accessible y curvature is negative,
+        // so the reduced modified-Newton direction reflects only that scalar
+        // mode and then meets the inactive y<=0.5 row. The returned topology
+        // must include the new blocker; it is not yet an exact Newton step.
+        let hessian = array![[1.0_f64, 0.0], [0.0, -2.0]];
+        let rhs = array![0.0_f64, 2.0];
+        let beta = array![0.0_f64, 0.0];
+        let constraints = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(
+                array![[1.0_f64, 0.0], [0.0, -1.0]],
+                array![0.0, -0.5],
+            )
+            .expect("x>=0 and y<=0.5"),
+        );
+        let (candidate, active, exact) = certified_reduced_face_newton_candidate(
+            &hessian,
+            &rhs,
+            &beta,
+            &constraints,
+            &[0],
+        )
+        .expect("reduced face classification")
+        .expect("strict tangent descent to the first blocker");
+        assert!(candidate[0].abs() <= 1e-12);
+        assert!((candidate[1] - 0.5).abs() <= 2e-8);
+        assert_eq!(active, vec![0, 1]);
+        assert!(!exact);
     }
 }
 
@@ -1785,23 +1895,24 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
                     let exact_face_candidate = if lower_bounds.is_none() {
                         if let Some(active_rows) = warm_joint_active.as_deref() {
-                            certified_exact_face_newton_candidate(
+                            certified_reduced_face_newton_candidate(
                                 &exact_lhs,
                                 &rhs_step,
                                 &beta_joint,
                                 constraints,
                                 active_rows,
                             )?
-                            .map(|candidate| (candidate, active_rows.to_vec()))
                         } else {
                             None
                         }
                     } else {
                         None
                     };
-                    let used_exact_face = exact_face_candidate.is_some();
-                    let solve_result = if let Some(exact) = exact_face_candidate {
-                        Ok(exact)
+                    let exact_face_kind = exact_face_candidate
+                        .as_ref()
+                        .map(|(_, _, exact)| *exact);
+                    let solve_result = if let Some((candidate, active, _)) = exact_face_candidate {
+                        Ok((candidate, active))
                     } else if let Some(bounds) = lower_bounds.as_ref() {
                         solve_quadratic_with_simple_lower_bounds(
                             &lhs,
@@ -1833,8 +1944,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             log::warn!(
                                 "[gam#979 constrained-QP] cycle={} path={} warm_rows={} active_set_rows={} beta_inf={:.4e}",
                                 cycle,
-                                if used_exact_face {
+                                if exact_face_kind == Some(true) {
                                     "exact-face"
+                                } else if exact_face_kind == Some(false) {
+                                    "tangent-face"
                                 } else if lower_bounds.is_some() {
                                     "simple"
                                 } else {
