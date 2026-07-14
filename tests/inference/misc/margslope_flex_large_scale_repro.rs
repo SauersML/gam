@@ -186,11 +186,11 @@ fn margslope_flex_beta_equivalence_smoke() {
     );
 }
 
-/// gam#683 regression: multiple real REML/continuation outer iterations under
+/// gam#683 regression: multiple real REML outer iterations under
 /// `linkwiggle()` must return. Unlike `margslope_flex_large_scale_repro_cycle0`
 /// (which caps `outer_max_iter = 1`), this allows several outer iterations so
-/// the degree-15/21 BMS row-cell-moment derivative path and the continuation
-/// pre-warm actually fire repeatedly — the exact regime #683 reported as
+/// the degree-15/21 BMS row-cell-moment derivative path fires repeatedly —
+/// the exact regime #683 reported as
 /// hanging (the outer LAML Hessian re-walked every cubic partition cell per
 /// `(ρ-axis i, ρ-axis j)` pair, O(D²·n·cells·r²) per outer step). The
 /// axis-projected per-row tensor cache collapses that to one O(n·cells·r²)

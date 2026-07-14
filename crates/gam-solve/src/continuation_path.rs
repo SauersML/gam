@@ -836,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn coupled_path_prewarm_requests_value_only_evals() {
+    fn coupled_path_waypoints_request_value_only_evals() {
         let mut path = ContinuationPath::enter(schedules());
         let mut obj = RecordingObjective::default();
         let initial_beta = Array1::zeros(0);

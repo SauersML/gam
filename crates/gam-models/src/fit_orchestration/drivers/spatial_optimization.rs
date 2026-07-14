@@ -6126,7 +6126,7 @@ impl<'d> ExactJointDesignCache<'d> {
     impl_exact_joint_theta_memo!();
 
     /// Cache a cost-only result. Called after `ensure_theta(theta)` for
-    /// line-search probes and value-only seed prewarming. We
+    /// literal-seed and line-search cost probes. We
     /// intentionally do not populate `last_eval` because no gradient was
     /// computed; the next outer evaluation at this θ will recompute
     /// (V, ∇V) via `evaluate_with_order` if the optimizer asks for it.
@@ -6715,8 +6715,9 @@ where
     // pilot-then-refine schedule for stationary-process likelihoods,
     // chosen here because the per-eval cost of the κ gradient grows
     // linearly in `n` and the pilot subsample reduces that cost by a
-    // factor of `n / K`. The exact continuation is a one-seed warm start that
-    // retains the learned trust radius and Hessian; it costs one terminal
+    // factor of `n / K`. The exact full-data refinement starts literally at
+    // the pilot checkpoint and retains the learned trust radius and Hessian;
+    // it costs one terminal
     // full-data evaluation when the pilot point already certifies and keeps
     // optimizing when it does not.
     //
@@ -7224,7 +7225,7 @@ where
 
     // ── P7 stage rotation ────────────────────────────────────────────────
     // The returned theta and certificate now belong to the exact full-data
-    // continuation. No separate probe may mutate that certified identity before
+    // refinement. No separate probe may mutate that certified identity before
     // the final coefficient fit.
     state.ensure_theta(&theta_star)?;
     let (mode_theta, mode_objective, mode) = state.terminal_mode.take().ok_or_else(|| {
@@ -7820,8 +7821,9 @@ fn select_isotropic_matern_range_basin(
 
         let mut endpoint_spec = resolvedspec.clone();
         set_spatial_length_scale(&mut endpoint_spec, term_idx, long_length_scale)?;
-        // Profile rho at the competing geometry by continuation from the
-        // already certified incumbent rho. This is still a full standard REML
+        // Profile rho at the competing geometry by starting the ordinary outer
+        // optimizer literally at the already certified incumbent rho. This is
+        // still a full standard REML
         // solve (including its ordinary seed certification), but it avoids
         // throwing away the exact smoothing optimum immediately before a
         // deliberately coarser center-resolution geometry move. The incumbent

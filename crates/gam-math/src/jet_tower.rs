@@ -652,9 +652,9 @@ impl<const K: usize> jet_algebra::JetAlgebra<5> for Tower4<K> {
 /// or `t4`), so dropping the third/fourth tensors cannot perturb the value,
 /// gradient, or Hessian.
 ///
-/// It exists purely for performance: an inner Newton step (and the
-/// value-only ρ-homotopy pre-warm) needs at most curvature, never the
-/// outer-κ/ψ third/fourth derivatives. Evaluating a row likelihood over
+/// It exists purely for performance: an inner Newton step and a value-only
+/// outer-objective probe need at most curvature, never the outer-κ/ψ
+/// third/fourth derivatives. Evaluating a row likelihood over
 /// `Tower2` skips the `K⁴` fourth-tensor product/composition arithmetic that
 /// dominates the cold marginal-slope fit, while returning the exact same
 /// `(v, g, h)`.

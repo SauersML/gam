@@ -12,14 +12,14 @@ pub(crate) struct TransformationExactGeometryCache {
 
 #[derive(Default)]
 pub(crate) struct TransformationExactModeBranch {
-    continuation: Option<CustomFamilyWarmStart>,
+    carried_mode: Option<CustomFamilyWarmStart>,
     anchor: Option<CustomFamilyWarmStart>,
     frozen: bool,
 }
 
 impl TransformationExactModeBranch {
-    /// Before the branch is frozen, compare a cold solve with the carried
-    /// continuation at every value-only prewarm point. This is a deterministic
+    /// Before the branch is frozen, compare a cold solve with the carried mode
+    /// at every value-only objective trial. This is a deterministic
     /// mode-selection rule based on the profiled criterion, not coefficient
     /// magnitude or cache distance. Freezing makes the carried candidate
     /// immutable; cold remains a candidate so a worse anchor can never define
@@ -33,7 +33,7 @@ impl TransformationExactModeBranch {
         let carried = self
             .frozen
             .then_some(&self.anchor)
-            .unwrap_or(&self.continuation)
+            .unwrap_or(&self.carried_mode)
             .as_ref()
             .filter(|warm| warm.compatible_with_rho(rho))
             .cloned();
@@ -50,19 +50,20 @@ impl TransformationExactModeBranch {
         if self.frozen || matches!(eval_mode, gam_problem::EvalMode::ValueOnly) {
             return false;
         }
-        self.anchor = self.continuation.take();
+        self.anchor = self.carried_mode.take();
         self.frozen = true;
         true
     }
 
-    /// Value-only prewarm is the sole phase allowed to advance the continuation.
+    /// Value-only objective trials are the sole phase allowed to advance the
+    /// carried mode.
     pub(crate) fn record_value(
         &mut self,
         eval_mode: gam_problem::EvalMode,
         warm_start: CustomFamilyWarmStart,
     ) {
         if !self.frozen && matches!(eval_mode, gam_problem::EvalMode::ValueOnly) {
-            self.continuation = Some(warm_start);
+            self.carried_mode = Some(warm_start);
         }
     }
 }
@@ -386,7 +387,7 @@ pub fn fit_transformation_normal(
     }
 
     // SCOP's squared shape coordinates make the coefficient objective
-    // non-convex. Value-only prewarming compares cold and continuation modes;
+    // non-convex. Value-only trials compare cold and carried modes;
     // the first derivative-bearing evaluation freezes the selected mode's
     // INPUT as the branch anchor. Every later trial restarts from that fixed
     // anchor, making the profile independent of rejected-trial cache history.

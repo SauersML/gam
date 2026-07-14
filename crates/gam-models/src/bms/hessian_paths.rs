@@ -232,7 +232,7 @@ impl BernoulliBlockHessianAccumulator {
         // matrix as borrowed views. `try_row_chunk` would instead `.to_owned()`
         // a fresh `(rows × p)` `Array2` every chunk every cycle — the dominant
         // `OwnedRepr<f64>` alloc/`drop_in_place` churn the cold marginal-slope
-        // fit pays in its repeated inner Newton / ρ-homotopy pre-warm passes.
+        // fit pays across its repeated inner-Newton and outer-evaluation passes.
         // `fast_xt_diag_*` is generic over `Data<Elem = f64>`, so an
         // `ArrayView2` slice feeds the identical BLAS-3 kernels with identical
         // arithmetic — exact, just without the copy.

@@ -71,8 +71,9 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     /// mode is undamped: the active-set minimiser is unique only to round-off
     /// along it, the proposal slides an O(1) step every cycle, `step_inf` never
     /// exhausts, the KKT / constrained-fixed-point certificate never fires, and
-    /// the inner joint-Newton grinds its full cycle budget on EVERY outer ρ-eval
-    /// — the ~35s-per-seed pre-warm slowdown (#979). The self-vanishing μ
+    /// the inner joint-Newton grinds its full cycle budget on EVERY literal-seed
+    /// and solver ρ evaluation — the repeated inner-solve cost behind #979.
+    /// The self-vanishing μ
     /// (∝ projected KKT residual → 0 at the fixed point) gives the near-null
     /// mode a tiny positive curvature so the minimiser is unique and `step_inf`
     /// exhausts, WITHOUT moving the converged β (the link-deviation / log-slope
@@ -2793,7 +2794,7 @@ impl BernoulliMarginalSlopeFamily {
                 // the chunk rows are read straight from the stored matrix as
                 // borrowed `ArrayView2` slices. `try_row_chunk` would `.to_owned()`
                 // a fresh `(rows × p)` `Array2` for every chunk on every
-                // ρ-homotopy pre-warm pass — the dominant `OwnedRepr<f64>`
+                // outer derivative evaluation — the dominant `OwnedRepr<f64>`
                 // alloc/`drop_in_place` churn of the cold marginal-slope fit.
                 // `fast_ab` is generic over `Data<Elem = f64>`, so the view feeds
                 // the identical BLAS-3 kernel with identical arithmetic.

@@ -444,11 +444,11 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         //   * `ValueOnly`            → neither cache (the objective is read off
         //                              the converged inner mode; no directional
         //                              contraction is taken). Seed screening,
-        //                              line-search cost probes, and continuation
-        //                              pre-warm are all value-only — at biobank
-        //                              scale each was paying two full `O(n)` jet
-        //                              passes (third + fourth) for tensors it
-        //                              never reads.
+        //                              line-search cost probes, and typed reactive
+        //                              `ContinuationPath` waypoints are all
+        //                              value-only — at biobank scale each would
+        //                              otherwise pay two full `O(n)` jet passes
+        //                              (third + fourth) for tensors it never reads.
         //   * `ValueAndGradient`     → third-derivative cache only. The REML/LAML
         //                              gradient's `coord_corrections` IFT-drift
         //                              trace is a *first* directional derivative
