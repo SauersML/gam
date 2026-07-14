@@ -117,8 +117,7 @@ use gam_terms::structure::anova_atom::{
     CarveReport, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
 };
 use opt::{
-    Bfgs, Bounds, FirstOrderSample, FusedObjective, GradientTolerance, MaxIterations,
-    ObjectiveEvalError, Profile,
+    BracketedRootConfig, FirstOrderSample, ObjectiveEvalError, find_root_bracketed,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3226,64 +3225,83 @@ fn optimize_torus_metric_coordinate(
     lower: f64,
     upper: f64,
 ) -> Result<f64, String> {
-    let evaluate = |point: &Array1<f64>| -> Result<FirstOrderSample, ObjectiveEvalError> {
+    if !(lower.is_finite() && upper.is_finite() && lower < upper) {
+        return Err(format!(
+            "torus reference-metric coordinate domain [{lower}, {upper}] is invalid"
+        ));
+    }
+    let evaluate = |coordinate: f64| {
         evaluate_torus_metric_profile(
             phi,
             target,
             weights,
             per_axis_order,
             family,
-            point[0],
+            coordinate,
         )
     };
-    let bound_resolution = f64::EPSILON.sqrt();
-    let bounds = Bounds::new(
-        Array1::from_vec(vec![lower]),
-        Array1::from_vec(vec![upper]),
-        bound_resolution,
-    )
-    .map_err(|error| format!("torus metric bounds: {error}"))?;
-    // Each metric family starts from the center of its own legal coordinate.
-    // In particular, mapping the flat square-torus winner (tau = 0) into the
-    // embedded coordinate gives beta = 1, exactly the degenerate A -> 1 donut
-    // boundary where the penalty derivative diverges.  Clamping that inherited
-    // seed just inside the box leaves BFGS with an enormous projected direction
-    // and an Armijo model dominated by the boundary kink.  A domain-centered
-    // seed is invariant to the competing family's optimum and stays separated
-    // from both artificial numerical boundaries.
-    let seed = lower + 0.5 * (upper - lower);
-    let seed_point = Array1::from_vec(vec![seed]);
-    let objective = FusedObjective::new(evaluate);
-    let mut optimizer = Bfgs::new(seed_point, objective)
-        .with_bounds(bounds)
-        .with_profile(Profile::Deterministic)
-        .with_max_iterations(
-            MaxIterations::new(f64::MANTISSA_DIGITS as usize)
-                .map_err(|error| format!("torus metric iteration budget: {error}"))?,
-        )
-        .with_gradient_tolerance(GradientTolerance::relative_to_cost(bound_resolution));
-    let solution = optimizer.run().map_err(|error| {
-        let diagnostic = [lower, seed.clamp(lower, upper), upper].map(|coordinate| {
-            match evaluate_torus_metric_profile(
-                phi,
-                target,
-                weights,
-                per_axis_order,
-                family,
-                coordinate,
-            ) {
-                Ok(sample) => format!(
-                    "({coordinate}, value={}, gradient={})",
-                    sample.value, sample.gradient[0]
-                ),
-                Err(eval_error) => format!("({coordinate}, error={eval_error})"),
+    let lower_sample = evaluate(lower)
+        .map_err(|error| format!("{family:?} torus lower-endpoint profile: {error}"))?;
+    let upper_sample = evaluate(upper)
+        .map_err(|error| format!("{family:?} torus upper-endpoint profile: {error}"))?;
+    let lower_gradient = lower_sample.gradient[0];
+    let upper_gradient = upper_sample.gradient[0];
+    let position_tolerance = f64::EPSILON.sqrt();
+    let objective_scale = lower_sample
+        .value
+        .abs()
+        .max(upper_sample.value.abs())
+        .max(1.0);
+    let gradient_tolerance = position_tolerance * objective_scale / (upper - lower);
+
+    // This is a scalar constrained problem, so its exact first-order KKT
+    // conditions are stronger and cheaper than a multidimensional line-search
+    // heuristic. At the lower wall the feasible derivative must be nonnegative;
+    // at the upper wall it must be nonpositive. If neither wall satisfies KKT,
+    // continuity gives the correctly oriented negative-to-positive derivative
+    // bracket of an interior minimum. `find_root_bracketed` preserves that
+    // certificate without finite differences or a monotonicity assumption.
+    let lower_is_kkt = lower_gradient >= -gradient_tolerance;
+    let upper_is_kkt = upper_gradient <= gradient_tolerance;
+    let coordinate = match (lower_is_kkt, upper_is_kkt) {
+        (true, false) => lower,
+        (false, true) => upper,
+        (true, true) => {
+            if lower_sample.value <= upper_sample.value {
+                lower
+            } else {
+                upper
             }
-        });
-        format!(
-            "{family:?} torus reference-metric optimization did not converge: {error}; boundary/seed profile={diagnostic:?}"
-        )
-    })?;
-    let coordinate = solution.final_point[0];
+        }
+        (false, false) => {
+            let config = BracketedRootConfig::new(
+                position_tolerance,
+                gradient_tolerance,
+                f64::MANTISSA_DIGITS as usize,
+            );
+            find_root_bracketed(
+                |candidate| {
+                    if candidate == lower {
+                        Ok(lower_gradient)
+                    } else if candidate == upper {
+                        Ok(upper_gradient)
+                    } else {
+                        evaluate(candidate).map(|sample| sample.gradient[0])
+                    }
+                },
+                lower,
+                upper,
+                &config,
+            )
+            .map_err(|error| {
+                format!(
+                    "{family:?} torus reference-metric stationary solve did not converge: {error}; endpoint profile=[({lower}, value={}, gradient={lower_gradient}), ({upper}, value={}, gradient={upper_gradient})]",
+                    lower_sample.value, upper_sample.value
+                )
+            })?
+            .root
+        }
+    };
     if !(coordinate.is_finite() && coordinate >= lower && coordinate <= upper) {
         return Err(format!(
             "torus reference-metric optimizer returned invalid coordinate {coordinate} outside [{lower}, {upper}]"
