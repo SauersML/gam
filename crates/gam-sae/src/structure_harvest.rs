@@ -3247,12 +3247,14 @@ fn optimize_torus_metric_coordinate(
     let lower_gradient = lower_sample.gradient[0];
     let upper_gradient = upper_sample.gradient[0];
     let position_tolerance = f64::EPSILON.sqrt();
-    let objective_scale = lower_sample
-        .value
+    // Scale stationarity by the derivative itself, not by the absolute REML
+    // score: adding a constant to an objective must not change which point is
+    // considered converged.
+    let gradient_scale = lower_gradient
         .abs()
-        .max(upper_sample.value.abs())
+        .max(upper_gradient.abs())
         .max(1.0);
-    let gradient_tolerance = position_tolerance * objective_scale / (upper - lower);
+    let gradient_tolerance = position_tolerance * gradient_scale;
 
     // This is a scalar constrained problem, so its exact first-order KKT
     // conditions are stronger and cheaper than a multidimensional line-search
