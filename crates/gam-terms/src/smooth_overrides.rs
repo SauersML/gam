@@ -33,8 +33,8 @@ use std::path::PathBuf;
 
 use crate::basis::{
     BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, ConstantCurvatureBasisSpec, DuchonBasisSpec,
-    DuchonNullspaceOrder, MaternBasisSpec, MaternNu, MeasureJetBasisSpec, OneDimensionalBoundary,
-    SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
+    DuchonNullspaceOrder, MaternBasisSpec, MaternLengthScale, MaternNu, MeasureJetBasisSpec,
+    OneDimensionalBoundary, SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
 };
 use crate::smooth::{
     BySmoothKind, ByVariableSpec, SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec,
@@ -497,7 +497,7 @@ fn apply_matern(
                 "smooths[{symbol:?}].length_scale must be a positive finite value, got {ls}"
             ));
         }
-        spec.length_scale = ls;
+        spec.length_scale = MaternLengthScale::fixed(ls);
     }
     if let Some(anis) = descriptor.get("aniso_log_scales") {
         spec.aniso_log_scales = Some(parse_f64_vec(anis, "aniso_log_scales", symbol)?);

@@ -2,6 +2,18 @@ use super::*;
 
 pub(crate) const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
 
+/// Inner coefficient state bound to one exact outer seed.
+///
+/// A cached coefficient vector is only a valid initialization for the outer
+/// coordinate that produced it.  Keeping the coordinate beside the vector
+/// prevents a multi-start run from silently reusing one basin's coefficients
+/// at a different seed.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundInnerSeed {
+    pub(crate) theta: Array1<f64>,
+    pub(crate) beta: Array1<f64>,
+}
+
 /// Hold terminal evidence at full inner-solve fidelity.
 ///
 /// Search-time REML evaluations may deliberately cap P-IRLS.  A terminal
@@ -55,6 +67,7 @@ pub(crate) struct OuterConfig {
     pub(crate) rho_bound: f64,
     pub(crate) heuristic_lambdas: Option<Vec<f64>>,
     pub(crate) initial_rho: Option<Array1<f64>>,
+    pub(crate) initial_inner_seed: Option<BoundInnerSeed>,
     pub(crate) fallback_policy: FallbackPolicy,
     pub(crate) screening_cap: Option<Arc<AtomicUsize>>,
     pub(crate) screen_initial_rho: bool,
@@ -102,18 +115,6 @@ pub(crate) struct OuterConfig {
     /// from this one, even after an interrupted run.
     pub(crate) cache_mirror_sessions: Vec<Arc<CacheSession>>,
     pub(crate) rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize,
-    /// Set by the persistent-cache resume path (`run`) when the outer seed
-    /// originates from a warm-start cache *hit* — i.e. `config.initial_rho`
-    /// (and, since 0.1.204, the inner β) was populated from a prior fit's
-    /// persisted near-optimal iterate (`CacheSeedDecision::Seed`). On a hit
-    /// the continuation pre-warm — which exists to anneal a COLD seed toward
-    /// the optimum — is redundant work (the seed is already near-optimal), so
-    /// the pre-warm step budget is dropped to zero and the run proceeds
-    /// straight to the BFGS/Newton certificate from the cached iterate. The
-    /// converged optimum is unchanged: warm start only sets the STARTING
-    /// point. Defaulted `false`, so every cold-start / no-cache path keeps its
-    /// existing continuation pre-warm budget byte-for-byte.
-    pub(crate) warm_start_cache_hit: bool,
     /// Converged exact outer Hessian `H(θ̂)` transferred from a prior
     /// structurally-matching fit via the persistent cache (a warm-start *hit*),
     /// in the full θ layout. When present and SPD, the BFGS host path seeds its
@@ -155,6 +156,7 @@ impl Default for OuterConfig {
             rho_bound: 30.0,
             heuristic_lambdas: None,
             initial_rho: None,
+            initial_inner_seed: None,
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
             screen_initial_rho: false,
@@ -168,7 +170,6 @@ impl Default for OuterConfig {
             cache_mirror_sessions: Vec::new(),
             rho_uncertainty_problem_size:
                 crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
-            warm_start_cache_hit: false,
             warm_start_outer_hessian: None,
             rho_canonical_keys: None,
         }
@@ -214,7 +215,6 @@ pub struct OuterProblem {
     cache_session: Option<Arc<CacheSession>>,
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
     rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize,
-    continuation_prewarm: bool,
     rho_canonical_keys: Option<Vec<u64>>,
 }
 
@@ -249,7 +249,6 @@ impl OuterProblem {
             cache_mirror_sessions: Vec::new(),
             rho_uncertainty_problem_size:
                 crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
-            continuation_prewarm: true,
             rho_canonical_keys: None,
         }
     }
@@ -341,13 +340,6 @@ impl OuterProblem {
     }
     pub fn with_initial_rho(mut self, rho: Array1<f64>) -> Self {
         self.initial_rho = Some(rho);
-        self
-    }
-    /// Toggle the generic rho-continuation seed pre-warm. This does not affect
-    /// objectives that require an explicit continuation path; it only controls
-    /// the cheap-by-default pre-pass gated by `allow_continuation_prewarm()`.
-    pub fn with_continuation_prewarm(mut self, enabled: bool) -> Self {
-        self.continuation_prewarm = enabled;
         self
     }
     pub fn with_screening_cap(mut self, screening_cap: Arc<AtomicUsize>) -> Self {
@@ -512,6 +504,7 @@ impl OuterProblem {
             rho_bound: self.rho_bound,
             heuristic_lambdas: self.heuristic_lambdas.clone(),
             initial_rho: self.initial_rho.clone(),
+            initial_inner_seed: None,
             fallback_policy: self.fallback_policy,
             screening_cap: self.screening_cap.clone(),
             screen_initial_rho: self.screen_initial_rho,
@@ -524,11 +517,6 @@ impl OuterProblem {
             cache_session: self.cache_session.clone(),
             cache_mirror_sessions: self.cache_mirror_sessions.clone(),
             rho_uncertainty_problem_size: self.rho_uncertainty_problem_size,
-            // Cold by construction. The persistent-cache resume path in `run`
-            // flips this to `true` only after a warm-start cache *hit* installs
-            // a near-optimal seed; every other entry point keeps the cold-start
-            // continuation pre-warm budget byte-for-byte.
-            warm_start_cache_hit: false,
             // Populated only by the persistent-cache resume path in `run` after
             // a warm-start hit decodes a converged outer Hessian; cold by
             // construction here, like `warm_start_cache_hit`.
@@ -575,7 +563,6 @@ impl OuterProblem {
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             terminal_eval_order: None,
-            continuation_prewarm: self.continuation_prewarm,
         }
     }
 
@@ -614,7 +601,6 @@ impl OuterProblem {
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             terminal_eval_order: None,
-            continuation_prewarm: self.continuation_prewarm,
         }
     }
 
@@ -655,7 +641,6 @@ impl OuterProblem {
             screening_proxy_fn: Some(screening_proxy_fn),
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             terminal_eval_order: None,
-            continuation_prewarm: self.continuation_prewarm,
         }
     }
 

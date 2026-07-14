@@ -297,7 +297,7 @@ fn test_matern_public_second_derivative_matchesfd_of_public_first_derivative() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: 0.9,
+        length_scale: 0.9.into(),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,
@@ -308,13 +308,13 @@ fn test_matern_public_second_derivative_matchesfd_of_public_first_derivative() {
         .expect("analytic Matérn second derivative should build");
 
     let eps: f64 = 1e-5;
-    let kappa = 1.0 / spec.length_scale;
+    let kappa = 1.0 / spec.length_scale.resolved().unwrap();
     let ls_plus = 1.0 / (kappa * eps.exp());
     let ls_minus = 1.0 / (kappa * (-eps).exp());
     let mut spec_plus = spec.clone();
     let mut spec_minus = spec.clone();
-    spec_plus.length_scale = ls_plus;
-    spec_minus.length_scale = ls_minus;
+    spec_plus.length_scale.set_resolved(ls_plus);
+    spec_minus.length_scale.set_resolved(ls_minus);
     let plus = build_matern_basis_log_kappa_derivative(data.view(), &spec_plus).expect("plus");
     let minus = build_matern_basis_log_kappa_derivative(data.view(), &spec_minus).expect("minus");
 
@@ -356,7 +356,7 @@ fn test_matern_aniso_operator_penalties_use_cross_provider() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: 0.9,
+        length_scale: 0.9.into(),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,

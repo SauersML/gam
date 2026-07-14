@@ -66,7 +66,7 @@ fn psi_to_length_scale_and_eta(psi: &[f64]) -> (f64, Vec<f64>) {
 fn realized_design_at_psi(data: &Array2<f64>, spec: &MaternBasisSpec, psi: &[f64]) -> Array2<f64> {
     let (ls, eta) = psi_to_length_scale_and_eta(psi);
     let mut trial = spec.clone();
-    trial.length_scale = ls;
+    trial.length_scale.set_resolved(ls);
     trial.aniso_log_scales = Some(eta);
     build_matern_basiswithworkspace(data.view(), &trial, &mut BasisWorkspace::default())
         .expect("realized aniso design build")
@@ -428,7 +428,7 @@ fn fit_aniso_recovery(double_penalty: bool, num_centers: usize) -> AnisoRecovery
     let (eta, length_scale) = match &resolved.basis {
         SmoothBasisSpec::Matern { spec, .. } => (
             spec.aniso_log_scales.clone().unwrap_or_default(),
-            spec.length_scale,
+            spec.length_scale.resolved().unwrap(),
         ),
         _ => (Vec::new(), f64::NAN),
     };

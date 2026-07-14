@@ -40,7 +40,7 @@ fn realized_penalties_at_psi(
 ) -> Vec<Array2<f64>> {
     let (ls, eta) = psi_to_length_scale_and_eta(psi);
     let mut trial = spec.clone();
-    trial.length_scale = ls;
+    trial.length_scale.set_resolved(ls);
     trial.aniso_log_scales = Some(eta);
     build_matern_basiswithworkspace(data.view(), &trial, &mut BasisWorkspace::default())
         .expect("realized aniso penalty build")

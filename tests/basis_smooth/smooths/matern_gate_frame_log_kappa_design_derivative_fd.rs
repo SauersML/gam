@@ -127,7 +127,7 @@ fn frozen_frame_design_derivative_max_error(
     }
     // The optimizer has moved κ to the EVAL point; the frozen spec carries the
     // eval-κ length-scale while keeping the κ₀-frozen centers/transform.
-    frozen.length_scale = ls_eff;
+    frozen.length_scale.set_resolved(ls_eff);
 
     // 4) Analytic derivative in the frozen frame (evaluated at the eval κ).
     let analytic = build_matern_basis_log_kappa_derivatives(xs.view(), &frozen)
@@ -145,7 +145,7 @@ fn frozen_frame_design_derivative_max_error(
         // and the analytic derivative live in identical coordinates.
         let ls_r_eff = compensate_length_scale_for_standardization(ls_r, &scales);
         let mut s = frozen.clone();
-        s.length_scale = ls_r_eff;
+        s.length_scale.set_resolved(ls_r_eff);
         build_matern_basis(xs.view(), &s)
             .expect("value rebuild")
             .design

@@ -579,7 +579,7 @@ fn iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic() {
                     SmoothBasisSpec::Matern { spec, .. } => format!(
                         "Matern{{nu={:?}, ls={:.8}, dp={}, ident={}, aniso={:?}, centers_kind={}}}",
                         spec.nu,
-                        spec.length_scale,
+                        spec.length_scale.resolved().unwrap(),
                         spec.double_penalty,
                         match &spec.identifiability {
                             MaternIdentifiability::FrozenTransform { transform } =>

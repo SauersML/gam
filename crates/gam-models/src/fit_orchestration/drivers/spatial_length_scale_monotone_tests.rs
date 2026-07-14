@@ -78,7 +78,7 @@ mod spatial_length_scale_monotone_tests {
         assert!(optimized_score <= baseline_score + 1e-10);
 
         let ls = match &optimized.resolvedspec.smooth_terms[0].basis {
-            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
+            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale.resolved().unwrap(),
             _ => panic!("expected Matérn term"),
         };
         assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));

@@ -115,11 +115,11 @@ fn matern_gradient_dkappa_matches_finite_difference() {
     let analytic = build_matern_basis_log_kappa_derivative(data.view(), &spec)
         .expect("analytic derivative should build");
     let eps = 1.0e-6_f64;
-    let kappa = 1.0 / spec.length_scale;
+    let kappa = 1.0 / spec.length_scale.resolved().unwrap();
     let mut sp = spec.clone();
     let mut sm = spec.clone();
-    sp.length_scale = 1.0 / (kappa * eps.exp());
-    sm.length_scale = 1.0 / (kappa * (-eps).exp());
+    sp.length_scale.set_resolved(1.0 / (kappa * eps.exp()));
+    sm.length_scale.set_resolved(1.0 / (kappa * (-eps).exp()));
     let plus = build_matern_basis(data.view(), &sp).expect("plus build");
     let minus = build_matern_basis(data.view(), &sm).expect("minus build");
     let fd = (plus.design.to_dense() - minus.design.to_dense()) / (2.0 * eps);

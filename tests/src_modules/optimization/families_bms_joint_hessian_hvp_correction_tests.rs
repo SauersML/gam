@@ -1832,7 +1832,7 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
-                    length_scale,
+                    length_scale: length_scale.into(),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,
@@ -1860,7 +1860,8 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
     let build_at = |psi_offset: f64, want_second: bool| {
         let mut spec = frozen_spec.clone();
         if let SmoothBasisSpec::Matern { spec: ms, .. } = &mut spec.smooth_terms[0].basis {
-            ms.length_scale = base_length_scale * (-psi_offset).exp();
+            ms.length_scale
+                .set_resolved(base_length_scale * (-psi_offset).exp());
         }
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let logslope_psi = build_block_spatial_psi_derivatives(data.view(), &spec, &design)
@@ -2061,7 +2062,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
-                    length_scale,
+                    length_scale: length_scale.into(),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,
@@ -2100,7 +2101,8 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         // the matern `length_scale` field (centers stay frozen).
         let mut spec = frozen_spec.clone();
         if let SmoothBasisSpec::Matern { spec: ms, .. } = &mut spec.smooth_terms[0].basis {
-            ms.length_scale = base_length_scale * (-psi_offset).exp();
+            ms.length_scale
+                .set_resolved(base_length_scale * (-psi_offset).exp());
         }
         let design = build_term_collection_design(data.view(), &spec).expect("perturbed design");
         // ψ derivative blocks for the logslope spatial block at this length-scale.

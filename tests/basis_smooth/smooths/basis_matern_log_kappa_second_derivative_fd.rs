@@ -28,7 +28,7 @@ fn matern_log_kappa_second_derivative_matches_finite_difference() {
     let h = 1e-4;
     let mk = |r: f64| {
         let mut s = spec.clone();
-        s.length_scale = (-r).exp();
+        s.length_scale.set_resolved((-r).exp());
         build_matern_basis(data.view(), &s)
             .unwrap()
             .design

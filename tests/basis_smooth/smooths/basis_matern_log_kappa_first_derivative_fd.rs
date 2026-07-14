@@ -31,7 +31,7 @@ fn matern_log_kappa_first_derivative_matches_finite_difference() {
         let mk = |r: f64| {
             let ls_r = (-r).exp();
             let mut s = spec.clone();
-            s.length_scale = ls_r;
+            s.length_scale.set_resolved(ls_r);
             build_matern_basis(data.view(), &s)
                 .unwrap()
                 .design

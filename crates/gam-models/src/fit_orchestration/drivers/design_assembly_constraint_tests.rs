@@ -3295,7 +3295,7 @@ fn assert_matern_spatial_length_scale_optimization_monotone(
     assert!(optimized_score <= baseline_score + 1e-10);
 
     let ls = match &optimized.resolvedspec.smooth_terms[0].basis {
-        SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
+        SmoothBasisSpec::Matern { spec, .. } => spec.length_scale.resolved().unwrap(),
         _ => panic!("expected Matérn term"),
     };
     assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
@@ -8365,7 +8365,7 @@ fn aniso_bounds_clamp_preserves_in_range_global_length_scale_and_eta() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "aniso projection should decode", e));
     match &updated.smooth_terms[0].basis {
         SmoothBasisSpec::Matern { spec, .. } => {
-            assert!((spec.length_scale - 1.0).abs() <= 1e-12);
+            assert!((spec.length_scale.resolved().unwrap() - 1.0).abs() <= 1e-12);
             let eta = spec
                 .aniso_log_scales
                 .as_ref()
@@ -8502,7 +8502,10 @@ fn spatial_anisotropy_pilot_initializer_seeds_geometry_without_fit() {
                 eta.iter().any(|value| value.abs() > 1e-6),
                 "pilot geometry should seed nonzero axis contrast"
             );
-            assert!(spec.length_scale.is_finite() && spec.length_scale > 0.0);
+            assert!(spec
+                .length_scale
+                .resolved()
+                .is_some_and(|value| value.is_finite() && value > 0.0));
         }
         _ => panic!("expected Matern term"),
     }
