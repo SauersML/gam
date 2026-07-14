@@ -1298,16 +1298,33 @@ mod tests {
         .unwrap()
     }
 
+    /// Boundary faces of an octahedron: a small sphere whose generic simplex
+    /// inventory costs more than its `log2(vertex_count)` name. A tetrahedron
+    /// boundary is deliberately unsuitable for compression tests because its
+    /// complete edge and face inventories each have zero complement-aware
+    /// selection cost, so the generic code is shorter than the word "sphere".
+    fn compressible_sphere_faces() -> Vec<Vec<usize>> {
+        let equator = [2, 3, 4, 5];
+        let mut faces = Vec::with_capacity(8);
+        for position in 0..equator.len() {
+            let a = equator[position];
+            let b = equator[(position + 1) % equator.len()];
+            faces.push(vec![0, a, b]);
+            faces.push(vec![1, a, b]);
+        }
+        faces
+    }
+
     #[test]
     fn charts_tiling_synthetic_sphere_have_h2() {
-        let faces = vec![vec![0, 1, 2], vec![0, 1, 3], vec![0, 2, 3], vec![1, 2, 3]];
-        let charts = charts_from_faces(4, &faces);
-        let gates = all_valid_pair_gates(4);
+        let faces = compressible_sphere_faces();
+        let charts = charts_from_faces(6, &faces);
+        let gates = all_valid_pair_gates(6);
         let diagram = build_atlas_nerve(&charts, &gates, None, None).unwrap();
         assert_eq!(diagram.betti.b0, 1);
         assert_eq!(diagram.betti.b1, 0);
         assert_eq!(diagram.betti.b2, Some(1));
-        assert_eq!(diagram.n_triangles, 4);
+        assert_eq!(diagram.n_triangles, 8);
         assert_eq!(diagram.n_tetrahedra, 0);
         assert_eq!(diagram.euler_characteristic, 2);
         assert!(!diagram.good_cover_certified);
@@ -1321,8 +1338,8 @@ mod tests {
             AtlasCoveringSide::AtOrAboveCoveringNumber
         );
 
-        let cover = good_cover_certificate(4, &faces);
-        let orientation = orientation_certificate(4, &faces, None);
+        let cover = good_cover_certificate(6, &faces);
+        let orientation = orientation_certificate(6, &faces, None);
         let certified =
             build_atlas_nerve(&charts, &gates, Some(&cover), Some(orientation)).unwrap();
         assert_eq!(
@@ -1334,16 +1351,16 @@ mod tests {
 
     #[test]
     fn noisy_sphere_promotion_requires_agreeing_integer_curvature_confidence() {
-        let faces = vec![vec![0, 1, 2], vec![0, 1, 3], vec![0, 2, 3], vec![1, 2, 3]];
-        let charts = charts_from_faces(4, &faces);
-        let gates = all_valid_pair_gates(4);
-        let cover = good_cover_certificate(4, &faces);
+        let faces = compressible_sphere_faces();
+        let charts = charts_from_faces(6, &faces);
+        let gates = all_valid_pair_gates(6);
+        let cover = good_cover_certificate(6, &faces);
 
         let agreeing = build_atlas_nerve(
             &charts,
             &gates,
             Some(&cover),
-            Some(confident_gaussian_certificate(4, &faces, 2)),
+            Some(confident_gaussian_certificate(6, &faces, 2)),
         )
         .unwrap();
         assert_eq!(
@@ -1362,7 +1379,7 @@ mod tests {
             &charts,
             &gates,
             Some(&cover),
-            Some(confident_gaussian_certificate(4, &faces, 1)),
+            Some(confident_gaussian_certificate(6, &faces, 1)),
         )
         .unwrap();
         assert_eq!(
