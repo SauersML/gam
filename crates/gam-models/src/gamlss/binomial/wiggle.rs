@@ -20,10 +20,10 @@ pub(crate) struct BinomialLocationScaleWiggleRowProgram<'a> {
     eta_t: &'a Array1<f64>,
     eta_ls: &'a Array1<f64>,
     etaw: &'a Array1<f64>,
-    beta_w: &'a Array1<f64>,
+    pub(super) beta_w: &'a Array1<f64>,
     core: BinomialLocationScaleCore,
     /// `basis_derivatives[d][[row, j]] = d^d B_j(q0[row]) / dq0^d`.
-    basis_derivatives: Vec<Array2<f64>>,
+    pub(super) basis_derivatives: Vec<Array2<f64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -72,7 +72,7 @@ fn binomial_location_scale_wiggle_predictor_expression<S: Clone>(
 }
 
 impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
-    fn new(
+    pub(super) fn new(
         family: &'a BinomialLocationScaleWiggleFamily,
         block_states: &'a [ParameterBlockState],
         derivative_order: usize,
@@ -265,7 +265,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         Ok(rows)
     }
 
-    fn first_directional_rows(
+    pub(super) fn first_directional_rows(
         &self,
         d_eta_t: &Array1<f64>,
         d_eta_ls: &Array1<f64>,
@@ -312,7 +312,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         Ok(rows)
     }
 
-    fn second_directional_rows(
+    pub(super) fn second_directional_rows(
         &self,
         d_eta_t_u: &Array1<f64>,
         d_eta_ls_u: &Array1<f64>,
@@ -2809,7 +2809,7 @@ impl BinomialWiggleFirstDirectionalRows {
         }
     }
 
-    fn assemble_dense(
+    pub(super) fn assemble_dense(
         &self,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
@@ -2883,7 +2883,7 @@ impl BinomialWiggleSecondDirectionalRows {
         }
     }
 
-    fn assemble_dense(
+    pub(super) fn assemble_dense(
         &self,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
