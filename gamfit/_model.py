@@ -1190,16 +1190,26 @@ class Model:
             else:
                 raise ValueError("partial_dependence: grid must be 1-D or 2-D")
 
+        # The FFI takes an encoded table (#2318 boundary hardening), so route
+        # the constructed grid through the same normalize_table encode path
+        # every other table-crossing call uses — a raw list of string rows is
+        # rejected at the boundary.
         headers = list(template.keys())
-        rows: list[list[str]] = []
+        categorical_names = {
+            str(col.get("name")) for col in schema_cols if col.get("kind") == "categorical"
+        }
+        columns: dict[str, list[Any]] = {h: [] for h in headers}
         for row_vals in grid_matrix:
             row = dict(template)
             for col_name, value in zip(sweep_columns, row_vals, strict=False):
                 row[col_name] = str(float(value))
-            rows.append([str(row[h]) for h in headers])
-
+            for h in headers:
+                columns[h].append(
+                    row[h] if h in categorical_names else float(row[h])
+                )
+        enc_headers, enc_rows, _ = normalize_table(columns)
         predicted, se, covariance_source = rust_module().model_partial_dependence(
-            self._model_bytes, term, headers, rows
+            self._model_bytes, term, enc_headers, enc_rows
         )
         return {
             "grid": grid_out,

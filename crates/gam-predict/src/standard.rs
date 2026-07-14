@@ -469,6 +469,12 @@ impl PredictableModel for StandardPredictor {
                 // centred consistently with the reported point — only their width
                 // changes with `covariance_mode`.
                 result.eta_standard_error = unc.eta_standard_error;
+                // Result-owned provenance (#2296): the SE/band adopted here
+                // came from the full-uncertainty engine, so record the exact
+                // covariance definition IT resolved — the field the FFI/CLI
+                // serialize as `covariance_source`. Leaving this unset made
+                // curved-link interval payloads omit the key entirely.
+                result.uncertainty_covariance_source = Some(unc.covariance_source);
                 enrich_posterior_mean_bounds(
                     &mut result,
                     level,
