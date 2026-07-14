@@ -33,6 +33,7 @@ pub mod fisher_rao;
 pub mod gauge;
 pub mod identifiability_audit;
 pub mod joint_penalty;
+mod constraint_set;
 mod linear_constraints;
 pub mod log_strength;
 pub mod monotone_root_error;
@@ -99,6 +100,7 @@ pub use identifiability_audit::{
     AliasedPair, BlockIdentity, DroppedColumn, IdentifiabilityAudit, MapUniquenessError,
 };
 pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
+pub use constraint_set::{ConstraintSet, KhatriRaoConeConstraints};
 pub use linear_constraints::LinearInequalityConstraints;
 pub use log_strength::{
     IndexedLogStrengthDomainError, LOG_STRENGTH_MAX, LOG_STRENGTH_MIN, LogStrengthDomainError,
