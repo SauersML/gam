@@ -4954,6 +4954,7 @@ pub fn select_hybrid_split(
 mod tests {
     use super::*;
     use crate::arrow_schur::ArrowFactorSlab;
+    use ndarray::array;
 
     // Dense `H⁻¹` apply via explicit inverse (test-only reference solver).
     fn dense_inverse(h: &Array2<f64>) -> Array2<f64> {
@@ -5783,7 +5784,7 @@ mod tests {
         // The stopping rule must measure the density parameter, not an inert
         // conditional coordinate whose meaning disappears with component mass.
         let tolerance = f64::EPSILON.sqrt();
-        let raw_coordinate_step = 4.6e-8;
+        let raw_coordinate_step: f64 = 4.6e-8;
         assert!(raw_coordinate_step > tolerance);
         let weights = array![0.25, 0.75];
         let previous_means = array![[0.0], [2.0]];
