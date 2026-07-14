@@ -177,8 +177,6 @@ impl BernoulliMarginalSlopeFamily {
         out: &mut [f64],
     ) {
         let r = primary.total;
-        debug_assert_eq!(tail_tail.len(), r * r);
-        debug_assert_eq!(out.len(), r * r);
         out.copy_from_slice(tail_tail);
 
         let mut qq = 0.0;

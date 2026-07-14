@@ -11,23 +11,19 @@ use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 /// - `q0_i`: entry-time probit argument (per-row, length n)
 /// - `q1_i`: exit-time probit argument (per-row, length n)
 /// - `qd1_i`: derivative probit argument (per-row, length n)
-/// - `slopes`: per-row physical log-slope vector `(n × K)`
 /// - `c_i`: `sqrt(1 + s² g_iᵀΣg_i)` (per-row, length n)
 /// - `timewiggle_primary_rows`: canonical channel-major q-gradient rows when
 ///   the nonlinear timewiggle map is active
-/// - `s`: probit scale (scalar, = `probit_frailty_scale()`)
 pub struct SurvivalMarginalSlopeFamilyScalars {
     pub(crate) q0_i: Vec<f64>,
     pub(crate) q1_i: Vec<f64>,
     pub(crate) qd1_i: Vec<f64>,
-    pub(crate) slopes: Array2<f64>,
     pub(crate) c_i: Vec<f64>,
     /// Exact channel-major `(3n × p_time, 3n × p_marginal)` q-Jacobian rows
     /// when timewiggle is active. These come from the family's canonical
     /// `row_dynamic_q_gradient`; callbacks must not reconstruct joint state
     /// from a block-local audit coefficient slice.
     pub(crate) timewiggle_primary_rows: Option<(Array2<f64>, Array2<f64>)>,
-    pub(crate) s: f64,
 }
 
 fn scaled_channel_major_rows(
@@ -142,10 +138,8 @@ impl SurvivalMarginalSlopeFamilyScalars {
             q0_i,
             q1_i,
             qd1_i,
-            slopes,
             c_i,
             timewiggle_primary_rows,
-            s,
         })
     }
 }

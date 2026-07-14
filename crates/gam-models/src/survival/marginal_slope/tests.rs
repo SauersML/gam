@@ -322,7 +322,6 @@ fn converged_identifiability_scalars_use_current_vector_geometry_932() {
     let scalars = erased
         .downcast_ref::<SurvivalMarginalSlopeFamilyScalars>()
         .expect("survival scalar type");
-    assert_eq!(scalars.slopes.column(0), eta_logslope.view());
     for row in 0..n {
         assert_eq!(scalars.q0_i[row], family.offset_entry[row]);
         assert_eq!(scalars.q1_i[row], family.offset_exit[row]);
