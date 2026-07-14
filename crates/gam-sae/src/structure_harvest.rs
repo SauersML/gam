@@ -3122,7 +3122,7 @@ fn fit_topology_candidate(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum TorusMetricFamily {
     Flat,
     EmbeddedDonut,
@@ -3230,14 +3230,22 @@ fn optimize_torus_metric_coordinate(
     let objective = FusedObjective::new(evaluate);
     let mut optimizer = Bfgs::new(seed_point, objective)
         .with_bounds(bounds)
-        .with_profile(Profile::Deterministic)
+        // Profiled REML is smooth but can be flat to working precision when
+        // the metric change is nearly absorbed by the optimized global
+        // smoothing strength. The robust profile is still deterministic; it
+        // uses opt's safeguarded cost-decreasing steps on precisely this
+        // roundoff-flat geometry instead of requiring an unattainable Wolfe
+        // curvature decrease from a one-dimensional profile.
+        .with_profile(Profile::Robust)
         .with_max_iterations(
             MaxIterations::new(f64::MANTISSA_DIGITS as usize)
                 .map_err(|error| format!("torus metric iteration budget: {error}"))?,
         )
         .with_gradient_tolerance(GradientTolerance::relative_to_cost(bound_resolution));
     let solution = optimizer.run().map_err(|error| {
-        format!("torus reference-metric optimization did not converge: {error}")
+        format!(
+            "{family:?} torus reference-metric optimization did not converge: {error}"
+        )
     })?;
     let coordinate = solution.final_point[0];
     if !(coordinate.is_finite() && coordinate >= lower && coordinate <= upper) {
@@ -6885,6 +6893,15 @@ mod tests {
                 target[[row, 1]] = radial * (2.0 * theta).sin();
                 target[[row, 2]] = 0.5 * phi.sin() * theta.cos();
                 target[[row, 3]] = 0.5 * phi.sin() * theta.sin();
+                // A noiseless finite Fourier embedding is represented exactly
+                // by both candidate frames and therefore has no finite
+                // profiled Gaussian dispersion. Add a small deterministic
+                // observation perturbation so this is an evidence comparison,
+                // not an attempt to assign REML to a zero-residual sample.
+                for output in 0..target.ncols() {
+                    target[[row, output]] +=
+                        (((row + 1) * (output + 3)) as f64).sin() / n as f64;
+                }
             }
         }
         let manifold = LatentManifold::Product(vec![
