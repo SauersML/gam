@@ -217,12 +217,6 @@ impl RhoModeSpectrum {
         self.c.iter().map(|&c| (3.0 * c + 1.0) / 8.0).sum()
     }
 
-    /// Global bound `B₂ = Σ (c_i + ½)/4 ≥ sup |V''|` used by the isolation
-    /// subdivision certificate.
-    fn b2_bound(&self) -> f64 {
-        self.c.iter().map(|&c| (c + 0.5) / 4.0).sum()
-    }
-
     /// Interval-local bound `sup_{ρ∈[a,b]} |V''(ρ)| ≤ Σ w_i(a,b)·(c_i + ½)`,
     /// where `w_i = max σ(1−σ)` over `u_i ∈ [a+log s_i, b+log s_i]`
     /// (`σ(1−σ)` is unimodal with peak ¼ at `u = 0`, so the max is at the
@@ -722,10 +716,10 @@ mod tests {
     }
 
     /// Validation plan §7.5 (constant): L₃ really bounds |V'''| — checked on
-    /// dense grids over random spectra, alongside the |V''| ≤ B₂ bound the
-    /// isolation certificate depends on.
+    /// dense grids over random spectra, alongside the interval-local
+    /// `|V''| ≤ B₂(a,b)` bound the isolation certificate actually consumes.
     #[test]
-    fn l3_and_b2_bound_the_third_and_second_derivatives_everywhere() {
+    fn l3_and_interval_b2_bound_the_third_and_second_derivatives_everywhere() {
         let mut rng = XorShift(0xB0DE_2312);
         for _ in 0..50 {
             let m = 1 + (rng.next_unit() * 8.0) as usize;
@@ -737,9 +731,10 @@ mod tests {
             }
             let spec = RhoModeSpectrum::new(s, c).expect("valid spectrum");
             let l3 = spec.l3_bound();
-            let b2 = spec.b2_bound();
             for k in 0..2000 {
                 let rho = -30.0 + 60.0 * k as f64 / 1999.0;
+                let half_step = 15.0 / 1999.0;
+                let b2 = spec.b2_bound_on(rho - half_step, rho + half_step);
                 assert!(
                     spec.third_derivative(rho).abs() <= l3 * (1.0 + 1e-12),
                     "L3 bound violated at rho={rho}"
