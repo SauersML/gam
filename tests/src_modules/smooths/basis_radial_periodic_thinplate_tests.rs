@@ -5915,7 +5915,7 @@ fn test_matern_center_sum_tozero_produces_kernel_transform() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
-        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.7),
+        length_scale: MaternLengthScale::fixed(0.7),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,
@@ -5952,7 +5952,7 @@ fn test_matern_operator_penalties_follow_rkhs_smoothness() {
         let spec = MaternBasisSpec {
             periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
-            length_scale: gam::terms::basis::MaternLengthScale::fixed(0.4),
+            length_scale: MaternLengthScale::fixed(0.4),
             nu,
             include_intercept: false,
             double_penalty: false,
@@ -6109,6 +6109,7 @@ fn test_matern_operator_psi_derivatives_index_align_with_forward_gate() {
             .find(|c| c.source == source)
             .unwrap_or_else(|| panic!("forward penalty {source:?} present"))
             .matrix
+            .into_dense()
     };
     let h = 1e-5_f64;
     for (idx, source) in forward_sources.iter().enumerate() {
@@ -6152,7 +6153,7 @@ fn test_matern_overspecified_centers_yield_full_rank_basis() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: gam::terms::basis::MaternLengthScale::fixed(3.0),
+        length_scale: MaternLengthScale::fixed(3.0),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,
@@ -6192,7 +6193,7 @@ fn test_matern_include_intercept_keeps_single_unpenalized_dimension() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
-        length_scale: gam::terms::basis::MaternLengthScale::fixed(1.1),
+        length_scale: MaternLengthScale::fixed(1.1),
         nu: MaternNu::ThreeHalves,
         include_intercept: true,
         double_penalty: false,
@@ -6213,7 +6214,7 @@ fn test_matern_double_penalty_omits_structurally_absent_nullspace_block_without_
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: gam::terms::basis::MaternLengthScale::fixed(1.1),
+        length_scale: MaternLengthScale::fixed(1.1),
         nu: MaternNu::ThreeHalves,
         include_intercept: false,
         double_penalty: true,
@@ -6237,7 +6238,7 @@ fn test_matern_double_penalty_keeps_intercept_shrinkage_block() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: gam::terms::basis::MaternLengthScale::fixed(1.1),
+        length_scale: MaternLengthScale::fixed(1.1),
         nu: MaternNu::ThreeHalves,
         include_intercept: true,
         double_penalty: true,
@@ -6283,7 +6284,7 @@ fn matern_frozen_transform_skips_rank_reduction_on_degenerate_cloud() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
-        length_scale: gam::terms::basis::MaternLengthScale::fixed(1.1),
+        length_scale: MaternLengthScale::fixed(1.1),
         nu: MaternNu::ThreeHalves,
         include_intercept: false,
         double_penalty: false,
@@ -6349,7 +6350,7 @@ fn matern_cold_zero_rank_cloud_fails_loudly() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: gam::terms::basis::MaternLengthScale::fixed(1.0e-3),
+        length_scale: MaternLengthScale::fixed(1.0e-3),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,
@@ -6372,7 +6373,7 @@ fn test_matern_log_kappa_derivative_matchesfd() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.9),
+        length_scale: MaternLengthScale::fixed(0.9),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,
@@ -6449,7 +6450,7 @@ fn test_matern_double_penalty_log_kappa_derivative_matchesfd() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.9),
+        length_scale: MaternLengthScale::fixed(0.9),
         nu: MaternNu::FiveHalves,
         include_intercept: true,
         double_penalty: true,

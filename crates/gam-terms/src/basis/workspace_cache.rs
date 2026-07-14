@@ -1245,7 +1245,7 @@ mod matern_function_metric_tests {
         let base =
             matern_double_penalty_candidates(&embedded, &gram, true).expect("raw candidates");
         assert_eq!(base.len(), 2);
-        let raw_ridge = &base[1].matrix * base[1].normalization_scale;
+        let raw_ridge = base[1].matrix.dense() * base[1].normalization_scale;
 
         let intercept = array![[0.0], [0.0], [0.0], [1.0]];
         let action_error = (&raw_ridge.dot(&intercept) - &gram.dot(&intercept))
@@ -1272,7 +1272,7 @@ mod matern_function_metric_tests {
             .expect("transformed center function Gram");
         let transformed = matern_double_penalty_candidates(&primary_t, &gram_t, true)
             .expect("transformed candidates");
-        let ridge_t = &transformed[1].matrix * transformed[1].normalization_scale;
+        let ridge_t = transformed[1].matrix.dense() * transformed[1].normalization_scale;
         let expected = fast_atb(&transform, &fast_ab(&raw_ridge, &transform));
         let covariance_error = (&ridge_t - &expected)
             .iter()

@@ -1874,7 +1874,7 @@ mod mixed_periodicity_psd_tests {
             .iter()
             .find(|candidate| matches!(candidate.source, PenaltySource::DoublePenaltyNullspace))
             .expect("affine Duchon basis must emit a trend ridge");
-        let ridge = &ridge.matrix * ridge.normalization_scale;
+        let ridge = ridge.matrix.dense() * ridge.normalization_scale;
 
         let (center_kernel, amplification) =
             duchon_center_kernel_value_matrix(centers.view(), None, 0.0, order, None)
