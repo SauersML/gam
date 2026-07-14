@@ -3458,6 +3458,7 @@ fn blockwise_logdet_reuses_cached_jeffreys_hphi_without_rebuilding_axes() {
         &BlockwiseFitOptions::default(),
         None,
         Some(&cached_hphi),
+        None,
     )
     .expect("cached Jeffreys H_phi should feed the terminal logdet");
 

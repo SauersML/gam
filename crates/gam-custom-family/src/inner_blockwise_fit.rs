@@ -5389,6 +5389,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 joint_bundle,
                 Some(specs),
             );
+            let active_constraints = {
+                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+                assemble_active_constraint_block(
+                    &block_constraints,
+                    &cached_active_sets,
+                    &ranges,
+                    total_p,
+                )
+                .map(std::sync::Arc::new)
+            };
             let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
                 family,
                 specs,
@@ -5397,6 +5407,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 options,
                 cached_joint_workspace.clone(),
                 final_jeffreys_cache.map(|(_, _, hphi)| hphi),
+                active_constraints.as_deref(),
             )?;
             // The IFT/outer KKT residual must be the AUGMENTED stationarity
             // `∇L − Sβ + ∇Φ` the inner Newton actually drove to zero — NOT the bare
@@ -5464,16 +5475,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // no rows are currently active at the cert point; in either
             // case the consumer-side `with_active_constraints` helper
             // degrades back to the bare penalty-projected pseudo-inverse.
-            let active_constraints = {
-                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
-                assemble_active_constraint_block(
-                    &block_constraints,
-                    &cached_active_sets,
-                    &ranges,
-                    total_p,
-                )
-                .map(std::sync::Arc::new)
-            };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 terminal_working_sets: cached_eval
@@ -5645,15 +5646,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 joint_bundle,
                 Some(specs),
             );
-            let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
-                family,
-                specs,
-                &mut states,
-                block_log_lambdas,
-                options,
-                cached_joint_workspace.clone(),
-                None,
-            )?;
             let active_constraints = {
                 let local_ranges = block_param_ranges(specs);
                 let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
@@ -5666,6 +5658,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 )
                 .map(std::sync::Arc::new)
             };
+            let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
+                family,
+                specs,
+                &mut states,
+                block_log_lambdas,
+                options,
+                cached_joint_workspace.clone(),
+                None,
+                active_constraints.as_deref(),
+            )?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 terminal_working_sets: cached_eval
@@ -5709,15 +5711,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 joint_bundle,
                 Some(specs),
             );
-            let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
-                family,
-                specs,
-                &mut states,
-                block_log_lambdas,
-                options,
-                cached_joint_workspace.clone(),
-                None,
-            )?;
             let active_constraints = {
                 let local_ranges = block_param_ranges(specs);
                 let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
@@ -5730,6 +5723,16 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 )
                 .map(std::sync::Arc::new)
             };
+            let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
+                family,
+                specs,
+                &mut states,
+                block_log_lambdas,
+                options,
+                cached_joint_workspace.clone(),
+                None,
+                active_constraints.as_deref(),
+            )?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 terminal_working_sets: cached_eval
@@ -6726,6 +6729,15 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
         Some(specs),
     );
 
+    let active_constraints = {
+        assemble_active_constraint_block(
+            &block_constraints,
+            &cached_active_sets,
+            &local_ranges,
+            local_total_p,
+        )
+        .map(std::sync::Arc::new)
+    };
     let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
         family,
         specs,
@@ -6734,6 +6746,7 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
         options,
         certified_workspace.clone(),
         None,
+        active_constraints.as_deref(),
     )?;
     let kkt_residual = if converged {
         match exact_newton_joint_gradient_from_eval(cached_eval, specs, &states)? {
@@ -6764,15 +6777,6 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
         None
     };
 
-    let active_constraints = {
-        assemble_active_constraint_block(
-            &block_constraints,
-            &cached_active_sets,
-            &local_ranges,
-            local_total_p,
-        )
-        .map(std::sync::Arc::new)
-    };
     Ok(BlockwiseInnerResult {
         block_states: states,
         terminal_working_sets: Some(cached_eval.blockworking_sets.clone()),

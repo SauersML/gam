@@ -1820,6 +1820,37 @@ pub(crate) fn auto_determinant_mode_is_exact_full_logdet_policy() {
 }
 
 #[test]
+pub(crate) fn active_face_logdet_ignores_constraint_normal_indefiniteness() {
+    // The first coefficient is fixed by the active row. Its negative curvature
+    // is normal to the integration manifold and must not make the one-dimensional
+    // tangent Laplace determinant fail.
+    let h = array![[-4.0, 0.0], [0.0, 3.0]];
+    assert!(
+        stable_logdet_with_ridge_policy(&h, 0.0, RidgePolicy::exact_full_objective()).is_err(),
+        "the full-space Cholesky witness must be indefinite",
+    );
+    let active = ActiveLinearConstraintBlock {
+        a: array![[1.0, 0.0]],
+    };
+    let full_correction = 2.0 * 5.0_f64.ln();
+    let logdet = active_face_logdet_with_ridge_policy(
+        &h,
+        Some(&active),
+        false,
+        10,
+        0.0,
+        RidgePolicy::exact_full_objective(),
+        full_correction,
+    )
+    .expect("active-face determinant should use only positive tangent curvature");
+    let expected = 3.0_f64.ln() + 5.0_f64.ln();
+    assert!(
+        (logdet - expected).abs() < 1e-12,
+        "active-face logdet={logdet}, expected={expected}",
+    );
+}
+
+#[test]
 pub(crate) fn indefinite_hessian_uses_smooth_regularized_logdet() {
     // Indefinite Hessian: eigenvalues {-1, 2}.
     //

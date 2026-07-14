@@ -1198,6 +1198,58 @@ pub(crate) fn use_exact_newton_strict_spd<F: CustomFamily + ?Sized>(family: &F) 
     family.exact_newton_outerobjective() == ExactNewtonOuterObjective::StrictPseudoLaplace
 }
 
+/// Evaluate the coefficient-Hessian determinant in the same active-face
+/// geometry used by the unified outer evaluator.
+///
+/// At a locally constant active set, coefficient perturbations live in
+/// `null(A_active)`. Curvature normal to that face is neither integrated by the
+/// Laplace approximation nor differentiated by the constrained outer kernel,
+/// so asking a full-space Cholesky to certify it is mathematically wrong. The
+/// fully-pinned convention remains the fixed-mode full-curvature criterion used
+/// by `try_tangent_projected_evaluate`.
+pub(crate) fn active_face_logdet_with_ridge_policy(
+    matrix: &Array2<f64>,
+    active_constraints: Option<&ActiveLinearConstraintBlock>,
+    strict_spd: bool,
+    n_observations: usize,
+    ridge_floor: f64,
+    ridge_policy: RidgePolicy,
+    full_space_logdet_correction: f64,
+) -> Result<f64, String> {
+    let mut projected = None;
+    let mut logdet_correction = full_space_logdet_correction;
+    if let Some(active) = active_constraints {
+        if active.a.ncols() != matrix.nrows() || matrix.nrows() != matrix.ncols() {
+            return Err(format!(
+                "active-face logdet shape mismatch: Hessian is {}x{}, active block is {}x{}",
+                matrix.nrows(),
+                matrix.ncols(),
+                active.a.nrows(),
+                active.a.ncols(),
+            ));
+        }
+        match active_constraint_tangent_geometry(&active.a)? {
+            ActiveConstraintTangentGeometry::Tangent(z) => {
+                let tangent_dim = z.ncols();
+                projected = Some(z.t().dot(matrix).dot(&z));
+                logdet_correction = if matrix.nrows() == 0 {
+                    0.0
+                } else {
+                    full_space_logdet_correction * tangent_dim as f64 / matrix.nrows() as f64
+                };
+            }
+            ActiveConstraintTangentGeometry::FullyPinned => {}
+        }
+    }
+    let determinant_matrix = projected.as_ref().unwrap_or(matrix);
+    let logdet = if strict_spd {
+        strict_exact_pseudo_logdet(determinant_matrix, n_observations)?
+    } else {
+        stable_logdet_with_ridge_policy(determinant_matrix, ridge_floor, ridge_policy)?
+    };
+    Ok(logdet + logdet_correction)
+}
+
 pub(crate) fn blockwise_logdet_terms_with_workspace<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
@@ -1208,6 +1260,7 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
     options: &BlockwiseFitOptions,
     preferred_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     cached_jeffreys_hphi: Option<&Array2<f64>>,
+    active_constraints: Option<&ActiveLinearConstraintBlock>,
 ) -> Result<(f64, f64), String> {
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
@@ -1450,16 +1503,15 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
         if let Some(hphi) = logdet_jeffreys_hphi.as_ref() {
             h_joint.scaled_add(curvature.rho_curvature_scale, hphi);
         }
-        let logdet_h_scaled = if strict_spd {
-            strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
-        } else {
-            stable_logdet_with_ridge_policy(
-                &h_joint,
-                options.ridge_floor * curvature.rho_curvature_scale,
-                options.ridge_policy,
-            )?
-        };
-        let logdet_h_total = logdet_h_scaled + curvature.hessian_logdet_correction;
+        let logdet_h_total = active_face_logdet_with_ridge_policy(
+            &h_joint,
+            active_constraints,
+            strict_spd,
+            joint_observation_count(states),
+            options.ridge_floor * curvature.rho_curvature_scale,
+            options.ridge_policy,
+            curvature.hessian_logdet_correction,
+        )?;
         return Ok((logdet_h_total, penalty_logdet_s_total));
     }
     let exact_joint_source = if let Some(workspace) = preferred_workspace.as_ref() {
@@ -1510,11 +1562,15 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
         if let Some(hphi) = logdet_jeffreys_hphi.as_ref() {
             h_joint.scaled_add(1.0, hphi);
         }
-        let logdet_h_total = if strict_spd {
-            strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
-        } else {
-            stable_logdet_with_ridge_policy(&h_joint, options.ridge_floor, options.ridge_policy)?
-        };
+        let logdet_h_total = active_face_logdet_with_ridge_policy(
+            &h_joint,
+            active_constraints,
+            strict_spd,
+            joint_observation_count(states),
+            options.ridge_floor,
+            options.ridge_policy,
+            0.0,
+        )?;
         return Ok((logdet_h_total, penalty_logdet_s_total));
     }
     // Fallback: try the non-rescaled symmetrized path (for families that
@@ -1536,11 +1592,15 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
         if let Some(hphi) = logdet_jeffreys_hphi.as_ref() {
             h_joint.scaled_add(1.0, hphi);
         }
-        let logdet_h_total = if strict_spd {
-            strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
-        } else {
-            stable_logdet_with_ridge_policy(&h_joint, options.ridge_floor, options.ridge_policy)?
-        };
+        let logdet_h_total = active_face_logdet_with_ridge_policy(
+            &h_joint,
+            active_constraints,
+            strict_spd,
+            joint_observation_count(states),
+            options.ridge_floor,
+            options.ridge_policy,
+            0.0,
+        )?;
         return Ok((logdet_h_total, penalty_logdet_s_total));
     }
 
@@ -1554,6 +1614,9 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
     }
 
     let mut logdet_h_total = 0.0;
+    let mut active_face_hessian = active_constraints
+        .is_some()
+        .then(|| Array2::<f64>::zeros((total, total)));
     let logdet_s_total = penalty_logdet_s_total;
     for b in 0..specs.len() {
         let spec = &specs[b];
@@ -1589,11 +1652,31 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
 
         let mut h = xtwx;
         h += s_lambda;
-        logdet_h_total += if strict_spd {
-            strict_exact_pseudo_logdet(&h, joint_observation_count(states))?
+        if let Some(h_joint) = active_face_hessian.as_mut() {
+            let (start, end) = ranges[b];
+            h_joint.slice_mut(ndarray::s![start..end, start..end]).assign(&h);
         } else {
-            stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?
-        };
+            logdet_h_total += active_face_logdet_with_ridge_policy(
+                &h,
+                None,
+                strict_spd,
+                joint_observation_count(states),
+                options.ridge_floor,
+                options.ridge_policy,
+                0.0,
+            )?;
+        }
+    }
+    if let Some(h_joint) = active_face_hessian {
+        logdet_h_total = active_face_logdet_with_ridge_policy(
+            &h_joint,
+            active_constraints,
+            strict_spd,
+            joint_observation_count(states),
+            options.ridge_floor,
+            options.ridge_policy,
+            0.0,
+        )?;
     }
     Ok((logdet_h_total, logdet_s_total))
 }

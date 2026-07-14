@@ -559,32 +559,54 @@ pub(crate) fn outer_hessian_entry(
 // (gradient, Hessian, IFT corrections) through the projected operator
 // without duplicating cost/gradient formulas.
 
-/// Orthonormal basis `Z ∈ ℝ^{p × m}` for `null(A_act)` via eigendecomposition
-/// of `A_actᵀ A_act` (PSD; `null(A_actᵀ A_act) = null(A_act)`). Returns
-/// `None` when the active set is empty or the tangent space is empty
-/// (k_act ≥ p).
-pub(crate) fn compute_active_constraint_tangent_basis(a_act: &Array2<f64>) -> Option<Array2<f64>> {
-    let k_act = a_act.nrows();
+/// Authoritative coefficient geometry of a non-empty active constraint face.
+pub enum ActiveConstraintTangentGeometry {
+    /// The active rows span coefficient space, so the mode is fully pinned.
+    FullyPinned,
+    /// Orthonormal basis `Z` for the non-empty tangent `null(A_act)`.
+    Tangent(Array2<f64>),
+}
+
+/// Compute the coefficient geometry of a non-empty active constraint face.
+///
+/// This is shared by the terminal inner determinant and the outer evaluator so
+/// the value cannot classify curvature in one coefficient space while its
+/// derivatives use another. A non-empty row block with zero numerical rank is
+/// invalid active-set evidence, not an unconstrained fallback.
+pub fn active_constraint_tangent_geometry(
+    a_act: &Array2<f64>,
+) -> Result<ActiveConstraintTangentGeometry, String> {
+    if a_act.nrows() == 0 {
+        return Err("active constraint tangent geometry requires at least one row".to_string());
+    }
     let p = a_act.ncols();
-    if k_act == 0 {
-        return None;
+    if p == 0 {
+        return Ok(ActiveConstraintTangentGeometry::FullyPinned);
     }
     // `null(A_act) = null(A_actᵀ A_act)`; eigendecompose the symmetric PSD
     // `p × p` matrix and pull the eigenvectors with σ ≤ threshold as the
     // null basis. This gives `m = p − rank(A_act)`, the correct tangent
     // dimension regardless of whether `A_act` has linearly dependent rows.
     let ata = a_act.t().dot(a_act);
-    let (evals, evecs) = ata.eigh(faer::Side::Lower).ok()?;
-    let evals_slice = evals.as_slice()?;
+    let (evals, evecs) = ata
+        .eigh(faer::Side::Lower)
+        .map_err(|error| format!("active constraint tangent eigendecomposition failed: {error}"))?;
+    let evals_slice = evals
+        .as_slice()
+        .ok_or_else(|| "active constraint tangent eigenvalues are not contiguous".to_string())?;
     let threshold = positive_eigenvalue_threshold(evals_slice);
     let null_count = evals_slice.iter().filter(|&&s| s <= threshold).count();
-    if null_count == 0 || null_count == p {
-        // `null_count == p` means A_act has no effective constraint (every
-        // row is in the noise floor). Returning `None` skips the projection
-        // and lets the full p-space evaluator run unmodified.
-        return None;
+    if null_count == p {
+        return Err(
+            "non-empty active constraint block has zero numerical row rank".to_string(),
+        );
     }
-    Some(evecs.slice(ndarray::s![.., 0..null_count]).to_owned())
+    if null_count == 0 {
+        return Ok(ActiveConstraintTangentGeometry::FullyPinned);
+    }
+    Ok(ActiveConstraintTangentGeometry::Tangent(
+        evecs.slice(ndarray::s![.., 0..null_count]).to_owned(),
+    ))
 }
 
 /// Dense `p × p` materialization of a penalty coordinate via canonical
@@ -923,9 +945,9 @@ pub(crate) fn try_tangent_projected_evaluate(
     // those callbacks return objects in p-space whose projected form
     // requires composing with `Z` per-call; for `ValueAndGradient` the
     // per-coord `g`/`drift` is sufficient.
-    let z = match compute_active_constraint_tangent_basis(&block.a) {
-        Some(z) => z,
-        None => {
+    let z = match active_constraint_tangent_geometry(&block.a)? {
+        ActiveConstraintTangentGeometry::Tangent(z) => z,
+        ActiveConstraintTangentGeometry::FullyPinned => {
             // Constraint matrix spans the full p-space — the tangent manifold is
             // the single point {β̂}: β̂ is fully pinned by the active set and has
             // NO mode response to ρ. The exact-Newton outer objective is still
