@@ -377,11 +377,12 @@ impl<'a> GamWorkingModel<'a> {
 
     fn solve_fisher_direction_from_root(
         &self,
+        beta: &Coefficients,
         state: &WorkingState,
         loop_lambda: f64,
         lm_d2: &Array1<f64>,
         direction_out: &mut Array1<f64>,
-    ) -> Result<(), EstimationError> {
+    ) -> Result<f64, EstimationError> {
         let n = self.lasthessian_weights.len();
         let p = state.gradient.len();
         let penalty_rows = self.penalty.rank();
@@ -393,14 +394,21 @@ impl<'a> GamWorkingModel<'a> {
                     "PIRLS square-root row count overflowed usize".to_string(),
                 )
             })?;
-        // Peak live storage is the root, faer's QR factor, and the temporary Q
-        // produced by the shared QR adapter.  Charge all three atomically.
+        // Peak live storage is the root, faer's QR factor, the temporary Q,
+        // and the augmented least-squares residual. Charge all four atomically.
         let root_qr_reservation = gam_runtime::resource::MemoryGovernor::global()
-            .try_reserve_dense_f64_copies(rows, p, 3, "PIRLS Householder QR square-root solve")
+            .try_reserve_dense_f64_copies(rows, p, 4, "PIRLS Householder QR square-root solve")
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
         let mut root = Array2::<f64>::zeros((rows, p).f());
+        let mut residual = Array1::<f64>::zeros(rows);
         self.write_fisher_design_root(&mut root)?;
+        for i in 0..n {
+            let weight = self.lasthessian_weights[i];
+            let scale = weight.sqrt();
+            residual[i] = (state.eta[i] - self.lastz[i]) * scale;
+        }
         self.penalty.write_root_rows(&mut root, n);
+        self.penalty.write_root_residual(beta.as_ref(), &mut residual, n);
         let diagonal_start = n + penalty_rows;
         for j in 0..p {
             let energy = state.ridge_used + loop_lambda * lm_d2[j];
@@ -409,9 +417,12 @@ impl<'a> GamWorkingModel<'a> {
                     "PIRLS square-root LM diagonal must be finite and positive, got {energy} at coefficient {j}"
                 );
             }
-            root[[diagonal_start + j, j]] = energy.sqrt();
+            let root_energy = energy.sqrt();
+            root[[diagonal_start + j, j]] = root_energy;
+            residual[diagonal_start + j] =
+                state.ridge_used * beta.as_ref()[j] / root_energy;
         }
-        let result = solve_newton_direction_from_root(&root, &state.gradient, direction_out);
+        let result = solve_newton_direction_from_root(&root, &residual, direction_out);
         drop(root_qr_reservation);
         result
     }
@@ -1352,12 +1363,13 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
 
     fn solve_unconstrained_direction(
         &mut self,
+        beta: &Coefficients,
         state: &WorkingState,
         loop_lambda: f64,
         lm_d2: &Array1<f64>,
         regularized_hessian: &Array2<f64>,
         direction_out: &mut Array1<f64>,
-    ) -> Result<(), EstimationError> {
+    ) -> Result<Option<f64>, EstimationError> {
         let stabilizing_floor = lm_d2
             .iter()
             .map(|&scale| state.ridge_used + loop_lambda * scale)
@@ -1365,9 +1377,17 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         if state.hessian_curvature == HessianCurvatureKind::Fisher
             && self.penalty.requires_root_solve(stabilizing_floor)
         {
-            self.solve_fisher_direction_from_root(state, loop_lambda, lm_d2, direction_out)
+            self.solve_fisher_direction_from_root(
+                beta,
+                state,
+                loop_lambda,
+                lm_d2,
+                direction_out,
+            )
+            .map(Some)
         } else {
-            solve_newton_direction_dense(regularized_hessian, &state.gradient, direction_out)
+            solve_newton_direction_dense(regularized_hessian, &state.gradient, direction_out)?;
+            Ok(None)
         }
     }
 }

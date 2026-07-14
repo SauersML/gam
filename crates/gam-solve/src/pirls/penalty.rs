@@ -156,6 +156,52 @@ impl PirlsPenalty {
         }
     }
 
+    /// Write the affine penalty residual `q` whose normal-equation image is
+    /// the exact shifted penalty gradient: `E' q = S beta - linear_shift`.
+    ///
+    /// Keeping this residual in root space lets the stiff-penalty PIRLS path
+    /// solve the augmented least-squares problem directly. Forming the two
+    /// large terms in coefficient space and subtracting them first would lose
+    /// precisely the stationarity digits that the root solve is meant to
+    /// preserve.
+    pub(super) fn write_root_residual(
+        &self,
+        beta: &Array1<f64>,
+        out: &mut Array1<f64>,
+        first_row: usize,
+    ) {
+        match self {
+            Self::Dense {
+                e_transformed,
+                linear_shift,
+                ..
+            } => {
+                let e_beta = fast_av(e_transformed, beta);
+                for (local_row, row) in e_transformed.rows().into_iter().enumerate() {
+                    let energy = row.dot(&row);
+                    let affine_shift = if energy > 0.0 {
+                        row.dot(linear_shift) / energy
+                    } else {
+                        0.0
+                    };
+                    out[first_row + local_row] = e_beta[local_row] - affine_shift;
+                }
+            }
+            Self::Diagonal {
+                diag,
+                positive_indices,
+                linear_shift,
+                ..
+            } => {
+                for (local_row, &coefficient) in positive_indices.iter().enumerate() {
+                    let root = diag[coefficient].sqrt();
+                    out[first_row + local_row] =
+                        root * beta[coefficient] - linear_shift[coefficient] / root;
+                }
+            }
+        }
+    }
+
     pub(super) fn add_to_hessian(&self, hessian: &mut Array2<f64>) {
         match self {
             Self::Dense { s_transformed, .. } => {
@@ -297,6 +343,26 @@ mod tests {
         };
         assert!(rank_one.requires_root_solve(1.0));
         assert!(!rank_one.requires_root_solve(1.0e4));
+    }
+
+    #[test]
+    fn affine_root_residual_maps_to_shifted_penalty_gradient() {
+        let root = array![[3.0, 0.0], [0.0, 2.0]];
+        let linear_shift = array![4.5, -2.0];
+        let penalty = PirlsPenalty::Dense {
+            s_transformed: root.t().dot(&root),
+            e_transformed: root.clone(),
+            linear_shift,
+            constant_shift: 0.0,
+            prior_mean_target: Array1::zeros(2),
+        };
+        let beta = array![0.25, -0.75];
+        let mut residual = Array1::<f64>::zeros(4);
+
+        penalty.write_root_residual(&beta, &mut residual, 2);
+        let mapped = root.t().dot(&residual.slice(ndarray::s![2..]).to_owned());
+
+        assert_eq!(mapped, penalty.shifted_gradient(&beta));
     }
 }
 

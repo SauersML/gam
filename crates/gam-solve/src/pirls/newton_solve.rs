@@ -560,24 +560,26 @@ pub(super) fn solve_newton_direction_dense(
     ))
 }
 
-/// Solve `(A' A) direction = -gradient` without ever assembling `A' A`.
-/// Householder QR sees condition `kappa(A)`, whereas Cholesky of the rounded
-/// Gram sees `kappa(A)^2` and can lose weak but identifiable directions.
+/// Solve `min_direction ||A direction + residual||` without assembling either
+/// `A' A` or the cancellation-prone normal-equation right-hand side
+/// `A' residual`. Householder QR sees condition `kappa(A)`, whereas forming
+/// the normal equations squares it and can erase stationarity digits when
+/// large score and penalty components cancel.
 pub(super) fn solve_newton_direction_from_root(
     root: &Array2<f64>,
-    gradient: &Array1<f64>,
+    root_residual: &Array1<f64>,
     direction_out: &mut Array1<f64>,
-) -> Result<(), EstimationError> {
+) -> Result<f64, EstimationError> {
     let p = root.ncols();
-    if root.nrows() < p || gradient.len() != p {
+    if root.nrows() < p || root_residual.len() != root.nrows() {
         crate::bail_invalid_estim!(
-            "PIRLS square-root solve dimension mismatch: root={}x{}, gradient={}",
+            "PIRLS square-root solve dimension mismatch: root={}x{}, residual={}",
             root.nrows(),
             p,
-            gradient.len()
+            root_residual.len()
         );
     }
-    let (_, r) = root
+    let (q, r) = root
         .qr()
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     if r.nrows() != p || r.ncols() != p {
@@ -588,13 +590,19 @@ pub(super) fn solve_newton_direction_from_root(
         );
     }
 
-    // R' y = -g, followed by R direction = y.  Explicit triangular
-    // substitution avoids constructing the Gram or an inverse at either step.
-    let mut intermediate = Array1::<f64>::zeros(p);
-    for i in 0..p {
-        let mut value = -gradient[i];
-        for k in 0..i {
-            value -= r[[k, i]] * intermediate[k];
+    // R direction = -Q' residual. Applying Q before triangular substitution
+    // preserves the small projected residual directly; forming A' residual
+    // first would subtract the large score and penalty gradients in the least
+    // accurate coordinate frame.
+    let projected_residual = q.t().dot(root_residual);
+    if direction_out.len() != p {
+        *direction_out = Array1::zeros(p);
+    }
+    for reverse in 0..p {
+        let i = p - 1 - reverse;
+        let mut value = -projected_residual[i];
+        for k in (i + 1)..p {
+            value -= r[[i, k]] * direction_out[k];
         }
         let diagonal = r[[i, i]];
         if !(diagonal.is_finite() && diagonal != 0.0) {
@@ -602,27 +610,17 @@ pub(super) fn solve_newton_direction_from_root(
                 condition_number: f64::INFINITY,
             });
         }
-        intermediate[i] = value / diagonal;
-    }
-    if direction_out.len() != p {
-        *direction_out = Array1::zeros(p);
-    }
-    for reverse in 0..p {
-        let i = p - 1 - reverse;
-        let mut value = intermediate[i];
-        for k in (i + 1)..p {
-            value -= r[[i, k]] * direction_out[k];
-        }
-        direction_out[i] = value / r[[i, i]];
+        direction_out[i] = value / diagonal;
     }
 
-    // Normwise backward-error certificate evaluated through A itself.  The
-    // denominator is ||A'||_inf ||A||_inf ||d||_inf + ||g||_inf, so this tests
-    // the computed direction rather than the cancellation-prone rounded Gram.
-    let root_direction = root.dot(direction_out);
-    let mut residual = root.t().dot(&root_direction);
-    residual += gradient;
-    let residual_inf = inf_norm(residual.iter().copied());
+    // Least-squares stationarity certificate evaluated through A itself.
+    // `A' (A d + q)` must vanish; its denominator uses the unprojected residual
+    // scale, so the test remains meaningful without constructing a rounded
+    // Gram or treating a cancelled coefficient-space gradient as input data.
+    let mut least_squares_residual = root.dot(direction_out);
+    least_squares_residual += root_residual;
+    let normal_residual = root.t().dot(&least_squares_residual);
+    let residual_inf = inf_norm(normal_residual.iter().copied());
     let root_inf = root
         .rows()
         .into_iter()
@@ -634,8 +632,8 @@ pub(super) fn solve_newton_direction_from_root(
         .map(|column| column.iter().map(|value| value.abs()).sum::<f64>())
         .fold(0.0_f64, f64::max);
     let direction_inf = inf_norm(direction_out.iter().copied());
-    let gradient_inf = inf_norm(gradient.iter().copied());
-    let scale = root_transpose_inf * root_inf * direction_inf + gradient_inf;
+    let root_residual_inf = inf_norm(root_residual.iter().copied());
+    let scale = root_transpose_inf * (root_inf * direction_inf + root_residual_inf);
     let backward_error = if scale > 0.0 {
         residual_inf / scale
     } else {
@@ -652,12 +650,13 @@ pub(super) fn solve_newton_direction_from_root(
         crate::bail_invalid_estim!("PIRLS square-root Newton direction is non-finite");
     }
     log::info!(
-        "[STAGE] PIRLS dense newton solve backend=CPU p={} rows={} route=\"Householder QR of PSD root\" backward_error={:.3e}",
+        "[STAGE] PIRLS dense newton solve backend=CPU p={} rows={} route=\"Householder QR of PSD root\" backward_error={:.3e} damped_decrement_sq={:.3e}",
         p,
         root.nrows(),
         backward_error,
+        projected_residual.dot(&projected_residual),
     );
-    Ok(())
+    Ok(projected_residual.dot(&projected_residual))
 }
 
 #[cfg(test)]
@@ -672,13 +671,32 @@ mod square_root_solve_tests {
         // direction; QR acts on A and keeps that direction directly.
         let root = array![[1.0e5, 1.0e5], [1.0, -1.0], [1.0e-3, 0.0], [0.0, 1.0e-3]];
         let expected = array![1.0, -1.0];
-        let gradient = -root.t().dot(&root.dot(&expected));
+        let residual = -root.dot(&expected);
         let mut actual = Array1::<f64>::zeros(2);
 
-        solve_newton_direction_from_root(&root, &gradient, &mut actual).expect("square-root solve");
+        let decrement = solve_newton_direction_from_root(&root, &residual, &mut actual)
+            .expect("square-root solve");
 
         assert!((actual[0] - expected[0]).abs() < 1.0e-9);
         assert!((actual[1] - expected[1]).abs() < 1.0e-9);
+        assert!(decrement.is_finite() && decrement > 0.0);
+    }
+
+    #[test]
+    fn qr_root_solve_does_not_form_a_cancelling_normal_rhs() {
+        let root = array![[1.0e8, 1.0e8], [1.0, -1.0], [0.0, 1.0]];
+        let expected = array![0.25, -0.25];
+        // This component is exactly orthogonal to both columns of `root` but
+        // is much larger than the projected residual in the weak direction.
+        let orthogonal_residual = array![1.0e-8, -1.0, -2.0];
+        let residual = -root.dot(&expected) + orthogonal_residual;
+        let mut actual = Array1::<f64>::zeros(2);
+
+        solve_newton_direction_from_root(&root, &residual, &mut actual)
+            .expect("least-squares root solve");
+
+        assert!((actual[0] - expected[0]).abs() < 1.0e-8);
+        assert!((actual[1] - expected[1]).abs() < 1.0e-8);
     }
 }
 

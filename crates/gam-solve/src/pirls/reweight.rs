@@ -824,6 +824,7 @@ where
 
             let has_constraints =
                 options.linear_constraints.is_some() || options.coefficient_lower_bounds.is_some();
+            let mut root_damped_decrement_sq = None;
             let direction = match if let Some(h_sparse) = state.hessian.as_sparse() {
                 if has_constraints {
                     Err(EstimationError::InvalidInput(
@@ -997,12 +998,16 @@ where
                     }
                 } else {
                     model.solve_unconstrained_direction(
+                        &beta,
                         &state,
                         loop_lambda,
                         &lm_d2,
                         dense_reg,
                         &mut newton_direction,
                     )
+                    .map(|certificate| {
+                        root_damped_decrement_sq = certificate;
+                    })
                 }
             } {
                 Ok(()) => &newton_direction,
@@ -1492,7 +1497,9 @@ where
                         let f_scale = 1.0 + current_penalized.abs();
                         let lambda_floor = final_state_ref.ridge_used.max(1.0e-12);
                         let nd_correction = 1.0 + loop_lambda / lambda_floor;
-                        let newton_decrement_sq_upper = (-lin).max(0.0) * nd_correction;
+                        let damped_decrement_sq = root_damped_decrement_sq
+                            .unwrap_or_else(|| (-lin).max(0.0));
+                        let newton_decrement_sq_upper = damped_decrement_sq * nd_correction;
                         let nd_threshold = kkt_tolerance * kkt_tolerance * f_scale;
                         let nd_pass = newton_decrement_sq_upper <= nd_threshold;
                         // Once realized progress is below the objective's

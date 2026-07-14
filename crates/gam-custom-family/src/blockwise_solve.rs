@@ -247,8 +247,8 @@ pub(crate) fn custom_family_seed_screening_proxy_labeled<
     let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
     let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
     let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
-    // Seed screening only RANKS candidate seeds by their penalized objective; it
-    // is capped and never produces the final fit. Mark the inner solve as a
+    // Seed screening only RANKS candidate seeds by their penalized inner merit;
+    // it is capped and never produces the final fit. Mark the inner solve as a
     // screening solve so it skips the O(p · per-axis-Hdot) full Jeffreys/Firth
     // curvature loop and keeps only the cheap value-only Jeffreys term in the
     // score (gam#729/#808). For a K-block coupled family (Dirichlet/multinomial)
@@ -282,10 +282,18 @@ pub(crate) fn custom_family_seed_screening_proxy_labeled<
     )?;
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let prior_terms = rho_prior_cost_gradient_hessian(rho_prior, rho)?;
-    let score = inner_penalized_objective(
-        &inner,
-        include_exact_newton_logdet_h(family, options),
-        include_exact_newton_logdet_s(family, options),
+    // A capped screening iterate is deliberately not a certified coefficient
+    // mode. Its Laplace determinants are therefore undefined, and using them
+    // here would either rank noisy partial-fit curvature or (correctly) fail
+    // once determinant construction is restricted to converged modes. Rank on
+    // the same curvature-free penalized merit minimized by the inner solver.
+    // Accepted inner steps decrease this quantity, so the terminal capped
+    // iterate is a meaningful seed-quality signal. Full outer evaluations keep
+    // requiring convergence and certified REML/LAML determinants.
+    let score = checked_penalizedobjective(
+        inner.log_likelihood,
+        inner.penalty_value,
+        0.0,
         "custom-family labeled seed-screening proxy",
     )? + prior_terms.0;
     let warm = ConstrainedWarmStart {

@@ -46,12 +46,20 @@ pub trait WorkingModel {
     /// override this atom without changing constraints or trust-region logic.
     fn solve_unconstrained_direction(
         &mut self,
+        beta: &Coefficients,
         state: &WorkingState,
         loop_lambda: f64,
         lm_d2: &Array1<f64>,
         regularized_hessian: &Array2<f64>,
         direction_out: &mut Array1<f64>,
-    ) -> Result<(), EstimationError> {
+    ) -> Result<Option<f64>, EstimationError> {
+        if beta.as_ref().len() != state.gradient.len() {
+            crate::bail_invalid_estim!(
+                "PIRLS coefficient length {} does not match gradient length {}",
+                beta.as_ref().len(),
+                state.gradient.len()
+            );
+        }
         if !(loop_lambda.is_finite() && loop_lambda >= 0.0) {
             crate::bail_invalid_estim!(
                 "PIRLS LM damping must be finite and nonnegative, got {loop_lambda}"
@@ -64,7 +72,8 @@ pub trait WorkingModel {
                 state.gradient.len()
             );
         }
-        solve_newton_direction_dense(regularized_hessian, &state.gradient, direction_out)
+        solve_newton_direction_dense(regularized_hessian, &state.gradient, direction_out)?;
+        Ok(None)
     }
 
     /// Dispersion factor `k` the inner working weight carries but the reported

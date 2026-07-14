@@ -3006,7 +3006,7 @@ pub(crate) fn nonconverged_inner_refuses_profile_derivatives() {
 }
 
 #[test]
-pub(crate) fn custom_family_seed_screening_proxy_accepts_finite_partial_inner_fit() {
+pub(crate) fn custom_family_seed_screening_proxy_ranks_partial_fit_without_laplace_terms() {
     let specs = vec![default_diagonal_exact_hook_spec()];
     let penalty_counts = validate_blockspecs(&specs).expect("valid test spec");
     let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
@@ -3037,6 +3037,14 @@ pub(crate) fn custom_family_seed_screening_proxy_accepts_finite_partial_inner_fi
     );
     assert_eq!(warm_start.rho, array![0.0]);
     assert_eq!(warm_start.block_beta.len(), 1);
+    let cached = warm_start
+        .cached_inner
+        .expect("screening warm start owns the partial inner iterate");
+    assert!(!cached.converged);
+    assert!(cached.block_logdet_h.is_none());
+    assert!(cached.block_logdet_s.is_none());
+    let expected = -cached.log_likelihood + cached.penalty_value;
+    assert_eq!(score.to_bits(), expected.to_bits());
 }
 
 #[test]
