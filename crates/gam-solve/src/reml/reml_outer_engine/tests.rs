@@ -6988,3 +6988,293 @@ pub(crate) fn tangent_projected_trace_logdet_operator_matches_densify_then_proje
     );
     assert_relative_eq!(got, reference, max_relative = 1e-10, epsilon = 1e-12);
 }
+
+/// #2319 closure oracle below the optimizer boundary.
+///
+/// The public installed-wheel test proves that two complete fits agree after a
+/// rigid rotation.  This test pins the stronger cause: before an outer step is
+/// taken, the two Duchon constructions must describe the same statistical
+/// problem.  Coefficient vectors and eigenspace bases are deliberately not
+/// compared because both are gauge-dependent.  Instead we compare physical
+/// center sets, generalized penalty spectra, data-space range projectors, and
+/// the production fixed-rho REML/LAML value/gradient/Hessian.
+#[test]
+pub(crate) fn duchon_rotation_is_equivariant_before_outer_optimization_gh2319() {
+    use gam_terms::basis::{
+        BasisBuildResult, BasisMetadata, CenterStrategy, DuchonBasisSpec,
+        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, OneDimensionalBoundary,
+        SpatialIdentifiability, build_duchon_basis,
+    };
+
+    const N: usize = 96;
+    const ANGLE: f64 = 0.698;
+    const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
+
+    // A deterministic, asymmetric disk cloud.  The modular radius order and
+    // irrational angular stride avoid artificial distance ties while retaining
+    // the reporter's isotropic geometry class.
+    let data = Array2::from_shape_fn((N, 2), |(row, axis)| {
+        let radius_rank = (37 * row) % N;
+        let radius = 3.0 * ((radius_rank as f64 + 0.5) / N as f64).sqrt();
+        let phase = ((row as f64 + 0.5) * 0.618_033_988_749_894_9).fract();
+        let theta = TWO_PI * phase;
+        if axis == 0 {
+            radius * theta.cos()
+        } else {
+            radius * theta.sin()
+        }
+    });
+    let center = array![
+        data.column(0).sum() / N as f64,
+        data.column(1).sum() / N as f64,
+    ];
+    let (sin_angle, cos_angle) = ANGLE.sin_cos();
+    let rotate = |points: &Array2<f64>| {
+        Array2::from_shape_fn(points.raw_dim(), |(row, axis)| {
+            let x = points[[row, 0]] - center[0];
+            let z = points[[row, 1]] - center[1];
+            if axis == 0 {
+                center[0] + cos_angle * x - sin_angle * z
+            } else {
+                center[1] + sin_angle * x + cos_angle * z
+            }
+        })
+    };
+    let rotated_data = rotate(&data);
+
+    let spec = DuchonBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint { num_centers: 30 },
+        periodic: None,
+        length_scale: None,
+        // d=2 cubic Duchon default: 2(p+s)-d=3 for p=2, s=1/2.
+        power: 0.5,
+        nullspace_order: DuchonNullspaceOrder::Linear,
+        identifiability: SpatialIdentifiability::default(),
+        aniso_log_scales: None,
+        operator_penalties: DuchonOperatorPenaltySpec::default(),
+        boundary: OneDimensionalBoundary::Open,
+        radial_reparam: None,
+    };
+    let base = build_duchon_basis(data.view(), &spec).expect("base Duchon preoptimizer build");
+    let rotated = build_duchon_basis(rotated_data.view(), &spec)
+        .expect("rotated Duchon preoptimizer build");
+
+    let centers = |built: &BasisBuildResult| match &built.metadata {
+        BasisMetadata::Duchon { centers, .. } => centers,
+        _ => panic!("Duchon builder must return Duchon metadata"),
+    };
+    let expected_rotated_centers = rotate(centers(&base));
+    let actual_rotated_centers = centers(&rotated);
+    assert_eq!(expected_rotated_centers.raw_dim(), actual_rotated_centers.raw_dim());
+    let mut unmatched = vec![true; actual_rotated_centers.nrows()];
+    let mut worst_center_residual = 0.0_f64;
+    for expected in expected_rotated_centers.rows() {
+        let (matched, residual) = actual_rotated_centers
+            .rows()
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| unmatched[*index])
+            .map(|(index, actual)| {
+                let residual = expected
+                    .iter()
+                    .zip(actual.iter())
+                    .map(|(&left, &right)| (left - right).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                (index, residual)
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .expect("equal nonempty center sets");
+        unmatched[matched] = false;
+        worst_center_residual = worst_center_residual.max(residual);
+    }
+    assert!(
+        worst_center_residual <= 2.0e-12,
+        "physical Duchon center set changed under rotation: worst residual={worst_center_residual:.3e}"
+    );
+
+    let base_design = base.design.to_dense();
+    let rotated_design = rotated.design.to_dense();
+    assert_eq!(base_design.raw_dim(), rotated_design.raw_dim());
+    assert_eq!(base.active_penalties.len(), rotated.active_penalties.len());
+    for (left, right) in base
+        .active_penalties
+        .iter()
+        .zip(rotated.active_penalties.iter())
+    {
+        assert_eq!(left.info.source, right.info.source);
+    }
+
+    let rho = Array1::from_shape_fn(base.active_penalties.len(), |index| {
+        -0.9 + 0.55 * index as f64
+    });
+    let lambdas = rho.mapv(f64::exp);
+    let penalty_matrices = |built: &BasisBuildResult| {
+        built
+            .active_penalties
+            .iter()
+            .map(|penalty| penalty.matrix.clone())
+            .collect::<Vec<_>>()
+    };
+    let base_penalties = penalty_matrices(&base);
+    let rotated_penalties = penalty_matrices(&rotated);
+    let combined_penalty = |penalties: &[Array2<f64>]| {
+        let mut combined = Array2::<f64>::zeros(penalties[0].raw_dim());
+        for (&lambda, penalty) in lambdas.iter().zip(penalties) {
+            combined.scaled_add(lambda, penalty);
+        }
+        combined
+    };
+
+    // Return the data-space range projector and the generalized spectrum of
+    // S v = mu (X'X) v.  Whitening by the data Gram removes arbitrary
+    // coefficient gauges, including rotations inside repeated eigenspaces.
+    let geometry = |design: &Array2<f64>, penalties: &[Array2<f64>]| {
+        let gram = design.t().dot(design);
+        let (gram_values, gram_vectors) = gram
+            .eigh(faer::Side::Lower)
+            .expect("Duchon data Gram eigendecomposition");
+        let gram_scale = gram_values.iter().copied().fold(0.0_f64, f64::max);
+        assert!(
+            gram_values.iter().all(|&value| value > 1.0e-11 * gram_scale),
+            "preoptimizer Duchon design must be full column rank: {gram_values:?}"
+        );
+        let mut inverse_sqrt = gram_vectors;
+        for (column, &value) in gram_values.iter().enumerate() {
+            let scale = value.sqrt().recip();
+            inverse_sqrt.column_mut(column).mapv_inplace(|entry| entry * scale);
+        }
+        let orthonormal_design = design.dot(&inverse_sqrt);
+        let projector = orthonormal_design.dot(&orthonormal_design.t());
+        let whitened_penalty = inverse_sqrt
+            .t()
+            .dot(&combined_penalty(penalties))
+            .dot(&inverse_sqrt);
+        let (spectrum, _) = whitened_penalty
+            .eigh(faer::Side::Lower)
+            .expect("Duchon generalized penalty eigendecomposition");
+        (projector, spectrum)
+    };
+    let (base_projector, base_spectrum) = geometry(&base_design, &base_penalties);
+    let (rotated_projector, rotated_spectrum) =
+        geometry(&rotated_design, &rotated_penalties);
+    let projector_defect = (&base_projector - &rotated_projector)
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        projector_defect <= 2.0e-10,
+        "Duchon design range projector changed under rotation: defect={projector_defect:.3e}"
+    );
+    for (&left, &right) in base_spectrum.iter().zip(rotated_spectrum.iter()) {
+        let scale = left.abs().max(right.abs()).max(1.0);
+        assert!(
+            (left - right).abs() <= 2.0e-9 * scale,
+            "Duchon generalized spectrum changed under rotation: {left:.12e} vs {right:.12e}"
+        );
+    }
+
+    let response = Array1::from_shape_fn(N, |row| {
+        let x = data[[row, 0]] - center[0];
+        let z = data[[row, 1]] - center[1];
+        let radius = x.hypot(z);
+        2.0 * (-((radius - 1.0) / 0.6).powi(2)).exp() + 0.4 * radius
+    });
+    let evaluate_fixed_rho = |design: &Array2<f64>, penalties: &[Array2<f64>]| {
+        let gram = design.t().dot(design);
+        let xty = design.t().dot(&response);
+        let mut hessian = gram.clone();
+        hessian += &combined_penalty(penalties);
+        let hessian_op = DenseSpectralOperator::from_symmetric(&hessian)
+            .expect("fixed-rho Duchon Hessian factorization");
+        let beta = hessian_op.solve(&xty);
+        let residual = &response - &design.dot(&beta);
+        let penalty_quadratic = lambdas
+            .iter()
+            .zip(penalties)
+            .map(|(&lambda, penalty)| lambda * beta.dot(&penalty.dot(&beta)))
+            .sum();
+        let penalty_coords = penalties
+            .iter()
+            .map(|penalty| {
+                PenaltyCoordinate::from_dense_root(
+                    penalty_matrix_root(penalty).expect("constructive Duchon penalty root"),
+                )
+            })
+            .collect();
+        let penalty_blocks: [&[Array2<f64>]; 1] = [penalties];
+        let penalty_logdet = compute_block_penalty_logdet_derivs(
+            std::slice::from_ref(&rho),
+            &penalty_blocks,
+            0.0,
+        )
+        .expect("exact Duchon penalty logdet derivatives");
+        let solution = InnerSolution {
+            log_likelihood: -0.5 * residual.dot(&residual),
+            penalty_quadratic,
+            hessian_op: Arc::new(hessian_op),
+            beta,
+            penalty_coords,
+            penalty_logdet,
+            deriv_provider: Box::new(GaussianDerivatives),
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            rho_prior: gam_problem::RhoPrior::Flat,
+            n_observations: N,
+            nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
+            dp_floor_scale: 1.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            contracted_psi_second_order: None,
+            barrier_config: None,
+            kkt_residual: None,
+            active_constraints: None,
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
+        };
+        reml_laml_evaluate(
+            &solution,
+            rho.as_slice().expect("contiguous rho fixture"),
+            EvalMode::ValueGradientHessian,
+            None,
+        )
+        .expect("fixed-rho Duchon REML/LAML evaluation")
+    };
+    let base_eval = evaluate_fixed_rho(&base_design, &base_penalties);
+    let rotated_eval = evaluate_fixed_rho(&rotated_design, &rotated_penalties);
+    assert_relative_eq!(
+        base_eval.cost,
+        rotated_eval.cost,
+        epsilon = 2.0e-9,
+        max_relative = 2.0e-10
+    );
+    let base_gradient = base_eval.gradient.expect("fixed-rho gradient");
+    let rotated_gradient = rotated_eval.gradient.expect("rotated fixed-rho gradient");
+    for (&left, &right) in base_gradient.iter().zip(rotated_gradient.iter()) {
+        assert_relative_eq!(left, right, epsilon = 2.0e-9, max_relative = 2.0e-9);
+    }
+    let dense_hessian = |value: gam_problem::HessianValue| match value {
+        gam_problem::HessianValue::Dense(matrix) => matrix,
+        gam_problem::HessianValue::Operator(operator) => operator
+            .materialize_dense()
+            .expect("materialize fixed-rho outer Hessian"),
+        gam_problem::HessianValue::Unavailable => {
+            panic!("analytic fixed-rho outer Hessian must be available")
+        }
+    };
+    let base_hessian = dense_hessian(base_eval.hessian);
+    let rotated_hessian = dense_hessian(rotated_eval.hessian);
+    for (&left, &right) in base_hessian.iter().zip(rotated_hessian.iter()) {
+        assert_relative_eq!(left, right, epsilon = 3.0e-9, max_relative = 3.0e-8);
+    }
+}
