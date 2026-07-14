@@ -91,7 +91,7 @@ pub(crate) use super::*;
 #[cfg(test)]
 mod tests {
     use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
-    use super::reweight::{exact_newton_decrement_sq, madsen_lm_accept_factor};
+    use super::reweight::madsen_lm_accept_factor;
     use super::{
         DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily,
@@ -3208,6 +3208,7 @@ mod tests {
 #[cfg(test)]
 mod root_cause_tests {
     use super::*;
+    use super::reweight::exact_newton_decrement_sq;
     use approx::assert_relative_eq;
     use gam_problem::LogSmoothingParamsView;
     use ndarray::{Array1, Array2, array};
