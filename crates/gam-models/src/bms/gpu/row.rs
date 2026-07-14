@@ -3346,8 +3346,6 @@ pub fn launch_bms_flex_row_dense_block(
 // Host numerical primitives and the production CPU↔generated-CUDA parity lock.
 #[cfg(test)]
 mod row_kernel_tests {
-    use super::*;
-
     pub(crate) fn host_log_ndtr_and_mills(x: f64) -> (f64, f64) {
         gam_gpu::numerics_host::log_ndtr_and_mills(x)
     }
@@ -3892,7 +3890,7 @@ mod tests {
                 && primary.w.as_ref().is_some_and(|range| !range.is_empty()),
             "full-row timing fixture must exercise both h and w"
         );
-        let pin_bytes = crate::bms::BernoulliMarginalSlopeFamily::row_primary_eval_tile_bytes(N, r);
+        let pin_bytes = crate::bms::family::BernoulliMarginalSlopeFamily::row_primary_eval_tile_bytes(N, r);
 
         let run_cpu = || {
             let completed = AtomicUsize::new(0);

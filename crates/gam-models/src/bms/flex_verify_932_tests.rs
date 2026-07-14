@@ -471,8 +471,8 @@ fn run_production_gate(is_score_warp: bool) {
     // The analytic path (production root) and the FD path (ulp-tight
     // independent root) must agree on the value at the base point.
     assert!(
-        (v_gh - v_hand).abs() <= 1e-9 * v_hand.abs().max(1.0),
-        "{label} analytic-call value {v_gh:+.12e} != value-call {v_hand:+.12e}"
+        (v_gh - v_production).abs() <= 1e-9 * v_production.abs().max(1.0),
+        "{label} analytic-call value {v_gh:+.12e} != value-call {v_production:+.12e}"
     );
     let h = 1.0e-3_f64;
     let mut max_g = 0.0_f64;

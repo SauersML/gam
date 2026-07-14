@@ -38,6 +38,7 @@
 #[cfg(test)]
 mod spatial_adaptive_hyper_fd_tests {
     use super::*;
+    use gam_custom_family::evaluate_custom_family_joint_hyper;
     use gam_solve::model_types::AdaptiveRegularizationOptions;
     // `CenterStrategy` and `MaternIdentifiability` already arrive through
     // `super::*` (the parent drivers module imports them from

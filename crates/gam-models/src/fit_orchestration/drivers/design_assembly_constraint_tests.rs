@@ -3556,7 +3556,10 @@ fn staged_exact_joint_outer_reoptimizes_and_certifies_the_full_row_measure() {
         true,
         None,
         policy,
-        |theta, specs, designs, provenance| {
+        |theta,
+         specs,
+         designs,
+         provenance: SpatialFitProvenance<'_, TerminalEvidence>| {
             assert_eq!(specs.len(), 2);
             assert_eq!(designs.len(), 2);
             let SpatialFitProvenance::Certified { outer, mode } = provenance else {
