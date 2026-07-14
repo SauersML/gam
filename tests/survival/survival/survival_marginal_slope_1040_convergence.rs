@@ -3,9 +3,9 @@
 //! this must enter the joint automatic-κ optimizer rather than the cheaper
 //! fixed-geometry route.
 //!
-//! The fixture deliberately uses the smallest requested spatial shape
-//! (`centers=4`, no FLEX/time-wiggle family axes) and deterministic censored
-//! data. Its contracts are semantic rather than tolerance patches:
+//! The fixture uses the issue-scale spatial shape (`centers=12`, `n=2500`, no
+//! FLEX/time-wiggle family axes) and deterministic censored data. Its
+//! contracts are semantic rather than tolerance patches:
 //!   * a returned fit is the sealed SPEC-20 convergence certificate;
 //!   * both returned term manifests must retain typed `Auto` ownership and a
 //!     finite resolved scale, proving the automatic-κ route survived planning,
@@ -20,12 +20,12 @@ use csv::StringRecord;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use gam::terms::basis::MaternLengthScale;
+use gam::terms::basis::{CenterStrategy, MaternLengthScale, MaternNu};
 use gam::terms::smooth::{SmoothBasisSpec, TermCollectionSpec};
 use std::time::Instant;
 
-const N: usize = 96;
-const CENTERS: usize = 4;
+const N: usize = 2_500;
+const CENTERS: usize = 12;
 
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -116,6 +116,21 @@ fn resolved_auto_matern_scale(spec: &TermCollectionSpec, channel: &str) -> f64 {
     let SmoothBasisSpec::Matern { spec: matern, .. } = &spec.smooth_terms[0].basis else {
         panic!("{channel} resolved to a non-Matérn basis");
     };
+    let CenterStrategy::FarthestPoint { num_centers } = &matern.center_strategy else {
+        panic!(
+            "{channel} must retain formula-selected farthest-point centers; got {:?}",
+            matern.center_strategy
+        );
+    };
+    assert_eq!(
+        *num_centers, CENTERS,
+        "{channel} must retain the requested center count"
+    );
+    assert!(
+        matches!(matern.nu, MaternNu::FiveHalves),
+        "{channel} must retain the formula default nu=5/2; got {:?}",
+        matern.nu
+    );
     let MaternLengthScale::Auto {
         resolved: Some(scale),
     } = matern.length_scale
@@ -133,7 +148,7 @@ fn resolved_auto_matern_scale(spec: &TermCollectionSpec, channel: &str) -> f64 {
 }
 
 #[test]
-fn survival_marginal_slope_auto_matern_logslope_converges() {
+fn survival_marginal_slope_auto_matern_logslope_centers12_converges() {
     init_parallelism();
 
     // No CUDA driver in CI on macOS.
@@ -172,7 +187,8 @@ fn survival_marginal_slope_auto_matern_logslope_converges() {
     eprintln!(
         "[979-SURVIVAL] n={N} centers={CENTERS} total_s={elapsed:.3} \
          marginal_scale={marginal_scale:.6e} logslope_scale={logslope_scale:.6e} \
-         outer_iters={} inner_cycles={} converged=certified auto_kappa=both",
+         outer_iters={} inner_cycles={} converged=certified auto_kappa=both \
+         centers_strategy=farthest_point nu=5/2",
         fit.fit.outer_iterations, fit.fit.inner_cycles
     );
 
