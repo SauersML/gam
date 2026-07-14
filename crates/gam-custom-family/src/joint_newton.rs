@@ -4363,6 +4363,7 @@ pub(crate) fn residual_in_steady_geometric_descent(
 /// stationarity. Returns `None` when there is no null space (range == whole space)
 /// — there the raw per-block residual already IS the range residual, so the caller
 /// keeps its existing gate unchanged.
+#[cfg(test)]
 pub(crate) fn projected_residual_range_space_per_block_inf(
     projected_residual: &Array1<f64>,
     joint_hessian_source: &JointHessianSource,
@@ -4424,6 +4425,7 @@ pub(crate) fn projected_residual_range_space_per_block_inf(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn projected_residual_range_space_inf(
     projected_residual: &Array1<f64>,
     joint_hessian_source: &JointHessianSource,
