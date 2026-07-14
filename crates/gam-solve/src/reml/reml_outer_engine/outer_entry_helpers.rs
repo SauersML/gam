@@ -583,30 +583,123 @@ pub fn active_constraint_tangent_geometry(
     if p == 0 {
         return Ok(ActiveConstraintTangentGeometry::FullyPinned);
     }
-    // `null(A_act) = null(A_actᵀ A_act)`; eigendecompose the symmetric PSD
-    // `p × p` matrix and pull the eigenvectors with σ ≤ threshold as the
-    // null basis. This gives `m = p − rank(A_act)`, the correct tangent
-    // dimension regardless of whether `A_act` has linearly dependent rows.
-    let ata = a_act.t().dot(a_act);
-    let (evals, evecs) = ata
-        .eigh(faer::Side::Lower)
-        .map_err(|error| format!("active constraint tangent eigendecomposition failed: {error}"))?;
-    let evals_slice = evals
-        .as_slice()
-        .ok_or_else(|| "active constraint tangent eigenvalues are not contiguous".to_string())?;
-    let threshold = positive_eigenvalue_threshold(evals_slice);
-    let null_count = evals_slice.iter().filter(|&&s| s <= threshold).count();
-    if null_count == p {
+    // Factor the rectangular row block directly. Forming `A_actᵀ A_act`
+    // squares its condition number and can erase independent active rows near
+    // machine precision. That produces a tangent which leaks in a constraint-
+    // normal direction: the next accepted point then falls off the working
+    // face and discards the entire warm active set. The thin SVD gives the row
+    // rank without normal equations; complete its right-singular row basis to
+    // an orthonormal null basis using twice-reorthogonalized coordinate axes.
+    let (_u, singular, vt) = a_act
+        .svd(false, true)
+        .map_err(|error| format!("active constraint tangent SVD failed: {error}"))?;
+    let vt = vt.ok_or_else(|| "active constraint tangent SVD omitted Vᵀ".to_string())?;
+    let smax = singular.iter().fold(0.0_f64, |largest, &s| largest.max(s));
+    let rank_threshold =
+        100.0 * f64::EPSILON * (a_act.nrows().max(p) as f64) * smax;
+    let rank = singular.iter().filter(|&&s| s > rank_threshold).count();
+    if rank == 0 {
         return Err(
             "non-empty active constraint block has zero numerical row rank".to_string(),
         );
     }
-    if null_count == 0 {
+    if rank == p {
         return Ok(ActiveConstraintTangentGeometry::FullyPinned);
     }
-    Ok(ActiveConstraintTangentGeometry::Tangent(
-        evecs.slice(ndarray::s![.., 0..null_count]).to_owned(),
-    ))
+
+    let null_count = p - rank;
+    let mut orthonormal_basis: Vec<Array1<f64>> =
+        (0..rank).map(|i| vt.row(i).to_owned()).collect();
+    let mut z = Array2::<f64>::zeros((p, null_count));
+    let mut collected = 0usize;
+    let independence_floor = 100.0 * f64::EPSILON * p as f64;
+    for axis in 0..p {
+        if collected == null_count {
+            break;
+        }
+        let mut candidate = Array1::<f64>::zeros(p);
+        candidate[axis] = 1.0;
+        // A second pass is deliberate: modified Gram–Schmidt reorthogonalization
+        // keeps the constructed complement accurate for ill-conditioned faces.
+        for _ in 0..2 {
+            for q in &orthonormal_basis {
+                candidate.scaled_add(-q.dot(&candidate), q);
+            }
+        }
+        let norm = candidate.dot(&candidate).sqrt();
+        if norm > independence_floor {
+            candidate /= norm;
+            z.column_mut(collected).assign(&candidate);
+            orthonormal_basis.push(candidate);
+            collected += 1;
+        }
+    }
+    if collected != null_count {
+        return Err(format!(
+            "active constraint tangent complement construction produced {collected} of {null_count} columns"
+        ));
+    }
+
+    // This routine is the shared authority for both optimization and LAML
+    // projection. Refuse geometry that cannot preserve the solver's working-
+    // face contract instead of silently returning a numerically false tangent.
+    for row in a_act.rows() {
+        let row_norm = row.dot(&row).sqrt();
+        if row_norm == 0.0 {
+            continue;
+        }
+        for tangent in z.columns() {
+            let relative_leakage = row.dot(&tangent).abs() / row_norm;
+            if relative_leakage > crate::active_set::ACTIVE_SET_WORKING_FACE_TOL {
+                return Err(format!(
+                    "active constraint tangent leaks through its working face: relative leakage {relative_leakage:.3e}"
+                ));
+            }
+        }
+    }
+    Ok(ActiveConstraintTangentGeometry::Tangent(z))
+}
+
+#[cfg(test)]
+mod active_constraint_tangent_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn direct_rectangular_factorization_preserves_ill_conditioned_row_rank() {
+        // The two independent rows have condition number O(1e8), so forming
+        // AᵀA pushes their squared condition to machine precision. The true
+        // tangent is exactly the third coordinate and must remain one-dimensional.
+        let a = ndarray::array![[1.0, 1.0, 0.0], [1.0, 1.0 + 1e-7, 0.0]];
+        let ActiveConstraintTangentGeometry::Tangent(z) =
+            active_constraint_tangent_geometry(&a).expect("direct SVD geometry")
+        else {
+            panic!("ill-conditioned rank-two face must have a tangent");
+        };
+        assert_eq!(z.dim(), (3, 1));
+        assert!((z.column(0).dot(&z.column(0)) - 1.0).abs() < 1e-12);
+        for row in a.rows() {
+            assert!(row.dot(&z.column(0)).abs() / row.dot(&row).sqrt() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn dependent_rows_produce_the_full_exact_null_space() {
+        let a = ndarray::array![[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
+        let ActiveConstraintTangentGeometry::Tangent(z) =
+            active_constraint_tangent_geometry(&a).expect("rank-one geometry")
+        else {
+            panic!("rank-one face in three dimensions must have a tangent");
+        };
+        assert_eq!(z.dim(), (3, 2));
+        let gram = z.t().dot(&z);
+        for i in 0..2 {
+            for j in 0..2 {
+                let target = if i == j { 1.0 } else { 0.0 };
+                assert!((gram[[i, j]] - target).abs() < 1e-12);
+            }
+        }
+        assert!(a.dot(&z).iter().all(|value| value.abs() < 1e-12));
+    }
 }
 
 /// Dense `p × p` materialization of a penalty coordinate via canonical
