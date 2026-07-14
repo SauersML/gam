@@ -488,75 +488,46 @@ mod tests {
         }
     }
 
-    /// Audit §34 "MDL sample invariance": holding `amortization_horizon` fixed,
-    /// scoring the SAME fitted model at estimation subsamples of 256 / 1024 / 8192
-    /// rows must leave the dictionary term BITWISE identical, and the total must
-    /// agree with the 8192-row total to within the Monte-Carlo standard error of
-    /// the code / residual / support expectations at the smaller sample. This is
-    /// the acceptance test for #2283: the dictionary code no longer picks up the
-    /// estimation subsample size.
-    ///
-    /// # Why the totals need an n-dependent tolerance, not a flat one
-    ///
-    /// Only the DICTIONARY term is an exact function of declared quantities. The
-    /// code / residual / support terms are expectations under the row distribution,
-    /// estimated from the `n` sampled rows, so
-    ///     `bits(n) = bits(∞) + O(1/n) [bias] + O_p(σ_bits/√n) [variance]`.
-    /// A constant relative tolerance is mis-calibrated by construction — it demands
-    /// that a 256-row estimate be as accurate as an 8192-row one. The bound used
-    /// below covers both terms and shrinks with `n`: the variance scale `σ_bits` is
-    /// MEASURED from 32 disjoint row blocks, and the bias term is DERIVED from the
-    /// scorer's own `n−1`-vs-`n` normalisation mismatch (see the block comment at
-    /// the tolerance). Neither is a tuned constant.
-    ///
-    /// Rows are drawn i.i.d. from a fixed deterministic generator, so the leading
-    /// `n` rows really are a random subsample of the same population (the previous
-    /// fixture's rows were a smooth ramp in `i`, where "the first 256 rows" is a
-    /// different, narrower population — the drift it produced was a systematic
-    /// coverage difference, not Monte-Carlo error).
+    /// Audit §34 "MDL sample invariance": holding the deployment horizon and
+    /// fitted featurizer fixed while changing only the estimator row count must
+    /// leave dictionary bits bitwise identical. The remaining finite-n drift is
+    /// checked against the exact Bessel-correction formula of a balanced,
+    /// repeated quadrature block—no stochastic tolerance or resampling loop.
     #[test]
     fn eq4_dictionary_term_is_invariant_to_the_estimation_subsample() {
-        // One fitted model (a fixed 0.85 shrinkage decoder, a single flat code_dim-1
-        // atom firing on every row) scored on i.i.d. rows. Deterministic LCG +
-        // Box–Muller: the sequence is fixed run to run, but the rows are exchangeable,
-        // which is exactly what makes "the first n rows" an honest MC subsample.
-        let full_rows = 8192_usize;
-        let d = 3_usize;
-        let mut state = 0x2283_5EED_u64;
-        let mut next_uniform = move || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            // Open unit interval: Box–Muller must never see an exact zero.
-            ((state >> 11) as f64 + 0.5) / (1_u64 << 53) as f64
-        };
-        let mut next_normal = move || {
-            let u1: f64 = next_uniform();
-            let u2: f64 = next_uniform();
-            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-        };
-        let mut test_x = Array2::<f64>::zeros((full_rows, d));
-        for i in 0..full_rows {
-            // Correlated, non-isotropic rows so the residual spectrum is nontrivial.
-            let z0 = next_normal();
-            let z1 = next_normal();
-            let z2 = next_normal();
-            test_x[[i, 0]] = z0;
-            test_x[[i, 1]] = 0.6 * z0 + 0.8 * z1;
-            test_x[[i, 2]] = 0.3 * z0 - 0.4 * z1 + 0.5 * z2;
+        const FULL_ROWS: usize = 8192;
+        const BLOCK_ROWS: usize = 8;
+        let mut test_x = Array2::<f64>::zeros((FULL_ROWS, 2));
+        let mut recon = Array2::<f64>::zeros((FULL_ROWS, 2));
+        let mut gate = Array2::<f64>::zeros((FULL_ROWS, 1));
+
+        // One honest flat atom: it fires on four rows per block with scalar
+        // codes [+1,+1,-1,-1] and decoder [1,0], so every contribution matrix
+        // is rigorously rank one. The independent second coordinate is a
+        // balanced ±1 residual. Every prefix below contains whole blocks and
+        // therefore has exactly the same empirical row distribution:
+        // p_fire=1/2, zero means, and reference variance 1/2 + 1 = 3/2.
+        for row in 0..FULL_ROWS {
+            let within = row % BLOCK_ROWS;
+            let code = match within {
+                0 | 2 => 1.0,
+                4 | 6 => -1.0,
+                _ => 0.0,
+            };
+            let active = within % 2 == 0;
+            let residual = if within < 4 { 1.0 } else { -1.0 };
+            recon[[row, 0]] = code;
+            test_x[[row, 0]] = code;
+            test_x[[row, 1]] = residual;
+            gate[[row, 0]] = if active { 1.0 } else { 0.0 };
         }
-        let recon = test_x.mapv(|value| 0.85 * value);
-        let gate = Array2::ones((full_rows, 1));
 
         let horizon = 120_000_i64;
         let dictionary_params = 4096_i64;
         let targets = [0.99, 0.95, 0.90, 0.80];
-
-        // Score the contiguous row window `[start, start + len)` as an independent
-        // estimation subsample of the SAME fitted model.
-        let score_range = |start: usize, len: usize| -> Eq4DescriptionLength {
-            let window = ndarray::s![start..start + len, ..];
-            let contribution = recon.slice(window).to_owned();
+        let score_at = |rows: usize| -> Eq4DescriptionLength {
+            let window = ndarray::s![..rows, ..];
+            let contribution = recon.slice(window);
             eq4_fixed_distortion_description_length(
                 test_x.slice(window),
                 recon.slice(window),
@@ -569,166 +540,83 @@ mod tests {
                 move |_atom, take| {
                     let mut selected = Array2::zeros((take.len(), contribution.ncols()));
                     for (out_row, &source_row) in take.iter().enumerate() {
-                        selected.row_mut(out_row).assign(&contribution.row(source_row));
+                        selected
+                            .row_mut(out_row)
+                            .assign(&contribution.row(source_row));
                     }
                     Ok(selected)
                 },
             )
-            .unwrap()
+            .expect("balanced Eq. 4 fixture must score")
         };
 
-        let small = score_range(0, 256);
-        let medium = score_range(0, 1024);
-        let large = score_range(0, full_rows);
-
-        // Every run declared the same horizon and priced the same decoder.
+        // Exactly three scorer calls. At N=8192 the atom fires 4096 times, so
+        // the production 4096-row spectrum cap is reached but never crossed.
+        let small = score_at(256);
+        let medium = score_at(1024);
+        let large = score_at(FULL_ROWS);
         for run in [&small, &medium, &large] {
             assert_eq!(run.amortization_horizon, horizon);
+            assert_eq!(run.achieved_block_l0, 0.5);
         }
         assert_eq!(small.estimation_rows, 256);
         assert_eq!(medium.estimation_rows, 1024);
-        assert_eq!(large.estimation_rows, 8192);
+        assert_eq!(large.estimation_rows, FULL_ROWS as i64);
 
-        // ── The load-bearing §21 assertion ────────────────────────────────────
-        // The dictionary term is BITWISE identical across subsamples: it depends
-        // only on the declared horizon, so re-estimation does not move it at all.
-        let expected_dict =
+        // Load-bearing #2283 contract: dictionary storage is priced in the
+        // declared deployment horizon, not in the estimator sample size.
+        let expected_dictionary =
             0.5 * dictionary_params as f64 / horizon as f64 * (horizon as f64).log2();
-        assert_eq!(small.dictionary_bits, expected_dict);
-        assert_eq!(medium.dictionary_bits, small.dictionary_bits);
-        assert_eq!(large.dictionary_bits, small.dictionary_bits);
+        assert_eq!(small.dictionary_bits, expected_dictionary);
+        assert_eq!(medium.dictionary_bits, expected_dictionary);
+        assert_eq!(large.dictionary_bits, expected_dictionary);
 
-        // ── The estimator's two n-dependent error terms ───────────────────────
-        // `bits(n) − bits(∞)` has exactly two sources, and the tolerance must cover
-        // BOTH. Neither is a free constant: one is measured, one is derived.
-        //
-        // (1) VARIANCE, O(σ/√n). Measured, not assumed. Split the 8192 rows into 32
-        //     DISJOINT 256-row blocks and score each: the spread of those 32 totals
-        //     is a direct, assumption-light estimate of the sampling sd of a 256-row
-        //     bits estimate, `σ̂₂₅₆`, per target.
-        //
-        // (2) BIAS, O(1/n). Derived. The bits functional is scale-invariant —
-        //     `bits(α·spectra, α·D) = bits(spectra, D)`, since reverse water-filling
-        //     only ever sees variance RATIOS. The scorer forms the spectra with the
-        //     Bessel denominator `n−1` (`covariance_eigenvalues`, `atom_code_spectrum`)
-        //     but forms `reference_variance` — hence the distortion budget
-        //     `D = (1−R²)·reference_variance` — with denominator `n`. By scale
-        //     invariance that mismatch is EXACTLY equivalent to inflating the budget
-        //     by `c(n) = n/(n−1)`, a deterministic O(1/n) perturbation that survives
-        //     even at zero sampling noise (at the loose targets the block spread is
-        //     ~1e-15, yet the totals still move — this term, not noise, is what a
-        //     variance-only tolerance would wrongly flag).
-        //
-        // Bounding (2) by the envelope theorem: at the shared water level `L`,
-        // `∂bits/∂D = −M/(2 ln2 · L)` with `M = Σ_{above water} wᵢ`, and the budget
-        // moves by `D·(c−1) = D/(n−1)`, so
-        //     |Δbits| ≤ M/(2 ln2) · (D/L) / (n−1) ≤ W²/(2 ln2) / (n−1),
-        // using `M ≤ W` and `D/L ≤ W`, where `W = Σ_g p_g + 1` is the total
-        // water-filling component weight (every atom weighted by its firing
-        // probability, plus the weight-1 residual). `Σ_g p_g` is exactly the reported
-        // mean per-token support cardinality, so `W` is read off the report — it is a
-        // derived quantity, not a tuned one.
-        const BLOCK: usize = 256;
-        let blocks = full_rows / BLOCK;
-        let mut block_bits: Vec<Vec<f64>> = vec![Vec::with_capacity(blocks); targets.len()];
-        for block in 0..blocks {
-            let scored = score_range(block * BLOCK, BLOCK);
-            for (t, row) in scored.per_target.iter().enumerate() {
-                block_bits[t].push(row.bits);
-            }
-        }
-        let block_sd: Vec<f64> = block_bits
-            .iter()
-            .map(|samples| {
-                let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-                let variance = samples.iter().map(|b| (b - mean).powi(2)).sum::<f64>()
-                    / (samples.len() - 1) as f64;
-                variance.sqrt()
-            })
-            .collect();
-
-        // Total component weight W = Σ_g p_g + 1 (residual). Σ_g p_g is the reported
-        // mean support cardinality.
-        let total_weight = large.achieved_block_l0 + 1.0;
-        let bias_bound = |n: usize| -> f64 {
-            total_weight * total_weight / (2.0 * std::f64::consts::LN_2)
-                * (1.0 / (n as f64 - 1.0) - 1.0 / (full_rows as f64 - 1.0))
+        // The balanced block makes the only finite-n change analytic. With n
+        // rows, the active code and residual sample variances are respectively
+        //   a_c(n)=(n/2)/(n/2-1),  a_r(n)=n/(n-1).
+        // All four requested water levels remain below both positive modes, so
+        // relative to N the total-bit drift is exactly
+        //   1/4 log2(a_c(n)/a_c(N)) + 1/2 log2(a_r(n)/a_r(N)).
+        let code_variance = |rows: usize| (rows as f64 / 2.0) / (rows as f64 / 2.0 - 1.0);
+        let residual_variance = |rows: usize| rows as f64 / (rows as f64 - 1.0);
+        let expected_drift = |rows: usize| {
+            0.25 * (code_variance(rows) / code_variance(FULL_ROWS)).log2()
+                + 0.5 * (residual_variance(rows) / residual_variance(FULL_ROWS)).log2()
         };
+        let small_drift = expected_drift(256);
+        let medium_drift = expected_drift(1024);
+        assert!(small_drift > medium_drift && medium_drift > 0.0);
 
-        // Standard error of the DIFFERENCE between a nested n-row estimate and the
-        // N-row estimate. The n rows are a SUBSET of the N rows, so for an
-        // average-like estimator the shared rows cancel and
-        //     Var[bits(n) − bits(N)] = σ²·(1/n − 1/N)
-        // (strictly tighter than the independent-samples σ²(1/n + 1/N), and it
-        // correctly vanishes as n → N). σ² is extrapolated from the measured block
-        // spread by the CLT scaling law: σ² = BLOCK·σ̂₂₅₆².
-        let se_diff = |sd: f64, n: usize| -> f64 {
-            (sd * sd * BLOCK as f64 * (1.0 / n as f64 - 1.0 / full_rows as f64)).sqrt()
-        };
-        // k = 6 standard errors on the variance term. Under the CLT/delta-method
-        // normal approximation that is a ~2e-9 two-sided tail per comparison (8
-        // comparisons here ⇒ family-wise false-alarm rate ~1e-8); with NO
-        // distributional assumption at all, Chebyshev still caps each comparison at
-        // 1/36. It is a significance level, not a fudge factor: it does not scale
-        // with the observed discrepancy.
-        const K_SIGMA: f64 = 6.0;
-
-        for (target_idx, &target) in targets.iter().enumerate() {
-            let s = small.per_target[target_idx].bits;
-            let m = medium.per_target[target_idx].bits;
-            let l = large.per_target[target_idx].bits;
-            let sd = block_sd[target_idx];
+        for (target_index, &target) in targets.iter().enumerate() {
+            let observed_small =
+                small.per_target[target_index].bits - large.per_target[target_index].bits;
+            let observed_medium =
+                medium.per_target[target_index].bits - large.per_target[target_index].bits;
+            let tolerance = 1.0e-11
+                * (1.0
+                    + large.per_target[target_index].bits.abs()
+                    + small_drift.abs());
             assert!(
-                sd.is_finite() && sd >= 0.0,
-                "target {target} block spread must be finite and nonnegative, got {sd}"
-            );
-            // bias(n) + k·se(n); the 1e-9·(1+|l|) floor only absorbs float noise in
-            // the exactly-shared support/dictionary terms.
-            let tolerance = |n: usize| -> f64 {
-                bias_bound(n) + K_SIGMA * se_diff(sd, n) + 1.0e-9 * (1.0 + l.abs())
-            };
-            let tol_small = tolerance(256);
-            let tol_medium = tolerance(1024);
-            assert!(
-                (s - l).abs() <= tol_small,
-                "target {target}: 256-row total {s} differs from the 8192-row total {l} \
-                 by {} > bias+{K_SIGMA}σ ({tol_small}); σ̂₂₅₆ = {sd}",
-                (s - l).abs()
-            );
-            // Convergence: BOTH error terms shrink with n, so the 1024-row bound is
-            // strictly tighter than the 256-row bound — and the estimate still meets
-            // it. This is the "more rows ⇒ closer to the limit" guard, stated as a
-            // shrinking bound the estimator must satisfy rather than as a strict
-            // ordering of two single noisy realisations (which would be flaky by
-            // construction).
-            assert!(
-                tol_medium < tol_small,
-                "the n-row bound must tighten with n: {tol_medium} !< {tol_small}"
+                (observed_small - small_drift).abs() <= tolerance,
+                "target {target}: 256-row drift {observed_small:.17e} != derived \
+                 {small_drift:.17e} within {tolerance:.3e}"
             );
             assert!(
-                (m - l).abs() <= tol_medium,
-                "target {target}: 1024-row total {m} differs from the 8192-row total {l} \
-                 by {} > bias+{K_SIGMA}σ ({tol_medium}); σ̂₂₅₆ = {sd}",
-                (m - l).abs()
-            );
-
-            // ── Anti-vacuity ──────────────────────────────────────────────────
-            // The tolerance must stay far too tight to hide the #2283 confound. Under
-            // the OLD behaviour the dictionary term was `0.5·params·log₂(n)/n` in the
-            // ESTIMATION rows, so the SAME fitted model's total moved by ~60.7 bits
-            // between 256 and 8192 rows. Assert that swing is orders of magnitude
-            // above the tolerance just allowed — i.e. this test would still FAIL
-            // loudly on the pre-fix scorer, and has not been widened into vacuity.
-            let confounded_dictionary_bits =
-                |n: usize| 0.5 * dictionary_params as f64 * (n as f64).log2() / n as f64;
-            let confound_swing =
-                (confounded_dictionary_bits(256) - confounded_dictionary_bits(8192)).abs();
-            assert!(
-                confound_swing > 10.0 * tol_small,
-                "target {target}: tolerance {tol_small} is too loose to catch the #2283 \
-                 confound, whose 256-vs-8192 dictionary swing is {confound_swing} bits"
+                (observed_medium - medium_drift).abs() <= tolerance,
+                "target {target}: 1024-row drift {observed_medium:.17e} != derived \
+                 {medium_drift:.17e} within {tolerance:.3e}"
             );
         }
+
+        // Anti-vacuity: the pre-#2283 estimator-sized dictionary charge moved
+        // by exactly 60.75 bits between these row counts, more than four orders
+        // above the legitimate finite-n spectral drift.
+        let legacy_dictionary =
+            |rows: usize| 0.5 * dictionary_params as f64 * (rows as f64).log2() / rows as f64;
+        let legacy_swing =
+            (legacy_dictionary(256) - legacy_dictionary(FULL_ROWS)).abs();
+        assert!((legacy_swing - 60.75).abs() < 1.0e-12);
+        assert!(legacy_swing > 1000.0 * small_drift);
     }
 
     #[test]
