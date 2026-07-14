@@ -6551,9 +6551,6 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
                     &beta_joint,
                     bounds,
                     warm.as_deref(),
-                    // Polish path is not curvature-reflected: same Hessian for
-                    // step and KKT test (gam#979).
-                    None,
                 ) {
                     Ok((beta_new, _active)) => &beta_new - &beta_joint,
                     Err(_) => break,
