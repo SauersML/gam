@@ -295,7 +295,11 @@ pub struct LocalChart {
     /// Ambient centroid `μ` of the neighborhood, length `p`.
     pub mean: Array1<f64>,
     /// Orthonormal chart frame `F`, shape `(p, d)`: the leading `d` right singular
-    /// vectors of the centered neighborhood. The chart map is `x ↦ Fᵀ(x − μ)`.
+    /// vectors of the centered neighborhood, each in the canonical sign gauge (its
+    /// largest-magnitude component is positive, lowest index winning a tie). The
+    /// chart map is `x ↦ Fᵀ(x − μ)`. Singular vectors are only defined up to sign,
+    /// so without this gauge the chart's coordinate axes — and every `det` read off
+    /// them — would carry an arbitrary solver-chosen orientation.
     pub frame: Array2<f64>,
     /// Captured singular values `σ₁ ≥ … ≥ σ_d`, length `d`.
     pub singular_values: Array1<f64>,
@@ -327,10 +331,14 @@ impl LocalChart {
 /// exact sign cocycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransitionConfidence {
-    /// The cross-covariance was well conditioned; `sign` is an exact handedness.
+    /// The frames' overlap determinant is non-degenerate (the chart change is a
+    /// local diffeomorphism) AND the shared-support cross-covariance is well
+    /// conditioned (the alignment is well posed); `sign` is an exact handedness.
     Certified,
-    /// The shared support did not span all `d` chart directions; the sign is
-    /// geometry only and is excluded from [`LocalAtlas::signed_edges`].
+    /// Either the two tangent planes are nearly orthogonal (so the chart change is
+    /// not a diffeomorphism and no handedness exists), or the shared support did
+    /// not span all `d` chart directions (so the alignment is ambiguous). The edge
+    /// is geometry only and is excluded from [`LocalAtlas::signed_edges`].
     Degenerate,
 }
 
@@ -338,9 +346,18 @@ pub enum TransitionConfidence {
 /// translation, and an orientation sign.
 ///
 /// Convention: for a shared ambient point with chart coordinates `c_from` in the
-/// `from` chart and `c_to` in the `to` chart, `c_to ≈ R · c_from + t`. `R` is the
-/// plain `U Vᵀ` orthogonal Procrustes factor (reflections allowed), so
-/// `sign = det R ∈ {±1}` records a genuine handedness flip.
+/// `from` chart and `c_to` in the `to` chart, `c_to ≈ R · c_from + t`.
+///
+/// The orientation is read from the EXACT transition Jacobian, `sign =
+/// sgn det(F_toᵀ F_from)`, and `R` is the orthogonal Procrustes factor restricted to
+/// that handedness class (`U diag(1, …, 1, ±1) Vᵀ`), so `det R = sign` and a genuine
+/// reflection is recorded rather than forced to `+1`. Reading the sign off the
+/// frames rather than off the fitted `U Vᵀ` matters: on a small or elongated shared
+/// support the free Procrustes factor is reflection-ambiguous (a reflection fits the
+/// overlap just as well as a rotation, at identical residual), and one such spurious
+/// flip anywhere in the atlas would slander an orientable manifold as non-orientable.
+/// The frame determinant has no such ambiguity — it is a property of the two tangent
+/// planes, not of the handful of points they happen to share.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChartTransition {
     /// Source patch index (`< to_patch`, the canonical undirected orientation).
@@ -352,11 +369,12 @@ pub struct ChartTransition {
     pub overlap_id: usize,
     /// The shared support rows, sorted ascending.
     pub shared_rows: Vec<usize>,
-    /// Orthogonal Procrustes rotation `R`, shape `(d, d)`: `c_to ≈ R c_from + t`.
+    /// Orthogonal Procrustes rotation `R`, shape `(d, d)`: `c_to ≈ R c_from + t`,
+    /// restricted to the handedness class of `sign` (so `det R = sign`).
     pub rotation: Array2<f64>,
     /// Translation `t`, length `d`.
     pub translation: Array1<f64>,
-    /// Orientation sign `det R ∈ {±1}`.
+    /// Orientation sign `sgn det(F_toᵀ F_from) = det R ∈ {±1}`.
     pub sign: i8,
     /// Relative Procrustes residual `‖C_to − R C_from‖_F / ‖C_to‖_F` — how coherent
     /// the two charts are on the overlap (`0` = perfectly co-oriented planes).
@@ -431,12 +449,12 @@ impl LocalAtlas {
         // (1) deterministic farthest-point centers (reused intrinsic-seed machinery).
         let centers = farthest_point_landmarks(z, config.patch_count.max(1).min(n));
 
-        // (2)+(3) one certified local-PCA chart per patch.
+        // (2)+(3) one certified local-PCA chart per patch, on the largest
+        // neighborhood that certifies (see `certified_neighborhood_chart`).
         let mut patches: Vec<LocalPatch> = Vec::with_capacity(centers.len());
         let mut charts: Vec<LocalChart> = Vec::with_capacity(centers.len());
         for &center in &centers {
-            let members = nearest_rows(z, center, patch_size);
-            let chart = build_local_chart(z, center, &members, d)?;
+            let (members, chart) = certified_neighborhood_chart(z, center, patch_size, d)?;
             patches.push(LocalPatch { center, members });
             charts.push(chart);
         }
@@ -611,15 +629,54 @@ impl LocalAtlas {
     }
 }
 
-/// The `size` nearest ambient rows to `center` (including `center`), by Euclidean
-/// distance with an ascending-index tie-break, returned sorted ascending.
-fn nearest_rows(z: ArrayView2<'_, f64>, center: usize, size: usize) -> Vec<usize> {
+/// Every ambient row ordered by ascending Euclidean distance to `center`, ties
+/// broken by ascending row index (a TOTAL order, so the ordering is independent of
+/// the sort's stability and identical run-to-run). `center` itself is first.
+fn distance_order(z: ArrayView2<'_, f64>, center: usize) -> Vec<usize> {
     let n = z.nrows();
     let mut scored: Vec<(f64, usize)> = (0..n).map(|r| (sq_distance(z, center, r), r)).collect();
     scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let mut members: Vec<usize> = scored.into_iter().take(size).map(|(_, r)| r).collect();
-    members.sort_unstable();
-    members
+    scored.into_iter().map(|(_, r)| r).collect()
+}
+
+/// The chart of the LARGEST certifiable neighborhood of `center`, at most
+/// `patch_size` rows.
+///
+/// A local-PCA frame is the patch's TANGENT plane only while the neighborhood stays
+/// inside the local curvature scale. Past it the leading `d` singular directions
+/// stop being tangent: on a strongly curved, anisotropically sampled patch (a coarse
+/// swiss roll, where the along-roll sample spacing is many times the across-roll
+/// spacing) the top two directions are both spent resolving the arc's BEND, the
+/// across-roll direction is demoted out of the frame, and rows separated only across
+/// the roll project onto the SAME chart coordinate — the chart is not injective and
+/// the patch is honestly rejected. The cure is not to relax the certificate but to
+/// use a neighborhood the tangent plane actually fits: drop the farthest member and
+/// retry, down to the `2(d + 1)` over-determination floor. Prefixes of the distance
+/// order are nested, so this walks a deterministic chain of shrinking balls and
+/// returns the first — hence largest — one that certifies. If none does, the last
+/// (smallest-neighborhood) typed error is returned: genuinely `d`-degenerate data
+/// (a line charted at `d = 2`) still fails, at every size, with `DegeneratePatch`.
+fn certified_neighborhood_chart(
+    z: ArrayView2<'_, f64>,
+    center: usize,
+    patch_size: usize,
+    d: usize,
+) -> Result<(Vec<usize>, LocalChart), LocalChartError> {
+    let order = distance_order(z, center);
+    // Over-determination floor: a `d`-frame and a `d`-dimensional Procrustes both
+    // want at least `2(d + 1)` rows, but never demand more rows than the caller's
+    // patch budget, and never fewer than the `d + 1` a `d`-chart strictly needs.
+    let floor = (2 * (d + 1)).min(patch_size).max(d + 1);
+    let mut size = patch_size;
+    loop {
+        let mut members: Vec<usize> = order.iter().take(size).copied().collect();
+        members.sort_unstable();
+        match build_local_chart(z, center, &members, d) {
+            Ok(chart) => return Ok((members, chart)),
+            Err(_) if size > floor => size -= 1,
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn sq_distance(z: ArrayView2<'_, f64>, a: usize, b: usize) -> f64 {
@@ -700,11 +757,32 @@ fn build_local_chart(
         });
     }
 
-    // Frame = leading d right singular vectors (rows of Vᵀ), stored as (p × d).
+    // Frame = leading d right singular vectors (rows of Vᵀ), stored as (p × d), each
+    // put in the CANONICAL SIGN GAUGE: a singular vector is only defined up to sign,
+    // so the solver's arbitrary choice is replaced by a deterministic, data-derived
+    // one — make each axis's largest-magnitude component positive (lowest index wins
+    // a tie). Flipping an axis is an orthogonal change of chart coordinates, so it
+    // leaves every distance, the injectivity certificate and the captured variance
+    // untouched; what it buys is that a `det` read off these frames measures a
+    // GEOMETRIC relation between two patches rather than a pair of coin flips.
     let mut frame = Array2::<f64>::zeros((p, d));
     for ax in 0..d {
         for c in 0..p {
             frame[[c, ax]] = vt[[ax, c]];
+        }
+        let mut pivot = 0usize;
+        let mut best = frame[[0, ax]].abs();
+        for c in 1..p {
+            let v = frame[[c, ax]].abs();
+            if v > best {
+                best = v;
+                pivot = c;
+            }
+        }
+        if frame[[pivot, ax]] < 0.0 {
+            for c in 0..p {
+                frame[[c, ax]] = -frame[[c, ax]];
+            }
         }
     }
     // Chart coordinates of every member: centered · frame  (m × d).

@@ -100,8 +100,23 @@ pub(crate) enum CubicCellMomentStatus {
     /// Evaluator produced a non-finite moment (q overflow on a pathological
     /// cell). The row is zeroed; this is the GPU-side counterpart to a CPU
     /// `Err`.
-    #[cfg(test)]
     NonFiniteEvaluation = 4,
+}
+
+#[cfg(target_os = "linux")]
+impl CubicCellMomentStatus {
+    fn from_device_code(code: u8) -> Result<Self, GpuError> {
+        match code {
+            0 => Ok(Self::Ok),
+            1 => Ok(Self::InvalidInterval),
+            2 => Ok(Self::NonAffineInfiniteInterval),
+            3 => Ok(Self::NonFiniteCoefficient),
+            4 => Ok(Self::NonFiniteEvaluation),
+            _ => Err(GpuError::DriverCallFailed {
+                reason: format!("gpu cubic-cell kernel emitted unknown status code {code}"),
+            }),
+        }
+    }
 }
 
 /// Host-side input view for `try_build_cubic_cell_derivative_moments`.
@@ -118,7 +133,7 @@ pub(crate) struct CubicCellDerivativeMomentHostView<'a> {
 #[derive(Debug)]
 pub(crate) struct CubicCellDerivativeMomentOutput {
     pub(crate) d_moments: cudarc::driver::CudaSlice<f64>,
-    pub(crate) status: Vec<u8>,
+    pub(crate) status: Vec<CubicCellMomentStatus>,
     pub(crate) stride: usize,
     pub(crate) n_cells: usize,
 }

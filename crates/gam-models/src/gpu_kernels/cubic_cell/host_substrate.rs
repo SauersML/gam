@@ -56,7 +56,7 @@ mod tests {
     /// independent CPU evaluator.
     struct HostMomentBatch {
         pub moments: Vec<f64>,
-        pub status: Vec<u8>,
+        pub status: Vec<CubicCellMomentStatus>,
         pub stride: usize,
     }
 
@@ -69,7 +69,7 @@ mod tests {
         let n_cells = view.cells.len();
         let stride = view.max_degree + 1;
         let mut moments = vec![0.0_f64; n_cells.saturating_mul(stride)];
-        let mut status = vec![CubicCellMomentStatus::Ok as u8; n_cells];
+        let mut status = vec![CubicCellMomentStatus::Ok; n_cells];
 
         for (i, &gpu_cell) in view.cells.iter().enumerate() {
             let row = &mut moments[i * stride..(i + 1) * stride];
@@ -77,13 +77,13 @@ mod tests {
             let host_tag = match classify_cell_for_gpu(gpu_cell) {
                 Ok(tag) => tag,
                 Err(code) => {
-                    status[i] = code as u8;
+                    status[i] = code;
                     continue;
                 }
             };
             let caller_tag = view.branches[i];
             if host_tag != caller_tag {
-                status[i] = CubicCellMomentStatus::InvalidInterval as u8;
+                status[i] = CubicCellMomentStatus::InvalidInterval;
                 continue;
             }
 
@@ -103,15 +103,15 @@ mod tests {
                         for slot in row.iter_mut() {
                             *slot = 0.0;
                         }
-                        status[i] = CubicCellMomentStatus::NonFiniteEvaluation as u8;
+                        status[i] = CubicCellMomentStatus::NonFiniteEvaluation;
                     }
                 }
                 Err(_) => {
                     status[i] = match host_tag {
                         GpuCellBranchTag::AffineTail => {
-                            CubicCellMomentStatus::NonAffineInfiniteInterval as u8
+                            CubicCellMomentStatus::NonAffineInfiniteInterval
                         }
-                        _ => CubicCellMomentStatus::InvalidInterval as u8,
+                        _ => CubicCellMomentStatus::InvalidInterval,
                     };
                 }
             }
@@ -229,7 +229,7 @@ mod tests {
             max_degree: 9,
         };
         let out = build_host_moments(&view).expect("host substrate");
-        assert_eq!(out.status[0], CubicCellMomentStatus::Ok as u8);
+        assert_eq!(out.status[0], CubicCellMomentStatus::Ok);
         assert_row_matches_cpu(&out.moments[..out.stride], cpu, 9, 0.0);
     }
 
@@ -251,7 +251,7 @@ mod tests {
             max_degree: 21,
         };
         let out = build_host_moments(&view).expect("host substrate");
-        assert_eq!(out.status[0], CubicCellMomentStatus::Ok as u8);
+        assert_eq!(out.status[0], CubicCellMomentStatus::Ok);
         assert_row_matches_cpu(&out.moments[..out.stride], cpu, 21, 0.0);
     }
 
@@ -273,7 +273,7 @@ mod tests {
             max_degree: 15,
         };
         let out = build_host_moments(&view).expect("host substrate");
-        assert_eq!(out.status[0], CubicCellMomentStatus::Ok as u8);
+        assert_eq!(out.status[0], CubicCellMomentStatus::Ok);
         assert_row_matches_cpu(&out.moments[..out.stride], cpu, 15, 0.0);
     }
 
@@ -295,7 +295,7 @@ mod tests {
             max_degree: 9,
         };
         let out = build_host_moments(&view).expect("host substrate");
-        assert_eq!(out.status[0], CubicCellMomentStatus::Ok as u8);
+        assert_eq!(out.status[0], CubicCellMomentStatus::Ok);
         assert_row_matches_cpu(&out.moments[..out.stride], cpu, 9, 0.0);
     }
 
@@ -316,7 +316,7 @@ mod tests {
             max_degree: 9,
         };
         let out = build_host_moments(&view).expect("host substrate");
-        assert_eq!(out.status[0], CubicCellMomentStatus::InvalidInterval as u8);
+        assert_eq!(out.status[0], CubicCellMomentStatus::InvalidInterval);
         assert!(out.moments.iter().all(|&x| x == 0.0));
     }
 
@@ -407,7 +407,7 @@ mod tests {
             for (i, &cell) in cells_cpu.iter().enumerate() {
                 assert_eq!(
                     out.status[i],
-                    CubicCellMomentStatus::Ok as u8,
+                    CubicCellMomentStatus::Ok,
                     "cell {i} status was {} at degree={max_degree}",
                     out.status[i]
                 );
@@ -439,7 +439,7 @@ mod tests {
             max_degree: 9,
         };
         let out = build_host_moments(&view).expect("host substrate");
-        assert_eq!(out.status[0], CubicCellMomentStatus::InvalidInterval as u8);
+        assert_eq!(out.status[0], CubicCellMomentStatus::InvalidInterval);
         assert!(out.moments.iter().all(|&x| x == 0.0));
     }
 }

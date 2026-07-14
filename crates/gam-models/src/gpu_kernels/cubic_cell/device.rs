@@ -169,7 +169,7 @@ impl CubicCellGpuBackend {
         //      non-affine infinite intervals) get host status codes and a
         //      placeholder branch the kernel will reject. This mirrors the
         //      `dispatch` host-resident path's classifier behavior.
-        let mut status_host = vec![CubicCellMomentStatus::Ok as u8; n_cells];
+        let mut status_host = vec![CubicCellMomentStatus::Ok; n_cells];
         // Branch code per cell for the kernel:
         // BRANCH_AFFINE = 0, BRANCH_NONAFFINE_FIN = 1, BRANCH_AFFINE_TAIL = 2.
         // 255 marks "classifier-rejected" — the kernel's lane-0 validator
@@ -194,7 +194,7 @@ impl CubicCellGpuBackend {
             match classify_cell_for_gpu(gpu_cell) {
                 Ok(host_tag) => {
                     if host_tag != view.branches[i] {
-                        status_host[i] = CubicCellMomentStatus::InvalidInterval as u8;
+                        status_host[i] = CubicCellMomentStatus::InvalidInterval;
                         continue;
                     }
                     branch_code[i] = match host_tag {
@@ -204,7 +204,7 @@ impl CubicCellGpuBackend {
                     };
                 }
                 Err(code) => {
-                    status_host[i] = code as u8;
+                    status_host[i] = code;
                 }
             }
         }
@@ -283,8 +283,7 @@ impl CubicCellGpuBackend {
         //   (a) merge with classifier-rejected entries it already knows
         //       (those use the classifier's specific status code, not
         //        the kernel's catch-all STATUS_INVALID),
-        //   (b) hand callers a ready-made `status: Vec<u8>` they can
-        //       branch on without a second DtoH.
+        //   (b) decode the kernel ABI bytes exactly once into typed statuses.
         let kernel_status = stream
             .clone_dtoh(&d_status)
             .gpu_ctx("cubic_cell device-resident DtoH status")?;
@@ -297,8 +296,8 @@ impl CubicCellGpuBackend {
         // STATUS_INVALID path so the device buffer is already correct).
         // Otherwise take the kernel's status verbatim.
         for i in 0..n_cells {
-            if status_host[i] == CubicCellMomentStatus::Ok as u8 {
-                status_host[i] = kernel_status[i];
+            if status_host[i] == CubicCellMomentStatus::Ok {
+                status_host[i] = CubicCellMomentStatus::from_device_code(kernel_status[i])?;
             }
         }
         drop(d_status);
@@ -469,7 +468,7 @@ mod tests {
             for (i, &cpu_cell) in cpu_cells.iter().enumerate() {
                 assert_eq!(
                     status[i],
-                    CubicCellMomentStatus::Ok as u8,
+                    CubicCellMomentStatus::Ok,
                     "cell {i} must classify Ok (status={})",
                     status[i]
                 );

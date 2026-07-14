@@ -1743,7 +1743,7 @@ impl BernoulliMarginalSlopeFamily {
             let refused = status
                 .iter()
                 .filter(|&&s| {
-                    s != crate::gpu_kernels::cubic_cell::CubicCellMomentStatus::Ok as u8
+                    s != crate::gpu_kernels::cubic_cell::CubicCellMomentStatus::Ok
                 })
                 .count();
             if refused > 0 {
