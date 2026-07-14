@@ -1236,8 +1236,11 @@ pub fn select_thin_plate_knots(
     // thin-plate equivariance contract.  The sorted multiset
     // `{‖x_i - x_l‖² : l=1..n}` is a pure function of the unordered Euclidean
     // geometry, so it survives both row permutations and rigid rotations.  Only
-    // genuinely duplicate/interchangeable rows fall through to the row index.
-    let distance_profile_less = |i: usize, j: usize| -> bool {
+    // A complete tie after this key is a nontrivial symmetry orbit. No
+    // permutation-equivariant rule can choose one distinct member of that
+    // orbit, so callers below retain the whole class atomically. Only coincident
+    // rows may be collapsed because they generate the same kernel column.
+    let distance_profile_cmp = |i: usize, j: usize| -> std::cmp::Ordering {
         let mut profile_i = Vec::with_capacity(n);
         let mut profile_j = Vec::with_capacity(n);
         for row in 0..n {
@@ -1256,12 +1259,30 @@ pub fn select_thin_plate_knots(
         profile_j.sort_by(|a, b| a.total_cmp(b));
         for (&di, &dj) in profile_i.iter().zip(profile_j.iter()) {
             match di.total_cmp(&dj) {
-                std::cmp::Ordering::Less => return true,
-                std::cmp::Ordering::Greater => return false,
+                std::cmp::Ordering::Less => return std::cmp::Ordering::Less,
+                std::cmp::Ordering::Greater => return std::cmp::Ordering::Greater,
                 std::cmp::Ordering::Equal => {}
             }
         }
-        i < j
+        std::cmp::Ordering::Equal
+    };
+
+    let distinct_orbit = |candidates: &[usize], already_selected: &[usize]| -> Vec<usize> {
+        let mut distinct = Vec::with_capacity(candidates.len());
+        'candidate: for &candidate in candidates {
+            for &selected in already_selected.iter().chain(distinct.iter()) {
+                let mut distance2 = 0.0;
+                for c in 0..d {
+                    let delta = data[[candidate, c]] - data[[selected, c]];
+                    distance2 += delta * delta;
+                }
+                if distance2 == 0.0 {
+                    continue 'candidate;
+                }
+            }
+            distinct.push(candidate);
+        }
+        distinct
     };
 
     // Round-off-robust tie tolerance (#1818). The data's squared radius sets the
@@ -1288,25 +1309,53 @@ pub fn select_thin_plate_knots(
         .fold(f64::INFINITY, f64::min);
     let seed_idx = (0..n)
         .filter(|&i| dist2_to_centroid[i] <= seed_min + tie_tol)
-        .reduce(|a, b| if distance_profile_less(a, b) { a } else { b })
+        .reduce(|a, b| {
+            if distance_profile_cmp(a, b).is_lt() {
+                a
+            } else {
+                b
+            }
+        })
         .unwrap_or(0);
+
+    let seed_class: Vec<usize> = (0..n)
+        .filter(|&i| {
+            dist2_to_centroid[i] <= seed_min + tie_tol && distance_profile_cmp(i, seed_idx).is_eq()
+        })
+        .collect();
+    let seed_orbit = distinct_orbit(&seed_class, &[]);
+    if seed_orbit.len() > num_knots {
+        crate::bail_invalid_basis!(
+            "thin-plate farthest-point seed symmetry orbit has {} distinct points, exceeding the requested knot budget {num_knots}; use a budget at least as large as the orbit or provide explicit centers",
+            seed_orbit.len()
+        );
+    }
 
     let mut selected = Vec::with_capacity(num_knots);
     let mut chosen = vec![false; n];
     let mut min_dist2 = vec![f64::INFINITY; n];
 
-    selected.push(seed_idx);
-    chosen[seed_idx] = true;
+    for &i in &seed_class {
+        chosen[i] = true;
+    }
+    selected.extend(seed_orbit.iter().copied());
 
     min_dist2.par_iter_mut().enumerate().for_each(|(i, slot)| {
-        let mut d2 = 0.0;
-        for c in 0..d {
-            let delta = data[[i, c]] - data[[seed_idx, c]];
-            d2 += delta * delta;
-        }
-        *slot = d2;
+        *slot = seed_orbit
+            .iter()
+            .map(|&center| {
+                let mut d2 = 0.0;
+                for c in 0..d {
+                    let delta = data[[i, c]] - data[[center, c]];
+                    d2 += delta * delta;
+                }
+                d2
+            })
+            .fold(f64::INFINITY, f64::min);
     });
-    min_dist2[seed_idx] = 0.0;
+    for &i in &seed_class {
+        min_dist2[i] = 0.0;
+    }
 
     while selected.len() < num_knots {
         // Maximin: take the larger min-distance to the chosen set. Exact
@@ -1343,28 +1392,59 @@ pub fn select_thin_plate_knots(
             .map(|&i| dist2_to_centroid[i])
             .fold(f64::NEG_INFINITY, f64::max);
         candidates.retain(|&i| dist2_to_centroid[i] >= cand_max_centroid - tie_tol);
-        // Tertiary invariant key: smallest support-distance profile (then row
-        // index, for genuinely interchangeable duplicate points).
+        // Tertiary invariant key: smallest support-distance profile. A tie
+        // after every intrinsic key is an indivisible symmetry orbit.
         let next_idx = candidates
-            .into_iter()
-            .reduce(|a, b| if distance_profile_less(a, b) { a } else { b })
+            .iter()
+            .copied()
+            .reduce(|a, b| {
+                if distance_profile_cmp(a, b).is_lt() {
+                    a
+                } else {
+                    b
+                }
+            })
             .expect("candidate set is non-empty");
-        selected.push(next_idx);
-        chosen[next_idx] = true;
+        candidates.retain(|&i| distance_profile_cmp(i, next_idx).is_eq());
+        let orbit = distinct_orbit(&candidates, &selected);
+        let remaining = num_knots - selected.len();
+        if orbit.len() > remaining {
+            crate::bail_invalid_basis!(
+                "thin-plate farthest-point tie class has {} distinct points but only {remaining} of the exact {num_knots}-knot budget remain; choose a compatible knot count or provide explicit centers",
+                orbit.len()
+            );
+        }
+        for &i in &candidates {
+            chosen[i] = true;
+            min_dist2[i] = 0.0;
+        }
+        if orbit.is_empty() {
+            continue;
+        }
+        selected.extend(orbit.iter().copied());
 
         min_dist2.par_iter_mut().enumerate().for_each(|(i, slot)| {
             if chosen[i] {
                 return;
             }
-            let mut d2 = 0.0;
-            for c in 0..d {
-                let delta = data[[i, c]] - data[[next_idx, c]];
-                d2 += delta * delta;
-            }
-            if d2 < *slot {
-                *slot = d2;
+            for &center in &orbit {
+                let mut d2 = 0.0;
+                for c in 0..d {
+                    let delta = data[[i, c]] - data[[center, c]];
+                    d2 += delta * delta;
+                }
+                if d2 < *slot {
+                    *slot = d2;
+                }
             }
         });
+    }
+
+    if selected.len() < num_knots {
+        crate::bail_invalid_basis!(
+            "requested {num_knots} distinct thin-plate knots but the data contain only {} geometrically distinct selectable points",
+            selected.len()
+        );
     }
 
     let mut knots = Array2::<f64>::zeros((selected.len(), d));
@@ -3061,6 +3141,49 @@ mod knot_selection_invariance_tests {
             canonical(&knots),
             canonical(&knots_perm),
             "reordering rows must not change the selected knot set (gh#1378)"
+        );
+    }
+
+    #[test]
+    fn symmetric_nonseed_orbit_is_completed_atomically() {
+        let data = ndarray::array![[0.0, 0.0], [0.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
+        let permutations = [[0_usize, 1, 2, 3], [0, 1, 3, 2], [2, 0, 3, 1], [3, 1, 2, 0]];
+        let mut reference = None;
+
+        for order in permutations {
+            let permuted = Array2::from_shape_fn((4, 2), |(row, col)| data[[order[row], col]]);
+            let knots = select_thin_plate_knots(permuted.view(), 3)
+                .expect("origin plus the complete endpoint orbit fits the budget");
+            let center_set = canonical(&knots);
+            if let Some(expected) = reference.as_ref() {
+                assert_eq!(&center_set, expected);
+            } else {
+                reference = Some(center_set);
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_nonseed_orbit_is_refused() {
+        let data = ndarray::array![[0.0, 0.0], [0.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
+        let error = select_thin_plate_knots(data.view(), 2)
+            .expect_err("one remaining slot cannot split the endpoint orbit");
+        assert!(
+            error
+                .to_string()
+                .contains("only 1 of the exact 2-knot budget remain"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn seed_orbit_larger_than_budget_is_refused() {
+        let data = ndarray::array![[-1.0, 0.0], [1.0, 0.0]];
+        let error = select_thin_plate_knots(data.view(), 1)
+            .expect_err("an antipodal seed orbit cannot fit one knot");
+        assert!(
+            error.to_string().contains("seed symmetry orbit"),
+            "unexpected refusal: {error}"
         );
     }
 }
