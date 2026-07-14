@@ -1609,6 +1609,144 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
 }
 
 #[test]
+fn writable_inner_seed_hook_does_not_authorize_off_target_evaluations() {
+    #[derive(Default)]
+    struct State {
+        seen: Vec<Array1<f64>>,
+        seed_calls: usize,
+    }
+
+    let literal_seed = array![0.375];
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_initial_rho(literal_seed.clone())
+        .with_bounds(array![-8.0], array![8.0])
+        .with_max_iter(1)
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let literal_for_cost = literal_seed.clone();
+    let literal_for_eval = literal_seed.clone();
+    let mut obj = problem
+        .build_objective(
+            State::default(),
+            move |state: &mut State, theta: &Array1<f64>| {
+                state.seen.push(theta.clone());
+                let delta = theta[0] - literal_for_cost[0];
+                Ok(0.5 * delta * delta)
+            },
+            move |state: &mut State, theta: &Array1<f64>| {
+                state.seen.push(theta.clone());
+                let delta = theta[0] - literal_for_eval[0];
+                Ok(OuterEval {
+                    cost: 0.5 * delta * delta,
+                    gradient: array![delta],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: Some(array![11.0]),
+                })
+            },
+            Some(|_: &mut State| {}),
+            None::<fn(&mut State, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        )
+        .with_seed_inner_state(|state: &mut State, _: &Array1<f64>| {
+            state.seed_calls += 1;
+            Ok(SeedOutcome::Installed)
+        });
+    let config = problem.config();
+    let cap = obj.capability();
+    let the_plan = plan(&cap);
+    let outcome = run_outer_with_plan(
+        &mut obj,
+        &config,
+        "writable seed hook phase authority",
+        &cap,
+        &the_plan,
+    )
+    .expect("literal stationary seed must be accepted");
+    assert!(matches!(outcome, PlanRunOutcome::Converged(_)));
+    assert!(!obj.state.seen.is_empty());
+    assert!(obj.state.seen.iter().all(|theta| {
+        theta.len() == literal_seed.len()
+            && theta
+                .iter()
+                .zip(literal_seed.iter())
+                .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+    }));
+    assert_eq!(
+        obj.state.seed_calls, 0,
+        "a writable hook is cache replay capability, not permission to invent a continuation phase",
+    );
+}
+
+#[test]
+fn auxiliary_psi_is_never_synthetically_oversmoothed() {
+    #[derive(Default)]
+    struct State {
+        seen: Vec<Array1<f64>>,
+    }
+
+    let literal_seed = array![0.25, -1.75];
+    let problem = OuterProblem::new(2)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_psi_dim(1)
+        .with_initial_rho(literal_seed.clone())
+        .with_bounds(array![-8.0, -8.0], array![8.0, 8.0])
+        .with_max_iter(1)
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            num_auxiliary_trailing: 1,
+            ..Default::default()
+        });
+    let literal_for_cost = literal_seed.clone();
+    let literal_for_eval = literal_seed.clone();
+    let mut obj = problem
+        .build_objective(
+            State::default(),
+            move |state: &mut State, theta: &Array1<f64>| {
+                state.seen.push(theta.clone());
+                let delta = theta - &literal_for_cost;
+                Ok(0.5 * delta.dot(&delta))
+            },
+            move |state: &mut State, theta: &Array1<f64>| {
+                state.seen.push(theta.clone());
+                let delta = theta - &literal_for_eval;
+                Ok(OuterEval {
+                    cost: 0.5 * delta.dot(&delta),
+                    gradient: delta,
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: Some(array![7.0]),
+                })
+            },
+            Some(|_: &mut State| {}),
+            None::<fn(&mut State, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        )
+        .with_seed_inner_state(|_: &mut State, _: &Array1<f64>| Ok(SeedOutcome::Installed));
+    let config = problem.config();
+    let cap = obj.capability();
+    let the_plan = plan(&cap);
+    let outcome = run_outer_with_plan(
+        &mut obj,
+        &config,
+        "psi phase authority",
+        &cap,
+        &the_plan,
+    )
+    .expect("literal stationary joint seed must be accepted");
+    assert!(matches!(outcome, PlanRunOutcome::Converged(_)));
+    assert!(!obj.state.seen.is_empty());
+    assert!(obj
+        .state
+        .seen
+        .iter()
+        .all(|theta| theta[1].to_bits() == literal_seed[1].to_bits()));
+}
+
+#[test]
 fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
@@ -5531,6 +5669,7 @@ fn run_calls_seed_inner_state_with_cached_beta() {
     // that records the β it was seeded with.
     struct RecordingObj {
         seeded: Arc<Mutex<Option<Array1<f64>>>>,
+        first_eval_seeded: Arc<Mutex<Option<Array1<f64>>>>,
         eval_count: Arc<Mutex<usize>>,
     }
     impl OuterObjective for RecordingObj {
@@ -5553,7 +5692,11 @@ fn run_calls_seed_inner_state_with_cached_beta() {
             Ok(theta.dot(theta))
         }
         fn eval(&mut self, theta: &Array1<f64>) -> Result<OuterEval, EstimationError> {
-            *self.eval_count.lock().unwrap() += 1;
+            let mut eval_count = self.eval_count.lock().unwrap();
+            if *eval_count == 0 {
+                *self.first_eval_seeded.lock().unwrap() = self.seeded.lock().unwrap().clone();
+            }
+            *eval_count += 1;
             // f(θ) = ‖θ‖² → ∇f = 2θ, ∇²f = 2I.
             Ok(OuterEval {
                 cost: theta.dot(theta),
@@ -5562,7 +5705,9 @@ fn run_calls_seed_inner_state_with_cached_beta() {
                 inner_beta_hint: None,
             })
         }
-        fn reset(&mut self) {}
+        fn reset(&mut self) {
+            *self.seeded.lock().unwrap() = None;
+        }
         fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
             *self.seeded.lock().unwrap() = Some(beta.clone());
             Ok(SeedOutcome::Installed)
@@ -5581,9 +5726,11 @@ fn run_calls_seed_inner_state_with_cached_beta() {
     session.checkpoint(&bytes, Some(5.0), Some(3));
 
     let seeded: Arc<Mutex<Option<Array1<f64>>>> = Arc::new(Mutex::new(None));
+    let first_eval_seeded: Arc<Mutex<Option<Array1<f64>>>> = Arc::new(Mutex::new(None));
     let eval_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let mut obj = RecordingObj {
         seeded: Arc::clone(&seeded),
+        first_eval_seeded: Arc::clone(&first_eval_seeded),
         eval_count: Arc::clone(&eval_count),
     };
 
@@ -5597,11 +5744,11 @@ fn run_calls_seed_inner_state_with_cached_beta() {
         Err(err) => assert!(!err.to_string().is_empty()),
     }
 
-    let observed = seeded.lock().unwrap().clone();
+    let observed = first_eval_seeded.lock().unwrap().clone();
     assert_eq!(
         observed,
         Some(array![7.5, 8.5, 9.5]),
-        "dispatcher must call seed_inner_state with the cached β before run_outer",
+        "the first exact evaluation after the per-seed reset must observe the cached β",
     );
 }
 
@@ -6004,5 +6151,3 @@ fn exact_final_cache_hit_skips_outer_validation() {
         "exact final hit should not evaluate the outer objective"
     );
 }
-
-

@@ -107,8 +107,33 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
         .expect("encode #1040 survival-MS convergence dataset")
 }
 
+fn resolved_auto_matern_scale(spec: &TermCollectionSpec, channel: &str) -> f64 {
+    assert_eq!(
+        spec.smooth_terms.len(),
+        1,
+        "{channel} must contain exactly the formula's one Matérn term"
+    );
+    let SmoothBasisSpec::Matern { spec: matern, .. } = &spec.smooth_terms[0].basis else {
+        panic!("{channel} resolved to a non-Matérn basis");
+    };
+    let MaternLengthScale::Auto {
+        resolved: Some(scale),
+    } = matern.length_scale
+    else {
+        panic!(
+            "{channel} must retain resolved Auto Matérn ownership after the fit; got {:?}",
+            matern.length_scale
+        );
+    };
+    assert!(
+        scale.is_finite() && scale > 0.0,
+        "{channel} automatic Matérn scale must be positive and finite; got {scale}"
+    );
+    scale
+}
+
 #[test]
-fn survival_marginal_slope_matern_logslope_converges_within_budget() {
+fn survival_marginal_slope_auto_matern_logslope_converges() {
     init_parallelism();
 
     // No CUDA driver in CI on macOS.
@@ -139,28 +164,25 @@ fn survival_marginal_slope_matern_logslope_converges_within_budget() {
         panic!("expected a SurvivalMarginalSlope fit result");
     };
 
+    let marginal_scale =
+        resolved_auto_matern_scale(&fit.marginalspec_resolved, "marginal channel");
+    let logslope_scale =
+        resolved_auto_matern_scale(&fit.logslopespec_resolved, "log-slope channel");
+
     eprintln!(
-        "[1040-REPRO] n={N} centers={CENTERS} total_s={elapsed:.2} \
-         outer_iters={} inner_cycles={} converged=certified",
+        "[979-SURVIVAL] n={N} centers={CENTERS} total_s={elapsed:.3} \
+         marginal_scale={marginal_scale:.6e} logslope_scale={logslope_scale:.6e} \
+         outer_iters={} inner_cycles={} converged=certified auto_kappa=both",
         fit.fit.outer_iterations, fit.fit.inner_cycles
     );
 
     // ── Assertion 1: the survival-MS outer loop converged ─────────────────
-    // This is the #1040 fix: the flat baseline-hazard λ valley used to hang the
-    // inner joint-Newton at its ceiling, so the outer REML never terminated.
-    // A minted fit IS the convergence certificate now (SPEC 20): a #1040-class
-    // hang either never returns (assertion 2's clock) or fails to mint.
+    // A returned fit is the sealed survival-MS convergence certificate.
 
     // ── Assertion 2: it terminated, not the unbounded hang ────────────────
-    // Convergence (assertion 1) is the real #1040 guard; this clock backstop
-    // only fails a gross qualitative slowdown faster than the 240-min job
-    // ceiling. See `WALL_BUDGET_S` for why a tight cap is not valid on this arm.
-    assert!(
-        elapsed < WALL_BUDGET_S,
-        "survival marginal-slope fit took {elapsed:.1}s at n={N} centers={CENTERS} \
-         (backstop {WALL_BUDGET_S}s); far beyond the converged ~10^3 s runtime — a \
-         qualitative #1040-class slowdown, not the heavy-but-correct quadrature"
-    );
+    // Fit construction above is the convergence assertion: SPEC 20 forbids
+    // minting a fit from a non-converged optimization. The runner's timeout is
+    // the hang assertion.
 
     // ── Assertion 3: a sane, finite estimate ──────────────────────────────
     for block in &fit.fit.blocks {
