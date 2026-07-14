@@ -5147,6 +5147,9 @@ mod tests {
         assert_eq!(branch_cell(cell).unwrap(), ExactCellBranch::Sextic);
 
         let state = evaluate_cell_moments(cell, 9).expect("degenerate sextic cell");
+        let reduced = reduce_sextic_moments(cell, [0.0; 5], 9)
+            .expect("ill-conditioned recurrence must use exact transport");
+        assert_eq!(reduced.as_slice(), state.moments.as_slice());
         let affine = evaluate_affine_cell_state(
             DenestedCubicCell {
                 c2: 0.0,
