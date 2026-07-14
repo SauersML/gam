@@ -456,19 +456,6 @@ impl AtlasSignedEdge {
         )
     }
 
-    /// Construct an analytic fixture without weakening the production provenance
-    /// boundary. Production exact edges can only come from a typed analytic
-    /// transition constructor.
-    #[cfg(test)]
-    pub(crate) fn new_test_analytic(
-        a: usize,
-        b: usize,
-        overlap: usize,
-        sign: i8,
-    ) -> Result<Self, String> {
-        Self::from_validated_analytic_sign(a, b, overlap, sign)
-    }
-
     #[must_use]
     pub fn identity(self) -> AtlasHolonomyEdgeId {
         AtlasHolonomyEdgeId {
@@ -1833,7 +1820,24 @@ impl AtlasHolonomyCertificate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifold::AtlasSeamKind;
     use ndarray::{arr2, array};
+
+    fn analytic_edge(a: usize, b: usize, overlap: usize, sign: i8) -> AtlasSignedEdge {
+        assert!(matches!(sign, -1 | 1));
+        let transition = SphereChartTransition::new_analytic(
+            a,
+            b,
+            [
+                [f64::from(sign), 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            AtlasSeamKind::Regular,
+        )
+        .unwrap();
+        AtlasSignedEdge::from_analytic_sphere_transition(&transition, overlap).unwrap()
+    }
 
     fn projection_frame(angle: f64, padded_ambient: usize) -> Array2<f64> {
         let mut frame = Array2::<f64>::zeros((3 + padded_ambient, 3));
@@ -2175,7 +2179,10 @@ mod tests {
             AtlasHolonomyEdgeId::new(4, 2, 9).unwrap(),
             AtlasHolonomyEdgeId::new(2, 4, 9).unwrap()
         );
-        assert!(AtlasSignedEdge::new_test_analytic(0, 1, 0, 0).is_err());
+        assert!(
+            SphereChartTransition::new_analytic(0, 1, [[0.0; 3]; 3], AtlasSeamKind::Regular,)
+                .is_err()
+        );
         assert!(
             ProjectedAtlasEdgeSpec::new(
                 0,
@@ -2189,19 +2196,12 @@ mod tests {
         assert!(
             ExactAnalyticHolonomyCertificate::new(
                 2,
-                vec![
-                    AtlasSignedEdge::new_test_analytic(0, 1, 3, 1).unwrap(),
-                    AtlasSignedEdge::new_test_analytic(0, 1, 3, -1).unwrap(),
-                ],
+                vec![analytic_edge(0, 1, 3, 1), analytic_edge(0, 1, 3, -1),],
             )
             .is_err()
         );
         assert!(
-            ExactAnalyticHolonomyCertificate::new(
-                2,
-                vec![AtlasSignedEdge::new_test_analytic(0, 2, 0, 1).unwrap()],
-            )
-            .is_err()
+            ExactAnalyticHolonomyCertificate::new(2, vec![analytic_edge(0, 2, 0, 1)],).is_err()
         );
     }
 
@@ -2232,10 +2232,7 @@ mod tests {
     fn exact_parallel_overlap_components_form_their_own_orientation_cycle() {
         let certificate = ExactAnalyticHolonomyCertificate::new(
             2,
-            vec![
-                AtlasSignedEdge::new_test_analytic(0, 1, 0, 1).unwrap(),
-                AtlasSignedEdge::new_test_analytic(0, 1, 1, -1).unwrap(),
-            ],
+            vec![analytic_edge(0, 1, 0, 1), analytic_edge(0, 1, 1, -1)],
         )
         .unwrap();
         assert_eq!(

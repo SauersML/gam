@@ -1047,9 +1047,27 @@ mod tests {
         GaussianPcaPopulationBounds, GaussianPcaSpectrumProvenance, PilotProjectionProvenance,
         PopulationCrossGramProvenance, ProjectedAtlasEdgeSpec,
     };
-    use crate::manifold::{AtlasOrientability, GraphCompressionKind};
+    use crate::manifold::{
+        AtlasOrientability, AtlasSeamKind, GraphCompressionKind, SphereChartTransition,
+    };
     use ndarray::{Array2, arr2, array};
     use std::collections::BTreeSet;
+
+    fn analytic_edge(a: usize, b: usize, overlap: usize, sign: i8) -> AtlasSignedEdge {
+        assert!(matches!(sign, -1 | 1));
+        let transition = SphereChartTransition::new_analytic(
+            a,
+            b,
+            [
+                [f64::from(sign), 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            AtlasSeamKind::Regular,
+        )
+        .unwrap();
+        AtlasSignedEdge::from_analytic_sphere_transition(&transition, overlap).unwrap()
+    }
 
     fn charts_from_faces(n_charts: usize, faces: &[Vec<usize>]) -> Vec<AtlasChart> {
         let mut support_rows = vec![Vec::new(); n_charts];
@@ -1143,13 +1161,7 @@ mod tests {
         let edges = pairs
             .into_iter()
             .map(|(a, b)| {
-                AtlasSignedEdge::new_test_analytic(
-                    a,
-                    b,
-                    0,
-                    if reversed_edge == Some((a, b)) { -1 } else { 1 },
-                )
-                .unwrap()
+                analytic_edge(a, b, 0, if reversed_edge == Some((a, b)) { -1 } else { 1 })
             })
             .collect();
         AtlasHolonomyCertificate::ExactAnalytic(
@@ -1448,10 +1460,7 @@ mod tests {
         let wrong_chart_count = AtlasHolonomyCertificate::ExactAnalytic(
             ExactAnalyticHolonomyCertificate::new(
                 3,
-                vec![
-                    AtlasSignedEdge::new_test_analytic(0, 1, 3, 1).unwrap(),
-                    AtlasSignedEdge::new_test_analytic(0, 1, 7, 1).unwrap(),
-                ],
+                vec![analytic_edge(0, 1, 3, 1), analytic_edge(0, 1, 7, 1)],
             )
             .unwrap(),
         );
@@ -1459,11 +1468,7 @@ mod tests {
         assert!(error.contains("certificate is for 3 charts but the atlas has 2"));
 
         let missing_overlap = AtlasHolonomyCertificate::ExactAnalytic(
-            ExactAnalyticHolonomyCertificate::new(
-                2,
-                vec![AtlasSignedEdge::new_test_analytic(0, 1, 3, 1).unwrap()],
-            )
-            .unwrap(),
+            ExactAnalyticHolonomyCertificate::new(2, vec![analytic_edge(0, 1, 3, 1)]).unwrap(),
         );
         let error = build_atlas_nerve(&charts, &gates, None, Some(missing_overlap)).unwrap_err();
         assert!(error.contains("full admitted (a, b, overlap) inventory"));
@@ -1472,10 +1477,7 @@ mod tests {
         let complete = AtlasHolonomyCertificate::ExactAnalytic(
             ExactAnalyticHolonomyCertificate::new(
                 2,
-                vec![
-                    AtlasSignedEdge::new_test_analytic(0, 1, 3, 1).unwrap(),
-                    AtlasSignedEdge::new_test_analytic(0, 1, 7, -1).unwrap(),
-                ],
+                vec![analytic_edge(0, 1, 3, 1), analytic_edge(0, 1, 7, -1)],
             )
             .unwrap(),
         );
