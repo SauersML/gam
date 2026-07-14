@@ -456,6 +456,7 @@ impl SaeManifoldTerm {
         let fixed_decoder = self.fixed_decoder_assembly;
         let admission_plan = self
             .streaming_plan()
+            .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?
             .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
             .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         // #1407: fixed-decoder builds NO dense β-Hessian (hbb) — force the

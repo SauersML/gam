@@ -457,7 +457,7 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
     let active_mask = (0..k_atoms)
         .map(|atom_index| assignments.column(atom_index).sum() > SAE_ACTIVE_ASSIGNMENT_MASS)
         .collect();
-    let streaming_plan = term.streaming_plan();
+    let streaming_plan = term.streaming_plan()?;
 
     Ok(SaeOosReport {
         atoms: atom_reports,

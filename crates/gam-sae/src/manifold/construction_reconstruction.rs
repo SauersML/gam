@@ -633,7 +633,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<SaeShapeUncertainty, String> {
-        let plan = self.streaming_plan().admitted_or_error(
+        let plan = self.streaming_plan()?.admitted_or_error(
             self.n_obs(),
             self.output_dim(),
             self.k_atoms(),

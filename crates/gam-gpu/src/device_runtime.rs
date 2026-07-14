@@ -286,7 +286,7 @@ impl GpuRuntime {
             // installed before any `fast_ab` caller can observe an available
             // runtime. The policy gate inside each `try_*` still decides
             // CPU-vs-GPU per call, so small products are unaffected.
-            if matches!(outcome, Ok(GpuAvailability::Available(_))) {
+            if matches!(&outcome, Ok(GpuAvailability::Available(_))) {
                 gam_linalg::gpu_hook::register_gpu_dispatch(Box::new(
                     super::linalg_dispatch::CudaGemmDispatch,
                 ));

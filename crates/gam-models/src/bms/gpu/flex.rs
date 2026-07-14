@@ -24,10 +24,10 @@ pub fn row_primary_hessian_decision(n: usize, r: usize) -> Result<GpuDecision, G
             .map(|runtime| n >= runtime.policy().row_kernel_min_n)
             .unwrap_or(false)
     };
-    Ok(decide(
+    decide(
         GpuKernel::MarginalSlopeRows,
         gam_gpu::GpuEligibility::from_flags(BmsFlexGpuBackend::compiled(), large_enough),
-    ))
+    )
 }
 
 /// Same as [`row_primary_hessian_decision`] but turns

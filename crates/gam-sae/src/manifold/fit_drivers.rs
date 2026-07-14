@@ -176,6 +176,7 @@ impl SaeManifoldTerm {
         // tuning knobs — just the existing proximal-correction schedule.
         let plan = self
             .streaming_plan()
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?
             .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let options = plan.solve_options_for_border_dim(sys.k);
@@ -6017,6 +6018,7 @@ impl SaeManifoldTerm {
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             let plan = self
                 .streaming_plan()
+                .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?
                 .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             let mut solve_options = plan.solve_options_for_border_dim(sys.k);
@@ -7962,7 +7964,7 @@ impl SaeManifoldTerm {
                 target.dim()
             ));
         }
-        let chunk_size = self.streaming_plan().chunk_size.min(n_total.max(1));
+        let chunk_size = self.streaming_plan()?.chunk_size.min(n_total.max(1));
         // Snapshot the resident seed state so the per-pass re-seed is a pure
         // read (the streaming driver re-invokes the closure every line-search
         // trial and must hand back identical seeds each time).

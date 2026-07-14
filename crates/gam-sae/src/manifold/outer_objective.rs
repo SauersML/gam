@@ -720,7 +720,29 @@ pub struct SaeManifoldOuterObjective {
 /// cgroup-aware host budget as the SAE streaming plan. Reaching it is an
 /// explicit feasibility error from `BasinBundle::admit`, not an inexact envelope.
 fn basin_bundle_member_capacity(term: &SaeManifoldTerm) -> usize {
-    let plan = term.streaming_plan();
+    let (host_budget, host_available) = super::sae_host_in_core_budget_bytes();
+    let total_basis: usize = term.atoms.iter().map(SaeManifoldAtom::basis_size).sum();
+    let d_max = term
+        .atoms
+        .iter()
+        .map(SaeManifoldAtom::latent_dim)
+        .max()
+        .unwrap_or(0);
+    let border_dim = if term.any_frame_active() {
+        term.factored_border_dim()
+    } else {
+        term.beta_dim()
+    };
+    let plan = super::sae_streaming_plan_from_budget(
+        term.n_obs(),
+        total_basis,
+        term.k_atoms(),
+        d_max,
+        border_dim,
+        host_budget,
+        super::SAE_CPU_L2_CACHE_BYTES * super::SAE_CHUNK_CACHE_MULTIPLE,
+        host_available,
+    );
     if !plan.direct_logdet_admitted() {
         return 0;
     }
@@ -792,7 +814,7 @@ impl SaeManifoldOuterObjective {
     ) -> Result<Option<SaeVanishedStageState>, String> {
         let rho = self.baseline_rho.from_flat(rho_flat)?;
         let mut term = self.term.clone();
-        let evaluated = if term.streaming_plan().direct_logdet_admitted() {
+        let evaluated = if term.streaming_plan()?.direct_logdet_admitted() {
             term.penalized_quasi_laplace_criterion_with_cache(
                 self.target.view(),
                 &rho,
@@ -1714,7 +1736,7 @@ impl SaeManifoldOuterObjective {
         // #2230/#2087 — the ρ search is over; drop the saved basins too.
         self.basin_bundle.clear();
         let rho = self.current_rho.clone();
-        let plan = self.term.streaming_plan().admitted_or_error(
+        let plan = self.term.streaming_plan()?.admitted_or_error(
             self.term.n_obs(),
             self.term.output_dim(),
             self.term.k_atoms(),
@@ -2736,7 +2758,7 @@ impl SaeManifoldOuterObjective {
         // (1) Bypass: streaming/matrix-free (no dense per-basin factor to
         // re-converge) or the freeze contract (verbatim reuse). Byte-for-byte
         // historical single trajectory.
-        if self.inner_max_iter == 0 || !self.term.streaming_plan().direct_logdet_admitted() {
+        if self.inner_max_iter == 0 || !self.term.streaming_plan()?.direct_logdet_admitted() {
             return self.evaluate_value_probe_with_drive(rho_flat, drive);
         }
 
@@ -2972,7 +2994,7 @@ impl SaeManifoldOuterObjective {
         // `(probes, S^-1 probes)` bundle. Reassembling the operator after the
         // value would both duplicate the dominant pass and risk differentiating
         // a different functional.
-        let direct_logdet_admitted = self.term.streaming_plan().direct_logdet_admitted();
+        let direct_logdet_admitted = self.term.streaming_plan()?.direct_logdet_admitted();
         let criterion = self.evaluate_outer_criterion_route(&rho, direct_logdet_admitted, true);
         let infeasible_evaluation = |reason: &str| {
             (
@@ -3880,7 +3902,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // penalized quasi-Laplace cost (paired with a zero gradient it never consumes) and the fit
         // proceeds on the EFS lane. Dense-admitted fits never enter this branch and
         // are byte-for-byte unchanged.
-        if !self.audit_installed_state && !self.term.streaming_plan().direct_logdet_admitted() {
+        if !self.audit_installed_state
+            && !self
+                .term
+                .streaming_plan()
+                .map_err(EstimationError::RemlOptimizationFailed)?
+                .direct_logdet_admitted()
+        {
             let (cost, _beta_hat) = match self.evaluate_with_refine_policy(rho.view(), false) {
                 Ok(evaluated) => evaluated,
                 // A recoverable refusal means the streaming quasi-Laplace score is
@@ -4010,7 +4038,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // while ordered_beta_bernoulli (whose seed happens to stay PD) survived. Treat it the
         // same infeasible way here so the three lanes agree; a genuinely
         // non-recoverable error still propagates.
-        let direct_logdet_admitted = self.term.streaming_plan().direct_logdet_admitted();
+        let direct_logdet_admitted = self
+            .term
+            .streaming_plan()
+            .map_err(EstimationError::RemlOptimizationFailed)?
+            .direct_logdet_admitted();
         let evaluation =
             match self.evaluate_outer_criterion_route(&rho_state, direct_logdet_admitted, false) {
                 Ok(evaluated) => evaluated,
@@ -4389,7 +4421,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
     ) -> Result<Option<gam_solve::continuation_path::ContinuationScalarContract>, EstimationError>
     {
         if self.baseline_term.k_atoms() < 2
-            || !self.baseline_term.streaming_plan().direct_logdet_admitted()
+            || !self
+                .baseline_term
+                .streaming_plan()
+                .map_err(EstimationError::RemlOptimizationFailed)?
+                .direct_logdet_admitted()
         {
             return Ok(None);
         }

@@ -4302,22 +4302,13 @@ mod tests {
         // skipped because the kernel actually launches.
         #[cfg(target_os = "linux")]
         {
-            // Linux builds may or may not have a device; the dispatcher
-            // contract is that without a runtime, probe() returns
-            // DriverLibraryUnavailable. Either outcome (NoDeviceKernel,
-            // DriverLibraryUnavailable, or DriverCallFailed) is acceptable
-            // here; success would mean the kernel actually ran which is a
-            // V100-only outcome we don't gate the unit test on.
+            if cuda_runtime_for_test("bms_flex_row launch smoke test").is_none() {
+                return;
+            }
             let buffers = make_buffers(1, 4, 1, 1);
             let inputs = minimal_inputs(&buffers);
-            match launch_bms_flex_row_kernel(inputs) {
-                Ok(_) => { /* V100 host: real launch */ }
-                Err(GpuError::DriverLibraryUnavailable { .. })
-                | Err(GpuError::DriverCallFailed { .. })
-                | Err(GpuError::DriverSymbolMissing { .. })
-                | Err(GpuError::NoDeviceKernel { .. }) => { /* expected on CPU-only */ }
-                Err(other) => panic!("unexpected GpuError variant: {other:?}"),
-            }
+            launch_bms_flex_row_kernel(inputs)
+                .expect("BMS FLEX row kernel must launch after CUDA admission");
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -5091,10 +5082,9 @@ mod tests {
 
     #[test]
     pub(crate) fn bms_flex_row_hvp_multi_kernel_matches_cpu_oracle_when_cuda_available() {
-        let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            eprintln!("[bms_flex_row hvp_multi parity] no CUDA runtime — skipping device parity");
+        if cuda_runtime_for_test("bms_flex_row hvp_multi parity").is_none() {
             return;
-        };
+        }
         let n = 5_usize;
         let r = 4_usize;
         let p_m = 2_usize;
@@ -5236,13 +5226,9 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-                eprintln!(
-                    "[bms_flex_row hvp_into_device parity] no CUDA runtime — \
-                     skipping device parity"
-                );
+            if cuda_runtime_for_test("bms_flex_row hvp_into_device parity").is_none() {
                 return;
-            };
+            }
             let n = 4_usize;
             let r = 4_usize;
             let p_m = 2_usize;
@@ -5396,13 +5382,9 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-                eprintln!(
-                    "[bms_flex_row hvp parity n64_r20_p44] no CUDA runtime — \
-                     skipping device parity"
-                );
+            if cuda_runtime_for_test("bms_flex_row hvp parity n64_r20_p44").is_none() {
                 return;
-            };
+            }
             let n = 64_usize;
             let p_m = 14_usize;
             let p_g = 12_usize;
@@ -5587,10 +5569,9 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-                eprintln!("[bms_flex_row dense_block parity] no CUDA runtime — skipping");
+            if cuda_runtime_for_test("bms_flex_row dense_block parity").is_none() {
                 return;
-            };
+            }
             // Small fixture: n=24, r=8 (2 + 3 + 3), p_total=18 (4+4+3+3).
             // Keeps the CPU pullback fast while still exercising every
             // primary slot (q, g, h, w).
@@ -5760,10 +5741,9 @@ mod tests {
 
     #[test]
     pub(crate) fn bms_flex_row_dense_hvp_materialization_matches_cpu_above_block_cap_932() {
-        let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-            eprintln!("[bms_flex_row dense HVP parity] no CUDA runtime — skipping");
+        if cuda_runtime_for_test("bms_flex_row dense HVP parity").is_none() {
             return;
-        };
+        }
         let n = 1_usize;
         let r = 2_usize;
         let p_m = 37_usize;
@@ -5868,12 +5848,9 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-                eprintln!(
-                    "[bms_flex_row hvp hill-climb] no CUDA runtime — skipping V100 perf gate"
-                );
+            if cuda_runtime_for_test("bms_flex_row hvp hill-climb").is_none() {
                 return;
-            };
+            }
             let n = 195_000_usize;
             let p_m = 14_usize;
             let p_g = 12_usize;
@@ -6085,12 +6062,9 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-                eprintln!(
-                    "[bms_flex_row dense_block hill-climb] no CUDA runtime — skipping V100 perf gate"
-                );
+            if cuda_runtime_for_test("bms_flex_row dense_block hill-climb").is_none() {
                 return;
-            };
+            }
             let n = 195_000_usize;
             let p_m = 14_usize;
             let p_g = 12_usize;

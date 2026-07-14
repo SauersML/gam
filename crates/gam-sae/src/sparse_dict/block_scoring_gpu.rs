@@ -180,8 +180,7 @@ const GPU_BLOCK_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE
 /// `m × k` `(block, gate)` shortlists.
 ///
 /// # Errors
-/// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuPolicy::Required`] is set but the
-/// device path cannot run for this minibatch.
+/// Returns [`gam_gpu::GpuError`] when CUDA admission or execution fails.
 /// One-shot engagement report for the block-gate router, mirroring the atom
 /// lane's [`super::scoring_gpu`] `note_route_engagement` (#1551 "GPU 0%" class:
 /// an `Auto` run that silently declines the device and falls back to the CPU
@@ -275,31 +274,30 @@ pub fn route_blocks_required(
         return Ok((cpu_route(), BlockRoutePath::Cpu, 0));
     }
 
+    let runtime = match mode {
+        GpuPolicy::Required => Some(gam_gpu::GpuRuntime::require()?),
+        GpuPolicy::Auto => gam_gpu::GpuRuntime::resolve(mode)?,
+        GpuPolicy::Off => unreachable!("Off returns before CUDA admission"),
+    };
+    if runtime.is_none() {
+        note_block_route_engagement(false, "Auto admission found no CUDA device");
+        return Ok((cpu_route(), BlockRoutePath::Cpu, 0));
+    }
+
     // Blocks per launch: bound the per-launch `z` block `m × (tile_blocks·b)` to
     // GPU_BLOCK_ROUTE_TILE_ELEMS, at least one block, never more than G.
     let tile_blocks = (plan.tile_items / b.max(1)).clamp(1, g);
 
-    match device::route_blocks_device(rows, decoder, b, g, active, tile_blocks) {
-        Ok(out) => {
-            note_block_route_engagement(
-                true,
-                &format!("block {m}x{krows}, tile_blocks={tile_blocks}, active={active}"),
-            );
-            Ok((
-                out.selections,
-                BlockRoutePath::Device,
-                out.device_dtoh_bytes,
-            ))
-        }
-        Err(err) => {
-            note_block_route_engagement(false, &format!("device route fault: {err}"));
-            if mode == GpuPolicy::Required {
-                return Err(err);
-            }
-            // Auto: device faulted mid-route; run the exact CPU oracle.
-            Ok((cpu_route(), BlockRoutePath::Cpu, 0))
-        }
-    }
+    let out = device::route_blocks_device(rows, decoder, b, g, active, tile_blocks)?;
+    note_block_route_engagement(
+        true,
+        &format!("block {m}x{krows}, tile_blocks={tile_blocks}, active={active}"),
+    );
+    Ok((
+        out.selections,
+        BlockRoutePath::Device,
+        out.device_dtoh_bytes,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -327,9 +325,9 @@ mod device {
                     ctx: parts.ctx,
                     stream: parts.stream,
                     modules: Mutex::new(HashMap::new()),
-                    max_shared_mem_per_block: gam_gpu::GpuRuntime::global()
-                        .map(|runtime| runtime.selected_device().max_shared_mem_per_block)
-                        .unwrap_or(0),
+                    max_shared_mem_per_block: gam_gpu::GpuRuntime::require()?
+                        .selected_device()
+                        .max_shared_mem_per_block,
                 })
             })
             .as_ref()
@@ -682,6 +680,17 @@ mod tests {
     use super::*;
     use ndarray::Array2;
 
+    fn cuda_available_for_test(label: &str) -> bool {
+        match gam_gpu::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                eprintln!("[sparse_dict block-gate test] no CUDA device; skipping {label}");
+                false
+            }
+            Err(error) => panic!("[sparse_dict block-gate test] CUDA admission failed: {error}"),
+        }
+    }
+
     /// Deterministic fp32 fixture: `n_rows × p` rows and a `G·b × p` decoder whose
     /// blocks are orthonormalised so the gate `‖x D_gᵀ‖₂` is a genuine subspace
     /// energy — the shape the block lane fits.
@@ -760,6 +769,10 @@ mod tests {
 
         let cpu = route_blocks_cpu(rows.view(), decoder.view(), g, b, k);
 
+        if !cuda_available_for_test("block-route parity") {
+            return;
+        }
+
         match route_blocks_required(
             rows.view(),
             decoder.view(),
@@ -795,23 +808,7 @@ mod tests {
                     }
                 }
             }
-            Err(err) => {
-                assert!(
-                    gam_gpu::GpuRuntime::global().is_none(),
-                    "Required errored despite a live CUDA runtime: {err}"
-                );
-                let (routed, path, dtoh_bytes) = route_blocks_required(
-                    rows.view(),
-                    decoder.view(),
-                    b,
-                    k,
-                    gam_gpu::GpuPolicy::Auto,
-                )
-                .expect("Auto must not error on a device-absent host");
-                assert_eq!(path, BlockRoutePath::Cpu);
-                assert_eq!(dtoh_bytes, 0);
-                assert_eq!(routed, cpu);
-            }
+            Err(err) => panic!("Required block route failed after CUDA admission: {err}"),
         }
     }
 
@@ -830,6 +827,10 @@ mod tests {
         assert!(m * krows >= DEVICE_BLOCK_GATE_MIN_ELEMS);
         let (rows, decoder) = fixture(m, g, b, p);
         let cpu = route_blocks_cpu(rows.view(), decoder.view(), g, b, k);
+
+        if !cuda_available_for_test("block-route scale parity") {
+            return;
+        }
 
         match route_blocks_required(
             rows.view(),
@@ -856,12 +857,7 @@ mod tests {
                     }
                 }
             }
-            Err(err) => {
-                assert!(
-                    gam_gpu::GpuRuntime::global().is_none(),
-                    "Required errored despite a live CUDA runtime: {err}"
-                );
-            }
+            Err(err) => panic!("Required scale route failed after CUDA admission: {err}"),
         }
     }
 }

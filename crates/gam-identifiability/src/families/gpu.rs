@@ -18,9 +18,9 @@
 //!     channel pairs that contributed to `gram_h` (i.e. the support of
 //!     channel availability rather than the support of `h`)
 //!
-//! Runtime absence is represented as `Ok(None)`. Runtime-probe faults are
-//! preserved as [`gam_gpu::gpu_error::GpuError`] instead of being collapsed
-//! into an apparent absence.
+//! Runtime absence is represented as `Ok(None)`. Runtime-probe and admitted
+//! execution faults are preserved as [`gam_gpu::gpu_error::GpuError`] instead
+//! of being collapsed into an apparent absence.
 
 use ndarray::Array2;
 use std::ops::Range;
@@ -77,13 +77,34 @@ pub fn try_primary_state_gram_cuda(
     }
     #[cfg(target_os = "linux")]
     {
-        let Some(workspace) =
-            cuda_impl::WorkspaceInner::try_new(runtime, channel_blocks, raw_block_ranges)
-        else {
-            return Ok(None);
-        };
-        Ok(workspace.compute_grams(h_packed))
+        primary_state_gram_cuda_with_runtime(
+            runtime,
+            channel_blocks,
+            h_packed,
+            raw_block_ranges,
+        )
+        .map(Some)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn primary_state_gram_cuda_with_runtime(
+    runtime: &gam_gpu::device_runtime::GpuRuntime,
+    channel_blocks: &[Vec<Option<Array2<f64>>>],
+    h_packed: &Array2<f64>,
+    raw_block_ranges: &[Range<usize>],
+) -> Result<GramBundle, gam_gpu::gpu_error::GpuError> {
+    let workspace =
+        cuda_impl::WorkspaceInner::try_new(runtime, channel_blocks, raw_block_ranges)
+        .ok_or_else(|| gam_gpu::gpu_error::GpuError::DriverCallFailed {
+            reason: "identifiability GPU Gram workspace construction failed after CUDA admission"
+                .to_string(),
+        })?;
+    workspace.compute_grams(h_packed).ok_or_else(|| {
+        gam_gpu::gpu_error::GpuError::DriverCallFailed {
+            reason: "identifiability GPU Gram execution failed after CUDA admission".to_string(),
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -766,28 +787,21 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
-                Ok(Some(_)) => {}
+            let runtime = match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+                Ok(Some(runtime)) => runtime,
                 Ok(None) => {
                     eprintln!("[identifiability_compile] no CUDA device — skipping parity check");
                     return;
                 }
                 Err(error) => panic!("[identifiability_compile] CUDA probe failed: {error}"),
-            }
-            let Some(bundle) = try_primary_state_gram_cuda(&channel_blocks, &h_packed, &ranges)
-                .expect("CUDA resolution and primary-state Gram dispatch must succeed")
-            else {
-                // We already returned above when no CUDA runtime is present, so a
-                // None here means the GPU Gram build DECLINED with a runtime
-                // present — a real device/dispatch fault, not an infra outage.
-                // Fail loud (the device-PCG skip-pass class, eee12f6b2) instead of
-                // masking the fault as a pass.
-                panic!(
-                    "[identifiability_compile] GPU primary-state Gram build returned None \
-                     with a CUDA runtime present — the device path declined a workload it \
-                     must run (kernel/dispatch fault), not a CI infra outage"
-                );
             };
+            let bundle = primary_state_gram_cuda_with_runtime(
+                runtime,
+                &channel_blocks,
+                &h_packed,
+                &ranges,
+            )
+            .expect("CUDA primary-state Gram dispatch must succeed after Auto admission");
             let (cpu_h, cpu_s) = cpu_oracle(&channel_blocks, &h_packed, &ranges);
             let tol_abs = 1e-9_f64;
             let tol_rel = 1e-9_f64;

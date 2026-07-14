@@ -80,6 +80,42 @@ pub(crate) struct FlexTimepointBidirectionalPack {
     pub(crate) d_uv_uv: Vec<f64>,
 }
 
+/// Motion of every family-owned scalar entering one FLEX row along one outer
+/// direction.
+///
+/// The offset entries are deliberately not derivatives of the final
+/// `(q0, q1, qd1)` coordinates: when time wiggle is active, the generic q-map
+/// owns that nonlinear composition. `probit_scale` is motion of the physical
+/// multiplicative probit scale (not log-sigma); a baseline direction sets it to
+/// zero, while a learned-scale direction supplies the exact analytic scale
+/// derivative stack. This carrier therefore serves baseline, scale, and their
+/// combined/polarized directions without another row formula.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FlexFamilyRowDirection {
+    pub(crate) entry: f64,
+    pub(crate) exit: f64,
+    pub(crate) derivative_exit: f64,
+    pub(crate) probit_scale: f64,
+}
+
+/// One family derivative channel of a complete FLEX row in flattened
+/// coefficient coordinates.
+#[derive(Clone, Debug)]
+pub(crate) struct FlexFamilyCoefficientTerms {
+    pub(crate) objective: f64,
+    pub(crate) gradient: Array1<f64>,
+    pub(crate) hessian: Array2<f64>,
+}
+
+/// Exact first and same-direction second baseline derivatives of a complete
+/// FLEX row, plus an optional coefficient-direction drift of the first channel.
+#[derive(Clone, Debug)]
+pub(crate) struct FlexFamilyDirectionRowTerms {
+    pub(crate) first: FlexFamilyCoefficientTerms,
+    pub(crate) second: FlexFamilyCoefficientTerms,
+    pub(crate) beta_drift: Option<FlexFamilyCoefficientTerms>,
+}
+
 pub(crate) fn pack_flex_timepoint_base(base: &SurvivalFlexTimepointExact) -> FlexTimepointBasePack {
     FlexTimepointBasePack {
         eta: base.eta,
@@ -908,6 +944,67 @@ impl FlexJet for Jet3 {
             base: self.base.scale_homogeneous_from(0, factors),
             eps: self.eps.scale_homogeneous_from(1, factors),
         }
+    }
+}
+
+/// Inner coefficient algebra used by the baseline-family row evaluator.
+///
+/// `Jet2` owns the coefficient value/score/Hessian channels. `Jet3` adds one
+/// nilpotent coefficient direction whose epsilon part is the exact directional
+/// drift of those same channels. The outer baseline coordinate is supplied by
+/// `Dual2<J>` and is intentionally absent from this constructor.
+trait FlexCoefficientJet: FlexJet {
+    fn affine(value: f64, gradient: Vec<f64>, directional_value: f64) -> Self;
+
+    fn constant(value: f64, dimension: usize) -> Self {
+        Self::affine(value, vec![0.0; dimension], 0.0)
+    }
+
+    fn owned_base_terms(&self) -> FlexFamilyCoefficientTerms;
+
+    fn owned_directional_terms(&self) -> Option<FlexFamilyCoefficientTerms>;
+}
+
+fn owned_jet2_terms(jet: &Jet2) -> FlexFamilyCoefficientTerms {
+    let dimension = jet.g.len();
+    FlexFamilyCoefficientTerms {
+        objective: jet.v,
+        gradient: Array1::from_vec(jet.g.clone()),
+        hessian: Array2::from_shape_vec((dimension, dimension), jet.h.clone())
+            .expect("Jet2 coefficient Hessian shape invariant"),
+    }
+}
+
+impl FlexCoefficientJet for Jet2 {
+    fn affine(value: f64, gradient: Vec<f64>, directional_value: f64) -> Self {
+        debug_assert_eq!(directional_value, 0.0);
+        Self::from_parts(value, &gradient, &[])
+    }
+
+    fn owned_base_terms(&self) -> FlexFamilyCoefficientTerms {
+        owned_jet2_terms(self)
+    }
+
+    fn owned_directional_terms(&self) -> Option<FlexFamilyCoefficientTerms> {
+        None
+    }
+}
+
+impl FlexCoefficientJet for Jet3 {
+    fn affine(value: f64, gradient: Vec<f64>, directional_value: f64) -> Self {
+        let zeros = vec![0.0; gradient.len()];
+        Self {
+            base: Jet2::from_parts(value, &gradient, &[]),
+            eps: Jet2::from_parts(directional_value, &zeros, &[]),
+        }
+    }
+
+    fn owned_base_terms(&self) -> FlexFamilyCoefficientTerms {
+        owned_jet2_terms(&self.base)
+    }
+
+    fn owned_directional_terms(&self) -> Option<FlexFamilyCoefficientTerms> {
+        Some(owned_jet2_terms(&self.eps))
     }
 }
 

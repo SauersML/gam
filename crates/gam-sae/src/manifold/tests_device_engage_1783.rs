@@ -296,6 +296,7 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
     );
     let plan = term
         .streaming_plan()
+        .expect("fixture CUDA admission must resolve")
         .admitted_or_error(N_OBS, P, K_ATOMS)
         .expect("fixture admitted by production memory plan");
     let options = plan.solve_options_for_border_dim(sys.k);

@@ -2260,6 +2260,14 @@ mod cubic_bspline_moments_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn gpu_hex_tensor_moments_match_cpu_reference() {
+        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                eprintln!("skipping GPU parity test: no CUDA device");
+                return;
+            }
+            Err(error) => panic!("GPU parity CUDA probe failed: {error}"),
+        }
         let t = nonuniform_knots();
         let table = AxisCubicMomentTables::build(&t, 0, 0);
         let axes_cpu: Vec<&AxisCubicMomentTables> = vec![&table, &table];
@@ -2305,25 +2313,8 @@ mod cubic_bspline_moments_tests {
             d: 2,
         };
 
-        let dev = match super::build_hex_tensor_moments_device(&spec, &axes_for_build, &cells) {
-            Ok(d) => d,
-            Err(err) => {
-                // A legitimate skip happens ONLY when no CUDA runtime exists. With
-                // a runtime present, any build error (including DriverCallFailed) is
-                // a real device fault, not a "no CUDA" skip — fail loud (the
-                // device-PCG skip-pass class, eee12f6b2). The earlier version
-                // skip-passed on DriverCallFailed/NoDeviceKernel even on a GPU host,
-                // masking real kernel faults.
-                assert!(
-                    gam_gpu::device_runtime::GpuRuntime::global().is_none(),
-                    "GPU hex-tensor moment build failed with a CUDA runtime present: \
-                     {err:?}. A runtime-present build failure is a real device/kernel \
-                     fault, not a legitimate no-CUDA skip."
-                );
-                eprintln!("skipping GPU parity test (no CUDA runtime): {err}");
-                return;
-            }
-        };
+        let dev = super::build_hex_tensor_moments_device(&spec, &axes_for_build, &cells)
+            .expect("GPU hex-tensor moment build must succeed after CUDA admission");
 
         // Copy the alpha-major device buffer back to host.
         let stream = CubicMomentBackend::probe()
@@ -2377,6 +2368,14 @@ mod cubic_bspline_moments_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn hex_tensor_module_cache_hits_on_repeat_spec() {
+        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                eprintln!("skipping module-cache test: no CUDA device");
+                return;
+            }
+            Err(error) => panic!("module-cache CUDA probe failed: {error}"),
+        }
         let t = nonuniform_knots();
         let table = AxisCubicMomentTables::build(&t, 0, 0);
         let axes_for_build: Vec<Vec<AxisCubicMomentTables>> =
@@ -2399,21 +2398,8 @@ mod cubic_bspline_moments_tests {
         };
 
         // First build — compiles the module.
-        let first = match super::build_hex_tensor_moments_device(&spec, &axes_for_build, &cells) {
-            Ok(d) => d,
-            Err(err) => {
-                // Legit skip only with no CUDA runtime; a runtime-present build
-                // failure is a real device fault (device-PCG skip-pass class).
-                assert!(
-                    gam_gpu::device_runtime::GpuRuntime::global().is_none(),
-                    "GPU hex-tensor module-cache build failed with a CUDA runtime \
-                     present: {err:?}. A runtime-present build failure is a real \
-                     device/kernel fault, not a legitimate no-CUDA skip."
-                );
-                eprintln!("skipping module-cache test (no CUDA runtime): {err}");
-                return;
-            }
-        };
+        let first = super::build_hex_tensor_moments_device(&spec, &axes_for_build, &cells)
+            .expect("GPU hex-tensor module-cache build must succeed after CUDA admission");
         let backend = CubicMomentBackend::probe().expect("backend probe");
         let cache_len_after_first = {
             let g = backend.inner.modules.lock().expect("cache lock");
@@ -2700,28 +2686,32 @@ mod cubic_bspline_moments_tests {
     #[test]
     fn backend_compiled_flag_matches_platform() {
         assert_eq!(CubicMomentBackend::compiled(), cfg!(target_os = "linux"));
-        let probe = CubicMomentBackend::probe();
         if cfg!(target_os = "linux") {
             // `probe()` must not panic (reaching here proves that). Strengthen the
             // old tautological `is_ok() || is_err()` placeholder: when a CUDA
             // runtime IS present the probe must SUCCEED — a probe failure with a
             // live runtime is a real backend-init fault (device-PCG skip-pass
             // class, eee12f6b2). With no runtime, an Err is the legitimate outcome.
-            if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
-                assert!(
-                    probe.is_ok(),
-                    "CubicMomentBackend::probe() must succeed when a CUDA runtime is \
-                     present, got {:?}",
-                    probe.err()
-                );
-            } else {
-                assert!(
-                    probe.is_err(),
-                    "probe() must return Err on a Linux host with no CUDA runtime"
-                );
+            match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+                Ok(Some(_)) => {
+                    let probe = CubicMomentBackend::probe();
+                    assert!(
+                        probe.is_ok(),
+                        "CubicMomentBackend::probe() must succeed when CUDA is present, got {:?}",
+                        probe.err()
+                    );
+                }
+                Ok(None) => assert!(
+                    CubicMomentBackend::probe().is_err(),
+                    "probe() must return Err on a Linux host with no CUDA device"
+                ),
+                Err(error) => panic!("CubicMomentBackend CUDA probe failed: {error}"),
             }
         } else {
-            assert!(probe.is_err(), "non-Linux probe must return Err");
+            assert!(
+                CubicMomentBackend::probe().is_err(),
+                "non-Linux probe must return Err"
+            );
         }
     }
 }

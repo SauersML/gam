@@ -269,9 +269,6 @@ pub fn decide(
         (GpuPolicy::Required, GpuEligibility::BackendNotCompiled) => {
             (false, "cpu-gpu-required-unsupported")
         }
-        (GpuPolicy::Required, _) if !runtime_available => {
-            (false, "cpu-gpu-required-runtime-unavailable")
-        }
         // Under `required`, the workload-threshold gate is intentionally bypassed:
         // the user explicitly asked for GPU regardless of size.
         (GpuPolicy::Required, GpuEligibility::WorkloadBelowThreshold)

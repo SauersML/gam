@@ -2579,7 +2579,7 @@ impl SaeManifoldTerm {
     /// This is intentionally not user-configurable: the route follows the
     /// retained full-batch working-set estimate and the currently selected GPU
     /// memory budget when CUDA is usable, otherwise a conservative host budget.
-    pub fn streaming_plan(&self) -> SaeStreamingPlan {
+    pub fn streaming_plan(&self) -> Result<SaeStreamingPlan, String> {
         let n_obs = self.n_obs();
         let total_basis: usize = self.atoms.iter().map(|atom| atom.basis_size()).sum();
         let d_max = self

@@ -1837,7 +1837,8 @@ mod tests {
             })
             .collect();
         let amps: Vec<f64> = (0..n).map(|_| 1.0).collect();
-        let (batch, path) = sae_certified_encode_batch(&dev, &rows, &amps);
+        let (batch, path) = sae_certified_encode_batch(&dev, &rows, &amps)
+            .expect("small CPU batch must not erase CUDA admission faults");
         assert_eq!(path, EncodePath::Cpu, "small batch stays on CPU");
         // Batch == per-row emulate, and per-row == production certified flag.
         for (k, r) in batch.iter().enumerate() {
@@ -1902,7 +1903,8 @@ mod tests {
         }
 
         // The benchmark: time the exact encode and derive the surrogate decision.
-        let tput = measure_device_encode_throughput(&dev, &rows, &amps);
+        let tput = measure_device_encode_throughput(&dev, &rows, &amps)
+            .expect("exact-encode benchmark must preserve CUDA failures");
         eprintln!(
             "[device-encode #988] n={} rows/sec={:.1} path={:?} decision={:?}",
             tput.n_rows, tput.rows_per_sec, tput.path, tput.decision
@@ -1923,7 +1925,8 @@ mod tests {
         // The benchmark must be non-vacuous: on a well-conditioned dictionary the
         // planted on-manifold rows certify through the exact encode (proving the
         // routing + basin Newton + certificate really ran, not a trivial pass).
-        let (batch, _) = sae_certified_encode_batch(&dev, &rows, &amps);
+        let (batch, _) = sae_certified_encode_batch(&dev, &rows, &amps)
+            .expect("exact encode must preserve CUDA failures");
         let certified = batch.iter().filter(|r| r.cert.certified()).count();
         assert!(
             certified > 0,
@@ -1965,9 +1968,9 @@ mod tests {
                 "a CPU-emulator exact encode must leave the surrogate decision Undetermined, got {:?}",
                 tput.decision
             );
-            if gam_gpu::device_runtime::GpuRuntime::global()
-                .map(|rt| rt.device_count() > 0)
-                .unwrap_or(false)
+            if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+                .unwrap_or_else(|error| panic!("exact-encode CUDA admission failed: {error}"))
+                .is_some_and(|runtime| runtime.device_count() > 0)
             {
                 assert_eq!(
                     tput.decision,
@@ -2053,26 +2056,30 @@ mod tests {
             .collect();
         let amps = vec![1.0; n];
         let cpu = emulate_certified_encode_batch(&dev, &rows, &amps);
-        if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
-            let devout = device::sae_certified_encode_device(&dev, &rows, &amps)
-                .expect("admitted GPU runtime must run the sae_encode kernel");
-            let mut max_coord = 0.0_f64;
-            for (a, b) in cpu.iter().zip(devout.iter()) {
-                assert_eq!(
-                    a.cert.certified(),
-                    b.cert.certified(),
-                    "device certified flag"
-                );
-                if a.cert.certified() {
-                    for axis in 0..dev.d {
-                        max_coord = max_coord.max((a.coord[axis] - b.coord[axis]).abs());
+        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(None) => return,
+            Err(error) => panic!("sae_encode CUDA admission failed: {error}"),
+            Ok(Some(_)) => {
+                let devout = device::sae_certified_encode_device(&dev, &rows, &amps)
+                    .expect("admitted GPU runtime must run the sae_encode kernel");
+                let mut max_coord = 0.0_f64;
+                for (a, b) in cpu.iter().zip(devout.iter()) {
+                    assert_eq!(
+                        a.cert.certified(),
+                        b.cert.certified(),
+                        "device certified flag"
+                    );
+                    if a.cert.certified() {
+                        for axis in 0..dev.d {
+                            max_coord = max_coord.max((a.coord[axis] - b.coord[axis]).abs());
+                        }
                     }
                 }
+                assert!(
+                    max_coord <= 1e-9,
+                    "device vs emulator coord diff {max_coord:.3e} > 1e-9"
+                );
             }
-            assert!(
-                max_coord <= 1e-9,
-                "device vs emulator coord diff {max_coord:.3e} > 1e-9"
-            );
         }
     }
 }

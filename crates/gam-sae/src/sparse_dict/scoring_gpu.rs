@@ -451,16 +451,16 @@ pub enum ScoreBlockPath {
 /// [`gam_gpu::GpuPolicy::Required`] a missing CUDA runtime, an NVRTC/arch compile
 /// failure, a launch fault, or a block below the device break-even all return
 /// `Err` instead of silently degrading to the CPU. [`gam_gpu::GpuPolicy::Auto`]
-/// uses the device when admitted and the block clears the break-even, else the
-/// CPU; [`gam_gpu::GpuPolicy::Off`] always the CPU. The returned [`ScoreBlockPath`]
-/// reports which path actually ran.
+/// uses the device when admitted and the block clears the break-even, uses the
+/// CPU only when no device is available, and propagates device faults;
+/// [`gam_gpu::GpuPolicy::Off`] always uses the CPU. The returned
+/// [`ScoreBlockPath`] reports which path actually ran.
 ///
 /// Both paths produce a BIT-IDENTICAL `f32` score block (see module docs), so
 /// the routed top-`s` support is identical whichever path runs.
 ///
 /// # Errors
-/// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuPolicy::Required`] is set but
-/// the device path cannot run.
+/// Returns [`gam_gpu::GpuError`] when CUDA admission or execution fails.
 pub fn score_block_required(
     rows: ArrayView2<'_, f32>,
     atoms: ArrayView2<'_, f32>,
@@ -492,15 +492,16 @@ pub fn score_block_required(
         ));
     }
     if plan.device_admitted {
-        match device::score_block_device(rows, atoms) {
-            Ok(out) => return Ok((out, ScoreBlockPath::Device)),
-            Err(err) => {
-                if mode == GpuPolicy::Required {
-                    return Err(err);
-                }
-                // Auto: fall through to the CPU.
-            }
+        let runtime = match mode {
+            GpuPolicy::Required => Some(gam_gpu::GpuRuntime::require()?),
+            GpuPolicy::Auto => gam_gpu::GpuRuntime::resolve(mode)?,
+            GpuPolicy::Off => unreachable!("Off returns before device admission"),
+        };
+        if runtime.is_none() {
+            return Ok((score_block_cpu(rows, atoms), ScoreBlockPath::Cpu));
         }
+        let out = device::score_block_device(rows, atoms)?;
+        return Ok((out, ScoreBlockPath::Device));
     }
 
     Ok((score_block_cpu(rows, atoms), ScoreBlockPath::Cpu))
@@ -531,14 +532,13 @@ const GPU_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE_ELEMS
 /// folded into resident device top-`s` buffers and discarded, so peak score
 /// memory is `m × tile_cols`, independent of `K`.
 ///
-/// Falls back to the per-row CPU `top_s_online` under [`gam_gpu::GpuPolicy::Off`],
-/// below the device break-even, or on any device error under
-/// [`gam_gpu::GpuPolicy::Auto`]; under [`gam_gpu::GpuPolicy::Required`] a device
-/// failure is propagated. The returned [`ScoreBlockPath`] reports which path ran.
+/// Uses the per-row CPU `top_s_online` under [`gam_gpu::GpuPolicy::Off`], below
+/// the device break-even, or when Auto admission reports no device. CUDA
+/// admission and execution failures are propagated for both Auto and Required.
+/// The returned [`ScoreBlockPath`] reports which path ran.
 ///
 /// # Errors
-/// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuPolicy::Required`] is set but
-/// the device path cannot run for this minibatch.
+/// Returns [`gam_gpu::GpuError`] when CUDA admission or execution fails.
 /// One-shot engagement report for the T1 score router (#1551 class: "GPU 0%"
 /// runs where the decline reason was swallowed by the Auto fallback). Routed
 /// through `log::warn!` — the repo's sanctioned diagnostics path (same class as
@@ -578,8 +578,8 @@ pub fn route_minibatch_required(
     let k = decoder.nrows();
     let active = s.max(1).min(k.max(1));
 
-    // CPU per-row path (bit-identical oracle), used for Off / below break-even /
-    // Auto device-error fallback.
+    // CPU per-row path (bit-identical oracle), used for Off, below break-even,
+    // or a genuine device absence under Auto.
     let cpu_route = || -> Vec<Vec<(u32, f32)>> {
         rows.outer_iter()
             .map(|row| top_s_online(row, decoder, s, tile))
@@ -623,32 +623,30 @@ pub fn route_minibatch_required(
         return Ok((cpu_route(), ScoreBlockPath::Cpu, 0));
     }
 
+    let runtime = match mode {
+        gam_gpu::GpuPolicy::Required => Some(gam_gpu::GpuRuntime::require()?),
+        gam_gpu::GpuPolicy::Auto => gam_gpu::GpuRuntime::resolve(mode)?,
+        gam_gpu::GpuPolicy::Off => unreachable!("Off returns before CUDA admission"),
+    };
+    if runtime.is_none() {
+        note_route_engagement(false, "Auto admission found no CUDA device");
+        return Ok((cpu_route(), ScoreBlockPath::Cpu, 0));
+    }
+
     // Atom-columns per device launch: bound the per-launch block to
     // GPU_ROUTE_TILE_ELEMS, at least one column, never more than K.
     let tile_cols = plan.tile_items;
 
-    match device::route_decoder_tiled_device(rows, decoder, active, tile_cols) {
-        Ok(out) => {
-            note_route_engagement(
-                true,
-                &format!("block {m}x{k}, tile_cols={tile_cols}, active={active}"),
-            );
-            return Ok((
-                out.selections,
-                ScoreBlockPath::Device,
-                out.device_dtoh_bytes,
-            ));
-        }
-        Err(err) => {
-            note_route_engagement(false, &format!("device route fault: {err}"));
-            if mode == gam_gpu::GpuPolicy::Required {
-                return Err(err);
-            }
-            // Auto: the device faulted mid-route; discard partial selectors and
-            // run the exact CPU oracle for the whole minibatch.
-            return Ok((cpu_route(), ScoreBlockPath::Cpu, 0));
-        }
-    }
+    let out = device::route_decoder_tiled_device(rows, decoder, active, tile_cols)?;
+    note_route_engagement(
+        true,
+        &format!("block {m}x{k}, tile_cols={tile_cols}, active={active}"),
+    );
+    Ok((
+        out.selections,
+        ScoreBlockPath::Device,
+        out.device_dtoh_bytes,
+    ))
 }
 
 mod device {
@@ -676,9 +674,9 @@ mod device {
                     ctx: parts.ctx,
                     stream: parts.stream,
                     modules: Mutex::new(HashMap::new()),
-                    max_shared_mem_per_block: gam_gpu::GpuRuntime::global()
-                        .map(|runtime| runtime.selected_device().max_shared_mem_per_block)
-                        .unwrap_or(0),
+                    max_shared_mem_per_block: gam_gpu::GpuRuntime::require()?
+                        .selected_device()
+                        .max_shared_mem_per_block,
                 })
             })
             .as_ref()
@@ -1074,6 +1072,17 @@ mod tests {
     use super::*;
     use ndarray::Array2;
 
+    fn cuda_available_for_test(label: &str) -> bool {
+        match gam_gpu::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                eprintln!("[sparse_dict score test] no CUDA device; skipping {label}");
+                false
+            }
+            Err(error) => panic!("[sparse_dict score test] CUDA admission failed: {error}"),
+        }
+    }
+
     /// Deterministic fp32 fixture: `n_rows × p` rows and `n_atoms × p` unit-norm
     /// atoms (the lane unit-norms its decoder, so |xᵀd| is the projection).
     fn fixture(n_rows: usize, n_atoms: usize, p: usize) -> (Array2<f32>, Array2<f32>) {
@@ -1142,6 +1151,10 @@ mod tests {
             .map(|row| top_s_online(row, atoms.view(), s, tile))
             .collect();
 
+        if !cuda_available_for_test("minibatch top-s parity") {
+            return;
+        }
+
         match route_minibatch_required(
             rows.view(),
             atoms.view(),
@@ -1177,24 +1190,7 @@ mod tests {
                     }
                 }
             }
-            Err(err) => {
-                assert!(
-                    gam_gpu::GpuRuntime::global().is_none(),
-                    "Required errored despite a live CUDA runtime: {err}"
-                );
-                // Device absent: Auto must reproduce the CPU oracle exactly.
-                let (routed, path, dtoh_bytes) = route_minibatch_required(
-                    rows.view(),
-                    atoms.view(),
-                    s,
-                    tile,
-                    gam_gpu::GpuPolicy::Auto,
-                )
-                .expect("Auto must not error on a device-absent host");
-                assert_eq!(path, ScoreBlockPath::Cpu);
-                assert_eq!(dtoh_bytes, 0);
-                assert_eq!(routed, cpu);
-            }
+            Err(err) => panic!("Required route failed after CUDA admission: {err}"),
         }
     }
 
@@ -1222,6 +1218,10 @@ mod tests {
             .outer_iter()
             .map(|row| top_s_online(row, atoms.view(), s, tile))
             .collect();
+
+        if !cuda_available_for_test("K=32k top-s parity") {
+            return;
+        }
 
         match route_minibatch_required(
             rows.view(),
@@ -1261,23 +1261,7 @@ mod tests {
                     }
                 }
             }
-            Err(err) => {
-                assert!(
-                    gam_gpu::GpuRuntime::global().is_none(),
-                    "Required errored at K=32k despite a live CUDA runtime: {err}"
-                );
-                let (routed, path, dtoh_bytes) = route_minibatch_required(
-                    rows.view(),
-                    atoms.view(),
-                    s,
-                    tile,
-                    gam_gpu::GpuPolicy::Auto,
-                )
-                .expect("Auto must not error on a device-absent host");
-                assert_eq!(path, ScoreBlockPath::Cpu);
-                assert_eq!(dtoh_bytes, 0);
-                assert_eq!(routed, cpu);
-            }
+            Err(err) => panic!("Required K=32k route failed after CUDA admission: {err}"),
         }
     }
 
@@ -1297,6 +1281,10 @@ mod tests {
         let (rows, atoms) = fixture(n_rows, n_atoms, p);
         let cpu = score_block_cpu(rows.view(), atoms.view());
 
+        if !cuda_available_for_test("score-block parity") {
+            return;
+        }
+
         match score_block_required(rows.view(), atoms.view(), gam_gpu::GpuPolicy::Required) {
             Ok((got, path)) => {
                 assert_eq!(
@@ -1313,19 +1301,7 @@ mod tests {
                     );
                 }
             }
-            Err(err) => {
-                // No CUDA runtime on this host: Required correctly failed closed.
-                assert!(
-                    gam_gpu::GpuRuntime::global().is_none(),
-                    "Required errored despite a live CUDA runtime: {err}"
-                );
-                // The CPU path must still be exact under Auto.
-                let (got, path) =
-                    score_block_required(rows.view(), atoms.view(), gam_gpu::GpuPolicy::Auto)
-                        .expect("Auto must not error on a device-absent host");
-                assert_eq!(path, ScoreBlockPath::Cpu);
-                assert_eq!(got, cpu);
-            }
+            Err(err) => panic!("Required score block failed after CUDA admission: {err}"),
         }
     }
 }

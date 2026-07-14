@@ -685,10 +685,10 @@ pub fn sphere_kernel_decision(
         }
         None => false,
     };
-    Ok(decide(
+    decide(
         GpuKernel::SpatialKernelOperator,
         gam_gpu::GpuEligibility::from_flags(sphere_gpu_compiled(), large_enough),
-    ))
+    )
 }
 
 /// Map a truncated `SphereWahbaKernel` variant onto the device kernel kind +

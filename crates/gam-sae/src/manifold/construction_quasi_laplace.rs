@@ -141,7 +141,7 @@ impl SaeManifoldTerm {
         // progress-budget-collapse pathology), so the criterion entry owns the
         // clear.
         self.collapse_events.clear();
-        let plan = self.streaming_plan().admitted_or_error(
+        let plan = self.streaming_plan()?.admitted_or_error(
             self.n_obs(),
             self.output_dim(),
             self.k_atoms(),
@@ -228,7 +228,7 @@ impl SaeManifoldTerm {
         // reseed budget here; the double clear when routed through the value
         // entry is an idempotent no-op.
         self.collapse_events.clear();
-        let admission_plan = self.streaming_plan().admitted_or_error(
+        let admission_plan = self.streaming_plan()?.admitted_or_error(
             self.n_obs(),
             self.output_dim(),
             self.k_atoms(),
@@ -2705,7 +2705,7 @@ impl SaeManifoldTerm {
             ri.n_eff = vec![0.0; self.k_atoms()];
             ri.log_det_tt = 0.0;
         }
-        let plan = self.streaming_plan().admitted_or_error(
+        let plan = self.streaming_plan()?.admitted_or_error(
             self.n_obs(),
             self.output_dim(),
             self.k_atoms(),
