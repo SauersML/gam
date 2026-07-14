@@ -182,8 +182,8 @@ pub(crate) use gam::terms::sae::manifold::{
     GumbelTemperatureSchedule, SPHERE_CHART_PENALTY_DIAGONAL, SaeAtomGeometryPlan,
     SaeFisherRowMetricRequest, SaeFitAssignmentKind, SaeFitSeedReport, SaeFitSeedRequest,
     SaeMinimalSeedReport, SaeMinimalSeedRequest, ScheduleKind, build_sae_fisher_row_metric,
-    build_sae_fit_seed, build_sae_minimal_seed, sae_atom_basis_kind_from_str,
-    sae_atom_basis_kind_name, sae_fitted_atom_plans, sphere_chart_basis_jet,
+    build_sae_fit_seed, build_sae_minimal_seed, sae_atom_basis_kind_name, sae_fitted_atom_plans,
+    sphere_chart_basis_jet,
 };
 
 pub(crate) use gam::terms::decoders::skip_transcoder::{

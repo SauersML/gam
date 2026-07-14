@@ -3016,8 +3016,11 @@ mod sae_assignment_kind_tests {
 
 #[cfg(test)]
 mod sae_linear_atom_tests {
-    use super::{sae_atom_basis_kind_from_str, sae_atom_basis_kind_name};
-    use gam::terms::sae::manifold::{EuclideanPatchEvaluator, SaeAtomBasisKind, SaeBasisEvaluator};
+    use super::sae_atom_basis_kind_name;
+    use gam::terms::sae::manifold::{
+        EuclideanPatchEvaluator, SaeAtomBasisKind, SaeBasisEvaluator,
+        sae_atom_basis_kind_from_str,
+    };
     use ndarray::Array2;
 
     /// #1221 — `"linear"` (and its synonyms) is a first-class topology distinct
