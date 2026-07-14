@@ -479,12 +479,23 @@ pub(super) fn solve_direction_with_dense_factor(
     direction_out.mapv_inplace(|v| -v);
 }
 
-/// Compute `H·direction + gradient` with compensated row accumulation.
+/// Error-free transform of one floating-point addition.
+#[inline]
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let sum = a + b;
+    let b_virtual = sum - a;
+    let error = (a - (sum - b_virtual)) + (b - b_virtual);
+    (sum, error)
+}
+
+/// Compute `H·direction + gradient` with double-double row accumulation.
 ///
 /// This residual is the correctness certificate for the Newton equation
 /// `H·direction = -gradient`. Near a stiff penalty rail, ordinary BLAS matvec
-/// accumulation can lose the small residual to cancellation between
-/// `O(1e12)` terms, exactly where refinement needs the residual most.
+/// accumulation can lose the small residual to product rounding and
+/// cancellation between `O(1e12)` terms, exactly where refinement needs the
+/// residual most. Each product's rounding error is recovered with fused
+/// multiply-add and accumulated alongside the error-free addition residual.
 pub(super) fn dense_newton_residual_into(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -496,16 +507,19 @@ pub(super) fn dense_newton_residual_into(
     }
     let mut residual_inf = 0.0_f64;
     for i in 0..gradient.len() {
-        let mut sum = 0.0_f64;
-        let mut compensation = 0.0_f64;
+        let mut sum_hi = 0.0_f64;
+        let mut sum_lo = 0.0_f64;
         for j in 0..direction.len() {
             let product = hessian[[i, j]] * direction[j];
-            let corrected = product - compensation;
-            let next = sum + corrected;
-            compensation = (next - sum) - corrected;
-            sum = next;
+            let product_error = hessian[[i, j]].mul_add(direction[j], -product);
+            let (next_hi, addition_error) = two_sum(sum_hi, product);
+            let next_lo = sum_lo + (product_error + addition_error);
+            let (renormalized_hi, renormalized_lo) = two_sum(next_hi, next_lo);
+            sum_hi = renormalized_hi;
+            sum_lo = renormalized_lo;
         }
-        let value = sum + gradient[i];
+        let (with_gradient_hi, with_gradient_error) = two_sum(sum_hi, gradient[i]);
+        let value = with_gradient_hi + (sum_lo + with_gradient_error);
         residual[i] = value;
         residual_inf = residual_inf.max(value.abs());
     }
@@ -558,8 +572,8 @@ pub(super) fn solve_newton_direction_dense(
     // accepted relative residuals up to 1e-3 even when the inner KKT contract
     // requested 1e-10. With a 1e12–1e13 penalty condition number that solve
     // error was the entire persistent P-IRLS gradient floor (#2316). Refine
-    // from a compensated residual until the solve reaches its dimension-scaled
-    // floating-point backward-error floor. If three correction solves cannot
+    // from a double-double residual until the solve reaches its dimension-scaled
+    // floating-point backward-error floor. If eight correction solves cannot
     // do so, reject this direction to the LM controller; increasing damping is
     // the mathematically appropriate way to improve the system's conditioning.
     let g_inf = gradient.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
@@ -573,7 +587,7 @@ pub(super) fn solve_newton_direction_dense(
         if residual_inf.is_finite() && residual_inf <= residual_target {
             break residual_inf;
         }
-        if refinement_steps == 3 || !residual_inf.is_finite() {
+        if refinement_steps == 8 || !residual_inf.is_finite() {
             break residual_inf;
         }
         solve_direction_with_dense_factor(&factor, &residual, &mut correction);
