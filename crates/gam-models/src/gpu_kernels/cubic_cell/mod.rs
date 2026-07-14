@@ -30,9 +30,9 @@
 //! * `tests_host_substrate` — test-only CPU oracle for device-kernel parity.
 //! * [`kernel_src`] — NVRTC-compilable CUDA C++ source as Rust string
 //!   constants (D9 / D15 / D21 specializations).
-//! * [`device`] — Linux+CUDA dispatcher that compiles, launches, and
-//!   gathers the NVRTC kernel for the NonAffineFinite bucket; Affine /
-//!   AffineTail buckets stay on CPU until Stage-2.
+//! * [`device`] — Linux+CUDA dispatcher that classifies each cell once,
+//!   compiles and launches the all-branch NVRTC kernel, and leaves moments
+//!   device-resident for the consuming row kernel.
 
 pub(crate) mod branch;
 #[cfg(target_os = "linux")]
@@ -83,15 +83,13 @@ pub(crate) enum GpuCellBranchTag {
     AffineTail,
 }
 
-/// Per-cell status code written by the substrate. Numeric values match the
-/// device kernel's status code emission so the GPU and host paths fill
-/// `Vec<u8>` with the same byte pattern.
+/// Typed per-cell status decoded from the device kernel ABI.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CubicCellMomentStatus {
     Ok = 0,
-    /// Finite cell with `right <= left`, mismatched caller branch tag, or
-    /// CPU classifier rejected the cell.
+    /// Finite cell with `right <= left`, or the canonical classifier rejected
+    /// the cell.
     InvalidInterval = 1,
     /// Semi-infinite cell with material `c_2` or `c_3`.
     NonAffineInfiniteInterval = 2,
@@ -120,11 +118,10 @@ impl CubicCellMomentStatus {
 }
 
 /// Host-side input view for `try_build_cubic_cell_derivative_moments`.
-/// The substrate borrows cell data from the caller; it does not own the
-/// CPU partition. `branches` is parallel to `cells`.
+/// The substrate borrows cell data from the caller and owns branch
+/// classification so callers cannot drift from the kernel's tolerance.
 pub(crate) struct CubicCellDerivativeMomentHostView<'a> {
     pub cells: &'a [GpuDenestedCubicCell],
-    pub branches: &'a [GpuCellBranchTag],
     pub max_degree: usize,
 }
 
@@ -140,11 +137,10 @@ pub(crate) struct CubicCellDerivativeMomentOutput {
 
 /// Try to build derivative moments via the substrate.
 ///
-/// On Linux+CUDA, the dispatcher launches the NVRTC kernel for the
-/// NonAffineFinite bucket and CPU-classifies the Affine/AffineTail buckets,
-/// packing all accepted rows into one device-resident output. Runtime absence
-/// at this already-selected device boundary is a typed error, never host
-/// substitution.
+/// On Linux+CUDA, the dispatcher classifies every cell through the canonical
+/// CPU predicate, launches the all-branch NVRTC kernel, and returns one
+/// device-resident output. Runtime absence at this already-selected device
+/// boundary is a typed error, never host substitution.
 ///
 /// Returns `Ok(None)` only when the workload is empty.
 ///
@@ -152,13 +148,6 @@ pub(crate) struct CubicCellDerivativeMomentOutput {
 pub(crate) fn try_build_cubic_cell_derivative_moments(
     input: CubicCellDerivativeMomentHostView<'_>,
 ) -> Result<Option<CubicCellDerivativeMomentOutput>, GpuError> {
-    if input.cells.len() != input.branches.len() {
-        gam_gpu::gpu_bail!(
-            "gpu cubic-cell substrate: cells.len()={} != branches.len()={}",
-            input.cells.len(),
-            input.branches.len()
-        );
-    }
     if input.max_degree > MAX_SUPPORTED_DEGREE {
         gam_gpu::gpu_bail!(
             "gpu cubic-cell substrate: max_degree={} exceeds MAX_SUPPORTED_DEGREE={}",

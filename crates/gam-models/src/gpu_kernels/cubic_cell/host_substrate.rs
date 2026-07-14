@@ -9,12 +9,10 @@
 //! `crate::cubic_cell_kernel::evaluate_cell_derivative_moments_uncached`.
 //! This module's only jobs are:
 //!
-//! 1. validate the host view (lengths and supported degree),
-//! 2. per-cell: respect the caller-supplied branch tag *if* it agrees with
-//!    the host classifier (mismatches degrade the cell to a status code
-//!    instead of silently producing different math),
+//! 1. validate the supported degree,
+//! 2. classify each cell through the same canonical predicate as production,
 //! 3. pack moments into the GPU-shaped output buffer with the agreed stride,
-//! 4. record one status code per cell so the caller can react to per-cell
+//! 4. record one status per cell so the caller can react to per-cell
 //!    failures without having to re-run the CPU classifier.
 //!
 //! The moment-emitting path below is the numerical parity oracle.
@@ -24,13 +22,6 @@ use crate::gpu_kernels::cubic_cell::{
 };
 
 fn validate_host_view(view: &CubicCellDerivativeMomentHostView<'_>) -> Result<(), String> {
-    if view.cells.len() != view.branches.len() {
-        return Err(format!(
-            "host cubic-cell oracle: cells.len()={} != branches.len()={}",
-            view.cells.len(),
-            view.branches.len()
-        ));
-    }
     if view.max_degree > MAX_SUPPORTED_DEGREE {
         return Err(format!(
             "host cubic-cell oracle: max_degree={} exceeds MAX_SUPPORTED_DEGREE={}",
@@ -80,12 +71,6 @@ mod tests {
                     continue;
                 }
             };
-            let caller_tag = view.branches[i];
-            if host_tag != caller_tag {
-                status[i] = CubicCellMomentStatus::InvalidInterval;
-                continue;
-            }
-
             let cpu_cell = DenestedCubicCell {
                 left: gpu_cell.left,
                 right: gpu_cell.right,
@@ -157,35 +142,12 @@ mod tests {
     fn host_oracle_accepts_empty_workload() {
         let view = CubicCellDerivativeMomentHostView {
             cells: &[],
-            branches: &[],
             max_degree: 9,
         };
         let out = build_host_moments(&view).expect("empty oracle workload is valid");
         assert!(out.moments.is_empty());
         assert!(out.status.is_empty());
         assert_eq!(out.stride, 10);
-    }
-
-    #[test]
-    fn host_oracle_rejects_mismatched_cell_and_branch_counts() {
-        let cells = [GpuDenestedCubicCell {
-            left: -1.0,
-            right: 1.0,
-            c0: 0.0,
-            c1: 0.0,
-            c2: 0.0,
-            c3: 0.0,
-        }];
-        let view = CubicCellDerivativeMomentHostView {
-            cells: &cells,
-            branches: &[],
-            max_degree: 9,
-        };
-        let error = build_host_moments(&view)
-            .err()
-            .expect("mismatched parallel arrays must fail");
-        assert!(error.contains("cells.len()"), "got: {error}");
-        assert!(error.contains("branches.len()"), "got: {error}");
     }
 
     #[test]
@@ -198,10 +160,8 @@ mod tests {
             c2: 0.0,
             c3: 0.0,
         }];
-        let branches = [GpuCellBranchTag::Affine];
         let view = CubicCellDerivativeMomentHostView {
             cells: &cells,
-            branches: &branches,
             max_degree: MAX_SUPPORTED_DEGREE + 1,
         };
         let error = build_host_moments(&view)
@@ -221,10 +181,8 @@ mod tests {
             c3: 0.0,
         };
         let gpu = gpu_from_cpu(cpu);
-        let branches = vec![GpuCellBranchTag::NonAffineFinite];
         let view = CubicCellDerivativeMomentHostView {
             cells: std::slice::from_ref(&gpu),
-            branches: &branches,
             max_degree: 9,
         };
         let out = build_host_moments(&view).expect("host substrate");
@@ -243,10 +201,8 @@ mod tests {
             c3: 0.18,
         };
         let gpu = gpu_from_cpu(cpu);
-        let branches = vec![GpuCellBranchTag::NonAffineFinite];
         let view = CubicCellDerivativeMomentHostView {
             cells: std::slice::from_ref(&gpu),
-            branches: &branches,
             max_degree: 21,
         };
         let out = build_host_moments(&view).expect("host substrate");
@@ -265,10 +221,8 @@ mod tests {
             c3: 0.0,
         };
         let gpu = gpu_from_cpu(cpu);
-        let branches = vec![GpuCellBranchTag::AffineTail];
         let view = CubicCellDerivativeMomentHostView {
             cells: std::slice::from_ref(&gpu),
-            branches: &branches,
             max_degree: 15,
         };
         let out = build_host_moments(&view).expect("host substrate");
@@ -287,10 +241,8 @@ mod tests {
             c3: 0.0,
         };
         let gpu = gpu_from_cpu(cpu);
-        let branches = vec![GpuCellBranchTag::AffineTail];
         let view = CubicCellDerivativeMomentHostView {
             cells: std::slice::from_ref(&gpu),
-            branches: &branches,
             max_degree: 9,
         };
         let out = build_host_moments(&view).expect("host substrate");
@@ -308,10 +260,8 @@ mod tests {
             c2: 0.0,
             c3: 0.0,
         };
-        let branches = vec![GpuCellBranchTag::NonAffineFinite];
         let view = CubicCellDerivativeMomentHostView {
             cells: std::slice::from_ref(&gpu),
-            branches: &branches,
             max_degree: 9,
         };
         let out = build_host_moments(&view).expect("host substrate");
@@ -378,18 +328,6 @@ mod tests {
         ];
         let cells_gpu: Vec<GpuDenestedCubicCell> =
             cells_cpu.iter().copied().map(gpu_from_cpu).collect();
-        let branches: Vec<GpuCellBranchTag> = cells_cpu
-            .iter()
-            .map(|c| {
-                if !c.left.is_finite() || !c.right.is_finite() {
-                    GpuCellBranchTag::AffineTail
-                } else if c.c2 == 0.0 && c.c3 == 0.0 {
-                    GpuCellBranchTag::Affine
-                } else {
-                    GpuCellBranchTag::NonAffineFinite
-                }
-            })
-            .collect();
 
         // Exercise every degree the production consumers actually request
         // (9 = Bernoulli flex Hessian, 15 = intermediate, 21 = BMS outer
@@ -397,7 +335,6 @@ mod tests {
         for &max_degree in &[9usize, 15, 21] {
             let view = CubicCellDerivativeMomentHostView {
                 cells: &cells_gpu,
-                branches: &branches,
                 max_degree,
             };
             let out = build_host_moments(&view).expect("host substrate");
@@ -420,25 +357,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn host_substrate_flags_caller_branch_mismatch() {
-        // A finite quartic cell, but the caller claims AffineTail.
-        let gpu = GpuDenestedCubicCell {
-            left: -1.0,
-            right: 1.0,
-            c0: 0.2,
-            c1: 0.3,
-            c2: 0.4,
-            c3: 0.0,
-        };
-        let branches = vec![GpuCellBranchTag::AffineTail];
-        let view = CubicCellDerivativeMomentHostView {
-            cells: std::slice::from_ref(&gpu),
-            branches: &branches,
-            max_degree: 9,
-        };
-        let out = build_host_moments(&view).expect("host substrate");
-        assert_eq!(out.status[0], CubicCellMomentStatus::InvalidInterval);
-        assert!(out.moments.iter().all(|&x| x == 0.0));
-    }
 }

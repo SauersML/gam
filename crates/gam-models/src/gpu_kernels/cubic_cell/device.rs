@@ -1,23 +1,10 @@
 //! Device-resident dispatcher for the cubic-cell derivative-moment substrate.
 //!
-//! Stage-1 scope:
-//!
-//! * **NonAffineFinite** cells are evaluated on the GPU by NVRTC-compiling the
-//!   384-point Gauss–Legendre kernel emitted by [`super::kernel_src`] (the
-//!   `cubic_deriv_moments_d{degree}` specialization). One warp processes one
-//!   cell; results land in the same row-major `[n_cells, max_degree+1]` host
-//!   buffer the host substrate produces.
-//! * **Affine** and **AffineTail** cells stay on CPU for Stage-1: the device
-//!   kernel already contains closed-form branches for them, but Stage-1 keeps
-//!   the dispatcher conservative and bit-equal to the CPU parity reference for
-//!   those buckets. The closed-form device port lands with Stage-2.
-//!
-//! No silent fallback: cells are pre-bucketed on the host. The GPU launch is
-//! issued only on the NonAffineFinite bucket; CPU evaluation is issued only on
-//! the Affine / AffineTail buckets. Both contribute to the same host output
-//! buffer. Cells with non-OK classifier status receive zeroed rows and the
-//! corresponding [`super::CubicCellMomentStatus`] code, exactly like the host
-//! substrate.
+//! Every cell is classified exactly once by the canonical CPU predicate, then
+//! the all-branch NVRTC kernel evaluates affine, non-affine finite, and affine
+//! tail cells into one device-resident `[n_cells, max_degree+1]` buffer. There
+//! is no selected-device-to-host fallback. Invalid cells receive zeroed rows and
+//! a typed [`super::CubicCellMomentStatus`].
 
 #[cfg(target_os = "linux")]
 use crate::gpu_kernels::cubic_cell::{
@@ -193,10 +180,6 @@ impl CubicCellGpuBackend {
             c3[i] = gpu_cell.c3;
             match classify_cell_for_gpu(gpu_cell) {
                 Ok(host_tag) => {
-                    if host_tag != view.branches[i] {
-                        status_host[i] = CubicCellMomentStatus::InvalidInterval;
-                        continue;
-                    }
                     branch_code[i] = match host_tag {
                         GpuCellBranchTag::Affine => 0,
                         GpuCellBranchTag::NonAffineFinite => 1,
@@ -431,23 +414,9 @@ mod tests {
                 c3: c.c3,
             })
             .collect();
-        let branches: Vec<GpuCellBranchTag> = cpu_cells
-            .iter()
-            .map(|c| {
-                if !c.left.is_finite() || !c.right.is_finite() {
-                    GpuCellBranchTag::AffineTail
-                } else if c.c2 == 0.0 && c.c3 == 0.0 {
-                    GpuCellBranchTag::Affine
-                } else {
-                    GpuCellBranchTag::NonAffineFinite
-                }
-            })
-            .collect();
-
         for &max_degree in &[9_usize, 15, 21] {
             let view = CubicCellDerivativeMomentHostView {
                 cells: &cells_gpu,
-                branches: &branches,
                 max_degree,
             };
             let CubicCellDerivativeMomentOutput {

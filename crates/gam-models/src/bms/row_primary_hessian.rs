@@ -1387,14 +1387,10 @@ impl BernoulliMarginalSlopeFamily {
         } else {
             vec![0.0_f64; total_cells_us * moment_stride]
         };
-        // Per-cell SoA for the device cubic-cell substrate. Populated on
-        // every code path so the compiler sees `gpu_cells`/`gpu_branches`
-        // used unconditionally — the substrate dispatch below only fires
-        // when `build_device_moments` is true, but the small Vec push cost
-        // per cell is negligible compared to the moment compute itself.
+        // Per-cell SoA for the device cubic-cell substrate. The substrate owns
+        // canonical branch classification; this caller supplies only cell
+        // geometry, so its tolerance cannot drift from the kernel boundary.
         let mut gpu_cells: Vec<crate::gpu_kernels::cubic_cell::GpuDenestedCubicCell> =
-            Vec::with_capacity(total_cells_us);
-        let mut gpu_branches: Vec<crate::gpu_kernels::cubic_cell::GpuCellBranchTag> =
             Vec::with_capacity(total_cells_us);
 
         // Reusable per-row coefficient buffers. Same layout as
@@ -1568,15 +1564,6 @@ impl BernoulliMarginalSlopeFamily {
                     c2: cell.c2,
                     c3: cell.c3,
                 });
-                let branch = if !cell.left.is_finite() || !cell.right.is_finite() {
-                    crate::gpu_kernels::cubic_cell::GpuCellBranchTag::AffineTail
-                } else if cell.c2 == 0.0 && cell.c3 == 0.0 {
-                    crate::gpu_kernels::cubic_cell::GpuCellBranchTag::Affine
-                } else {
-                    crate::gpu_kernels::cubic_cell::GpuCellBranchTag::NonAffineFinite
-                };
-                gpu_branches.push(branch);
-
                 // cell_moments: copy state.moments, zero-pad to 10 — only
                 // when host moments are selected. When the device-moment
                 // build is selected, this storage is
@@ -1699,7 +1686,7 @@ impl BernoulliMarginalSlopeFamily {
 
         // ── Phase-4: when device-moment build was selected, dispatch the
         //    cubic-cell substrate now (all rows' cells were collected in
-        //    `gpu_cells` / `gpu_branches` during the per-row loop). The
+        //    `gpu_cells` during the per-row loop). The
         //    returned device buffer lives on the shared CUDA context the
         //    bms_flex_row backend also uses, so the launcher consumes it
         //    without any cross-context copying.
@@ -1711,17 +1698,15 @@ impl BernoulliMarginalSlopeFamily {
             };
             // Sanity: the per-row loop must have produced exactly one
             // entry per cell index.
-            if gpu_cells.len() != total_cells_us || gpu_branches.len() != total_cells_us {
+            if gpu_cells.len() != total_cells_us {
                 return Err(format!(
-                    "bms_flex_row pack: gpu_cells.len()={} branches.len()={} mismatch total_cells={}",
+                    "bms_flex_row pack: gpu_cells.len()={} mismatch total_cells={}",
                     gpu_cells.len(),
-                    gpu_branches.len(),
                     total_cells_us
                 ));
             }
             let view = CubicCellDerivativeMomentHostView {
                 cells: &gpu_cells,
-                branches: &gpu_branches,
                 max_degree: crate::bms::gpu::row::MOMENT_STRIDE - 1,
             };
             let CubicCellDerivativeMomentOutput {
@@ -1760,7 +1745,6 @@ impl BernoulliMarginalSlopeFamily {
         };
         // Free the now-unneeded scratch.
         drop(gpu_cells);
-        drop(gpu_branches);
 
         Ok(Some(crate::bms::gpu::row::BmsFlexRowKernelInputsOwned {
             n_rows: n,
