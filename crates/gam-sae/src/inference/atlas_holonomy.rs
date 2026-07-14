@@ -416,8 +416,12 @@ pub struct AtlasSignedEdge {
 }
 
 impl AtlasSignedEdge {
-    #[must_use = "signed-edge validation errors must be handled"]
-    pub fn new_analytic(a: usize, b: usize, overlap: usize, sign: i8) -> Result<Self, String> {
+    fn from_validated_analytic_sign(
+        a: usize,
+        b: usize,
+        overlap: usize,
+        sign: i8,
+    ) -> Result<Self, String> {
         let identity = AtlasHolonomyEdgeId::new(a, b, overlap)?;
         if !matches!(sign, -1 | 1) {
             return Err(format!(
@@ -444,12 +448,25 @@ impl AtlasSignedEdge {
             "a fitted sphere transition cannot enter an exact analytic holonomy certificate"
                 .to_string()
         })?;
-        Self::new_analytic(
+        Self::from_validated_analytic_sign(
             transition.from_chart(),
             transition.to_chart(),
             overlap,
             sign,
         )
+    }
+
+    /// Construct an analytic fixture without weakening the production provenance
+    /// boundary. Production exact edges can only come from a typed analytic
+    /// transition constructor.
+    #[cfg(test)]
+    pub(crate) fn new_test_analytic(
+        a: usize,
+        b: usize,
+        overlap: usize,
+        sign: i8,
+    ) -> Result<Self, String> {
+        Self::from_validated_analytic_sign(a, b, overlap, sign)
     }
 
     #[must_use]
@@ -2158,7 +2175,7 @@ mod tests {
             AtlasHolonomyEdgeId::new(4, 2, 9).unwrap(),
             AtlasHolonomyEdgeId::new(2, 4, 9).unwrap()
         );
-        assert!(AtlasSignedEdge::new_analytic(0, 1, 0, 0).is_err());
+        assert!(AtlasSignedEdge::new_test_analytic(0, 1, 0, 0).is_err());
         assert!(
             ProjectedAtlasEdgeSpec::new(
                 0,
@@ -2173,8 +2190,8 @@ mod tests {
             ExactAnalyticHolonomyCertificate::new(
                 2,
                 vec![
-                    AtlasSignedEdge::new_analytic(0, 1, 3, 1).unwrap(),
-                    AtlasSignedEdge::new_analytic(0, 1, 3, -1).unwrap(),
+                    AtlasSignedEdge::new_test_analytic(0, 1, 3, 1).unwrap(),
+                    AtlasSignedEdge::new_test_analytic(0, 1, 3, -1).unwrap(),
                 ],
             )
             .is_err()
@@ -2182,7 +2199,7 @@ mod tests {
         assert!(
             ExactAnalyticHolonomyCertificate::new(
                 2,
-                vec![AtlasSignedEdge::new_analytic(0, 2, 0, 1).unwrap()],
+                vec![AtlasSignedEdge::new_test_analytic(0, 2, 0, 1).unwrap()],
             )
             .is_err()
         );
@@ -2216,8 +2233,8 @@ mod tests {
         let certificate = ExactAnalyticHolonomyCertificate::new(
             2,
             vec![
-                AtlasSignedEdge::new_analytic(0, 1, 0, 1).unwrap(),
-                AtlasSignedEdge::new_analytic(0, 1, 1, -1).unwrap(),
+                AtlasSignedEdge::new_test_analytic(0, 1, 0, 1).unwrap(),
+                AtlasSignedEdge::new_test_analytic(0, 1, 1, -1).unwrap(),
             ],
         )
         .unwrap();

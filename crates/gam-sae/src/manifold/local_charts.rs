@@ -7,8 +7,8 @@
 //! chart but a COLLECTION of overlapping local charts, each an injective map from
 //! a neighborhood into `R^d`, glued by transition maps on their overlaps. This
 //! module builds exactly that object — a [`LocalAtlas`] — as a pure, deterministic
-//! construction with per-chart injectivity certificates and a signed transition
-//! cocycle.
+//! construction with per-chart injectivity checks and observed transition
+//! geometry.
 //!
 //! The construction is the classical local-PCA atlas:
 //!
@@ -33,8 +33,8 @@
 //!      gate (no two neighborhood rows collapse to the same chart coordinate). A
 //!      patch that cannot certify at any admissible size is rejected with a typed
 //!      [`LocalChartError`];
-//!   4. one TRANSITION per overlapping patch pair. Its orientation is the EXACT
-//!      transition Jacobian's determinant: on the overlap the chart change is
+//!   4. one TRANSITION per overlapping patch pair. Its observed orientation is
+//!      the fitted chart Jacobian's determinant: on the overlap the chart change is
 //!      `c_to = F_toᵀ(μ_from − μ_to) + (F_toᵀ F_from) c_from + O(curvature)`, so the
 //!      handedness relation of the two charts is `sign = sgn det(F_toᵀ F_from)` —
 //!      a well-conditioned frame quantity (`|det| = ∏ cos θ_k` over the principal
@@ -44,19 +44,20 @@
 //!      translation, so `det R = sign` by construction and reflections are recorded
 //!      rather than forced to `+1`.
 //!
-//! # Transition cocycle interface
+//! # Statistical authority boundary
 //!
-//! The signed transition edges are the exact substrate the #2311 holonomy readout
-//! ([`crate::inference::atlas_holonomy`]) and the #2310 quotient census consume.
-//! [`LocalAtlas::signed_edges`] yields `(a, b, overlap, sign)` tuples that map
-//! one-to-one onto [`crate::inference::atlas_holonomy::AtlasSignedEdge::new_analytic`],
-//! and [`LocalAtlas::orientability`] reproduces the SAME sign-cocycle propagation
-//! as [`super::chart_atlas::ManifoldChartAtlas::orientability`], returning the
-//! shared [`super::AtlasOrientability`] verdict. For a one-dimensional chart the
-//! orthogonal Procrustes factor is exactly a `±1` scalar, so this `sign` coincides
-//! with the `sign` field of [`super::chart_atlas::UnitSpeedChartTransition`] — the
-//! one-dimensional and the general-`d` transition speak the same orientation
-//! language.
+//! These charts and transitions are fitted to the observed rows. Numerical rank,
+//! injectivity, and conditioning checks establish that the fitted geometry is
+//! well posed; they do not turn its orientation signs into population claims.
+//! Consequently this module exposes an explicitly observed sign-cocycle readout,
+//! never an [`crate::inference::atlas_holonomy::AtlasSignedEdge`] or an exact
+//! holonomy certificate. A promotable noisy-topology result must instead go
+//! through [`crate::inference::atlas_holonomy::AtlasHolonomyCertificate::gaussian_pca`],
+//! whose independent pilot/inference rows, population bounds, familywise level,
+//! and typed refusals supply the finite-sample authority. For a one-dimensional
+//! chart the orthogonal Procrustes factor is still exactly a `±1` scalar, so the
+//! observed transition uses the same orientation convention as
+//! [`super::chart_atlas::UnitSpeedChartTransition`].
 //!
 //! # Determinism
 //!
@@ -102,7 +103,7 @@ const CHART_INJECTIVITY_FLOOR_FRAC: f64 = 1.0e-6;
 /// fraction of its largest. A near-singular `M` means the shared support does not
 /// span all `d` chart directions, so the rotation that best fits the overlap point
 /// cloud is ambiguous in the unspanned direction. Such an edge is retained as
-/// geometry but marked [`TransitionConfidence::Degenerate`] and kept out of the
+/// geometry but marked [`TransitionConditioning::Degenerate`] and kept out of the
 /// sign cocycle, mirroring the analytic-vs-fitted split in [`super::chart_atlas`].
 const TRANSITION_CONDITION_FLOOR_FRAC: f64 = 1.0e-6;
 
@@ -113,7 +114,7 @@ const TRANSITION_CONDITION_FLOOR_FRAC: f64 = 1.0e-6;
 /// some chart direction of one patch is invisible to the other. `1e-6` is the
 /// numerical "the planes are not orthogonal" floor (overlapping patches on a
 /// manifold sit far above it — the sphere/Möbius/cylinder fixtures run at `|det|`
-/// of order `0.5` to `1`), below which the edge is [`TransitionConfidence::Degenerate`]
+/// of order `0.5` to `1`), below which the edge is [`TransitionConditioning::Degenerate`]
 /// and contributes no sign.
 const FRAME_OVERLAP_DETERMINANT_FLOOR: f64 = 1.0e-6;
 
@@ -188,7 +189,10 @@ pub enum LocalChartError {
     /// A non-finite ambient coordinate.
     NonFiniteAmbient { row: usize, col: usize, value: f64 },
     /// The chart dimension exceeds what any neighborhood could span.
-    IntrinsicDimTooLarge { intrinsic_dim: usize, ambient_dim: usize },
+    IntrinsicDimTooLarge {
+        intrinsic_dim: usize,
+        ambient_dim: usize,
+    },
     /// The `d`-th captured singular value did not clear the rank floor at ANY
     /// admissible neighborhood size: the neighborhood spans fewer than `d`
     /// directions however far it is shrunk.
@@ -251,7 +255,10 @@ impl fmt::Display for LocalChartError {
                  {min_ambient_sq_distance:.3e})"
             ),
             Self::SvdFailure { center, detail } => {
-                write!(f, "local_charts: SVD failed for patch at row {center}: {detail}")
+                write!(
+                    f,
+                    "local_charts: SVD failed for patch at row {center}: {detail}"
+                )
             }
         }
     }
@@ -330,18 +337,18 @@ impl LocalChart {
     }
 }
 
-/// Whether a transition's orientation sign is trustworthy enough to enter the
-/// exact sign cocycle.
+/// Numerical conditioning of an observed fitted transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransitionConfidence {
+pub enum TransitionConditioning {
     /// The frames' overlap determinant is non-degenerate (the chart change is a
     /// local diffeomorphism) AND the shared-support cross-covariance is well
-    /// conditioned (the alignment is well posed); `sign` is an exact handedness.
-    Certified,
+    /// conditioned (the alignment is well posed). This is not a statistical
+    /// confidence statement about the population transition.
+    WellConditioned,
     /// Either the two tangent planes are nearly orthogonal (so the chart change is
     /// not a diffeomorphism and no handedness exists), or the shared support did
     /// not span all `d` chart directions (so the alignment is ambiguous). The edge
-    /// is geometry only and is excluded from [`LocalAtlas::signed_edges`].
+    /// is retained as geometry but excluded from the observed sign cocycle.
     Degenerate,
 }
 
@@ -351,7 +358,7 @@ pub enum TransitionConfidence {
 /// Convention: for a shared ambient point with chart coordinates `c_from` in the
 /// `from` chart and `c_to` in the `to` chart, `c_to ≈ R · c_from + t`.
 ///
-/// The orientation is read from the EXACT transition Jacobian, `sign =
+/// The orientation is read from the fitted transition Jacobian, `sign =
 /// sgn det(F_toᵀ F_from)`, and `R` is the orthogonal Procrustes factor restricted to
 /// that handedness class (`U diag(1, …, 1, ±1) Vᵀ`), so `det R = sign` and a genuine
 /// reflection is recorded rather than forced to `+1`. Reading the sign off the
@@ -367,8 +374,7 @@ pub struct ChartTransition {
     pub from_patch: usize,
     /// Target patch index.
     pub to_patch: usize,
-    /// Running index of this overlap, matching the `overlap` argument of the
-    /// holonomy consumer's `AtlasSignedEdge::new_analytic` / `AtlasHolonomyEdgeId`.
+    /// Running index of this overlap component.
     pub overlap_id: usize,
     /// The shared support rows, sorted ascending.
     pub shared_rows: Vec<usize>,
@@ -382,8 +388,8 @@ pub struct ChartTransition {
     /// Relative Procrustes residual `‖C_to − R C_from‖_F / ‖C_to‖_F` — how coherent
     /// the two charts are on the overlap (`0` = perfectly co-oriented planes).
     pub residual: f64,
-    /// Whether `sign` is exact enough to enter the sign cocycle.
-    pub confidence: TransitionConfidence,
+    /// Whether the observed fitted transition is numerically well conditioned.
+    pub conditioning: TransitionConditioning,
 }
 
 impl ChartTransition {
@@ -471,8 +477,7 @@ impl LocalAtlas {
                 if shared.len() < min_overlap {
                     continue;
                 }
-                let transition =
-                    build_transition(&charts, &patches, i, j, overlap_id, &shared);
+                let transition = build_transition(&charts, &patches, i, j, overlap_id, &shared);
                 transitions.push(transition);
                 overlap_id += 1;
             }
@@ -523,33 +528,40 @@ impl LocalAtlas {
         self.charts.len()
     }
 
-    /// The certified signed transition edges as `(a, b, overlap, sign)`, ready for
-    /// the #2311 holonomy consumer's
-    /// [`crate::inference::atlas_holonomy::AtlasSignedEdge::new_analytic`].
-    /// Degenerate transitions are intentionally absent, exactly as fitted sphere
-    /// seams are absent from [`super::chart_atlas`]'s exact cocycle.
+    /// Numerically well-conditioned observed transition signs as
+    /// `(a, b, overlap, sign)`.
+    ///
+    /// This is a diagnostic of the fitted atlas, not an exact or finite-sample
+    /// sign certificate. It deliberately returns ordinary tuples that no
+    /// authoritative holonomy constructor accepts as analytic provenance.
     #[must_use]
-    pub fn signed_edges(&self) -> Vec<(usize, usize, usize, i8)> {
+    pub fn observed_signed_edges(&self) -> Vec<(usize, usize, usize, i8)> {
         self.transitions
             .iter()
-            .filter(|t| matches!(t.confidence, TransitionConfidence::Certified))
+            .filter(|transition| {
+                matches!(
+                    transition.conditioning,
+                    TransitionConditioning::WellConditioned
+                )
+            })
             .map(|t| (t.from_patch, t.to_patch, t.overlap_id, t.sign))
             .collect()
     }
 
-    /// Read orientability from the certified sign cocycle, reusing the SAME
-    /// verdict type and propagation as
-    /// [`super::chart_atlas::ManifoldChartAtlas::orientability`]: propagate a local
-    /// orientation across certified edges; a contradictory revisit is a
-    /// negative-holonomy cycle (the Möbius obstruction). Disconnected components
-    /// are each resolved independently. Always `Some` here because every certified
-    /// edge carries an exact sign.
+    /// Point readout from the numerically well-conditioned portion of the fitted
+    /// sign cocycle.
+    ///
+    /// This method is intentionally named `observed_*`: it has no sampling model,
+    /// error probability, or authority to promote topology. Use the Gaussian-PCA
+    /// holonomy certificate for a population claim. A contradictory revisit is a
+    /// negative observed-holonomy cycle; disconnected components are resolved
+    /// independently.
     #[must_use]
-    pub fn orientability(&self) -> Option<AtlasOrientability> {
+    pub fn observed_orientability(&self) -> AtlasOrientability {
         let mut orientation: BTreeMap<usize, i8> = BTreeMap::new();
-        // Adjacency over certified signed edges only.
+        // Adjacency over numerically well-conditioned observed edges only.
         let mut adj: BTreeMap<usize, Vec<(usize, i8)>> = BTreeMap::new();
-        for (a, b, _, sign) in self.signed_edges() {
+        for (a, b, _, sign) in self.observed_signed_edges() {
             adj.entry(a).or_default().push((b, sign));
             adj.entry(b).or_default().push((a, sign));
         }
@@ -566,7 +578,7 @@ impl LocalAtlas {
                         let required = here * sign;
                         match orientation.get(&next) {
                             Some(&existing) if existing != required => {
-                                return Some(AtlasOrientability::NonOrientable);
+                                return AtlasOrientability::NonOrientable;
                             }
                             Some(_) => {}
                             None => {
@@ -578,7 +590,7 @@ impl LocalAtlas {
                 }
             }
         }
-        Some(AtlasOrientability::Orientable)
+        AtlasOrientability::Orientable
     }
 
     /// The directed rotation `from → to` (`Some` iff the two patches share a
@@ -851,7 +863,11 @@ fn build_local_chart(
         leading_singular: leading,
         smallest_captured_singular: smallest_captured,
         captured_variance_fraction,
-        min_projection_stretch: if min_stretch.is_finite() { min_stretch } else { 1.0 },
+        min_projection_stretch: if min_stretch.is_finite() {
+            min_stretch
+        } else {
+            1.0
+        },
     };
 
     Ok(LocalChart {
@@ -939,7 +955,7 @@ fn build_transition(
     // R = U diag(1, …, 1, ±1) Vᵀ. So det R = sign by construction, and reflections are
     // recorded rather than forced to +1.
     let m_mat = c_to.dot(&c_from.t());
-    let (rotation, confidence) = match m_mat.svd(true, true) {
+    let (rotation, conditioning) = match m_mat.svd(true, true) {
         Ok((Some(u), sv, Some(vt))) => {
             let mut r = u.dot(&vt);
             if (determinant(&r) >= 0.0) != (sign >= 0) {
@@ -952,19 +968,18 @@ fn build_transition(
             }
             let leading = sv.first().copied().unwrap_or(0.0);
             let smallest = sv.get(d - 1).copied().unwrap_or(0.0);
-            let well_posed =
-                leading > 0.0 && smallest > TRANSITION_CONDITION_FLOOR_FRAC * leading;
-            let confidence = if well_posed && frame_nondegenerate {
-                TransitionConfidence::Certified
+            let well_posed = leading > 0.0 && smallest > TRANSITION_CONDITION_FLOOR_FRAC * leading;
+            let conditioning = if well_posed && frame_nondegenerate {
+                TransitionConditioning::WellConditioned
             } else {
-                TransitionConfidence::Degenerate
+                TransitionConditioning::Degenerate
             };
-            (r, confidence)
+            (r, conditioning)
         }
         // A failed / rank-empty SVD leaves the alignment unresolved: the identity of
-        // the right handedness class, degenerate confidence (excluded from the sign
-        // cocycle).
-        _ => (signed_identity(d, sign), TransitionConfidence::Degenerate),
+        // the right handedness class, degenerate conditioning (excluded from the
+        // observed sign cocycle).
+        _ => (signed_identity(d, sign), TransitionConditioning::Degenerate),
     };
 
     // Residual ‖C_to − R C_from‖_F / ‖C_to‖_F.
@@ -999,11 +1014,11 @@ fn build_transition(
         translation,
         sign,
         residual,
-        confidence,
+        conditioning,
     }
 }
 
-/// The `d × d` frame overlap `F_toᵀ F_from` — the exact Jacobian of the chart
+/// The `d × d` frame overlap `F_toᵀ F_from` — the Jacobian of the fitted chart
 /// transition `c_from ↦ c_to` on the two patches' common tangent plane. Its entries
 /// are the pairwise inner products of the two orthonormal chart frames, its singular
 /// values are the cosines of the principal angles between the tangent planes, and
@@ -1267,7 +1282,10 @@ mod tests {
             defect < 1e-8,
             "exact-plane triple cocycle must close to rounding, defect {defect:.3e}"
         );
-        assert_eq!(atlas.orientability(), Some(AtlasOrientability::Orientable));
+        assert_eq!(
+            atlas.observed_orientability(),
+            AtlasOrientability::Orientable
+        );
     }
 
     /// On a sphere every chart is an injective local tangent map and the atlas is
@@ -1285,8 +1303,8 @@ mod tests {
             );
         }
         assert_eq!(
-            atlas.orientability(),
-            Some(AtlasOrientability::Orientable),
+            atlas.observed_orientability(),
+            AtlasOrientability::Orientable,
             "the sphere is orientable"
         );
         let (a, b, c) = genuine_triple(&atlas).expect("sphere must have a triple overlap");
@@ -1310,8 +1328,8 @@ mod tests {
         let cyl_atlas = LocalAtlas::build(cyl.view(), LocalAtlasConfig::balanced(cyl.nrows(), 2))
             .expect("cylinder atlas must build");
         assert_eq!(
-            cyl_atlas.orientability(),
-            Some(AtlasOrientability::Orientable),
+            cyl_atlas.observed_orientability(),
+            AtlasOrientability::Orientable,
             "a cylinder is orientable"
         );
 
@@ -1319,8 +1337,8 @@ mod tests {
         let mob_atlas = LocalAtlas::build(mob.view(), LocalAtlasConfig::balanced(mob.nrows(), 2))
             .expect("mobius atlas must build");
         assert_eq!(
-            mob_atlas.orientability(),
-            Some(AtlasOrientability::NonOrientable),
+            mob_atlas.observed_orientability(),
+            AtlasOrientability::NonOrientable,
             "a Möbius strip is non-orientable: the sign cocycle has a negative-holonomy loop"
         );
     }
@@ -1341,7 +1359,13 @@ mod tests {
         let config = LocalAtlasConfig::balanced(n, 2);
         let err = LocalAtlas::build(z.view(), config).unwrap_err();
         assert!(
-            matches!(err, LocalChartError::DegeneratePatch { intrinsic_dim: 2, .. }),
+            matches!(
+                err,
+                LocalChartError::DegeneratePatch {
+                    intrinsic_dim: 2,
+                    ..
+                }
+            ),
             "collinear data cannot yield a 2-chart; got {err}"
         );
     }
@@ -1356,14 +1380,13 @@ mod tests {
         assert_eq!(a, b, "local atlas must be bit-identical run-to-run");
     }
 
-    /// The signed-edge export matches the holonomy consumer's contract: `(a, b,
-    /// overlap, sign)` with `a < b`, unique overlap ids, and `sign ∈ {±1}`.
+    /// The observed signed-edge diagnostic is canonical without claiming analytic
+    /// or finite-sample provenance.
     #[test]
-    fn signed_edges_match_holonomy_consumer_contract_2280() {
+    fn observed_signed_edges_are_canonical_but_not_certificates_2280() {
         let z = sphere(12, 16);
-        let atlas =
-            LocalAtlas::build(z.view(), LocalAtlasConfig::balanced(z.nrows(), 2)).unwrap();
-        let edges = atlas.signed_edges();
+        let atlas = LocalAtlas::build(z.view(), LocalAtlasConfig::balanced(z.nrows(), 2)).unwrap();
+        let edges = atlas.observed_signed_edges();
         assert!(!edges.is_empty(), "a covered sphere has overlaps");
         let mut seen_overlaps = std::collections::BTreeSet::new();
         for (a, b, overlap, sign) in edges {
@@ -1388,8 +1411,7 @@ mod tests {
             z[[r, 1]] = t.sin();
             z[[r, 2]] = 0.1 * t;
         }
-        let atlas =
-            LocalAtlas::build(z.view(), LocalAtlasConfig::balanced(n, 1)).unwrap();
+        let atlas = LocalAtlas::build(z.view(), LocalAtlasConfig::balanced(n, 1)).unwrap();
         assert_eq!(atlas.intrinsic_dim(), 1);
         for t in atlas.transitions() {
             assert_eq!(t.rotation.dim(), (1, 1));

@@ -1143,7 +1143,7 @@ mod tests {
         let edges = pairs
             .into_iter()
             .map(|(a, b)| {
-                AtlasSignedEdge::new_analytic(
+                AtlasSignedEdge::new_test_analytic(
                     a,
                     b,
                     0,
@@ -1431,8 +1431,8 @@ mod tests {
             ExactAnalyticHolonomyCertificate::new(
                 3,
                 vec![
-                    AtlasSignedEdge::new_analytic(0, 1, 3, 1).unwrap(),
-                    AtlasSignedEdge::new_analytic(0, 1, 7, 1).unwrap(),
+                    AtlasSignedEdge::new_test_analytic(0, 1, 3, 1).unwrap(),
+                    AtlasSignedEdge::new_test_analytic(0, 1, 7, 1).unwrap(),
                 ],
             )
             .unwrap(),
@@ -1443,7 +1443,7 @@ mod tests {
         let missing_overlap = AtlasHolonomyCertificate::ExactAnalytic(
             ExactAnalyticHolonomyCertificate::new(
                 2,
-                vec![AtlasSignedEdge::new_analytic(0, 1, 3, 1).unwrap()],
+                vec![AtlasSignedEdge::new_test_analytic(0, 1, 3, 1).unwrap()],
             )
             .unwrap(),
         );
@@ -1455,8 +1455,8 @@ mod tests {
             ExactAnalyticHolonomyCertificate::new(
                 2,
                 vec![
-                    AtlasSignedEdge::new_analytic(0, 1, 3, 1).unwrap(),
-                    AtlasSignedEdge::new_analytic(0, 1, 7, -1).unwrap(),
+                    AtlasSignedEdge::new_test_analytic(0, 1, 3, 1).unwrap(),
+                    AtlasSignedEdge::new_test_analytic(0, 1, 7, -1).unwrap(),
                 ],
             )
             .unwrap(),
