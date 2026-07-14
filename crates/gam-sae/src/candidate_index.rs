@@ -330,17 +330,36 @@ impl AtomFrameSketch for RandomProjectionFrameSketch {
         if frame.ncols() == 0 {
             return vec![self.atom_sketch(atom_id)];
         }
-        // One bucket representative per orthonormal frame column: an
-        // on-manifold query direction is then within arccos(1/√r) of some
-        // bucketed point instead of up to 90° from the lone dominant column
-        // (see the trait doc — the deterministic phase-miss fix).
-        (0..frame.ncols())
-            .map(|col| {
-                let mut sk = mat_vec(&self.projection, frame.column(col));
-                normalize_in_place(&mut sk);
-                sk
-            })
-            .collect()
+        // Bucket representatives covering the atom's whole range (see the
+        // trait doc — the deterministic phase-miss fix): one per orthonormal
+        // frame column PLUS the pairwise bisectors (u_i ± u_j)/√2. Columns
+        // alone leave a 45° worst-case query angle at r = 2 (the diagonal
+        // phases), where the per-table cosine-LSH collision is weak enough
+        // that a phase sweep still loses ~2% of exact on-plane queries; with
+        // the bisectors the worst case drops to 22.5° (r = 2) and the
+        // per-query miss probability is negligible at every table
+        // configuration the auto-config produces. Signature canonicalization
+        // folds ±, so each bisector line needs bucketing once, and the entry
+        // count stays r² — bounded by the tiny intrinsic dimension.
+        let r = frame.ncols();
+        let mut sketches = Vec::with_capacity(r * r);
+        for col in 0..r {
+            let mut sk = mat_vec(&self.projection, frame.column(col));
+            normalize_in_place(&mut sk);
+            sketches.push(sk);
+        }
+        for i in 0..r {
+            for j in (i + 1)..r {
+                for &sign in &[1.0_f64, -1.0] {
+                    let mut dir = frame.column(i).to_owned();
+                    dir.scaled_add(sign, &frame.column(j));
+                    let mut sk = mat_vec(&self.projection, dir.view());
+                    normalize_in_place(&mut sk);
+                    sketches.push(sk);
+                }
+            }
+        }
+        sketches
     }
 
     fn project_direction(&self, atom_id: usize, direction: ArrayView1<f64>) -> Array1<f64> {
