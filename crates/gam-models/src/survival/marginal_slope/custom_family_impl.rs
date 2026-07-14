@@ -693,7 +693,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 self.sigma_exact_joint_psi_terms(block_states, specs)
             }
             Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
-                .rigid_baseline_exact_joint_psi_terms_with_options(
+                .baseline_exact_joint_psi_terms_with_options(
                     block_states,
                     axis,
                     &BlockwiseFitOptions::default(),
@@ -726,10 +726,26 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)),
                 Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(other_axis)),
             ) => self
-                .rigid_baseline_exact_joint_psisecond_order_terms_with_options(
+                .baseline_exact_joint_psisecond_order_terms_with_options(
                     block_states,
                     axis,
                     other_axis,
+                    &BlockwiseFitOptions::default(),
+                ),
+            (Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)), None) => self
+                .baseline_design_exact_joint_psisecond_order_terms_with_options(
+                    block_states,
+                    hyper_layout.design_derivative_blocks(),
+                    axis,
+                    psi_j,
+                    &BlockwiseFitOptions::default(),
+                ),
+            (None, Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis))) => self
+                .baseline_design_exact_joint_psisecond_order_terms_with_options(
+                    block_states,
+                    hyper_layout.design_derivative_blocks(),
+                    axis,
+                    psi_i,
                     &BlockwiseFitOptions::default(),
                 ),
             _ => Err(format!(
@@ -758,7 +774,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 self.sigma_exact_joint_psihessian_directional_derivative(block_states, d_beta_flat)
             }
             Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
-                .rigid_baseline_exact_joint_psihessian_directional_derivative_with_options(
+                .baseline_exact_joint_psihessian_directional_derivative_with_options(
                     block_states,
                     axis,
                     d_beta_flat,

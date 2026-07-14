@@ -297,7 +297,7 @@ fn test_matern_public_second_derivative_matchesfd_of_public_first_derivative() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: 0.9.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.9),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,
@@ -356,7 +356,7 @@ fn test_matern_aniso_operator_penalties_use_cross_provider() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: 0.9.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.9),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,

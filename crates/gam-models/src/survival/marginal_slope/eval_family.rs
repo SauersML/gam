@@ -447,7 +447,7 @@ impl SurvivalMarginalSlopeFamily {
         }))
     }
 
-    pub(crate) fn rigid_baseline_exact_joint_psisecond_order_terms_with_options(
+    pub(crate) fn baseline_exact_joint_psisecond_order_terms_with_options(
         &self,
         block_states: &[ParameterBlockState],
         axis: usize,
@@ -455,8 +455,81 @@ impl SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let geometry = self.rigid_baseline_geometry()?;
-        let (objective_psi_psi, score_psi_psi, hessian_psi_psi_operator) = self
-            .reduce_rigid_family_primary_terms(block_states, options, |row| {
+        if self.per_z_logslope_active() {
+            return Err(
+                "survival marginal-slope baseline family pairs do not support per-score logslope geometry"
+                    .to_string(),
+            );
+        }
+        let use_flex = self.effective_flex_active(block_states)? || self.flex_timewiggle_active();
+        let (objective_psi_psi, score_psi_psi, hessian_psi_psi_operator) = if use_flex {
+            self.reduce_flex_family_coefficient_terms(block_states, options, |row| {
+                let first = Self::flex_baseline_first(geometry, row, axis)?;
+                let other_first = Self::flex_baseline_first(geometry, row, other_axis)?;
+                let second =
+                    Self::flex_baseline_second(geometry, row, axis, other_axis)?;
+                if axis == other_axis {
+                    return self
+                        .flex_family_direction_row_terms(
+                            row,
+                            block_states,
+                            first,
+                            second,
+                            None,
+                        )
+                        .map(|terms| terms.second);
+                }
+
+                let combined_first = FlexFamilyRowDirection {
+                    entry: first.entry + other_first.entry,
+                    exit: first.exit + other_first.exit,
+                    derivative_exit: first.derivative_exit + other_first.derivative_exit,
+                    probit_scale: first.probit_scale + other_first.probit_scale,
+                };
+                let twice_cross = FlexFamilyRowDirection {
+                    entry: 2.0 * second.entry,
+                    exit: 2.0 * second.exit,
+                    derivative_exit: 2.0 * second.derivative_exit,
+                    probit_scale: 2.0 * second.probit_scale,
+                };
+                let combined = self
+                    .flex_family_direction_row_terms(
+                        row,
+                        block_states,
+                        combined_first,
+                        twice_cross,
+                        None,
+                    )?
+                    .second;
+                let axis_diagonal = self
+                    .flex_family_direction_row_terms(
+                        row,
+                        block_states,
+                        first,
+                        FlexFamilyRowDirection::default(),
+                        None,
+                    )?
+                    .second;
+                let other_diagonal = self
+                    .flex_family_direction_row_terms(
+                        row,
+                        block_states,
+                        other_first,
+                        FlexFamilyRowDirection::default(),
+                        None,
+                    )?
+                    .second;
+                Ok(combine_flex_family_coefficient_terms(
+                    &combined,
+                    0.5,
+                    &axis_diagonal,
+                    -0.5,
+                    &other_diagonal,
+                    -0.5,
+                ))
+            })?
+        } else {
+            self.reduce_rigid_family_primary_terms(block_states, options, |row| {
                 let first = Self::rigid_baseline_primary_first(geometry, row, axis)?;
                 let other_first =
                     Self::rigid_baseline_primary_first(geometry, row, other_axis)?;
@@ -503,6 +576,80 @@ impl SurvivalMarginalSlopeFamily {
                     &other_diagonal,
                     -0.5,
                 ))
+            })?
+        };
+        Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
+            objective_psi_psi,
+            score_psi_psi,
+            hessian_psi_psi: Array2::zeros((0, 0)),
+            hessian_psi_psi_operator: Some(hessian_psi_psi_operator),
+        }))
+    }
+
+    /// Exact baseline-family × design-hyper pair at fixed coefficients.
+    ///
+    /// The FLEX Jet3 direction receives the actual `X_psi` row.  Its value
+    /// seed is `X_psi beta` and its inner gradient seed is `X_psi`, so this
+    /// one row program differentiates both the predictor and the
+    /// coefficient-space pullback.  Treating `first.gradient` as this mixed
+    /// pair would omit the latter and is therefore forbidden.
+    pub(crate) fn baseline_design_exact_joint_psisecond_order_terms_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        baseline_axis: usize,
+        design_psi_index: usize,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let geometry = self.rigid_baseline_geometry()?;
+        if self.per_z_logslope_active() {
+            return Err(
+                "survival marginal-slope baseline-by-design calculus does not support per-score logslope geometry"
+                    .to_string(),
+            );
+        }
+        let use_flex = self.effective_flex_active(block_states)? || self.flex_timewiggle_active();
+        if !use_flex {
+            return Err(
+                "survival marginal-slope rigid baseline-by-design calculus is not installed; refusing to substitute FLEX or a zero mixed pair"
+                    .to_string(),
+            );
+        }
+        let Some((block, local_index, coefficient_width, label)) =
+            self.psi_block_info(derivative_blocks, design_psi_index)?
+        else {
+            return Err(format!(
+                "survival marginal-slope design hyper axis {design_psi_index} has no derivative block"
+            ));
+        };
+        let derivative = &derivative_blocks[block][local_index];
+        let policy = gam_runtime::resource::ResourcePolicy::default_library();
+        let psi_map = crate::custom_family::resolve_custom_family_x_psi_map(
+            derivative,
+            self.n,
+            coefficient_width,
+            0..self.n,
+            label,
+            &policy,
+        )?;
+        let (objective_psi_psi, score_psi_psi, hessian_psi_psi_operator) = self
+            .reduce_flex_family_coefficient_terms(block_states, options, |row| {
+                let derivative_row = psi_map
+                    .row_vector(row)
+                    .map_err(|error| format!("survival family-by-design psi row: {error}"))?;
+                let first = Self::flex_baseline_first(geometry, row, baseline_axis)?;
+                self.flex_family_design_direction_row_terms(
+                    row,
+                    block_states,
+                    first,
+                    FlexFamilyRowDirection::default(),
+                    block,
+                    &derivative_row,
+                )?
+                .directional
+                .ok_or_else(|| {
+                    "FLEX family design-direction row did not return its Jet3 channel".to_string()
+                })
             })?;
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
@@ -512,7 +659,7 @@ impl SurvivalMarginalSlopeFamily {
         }))
     }
 
-    pub(crate) fn rigid_baseline_exact_joint_psihessian_directional_derivative_with_options(
+    pub(crate) fn baseline_exact_joint_psihessian_directional_derivative_with_options(
         &self,
         block_states: &[ParameterBlockState],
         axis: usize,
@@ -520,11 +667,38 @@ impl SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Array2<f64>>, String> {
         let geometry = self.rigid_baseline_geometry()?;
+        if self.per_z_logslope_active() {
+            return Err(
+                "survival marginal-slope baseline family Hessian drift does not support per-score logslope geometry"
+                    .to_string(),
+            );
+        }
         let slices = block_slices(self, block_states);
-        let (_, _, operator) = self.reduce_rigid_family_primary_terms(
-            block_states,
-            options,
-            |row| {
+        if d_beta_flat.len() != slices.total {
+            return Err(format!(
+                "survival marginal-slope baseline family beta direction length {} != flattened coefficient width {}",
+                d_beta_flat.len(),
+                slices.total,
+            ));
+        }
+        let use_flex = self.effective_flex_active(block_states)? || self.flex_timewiggle_active();
+        let (_, _, operator) = if use_flex {
+            self.reduce_flex_family_coefficient_terms(block_states, options, |row| {
+                let first = Self::flex_baseline_first(geometry, row, axis)?;
+                self.flex_family_direction_row_terms(
+                    row,
+                    block_states,
+                    first,
+                    FlexFamilyRowDirection::default(),
+                    Some(d_beta_flat),
+                )?
+                .directional
+                .ok_or_else(|| {
+                    "FLEX family beta-direction row did not return its Jet3 channel".to_string()
+                })
+            })?
+        } else {
+            self.reduce_rigid_family_primary_terms(block_states, options, |row| {
                 let first = Self::rigid_baseline_primary_first(geometry, row, axis)?;
                 let direction = self.row_primary_direction_from_flat_dynamic(
                     row,
@@ -539,14 +713,8 @@ impl SurvivalMarginalSlopeFamily {
                     first,
                     primary_direction,
                 )
-            },
-        )?;
-        let mut dense = Array2::<f64>::zeros((slices.total, slices.total));
-        for column in 0..slices.total {
-            let mut basis = Array1::<f64>::zeros(slices.total);
-            basis[column] = 1.0;
-            dense.column_mut(column).assign(&operator.mul_vec(&basis));
-        }
-        Ok(Some(dense))
+            })?
+        };
+        Ok(Some(operator.to_dense()))
     }
 }

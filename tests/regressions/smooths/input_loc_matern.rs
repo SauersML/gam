@@ -105,7 +105,7 @@ fn matern_gradient_dkappa_matches_finite_difference() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: 0.7.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.7),
         nu: MaternNu::SevenHalves,
         include_intercept: false,
         double_penalty: false,

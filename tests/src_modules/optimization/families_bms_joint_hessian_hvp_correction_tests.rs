@@ -1832,7 +1832,7 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
-                    length_scale: length_scale.into(),
+                    length_scale: gam::terms::basis::MaternLengthScale::fixed(length_scale),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,
@@ -2062,7 +2062,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
-                    length_scale: length_scale.into(),
+                    length_scale: gam::terms::basis::MaternLengthScale::fixed(length_scale),
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
                     double_penalty: false,

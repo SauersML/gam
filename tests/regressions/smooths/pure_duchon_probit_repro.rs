@@ -91,7 +91,7 @@ fn matern_pc3(name: &str) -> SmoothTermSpec {
             spec: MaternBasisSpec {
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
                 periodic: None,
-                length_scale: 1.0.into(),
+                length_scale: gam::terms::basis::MaternLengthScale::fixed(1.0),
                 nu: MaternNu::ThreeHalves,
                 include_intercept: false,
                 double_penalty: false,

@@ -37,7 +37,7 @@ fn matern_smooth(name: &str, centers: usize) -> SmoothTermSpec {
                     num_centers: centers,
                 },
                 periodic: None,
-                length_scale: 1.0.into(),
+                length_scale: gam::terms::basis::MaternLengthScale::fixed(1.0),
                 nu: MaternNu::ThreeHalves,
                 include_intercept: false,
                 double_penalty: false,

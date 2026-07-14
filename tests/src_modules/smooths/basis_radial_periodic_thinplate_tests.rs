@@ -5915,7 +5915,7 @@ fn test_matern_center_sum_tozero_produces_kernel_transform() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
-        length_scale: 0.7.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.7),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,
@@ -5952,7 +5952,7 @@ fn test_matern_operator_penalties_follow_rkhs_smoothness() {
         let spec = MaternBasisSpec {
             periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
-            length_scale: 0.4.into(),
+            length_scale: gam::terms::basis::MaternLengthScale::fixed(0.4),
             nu,
             include_intercept: false,
             double_penalty: false,
@@ -6152,7 +6152,7 @@ fn test_matern_overspecified_centers_yield_full_rank_basis() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: 3.0.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(3.0),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,
@@ -6192,7 +6192,7 @@ fn test_matern_include_intercept_keeps_single_unpenalized_dimension() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
-        length_scale: 1.1.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(1.1),
         nu: MaternNu::ThreeHalves,
         include_intercept: true,
         double_penalty: false,
@@ -6213,7 +6213,7 @@ fn test_matern_double_penalty_omits_structurally_absent_nullspace_block_without_
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: 1.1.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(1.1),
         nu: MaternNu::ThreeHalves,
         include_intercept: false,
         double_penalty: true,
@@ -6237,7 +6237,7 @@ fn test_matern_double_penalty_keeps_intercept_shrinkage_block() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: 1.1.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(1.1),
         nu: MaternNu::ThreeHalves,
         include_intercept: true,
         double_penalty: true,
@@ -6283,7 +6283,7 @@ fn matern_frozen_transform_skips_rank_reduction_on_degenerate_cloud() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
-        length_scale: 1.1.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(1.1),
         nu: MaternNu::ThreeHalves,
         include_intercept: false,
         double_penalty: false,
@@ -6349,7 +6349,7 @@ fn matern_cold_zero_rank_cloud_fails_loudly() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: 1.0e-3.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(1.0e-3),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,
@@ -6372,7 +6372,7 @@ fn test_matern_log_kappa_derivative_matchesfd() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: 0.9.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.9),
         nu: MaternNu::FiveHalves,
         include_intercept: false,
         double_penalty: false,
@@ -6449,7 +6449,7 @@ fn test_matern_double_penalty_log_kappa_derivative_matchesfd() {
     let spec = MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
-        length_scale: 0.9.into(),
+        length_scale: gam::terms::basis::MaternLengthScale::fixed(0.9),
         nu: MaternNu::FiveHalves,
         include_intercept: true,
         double_penalty: true,

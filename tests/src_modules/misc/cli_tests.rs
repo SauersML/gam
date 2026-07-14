@@ -3261,7 +3261,7 @@ fn does_notwarn_for_singlemultivariate_matern_spatial_term() {
                 feature_cols: vec![0, 1, 2],
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                    length_scale: 1.0.into(),
+                    length_scale: gam::terms::basis::MaternLengthScale::fixed(1.0),
                     nu: MaternNu::ThreeHalves,
                     double_penalty: true,
                     include_intercept: false,
