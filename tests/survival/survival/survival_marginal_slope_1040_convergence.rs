@@ -116,15 +116,20 @@ fn resolved_auto_matern_scale(spec: &TermCollectionSpec, channel: &str) -> f64 {
     let SmoothBasisSpec::Matern { spec: matern, .. } = &spec.smooth_terms[0].basis else {
         panic!("{channel} resolved to a non-Matérn basis");
     };
-    let CenterStrategy::FarthestPoint { num_centers } = &matern.center_strategy else {
+    let CenterStrategy::UserProvided(frozen_centers) = &matern.center_strategy else {
         panic!(
-            "{channel} must retain formula-selected farthest-point centers; got {:?}",
+            "{channel} must own the explicit center matrix frozen by formula materialization; got {:?}",
             matern.center_strategy
         );
     };
     assert_eq!(
-        *num_centers, CENTERS,
-        "{channel} must retain the requested center count"
+        frozen_centers.dim(),
+        (CENTERS, 2),
+        "{channel} frozen center matrix must retain the requested count and two-dimensional geometry"
+    );
+    assert!(
+        frozen_centers.iter().all(|value| value.is_finite()),
+        "{channel} frozen center matrix must be finite"
     );
     assert!(
         matches!(matern.nu, MaternNu::FiveHalves),
@@ -188,7 +193,7 @@ fn survival_marginal_slope_auto_matern_logslope_centers12_converges() {
         "[979-SURVIVAL] n={N} centers={CENTERS} total_s={elapsed:.3} \
          marginal_scale={marginal_scale:.6e} logslope_scale={logslope_scale:.6e} \
          outer_iters={} inner_cycles={} converged=certified auto_kappa=both \
-         centers_strategy=farthest_point nu=5/2",
+         requested_centers_strategy=farthest_point resolved_centers_strategy=user_provided nu=5/2",
         fit.fit.outer_iterations, fit.fit.inner_cycles
     );
 

@@ -14,10 +14,11 @@
 //!
 //! A returned fit is the sealed SPEC-20 convergence certificate. Each case
 //! also verifies that materialization and fit freezing preserve the exact
-//! requested model: farthest-point centers, default ν=5/2, and typed `Auto`
-//! Matérn ownership with a positive resolved scale in both channels. Runtime
-//! is emitted as `[979-BINARY]` telemetry. The invoking workflow owns the
-//! wall-clock timeout so a blocked fit is interrupted externally.
+//! requested model: the selected farthest-point rows are frozen as an explicit
+//! center matrix of the requested size, ν remains the default 5/2, and typed
+//! `Auto` Matérn ownership retains a positive resolved scale in both channels.
+//! Runtime is emitted as `[979-BINARY]` telemetry. The invoking workflow owns
+//! the wall-clock timeout so a blocked fit is interrupted externally.
 
 use csv::StringRecord;
 use gam::terms::basis::{CenterStrategy, MaternLengthScale, MaternNu};
@@ -119,15 +120,20 @@ fn resolved_auto_matern_scale(
     let SmoothBasisSpec::Matern { spec: matern, .. } = &spec.smooth_terms[0].basis else {
         panic!("{channel} resolved to a non-Matérn basis");
     };
-    let CenterStrategy::FarthestPoint { num_centers } = &matern.center_strategy else {
+    let CenterStrategy::UserProvided(frozen_centers) = &matern.center_strategy else {
         panic!(
-            "{channel} must retain formula-selected farthest-point centers; got {:?}",
+            "{channel} must own the explicit center matrix frozen by formula materialization; got {:?}",
             matern.center_strategy
         );
     };
     assert_eq!(
-        *num_centers, expected_centers,
-        "{channel} must retain the requested center count"
+        frozen_centers.dim(),
+        (expected_centers, 2),
+        "{channel} frozen center matrix must retain the requested count and two-dimensional geometry"
+    );
+    assert!(
+        frozen_centers.iter().all(|value| value.is_finite()),
+        "{channel} frozen center matrix must be finite"
     );
     assert!(
         matches!(matern.nu, MaternNu::FiveHalves),
@@ -198,7 +204,7 @@ fn fit_issue_case(centers: usize) {
         "[979-BINARY] n={N} centers={centers} total_s={elapsed:.3} \
          marginal_scale={marginal_scale:.6e} logslope_scale={logslope_scale:.6e} \
          outer_iters={} inner_cycles={} converged=certified auto_kappa=both \
-         centers_strategy=farthest_point nu=5/2",
+         requested_centers_strategy=farthest_point resolved_centers_strategy=user_provided nu=5/2",
         fit.fit.outer_iterations, fit.fit.inner_cycles
     );
 }
