@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
+use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve, SolveLstsq};
 use faer::{Side, Unbind};
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerLinalgError, FaerSvd, array1_to_col_matmut};
 use gam_linalg::utils::{StableSolver, array_is_finite, boundary_hit_step_fraction};
@@ -1323,10 +1323,7 @@ fn fallback_projected_gradient_direction(
         -gradient
     } else {
         let Some((stationarity_residual, _multipliers)) =
-            project_stationarity_residual_on_constraint_cone(
-                gradient,
-                &working_constraints.a,
-            )
+            project_stationarity_residual_on_constraint_cone(gradient, &working_constraints.a)
         else {
             return Ok(None);
         };
@@ -1749,13 +1746,9 @@ fn solve_newton_direction_with_linear_constraints_impl(
         return Ok(());
     }
     let fallback_working = gather_linear_constraint_rows(constraints, &active)?;
-    if let Some((fallback_direction, fallback_active)) = fallback_projected_gradient_direction(
-        &x,
-        &d_total,
-        &g_cur,
-        &fallback_working,
-        constraints,
-    )? {
+    if let Some((fallback_direction, fallback_active)) =
+        fallback_projected_gradient_direction(&x, &d_total, &g_cur, &fallback_working, constraints)?
+    {
         if let Some(hint) = active_hint {
             hint.clear();
             hint.extend(fallback_active);
@@ -2028,17 +2021,15 @@ fn fallback_projected_gradient_direction_with_constraint_set(
     if step_inf <= 1e-12 {
         let (worst, _) = ops.max_violation(&values_x);
         if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
-            let Some(projected) =
-                project_point_strictly_into_feasible_constraint_set(x, ops.set).filter(
-                    |candidate| {
-                        ops.values(candidate)
-                            .map(|candidate_values| {
-                                ops.max_violation(&candidate_values).0
-                                    <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-                            })
-                            .unwrap_or(false)
-                    },
-                )
+            let Some(projected) = project_point_strictly_into_feasible_constraint_set(x, ops.set)
+                .filter(|candidate| {
+                    ops.values(candidate)
+                        .map(|candidate_values| {
+                            ops.max_violation(&candidate_values).0
+                                <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+                        })
+                        .unwrap_or(false)
+                })
             else {
                 return Ok(None);
             };
@@ -2122,8 +2113,7 @@ fn solve_newton_direction_with_constraint_set_impl(
     if !has_active_hint && solve_newton_direction_dense(hessian, gradient, direction_out).is_ok() {
         let candidate = beta + &*direction_out;
         let candidate_values = ops.values(&candidate)?;
-        let feasible =
-            (0..m).all(|row| ops.scaled_slack(&candidate_values, row) >= -tol_active);
+        let feasible = (0..m).all(|row| ops.scaled_slack(&candidate_values, row) >= -tol_active);
         if feasible {
             return Ok(());
         }
@@ -2371,11 +2361,7 @@ fn solve_newton_direction_with_constraint_set_impl(
     }
     if let Some((fallback_direction, fallback_active)) =
         fallback_projected_gradient_direction_with_constraint_set(
-            &x,
-            &d_total,
-            &g_cur,
-            &active,
-            ops,
+            &x, &d_total, &g_cur, &active, ops,
         )?
     {
         if let Some(hint) = active_hint.as_mut() {
@@ -2469,9 +2455,13 @@ pub fn solve_quadratic_with_constraint_set(
     warm_active_set: Option<&[usize]>,
 ) -> Result<(Array1<f64>, Vec<usize>), EstimationError> {
     match set {
-        ConstraintSet::Dense(dense) => {
-            solve_quadratic_with_linear_constraints(hessian, rhs, beta_start, dense, warm_active_set)
-        }
+        ConstraintSet::Dense(dense) => solve_quadratic_with_linear_constraints(
+            hessian,
+            rhs,
+            beta_start,
+            dense,
+            warm_active_set,
+        ),
         _ => {
             if hessian.ncols() != hessian.nrows()
                 || rhs.len() != hessian.nrows()
@@ -2485,8 +2475,7 @@ pub fn solve_quadratic_with_constraint_set(
             let ops = ConstraintSetOps::new(set, 0.0)?;
             let gradient = hessian.dot(beta_start) - rhs;
             let mut delta = Array1::<f64>::zeros(beta_start.len());
-            let mut active_hint =
-                warm_active_set.map_or_else(Vec::new, |active| active.to_vec());
+            let mut active_hint = warm_active_set.map_or_else(Vec::new, |active| active.to_vec());
             let max_iterations = (beta_start.len() + set.nrows() + 8) * 4;
             solve_newton_direction_with_constraint_set_impl(
                 hessian,
@@ -2636,11 +2625,11 @@ mod tests {
         project_point_strictly_into_feasible_constraint_set,
         project_stationarity_residual_on_constraint_cone,
         rank_reduce_rows_pivoted_qr_with_dependence, scaled_constraint_slack,
-        solve_newton_direction_with_linear_constraints_impl,
-        solve_quadratic_with_constraint_set, solve_quadratic_with_linear_constraints,
+        solve_newton_direction_with_linear_constraints_impl, solve_quadratic_with_constraint_set,
+        solve_quadratic_with_linear_constraints,
     };
-    use gam_problem::KhatriRaoConeConstraints;
     use approx::assert_relative_eq;
+    use gam_problem::KhatriRaoConeConstraints;
     use ndarray::{Array1, Array2, array};
 
     /// A `β = 0` seed sits on the boundary of EVERY row of a homogeneous
@@ -2805,8 +2794,8 @@ mod tests {
         let x = array![0.0_f64];
         let d_total = array![0.0_f64];
         let gradient = array![-1.0_f64];
-        let constraints = LinearInequalityConstraints::new(array![[1.0]], array![0.0])
-            .expect("one-sided bound");
+        let constraints =
+            LinearInequalityConstraints::new(array![[1.0]], array![0.0]).expect("one-sided bound");
 
         let (direction, active) = fallback_projected_gradient_direction(
             &x,
@@ -3105,14 +3094,8 @@ mod tests {
     /// 4 × 2, coefficient block is 3 × 2 (row 0 unconstrained location,
     /// rows 1–2 coupled), so p = 6 and the cone has 8 rows.
     fn small_cone() -> KhatriRaoConeConstraints {
-        let psi = array![
-            [1.0_f64, 0.2],
-            [1.0, -0.4],
-            [1.0, 1.3],
-            [1.0, 0.8],
-        ];
-        KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1, 2], 3)
-            .expect("small cone")
+        let psi = array![[1.0_f64, 0.2], [1.0, -0.4], [1.0, 1.3], [1.0, 0.8],];
+        KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1, 2], 3).expect("small cone")
     }
 
     /// Deterministic PD Hessian with off-diagonal coupling so active-set
@@ -3201,7 +3184,10 @@ mod tests {
                 "interior operator solve must match unconstrained optimum at {j}"
             );
         }
-        assert!(active_op.is_empty(), "interior optimum must have empty face");
+        assert!(
+            active_op.is_empty(),
+            "interior optimum must have empty face"
+        );
     }
 
     #[test]
@@ -3254,7 +3240,11 @@ mod tests {
             solve_quadratic_with_constraint_set(&hessian, &rhs, &beta_start, &set, Some(&[0]))
                 .expect("vertex solve");
 
-        assert_eq!(active, vec![0], "redundant tight rows entered the working set");
+        assert_eq!(
+            active,
+            vec![0],
+            "redundant tight rows entered the working set"
+        );
         assert!(beta[2].abs() <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL);
         assert!((beta[0] - 0.3).abs() < 1e-10);
         assert!((beta[1] + 0.2).abs() < 1e-10);
