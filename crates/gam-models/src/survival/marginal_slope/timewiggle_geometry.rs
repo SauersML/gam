@@ -20,19 +20,37 @@ pub(crate) struct TimewiggleBasisDerivativeRows<'a> {
 }
 
 impl<'a> TimewiggleBasisDerivativeRows<'a> {
-    fn from_geometry(
+    pub(crate) fn new(
+        basis: ArrayView1<'a, f64>,
+        basis_d1: ArrayView1<'a, f64>,
+        basis_d2: ArrayView1<'a, f64>,
+        basis_d3: ArrayView1<'a, f64>,
+        basis_d4: ArrayView1<'a, f64>,
+        basis_d5: ArrayView1<'a, f64>,
+    ) -> Self {
+        Self {
+            basis,
+            basis_d1,
+            basis_d2,
+            basis_d3,
+            basis_d4,
+            basis_d5,
+        }
+    }
+
+    pub(crate) fn from_geometry(
         geometry: &'a SurvivalTimeWiggleGeometry,
         basis_d5: &'a Array2<f64>,
         row: usize,
     ) -> Self {
-        Self {
-            basis: geometry.basis.row(row),
-            basis_d1: geometry.basis_d1.row(row),
-            basis_d2: geometry.basis_d2.row(row),
-            basis_d3: geometry.basis_d3.row(row),
-            basis_d4: geometry.basis_d4.row(row),
-            basis_d5: basis_d5.row(row),
-        }
+        Self::new(
+            geometry.basis.row(row),
+            geometry.basis_d1.row(row),
+            geometry.basis_d2.row(row),
+            geometry.basis_d3.row(row),
+            geometry.basis_d4.row(row),
+            basis_d5.row(row),
+        )
     }
 
     fn validate_width(&self, width: usize, endpoint: &str) -> Result<(), String> {
@@ -576,22 +594,42 @@ impl SurvivalMarginalSlopeFamily {
         let h1 = x_exit_base.dot(&beta_time_base) + self.offset_exit[row] + base_marginal;
         let d_raw = x_deriv_base.dot(&beta_time_base) + self.derivative_offset_exit[row];
 
-        let entry_geom = self
-            .time_wiggle_geometry(Array1::from_vec(vec![h0]).view(), beta_time_w)?
+        let (entry_geom, entry_basis_d5) = self
+            .time_wiggle_geometry_with_basis_d5(Array1::from_vec(vec![h0]).view(), beta_time_w)?
             .ok_or_else(|| {
                 "survival marginal-slope timewiggle metadata is present but geometry could not be built at entry"
                     .to_string()
             })?;
-        let exit_geom = self
-            .time_wiggle_geometry(Array1::from_vec(vec![h1]).view(), beta_time_w)?
+        let (exit_geom, exit_basis_d5) = self
+            .time_wiggle_geometry_with_basis_d5(Array1::from_vec(vec![h1]).view(), beta_time_w)?
             .ok_or_else(|| {
                 "survival marginal-slope timewiggle metadata is present but geometry could not be built at exit"
                     .to_string()
             })?;
 
-        out.q0 = h0 + entry_geom.basis.row(0).dot(&beta_time_w);
-        out.q1 = h1 + exit_geom.basis.row(0).dot(&beta_time_w);
-        out.qd1 = exit_geom.dq_dq0[0] * d_raw;
+        let beta_time_w_scalars = beta_time_w.as_slice().ok_or_else(|| {
+            "survival marginal-slope timewiggle coefficient view must be contiguous".to_string()
+        })?;
+        let entry_basis =
+            TimewiggleBasisDerivativeRows::from_geometry(&entry_geom, &entry_basis_d5, 0);
+        let exit_basis =
+            TimewiggleBasisDerivativeRows::from_geometry(&exit_geom, &exit_basis_d5, 0);
+        let scalar_q = timewiggle_q_from_basis_derivative_rows(
+            &h0,
+            &h1,
+            &d_raw,
+            beta_time_w_scalars,
+            &entry_basis,
+            &exit_basis,
+            TimewiggleQBaseValues {
+                q0: h0 + entry_geom.basis.row(0).dot(&beta_time_w),
+                q1: h1 + exit_geom.basis.row(0).dot(&beta_time_w),
+                dq1_dh1: exit_geom.dq_dq0[0],
+            },
+        )?;
+        out.q0 = scalar_q.q0;
+        out.q1 = scalar_q.q1;
+        out.qd1 = scalar_q.qd1;
 
         for j in 0..p_base {
             out.dq0_time[j] = entry_geom.dq_dq0[0] * x_entry_base[j];
@@ -774,5 +812,249 @@ impl SurvivalMarginalSlopeFamily {
             mu,
             psi_row: psi_row.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod generic_scalar_q_tests {
+    use super::*;
+    use gam_math::jet_scalar::{JetScalar, OneSeed, Order2};
+    use gam_math::nested_dual::Dual2;
+    use ndarray::Array1;
+
+    // Two analytic basis functions, B0(h)=h^2 and B1(h)=exp(h), represented by
+    // their exact B..B5 rows. This isolates the scalar algebra from spline
+    // construction and contains no finite-difference oracle.
+    fn analytic_basis_derivatives(h: f64) -> [Array1<f64>; 6] {
+        let exponential = h.exp();
+        [
+            Array1::from_vec(vec![h * h, exponential]),
+            Array1::from_vec(vec![2.0 * h, exponential]),
+            Array1::from_vec(vec![2.0, exponential]),
+            Array1::from_vec(vec![0.0, exponential]),
+            Array1::from_vec(vec![0.0, exponential]),
+            Array1::from_vec(vec![0.0, exponential]),
+        ]
+    }
+
+    fn derivative_rows(derivatives: &[Array1<f64>; 6]) -> TimewiggleBasisDerivativeRows<'_> {
+        TimewiggleBasisDerivativeRows::new(
+            derivatives[0].view(),
+            derivatives[1].view(),
+            derivatives[2].view(),
+            derivatives[3].view(),
+            derivatives[4].view(),
+            derivatives[5].view(),
+        )
+    }
+
+    fn analytic_base_values(h0: f64, h1: f64, beta: [f64; 2]) -> TimewiggleQBaseValues {
+        TimewiggleQBaseValues {
+            q0: h0 + beta[0] * h0 * h0 + beta[1] * h0.exp(),
+            q1: h1 + beta[0] * h1 * h1 + beta[1] * h1.exp(),
+            dq1_dh1: 1.0 + 2.0 * beta[0] * h1 + beta[1] * h1.exp(),
+        }
+    }
+
+    fn analytic_q<const K: usize, J: JetScalar<K>>(
+        h0: &J,
+        h1: &J,
+        d_raw: &J,
+        beta: &[J; 2],
+    ) -> TimewiggleScalarQ<J> {
+        let entry_exponential = h0.exp();
+        let exit_exponential = h1.exp();
+        let q0 = h0
+            .add(&beta[0].mul(&h0.mul(h0)))
+            .add(&beta[1].mul(&entry_exponential));
+        let q1 = h1
+            .add(&beta[0].mul(&h1.mul(h1)))
+            .add(&beta[1].mul(&exit_exponential));
+        let dq1_dh1 = J::constant(1.0)
+            .add(&beta[0].mul(&h1.scale(2.0)))
+            .add(&beta[1].mul(&exit_exponential));
+        TimewiggleScalarQ {
+            q0,
+            q1,
+            qd1: dq1_dh1.mul(d_raw),
+        }
+    }
+
+    fn assert_close(actual: f64, expected: f64, channel: &str) {
+        let tolerance = 1024.0 * f64::EPSILON * (1.0 + actual.abs().max(expected.abs()));
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{channel}: actual={actual:.17e}, expected={expected:.17e}, tolerance={tolerance:.3e}"
+        );
+    }
+
+    fn assert_order2<const K: usize>(
+        actual: &Order2<K>,
+        expected: &Order2<K>,
+        prefix: &str,
+    ) {
+        assert_close(actual.value(), expected.value(), &format!("{prefix}.value"));
+        for a in 0..K {
+            assert_close(actual.g()[a], expected.g()[a], &format!("{prefix}.g[{a}]"));
+            for b in 0..K {
+                assert_close(
+                    actual.h()[a][b],
+                    expected.h()[a][b],
+                    &format!("{prefix}.h[{a}][{b}]"),
+                );
+            }
+        }
+    }
+
+    fn assert_dual_order2<const K: usize>(
+        actual: &Dual2<Order2<K>>,
+        expected: &Dual2<Order2<K>>,
+        prefix: &str,
+    ) {
+        assert_order2(&actual.v, &expected.v, &format!("{prefix}.v"));
+        assert_order2(&actual.g, &expected.g, &format!("{prefix}.g"));
+        assert_order2(&actual.h, &expected.h, &format!("{prefix}.h"));
+    }
+
+    fn assert_oneseed<const K: usize>(
+        actual: &OneSeed<K>,
+        expected: &OneSeed<K>,
+        prefix: &str,
+    ) {
+        assert_order2(&actual.base, &expected.base, &format!("{prefix}.base"));
+        assert_order2(&actual.eps, &expected.eps, &format!("{prefix}.eps"));
+    }
+
+    fn assert_dual_oneseed<const K: usize>(
+        actual: &Dual2<OneSeed<K>>,
+        expected: &Dual2<OneSeed<K>>,
+        prefix: &str,
+    ) {
+        assert_oneseed(&actual.v, &expected.v, &format!("{prefix}.v"));
+        assert_oneseed(&actual.g, &expected.g, &format!("{prefix}.g"));
+        assert_oneseed(&actual.h, &expected.h, &format!("{prefix}.h"));
+    }
+
+    fn order2_family_variable<const K: usize>(
+        value: f64,
+        axis: usize,
+        family_first: f64,
+        family_second: f64,
+    ) -> Dual2<Order2<K>> {
+        Dual2 {
+            v: Order2::variable(value, axis),
+            g: Order2::constant(family_first),
+            h: Order2::constant(family_second),
+        }
+    }
+
+    fn oneseed_family_variable<const K: usize>(
+        value: f64,
+        axis: usize,
+        direction: f64,
+        family_first: f64,
+        family_second: f64,
+    ) -> Dual2<OneSeed<K>> {
+        Dual2 {
+            v: OneSeed::seed_direction(value, axis, direction),
+            g: OneSeed::constant(family_first),
+            h: OneSeed::constant(family_second),
+        }
+    }
+
+    #[test]
+    fn f64_timewiggle_q_preserves_current_value_bits() {
+        let values = [0.35, -0.4, 1.2, 0.18, 0.07];
+        let beta = [values[3], values[4]];
+        let entry_derivatives = analytic_basis_derivatives(values[0]);
+        let exit_derivatives = analytic_basis_derivatives(values[1]);
+        let entry_rows = derivative_rows(&entry_derivatives);
+        let exit_rows = derivative_rows(&exit_derivatives);
+        let base_values = analytic_base_values(values[0], values[1], beta);
+
+        let actual = timewiggle_q_from_basis_derivative_rows(
+            &values[0],
+            &values[1],
+            &values[2],
+            &beta,
+            &entry_rows,
+            &exit_rows,
+            base_values,
+        )
+        .expect("analytic B..B5 rows have matching widths");
+
+        assert_eq!(actual.q0.to_bits(), base_values.q0.to_bits());
+        assert_eq!(actual.q1.to_bits(), base_values.q1.to_bits());
+        assert_eq!(
+            actual.qd1.to_bits(),
+            (base_values.dq1_dh1 * values[2]).to_bits()
+        );
+    }
+
+    #[test]
+    fn dual2_order2_timewiggle_q_matches_analytic_scalar_program() {
+        const K: usize = 5;
+        let values = [0.35, -0.4, 1.2, 0.18, 0.07];
+        let h0 = order2_family_variable(values[0], 0, 0.11, -0.03);
+        let h1 = order2_family_variable(values[1], 1, -0.08, 0.02);
+        let d_raw = order2_family_variable(values[2], 2, 0.05, -0.01);
+        let beta = [
+            <Dual2<Order2<K>> as JetScalar<K>>::variable(values[3], 3),
+            <Dual2<Order2<K>> as JetScalar<K>>::variable(values[4], 4),
+        ];
+        let entry_derivatives = analytic_basis_derivatives(values[0]);
+        let exit_derivatives = analytic_basis_derivatives(values[1]);
+        let entry_rows = derivative_rows(&entry_derivatives);
+        let exit_rows = derivative_rows(&exit_derivatives);
+
+        let actual = timewiggle_q_from_basis_derivative_rows(
+            &h0,
+            &h1,
+            &d_raw,
+            &beta,
+            &entry_rows,
+            &exit_rows,
+            analytic_base_values(values[0], values[1], [values[3], values[4]]),
+        )
+        .expect("analytic B..B5 rows have matching widths");
+        let expected = analytic_q(&h0, &h1, &d_raw, &beta);
+
+        assert_dual_order2(&actual.q0, &expected.q0, "q0");
+        assert_dual_order2(&actual.q1, &expected.q1, "q1");
+        assert_dual_order2(&actual.qd1, &expected.qd1, "qd1");
+    }
+
+    #[test]
+    fn dual2_oneseed_timewiggle_q_matches_analytic_family_hessian_drift() {
+        const K: usize = 5;
+        let values = [0.35, -0.4, 1.2, 0.18, 0.07];
+        let direction = [0.3, -0.2, 0.15, -0.4, 0.25];
+        let h0 = oneseed_family_variable(values[0], 0, direction[0], 0.11, -0.03);
+        let h1 = oneseed_family_variable(values[1], 1, direction[1], -0.08, 0.02);
+        let d_raw = oneseed_family_variable(values[2], 2, direction[2], 0.05, -0.01);
+        let beta = [
+            oneseed_family_variable(values[3], 3, direction[3], 0.0, 0.0),
+            oneseed_family_variable(values[4], 4, direction[4], 0.0, 0.0),
+        ];
+        let entry_derivatives = analytic_basis_derivatives(values[0]);
+        let exit_derivatives = analytic_basis_derivatives(values[1]);
+        let entry_rows = derivative_rows(&entry_derivatives);
+        let exit_rows = derivative_rows(&exit_derivatives);
+
+        let actual = timewiggle_q_from_basis_derivative_rows(
+            &h0,
+            &h1,
+            &d_raw,
+            &beta,
+            &entry_rows,
+            &exit_rows,
+            analytic_base_values(values[0], values[1], [values[3], values[4]]),
+        )
+        .expect("analytic B..B5 rows have matching widths");
+        let expected = analytic_q(&h0, &h1, &d_raw, &beta);
+
+        assert_dual_oneseed(&actual.q0, &expected.q0, "q0");
+        assert_dual_oneseed(&actual.q1, &expected.q1, "q1");
+        assert_dual_oneseed(&actual.qd1, &expected.qd1, "qd1");
     }
 }
