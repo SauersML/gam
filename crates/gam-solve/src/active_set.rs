@@ -1902,6 +1902,82 @@ fn canonicalize_constraint_set_active_ids(
     Ok(canonical)
 }
 
+/// Project a stationarity residual onto the normal cone of an operator-carried
+/// constraint set without materializing its complete tight face.
+///
+/// `seed_active` is the QP's sparse face. The negative projected residual is a
+/// candidate feasible-tangent direction. If any omitted tight row cuts that
+/// direction off, add the most violated row and re-project. This separation
+/// loop terminates with the same normal/tangent-cone certificate that a dense
+/// all-tight-row NNLS would compute, while gathering only rows that carry
+/// necessary cone geometry.
+pub fn project_stationarity_residual_on_constraint_set(
+    residual: &Array1<f64>,
+    beta: &Array1<f64>,
+    set: &ConstraintSet,
+    seed_active: &[usize],
+) -> Option<(Array1<f64>, Vec<usize>)> {
+    let p = residual.len();
+    if beta.len() != p || set.ncols() != p {
+        return None;
+    }
+    let ops = ConstraintSetOps::new(set, 0.0).ok()?;
+    let values_beta = ops.values(beta).ok()?;
+    let mut active = Vec::with_capacity(seed_active.len().min(p) + p);
+    let mut is_active = vec![false; ops.nrows()];
+    for &row in seed_active {
+        if row < ops.nrows() && ops.norms[row] > 0.0 && !is_active[row] {
+            active.push(row);
+            is_active[row] = true;
+        }
+    }
+
+    for _ in 0..(p + 8) * 4 {
+        let gathered = ops.gather_unit_rows(&active).ok()?;
+        let projected = if active.is_empty() {
+            residual.clone()
+        } else {
+            project_stationarity_residual_on_constraint_cone(residual, &gathered.a)?.0
+        };
+        if !array_is_finite(&projected) {
+            return None;
+        }
+        let tangent = -&projected;
+        let values_tangent = ops.values(&tangent).ok()?;
+        let mut blocker: Option<(usize, f64)> = None;
+        for row in 0..ops.nrows() {
+            if is_active[row] || ops.norms[row] <= 0.0 {
+                continue;
+            }
+            let slack = ops.scaled_slack(&values_beta, row);
+            if slack > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+                continue;
+            }
+            let rate = values_tangent[row] / ops.norms[row];
+            let scale = slack.abs().max(rate.abs()).max(1.0);
+            let directional_tol = (64.0 * f64::EPSILON * scale).max(1e-14);
+            if rate >= -directional_tol {
+                continue;
+            }
+            match blocker {
+                None => blocker = Some((row, rate)),
+                Some((best_row, best_rate))
+                    if rate < best_rate || (rate == best_rate && row < best_row) =>
+                {
+                    blocker = Some((row, rate));
+                }
+                _ => {}
+            }
+        }
+        let Some((row, _)) = blocker else {
+            return Some((projected, active));
+        };
+        active.push(row);
+        is_active[row] = true;
+    }
+    None
+}
+
 /// First-order escape from a tolerance-band working-set cycle for an operator
 /// constraint carrier. This is the factored equivalent of
 /// [`fallback_projected_gradient_direction`]: project `-gradient` into the
@@ -1920,124 +1996,80 @@ fn fallback_projected_gradient_direction_with_constraint_set(
     d_total: &Array1<f64>,
     gradient: &Array1<f64>,
     active: &[usize],
-    is_active: &[bool],
     ops: &ConstraintSetOps<'_>,
 ) -> Result<Option<(Array1<f64>, Vec<usize>)>, EstimationError> {
     let p = gradient.len();
-    if x.len() != p
-        || d_total.len() != p
-        || ops.set.ncols() != p
-        || is_active.len() != ops.nrows()
-    {
+    if x.len() != p || d_total.len() != p || ops.set.ncols() != p {
         crate::bail_invalid_estim!("operator projected-gradient fallback dimension mismatch");
     }
 
     let values_x = ops.values(x)?;
-    let mut tangent_active = active.to_vec();
-    let mut tangent_is_active = is_active.to_vec();
-    let max_separations = (p + 8) * 4;
-
-    for _ in 0..max_separations {
-        let working_constraints = ops.gather_unit_rows(&tangent_active)?;
-        let tangent_direction = if working_constraints.a.nrows() == 0 {
-            -gradient
-        } else {
-            let Some((stationarity_residual, _multipliers)) =
-                project_stationarity_residual_on_constraint_cone(
-                    gradient,
-                    &working_constraints.a,
+    let Some((stationarity_residual, mut tangent_active)) =
+        project_stationarity_residual_on_constraint_set(gradient, x, ops.set, active)
+    else {
+        return Ok(None);
+    };
+    let tangent_direction = -stationarity_residual;
+    let step_inf = tangent_direction
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+    if step_inf <= 1e-12 {
+        let (worst, _) = ops.max_violation(&values_x);
+        if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+            let Some(projected) =
+                project_point_strictly_into_feasible_constraint_set(x, ops.set).filter(
+                    |candidate| {
+                        ops.values(candidate)
+                            .map(|candidate_values| {
+                                ops.max_violation(&candidate_values).0
+                                    <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+                            })
+                            .unwrap_or(false)
+                    },
                 )
             else {
                 return Ok(None);
             };
-            -stationarity_residual
-        };
-        if !array_is_finite(&tangent_direction) {
-            return Ok(None);
+            let repair = &projected - x;
+            return Ok(Some((d_total + &repair, Vec::new())));
         }
-
-        let step_inf = tangent_direction
-            .iter()
-            .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-        if step_inf <= 1e-12 {
-            let (worst, _) = ops.max_violation(&values_x);
-            if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
-                let Some(projected) =
-                    project_point_strictly_into_feasible_constraint_set(x, ops.set).filter(
-                        |candidate| {
-                            ops.values(candidate)
-                                .map(|candidate_values| {
-                                    ops.max_violation(&candidate_values).0
-                                        <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-                                })
-                                .unwrap_or(false)
-                        },
-                    )
-                else {
-                    return Ok(None);
-                };
-                let repair = &projected - x;
-                return Ok(Some((d_total + &repair, Vec::new())));
-            }
-            return Ok(Some((
-                d_total.clone(),
-                canonicalize_constraint_set_active_ids(ops, &tangent_active)?,
-            )));
-        }
-
-        let directional_derivative = gradient.dot(&tangent_direction);
-        if !directional_derivative.is_finite() || directional_derivative >= 0.0 {
-            return Ok(None);
-        }
-
-        let values_direction = ops.values(&tangent_direction)?;
-        let mut alpha = 1.0_f64;
-        let mut blocking_row = None;
-        for row in 0..ops.nrows() {
-            if ops.norms[row] <= 0.0 || tangent_is_active[row] {
-                continue;
-            }
-            let slack = ops.scaled_slack(&values_x, row);
-            let rate = values_direction[row] / ops.norms[row];
-            if let Some(candidate) = boundary_hit_step_fraction(slack, rate, alpha) {
-                alpha = candidate;
-                blocking_row = Some(row);
-            }
-        }
-
-        // A zero-length ratio-test hit means the sparse face omitted a tight
-        // row whose half-space cuts off this projected direction. Add exactly
-        // that separator and re-project. Materializing every tight row is both
-        // unnecessary and the original #979 performance failure.
-        if alpha <= 1e-12
-            && let Some(row) = blocking_row
-        {
-            tangent_active.push(row);
-            tangent_is_active[row] = true;
-            continue;
-        }
-        if !alpha.is_finite() || alpha <= 0.0 {
-            return Ok(None);
-        }
-
-        let fallback_step = tangent_direction * alpha;
-        let new_x = x + &fallback_step;
-        let new_values = ops.values(&new_x)?;
-        if ops.max_violation(&new_values).0 > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
-            return Ok(None);
-        }
-
-        if let Some(row) = blocking_row
-            && !tangent_is_active[row]
-        {
-            tangent_active.push(row);
-        }
-        tangent_active.retain(|&row| ops.scaled_slack(&new_values, row) <= 1e-10);
-        let next_active = canonicalize_constraint_set_active_ids(ops, &tangent_active)?;
-        return Ok(Some((d_total + &fallback_step, next_active)));
+        return Ok(Some((d_total.clone(), tangent_active)));
     }
 
-    Ok(None)
+    let directional_derivative = gradient.dot(&tangent_direction);
+    if !directional_derivative.is_finite() || directional_derivative >= 0.0 {
+        return Ok(None);
+    }
+    let values_direction = ops.values(&tangent_direction)?;
+    let mut alpha = 1.0_f64;
+    let mut blocking_row = None;
+    for row in 0..ops.nrows() {
+        if ops.norms[row] <= 0.0 {
+            continue;
+        }
+        let slack = ops.scaled_slack(&values_x, row);
+        let rate = values_direction[row] / ops.norms[row];
+        if let Some(candidate) = boundary_hit_step_fraction(slack, rate, alpha) {
+            alpha = candidate;
+            blocking_row = Some(row);
+        }
+    }
+    if !alpha.is_finite() || alpha <= 0.0 {
+        return Ok(None);
+    }
+    let fallback_step = tangent_direction * alpha;
+    let new_x = x + &fallback_step;
+    let new_values = ops.values(&new_x)?;
+    if ops.max_violation(&new_values).0 > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+        return Ok(None);
+    }
+    if let Some(row) = blocking_row
+        && !tangent_active.contains(&row)
+    {
+        tangent_active.push(row);
+    }
+    tangent_active.retain(|&row| ops.scaled_slack(&new_values, row) <= 1e-10);
+    Ok(Some((d_total + &fallback_step, tangent_active)))
 }
 
 fn solve_newton_direction_with_constraint_set_impl(
@@ -2300,7 +2332,6 @@ fn solve_newton_direction_with_constraint_set_impl(
             &d_total,
             &g_cur,
             &active,
-            &is_active,
             ops,
         )?
     {
@@ -3205,15 +3236,11 @@ mod tests {
         // remaining negative gradient points along its slope coefficient,
         // which lies in the face tangent and moves all other rows inward.
         let gradient = array![0.0_f64, 0.0, 0.0, -1.0];
-        let mut is_active = vec![false; set.nrows()];
-        is_active[0] = true;
-
         let (direction, active) = fallback_projected_gradient_direction_with_constraint_set(
             &x,
             &d_total,
             &gradient,
             &[0],
-            &is_active,
             &ops,
         )
         .expect("operator fallback evaluation")
@@ -3252,15 +3279,11 @@ mod tests {
         let x = Array1::<f64>::zeros(4);
         let d_total = Array1::<f64>::zeros(4);
         let gradient = array![0.0_f64, 0.0, 0.0, -1.0];
-        let mut is_active = vec![false; set.nrows()];
-        is_active[0] = true;
-
         let (direction, active) = fallback_projected_gradient_direction_with_constraint_set(
             &x,
             &d_total,
             &gradient,
             &[0],
-            &is_active,
             &ops,
         )
         .expect("operator separator evaluation")

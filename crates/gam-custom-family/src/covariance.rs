@@ -495,21 +495,26 @@ pub fn projected_linear_constraint_stationarity_vector(
     if residual.len() != p || constraints.ncols() != p {
         return None;
     }
+    if let Some(hint) = known_active_rows {
+        // The QP face is the sparse seed, not necessarily the complete normal
+        // cone: an omitted factored row may be tight and cut off the negative
+        // projected residual at zero step. Use the same separation oracle as
+        // the operator QP cycle escape so step, convergence certificate,
+        // covariance, and return all certify against one cone geometry.
+        return gam_solve::active_set::project_stationarity_residual_on_constraint_set(
+            residual,
+            beta,
+            constraints,
+            hint,
+        )
+        .map(|(projected, _active)| projected);
+    }
     let n_rows = constraints.nrows();
     let values = constraints.values(beta.view()).ok()?;
-    // A supplied QP face is authoritative, including `Some(&[])`. When no face
-    // provenance exists, discover candidates from slack. Using a boolean
-    // membership table preserves canonical row order in either case.
+    // With no QP provenance, discover candidates from slack. Using a boolean
+    // membership table preserves canonical row order.
     let mut in_active = vec![false; n_rows];
-    if let Some(hint) = known_active_rows {
-        for &row in hint {
-            if row < n_rows && constraints.bound(row).is_ok_and(f64::is_finite) {
-                in_active[row] = true;
-            }
-        }
-    }
-    if known_active_rows.is_none() {
-        for row in 0..n_rows {
+    for row in 0..n_rows {
             let bound = constraints.bound(row).ok()?;
             if bound == f64::NEG_INFINITY {
                 continue;
@@ -564,7 +569,6 @@ pub fn projected_linear_constraint_stationarity_vector(
             if slack <= active_tol {
                 in_active[row] = true;
             }
-        }
     }
     let active_rows: Vec<usize> = (0..n_rows).filter(|&row| in_active[row]).collect();
     if active_rows.is_empty() {
