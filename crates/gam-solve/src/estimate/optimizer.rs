@@ -980,22 +980,6 @@ where
                         }
                         seed
                     });
-                //   3. The #2312 exact per-block landscape sweep: one
-                //      Gauss–Seidel pass of certified global 1-D solves of the
-                //      fixed-dispersion working REML criterion over each
-                //      block's generalized eigenmodes (the full m-mode exact
-                //      solve the one-mode surrogates above approximate).
-                //      Like the others it is only a PROPOSAL — admitted below
-                //      solely on a strictly-cheaper true coupled REML cost.
-                let landscape_sweep = reml_state
-                    .analytic_landscape_gauss_seidel_rho(&base, (lo, hi))?
-                    .map(|rho_blocks| {
-                        let mut seed = base.clone();
-                        for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
-                            *coord = r.clamp(lo, hi);
-                        }
-                        seed
-                    });
                 let base_cost = reml_state
                     .compute_cost(&base)
                     .ok()
@@ -1003,10 +987,7 @@ where
                 // Keep the strictly-cheapest certified/scored candidate.
                 let mut refined = base.clone();
                 let mut best_cost = base_cost;
-                for candidate in [initial_sp, summed_diagonal, landscape_sweep]
-                    .into_iter()
-                    .flatten()
-                {
+                for candidate in [initial_sp, summed_diagonal].into_iter().flatten() {
                     let candidate_cost = reml_state
                         .compute_cost(&candidate)
                         .ok()
