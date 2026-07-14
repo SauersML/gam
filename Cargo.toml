@@ -66,10 +66,10 @@ resolver = "3"
 [workspace.dependencies]
 # 0.5.14 makes ARC convergence second-order: reduced-space Hessian curvature
 # is certified and strict saddles take the exact cubic hard-case step. Git-pinned until
-# 0.5.14 is published to crates.io (`cargo login` + `cargo publish -p opt`
+# 0.5.15 is published to crates.io (`cargo login` + `cargo publish -p opt`
 # from /Users/user/opt); the `version` key keeps this publish-compatible —
 # cargo strips the git ref and keeps the version requirement on publish.
-opt = { version = "=0.5.14", git = "https://github.com/SauersML/opt.git", rev = "8684873a62512a05445cc7edab42d854402f006e" }
+opt = { version = "=0.5.15", git = "https://github.com/SauersML/opt.git", rev = "245c5d25e74f0bbc038cfb8aabbed3a9434cf9c9" }
 cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12000"] }
 
 [lints.rust]
