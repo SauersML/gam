@@ -2203,22 +2203,6 @@ pub(crate) fn strict_exact_pseudo_logdet(
         .sum())
 }
 
-/// Numerical nullity of a symmetric penalized Hessian at the shared
-/// `KKT_REFUSAL_RANK_TOL` relative cutoff (the same threshold the spectral
-/// range solve and the REML penalty-rank machinery use). Returns `None` only
-/// when the eigendecomposition fails or the matrix is the zero matrix (no
-/// finite curvature scale to normalize against); callers treat a `None` as
-/// "could not certify full rank" and fall back to the conservative (damped)
-/// path.
-///
-/// This exists so the CONSTRAINED active-set QP branch can decide whether the
-/// joint design is genuinely rank-deficient (`nullity > 0` ⇒ an unidentified
-/// gauge direction that needs the self-vanishing Levenberg floor to make the
-/// QP minimizer unique) or fully identified (`nullity == 0` ⇒ the exact,
-/// undamped Newton/KKT step is well-posed and converges quadratically). The
-/// spectral-range branch already gets this for free via
-/// `JointSpectralNewtonStep::nullity`; the constrained branch never runs the
-/// eigensolve otherwise, so it computes it here on the already-penalized `lhs`.
 /// PSD part of a symmetric matrix: eigendecompose and clamp negative
 /// eigenvalues to zero. Used by the step consumers that REQUIRE a convex
 /// model (the constrained active-set QP and the SPD-PCG matvec) when folding
@@ -2241,10 +2225,29 @@ pub(crate) fn symmetric_psd_projection(matrix: &Array2<f64>) -> Array2<f64> {
     scaled.dot(&evecs.t())
 }
 
-/// Modified-Newton convexification of a symmetric (penalized) Hessian: reflect
-/// every negative-curvature eigen-direction to its magnitude `|λ|` and floor the
-/// remaining (near-null) modes to a small positive multiple of `λmax`, returning
-/// a positive-definite matrix with the SAME eigenvectors.
+pub(crate) struct ConstrainedHessianGeometry {
+    pub(crate) matrix: Array2<f64>,
+    pub(crate) nullity: usize,
+    pub(crate) condition: f64,
+    pub(crate) raw_min_eigenvalue: f64,
+    pub(crate) stabilized_min_eigenvalue: f64,
+}
+
+/// Modified-Newton convexification and selective gauge stabilization for a
+/// symmetric penalized Hessian.
+///
+/// Negative identified curvature is reflected to `|λ|`. Numerical-null modes
+/// receive the requested Levenberg curvature, but identified modes are left at
+/// their exact magnitude. Adding `μ I` to a rank-deficient Hessian makes the QP
+/// unique by perturbing every weak identified direction too, reducing Newton's
+/// quadratic endgame to the measured `H/(H+μ)` linear crawl (#979). Adding
+/// `μ P_null` provides the same gauge uniqueness without changing the Newton
+/// equation on `range(H)`.
+///
+/// A family may separately request the historical full-rank ill-conditioning
+/// damping. That case has no numerical null projector, so it retains the
+/// ambient `λ -> λ + μ` shift. Both policies are constructed from this one
+/// eigendecomposition, along with their rank and condition diagnostics.
 ///
 /// This is the exact negative-curvature handling the unconstrained dense-spectral
 /// path already performs inside `WhitenedHessianSpectrum::assemble` (negative `γ`
@@ -2268,44 +2271,78 @@ pub(crate) fn symmetric_psd_projection(matrix: &Array2<f64>) -> Array2<f64> {
 /// clamp-to-zero null mode would make the QP unbounded along that direction). At
 /// a genuine optimum the constrained Hessian over the identified subspace is PSD,
 /// so the reflection is a no-op there and the converged β is unchanged — exactly
-/// the property the dense path relies on. Falls back to the (symmetrized) input
-/// if the eigendecomposition fails: the conservative undamped step, never a wrong
-/// one.
-pub(crate) fn symmetric_negative_curvature_reflected(matrix: &Array2<f64>) -> Array2<f64> {
+/// the property the dense path relies on. Eigensolver failure is a hard error:
+/// silently reverting to an indefinite or differently damped QP would switch
+/// algorithms after its curvature contract failed.
+pub(crate) fn symmetric_constrained_hessian_geometry(
+    matrix: &Array2<f64>,
+    levenberg_mu: f64,
+    damp_full_rank_ill_conditioned: bool,
+) -> Result<ConstrainedHessianGeometry, String> {
     let p = matrix.nrows();
+    if p == 0 || matrix.ncols() != p {
+        return Err(format!(
+            "constrained Hessian must be nonempty and square, got {}x{}",
+            matrix.nrows(),
+            matrix.ncols()
+        ));
+    }
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
-    let Ok((evals, evecs)) = FaerEigh::eigh(&sym, Side::Lower) else {
-        return sym;
-    };
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower)
+        .map_err(|error| format!("constrained Hessian eigendecomposition failed: {error:?}"))?;
     let lambda_max_abs = evals.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
     if !(lambda_max_abs.is_finite() && lambda_max_abs > 0.0) {
-        return sym;
+        return Err("constrained Hessian has no finite nonzero curvature scale".to_string());
     }
-    // Positive floor for near-null modes: the same relative scale the dense
-    // spectral path uses for its numerical-rank cutoff, so a flat direction
-    // gets a tiny-but-strictly-positive curvature (bounded QP) instead of a
-    // zero one (unbounded QP). Reflecting already makes every above-floor mode
-    // positive; this only lifts the genuine null modes off zero.
+    let cutoff = KKT_REFUSAL_RANK_TOL * lambda_max_abs;
+    let nullity = evals.iter().filter(|value| value.abs() < cutoff).count();
+    let min_range = evals
+        .iter()
+        .map(|value| value.abs())
+        .filter(|magnitude| *magnitude >= cutoff && *magnitude > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let condition = if min_range.is_finite() && min_range > 0.0 {
+        lambda_max_abs / min_range
+    } else {
+        f64::INFINITY
+    };
+    let ambient_levenberg = nullity == 0
+        && damp_full_rank_ill_conditioned
+        && condition > LEVENBERG_ILL_CONDITIONING_THRESHOLD;
     let floor = lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
-    let reflected = Array1::from_iter(evals.iter().map(|lam| lam.abs().max(floor)));
-    let scaled = &evecs * &reflected.view().insert_axis(ndarray::Axis(0));
-    scaled.dot(&evecs.t())
+    let mu = if levenberg_mu.is_finite() && levenberg_mu > 0.0 {
+        levenberg_mu
+    } else {
+        0.0
+    };
+    let stabilized = Array1::from_iter(evals.iter().map(|lambda| {
+        if nullity > 0 && lambda.abs() < cutoff {
+            mu.max(floor)
+        } else if ambient_levenberg {
+            (lambda + mu).abs().max(floor)
+        } else {
+            lambda.abs().max(floor)
+        }
+    }));
+    let stabilized_min_eigenvalue = stabilized
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let scaled = &evecs * &stabilized.view().insert_axis(ndarray::Axis(0));
+    Ok(ConstrainedHessianGeometry {
+        matrix: scaled.dot(&evecs.t()),
+        nullity,
+        condition,
+        raw_min_eigenvalue: evals.iter().copied().fold(f64::INFINITY, f64::min),
+        stabilized_min_eigenvalue,
+    })
 }
 
-/// Smallest (signed) eigenvalue of a symmetric matrix; `NaN` if the
-/// eigendecomposition fails. Diagnostic helper for the #1040 convexification
-/// trace — reads the most-negative curvature so the log can confirm whether the
-/// constrained-QP Hessian is indefinite and whether the reflection engaged.
-pub(crate) fn symmetric_min_eigenvalue_signed(matrix: &Array2<f64>) -> f64 {
-    let mut sym = matrix.clone();
-    symmetrize_dense_in_place(&mut sym);
-    match FaerEigh::eigh(&sym, Side::Lower) {
-        Ok((evals, _)) => evals.iter().copied().fold(f64::INFINITY, f64::min),
-        Err(_) => f64::NAN,
-    }
-}
-
+/// Numerical nullity of a symmetric penalized Hessian at the shared
+/// `KKT_REFUSAL_RANK_TOL` relative cutoff used by the spectral range and REML
+/// penalty-rank machinery. Returns `None` when no finite curvature scale or
+/// eigendecomposition is available.
 pub(crate) fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<usize> {
     let p = lhs.nrows();
     if p == 0 || lhs.ncols() != p {
@@ -2320,45 +2357,43 @@ pub(crate) fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<u
     Some(evals.iter().filter(|x| x.abs() < cutoff).count())
 }
 
-/// Numerical null-space count AND the (range-space) condition number of a
-/// symmetric penalized Hessian, from ONE eigendecomposition.
-///
-/// `nullity` counts eigenvalues below the shared rank tolerance (`< tol·λmax`);
-/// `condition` is `λmax / λmin_range` where `λmin_range` is the smallest
-/// eigenvalue magnitude ABOVE that tolerance (the smallest *identified*
-/// curvature). On a full-rank-but-ill-conditioned `H_pen` (`nullity == 0`,
-/// `condition` large) the constrained active-set QP minimiser is unique only up
-/// to round-off along the near-null mode, so without a Levenberg floor the
-/// active set slides an O(1) proposal step every cycle and the inner solve
-/// grinds its whole budget — the survival marginal-slope hang (gam#1040). Both
-/// signals come from the single `eigh` the nullity check already paid for.
-pub(crate) fn symmetric_penalized_hessian_nullity_and_condition(
-    lhs: &Array2<f64>,
-) -> Option<(usize, f64)> {
-    let p = lhs.nrows();
-    if p == 0 || lhs.ncols() != p {
-        return Some((0, 1.0));
+#[cfg(test)]
+mod constrained_hessian_geometry_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn rank_deficient_levenberg_curvature_is_confined_to_the_null_projector() {
+        // Eigenpairs: range vectors (1,0,-1)/sqrt(2) at lambda=4 and
+        // (0,1,0) at lambda=1; gauge vector (1,0,1)/sqrt(2) at lambda=0.
+        let hessian = array![
+            [2.0, 0.0, -2.0],
+            [0.0, 1.0, 0.0],
+            [-2.0, 0.0, 2.0]
+        ];
+        let mu = 0.25;
+        let geometry = symmetric_constrained_hessian_geometry(&hessian, mu, false)
+            .expect("rank-deficient symmetric geometry");
+        assert_eq!(geometry.nullity, 1);
+
+        let inv_sqrt_two = 0.5_f64.sqrt();
+        let range = array![inv_sqrt_two, 0.0, -inv_sqrt_two];
+        let second_range = array![0.0, 1.0, 0.0];
+        let null = array![inv_sqrt_two, 0.0, inv_sqrt_two];
+        let range_image = geometry.matrix.dot(&range);
+        let second_range_image = geometry.matrix.dot(&second_range);
+        let null_image = geometry.matrix.dot(&null);
+
+        for (actual, expected) in range_image.iter().zip((4.0 * &range).iter()) {
+            assert!((actual - expected).abs() <= 1e-12);
+        }
+        for (actual, expected) in second_range_image.iter().zip(second_range.iter()) {
+            assert!((actual - expected).abs() <= 1e-12);
+        }
+        for (actual, expected) in null_image.iter().zip((mu * &null).iter()) {
+            assert!((actual - expected).abs() <= 1e-12);
+        }
     }
-    let (evals, _) = FaerEigh::eigh(lhs, Side::Lower).ok()?;
-    let max_abs = evals.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
-    if !(max_abs.is_finite() && max_abs > 0.0) {
-        return None;
-    }
-    let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
-    let nullity = evals.iter().filter(|x| x.abs() < cutoff).count();
-    // Smallest identified (range-space) eigenvalue magnitude: the floor for the
-    // condition number. Eigenvalues below `cutoff` are the null space, excluded.
-    let min_range = evals
-        .iter()
-        .map(|x: &f64| x.abs())
-        .filter(|&m| m >= cutoff && m > 0.0)
-        .fold(f64::INFINITY, f64::min);
-    let condition = if min_range.is_finite() && min_range > 0.0 {
-        max_abs / min_range
-    } else {
-        f64::INFINITY
-    };
-    Some((nullity, condition))
 }
 
 #[cfg(test)]

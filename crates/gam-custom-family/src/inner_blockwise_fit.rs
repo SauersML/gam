@@ -1549,111 +1549,22 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         rhs_step += grad_phi;
                         lhs += &symmetric_psd_projection(hphi);
                     }
-                    // Self-vanishing Levenberg–Marquardt damping for the
-                    // CONSTRAINED active-set QP, mirroring the spectral-range
-                    // branch below (μ = JOINT_SPECTRAL_LEVENBERG_FACTOR·‖rhs‖∞).
+                    // The constrained QP cannot drop ker(H_pen) the way the
+                    // spectral range solve does. A numerical gauge therefore
+                    // needs positive curvature so the minimizer is unique, but
+                    // adding the residual-scaled μ to every diagonal also damps
+                    // weak IDENTIFIED modes. The 4,800-row CTN measured the result:
+                    // a stable 79-row face, flat objective, and residual contraction
+                    // of 0.9998 per cycle. `symmetric_constrained_hessian_geometry`
+                    // installs μ only on the certified null projector, leaving
+                    // range(H_pen) on the exact Newton equation. A family that
+                    // explicitly owns the separate full-rank ill-conditioning case
+                    // retains its ambient policy.
                     //
-                    // When the joint design carries inequality constraints
-                    // (the monotone I-spline time-warp of a survival
-                    // location-scale / AFT fit) the spectral range step that
-                    // drops ker(H_pen) is NOT taken — this dense active-set QP
-                    // runs instead. On a constant-scale AFT the 12-col monotone
-                    // time-warp's non-affine deviation is statistically
-                    // UNIDENTIFIED, so H_pen is rank-deficient along that gauge
-                    // direction. An undamped QP then has a continuum of optima
-                    // differing only by the free gauge component, and the
-                    // active set slides along the monotone constraint face
-                    // taking an O(1) proposal step in that direction every
-                    // cycle. The proposal `step_inf` never exhausts, so the
-                    // identified-subspace KKT certificate (gated on
-                    // `step_inf ≤ step_tol`) never fires and the inner
-                    // joint-Newton grinds the full `inner_max_cycles` on EVERY
-                    // outer ρ-eval — the survival-LS AFT "hang" (#736/#735/#721).
-                    //
-                    // Adding μ·I to the QP Hessian gives ker(H_pen) a tiny
-                    // positive curvature, so the constrained minimizer is unique
-                    // and its gauge component is driven toward zero; the proposal
-                    // step then exhausts at the identified-subspace optimum and
-                    // the certificate fires in a handful of cycles. Because
-                    // μ ∝ ‖∇L − Sβ‖∞ → 0 at the KKT fixed point, the converged β
-                    // and the well-identified flexible-scale fast path (where the
-                    // time-warp IS identified and H_pen is non-singular) are
-                    // unchanged — a genuinely flexible survival-LS fit still
-                    // performs its full search.
-                    //
-                    // CRITICAL: the floor is only correct on a genuinely
-                    // rank-deficient `H_pen`. Gate it strictly on
-                    // `nullity > 0`. On a FULLY IDENTIFIED constrained fit
-                    // (e.g. the post-reduction constant-scale loglogistic AFT,
-                    // #736/#735/#721/#733/#734 — a 3-parameter model with
-                    // block_widths = [1,1,1] and an empty `ker(H_pen)`) the QP
-                    // minimizer is already unique, so the floor adds nothing it
-                    // is needed for but everything it costs: with residual r and
-                    // factor 1e-3 the floor is μ≈1e-3·r, and on an unpenalized
-                    // location intercept whose likelihood curvature H is small
-                    // at n=23 the damped Newton component shrinks the residual
-                    // only by the GEOMETRIC ratio H/(H+μ) per cycle instead of
-                    // quadratically. With μ≈1e-6 and a small H that ratio is far
-                    // from 1, so the threshold-block stationarity residual
-                    // plateaus at ~1e-3–1e-4 and the inner solve burns its whole
-                    // cycle budget without ever reaching `residual_tol`. The
-                    // self-vanishing μ→0 is too slow because it vanishes only as
-                    // fast as the residual it is throttling. Disabling the floor
-                    // when `nullity == 0` makes the constrained QP solve the
-                    // EXACT undamped Newton/KKT system, recovering quadratic
-                    // convergence to `residual_tol` in a handful of cycles. The
-                    // rank-deficient case (`nullity > 0`, the pre-reduction
-                    // unidentified time-warp gauge) keeps the floor and its hang
-                    // fix unchanged. `None` (eigensolve failed / zero Hessian)
-                    // falls back to the damped path conservatively.
-                    // gam#1040: the survival marginal-slope joint shares one
-                    // matern PC basis between the marginal and the log-slope
-                    // surface, so `H_pen` is FULL RANK (`nullity == 0`) yet
-                    // severely ill-conditioned (cond ≈ 5.8e6). With the floor
-                    // gated on `nullity > 0` alone the undamped active-set QP has
-                    // a constrained minimiser that is unique only up to round-off
-                    // along the near-null mode: the active set slides an O(1)
-                    // proposal step every cycle, `step_inf` never exhausts, the
-                    // constrained-fixed-point / KKT certificate never fires, and
-                    // the inner joint-Newton grinds the full cycle budget on EVERY
-                    // outer ρ-eval (the hours-long survival-MS hang). The family
-                    // opts into damping this case via
-                    // `levenberg_on_ill_conditioning()`; the self-vanishing μ
-                    // (∝ projected residual → 0 at the KKT fixed point) gives the
-                    // near-null mode a tiny positive curvature so the minimiser is
-                    // unique and `step_inf` exhausts, WITHOUT moving the converged
-                    // β. Apply it only when the matrix is genuinely ill-conditioned
-                    // (`cond > LEVENBERG_ILL_CONDITIONING_THRESHOLD`); a
-                    // well-conditioned full-rank constrained fit (the tiny
-                    // unpenalised loglogistic AFT, #736/#735/#721, where the floor
-                    // would cap the convergence rate at the geometric H/(H+μ) ratio)
-                    // keeps the EXACT undamped Newton/KKT solve and its quadratic
-                    // convergence. `None` (eigensolve failed / zero Hessian) falls
-                    // back to the damped path conservatively.
-                    let (hpen_nullity, hpen_condition) =
-                        match symmetric_penalized_hessian_nullity_and_condition(&lhs) {
-                            Some((n, c)) => (Some(n), c),
-                            None => (None, f64::INFINITY),
-                        };
-                    let nullity_floor = hpen_nullity.map(|n| n > 0).unwrap_or(true);
-                    let ill_conditioned_floor = family.levenberg_on_ill_conditioning()
-                        && hpen_nullity == Some(0)
-                        && hpen_condition > LEVENBERG_ILL_CONDITIONING_THRESHOLD;
-                    let apply_constrained_floor = nullity_floor || ill_conditioned_floor;
-                    // Self-vanishing scale = the PROJECTED stationarity residual
-                    // (`current_kkt_norm`), NOT the raw ‖∇ℓ − Sβ + ∇Φ‖∞. At a
-                    // CONSTRAINED optimum the raw RHS converges to the active-set
-                    // multiplier mass ‖Aᵀλ‖∞ — an O(1) quantity that never
-                    // vanishes — so a floor scaled by it never lifts, throttling
-                    // every weakly-curved identified direction to a geometric
-                    // H/(H+μ) contraction and exhausting the inner budget with the
-                    // projected residual stalled just above tolerance (#1025: the
-                    // competing-risks twin time-basis fit, per_block_resid stuck at
-                    // 1.457 for the full budget). The projected residual is the
-                    // honest distance-from-KKT measure: it equals the raw RHS on
-                    // unconstrained fits (no behavior change there) and → 0 at a
-                    // constrained optimum, so the floor vanishes exactly where the
-                    // comment above promises it does.
+                    // Scale gauge curvature by the PROJECTED stationarity residual,
+                    // not the raw RHS: at a constrained optimum the raw RHS includes
+                    // the non-vanishing multiplier mass Aᵀλ, while the projected
+                    // residual is the actual distance from KKT and tends to zero.
                     let rhs_inf = rhs_step.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
                     let floor_scale = if current_kkt_norm.is_finite() {
                         current_kkt_norm.min(rhs_inf)
@@ -1661,14 +1572,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         rhs_inf
                     };
                     let constrained_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * floor_scale;
-                    if apply_constrained_floor
-                        && constrained_levenberg_mu > 0.0
-                        && constrained_levenberg_mu.is_finite()
-                    {
-                        for d in 0..lhs.nrows() {
-                            lhs[[d, d]] += constrained_levenberg_mu;
-                        }
-                    }
                     // MODIFIED-NEWTON CONVEXIFICATION (gam#1040 / gam#979). The
                     // exact survival marginal-slope joint NLL Hessian is INDEFINITE
                     // on the flat baseline-hazard λ valley (the linear baseline +
@@ -1713,12 +1616,18 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     ) {
                         joint_spectrum = Some(spectrum);
                     }
-                    let lhs_reflected = symmetric_negative_curvature_reflected(&lhs);
+                    let constrained_geometry = symmetric_constrained_hessian_geometry(
+                        &lhs,
+                        constrained_levenberg_mu,
+                        family.levenberg_on_ill_conditioning(),
+                    )?;
                     if cycle <= 2 {
-                        let min_eval_raw = symmetric_min_eigenvalue_signed(&lhs);
-                        let min_eval_refl = symmetric_min_eigenvalue_signed(&lhs_reflected);
+                        let min_eval_raw = constrained_geometry.raw_min_eigenvalue;
+                        let min_eval_refl = constrained_geometry.stabilized_min_eigenvalue;
                         log::info!(
-                            "[JN-REFLECT-DIAG #1040] cycle={cycle} CONSTRAINED_QP lambda_min_signed_raw={min_eval_raw:.3e} lambda_min_signed_reflected={min_eval_refl:.3e} (reflection {})",
+                            "[JN-REFLECT-DIAG #1040] cycle={cycle} CONSTRAINED_QP lambda_min_signed_raw={min_eval_raw:.3e} lambda_min_signed_reflected={min_eval_refl:.3e} nullity={} condition={:.3e} (reflection {})",
+                            constrained_geometry.nullity,
+                            constrained_geometry.condition,
                             if min_eval_refl > min_eval_raw + min_eval_raw.abs() * 1e-9 {
                                 "CHANGED the spectrum"
                             } else {
@@ -1730,7 +1639,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     // same convexified Hessian. Mixing the reflected step model
                     // with the original indefinite curvature or the bare gradient
                     // makes release and entry contradict each other (gam#979).
-                    let lhs = lhs_reflected;
+                    let lhs = constrained_geometry.matrix;
                     let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
                     let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
                         solve_quadratic_with_simple_lower_bounds(
