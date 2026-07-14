@@ -713,6 +713,26 @@ fn block_slices_handles_link_only_survival_flex_layout() {
     assert_eq!(slices.total, 1 + 2 + 3 + link_runtime.basis_dim());
 }
 
+#[test]
+fn exact_survival_callbacks_lock_the_family_owned_coefficient_chart() {
+    use crate::custom_family::BlockEffectiveJacobian;
+
+    let one = Arc::new(Array2::<f64>::ones((2, 1)));
+    let time = TimeBlockJacobian::new(Arc::clone(&one), Arc::clone(&one), Arc::clone(&one));
+    let marginal = MarginalBlockJacobian::new(Arc::clone(&one));
+    let family = test_family(None, None);
+    let logslope = LogslopeBlockJacobian::new(
+        family.logslope_layout.clone(),
+        Arc::clone(&family.z),
+        family.score_covariance.clone(),
+    )
+    .expect("test logslope callback");
+
+    assert!(time.locks_raw_width_reduction());
+    assert!(marginal.locks_raw_width_reduction());
+    assert!(logslope.locks_raw_width_reduction());
+}
+
 // ── Single-source block-layout parity (#428) ─────────────────────────
 //
 // `HessBlock` + `BlockHessianAccumulator::block_view` are the one place

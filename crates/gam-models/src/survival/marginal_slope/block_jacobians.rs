@@ -286,6 +286,14 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
     fn n_outputs(&self) -> usize {
         3
     }
+
+    fn locks_raw_width_reduction(&self) -> bool {
+        // The exact survival workspace evaluates its family-owned raw
+        // LogslopeLayout, not this audit callback. A selection gauge applied
+        // only to the spec would therefore hand that workspace a reduced beta
+        // against a raw-width layout.
+        true
+    }
 }
 
 /// n_outputs=3 stacked Jacobian for the marginal block.
@@ -366,6 +374,13 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
 
     fn n_outputs(&self) -> usize {
         3
+    }
+
+    fn locks_raw_width_reduction(&self) -> bool {
+        // The exact survival workspace evaluates `family.marginal_design`
+        // directly. Keep the coefficient width paired with that owned design;
+        // composing a gauge into this callback alone cannot transform it.
+        true
     }
 }
 
@@ -468,6 +483,13 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
 
     fn n_outputs(&self) -> usize {
         3
+    }
+
+    fn locks_raw_width_reduction(&self) -> bool {
+        // One beta drives the family-owned entry, exit, and derivative
+        // designs. They are consumed directly by exact row geometry, so a
+        // callback-only selection gauge would desynchronise all three.
+        true
     }
 }
 
@@ -918,6 +940,13 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
 
     fn n_outputs(&self) -> usize {
         3
+    }
+
+    fn locks_raw_width_reduction(&self) -> bool {
+        // Time-wiggle exact geometry consumes the family-owned marginal
+        // design at raw width. Gauge-composing only this audit callback does
+        // not transform that likelihood geometry.
+        true
     }
 }
 
