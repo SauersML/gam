@@ -144,13 +144,14 @@ fn composed_zoo() -> Vec<ComposedSpec> {
             ],
             base_prior: RhoPrior::Normal { mean: 0.0, sd: 2.0 },
         },
-        // B: cross-block tie ("tied" appears in both blocks) + a fixed base
+        // B: cross-block tie ("tied" appears in both blocks, with the same
+        // initial value because it is one optimizer coordinate) + a fixed base
         // penalty (no optimizer coordinate) + a linear depth-3 chain.
         ComposedSpec {
             name: "cross_block_tie_fixed_penalty_linear_depth3",
             specs: vec![
                 block("loc", 2, vec![plain(2), labeled(2, "tied")], -2.0),
-                block("disp", 2, vec![labeled(2, "tied"), fixed(2, 1.5)], 0.5),
+                block("disp", 2, vec![labeled(2, "tied"), fixed(2, 1.5)], -1.5),
             ],
             groups: vec![
                 GroupSeed { label: "child_g", coords: vec![("loc", 0)], parent: Some("parent_g"), mean: 11.0, sd: 1.0, init_log_precision: 3.0 },
