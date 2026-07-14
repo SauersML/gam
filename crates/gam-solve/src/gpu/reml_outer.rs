@@ -189,7 +189,7 @@ where
                 value: eval.objective,
                 gradient: eval.gradient,
             })
-            .map_err(|err| ObjectiveEvalError::recoverable(err.to_string()))
+            .map_err(|err| ObjectiveEvalError::fatal(err.to_string()))
     });
     let mut optimizer = Bfgs::new(input.seed_rho.clone(), objective)
         .with_initial_sample(input.seed_rho, seed_sample)
@@ -206,6 +206,12 @@ where
         Ok(solution) => (solution, true),
         Err(BfgsError::MaxIterationsReached { last_solution })
         | Err(BfgsError::LineSearchFailed { last_solution, .. }) => (*last_solution, false),
+        Err(BfgsError::ObjectiveFailed { message }) => {
+            return Err(EstimationError::fatal_outer_evaluation(
+                "device-backed outer BFGS evaluation",
+                EstimationError::RemlOptimizationFailed(message),
+            ));
+        }
         Err(err) => {
             return Err(EstimationError::RemlOptimizationFailed(format!(
                 "device-backed opt::Bfgs failed: {err}"

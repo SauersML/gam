@@ -1213,6 +1213,9 @@ pub(crate) fn run_outer_with_plan(
                             Ok::<OuterResult, EstimationError>(result)
                         }
                         Err(err) => {
+                            if err.is_fatal_outer_evaluation() {
+                                return Err(err);
+                            }
                             log::warn!(
                                 "[OUTER] {context}: device-BFGS failed at seed {seed_idx}: {err}; falling back to host BFGS"
                             );

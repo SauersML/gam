@@ -4758,6 +4758,56 @@ fn run_screening_reorders_expensive_generated_seeds_before_full_startup_eval() {
 }
 
 #[test]
+fn thrown_screening_error_is_fatal_across_multistart_and_solver_plans() {
+    const SENTINEL: &str = "fatal outer evaluation sentinel";
+
+    let mut seed_config = gam_problem::SeedConfig::default();
+    seed_config.max_seeds = 4;
+    seed_config.seed_budget = 2;
+    seed_config.risk_profile = gam_problem::SeedRiskProfile::GeneralizedLinear;
+    let screening_cap = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Either)
+        .with_seed_config(seed_config)
+        .with_screening_cap(Arc::clone(&screening_cap))
+        .with_max_iter(1);
+    let mut obj = problem.build_objective(
+        (),
+        {
+            let calls = Arc::clone(&calls);
+            move |_: &mut (), _theta: &Array1<f64>| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Err(EstimationError::InvalidInput(SENTINEL.to_string()))
+            }
+        },
+        |_: &mut (), _theta: &Array1<f64>| -> Result<OuterEval, EstimationError> {
+            panic!("a fatal screening error must prevent full outer evaluation")
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+
+    let error = match problem.run(&mut obj, "fatal screening error") {
+        Err(error) => error,
+        Ok(_) => panic!("a fatal screening error unexpectedly minted an outer result"),
+    };
+    assert!(error.is_fatal_outer_evaluation(), "{error}");
+    assert!(error.to_string().contains(SENTINEL), "{error}");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "a thrown evaluator error must not be replayed across seeds, cap stages, or solver plans"
+    );
+    assert_eq!(
+        screening_cap.load(Ordering::Relaxed),
+        0,
+        "fatal screening exit must restore the caller's inner-iteration cap"
+    );
+}
+
+#[test]
 fn initial_rho_with_single_seed_budget_skips_expensive_screening() {
     let mut seed_config = gam_problem::SeedConfig::default();
     seed_config.max_seeds = 4;
