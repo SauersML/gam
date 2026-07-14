@@ -532,7 +532,7 @@ impl TransformationNormalPsiHessianOperator {
             trace_cache_id,
             row_quantities: TransformationNormalRowQuantityCache {
                 beta: Arc::new(beta),
-                gamma: row_gamma,
+                alpha: row_gamma,
                 h_lower: Arc::new(Array1::zeros(row_h.len())),
                 h_upper: Arc::new(Array1::zeros(row_h.len())),
                 h: row_h,

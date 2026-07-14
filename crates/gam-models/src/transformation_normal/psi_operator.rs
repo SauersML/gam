@@ -1061,7 +1061,7 @@ impl TransformationNormalPsiWorkspace {
                     let inv_hp = 1.0 / hp;
                     let inv_hp_sq = inv_hp * inv_hp;
                     let q = &endpoint_q[i];
-                    let gamma_row = row.gamma.row(i);
+                    let gamma_row = row.alpha.row(i);
 
                     for k in 0..p_resp {
                         gamma[k] = gamma_row[k];
@@ -1188,7 +1188,7 @@ impl TransformationNormalPsiWorkspace {
                 axis,
                 trace_axes: Arc::clone(&trace_axes),
                 trace_axis_pos: axis_idx,
-                row_gamma: Arc::clone(&row.gamma),
+                row_gamma: Arc::clone(&row.alpha),
                 row_h: Arc::clone(&row.h),
                 row_h_prime: Arc::clone(&row.h_prime),
                 endpoint_q: Arc::clone(&row.endpoint_q),
@@ -1539,7 +1539,7 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
         }
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::clone(&entry.beta),
-            gamma: Arc::clone(&entry.row_gamma),
+            alpha: Arc::clone(&entry.row_gamma),
             h: Arc::clone(&entry.row_h),
             h_prime: Arc::clone(&entry.row_h_prime),
             h_lower: Arc::new(Array1::zeros(entry.row_h.len())),

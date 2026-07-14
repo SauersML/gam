@@ -89,11 +89,9 @@ impl TransformationNormalFamily {
                 alpha_psi[k] = beta_mat.row(k).dot(&psi_row);
             }
 
-            let mut h_psi = 0.0;
             let mut hp_psi = 0.0;
             let mut endpoint_psi = [0.0; 2];
             for k in 0..p_resp {
-                h_psi += rv[k] * alpha_psi[k];
                 hp_psi += rd[k] * alpha_psi[k];
                 endpoint_psi[0] += endpoint_basis[0][k] * alpha_psi[k];
                 endpoint_psi[1] += endpoint_basis[1][k] * alpha_psi[k];
@@ -453,8 +451,10 @@ impl TransformationNormalFamily {
                         }
                     }
 
-                    let (h_psi, hp_psi, endpoint_psi) =
+                    let psi_marginal =
                         scop_psi_marginal(rv, rd, p_resp, endpoint_basis, &acc.alpha_psi);
+                    let hp_psi = psi_marginal.1;
+                    let endpoint_psi = psi_marginal.2;
 
                     for col in 0..rank {
                         acc.h_dir[col] = 0.0;
