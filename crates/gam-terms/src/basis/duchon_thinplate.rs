@@ -1238,8 +1238,11 @@ pub fn select_thin_plate_knots(
     // geometry, so it survives both row permutations and rigid rotations.  Only
     // A complete tie after this key is a nontrivial symmetry orbit. No
     // permutation-equivariant rule can choose one distinct member of that
-    // orbit, so callers below retain the whole class atomically. Only coincident
-    // rows may be collapsed because they generate the same kernel column.
+    // orbit, so callers below retain the whole class atomically *when it fits the
+    // knot budget*; when a strict subset is unavoidable they cap it to the budget
+    // deterministically rather than refusing the fit (see the seed/loop notes).
+    // Only coincident rows are collapsed, because they generate the same kernel
+    // column.
     let distance_profile_cmp = |i: usize, j: usize| -> std::cmp::Ordering {
         let mut profile_i = Vec::with_capacity(n);
         let mut profile_j = Vec::with_capacity(n);
@@ -1323,13 +1326,24 @@ pub fn select_thin_plate_knots(
             dist2_to_centroid[i] <= seed_min + tie_tol && distance_profile_cmp(i, seed_idx).is_eq()
         })
         .collect();
-    let seed_orbit = distinct_orbit(&seed_class, &[]);
-    if seed_orbit.len() > num_knots {
-        crate::bail_invalid_basis!(
-            "thin-plate farthest-point seed symmetry orbit has {} distinct points, exceeding the requested knot budget {num_knots}; use a budget at least as large as the orbit or provide explicit centers",
-            seed_orbit.len()
-        );
-    }
+    // When an indivisible symmetry orbit is larger than the entire knot budget,
+    // no rule can pick an *equivariant* strict subset of it — the orbit's members
+    // are interchangeable under the data's symmetry group (#2319). The previous
+    // behaviour refused the fit outright, which bricks the single most common
+    // gridded/lattice spatial input (an integer raster or designed grid has
+    // exactly-representable coordinates, so its corner/edge orbits tie exactly and
+    // exceed typical `k`). Refusing is strictly worse than a deterministic subset,
+    // so we cap the orbit to the budget by taking its lowest-row members. That
+    // choice is still rotation-equivariant — a rigid rotation preserves each row's
+    // identity, so the base and rotated fits select corresponding physical points
+    // and the knot set rotates with the data. Permutation-invariance is provably
+    // unattainable for a strict subset of an exact orbit, and is knowingly traded
+    // away only in that measure-zero case. Orbits that fit the budget are still
+    // taken atomically (whole), preserving both invariants exactly.
+    let seed_orbit: Vec<usize> = distinct_orbit(&seed_class, &[])
+        .into_iter()
+        .take(num_knots)
+        .collect();
 
     let mut selected = Vec::with_capacity(num_knots);
     let mut chosen = vec![false; n];
@@ -1406,14 +1420,16 @@ pub fn select_thin_plate_knots(
             })
             .expect("candidate set is non-empty");
         candidates.retain(|&i| distance_profile_cmp(i, next_idx).is_eq());
-        let orbit = distinct_orbit(&candidates, &selected);
         let remaining = num_knots - selected.len();
-        if orbit.len() > remaining {
-            crate::bail_invalid_basis!(
-                "thin-plate farthest-point tie class has {} distinct points but only {remaining} of the exact {num_knots}-knot budget remain; choose a compatible knot count or provide explicit centers",
-                orbit.len()
-            );
-        }
+        // Cap an oversized indivisible orbit to the remaining budget rather than
+        // refusing the fit (see the seed-orbit note above): take its lowest-row
+        // members, which keeps the selection rotation-equivariant and always
+        // yields a fittable `num_knots`-center design. An orbit that fits is still
+        // completed atomically.
+        let orbit: Vec<usize> = distinct_orbit(&candidates, &selected)
+            .into_iter()
+            .take(remaining)
+            .collect();
         for &i in &candidates {
             chosen[i] = true;
             min_dist2[i] = 0.0;
@@ -3164,26 +3180,83 @@ mod knot_selection_invariance_tests {
     }
 
     #[test]
-    fn incomplete_nonseed_orbit_is_refused() {
+    fn incomplete_nonseed_orbit_is_capped_not_refused() {
+        // origin (coincident pair, one distinct seed) plus the endpoint orbit
+        // {(0,1),(0,-1)}. With one slot left after the seed, the endpoint orbit
+        // cannot be split equivariantly — but refusing the fit is worse than
+        // taking a deterministic member. The selection must succeed with exactly
+        // `num_knots` distinct centers: the seed plus the lowest-row endpoint.
         let data = ndarray::array![[0.0, 0.0], [0.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
-        let error = select_thin_plate_knots(data.view(), 2)
-            .expect_err("one remaining slot cannot split the endpoint orbit");
-        assert!(
-            error
-                .to_string()
-                .contains("only 1 of the exact 2-knot budget remain"),
-            "unexpected refusal: {error}"
+        let knots = select_thin_plate_knots(data.view(), 2)
+            .expect("an oversized orbit must be capped, never refused");
+        assert_eq!(knots.nrows(), 2, "capped selection must honour the budget");
+        assert_eq!(
+            canonical(&knots),
+            canonical(&ndarray::array![[0.0, 0.0], [0.0, 1.0]]),
+            "seed plus the lowest-row endpoint of the tied orbit"
         );
     }
 
     #[test]
-    fn seed_orbit_larger_than_budget_is_refused() {
+    fn seed_orbit_larger_than_budget_is_capped_not_refused() {
+        // Two antipodal points form a single indivisible seed orbit; a one-knot
+        // budget cannot represent both. The selection must still succeed, taking
+        // the lowest-row member deterministically rather than refusing.
         let data = ndarray::array![[-1.0, 0.0], [1.0, 0.0]];
-        let error = select_thin_plate_knots(data.view(), 1)
-            .expect_err("an antipodal seed orbit cannot fit one knot");
-        assert!(
-            error.to_string().contains("seed symmetry orbit"),
-            "unexpected refusal: {error}"
+        let knots = select_thin_plate_knots(data.view(), 1)
+            .expect("an antipodal seed orbit must be capped, never refused");
+        assert_eq!(knots.nrows(), 1, "capped selection must honour the budget");
+        assert_eq!(
+            canonical(&knots),
+            canonical(&ndarray::array![[-1.0, 0.0]]),
+            "lowest-row member of the antipodal seed orbit"
+        );
+    }
+
+    #[test]
+    fn regular_grid_fits_every_budget_with_distinct_centers() {
+        // #2319 regression guard: a regular integer grid has exactly-representable
+        // coordinates, so its corner/edge maximin orbits tie EXACTLY and typically
+        // exceed the requested budget. The atomic-orbit rule used to refuse the
+        // fit for common budgets (e.g. `k=15` on a 7x7 grid); it must instead cap
+        // each oversized orbit and return exactly `k` geometrically distinct
+        // centers for every in-range budget.
+        let side = 7usize;
+        let grid = Array2::from_shape_fn((side * side, 2), |(row, col)| {
+            let (ix, iy) = (row % side, row / side);
+            if col == 0 { ix as f64 } else { iy as f64 }
+        });
+        for k in 1..=side * side {
+            let knots = select_thin_plate_knots(grid.view(), k)
+                .unwrap_or_else(|e| panic!("grid must fit k={k}, got: {e}"));
+            assert_eq!(knots.nrows(), k, "grid selection must honour budget k={k}");
+            // Centers must be geometrically distinct (no coincident rows), or the
+            // thin-plate Gram is singular.
+            let mut set = canonical(&knots);
+            let full = set.len();
+            set.dedup();
+            assert_eq!(set.len(), full, "duplicate centers at k={k}");
+        }
+    }
+
+    #[test]
+    fn capping_preserves_rotation_equivariance_on_generic_cloud() {
+        // The #2319 contract lives on ISOTROPIC data, where generic coordinates
+        // never tie exactly, so the capping path is not even entered and every
+        // maximin/tie-break key is exactly rotation-invariant. Verify a budget
+        // large enough to exercise many selection steps stays equivariant under
+        // an exact 90-degree rotation (bit-preserving), so the fix did not perturb
+        // the property the issue is actually about.
+        let data = sample_cloud();
+        let num_knots = 9.min(data.nrows() - 1);
+        let (cx, cz) = data_centroid_2d(&data);
+        let knots = select_thin_plate_knots(data.view(), num_knots).expect("base select");
+        let rotated = rotate_90_about(&data, cx, cz);
+        let knots_rot = select_thin_plate_knots(rotated.view(), num_knots).expect("rotated select");
+        assert_eq!(
+            canonical(&rotate_90_about(&knots, cx, cz)),
+            canonical(&knots_rot),
+            "capping change must not break rotation equivariance on generic data"
         );
     }
 }
