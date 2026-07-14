@@ -23,16 +23,14 @@ name: Rolling wheel (warm-start artifact)
 on:
   push:
     branches: [main]
-  workflow_dispatch:
 
-# Per-SHA concurrency: main churns faster than a wheel builds (~5 min), so a
-# single cancel-in-progress group would cancel every run before it published
-# and `wheel-latest` would go stale. Grouping by SHA lets each push's build run
-# to completion (GHA minutes are free), so a fresh wheel lands continuously —
-# the newest completed upload wins the rolling release.
+# A rolling release has one writer. Superseded SHAs must not keep compiling or
+# race a newer build and overwrite its exact provenance with stale artifacts.
+# The warm compiler cache keeps replacement builds short enough that the newest
+# main commit remains the only useful unit of work.
 concurrency:
-  group: wheel-${{ github.sha }}
-  cancel-in-progress: false
+  group: rolling-main-runtime
+  cancel-in-progress: true
 
 permissions:
   contents: write
