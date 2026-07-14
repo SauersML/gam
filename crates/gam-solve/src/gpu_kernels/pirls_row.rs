@@ -1730,13 +1730,19 @@ fn common_device_prolog() -> String {
     // brace stays literal (no `format!` grammar to escape), and substitute the
     // two host solver bounds by unique sentinel token.
     r#"
+// NVRTC math builtins: prototypes must carry an execution space. Newer
+// NVRTC (CUDA 12.x JIT semantics) rejects unannotated declarations outright
+// ("host functions are not allowed in JIT mode"), which failed every
+// pirls_row kernel compile on real hardware while CPU-only CI stayed green
+// (#2313 hardware sweep). `__device__` matches how the CUDA math library
+// declares them; the definitions come from libdevice as before.
 extern "C" {
-    double exp(double);
-    double log(double);
-    double log1p(double);
-    double expm1(double);
-    double fabs(double);
-    double erfc(double);
+    __device__ double exp(double);
+    __device__ double log(double);
+    __device__ double log1p(double);
+    __device__ double expm1(double);
+    __device__ double fabs(double);
+    __device__ double erfc(double);
 }
 
 static constexpr double PIRLS_LOG_ETA_MIN = __PIRLS_LOG_ETA_MIN__;

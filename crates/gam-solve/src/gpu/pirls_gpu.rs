@@ -1992,8 +1992,10 @@ extern "C" __global__ void chol_logdet_col_major(
     /// Bundled NVRTC helpers for the Stage 3.3 loop driver: axpy +
     /// single-block sum / linf reductions. Cached process-wide.
     const PIRLS_LOOP_PTX_SOURCE: &str = r#"
+// __device__ annotation required by newer NVRTC JIT semantics (see
+// gpu_kernels/pirls_row.rs common_device_prolog — the #2313 hardware sweep).
 extern "C" {
-    double fabs(double);
+    __device__ double fabs(double);
 }
 
 extern "C" __global__ void axpy_n(
