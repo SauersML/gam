@@ -267,9 +267,8 @@ const KERNEL_BODY: &str = r#"    const double* __restrict__ cell_left,
         double expL = 0.0, expR = 0.0;
         bool L_finite = isfinite(L);
         bool R_finite = isfinite(R);
-        // Affine path uses c2=c3=0 exactly so the q values agree with the
-        // CPU `affine_anchor_moment_vector` reference even when the host
-        // classifier let sub-tolerance c2/c3 through.
+        // Affine path uses c2=c3=0 exactly, matching the host's structural
+        // polynomial classifier and `affine_anchor_moment_vector` reference.
         if (L_finite) {
             qL = q_of_z(L, c0, c1, 0.0, 0.0);
             if (!isfinite(qL)) {
