@@ -739,4 +739,64 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn zz_probe_inner_solve() {
+        let base = array![0.35_f64.ln(), 2.8_f64.ln()];
+        for &tr in &[1.0_f64, 0.25, 0.05] {
+            for &tol in &[1.0e-9_f64, 1.0e-8, 1.0e-7, 1.0e-6, 1.0e-5] {
+                let mut o = build_objective();
+                let lambda = o.layout.expand(&base).expect("expand");
+                let target = o.target.clone();
+                let ard = o.ard_precisions.clone();
+                match o
+                    .term
+                    .solve_fixed_point(target.view(), &lambda, &ard, 5000, tol, tr)
+                {
+                    Ok(r) => println!(
+                        "PROBE tr={tr} tol={tol:e} OK iters={} kkt={:e} obj={:e}",
+                        r.iterations,
+                        r.stationarity.max_abs(),
+                        r.objective
+                    ),
+                    Err(e) => println!("PROBE tr={tr} tol={tol:e} ERR {e}"),
+                }
+            }
+        }
+        for maxit in [1usize, 2, 3, 5, 10, 20, 50, 200, 1000] {
+            let mut o = build_objective();
+            let lambda = o.layout.expand(&base).expect("expand");
+            let target = o.target.clone();
+            let ard = o.ard_precisions.clone();
+            match o
+                .term
+                .solve_fixed_point(target.view(), &lambda, &ard, maxit, 1.0e-14, 1.0)
+            {
+                Ok(r) => println!("TRACE maxit={maxit} OK iters={}", r.iterations),
+                Err(e) => println!("TRACE maxit={maxit} {e}"),
+            }
+        }
+        // Softer/rescaled fixture variants: smaller weights (loss scale), bigger ARD.
+        for &ard_p in &[1.0_f64, 4.0] {
+            for &scale in &[1.0_f64, 0.25] {
+                let mut o = build_objective();
+                o.target = &o.target * scale;
+                o.ard_precisions = vec![vec![ard_p], vec![ard_p, ard_p]];
+                let lambda = o.layout.expand(&base).expect("expand");
+                let target = o.target.clone();
+                let ard = o.ard_precisions.clone();
+                match o
+                    .term
+                    .solve_fixed_point(target.view(), &lambda, &ard, 5000, 1.0e-9, 1.0)
+                {
+                    Ok(r) => println!(
+                        "VAR ard={ard_p} scale={scale} OK iters={} kkt={:e}",
+                        r.iterations,
+                        r.stationarity.max_abs()
+                    ),
+                    Err(e) => println!("VAR ard={ard_p} scale={scale} ERR {e}"),
+                }
+            }
+        }
+    }
 }

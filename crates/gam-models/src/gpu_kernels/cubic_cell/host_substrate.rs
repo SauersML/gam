@@ -17,8 +17,7 @@
 //! 4. record one status code per cell so the caller can react to per-cell
 //!    failures without having to re-run the CPU classifier.
 //!
-//! [`build_host_cell_status`] supports the parent module's validation tests;
-//! the moment-emitting path below is the numerical parity oracle.
+//! The moment-emitting path below is the numerical parity oracle.
 
 use crate::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_derivative_moments_uncached};
 use crate::gpu_kernels::cubic_cell::branch::classify_cell_for_gpu;
@@ -44,65 +43,6 @@ fn validate_host_view(view: &CubicCellDerivativeMomentHostView<'_>) -> Result<()
     Ok(())
 }
 
-/// Classify each cell with the host classifier and return the per-cell status
-/// vector used by the parent module's shape and classification tests.
-pub(crate) fn build_host_cell_status(
-    view: &CubicCellDerivativeMomentHostView<'_>,
-) -> Result<Vec<u8>, String> {
-    validate_host_view(view)?;
-    let n_cells = view.cells.len();
-    let mut status = vec![CubicCellMomentStatus::Ok as u8; n_cells];
-
-    for (i, &gpu_cell) in view.cells.iter().enumerate() {
-        let host_tag = match classify_cell_for_gpu(gpu_cell) {
-            Ok(tag) => tag,
-            Err(code) => {
-                status[i] = code as u8;
-                continue;
-            }
-        };
-        let caller_tag = view.branches[i];
-        if host_tag != caller_tag {
-            // Caller's classifier disagreed with ours — refuse the cell
-            // rather than silently producing a different cell's status.
-            status[i] = CubicCellMomentStatus::InvalidInterval as u8;
-            continue;
-        }
-
-        // The production substrate path does not need the moments
-        // themselves; it consumes only the per-cell classifier verdict.
-        // We still simulate the evaluator's failure modes here so the
-        // status vector mirrors what `build_host_moments` would have
-        // recorded (NonFiniteEvaluation, etc.) for parity with the
-        // moment-emitting path.
-        let cpu_cell = DenestedCubicCell {
-            left: gpu_cell.left,
-            right: gpu_cell.right,
-            c0: gpu_cell.c0,
-            c1: gpu_cell.c1,
-            c2: gpu_cell.c2,
-            c3: gpu_cell.c3,
-        };
-        match evaluate_cell_derivative_moments_uncached(cpu_cell, view.max_degree) {
-            Ok(state) => {
-                if state.moments.iter().any(|x| !x.is_finite()) {
-                    status[i] = CubicCellMomentStatus::NonFiniteEvaluation as u8;
-                }
-            }
-            Err(_) => {
-                status[i] = match host_tag {
-                    GpuCellBranchTag::AffineTail => {
-                        CubicCellMomentStatus::NonAffineInfiniteInterval as u8
-                    }
-                    _ => CubicCellMomentStatus::InvalidInterval as u8,
-                };
-            }
-        }
-    }
-
-    Ok(status)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,17 +55,15 @@ mod tests {
     /// kernel writes. Production callers consume only the status (see
     /// [`build_host_cell_status`]); this batch shape is the parity oracle
     /// the moment-emitting unit tests compare to the CPU evaluator.
-    pub(super) struct HostMomentBatch {
+    struct HostMomentBatch {
         pub moments: Vec<f64>,
         pub status: Vec<u8>,
         pub stride: usize,
     }
 
-    /// Moment-emitting analog of [`super::build_host_cell_status`] — runs
-    /// the CPU evaluator on every Ok cell so the test suite can check
-    /// substrate moments against the CPU reference without the production
-    /// substrate having to materialize a Vec<f64> nobody reads.
-    pub(super) fn build_host_moments(
+    /// Run the CPU evaluator on every accepted cell so the test suite can check
+    /// substrate moments against an independent host reference.
+    fn build_host_moments(
         view: &CubicCellDerivativeMomentHostView<'_>,
     ) -> Result<HostMomentBatch, String> {
         validate_host_view(view)?;
@@ -215,6 +153,63 @@ mod tests {
                 "moment k={k} got={got:.17e} want={want:.17e} rel={rel:.3e} tol={ulp_rel:.3e}"
             );
         }
+    }
+
+    #[test]
+    fn host_oracle_accepts_empty_workload() {
+        let view = CubicCellDerivativeMomentHostView {
+            cells: &[],
+            branches: &[],
+            max_degree: 9,
+        };
+        let out = build_host_moments(&view).expect("empty oracle workload is valid");
+        assert!(out.moments.is_empty());
+        assert!(out.status.is_empty());
+        assert_eq!(out.stride, 10);
+    }
+
+    #[test]
+    fn host_oracle_rejects_mismatched_cell_and_branch_counts() {
+        let cells = [GpuDenestedCubicCell {
+            left: -1.0,
+            right: 1.0,
+            c0: 0.0,
+            c1: 0.0,
+            c2: 0.0,
+            c3: 0.0,
+        }];
+        let view = CubicCellDerivativeMomentHostView {
+            cells: &cells,
+            branches: &[],
+            max_degree: 9,
+        };
+        let error = build_host_moments(&view)
+            .err()
+            .expect("mismatched parallel arrays must fail");
+        assert!(error.contains("cells.len()"), "got: {error}");
+        assert!(error.contains("branches.len()"), "got: {error}");
+    }
+
+    #[test]
+    fn host_oracle_rejects_unsupported_degree() {
+        let cells = [GpuDenestedCubicCell {
+            left: -1.0,
+            right: 1.0,
+            c0: 0.0,
+            c1: 0.0,
+            c2: 0.0,
+            c3: 0.0,
+        }];
+        let branches = [GpuCellBranchTag::Affine];
+        let view = CubicCellDerivativeMomentHostView {
+            cells: &cells,
+            branches: &branches,
+            max_degree: MAX_SUPPORTED_DEGREE + 1,
+        };
+        let error = build_host_moments(&view)
+            .err()
+            .expect("unsupported degree must fail");
+        assert!(error.contains("MAX_SUPPORTED_DEGREE"), "got: {error}");
     }
 
     #[test]

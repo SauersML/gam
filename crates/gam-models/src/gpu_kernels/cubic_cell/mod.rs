@@ -161,67 +161,6 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::tests_host_substrate::build_host_cell_status;
-
-    fn affine_cell() -> GpuDenestedCubicCell {
-        GpuDenestedCubicCell {
-            left: -1.0,
-            right: 1.0,
-            c0: 0.0,
-            c1: 0.0,
-            c2: 0.0,
-            c3: 0.0,
-        }
-    }
-
-    fn host_view<'a>(
-        cells: &'a [GpuDenestedCubicCell],
-        branches: &'a [GpuCellBranchTag],
-        max_degree: usize,
-    ) -> CubicCellDerivativeMomentHostView<'a> {
-        CubicCellDerivativeMomentHostView {
-            cells,
-            branches,
-            max_degree,
-        }
-    }
-
-    #[test]
-    fn host_classifier_returns_ok_status_for_valid_cell() {
-        let cells = [affine_cell()];
-        let branches = [GpuCellBranchTag::Affine];
-        let status = build_host_cell_status(&host_view(&cells, &branches, 9))
-            .expect("host classifier succeeds on a valid cell");
-        assert_eq!(status, vec![CubicCellMomentStatus::Ok as u8]);
-    }
-
-    #[test]
-    fn empty_host_classifier_returns_empty_status() {
-        let status = build_host_cell_status(&host_view(&[], &[], 9)).expect("empty view is valid");
-        assert!(status.is_empty());
-    }
-
-    #[test]
-    fn rejects_mismatched_lengths() {
-        let cells = [affine_cell()];
-        let branches: [GpuCellBranchTag; 0] = [];
-        let msg = build_host_cell_status(&host_view(&cells, &branches, 9)).unwrap_err();
-        assert!(msg.contains("cells.len()"), "got: {msg}");
-        assert!(msg.contains("branches.len()"), "got: {msg}");
-    }
-
-    #[test]
-    fn rejects_degree_above_supported_max() {
-        let cells = [affine_cell()];
-        let branches = [GpuCellBranchTag::Affine];
-        let err = build_host_cell_status(&host_view(
-            &cells,
-            &branches,
-            MAX_SUPPORTED_DEGREE + 1,
-        ))
-        .unwrap_err();
-        assert!(err.to_string().contains("MAX_SUPPORTED_DEGREE"));
-    }
 
     #[test]
     fn status_codes_match_kernel_abi() {

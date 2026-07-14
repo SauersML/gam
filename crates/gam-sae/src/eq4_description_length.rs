@@ -490,40 +490,74 @@ mod tests {
 
     /// Audit §34 "MDL sample invariance": holding `amortization_horizon` fixed,
     /// scoring the SAME fitted model at estimation subsamples of 256 / 1024 / 8192
-    /// rows must leave the dictionary term BITWISE identical and the total agree
-    /// within Monte-Carlo error. This is the acceptance test for #2283: the
-    /// dictionary code no longer picks up the estimation subsample size.
+    /// rows must leave the dictionary term BITWISE identical, and the total must
+    /// agree with the 8192-row total to within the Monte-Carlo standard error of
+    /// the code / residual / support expectations at the smaller sample. This is
+    /// the acceptance test for #2283: the dictionary code no longer picks up the
+    /// estimation subsample size.
+    ///
+    /// # Why the totals need a `1/√n` tolerance, not a flat one
+    ///
+    /// Only the DICTIONARY term is an exact function of declared quantities. The
+    /// code / residual / support terms are expectations under the row distribution,
+    /// estimated from the `n` sampled rows: the bits functional is a smooth
+    /// (water-filling) function of the sample covariance / firing statistics, so by
+    /// the CLT + delta method `bits(n) = bits(∞) + O_p(σ_bits/√n)`. A constant
+    /// relative tolerance is therefore mis-calibrated by construction — it demands
+    /// that a 256-row estimate be as accurate as an 8192-row one. The bound below
+    /// scales like `1/√n`, and its scale `σ_bits` is measured from the data rather
+    /// than asserted.
+    ///
+    /// Rows are drawn i.i.d. from a fixed deterministic generator, so the leading
+    /// `n` rows really are a random subsample of the same population (the previous
+    /// fixture's rows were a smooth ramp in `i`, where "the first 256 rows" is a
+    /// different, narrower population — the drift it produced was a systematic
+    /// coverage difference, not Monte-Carlo error).
     #[test]
     fn eq4_dictionary_term_is_invariant_to_the_estimation_subsample() {
-        // A single deterministic fitted model on many rows: a flat rank-one atom
-        // (code_dim 1) whose contribution is a fixed function of the row, so any
-        // row subsample scores the SAME underlying model.
+        // One fitted model (a fixed 0.85 shrinkage decoder, a single flat code_dim-1
+        // atom firing on every row) scored on i.i.d. rows. Deterministic LCG +
+        // Box–Muller: the sequence is fixed run to run, but the rows are exchangeable,
+        // which is exactly what makes "the first n rows" an honest MC subsample.
         let full_rows = 8192_usize;
         let d = 3_usize;
+        let mut state = 0x2283_5EED_u64;
+        let mut next_uniform = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Open unit interval: Box–Muller must never see an exact zero.
+            ((state >> 11) as f64 + 0.5) / (1_u64 << 53) as f64
+        };
+        let mut next_normal = move || {
+            let u1: f64 = next_uniform();
+            let u2: f64 = next_uniform();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        };
         let mut test_x = Array2::<f64>::zeros((full_rows, d));
         for i in 0..full_rows {
-            let phase = i as f64 * 0.001;
-            test_x[[i, 0]] = phase.sin();
-            test_x[[i, 1]] = (0.5 * phase).cos();
-            test_x[[i, 2]] = 0.3 * phase.sin() - 0.2;
+            // Correlated, non-isotropic rows so the residual spectrum is nontrivial.
+            let (z0, z1, z2) = (next_normal(), next_normal(), next_normal());
+            test_x[[i, 0]] = z0;
+            test_x[[i, 1]] = 0.6 * z0 + 0.8 * z1;
+            test_x[[i, 2]] = 0.3 * z0 - 0.4 * z1 + 0.5 * z2;
         }
         let recon = test_x.mapv(|value| 0.85 * value);
-        let contribution = recon.clone();
         let gate = Array2::ones((full_rows, 1));
 
         let horizon = 120_000_i64;
         let dictionary_params = 4096_i64;
         let targets = [0.99, 0.95, 0.90, 0.80];
 
-        let score_at = |rows: usize| -> Eq4DescriptionLength {
-            let tx = test_x.slice(ndarray::s![..rows, ..]);
-            let rc = recon.slice(ndarray::s![..rows, ..]);
-            let gt = gate.slice(ndarray::s![..rows, ..]);
-            let contribution = contribution.clone();
+        // Score the contiguous row window `[start, start + len)` as an independent
+        // estimation subsample of the SAME fitted model.
+        let score_range = |start: usize, len: usize| -> Eq4DescriptionLength {
+            let window = ndarray::s![start..start + len, ..];
+            let contribution = recon.slice(window).to_owned();
             eq4_fixed_distortion_description_length(
-                tx,
-                rc,
-                gt,
+                test_x.slice(window),
+                recon.slice(window),
+                gate.slice(window),
                 &[1],
                 dictionary_params,
                 horizon,
@@ -540,9 +574,9 @@ mod tests {
             .unwrap()
         };
 
-        let small = score_at(256);
-        let medium = score_at(1024);
-        let large = score_at(8192);
+        let small = score_range(0, 256);
+        let medium = score_range(0, 1024);
+        let large = score_range(0, full_rows);
 
         // Every run declared the same horizon and priced the same decoder.
         for run in [&small, &medium, &large] {
@@ -552,26 +586,102 @@ mod tests {
         assert_eq!(medium.estimation_rows, 1024);
         assert_eq!(large.estimation_rows, 8192);
 
+        // ── The load-bearing §21 assertion ────────────────────────────────────
         // The dictionary term is BITWISE identical across subsamples: it depends
         // only on the declared horizon, so re-estimation does not move it at all.
-        let expected_dict = 0.5 * dictionary_params as f64 / horizon as f64 * (horizon as f64).log2();
+        let expected_dict =
+            0.5 * dictionary_params as f64 / horizon as f64 * (horizon as f64).log2();
         assert_eq!(small.dictionary_bits, expected_dict);
         assert_eq!(medium.dictionary_bits, small.dictionary_bits);
         assert_eq!(large.dictionary_bits, small.dictionary_bits);
 
-        // The dictionary charge is ~95% of the score at this overcompleteness; the
-        // confound would have moved the total by `0.5·params·(log₂ Nⱼ/Nⱼ − …)`
-        // hundreds of bits. With the fix the totals agree within Monte-Carlo error
-        // of the code/residual expectations across a 32× subsample change.
-        for target_idx in 0..targets.len() {
+        // ── Calibrating σ_bits from the sample itself ─────────────────────────
+        // Split the 8192 rows into 32 DISJOINT 256-row blocks and score each. The
+        // spread of those 32 totals is a direct, assumption-light estimate of the
+        // sampling standard deviation of a 256-row bits estimate, `σ̂₂₅₆`, per
+        // target. Nothing about the tolerance is asserted a priori: it is measured.
+        const BLOCK: usize = 256;
+        let blocks = full_rows / BLOCK;
+        let mut block_bits: Vec<Vec<f64>> = vec![Vec::with_capacity(blocks); targets.len()];
+        for block in 0..blocks {
+            let scored = score_range(block * BLOCK, BLOCK);
+            for (t, row) in scored.per_target.iter().enumerate() {
+                block_bits[t].push(row.bits);
+            }
+        }
+        let block_sd: Vec<f64> = block_bits
+            .iter()
+            .map(|samples| {
+                let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+                let variance = samples.iter().map(|b| (b - mean).powi(2)).sum::<f64>()
+                    / (samples.len() - 1) as f64;
+                variance.sqrt()
+            })
+            .collect();
+
+        // The standard error of the DIFFERENCE between a nested n-row estimate and
+        // the N-row estimate. For an average-like estimator the n-row sample is a
+        // subset of the N-row sample, so
+        //     Var[bits(n) − bits(N)] = σ² · (1/n − 1/N)
+        // (the shared rows cancel; this is strictly smaller than the independent-
+        // samples σ²(1/n + 1/N), and it vanishes as n → N as it must). We
+        // extrapolate σ² from the measured block spread: σ² = BLOCK · σ̂₂₅₆².
+        let se_diff = |sd: f64, n: usize| -> f64 {
+            (sd * sd * BLOCK as f64 * (1.0 / n as f64 - 1.0 / full_rows as f64)).sqrt()
+        };
+        // k = 6 standard errors. Under the CLT/delta-method normal approximation
+        // that is a ~2e-9 two-sided tail per comparison (8 comparisons here, so the
+        // family-wise false-alarm rate is ~1e-8); even with NO distributional
+        // assumption at all, Chebyshev caps each comparison at 1/36. It is a
+        // significance level, not a fudge factor — it does not scale with the
+        // observed discrepancy. The additive 1e-9·(1+|l|) floor only absorbs
+        // floating-point noise in the exactly-shared support/dictionary terms.
+        const K_SIGMA: f64 = 6.0;
+
+        for (target_idx, &target) in targets.iter().enumerate() {
             let s = small.per_target[target_idx].bits;
             let m = medium.per_target[target_idx].bits;
             let l = large.per_target[target_idx].bits;
-            let mc_tol = 1.0e-2 * (1.0 + l.abs());
+            let sd = block_sd[target_idx];
             assert!(
-                (s - l).abs() <= mc_tol && (m - l).abs() <= mc_tol,
-                "target {} totals drifted beyond MC tol: 256={s} 1024={m} 8192={l}",
-                targets[target_idx]
+                sd > 0.0 && sd.is_finite(),
+                "target {target} block spread must be positive and finite, got {sd}"
+            );
+            let float_floor = 1.0e-9 * (1.0 + l.abs());
+            let tol_small = K_SIGMA * se_diff(sd, 256) + float_floor;
+            let tol_medium = K_SIGMA * se_diff(sd, 1024) + float_floor;
+            assert!(
+                (s - l).abs() <= tol_small,
+                "target {target}: 256-row total {s} differs from 8192-row total {l} by \
+                 {} > {K_SIGMA}·se ({tol_small}); σ̂₂₅₆ = {sd}",
+                (s - l).abs()
+            );
+            // Convergence: the 1024-row bound is 2× tighter than the 256-row bound
+            // (`se ∝ 1/√n`), and the estimate still meets it. That is the monotone
+            // "more rows ⇒ closer to the limit" guard, stated as a shrinking bound
+            // the estimator must satisfy rather than as a strict ordering of two
+            // single noisy realisations (which would be flaky by construction).
+            assert!(tol_medium < tol_small);
+            assert!(
+                (m - l).abs() <= tol_medium,
+                "target {target}: 1024-row total {m} differs from 8192-row total {l} by \
+                 {} > {K_SIGMA}·se ({tol_medium}); σ̂₂₅₆ = {sd}",
+                (m - l).abs()
+            );
+
+            // ── Anti-vacuity ──────────────────────────────────────────────────
+            // The tolerance must be far too tight to hide the #2283 confound. Under
+            // the OLD behaviour the dictionary term was `0.5·params·log₂(n)/n` in the
+            // ESTIMATION rows, so the same fitted model's total moved by ~60.7 bits
+            // between 256 and 8192 rows. Assert that gap is orders of magnitude above
+            // the tolerance we just allowed: this test would have FAILED loudly on the
+            // pre-fix scorer.
+            let confounded_dict = |n: usize| 0.5 * dictionary_params as f64 * (n as f64).log2() / n as f64;
+            let confound_gap = (confounded_dict(256) - confounded_dict(8192)).abs();
+            assert!(
+                confound_gap > 10.0 * tol_small,
+                "tolerance {tol_small} is too loose to catch the #2283 confound, whose \
+                 256-vs-8192 dictionary swing is {confound_gap} bits (target {target})"
             );
         }
     }
