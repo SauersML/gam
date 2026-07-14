@@ -3735,40 +3735,6 @@ mod root_cause_tests {
         assert!(!state.certifies_kkt(9.9e-4, tol));
     }
 
-    /// The Newton-decrement upper bound `(−lin)·(1 + λ_lm/λ_min)` is
-    /// derived from the resolvent identity and is a *provable* upper bound
-    /// on `gᵀH⁻¹g` whenever `λ_min(H) ≥ ridge_floor`. Verify the algebraic
-    /// inequality on a 2×2 worked example so the formula is locked in.
-    #[test]
-    pub(crate) fn newton_decrement_correction_upper_bounds_true_decrement() {
-        // H = diag(2, 0.5).  λ_min = 0.5.  λ_lm = 0.25.
-        let lambda_min = 0.5_f64;
-        let lambda_lm = 0.25_f64;
-        let g = ndarray::array![1.0_f64, 1.0];
-        // True Newton decrement²: gᵀ H⁻¹ g = 1/2 + 1/0.5 = 0.5 + 2.0 = 2.5
-        let true_decrement_sq = g[0].powi(2) / 2.0 + g[1].powi(2) / 0.5;
-        // Damped: gᵀ (H+λI)⁻¹ g = 1/(2+0.25) + 1/(0.5+0.25) = 1/2.25 + 1/0.75
-        let damped_decrement_sq =
-            g[0].powi(2) / (2.0 + lambda_lm) + g[1].powi(2) / (0.5 + lambda_lm);
-        // Correction factor: 1 + λ_lm / λ_min = 1 + 0.25/0.5 = 1.5
-        let correction = 1.0 + lambda_lm / lambda_min;
-        let upper_bound = damped_decrement_sq * correction;
-        assert!(
-            upper_bound >= true_decrement_sq,
-            "(1 + λ_lm/λ_min)·damped must upper-bound true decrement: \
-             upper={:.6}  true={:.6}",
-            upper_bound,
-            true_decrement_sq,
-        );
-        // And the bound should be tight enough to be useful (within 2× of true).
-        assert!(
-            upper_bound <= 2.0 * true_decrement_sq,
-            "correction should not be wildly loose: upper={:.6}  true={:.6}",
-            upper_bound,
-            true_decrement_sq,
-        );
-    }
-
     /// Hypothesis 3: LM gain-ratio fallback should accept when both predicted
     /// and actual reduction are floating-point noise relative to the objective.
     #[test]

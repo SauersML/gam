@@ -824,7 +824,6 @@ where
 
             let has_constraints =
                 options.linear_constraints.is_some() || options.coefficient_lower_bounds.is_some();
-            let mut root_damped_decrement_sq = None;
             let direction = match if let Some(h_sparse) = state.hessian.as_sparse() {
                 if has_constraints {
                     Err(EstimationError::InvalidInput(
@@ -1005,9 +1004,6 @@ where
                         dense_reg,
                         &mut newton_direction,
                     )
-                    .map(|certificate| {
-                        root_damped_decrement_sq = certificate;
-                    })
                 }
             } {
                 Ok(()) => &newton_direction,
@@ -1463,50 +1459,14 @@ where
                             .as_ref()
                             .expect("final_state set immediately above");
 
-                        // Newton-decrement acceptance (Boyd & Vandenberghe §9.5.1):
-                        // at the pre-step iterate the squared decrement is
-                        //     λ_N²(β) = gᵀ H⁻¹ g  =  −g · d_N,
-                        // where d_N = −H⁻¹g is the pure Newton step.
-                        //
-                        // The direction we just solved is d = −(H + λ_lm·I)⁻¹g,
-                        // so −lin = gᵀ(H + λ_lm·I)⁻¹g UNDER-estimates λ_N².
-                        // From the resolvent identity
-                        //     H⁻¹ = (H + λ_lm·I)⁻¹ + λ_lm·H⁻¹·(H + λ_lm·I)⁻¹,
-                        // applied between gᵀ and g and bounded by ‖H⁻¹‖₂ ≤
-                        // 1/λ_min(H), we get the *exact* upper bound
-                        //     λ_N² ≤ (−lin) · (1 + λ_lm/λ_min(H)).
-                        // PIRLS's `ensure_positive_definite_with_ridge` step
-                        // guarantees λ_min(H) ≥ `ridge_used` after the ridge
-                        // is folded in (with a 1e-12 absolute floor for the
-                        // ridge-free case). Multiplying −lin by that
-                        // correction makes the test a *provably* faithful
-                        // upper bound on the true Newton decrement, removing
-                        // the prior heuristic gate `loop_lambda ≤ 1.0`.
-                        //
-                        // The scale-invariant criterion
-                        //     λ_N² / (1 + |F(β)|) ≤ τ²
-                        // is the textbook Newton stopping rule: ½λ_N² is the
-                        // model's predicted decrease in F from this iterate,
-                        // so when it falls below the objective's natural
-                        // rounding scale, further inner iterations cannot
-                        // improve the certificate. This is an *additional*
-                        // acceptance — it never weakens the gradient-norm
-                        // tests, only certifies convergence in problems where
-                        // ‖g‖ is intrinsically large (very ill-conditioned
-                        // designs) but H⁻¹g is already tiny.
-                        let f_scale = 1.0 + current_penalized.abs();
-                        let lambda_floor = final_state_ref.ridge_used.max(1.0e-12);
-                        let nd_correction = 1.0 + loop_lambda / lambda_floor;
-                        let damped_decrement_sq = root_damped_decrement_sq
-                            .unwrap_or_else(|| (-lin).max(0.0));
-                        let newton_decrement_sq_upper = damped_decrement_sq * nd_correction;
-                        let nd_threshold = kkt_tolerance * kkt_tolerance * f_scale;
-                        let nd_pass = newton_decrement_sq_upper <= nd_threshold;
                         // Once realized progress is below the objective's
-                        // floating-point noise floor, the damped resolvent bound
-                        // above can be arbitrarily loose even though the exact
-                        // bare-Hessian decrement is decisive. Compute that exact
-                        // certificate once at the plateau. This is restricted to
+                        // floating-point noise floor, compute the exact
+                        // bare-Hessian Newton decrement at the accepted state.
+                        // A damped decrement from the pre-step state is neither
+                        // a certificate for this state nor, under anisotropic
+                        // LM damping, convertible without an independently
+                        // certified lower spectral bound for H.  Do not reuse
+                        // it. This exact check is restricted to
                         // unconstrained coefficient geometry: constrained KKT
                         // points and Arrow-Schur joint states require their own
                         // projected/block decrement, so the raw beta Hessian is
@@ -1519,18 +1479,32 @@ where
                             && !has_explicit_constraints
                             && options.arrow_schur.is_none()
                         {
-                            exact_newton_decrement_sq(final_state_ref)
+                            // Certify the accepted state itself.  The root
+                            // solve used to produce this LM step described the
+                            // pre-step state and cannot be carried across the
+                            // coefficient update.  Models that retain an
+                            // augmented least-squares root recompute the bare
+                            // decrement here without ever forming the
+                            // cancellation-prone coefficient gradient; other
+                            // models use the assembled exact Hessian solve.
+                            model
+                                .exact_unconstrained_decrement_sq(&beta, final_state_ref)?
+                                .or_else(|| exact_newton_decrement_sq(final_state_ref))
                         } else {
                             None
                         };
+                        let exact_nd_threshold = kkt_tolerance
+                            * kkt_tolerance
+                            * (1.0
+                                + penalizedobjective(final_state_ref, penalized_dev_scale).abs());
                         let exact_nd_pass = exact_decrement_sq
-                            .is_some_and(|decrement_sq| decrement_sq <= nd_threshold);
+                            .is_some_and(|decrement_sq| decrement_sq <= exact_nd_threshold);
                         if should_check_exact_nd {
                             log::info!(
                                 "[PIRLS exact-decrement] applicable={} decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} relative_gradient={:.6e} dimension_scale={:.6e} natural_scale={:.6e} objective={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e}",
                                 !has_explicit_constraints && options.arrow_schur.is_none(),
                                 exact_decrement_sq.unwrap_or(f64::NAN),
-                                nd_threshold,
+                                exact_nd_threshold,
                                 exact_nd_pass,
                                 convergence_grad_norm,
                                 final_state_ref.relative_gradient_norm(convergence_grad_norm),
@@ -1556,7 +1530,6 @@ where
                         // acceptance for ill-conditioned problems where ‖g‖
                         // is intrinsically large but H⁻¹g is already tiny.
                         if final_state_ref.certifies_kkt(convergence_grad_norm, kkt_tolerance)
-                            || nd_pass
                             || exact_nd_pass
                         {
                             status = PirlsStatus::Converged;

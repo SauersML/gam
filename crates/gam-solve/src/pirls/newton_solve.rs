@@ -697,6 +697,20 @@ mod square_root_solve_tests {
 
         assert!((actual[0] - expected[0]).abs() < 1.0e-8);
         assert!((actual[1] - expected[1]).abs() < 1.0e-8);
+
+        // Certification is state-local: at the stationary state the same
+        // large root-space residual is orthogonal to the model range, so its
+        // bare Newton decrement is machine zero without taking another step
+        // and recomputing a cancellation-prone coefficient gradient.
+        let mut stationary_direction = Array1::<f64>::zeros(2);
+        let stationary_decrement = solve_newton_direction_from_root(
+            &root,
+            &orthogonal_residual,
+            &mut stationary_direction,
+        )
+        .expect("stationary least-squares root certificate");
+        assert!(stationary_direction.dot(&stationary_direction) <= 1.0e-28);
+        assert!(stationary_decrement <= 1.0e-28);
     }
 }
 

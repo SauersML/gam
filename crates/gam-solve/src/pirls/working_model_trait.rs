@@ -52,7 +52,7 @@ pub trait WorkingModel {
         lm_d2: &Array1<f64>,
         regularized_hessian: &Array2<f64>,
         direction_out: &mut Array1<f64>,
-    ) -> Result<Option<f64>, EstimationError> {
+    ) -> Result<(), EstimationError> {
         if beta.as_ref().len() != state.gradient.len() {
             crate::bail_invalid_estim!(
                 "PIRLS coefficient length {} does not match gradient length {}",
@@ -73,6 +73,28 @@ pub trait WorkingModel {
             );
         }
         solve_newton_direction_dense(regularized_hessian, &state.gradient, direction_out)?;
+        Ok(())
+    }
+
+    /// Return an exact squared Newton decrement for the supplied coefficient
+    /// state when the model owns a numerically stronger representation than
+    /// the assembled coefficient-space gradient/Hessian.
+    ///
+    /// The certificate must describe `beta` and `state` themselves.  A
+    /// decrement computed while solving a previous LM step cannot be reused
+    /// after that step has changed the coefficients.
+    fn exact_unconstrained_decrement_sq(
+        &mut self,
+        beta: &Coefficients,
+        state: &WorkingState,
+    ) -> Result<Option<f64>, EstimationError> {
+        if beta.as_ref().len() != state.gradient.len() {
+            crate::bail_invalid_estim!(
+                "PIRLS coefficient length {} does not match gradient length {}",
+                beta.as_ref().len(),
+                state.gradient.len()
+            );
+        }
         Ok(None)
     }
 

@@ -18,6 +18,19 @@ use super::*;
 //     dV/dρ_k = 0.5 λ_k βᵀ S_k β + 0.5 λ_k tr(H^{-1} S_k) - 0.5 det1[k].
 pub(crate) const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 
+fn augmented_root_represents_working_system(
+    curvature: HessianCurvatureKind,
+    firth_bias_reduction: bool,
+    stiff_penalty: bool,
+    hessian_weights: &Array1<f64>,
+) -> bool {
+    curvature == HessianCurvatureKind::Fisher
+        && (firth_bias_reduction || stiff_penalty)
+        && hessian_weights
+            .iter()
+            .all(|&weight| weight.is_finite() && weight >= 0.0)
+}
+
 pub(crate) struct GamWorkingModel<'a> {
     pub(crate) x_original: DesignMatrix,
     pub(crate) coordinate_design: WorkingCoordinateDesign,
@@ -412,10 +425,18 @@ impl<'a> GamWorkingModel<'a> {
         let diagonal_start = n + penalty_rows;
         for j in 0..p {
             let energy = state.ridge_used + loop_lambda * lm_d2[j];
-            if !(energy.is_finite() && energy > 0.0) {
+            if !(energy.is_finite() && energy >= 0.0) {
                 crate::bail_invalid_estim!(
-                    "PIRLS square-root LM diagonal must be finite and positive, got {energy} at coefficient {j}"
+                    "PIRLS square-root LM diagonal must be finite and nonnegative, got {energy} at coefficient {j}"
                 );
+            }
+            // The exact bare-Hessian stationarity certificate calls this path
+            // with both structural ridge and transient LM damping equal to
+            // zero.  Its augmented diagonal row is then mathematically absent;
+            // leave the preallocated row and residual at zero rather than
+            // manufacturing a ridge merely to make the storage rectangular.
+            if energy == 0.0 {
+                continue;
             }
             let root_energy = energy.sqrt();
             root[[diagonal_start + j, j]] = root_energy;
@@ -1369,14 +1390,27 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         lm_d2: &Array1<f64>,
         regularized_hessian: &Array2<f64>,
         direction_out: &mut Array1<f64>,
-    ) -> Result<Option<f64>, EstimationError> {
+    ) -> Result<(), EstimationError> {
         let stabilizing_floor = lm_d2
             .iter()
             .map(|&scale| state.ridge_used + loop_lambda * scale)
             .fold(f64::INFINITY, f64::min);
-        if state.hessian_curvature == HessianCurvatureKind::Fisher
-            && self.penalty.requires_root_solve(stabilizing_floor)
-        {
+        // Firth scoring is itself defined by the adjusted working residual.
+        // Forming X'W(eta-z*) before solving discards digits whenever the
+        // Jeffreys score cancels the ordinary score, even when the penalty is
+        // not yet large enough to trip the stiffness gate.  If the realized
+        // row curvature is PSD, the augmented least-squares root is the exact
+        // same LM system and preserves that cancellation directly.  Observed
+        // noncanonical curvature is not the curvature of the Firth working
+        // residual (even when every realized row weight happens to be
+        // positive), so it retains the assembled dense solve; Fisher fallback
+        // supplies the exact PSD-root state.
+        if augmented_root_represents_working_system(
+            state.hessian_curvature,
+            self.firth_bias_reduction,
+            self.penalty.requires_root_solve(stabilizing_floor),
+            &self.lasthessian_weights,
+        ) {
             self.solve_fisher_direction_from_root(
                 beta,
                 state,
@@ -1384,10 +1418,74 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 lm_d2,
                 direction_out,
             )
-            .map(Some)
+            .map(|_| ())
         } else {
             solve_newton_direction_dense(regularized_hessian, &state.gradient, direction_out)?;
-            Ok(None)
+            Ok(())
         }
+    }
+
+    fn exact_unconstrained_decrement_sq(
+        &mut self,
+        beta: &Coefficients,
+        state: &WorkingState,
+    ) -> Result<Option<f64>, EstimationError> {
+        if !augmented_root_represents_working_system(
+            state.hessian_curvature,
+            self.firth_bias_reduction,
+            self.penalty.requires_root_solve(0.0),
+            &self.lasthessian_weights,
+        ) {
+            return Ok(None);
+        }
+        let mut direction = Array1::<f64>::zeros(state.gradient.len());
+        let unit_diagonal = Array1::<f64>::ones(state.gradient.len());
+        self.solve_fisher_direction_from_root(
+            beta,
+            state,
+            0.0,
+            &unit_diagonal,
+            &mut direction,
+        )
+        .map(Some)
+    }
+}
+
+#[cfg(test)]
+mod augmented_root_route_tests {
+    use super::*;
+
+    #[test]
+    fn firth_fisher_scoring_uses_root_before_penalty_becomes_stiff() {
+        let weights = ndarray::array![0.25, 0.1, 0.0];
+        assert!(augmented_root_represents_working_system(
+            HessianCurvatureKind::Fisher,
+            true,
+            false,
+            &weights,
+        ));
+        assert!(!augmented_root_represents_working_system(
+            HessianCurvatureKind::Fisher,
+            false,
+            false,
+            &weights,
+        ));
+    }
+
+    #[test]
+    fn root_route_requires_the_exact_psd_working_curvature() {
+        let positive = ndarray::array![0.25, 0.1];
+        assert!(!augmented_root_represents_working_system(
+            HessianCurvatureKind::Observed,
+            true,
+            true,
+            &positive,
+        ));
+        assert!(!augmented_root_represents_working_system(
+            HessianCurvatureKind::Fisher,
+            true,
+            true,
+            &ndarray::array![0.25, -0.1],
+        ));
     }
 }
