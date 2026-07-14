@@ -3015,6 +3015,13 @@ pub fn branch_cell(cell: DenestedCubicCell) -> Result<ExactCellBranch, String> {
         ))
         .into());
     }
+    if cell.right <= cell.left {
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
+            "finite cell must have left < right, got [{}, {}]",
+            cell.left, cell.right
+        ))
+        .into());
+    }
     // These are exact polynomial classes, not approximation bands. Numerical
     // conditioning is handled inside the evaluator without erasing terms.
     if cell.c2 == 0.0 && cell.c3 == 0.0 {
