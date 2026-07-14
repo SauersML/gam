@@ -1462,7 +1462,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
     beta: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
     direction_out: &mut Array1<f64>,
-    active_hint: Option<&mut Vec<usize>>,
+    mut active_hint: Option<&mut Vec<usize>>,
     max_iterations: usize,
     allow_projected_gradient_fallback: bool,
 ) -> Result<(), EstimationError> {
@@ -1487,6 +1487,20 @@ fn solve_newton_direction_with_linear_constraints_impl(
     let mut x = beta.to_owned();
     let mut d_total = Array1::<f64>::zeros(p);
     let mut g_cur = gradient.to_owned();
+
+    // A warm working set describes the face at the point that produced it.
+    // Trust-region globalization may accept only a strict subsegment of that
+    // point's QP chord, in which case rows that bind at the QP endpoint are
+    // slack at the accepted iterate. Treating those stale row ids as equality
+    // constraints pins the next Newton solve to a face it has not reached and
+    // turns a full Newton step into geometric boundary chasing (#979). A row
+    // can enter the working set only if it is actually tight at this solve's
+    // primal point; the ordinary ratio test rediscovers it when reached.
+    if let Some(hint) = active_hint.as_mut() {
+        hint.retain(|&idx| {
+            idx < m && scaled_constraint_slack(&x, constraints, idx) <= tol_active
+        });
+    }
 
     let has_active_hint = active_hint
         .as_ref()
@@ -2234,6 +2248,20 @@ fn solve_newton_direction_with_constraint_set_impl(
     let mut g_cur = gradient.to_owned();
     let mut values_x = ops.values(&x)?;
 
+    // Face provenance is point-local. If globalization accepted only part of
+    // the previous QP chord, its endpoint rows are not active at the accepted
+    // point. Retaining them as warm equalities makes the next operator solve
+    // chase a still-slack face by the same small trust fraction every cycle.
+    // Keep only rows tight at the current beta; the full-set ratio test adds
+    // any discarded row exactly when the iterate actually reaches it.
+    if let Some(hint) = active_hint.as_mut() {
+        hint.retain(|&idx| {
+            idx < m
+                && ops.norms[idx] > 0.0
+                && ops.scaled_slack(&values_x, idx) <= tol_active
+        });
+    }
+
     let has_active_hint = active_hint
         .as_ref()
         .map(|hint| !hint.is_empty())
@@ -2801,6 +2829,46 @@ mod tests {
         assert!(alpha > 0.0);
         let terminal_slack = slack + alpha * rate;
         assert!(terminal_slack >= -ACTIVE_SET_PRIMAL_FEASIBILITY_TOL * (1.0 + 1e-12));
+    }
+
+    #[test]
+    fn warm_face_rows_are_point_local_for_dense_and_operator_constraints() {
+        // The previous QP endpoint was x=0, where x>=0 binds, but a trust
+        // step accepted only an interior point x=1. Reusing row 0 as an
+        // equality at x=1 would solve the wrong problem and drive x back to
+        // the stale boundary. The actual quadratic has its feasible minimizer
+        // at x=2, so both carriers must discard the slack warm row and return
+        // the unconstrained interior minimizer with an empty face.
+        let hessian = array![[1.0_f64]];
+        let rhs = array![2.0_f64];
+        let interior = array![1.0_f64];
+        let dense = LinearInequalityConstraints::new(array![[1.0]], array![0.0])
+            .expect("one-dimensional half-line");
+        let (dense_solution, dense_active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &interior,
+            &dense,
+            Some(&[0]),
+        )
+        .expect("dense stale-face solve");
+        assert_relative_eq!(dense_solution[0], 2.0, epsilon = 1e-12);
+        assert!(dense_active.is_empty());
+
+        let factor = std::sync::Arc::new(array![[1.0_f64]]);
+        let cone = KhatriRaoConeConstraints::new(factor, vec![0], 1)
+            .expect("one-dimensional factored half-line");
+        let operator = ConstraintSet::KhatriRaoCone(cone);
+        let (operator_solution, operator_active) = solve_quadratic_with_constraint_set(
+            &hessian,
+            &rhs,
+            &interior,
+            &operator,
+            Some(&[0]),
+        )
+        .expect("operator stale-face solve");
+        assert_relative_eq!(operator_solution[0], 2.0, epsilon = 1e-12);
+        assert!(operator_active.is_empty());
     }
 
     /// A `β = 0` seed sits on the boundary of EVERY row of a homogeneous
