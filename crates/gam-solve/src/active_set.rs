@@ -2238,6 +2238,37 @@ fn solve_newton_direction_with_constraint_set_impl(
             break;
         }
 
+        // A zero-length blocking step changes only the row representation of
+        // this active face; the primal point and its quadratic gradient have not
+        // moved. A factored cone can have thousands of observation rows carrying
+        // the same low-dimensional normal geometry, so continuing the add/drop
+        // loop enumerates distinct row-ID combinations without primal progress.
+        // The issue-979 CTN witness held a 92/93-row face and performed hundreds
+        // of these swaps immediately; its row-count-derived ceiling permitted
+        // roughly 96,000.
+        //
+        // This event is exactly a normal-cone identification problem at the
+        // current x. Ask the shared factored separator for the tangent-cone
+        // projection now. It adds only geometrically necessary omitted rows and
+        // returns a full-set-feasible strict descent direction, or declines and
+        // leaves the ordinary active-set loop in control. The trigger is a
+        // mathematical no-progress event, not an iteration or wall-clock budget.
+        let primal_step_norm = alpha.abs() * step_norm;
+        if added_new_active && primal_step_norm <= tol_step {
+            if let Some((fallback_direction, fallback_active)) =
+                fallback_projected_gradient_direction_with_constraint_set(
+                    &x, &d_total, &g_cur, &active, ops,
+                )?
+            {
+                if let Some(hint) = active_hint.as_mut() {
+                    hint.clear();
+                    hint.extend(fallback_active);
+                }
+                direction_out.assign(&fallback_direction);
+                return Ok(());
+            }
+        }
+
         if active.is_empty() && !added_new_active {
             if let Some(hint) = active_hint.as_mut() {
                 hint.clear();
