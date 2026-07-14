@@ -2659,7 +2659,7 @@ fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
     // a converged verdict — superseding the (non-stationary, higher raw-cost)
     // seed.
     let boundary_probe = array![-10.0, -10.0];
-    let verdict = guard.observe_constrained_stationary(&boundary_probe, 0.5, 0.0, true);
+    let verdict = guard.observe_constrained_stationary(&boundary_probe, 0.5, 0.0, true, None);
     assert!(
         matches!(verdict, CostStallVerdict::Converged),
         "a finite constrained-stationary separation probe should halt immediately"
@@ -2706,7 +2706,8 @@ fn constrained_stationary_probe_keeps_better_incumbent() {
     // separation probe) while two more rail at λ→∞; its cost is hundreds of
     // units WORSE than the incumbent.
     let collapse_corner = array![30.0, 29.95, -30.0, -30.0];
-    let verdict = guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true);
+    let verdict =
+        guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true, None);
 
     // The probe regresses, so the guard must NOT halt-and-publish it as the
     // optimum on this single observation; it folds in as an ordinary
@@ -2730,8 +2731,9 @@ fn constrained_stationary_probe_keeps_better_incumbent() {
 
     // Driving the no-improvement window to its limit halts on the GOOD
     // incumbent, never on the collapse corner.
-    guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true);
-    let final_verdict = guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true);
+    guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true, None);
+    let final_verdict =
+        guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true, None);
     assert!(
         !matches!(final_verdict, CostStallVerdict::Continue),
         "the stall window should eventually fill and halt"

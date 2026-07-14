@@ -718,22 +718,6 @@ impl CostStallGuard {
         value: f64,
         grad_norm: f64,
         inner_converged: bool,
-    ) -> CostStallVerdict {
-        self.observe_second_order_constrained_stationary(
-            rho,
-            value,
-            grad_norm,
-            inner_converged,
-            None,
-        )
-    }
-
-    pub(crate) fn observe_second_order_constrained_stationary(
-        &mut self,
-        rho: &Array1<f64>,
-        value: f64,
-        grad_norm: f64,
-        inner_converged: bool,
         hessian_psd: Option<bool>,
     ) -> CostStallVerdict {
         if !value.is_finite() {
@@ -1894,7 +1878,7 @@ impl OuterSecondOrderBridge<'_> {
             // ridge of #1426 — keeps that interior mass in ‖g_proj‖, so
             // `publish_stall` honestly returns FlatValleyStall / converged=false
             // instead of shipping the overfit silently behind a fake zero.
-            guard.observe_second_order_constrained_stationary(
+            guard.observe_constrained_stationary(
                 x,
                 cost,
                 projected_g_norm,
