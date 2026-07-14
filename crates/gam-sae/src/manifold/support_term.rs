@@ -898,7 +898,18 @@ impl SaeSupportSparseTerm {
             )
             .map_err(|error| format!("SaeSupportSparseTerm::coordinate_sweep: {error}"))?;
             let directional = rhs_vector.dot(&delta);
-            if directional <= f64::EPSILON {
+            if !directional.is_finite() || directional < 0.0 {
+                return Err(format!(
+                    "SaeSupportSparseTerm::coordinate_sweep: trust-region step is not a finite descent direction (rhs_dot_delta={directional})"
+                ));
+            }
+            // `rhsᵀ delta` is quadratic in the gradient near a stationary point.
+            // Comparing it with an absolute machine epsilon therefore invents a
+            // sqrt(EPSILON) gradient floor (~1.5e-8 for f64), preventing tighter
+            // KKT tolerances from ever being reached. Exact zero is the only
+            // no-direction case; any positive value remains a valid descent
+            // certificate regardless of magnitude.
+            if directional == 0.0 {
                 continue;
             }
             let old_coords = self.assignment.coords_row(row).to_vec();
