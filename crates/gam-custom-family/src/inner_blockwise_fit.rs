@@ -27,6 +27,139 @@ impl ExactJointModeCurvatureCertificate {
     }
 }
 
+/// Exact Newton candidate on a certified, locally fixed inequality face.
+///
+/// The global constrained step uses a convex model to discover the active
+/// face. Once that face is known, convexifying the Hessian in ambient
+/// coefficient space is mathematically wrong: curvature normal to the face is
+/// inaccessible, and reflecting it can perturb the tangent Newton equation.
+/// This routine instead solves the exact reduced system
+///
+///     (Z' H Z) delta_z = Z' r,   delta = Z delta_z,
+///
+/// where `Z` spans `null(A_active)`. The candidate is returned only when the
+/// reduced Hessian is strictly positive definite, the complete constraint set
+/// remains feasible, and the quadratic gradient has a nonnegative active-face
+/// multiplier representation. Otherwise face discovery retains ownership.
+fn certified_exact_face_newton_candidate(
+    exact_hessian: &Array2<f64>,
+    rhs: &Array1<f64>,
+    beta: &Array1<f64>,
+    constraints: &ConstraintSet,
+    active_rows: &[usize],
+) -> Result<Option<Array1<f64>>, String> {
+    let p = beta.len();
+    if active_rows.is_empty()
+        || rhs.len() != p
+        || exact_hessian.nrows() != p
+        || exact_hessian.ncols() != p
+        || constraints.ncols() != p
+    {
+        return Ok(None);
+    }
+    let gathered = constraints
+        .gather_rows(active_rows)
+        .map_err(|error| format!("exact active-face row gather failed: {error}"))?;
+    let tangent = match active_constraint_tangent_geometry(&gathered.a)? {
+        ActiveConstraintTangentGeometry::FullyPinned => return Ok(None),
+        ActiveConstraintTangentGeometry::Tangent(tangent) => tangent,
+    };
+    let mut reduced_hessian = tangent.t().dot(exact_hessian).dot(&tangent);
+    symmetrize_dense_in_place(&mut reduced_hessian);
+    let (eigenvalues, eigenvectors) = FaerEigh::eigh(&reduced_hessian, faer::Side::Lower)
+        .map_err(|error| format!("exact active-face Hessian eigendecomposition failed: {error:?}"))?;
+    let curvature_scale = eigenvalues
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    if !(curvature_scale.is_finite() && curvature_scale > 0.0) {
+        return Ok(None);
+    }
+    let positive_floor = KKT_REFUSAL_RANK_TOL * curvature_scale;
+    if eigenvalues
+        .iter()
+        .any(|value| !value.is_finite() || *value <= positive_floor)
+    {
+        return Ok(None);
+    }
+    let reduced_rhs = tangent.t().dot(rhs);
+    let mut spectral_step = eigenvectors.t().dot(&reduced_rhs);
+    for (coefficient, eigenvalue) in spectral_step.iter_mut().zip(eigenvalues.iter()) {
+        *coefficient /= *eigenvalue;
+    }
+    let delta = tangent.dot(&eigenvectors.dot(&spectral_step));
+    if delta.iter().any(|value| !value.is_finite()) {
+        return Ok(None);
+    }
+    let candidate = beta + &delta;
+    if check_linear_feasibility(
+        &candidate,
+        constraints,
+        gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
+    )
+    .is_err()
+    {
+        return Ok(None);
+    }
+
+    // The reduced solve certifies tangent stationarity. Certify the other KKT
+    // half as well: its remaining quadratic gradient must be representable by
+    // nonnegative multipliers on this face. The shared cone projector owns
+    // dependent-row compression and multiplier signs.
+    let quadratic_gradient = exact_hessian.dot(&delta) - rhs;
+    let Some((projected, _multipliers)) =
+        project_stationarity_residual_on_constraint_cone(&quadratic_gradient, &gathered.a)
+    else {
+        return Ok(None);
+    };
+    let residual_inf = projected
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    let gradient_scale = quadratic_gradient
+        .iter()
+        .chain(rhs.iter())
+        .map(|value| value.abs())
+        .fold(1.0_f64, f64::max);
+    if residual_inf > 1e-8 * gradient_scale {
+        return Ok(None);
+    }
+    Ok(Some(candidate))
+}
+
+#[cfg(test)]
+mod exact_face_newton_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn exact_face_newton_uses_tangent_curvature_not_ambient_reflection() {
+        // H is indefinite in ambient space (det(H) = -3), but the active
+        // half-space x>=0 pins its inaccessible negative-curvature direction.
+        // On the tangent x=0 the exact curvature is +2, so the certified Newton
+        // solution is y=1. Ambient eigenvalue reflection changes that tangent
+        // equation and therefore cannot own the fixed-face endgame.
+        let hessian = array![[-1.0_f64, 1.0], [1.0, 2.0]];
+        let rhs = array![0.0_f64, 2.0];
+        let beta = array![0.0_f64, 0.0];
+        let constraints = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(array![[1.0_f64, 0.0]], array![0.0])
+                .expect("x>=0 half-space"),
+        );
+        let candidate = certified_exact_face_newton_candidate(
+            &hessian,
+            &rhs,
+            &beta,
+            &constraints,
+            &[0],
+        )
+        .expect("exact face classification")
+        .expect("positive reduced curvature and nonnegative multiplier");
+        assert!(candidate[0].abs() <= 1e-12);
+        assert!((candidate[1] - 1.0).abs() <= 1e-12);
+    }
+}
+
 pub(crate) fn fused_first_attempt_log_likelihood<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
@@ -1483,6 +1616,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         Ok(matrix) => matrix,
                         Err(_) => break,
                     };
+                    let mut exact_lhs = lhs.clone();
+                    add_joint_penalty_to_matrix(
+                        &mut exact_lhs,
+                        &ranges,
+                        &s_lambdas,
+                        joint_mode_diagonal_ridge,
+                        joint_bundle,
+                    );
                     add_joint_penalty_to_matrix(
                         &mut lhs,
                         &ranges,
@@ -1547,6 +1688,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         && grad_phi.len() == rhs_step.len()
                     {
                         rhs_step += grad_phi;
+                        exact_lhs += hphi;
                         lhs += &symmetric_psd_projection(hphi);
                     }
                     // The constrained QP cannot drop ker(H_pen) the way the
@@ -1641,7 +1783,26 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     // makes release and entry contradict each other (gam#979).
                     let lhs = constrained_geometry.matrix;
                     let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
-                    let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
+                    let exact_face_candidate = if lower_bounds.is_none() {
+                        if let Some(active_rows) = warm_joint_active.as_deref() {
+                            certified_exact_face_newton_candidate(
+                                &exact_lhs,
+                                &rhs_step,
+                                &beta_joint,
+                                constraints,
+                                active_rows,
+                            )?
+                            .map(|candidate| (candidate, active_rows.to_vec()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let used_exact_face = exact_face_candidate.is_some();
+                    let solve_result = if let Some(exact) = exact_face_candidate {
+                        Ok(exact)
+                    } else if let Some(bounds) = lower_bounds.as_ref() {
                         solve_quadratic_with_simple_lower_bounds(
                             &lhs,
                             &rhs_beta,
@@ -1672,7 +1833,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             log::warn!(
                                 "[gam#979 constrained-QP] cycle={} path={} warm_rows={} active_set_rows={} beta_inf={:.4e}",
                                 cycle,
-                                if lower_bounds.is_some() {
+                                if used_exact_face {
+                                    "exact-face"
+                                } else if lower_bounds.is_some() {
                                     "simple"
                                 } else {
                                     "linear"
