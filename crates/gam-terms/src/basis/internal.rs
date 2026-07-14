@@ -63,13 +63,30 @@ pub(crate) fn evaluate_splines_at_point_full_support_into(
         return;
     }
 
+    // A genuinely right-clamped knot vector repeats its terminal knot
+    // `degree + 1` times.  The half-open degree-zero intervals beneath that
+    // endpoint are therefore all degenerate, so seeding the last interval and
+    // running Cox--de Boor would incorrectly collapse the endpoint row to
+    // zero.  Apply the standard clamped-endpoint convention directly in the
+    // final basis coordinate.  Do not extend this convention to an unclamped
+    // outer knot: exterior-support evaluators still need its ordinary
+    // half-open-span semantics.
+    let last_knot = knots[num_knots - 1];
+    let terminal_multiplicity = degree + 1;
+    let right_clamped = terminal_multiplicity <= num_knots
+        && (num_knots - terminal_multiplicity..num_knots)
+            .all(|index| knots[index] == last_knot);
+    if x == last_knot && right_clamped {
+        basisvalues[num_basis - 1] = 1.0;
+        return;
+    }
+
     let zero_degree_len = num_knots - 1;
     scratch.all_prev.resize(zero_degree_len, 0.0);
     scratch.all_prev.fill(0.0);
 
-    let last_knot = knots[num_knots - 1];
     for i in 0..zero_degree_len {
-        if (knots[i] <= x && x < knots[i + 1]) || (x == last_knot && i + 1 == zero_degree_len) {
+        if knots[i] <= x && x < knots[i + 1] {
             scratch.all_prev[i] = 1.0;
         }
     }

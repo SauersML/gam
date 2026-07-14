@@ -3816,14 +3816,16 @@ fn test_even_d_duchon_collision_derivative_matches_finite_difference_2315() {
     // (2(p+s) > d + 2j + 2) and places the r^{2j} polyharmonic block on the
     // even-d ln(r) branch at m = d/2 + j <= p, so the log-cancellation path is
     // genuinely live. j=1 uses the 3-point second-derivative stencil (tol 1e-5,
-    // matching the Matern/Riesz radial ladders); j=2 uses the 5-point
-    // fourth-derivative stencil (tol 1e-3, matching the isotropic-kappa
-    // second-difference gate).
+    // matching the Matern/Riesz radial ladders); j=2 uses Richardson
+    // extrapolation between two 5-point fourth-derivative stencils.  The latter
+    // deliberately uses a moderate base step: dividing an O(h^4) cancellation
+    // residual by h^4 at h=3e-3 amplifies ordinary kernel-value roundoff by
+    // roughly 1e10 and is not an independent numerical oracle.
     let cases: &[(usize, usize, usize, usize, f64, f64)] = &[
         (2, 2, 2, 1, 5e-3, 1e-5),
         (4, 3, 2, 1, 5e-3, 1e-5),
-        (2, 3, 2, 2, 3e-3, 1e-3),
-        (4, 4, 2, 2, 3e-3, 1e-3),
+        (2, 3, 2, 2, 4e-2, 1e-3),
+        (4, 4, 2, 2, 4e-2, 1e-3),
     ];
 
     let length_scale = 1.0_f64;
@@ -3879,9 +3881,10 @@ fn test_even_d_duchon_collision_derivative_matches_finite_difference_2315() {
         // the independent direct kernel evaluation (not the collision-derivative
         // Taylor carrier).
         let taylor_radius = DUCHON_COLLISION_TAYLOR_REL * length_scale;
+        let smallest_step = if j == 2 { 0.5 * h } else { h };
         assert!(
-            h > taylor_radius,
-            "d={d}: FD step h={h} must exceed the near-collision radius {taylor_radius:.3e} to stay on the independent kernel path"
+            smallest_step > taylor_radius,
+            "d={d}: smallest FD step {smallest_step} must exceed the near-collision radius {taylor_radius:.3e} to stay on the independent kernel path"
         );
         let phi = |rr: f64| {
             duchon_matern_kernel_general_from_distance(
@@ -3901,7 +3904,15 @@ fn test_even_d_duchon_collision_derivative_matches_finite_difference_2315() {
         //   phi''''(0) = (2 phi(2h) - 8 phi(h) + 6 phi(0)) / h^4
         let fd = match j {
             1 => (2.0 * phi(h) - 2.0 * phi0) / (h * h),
-            2 => (2.0 * phi(2.0 * h) - 8.0 * phi(h) + 6.0 * phi0) / (h * h * h * h),
+            2 => {
+                let fourth_difference = |step: f64| {
+                    (2.0 * phi(2.0 * step) - 8.0 * phi(step) + 6.0 * phi0)
+                        / step.powi(4)
+                };
+                let coarse = fourth_difference(h);
+                let fine = fourth_difference(0.5 * h);
+                (4.0 * fine - coarse) / 3.0
+            }
             other => unreachable!("only j in {{1, 2}} are gated here, got {other}"),
         };
 

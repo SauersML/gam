@@ -1954,6 +1954,23 @@ mod atomic_penalty_record_tests {
 
     use super::*;
 
+    fn assert_matrix_roundoff_equal(actual: &Array2<f64>, expected: &Array2<f64>) {
+        assert_eq!(actual.dim(), expected.dim());
+        let scale = expected
+            .iter()
+            .fold(1.0_f64, |current, value| current.max(value.abs()));
+        let tolerance = 32.0 * f64::EPSILON * scale;
+        let max_error = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_error <= tolerance,
+            "canonical PSD reconstruction changed a penalty beyond roundoff: max error {max_error:e}, tolerance {tolerance:e}"
+        );
+    }
+
     #[test]
     fn dropped_candidate_cannot_shift_atomic_active_penalty_identity_2315() {
         let primary_matrix = array![[4.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
@@ -2009,7 +2026,7 @@ mod atomic_penalty_record_tests {
         assert_eq!(primary.info.source, PenaltySource::Primary);
         assert_eq!(primary.info.effective_rank, 1);
         assert_eq!(primary.info.normalization_scale, 13.0);
-        assert_eq!(primary.matrix, primary_matrix);
+        assert_matrix_roundoff_equal(&primary.matrix, &primary_matrix);
         assert_eq!(primary.nullity, 2);
         assert_eq!(
             primary
@@ -2028,7 +2045,7 @@ mod atomic_penalty_record_tests {
         assert_eq!(secondary.info.source, PenaltySource::DoublePenaltyNullspace);
         assert_eq!(secondary.info.effective_rank, 2);
         assert_eq!(secondary.info.normalization_scale, 17.0);
-        assert_eq!(secondary.matrix, secondary_matrix);
+        assert_matrix_roundoff_equal(&secondary.matrix, &secondary_matrix);
         assert_eq!(secondary.nullity, 1);
         assert_eq!(
             secondary
@@ -2059,18 +2076,62 @@ mod atomic_penalty_record_tests {
 ///
 /// Fit-invariant at the REML optimum: rescaling `S → S/c` only rescales the
 /// recorded `λ̂` by `c`. Scaling a block never changes its rank, so this cannot
-/// alter which penalties `filter_penalty_candidates` keeps
-/// active; the `> 1e-12` guard only avoids dividing a numerically-zero block.
+/// alter which penalties `filter_penalty_candidates` keeps active.  The norm is
+/// accumulated with a scaled sum of squares so admission has no unit-dependent
+/// absolute floor and cannot overflow merely because individual entries are
+/// representable.
+fn stable_frobenius_norm(matrix: &ConstructiveQuadratic) -> f64 {
+    let mut scale = 0.0_f64;
+    let mut sum_squares = 1.0_f64;
+    for magnitude in matrix.iter().map(|value| value.abs()) {
+        if magnitude == 0.0 {
+            continue;
+        }
+        if scale < magnitude {
+            let ratio = scale / magnitude;
+            sum_squares = 1.0 + sum_squares * ratio * ratio;
+            scale = magnitude;
+        } else {
+            let ratio = magnitude / scale;
+            sum_squares += ratio * ratio;
+        }
+    }
+    if scale == 0.0 {
+        0.0
+    } else {
+        scale * sum_squares.sqrt()
+    }
+}
+
 fn renormalize_constrained_penalty_candidates(
     mut candidates: Vec<PenaltyCandidate>,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     for candidate in &mut candidates {
-        let frob = candidate.matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if frob.is_finite() && frob > 1e-12 {
+        let frob = stable_frobenius_norm(&candidate.matrix);
+        if !frob.is_finite() {
+            crate::bail_invalid_basis!(
+                "constrained penalty Frobenius norm is not representable"
+            );
+        }
+        if frob > 0.0 {
+            let reciprocal = 1.0 / frob;
+            if !reciprocal.is_finite() {
+                crate::bail_invalid_basis!(
+                    "constrained penalty is too small to normalize representably"
+                );
+            }
+            let combined_scale = candidate.normalization_scale * frob;
+            if !combined_scale.is_finite()
+                || (candidate.normalization_scale > 0.0 && combined_scale == 0.0)
+            {
+                crate::bail_invalid_basis!(
+                    "constrained penalty normalization scale is not representable"
+                );
+            }
             candidate.matrix = candidate
                 .matrix
-                .scaled(1.0 / frob, "constrained penalty normalization")?;
-            candidate.normalization_scale *= frob;
+                .scaled(reciprocal, "constrained penalty normalization")?;
+            candidate.normalization_scale = combined_scale;
         }
     }
     Ok(candidates)
