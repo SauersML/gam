@@ -71,9 +71,9 @@ pub enum SeedOutcome {
 ///   step to first-order behavior instead of requiring the objective to fake a
 ///   stale or non-finite Hessian.
 /// - Use `eval_cost()` / `OuterEval::infeasible()` for infeasible trial points.
-///   Return `Err(...)` for genuine evaluation breakdowns so the runner can mark
-///   the step as a recoverable solver failure and escalate to the next declared
-///   fallback plan if the full attempt still fails.
+///   Return `Err(...)` only when the evaluation artifact itself cannot be
+///   constructed. Such errors are fatal across screening, multistart, and
+///   solver plans; they are never reinterpreted as another numerical trial.
 /// - `eval_cost()` is used only for cost-based optimization paths.
 /// - `eval()` is the main evaluation path (cost + gradient + optional Hessian).
 /// - `eval_efs()` is used only by the EFS solver. It runs the inner solve,
@@ -1032,7 +1032,7 @@ where
 }
 
 pub(crate) fn into_objective_error(context: &str, err: EstimationError) -> ObjectiveEvalError {
-    ObjectiveEvalError::recoverable(format!("{context}: {err}"))
+    ObjectiveEvalError::fatal(format!("{context}: {err}"))
 }
 
 pub(crate) fn finite_cost_or_error(context: &str, cost: f64) -> Result<f64, ObjectiveEvalError> {

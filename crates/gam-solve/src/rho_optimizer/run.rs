@@ -2565,6 +2565,9 @@ pub(crate) fn run_outer_uncertified(
                 last_error = Some(EstimationError::RemlOptimizationFailed(message));
             }
             Err(e) => {
+                if e.is_fatal_outer_evaluation() {
+                    return Err(e);
+                }
                 log::debug!(
                     "[OUTER] {context}: attempt {} (plan={the_plan}) failed: {e}",
                     attempt_idx + 1
@@ -2862,17 +2865,20 @@ pub(crate) fn run_fixed_point_outer_solver(
     };
     let seed_sample = match objective.eval_step(seed) {
         Ok(sample) => sample,
-        Err(err) => {
-            let err = match err {
-                ObjectiveEvalError::Recoverable { message }
-                | ObjectiveEvalError::Fatal { message } => {
-                    EstimationError::RemlOptimizationFailed(message)
-                }
-            };
+        Err(ObjectiveEvalError::Recoverable { message }) => {
+            let err = EstimationError::RemlOptimizationFailed(message);
             if requests_immediate_first_order_fallback(&err.to_string()) {
                 return Err(FixedPointOuterRunError::ImmediateFallback(err));
             }
             return Err(FixedPointOuterRunError::SeedRejected(err));
+        }
+        Err(ObjectiveEvalError::Fatal { message }) => {
+            return Err(FixedPointOuterRunError::Failed(
+                EstimationError::fatal_outer_evaluation(
+                    "outer fixed-point seed evaluation",
+                    EstimationError::RemlOptimizationFailed(message),
+                ),
+            ));
         }
     };
     let (lo, hi) = outer_bounds_template(config, layout.n_params);
@@ -2912,6 +2918,14 @@ pub(crate) fn run_fixed_point_outer_solver(
                 last_solution.final_gradient_norm.unwrap_or(f64::NAN),
             );
             Ok(solution_into_outer_result(*last_solution, false, the_plan))
+        }
+        Err(FixedPointError::ObjectiveFailed { message }) => {
+            Err(FixedPointOuterRunError::Failed(
+                EstimationError::fatal_outer_evaluation(
+                    "outer fixed-point evaluation",
+                    EstimationError::RemlOptimizationFailed(message),
+                ),
+            ))
         }
         Err(e) => Err(FixedPointOuterRunError::Failed(
             EstimationError::RemlOptimizationFailed(format!("{failure_prefix}: {e:?}")),

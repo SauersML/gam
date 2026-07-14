@@ -2801,7 +2801,7 @@ fn matern_basis<'py>(
         .map(|slice| slice.to_vec());
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
-        length_scale: gam_terms::basis::MaternLengthScale::fixed(length_scale),
+        length_scale: MaternLengthScale::fixed(length_scale),
         nu: nu_parsed,
         include_intercept: false,
         double_penalty: false,
@@ -7155,7 +7155,7 @@ fn build_latent_forward_design(
             let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
             let spec = MaternBasisSpec {
                 center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
-                length_scale: gam_terms::basis::MaternLengthScale::fixed(1.0),
+                length_scale: MaternLengthScale::fixed(1.0),
                 nu: MaternNu::ThreeHalves,
                 include_intercept: false,
                 double_penalty: false,

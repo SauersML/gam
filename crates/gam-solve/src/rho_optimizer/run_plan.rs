@@ -155,7 +155,9 @@ pub(crate) fn run_outer_with_plan(
     if !explicit_initial_rho_owns_single_seed_budget
         && should_screen_seeds(config, the_plan.solver, seeds.len(), seed_budget)
     {
-        seeds = rank_seeds_with_screening(obj, config, context, &seeds)?;
+        seeds = rank_seeds_with_screening(obj, config, context, &seeds).map_err(|error| {
+            EstimationError::fatal_outer_evaluation("outer seed screening", error)
+        })?;
     }
     log::debug!(
         "[OUTER] {context}: trying generated seeds directly (generated={}, budget={})",
@@ -557,13 +559,10 @@ pub(crate) fn run_outer_with_plan(
                     continue 'seed_attempts;
                 }
                 Err(err) => {
-                    let msg = format!(
-                        "reactive domain entry refused: exact seed verification failed after \
-                         certified continuation arrival: {err}"
-                    );
-                    log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
-                    rejection_reasons.push((seed_idx, "domain-entry", msg));
-                    continue 'seed_attempts;
+                    return Err(EstimationError::fatal_outer_evaluation(
+                        "reactive continuation target verification",
+                        err,
+                    ));
                 }
             }
         }
@@ -576,13 +575,8 @@ pub(crate) fn run_outer_with_plan(
                     .map_err(|err| into_objective_error("outer eval failed", err));
                 let seed_eval = match seed_eval {
                     Ok(seed_eval) => seed_eval,
-                    Err(err) => {
-                        let err = match err {
-                            ObjectiveEvalError::Recoverable { message }
-                            | ObjectiveEvalError::Fatal { message } => {
-                                EstimationError::RemlOptimizationFailed(message)
-                            }
-                        };
+                    Err(ObjectiveEvalError::Recoverable { message }) => {
+                        let err = EstimationError::RemlOptimizationFailed(message);
                         if requests_immediate_first_order_fallback(&err.to_string()) {
                             return Err(err);
                         }
@@ -592,22 +586,29 @@ pub(crate) fn run_outer_with_plan(
                         rejection_reasons.push((seed_idx, "validation", err.to_string()));
                         continue 'seed_attempts;
                     }
+                    Err(ObjectiveEvalError::Fatal { message }) => {
+                        return Err(EstimationError::fatal_outer_evaluation(
+                            "outer ARC seed evaluation",
+                            EstimationError::RemlOptimizationFailed(message),
+                        ));
+                    }
                 };
-                let seed_eval = finite_outer_eval_or_error("outer eval failed", layout, seed_eval)
-                    .map_err(|err| match err {
-                        ObjectiveEvalError::Recoverable { message }
-                        | ObjectiveEvalError::Fatal { message } => {
-                            EstimationError::RemlOptimizationFailed(message)
-                        }
-                    });
+                let seed_eval = finite_outer_eval_or_error("outer eval failed", layout, seed_eval);
                 let mut seed_eval = match seed_eval {
                     Ok(seed_eval) => seed_eval,
-                    Err(err) => {
+                    Err(ObjectiveEvalError::Recoverable { message }) => {
+                        let err = EstimationError::RemlOptimizationFailed(message);
                         log::warn!(
                             "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                         );
                         rejection_reasons.push((seed_idx, "validation", err.to_string()));
                         continue 'seed_attempts;
+                    }
+                    Err(ObjectiveEvalError::Fatal { message }) => {
+                        return Err(EstimationError::fatal_outer_evaluation(
+                            "outer ARC seed validation",
+                            EstimationError::RemlOptimizationFailed(message),
+                        ));
                     }
                 };
                 validate_second_order_seed_hessian(context, layout, &seed_eval).map_err(|err| {
@@ -824,11 +825,17 @@ pub(crate) fn run_outer_with_plan(
                             Ok(result)
                         }
                         OptimizationStatus::ObjectiveFailed
-                        | OptimizationStatus::NumericalFailure
+                            => Err(EstimationError::fatal_outer_evaluation(
+                                "matrix-free trust-region evaluation",
+                                EstimationError::RemlOptimizationFailed(
+                                    "matrix-free trust-region objective evaluation failed"
+                                        .to_string(),
+                                ),
+                            )),
+                        OptimizationStatus::NumericalFailure
                         | OptimizationStatus::LineSearchFailed => {
                             Err(EstimationError::RemlOptimizationFailed(format!(
-                                "matrix-free TR solver failed with status={:?}",
-                                report.status
+                                "matrix-free TR solver failed with status={:?}", report.status
                             )))
                         }
                     }
@@ -1064,6 +1071,12 @@ pub(crate) fn run_outer_with_plan(
                                 ))),
                             }
                         }
+                        Err(ArcError::ObjectiveFailed { message }) => {
+                            Err(EstimationError::fatal_outer_evaluation(
+                                "outer ARC evaluation",
+                                EstimationError::RemlOptimizationFailed(message),
+                            ))
+                        }
                         Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
                             "Arc solver failed: {e:?}"
                         ))),
@@ -1121,18 +1134,19 @@ pub(crate) fn run_outer_with_plan(
                         .map_err(|err| into_objective_error("outer eval failed", err))
                     {
                         Ok(e) => e,
-                        Err(err) => {
-                            let err = match err {
-                                ObjectiveEvalError::Recoverable { message }
-                                | ObjectiveEvalError::Fatal { message } => {
-                                    EstimationError::RemlOptimizationFailed(message)
-                                }
-                            };
+                        Err(ObjectiveEvalError::Recoverable { message }) => {
+                            let err = EstimationError::RemlOptimizationFailed(message);
                             log::warn!(
                                 "[OUTER] {context}: rejecting seed {seed_idx} before device-BFGS start: {err}"
                             );
                             rejection_reasons.push((seed_idx, "validation", err.to_string()));
                             continue 'seed_attempts;
+                        }
+                        Err(ObjectiveEvalError::Fatal { message }) => {
+                            return Err(EstimationError::fatal_outer_evaluation(
+                                "outer device-BFGS seed evaluation",
+                                EstimationError::RemlOptimizationFailed(message),
+                            ));
                         }
                     };
                     started_seeds += 1;
@@ -1239,38 +1253,40 @@ pub(crate) fn run_outer_with_plan(
                         .map_err(|err| into_objective_error("outer eval failed", err));
                     let seed_eval = match seed_eval {
                         Ok(seed_eval) => seed_eval,
-                        Err(err) => {
-                            let err = match err {
-                                ObjectiveEvalError::Recoverable { message }
-                                | ObjectiveEvalError::Fatal { message } => {
-                                    EstimationError::RemlOptimizationFailed(message)
-                                }
-                            };
+                        Err(ObjectiveEvalError::Recoverable { message }) => {
+                            let err = EstimationError::RemlOptimizationFailed(message);
                             log::warn!(
                                 "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                             );
                             rejection_reasons.push((seed_idx, "validation", err.to_string()));
                             continue 'seed_attempts;
+                        }
+                        Err(ObjectiveEvalError::Fatal { message }) => {
+                            return Err(EstimationError::fatal_outer_evaluation(
+                                "outer BFGS seed evaluation",
+                                EstimationError::RemlOptimizationFailed(message),
+                            ));
                         }
                     };
                     let seed_eval = match finite_outer_first_order_eval_or_error(
                         "outer eval failed",
                         layout,
                         seed_eval,
-                    )
-                    .map_err(|err| match err {
-                        ObjectiveEvalError::Recoverable { message }
-                        | ObjectiveEvalError::Fatal { message } => {
-                            EstimationError::RemlOptimizationFailed(message)
-                        }
-                    }) {
+                    ) {
                         Ok(eval) => eval,
-                        Err(err) => {
+                        Err(ObjectiveEvalError::Recoverable { message }) => {
+                            let err = EstimationError::RemlOptimizationFailed(message);
                             log::warn!(
                                 "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                             );
                             rejection_reasons.push((seed_idx, "validation", err.to_string()));
                             continue 'seed_attempts;
+                        }
+                        Err(ObjectiveEvalError::Fatal { message }) => {
+                            return Err(EstimationError::fatal_outer_evaluation(
+                                "outer BFGS seed validation",
+                                EstimationError::RemlOptimizationFailed(message),
+                            ));
                         }
                     };
                     started_seeds += 1;
@@ -1598,9 +1614,10 @@ pub(crate) fn run_outer_with_plan(
                             )))
                         }
                         Err(BfgsError::ObjectiveFailed { message }) => {
-                            Err(EstimationError::RemlOptimizationFailed(format!(
-                                "BFGS solver failed: ObjectiveFailed {{ message: {message:?} }}"
-                            )))
+                            Err(EstimationError::fatal_outer_evaluation(
+                                "outer BFGS evaluation",
+                                EstimationError::RemlOptimizationFailed(message),
+                            ))
                         }
                         Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
                             "BFGS solver failed: {e:?}"
@@ -1778,6 +1795,9 @@ pub(crate) fn run_outer_with_plan(
                 }
             }
             Err(e) => {
+                if e.is_fatal_outer_evaluation() {
+                    return Err(e);
+                }
                 if requests_immediate_first_order_fallback(&e.to_string()) {
                     return Err(e);
                 }

@@ -125,7 +125,7 @@ def test_sae_manifold_fit_multi_atom_duchon_mix(random_data: np.ndarray) -> None
 def test_euclidean_atom_is_not_thin_plate(random_data: np.ndarray) -> None:
     """Euclidean atoms should not produce a thin-plate kernel design.
 
-    A clear contract: when atom_basis="euclidean", the basis_specs metadata should
+    A clear contract: when atom_basis="euclidean", the geometry plan should
     distinguish it from "duchon". Today they share the underlying builder.
     """
     fit = gamfit.sae_manifold_fit(
@@ -137,8 +137,7 @@ def test_euclidean_atom_is_not_thin_plate(random_data: np.ndarray) -> None:
         n_iter=1,
         random_state=0,
     )
-    # basis_specs should report "euclidean" or "euclidean_patch", not "duchon"
-    specs = list(fit.basis_specs)
-    assert "duchon" not in specs[0].lower(), (
-        f"euclidean atom_basis must not be reported as duchon; got {specs}"
+    plans = list(fit.geometry_plans)
+    assert plans[0]["kind"] == "euclidean_patch", (
+        f"euclidean atom_basis must retain its polynomial geometry; got {plans}"
     )

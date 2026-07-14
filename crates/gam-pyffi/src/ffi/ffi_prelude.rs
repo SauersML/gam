@@ -133,7 +133,7 @@ pub(crate) use gam::families::survival::marginal_slope::SurvivalMarginalSlopeFit
 
 pub(crate) use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
-    DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability, MaternNu,
+    DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability, MaternLengthScale, MaternNu,
     OneDimensionalBoundary, OperatorPenaltySpec, PeriodicBSplineBasisSpec, SpatialIdentifiability,
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
     SplineScratch, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,

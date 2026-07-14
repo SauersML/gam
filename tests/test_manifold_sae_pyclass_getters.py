@@ -57,15 +57,11 @@ def test_dense_array_getters() -> None:
         core.training_mean, np.asarray(golden["training_mean"])
     )
     np.testing.assert_array_equal(core.tier0_scale, np.asarray(golden["tier0_scale"]))
-    # coords / decoder_blocks / duchon_centers are per-atom lists of arrays.
+    # Numeric state stays array-valued; geometry is one validated mapping list.
     assert isinstance(core.coords, list) and len(core.coords) == len(golden["coords"])
     np.testing.assert_array_equal(core.coords[0], np.asarray(golden["coords"][0]))
     assert len(core.decoder_blocks) == len(golden["decoder_blocks"])
-    duchon = core.duchon_centers
-    assert duchon[0] is None  # non-duchon atoms carry no centers
-    np.testing.assert_array_equal(
-        duchon[2], np.asarray(golden["duchon_centers"][2])
-    )
+    assert core.geometry_plans == golden["geometry_plans"]
 
 
 def test_fisher_and_selected_getters() -> None:
@@ -90,7 +86,7 @@ def test_fisher_and_selected_getters() -> None:
 def test_scalar_and_list_getters() -> None:
     golden = _golden()
     core = ManifoldSAE(golden)
-    assert core.atom_topology == golden["atom_topology"]
+    assert core.atom_topology == "mixed"
     assert core.assignment == golden["assignment"]
     assert core.assignment_label == golden["assignment_label"]
     assert core.metric_provenance == golden["metric_provenance"]
@@ -101,10 +97,10 @@ def test_scalar_and_list_getters() -> None:
     assert core.penalized_loss_score == golden["penalized_loss_score"]
     assert core.chosen_k == len(golden["atoms"])
     assert core.selected_log_lambda_sparse == golden["selected_log_lambda_sparse"]
-    assert core.atom_topologies == golden["atom_topologies"]
-    assert core.basis_kinds == golden["basis_kinds"]
-    assert core.atom_dims == golden["atom_dims"]
-    assert core.n_harmonics == golden["n_harmonics"]
+    assert core.atom_topologies == ["circle", "linear", "euclidean"]
+    assert core.basis_kinds == ["periodic", "linear", "duchon"]
+    assert core.atom_dims == [plan["latent_dim"] for plan in golden["geometry_plans"]]
+    assert core.basis_sizes == [len(block) for block in golden["decoder_blocks"]]
 
 
 def test_atoms_is_an_object_surface() -> None:
@@ -117,7 +113,7 @@ def test_atoms_is_an_object_surface() -> None:
     a0 = atoms[0]
     g0 = golden["atoms"][0]
     assert not isinstance(a0, dict)  # object surface, not a mapping
-    assert a0.basis == g0["basis"]
+    assert a0.basis == golden["geometry_plans"][0]["kind"]
     assert a0.active_dim == g0["active_dim"]
     assert a0.evidence == g0["evidence"]
     np.testing.assert_array_equal(
@@ -178,7 +174,7 @@ def test_native_summary_and_description_length_use_the_fitted_artifact() -> None
 
     summary = core.summary()
     assert summary["K"] == len(golden["atoms"])
-    assert summary["atom_topology"] == golden["atom_topology"]
+    assert summary["atom_topology"] == "mixed"
     assert summary["penalized_loss_score"] == golden["penalized_loss_score"]
     assert summary["penalized_quasi_laplace_criterion"] == pytest.approx(
         golden["penalized_quasi_laplace_criterion"]

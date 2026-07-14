@@ -1,6 +1,6 @@
 """RED tests for issue #243 — sae_manifold_fit drops user-supplied atom_basis
 from the topology metadata, leaving `summary()["atom_topology"]` stuck at the
-default `"circle"` even when basis specs were resolved correctly.
+default `"circle"` even when atom geometry was resolved correctly.
 
 These tests must fail today and pass once the topology field is reconciled
 with `atom_basis` (or callers are forced to supply both consistently).
@@ -48,7 +48,7 @@ def test_summary_topology_matches_atom_basis(
     summary = fit.summary()
     assert summary["atom_topology"] == expected_topology, (
         f"atom_basis={atom_basis!r} → expected topology={expected_topology!r}, "
-        f"got {summary['atom_topology']!r} (basis_specs={fit.basis_specs!r})"
+        f"got {summary['atom_topology']!r} (geometry_plans={fit.geometry_plans!r})"
     )
 
 
@@ -81,8 +81,8 @@ def test_payload_round_trip_preserves_topology(
     )
 
 
-def test_basis_specs_and_topology_are_internally_consistent() -> None:
-    """The most user-visible invariant: basis_specs and summary topology must
+def test_geometry_plans_and_topology_are_internally_consistent() -> None:
+    """The most user-visible invariant: geometry plans and summary topology must
     not contradict each other. Pin the consistency rule directly so future
     drift in either field fails this test."""
     X = _toy_inputs()
@@ -96,9 +96,9 @@ def test_basis_specs_and_topology_are_internally_consistent() -> None:
         random_state=0,
     )
     topology = fit.summary()["atom_topology"]
-    assert all(spec == "sphere" for spec in fit.basis_specs), fit.basis_specs
+    assert all(plan["kind"] == "sphere" for plan in fit.geometry_plans), fit.geometry_plans
     assert topology == "sphere", (
-        f"basis_specs say sphere but summary['atom_topology']={topology!r}"
+        f"geometry plans say sphere but summary['atom_topology']={topology!r}"
     )
 
 
@@ -126,12 +126,12 @@ def test_linear_topology_is_distinct_from_euclidean_quadratic_patch() -> None:
     )
 
     assert linear.atom_topology == "linear"
-    assert linear.basis_specs == ["linear"]
+    assert [plan["kind"] for plan in linear.geometry_plans] == ["linear"]
     assert linear.atoms[0].basis == "linear"
     assert linear.atoms[0].decoder_coefficients.shape[0] == 2
 
     assert euclidean.atom_topology == "euclidean"
-    assert euclidean.basis_specs == ["euclidean"]
+    assert [plan["kind"] for plan in euclidean.geometry_plans] == ["euclidean_patch"]
     assert euclidean.atoms[0].basis == "euclidean"
     assert euclidean.atoms[0].decoder_coefficients.shape[0] > linear.atoms[0].decoder_coefficients.shape[0]
 

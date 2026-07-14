@@ -403,11 +403,13 @@ def test_steer_dosimetry_against_analytic_kl(
     # delta equals that chord.
     assert float(plan["amplitude"]) == pytest.approx(1.0, abs=1e-9)
     decoder = np.asarray(fit_with_shard.decoder_blocks[atom_k], dtype=float)
+    resolution = fit_with_shard.geometry_plans[atom_k]["resolution"]
+    assert resolution["kind"] == "periodic_harmonics"
     phi = np.asarray(
         rust_module().basis_with_jet(
             "periodic",
             np.ascontiguousarray(np.asarray([t_from, t_to], dtype=float).reshape(2, 1)),
-            {"n_harmonics": int(fit_with_shard._n_harmonics[atom_k])},
+            {"n_harmonics": int(resolution["order"])},
         )[0],
         dtype=float,
     )

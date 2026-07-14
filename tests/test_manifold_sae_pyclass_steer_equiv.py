@@ -20,17 +20,47 @@ GOLDEN = (
     / "golden_full.json"
 )
 
+LINEAR_PLAN = {
+    "kind": "linear",
+    "latent_dim": 2,
+    "resolution": {"kind": "polynomial", "degree": 1},
+    "reference_metric": {"kind": "euclidean_polynomial"},
+}
+TORUS_PLAN = {
+    "kind": "torus",
+    "latent_dim": 2,
+    "resolution": {"kind": "torus_harmonics", "per_axis_order": 1},
+    "reference_metric": {"kind": "flat_rectangular_torus", "tau": 0.4},
+}
+CYLINDER_PLAN = {
+    "kind": "cylinder",
+    "latent_dim": 2,
+    "resolution": {
+        "kind": "cylinder_harmonics",
+        "circle_order": 1,
+        "line_degree": 1,
+    },
+    "reference_metric": {"kind": "cylinder_product"},
+}
+MOBIUS_PLAN = {
+    "kind": "mobius",
+    "latent_dim": 2,
+    "resolution": {
+        "kind": "mobius_harmonics",
+        "circle_order": 1,
+        "width_degree": 1,
+    },
+    "reference_metric": {"kind": "mobius_quotient"},
+}
+
 
 def _model() -> ManifoldSAE:
     return ManifoldSAE.from_dict(json.loads(GOLDEN.read_text()))
 
 
 def _analytic_topology_model(
-    basis: str,
-    topology: str,
-    latent_dim: int,
+    geometry_plan: dict[str, object],
     basis_size: int,
-    n_harmonics: int,
 ) -> ManifoldSAE:
     """Replace atom zero with one exact analytic persisted topology.
 
@@ -39,6 +69,7 @@ def _analytic_topology_model(
     the public model's frozen-state rebuild rather than any fit path.
     """
     payload = deepcopy(json.loads(GOLDEN.read_text()))
+    latent_dim = int(geometry_plan["latent_dim"])
     n_rows = len(payload["coords"][0])
     p_out = len(payload["decoder_blocks"][0][0])
     coords = [
@@ -50,21 +81,11 @@ def _analytic_topology_model(
         for basis_row in range(basis_size)
     ]
 
-    payload["basis_kinds"][0] = basis
-    payload["basis_specs"][0] = f"{basis}:persisted"
-    payload["atom_topologies"][0] = topology
-    payload["atom_topology"] = (
-        topology if all(value == topology for value in payload["atom_topologies"]) else "mixed"
-    )
-    payload["atom_dims"][0] = latent_dim
-    payload["basis_sizes"][0] = basis_size
-    payload["n_harmonics"][0] = n_harmonics
+    payload["geometry_plans"][0] = geometry_plan
     payload["coords"][0] = coords
     payload["decoder_blocks"][0] = decoder
-    payload["duchon_centers"][0] = None
 
     atom = payload["atoms"][0]
-    atom["basis"] = basis
     atom["active_dim"] = latent_dim
     atom["coords"] = coords
     atom["coords_u_arc"] = None
@@ -289,26 +310,21 @@ def test_target_dose_unreachable_requires_a_global_envelope_certificate() -> Non
 
 
 @pytest.mark.parametrize(
-    ("basis", "topology", "latent_dim", "basis_size", "n_harmonics", "t_from", "t_to"),
+    ("geometry_plan", "basis_size", "t_from", "t_to"),
     [
-        ("euclidean", "euclidean", 2, 3, 0, [0.2, -0.3], [0.45, -0.1]),
-        ("torus", "torus", 2, 9, 1, [0.99, 0.3], [0.01, 0.55]),
-        ("cylinder", "cylinder", 2, 6, 1, [0.99, 0.25], [0.01, 0.4]),
-        ("mobius", "mobius", 2, 3, 1, [0.2, 0.4], [0.45, -0.2]),
+        (LINEAR_PLAN, 3, [0.2, -0.3], [0.45, -0.1]),
+        (TORUS_PLAN, 9, [0.99, 0.3], [0.01, 0.55]),
+        (CYLINDER_PLAN, 6, [0.99, 0.25], [0.01, 0.4]),
+        (MOBIUS_PLAN, 3, [0.2, 0.4], [0.45, -0.2]),
     ],
 )
 def test_public_steer_rebuilds_every_analytic_coordinate_action(
-    basis: str,
-    topology: str,
-    latent_dim: int,
+    geometry_plan: dict[str, object],
     basis_size: int,
-    n_harmonics: int,
     t_from: list[float],
     t_to: list[float],
 ) -> None:
-    model = _analytic_topology_model(
-        basis, topology, latent_dim, basis_size, n_harmonics
-    )
+    model = _analytic_topology_model(geometry_plan, basis_size)
     source = np.asarray(t_from, dtype=np.float64)
     target = np.asarray(t_to, dtype=np.float64)
 
@@ -320,12 +336,11 @@ def test_public_steer_rebuilds_every_analytic_coordinate_action(
 
 
 @pytest.mark.parametrize(
-    ("basis", "topology", "basis_size", "period", "t_from", "t_wrapped", "t_unwrapped"),
+    ("geometry_plan", "basis_size", "period", "t_from", "t_wrapped", "t_unwrapped"),
     [
-        ("torus", "torus", 9, 1.0, [0.99, 0.3], [0.01, 0.3], [1.01, 0.3]),
+        (TORUS_PLAN, 9, 1.0, [0.99, 0.3], [0.01, 0.3], [1.01, 0.3]),
         (
-            "cylinder",
-            "cylinder",
+            CYLINDER_PLAN,
             6,
             1.0,
             [0.99, 0.25],
@@ -335,15 +350,14 @@ def test_public_steer_rebuilds_every_analytic_coordinate_action(
     ],
 )
 def test_public_steer_respects_periodic_seams_in_product_manifolds(
-    basis: str,
-    topology: str,
+    geometry_plan: dict[str, object],
     basis_size: int,
     period: float,
     t_from: list[float],
     t_wrapped: list[float],
     t_unwrapped: list[float],
 ) -> None:
-    model = _analytic_topology_model(basis, topology, 2, basis_size, 1)
+    model = _analytic_topology_model(geometry_plan, basis_size)
     source = np.asarray(t_from, dtype=np.float64)
     wrapped = model.steer(0, 0, 1.0, source, np.asarray(t_wrapped, dtype=np.float64))
     unwrapped = model.steer(
@@ -354,7 +368,7 @@ def test_public_steer_respects_periodic_seams_in_product_manifolds(
 
 
 def test_public_mobius_steer_identifies_deck_twins() -> None:
-    model = _analytic_topology_model("mobius", "mobius", 2, 3, 1)
+    model = _analytic_topology_model(MOBIUS_PLAN, 3)
     source = np.asarray([0.2, 0.4], dtype=np.float64)
     deck_twin = np.asarray([1.2, -0.4], dtype=np.float64)
     plan = model.steer(0, 0, 1.0, source, deck_twin)
@@ -362,7 +376,7 @@ def test_public_mobius_steer_identifies_deck_twins() -> None:
 
 
 def test_public_target_dose_rebuilds_cylinder_metadata() -> None:
-    model = _analytic_topology_model("cylinder", "cylinder", 2, 6, 1)
+    model = _analytic_topology_model(CYLINDER_PLAN, 6)
     t_from = np.asarray([0.15, -0.2], dtype=np.float64)
     t_to = np.asarray([0.18, -0.1], dtype=np.float64)
     unit = model.steer(0, 0, 1.0, t_from, t_to)

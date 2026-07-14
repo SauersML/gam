@@ -300,6 +300,16 @@ impl ManifoldSaePayload {
         if k == 0 {
             return Err("ManifoldSAE.from_json: geometry_plans must be non-empty".to_string());
         }
+        if payload.max_iter < 1 {
+            return Err("ManifoldSAE.from_json: max_iter must be at least 1".to_string());
+        }
+        if let Some(top_k) = payload.top_k {
+            if top_k < 1 || usize::try_from(top_k).ok().is_none_or(|value| value > k) {
+                return Err(format!(
+                    "ManifoldSAE.from_json: top_k must satisfy 1 <= top_k <= K={k}; got {top_k}"
+                ));
+            }
+        }
         if payload.atoms.len() != k
             || payload.coords.len() != k
             || payload.decoder_blocks.len() != k

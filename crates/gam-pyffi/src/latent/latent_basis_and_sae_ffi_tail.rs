@@ -3,7 +3,7 @@
 /// stack + PCA seed coords + zero-init decoder + zero-init logits internally
 /// before delegating to the same end-to-end Rust Newton loop as
 /// the native fit orchestration. Returns the raw native fit payload with
-/// `"atom_plans"`, holding the per-atom basis spec so OOS prediction can
+/// `"geometry_plans"`, holding each validated atom geometry so OOS prediction can
 /// rebuild the design without going through Python.
 ///
 /// `initial_logits` (N, K) and `initial_coords` (K, N, D_max) are optional

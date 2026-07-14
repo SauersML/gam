@@ -6812,6 +6812,22 @@ impl ManifoldSaeCore {
             .map(|b| manifold_sae_owned2(b))
             .collect::<PyResult<_>>()?;
         let hybrid = manifold_sae_hybrid_linear_images(&inner.hybrid_split)?;
+        let max_iter = usize::try_from(inner.max_iter).map_err(|_| {
+            py_value_error(format!(
+                "ManifoldSAE: saved max_iter must be positive; got {}",
+                inner.max_iter
+            ))
+        })?;
+        let top_k = inner
+            .top_k
+            .map(|support| {
+                usize::try_from(support).map_err(|_| {
+                    py_value_error(format!(
+                        "ManifoldSAE: saved top_k must be positive; got {support}"
+                    ))
+                })
+            })
+            .transpose()?;
         let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
             decoder_owned.iter().map(|a| a.view()).collect();
         let request = sae_oos_request_from_arrays(
@@ -6821,7 +6837,7 @@ impl ManifoldSaeCore {
             inner.alpha,
             inner.tau,
             inner.assignment.clone(),
-            inner.max_iter.max(0) as usize,
+            max_iter,
             inner.learning_rate,
             // Coordinate ridge: Python `_oos_payload` omits it, so the
             // `sae_manifold_predict_oos` pyfunction supplies this `1e-6` default.
@@ -6829,7 +6845,7 @@ impl ManifoldSaeCore {
             None,
             None,
             inner.threshold_gate_threshold,
-            inner.top_k.map(|t| t.max(0) as usize),
+            top_k,
             hybrid,
             inner.selected_log_lambda_sparse,
             inner.selected_log_lambda_smooth.clone(),

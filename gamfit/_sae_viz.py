@@ -9,17 +9,6 @@ from collections.abc import Mapping
 import numpy as np
 
 
-_BASIS_TO_TOPOLOGY = {
-    "periodic": "circle",
-    "circle": "circle",
-    "sphere": "sphere",
-    "torus": "torus",
-    "duchon": "euclidean",
-    "euclidean": "euclidean",
-    "euclidean_patch": "euclidean",
-}
-
-
 def plot_atom(fit: Any, k: int, ax: Any = None) -> Any:
     """Plot one SAE manifold atom in its leading decoder SVD subspace.
 
@@ -40,8 +29,8 @@ def plot_atom(fit: Any, k: int, ax: Any = None) -> Any:
     """
     atom = _atom_at(fit, k)
     decoder = _as_2d(atom.decoder_coefficients, "decoder_coefficients")
-    basis = _basis_for(fit, atom, k)
-    topology = _topology_for(fit, basis, k)
+    basis = _basis_for(fit, k)
+    topology = _topology_for(fit, k)
 
     shape = _shape_points(fit, atom, k, basis, topology)
     if shape.size == 0:
@@ -167,21 +156,27 @@ def _as_2d(value: Any, name: str) -> np.ndarray:
     return arr
 
 
-def _basis_for(fit: Any, atom: Any, k: int) -> str:
-    specs = getattr(fit, "basis_specs", None)
-    if specs is not None and int(k) < len(specs):
-        return str(specs[int(k)])
-    kinds = getattr(fit, "_basis_kinds", None)
-    if kinds is not None and int(k) < len(kinds):
-        return str(kinds[int(k)])
-    return str(getattr(atom, "basis", ""))
+def _geometry_plan_for(fit: Any, k: int) -> Mapping[str, Any]:
+    plans = fit.geometry_plans
+    idx = int(k)
+    if idx < 0 or idx >= len(plans) or not isinstance(plans[idx], Mapping):
+        raise ValueError(f"geometry_plans must contain a mapping for atom {idx}")
+    return plans[idx]
 
 
-def _topology_for(fit: Any, basis: str, k: int) -> str:
-    topologies = getattr(fit, "atom_topologies", None)
-    if topologies is not None and int(k) < len(topologies):
-        return str(topologies[int(k)])
-    return _BASIS_TO_TOPOLOGY.get(str(basis), str(basis) or "unknown")
+def _basis_for(fit: Any, k: int) -> str:
+    plan = _geometry_plan_for(fit, k)
+    kind = plan.get("kind")
+    if not isinstance(kind, str) or not kind:
+        raise ValueError(f"geometry_plans[{int(k)}].kind must be a non-empty string")
+    return kind
+
+
+def _topology_for(fit: Any, k: int) -> str:
+    topologies = fit.atom_topologies
+    if int(k) < 0 or int(k) >= len(topologies):
+        raise ValueError(f"atom_topologies has no entry for atom {int(k)}")
+    return str(topologies[int(k)])
 
 
 def _shape_points(fit: Any, atom: Any, k: int, basis: str, topology: str) -> np.ndarray:
@@ -193,7 +188,7 @@ def _shape_points(fit: Any, atom: Any, k: int, basis: str, topology: str) -> np.
 
     decoder = _as_2d(atom.decoder_coefficients, "decoder_coefficients")
     coords = _grid_for(atom, topology)
-    phi = _basis_matrix(fit, atom, k, basis, topology, coords, decoder.shape[0])
+    phi = _basis_matrix(fit, k, basis, topology, coords, decoder.shape[0])
     if phi is None:
         return np.empty((0, decoder.shape[1]), dtype=float)
     return phi @ decoder
@@ -202,8 +197,8 @@ def _shape_points(fit: Any, atom: Any, k: int, basis: str, topology: str) -> np.
 def _token_points(fit: Any, atom: Any, k: int, basis: str) -> np.ndarray:
     decoder = _as_2d(atom.decoder_coefficients, "decoder_coefficients")
     coords = _as_2d(atom.coords, "coords")
-    topology = _topology_for(fit, basis, k)
-    phi = _basis_matrix(fit, atom, k, basis, topology, coords, decoder.shape[0])
+    topology = _topology_for(fit, k)
+    phi = _basis_matrix(fit, k, basis, topology, coords, decoder.shape[0])
     if phi is None:
         fitted = getattr(fit, "fitted", None)
         if fitted is not None:
@@ -258,7 +253,6 @@ def _coordinate_bounds(coords: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 def _basis_matrix(
     fit: Any,
-    atom: Any,
     k: int,
     basis: str,
     topology: str,
@@ -268,24 +262,27 @@ def _basis_matrix(
     basis_key = str(basis).lower()
     topology_key = str(topology).lower()
     if basis_key in {"periodic", "circle"} or topology_key == "circle":
-        harmonics = _harmonic_count(fit, atom, k, n_cols)
+        harmonics = _harmonic_count(fit, k)
         return _periodic_basis(coords[:, 0], harmonics, n_cols)
     if basis_key == "sphere" or topology_key == "sphere":
         if coords.shape[1] < 2:
             return None
         return _pad_or_trim(_sphere_basis(coords[:, :2]), n_cols)
     if basis_key == "torus" or topology_key == "torus":
-        return _torus_basis(coords, n_cols)
-    if basis_key in {"euclidean", "euclidean_patch"}:
+        resolution = _geometry_plan_for(fit, k)["resolution"]
+        if not isinstance(resolution, Mapping) or resolution.get("kind") != "torus_harmonics":
+            raise ValueError(f"geometry_plans[{int(k)}] has invalid torus resolution")
+        return _torus_basis(coords, int(resolution["per_axis_order"]), n_cols)
+    if basis_key in {"linear", "euclidean", "euclidean_patch"}:
         return _euclidean_patch_basis(coords, n_cols)
     return None
 
 
-def _harmonic_count(fit: Any, atom: Any, k: int, n_cols: int) -> int:
-    harmonics = getattr(fit, "_n_harmonics", None)
-    if harmonics is not None and int(k) < len(harmonics) and int(harmonics[int(k)]) > 0:
-        return int(harmonics[int(k)])
-    return max(1, (int(n_cols) - 1) // 2)
+def _harmonic_count(fit: Any, k: int) -> int:
+    resolution = _geometry_plan_for(fit, k)["resolution"]
+    if not isinstance(resolution, Mapping) or resolution.get("kind") != "periodic_harmonics":
+        raise ValueError(f"geometry_plans[{int(k)}] has invalid periodic resolution")
+    return int(resolution["order"])
 
 
 def _periodic_basis(t: np.ndarray, n_harmonics: int, n_cols: int) -> np.ndarray:
@@ -309,17 +306,18 @@ def _sphere_basis(coords: np.ndarray) -> np.ndarray:
     return np.column_stack([np.ones(coords.shape[0]), x, y, z, x * y, y * z, x * z])
 
 
-def _torus_basis(coords: np.ndarray, n_cols: int) -> np.ndarray:
+def _torus_basis(coords: np.ndarray, per_axis_order: int, n_cols: int) -> np.ndarray:
     d = coords.shape[1]
-    axis_m = round(n_cols ** (1.0 / max(1, d)))
-    if axis_m < 3 or axis_m % 2 == 0 or axis_m**d != n_cols:
-        return _euclidean_patch_basis(coords, n_cols)
-    h_max = (axis_m - 1) // 2
+    axis_m = 2 * int(per_axis_order) + 1
+    if axis_m**d != n_cols:
+        raise ValueError(
+            f"torus geometry derives {axis_m**d} columns, decoder has {n_cols}"
+        )
     per_axis: list[np.ndarray] = []
     for axis in range(d):
         col = coords[:, axis]
         phi_axis = np.ones((coords.shape[0], axis_m), dtype=float)
-        for h in range(1, h_max + 1):
+        for h in range(1, int(per_axis_order) + 1):
             angle = 2.0 * np.pi * h * col
             phi_axis[:, 2 * h - 1] = np.sin(angle)
             phi_axis[:, 2 * h] = np.cos(angle)
