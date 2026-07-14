@@ -48,6 +48,7 @@ mod bridges;
 mod capability;
 mod hessian_operator;
 mod objective;
+mod rho_landscape;
 mod run;
 mod run_plan;
 mod seed_screening;
@@ -72,5 +73,9 @@ pub use run::{CertifiedOuterResult, OuterResult};
 // SaeOuterTermination) can name the variants.
 pub use run::OuterConvergedVia;
 pub use run::{OuterStationaryPointRejection, audit_stationary_point};
+// #2312: exact 1-D REML landscape along one ρ coordinate — a-priori
+// quasi-convexity / basin certificate, exact global 1-D solve, and the
+// explicit ARC cubic weight L₃.
+pub use rho_landscape::{RhoGlobalMinimum, RhoLandscapeCertificate, RhoModeSpectrum};
 pub(crate) use run_plan::*;
 pub(crate) use seed_screening::*;
