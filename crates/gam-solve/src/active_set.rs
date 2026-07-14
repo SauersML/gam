@@ -1912,12 +1912,13 @@ fn canonicalize_constraint_set_active_ids(
 /// thousands of Khatri-Rao observation rows tight; rediscovering every tight
 /// row here would recreate the all-face materialization this operator path is
 /// specifically meant to avoid. The old working rows remain tight under the
-/// tangent step, and at most the one ratio-test blocker joins them.
+/// tangent step. If a currently omitted tight row blocks at zero step, add
+/// that separator and recompute the cone projection; this cutting-plane loop
+/// discovers only the rows needed to describe a feasible tangent direction.
 fn fallback_projected_gradient_direction_with_constraint_set(
     x: &Array1<f64>,
     d_total: &Array1<f64>,
     gradient: &Array1<f64>,
-    working_constraints: &LinearInequalityConstraints,
     active: &[usize],
     is_active: &[bool],
     ops: &ConstraintSetOps<'_>,
@@ -1931,90 +1932,112 @@ fn fallback_projected_gradient_direction_with_constraint_set(
         crate::bail_invalid_estim!("operator projected-gradient fallback dimension mismatch");
     }
 
-    let tangent_direction = if working_constraints.a.nrows() == 0 {
-        -gradient
-    } else {
-        let Some((stationarity_residual, _multipliers)) =
-            project_stationarity_residual_on_constraint_cone(
-                gradient,
-                &working_constraints.a,
-            )
-        else {
-            return Ok(None);
-        };
-        -stationarity_residual
-    };
-    if !array_is_finite(&tangent_direction) {
-        return Ok(None);
-    }
+    let values_x = ops.values(x)?;
+    let mut tangent_active = active.to_vec();
+    let mut tangent_is_active = is_active.to_vec();
+    let max_separations = (p + 8) * 4;
 
-    let step_inf = tangent_direction
-        .iter()
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-    if step_inf <= 1e-12 {
-        let values = ops.values(x)?;
-        let (worst, _) = ops.max_violation(&values);
-        if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
-            let Some(projected) = project_point_strictly_into_feasible_constraint_set(x, ops.set)
-                .filter(|candidate| {
-                    ops.values(candidate)
-                        .map(|candidate_values| {
-                            ops.max_violation(&candidate_values).0
-                                <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-                        })
-                        .unwrap_or(false)
-                })
+    for _ in 0..max_separations {
+        let working_constraints = ops.gather_unit_rows(&tangent_active)?;
+        let tangent_direction = if working_constraints.a.nrows() == 0 {
+            -gradient
+        } else {
+            let Some((stationarity_residual, _multipliers)) =
+                project_stationarity_residual_on_constraint_cone(
+                    gradient,
+                    &working_constraints.a,
+                )
             else {
                 return Ok(None);
             };
-            let repair = &projected - x;
-            return Ok(Some((d_total + &repair, Vec::new())));
+            -stationarity_residual
+        };
+        if !array_is_finite(&tangent_direction) {
+            return Ok(None);
         }
-        return Ok(Some((
-            d_total.clone(),
-            canonicalize_constraint_set_active_ids(ops, active)?,
-        )));
-    }
 
-    let directional_derivative = gradient.dot(&tangent_direction);
-    if !directional_derivative.is_finite() || directional_derivative >= 0.0 {
-        return Ok(None);
-    }
+        let step_inf = tangent_direction
+            .iter()
+            .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+        if step_inf <= 1e-12 {
+            let (worst, _) = ops.max_violation(&values_x);
+            if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+                let Some(projected) =
+                    project_point_strictly_into_feasible_constraint_set(x, ops.set).filter(
+                        |candidate| {
+                            ops.values(candidate)
+                                .map(|candidate_values| {
+                                    ops.max_violation(&candidate_values).0
+                                        <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+                                })
+                                .unwrap_or(false)
+                        },
+                    )
+                else {
+                    return Ok(None);
+                };
+                let repair = &projected - x;
+                return Ok(Some((d_total + &repair, Vec::new())));
+            }
+            return Ok(Some((
+                d_total.clone(),
+                canonicalize_constraint_set_active_ids(ops, &tangent_active)?,
+            )));
+        }
 
-    let values_x = ops.values(x)?;
-    let values_direction = ops.values(&tangent_direction)?;
-    let mut alpha = 1.0_f64;
-    let mut blocking_row = None;
-    for row in 0..ops.nrows() {
-        if ops.norms[row] <= 0.0 || is_active[row] {
+        let directional_derivative = gradient.dot(&tangent_direction);
+        if !directional_derivative.is_finite() || directional_derivative >= 0.0 {
+            return Ok(None);
+        }
+
+        let values_direction = ops.values(&tangent_direction)?;
+        let mut alpha = 1.0_f64;
+        let mut blocking_row = None;
+        for row in 0..ops.nrows() {
+            if ops.norms[row] <= 0.0 || tangent_is_active[row] {
+                continue;
+            }
+            let slack = ops.scaled_slack(&values_x, row);
+            let rate = values_direction[row] / ops.norms[row];
+            if let Some(candidate) = boundary_hit_step_fraction(slack, rate, alpha) {
+                alpha = candidate;
+                blocking_row = Some(row);
+            }
+        }
+
+        // A zero-length ratio-test hit means the sparse face omitted a tight
+        // row whose half-space cuts off this projected direction. Add exactly
+        // that separator and re-project. Materializing every tight row is both
+        // unnecessary and the original #979 performance failure.
+        if alpha <= 1e-12
+            && let Some(row) = blocking_row
+        {
+            tangent_active.push(row);
+            tangent_is_active[row] = true;
             continue;
         }
-        let slack = ops.scaled_slack(&values_x, row);
-        let rate = values_direction[row] / ops.norms[row];
-        if let Some(candidate) = boundary_hit_step_fraction(slack, rate, alpha) {
-            alpha = candidate;
-            blocking_row = Some(row);
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Ok(None);
         }
-    }
-    if !alpha.is_finite() || alpha <= 0.0 {
-        return Ok(None);
+
+        let fallback_step = tangent_direction * alpha;
+        let new_x = x + &fallback_step;
+        let new_values = ops.values(&new_x)?;
+        if ops.max_violation(&new_values).0 > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+            return Ok(None);
+        }
+
+        if let Some(row) = blocking_row
+            && !tangent_is_active[row]
+        {
+            tangent_active.push(row);
+        }
+        tangent_active.retain(|&row| ops.scaled_slack(&new_values, row) <= 1e-10);
+        let next_active = canonicalize_constraint_set_active_ids(ops, &tangent_active)?;
+        return Ok(Some((d_total + &fallback_step, next_active)));
     }
 
-    let fallback_step = tangent_direction * alpha;
-    let new_x = x + &fallback_step;
-    let new_values = ops.values(&new_x)?;
-    if ops.max_violation(&new_values).0 > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
-        return Ok(None);
-    }
-
-    let mut next_active = active.to_vec();
-    if let Some(row) = blocking_row
-        && !next_active.contains(&row)
-    {
-        next_active.push(row);
-    }
-    let next_active = canonicalize_constraint_set_active_ids(ops, &next_active)?;
-    Ok(Some((d_total + &fallback_step, next_active)))
+    Ok(None)
 }
 
 fn solve_newton_direction_with_constraint_set_impl(
@@ -2271,13 +2294,11 @@ fn solve_newton_direction_with_constraint_set_impl(
         direction_out.assign(&d_total);
         return Ok(());
     }
-    let fallback_working = ops.gather_unit_rows(&active)?;
     if let Some((fallback_direction, fallback_active)) =
         fallback_projected_gradient_direction_with_constraint_set(
             &x,
             &d_total,
             &g_cur,
-            &fallback_working,
             &active,
             &is_active,
             ops,
@@ -3184,7 +3205,6 @@ mod tests {
         // remaining negative gradient points along its slope coefficient,
         // which lies in the face tangent and moves all other rows inward.
         let gradient = array![0.0_f64, 0.0, 0.0, -1.0];
-        let working = ops.gather_unit_rows(&[0]).expect("one-row working face");
         let mut is_active = vec![false; set.nrows()];
         is_active[0] = true;
 
@@ -3192,7 +3212,6 @@ mod tests {
             &x,
             &d_total,
             &gradient,
-            &working,
             &[0],
             &is_active,
             &ops,
@@ -3216,6 +3235,46 @@ mod tests {
             active,
             vec![0],
             "operator escape expanded one sparse face row into all tight rows"
+        );
+    }
+
+    #[test]
+    fn operator_cycle_escape_discovers_a_zero_step_tangent_separator() {
+        // All three rows are tight at the vertex. Row 0 alone permits a pure
+        // positive-slope direction, but row 2 (`constant - slope >= 0`) blocks
+        // it at alpha=0. The operator escape must add that one separator and
+        // re-project, not give up and not materialize every tight row.
+        let psi = array![[1.0_f64, 0.0], [1.0, 1.0], [1.0, -1.0]];
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1], 2)
+            .expect("separator cone");
+        let set = ConstraintSet::KhatriRaoCone(cone);
+        let ops = ConstraintSetOps::new(&set, 0.0).expect("operator geometry");
+        let x = Array1::<f64>::zeros(4);
+        let d_total = Array1::<f64>::zeros(4);
+        let gradient = array![0.0_f64, 0.0, 0.0, -1.0];
+        let mut is_active = vec![false; set.nrows()];
+        is_active[0] = true;
+
+        let (direction, active) = fallback_projected_gradient_direction_with_constraint_set(
+            &x,
+            &d_total,
+            &gradient,
+            &[0],
+            &is_active,
+            &ops,
+        )
+        .expect("operator separator evaluation")
+        .expect("one omitted tight separator must not defeat the escape");
+
+        assert!(gradient.dot(&direction) < 0.0);
+        let candidate = &x + &direction;
+        let (worst, _) = set
+            .max_scaled_violation(candidate.view())
+            .expect("full-set feasibility");
+        assert!(worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL);
+        assert!(
+            active.len() <= 2,
+            "separator discovery expanded a three-row vertex: {active:?}"
         );
     }
 }
