@@ -1539,6 +1539,87 @@ impl SplineScanFit {
 
 #[cfg(test)]
 mod tests {
+
+    /// Diagnostic reproduction of the #2300 weighted-scan non-termination:
+    /// the exact acceptance DGP (n=180, step weights 1/9), with the SAME
+    /// certified search `fit_spline_scan` runs — but through a counting
+    /// wrapper that bails out with the evaluation count and the stuck
+    /// abscissa once the search exceeds a budget no terminating search on a
+    /// 36-wide bracket can legitimately need. A pass proves termination in
+    /// bounded work; the panic message is the diagnosis.
+    #[test]
+    fn weighted_scan_dgp_2300_search_terminates_in_bounded_evaluations() {
+        // Deterministic stand-in for the acceptance DGP (xorshift Box-Muller;
+        // the hang class is structural, not noise-realization-specific).
+        let n = 180usize;
+        let mut state: u64 = 0x2300_2300_2300_2300;
+        let mut next_unit = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut w = Vec::with_capacity(n);
+        for i in 0..n {
+            let xi = -2.0 + 4.0 * (i as f64) / ((n - 1) as f64);
+            let wi = if xi < 0.0 { 1.0 } else { 9.0 };
+            let u1 = next_unit().max(1e-12);
+            let u2 = next_unit();
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            x.push(xi);
+            w.push(wi);
+            y.push(0.4 + (1.3 * xi).sin() + (0.45 / wi.sqrt()) * z);
+        }
+        let order = 2usize;
+        let (nodes, ssr_within, n_obs) = pool_nodes(&x, &y, &w, order).expect("pool");
+        let span = nodes.last().unwrap().x - nodes.first().unwrap().x;
+        let scale_shift = (2 * order - 1) as f64 * span.ln();
+        let lo = LOG_LAMBDA_LO + scale_shift;
+        let hi = LOG_LAMBDA_HI + scale_shift;
+
+        let evals = std::cell::Cell::new(0u64);
+        let last_x = std::cell::Cell::new(f64::NAN);
+        let budget = 2_000_000u64;
+        let result = gam_math::score_opt::maximize_score_1d(
+            lo,
+            hi,
+            f64::EPSILON.sqrt(),
+            |ll| {
+                let count = evals.get() + 1;
+                evals.set(count);
+                last_x.set(ll);
+                assert!(
+                    count <= budget,
+                    "certified scan search exceeded {budget} criterion evaluations \
+                     (last log-lambda sample {ll:.9}; bracket [{lo:.3}, {hi:.3}]) — \
+                     non-terminating subdivision reproduced"
+                );
+                concentrated_criterion_jet(&nodes, ssr_within, n_obs, ll, order).map(
+                    |(value, derivative, curvature)| gam_math::score_opt::ScoreJet {
+                        value,
+                        derivative,
+                        curvature,
+                    },
+                )
+            },
+            |a, b| concentrated_criterion_enclosure(&nodes, ssr_within, n_obs, a, b, order),
+        );
+        match result {
+            Ok(search) => {
+                assert!(
+                    search.optimum.x.is_finite(),
+                    "search must return a finite optimum"
+                );
+            }
+            Err(error) => panic!(
+                "weighted scan search failed after {} evaluations (last x {:.9}): {error:?}",
+                evals.get(),
+                last_x.get()
+            ),
+        }
+    }
     /// Value-only diagnostic surface retained for the derivative oracle tests.
     fn concentrated_criterion(
         nodes: &[PooledNode],
