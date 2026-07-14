@@ -197,11 +197,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         && !family.has_explicit_joint_hessian()
         && !has_workspace_source
         && family.joint_hessian_is_structurally_coupled(&states)?;
-    let coupled_exact_joint_required = specs.len() >= 2
-        && !family.likelihood_blocks_uncoupled()
-        && (family.has_explicit_joint_hessian()
-            || has_workspace_source
-            || structurally_coupled_joint_hessian);
     // When the family declares its likelihood blocks UNCOUPLED
     // (`∂²L/∂β_a∂β_b = 0` for every a ≠ b) the joint penalized objective is
     // fully separable across blocks: the joint Hessian is exactly
@@ -224,10 +219,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     // every outer ρ-eval, and the fit only survives by falling through to the
     // block-coordinate path anyway (which then converges in a handful of
     // cycles). Route uncoupled multi-block specs straight to that exact
-    // separable path. `coupled_exact_joint_required` is already gated the same
-    // way (uncoupled families are designed to fall through to blockwise), so
-    // this only stops the engine from attempting — and grinding on — a joint
-    // solve it was never required to run.
+    // separable path. Uncoupled families are routed to blockwise before a joint
+    // solve starts, so this stops the engine from attempting — and grinding on
+    // — a joint solve it was never required to run.
     //
     // Single-block families and genuinely coupled multi-block families are
     // unaffected: the former never had cross-block coupling to begin with, the
@@ -5587,7 +5581,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     block_diag_default,
                     last_math_summary,
                 );
-                if coupled_exact_joint_required {
+                {
                     // Budget exhaustion is a failed *inner mode at this rho*, not
                     // malformed user input.  Propagate it as a finite
                     // `converged=false` inner result so the outer objective can
@@ -5687,13 +5681,17 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 active_constraints,
             });
         }
-        if coupled_exact_joint_required {
-            // An early exit from the exact joint path is also a non-certifying
-            // inner mode at the current rho, not invalid input.  Do not fall
-            // through to blockwise iteration (that would drop required
-            // cross-block curvature), but do return the current finite iterate
-            // with `converged=false` so the outer optimizer can reject this rho
-            // and continue.
+        {
+            // An early exit from an exact joint path is a non-certifying inner
+            // mode at the current rho, not invalid input. The selected joint
+            // solver is authoritative even for a single tensor block: falling
+            // through to coordinate iteration would silently switch algorithms
+            // after a failed certificate, discard its active-set provenance,
+            // and grind a second cycle budget before reaching the same outer-rho
+            // rejection. Families whose objective is deliberately separable are
+            // routed to blockwise before this joint path starts. Return the
+            // current finite iterate with `converged=false` so the outer
+            // optimizer can reject this rho and continue.
             let block_diag = last_kkt_refusal_report
                 .as_ref()
                 .map(KktRefusalReport::format_bubbled_error)
@@ -5742,7 +5740,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 active_constraints,
             });
         }
-        // Otherwise fall through to blockwise iteration below.
     }
 
     let mut cached_eval = match cached_eval {

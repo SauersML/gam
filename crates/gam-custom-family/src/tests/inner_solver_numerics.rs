@@ -741,8 +741,7 @@ pub(crate) fn joint_newton_budget_exhaustion_refuses_coupled_exact_inner() {
 
     // A coupled exact-joint family whose gradient never reaches KKT (the unit
     // persistent gradient) exhausts a one-cycle budget. Per the coupled-exact
-    // budget-exhaustion contract (`inner_blockwise_fit`, the `if
-    // coupled_exact_joint_required` budget branch), that is NOT malformed input:
+    // budget-exhaustion contract (`inner_blockwise_fit`), that is NOT malformed input:
     // the inner solver returns a finite, NON-converged mode so the OUTER
     // optimizer can reject this rho and back off to a fit-able neighbour —
     // escaping the survival/location-scale flat-baseline valley — instead of
