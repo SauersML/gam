@@ -95,6 +95,8 @@ pub enum GraphCompressionKind {
     Cylinder,
     Torus,
     Sphere,
+    ProjectivePlane,
+    KleinBottle,
     Graph,
 }
 

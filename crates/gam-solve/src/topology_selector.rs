@@ -73,6 +73,12 @@ pub enum AutoTopologyKind {
     Sphere,
     Torus,
     Cylinder,
+    /// Real projective plane represented by the even spherical harmonics on
+    /// its antipodal `S2` cover.
+    ProjectivePlane,
+    /// Flat Klein bottle represented by the invariant Fourier modes on its
+    /// two-torus cover.
+    KleinBottle,
     /// Möbius band (#2240): the unique non-orientable smooth `d = 2`
     /// candidate. Genuinely non-homotopic to the torus / cylinder / sphere /
     /// patch, so it races as its own discrete candidate — no curvature fusion
@@ -129,6 +135,8 @@ impl AutoTopologyKind {
             AutoTopologyKind::Sphere => "sphere",
             AutoTopologyKind::Torus => "torus",
             AutoTopologyKind::Cylinder => "cylinder",
+            AutoTopologyKind::ProjectivePlane => "projective_plane",
+            AutoTopologyKind::KleinBottle => "klein_bottle",
             AutoTopologyKind::Mobius => "mobius",
             AutoTopologyKind::DuchonSheet => "duchon_sheet",
             AutoTopologyKind::ConstantCurvature => "constant_curvature",
@@ -229,11 +237,13 @@ impl AutoTopologyKind {
             "sphere" => Ok(AutoTopologyKind::Sphere),
             "torus" => Ok(AutoTopologyKind::Torus),
             "cylinder" => Ok(AutoTopologyKind::Cylinder),
+            "projective_plane" => Ok(AutoTopologyKind::ProjectivePlane),
+            "klein_bottle" => Ok(AutoTopologyKind::KleinBottle),
             "mobius" => Ok(AutoTopologyKind::Mobius),
             "duchon_sheet" => Ok(AutoTopologyKind::DuchonSheet),
             "constant_curvature" => Ok(AutoTopologyKind::ConstantCurvature),
             _ => Err(format!(
-                "topology candidate must be an exact canonical name: euclidean, circle, sphere, torus, cylinder, mobius, duchon_sheet, constant_curvature, mixture_k{{n}}, ring_clusters_k{{n}}, union_circle+circle, union_circle+cluster, or union_line+cluster; got {value:?}"
+                "topology candidate must be an exact canonical name: euclidean, circle, sphere, torus, cylinder, projective_plane, klein_bottle, mobius, duchon_sheet, constant_curvature, mixture_k{{n}}, ring_clusters_k{{n}}, union_circle+circle, union_circle+cluster, or union_line+cluster; got {value:?}"
             )),
         }
     }
@@ -245,6 +255,8 @@ impl AutoTopologyKind {
             AutoTopologyKind::Sphere,
             AutoTopologyKind::Torus,
             AutoTopologyKind::Cylinder,
+            AutoTopologyKind::ProjectivePlane,
+            AutoTopologyKind::KleinBottle,
         ]
     }
 
@@ -2749,6 +2761,8 @@ mod tests {
             AutoTopologyKind::Sphere,
             AutoTopologyKind::Torus,
             AutoTopologyKind::Cylinder,
+            AutoTopologyKind::ProjectivePlane,
+            AutoTopologyKind::KleinBottle,
             AutoTopologyKind::Mobius,
             AutoTopologyKind::DuchonSheet,
             AutoTopologyKind::ConstantCurvature,

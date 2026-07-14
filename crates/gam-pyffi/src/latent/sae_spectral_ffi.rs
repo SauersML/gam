@@ -1441,6 +1441,8 @@ fn atlas_nerve_dict<'py>(
             gam::terms::sae::manifold::GraphCompressionKind::Cylinder => "cylinder",
             gam::terms::sae::manifold::GraphCompressionKind::Torus => "torus",
             gam::terms::sae::manifold::GraphCompressionKind::Sphere => "sphere",
+            gam::terms::sae::manifold::GraphCompressionKind::ProjectivePlane => "projective_plane",
+            gam::terms::sae::manifold::GraphCompressionKind::KleinBottle => "klein_bottle",
             gam::terms::sae::manifold::GraphCompressionKind::Graph => "graph",
         },
     )?;

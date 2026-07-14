@@ -356,28 +356,19 @@ impl AtlasNerveDiagram {
                 .is_some_and(|chi| i128::from(chi.value()) == self.euler_characteristic),
             None => false,
         };
-        if !self.good_cover_certified
-            || self.certified_orientability() != Some(AtlasOrientability::Orientable)
-            || !curvature_agrees
-        {
+        let Some(orientability) = self.certified_orientability() else {
+            return GraphCompressionReport::unnamed(generic);
+        };
+        if !self.good_cover_certified || !curvature_agrees {
             return GraphCompressionReport::unnamed(generic);
         }
         let log_vertices = (self.n_vertices.max(2) as f64).log2();
-        let named = match (
-            self.betti.b0,
-            self.betti.b1,
-            self.betti.b2,
+        let named = certified_surface_name(
+            self.betti,
             self.euler_characteristic,
-        ) {
-            (1, 2, Some(1), 0) => Some((GraphCompressionKind::Torus, "torus", 2.0 * log_vertices)),
-            (1, 1, Some(0), 0) => Some((
-                GraphCompressionKind::Cylinder,
-                "cylinder",
-                2.0 * log_vertices,
-            )),
-            (1, 0, Some(1), 2) => Some((GraphCompressionKind::Sphere, "sphere", log_vertices)),
-            _ => None,
-        };
+            orientability,
+            log_vertices,
+        );
         if let Some((kind, name, named_bits)) = named {
             let report = GraphCompressionReport::certified(kind, name, generic, named_bits);
             if report.bits_saved > 0.0 {
@@ -385,6 +376,44 @@ impl AtlasNerveDiagram {
             }
         }
         GraphCompressionReport::unnamed(generic)
+    }
+}
+
+fn certified_surface_name(
+    betti: BettiSignature,
+    euler_characteristic: i128,
+    orientability: AtlasOrientability,
+    log_vertices: f64,
+) -> Option<(GraphCompressionKind, &'static str, f64)> {
+    match (
+        betti.b0,
+        betti.b1,
+        betti.b2,
+        euler_characteristic,
+        orientability,
+    ) {
+        (1, 2, Some(1), 0, AtlasOrientability::Orientable) => {
+            Some((GraphCompressionKind::Torus, "torus", 2.0 * log_vertices))
+        }
+        (1, 1, Some(0), 0, AtlasOrientability::Orientable) => Some((
+            GraphCompressionKind::Cylinder,
+            "cylinder",
+            2.0 * log_vertices,
+        )),
+        (1, 0, Some(1), 2, AtlasOrientability::Orientable) => {
+            Some((GraphCompressionKind::Sphere, "sphere", log_vertices))
+        }
+        (1, 1, Some(1), 1, AtlasOrientability::NonOrientable) => Some((
+            GraphCompressionKind::ProjectivePlane,
+            "projective_plane",
+            log_vertices,
+        )),
+        (1, 2, Some(1), 0, AtlasOrientability::NonOrientable) => Some((
+            GraphCompressionKind::KleinBottle,
+            "klein_bottle",
+            2.0 * log_vertices,
+        )),
+        _ => None,
     }
 }
 
@@ -1535,6 +1564,41 @@ mod tests {
             mobius.certified_compression().kind,
             GraphCompressionKind::Graph,
             "GF(2) Betti numbers alone cannot call a Möbius cover a cylinder"
+        );
+    }
+
+    #[test]
+    fn closed_nonorientable_surface_names_require_the_exact_orientation_row() {
+        let rp2_betti = crate::manifold::BettiSignature {
+            b0: 1,
+            b1: 1,
+            b2: Some(1),
+        };
+        let klein_betti = crate::manifold::BettiSignature {
+            b0: 1,
+            b1: 2,
+            b2: Some(1),
+        };
+        assert_eq!(
+            super::certified_surface_name(rp2_betti, 1, AtlasOrientability::NonOrientable, 8.0,)
+                .map(|row| row.0),
+            Some(GraphCompressionKind::ProjectivePlane)
+        );
+        assert_eq!(
+            super::certified_surface_name(klein_betti, 0, AtlasOrientability::NonOrientable, 8.0,)
+                .map(|row| row.0),
+            Some(GraphCompressionKind::KleinBottle)
+        );
+        assert_eq!(
+            super::certified_surface_name(klein_betti, 0, AtlasOrientability::Orientable, 8.0,)
+                .map(|row| row.0),
+            Some(GraphCompressionKind::Torus),
+            "the same F2 homology becomes a different surface only through certified orientation"
+        );
+        assert!(
+            super::certified_surface_name(rp2_betti, 1, AtlasOrientability::Orientable, 8.0,)
+                .is_none(),
+            "an impossible orientable RP2 signature must not earn any name"
         );
     }
 

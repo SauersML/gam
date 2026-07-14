@@ -2959,6 +2959,15 @@ fn topology_candidates_for_dim(
                 coords_d(2),
             )?);
             specs.push(TopologyCandidateSpec::new(
+                AutoTopologyKind::KleinBottle,
+                SaeAtomGeometryPlan::klein_bottle(2)?,
+                LatentManifold::Product(vec![
+                    LatentManifold::Circle { period: 1.0 },
+                    LatentManifold::Circle { period: 1.0 },
+                ]),
+                coords_d(2),
+            )?);
+            specs.push(TopologyCandidateSpec::new(
                 AutoTopologyKind::Sphere,
                 SaeAtomGeometryPlan::new(
                     SaeAtomBasisKind::Sphere,
@@ -2973,6 +2982,20 @@ fn topology_candidates_for_dim(
                 // unit 3-vectors the chart never produces. This matches the
                 // production seeding (`AtomTopology::Sphere` →
                 // Product[Interval(-π/2, π/2), Circle(τ)] in `sae::manifold::atom`).
+                LatentManifold::Product(vec![
+                    LatentManifold::Interval {
+                        lo: -std::f64::consts::FRAC_PI_2,
+                        hi: std::f64::consts::FRAC_PI_2,
+                    },
+                    LatentManifold::Circle {
+                        period: std::f64::consts::TAU,
+                    },
+                ]),
+                coords_d(2),
+            )?);
+            specs.push(TopologyCandidateSpec::new(
+                AutoTopologyKind::ProjectivePlane,
+                SaeAtomGeometryPlan::projective_plane(1)?,
                 LatentManifold::Product(vec![
                     LatentManifold::Interval {
                         lo: -std::f64::consts::FRAC_PI_2,
@@ -3900,6 +3923,20 @@ pub fn discover_primary_atom_topologies(
                                 period: std::f64::consts::TAU,
                             },
                         ]),
+                        coords.clone(),
+                    )?);
+                    specs.push(TopologyCandidateSpec::new(
+                        AutoTopologyKind::ProjectivePlane,
+                        SaeAtomGeometryPlan::projective_plane(1)?,
+                        LatentManifold::Product(vec![
+                            LatentManifold::Interval {
+                                lo: -std::f64::consts::FRAC_PI_2,
+                                hi: std::f64::consts::FRAC_PI_2,
+                            },
+                            LatentManifold::Circle {
+                                period: std::f64::consts::TAU,
+                            },
+                        ]),
                         coords,
                     )?);
                 }
@@ -3950,6 +3987,15 @@ pub fn discover_primary_atom_topologies(
                             SaeBasisResolution::TorusHarmonics { per_axis_order: 2 },
                             SaeReferenceMetricPlan::FlatRectangularTorus { tau: 0.0 },
                         )?,
+                        LatentManifold::Product(vec![
+                            LatentManifold::Circle { period: 1.0 },
+                            LatentManifold::Circle { period: 1.0 },
+                        ]),
+                        coords.clone(),
+                    )?);
+                    specs.push(TopologyCandidateSpec::new(
+                        AutoTopologyKind::KleinBottle,
+                        SaeAtomGeometryPlan::klein_bottle(2)?,
                         LatentManifold::Product(vec![
                             LatentManifold::Circle { period: 1.0 },
                             LatentManifold::Circle { period: 1.0 },
@@ -4065,18 +4111,26 @@ pub fn discover_primary_atom_topologies(
             // to discriminate topology, but a genuinely toroidal factor with
             // high-frequency angular content on either circle factor is capped
             // by that order.
-            let n_torus_harmonics = if fit_kind == SaeAtomBasisKind::Torus {
+            let n_torus_harmonics = if matches!(
+                &fit_kind,
+                SaeAtomBasisKind::Torus | SaeAtomBasisKind::KleinBottle
+            ) {
                 let coords = torus_coords.as_ref().ok_or_else(|| {
                     format!(
-                        "discover_primary_atom_topologies: torus winner without a 2-D chart for auto atom {atom_idx}"
+                        "discover_primary_atom_topologies: torus-cover winner without a 2-D chart for auto atom {atom_idx}"
                     )
                 })?;
-                Some(select_torus_resolution(
+                let selected = select_torus_resolution(
                     coords.view(),
                     target,
                     weights.view(),
                     rows.len(),
-                )?)
+                )?;
+                Some(if fit_kind == SaeAtomBasisKind::KleinBottle {
+                    selected.max(2)
+                } else {
+                    selected
+                })
             } else {
                 None
             };
@@ -6315,6 +6369,36 @@ mod tests {
         assert!(error.contains("at least 16"), "unexpected error: {error}");
         assert_eq!(basis, vec!["auto"], "failure must not install a fallback");
         assert_eq!(dims, vec![2], "failure must not rewrite latent dimension");
+    }
+
+    #[test]
+    fn quotient_surface_candidates_are_reachable_with_their_cover_geometry() {
+        use gam_solve::AutoTopologyKind;
+
+        let coords = Array2::<f64>::zeros((32, 2));
+        let specs = topology_candidates_for_dim(coords.view(), 2).unwrap();
+        let projective = specs
+            .iter()
+            .find(|spec| spec.kind == AutoTopologyKind::ProjectivePlane)
+            .expect("RP2 must be enrolled in the two-dimensional evidence race");
+        assert_eq!(
+            projective.geometry.kind(),
+            &SaeAtomBasisKind::ProjectivePlane
+        );
+        assert_eq!(projective.geometry.basis_size().unwrap(), 6);
+        let klein = specs
+            .iter()
+            .find(|spec| spec.kind == AutoTopologyKind::KleinBottle)
+            .expect("Klein bottle must be enrolled in the two-dimensional evidence race");
+        assert_eq!(klein.geometry.kind(), &SaeAtomBasisKind::KleinBottle);
+        assert_eq!(klein.geometry.basis_size().unwrap(), 13);
+        assert_eq!(
+            klein.manifold,
+            LatentManifold::Product(vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ])
+        );
     }
 
     /// #2238 — a genuinely two-dimensional primary factor must not be pinned to
