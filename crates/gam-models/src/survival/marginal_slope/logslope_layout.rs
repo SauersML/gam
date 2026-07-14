@@ -70,25 +70,6 @@ impl LogslopeTopology {
         )
     }
 
-    pub(crate) fn materialize(
-        &self,
-        raw_design: DesignMatrix,
-        current_from_raw: Array2<f64>,
-        common_offset: &Array1<f64>,
-    ) -> Result<LogslopeLayout, String> {
-        let coefficient_design = identifiability::wrap_design_with_transform(
-            raw_design.clone(),
-            &current_from_raw,
-            "logslope layout coefficient design",
-        )?;
-        self.materialize_with_design(
-            raw_design,
-            coefficient_design,
-            current_from_raw,
-            common_offset,
-        )
-    }
-
     fn materialize_with_design(
         &self,
         raw_design: DesignMatrix,
@@ -584,13 +565,6 @@ mod tests {
         }
     }
 
-    fn assert_close(left: &Array2<f64>, right: &Array2<f64>) {
-        assert_eq!(left.dim(), right.dim());
-        for (lhs, rhs) in left.iter().zip(right.iter()) {
-            assert!((lhs - rhs).abs() <= 1e-12, "{lhs} != {rhs}");
-        }
-    }
-
     #[test]
     fn unequal_raw_widths_emit_full_width_channel_rows_and_offsets() {
         let raw = array![[2.0, 3.0, 5.0], [7.0, 11.0, 13.0]];
@@ -609,123 +583,6 @@ mod tests {
             array![[2.0, 0.0, 0.0], [0.0, 3.0, 5.0]]
         );
         assert_eq!(workspace.values(), &[34.5, 172.5]);
-    }
-
-    #[test]
-    fn physical_values_and_streamed_primary_rows_share_one_layout_truth_932() {
-        let topology = LogslopeTopology::per_score(vec![0..1, 1..3], 3).unwrap();
-        let transform = array![[1.0, 0.5], [0.0, 2.0], [3.0, -1.0]];
-        let layout = topology
-            .materialize(
-                DesignMatrix::from(array![[2.0, 3.0, 5.0], [7.0, 11.0, 13.0]]),
-                transform,
-                &array![0.25, -0.5],
-            )
-            .unwrap();
-        let beta = array![0.4, -0.2];
-
-        let values = layout.physical_values(2, beta.view()).unwrap();
-        let mut rows = Array2::<f64>::zeros((4, 2));
-        layout
-            .fill_primary_jacobian_rows(2, 0..2, 0..2, &mut rows)
-            .unwrap();
-
-        for row in 0..2 {
-            let offset = [0.25, -0.5][row];
-            for channel in 0..2 {
-                let streamed = rows.row(row * 2 + channel);
-                assert!((values[[row, channel]] - (streamed.dot(&beta) + offset)).abs() <= 1e-12);
-            }
-        }
-        assert_eq!(rows.row(0), array![2.0, 1.0]);
-        assert_eq!(rows.row(1), array![15.0, 1.0]);
-        assert_eq!(rows.row(2), array![7.0, 3.5]);
-        assert_eq!(rows.row(3), array![39.0, 9.0]);
-    }
-
-    #[test]
-    fn transformed_channels_preserve_value_gradient_and_hessian_pullback() {
-        let raw = array![[2.0, 3.0, 5.0, 7.0]];
-        let current_from_raw = array![
-            [1.0, 0.5, 0.0],
-            [0.0, 1.0, 0.25],
-            [0.5, 0.0, 1.0],
-            [0.0, 0.5, 1.0]
-        ];
-        let topology = LogslopeTopology::per_score(vec![0..1, 1..4], 4).unwrap();
-        let layout = topology
-            .materialize(
-                DesignMatrix::from(raw.clone()),
-                current_from_raw.clone(),
-                &array![0.75],
-            )
-            .unwrap();
-        let theta = array![11.0, 13.0, 17.0];
-        let beta_raw = current_from_raw.dot(&theta);
-        let raw_channels = array![[2.0, 0.0, 0.0, 0.0], [0.0, 3.0, 5.0, 7.0]];
-        let expected_current_channels = raw_channels.dot(&current_from_raw);
-        let mut workspace = layout.row_workspace(2).unwrap();
-        layout
-            .fill_per_score_row(0, theta.view(), &mut workspace)
-            .unwrap();
-        assert_close(
-            &workspace.channel_rows().to_owned(),
-            &expected_current_channels,
-        );
-        let expected_values = raw_channels.dot(&beta_raw) + 0.75;
-        for (actual, expected) in workspace.values().iter().zip(expected_values.iter()) {
-            assert!((actual - expected).abs() <= 1e-12);
-        }
-
-        let channel_gradient = array![0.25, -1.5];
-        let channel_hessian = array![[2.0, 0.5], [0.5, 3.0]];
-        let current_gradient = expected_current_channels.t().dot(&channel_gradient);
-        let raw_gradient = raw_channels.t().dot(&channel_gradient);
-        let expected_gradient = current_from_raw.t().dot(&raw_gradient);
-        for (actual, expected) in current_gradient.iter().zip(expected_gradient.iter()) {
-            assert!((actual - expected).abs() <= 1e-12);
-        }
-        let current_hessian = expected_current_channels
-            .t()
-            .dot(&channel_hessian)
-            .dot(&expected_current_channels);
-        let raw_hessian = raw_channels.t().dot(&channel_hessian).dot(&raw_channels);
-        let expected_hessian = current_from_raw
-            .t()
-            .dot(&raw_hessian)
-            .dot(&current_from_raw);
-        assert_close(&current_hessian, &expected_hessian);
-    }
-
-    #[test]
-    fn transformed_zero_physical_channel_is_rejected_exactly() {
-        let topology = LogslopeTopology::per_score(vec![0..1, 1..2], 2).unwrap();
-        let error = topology
-            .materialize(
-                DesignMatrix::from(array![[1.0, 2.0]]),
-                array![[1.0], [0.0]],
-                &array![0.0],
-            )
-            .err()
-            .expect("second physical channel must be rejected");
-        assert!(error.contains("channel 1 is identically zero"), "{error}");
-    }
-
-    #[test]
-    fn shared_transformed_zero_physical_channel_is_rejected_exactly() {
-        let topology = LogslopeTopology::shared();
-        let error = topology
-            .materialize(
-                DesignMatrix::from(array![[1.0, 2.0], [3.0, 6.0]]),
-                array![[2.0], [-1.0]],
-                &array![0.0, 0.0],
-            )
-            .err()
-            .expect("shared physical channel must survive the coefficient transform");
-        assert!(
-            error.contains("shared logslope channel 0 is identically zero"),
-            "{error}"
-        );
     }
 
     #[test]

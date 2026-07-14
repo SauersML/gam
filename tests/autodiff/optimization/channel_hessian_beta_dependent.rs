@@ -1,22 +1,19 @@
-//! Tests for the β-dependent channel Hessian refresh (T34).
+//! Tests for identifiability-audit drift and β-independent channel Hessians.
 //!
 //! Verifies that:
 //!
-//! 1. `SurvivalRowHessian::channel_hessian_at` returns a different W when
-//!    the primary state changes (survival_marginal_slope_w_changes_with_beta).
-//! 2. The drift detection log fires when the rank verdict changes between
+//! 1. The drift detection log fires when the rank verdict changes between
 //!    the pilot β and a non-trivial β
 //!    (audit_drift_detection_logs_when_rank_changes).
-//! 3. The drift detection is silent when the rank verdict is stable
+//! 2. The drift detection is silent when the rank verdict is stable
 //!    (audit_drift_silent_when_rank_stable).
-//! 4. The TensorChannelHessian (β-independent default path) returns the
+//! 3. The TensorChannelHessian (β-independent default path) returns the
 //!    same W regardless of β (gaussian_identity_w_is_beta_independent).
 //!
 //! Architecture: all tests are self-contained — no survival family construction,
 //! no cargo --release, no parallel cargo.
 
 use gam::families::custom_family::{FamilyChannelHessian, ParameterBlockSpec};
-use gam::families::survival::marginal_slope::identifiability::SurvivalRowHessian;
 use gam::identifiability::audit::{IdentifiabilityAudit, maybe_log_audit_drift};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
@@ -40,212 +37,7 @@ fn spec_from_dense(name: &str, design: Array2<f64>) -> ParameterBlockSpec {
     }
 }
 
-/// Build a minimal `SurvivalRowHessian` from explicit primary-state arrays.
-/// Uses n=4 rows so the test stays tiny.
-fn make_survival_row_hessian(
-    q0: &[f64],
-    q1: &[f64],
-    qd1: &[f64],
-    g: &[f64],
-    z: &[f64],
-) -> SurvivalRowHessian {
-    let n = q0.len();
-    let q0_arr = Array1::from_vec(q0.to_vec());
-    let q1_arr = Array1::from_vec(q1.to_vec());
-    let qd1_arr = Array1::from_vec(qd1.to_vec());
-    let g_arr = Array1::from_vec(g.to_vec());
-    let z_arr = Array1::from_vec(z.to_vec());
-    let weights = Array1::from_elem(n, 1.0_f64);
-    let event = Array1::from_elem(n, 1.0_f64);
-    SurvivalRowHessian::from_pilot_primary_state(
-        &q0_arr, &q1_arr, &qd1_arr, &g_arr, &z_arr, &weights, &event,
-        1e-6, // derivative_guard
-        1.0,  // probit_scale
-    )
-    .expect("make_survival_row_hessian: from_pilot_primary_state failed")
-}
-
-// ── T34 test 1: W changes with β ──────────────────────────────────────────
-
-/// `channel_hessian_at(beta_b, scalars_b)` must differ from
-/// `channel_hessian_at(beta_a, scalars_a)` when the primary state changes.
-///
-/// We build two primary-state configurations that differ substantially in
-/// `g_i`: state A has g=0 (β=0 pilot), state B has g=2.0 (non-trivial β).
-/// At g=0 the cross-channel off-diagonal terms W[0,3] = W[3,0] etc. are zero
-/// (q·c1 + s·z = 0 when g=0 → c1=0). At g=2 those cross-terms are non-zero.
-/// So W_A ≠ W_B in the off-diagonal entries, and the test asserts that at
-/// least one entry differs by more than 1e-6.
-#[test]
-fn survival_marginal_slope_w_changes_with_beta() {
-    use gam::families::survival::marginal_slope::SurvivalMarginalSlopeFamilyScalars;
-    use std::sync::Arc;
-
-    let n = 4;
-
-    // State A: pilot β=0 → g=0, c=1, q0=q1=qd1=0.5.
-    let hess_a = make_survival_row_hessian(
-        &[0.5, 0.5, 0.5, 0.5],   // q0
-        &[0.5, 0.5, 0.5, 0.5],   // q1
-        &[1.0, 1.0, 1.0, 1.0],   // qd1 (must be > derivative_guard)
-        &[0.0, 0.0, 0.0, 0.0],   // g = 0
-        &[1.0, -1.0, 0.5, -0.5], // z
-    );
-
-    // W at pilot β: call channel_hessian_at with beta=all zeros, scalars=None.
-    let w_a = hess_a
-        .channel_hessian_at(&[0.0_f64; 0], None)
-        .expect("channel_hessian_at beta_a failed");
-    let tensor_a = w_a.evaluate_full();
-
-    // State B: non-trivial β → g=2.0. Build scalars.
-    let g_b = vec![2.0_f64; n];
-    let q0_b = vec![0.5_f64; n];
-    let q1_b = vec![0.5_f64; n];
-    let qd1_b = vec![1.0_f64; n];
-    let z_b = vec![1.0, -1.0, 0.5, -0.5];
-    let s_b = 1.0_f64;
-    let scalars_b =
-        SurvivalMarginalSlopeFamilyScalars::new(q0_b, q1_b, qd1_b, g_b.clone(), s_b, z_b.clone());
-    let scalars_arc: Arc<dyn std::any::Any + Send + Sync> = Arc::new(scalars_b);
-
-    // Build a hessian from the pilot primary state (same as hess_a but we
-    // want to call channel_hessian_at on a fresh instance with the B scalars).
-    let hess_for_b = make_survival_row_hessian(
-        &[0.5, 0.5, 0.5, 0.5],
-        &[0.5, 0.5, 0.5, 0.5],
-        &[1.0, 1.0, 1.0, 1.0],
-        &[0.0, 0.0, 0.0, 0.0],
-        &[1.0, -1.0, 0.5, -0.5],
-    );
-
-    let beta_b = vec![1.0_f64; 1]; // non-trivial beta
-    let w_b = hess_for_b
-        .channel_hessian_at(&beta_b, Some(&scalars_arc))
-        .expect("channel_hessian_at beta_b failed");
-    let tensor_b = w_b.evaluate_full();
-
-    // W_a and W_b must differ: at g=0 the off-diagonal W[0,3]=W[3,0] etc.
-    // are zero; at g=2 they are non-zero. Assert at least one entry differs
-    // by more than 1e-6.
-    let max_diff = tensor_a
-        .iter()
-        .zip(tensor_b.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f64, f64::max);
-
-    assert!(
-        max_diff > 1e-6,
-        "W(beta_a) and W(beta_b) should differ for distinct primary states: max_diff={max_diff}"
-    );
-}
-
-/// A refreshed survival channel Hessian must use the original observation
-/// weights and censoring indicators. Replacing them by `(1, 1)` changes both
-/// the scale and structure of W and can therefore change a rank certificate.
-#[test]
-fn survival_marginal_slope_w_refresh_preserves_row_data() {
-    use gam::families::survival::marginal_slope::SurvivalMarginalSlopeFamilyScalars;
-    use std::sync::Arc;
-
-    let q0_pilot = Array1::from_vec(vec![0.10, -0.20, 0.35]);
-    let q1_pilot = Array1::from_vec(vec![0.45, 0.30, 0.80]);
-    let qd1_pilot = Array1::from_vec(vec![0.70, 1.10, 0.55]);
-    let g_pilot = Array1::zeros(3);
-    let z = Array1::from_vec(vec![-1.25, 0.40, 1.10]);
-    let weights = Array1::from_vec(vec![0.25, 2.0, 4.5]);
-    let event = Array1::from_vec(vec![0.0, 1.0, 0.0]);
-    let derivative_guard = 1e-6;
-    let probit_scale = 1.2;
-    let stored = SurvivalRowHessian::from_pilot_primary_state(
-        &q0_pilot,
-        &q1_pilot,
-        &qd1_pilot,
-        &g_pilot,
-        &z,
-        &weights,
-        &event,
-        derivative_guard,
-        probit_scale,
-    )
-    .expect("pilot row Hessian");
-
-    let q0_current = Array1::from_vec(vec![0.20, -0.05, 0.50]);
-    let q1_current = Array1::from_vec(vec![0.60, 0.55, 0.95]);
-    let qd1_current = Array1::from_vec(vec![0.85, 1.25, 0.75]);
-    let g_current = Array1::from_vec(vec![0.30, -0.45, 0.70]);
-    let scalars = SurvivalMarginalSlopeFamilyScalars::new(
-        q0_current.to_vec(),
-        q1_current.to_vec(),
-        qd1_current.to_vec(),
-        g_current.to_vec(),
-        probit_scale,
-        z.to_vec(),
-    );
-    let scalars: Arc<dyn std::any::Any + Send + Sync> = Arc::new(scalars);
-    let refreshed = stored
-        .channel_hessian_at(&[1.0], Some(&scalars))
-        .expect("exact current-state refresh")
-        .evaluate_full();
-
-    let expected = SurvivalRowHessian::from_pilot_primary_state(
-        &q0_current,
-        &q1_current,
-        &qd1_current,
-        &g_current,
-        &z,
-        &weights,
-        &event,
-        derivative_guard,
-        probit_scale,
-    )
-    .expect("direct current-state row Hessian");
-    let expected = FamilyChannelHessian::evaluate_full(&expected);
-    let max_diff = refreshed
-        .iter()
-        .zip(expected.iter())
-        .map(|(actual, expected)| (actual - expected).abs())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        max_diff < 1e-12,
-        "refreshed W must equal direct W with the original row data; max_diff={max_diff:e}"
-    );
-}
-
-/// Invalid current-state curvature must abort the audit instead of silently
-/// reusing a stale pilot row.
-#[test]
-fn survival_marginal_slope_w_refresh_fails_closed() {
-    use gam::families::survival::marginal_slope::SurvivalMarginalSlopeFamilyScalars;
-    use std::sync::Arc;
-
-    let stored = make_survival_row_hessian(
-        &[0.5, 0.5, 0.5, 0.5],
-        &[0.5, 0.5, 0.5, 0.5],
-        &[1.0, 1.0, 1.0, 1.0],
-        &[0.0, 0.0, 0.0, 0.0],
-        &[1.0, -1.0, 0.5, -0.5],
-    );
-    let scalars = SurvivalMarginalSlopeFamilyScalars::new(
-        vec![0.5; 4],
-        vec![0.5; 4],
-        vec![0.0; 4],
-        vec![0.5; 4],
-        1.0,
-        vec![1.0, -1.0, 0.5, -0.5],
-    );
-    let scalars: Arc<dyn std::any::Any + Send + Sync> = Arc::new(scalars);
-    let err = match stored.channel_hessian_at(&[1.0], Some(&scalars)) {
-        Ok(_) => panic!("invalid current qd1 must not reuse pilot curvature"),
-        Err(err) => err,
-    };
-    assert!(
-        err.contains("row 0"),
-        "refresh error must identify the invalid row: {err}"
-    );
-}
-
-// ── T34 test 2: drift detected when rank changes ───────────────────────────
+// ── Audit drift when rank changes ─────────────────────────────────────────
 
 /// Build a minimal audit result with a given set of dropped columns.
 fn fake_audit(effective_dims: &[usize], original_dims: &[usize]) -> IdentifiabilityAudit {
@@ -337,7 +129,7 @@ fn audit_drift_detection_fires_when_rank_changes() {
     );
 }
 
-// ── T34 test 3: drift silent when rank stable ──────────────────────────────
+// ── Stable audit rank ─────────────────────────────────────────────────────
 
 /// When the rank verdict is stable (no change between pilot and current β),
 /// `maybe_log_audit_drift` should still return `Some` (the check ran), but
@@ -396,7 +188,7 @@ fn audit_drift_silent_when_rank_stable() {
     );
 }
 
-// ── T34 test 4: Gaussian-identity W is β-independent ─────────────────────
+// ── β-independent channel Hessian ─────────────────────────────────────────
 
 /// The default `channel_hessian_at` implementation (used by families whose
 /// W is β-independent) must return the same tensor regardless of β.

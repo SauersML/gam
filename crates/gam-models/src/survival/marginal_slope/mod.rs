@@ -13,14 +13,6 @@
 //! the `CustomFamily` impl, block Jacobians, fit setup, and the entry point.
 //!
 
-// Public surface: the family-agnostic marginal-slope identifiability utilities
-// remain available to downstream consumers. The survival construction seam
-// that consumes `LogslopeLayout` is crate-private: the layout owns transformed
-// family state and cannot be constructed independently without breaking its
-// channel/offset invariants. Keeping the module public exposes only the
-// reusable compiler and projection contracts, not that internal state carrier.
-pub mod identifiability;
-
 pub(crate) use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace, FamilyEvaluation,
