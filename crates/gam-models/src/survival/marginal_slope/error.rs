@@ -1,6 +1,6 @@
-//! Error and preflight-block enums for survival marginal-slope fitting,
-//! with their `Display`/`Error`/`From` conversions. Self-contained: no
-//! dependency on the fitting machinery.
+//! Errors for survival marginal-slope fitting, with their
+//! `Display`/`Error`/`From` conversions. Self-contained: no dependency on the
+//! fitting machinery.
 
 #[derive(Debug, Clone)]
 pub enum SurvivalMarginalSlopeError {
@@ -30,31 +30,6 @@ pub enum SurvivalMarginalSlopeError {
     /// probit base link, flexible row calculus with K > 1, spatial psi
     /// for unsupported block roles, ...).
     UnsupportedConfiguration { reason: String },
-}
-
-/// Block tag used by the joint training-row preflight diagnostic.
-/// Names a single block in the joint design layout
-/// `[time | marginal | logslope | score_warp? | link_dev?]`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum JointPreflightBlock {
-    Time,
-    Marginal,
-    Logslope,
-    ScoreWarp,
-    LinkDev,
-}
-
-impl std::fmt::Display for JointPreflightBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            JointPreflightBlock::Time => "time",
-            JointPreflightBlock::Marginal => "marginal",
-            JointPreflightBlock::Logslope => "logslope",
-            JointPreflightBlock::ScoreWarp => "score_warp",
-            JointPreflightBlock::LinkDev => "link_dev",
-        };
-        f.write_str(name)
-    }
 }
 
 impl_reason_error_boilerplate! {
