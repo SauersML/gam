@@ -848,11 +848,17 @@ impl SaeSupportSparseTerm {
         target: ArrayView2<'_, f64>,
         ard_precisions: &[Vec<f64>],
         trust_radius: f64,
+        stationarity_tolerance: f64,
     ) -> Result<f64, String> {
         self.validate_ard(ard_precisions)?;
         if !(trust_radius.is_finite() && trust_radius > 0.0) {
             return Err(format!(
                 "SaeSupportSparseTerm::coordinate_sweep: trust_radius must be finite and positive; got {trust_radius}"
+            ));
+        }
+        if !(stationarity_tolerance.is_finite() && stationarity_tolerance > 0.0) {
+            return Err(format!(
+                "SaeSupportSparseTerm::coordinate_sweep: stationarity tolerance must be finite and positive; got {stationarity_tolerance}"
             ));
         }
         let mut max_change = 0.0_f64;
@@ -875,6 +881,12 @@ impl SaeSupportSparseTerm {
                 active_evals.push(active);
             }
             let residual = &target.row(row) - &fitted;
+            let mut row_objective_scale = 1.0
+                + 0.5
+                    * residual
+                        .iter()
+                        .map(|value| value * value)
+                        .sum::<f64>();
             let mut rhs_vector = jacobian.dot(&residual);
             let mut gram = jacobian.dot(&jacobian.t());
             let mut prior_cursor = 0usize;
@@ -887,10 +899,22 @@ impl SaeSupportSparseTerm {
                         self.assignment.coords_for_slot(row, slot)[axis],
                         periods[axis],
                     );
+                    row_objective_scale += prior.value.abs();
                     rhs_vector[prior_cursor] -= prior.grad;
                     gram[[prior_cursor, prior_cursor]] += prior.psd_majorizer_hess();
                     prior_cursor += 1;
                 }
+            }
+            let raw_gradient_max = rhs_vector
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f64, f64::max);
+            // A row already satisfying the caller's raw KKT request is a
+            // certified fixed point of this coordinate block. Do not manufacture
+            // a sub-ulp step and then ask an objective line search to distinguish
+            // it from the same represented point.
+            if raw_gradient_max <= stationarity_tolerance {
+                continue;
             }
             let delta = gam_linalg::psd_trust_region::solve_psd_trust_region(
                 gram.view(),
@@ -899,10 +923,6 @@ impl SaeSupportSparseTerm {
             )
             .map_err(|error| format!("SaeSupportSparseTerm::coordinate_sweep: {error}"))?;
             let directional = rhs_vector.dot(&delta);
-            let raw_gradient_max = rhs_vector
-                .iter()
-                .map(|value| value.abs())
-                .fold(0.0_f64, f64::max);
             let delta_max = delta
                 .iter()
                 .map(|value| value.abs())
@@ -927,6 +947,16 @@ impl SaeSupportSparseTerm {
             let mut best_step = 0.0_f64;
             let mut best_objective_delta = f64::NAN;
             let mut best_armijo_bound = f64::NAN;
+            let evaluation_ops = 1usize
+                + self.output_dim
+                + q
+                + active_evals
+                    .iter()
+                    .map(|active| active.phi.len() * self.output_dim)
+                    .sum::<usize>();
+            let gamma = evaluation_ops as f64 * f64::EPSILON
+                / (1.0 - evaluation_ops as f64 * f64::EPSILON);
+            let objective_resolution = gamma * row_objective_scale;
             for halving in 0..=24 {
                 self.assignment.set_row_coords(row, &old_coords)?;
                 let step = 2.0_f64.powi(-(halving as i32));
@@ -941,6 +971,7 @@ impl SaeSupportSparseTerm {
                 // first-order cancellation in a wide output/coordinate block.
                 let mut objective_delta = KahanSum::default();
                 let mut fitted_delta = vec![KahanSum::default(); self.output_dim];
+                let mut trial_evals = Vec::with_capacity(active_evals.len());
                 for (slot, old_active) in active_evals.iter().enumerate() {
                     let atom = self.assignment.support_indices(row)[slot] as usize;
                     let trial_active = self.evaluate_active(row, slot)?;
@@ -957,6 +988,7 @@ impl SaeSupportSparseTerm {
                             );
                         }
                     }
+                    trial_evals.push(trial_active);
                 }
                 for (output, delta_sum) in fitted_delta.into_iter().enumerate() {
                     let fitted_delta = delta_sum.sum();
@@ -987,7 +1019,35 @@ impl SaeSupportSparseTerm {
                     best_objective_delta = objective_delta;
                     best_armijo_bound = armijo_bound;
                 }
-                if objective_delta.is_finite() && objective_delta <= armijo_bound {
+                let mut trial_fitted = Array1::<f64>::zeros(self.output_dim);
+                for active in &trial_evals {
+                    trial_fitted += &active.decoded;
+                }
+                let trial_residual = &target.row(row) - &trial_fitted;
+                let mut trial_gradient_max = 0.0_f64;
+                for (slot, active) in trial_evals.iter().enumerate() {
+                    let atom = self.assignment.support_indices(row)[slot] as usize;
+                    let periods = self.assignment.atom_axis_periods(atom);
+                    for axis in 0..active.jacobian.nrows() {
+                        let likelihood_gradient = -active
+                            .jacobian
+                            .row(axis)
+                            .dot(&trial_residual);
+                        let gradient = likelihood_gradient
+                            + ArdAxisPrior::eval(
+                                ard_precisions[atom][axis],
+                                self.assignment.coords_for_slot(row, slot)[axis],
+                                periods[axis],
+                            )
+                            .grad;
+                        trial_gradient_max = trial_gradient_max.max(gradient.abs());
+                    }
+                }
+                let armijo_accept = objective_delta.is_finite() && objective_delta <= armijo_bound;
+                let roundoff_tie_accept = objective_delta.is_finite()
+                    && objective_delta.abs() <= objective_resolution
+                    && trial_gradient_max < raw_gradient_max;
+                if armijo_accept || roundoff_tie_accept {
                     accepted = Some(step);
                     break;
                 }
@@ -1005,7 +1065,8 @@ impl SaeSupportSparseTerm {
                          (raw KKT max={raw_gradient_max:.17e}, rhs_dot_delta={directional:.17e}, \
                          delta_max={delta_max:.17e}, best_step={best_step:.17e}, \
                          best_objective_delta={best_objective_delta:.17e}, \
-                         best_armijo_bound={best_armijo_bound:.17e}, gap={best_gap:.17e})"
+                         best_armijo_bound={best_armijo_bound:.17e}, gap={best_gap:.17e}, \
+                         objective_resolution={objective_resolution:.17e})"
                     ));
                 }
             }
@@ -1163,7 +1224,12 @@ impl SaeSupportSparseTerm {
         }
         let mut previous_candidate = false;
         for iteration in 1..=max_iter {
-            let max_change = self.coordinate_sweep(target, ard_precisions, trust_radius)?;
+            let max_change = self.coordinate_sweep(
+                target,
+                ard_precisions,
+                trust_radius,
+                tolerance,
+            )?;
             let (coordinate_l2, coordinate_max_abs) =
                 self.raw_coordinate_stationarity(target, ard_precisions)?;
             let candidate = max_change <= tolerance && coordinate_max_abs <= tolerance;
@@ -1211,7 +1277,12 @@ impl SaeSupportSparseTerm {
         let mut previous_candidate = false;
         for iteration in 1..=max_iter {
             let decoder_change = self.decoder_sweep(target, lambda_smooth)?;
-            let coordinate_change = self.coordinate_sweep(target, ard_precisions, trust_radius)?;
+            let coordinate_change = self.coordinate_sweep(
+                target,
+                ard_precisions,
+                trust_radius,
+                tolerance,
+            )?;
             let max_change = decoder_change.max(coordinate_change);
             let stationarity = self.raw_stationarity(target, lambda_smooth, ard_precisions)?;
             let candidate = max_change <= tolerance && stationarity.max_abs() <= tolerance;
