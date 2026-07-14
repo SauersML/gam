@@ -988,7 +988,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             }
         }
         let mut firth = FirthDiagnostics::Inactive;
-        let mut firth_score_shift_active = None;
         if self.firth_bias_reduction {
             if !self.link_kind.has_fisher_weight_jet() {
                 crate::bail_invalid_estim!(
@@ -1050,42 +1049,22 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                         *zi += delta_i;
                     }
                 });
-            firth_score_shift_active = Some(firth_score_shift);
         }
 
         let z = &self.lastz;
-        // Evaluate the data objective and eta-gradient as one inseparable row
-        // atom.
-        // Reconstructing the score as `W * (eta - z)` is algebraically exact,
-        // but numerically it subtracts the working response from the predictor
-        // after `z` was itself formed by adding a score/weight correction.  At
-        // wide smoothing-parameter ratios that cancellation left the objective
-        // and gradient on observably different surfaces, preventing a strict
-        // stationarity certificate (#2316).  P-IRLS minimizes half-deviance, so
-        // the coupled deviance-row oracle's `eta_score` is already the exact
-        // data-gradient coordinate needed here.
-        let deviance = calculate_deviance_and_eta_gradient_into(
-            self.y,
-            &self.workspace.eta_buf,
-            &self.likelihood,
-            &self.link_kind,
-            self.priorweights,
-            &mut self.workspace.weighted_residual,
-        )?;
-        if let Some(firth_score_shift) = firth_score_shift_active.as_ref() {
-            // The Jeffreys working-response shift Δ represents a positive
-            // log-likelihood score contribution `W Δ`.  Add its negative
-            // directly to the minimized-objective eta gradient rather than
-            // recovering it through the shifted working response.
-            ndarray::Zip::from(&mut self.workspace.weighted_residual)
-                .and(firth_score_shift)
-                .and(&self.lastweights)
-                .par_for_each(|gradient, &delta_i, &wi| *gradient -= wi * delta_i);
-        }
-        ndarray::Zip::from(&mut self.workspace.working_residual)
+        // Fused single-pass: compute weighted_residual = (eta - z) * w
+        // and working_residual = eta - z simultaneously, avoiding two
+        // separate O(n) passes and an intermediate copy.
+        ndarray::Zip::from(&mut self.workspace.weighted_residual)
+            .and(&mut self.workspace.working_residual)
             .and(&self.workspace.eta_buf)
             .and(z)
-            .par_for_each(|residual, &eta, &zi| *residual = eta - zi);
+            .and(&self.lastweights)
+            .par_for_each(|wr, r, &eta, &zi, &wi| {
+                let residual = eta - zi;
+                *r = residual;
+                *wr = residual * wi;
+            });
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
         // Score norm ||X' (weighted residual)||_2 — captured before adding the
         // penalty contribution so the natural gradient scale can be assembled
@@ -1138,6 +1117,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         //
         // This keeps the PIRLS fixed point aligned with the stabilized Hessian
         // that drives log|H| and the implicit-gradient correction.
+        let deviance = self.likelihood.loglik_deviance(
+            self.y,
+            &self.workspace.eta_buf,
+            &self.link_kind,
+            self.priorweights,
+        )?;
         let log_likelihood = pirls_data_log_kernel_from_eta(
             self.y,
             &self.workspace.eta_buf,
