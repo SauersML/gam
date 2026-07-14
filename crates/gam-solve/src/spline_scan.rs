@@ -781,9 +781,25 @@ fn concentrated_criterion_enclosure(
     let width = hi - lo;
     let proper_modes = (nodes.len() - order) as f64;
     let residual_dof = (n_obs - order) as f64;
-    let curvature_abs_bound = 0.5 * (0.25 * proper_modes + 2.0 * residual_dof);
     let third_abs_bound = 0.5 * (0.25 * proper_modes + 6.0 * residual_dof);
-    let derivative_radius = curvature_abs_bound * width;
+    // Derivative enclosure from the ENDPOINT CURVATURE JETS, not a global
+    // curvature constant. For any u in [lo, hi], Taylor with the L3-Lipschitz
+    // second derivative gives
+    //     |V'(u) − V'(endpoint)| ≤ (max|V''(endpoints)| + L3·w) · w,
+    // so hull(V'(lo), V'(hi)) padded by that radius is a valid OUTER range.
+    // The old radius was the global curvature bound × width
+    // (≈ n·w): in the λ→∞ saturation tail the true derivative decays
+    // exponentially while that radius stays O(n·w), so no interval wider
+    // than |V'|/n could certify no-root and the certified search ground
+    // through O(n·bracket/|V'|) cells — measured as >2·10⁶ criterion
+    // evaluations (an effective hang) on the #2300 weighted-scan fit. With
+    // the endpoint-jet radius the pad is (|V''|+L3·w)·w — QUADRATIC in w
+    // wherever the criterion is flat — and the tail certifies at width
+    // ~√(|V'|/L3) instead of |V'|/n.
+    let curvature_endpoint_abs = left.2.abs().max(right.2.abs());
+    let derivative_radius = (curvature_endpoint_abs + third_abs_bound * width) * width;
+    // Curvature enclosure: V'' is L3-Lipschitz, so endpoint hull ± L3·w is
+    // outer (unchanged — this one was already endpoint-anchored in scale).
     let curvature_radius = third_abs_bound * width;
     Ok(DerivativeEnclosure {
         derivative: ClosedInterval::outward(
