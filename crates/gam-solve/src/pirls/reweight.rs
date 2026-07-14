@@ -1496,7 +1496,7 @@ where
                             .is_some_and(|decrement_sq| decrement_sq <= nd_threshold);
                         if should_check_exact_nd {
                             log::info!(
-                                "[PIRLS exact-decrement] applicable={} decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} relative_gradient={:.6e} dimension_scale={:.6e} natural_scale={:.6e} objective={:.6e}",
+                                "[PIRLS exact-decrement] applicable={} decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} relative_gradient={:.6e} dimension_scale={:.6e} natural_scale={:.6e} objective={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e}",
                                 !has_explicit_constraints && options.arrow_schur.is_none(),
                                 exact_decrement_sq.unwrap_or(f64::NAN),
                                 nd_threshold,
@@ -1506,6 +1506,14 @@ where
                                 final_state_ref.kkt_dimension_scale(),
                                 final_state_ref.gradient_natural_scale,
                                 final_state_ref.penalized_objective(),
+                                actual_reduction,
+                                predicted_reduction,
+                                lin,
+                                direction.dot(direction).sqrt(),
+                                0.5
+                                    * penalized_dev_scale
+                                    * (state.deviance - final_state_ref.deviance),
+                                0.5 * (state.penalty_term - final_state_ref.penalty_term),
                             );
                         }
 
