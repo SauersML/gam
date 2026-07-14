@@ -6352,7 +6352,6 @@ mod tests {
     /// recovery — the two claims the companion issues turn on.
     #[test]
     fn auto_primary_topology_selects_curved_sphere_and_beats_circle_2238_2239() {
-        use crate::basis::SphereChartEvaluator;
         use gam_solve::AutoTopologyKind;
         use ndarray::Array1;
 

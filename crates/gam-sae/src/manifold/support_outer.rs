@@ -476,7 +476,7 @@ pub fn run_sae_support_outer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assignment_state::SaeAssignmentAtomSpec;
+    use crate::assignment_state::{SaeAssignmentAtomSpec, SaeAssignmentState};
     use ndarray::array;
     use std::sync::Arc;
 
