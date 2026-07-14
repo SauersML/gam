@@ -228,10 +228,8 @@ impl RhoModeSpectrum {
         if self.all_noise() {
             return Ok(Vec::new());
         }
-        let certified = crate::gaussian_reml::certify_fixed_dispersion_stationary_roots(
-            &self.s,
-            &self.c,
-        )?;
+        let certified =
+            crate::gaussian_reml::certify_fixed_dispersion_stationary_roots(&self.s, &self.c)?;
         let mut roots = Vec::with_capacity(certified.brackets.len());
         for [a, b] in certified.brackets {
             let fa = self.derivative(a);
@@ -276,8 +274,12 @@ impl RhoModeSpectrum {
         // V' is − before the first stationary point, so odd-numbered roots
         // (1st, 3rd, …) are minima and even-numbered ones are maxima.
         let interior_minima: Vec<f64> = stationary_points.iter().copied().step_by(2).collect();
-        let basin_boundaries: Vec<f64> =
-            stationary_points.iter().copied().skip(1).step_by(2).collect();
+        let basin_boundaries: Vec<f64> = stationary_points
+            .iter()
+            .copied()
+            .skip(1)
+            .step_by(2)
+            .collect();
 
         // Boundary limit: V(ρ→+∞) − const = Σ c_i, reached from below iff the
         // tail is attracting (last stationary point is a maximum, or none).
@@ -324,9 +326,10 @@ mod tests {
     /// count, isolated rho, and global-minimum classification.
     #[test]
     fn sturm_certificate_matches_pinned_two_mode_polynomial() {
-        let spec = RhoModeSpectrum::new(vec![1.0, 2.0], vec![1.0, 0.75])
-            .expect("valid spectrum");
-        let cert = spec.certificate().expect("decidable simple-root certificate");
+        let spec = RhoModeSpectrum::new(vec![1.0, 2.0], vec![1.0, 0.75]).expect("valid spectrum");
+        let cert = spec
+            .certificate()
+            .expect("decidable simple-root certificate");
         assert_eq!(cert.stationary_points.len(), 1);
         assert!(cert.quasi_convex);
         assert!(cert.stationary_points[0].abs() < 1.0e-9);
@@ -392,7 +395,9 @@ mod tests {
     fn all_noise_block_is_certified_boundary_attractor_with_no_roots() {
         let spec = RhoModeSpectrum::new(vec![0.01, 1.0, 50.0], vec![0.0, 0.2, 0.5])
             .expect("valid spectrum");
-        let cert = spec.certificate().expect("all-noise certificate is analytic");
+        let cert = spec
+            .certificate()
+            .expect("all-noise certificate is analytic");
         assert!(cert.all_noise);
         assert!(cert.stationary_points.is_empty());
         assert!(cert.tail_sum <= 0.0);
@@ -409,7 +414,9 @@ mod tests {
     fn single_signal_mode_matches_closed_form_crossing() {
         for &(s, c) in &[(0.5_f64, 2.0_f64), (3.0, 0.75), (1e-3, 100.0)] {
             let spec = RhoModeSpectrum::new(vec![s], vec![c]).expect("valid spectrum");
-            let cert = spec.certificate().expect("single-mode root is Sturm-decidable");
+            let cert = spec
+                .certificate()
+                .expect("single-mode root is Sturm-decidable");
             let expected = -s.ln() - (2.0 * c - 1.0).ln();
             assert!(cert.quasi_convex, "one signal mode must be quasi-convex");
             assert_eq!(cert.stationary_points.len(), 1);
@@ -438,7 +445,9 @@ mod tests {
         let s = vec![1e4, 1e-4, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
         let c = vec![80.0, 80.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let spec = RhoModeSpectrum::new(s, c).expect("valid spectrum");
-        let cert = spec.certificate().expect("multi-basin roots are Sturm-decidable");
+        let cert = spec
+            .certificate()
+            .expect("multi-basin roots are Sturm-decidable");
         assert!(
             cert.stationary_points.len() >= 3,
             "separated signal modes must be multi-basin, got stationary points {:?} (tail T={})",
@@ -504,8 +513,8 @@ mod tests {
                 "V'' mismatch at rho={rho}: analytic {}, FD {fd2}",
                 spec.second_derivative(rho)
             );
-            let fd3 = (spec.second_derivative(rho + h) - spec.second_derivative(rho - h))
-                / (2.0 * h);
+            let fd3 =
+                (spec.second_derivative(rho + h) - spec.second_derivative(rho - h)) / (2.0 * h);
             assert!(
                 (fd3 - spec.third_derivative(rho)).abs() < 1e-5 * (1.0 + fd3.abs()),
                 "V''' mismatch at rho={rho}: analytic {}, FD {fd3}",

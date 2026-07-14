@@ -4082,22 +4082,23 @@ impl<'a> RemlState<'a> {
             Ok(pair) => pair,
             Err(_) => return Ok(None),
         };
-        let h_floor = h_evals.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)).abs()
+        let h_floor = h_evals
+            .iter()
+            .fold(f64::NEG_INFINITY, |a, &b| a.max(b))
+            .abs()
             * f64::EPSILON
             * p as f64;
         if h_evals.iter().any(|&e| !(e.is_finite() && e > h_floor)) {
             return Ok(None);
         }
-        let apply_spectral = |evals: &Array1<f64>,
-                              evecs: &Array2<f64>,
-                              power: f64,
-                              rhs: &Array1<f64>| {
-            let mut coords = evecs.t().dot(rhs);
-            for (c, &e) in coords.iter_mut().zip(evals.iter()) {
-                *c *= e.powf(power);
-            }
-            evecs.dot(&coords)
-        };
+        let apply_spectral =
+            |evals: &Array1<f64>, evecs: &Array2<f64>, power: f64, rhs: &Array1<f64>| {
+                let mut coords = evecs.t().dot(rhs);
+                for (c, &e) in coords.iter_mut().zip(evals.iter()) {
+                    *c *= e.powf(power);
+                }
+                evecs.dot(&coords)
+            };
         let beta = apply_spectral(&h_evals, &h_evecs, -1.0, &xtwy);
         let fitted = x_dense.dot(&beta);
         let mut rss_w = 0.0_f64;
@@ -4156,7 +4157,10 @@ impl<'a> RemlState<'a> {
                 Ok(pair) => pair,
                 Err(_) => return Ok(None),
             };
-            let m = self.canonical_penalties[kk].positive_eigenvalues.len().min(p);
+            let m = self.canonical_penalties[kk]
+                .positive_eigenvalues
+                .len()
+                .min(p);
             if m == 0 {
                 continue;
             }
@@ -4176,8 +4180,7 @@ impl<'a> RemlState<'a> {
             if s_modes.is_empty() {
                 continue;
             }
-            let Ok(spectrum) = crate::rho_optimizer::RhoModeSpectrum::new(s_modes, c_modes)
-            else {
+            let Ok(spectrum) = crate::rho_optimizer::RhoModeSpectrum::new(s_modes, c_modes) else {
                 continue;
             };
             let certificate = match spectrum.certificate() {

@@ -4299,11 +4299,7 @@ fn sturm_root_count_in(p: &[Interval], lo: f64, hi: f64) -> Option<usize> {
     sturm_root_count_with_chain(&chain, lo, hi)
 }
 
-fn sturm_root_count_with_chain(
-    chain: &[Vec<Interval>],
-    lo: f64,
-    hi: f64,
-) -> Option<usize> {
+fn sturm_root_count_with_chain(chain: &[Vec<Interval>], lo: f64, hi: f64) -> Option<usize> {
     let sc_lo = sturm_sign_changes_at(&chain, lo)?;
     let sc_hi = sturm_sign_changes_at(&chain, hi)?;
     sc_lo.checked_sub(sc_hi)
@@ -4387,13 +4383,12 @@ pub(crate) fn certify_fixed_dispersion_stationary_roots(
     c: &[f64],
 ) -> Result<FixedDispersionRootCertificate, String> {
     if s.len() != c.len() || s.is_empty() {
-        return Err("fixed-dispersion Sturm certificate requires paired nonempty modes".to_string());
+        return Err(
+            "fixed-dispersion Sturm certificate requires paired nonempty modes".to_string(),
+        );
     }
     let log_min = s.iter().map(|x| x.ln()).fold(f64::INFINITY, f64::min);
-    let log_max = s
-        .iter()
-        .map(|x| x.ln())
-        .fold(f64::NEG_INFINITY, f64::max);
+    let log_max = s.iter().map(|x| x.ln()).fold(f64::NEG_INFINITY, f64::max);
     let log_scale = 0.5 * (log_min + log_max);
     if !log_scale.is_finite() {
         return Err("fixed-dispersion Sturm normalization is non-finite".to_string());
@@ -4418,7 +4413,9 @@ pub(crate) fn certify_fixed_dispersion_stationary_roots(
         "fixed-dispersion Sturm variation increased toward positive infinity".to_string()
     })?;
     if total == 0 {
-        return Ok(FixedDispersionRootCertificate { brackets: Vec::new() });
+        return Ok(FixedDispersionRootCertificate {
+            brackets: Vec::new(),
+        });
     }
 
     // Cauchy bounds in x and 1/x give a finite interval containing every
@@ -4462,14 +4459,14 @@ pub(crate) fn certify_fixed_dispersion_stationary_roots(
         }
         let mid = (0.5 * (lo.ln() + hi.ln())).exp();
         if !(mid > lo && mid < hi) {
-            return Err("fixed-dispersion Sturm root isolation exhausted f64 resolution".to_string());
+            return Err(
+                "fixed-dispersion Sturm root isolation exhausted f64 resolution".to_string(),
+            );
         }
-        let left = sturm_root_count_with_chain(&chain, lo, mid).ok_or_else(|| {
-            "fixed-dispersion Sturm split is sign-indeterminate".to_string()
-        })?;
-        let right = sturm_root_count_with_chain(&chain, mid, hi).ok_or_else(|| {
-            "fixed-dispersion Sturm split is sign-indeterminate".to_string()
-        })?;
+        let left = sturm_root_count_with_chain(&chain, lo, mid)
+            .ok_or_else(|| "fixed-dispersion Sturm split is sign-indeterminate".to_string())?;
+        let right = sturm_root_count_with_chain(&chain, mid, hi)
+            .ok_or_else(|| "fixed-dispersion Sturm split is sign-indeterminate".to_string())?;
         if left + right != count {
             // The split point is itself a root or interval rounding cannot
             // distinguish a repeated root.  Either case must be refused: the
@@ -4567,7 +4564,8 @@ fn assemble_stationary_polynomial(
 
     // Second term: ν·Σ_j G_j·Π_{k≠j} P_k.
     for j in 0..d {
-        let others: Vec<Vec<Interval>> = (0..d).filter(|&k| k != j).map(|k| p_j[k].clone()).collect();
+        let others: Vec<Vec<Interval>> =
+            (0..d).filter(|&k| k != j).map(|k| p_j[k].clone()).collect();
         let cofactor = poly_product_interval(&others);
         let term = poly_scale_interval(&poly_mul_interval(&g_j[j], &cofactor), nu);
         poly = poly_add_interval(&poly, &term);
@@ -4657,7 +4655,14 @@ fn rho_landscape_certificate_from_parts(
     validate_reml_profile_residuals(cache, ywy, projected_rhs_squared, RHO_LOWER)?;
     let nu = n_effective as f64 - cache.nullity as f64;
     let eval = |rho: f64| {
-        evaluate_reml_parts(cache, ywy, projected_rhs_squared, n_effective, n_outputs, rho)
+        evaluate_reml_parts(
+            cache,
+            ywy,
+            projected_rhs_squared,
+            n_effective,
+            n_outputs,
+            rho,
+        )
     };
     let window_costs = [eval(RHO_LOWER).cost, eval(RHO_UPPER).cost];
     let limit_costs = compactified_limit_costs(cache, ywy, projected_rhs_squared, n_outputs, nu);
@@ -4743,7 +4748,9 @@ pub fn gaussian_reml_rho_landscape_certificate(
     init_rho: Option<f64>,
 ) -> Result<RhoLandscapeCertificate, EstimationError> {
     if init_rho.is_some_and(|rho| !rho.is_finite()) {
-        crate::bail_invalid_estim!("Gaussian REML rho-landscape certificate requires a finite rho hint");
+        crate::bail_invalid_estim!(
+            "Gaussian REML rho-landscape certificate requires a finite rho hint"
+        );
     }
     let y2 = y.insert_axis(Axis(1));
     let prepared = prepare_gaussian_reml(x, y2.view(), penalty, nullspace_dim, weights, None)?;
@@ -6418,15 +6425,9 @@ mod tests {
         let cache = synthetic_cache(&[0.5, 3.0]);
         let prs = array![[1.0], [0.4]];
         let ywy = array![1.0 + 0.4 + 1.5];
-        let cert = rho_landscape_certificate_from_parts(
-            &cache,
-            ywy.view(),
-            prs.view(),
-            30,
-            1,
-            None,
-        )
-        .expect("two-mode certificate");
+        let cert =
+            rho_landscape_certificate_from_parts(&cache, ywy.view(), prs.view(), 30, 1, None)
+                .expect("two-mode certificate");
         assert_eq!(cert.root_brackets.len(), cert.stationary_count);
     }
 
