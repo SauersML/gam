@@ -1,5 +1,3 @@
-use super::*;
-
 //! Direct-α CTN curvature (gam#2306).
 //!
 //! With the identity chart the transformation is exactly LINEAR in the
@@ -29,6 +27,8 @@ use super::*;
 //! endpoint arguments; the coefficient-side factors are constants of the
 //! basis. Every (k, l) block is therefore `covᵀ diag(block_weights) cov`,
 //! assembled by the same weighted-Gram kernel the value Hessian always used.
+
+use super::*;
 
 impl TransformationNormalFamily {
     /// Shared validation for the curvature entry points.

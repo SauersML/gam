@@ -1,4 +1,5 @@
 use super::*;
+use gam_problem::ConstraintSet;
 use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, constants, escalate_ridge};
 use std::convert::Infallible;
 

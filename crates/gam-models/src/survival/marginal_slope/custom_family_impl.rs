@@ -4,6 +4,7 @@
 //! constraints, and post-update feasibility).
 
 use super::*;
+use gam_problem::ConstraintSet;
 
 impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn outer_derivative_pilot_schedule(

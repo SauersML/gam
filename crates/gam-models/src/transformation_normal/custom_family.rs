@@ -1,4 +1,5 @@
 use super::*;
+use gam_problem::ConstraintSet;
 
 // ---------------------------------------------------------------------------
 // CustomFamily implementation

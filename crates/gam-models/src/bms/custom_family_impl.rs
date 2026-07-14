@@ -7,6 +7,7 @@ use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::row_kernel::*;
 use super::*;
+use gam_problem::ConstraintSet;
 
 /// Returns the explicit-psi Jeffreys context only when the authoritative
 /// reduced-space plan says that the Jeffreys correction is active.
