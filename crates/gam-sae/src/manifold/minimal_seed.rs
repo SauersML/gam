@@ -34,6 +34,34 @@ pub struct SaeMinimalSeedReport {
     pub refine_routing: bool,
 }
 
+fn install_discovered_geometry_overrides(
+    plans: &mut [SaeAtomBuildPlan],
+    basis_kinds: &[SaeAtomBasisKind],
+    geometry_overrides: Vec<Option<SaeAtomGeometryPlan>>,
+) -> Result<(), String> {
+    if plans.len() != basis_kinds.len() || plans.len() != geometry_overrides.len() {
+        return Err(format!(
+            "install_discovered_geometry_overrides: plans={}, kinds={}, overrides={} must align",
+            plans.len(),
+            basis_kinds.len(),
+            geometry_overrides.len()
+        ));
+    }
+    for (atom_idx, geometry) in geometry_overrides.into_iter().enumerate() {
+        if let Some(geometry) = geometry {
+            if geometry.kind() != &basis_kinds[atom_idx] {
+                return Err(format!(
+                    "install_discovered_geometry_overrides: discovered geometry kind {:?} disagrees with resolved atom {atom_idx} kind {:?}",
+                    geometry.kind(),
+                    basis_kinds[atom_idx]
+                ));
+            }
+            plans[atom_idx] = SaeAtomBuildPlan { geometry };
+        }
+    }
+    Ok(())
+}
+
 pub fn build_sae_minimal_seed(
     mut request: SaeMinimalSeedRequest<'_>,
 ) -> Result<SaeMinimalSeedReport, String> {
@@ -79,16 +107,21 @@ pub fn build_sae_minimal_seed(
     } else {
         None
     };
-    let (overrides, coord_overrides) = if let Some(labels) = auto_labels.as_ref() {
-        crate::structure_harvest::resolve_auto_primary_atoms(
-            request.target,
-            labels,
-            &mut request.atom_basis,
-            &mut request.atom_dim,
-        )?
-    } else {
-        (vec![None; k_atoms], vec![None; k_atoms])
-    };
+    let (overrides, coord_overrides, geometry_overrides) =
+        if let Some(labels) = auto_labels.as_ref() {
+            crate::structure_harvest::resolve_auto_primary_atoms(
+                request.target,
+                labels,
+                &mut request.atom_basis,
+                &mut request.atom_dim,
+            )?
+        } else {
+            (
+                vec![None; k_atoms],
+                vec![None; k_atoms],
+                vec![None; k_atoms],
+            )
+        };
     let basis_kinds: Vec<SaeAtomBasisKind> = request
         .atom_basis
         .iter()
@@ -125,7 +158,7 @@ pub fn build_sae_minimal_seed(
             }
         }
     }
-    let plans = sae_build_atom_plans(
+    let mut plans = sae_build_atom_plans(
         request.target,
         &request.atom_basis,
         &request.atom_dim,
@@ -133,6 +166,7 @@ pub fn build_sae_minimal_seed(
         request.random_state,
         &overrides,
     )?;
+    install_discovered_geometry_overrides(&mut plans, &basis_kinds, geometry_overrides)?;
     let effective_atom_dim: Vec<usize> = plans.iter().map(SaeAtomBuildPlan::latent_dim).collect();
 
     let coords_are_cold = request.initial_coords.is_none();
@@ -300,5 +334,42 @@ mod tests {
         .err()
         .expect("empty target must fail");
         assert!(error.contains("non-empty"));
+    }
+
+    #[test]
+    fn discovered_torus_metric_plan_replaces_the_builder_default_atomically() {
+        let default = SaeAtomGeometryPlan::new(
+            SaeAtomBasisKind::Torus,
+            2,
+            SaeBasisResolution::TorusHarmonics { per_axis_order: 3 },
+            SaeReferenceMetricPlan::FlatRectangularTorus { tau: 0.0 },
+        )
+        .unwrap();
+        let selected = SaeAtomGeometryPlan::new(
+            SaeAtomBasisKind::Torus,
+            2,
+            SaeBasisResolution::TorusHarmonics { per_axis_order: 5 },
+            SaeReferenceMetricPlan::EmbeddedDonutTorus { tau: 0.8 },
+        )
+        .unwrap();
+        let mut plans = vec![SaeAtomBuildPlan { geometry: default }];
+        install_discovered_geometry_overrides(
+            &mut plans,
+            &[SaeAtomBasisKind::Torus],
+            vec![Some(selected.clone())],
+        )
+        .unwrap();
+        assert_eq!(plans[0].geometry, selected);
+
+        let mismatch = SaeAtomGeometryPlan::projective_plane(1).unwrap();
+        assert!(
+            install_discovered_geometry_overrides(
+                &mut plans,
+                &[SaeAtomBasisKind::Torus],
+                vec![Some(mismatch)],
+            )
+            .is_err(),
+            "a parallel kind scalar must never override the resolved typed plan"
+        );
     }
 }

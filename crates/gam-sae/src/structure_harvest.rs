@@ -3910,6 +3910,10 @@ fn race_spec_set(
 pub struct PrimaryTopologyChoice {
     pub basis_kind: SaeAtomBasisKind,
     pub latent_dim: usize,
+    /// Complete geometry selected by evidence, after resolution growth. This is
+    /// the only way a continuously optimized reference metric can cross the
+    /// primary-discovery boundary without being reconstructed as a default.
+    pub geometry: SaeAtomGeometryPlan,
     /// Evidence-selected harmonic resolution for a periodic (circle) winner
     /// (#2243): the number of Fourier harmonics the seed circle carries, chosen
     /// by REML marginal likelihood rather than the historical fixed budget.
@@ -4376,9 +4380,67 @@ pub fn discover_primary_atom_topologies(
                     coords[[row, col]] = fit.coords[[row, col]];
                 }
             }
+            let geometry = match &fit_kind {
+                SaeAtomBasisKind::Periodic => SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Periodic,
+                    1,
+                    SaeBasisResolution::PeriodicHarmonics {
+                        order: n_harmonics.ok_or_else(|| {
+                            format!(
+                                "discover_primary_atom_topologies: periodic winner without selected resolution for auto atom {atom_idx}"
+                            )
+                        })?,
+                    },
+                    SaeReferenceMetricPlan::UnitCircle,
+                )?,
+                SaeAtomBasisKind::Torus => SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Torus,
+                    2,
+                    SaeBasisResolution::TorusHarmonics {
+                        per_axis_order: n_torus_harmonics.ok_or_else(|| {
+                            format!(
+                                "discover_primary_atom_topologies: torus winner without selected resolution for auto atom {atom_idx}"
+                            )
+                        })?,
+                    },
+                    fit.geometry.reference_metric().clone(),
+                )?,
+                SaeAtomBasisKind::KleinBottle => SaeAtomGeometryPlan::klein_bottle(
+                    n_torus_harmonics.ok_or_else(|| {
+                        format!(
+                            "discover_primary_atom_topologies: Klein winner without selected resolution for auto atom {atom_idx}"
+                        )
+                    })?,
+                )?,
+                SaeAtomBasisKind::Duchon => {
+                    let center_count = n_duchon_centers.ok_or_else(|| {
+                        format!(
+                            "discover_primary_atom_topologies: Duchon winner without selected centers for auto atom {atom_idx}"
+                        )
+                    })?;
+                    let chart = sheet_coords.as_ref().ok_or_else(|| {
+                        format!(
+                            "discover_primary_atom_topologies: Duchon winner without chart for auto atom {atom_idx}"
+                        )
+                    })?;
+                    let centers = duchon_sheet_centers(chart, &rows, center_count).ok_or_else(|| {
+                        format!(
+                            "discover_primary_atom_topologies: cannot realize {center_count} selected Duchon centers for auto atom {atom_idx}"
+                        )
+                    })?;
+                    SaeAtomGeometryPlan::new(
+                        SaeAtomBasisKind::Duchon,
+                        fit_dim,
+                        SaeBasisResolution::DuchonCoordinates { centers },
+                        SaeReferenceMetricPlan::EuclideanDuchon,
+                    )?
+                }
+                _ => fit.geometry.clone(),
+            };
             Ok(PrimaryTopologyChoice {
                 basis_kind: fit_kind,
                 latent_dim: fit_dim,
+                geometry,
                 n_harmonics,
                 n_duchon_centers,
                 n_torus_harmonics,
@@ -4809,20 +4871,29 @@ fn select_torus_resolution(
 ///   the old periodic default; callers that require a fixed topology must name
 ///   that topology explicitly.
 ///
-/// Returns `(resolution_overrides, coord_overrides)`, both aligned with
+/// Returns `(resolution_overrides, coord_overrides, geometry_overrides)`, all aligned with
 /// `atom_basis`. `resolution_overrides[k]` is the per-atom basis-native
 /// resolution knob (`None` unless evidence-grown), interpreted per the resolved
 /// basis kind — Duchon center count for a flat/Duchon-sheet winner (#2240),
 /// per-axis harmonic order for a torus winner (#2243). `coord_overrides[k]` is
 /// the exact coordinate realization of an auto winner (`None` only for an
 /// explicitly named, non-auto atom), so the caller installs the same kind+chart
-/// candidate that earned the evidence verdict.
+/// candidate that earned the evidence verdict. `geometry_overrides[k]` is the
+/// complete post-growth typed plan of an evidence winner; installing it is what
+/// preserves continuously selected reference metrics across seed construction.
 pub fn resolve_auto_primary_atoms(
     target: ArrayView2<'_, f64>,
     labels: &[usize],
     atom_basis: &mut [String],
     atom_dim: &mut [usize],
-) -> Result<(Vec<Option<usize>>, Vec<Option<Array2<f64>>>), String> {
+) -> Result<
+    (
+        Vec<Option<usize>>,
+        Vec<Option<Array2<f64>>>,
+        Vec<Option<SaeAtomGeometryPlan>>,
+    ),
+    String,
+> {
     let k_atoms = atom_basis.len();
     if atom_dim.len() != k_atoms {
         return Err(format!(
@@ -4834,8 +4905,9 @@ pub fn resolve_auto_primary_atoms(
     // Per-atom seed-chart overrides: every auto winner carries the exact chart
     // realization on which it earned its evidence. Non-auto atoms remain None.
     let mut coord_overrides: Vec<Option<Array2<f64>>> = vec![None; k_atoms];
+    let mut geometry_overrides: Vec<Option<SaeAtomGeometryPlan>> = vec![None; k_atoms];
     if !atom_basis.iter().any(|basis| basis == "auto") {
-        return Ok((resolution_overrides, coord_overrides));
+        return Ok((resolution_overrides, coord_overrides, geometry_overrides));
     }
     let choices = discover_primary_atom_topologies(target, labels, k_atoms, atom_dim)?;
     for atom_idx in 0..k_atoms {
@@ -4849,28 +4921,33 @@ pub fn resolve_auto_primary_atoms(
                 // evidence-selected per-axis harmonic order rides the resolution
                 // override so the seed builder grows the torus past its fixed
                 // `SAE_DEFAULT_TORUS_HARMONICS` budget. `None` cannot occur for a
-                // torus winner (discovery always selects an order), but a missing
-                // value conservatively leaves the builder's default.
+                // torus winner (discovery always selects an order); the complete
+                // plan below is the installation authority.
                 atom_basis[atom_idx] = "torus".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
                 resolution_overrides[atom_idx] = choice.n_torus_harmonics;
+                geometry_overrides[atom_idx] = Some(choice.geometry.clone());
             }
             SaeAtomBasisKind::Sphere => {
                 atom_basis[atom_idx] = "sphere".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
+                geometry_overrides[atom_idx] = Some(choice.geometry.clone());
             }
             SaeAtomBasisKind::ProjectivePlane => {
                 atom_basis[atom_idx] = "projective_plane".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
+                geometry_overrides[atom_idx] = Some(choice.geometry.clone());
             }
             SaeAtomBasisKind::KleinBottle => {
                 atom_basis[atom_idx] = "klein_bottle".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
                 resolution_overrides[atom_idx] = choice.n_torus_harmonics;
+                geometry_overrides[atom_idx] = Some(choice.geometry.clone());
             }
             SaeAtomBasisKind::Mobius => {
                 atom_basis[atom_idx] = "mobius".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
+                geometry_overrides[atom_idx] = Some(choice.geometry.clone());
             }
             SaeAtomBasisKind::EuclideanPatch => {
                 atom_basis[atom_idx] = "duchon".to_string();
@@ -4884,6 +4961,7 @@ pub fn resolve_auto_primary_atoms(
                 atom_basis[atom_idx] = "duchon".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
                 resolution_overrides[atom_idx] = choice.n_duchon_centers;
+                geometry_overrides[atom_idx] = Some(choice.geometry.clone());
             }
             SaeAtomBasisKind::Periodic => {
                 atom_basis[atom_idx] = "periodic".to_string();
@@ -4892,11 +4970,12 @@ pub fn resolve_auto_primary_atoms(
                 // into the Fourier harmonic count for a periodic basis), so the
                 // seeded circle carries the resolution REML picked rather than
                 // the caller's default budget. `None` cannot occur for a
-                // periodic winner (discovery always selects a resolution), but a
-                // missing value conservatively leaves the caller's budget.
+                // periodic winner (discovery always selects a resolution), and
+                // the complete plan below is the installation authority.
                 if let Some(n_harmonics) = choice.n_harmonics {
                     atom_dim[atom_idx] = n_harmonics;
                 }
+                geometry_overrides[atom_idx] = Some(choice.geometry.clone());
             }
             ref unexpected => {
                 return Err(format!(
@@ -4906,7 +4985,7 @@ pub fn resolve_auto_primary_atoms(
         }
         coord_overrides[atom_idx] = Some(choice.coords.clone());
     }
-    Ok((resolution_overrides, coord_overrides))
+    Ok((resolution_overrides, coord_overrides, geometry_overrides))
 }
 
 /// A small neutral routing logit a born atom is seeded at: large enough that the
