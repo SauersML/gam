@@ -4866,6 +4866,50 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     } else {
         None
     };
+    // #2228 — a β-gauge-quotiented system has a reduced Schur that is singular
+    // along the gauge orbit, and every preconditioner in the ladder below
+    // (block-Jacobi, cluster, Schwarz, IC(0)) is formed from the UN-pinned
+    // operator, so it would misprice — or refuse as non-PD — that orbit
+    // direction. The matvec now applies the Faddeev–Popov pin `P S P + Q Qᵀ`,
+    // which is SPD and well-conditioned on the identifiable complement (the gauge
+    // dimension is tiny — one direction per circle/torus phase), so an identity
+    // preconditioner converges without a bespoke pinned diagonal. Route straight
+    // through it and skip the diagonal ladder, whose preconditioners assume the
+    // un-pinned Schur; the `None`-quotient path below is byte-identical.
+    if sys.beta_gauge_quotient.is_some() {
+        let identity = IdentityPreconditioner;
+        let (step, diag) = run_pcg_with_preconditioner(
+            sys,
+            htt_factors,
+            ridge_beta,
+            rhs,
+            |r| identity.apply(r),
+            pcg,
+            trust,
+            backend,
+            gpu_matvec,
+            metric_weights,
+            resident.as_ref(),
+        )?;
+        // Mirror the non-gauge contract: below the escalation threshold a MaxIter
+        // stop is accepted (the ladder returns it as `Ok`); above it the ladder
+        // would escalate the preconditioner, but the cluster/Schwarz/IC(0) tiers
+        // assume the un-pinned Schur and cannot precondition the gauge pin, so
+        // surface a recoverable failure and let the outer LM loop escalate the
+        // ridge instead (a bespoke pinned-diagonal preconditioner is the follow-up).
+        if diag.stopping_reason == PcgStopReason::MaxIter
+            && sys.k > PRECOND_ESCALATE_K_THRESHOLD
+        {
+            return Err(ArrowSchurError::PcgFailed {
+                reason: format!(
+                    "gauge-pinned Schur PCG (identity preconditioner) exhausted its \
+                     iteration budget without converging; final relative residual = {:e}",
+                    diag.final_relative_residual
+                ),
+            });
+        }
+        return Ok((step, diag));
+    }
     // #1026 — curvature-floor retry on the Jacobi tier. The unbounded SAE inner
     // PCG (trust radius = ∞) fails on `pᵀSp ≤ 0` when the reduced Schur is
     // indefinite (K≥4 co-collapse: a near-singular per-row `H_tt` over-subtracts
@@ -5164,28 +5208,23 @@ where
     let tol = pcg
         .relative_tolerance
         .max(trust.steihaug_relative_tolerance);
-    if let Some(gpu_mv) = gpu_matvec {
-        let gpu_mv = Arc::clone(gpu_mv);
-        steihaug_cg(
-            rhs,
-            move |p, out| gpu_mv(p, out),
-            apply_prec,
-            max_iters,
-            tol,
-            trust.radius,
-            metric_weights,
-        )
-    } else {
-        steihaug_cg(
-            rhs,
-            |p, out| schur_matvec(sys, htt_factors, ridge_beta, p, out, backend, resident),
-            apply_prec,
-            max_iters,
-            tol,
-            trust.radius,
-            metric_weights,
-        )
-    }
+    // #2228 — route the fit-step matvec through `ReducedSchurOperator`, which
+    // applies the Faddeev–Popov pin `v ↦ P S P v + Q Qᵀ v` when the system carries
+    // a β-gauge quotient and is byte-for-byte the bare `gpu_matvec` / `schur_matvec`
+    // apply when it does not. This gauge-fixes the wide-`p` InexactPCG Newton step
+    // exactly like the dense Direct/SqrtBA modes while leaving the `None`-quotient
+    // lane (every non-SAE-fit caller) unchanged.
+    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident)
+        .with_gpu_matvec(gpu_matvec);
+    steihaug_cg(
+        rhs,
+        |p, out| op.apply_into(p, out),
+        apply_prec,
+        max_iters,
+        tol,
+        trust.radius,
+        metric_weights,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]

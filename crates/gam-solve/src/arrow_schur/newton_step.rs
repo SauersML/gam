@@ -2424,12 +2424,15 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             (db, sf, diag)
         }
         ArrowSolverMode::InexactPCG => {
-            if beta_gauge_active {
-                return Err(ArrowSchurError::SchurFactorFailed {
-                    reason: "evidence beta-gauge quotient requires a dense Direct/SqrtBA factor or the dedicated matrix-free evidence operator; InexactPCG does not return an evidence factor"
-                        .to_string(),
-                });
-            }
+            // #2228 — the wide-`p` InexactPCG Newton step gauge-fixes exactly like
+            // the dense modes: the matrix-free reduced-Schur matvec applies the
+            // Faddeev–Popov pin `P S_β P + Q Qᵀ` when the system carries a β-gauge
+            // quotient (`ReducedSchurOperator::apply_into`), and the solve runs on
+            // the projected RHS `rhs_beta_evidence = P r_β`, so Δβ solves the
+            // identifiable system and carries no orbit motion. Only the CPU
+            // `steihaug_pcg_auto` lane projects today; the device
+            // `solve_sae_matrix_free_pcg` kernel does NOT yet apply the pin, so a
+            // set quotient forces the CPU path (gated below).
             if options.solve_precision.is_enabled() {
                 log::info!(
                     "arrow-Schur mixed precision fallback to f64: InexactPCG does not expose a dense Schur factor for certified f32 refinement"
@@ -2439,7 +2442,12 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             // Auto-select preconditioner level: starts with JacobiPreconditioner
             // (Diagonal / BetaBlockJacobi) and escalates to ClusterJacobi or
             // AdditiveSchwarz when K > 100 and PCG exhausts max_iterations.
-            if options.trust_region.radius == f64::INFINITY {
+            //
+            // #2228 — the device `solve_sae_matrix_free_pcg` kernel does not yet
+            // apply the Faddeev–Popov pin, so a gauge-quotiented system takes the
+            // CPU `steihaug_pcg_auto` lane (which projects through
+            // `ReducedSchurOperator`); kernel-side projection is the follow-up.
+            if options.trust_region.radius == f64::INFINITY && !beta_gauge_active {
                 if let Some(device_data) = sys.device_sae_pcg.as_ref() {
                     let max_iterations = options
                         .pcg
@@ -2476,7 +2484,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                             device_data.as_ref(),
                             ridge_t,
                             ridge_beta,
-                            &rhs_beta,
+                            &rhs_beta_evidence,
                             max_iterations,
                             relative_tolerance,
                         )
@@ -2486,7 +2494,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                             sys,
                             ridge_t,
                             ridge_beta,
-                            &rhs_beta,
+                            &rhs_beta_evidence,
                             max_iterations,
                             relative_tolerance,
                         ) {
@@ -2550,7 +2558,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                 sys,
                 &htt_factors,
                 ridge_beta,
-                &rhs_beta,
+                &rhs_beta_evidence,
                 &options.pcg,
                 &options.trust_region,
                 &backend,

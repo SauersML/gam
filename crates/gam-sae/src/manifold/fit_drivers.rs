@@ -6038,13 +6038,17 @@ impl SaeManifoldTerm {
             // the loss/criterion are gauge-invariant, so this only changes the
             // convergence path, converging to a gauge-fixed representative.
             //
-            // Scoped to the dense solve modes (the reduced matrix-free operator
-            // already projects the quotient for the large-border InexactPCG lane;
-            // installing it there is deferred to keep the wide-`p` lane byte-exact).
+            // Installed on the dense Direct/SqrtBA modes AND the wide-`p`
+            // InexactPCG lane: the matrix-free reduced-Schur matvec applies the
+            // same Faddeev–Popov pin `P S_β P + Q Qᵀ` (`ReducedSchurOperator`), and
+            // the CPU `steihaug_pcg_auto` lane projects the RHS onto the
+            // identifiable complement. The device `solve_sae_matrix_free_pcg`
+            // kernel does NOT yet apply the pin, so it is gated off to the CPU path
+            // whenever a quotient is present (a follow-up will project in-kernel).
             if sys.k > 0
                 && matches!(
                     solve_options.mode,
-                    ArrowSolverMode::Direct | ArrowSolverMode::SqrtBA
+                    ArrowSolverMode::Direct | ArrowSolverMode::SqrtBA | ArrowSolverMode::InexactPCG
                 )
             {
                 match self.closed_form_beta_gauge_directions() {

@@ -179,6 +179,61 @@ pub(crate) fn beta_gauge_quotient_value_inverse_and_gradient_are_orbit_invariant
     );
 }
 
+/// #2228 — the wide-`p` InexactPCG Newton step must gauge-fix identically to the
+/// dense Faddeev–Popov pin. Forcing the matrix-free lane on a gauge-quotiented
+/// system, the step must carry no gauge-orbit component (`Q·Δβ ≈ 0`) and match
+/// the dense Direct-mode pinned step componentwise on the identifiable
+/// complement. Before the fix this call `Err`ed ("InexactPCG does not return an
+/// evidence factor"); an un-pinned PCG solve would instead leave an arbitrary
+/// component along the singular gauge direction `[1, 0, 0]`.
+#[test]
+pub(crate) fn inexact_pcg_gauge_quotient_projects_step_and_matches_dense_pin_2228() {
+    let sys = beta_gauge_evidence_fixture([7.0, 2.0, -3.0]);
+    let (_, dbeta_direct, _) = solve_arrow_newton_step_with_options(
+        &sys,
+        0.0,
+        0.0,
+        &ArrowSolveOptions::direct().with_positive_definite_evidence(),
+    )
+    .expect("dense pinned step");
+    // Force the matrix-free lane on the SAME small gauge-quotiented system, with
+    // a tight CG tolerance so the componentwise match is not limited by the loose
+    // default ranking tolerance.
+    let mut pcg_options = ArrowSolveOptions::inexact_pcg().with_positive_definite_evidence();
+    pcg_options.pcg.relative_tolerance = 1e-12;
+    pcg_options.trust_region.steihaug_relative_tolerance = 1e-12;
+    let (_, dbeta_pcg, _) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &pcg_options)
+        .expect("matrix-free pinned step");
+    // (a) no gauge-orbit motion: the declared gauge direction `[1, 0, 0]` is
+    // erased from the matrix-free step, exactly as the dense pin erases it.
+    let gauge = array![1.0, 0.0, 0.0];
+    assert_abs_diff_eq!(gauge.dot(&dbeta_pcg), 0.0, epsilon = 1e-11);
+    // (b) the matrix-free step matches the dense Faddeev–Popov step.
+    for i in 0..3 {
+        assert_abs_diff_eq!(dbeta_pcg[i], dbeta_direct[i], epsilon = 1e-9);
+    }
+}
+
+/// #2228 byte-exact guard: routing the fit-step matvec through
+/// `ReducedSchurOperator` is bit-identical to the bare `schur_matvec` apply when
+/// the system carries no β-gauge quotient, so the wide-`p` InexactPCG lane is
+/// unchanged for every non-SAE-fit caller.
+#[test]
+pub(crate) fn reduced_schur_operator_matvec_is_bit_identical_without_quotient_2228() {
+    let mut sys = ArrowSchurSystem::new(0, 0, 3);
+    sys.hbb = array![[6.0, 1.0, -2.0], [1.0, 4.0, 0.5], [-2.0, 0.5, 5.0]];
+    assert!(sys.beta_gauge_quotient.is_none());
+    let factors = ArrowFactorSlab::from_blocks(Vec::new());
+    let backend = CpuBatchedBlockSolver;
+    let x = array![0.7, -1.3, 2.1];
+    let routed = ReducedSchurOperator::new(&sys, &factors, 0.0, &backend, None).apply_owned(&x);
+    let mut bare = array![0.0, 0.0, 0.0];
+    schur_matvec(&sys, &factors, 0.0, &x, &mut bare, &backend, None);
+    for i in 0..3 {
+        assert_eq!(routed[i].to_bits(), bare[i].to_bits(), "matvec entry {i}");
+    }
+}
+
 /// `SparseBlockKroneckerPenaltyOp` must reproduce the dense
 /// `KroneckerPenaltyOp { factor_a: G, factor_b: I_p }` on every interface
 /// (matvec, gradient, diagonal, to_dense) when the sparse block set covers
