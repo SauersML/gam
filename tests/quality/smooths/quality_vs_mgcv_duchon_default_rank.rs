@@ -124,11 +124,17 @@ fn assert_duchon_1d_default_rank(n: usize, sigma: f64, seed: u64, k_mgcv: usize,
         grid  <- df[df$is_train < 0.5, ]
         m <- gam(y ~ s(x, bs = "ds", k = {k_mgcv}, m = c(2, 0)), data = train, method = "REML")
         emit("fitted", as.numeric(predict(m, newdata = grid)))
+        emit("edf", sum(m$edf))
+        emit("sp", as.numeric(m$sp))
+        emit("reml", as.numeric(m$gcv.ubre))
         "#
         ),
     );
     let mgcv_fitted = r.vector("fitted");
     assert_eq!(mgcv_fitted.len(), m, "mgcv prediction length mismatch");
+    let mgcv_edf = r.scalar("edf");
+    let mgcv_sp = r.vector("sp");
+    let mgcv_reml = r.scalar("reml");
 
     let gam_truth_rmse = rmse(&gam_fitted, &y_truth);
     let mgcv_truth_rmse = rmse(mgcv_fitted, &y_truth);
@@ -138,6 +144,24 @@ fn assert_duchon_1d_default_rank(n: usize, sigma: f64, seed: u64, k_mgcv: usize,
         "duchon-default-rank-1d: n={n} sigma={sigma} k_mgcv={k_mgcv} \
          gam_truth_rmse={gam_truth_rmse:.4} mgcv_truth_rmse={mgcv_truth_rmse:.4} \
          (context: rel_l2(gam,mgcv)={rel_gam_vs_mgcv:.4})"
+    );
+
+    // #1561 λ-selection diagnostic (pure instrumentation; no pass criterion). gam
+    // uses MORE default centers than mgcv's k here yet recovers worse, so the gap
+    // is smoothing-parameter SELECTION, not capacity. Emit both sides' selected
+    // smoothing state to compare gam's REML argmin against mgcv's head-to-head.
+    eprintln!(
+        "lambda_diag test=duchon_default_rank_1d n={n} k_mgcv={k_mgcv} \
+         gam_reml={:.4} gam_edf_total={:.4} \
+         gam_lambdas={:?} gam_log_lambdas={:?} \
+         gam_edf_by_block={:?} gam_block_trace={:?} \
+         mgcv_reml={mgcv_reml:.4} mgcv_edf={mgcv_edf:.4} mgcv_sp={mgcv_sp:?}",
+        fit.fit.reml_score,
+        fit.fit.edf_total().expect("gam reports total edf"),
+        fit.fit.lambdas.to_vec(),
+        fit.fit.log_lambdas.to_vec(),
+        fit.fit.edf_by_block().to_vec(),
+        fit.fit.penalty_block_trace().to_vec(),
     );
 
     // (1) Non-degeneracy / recovery bar (reused from the regime-B calibration).
@@ -275,11 +299,17 @@ fn assert_duchon_2d_default_rank(n: usize, sigma: f64, seed: u64, k_mgcv: usize,
         grid  <- df[df$is_train < 0.5, ]
         m <- gam(y ~ s(x, z, bs = "ds", k = {k_mgcv}, m = c(2, 0)), data = train, method = "REML")
         emit("fitted", as.numeric(predict(m, newdata = grid)))
+        emit("edf", sum(m$edf))
+        emit("sp", as.numeric(m$sp))
+        emit("reml", as.numeric(m$gcv.ubre))
         "#
         ),
     );
     let mgcv_fitted = r.vector("fitted");
     assert_eq!(mgcv_fitted.len(), m, "mgcv prediction length mismatch");
+    let mgcv_edf = r.scalar("edf");
+    let mgcv_sp = r.vector("sp");
+    let mgcv_reml = r.scalar("reml");
 
     let gam_truth_rmse = rmse(&gam_fitted, &y_truth);
     let mgcv_truth_rmse = rmse(mgcv_fitted, &y_truth);
@@ -290,6 +320,23 @@ fn assert_duchon_2d_default_rank(n: usize, sigma: f64, seed: u64, k_mgcv: usize,
         "duchon-default-rank-2d: n={n} grid={m} sigma={sigma} k_mgcv={k_mgcv} \
          gam_truth_rmse={gam_truth_rmse:.4} mgcv_truth_rmse={mgcv_truth_rmse:.4} \
          rms_truth={rms_truth:.4} (context: rel_l2(gam,mgcv)={rel_gam_vs_mgcv:.4})"
+    );
+
+    // #1561 λ-selection diagnostic (pure instrumentation; no pass criterion). Emit
+    // both sides' selected smoothing state so the artifact lets us compare gam's
+    // REML argmin against mgcv's head-to-head on the 2-D Duchon surface.
+    eprintln!(
+        "lambda_diag test=duchon_default_rank_2d n={n} k_mgcv={k_mgcv} \
+         gam_reml={:.4} gam_edf_total={:.4} \
+         gam_lambdas={:?} gam_log_lambdas={:?} \
+         gam_edf_by_block={:?} gam_block_trace={:?} \
+         mgcv_reml={mgcv_reml:.4} mgcv_edf={mgcv_edf:.4} mgcv_sp={mgcv_sp:?}",
+        fit.fit.reml_score,
+        fit.fit.edf_total().expect("gam reports total edf"),
+        fit.fit.lambdas.to_vec(),
+        fit.fit.log_lambdas.to_vec(),
+        fit.fit.edf_by_block().to_vec(),
+        fit.fit.penalty_block_trace().to_vec(),
     );
 
     // (1) Non-degeneracy / recovery bar (reused from the k=49 2-D calibration).

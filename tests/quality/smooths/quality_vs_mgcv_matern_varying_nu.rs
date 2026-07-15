@@ -133,10 +133,14 @@ fn gam_matern_family_recovers_truth_across_nu() {
                      data = fit_df, method = "REML")
             emit("grid_fit", as.numeric(predict(m, newdata = grid_df)))
             emit("edf", sum(m$edf))
+            emit("sp", as.numeric(m$sp))
+            emit("reml", as.numeric(m$gcv.ubre))
             "#,
         );
         let mgcv_grid = r.vector("grid_fit");
         let mgcv_edf = r.scalar("edf");
+        let mgcv_sp = r.vector("sp");
+        let mgcv_reml = r.scalar("reml");
         assert_eq!(
             mgcv_grid.len(),
             grid_n,
@@ -155,6 +159,25 @@ fn gam_matern_family_recovers_truth_across_nu() {
              mgcv_rmse_vs_truth={mgcv_rmse:.4} gam_pearson_vs_truth={gam_corr:.5} \
              gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} rel_l2(gam,mgcv)={rel_to_mgcv:.4} \
              noise_sigma={noise_sigma} signal_range={signal_range:.3}"
+        );
+
+        // #1561 λ-selection diagnostic (pure instrumentation; no pass criterion).
+        // The recovery gap here is "gam's fit ≈ mgcv's yet slightly worse on truth
+        // at ≥ mgcv EDF", i.e. a smoothing-parameter SELECTION divergence. Emit both
+        // sides' selected smoothing state so the artifact lets us compare gam's
+        // REML argmin (log_lambdas/rho + per-block EDF) against mgcv's (sp + EDF)
+        // head-to-head at the same Matérn order.
+        eprintln!(
+            "lambda_diag test=matern_varying_nu nu={nu} mgcv_m={kappa} \
+             gam_reml={:.4} gam_edf_total={gam_edf:.4} \
+             gam_lambdas={:?} gam_log_lambdas={:?} \
+             gam_edf_by_block={:?} gam_block_trace={:?} \
+             mgcv_reml={mgcv_reml:.4} mgcv_edf={mgcv_edf:.4} mgcv_sp={mgcv_sp:?}",
+            fit.fit.reml_score,
+            fit.fit.lambdas.to_vec(),
+            fit.fit.log_lambdas.to_vec(),
+            fit.fit.edf_by_block().to_vec(),
+            fit.fit.penalty_block_trace().to_vec(),
         );
 
         // PRIMARY claim: gam RECOVERS the known truth at every Matérn order.
