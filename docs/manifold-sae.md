@@ -640,6 +640,40 @@ Float32 activation corpora produce float32 controls; float64 inputs remain
 float64. The callback contract requires a fresh deterministic fit and receives
 the same `pipeline_seed` for all three runs.
 
+Label-aware charts need a different null. A class-mean PCA plane can manufacture
+a ring even after the labels are shuffled: on the recorded Qwen3-8B clock-time
+study, all 200 of 200 single shuffled-label charts still received a circular
+verdict. Consequently neither a chart-fixed permutation nor one shuffled draw
+is a false-positive floor. Rebuild the chart for every draw and compare the
+observed **circular margin** with the full shuffle-margin distribution:
+
+```python
+def labeled_chart_pipeline(matrix, labels, seed):
+    # Recompute class means, select/refit the chart, then adjudicate it.
+    coords = build_class_mean_chart(matrix, labels)
+    return gamfit.adjudicate_atom_shape(
+        coords, folds=5, seed=seed, matched_controls=False
+    )
+
+margin_null = gamfit.run_label_shuffle_margin_null(
+    activations,
+    labels,
+    labeled_chart_pipeline,
+    n_draws=200,
+    shuffle_seed=11,
+    pipeline_seed=11,
+)
+print(margin_null.observed_margin)
+print(margin_null.p_value)
+```
+
+The helper invokes the same `(data, labels, pipeline_seed)` callback for the
+observed labels and every shuffled label vector, so chart reconstruction lives
+inside the randomized experiment. It reports every null margin and the
+conservative one-sided randomization p-value
+`(1 + #{null >= observed}) / (n_draws + 1)`; ties count against the observed
+claim. The default 200 draws give a minimum attainable p-value of `1/201`.
+
 `examples/topology_census_recipe.py` documents the full validated recipe.
 
 ### On real activations, lead with deterministic readouts

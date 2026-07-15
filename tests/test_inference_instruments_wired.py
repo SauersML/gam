@@ -103,9 +103,7 @@ def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
             np.ones((4, 2), dtype=np.complex64) * (1.0 + 2.0j), pipeline
         )
     with pytest.raises(TypeError, match="complex dtype"):
-        gamfit.run_shape_controlled_census(
-            [[1.0 + 2.0j, 3.0], [4.0, 5.0]], pipeline
-        )
+        gamfit.run_shape_controlled_census([[1.0 + 2.0j, 3.0], [4.0, 5.0]], pipeline)
 
 
 def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
@@ -128,12 +126,16 @@ def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
     ).astype(np.float32, copy=False)
 
     def forbid_float64_control(*args, **kwargs):
-        raise AssertionError("float32 census dispatched through the float64 native control")
+        raise AssertionError(
+            "float32 census dispatched through the float64 native control"
+        )
 
     monkeypatch.setattr(shape_census, "shape_matched_control", forbid_float64_control)
     calls: list[tuple[np.ndarray, int]] = []
 
-    def pipeline(matrix: np.ndarray, seed: int) -> tuple[np.dtype, tuple[int, ...], int]:
+    def pipeline(
+        matrix: np.ndarray, seed: int
+    ) -> tuple[np.dtype, tuple[int, ...], int]:
         assert matrix.dtype == np.float32
         assert matrix.nbytes == matrix.size * np.dtype(np.float32).itemsize
         calls.append((matrix.copy(), seed))
@@ -163,7 +165,9 @@ def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
     np.testing.assert_array_equal(shuffle, repeated_shuffle)
     np.testing.assert_array_equal(calls[1][0], shuffle)
     for col in range(activations.shape[1]):
-        np.testing.assert_array_equal(np.sort(shuffle[:, col]), np.sort(activations[:, col]))
+        np.testing.assert_array_equal(
+            np.sort(shuffle[:, col]), np.sort(activations[:, col])
+        )
 
     hadamard = gamfit.shape_matched_control_f32(
         activations,
@@ -202,9 +206,7 @@ def test_native_contiguous_source_is_shared_but_callbacks_are_private(
     native_sources: list[np.ndarray] = []
     callback_matrices: list[np.ndarray] = []
 
-    def recording_control(
-        source: np.ndarray, kind: str, *, seed: int
-    ) -> np.ndarray:
+    def recording_control(source: np.ndarray, kind: str, *, seed: int) -> np.ndarray:
         del kind, seed
         native_sources.append(source)
         assert source.flags.c_contiguous
@@ -239,9 +241,13 @@ def test_shape_controlled_census_converts_non_native_dtype_once_to_float64(
     import gamfit._shape_census as shape_census
 
     def forbid_float32_control(*args, **kwargs):
-        raise AssertionError("non-float32 census dispatched through the float32 native control")
+        raise AssertionError(
+            "non-float32 census dispatched through the float32 native control"
+        )
 
-    monkeypatch.setattr(shape_census, "shape_matched_control_f32", forbid_float32_control)
+    monkeypatch.setattr(
+        shape_census, "shape_matched_control_f32", forbid_float32_control
+    )
     source = np.arange(96, dtype=np.int16).reshape(32, 3)
 
     class CountingArrayLike:
@@ -265,6 +271,70 @@ def test_shape_controlled_census_converts_non_native_dtype_once_to_float64(
     gamfit.run_shape_controlled_census(counted_source, pipeline)
     assert counted_source.conversions == 1
     assert seen_dtypes == [np.dtype(np.float64)] * 3
+
+
+def test_label_shuffle_margin_null_rebuilds_every_draw_and_is_exactly_reproducible():
+    data = np.arange(48, dtype=np.float32).reshape(12, 4)
+    labels = np.repeat(np.arange(4), 3)
+    seen_labels: list[np.ndarray] = []
+
+    def pipeline(
+        matrix: np.ndarray, draw_labels: np.ndarray, seed: int
+    ) -> dict[str, float]:
+        assert seed == 29
+        assert not matrix.flags.writeable
+        assert draw_labels.flags.writeable
+        seen_labels.append(draw_labels.copy())
+        class_means = np.asarray(
+            [matrix[draw_labels == label, 0].mean() for label in np.unique(draw_labels)]
+        )
+        return {"circular_margin": float(np.var(np.diff(class_means)))}
+
+    first = gamfit.run_label_shuffle_margin_null(
+        data,
+        labels,
+        pipeline,
+        n_draws=17,
+        shuffle_seed=41,
+        pipeline_seed=29,
+    )
+    first_labels = [value.copy() for value in seen_labels]
+    seen_labels.clear()
+    second = gamfit.run_label_shuffle_margin_null(
+        data,
+        labels,
+        pipeline,
+        n_draws=17,
+        shuffle_seed=41,
+        pipeline_seed=29,
+    )
+
+    assert len(first_labels) == 18
+    np.testing.assert_array_equal(first_labels[0], labels)
+    for shuffled in first_labels[1:]:
+        np.testing.assert_array_equal(np.sort(shuffled), np.sort(labels))
+    np.testing.assert_array_equal(first.null_margins, second.null_margins)
+    assert first.observed_margin == second.observed_margin
+    assert first.exceedance_count == int(
+        np.count_nonzero(first.null_margins >= first.observed_margin)
+    )
+    assert first.p_value == (1 + first.exceedance_count) / 18
+    assert not first.null_margins.flags.writeable
+    assert data.flags.writeable
+    np.testing.assert_array_equal(labels, np.repeat(np.arange(4), 3))
+
+
+def test_label_shuffle_margin_null_rejects_uncalibrated_contracts():
+    data = np.arange(16, dtype=np.float64).reshape(8, 2)
+    labels = np.repeat([0, 1], 4)
+    with pytest.raises(ValueError, match="n_draws must be positive"):
+        gamfit.run_label_shuffle_margin_null(data, labels, lambda *_: {}, n_draws=0)
+    with pytest.raises(ValueError, match="at least two distinct labels"):
+        gamfit.run_label_shuffle_margin_null(
+            data, np.zeros(8), lambda *_: {"circular_margin": 0.0}
+        )
+    with pytest.raises(TypeError, match="circular_margin"):
+        gamfit.run_label_shuffle_margin_null(data, labels, lambda *_: {}, n_draws=1)
 
 
 def test_layer_transport_fit_reaches_python():
@@ -294,7 +364,11 @@ def test_fit_transport_object_inverts_and_composes():
     g_a = gamfit.fit_transport(frm, a_warp, "interval", "interval")
     assert g_a.topology_preserved is True
     assert g_a.isometry_defect >= 0.0
-    assert set(g_a.report().keys()) >= {"degree", "topology_preserved", "isometry_defect"}
+    assert set(g_a.report().keys()) >= {
+        "degree",
+        "topology_preserved",
+        "isometry_defect",
+    }
 
     # eval / invert round-trip.
     probe = np.array([0.2, 0.5, 0.8])
@@ -480,9 +554,7 @@ def test_lawley_bartlett_factor_estimated_lambda_reaches_python():
     assert estimated["mean_shift"] == pytest.approx(
         estimated["mean_shift_conditional"] + estimated["rho_variation_shift"]
     )
-    assert estimated["bartlett_factor"] == pytest.approx(
-        1.0 + estimated["mean_shift"]
-    )
+    assert estimated["bartlett_factor"] == pytest.approx(1.0 + estimated["mean_shift"])
     assert estimated["corrected_statistic"] == pytest.approx(
         4.0 / estimated["bartlett_factor"]
     )
@@ -588,9 +660,7 @@ def test_glm_full_conformal_bernoulli_reaches_python_and_covers():
         yt = (rng.uniform(size=n_small) < 1.0 / (1.0 + np.exp(-et))).astype(float)
         p_star = 1.0 / (1.0 + np.exp(-(x_star @ beta_true)))
         y_star = float(rng.uniform() < p_star)
-        res = gamfit.glm_full_conformal(
-            xt, yt, s_lambda, x_star, "bernoulli", alpha
-        )
+        res = gamfit.glm_full_conformal(xt, yt, s_lambda, x_star, "bernoulli", alpha)
         if y_star in res["members"]:
             covered += 1
     # Allow a small Monte-Carlo slack below the nominal 1 - alpha = 0.8.
