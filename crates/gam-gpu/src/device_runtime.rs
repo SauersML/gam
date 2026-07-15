@@ -441,9 +441,10 @@ fn absence_from_driver_init_error(error: &result::DriverError) -> Option<GpuAbse
         CudaErrorCode::CUDA_ERROR_STUB_LIBRARY => {
             "the loaded libcuda is a linker stub, not a real driver"
         }
-        CudaErrorCode::CUDA_ERROR_INSUFFICIENT_DRIVER => {
-            "the installed CUDA kernel driver is older than this CUDA userland requires"
-        }
+        // NOTE: there is deliberately no INSUFFICIENT_DRIVER arm — that code
+        // (`cudaErrorInsufficientDriver`) exists only in the CUDA *runtime*
+        // API; the driver API reports the userland/kernel version split as
+        // `CUDA_ERROR_SYSTEM_DRIVER_MISMATCH` below.
         CudaErrorCode::CUDA_ERROR_SYSTEM_NOT_READY => {
             "the CUDA system is not ready (kernel driver or fabric daemon not running)"
         }
@@ -810,7 +811,6 @@ mod policy_resolution_contract_tests {
     fn driver_mismatch_at_init_is_typed_absence_not_a_fault() {
         for code in [
             sys::cudaError_enum::CUDA_ERROR_SYSTEM_DRIVER_MISMATCH,
-            sys::cudaError_enum::CUDA_ERROR_INSUFFICIENT_DRIVER,
             sys::cudaError_enum::CUDA_ERROR_STUB_LIBRARY,
             sys::cudaError_enum::CUDA_ERROR_SYSTEM_NOT_READY,
             sys::cudaError_enum::CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE,
