@@ -164,7 +164,7 @@ def sae_manifold_fit(
     decoder_feature_sparsity_groups: Sequence[Sequence[int]] | None = None,
     n_iter: int = 50,
     *,
-    sparsity_weight: float = 0.0,
+    sparsity_weight: float = 1.0,
     coord_sparsity: str = "scad",
     scad_mcp_gamma: float | None = None,
     smoothness_weight: float = 1.0,
