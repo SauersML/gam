@@ -2401,23 +2401,21 @@ impl SaeManifoldTerm {
         Ok(hessian)
     }
 
-    /// PATH C (#2253) — assemble the exact fixed-stratum dense outer Hessian for
-    /// the small-dense ARC route from its analytic channels, and the production
-    /// consumer of the per-channel methods as they land.
+    /// PATH C (#2253) — assemble the COMPLETE exact fixed-stratum dense outer
+    /// Hessian for the small-dense ARC route from all four analytic channels
+    /// (ch1 explicit smoothness/ARD, ch2 rank-charge direct, ch4 log-determinant
+    /// Daleckii–Krein, ch5 third-order forward-sensitivity), enforce the
+    /// coordinate-coverage invariant, and return `Ok(block)`.
     ///
-    /// UNDER CONSTRUCTION: the solver-free explicit channel
-    /// ([`Self::outer_explicit_smoothness_ard_hessian`]), the rank-charge
-    /// `direct_rho` channel, and the deflated log-determinant Daleckii–Krein trace
-    /// ([`Self::logdet_daleckii_krein_hessian`]) are implemented; only the
-    /// third-order forward-sensitivity channel is still pending. Until every
-    /// channel is assembled the curvature is incomplete, so this REFUSES rather
-    /// than hand back a partial Hessian — the objective keeps
-    /// `DeclaredHessianForm::Unavailable` and its `eval` returns
-    /// `HessianValue::Unavailable`, so nothing steers on partial curvature. Each
-    /// landed channel extends the block assembled here; the final one turns the
-    /// refusal into `Ok` and flips `capability()` to `Dense`. `cache` is threaded
-    /// now for the pending solver-bound channels.
-    pub(crate) fn exact_fixed_stratum_outer_hessian(
+    /// ch5 refuses for any config outside the covered small-dense softmax route
+    /// (compact top-k layout, per-row deflation, border frames, non-softmax
+    /// priors), and the crosscoder-block guard / coverage invariant refuse an
+    /// unmodelled coordinate — those refusals propagate as `Err`, so this only
+    /// returns `Ok` when the full block is assembled AND validated. The public
+    /// [`Self::exact_fixed_stratum_outer_hessian`] currently wraps this in a
+    /// staged `Err` (see its doc); the finite-difference gates call THIS assembler
+    /// directly to validate the block.
+    pub(crate) fn assemble_exact_fixed_stratum_outer_hessian(
         &self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -2488,5 +2486,35 @@ impl SaeManifoldTerm {
             }
         }
         Ok(hessian)
+    }
+
+    /// PATH C (#2253) — production entry for the exact fixed-stratum outer
+    /// Hessian. COMMIT 1 (this): assemble AND validate the full block
+    /// ([`Self::assemble_exact_fixed_stratum_outer_hessian`]) — exercising the
+    /// config guards, all four channels, and the coordinate-coverage invariant —
+    /// then keep returning `Err` so `eval` yields `HessianValue::Unavailable` and
+    /// production stays on the analytic-gradient BFGS route during the blind
+    /// window. The finite-difference gates validate the assembly by calling the
+    /// assembler directly. COMMIT 2 (once the FD gate is green on MSI) replaces
+    /// this body with the assembler's `Ok` result and flips `capability()` to
+    /// `Dense` for the covered softmax config — a tiny separately-validated
+    /// change that carries the wrong-curvature-steering risk out of this window.
+    pub(crate) fn exact_fixed_stratum_outer_hessian(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+    ) -> Result<Array2<f64>, String> {
+        let hessian =
+            self.assemble_exact_fixed_stratum_outer_hessian(target, rho, loss, cache)?;
+        Err(format!(
+            "PATH C exact fixed-stratum outer Hessian is assembled and validated \
+             ({}×{}) but intentionally not advertised in commit 1: the Err→Ok + \
+             capability→Dense flip lands as a separately-validated commit once the \
+             finite-difference gate is green",
+            hessian.nrows(),
+            hessian.ncols()
+        ))
     }
 }

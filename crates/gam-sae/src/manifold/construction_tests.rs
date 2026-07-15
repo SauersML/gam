@@ -590,8 +590,11 @@ mod amortized_encoder_tests {
                 1.0e-6,
             )
             .expect("fixed-theta base cache");
+        // COMMIT 1 — the public `exact_fixed_stratum_outer_hessian` intentionally
+        // returns `Err` (production stays on BFGS); validate the assembly path
+        // directly via the assembler that returns the block.
         let analytic = term
-            .exact_fixed_stratum_outer_hessian(target.view(), &rho, &loss, &cache)
+            .assemble_exact_fixed_stratum_outer_hessian(target.view(), &rho, &loss, &cache)
             .expect("full exact fixed-stratum outer Hessian assembles");
 
         let base = rho.to_flat();
