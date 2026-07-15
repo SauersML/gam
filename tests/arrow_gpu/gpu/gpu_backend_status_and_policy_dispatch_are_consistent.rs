@@ -36,14 +36,14 @@ fn backend_status_and_policy_dispatch_are_consistent() {
     assert!(
         !off.use_gpu,
         "GPU policy Off should always select CPU execution."
-    )
-    .expect("Off policy decision is infallible");
+    );
 
     let global = gpu::global_policy();
     let forced = gpu::decide(
         GpuKernel::DenseMatvec,
         GpuEligibility::from_flags(true, true),
-    );
+    )
+    .expect("the installed Off policy must bypass runtime probing");
     if global == GpuPolicy::Off {
         assert!(
             !forced.use_gpu,
