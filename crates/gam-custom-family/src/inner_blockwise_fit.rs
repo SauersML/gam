@@ -111,7 +111,7 @@ fn certified_reduced_face_newton_candidate(
         // Hessian is positive it becomes the exact Newton equation above.
         *coefficient /= eigenvalue.abs();
     }
-    let mut delta = tangent.dot(&eigenvectors.dot(&spectral_step));
+    let delta = tangent.dot(&eigenvectors.dot(&spectral_step));
     if delta.iter().any(|value| !value.is_finite()) {
         return Ok(None);
     }
@@ -120,18 +120,27 @@ fn certified_reduced_face_newton_candidate(
         return Ok(None);
     }
 
-    // The tangent step can meet a previously inactive inequality. Truncate at
-    // the first certified numerical boundary and carry that blocker into the
-    // next face instead of discarding the whole reduced-space direction and
-    // returning to an ambient-convex crawl.
+    // The tangent step can meet a previously inactive inequality. That is a
+    // FACE-CHANGE event, and face discovery (release/entry with its ratio
+    // tests and multiplier signs) belongs to the global active-set QP — this
+    // routine owns only the fixed-face Newton endgame. The previous behavior
+    // truncated the step at the first blocker, returned the segment as the
+    // cycle's candidate, and carried the blocker in the returned face; but
+    // that short-circuited the full QP every cycle, and once trust-region
+    // globalization accepted only a subsegment the accepted-face tightness
+    // filter dropped the blocker again — measured on the #2301
+    // transformation-normal fit as a bit-frozen fixed point (cycles 29-45:
+    // warm_rows=21, candidate face 22, β pinned at 4.4377, the same 8.194e-7
+    // proposal every cycle, residual pinned at 1.556 vs tol 4.5e-5,
+    // diagnosis active_set_incomplete). Declining here routes the cycle to
+    // `solve_quadratic_with_constraint_set`, which performs the exchange and
+    // lands ON the new face exactly.
     let values_beta = constraints
         .values(beta.view())
         .map_err(|error| format!("exact active-face value evaluation failed: {error}"))?;
     let values_delta = constraints
         .values(delta.view())
         .map_err(|error| format!("exact active-face direction evaluation failed: {error}"))?;
-    let mut alpha = 1.0_f64;
-    let mut blocking_row = None;
     for row in 0..constraints.nrows() {
         if active_rows.contains(&row) {
             continue;
@@ -154,18 +163,10 @@ fn certified_reduced_face_newton_candidate(
             let fraction = (scaled_slack
                 + gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL)
                 / -scaled_rate;
-            if fraction.is_finite() && fraction >= 0.0 && fraction < alpha {
-                alpha = fraction;
-                blocking_row = Some(row);
+            if fraction.is_finite() && fraction >= 0.0 && fraction < 1.0 {
+                return Ok(None);
             }
         }
-    }
-    if !(alpha.is_finite() && alpha > 0.0) {
-        return Ok(None);
-    }
-    if alpha < 1.0 {
-        alpha *= 1.0 - 1e-12;
-        delta *= alpha;
     }
     let candidate = beta + &delta;
     let candidate_values = constraints
@@ -189,7 +190,7 @@ fn certified_reduced_face_newton_candidate(
         }
     }
 
-    let exact_newton = exact_positive_curvature && alpha >= 1.0;
+    let exact_newton = exact_positive_curvature;
     if exact_newton {
         // The full reduced Newton solve certifies tangent stationarity. Certify
         // the other KKT half as well: its remaining quadratic gradient must be
@@ -213,13 +214,7 @@ fn certified_reduced_face_newton_candidate(
             return Ok(None);
         }
     }
-    let mut next_active = active_rows.to_vec();
-    if let Some(row) = blocking_row
-        && !next_active.contains(&row)
-    {
-        next_active.push(row);
-    }
-    Ok(Some((candidate, next_active, exact_newton)))
+    Ok(Some((candidate, active_rows.to_vec(), exact_newton)))
 }
 
 #[cfg(test)]
@@ -252,11 +247,17 @@ mod exact_face_newton_tests {
     }
 
     #[test]
-    fn reduced_face_globalization_reflects_only_tangent_and_adds_first_blocker() {
-        // x>=0 is the current face. The accessible y curvature is negative,
-        // so the reduced modified-Newton direction reflects only that scalar
-        // mode and then meets the inactive y<=0.5 row. The returned topology
-        // must include the new blocker; it is not yet an exact Newton step.
+    fn reduced_face_declines_on_blocker_so_the_full_qp_owns_the_exchange() {
+        // x>=0 is the current face. The reduced tangent direction meets the
+        // inactive y<=0.5 row before its full length — a face-change event.
+        // The fast path must DECLINE (return None) so the call site falls
+        // through to the full active-set QP, which performs the exchange and
+        // lands ON the new face exactly. The former behavior returned the
+        // blocker-truncated segment as the cycle's candidate; combined with
+        // trust-region truncation and the tight-at-accepted-β face filter
+        // that produced the #2301 transformation-normal fixed point (cycles
+        // 29-45: the same truncated proposal re-generated every cycle, the
+        // blocker never activating, residual pinned at 1.556).
         let hessian = array![[1.0_f64, 0.0], [0.0, -2.0]];
         let rhs = array![0.0_f64, 2.0];
         let beta = array![0.0_f64, 0.0];
@@ -267,13 +268,39 @@ mod exact_face_newton_tests {
             )
             .expect("x>=0 and y<=0.5"),
         );
+        let candidate =
+            certified_reduced_face_newton_candidate(&hessian, &rhs, &beta, &constraints, &[0])
+                .expect("reduced face classification");
+        assert!(
+            candidate.is_none(),
+            "a blocker-truncated tangent step is a face change and must be \
+             handed to the full active-set QP, not returned as the candidate"
+        );
+    }
+
+    #[test]
+    fn reduced_face_full_step_with_negative_tangent_curvature_stays_available() {
+        // Same negative accessible curvature, but the blocker sits beyond the
+        // unit step (y<=5), so the full reflected tangent step is feasible:
+        // the fast path keeps owning the globalization direction and reports
+        // it as non-exact (no fixed-face Newton certificate).
+        let hessian = array![[1.0_f64, 0.0], [0.0, -2.0]];
+        let rhs = array![0.0_f64, 2.0];
+        let beta = array![0.0_f64, 0.0];
+        let constraints = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(
+                array![[1.0_f64, 0.0], [0.0, -1.0]],
+                array![0.0, -5.0],
+            )
+            .expect("x>=0 and y<=5"),
+        );
         let (candidate, active, exact) =
             certified_reduced_face_newton_candidate(&hessian, &rhs, &beta, &constraints, &[0])
                 .expect("reduced face classification")
-                .expect("strict tangent descent to the first blocker");
+                .expect("full-length reflected tangent step is feasible");
         assert!(candidate[0].abs() <= 1e-12);
-        assert!((candidate[1] - 0.5).abs() <= 2e-8);
-        assert_eq!(active, vec![0, 1]);
+        assert!((candidate[1] - 1.0).abs() <= 1e-12);
+        assert_eq!(active, vec![0]);
         assert!(!exact);
     }
 
