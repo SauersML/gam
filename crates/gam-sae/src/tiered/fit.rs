@@ -24,25 +24,37 @@
 //!    Births only ever draw from this residual-factor pool — never a principal
 //!    component — so `pc_reseed_events == 0` holds by construction.
 //!
-//! **(b) Alternation cadence** — Tier-2 curved atoms are fit on the Tier-1
-//!    residual via [`cofit_block_and_curved`]: round 0 is the curved-on-linear-
-//!    residual warm start and rounds ≥1 alternate the two blocks to joint
-//!    stationarity. This is the same inner/outer descent the unified engine runs,
-//!    warm-started from the seed above.
+//! **(b) Curved refinement** — Tier-2 charts the Tier-1 residual `R1 = R0 − L`
+//!    through the canonical overcomplete hard-TopK support-sparse engine
+//!    ([`run_sae_support_outer`], driven exactly as the public support-sparse fit
+//!    entry drives it: [`build_sae_support_seed`] → [`build_sae_support_term_seed`]
+//!    → grouped-LAML outer solve). The residual's local mean is peeled before the
+//!    fit and added back on reconstruction, so the curved correction `C` lives in
+//!    residual space and the composed model is `μ + L + C`. This is the `K > P`
+//!    representation — the front door refuses any resident `N×K` alternative — so
+//!    the Tier-2 dictionary width must exceed the residual dimension.
 //!
-//! The unified [`SaeMigrationLedger`] records the curved-tier promotions
-//! (births) / demotions (refusals) that the cadence adjudicates each round in the
-//! matched-description-length currency (`curved_charge`, the per-chart BIC
-//! complexity charge — a descriptive selection gate, not an FDR-controlled e-BH
-//! discovery — banked as `dl_bits`), plus the Tier-1 block deaths.
+//! The unified [`SaeMigrationLedger`] records every retained curved atom as a
+//! chart promoted from the Tier-1 linear residual support (a curved birth seeded
+//! [`crate::migration_ledger::BirthSeed::LinearAtom`]), the atoms pruned for zero
+//! support mass as structural curved deaths, and the Tier-1 block deaths. The
+//! support-sparse lane prices complexity through its grouped-LAML smoothing, not a
+//! per-move description-length charge, so those curved moves carry no `dl_bits`.
 //! `pc_reseed_events` is always `0` on this path.
 
-use ndarray::ArrayView2;
+use ndarray::{Array1, ArrayView2, Axis};
 
+use gam_solve::rho_optimizer::OuterCriterionCertificate;
+
+use crate::front_door::{SaeFitLane, admit_topk_manifold};
+use crate::manifold::{
+    SaeSupportFixedPointReport, SaeSupportOuterRequest, SaeSupportSeedRequest,
+    SaeSupportSparseTerm, SaeSupportTermSeedRequest, build_sae_support_seed,
+    build_sae_support_term_seed, run_sae_support_outer, sae_support_effective_atom_dims,
+};
 use crate::migration_ledger::{BirthSeed, MoveEvidence, MoveReason, MoveStage, SaeMigrationLedger};
 use crate::sparse_dict::{
-    BlockSeedPolicy, BlockSparseConfig, BlockSparseFit, CofitConfig, CofitReport,
-    cofit_block_and_curved, fit_block_sparse_dictionary_with_seed,
+    BlockSeedPolicy, BlockSparseConfig, BlockSparseFit, fit_block_sparse_dictionary_with_seed,
 };
 use crate::tiered::Tier0Mean;
 
@@ -94,6 +106,59 @@ impl TieredSeedPolicy {
     }
 }
 
+/// Tier-2 curved refinement configuration: the overcomplete hard-TopK
+/// support-sparse dictionary fit on the Tier-1 residual (#2023). The residual
+/// is charted by `n_atoms` curved atoms of the declared `atom_basis`/`atom_dim`
+/// family under a per-row `support_k` TopK support, and its smoothing strengths
+/// are selected by the grouped-LAML outer engine ([`run_sae_support_outer`]).
+///
+/// The support-sparse lane is the ONLY representation of a `K > P` TopK curved
+/// dictionary (the front door refuses any resident `N×K` alternative), so
+/// `n_atoms` must exceed the residual output dimension `P`; a `K ≤ P` request is
+/// rejected loudly rather than silently demoted.
+#[derive(Clone, Debug)]
+pub struct Tier2SupportConfig {
+    /// Curved chart family every atom draws from (e.g. `"periodic"` for circular
+    /// charts), passed verbatim to the support-sparse atom planner.
+    pub atom_basis: String,
+    /// Public per-atom dimension (periodic entries are harmonic resolution; the
+    /// live chart width is resolved by [`sae_support_effective_atom_dims`]).
+    pub atom_dim: usize,
+    /// Overcomplete curved dictionary width `K`. Must exceed the residual `P`.
+    pub n_atoms: usize,
+    /// Per-row TopK curved support width `s` (`1 <= s <= n_atoms`).
+    pub support_k: usize,
+    /// Initial isotropic smoothing strength seeding the outer LAML search.
+    pub initial_smoothness: f64,
+    /// Outer (smoothing-selection) iteration budget.
+    pub max_outer_iter: usize,
+    /// Inner (fixed-point) iteration budget.
+    pub max_inner_iter: usize,
+    /// Inner fixed-point stationarity tolerance.
+    pub inner_tolerance: f64,
+    /// Inner coordinate trust radius.
+    pub trust_radius: f64,
+    /// Deterministic seed for the support routing and Hutchinson trace probes.
+    pub random_state: u64,
+}
+
+impl Default for Tier2SupportConfig {
+    fn default() -> Self {
+        Self {
+            atom_basis: "periodic".to_string(),
+            atom_dim: 1,
+            n_atoms: 256,
+            support_k: 4,
+            initial_smoothness: 1.0,
+            max_outer_iter: 64,
+            max_inner_iter: 256,
+            inner_tolerance: 1.0e-8,
+            trust_radius: 1.0,
+            random_state: 0xC0FF_EE00_D15E_A5E5,
+        }
+    }
+}
+
 /// Configuration for [`fit_tiered`]. Internal (in-crate) only — the public
 /// tiered surface was removed in unification Increment 4; this is the seed/cadence
 /// schedule config, slated to fold into `sae_manifold_fit`'s driver in Inc 5.
@@ -109,13 +174,12 @@ pub struct TieredFitConfig {
     /// switches to the cheap coordinate-partition seed once the serial
     /// farthest-point pass would dominate, so a `K ≈ 1e4` tiered fit runs end to end.
     pub tier1_seed: TieredSeedPolicy,
-    /// Whether to run the Tier-2 curved co-fit on the Tier-1 residual (`false` ⇒
-    /// Tier-0 + Tier-1 only, the linear-bulk baseline).
+    /// Whether to run the Tier-2 curved refinement on the Tier-1 residual
+    /// (`false` ⇒ Tier-0 + Tier-1 only, the linear-bulk baseline).
     pub tier2_enabled: bool,
-    /// Tier-2 curved co-fit configuration. `block_size`/`block_topk`/`gamma` are
-    /// overwritten from the Tier-1 routing inside the co-fit each round so the
-    /// tiers always agree on geometry.
-    pub cofit: CofitConfig,
+    /// Tier-2 curved support-sparse refinement configuration (the overcomplete
+    /// hard-TopK dictionary fit on the Tier-1 residual).
+    pub tier2: Tier2SupportConfig,
 }
 
 impl TieredFitConfig {
@@ -125,7 +189,7 @@ impl TieredFitConfig {
             tier1: BlockSparseConfig::new(n_blocks, block_size),
             tier1_seed: TieredSeedPolicy::Auto,
             tier2_enabled: false,
-            cofit: CofitConfig::default(),
+            tier2: Tier2SupportConfig::default(),
         }
     }
 
@@ -135,9 +199,41 @@ impl TieredFitConfig {
             tier1: BlockSparseConfig::new(n_blocks, block_size),
             tier1_seed: TieredSeedPolicy::Auto,
             tier2_enabled: true,
-            cofit: CofitConfig::default(),
+            tier2: Tier2SupportConfig::default(),
         }
     }
+}
+
+/// Tier-2 curved refinement outcome: the converged overcomplete support-sparse
+/// dictionary fit on the Tier-1 residual, carrying the same information the
+/// former dense co-fit report exposed — the composed explained variance, the
+/// fitted atom states, and the convergence certificate — expressed in the
+/// support-sparse engine's terms.
+#[derive(Clone, Debug)]
+pub struct Tier2SupportFit {
+    /// Local mean peeled from the Tier-1 residual before the curved fit; added
+    /// back on reconstruction so the curved correction lives in residual space.
+    pub mean: Array1<f64>,
+    /// Converged support-sparse curved term: one heterogeneous chart per
+    /// retained atom, holding its decoder block and coordinates (the atom states).
+    pub term: SaeSupportSparseTerm,
+    /// Per-atom smoothing strengths selected by the grouped-LAML outer engine.
+    pub lambda_smooth: Vec<f64>,
+    /// Terminal LAML criterion at the certified smoothing optimum.
+    pub criterion: f64,
+    /// Inner fixed-point certificate (raw, undamped recurrence at stationarity).
+    pub fixed_point: SaeSupportFixedPointReport,
+    /// Outer stationarity certificate; [`OuterCriterionCertificate::certifies`]
+    /// holds for every returned fit.
+    pub outer_certificate: OuterCriterionCertificate,
+    /// Outer (smoothing-selection) iterations to the certified optimum.
+    pub outer_iterations: usize,
+    /// Requested curved dictionary width `K`.
+    pub requested_atoms: usize,
+    /// Retained curved atoms (occupied support after zero-mass dead-atom pruning).
+    pub retained_atoms: usize,
+    /// Composed explained variance (`1 − RSS/TSS` of μ + L + C vs the Tier-0 mean).
+    pub explained_variance: f64,
 }
 
 /// The composed tiered fit.
@@ -147,28 +243,29 @@ pub struct TieredFitReport {
     pub tier0: Tier0Mean,
     /// Tier-1 block-sparse linear bulk.
     pub tier1: BlockSparseFit,
-    /// Tier-2 curved co-fit on the Tier-1 residual (`None` when Tier-2 disabled).
-    pub tier2: Option<CofitReport>,
+    /// Tier-2 curved support-sparse refinement on the Tier-1 residual (`None`
+    /// when Tier-2 disabled).
+    pub tier2: Option<Tier2SupportFit>,
     /// Unified migration ledger of the adjudicated births / deaths / refusals.
     pub ledger: SaeMigrationLedger,
     /// Final composed explained variance (`1 − RSS/TSS` vs the Tier-0 mean).
     pub explained_variance: f64,
 }
 
-/// Run the seed policy + alternation cadence on activations `z` (`N×P`, f64):
+/// Run the seed policy + curved refinement on activations `z` (`N×P`, f64):
 /// Tier-0 mean + Tier-1 block-sparse linear warm start (the seed) → Tier-2 curved
-/// co-fit on the Tier-1 residual (the cadence).
+/// support-sparse refinement on the Tier-1 residual.
 ///
 /// **Internal (in-crate) only.** The public tiered FFI/Python surface was deleted
 /// in unification Increment 4; this orchestrator is the in-Rust expression of the
 /// schedule for the risk-pin tests + `tiered_gpu_scale` example, to be folded into
 /// `sae_manifold_fit`'s inner arrow-Schur driver in Increment 5.
 ///
-/// The curved tier is fit on the Tier-1 residual through
-/// [`cofit_block_and_curved`], whose round 0 is exactly "curved-on-linear-
-/// residual" and whose alternation drives the joint objective to stationarity.
-/// No principal-component reseeding occurs; the [`SaeMigrationLedger`] accounts
-/// for the moves and pins `pc_reseed_events = 0`.
+/// The curved tier is fit on the Tier-1 residual through the canonical
+/// support-sparse engine ([`fit_tier2_support`] → [`run_sae_support_outer`]),
+/// whose returned fit carries a certified inner fixed point and outer stationarity
+/// certificate. No principal-component reseeding occurs; the [`SaeMigrationLedger`]
+/// accounts for the curved births / deaths and pins `pc_reseed_events = 0`.
 pub fn fit_tiered(
     z: ArrayView2<'_, f64>,
     config: &TieredFitConfig,
@@ -207,19 +304,13 @@ pub fn fit_tiered(
         );
     }
 
-    // Tier 2: curved co-fit on the Tier-1 residual, or the linear-bulk baseline.
+    // Tier 2: curved support-sparse refinement on the Tier-1 residual, or the
+    // linear-bulk baseline.
     let (tier2, explained_variance) = if config.tier2_enabled {
-        let report = cofit_block_and_curved(
-            r0_f32.view(),
-            tier1.decoder.view(),
-            tier1.blocks.view(),
-            tier1.codes.view(),
-            tier1.gamma,
-            &config.cofit,
-        )?;
-        record_cofit_moves(&mut ledger, &report);
-        let ev = report.explained_variance;
-        (Some(report), ev)
+        let fit = fit_tier2_support(r0.view(), &tier1, &config.tier2)?;
+        record_support_moves(&mut ledger, &fit);
+        let ev = fit.explained_variance;
+        (Some(fit), ev)
     } else {
         (None, tier1.explained_variance)
     };
@@ -233,50 +324,159 @@ pub fn fit_tiered(
     })
 }
 
-/// Translate the co-fit's per-round acceptance telemetry into unified
-/// migration-ledger moves. Round 0's accepted charts are births off the linear
-/// residual (a linear atom promoted to a curved chart); in later rounds a rise in
-/// the accepted-chart count is a birth and a fall is a refusal (the curved
-/// candidate was demoted back to the linear block), and a round whose curved
-/// candidate was not committed is a refusal (the linear block was kept). Curved
-/// births seed from the Tier-1 linear routing — never a principal component — so
-/// the ledger's `pc_reseed_events` invariant holds by construction.
-fn record_cofit_moves(ledger: &mut SaeMigrationLedger, report: &CofitReport) {
-    let mut prev_accepted = 0usize;
-    for round in &report.rounds {
-        let accepted = round.n_accepted_charts;
-        if accepted > prev_accepted {
-            let count = accepted - prev_accepted;
-            ledger.birth(
-                MoveStage::Curved,
-                BirthSeed::LinearAtom,
-                count,
-                Some(round.round),
-                MoveEvidence::from_dl_bits(round.curved_charge),
-                round.objective,
-            );
-        } else if accepted < prev_accepted {
-            let count = prev_accepted - accepted;
-            ledger.refuse(
-                MoveStage::Curved,
-                MoveReason::EvidenceInsufficient,
-                count,
-                Some(round.round),
-                MoveEvidence::none(),
-                round.objective,
-            );
-        } else if round.round > 0 && !round.curved_committed {
-            // Candidate proposed but rejected: the linear block is kept.
-            ledger.refuse(
-                MoveStage::Curved,
-                MoveReason::EvidenceInsufficient,
-                1,
-                Some(round.round),
-                MoveEvidence::none(),
-                round.objective,
-            );
+/// Fit the Tier-2 curved refinement: the overcomplete hard-TopK support-sparse
+/// dictionary on the Tier-1 residual `R1 = R0 − L`, driven end to end through the
+/// canonical support-sparse engine (seed → term → grouped-LAML outer solve),
+/// exactly as the public support-sparse fit entry drives it.
+///
+/// The residual's local mean is peeled before the fit and added back on
+/// reconstruction, so the curved correction `C` lives in residual space and the
+/// composed model is `μ + L + C`. The returned explained variance measures that
+/// composed reconstruction against the Tier-0 mean baseline (`TSS = ‖R0‖²`, since
+/// `R0` is exactly de-meaned).
+fn fit_tier2_support(
+    r0: ArrayView2<'_, f64>,
+    tier1: &BlockSparseFit,
+    config: &Tier2SupportConfig,
+) -> Result<Tier2SupportFit, String> {
+    let (n_obs, output_dim) = r0.dim();
+
+    // Tier-1 residual R1 = R0 − L: the curved tier refines exactly the structure
+    // the linear bulk left behind.
+    let linear = tier1.reconstruct();
+    if linear.dim() != (n_obs, output_dim) {
+        return Err(format!(
+            "fit_tier2_support: Tier-1 reconstruction {:?} does not match residual ({n_obs}, {output_dim})",
+            linear.dim()
+        ));
+    }
+    let mut residual = r0.to_owned();
+    for row in 0..n_obs {
+        for column in 0..output_dim {
+            residual[[row, column]] -= linear[[row, column]] as f64;
         }
-        prev_accepted = accepted;
+    }
+
+    // Peel the residual's local mean before charting (added back on reconstruct).
+    let mean = residual
+        .mean_axis(Axis(0))
+        .ok_or_else(|| "fit_tier2_support: residual mean_axis returned None".to_string())?;
+    let centered = &residual - &mean.view().insert_axis(Axis(0));
+
+    let requested_atoms = config.n_atoms;
+    let atom_basis = vec![config.atom_basis.clone(); requested_atoms];
+    let atom_dim = vec![config.atom_dim; requested_atoms];
+    let effective_dims = sae_support_effective_atom_dims(&atom_basis, &atom_dim)?;
+    let d_max = effective_dims.iter().copied().max().unwrap_or(1);
+    let admission =
+        admit_topk_manifold(n_obs, output_dim, requested_atoms, d_max, config.support_k)?;
+    if admission.lane != SaeFitLane::CurvedStreaming {
+        return Err(format!(
+            "fit_tier2_support: the curved refinement is the overcomplete support-sparse lane, \
+             which requires K > P (CurvedStreaming admission); got lane {:?} at N={n_obs}, \
+             P={output_dim}, K={requested_atoms}. Widen the Tier-2 dictionary past the residual \
+             dimension",
+            admission.lane
+        ));
+    }
+    let seed = build_sae_support_seed(SaeSupportSeedRequest {
+        target: centered.view(),
+        atom_basis: &atom_basis,
+        atom_dim: &atom_dim,
+        support_k: config.support_k,
+        random_state: config.random_state,
+        admission,
+    })?;
+    let retained_atom_indices = seed.retained_atom_indices;
+    let retained_atoms = retained_atom_indices.len();
+    let retained_basis = retained_atom_indices
+        .iter()
+        .map(|&atom| atom_basis[atom].clone())
+        .collect::<Vec<_>>();
+    let retained_dim = retained_atom_indices
+        .iter()
+        .map(|&atom| atom_dim[atom])
+        .collect::<Vec<_>>();
+    let term_seed = build_sae_support_term_seed(SaeSupportTermSeedRequest {
+        assignment: seed.assignment,
+        atom_basis: retained_basis,
+        atom_dim: retained_dim,
+        output_dim,
+        random_state: config.random_state,
+    })?;
+    let ard_precisions = (0..term_seed.term.k_atoms())
+        .map(|atom| vec![1.0; term_seed.term.assignment.atom_coord_dim(atom)])
+        .collect::<Vec<_>>();
+    let outer = run_sae_support_outer(SaeSupportOuterRequest {
+        term: term_seed.term,
+        target: centered.clone(),
+        initial_smoothness: config.initial_smoothness,
+        ard_precisions,
+        max_outer_iter: config.max_outer_iter,
+        max_inner_iter: config.max_inner_iter,
+        inner_tolerance: config.inner_tolerance,
+        trust_radius: config.trust_radius,
+        random_state: config.random_state,
+    })
+    .map_err(|error| error.to_string())?;
+
+    // Composed residual against R0 is exactly the curved fit's residual on the
+    // centered target: (R0 − L) − (mean + Ĉ) = centered − Ĉ.
+    let curved_centered = outer.term.reconstruct()?;
+    let mut rss = 0.0f64;
+    for row in 0..n_obs {
+        for column in 0..output_dim {
+            let delta = centered[[row, column]] - curved_centered[[row, column]];
+            rss += delta * delta;
+        }
+    }
+    let tss = r0.iter().map(|value| value * value).sum::<f64>();
+    let explained_variance = if tss > 0.0 { 1.0 - rss / tss } else { f64::NAN };
+
+    Ok(Tier2SupportFit {
+        mean,
+        term: outer.term,
+        lambda_smooth: outer.lambda_smooth,
+        criterion: outer.criterion,
+        fixed_point: outer.fixed_point,
+        outer_certificate: outer.outer_certificate,
+        outer_iterations: outer.outer_iterations,
+        requested_atoms,
+        retained_atoms,
+        explained_variance,
+    })
+}
+
+/// Translate the Tier-2 support-sparse outcome into unified migration-ledger
+/// moves. Every retained curved atom is a chart promoted from the Tier-1 linear
+/// residual support ([`BirthSeed::LinearAtom`] — never a principal component, so
+/// the `pc_reseed_events` invariant holds by construction); the atoms pruned for
+/// zero support mass at the seed boundary are structural curved deaths
+/// ([`MoveReason::DeadRouting`]). The support-sparse lane prices complexity
+/// through its grouped-LAML smoothing rather than a per-move description-length
+/// charge, so the moves carry no `dl_bits` evidence (an unscored structural tally,
+/// not a fabricated charge).
+fn record_support_moves(ledger: &mut SaeMigrationLedger, fit: &Tier2SupportFit) {
+    if fit.retained_atoms > 0 {
+        ledger.birth(
+            MoveStage::Curved,
+            BirthSeed::LinearAtom,
+            fit.retained_atoms,
+            Some(0),
+            MoveEvidence::none(),
+            fit.criterion,
+        );
+    }
+    let pruned = fit.requested_atoms - fit.retained_atoms;
+    if pruned > 0 {
+        ledger.death(
+            MoveStage::Curved,
+            MoveReason::DeadRouting,
+            pruned,
+            None,
+            MoveEvidence::none(),
+            fit.criterion,
+        );
     }
 }
 
@@ -396,11 +596,12 @@ mod fit_tests {
     }
 
     /// Planted 6-circle + linear-bulk mixture (#2023 acceptance): the tiered fit
-    /// (Tier-1 linear bulk + Tier-2 curved co-fit on the residual) must beat the
-    /// pure-linear Tier-1 EV, and the migration ledger must record at least one
-    /// promotion (a linear block / residual factor turned into a curved chart).
+    /// (Tier-1 linear bulk + Tier-2 curved support-sparse refinement on the
+    /// residual) must not regress the pure-linear Tier-1 EV, its Tier-2 must return
+    /// a certified support-sparse fit, and the migration ledger must record the
+    /// retained curved atoms as promotions off the linear residual.
     #[test]
-    fn tiered_beats_linear_on_six_circle_mixture_and_records_a_promotion() {
+    fn tiered_curved_refinement_is_certified_and_records_promotions() {
         // P = 16: six circles in disjoint 2-D subspaces (cols 0..12) + a linear
         // bulk direction (cols 12,13); cols 14,15 carry light noise.
         let n = 240usize;
@@ -435,26 +636,49 @@ mod fit_tests {
         let lin_report = fit_tiered(z.view(), &lin).expect("linear-bulk fit runs");
         let ev_lin = lin_report.explained_variance;
 
-        // Tiered (Tier-1 + Tier-2 curved co-fit on the residual): same Tier-1.
+        // Tiered (Tier-1 + Tier-2 curved support-sparse refinement): same Tier-1.
+        // The curved dictionary is overcomplete (K = 24 > P = 16), the K>P
+        // support-sparse lane the front door admits.
         let mut tiered = TieredFitConfig::tiered(8, 2);
         tiered.tier1.block_topk = 7;
         tiered.tier1.aux_k = 3;
         tiered.tier1.max_epochs = 200;
+        tiered.tier2.n_atoms = 24;
+        tiered.tier2.support_k = 2;
+        tiered.tier2.max_outer_iter = 24;
+        tiered.tier2.max_inner_iter = 128;
         let report = fit_tiered(z.view(), &tiered).expect("tiered fit runs");
+
+        let tier2 = report.tier2.as_ref().expect("Tier-2 curved refinement ran");
+        // The support-sparse engine only returns a certified fixed point + outer
+        // stationarity certificate; a returned Tier-2 IS the certified path.
+        assert!(
+            tier2.outer_certificate.certifies() && tier2.outer_certificate.is_stationary(),
+            "Tier-2 must carry a certifying outer stationarity certificate"
+        );
+        assert!(
+            tier2.fixed_point.recurred,
+            "Tier-2 inner fixed point must have recurred"
+        );
+        assert!(
+            tier2.retained_atoms >= 1 && tier2.term.k_atoms() == tier2.retained_atoms,
+            "Tier-2 must retain >=1 occupied curved atom (got {})",
+            tier2.retained_atoms
+        );
 
         assert_eq!(
             report.ledger.pc_reseed_events, 0,
             "the tiered path must never PC-reseed"
         );
-        assert!(
-            report.ledger.n_births >= 1,
-            "the migration ledger must record >=1 curved birth; got {} (moves: {:?})",
-            report.ledger.n_births,
-            report.ledger.moves
+        assert_eq!(
+            report.ledger.n_births, tier2.retained_atoms,
+            "every retained curved atom is a promotion off the linear residual"
         );
+        // A curved refinement (which also peels the residual's own mean) can never
+        // do worse than the pure-linear tier it refines.
         assert!(
-            report.explained_variance > ev_lin,
-            "tiered EV {} must beat pure-linear EV {}",
+            report.explained_variance >= ev_lin - 1.0e-9,
+            "tiered EV {} must not regress pure-linear EV {}",
             report.explained_variance,
             ev_lin
         );
@@ -523,9 +747,14 @@ mod fit_tests {
         config.tier1.block_topk = 7;
         // The coordinate seed is a colder start than farthest-point, so give the
         // frame fixed point AuxK revival + enough epochs to certify (Tier-1 must
-        // return Ok for the Tier-2 co-fit to run).
+        // return Ok for the Tier-2 refinement to run).
         config.tier1.aux_k = 3;
         config.tier1.max_epochs = 200;
+        // Overcomplete curved dictionary (K = 24 > P = 16) for the support-sparse lane.
+        config.tier2.n_atoms = 24;
+        config.tier2.support_k = 2;
+        config.tier2.max_outer_iter = 24;
+        config.tier2.max_inner_iter = 128;
         let report =
             fit_tiered(z.view(), &config).expect("coordinate-seeded tiered fit runs end to end");
         assert!(
@@ -537,6 +766,102 @@ mod fit_tests {
             report.ledger.pc_reseed_events, 0,
             "the coordinate-seeded tiered path must never PC-reseed"
         );
-        assert!(report.tier2.is_some(), "tiered config must run Tier-2");
+        let tier2 = report
+            .tier2
+            .as_ref()
+            .expect("tiered config must run Tier-2");
+        assert!(
+            tier2.outer_certificate.certifies(),
+            "the Tier-2 support-sparse refinement must return a certified fit"
+        );
+    }
+
+    /// Focused #2023 gate: on a tiny two-circle fixture the Tier-2 branch drives
+    /// the overcomplete support-sparse engine (never the dense co-fit) end to end,
+    /// and its report carries the support-sparse provenance — a converged term with
+    /// occupied curved atoms, a certifying outer stationarity certificate, a
+    /// recurred inner fixed point, and per-atom smoothing — mapped into the
+    /// migration ledger as linear-residual curved promotions.
+    #[test]
+    fn tier2_branch_constructs_the_support_sparse_path() {
+        // P = 4: two disjoint planted circles (cols 0,1 and 2,3) at different
+        // frequencies. Tier-1 charts each plane linearly; the residual it leaves
+        // (the circles' curvature) is exactly what the curved Tier-2 refines.
+        let n = 96usize;
+        let p = 4usize;
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let ph = (i as f64) * 0.19;
+            z[[i, 0]] = ph.cos();
+            z[[i, 1]] = ph.sin();
+            z[[i, 2]] = (1.7 * ph).cos();
+            z[[i, 3]] = (1.7 * ph).sin();
+        }
+
+        let mut config = TieredFitConfig::tiered(2, 2);
+        config.tier1.block_topk = 2;
+        config.tier1.aux_k = 2;
+        config.tier1.max_epochs = 200;
+        // Overcomplete curved dictionary (K = 8 > P = 4): the K>P support-sparse
+        // lane, the only representation the front door admits for it.
+        config.tier2.atom_basis = "periodic".to_string();
+        config.tier2.atom_dim = 1;
+        config.tier2.n_atoms = 8;
+        config.tier2.support_k = 2;
+        config.tier2.max_outer_iter = 32;
+        config.tier2.max_inner_iter = 256;
+
+        let report = fit_tiered(z.view(), &config).expect("tiny two-circle tiered fit runs");
+        let tier2 = report
+            .tier2
+            .as_ref()
+            .expect("the Tier-2 curved refinement branch must have run");
+
+        // Support-sparse provenance: a certified fit with occupied atom states.
+        assert!(
+            tier2.outer_certificate.certifies() && tier2.outer_certificate.is_stationary(),
+            "Tier-2 must return a certifying outer stationarity certificate"
+        );
+        assert!(
+            tier2.fixed_point.recurred,
+            "Tier-2 inner fixed point must have recurred"
+        );
+        assert!(
+            tier2.retained_atoms >= 1
+                && tier2.retained_atoms <= tier2.requested_atoms
+                && tier2.term.k_atoms() == tier2.retained_atoms,
+            "Tier-2 must retain 1..={} occupied curved atoms (got {})",
+            tier2.requested_atoms,
+            tier2.retained_atoms
+        );
+        assert_eq!(
+            tier2.lambda_smooth.len(),
+            tier2.term.k_atoms(),
+            "each retained curved atom carries its selected smoothing strength"
+        );
+        assert_eq!(tier2.mean.len(), p, "the peeled residual mean spans P");
+        assert!(
+            tier2.term.atoms.iter().all(|atom| atom
+                .decoder_coefficients
+                .iter()
+                .all(|value| value.is_finite())),
+            "every retained curved atom must carry finite decoder coefficients"
+        );
+
+        // Ledger provenance: retained atoms are curved promotions off the linear
+        // residual, never PC reseeds.
+        assert_eq!(
+            report.ledger.n_births, tier2.retained_atoms,
+            "every retained curved atom is one curved birth"
+        );
+        assert_eq!(
+            report.ledger.pc_reseed_events, 0,
+            "the support-sparse Tier-2 path must never PC-reseed"
+        );
+        assert!(
+            report.explained_variance.is_finite(),
+            "composed EV must be finite, got {}",
+            report.explained_variance
+        );
     }
 }

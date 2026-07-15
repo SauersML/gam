@@ -263,17 +263,17 @@ fn run() -> Result<(), String> {
     let tiered_report = fit_tiered(z_train_f64.view(), &tiered)?;
     let tiered_wall = t1.elapsed().as_secs_f64();
     let ev_composed_in = tiered_report.explained_variance;
-    let tier2_rounds = tiered_report
+    let tier2_outer_iters = tiered_report
         .tier2
         .as_ref()
-        .map(|r| r.rounds.len())
+        .map(|r| r.outer_iterations)
         .unwrap_or(0);
 
     println!(
-        "[k2000] COMPOSED in_sample_ev={:.6} tier2_rounds={} births={} refusals={} \
+        "[k2000] COMPOSED in_sample_ev={:.6} tier2_outer_iters={} births={} refusals={} \
          pc_reseed_events={} wall={:.1}s",
         ev_composed_in,
-        tier2_rounds,
+        tier2_outer_iters,
         tiered_report.ledger.n_births,
         tiered_report.ledger.n_refusals,
         tiered_report.ledger.pc_reseed_events,
