@@ -622,4 +622,97 @@ mod tests {
             LINEAR_RATE_PROJECTION_CAP
         ));
     }
+
+    /// #979 CTN endgame regression: the counter-based stall guards in
+    /// `inner_blockwise_fit.rs` count a cycle as "no improvement" unless the
+    /// residual drops ≥10% below the best seen, so a slow monotone endgame
+    /// walking the last few percent toward tol (measured: r=9.05e-3 vs
+    /// tol=9.56e-3, killed at cycle 123 when the 120-cycle merit-veto cap
+    /// expired) accumulates a no-improve streak indistinguishable from a flat
+    /// stall. The fix defers those guards to the deterministic reachability
+    /// projection. This test replays the production counter + window
+    /// bookkeeping over both shapes and asserts the projection separates them:
+    /// the endgame stream is classified reachable (guards exempt, solve
+    /// certifies) even after the no-improve streak passes the veto cap, while
+    /// a genuinely flat stream past tol stays unreachable (guards fire).
+    #[test]
+    fn endgame_descent_is_reachable_while_flat_stall_is_not_979() {
+        const LINEAR_RATE_WINDOW: usize = 16;
+        const LINEAR_RATE_PROJECTION_CAP: usize = 100;
+        const RESIDUAL_STALL_NO_IMPROVE_CYCLES: usize = 30;
+        const RESIDUAL_STALL_MERIT_VETO_MAX_CYCLES: usize = 4 * RESIDUAL_STALL_NO_IMPROVE_CYCLES;
+        const RESIDUAL_STALL_IMPROVEMENT_FACTOR: f64 = 0.9;
+        let residual_tol = 9.557e-3_f64;
+
+        // Replay: per-cycle residual stream -> (max no-improve streak reached
+        // while the projection classified tol as UNREACHABLE, cycle tol reached).
+        let replay = |stream: &dyn Fn(usize) -> f64, budget: usize| -> (usize, Option<usize>) {
+            let mut history: std::collections::VecDeque<f64> =
+                std::collections::VecDeque::with_capacity(LINEAR_RATE_WINDOW + 1);
+            let mut best_seen = f64::INFINITY;
+            let mut no_improve = 0usize;
+            let mut worst_unreachable_streak = 0usize;
+            for cycle in 0..budget {
+                let residual = stream(cycle);
+                if residual <= residual_tol {
+                    return (worst_unreachable_streak, Some(cycle));
+                }
+                if residual < RESIDUAL_STALL_IMPROVEMENT_FACTOR * best_seen {
+                    best_seen = residual;
+                    no_improve = 0;
+                } else {
+                    no_improve += 1;
+                }
+                if history.len() > LINEAR_RATE_WINDOW {
+                    history.pop_front();
+                }
+                history.push_back(residual);
+                let reachable = history.len() > LINEAR_RATE_WINDOW
+                    && !slow_geometric_rate_exceeds_projection_cap(
+                        residual,
+                        *history.front().unwrap(),
+                        LINEAR_RATE_WINDOW,
+                        residual_tol,
+                        LINEAR_RATE_PROJECTION_CAP,
+                    );
+                if !reachable && no_improve > worst_unreachable_streak {
+                    worst_unreachable_streak = no_improve;
+                }
+            }
+            (worst_unreachable_streak, None)
+        };
+
+        // CTN endgame shape: an asymptotic terminal approach — the residual
+        // decays toward a level just BELOW tol (ratio → 1 from above), so the
+        // per-cycle drops shrink and the last ≥10% improvement happens ~80
+        // cycles before certification. The no-improve streak at the crossing
+        // (~84) is far past the 30-cycle guard window, so the pre-fix guards
+        // kill this solve; the projection must classify every armed cycle as
+        // reachable, exempting the guards until certification.
+        let endgame = |cycle: usize| residual_tol * (0.98 + 0.52 * 0.98_f64.powi(cycle as i32));
+        let (endgame_streak, endgame_reached) = replay(&endgame, 400);
+        let reached =
+            endgame_reached.expect("the endgame stream must certify within its projection");
+        assert!(
+            reached > RESIDUAL_STALL_MERIT_VETO_MAX_CYCLES,
+            "fixture must genuinely outlive the veto cap to exercise the kill site \
+             (reached tol at cycle {reached})"
+        );
+        assert!(
+            endgame_streak < RESIDUAL_STALL_NO_IMPROVE_CYCLES,
+            "a monotone endgame descent must never accumulate a guard-firing no-improve \
+             streak while the projection says unreachable (worst streak {endgame_streak})"
+        );
+
+        // Genuinely flat stall well above tol: the projection must classify it
+        // unreachable and let the no-improve streak arm the guards.
+        let flat = |_cycle: usize| 150.0 * residual_tol;
+        let (flat_streak, flat_reached) = replay(&flat, 400);
+        assert!(flat_reached.is_none(), "the flat stream must never certify");
+        assert!(
+            flat_streak >= RESIDUAL_STALL_MERIT_VETO_MAX_CYCLES,
+            "a flat residual must keep arming the stall guards through the veto cap \
+             (worst unreachable streak {flat_streak})"
+        );
+    }
 }

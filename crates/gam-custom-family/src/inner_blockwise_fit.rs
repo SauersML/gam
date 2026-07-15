@@ -83,8 +83,10 @@ fn certified_reduced_face_newton_candidate(
     };
     let mut reduced_hessian = tangent.t().dot(exact_hessian).dot(&tangent);
     symmetrize_dense_in_place(&mut reduced_hessian);
-    let (eigenvalues, eigenvectors) = FaerEigh::eigh(&reduced_hessian, faer::Side::Lower)
-        .map_err(|error| format!("exact active-face Hessian eigendecomposition failed: {error:?}"))?;
+    let (eigenvalues, eigenvectors) =
+        FaerEigh::eigh(&reduced_hessian, faer::Side::Lower).map_err(|error| {
+            format!("exact active-face Hessian eigendecomposition failed: {error:?}")
+        })?;
     let curvature_scale = eigenvalues
         .iter()
         .map(|value| value.abs())
@@ -239,15 +241,10 @@ mod exact_face_newton_tests {
             LinearInequalityConstraints::new(array![[1.0_f64, 0.0]], array![0.0])
                 .expect("x>=0 half-space"),
         );
-        let (candidate, active, exact) = certified_reduced_face_newton_candidate(
-            &hessian,
-            &rhs,
-            &beta,
-            &constraints,
-            &[0],
-        )
-        .expect("exact face classification")
-        .expect("positive reduced curvature and nonnegative multiplier");
+        let (candidate, active, exact) =
+            certified_reduced_face_newton_candidate(&hessian, &rhs, &beta, &constraints, &[0])
+                .expect("exact face classification")
+                .expect("positive reduced curvature and nonnegative multiplier");
         assert_eq!(active, vec![0]);
         assert!(exact);
         assert!(candidate[0].abs() <= 1e-12);
@@ -270,15 +267,10 @@ mod exact_face_newton_tests {
             )
             .expect("x>=0 and y<=0.5"),
         );
-        let (candidate, active, exact) = certified_reduced_face_newton_candidate(
-            &hessian,
-            &rhs,
-            &beta,
-            &constraints,
-            &[0],
-        )
-        .expect("reduced face classification")
-        .expect("strict tangent descent to the first blocker");
+        let (candidate, active, exact) =
+            certified_reduced_face_newton_candidate(&hessian, &rhs, &beta, &constraints, &[0])
+                .expect("reduced face classification")
+                .expect("strict tangent descent to the first blocker");
         assert!(candidate[0].abs() <= 1e-12);
         assert!((candidate[1] - 0.5).abs() <= 2e-8);
         assert_eq!(active, vec![0, 1]);
@@ -1759,707 +1751,702 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 joint_active_set,
                 joint_step_spectral_nullity,
                 joint_reduced_face_kind,
-            ) =
-                if solve_joint_constraints_dense
-                    && let Some(constraints) = joint_constraints.as_ref()
+            ) = if solve_joint_constraints_dense
+                && let Some(constraints) = joint_constraints.as_ref()
+            {
+                let mut lhs = match materialize_joint_hessian_source(
+                    &joint_hessian_source,
+                    total_p,
+                    "joint Newton inner constrained Hessian materialization",
+                ) {
+                    Ok(matrix) => matrix,
+                    Err(_) => break,
+                };
+                let mut exact_lhs = lhs.clone();
+                add_joint_penalty_to_matrix(
+                    &mut exact_lhs,
+                    &ranges,
+                    &s_lambdas,
+                    joint_mode_diagonal_ridge,
+                    joint_bundle,
+                );
+                add_joint_penalty_to_matrix(
+                    &mut lhs,
+                    &ranges,
+                    &s_lambdas,
+                    trace_diagonal_ridge,
+                    joint_bundle,
+                );
+                if joint_solver_diagonal_ridge != trace_diagonal_ridge {
+                    for d in 0..lhs.nrows() {
+                        lhs[[d, d]] += joint_solver_diagonal_ridge - trace_diagonal_ridge;
+                    }
+                }
+                check_linear_feasibility(&beta_joint, constraints, 1e-8)
+                    .map_err(|e| format!("joint Newton constrained solve [cycle={cycle}]: {e}"))?;
+                let warm_joint_active =
+                    flatten_joint_active_set(&cached_active_sets, &block_constraints);
+                let lower_bounds = match extract_simple_lower_bounds(constraints, total_p) {
+                    Ok(bounds) => bounds,
+                    Err(_) => break,
+                };
+                // Newton IRLS step in absolute-β space:
+                //
+                //   β_new = H_pen⁻¹ (H_L β + ∇ℓ)
+                //
+                // where H_pen = H_L + S, derived from Newton's update
+                //   β_new = β + H_pen⁻¹(∇ℓ − Sβ)
+                //         = H_pen⁻¹(H_pen β + ∇ℓ − Sβ)
+                //         = H_pen⁻¹(H_L β + ∇ℓ).
+                //
+                // The QP `min 0.5 β' H_pen β − rhs_beta' β` has unconstrained
+                // optimum β = H_pen⁻¹ rhs_beta, so rhs_beta = H_pen β + (∇ℓ − Sβ)
+                // gives the correct Newton update. Passing raw grad_joint (=∇ℓ)
+                // would collapse to β = H_pen⁻¹ ∇ℓ, which at the true optimum
+                // (∇ℓ = Sβ̂) gives H_pen⁻¹ Sβ̂ ≠ β̂ — wrong fixed point.
+                let penalty_beta_joint = apply_joint_block_penalty(
+                    &ranges,
+                    &s_lambdas,
+                    &beta_joint,
+                    joint_mode_diagonal_ridge,
+                    joint_bundle,
+                );
+                let mut rhs_step = &grad_joint - &penalty_beta_joint;
+                // Reuse the head-β Jeffreys triple (consistently attenuated in
+                // `head_jeffreys_term` — both ∇Φ and H_Φ scaled by one scalar,
+                // gam#826/#872/#715). Skipped when the cheap pre-check certifies
+                // well-conditioning: ∇Φ = 0 and H_Φ = 0 there, so neither
+                // rhs_step nor lhs change.
+                // PSD PROJECTION (gam#979). The exact divided-difference H_Φ is
+                // indefinite exactly where Φ is (mixed-sign reduced spectrum at
+                // off-mode trial points). The unconstrained dense-spectral path
+                // consumes it exactly — the Moré–Sorensen subproblem handles
+                // indefiniteness rigorously — but THIS active-set QP requires a
+                // convex model (an indefinite QP cycles its active set and the
+                // inner grinds the budget). Use the PSD part of H_Φ here: honest
+                // magnitudes (unlike the old `K²` vec-Gram phantom), guaranteed
+                // solvable QP, and the exact ∇Φ in the rhs keeps the fixed point
+                // unchanged — only the convergence rate on indefinite stretches
+                // degrades to the damped-Newton rate the constrained path always
+                // had.
+                if let Some((grad_phi, hphi)) = head_jeffreys_term.as_ref()
+                    && grad_phi.len() == rhs_step.len()
                 {
-                    let mut lhs = match materialize_joint_hessian_source(
+                    rhs_step += grad_phi;
+                    exact_lhs += hphi;
+                    lhs += &symmetric_psd_projection(hphi);
+                }
+                // The constrained QP cannot drop ker(H_pen) the way the
+                // spectral range solve does. A numerical gauge therefore
+                // needs positive curvature so the minimizer is unique, but
+                // adding the residual-scaled μ to every diagonal also damps
+                // weak IDENTIFIED modes. The 4,800-row CTN measured the result:
+                // a stable 79-row face, flat objective, and residual contraction
+                // of 0.9998 per cycle. `symmetric_constrained_hessian_geometry`
+                // installs μ only on the certified null projector, leaving
+                // range(H_pen) on the exact Newton equation. A family that
+                // explicitly owns the separate full-rank ill-conditioning case
+                // retains its ambient policy.
+                //
+                // Scale gauge curvature by the PROJECTED stationarity residual,
+                // not the raw RHS: at a constrained optimum the raw RHS includes
+                // the non-vanishing multiplier mass Aᵀλ, while the projected
+                // residual is the actual distance from KKT and tends to zero.
+                let rhs_inf = rhs_step.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                let floor_scale = if current_kkt_norm.is_finite() {
+                    current_kkt_norm.min(rhs_inf)
+                } else {
+                    rhs_inf
+                };
+                let constrained_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * floor_scale;
+                // MODIFIED-NEWTON CONVEXIFICATION (gam#1040 / gam#979). The
+                // exact survival marginal-slope joint NLL Hessian is INDEFINITE
+                // on the flat baseline-hazard λ valley (the linear baseline +
+                // the z·exp(logslope) cross-coupling carry genuine negative
+                // curvature away from the optimum). The active-set QP below
+                // minimizes `½βᵀHβ − rhs_betaᵀβ`; with an indefinite `H` that
+                // model has a direction that LOWERS the local quadratic
+                // objective while moving AWAY from the KKT point. The
+                // trust-region wrapper gates acceptance on the objective-
+                // reduction ratio ρ — NOT on the stationarity residual — so it
+                // accepts every such step at ρ≈1 and GROWS its radius while the
+                // stationarity residual DIVERGES (the measured 3.5e4 → 9.5e6
+                // blow-up on the time block). The unconstrained dense-spectral
+                // path never exhibits this because `WhitenedHessianSpectrum`
+                // already reflects negative-curvature modes to `|γ|`; the
+                // constrained branch must do the same to its dense `lhs`.
+                // Reflecting (not clamping-to-zero) keeps the curvature
+                // magnitude so the QP stays bounded and the step length matches
+                // the dense path; at a genuine constrained optimum the reduced
+                // Hessian is PSD so this is a no-op and the converged β is
+                // unchanged.
+                //
+                // NEWTON-DECREMENT CERTIFICATE ON THE CONSTRAINED PATH
+                // (gam#1040 / gam#1088). The dense-spectral branch populates
+                // `joint_spectrum` (line ~1493) so the convergence loop's
+                // Newton-decrement exit can terminate the geometric/linear tail
+                // when the achievable model descent `½ Σ c_k²/|γ_k|` drops below
+                // `objective_tol`. The constrained branch never set it, so a
+                // weakly-identified survival-MS fit (the n≈2e5 logslope block,
+                // step clamped by the trust region, residual creeping ~7%/cycle)
+                // had no early-exit and ground the whole budget. Build the same
+                // D-whitened spectrum from the penalized `lhs` (decrement reflects
+                // negative modes via `.abs()` internally, so the pre-reflection
+                // `lhs` is the right input) and the augmented stationarity RHS, so
+                // the decrement read is consistent with the dense path. Diagnostic
+                // only for the convergence test — it does NOT change the QP step.
+                if let Ok(spectrum) = whitened_spectrum::WhitenedHessianSpectrum::decompose(
+                    &lhs,
+                    &rhs_step,
+                    &joint_trust_metric_diag,
+                    KKT_REFUSAL_RANK_TOL,
+                ) {
+                    joint_spectrum = Some(spectrum);
+                }
+                let constrained_geometry = symmetric_constrained_hessian_geometry(
+                    &lhs,
+                    constrained_levenberg_mu,
+                    family.levenberg_on_ill_conditioning(),
+                )?;
+                if cycle <= 2 {
+                    let min_eval_raw = constrained_geometry.raw_min_eigenvalue;
+                    let min_eval_refl = constrained_geometry.stabilized_min_eigenvalue;
+                    log::info!(
+                        "[JN-REFLECT-DIAG #1040] cycle={cycle} CONSTRAINED_QP lambda_min_signed_raw={min_eval_raw:.3e} lambda_min_signed_reflected={min_eval_refl:.3e} nullity={} condition={:.3e} (reflection {})",
+                        constrained_geometry.nullity,
+                        constrained_geometry.condition,
+                        if min_eval_refl > min_eval_raw + min_eval_raw.abs() * 1e-9 {
+                            "CHANGED the spectrum"
+                        } else {
+                            "NO-OP (already PSD)"
+                        },
+                    );
+                }
+                // The free solve and bound-multiplier KKT test must use this
+                // same convexified Hessian. Mixing the reflected step model
+                // with the original indefinite curvature or the bare gradient
+                // makes release and entry contradict each other (gam#979).
+                let lhs = constrained_geometry.matrix;
+                let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
+                let exact_face_candidate = if lower_bounds.is_none() {
+                    if let Some(active_rows) = warm_joint_active.as_deref() {
+                        certified_reduced_face_newton_candidate(
+                            &exact_lhs,
+                            &rhs_step,
+                            &beta_joint,
+                            constraints,
+                            active_rows,
+                        )?
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let exact_face_kind = exact_face_candidate.as_ref().map(|(_, _, exact)| *exact);
+                let solve_result = if let Some((candidate, active, _)) = exact_face_candidate {
+                    Ok((candidate, active))
+                } else if let Some(bounds) = lower_bounds.as_ref() {
+                    solve_quadratic_with_simple_lower_bounds(
+                        &lhs,
+                        &rhs_beta,
+                        &beta_joint,
+                        bounds,
+                        warm_joint_active.as_deref(),
+                    )
+                } else {
+                    gam_solve::active_set::solve_quadratic_with_constraint_set(
+                        &lhs,
+                        &rhs_beta,
+                        &beta_joint,
+                        constraints,
+                        warm_joint_active.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())
+                };
+                match solve_result {
+                    Ok((beta_new, active_set)) => {
+                        // gam#979 constrained-QP probe (temporary): per-cycle
+                        // active-set size + ‖β‖∞ so the failing survival pytest's
+                        // captured WARN output distinguishes (a) a THRASHING active
+                        // set (rows change every cycle → the QP never settles) from
+                        // (c) a STABLE set with a blowing-up free direction
+                        // (near-separation: ‖β‖∞ grows unbounded). WARN reaches the
+                        // failing-test capture; the cond/nullity/diagnosis come from
+                        // the existing `format_structured_log` at the refused exit.
+                        log::warn!(
+                            "[gam#979 constrained-QP] cycle={} path={} warm_rows={} active_set_rows={} beta_inf={:.4e}",
+                            cycle,
+                            if exact_face_kind == Some(true) {
+                                "exact-face"
+                            } else if exact_face_kind == Some(false) {
+                                "tangent-face"
+                            } else if lower_bounds.is_some() {
+                                "simple"
+                            } else {
+                                "linear"
+                            },
+                            warm_joint_active.as_ref().map_or(0, |v| v.len()),
+                            active_set.len(),
+                            beta_new.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
+                        );
+                        (beta_new, Some(active_set), 0usize, exact_face_kind)
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "joint constrained Newton QP failed at cycle {cycle} \
+                                 (constraint_rows={}, warm_active_rows={}, beta_inf={:.6e}, \
+                                 rhs_inf={:.6e}): {error}",
+                            constraints.nrows(),
+                            warm_joint_active.as_ref().map_or(0, Vec::len),
+                            beta_joint
+                                .iter()
+                                .map(|value| value.abs())
+                                .fold(0.0_f64, f64::max),
+                            rhs_step
+                                .iter()
+                                .map(|value| value.abs())
+                                .fold(0.0_f64, f64::max),
+                        ));
+                    }
+                }
+            } else {
+                // Stationarity residual: r = S*beta - gradient (for penalized NLL)
+                let penalty_beta = apply_joint_block_penalty(
+                    &ranges,
+                    &s_lambdas,
+                    &beta_joint,
+                    joint_mode_diagonal_ridge,
+                    joint_bundle,
+                );
+                let mut rhs = &grad_joint - &penalty_beta;
+                // Universal robustness: fold the family-general
+                // Jeffreys/Firth curvature `H_Φ` and score `∇Φ` into BOTH the
+                // matrix-free PCG step AND the dense spectral fallback below,
+                // scoped to the full-span basis `Z_J`. Computed ONCE here
+                // so the matvec closure and the RHS share the SAME term and the
+                // fallback does not recompute it. The inner objective is
+                // `−ℓ + ½βᵀSβ − Φ`, so the Newton system the step must solve is
+                //   (H + S_λ + H_Φ) δ = (∇ℓ − S_λβ) + ∇Φ.
+                // Previously the PCG matvec applied only `H + S_λ` and its RHS
+                // omitted `∇Φ`, so on the matrix-free path (large p / large n)
+                // Firth was a SILENT NO-OP: the proper-prior never reached the
+                // step that actually moves β, leaving separation/under-
+                // identification uncured exactly where the dense route is not
+                // taken. The dense route (small p, e.g. BMS p≈51) was already
+                // correct. `H_Φ` is the full-span Gauss-Newton surrogate
+                // `½ J H_id⁻¹ Jᵀ` (Z_J = identity ⇒ p×p, not low-rank), but the
+                // conditioning gate in `joint_jeffreys_term` returns the zero
+                // term on every well-conditioned fit, so this only arms on the
+                // near-separating span
+                // — and `hphi` is materialized once per cycle regardless, so the
+                // matvec adds only one O(p²) HVP, preserving the matrix-free
+                // path's asymptotics where Firth is negligible (term = `None`).
+                // Cheap pre-check certified well-conditioned ⇒ the exact term
+                // is the zero contribution (∇Φ = 0, H_Φ = 0). Short-circuit to
+                // `None` WITHOUT materializing the dense joint Hessian or running
+                // the O(p³) reduced eigendecomposition — this is the matrix-free
+                // PCG hot path, where forming a dense p×p H_Φ every cycle was the
+                // regression. Byte-identical to the gated-off dense path: `rhs`
+                // is left as `∇ℓ − S_λβ` and no H_Φ is folded into the matvec.
+                // Reuse the head-β Jeffreys triple (computed once this cycle);
+                // this Newton step is built at the same cycle-start β.
+                let inner_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
+                    match head_jeffreys_term.as_ref() {
+                        Some((grad_phi, hphi)) if grad_phi.len() == rhs.len() => {
+                            rhs += grad_phi;
+                            Some((grad_phi.clone(), hphi.clone()))
+                        }
+                        _ => None,
+                    };
+                // PSD PROJECTION for the SPD-PCG matvec (gam#979): the exact
+                // divided-difference H_Φ can be indefinite at off-mode trial
+                // points, which breaks the SPD-CG contract. The matvec uses its
+                // PSD part; the dense spectral fallback below keeps the EXACT
+                // (possibly indefinite) H_Φ — the Moré–Sorensen subproblem
+                // handles it rigorously.
+                let inner_jeffreys_hphi: Option<Arc<Array2<f64>>> = inner_jeffreys_term
+                    .as_ref()
+                    .map(|(_grad_phi, hphi)| Arc::new(symmetric_psd_projection(hphi)));
+                let pcg_started = std::time::Instant::now();
+                let pcg_requested = matrix_free_joint_requested
+                    && !joint_hessian_is_dense
+                    && !returned_mode_curvature_pending;
+                let mut spectral_nullity_for_step = 0usize;
+                let mut delta = if pcg_requested {
+                    let preconditioner_diag = match &joint_hessian_source {
+                        JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
+                            &h_joint.diag().to_owned(),
+                            &ranges,
+                            &s_lambdas,
+                            joint_solver_diagonal_ridge,
+                            joint_bundle,
+                        ),
+                        JointHessianSource::Operator { diagonal, .. } => {
+                            joint_penalty_preconditioner_diag(
+                                diagonal,
+                                &ranges,
+                                &s_lambdas,
+                                joint_solver_diagonal_ridge,
+                                joint_bundle,
+                            )
+                        }
+                    };
+                    // Pre-allocate the penalty workspace ONCE outside the
+                    // PCG closure so each CG iter (called hundreds-to-
+                    // thousands of times per outer iter at large scale)
+                    // reuses the buffer instead of allocating per call.
+                    // RefCell because solve_spd_pcg* expects `Fn` (immutable
+                    // borrow of captures) and we need interior mutability
+                    // to write into the workspace.
+                    let penalty_workspace = RefCell::new(Array1::<f64>::zeros(total_p));
+                    // Capture the Jeffreys/Firth curvature for the matvec. When
+                    // armed (and nonzero past the conditioning gate) the PCG
+                    // operator becomes `H + S_λ + H_Φ`, matching the augmented
+                    // RHS `(∇ℓ − S_λβ) + ∇Φ` set above and the dense spectral
+                    // fallback. `None` keeps the unaugmented matvec.
+                    let pcg_hphi_dense = inner_jeffreys_hphi.clone();
+                    let pcg_hphi_op = inner_jeffreys_hphi.clone();
+                    match &joint_hessian_source {
+                        JointHessianSource::Dense(h_joint) => {
+                            gam_linalg::utils::solve_spd_pcg_with_info_into(
+                                |v, out| {
+                                    // h_joint * v -> out (faer-backed, no alloc)
+                                    gam_linalg::faer_ndarray::fast_av_view_into(
+                                        h_joint,
+                                        v,
+                                        out.view_mut(),
+                                    );
+                                    let mut pen = penalty_workspace.borrow_mut();
+                                    apply_joint_block_penalty_into(
+                                        &ranges,
+                                        &s_lambdas,
+                                        v,
+                                        joint_solver_diagonal_ridge,
+                                        &mut pen,
+                                        joint_bundle,
+                                    );
+                                    *out += &*pen;
+                                    if let Some(hphi) = pcg_hphi_dense.as_ref() {
+                                        *out += &hphi.dot(v);
+                                    }
+                                },
+                                &rhs,
+                                &preconditioner_diag,
+                                pcg_rel_tol,
+                                JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
+                            )
+                            .map(|(solution, info)| {
+                                log_joint_pcg_diagnostics(
+                                    cycle,
+                                    total_p,
+                                    total_joint_n,
+                                    &preconditioner_diag,
+                                    &info,
+                                );
+                                solution
+                            })
+                        }
+                        JointHessianSource::Operator { apply_into, .. } => {
+                            let apply_h_into = Arc::clone(apply_into);
+                            gam_linalg::utils::solve_spd_pcg_with_info_into(
+                                |v, out| {
+                                    if let Err(error) = apply_h_into(v, out) {
+                                        log::warn!(
+                                            "joint Newton inner operator matvec failed: {error}"
+                                        );
+                                        out.fill(0.0);
+                                    }
+                                    let mut pen = penalty_workspace.borrow_mut();
+                                    apply_joint_block_penalty_into(
+                                        &ranges,
+                                        &s_lambdas,
+                                        v,
+                                        joint_solver_diagonal_ridge,
+                                        &mut pen,
+                                        joint_bundle,
+                                    );
+                                    *out += &*pen;
+                                    if let Some(hphi) = pcg_hphi_op.as_ref() {
+                                        *out += &hphi.dot(v);
+                                    }
+                                },
+                                &rhs,
+                                &preconditioner_diag,
+                                pcg_rel_tol,
+                                JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
+                            )
+                            .map(|(solution, info)| {
+                                log_joint_pcg_diagnostics(
+                                    cycle,
+                                    total_p,
+                                    total_joint_n,
+                                    &preconditioner_diag,
+                                    &info,
+                                );
+                                solution
+                            })
+                        }
+                    }
+                } else {
+                    None
+                };
+                if pcg_requested {
+                    log::info!(
+                        "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} solved={} elapsed={:.3}s",
+                        cycle,
+                        total_joint_n,
+                        total_p,
+                        delta.is_some(),
+                        pcg_started.elapsed().as_secs_f64()
+                    );
+                }
+                if delta.is_none() {
+                    if pcg_requested {
+                        break;
+                    }
+                    let mut lhs_true = match materialize_joint_hessian_source(
                         &joint_hessian_source,
                         total_p,
-                        "joint Newton inner constrained Hessian materialization",
+                        "joint Newton inner dense fallback Hessian materialization",
                     ) {
                         Ok(matrix) => matrix,
                         Err(_) => break,
                     };
-                    let mut exact_lhs = lhs.clone();
+                    // Capture the unpenalized dense `H` for the rest of this
+                    // cycle (gam#1040): the Cauchy leg and trust-region
+                    // predicted-reduction matvecs below can then reuse it as a
+                    // cheap `O(p²)` dense matvec instead of re-applying a
+                    // matrix-free operator `O(n·p)` per attempt. Only when the
+                    // source is an `Operator` — a `Dense` source already gives
+                    // those matvecs the fast path, so cloning would be waste.
+                    if matches!(&joint_hessian_source, JointHessianSource::Operator { .. }) {
+                        materialized_dense_unpenalized = Some(lhs_true.clone());
+                    }
+                    // Snapshot the Jeffreys information matrix only when a
+                    // family supplies the contracted completion. The generic
+                    // pairwise fallback costs p(p+1)/2 full second-directional
+                    // Hessian passes; at biobank scale (BMS p=35, n≈196k) it
+                    // turns a near-converged polishing cycle into ~50s of row
+                    // work. Without a contracted hook the divided-difference
+                    // H_phi model remains first-order correct and the KKT
+                    // certificate owns convergence.
+                    let jeffreys_completion_requested =
+                        family.joint_jeffreys_information_contracted_trace_hessian_available();
+                    let h_info_for_completion = (jeffreys_completion_endgame
+                        && inner_jeffreys_term.is_some()
+                        && jeffreys_completion_requested)
+                        .then(|| family.joint_jeffreys_information_with_specs(&states, specs))
+                        .transpose()?
+                        .flatten();
                     add_joint_penalty_to_matrix(
-                        &mut exact_lhs,
+                        &mut lhs_true,
                         &ranges,
                         &s_lambdas,
                         joint_mode_diagonal_ridge,
                         joint_bundle,
                     );
-                    add_joint_penalty_to_matrix(
-                        &mut lhs,
-                        &ranges,
-                        &s_lambdas,
-                        trace_diagonal_ridge,
-                        joint_bundle,
-                    );
-                    if joint_solver_diagonal_ridge != trace_diagonal_ridge {
-                        for d in 0..lhs.nrows() {
-                            lhs[[d, d]] += joint_solver_diagonal_ridge - trace_diagonal_ridge;
+                    // Universal robustness: add the
+                    // family-general Jeffreys curvature `H_Phi` to the
+                    // penalized Hessian. This is the Tier-B coupled-Newton form
+                    // of Firth: the reduced Fisher information `Z_J^T H Z_J`
+                    // supplies the missing O(n) curvature that bounds a
+                    // near-separating coefficient to O(1). When the Jeffreys
+                    // term is unavailable, the step stays unaugmented.
+                    //
+                    // `∇Φ` is NOT re-added here: `rhs` (and thus `spectral_rhs`)
+                    // already carries `+∇Φ` from the single shared computation
+                    // above, and we REUSE that same `H_Φ` here rather than
+                    // recomputing the (O(p) directional-derivative) term — the
+                    // dense fallback and the matrix-free PCG step now solve the
+                    // SAME Jeffreys-augmented Newton system.
+                    let spectral_rhs = rhs.clone();
+                    if let Some((_grad_phi, hphi)) = inner_jeffreys_term.as_ref() {
+                        lhs_true += hphi;
+                        // ENDGAME EXACTNESS (gam#979). The divided-difference
+                        // H_Φ omits the second-directional-Hessian remainder
+                        // `½ tr(K · D_ab)`; near a Firth-active mode that
+                        // remainder is comparable to the kept curvature, so
+                        // Newton converges only linearly (a residual sawtooth
+                        // plateauing just above the certificate tolerance —
+                        // enough mode noise to swamp outer finite differences
+                        // and feed the IFT near-flat-kernel amplification).
+                        // Once the residual enters the convergence band, add
+                        // the exact completion so the model is the true
+                        // Hessian of the Φ-augmented objective and the endgame
+                        // is quadratic. A family contracted trace hook can
+                        // supply it at any width; the pairwise `p(p+1)/2`
+                        // fallback remains limited to moderate p. `None`
+                        // degrades safely to the divided-difference model.
+                        if let (Some(h_info), Some(z_joint)) = (
+                            h_info_for_completion.as_ref(),
+                            joint_jeffreys_subspace.as_ref(),
+                        ) && let Some(completion) =
+                            custom_family_joint_jeffreys_second_order_completion(
+                                family, &states, specs, h_info, z_joint, false,
+                            )?
+                        {
+                            // TRUST-REGION GATE (gam#1607): fold the completion
+                            // only when `H_Φ + completion` stays PSD. In the
+                            // near-separable regime the `−½ tr(K·D_ab)` remainder
+                            // explodes negative and cancels `H_Φ`, leaving the
+                            // augmented inner Hessian strongly indefinite. The
+                            // trust-region spectral solve below would reflect those
+                            // negative modes, but that turns the quadratic endgame
+                            // back into a reflected-descent crawl that plateaus
+                            // above the certificate tolerance ("inner solve exited
+                            // before convergence"). Keeping the bounded PSD `H_Φ`
+                            // model preserves the linear-but-monotone endgame the
+                            // divided-difference solve already certifies.
+                            if custom_family_jeffreys_completion_preserves_psd(hphi, &completion) {
+                                lhs_true += &completion;
+                            }
                         }
                     }
-                    check_linear_feasibility(&beta_joint, constraints, 1e-8).map_err(|e| {
-                        format!("joint Newton constrained solve [cycle={cycle}]: {e}")
-                    })?;
-                    let warm_joint_active =
-                        flatten_joint_active_set(&cached_active_sets, &block_constraints);
-                    let lower_bounds = match extract_simple_lower_bounds(constraints, total_p) {
-                        Ok(bounds) => bounds,
-                        Err(_) => break,
-                    };
-                    // Newton IRLS step in absolute-β space:
-                    //
-                    //   β_new = H_pen⁻¹ (H_L β + ∇ℓ)
-                    //
-                    // where H_pen = H_L + S, derived from Newton's update
-                    //   β_new = β + H_pen⁻¹(∇ℓ − Sβ)
-                    //         = H_pen⁻¹(H_pen β + ∇ℓ − Sβ)
-                    //         = H_pen⁻¹(H_L β + ∇ℓ).
-                    //
-                    // The QP `min 0.5 β' H_pen β − rhs_beta' β` has unconstrained
-                    // optimum β = H_pen⁻¹ rhs_beta, so rhs_beta = H_pen β + (∇ℓ − Sβ)
-                    // gives the correct Newton update. Passing raw grad_joint (=∇ℓ)
-                    // would collapse to β = H_pen⁻¹ ∇ℓ, which at the true optimum
-                    // (∇ℓ = Sβ̂) gives H_pen⁻¹ Sβ̂ ≠ β̂ — wrong fixed point.
-                    let penalty_beta_joint = apply_joint_block_penalty(
-                        &ranges,
-                        &s_lambdas,
-                        &beta_joint,
-                        joint_mode_diagonal_ridge,
-                        joint_bundle,
-                    );
-                    let mut rhs_step = &grad_joint - &penalty_beta_joint;
-                    // Reuse the head-β Jeffreys triple (consistently attenuated in
-                    // `head_jeffreys_term` — both ∇Φ and H_Φ scaled by one scalar,
-                    // gam#826/#872/#715). Skipped when the cheap pre-check certifies
-                    // well-conditioning: ∇Φ = 0 and H_Φ = 0 there, so neither
-                    // rhs_step nor lhs change.
-                    // PSD PROJECTION (gam#979). The exact divided-difference H_Φ is
-                    // indefinite exactly where Φ is (mixed-sign reduced spectrum at
-                    // off-mode trial points). The unconstrained dense-spectral path
-                    // consumes it exactly — the Moré–Sorensen subproblem handles
-                    // indefiniteness rigorously — but THIS active-set QP requires a
-                    // convex model (an indefinite QP cycles its active set and the
-                    // inner grinds the budget). Use the PSD part of H_Φ here: honest
-                    // magnitudes (unlike the old `K²` vec-Gram phantom), guaranteed
-                    // solvable QP, and the exact ∇Φ in the rhs keeps the fixed point
-                    // unchanged — only the convergence rate on indefinite stretches
-                    // degrades to the damped-Newton rate the constrained path always
-                    // had.
-                    if let Some((grad_phi, hphi)) = head_jeffreys_term.as_ref()
-                        && grad_phi.len() == rhs_step.len()
-                    {
-                        rhs_step += grad_phi;
-                        exact_lhs += hphi;
-                        lhs += &symmetric_psd_projection(hphi);
-                    }
-                    // The constrained QP cannot drop ker(H_pen) the way the
-                    // spectral range solve does. A numerical gauge therefore
-                    // needs positive curvature so the minimizer is unique, but
-                    // adding the residual-scaled μ to every diagonal also damps
-                    // weak IDENTIFIED modes. The 4,800-row CTN measured the result:
-                    // a stable 79-row face, flat objective, and residual contraction
-                    // of 0.9998 per cycle. `symmetric_constrained_hessian_geometry`
-                    // installs μ only on the certified null projector, leaving
-                    // range(H_pen) on the exact Newton equation. A family that
-                    // explicitly owns the separate full-rank ill-conditioning case
-                    // retains its ambient policy.
-                    //
-                    // Scale gauge curvature by the PROJECTED stationarity residual,
-                    // not the raw RHS: at a constrained optimum the raw RHS includes
-                    // the non-vanishing multiplier mass Aᵀλ, while the projected
-                    // residual is the actual distance from KKT and tends to zero.
-                    let rhs_inf = rhs_step.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-                    let floor_scale = if current_kkt_norm.is_finite() {
-                        current_kkt_norm.min(rhs_inf)
-                    } else {
-                        rhs_inf
-                    };
-                    let constrained_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * floor_scale;
-                    // MODIFIED-NEWTON CONVEXIFICATION (gam#1040 / gam#979). The
-                    // exact survival marginal-slope joint NLL Hessian is INDEFINITE
-                    // on the flat baseline-hazard λ valley (the linear baseline +
-                    // the z·exp(logslope) cross-coupling carry genuine negative
-                    // curvature away from the optimum). The active-set QP below
-                    // minimizes `½βᵀHβ − rhs_betaᵀβ`; with an indefinite `H` that
-                    // model has a direction that LOWERS the local quadratic
-                    // objective while moving AWAY from the KKT point. The
-                    // trust-region wrapper gates acceptance on the objective-
-                    // reduction ratio ρ — NOT on the stationarity residual — so it
-                    // accepts every such step at ρ≈1 and GROWS its radius while the
-                    // stationarity residual DIVERGES (the measured 3.5e4 → 9.5e6
-                    // blow-up on the time block). The unconstrained dense-spectral
-                    // path never exhibits this because `WhitenedHessianSpectrum`
-                    // already reflects negative-curvature modes to `|γ|`; the
-                    // constrained branch must do the same to its dense `lhs`.
-                    // Reflecting (not clamping-to-zero) keeps the curvature
-                    // magnitude so the QP stays bounded and the step length matches
-                    // the dense path; at a genuine constrained optimum the reduced
-                    // Hessian is PSD so this is a no-op and the converged β is
-                    // unchanged.
-                    //
-                    // NEWTON-DECREMENT CERTIFICATE ON THE CONSTRAINED PATH
-                    // (gam#1040 / gam#1088). The dense-spectral branch populates
-                    // `joint_spectrum` (line ~1493) so the convergence loop's
-                    // Newton-decrement exit can terminate the geometric/linear tail
-                    // when the achievable model descent `½ Σ c_k²/|γ_k|` drops below
-                    // `objective_tol`. The constrained branch never set it, so a
-                    // weakly-identified survival-MS fit (the n≈2e5 logslope block,
-                    // step clamped by the trust region, residual creeping ~7%/cycle)
-                    // had no early-exit and ground the whole budget. Build the same
-                    // D-whitened spectrum from the penalized `lhs` (decrement reflects
-                    // negative modes via `.abs()` internally, so the pre-reflection
-                    // `lhs` is the right input) and the augmented stationarity RHS, so
-                    // the decrement read is consistent with the dense path. Diagnostic
-                    // only for the convergence test — it does NOT change the QP step.
-                    if let Ok(spectrum) = whitened_spectrum::WhitenedHessianSpectrum::decompose(
-                        &lhs,
-                        &rhs_step,
+                    // Single metric-whitened eigendecomposition drives BOTH the
+                    // seed step and every trust-region re-solve this cycle
+                    // (gam#979). The prior code ran a SECOND O(p³)
+                    // eigendecomposition of the raw Hessian here purely to form
+                    // the seed step — doubling the dominant per-cycle cost on the
+                    // ~5 s/cycle ill-conditioned survival marginal-slope inner.
+                    // The exact trust-region multiplier λ (chosen so ‖δ‖_D = r)
+                    // subsumes the old self-vanishing Levenberg-μ seed: `decompose`
+                    // whitens by the trust metric so the penalty (λ~e²⁴) and the
+                    // likelihood scales are throttled uniformly — the scale
+                    // invariance the multiplicative μ approximated. `lhs_true`
+                    // already carries the penalty and the Firth/Jeffreys curvature
+                    // H_Φ and `spectral_rhs` the augmented stationarity RHS, so the
+                    // subproblem model matches the predicted-reduction model and the
+                    // accept/reject gain ratio exactly.
+                    let spectrum = whitened_spectrum::WhitenedHessianSpectrum::decompose(
+                        &lhs_true,
+                        &spectral_rhs,
                         &joint_trust_metric_diag,
                         KKT_REFUSAL_RANK_TOL,
-                    ) {
-                        joint_spectrum = Some(spectrum);
-                    }
-                    let constrained_geometry = symmetric_constrained_hessian_geometry(
-                        &lhs,
-                        constrained_levenberg_mu,
-                        family.levenberg_on_ill_conditioning(),
                     )?;
-                    if cycle <= 2 {
-                        let min_eval_raw = constrained_geometry.raw_min_eigenvalue;
-                        let min_eval_refl = constrained_geometry.stabilized_min_eigenvalue;
-                        log::info!(
-                            "[JN-REFLECT-DIAG #1040] cycle={cycle} CONSTRAINED_QP lambda_min_signed_raw={min_eval_raw:.3e} lambda_min_signed_reflected={min_eval_refl:.3e} nullity={} condition={:.3e} (reflection {})",
-                            constrained_geometry.nullity,
-                            constrained_geometry.condition,
-                            if min_eval_refl > min_eval_raw + min_eval_raw.abs() * 1e-9 {
-                                "CHANGED the spectrum"
-                            } else {
-                                "NO-OP (already PSD)"
-                            },
-                        );
-                    }
-                    // The free solve and bound-multiplier KKT test must use this
-                    // same convexified Hessian. Mixing the reflected step model
-                    // with the original indefinite curvature or the bare gradient
-                    // makes release and entry contradict each other (gam#979).
-                    let lhs = constrained_geometry.matrix;
-                    let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
-                    let exact_face_candidate = if lower_bounds.is_none() {
-                        if let Some(active_rows) = warm_joint_active.as_deref() {
-                            certified_reduced_face_newton_candidate(
-                                &exact_lhs,
-                                &rhs_step,
-                                &beta_joint,
-                                constraints,
-                                active_rows,
-                            )?
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    let exact_face_kind = exact_face_candidate
-                        .as_ref()
-                        .map(|(_, _, exact)| *exact);
-                    let solve_result = if let Some((candidate, active, _)) = exact_face_candidate {
-                        Ok((candidate, active))
-                    } else if let Some(bounds) = lower_bounds.as_ref() {
-                        solve_quadratic_with_simple_lower_bounds(
-                            &lhs,
-                            &rhs_beta,
-                            &beta_joint,
-                            bounds,
-                            warm_joint_active.as_deref(),
-                        )
-                    } else {
-                        gam_solve::active_set::solve_quadratic_with_constraint_set(
-                            &lhs,
-                            &rhs_beta,
-                            &beta_joint,
-                            constraints,
-                            warm_joint_active.as_deref(),
-                        )
-                        .map_err(|e| e.to_string())
-                    };
-                    match solve_result {
-                        Ok((beta_new, active_set)) => {
-                            // gam#979 constrained-QP probe (temporary): per-cycle
-                            // active-set size + ‖β‖∞ so the failing survival pytest's
-                            // captured WARN output distinguishes (a) a THRASHING active
-                            // set (rows change every cycle → the QP never settles) from
-                            // (c) a STABLE set with a blowing-up free direction
-                            // (near-separation: ‖β‖∞ grows unbounded). WARN reaches the
-                            // failing-test capture; the cond/nullity/diagnosis come from
-                            // the existing `format_structured_log` at the refused exit.
-                            log::warn!(
-                                "[gam#979 constrained-QP] cycle={} path={} warm_rows={} active_set_rows={} beta_inf={:.4e}",
-                                cycle,
-                                if exact_face_kind == Some(true) {
-                                    "exact-face"
-                                } else if exact_face_kind == Some(false) {
-                                    "tangent-face"
-                                } else if lower_bounds.is_some() {
-                                    "simple"
-                                } else {
-                                    "linear"
-                                },
-                                warm_joint_active.as_ref().map_or(0, |v| v.len()),
-                                active_set.len(),
-                                beta_new.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
-                            );
-                            (beta_new, Some(active_set), 0usize, exact_face_kind)
-                        }
-                        Err(error) => {
-                            return Err(format!(
-                                "joint constrained Newton QP failed at cycle {cycle} \
-                                 (constraint_rows={}, warm_active_rows={}, beta_inf={:.6e}, \
-                                 rhs_inf={:.6e}): {error}",
-                                constraints.nrows(),
-                                warm_joint_active.as_ref().map_or(0, Vec::len),
-                                beta_joint.iter().map(|value| value.abs()).fold(0.0_f64, f64::max),
-                                rhs_step.iter().map(|value| value.abs()).fold(0.0_f64, f64::max),
-                            ));
-                        }
-                    }
-                } else {
-                    // Stationarity residual: r = S*beta - gradient (for penalized NLL)
-                    let penalty_beta = apply_joint_block_penalty(
-                        &ranges,
-                        &s_lambdas,
-                        &beta_joint,
-                        joint_mode_diagonal_ridge,
-                        joint_bundle,
-                    );
-                    let mut rhs = &grad_joint - &penalty_beta;
-                    // Universal robustness: fold the family-general
-                    // Jeffreys/Firth curvature `H_Φ` and score `∇Φ` into BOTH the
-                    // matrix-free PCG step AND the dense spectral fallback below,
-                    // scoped to the full-span basis `Z_J`. Computed ONCE here
-                    // so the matvec closure and the RHS share the SAME term and the
-                    // fallback does not recompute it. The inner objective is
-                    // `−ℓ + ½βᵀSβ − Φ`, so the Newton system the step must solve is
-                    //   (H + S_λ + H_Φ) δ = (∇ℓ − S_λβ) + ∇Φ.
-                    // Previously the PCG matvec applied only `H + S_λ` and its RHS
-                    // omitted `∇Φ`, so on the matrix-free path (large p / large n)
-                    // Firth was a SILENT NO-OP: the proper-prior never reached the
-                    // step that actually moves β, leaving separation/under-
-                    // identification uncured exactly where the dense route is not
-                    // taken. The dense route (small p, e.g. BMS p≈51) was already
-                    // correct. `H_Φ` is the full-span Gauss-Newton surrogate
-                    // `½ J H_id⁻¹ Jᵀ` (Z_J = identity ⇒ p×p, not low-rank), but the
-                    // conditioning gate in `joint_jeffreys_term` returns the zero
-                    // term on every well-conditioned fit, so this only arms on the
-                    // near-separating span
-                    // — and `hphi` is materialized once per cycle regardless, so the
-                    // matvec adds only one O(p²) HVP, preserving the matrix-free
-                    // path's asymptotics where Firth is negligible (term = `None`).
-                    // Cheap pre-check certified well-conditioned ⇒ the exact term
-                    // is the zero contribution (∇Φ = 0, H_Φ = 0). Short-circuit to
-                    // `None` WITHOUT materializing the dense joint Hessian or running
-                    // the O(p³) reduced eigendecomposition — this is the matrix-free
-                    // PCG hot path, where forming a dense p×p H_Φ every cycle was the
-                    // regression. Byte-identical to the gated-off dense path: `rhs`
-                    // is left as `∇ℓ − S_λβ` and no H_Φ is folded into the matvec.
-                    // Reuse the head-β Jeffreys triple (computed once this cycle);
-                    // this Newton step is built at the same cycle-start β.
-                    let inner_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
-                        match head_jeffreys_term.as_ref() {
-                            Some((grad_phi, hphi)) if grad_phi.len() == rhs.len() => {
-                                rhs += grad_phi;
-                                Some((grad_phi.clone(), hphi.clone()))
+                    // Seed = the unconstrained (Moore–Penrose, range-restricted)
+                    // exact step, so cycle 0 can take the full Newton step on a
+                    // well-conditioned model (the cycle-0 radius bump below relies
+                    // on this); the trust loop re-solves at finite radius for every
+                    // subsequent attempt. An indefinite model reflects negative
+                    // curvature to |λ|, exactly as the prior spectral solve did.
+                    let spectral_step = spectrum.trust_region_step(f64::INFINITY);
+                    spectral_nullity_for_step = spectral_step.nullity;
+                    // gam#979: Levenberg shift-to-PD of the SEED search direction on
+                    // the rigid ill-conditioned path. When the whitened inner Hessian
+                    // is indefinite the Moré–Sorensen step reflects the negative
+                    // modes to |λ|; on the near-separable coupled marginal-slope
+                    // surface those reflected modes then ride a poor gain ratio that
+                    // shrinks the single scalar trust radius, which clamps the
+                    // *well-conditioned* modes that DO carry real descent — the
+                    // measured "reflected-descent crawl" where the residual plateaus
+                    // (‖g‖~1e-1) while the objective creeps down ~1e-3/cycle and the
+                    // solve exhausts its budget without ever reaching residual_tol
+                    // (the binary twin of the survival-MS oversmoothed-ρ endgame).
+                    // Once the residual has stalled for a few cycles, seed the trust
+                    // loop from a genuinely convex modified-Newton step: add
+                    // μ·D_trust (μ just above |λ_min| so the reflected modes become
+                    // gently positive while the well-conditioned modes, |λ|≫μ, keep
+                    // their full Newton step) and re-solve once. This is a modified-
+                    // Newton SEARCH DIRECTION only — the trust-region accept/reject
+                    // still judges it against the true `lhs_true` model, `joint_spectrum`
+                    // stays the exact (unshifted) spectrum for the trust re-solves and
+                    // the Newton-decrement certificate, and μ is applied ONLY while the
+                    // Hessian is indefinite (it vanishes once the endgame becomes PD),
+                    // so a healthy convex fit is byte-unchanged and no non-minimum can
+                    // be certified. Family-gated on `levenberg_on_ill_conditioning()`.
+                    const JOINT_REFLECTED_CONVEXIFY_STALL_WINDOW: usize = 3;
+                    const JOINT_REFLECTED_CONVEXIFY_MARGIN: f64 = 1.5;
+                    let mut seed_delta = spectral_step.delta;
+                    if family.levenberg_on_ill_conditioning()
+                        && spectral_step.reflected_negative_modes > 0
+                        && cycles_since_residual_improved >= JOINT_REFLECTED_CONVEXIFY_STALL_WINDOW
+                        && spectral_step.most_negative_eigenvalue.is_finite()
+                        && spectral_step.most_negative_eigenvalue < 0.0
+                    {
+                        let mu = spectral_step.most_negative_eigenvalue.abs()
+                            * JOINT_REFLECTED_CONVEXIFY_MARGIN;
+                        if mu.is_finite() && mu > 0.0 {
+                            let mut lhs_convex = lhs_true.clone();
+                            for d in 0..lhs_convex.nrows() {
+                                lhs_convex[[d, d]] += mu * joint_trust_metric_diag[d];
                             }
-                            _ => None,
-                        };
-                    // PSD PROJECTION for the SPD-PCG matvec (gam#979): the exact
-                    // divided-difference H_Φ can be indefinite at off-mode trial
-                    // points, which breaks the SPD-CG contract. The matvec uses its
-                    // PSD part; the dense spectral fallback below keeps the EXACT
-                    // (possibly indefinite) H_Φ — the Moré–Sorensen subproblem
-                    // handles it rigorously.
-                    let inner_jeffreys_hphi: Option<Arc<Array2<f64>>> = inner_jeffreys_term
-                        .as_ref()
-                        .map(|(_grad_phi, hphi)| Arc::new(symmetric_psd_projection(hphi)));
-                    let pcg_started = std::time::Instant::now();
-                    let pcg_requested = matrix_free_joint_requested
-                        && !joint_hessian_is_dense
-                        && !returned_mode_curvature_pending;
-                    let mut spectral_nullity_for_step = 0usize;
-                    let mut delta = if pcg_requested {
-                        let preconditioner_diag = match &joint_hessian_source {
-                            JointHessianSource::Dense(h_joint) => {
-                                joint_penalty_preconditioner_diag(
-                                    &h_joint.diag().to_owned(),
-                                    &ranges,
-                                    &s_lambdas,
-                                    joint_solver_diagonal_ridge,
-                                    joint_bundle,
+                            if let Ok(convex_spectrum) =
+                                whitened_spectrum::WhitenedHessianSpectrum::decompose(
+                                    &lhs_convex,
+                                    &spectral_rhs,
+                                    &joint_trust_metric_diag,
+                                    KKT_REFUSAL_RANK_TOL,
                                 )
-                            }
-                            JointHessianSource::Operator { diagonal, .. } => {
-                                joint_penalty_preconditioner_diag(
-                                    diagonal,
-                                    &ranges,
-                                    &s_lambdas,
-                                    joint_solver_diagonal_ridge,
-                                    joint_bundle,
-                                )
-                            }
-                        };
-                        // Pre-allocate the penalty workspace ONCE outside the
-                        // PCG closure so each CG iter (called hundreds-to-
-                        // thousands of times per outer iter at large scale)
-                        // reuses the buffer instead of allocating per call.
-                        // RefCell because solve_spd_pcg* expects `Fn` (immutable
-                        // borrow of captures) and we need interior mutability
-                        // to write into the workspace.
-                        let penalty_workspace = RefCell::new(Array1::<f64>::zeros(total_p));
-                        // Capture the Jeffreys/Firth curvature for the matvec. When
-                        // armed (and nonzero past the conditioning gate) the PCG
-                        // operator becomes `H + S_λ + H_Φ`, matching the augmented
-                        // RHS `(∇ℓ − S_λβ) + ∇Φ` set above and the dense spectral
-                        // fallback. `None` keeps the unaugmented matvec.
-                        let pcg_hphi_dense = inner_jeffreys_hphi.clone();
-                        let pcg_hphi_op = inner_jeffreys_hphi.clone();
-                        match &joint_hessian_source {
-                            JointHessianSource::Dense(h_joint) => {
-                                gam_linalg::utils::solve_spd_pcg_with_info_into(
-                                    |v, out| {
-                                        // h_joint * v -> out (faer-backed, no alloc)
-                                        gam_linalg::faer_ndarray::fast_av_view_into(
-                                            h_joint,
-                                            v,
-                                            out.view_mut(),
-                                        );
-                                        let mut pen = penalty_workspace.borrow_mut();
-                                        apply_joint_block_penalty_into(
-                                            &ranges,
-                                            &s_lambdas,
-                                            v,
-                                            joint_solver_diagonal_ridge,
-                                            &mut pen,
-                                            joint_bundle,
-                                        );
-                                        *out += &*pen;
-                                        if let Some(hphi) = pcg_hphi_dense.as_ref() {
-                                            *out += &hphi.dot(v);
-                                        }
-                                    },
-                                    &rhs,
-                                    &preconditioner_diag,
-                                    pcg_rel_tol,
-                                    JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
-                                )
-                                .map(|(solution, info)| {
-                                    log_joint_pcg_diagnostics(
-                                        cycle,
-                                        total_p,
-                                        total_joint_n,
-                                        &preconditioner_diag,
-                                        &info,
-                                    );
-                                    solution
-                                })
-                            }
-                            JointHessianSource::Operator { apply_into, .. } => {
-                                let apply_h_into = Arc::clone(apply_into);
-                                gam_linalg::utils::solve_spd_pcg_with_info_into(
-                                    |v, out| {
-                                        if let Err(error) = apply_h_into(v, out) {
-                                            log::warn!(
-                                                "joint Newton inner operator matvec failed: {error}"
-                                            );
-                                            out.fill(0.0);
-                                        }
-                                        let mut pen = penalty_workspace.borrow_mut();
-                                        apply_joint_block_penalty_into(
-                                            &ranges,
-                                            &s_lambdas,
-                                            v,
-                                            joint_solver_diagonal_ridge,
-                                            &mut pen,
-                                            joint_bundle,
-                                        );
-                                        *out += &*pen;
-                                        if let Some(hphi) = pcg_hphi_op.as_ref() {
-                                            *out += &hphi.dot(v);
-                                        }
-                                    },
-                                    &rhs,
-                                    &preconditioner_diag,
-                                    pcg_rel_tol,
-                                    JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
-                                )
-                                .map(|(solution, info)| {
-                                    log_joint_pcg_diagnostics(
-                                        cycle,
-                                        total_p,
-                                        total_joint_n,
-                                        &preconditioner_diag,
-                                        &info,
-                                    );
-                                    solution
-                                })
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    if pcg_requested {
-                        log::info!(
-                            "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} solved={} elapsed={:.3}s",
-                            cycle,
-                            total_joint_n,
-                            total_p,
-                            delta.is_some(),
-                            pcg_started.elapsed().as_secs_f64()
-                        );
-                    }
-                    if delta.is_none() {
-                        if pcg_requested {
-                            break;
-                        }
-                        let mut lhs_true = match materialize_joint_hessian_source(
-                            &joint_hessian_source,
-                            total_p,
-                            "joint Newton inner dense fallback Hessian materialization",
-                        ) {
-                            Ok(matrix) => matrix,
-                            Err(_) => break,
-                        };
-                        // Capture the unpenalized dense `H` for the rest of this
-                        // cycle (gam#1040): the Cauchy leg and trust-region
-                        // predicted-reduction matvecs below can then reuse it as a
-                        // cheap `O(p²)` dense matvec instead of re-applying a
-                        // matrix-free operator `O(n·p)` per attempt. Only when the
-                        // source is an `Operator` — a `Dense` source already gives
-                        // those matvecs the fast path, so cloning would be waste.
-                        if matches!(&joint_hessian_source, JointHessianSource::Operator { .. }) {
-                            materialized_dense_unpenalized = Some(lhs_true.clone());
-                        }
-                        // Snapshot the Jeffreys information matrix only when a
-                        // family supplies the contracted completion. The generic
-                        // pairwise fallback costs p(p+1)/2 full second-directional
-                        // Hessian passes; at biobank scale (BMS p=35, n≈196k) it
-                        // turns a near-converged polishing cycle into ~50s of row
-                        // work. Without a contracted hook the divided-difference
-                        // H_phi model remains first-order correct and the KKT
-                        // certificate owns convergence.
-                        let jeffreys_completion_requested =
-                            family.joint_jeffreys_information_contracted_trace_hessian_available();
-                        let h_info_for_completion = (jeffreys_completion_endgame
-                            && inner_jeffreys_term.is_some()
-                            && jeffreys_completion_requested)
-                            .then(|| family.joint_jeffreys_information_with_specs(&states, specs))
-                            .transpose()?
-                            .flatten();
-                        add_joint_penalty_to_matrix(
-                            &mut lhs_true,
-                            &ranges,
-                            &s_lambdas,
-                            joint_mode_diagonal_ridge,
-                            joint_bundle,
-                        );
-                        // Universal robustness: add the
-                        // family-general Jeffreys curvature `H_Phi` to the
-                        // penalized Hessian. This is the Tier-B coupled-Newton form
-                        // of Firth: the reduced Fisher information `Z_J^T H Z_J`
-                        // supplies the missing O(n) curvature that bounds a
-                        // near-separating coefficient to O(1). When the Jeffreys
-                        // term is unavailable, the step stays unaugmented.
-                        //
-                        // `∇Φ` is NOT re-added here: `rhs` (and thus `spectral_rhs`)
-                        // already carries `+∇Φ` from the single shared computation
-                        // above, and we REUSE that same `H_Φ` here rather than
-                        // recomputing the (O(p) directional-derivative) term — the
-                        // dense fallback and the matrix-free PCG step now solve the
-                        // SAME Jeffreys-augmented Newton system.
-                        let spectral_rhs = rhs.clone();
-                        if let Some((_grad_phi, hphi)) = inner_jeffreys_term.as_ref() {
-                            lhs_true += hphi;
-                            // ENDGAME EXACTNESS (gam#979). The divided-difference
-                            // H_Φ omits the second-directional-Hessian remainder
-                            // `½ tr(K · D_ab)`; near a Firth-active mode that
-                            // remainder is comparable to the kept curvature, so
-                            // Newton converges only linearly (a residual sawtooth
-                            // plateauing just above the certificate tolerance —
-                            // enough mode noise to swamp outer finite differences
-                            // and feed the IFT near-flat-kernel amplification).
-                            // Once the residual enters the convergence band, add
-                            // the exact completion so the model is the true
-                            // Hessian of the Φ-augmented objective and the endgame
-                            // is quadratic. A family contracted trace hook can
-                            // supply it at any width; the pairwise `p(p+1)/2`
-                            // fallback remains limited to moderate p. `None`
-                            // degrades safely to the divided-difference model.
-                            if let (Some(h_info), Some(z_joint)) = (
-                                h_info_for_completion.as_ref(),
-                                joint_jeffreys_subspace.as_ref(),
-                            ) && let Some(completion) =
-                                custom_family_joint_jeffreys_second_order_completion(
-                                    family, &states, specs, h_info, z_joint, false,
-                                )?
                             {
-                                // TRUST-REGION GATE (gam#1607): fold the completion
-                                // only when `H_Φ + completion` stays PSD. In the
-                                // near-separable regime the `−½ tr(K·D_ab)` remainder
-                                // explodes negative and cancels `H_Φ`, leaving the
-                                // augmented inner Hessian strongly indefinite. The
-                                // trust-region spectral solve below would reflect those
-                                // negative modes, but that turns the quadratic endgame
-                                // back into a reflected-descent crawl that plateaus
-                                // above the certificate tolerance ("inner solve exited
-                                // before convergence"). Keeping the bounded PSD `H_Φ`
-                                // model preserves the linear-but-monotone endgame the
-                                // divided-difference solve already certifies.
-                                if custom_family_jeffreys_completion_preserves_psd(
-                                    hphi,
-                                    &completion,
-                                ) {
-                                    lhs_true += &completion;
-                                }
-                            }
-                        }
-                        // Single metric-whitened eigendecomposition drives BOTH the
-                        // seed step and every trust-region re-solve this cycle
-                        // (gam#979). The prior code ran a SECOND O(p³)
-                        // eigendecomposition of the raw Hessian here purely to form
-                        // the seed step — doubling the dominant per-cycle cost on the
-                        // ~5 s/cycle ill-conditioned survival marginal-slope inner.
-                        // The exact trust-region multiplier λ (chosen so ‖δ‖_D = r)
-                        // subsumes the old self-vanishing Levenberg-μ seed: `decompose`
-                        // whitens by the trust metric so the penalty (λ~e²⁴) and the
-                        // likelihood scales are throttled uniformly — the scale
-                        // invariance the multiplicative μ approximated. `lhs_true`
-                        // already carries the penalty and the Firth/Jeffreys curvature
-                        // H_Φ and `spectral_rhs` the augmented stationarity RHS, so the
-                        // subproblem model matches the predicted-reduction model and the
-                        // accept/reject gain ratio exactly.
-                        let spectrum = whitened_spectrum::WhitenedHessianSpectrum::decompose(
-                            &lhs_true,
-                            &spectral_rhs,
-                            &joint_trust_metric_diag,
-                            KKT_REFUSAL_RANK_TOL,
-                        )?;
-                        // Seed = the unconstrained (Moore–Penrose, range-restricted)
-                        // exact step, so cycle 0 can take the full Newton step on a
-                        // well-conditioned model (the cycle-0 radius bump below relies
-                        // on this); the trust loop re-solves at finite radius for every
-                        // subsequent attempt. An indefinite model reflects negative
-                        // curvature to |λ|, exactly as the prior spectral solve did.
-                        let spectral_step = spectrum.trust_region_step(f64::INFINITY);
-                        spectral_nullity_for_step = spectral_step.nullity;
-                        // gam#979: Levenberg shift-to-PD of the SEED search direction on
-                        // the rigid ill-conditioned path. When the whitened inner Hessian
-                        // is indefinite the Moré–Sorensen step reflects the negative
-                        // modes to |λ|; on the near-separable coupled marginal-slope
-                        // surface those reflected modes then ride a poor gain ratio that
-                        // shrinks the single scalar trust radius, which clamps the
-                        // *well-conditioned* modes that DO carry real descent — the
-                        // measured "reflected-descent crawl" where the residual plateaus
-                        // (‖g‖~1e-1) while the objective creeps down ~1e-3/cycle and the
-                        // solve exhausts its budget without ever reaching residual_tol
-                        // (the binary twin of the survival-MS oversmoothed-ρ endgame).
-                        // Once the residual has stalled for a few cycles, seed the trust
-                        // loop from a genuinely convex modified-Newton step: add
-                        // μ·D_trust (μ just above |λ_min| so the reflected modes become
-                        // gently positive while the well-conditioned modes, |λ|≫μ, keep
-                        // their full Newton step) and re-solve once. This is a modified-
-                        // Newton SEARCH DIRECTION only — the trust-region accept/reject
-                        // still judges it against the true `lhs_true` model, `joint_spectrum`
-                        // stays the exact (unshifted) spectrum for the trust re-solves and
-                        // the Newton-decrement certificate, and μ is applied ONLY while the
-                        // Hessian is indefinite (it vanishes once the endgame becomes PD),
-                        // so a healthy convex fit is byte-unchanged and no non-minimum can
-                        // be certified. Family-gated on `levenberg_on_ill_conditioning()`.
-                        const JOINT_REFLECTED_CONVEXIFY_STALL_WINDOW: usize = 3;
-                        const JOINT_REFLECTED_CONVEXIFY_MARGIN: f64 = 1.5;
-                        let mut seed_delta = spectral_step.delta;
-                        if family.levenberg_on_ill_conditioning()
-                            && spectral_step.reflected_negative_modes > 0
-                            && cycles_since_residual_improved
-                                >= JOINT_REFLECTED_CONVEXIFY_STALL_WINDOW
-                            && spectral_step.most_negative_eigenvalue.is_finite()
-                            && spectral_step.most_negative_eigenvalue < 0.0
-                        {
-                            let mu = spectral_step.most_negative_eigenvalue.abs()
-                                * JOINT_REFLECTED_CONVEXIFY_MARGIN;
-                            if mu.is_finite() && mu > 0.0 {
-                                let mut lhs_convex = lhs_true.clone();
-                                for d in 0..lhs_convex.nrows() {
-                                    lhs_convex[[d, d]] += mu * joint_trust_metric_diag[d];
-                                }
-                                if let Ok(convex_spectrum) =
-                                    whitened_spectrum::WhitenedHessianSpectrum::decompose(
-                                        &lhs_convex,
-                                        &spectral_rhs,
-                                        &joint_trust_metric_diag,
-                                        KKT_REFUSAL_RANK_TOL,
-                                    )
+                                let convex_step = convex_spectrum.trust_region_step(f64::INFINITY);
+                                if convex_step.reflected_negative_modes == 0
+                                    && convex_step.delta.iter().all(|v| v.is_finite())
                                 {
-                                    let convex_step =
-                                        convex_spectrum.trust_region_step(f64::INFINITY);
-                                    if convex_step.reflected_negative_modes == 0
-                                        && convex_step.delta.iter().all(|v| v.is_finite())
-                                    {
-                                        log::info!(
-                                            "[PIRLS/joint-Newton] cycle {cycle:>3} | gam#979 \
+                                    log::info!(
+                                        "[PIRLS/joint-Newton] cycle {cycle:>3} | gam#979 \
                                              Levenberg shift-to-PD seed: μ={mu:.3e}·D convexified \
                                              {} reflected mode(s) (λ_min={:.3e}) after {} stalled \
                                              cycle(s); seeding the trust loop from the convex \
                                              modified-Newton step to break the reflected-descent \
                                              crawl",
-                                            spectral_step.reflected_negative_modes,
-                                            spectral_step.most_negative_eigenvalue,
-                                            cycles_since_residual_improved,
-                                        );
-                                        seed_delta = convex_step.delta;
-                                    }
+                                        spectral_step.reflected_negative_modes,
+                                        spectral_step.most_negative_eigenvalue,
+                                        cycles_since_residual_improved,
+                                    );
+                                    seed_delta = convex_step.delta;
                                 }
                             }
                         }
-                        if spectral_step.reflected_negative_modes > 0 {
-                            log::info!(
-                                "[PIRLS/joint-Newton] cycle {cycle:>3} | indefinite inner \
+                    }
+                    if spectral_step.reflected_negative_modes > 0 {
+                        log::info!(
+                            "[PIRLS/joint-Newton] cycle {cycle:>3} | indefinite inner \
                                  Hessian: reflected {}/{} negative-curvature modes to |λ| \
                                  (λ_min={:.3e}); proceeding with modified-Newton descent step \
                                  under trust-region globalization",
-                                spectral_step.reflected_negative_modes,
-                                total_p,
-                                spectral_step.most_negative_eigenvalue,
-                            );
-                        }
-                        {
-                            log::info!(
-                                "[979-DIAG] cycle {cycle:>3} spectral solve: nullity@{:.0e}={}/{} \
+                            spectral_step.reflected_negative_modes,
+                            total_p,
+                            spectral_step.most_negative_eigenvalue,
+                        );
+                    }
+                    {
+                        log::info!(
+                            "[979-DIAG] cycle {cycle:>3} spectral solve: nullity@{:.0e}={}/{} \
                              |P0 rhs|∞={:.3e} |P+ rhs|∞={:.3e} λ_min+={:.3e} λ_max={:.3e} reflected={}",
-                                spectral_step.rank_tol,
-                                spectral_step.nullity,
-                                total_p,
-                                spectral_step.null_rhs_inf,
-                                spectral_step.range_rhs_inf,
-                                spectral_step.lambda_min_positive,
-                                spectral_step.lambda_max_abs,
-                                spectral_step.reflected_negative_modes,
-                            );
-                        }
-                        delta = Some(seed_delta);
-                        // The same factorization powers every trust-radius re-solve
-                        // in the loop below (gam#979) — no second eigendecomposition.
-                        // `spectrum` is the EXACT (unshifted) Hessian: the gam#979
-                        // Levenberg shift-to-PD above only reshapes the SEED direction,
-                        // so the trust re-solves and the Newton-decrement certificate
-                        // keep judging against the true model.
-                        joint_spectrum = Some(spectrum);
+                            spectral_step.rank_tol,
+                            spectral_step.nullity,
+                            total_p,
+                            spectral_step.null_rhs_inf,
+                            spectral_step.range_rhs_inf,
+                            spectral_step.lambda_min_positive,
+                            spectral_step.lambda_max_abs,
+                            spectral_step.reflected_negative_modes,
+                        );
                     }
+                    delta = Some(seed_delta);
+                    // The same factorization powers every trust-radius re-solve
+                    // in the loop below (gam#979) — no second eigendecomposition.
+                    // `spectrum` is the EXACT (unshifted) Hessian: the gam#979
+                    // Levenberg shift-to-PD above only reshapes the SEED direction,
+                    // so the trust re-solves and the Newton-decrement certificate
+                    // keep judging against the true model.
+                    joint_spectrum = Some(spectrum);
+                }
 
-                    let Some(delta) = delta else {
-                        break; // Fall back to blockwise
-                    };
-                    if !delta.iter().all(|v| v.is_finite()) {
-                        break; // Fall back to blockwise
-                    }
-                    (
-                        beta_joint.clone() + &delta,
-                        None,
-                        spectral_nullity_for_step,
-                        None,
-                    )
+                let Some(delta) = delta else {
+                    break; // Fall back to blockwise
                 };
+                if !delta.iter().all(|v| v.is_finite()) {
+                    break; // Fall back to blockwise
+                }
+                (
+                    beta_joint.clone() + &delta,
+                    None,
+                    spectral_nullity_for_step,
+                    None,
+                )
+            };
             // Hessian-source build (and any QP solve immediately above) are
             // done by the time we reach `delta`. Capture the wall-clock
             // before the line-search phase so the end-of-cycle summary can
@@ -3825,10 +3812,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             Some(accepted_joint_active.clone())
                         };
                         accepted_active_face_changed = accepted_face != active_face_before_step;
-                        cached_active_sets = scatter_joint_active_set(
-                            &accepted_joint_active,
-                            &block_constraints,
-                        );
+                        cached_active_sets =
+                            scatter_joint_active_set(&accepted_joint_active, &block_constraints);
                     }
                     last_joint_math = Some(joint_math);
                     last_accepted_hit_joint_trust_boundary = step_hit_trust_boundary;
@@ -5354,9 +5339,40 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 let drop = oldest - newest;
                 drop > (LINEAR_RATE_WINDOW as f64) * objective_tol
             };
+            // Deterministic tol-reachability exemption for the two counter-based
+            // stall guards below (gam#979 CTN endgame). The ≥10%-drop
+            // "improvement" test cannot distinguish a genuinely flat residual
+            // from a slow monotone endgame descent closing on tol: a residual
+            // walking 1.06×tol → tol over ~a dozen cycles never produces a
+            // single 10% drop, so `cycles_since_residual_improved` climbs and
+            // the guards (or the merit-veto cap expiring) kill a solve that is
+            // cycles away from certifying — measured on the #979 CTN smoke,
+            // where one run certifies at cycle ~122 (r=9.05e-3 ≤ tol=9.56e-3)
+            // and another is killed at cycle 123 by the veto-cap expiry with
+            // the residual 6% above tol and still descending. The trailing
+            // -window geometric projection already trusted by the slow-rate
+            // guard is the honest discriminator: if it projects reaching
+            // `residual_tol` within LINEAR_RATE_PROJECTION_CAP cycles the
+            // residual IS trending to KKT and a stall verdict is false, so the
+            // guards defer to the projection guard (which fires precisely when
+            // reachability fails). The genuine stall shapes keep exiting: a
+            // flat or rising window projects `unreachable`, and the historic
+            // #979 hang (~0.99×/cycle orders above tol) projects far past the
+            // cap. Deterministic: cycle indices and residual ratios only; the
+            // `inner_max_cycles` ceiling remains the hard backstop.
+            let residual_tol_reachable_within_cap = residual_rate_history.len()
+                > LINEAR_RATE_WINDOW
+                && !gam_solve::loop_guard::slow_geometric_rate_exceeds_projection_cap(
+                    residual,
+                    *residual_rate_history.front().unwrap(),
+                    LINEAR_RATE_WINDOW,
+                    residual_tol,
+                    LINEAR_RATE_PROJECTION_CAP,
+                );
             if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
                 && tr_clamped_during_stall
+                && !residual_tol_reachable_within_cap
             {
                 let last_math_summary = last_joint_math
                     .as_ref()
@@ -5497,6 +5513,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 && residual > residual_tol
                 && cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
+                && !residual_tol_reachable_within_cap
                 && (!merit_still_descending_over_window()
                     || cycles_since_residual_improved >= RESIDUAL_STALL_MERIT_VETO_MAX_CYCLES)
             {
