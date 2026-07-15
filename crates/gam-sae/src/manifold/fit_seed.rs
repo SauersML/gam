@@ -12,6 +12,12 @@ use ndarray::{Array1, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
 
 use super::*;
 
+/// Native initial scale for the optimized assignment-sparsity coordinate.
+/// `1 = exp(0)` is the neutral origin in the log-strength parameterization;
+/// callers that omit the scale delegate here instead of duplicating a
+/// facade-specific default.
+pub const DEFAULT_SAE_SPARSITY_STRENGTH: f64 = 1.0;
+
 /// Atom count at which native ARD switches from per-atom coordinates to one
 /// shared coordinate per intrinsic axis.
 pub const SAE_SHARED_ARD_K_THRESHOLD: usize = 256;

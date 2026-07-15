@@ -415,7 +415,7 @@ impl Tier0SaeCore {
     native_ard_enabled=true,
     decoder_feature_sparsity_groups=None,
     max_iter=50,
-    sparsity_strength=0.0,
+    sparsity_strength=None,
     coord_sparsity="scad",
     scad_mcp_gamma=None,
     smoothness=1.0,
@@ -460,7 +460,7 @@ fn sae_manifold_fit_model<'py>(
     native_ard_enabled: bool,
     decoder_feature_sparsity_groups: Option<Vec<Vec<usize>>>,
     max_iter: usize,
-    sparsity_strength: f64,
+    sparsity_strength: Option<f64>,
     coord_sparsity: &str,
     scad_mcp_gamma: Option<f64>,
     smoothness: f64,
@@ -487,6 +487,8 @@ fn sae_manifold_fit_model<'py>(
     run_structure_search: bool,
     structured_residual_passes: usize,
 ) -> PyResult<PyObject> {
+    let sparsity_strength = sparsity_strength
+        .unwrap_or(gam::terms::sae::manifold::DEFAULT_SAE_SPARSITY_STRENGTH);
     if k_atoms == 0 {
         return Err(py_value_error(
             "sae_manifold_fit requires K >= 1".to_string(),

@@ -29,6 +29,14 @@ def test_python_fit_defaults_match_unbundled_native_pipeline(monkeypatch):
     assert captured["run_structure_search"] is False
     assert captured["structured_residual_passes"] == 0
     assert type(captured["structured_residual_passes"]) is int
+    assert captured["sparsity_strength"] is None
+
+
+def test_python_sparsity_default_is_owned_by_native_front_door():
+    parameter = inspect.signature(_sae_manifold.sae_manifold_fit).parameters[
+        "sparsity_weight"
+    ]
+    assert parameter.default is None
 
 
 def test_external_certificate_defaults_to_evaluation_only():
