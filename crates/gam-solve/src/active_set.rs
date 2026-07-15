@@ -1510,6 +1510,7 @@ fn gather_linear_constraint_rows(
 }
 
 fn fallback_projected_gradient_direction(
+    beta: &Array1<f64>,
     x: &Array1<f64>,
     d_total: &Array1<f64>,
     gradient: &Array1<f64>,
@@ -1517,7 +1518,7 @@ fn fallback_projected_gradient_direction(
     constraints: &LinearInequalityConstraints,
 ) -> Result<Option<(Array1<f64>, Vec<usize>)>, EstimationError> {
     let p = gradient.len();
-    if x.len() != p || d_total.len() != p || constraints.a.ncols() != p {
+    if x.len() != p || d_total.len() != p || beta.len() != p || constraints.a.ncols() != p {
         crate::bail_invalid_estim!("projected-gradient fallback dimension mismatch");
     }
 
@@ -1582,8 +1583,18 @@ fn fallback_projected_gradient_direction(
                 return Ok(None);
             };
             let repair = &projected - x;
-            let active = canonicalize_active_constraint_ids(&projected, constraints, &[])?;
-            return Ok(Some((d_total + &repair, active)));
+            let new_direction = d_total + &repair;
+            // Certify the point the caller will reconstruct (`beta + dir`), not
+            // the projection itself: the two differ by the rounding of the
+            // x/d_total cancellation, and the caller's gate is what must pass.
+            let candidate = beta + &new_direction;
+            if max_linear_constraint_violation(&candidate, constraints).0
+                > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+            {
+                return Ok(None);
+            }
+            let active = canonicalize_active_constraint_ids(&candidate, constraints, &[])?;
+            return Ok(Some((new_direction, active)));
         }
         let active = canonicalize_active_constraint_ids(x, constraints, &[])?;
         return Ok(Some((d_total.clone(), active)));
@@ -1612,7 +1623,10 @@ fn fallback_projected_gradient_direction(
     }
 
     let fallback_step = tangent_direction * alpha;
-    let new_x = x + &fallback_step;
+    let new_direction = d_total + &fallback_step;
+    // Evaluate feasibility on the caller's reconstruction `beta + dir` so the
+    // acceptance here and the caller's final gate see the same bits.
+    let new_x = beta + &new_direction;
     // Per-row-scaled feasibility, matching ACTIVE_SET_PRIMAL_FEASIBILITY_TOL.
     let (worst, _) = max_linear_constraint_violation(&new_x, constraints);
     if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
@@ -1622,7 +1636,7 @@ fn fallback_projected_gradient_direction(
         .filter(|&i| scaled_constraint_slack(&new_x, constraints, i) <= 1e-10)
         .collect::<Vec<_>>();
     let active = canonicalize_active_constraint_ids(&new_x, constraints, &active)?;
-    Ok(Some((d_total + &fallback_step, active)))
+    Ok(Some((new_direction, active)))
 }
 
 fn log_active_set_transition(
@@ -1871,14 +1885,18 @@ fn solve_newton_direction_with_linear_constraints_impl(
             }
         }
 
-        ndarray::Zip::from(&mut x)
-            .and(&mut d_total)
+        ndarray::Zip::from(&mut d_total)
             .and(&d)
-            .for_each(|x_i, dt_i, &d_i| {
-                let alpha_d = alpha * d_i;
-                *x_i += alpha_d;
-                *dt_i += alpha_d;
+            .for_each(|dt_i, &d_i| {
+                *dt_i += alpha * d_i;
             });
+        // The public contract certifies `beta + d_total`, so the iterate must BE
+        // that sum bitwise. Accumulating `x` by its own `+= alpha*d` walks a
+        // different rounding path: a boundary-landing step (ratio test targets
+        // scaled slack −TOL) then certifies feasible on the loop's `x` while the
+        // caller's freshly summed candidate reads TOL + O(eps·scale) and the
+        // solve is rejected as an "infeasible iterate" (#979 CTN cycle 86).
+        x = beta + &d_total;
         g_cur = gradient + &hessian.dot(&d_total);
 
         let mut added_new_active = false;
@@ -2006,9 +2024,14 @@ fn solve_newton_direction_with_linear_constraints_impl(
     }
     let kkt = compute_constraint_kkt_diagnostics(&x, &g_cur, constraints);
     let fallback_working = gather_linear_constraint_rows(constraints, &active)?;
-    if let Some((fallback_direction, fallback_active)) =
-        fallback_projected_gradient_direction(&x, &d_total, &g_cur, &fallback_working, constraints)?
-    {
+    if let Some((fallback_direction, fallback_active)) = fallback_projected_gradient_direction(
+        beta,
+        &x,
+        &d_total,
+        &g_cur,
+        &fallback_working,
+        constraints,
+    )? {
         if let Some(hint) = active_hint {
             hint.clear();
             hint.extend(fallback_active);
@@ -2497,6 +2520,7 @@ fn nnls_tangent_cone_projection_fallback(
 /// that separator and recompute the cone projection; this cutting-plane loop
 /// discovers only the rows needed to describe a feasible tangent direction.
 fn fallback_projected_gradient_direction_with_constraint_set(
+    beta: &Array1<f64>,
     x: &Array1<f64>,
     d_total: &Array1<f64>,
     gradient: &Array1<f64>,
@@ -2504,7 +2528,7 @@ fn fallback_projected_gradient_direction_with_constraint_set(
     ops: &ConstraintSetOps<'_>,
 ) -> Result<Option<(Array1<f64>, Vec<usize>)>, EstimationError> {
     let p = gradient.len();
-    if x.len() != p || d_total.len() != p || ops.set.ncols() != p {
+    if x.len() != p || d_total.len() != p || beta.len() != p || ops.set.ncols() != p {
         crate::bail_invalid_estim!("operator projected-gradient fallback dimension mismatch");
     }
 
@@ -2534,7 +2558,16 @@ fn fallback_projected_gradient_direction_with_constraint_set(
                 return Ok(None);
             };
             let repair = &projected - x;
-            return Ok(Some((d_total + &repair, Vec::new())));
+            let new_direction = d_total + &repair;
+            // Certify the caller's reconstruction `beta + dir`, not the
+            // projection itself (they differ by the x/d_total cancellation
+            // rounding, and the caller's gate is what must pass).
+            let candidate = beta + &new_direction;
+            let candidate_values = ops.values(&candidate)?;
+            if ops.max_violation(&candidate_values).0 > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+                return Ok(None);
+            }
+            return Ok(Some((new_direction, Vec::new())));
         }
         return Ok(Some((d_total.clone(), tangent_active)));
     }
@@ -2561,7 +2594,10 @@ fn fallback_projected_gradient_direction_with_constraint_set(
         return Ok(None);
     }
     let fallback_step = tangent_direction * alpha;
-    let new_x = x + &fallback_step;
+    let new_direction = d_total + &fallback_step;
+    // Evaluate feasibility on the caller's reconstruction `beta + dir` so the
+    // acceptance here and the caller's final gate see the same bits.
+    let new_x = beta + &new_direction;
     let new_values = ops.values(&new_x)?;
     if ops.max_violation(&new_values).0 > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
         return Ok(None);
@@ -2572,7 +2608,7 @@ fn fallback_projected_gradient_direction_with_constraint_set(
         tangent_active.push(row);
     }
     tangent_active.retain(|&row| ops.scaled_slack(&new_values, row) <= 1e-10);
-    Ok(Some((d_total + &fallback_step, tangent_active)))
+    Ok(Some((new_direction, tangent_active)))
 }
 
 fn solve_newton_direction_with_constraint_set_impl(
@@ -2745,14 +2781,16 @@ fn solve_newton_direction_with_constraint_set_impl(
             }
         }
 
-        ndarray::Zip::from(&mut x)
-            .and(&mut d_total)
+        ndarray::Zip::from(&mut d_total)
             .and(&d)
-            .for_each(|x_i, dt_i, &d_i| {
-                let alpha_d = alpha * d_i;
-                *x_i += alpha_d;
-                *dt_i += alpha_d;
+            .for_each(|dt_i, &d_i| {
+                *dt_i += alpha * d_i;
             });
+        // Same bitwise-identity requirement as the dense loop: the caller
+        // certifies `beta + d_total`, so evaluate feasibility on exactly that
+        // sum (#979 CTN cycle 86: boundary-landing iterate feasible in the
+        // loop's arithmetic, 1.000e-8 > TOL in the wrapper's).
+        x = beta + &d_total;
         g_cur = gradient + &hessian.dot(&d_total);
         values_x = ops.values(&x)?;
 
@@ -2789,7 +2827,7 @@ fn solve_newton_direction_with_constraint_set_impl(
         if allow_projected_gradient_fallback && added_new_active && primal_step_norm <= tol_step {
             if let Some((fallback_direction, fallback_active)) =
                 fallback_projected_gradient_direction_with_constraint_set(
-                    &x, &d_total, &g_cur, &active, ops,
+                    beta, &x, &d_total, &g_cur, &active, ops,
                 )?
             {
                 if let Some(hint) = active_hint.as_mut() {
@@ -2907,7 +2945,7 @@ fn solve_newton_direction_with_constraint_set_impl(
     }
     if let Some((fallback_direction, fallback_active)) =
         fallback_projected_gradient_direction_with_constraint_set(
-            &x, &d_total, &g_cur, &active, ops,
+            beta, &x, &d_total, &g_cur, &active, ops,
         )?
     {
         if let Some(hint) = active_hint.as_mut() {
@@ -3407,6 +3445,7 @@ mod tests {
             LinearInequalityConstraints::new(array![[1.0]], array![0.0]).expect("one-sided bound");
 
         let (direction, active) = fallback_projected_gradient_direction(
+            &x,
             &x,
             &d_total,
             &gradient,
@@ -4102,6 +4141,7 @@ mod tests {
         let gradient = array![0.0_f64, 0.0, 0.0, -1.0];
         let (direction, active) = fallback_projected_gradient_direction_with_constraint_set(
             &x,
+            &x,
             &d_total,
             &gradient,
             &[0],
@@ -4183,6 +4223,7 @@ mod tests {
         let d_total = Array1::<f64>::zeros(4);
         let gradient = array![0.0_f64, 0.0, 0.0, -1.0];
         let (direction, active) = fallback_projected_gradient_direction_with_constraint_set(
+            &x,
             &x,
             &d_total,
             &gradient,
