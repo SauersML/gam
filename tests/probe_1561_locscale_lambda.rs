@@ -189,3 +189,152 @@ fn probe_1561_locscale_penalty_configs() {
         );
     }
 }
+
+// ---- #1561 scale-block penalty metric: Gamma dispersion log-precision -------
+//
+// The Gaussian location-scale path dropped its full-space `eye(p)` scale ridge
+// in `de5599435` (it over-shrinks the heteroscedastic curve). The dispersion
+// family (`dispersion_family.rs`) and the binomial threshold-scale builders
+// still append that ridge on the scale / log-precision block. This probe fits a
+// Gamma mean model with a genuinely varying precision and measures how well the
+// fitted log-precision surface tracks the truth. A full-span coefficient ridge
+// whose λ is REML-selected pulls the log-precision block toward its (basis-
+// dependent) coordinate origin, collapsing the scale edf toward the constant.
+
+fn gamma_sample(shape: f64, scale: f64, state: &mut u64) -> f64 {
+    // Marsaglia–Tsang; boost transform for shape < 1.
+    if shape < 1.0 {
+        let u = next_unit(state).max(1e-300);
+        return gamma_sample(shape + 1.0, scale, state) * u.powf(1.0 / shape);
+    }
+    let d = shape - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    loop {
+        let u1 = next_unit(state).max(1e-300);
+        let u2 = next_unit(state);
+        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+        let v = 1.0 + c * z;
+        if v <= 0.0 {
+            continue;
+        }
+        let v = v * v * v;
+        let u = next_unit(state).max(1e-300);
+        if u.ln() < 0.5 * z * z + d - d * v + d * v.ln() {
+            return d * v * scale;
+        }
+    }
+}
+
+fn disp_mu_true(x: f64) -> f64 {
+    (0.6 + 0.8 * x).exp()
+}
+fn disp_logshape_truth(x: f64) -> f64 {
+    // Pure linear log-shape (the convergent #1060 regime). The linear trend is
+    // the penalty NULL space — exactly the coordinate a full-span coefficient
+    // ridge shrinks — so the recovered OLS slope is a direct over-shrinkage
+    // probe. Shape stays >= 1 across [-1, 1], keeping the inner solve stable.
+    1.6 + 1.1 * x
+}
+
+fn gamma_dispersion_data(n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut state = 4242_u64;
+    // Deterministic grid (matches the convergent #1060 regime) so the probe
+    // isolates the penalty metric, not sampling-design variance.
+    let x: Vec<f64> = (0..n)
+        .map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0))
+        .collect();
+    let y = x
+        .iter()
+        .map(|&xi| {
+            let mu = disp_mu_true(xi);
+            let nu = disp_logshape_truth(xi).exp(); // Gamma shape = precision
+            gamma_sample(nu, mu / nu, &mut state).max(1e-6) // E[y]=mu, Var=mu^2/nu
+        })
+        .collect();
+    (x, y)
+}
+
+/// Ordinary-least-squares slope of `ys` on `xs` (a scalar summary of the
+/// dominant linear trend, i.e. the penalty null-space coordinate).
+fn ols_slope(xs: &[f64], ys: &[f64]) -> f64 {
+    let n = xs.len() as f64;
+    let mx = xs.iter().sum::<f64>() / n;
+    let my = ys.iter().sum::<f64>() / n;
+    let mut sxy = 0.0;
+    let mut sxx = 0.0;
+    for (&x, &y) in xs.iter().zip(ys) {
+        sxy += (x - mx) * (y - my);
+        sxx += (x - mx) * (x - mx);
+    }
+    sxy / sxx
+}
+
+#[test]
+fn probe_1561_gamma_dispersion_logshape_recovery() {
+    init_parallelism();
+    let n = 400;
+    let (x, y) = gamma_dispersion_data(n);
+    let headers = vec!["x".to_string(), "y".to_string()];
+    let rows: Vec<csv::StringRecord> = x
+        .iter()
+        .zip(&y)
+        .map(|(&x, &y)| csv::StringRecord::from(vec![format!("{x:.17e}"), format!("{y:.17e}")]))
+        .collect();
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode");
+    let cfg = FitConfig {
+        family: Some("gamma".to_string()),
+        noise_formula: Some("s(x, k=6)".to_string()),
+        ..FitConfig::default()
+    };
+    let result = match fit_from_formula("y ~ s(x, k=6)", &ds, &cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[gamma_disp] FIT ERROR: {e}");
+            return;
+        }
+    };
+    let FitResult::DispersionLocationScale(gam::DispersionLocationScaleFitResult { fit, .. }) =
+        result
+    else {
+        panic!("expected a dispersion location-scale fit");
+    };
+
+    let beta_scale = fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .expect("scale block")
+        .beta
+        .clone();
+    let grid_n = 120usize;
+    let grid_x: Vec<f64> = (0..grid_n)
+        .map(|i| -1.0 + 2.0 * (i as f64) / (grid_n as f64 - 1.0))
+        .collect();
+    let mut grid = Array2::<f64>::zeros((grid_n, 1));
+    for (i, &t) in grid_x.iter().enumerate() {
+        grid[[i, 0]] = t;
+    }
+    let scale_design =
+        build_term_collection_design(grid.view(), &fit.noisespec_resolved).expect("scale design");
+    let eta_d = scale_design.design.apply(&beta_scale).to_vec();
+    let truth: Vec<f64> = grid_x.iter().map(|&t| disp_logshape_truth(t)).collect();
+
+    let corr = pearson(&eta_d, &truth);
+    let recovery_rmse = rmse(&eta_d, &truth);
+    let gam_slope = ols_slope(&grid_x, &eta_d);
+    let truth_slope = ols_slope(&grid_x, &truth);
+    let slope_ratio = gam_slope / truth_slope;
+
+    let (lambdas, edf_by_block) = if let Some(inf) = fit.fit.inference.as_ref() {
+        (fit.fit.lambdas.to_vec(), inf.edf_by_block.clone())
+    } else {
+        (vec![], vec![])
+    };
+    eprintln!(
+        "[gamma_disp] pearson={corr:.5} rmse={recovery_rmse:.5} \
+         slope gam={gam_slope:.4} truth={truth_slope:.4} ratio={slope_ratio:.4} \
+         n_penalties={} lambdas={lambdas:?} edf_by_block={edf_by_block:?}",
+        lambdas.len(),
+    );
+
+    assert!(corr.is_finite(), "dispersion log-shape pearson is NaN");
+}

@@ -9,12 +9,12 @@ use super::weighted_design_products::{mirror_upper_to_lower, xt_diag_x_design, x
 use super::{
     BlockwiseTermFitResult, GamlssLambdaLayout, LOCATION_SCALE_N_OUTPUTS,
     LocationScaleFamilyBuilder, build_location_scale_block, fit_location_scale_terms,
-    identity_penalty, solve_penalizedweighted_projection, spatial_length_scale_term_indices,
+    solve_penalizedweighted_projection, spatial_length_scale_term_indices,
 };
 use crate::block_layout::block_count::validate_block_count;
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
 };
 use crate::gamlss::GamlssError;
 use crate::model_types::UnifiedFitResult;
@@ -1659,13 +1659,6 @@ impl LocationScaleFamilyBuilder for DispersionGlmLocationScaleTermBuilder {
         &self.noisespec
     }
 
-    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
-        // Mirror the Gaussian/Binomial scale block: a full-span shrinkage
-        // penalty pins the log-precision nullspace so REML does not optimise
-        // the dispersion smoothing on a flat surface.
-        noise_design.penalties.len() + 1
-    }
-
     fn build_blocks(
         &self,
         theta: &Array1<f64>,
@@ -1702,11 +1695,19 @@ impl LocationScaleFamilyBuilder for DispersionGlmLocationScaleTermBuilder {
             "DispersionLocationScale::build_blocks: mu",
         )?;
 
-        let p_disp = noise_design.design.ncols();
-        let mut disp_penalties = noise_design.penalties_as_penalty_matrix();
-        disp_penalties.push(PenaltyMatrix::Dense(identity_penalty(p_disp)));
-        let mut disp_nullspace = noise_design.nullspace_dims.clone();
-        disp_nullspace.push(0);
+        // SPEC-5: the log-precision block is penalized by its formula-native
+        // function-space penalties only (a smooth term carries its own
+        // REML-selected function-metric null-space shrinkage when
+        // `double_penalty=true`, the default). The previous full-span
+        // `identity_penalty` ridge was a basis-dependent coefficient-space prior
+        // that double-penalized the range space and shrank the fitted dispersion
+        // surface toward its coordinate origin — the exact over-shrinkage the
+        // Gaussian location-scale path dropped in `de5599435` (#1561). Mirroring
+        // that path here removes the extra REML smoothing coordinate the ridge
+        // introduced, so the coupled inner solve no longer optimizes the
+        // dispersion smoothing against a phantom full-span penalty.
+        let disp_penalties = noise_design.penalties_as_penalty_matrix();
+        let disp_nullspace = noise_design.nullspace_dims.clone();
         let mut dispspec = build_location_scale_block(
             "log_precision",
             noise_design.design.clone(),
