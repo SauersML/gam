@@ -1539,9 +1539,42 @@ fn survival_transformation_edf(
                 rhs[[block.range.start + r, c]] = block.matrix[[r, c]];
             }
         }
-        let sol = factor
-            .solvemulti(&rhs)
-            .map_err(|e| format!("survival edf trace solve failed: {e}"))?;
+        let sol = factor.solvemulti(&rhs).map_err(|e| {
+            // A converged fit whose penalized Hessian cannot support a finite
+            // trace solve is an identifiability failure; name the flat
+            // direction instead of the opaque solver string so the offending
+            // column (e.g. a structurally zero covariate) is visible from the
+            // error alone.
+            let spectrum_note = match gam_linalg::faer_ndarray::FaerEigh::eigh(
+                &h_dense,
+                faer::Side::Lower,
+            ) {
+                Ok((eigenvalues, eigenvectors)) => {
+                    let mut min_idx = 0usize;
+                    for (idx, value) in eigenvalues.iter().enumerate() {
+                        if value.abs() < eigenvalues[min_idx].abs() {
+                            min_idx = idx;
+                        }
+                    }
+                    let max_abs = eigenvalues
+                        .iter()
+                        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+                    let flat_direction: Vec<f64> =
+                        eigenvectors.column(min_idx).iter().copied().collect();
+                    format!(
+                        "penalized-Hessian spectrum: min_abs_eig={:.6e}, max_abs_eig={:.6e}, \
+                         eigenvalues={:?}, flattest direction (coefficient loadings)={:?}",
+                        eigenvalues[min_idx], max_abs, eigenvalues, flat_direction
+                    )
+                }
+                Err(error) => format!("penalized-Hessian eigendecomposition also failed: {error:?}"),
+            };
+            format!(
+                "survival edf trace solve failed for penalty block {kk} \
+                 (lambda={:.6e}, block_cols={block_cols}): {e}; {spectrum_note}",
+                block.lambda
+            )
+        })?;
         let mut trace = 0.0_f64;
         for j in 0..block_cols {
             trace += sol[[block.range.start + j, j]];
