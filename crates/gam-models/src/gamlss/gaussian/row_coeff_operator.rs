@@ -120,6 +120,44 @@ impl RowCoeffOperator {
             .push(scratch);
     }
 
+    /// Exact diagonal of the assembled operator, `O(n · Σ_a p_a)`.
+    ///
+    /// `H = Σ_{pairs} X_aᵀ diag(c) X_b (+ transpose when a ≠ b)`, so a pair
+    /// contributes diagonal mass only when both channels write the SAME
+    /// coefficient block: `Σ_i c_i · X_a[i,j]²` for `a == b`, and
+    /// `2 Σ_i c_i · X_a[i,j] · X_b[i,j]` for distinct channels sharing one
+    /// block. Cross-block pairs land strictly off the block diagonal.
+    ///
+    /// This is what lets a matvec-only workspace hand
+    /// `exact_newton_joint_hessian_source_from_workspace` a complete
+    /// operator source: the resolver requires a finite diagonal (probe +
+    /// preconditioner) alongside the HVP, and returning `None` there makes
+    /// every joint-workspace fit of the family fail at the inner-solve
+    /// boundary with "supplied no inner-solve curvature source" (#2299).
+    pub(crate) fn diagonal(&self) -> Array1<f64> {
+        let mut diag = Array1::<f64>::zeros(self.dim);
+        for pair in &self.pair_coeffs {
+            let channel_a = &self.channels[pair.a];
+            let channel_b = &self.channels[pair.b];
+            if channel_a.block != channel_b.block {
+                continue;
+            }
+            let offset = self.block_offsets[channel_a.block];
+            let width = self.block_widths[channel_a.block];
+            let factor = if pair.a == pair.b { 1.0 } else { 2.0 };
+            for j in 0..width {
+                let mut acc = 0.0_f64;
+                let col_a = channel_a.design.column(j);
+                let col_b = channel_b.design.column(j);
+                for ((&c, &xa), &xb) in pair.coeff.iter().zip(col_a.iter()).zip(col_b.iter()) {
+                    acc += c * xa * xb;
+                }
+                diag[offset + j] += factor * acc;
+            }
+        }
+        diag
+    }
+
     pub(crate) fn projected_trace(&self, factor: &Array2<f64>) -> f64 {
         let grams = self.projected_pair_gram_table(factor);
         self.trace_from_pair_gram_table(grams.view())
@@ -963,6 +1001,59 @@ pub(crate) fn make_two_block_design_row_coeff_operator(
         nrows,
         pa,
     })
+}
+
+#[cfg(test)]
+mod diagonal_exactness_tests {
+    use super::*;
+    use gam_problem::HyperOperator;
+
+    /// The closed-form diagonal must match the dense assembly entry-for-entry
+    /// across every pair kind: same-channel (`a == a`), distinct channels on
+    /// one block (`2·c·X_a[i,j]·X_b[i,j]` — the mean-wiggle basis/basis_d1
+    /// layout), and cross-block pairs (no diagonal mass).
+    #[test]
+    fn diagonal_matches_dense_assembly_for_every_pair_kind() {
+        let n = 23;
+        let (p0, p1) = (4, 3);
+        let mix = |i: usize, j: usize, salt: usize| -> f64 {
+            (((i * 31 + j * 17 + salt * 101) % 97) as f64 / 48.5) - 1.0
+        };
+        let x_eta = std::sync::Arc::new(Array2::from_shape_fn((n, p0), |(i, j)| mix(i, j, 1)));
+        let basis = std::sync::Arc::new(Array2::from_shape_fn((n, p1), |(i, j)| mix(i, j, 2)));
+        let basis_d1 = std::sync::Arc::new(Array2::from_shape_fn((n, p1), |(i, j)| mix(i, j, 3)));
+        let c0 = Array1::from_shape_fn(n, |i| 0.4 + mix(i, 0, 4).abs());
+        let c1 = Array1::from_shape_fn(n, |i| mix(i, 0, 5));
+        let c2 = Array1::from_shape_fn(n, |i| mix(i, 0, 6));
+        let c3 = Array1::from_shape_fn(n, |i| 0.3 + mix(i, 0, 7).abs());
+        let c4 = Array1::from_shape_fn(n, |i| mix(i, 0, 8));
+        let op = RowCoeffOperator::from_directions(
+            vec![p0, p1],
+            vec![(0, x_eta), (1, basis), (1, basis_d1)],
+            vec![
+                (0, 0, c0), // same channel, block 0
+                (0, 1, c1), // cross block: no diagonal mass
+                (0, 2, c2), // cross block: no diagonal mass
+                (1, 1, c3), // same channel, block 1
+                (1, 2, c4), // distinct channels sharing block 1
+            ],
+            n,
+        );
+        let diag = op.diagonal();
+        let total = p0 + p1;
+        assert_eq!(diag.len(), total);
+        for j in 0..total {
+            let mut e = Array1::<f64>::zeros(total);
+            e[j] = 1.0;
+            let column = op.mul_vec(&e);
+            assert!(
+                (diag[j] - column[j]).abs() <= 1e-12 * (1.0 + column[j].abs()),
+                "diagonal entry {j}: closed-form {} vs dense {}",
+                diag[j],
+                column[j]
+            );
+        }
+    }
 }
 
 #[cfg(test)]

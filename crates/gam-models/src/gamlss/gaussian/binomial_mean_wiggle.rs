@@ -1692,7 +1692,12 @@ impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
     }
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-        Ok(None)
+        // The source resolver requires a finite diagonal alongside the HVP to
+        // build an operator curvature source; `None` here made every
+        // joint-workspace fit of this family die at the inner-solve boundary
+        // with "supplied no inner-solve curvature source" (#2299 link-wiggle
+        // gate). The static operator's diagonal is exact and O(n·(p_η+p_w)).
+        Ok(Some(self.hessian_operator.diagonal()))
     }
 
     fn directional_derivative(

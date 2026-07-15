@@ -130,8 +130,8 @@ fn rotation_drift(term: &str) -> f64 {
         .zip(pr.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0_f64, f64::max);
-    let range = pb.iter().cloned().fold(f64::MIN, f64::max)
-        - pb.iter().cloned().fold(f64::MAX, f64::min);
+    let range =
+        pb.iter().cloned().fold(f64::MIN, f64::max) - pb.iter().cloned().fold(f64::MAX, f64::min);
     maxd / range
 }
 
