@@ -449,9 +449,22 @@ pub fn predict_latent_window_survival(
         });
     }
     if time_block.beta.len() != prepared.time_design_exit.ncols() {
+        // #2301: the built-in Weibull linear time basis dropped its redundant
+        // constant column (2 → 1 columns). A model saved BEFORE that change has a
+        // 2-coefficient linear time block that no longer matches the rebuilt
+        // 1-column basis; refuse typed-and-named rather than misindexing the stale
+        // constant coefficient as the shape.
+        let stale_weibull_basis = time_build.basisname == "linear"
+            && time_block.beta.len() == prepared.time_design_exit.ncols() + 1;
+        let hint = if stale_weibull_basis {
+            " (this looks like a model saved before the #2301 Weibull time-basis \
+             change, which removed the redundant constant column; refit the model)"
+        } else {
+            ""
+        };
         return Err(SurvivalPredictError::IncompatibleSchema {
             reason: format!(
-                "latent-window time/design mismatch: beta has {} coefficients but design has {} columns",
+                "latent-window time/design mismatch: beta has {} coefficients but design has {} columns{hint}",
                 time_block.beta.len(),
                 prepared.time_design_exit.ncols()
             ),

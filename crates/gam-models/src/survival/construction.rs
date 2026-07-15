@@ -122,21 +122,22 @@ pub struct SurvivalBaselineConfig {
     pub makeham: Option<f64>,
 }
 
-/// Recover the fitted Weibull baseline from anchor-centered linear
-/// `[1, log(t)]` time-basis coefficients.
+/// Recover the fitted Weibull baseline from the single-column `log(t)`
+/// time-basis coefficient.
 ///
-/// Centering at `anchor` makes the constant coefficient unidentified. The
-/// fitted model is therefore `shape * (log(t) - log(anchor))`: the identified
-/// shape is `beta[1]` and the identified scale is the anchor itself. Consumers
-/// must not reconstruct the scale from the stale constant coefficient.
+/// The redundant constant column was dropped at design build (#2301 — it was the
+/// intercept-confounded `−shape·log_scale` location, now carried by the mean
+/// intercept), so the identified shape is the sole time coefficient `beta[0]` and
+/// the identified scale is the anchor itself. The fitted baseline is
+/// `shape * (log(t) - log(anchor))`.
 pub fn fitted_weibull_baseline_from_linear_time_beta(
     beta: &Array1<f64>,
     anchor: f64,
 ) -> Option<SurvivalBaselineConfig> {
-    if beta.len() < 2 {
+    if beta.is_empty() {
         return None;
     }
-    let shape = beta[1];
+    let shape = beta[0];
     if !shape.is_finite() || shape <= 0.0 || !anchor.is_finite() || anchor <= 0.0 {
         return None;
     }
@@ -1298,15 +1299,26 @@ pub fn build_survival_time_basis(
             smooth_lambda: None,
         }),
         SurvivalTimeBasisConfig::Linear => {
-            let mut x_entry_time = Array2::<f64>::zeros((n, 2));
-            let mut x_exit_time = Array2::<f64>::zeros((n, 2));
-            let mut x_derivative_time = Array2::<f64>::zeros((n, 2));
+            // Single column `log t` — the Weibull baseline slope (shape). The
+            // constant column `[1, ·]` this basis used to carry (#2301) is the
+            // `−shape·log_scale` location, which is EXACTLY confounded with the
+            // linear-predictor intercept, so it made the converged penalized
+            // Hessian singular (the anchor gauge — the killed EDF trace solve and
+            // the LM crawl were both downstream of that singularity). Dropping it
+            // moves the whole location into the mean intercept and leaves `H`
+            // nonsingular. This is valid ONLY because intercept removal (`~ x - 1`)
+            // is a typed refusal at `formula_dsl.rs:2456` — the covariate block
+            // ALWAYS carries an intercept to absorb the location. If intercept
+            // suppression is ever implemented, the Weibull location becomes
+            // unidentified without this column and the two features MUST be
+            // reconciled here (re-add the constant and pin it, or keep the ban).
+            let mut x_entry_time = Array2::<f64>::zeros((n, 1));
+            let mut x_exit_time = Array2::<f64>::zeros((n, 1));
+            let mut x_derivative_time = Array2::<f64>::zeros((n, 1));
             for i in 0..n {
-                x_entry_time[[i, 0]] = 1.0;
-                x_exit_time[[i, 0]] = 1.0;
-                x_entry_time[[i, 1]] = log_entry[i];
-                x_exit_time[[i, 1]] = log_exit[i];
-                x_derivative_time[[i, 1]] = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
+                x_entry_time[[i, 0]] = log_entry[i];
+                x_exit_time[[i, 0]] = log_exit[i];
+                x_derivative_time[[i, 0]] = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
             }
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_entry_time)),
@@ -2003,7 +2015,10 @@ pub fn evaluate_survival_time_basis_row(
     let log_age = array![age.ln()];
     match cfg {
         SurvivalTimeBasisConfig::None => Ok(Array1::zeros(0)),
-        SurvivalTimeBasisConfig::Linear => Ok(array![1.0, age.ln()]),
+        // Single `log t` column (#2301): the confounded constant column is gone,
+        // its location absorbed by the mean intercept. See the Linear arm of
+        // `build_survival_time_basis`.
+        SurvivalTimeBasisConfig::Linear => Ok(array![age.ln()]),
         SurvivalTimeBasisConfig::BSpline { degree, knots, .. } => {
             if knots.is_empty() {
                 return Err(
@@ -4138,7 +4153,8 @@ mod tests {
 
     #[test]
     fn fitted_weibull_baseline_uses_identified_anchor_and_slope() {
-        let fitted = fitted_weibull_baseline_from_linear_time_beta(&array![123.0, 1.75], 4.5)
+        // Single-column time basis (#2301): the shape is the sole coefficient.
+        let fitted = fitted_weibull_baseline_from_linear_time_beta(&array![1.75], 4.5)
             .expect("valid Weibull baseline");
         assert_eq!(fitted.target, SurvivalBaselineTarget::Weibull);
         assert_eq!(fitted.scale, Some(4.5));
@@ -4146,9 +4162,14 @@ mod tests {
         assert_eq!(fitted.rate, None);
         assert_eq!(fitted.makeham, None);
 
-        assert!(fitted_weibull_baseline_from_linear_time_beta(&array![1.0], 4.5).is_none());
-        assert!(fitted_weibull_baseline_from_linear_time_beta(&array![0.0, 0.0], 4.5).is_none());
-        assert!(fitted_weibull_baseline_from_linear_time_beta(&array![0.0, 1.0], 0.0).is_none());
+        // Empty coefficient vector: no slope to recover.
+        assert!(
+            fitted_weibull_baseline_from_linear_time_beta(&Array1::<f64>::zeros(0), 4.5).is_none()
+        );
+        // Non-positive shape is not a valid Weibull baseline.
+        assert!(fitted_weibull_baseline_from_linear_time_beta(&array![0.0], 4.5).is_none());
+        // Non-positive anchor (scale) is invalid.
+        assert!(fitted_weibull_baseline_from_linear_time_beta(&array![1.0], 0.0).is_none());
     }
 
     #[test]

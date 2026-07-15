@@ -1503,12 +1503,30 @@ fn survival_transformation_edf(
     penalty_blocks: &[PenaltyBlock],
 ) -> Result<(f64, Vec<f64>, Vec<f64>, Array2<f64>), String> {
     let h_dense = state.hessian.to_dense();
+    let (edf_total, edf_by_block, penalty_block_trace) =
+        survival_edf_from_dense_hessian(&h_dense, penalty_blocks)?;
+    Ok((edf_total, edf_by_block, penalty_block_trace, h_dense))
+}
+
+/// Trace-form penalized EDF from a converged dense penalized Hessian.
+///
+/// Factored out of [`survival_transformation_edf`] so the exact-solve/naming
+/// contract is unit-testable against synthetic Hessians without a full
+/// `WorkingState`.
+fn survival_edf_from_dense_hessian(
+    h_dense: &Array2<f64>,
+    penalty_blocks: &[PenaltyBlock],
+) -> Result<(f64, Vec<f64>, Vec<f64>), String> {
     let p = h_dense.nrows();
     let h_sym = gam_linalg::matrix::SymmetricMatrix::Dense(h_dense.clone());
     // EDF is an exact trace of the fitted (unperturbed) penalized Hessian.
     // Factoring a different, ridged matrix silently changes the estimand, so a
     // singular/indefinite fitted Hessian is an inference failure rather than a
-    // license to manufacture a nearby covariance.
+    // license to manufacture a nearby covariance. The Weibull anchor gauge that
+    // used to make this Hessian singular (#2301) is removed at design build — the
+    // redundant Linear time-basis constant column is dropped in
+    // `build_survival_time_basis` — so a singularity HERE is now a genuine defect
+    // and refuses with the named flat direction (diag a0a9771ca).
     let factor = h_sym.factorize().map_err(|error| {
         format!("survival edf: exact penalized-Hessian factorization failed: {error}")
     })?;
@@ -1541,34 +1559,32 @@ fn survival_transformation_edf(
         }
         let sol = factor.solvemulti(&rhs).map_err(|e| {
             // A converged fit whose penalized Hessian cannot support a finite
-            // trace solve is an identifiability failure; name the flat
-            // direction instead of the opaque solver string so the offending
-            // column (e.g. a structurally zero covariate) is visible from the
-            // error alone.
-            let spectrum_note = match gam_linalg::faer_ndarray::FaerEigh::eigh(
-                &h_dense,
-                faer::Side::Lower,
-            ) {
-                Ok((eigenvalues, eigenvectors)) => {
-                    let mut min_idx = 0usize;
-                    for (idx, value) in eigenvalues.iter().enumerate() {
-                        if value.abs() < eigenvalues[min_idx].abs() {
-                            min_idx = idx;
+            // trace solve is an identifiability failure; name the flat direction
+            // (issue #2301, diag a0a9771ca) instead of the opaque solver string.
+            let spectrum_note =
+                match gam_linalg::faer_ndarray::FaerEigh::eigh(h_dense, faer::Side::Lower) {
+                    Ok((eigenvalues, eigenvectors)) => {
+                        let mut min_idx = 0usize;
+                        for (idx, value) in eigenvalues.iter().enumerate() {
+                            if value.abs() < eigenvalues[min_idx].abs() {
+                                min_idx = idx;
+                            }
                         }
+                        let max_abs = eigenvalues
+                            .iter()
+                            .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+                        let flat_direction: Vec<f64> =
+                            eigenvectors.column(min_idx).iter().copied().collect();
+                        format!(
+                            "penalized-Hessian spectrum: min_abs_eig={:.6e}, max_abs_eig={:.6e}, \
+                             eigenvalues={:?}, flattest direction (coefficient loadings)={:?}",
+                            eigenvalues[min_idx], max_abs, eigenvalues, flat_direction
+                        )
                     }
-                    let max_abs = eigenvalues
-                        .iter()
-                        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-                    let flat_direction: Vec<f64> =
-                        eigenvectors.column(min_idx).iter().copied().collect();
-                    format!(
-                        "penalized-Hessian spectrum: min_abs_eig={:.6e}, max_abs_eig={:.6e}, \
-                         eigenvalues={:?}, flattest direction (coefficient loadings)={:?}",
-                        eigenvalues[min_idx], max_abs, eigenvalues, flat_direction
-                    )
-                }
-                Err(error) => format!("penalized-Hessian eigendecomposition also failed: {error:?}"),
-            };
+                    Err(error) => {
+                        format!("penalized-Hessian eigendecomposition also failed: {error:?}")
+                    }
+                };
             format!(
                 "survival edf trace solve failed for penalty block {kk} \
                  (lambda={:.6e}, block_cols={block_cols}): {e}; {spectrum_note}",
@@ -1597,7 +1613,7 @@ fn survival_transformation_edf(
     {
         return Err("survival edf: non-finite effective degrees of freedom".to_string());
     }
-    Ok((edf_total, edf_by_block, penalty_block_trace, h_dense))
+    Ok((edf_total, edf_by_block, penalty_block_trace))
 }
 
 /// REML/LAML smoothing-parameter selection for the single-cause transformation
@@ -2683,30 +2699,13 @@ pub(crate) fn fit_survival_transformation_model(
             // count of smoothing blocks is recorded before the ridge is added
             // (issue #563).
             let num_smoothing_blocks = penalty_blocks.len();
-            // The Weibull linear time basis is `[1, log t]`. In the SINGLE-cause
-            // dedicated-PIRLS path the constant column carries the baseline level
-            // (β0 = −shape·ln(scale)), so the stabilization ridge excludes it
-            // (`ridge_range_start = 1`) to avoid shrinking the scale. But that
-            // same basis is ANCHOR-CENTERED, which makes the constant column
-            // identically zero — a dead, gradient-free direction. The single-cause
-            // PIRLS leaves β0 at its seed and tolerates the zero column; the
-            // CAUSE-SPECIFIC competing-risks path instead routes through the
-            // custom-family blockwise Newton solver, whose per-block Hessian then
-            // has an exactly-zero row/column on β0. Excluding it from the ridge
-            // leaves that Hessian singular, so the inner Newton step degenerates
-            // and NO coefficient moves off its seed (#1590). For the cause-specific
-            // path penalise the full width so the dead β0 is pinned (→ 0, which the
-            // downstream baseline recovery already ignores: scale = anchor, shape =
-            // β1), leaving the live time/covariate directions well-conditioned.
-            let ridge_range_start = if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull
-                && spec.time_build.basisname == "linear"
-                && spec.timewiggle.is_none()
-                && cause_count <= 1
-            {
-                1
-            } else {
-                0
-            };
+            // #2301: the Weibull built-in linear basis no longer carries the dead,
+            // intercept-confounded constant column (it was dropped at design build
+            // — see `build_survival_time_basis`'s Linear arm), so there is no
+            // gradient-free β0 to exclude from (or pin with) the ridge. Every column
+            // is now a live direction, so the stabilization ridge spans the full
+            // coefficient vector exactly as it does for the other likelihood modes.
+            let ridge_range_start = 0usize;
             if spec.ridge_lambda > 0.0 && p > ridge_range_start {
                 let dim = p - ridge_range_start;
                 let mut ridge = Array2::<f64>::zeros((dim, dim));
@@ -2767,13 +2766,31 @@ pub(crate) fn fit_survival_transformation_model(
                 let (scale, shape) = spec
                     .weibull_seed
                     .ok_or_else(|| "weibull survival fit missing scale/shape seed".to_string())?;
-                if p_time_total < 2 {
+                // #2301: the built-in Weibull time basis is now a single `log t`
+                // column carrying the shape. The `−shape·log_scale` LOCATION that
+                // the dropped constant column used to seed is folded into the mean
+                // intercept instead. This REQUIRES the covariate block to carry an
+                // intercept to absorb the location — guaranteed because intercept
+                // removal (`~ x - 1`) is a typed refusal at formula_dsl.rs:2456. The
+                // check below is a real invariant guard, not a comment: if that ban
+                // is ever lifted, the location has no home and the fit must refuse
+                // here rather than silently mis-seed a singular direction.
+                if p_time_total < 1 {
                     return Err(format!(
-                        "weibull built-in time basis has {p_time_total} columns but needs 2 to seed scale/shape"
+                        "weibull built-in time basis has {p_time_total} columns but needs 1 for the shape"
                     ));
                 }
-                beta0[0] = -shape * scale.ln();
-                beta0[1] = shape;
+                if covariate_design.intercept_range.is_empty() {
+                    return Err(
+                        "weibull survival fit requires a mean intercept to carry the baseline \
+                         location, but the covariate design has none (intercept suppression such \
+                         as `~ x - 1` is unsupported; see formula_dsl.rs:2456)"
+                            .to_string(),
+                    );
+                }
+                beta0[0] = shape;
+                let intercept_col = p_time_total + covariate_design.intercept_range.start;
+                beta0[intercept_col] = -shape * scale.ln();
             }
             let structural_lower_bounds =
                 if spec.likelihood_mode != SurvivalLikelihoodMode::Weibull && p_time_total > 0 {
@@ -3648,4 +3665,88 @@ pub(crate) fn crossfit_score_calibration(
     })?;
 
     Ok(Some(CrossFitScoreCalibration { z_oof, jac_oof }))
+}
+
+#[cfg(test)]
+mod survival_edf_tests {
+    // The #2301 anchor gauge that used to make this Hessian singular is now
+    // removed at design build (the Weibull Linear time-basis dropped its redundant
+    // constant column), so `survival_edf_from_dense_hessian` is back to the exact
+    // factorize + trace-solve path. The earlier rank-certified-pseudoinverse gauge
+    // tests are therefore obsolete and dropped; the exact-solve contract retained
+    // here is: (1) a correct exact trace on a well-conditioned Hessian, and (2) a
+    // typed refusal (carrying the a0a9771ca flat-direction naming on the trace-solve
+    // branch) on a singular Hessian. The end-to-end healthy-fit gate lives in the
+    // Weibull ALO regression (tests/bug_hunt_2301_diagnose_alo_multiclass_test.rs).
+    use super::*;
+    use crate::survival::PenaltyBlock;
+    use ndarray::array;
+
+    fn penalty_block(matrix: Array2<f64>, lambda: f64, start: usize) -> PenaltyBlock {
+        let cols = matrix.ncols();
+        PenaltyBlock {
+            matrix,
+            lambda,
+            range: start..start + cols,
+            nullspace_dim: 0,
+        }
+    }
+
+    /// Exact penalized EDF on a well-conditioned Hessian, checked against an
+    /// INDEPENDENT analytic trace (a hand-inverted 2×2 block), not the code's own
+    /// solve route.
+    #[test]
+    fn survival_edf_exact_trace_on_well_conditioned_hessian() {
+        // Block-diagonal PD H: a coupled 2×2 leading block plus an isolated
+        // third direction. Penalty is the identity on the leading block.
+        let h = array![[4.0, 1.0, 0.0], [1.0, 3.0, 0.0], [0.0, 0.0, 2.0]];
+        let blocks = vec![penalty_block(array![[1.0, 0.0], [0.0, 1.0]], 1.0, 0)];
+
+        let (edf_total, edf_by_block, penalty_block_trace) =
+            survival_edf_from_dense_hessian(&h, &blocks).expect("PD Hessian must compute EDF");
+
+        // Leading 2×2 block [[4,1],[1,3]] has det 11 and inverse (1/11)[[3,-1],[-1,4]];
+        // tr(H⁻¹ S) over that block = (3 + 4)/11 = 7/11. p = 3, so
+        // edf_total = 3 − 7/11 = 26/11 and edf_by_block[0] = 2 − 7/11 = 15/11.
+        let expected_trace = 7.0 / 11.0;
+        assert!(
+            (penalty_block_trace[0] - expected_trace).abs() < 1e-9,
+            "penalty trace {:.9} != analytic 7/11",
+            penalty_block_trace[0]
+        );
+        assert!(
+            (edf_by_block[0] - (2.0 - expected_trace)).abs() < 1e-9,
+            "per-block EDF {:.9} != 15/11",
+            edf_by_block[0]
+        );
+        assert!(
+            (edf_total - (3.0 - expected_trace)).abs() < 1e-9,
+            "total EDF {:.9} != 26/11",
+            edf_total
+        );
+    }
+
+    /// A singular converged Hessian is a typed inference failure, never a silently
+    /// fabricated finite EDF. The trace-solve branch additionally names the flat
+    /// direction (diag a0a9771ca); the guaranteed contract asserted here is the
+    /// typed `survival edf` refusal.
+    #[test]
+    fn survival_edf_refuses_on_singular_hessian() {
+        // Coupled singular H, matching the #2301 gauge structure: the leading 2×2
+        // block [[2,2],[2,2]] is rank 1 (null direction [1,−1,0]) and the penalty
+        // acts on exactly that block, so the trace solve H⁻¹ S runs through the
+        // singular operator and produces a non-finite result — the same signature
+        // the real anchor-gauge fit hit before the column was dropped. (A diagonal
+        // zero-pivot matrix can be silently lifted by the factorization fallback;
+        // this coupled form reproduces the genuine non-finite-solve refusal.)
+        let h = array![[2.0, 2.0, 0.0], [2.0, 2.0, 0.0], [0.0, 0.0, 3.0]];
+        let blocks = vec![penalty_block(array![[1.0, 0.0], [0.0, 1.0]], 1.0, 0)];
+
+        let err = survival_edf_from_dense_hessian(&h, &blocks)
+            .expect_err("a singular penalized Hessian must refuse, never fabricate a finite EDF");
+        assert!(
+            err.contains("survival edf"),
+            "refusal must be a typed survival-edf error: {err}"
+        );
+    }
 }
