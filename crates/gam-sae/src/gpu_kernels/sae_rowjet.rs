@@ -3126,6 +3126,167 @@ mod tests {
         assert!(any_beta, "beta-direction trace must engage");
     }
 
+    /// Independent finite-difference oracle for the θ-adjoint's softmax-logit
+    /// substitution — the novel #2304 surface that
+    /// `contracted_trace_matches_manual_selected_inverse_reduction_2304` cannot
+    /// validate because that test re-implements the production reduction formula
+    /// (a change-detector, not a correctness oracle).
+    ///
+    /// The whole point of the `Trace` shape is `Γ = tr(H⁻¹ ∂H/∂θ)`, where for a
+    /// logit direction `w` over a coordinate pair `(a,b)` the row Hessian's data
+    /// curvature block is the reconstruction Gram `G[a][b] = ⟨J_a, J_b⟩` and the
+    /// code differentiates it through the softmax assignment weights (the
+    /// `softmax_data_weight_product_logit_factor` substitution) rather than
+    /// through second jets. With the coordinate first jet
+    /// `J_a = z_{atom_a}·√w·da` (da = decoded-first for slot a) the Gram is
+    /// `G[a][b] = z_{atom_a} z_{atom_b} · w · ⟨da,db⟩`, an explicit function of
+    /// the softmax gates alone. Choosing the row-local t–t weight `E_tt` to
+    /// couple only always-active coordinate slots (and zeroing the border
+    /// inverses) collapses the logit-direction output to
+    /// `t[w] = Σ_{a,b} E_tt[a][b]·∂G[a][b]/∂ℓ_w = ∂/∂ℓ_w ⟨E_tt, G(ℓ)⟩`.
+    ///
+    /// This test recomputes that scalar `Φ(ℓ) = ⟨E_tt, G(ℓ)⟩` directly from the
+    /// softmax gates and the decoder inner products — sharing no code with the
+    /// production reduction, the substitution factor, or the row program's
+    /// jets — and central-differences it. A sign error, a missing/extra `inv_tau`
+    /// factor, a wrong assignment index in the substitution, or a
+    /// reduction-bookkeeping bug on the logit rows all break agreement. Run at
+    /// two temperatures so a dropped `inv_tau` cannot hide.
+    #[test]
+    fn contracted_trace_logit_adjoint_matches_softmax_finite_difference_2304() {
+        for &inv_tau in &[1.0_f64, 1.3_f64] {
+            let rows = complete_fixture(4);
+            let n = rows.len();
+            let q = rows[0].primaries.len();
+            let p = rows[0].out_dim;
+            let n_beta = rows[0].beta_atoms.len();
+
+            // Atoms 0 and 1 carry `active_atoms = true` on every row of
+            // `complete_fixture`; atom 2 does not. Restricting `E_tt` to their
+            // coordinate slots keeps every first jet in play nonzero, so the
+            // production substitution and the independent Gram agree row by row.
+            let coord_slots: Vec<usize> = rows[0]
+                .primaries
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, primary)| match primary {
+                    SaeRowJetPrimary::Coordinate { atom, .. } if *atom == 0 || *atom == 1 => {
+                        Some(slot)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                coord_slots.len() >= 2,
+                "fixture must expose at least two always-active coordinate slots"
+            );
+            let coord_atom = |slot: usize| -> usize {
+                match rows[0].primaries[slot] {
+                    SaeRowJetPrimary::Coordinate { atom, .. } => atom,
+                    SaeRowJetPrimary::Logit { .. } => {
+                        panic!("coord_slots must only contain coordinate primaries")
+                    }
+                }
+            };
+
+            // Deterministic symmetric weight on the coupled coordinate slots.
+            let raw_weight = |a: usize, b: usize| -> f64 { ((a * 7 + b * 3 + 1) as f64 * 0.05).cos() };
+            let mut e_tt = vec![0.0_f64; n * q * q];
+            for row in 0..n {
+                for &a in &coord_slots {
+                    for &b in &coord_slots {
+                        let value = 0.5 * (raw_weight(a, b) + raw_weight(b, a));
+                        e_tt[row * q * q + a * q + b] = value;
+                    }
+                }
+            }
+            // Zero borders isolate the coordinate-pair data-curvature term.
+            let inv_vbeta = vec![0.0_f64; n * q * n_beta];
+            let beta_inv = vec![0.0_f64; n_beta * n_beta];
+
+            let trace = execute_softmax_row_jet_tile_contracted(
+                &rows,
+                inv_tau,
+                SaeRowJetPath::Cpu,
+                SaeRowJetContraction::Trace {
+                    e_tt: &e_tt,
+                    inv_vbeta: &inv_vbeta,
+                    beta_inv: &beta_inv,
+                },
+            )
+            .expect("CPU trace contraction");
+
+            let dot =
+                |x: &[f64], y: &[f64]| -> f64 { x.iter().zip(y).map(|(&a, &b)| a * b).sum() };
+            // z(ℓ) = softmax(inv_tau·ℓ), stable.
+            let softmax = |logits: &[f64]| -> Vec<f64> {
+                let shift = logits
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let exps: Vec<f64> = logits
+                    .iter()
+                    .map(|&l| ((l - shift) * inv_tau).exp())
+                    .collect();
+                let sum: f64 = exps.iter().sum();
+                exps.iter().map(|&e| e / sum).collect()
+            };
+
+            let h = 1e-6;
+            let mut max_err = 0.0_f64;
+            let mut scale = 0.0_f64;
+            let mut checked = 0usize;
+            for row in 0..n {
+                let input = &rows[row];
+                let row_weight = input.sqrt_row_weight * input.sqrt_row_weight;
+                let da = |slot: usize| -> &[f64] { &input.decoded_first[slot * p..(slot + 1) * p] };
+                // Logits consistent with the stored gates: softmax(inv_tau·ℓ)=z
+                // for ℓ_k = ln(z_k)/inv_tau (softmax is shift-invariant and Σz=1).
+                let base_logits: Vec<f64> =
+                    input.gate_values.iter().map(|&z| z.ln() / inv_tau).collect();
+                let phi = |logits: &[f64]| -> f64 {
+                    let z = softmax(logits);
+                    let mut acc = 0.0_f64;
+                    for &a in &coord_slots {
+                        for &b in &coord_slots {
+                            let weight = e_tt[row * q * q + a * q + b];
+                            acc += weight
+                                * z[coord_atom(a)]
+                                * z[coord_atom(b)]
+                                * row_weight
+                                * dot(da(a), da(b));
+                        }
+                    }
+                    acc
+                };
+                for w in 0..q {
+                    let SaeRowJetPrimary::Logit { atom: atom_w } = input.primaries[w] else {
+                        continue;
+                    };
+                    let mut plus = base_logits.clone();
+                    plus[atom_w] += h;
+                    let mut minus = base_logits.clone();
+                    minus[atom_w] -= h;
+                    let finite_difference = (phi(&plus) - phi(&minus)) / (2.0 * h);
+                    let produced = trace.t[row * q + w];
+                    max_err = max_err.max((finite_difference - produced).abs());
+                    scale = scale.max(produced.abs()).max(finite_difference.abs());
+                    checked += 1;
+                }
+            }
+            assert!(checked >= 2, "must exercise at least two logit directions");
+            assert!(
+                scale > 1e-6,
+                "softmax-substitution trace outputs must be non-trivial (inv_tau={inv_tau}, scale={scale})"
+            );
+            assert!(
+                max_err <= 1e-6 * (1.0 + scale),
+                "logit θ-adjoint vs softmax finite difference disagree \
+                 (inv_tau={inv_tau}, max_err={max_err}, scale={scale})"
+            );
+        }
+    }
+
     /// The contracted ledger must charge the reduced download + probe upload
     /// and NEVER the `q²·p` second channel or `q·n_beta·p` mixed channel that
     /// dominates the elementwise tile. Pinned by exact byte arithmetic — not
