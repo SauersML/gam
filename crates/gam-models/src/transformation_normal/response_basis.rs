@@ -114,8 +114,10 @@ pub(crate) fn build_response_basis(
     let mut resp_deriv = Array2::<f64>::zeros((n, p_resp));
     resp_deriv.slice_mut(s![.., 1..]).assign(&shape_deriv);
 
-    // SCOP-CTN coef-transform is identity: I-splines have no constant in
-    // their span, and squaring γ removes the per-component sign null direction.
+    // SCOP-CTN coef-transform is identity: the direct-α chart (gam#2306) keeps
+    // the I-spline shape coordinates as-is (no square, no reparameterization),
+    // and I-splines carry no constant in their span, so no column folding is
+    // needed.
     let transform = Array2::<f64>::eye(p_shape);
 
     // SPEC-5: the response-direction penalty is the EXACT function-space

@@ -1,5 +1,14 @@
 use super::*;
 
+/// Boundary-roundoff floor (in ULP of the endpoint magnitude) for the
+/// certified-support gate in [`transformation_normal_pit_score`]. An honest
+/// training-boundary row reconstructs `lower`/`upper` through a `p_resp`-term
+/// basis-weighted α sum, accumulating `~p_resp·ε·scale` cancellation; this
+/// budget sits comfortably above realistic `p_resp` (≈ tens of shape columns)
+/// so genuine roundoff is snapped to the endpoint while any larger excursion
+/// is refused as out-of-certified-domain extrapolation.
+const PIT_CERTIFIED_DOMAIN_ROUNDOFF_ULPS: f64 = 256.0;
+
 pub fn transformation_normal_pit_score(
     h: f64,
     lower: f64,
@@ -25,26 +34,44 @@ pub fn transformation_normal_pit_score(
         ) }.into());
     }
 
-    // Extrapolation outside `[lower, upper]` is *not* a malformed input —
-    // a test sample whose response sits at-or-beyond the training response
-    // support will produce a finite `h` slightly below `lower` (or slightly
-    // above `upper`) by exactly the amount the kernel reconstructs the
-    // boundary. The PIT mapping is still well-defined: `u → 0` when
-    // `h ≤ lower`, `u → 1` when `h ≥ upper`, and the `clip_eps` clamp on
-    // the standard-normal quantile call at the end of this function turns
-    // both into the extreme-quantile finite values that downstream
-    // calibration code expects. Refusing here was surfacing routine
-    // boundary roundoff at large-scale shape (`p_resp` coefficients × O(1)
-    // basis evaluations introduce ~`p_resp·ε·scale` noise — 64·ε·scale
-    // is below that floor) as a hard prediction failure.
+    // Certified-domain gate (direct-α cutover, gam#2306). Positivity /
+    // monotonicity of the transform is certified only on the fitted rows —
+    // the factored Khatri-Rao cone guarantees `h(y_i, x_i) ∈ [lower_i,
+    // upper_i]` there — plus whatever domain certificate the persisted model
+    // carries. A prediction whose transformed value `h` sits meaningfully
+    // outside `[lower, upper]` is therefore an extrapolation past the
+    // certified support (a test response beyond the training range, or a
+    // covariate `x` where `α_k(x)` left the positivity cone). Fabricating an
+    // extreme-tail quantile by clamping would ship a silent, uncertified
+    // answer, so refuse it (typed) and name the offending value + domain.
     //
-    // A debug-level log preserves visibility for genuinely far-out
-    // inputs without aborting the prediction. Non-finite `h` is already
-    // rejected above at the `is_finite()` guard.
-    if h < lower || h > upper {
-        log::debug!(
-            "transformation-normal PIT extrapolation: h={h:.6e}, lower={lower:.6e}, upper={upper:.6e} — clamping to support and continuing"
-        );
+    // The only tolerated excursion is boundary roundoff: an honest
+    // training-boundary row reconstructs `lower`/`upper` through a
+    // `p_resp`-term basis-weighted α sum, accumulating ~`p_resp·ε·scale`
+    // cancellation. Snap that noise to the exact endpoint (it drives the
+    // legitimate `u → {0, 1}` saturation the fit-time score paths consume),
+    // and reject anything past the floor. Non-finite `h` is already rejected
+    // above at the `is_finite()` guard.
+    let support = upper - lower;
+    let domain_scale = support.max(lower.abs()).max(upper.abs());
+    let domain_tol = PIT_CERTIFIED_DOMAIN_ROUNDOFF_ULPS * f64::EPSILON * domain_scale;
+    if h < lower - domain_tol {
+        return Err(TransformationNormalError::OutsideCertifiedDomain { reason: format!(
+            "transformation-normal PIT: transformed response h={h:.6e} lies below the certified \
+             support lower endpoint {lower:.6e} by {:.6e} (> boundary-roundoff floor \
+             {domain_tol:.3e}); positivity is certified only on the training support \
+             [{lower:.6e}, {upper:.6e}], so this response/covariate is outside the fitted domain",
+            lower - h
+        ) }.into());
+    }
+    if h > upper + domain_tol {
+        return Err(TransformationNormalError::OutsideCertifiedDomain { reason: format!(
+            "transformation-normal PIT: transformed response h={h:.6e} lies above the certified \
+             support upper endpoint {upper:.6e} by {:.6e} (> boundary-roundoff floor \
+             {domain_tol:.3e}); positivity is certified only on the training support \
+             [{lower:.6e}, {upper:.6e}], so this response/covariate is outside the fitted domain",
+            h - upper
+        ) }.into());
     }
     let h_inside = h.clamp(lower, upper);
     let u = if h_inside <= lower {
@@ -199,28 +226,50 @@ mod tests {
     }
 
     #[test]
-    fn pit_at_or_below_lower_clamps_to_low_quantile() {
-        // h <= lower -> u = 0 -> clamped to clip_eps -> Phi^{-1}(clip_eps).
+    fn pit_at_lower_endpoint_saturates_but_below_domain_refuses() {
+        // In-domain path unchanged: h exactly at (or within the roundoff floor
+        // of) `lower` saturates u -> 0 -> clip_eps -> Phi^{-1}(clip_eps). This
+        // is the legitimate boundary saturation the fit-time score paths
+        // consume, so it must keep working.
         let clip = 1e-6;
         let expected = standard_normal_quantile(clip).unwrap();
         let at = transformation_normal_pit_score(-1.0, -1.0, 1.0, clip).unwrap();
-        let below = transformation_normal_pit_score(-1.5, -1.0, 1.0, clip).unwrap();
         assert!((at - expected).abs() < 1e-12);
-        assert!((below - expected).abs() < 1e-12);
-        // Low quantile is a large negative number.
         assert!(expected < -3.0);
+        // A tiny sub-floor roundoff excursion still snaps to the endpoint.
+        let roundoff = -1.0 - 8.0 * f64::EPSILON;
+        let at_roundoff = transformation_normal_pit_score(roundoff, -1.0, 1.0, clip).unwrap();
+        assert!((at_roundoff - expected).abs() < 1e-12);
+
+        // Direct-α cutover (gam#2306): a genuine out-of-certified-domain probe
+        // below `lower` is a typed refusal naming the value and the domain, not
+        // a clamped tail quantile.
+        let err = transformation_normal_pit_score(-1.5, -1.0, 1.0, clip)
+            .expect_err("h far below lower must refuse, not clamp");
+        assert!(err.contains("certified"), "message names the domain: {err}");
+        assert!(err.contains("-1.500000e0"), "message names h: {err}");
+        assert!(err.contains("outside the fitted domain"), "message: {err}");
     }
 
     #[test]
-    fn pit_at_or_above_upper_clamps_to_high_quantile() {
-        // h >= upper -> u = 1 -> clamped to 1 - clip_eps -> Phi^{-1}(1 - clip_eps).
+    fn pit_at_upper_endpoint_saturates_but_above_domain_refuses() {
+        // In-domain path unchanged: h at (or within the roundoff floor of)
+        // `upper` saturates u -> 1 -> 1 - clip_eps -> Phi^{-1}(1 - clip_eps).
         let clip = 1e-6;
         let expected = standard_normal_quantile(1.0 - clip).unwrap();
         let at = transformation_normal_pit_score(1.0, -1.0, 1.0, clip).unwrap();
-        let above = transformation_normal_pit_score(2.0, -1.0, 1.0, clip).unwrap();
         assert!((at - expected).abs() < 1e-12);
-        assert!((above - expected).abs() < 1e-12);
         assert!(expected > 3.0);
+        let roundoff = 1.0 + 8.0 * f64::EPSILON;
+        let at_roundoff = transformation_normal_pit_score(roundoff, -1.0, 1.0, clip).unwrap();
+        assert!((at_roundoff - expected).abs() < 1e-12);
+
+        // A genuine out-of-certified-domain probe above `upper` refuses.
+        let err = transformation_normal_pit_score(2.0, -1.0, 1.0, clip)
+            .expect_err("h far above upper must refuse, not clamp");
+        assert!(err.contains("certified"), "message names the domain: {err}");
+        assert!(err.contains("2.000000e0"), "message names h: {err}");
+        assert!(err.contains("outside the fitted domain"), "message: {err}");
     }
 
     #[test]

@@ -26,6 +26,7 @@ use crate::inference::model::{
     FittedEstimator, FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
     SavedResidualCascade, SavedSplineScan, SavedSurvivalLocationScaleStructure,
+    SavedTransformationNormalGeometry, TransformationNormalParameterization,
     TransformationScoreCalibration,
 };
 use crate::scale_design::ScaleDeviationTransform;
@@ -798,9 +799,36 @@ pub fn assemble_transformation_normal_payload(
     );
     payload.transformation_response_degree = Some(family.response_degree());
     payload.transformation_response_median = Some(family.response_median());
+    payload.transformation_geometry = Some(transformation_normal_geometry(family));
     payload.transformation_score_calibration = Some(score_calibration);
     source.apply_to(&mut payload);
     payload
+}
+
+/// Snapshot the direct-α CTN geometry (gam#2306) a saved model needs to replay
+/// the transform and the certified-domain prediction refusal.
+///
+/// The response value basis is `[1, I_1, …, I_K]` (`p_resp` columns), so the
+/// shape-coordinate count is `p_resp − 1` (column 0 is the unconstrained
+/// location field). The Khatri-Rao positivity-cone carrier is the `n × p_cov`
+/// covariate design, and the certified response support is the clamped-knot
+/// span `[knots.first, knots.last]` the endpoint bases were evaluated at.
+fn transformation_normal_geometry(
+    family: &TransformationNormalFamily,
+) -> SavedTransformationNormalGeometry {
+    let knots = family.response_knots();
+    let lo = knots.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = knots.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    SavedTransformationNormalGeometry {
+        parameterization: TransformationNormalParameterization::DirectAlpha,
+        response_degree: family.response_degree(),
+        response_knot_count: knots.len(),
+        shape_coordinate_count: family.p_resp().saturating_sub(1),
+        cone_carrier_covariate_width: family.p_cov(),
+        cone_carrier_row_count: family.n_obs(),
+        certified_response_support: (lo, hi),
+        response_median: family.response_median(),
+    }
 }
 
 /// Which likelihood a (non-survival) location-scale model carries: Gaussian

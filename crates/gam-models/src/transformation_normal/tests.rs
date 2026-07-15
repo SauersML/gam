@@ -634,26 +634,29 @@ pub(crate) fn transformation_normal_pit_score_uses_finite_support_normalizer() {
         .expect("positive-tail PIT score");
     assert!(positive_tail.is_finite());
 
-    // Extrapolation past the upper endpoint is *not* an error: the PIT
-    // mapping clamps `h` to `[lower, upper]` so `u → 1`, and the
-    // `clip_eps` clamp on the standard-normal quantile call yields the
-    // upper-tail extreme finite value (`≈ Φ⁻¹(1 - clip_eps)`). At
-    // large-scale shape, an honest test sample at-or-just-beyond the
-    // training response support routinely lands here from boundary
-    // roundoff alone, so failing closed would ship a hard prediction
-    // error on every CTN bootstrap pass.
+    // Direct-α cutover (gam#2306): extrapolation meaningfully past an endpoint
+    // is a typed refusal, not a clamped tail quantile. `h = 2.1` sits 0.1 above
+    // `upper = 2.0` on a support of width 4.0 — orders of magnitude past the
+    // boundary-roundoff floor — so it is outside the certified positivity
+    // domain and must be refused, naming the value and the domain.
     let above_upper = transformation_normal_pit_score(2.1, -2.0, 2.0, 1.0e-12)
-        .expect("extrapolation above upper endpoint should clamp, not error");
-    assert!(above_upper.is_finite());
-    assert!(above_upper > 0.0, "h>upper must produce upper-tail PIT");
+        .expect_err("extrapolation above upper endpoint must refuse, not clamp");
+    assert!(above_upper.contains("certified"));
+    assert!(above_upper.contains("outside the fitted domain"));
     let below_lower = transformation_normal_pit_score(-2.1, -2.0, 2.0, 1.0e-12)
-        .expect("extrapolation below lower endpoint should clamp, not error");
-    assert!(below_lower.is_finite());
-    assert!(below_lower < 0.0, "h<lower must produce lower-tail PIT");
+        .expect_err("extrapolation below lower endpoint must refuse, not clamp");
+    assert!(below_lower.contains("certified"));
+    assert!(below_lower.contains("outside the fitted domain"));
+
+    // A sub-floor roundoff excursion at the endpoint is still tolerated (snapped
+    // to the boundary), since honest training-boundary rows land there.
+    let roundoff = transformation_normal_pit_score(2.0 + 8.0 * f64::EPSILON, -2.0, 2.0, 1.0e-12)
+        .expect("boundary roundoff must snap to the endpoint, not refuse");
+    assert!(roundoff.is_finite() && roundoff > 0.0);
 
     // Genuinely-malformed input (NaN h) must still be rejected by the
-    // early `is_finite()` guard — the soft-clamp is for legitimate
-    // numerical extrapolation, not for non-finite values.
+    // early `is_finite()` guard — the roundoff tolerance is for legitimate
+    // numerical noise at the boundary, not for non-finite values.
     let nan_err = transformation_normal_pit_score(f64::NAN, -2.0, 2.0, 1.0e-12)
         .expect_err("NaN h must still be rejected");
     assert!(nan_err.contains("finite"));

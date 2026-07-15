@@ -60,6 +60,111 @@ use std::path::Path;
 /// forward-compatible.
 pub const MODEL_PAYLOAD_VERSION: u32 = 13;
 
+/// Coefficient parameterization of a saved transformation-normal (CTN) fit.
+///
+/// The direct-α cutover (gam#2306) made the transform
+/// `h(y, x) = α_0(x) + Σ_k α_k(x)·I_k(y)` LINEAR in the coefficient matrix,
+/// with per-covariate-row monotonicity enforced by the factored Khatri-Rao
+/// positivity cone rather than the pre-cutover squared-γ latent chart. The
+/// marker exists so a reader can reject coefficients written under any other
+/// chart as a typed mismatch instead of silently reinterpreting them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransformationNormalParameterization {
+    /// Direct-α chart: `h` linear in the coefficient matrix `A`, monotonicity
+    /// certified by the factored Khatri-Rao cone `α_k(x_i) = ψ_iᵀ A[k,:] ≥ 0`.
+    DirectAlpha,
+}
+
+/// Direct-α SCOP-CTN transformation geometry required to replay a saved
+/// transformation-normal fit (gam#2306).
+///
+/// Beyond the response knots/degree/median/transform snapshot, direct-α replay
+/// — and in particular the certified-domain refusal that
+/// [`crate::transformation_normal::transformation_normal_pit_score`] raises for
+/// out-of-support prediction — needs the coefficient parameterization marker,
+/// the response value-basis spec, the shape-coordinate count, the cone-carrier
+/// (Khatri-Rao factor) shape, and the response support the positivity cone was
+/// certified over. This is a REQUIRED v13 field for a transformation-normal
+/// model: loading a CTN payload that lacks it (a v12-or-older squared-γ model)
+/// is a typed rejection in [`FittedModelPayload::validate_for_persistence`],
+/// never a heuristic conversion.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedTransformationNormalGeometry {
+    /// Coefficient chart. Only `DirectAlpha` is written by a v13+ CTN writer.
+    pub parameterization: TransformationNormalParameterization,
+    /// I-spline response value-basis degree (`response_degree`).
+    pub response_degree: usize,
+    /// Number of response knots persisted in `transformation_response_knots`
+    /// (a provenance cross-check: replay rebuilds the value basis from those
+    /// knots and this count must agree).
+    pub response_knot_count: usize,
+    /// Number of shape coordinates `p_resp − 1`: the non-negativity-constrained
+    /// I-spline columns. Response column 0 is the unconstrained location field.
+    pub shape_coordinate_count: usize,
+    /// Covariate-side design width `p_cov`. The Khatri-Rao cone carrier factor
+    /// is `n × p_cov`, so the coefficient block is `p_resp × p_cov`.
+    pub cone_carrier_covariate_width: usize,
+    /// Number of covariate rows the positivity cone was certified over (the
+    /// fitted observation count `n`).
+    pub cone_carrier_row_count: usize,
+    /// Response support `[y_lo, y_hi]` (the clamped-knot span) the transform and
+    /// positivity cone were certified over — the certified domain the
+    /// out-of-support prediction refusal is defined against.
+    pub certified_response_support: (f64, f64),
+    /// Response median anchoring the per-row monotonicity floor `ε·(y − median)`.
+    pub response_median: f64,
+}
+
+impl SavedTransformationNormalGeometry {
+    /// Self-contained structural validation. Cross-checks against the sibling
+    /// response-basis payload fields (knot count, degree) are done by the
+    /// caller in `validate_for_persistence`.
+    pub fn validate(&self, context: &str) -> Result<(), FittedModelError> {
+        match self.parameterization {
+            TransformationNormalParameterization::DirectAlpha => {}
+        }
+        if self.response_degree < 1 {
+            return Err(FittedModelError::PayloadCorrupt {
+                reason: format!(
+                    "{context} CTN geometry response_degree must be >= 1, got {}",
+                    self.response_degree
+                ),
+            });
+        }
+        if self.shape_coordinate_count == 0 {
+            return Err(FittedModelError::PayloadCorrupt {
+                reason: format!("{context} CTN geometry needs at least one shape coordinate"),
+            });
+        }
+        if self.cone_carrier_covariate_width == 0 || self.cone_carrier_row_count == 0 {
+            return Err(FittedModelError::PayloadCorrupt {
+                reason: format!(
+                    "{context} CTN geometry cone carrier must be non-empty: {} rows x {} covariate columns",
+                    self.cone_carrier_row_count, self.cone_carrier_covariate_width
+                ),
+            });
+        }
+        let (lo, hi) = self.certified_response_support;
+        if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+            return Err(FittedModelError::PayloadCorrupt {
+                reason: format!(
+                    "{context} CTN geometry certified response support must be finite and ordered lo < hi, got [{lo}, {hi}]"
+                ),
+            });
+        }
+        if !self.response_median.is_finite() {
+            return Err(FittedModelError::PayloadCorrupt {
+                reason: format!(
+                    "{context} CTN geometry response_median must be finite, got {}",
+                    self.response_median
+                ),
+            });
+        }
+        Ok::<(), _>(())
+    }
+}
+
 /// Exact topology required to replay a saved survival location-scale fit.
 /// This is a required v11 payload field: `None` is explicit for every other
 /// family, while location-scale persistence requires `Some`.
@@ -507,6 +612,12 @@ pub struct FittedModelPayload {
     /// Transformation-normal: median of the response used for anchoring.
     #[serde(default)]
     pub transformation_response_median: Option<f64>,
+    /// Transformation-normal: direct-α geometry record (gam#2306). REQUIRED for
+    /// a transformation-normal model at v13+; `None` for every other family and
+    /// for pre-cutover CTN payloads, whose load `validate_for_persistence`
+    /// refuses (typed) rather than heuristically converting.
+    #[serde(default)]
+    pub transformation_geometry: Option<SavedTransformationNormalGeometry>,
     /// Transformation-normal saved score contract. The score is the exact
     /// finite-support PIT:
     /// z = Phi^{-1}((Phi(h) - Phi(h_L)) / (Phi(h_U) - Phi(h_L))).
@@ -788,6 +899,7 @@ impl FittedModelPayload {
             transformation_response_transform: None,
             transformation_response_degree: None,
             transformation_response_median: None,
+            transformation_geometry: None,
             transformation_score_calibration: None,
             resolved_termspec: None,
             resolved_termspec_noise: None,
@@ -4565,6 +4677,46 @@ impl FittedModel {
                 }
             })?;
             score.validate("transformation-normal model")?;
+            // Direct-α cutover (gam#2306): the geometry record is REQUIRED. A
+            // CTN payload without it is a pre-cutover (v12-or-older) squared-γ
+            // model whose coefficients cannot be replayed under the direct-α
+            // contract — refuse it (typed) rather than heuristically convert.
+            let geometry = self.transformation_geometry.as_ref().ok_or_else(|| {
+                FittedModelError::MissingField {
+                    reason: "transformation-normal model is missing the direct-α geometry record \
+                             (transformation_geometry); this is a pre-cutover (v12-or-older) CTN \
+                             model whose squared-γ chart is not replayable under the direct-α \
+                             cutover (gam#2306) — refit"
+                        .to_string(),
+                }
+            })?;
+            geometry.validate("transformation-normal model")?;
+            // Cross-check the geometry against the sibling response-basis fields
+            // so a mismatched (hand-edited / partially-migrated) payload cannot
+            // slip through: replay rebuilds the value basis from these.
+            if let Some(knots) = self.transformation_response_knots.as_ref() {
+                if geometry.response_knot_count != knots.len() {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "transformation-normal geometry response_knot_count {} disagrees with \
+                             transformation_response_knots length {}",
+                            geometry.response_knot_count,
+                            knots.len()
+                        ),
+                    });
+                }
+            }
+            if let Some(degree) = self.transformation_response_degree {
+                if geometry.response_degree != degree {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "transformation-normal geometry response_degree {} disagrees with \
+                             transformation_response_degree {degree}",
+                            geometry.response_degree
+                        ),
+                    });
+                }
+            }
         }
         if matches!(self.family_state, FittedFamily::MarginalSlope { .. }) {
             if self.formula_logslope.is_none() {
@@ -5224,6 +5376,137 @@ mod tests {
             random_effect_terms: vec![],
             smooth_terms: vec![],
         }
+    }
+
+    /// Minimal transformation-normal payload that reaches (and passes, when the
+    /// geometry record is present) the CTN branch of `validate_for_persistence`.
+    /// The response-basis snapshot fields are made consistent with the geometry
+    /// record so the cross-checks accept.
+    fn transformation_normal_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {
+        let mut payload = FittedModelPayload::new(
+            version,
+            "y ~ s(x)".to_string(),
+            ModelKind::TransformationNormal,
+            FittedFamily::TransformationNormal {
+                likelihood: LikelihoodSpec::gaussian_identity(),
+            },
+            "transformation-normal".to_string(),
+        );
+        payload.fit_result = Some(fit.clone());
+        payload.unified = Some(fit);
+        payload.data_schema = Some(DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        });
+        payload.set_training_feature_metadata(vec!["x".to_string()], vec![(0.0, 1.0)]);
+        payload.resolved_termspec = Some(empty_termspec());
+        let knots = vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0];
+        payload.transformation_response_knots = Some(knots.clone());
+        payload.transformation_response_transform = Some(vec![vec![1.0]]);
+        payload.transformation_response_degree = Some(2);
+        payload.transformation_response_median = Some(0.5);
+        payload.transformation_score_calibration =
+            Some(TransformationScoreCalibration::finite_support_pit());
+        payload.transformation_geometry = Some(SavedTransformationNormalGeometry {
+            parameterization: TransformationNormalParameterization::DirectAlpha,
+            response_degree: 2,
+            response_knot_count: knots.len(),
+            shape_coordinate_count: 3,
+            cone_carrier_covariate_width: 2,
+            cone_carrier_row_count: 16,
+            certified_response_support: (0.0, 1.0),
+            response_median: 0.5,
+        });
+        payload
+    }
+
+    fn transformation_normal_fit() -> UnifiedFitResult {
+        saved_fit(vec![FittedBlock {
+            beta: Array1::from_vec(vec![0.1, 0.2, -0.3]),
+            role: BlockRole::Mean,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        }])
+    }
+
+    /// gam#2306 v13: the direct-α geometry record must survive a JSON
+    /// round-trip and keep validating, with every field preserved.
+    #[test]
+    fn transformation_normal_geometry_round_trips_and_validates() {
+        let payload = transformation_normal_payload(MODEL_PAYLOAD_VERSION, transformation_normal_fit());
+        let model = FittedModel::from_payload(payload);
+        model
+            .validate_for_persistence()
+            .expect("CTN model carrying the direct-α geometry record validates");
+
+        let json = serde_json::to_string(&model).expect("serialize CTN model");
+        let restored: FittedModel = serde_json::from_str(&json).expect("parse CTN model");
+        restored
+            .validate_for_persistence()
+            .expect("restored CTN model validates");
+        let geometry = restored
+            .payload()
+            .transformation_geometry
+            .as_ref()
+            .expect("restored payload carries the direct-α geometry record");
+        assert_eq!(
+            geometry.parameterization,
+            TransformationNormalParameterization::DirectAlpha
+        );
+        assert_eq!(geometry.response_degree, 2);
+        assert_eq!(geometry.response_knot_count, 7);
+        assert_eq!(geometry.shape_coordinate_count, 3);
+        assert_eq!(geometry.cone_carrier_covariate_width, 2);
+        assert_eq!(geometry.cone_carrier_row_count, 16);
+        assert_eq!(geometry.certified_response_support, (0.0, 1.0));
+        assert_eq!(geometry.response_median, 0.5);
+    }
+
+    /// gam#2306 v13: a CTN payload lacking the geometry record — a pre-cutover
+    /// (v12-or-older) squared-γ model, whose geometry slot deserializes to
+    /// `None` — must be a typed rejection, never a heuristic conversion.
+    #[test]
+    fn validate_for_persistence_rejects_ctn_without_geometry_record() {
+        let mut payload =
+            transformation_normal_payload(MODEL_PAYLOAD_VERSION, transformation_normal_fit());
+        payload.transformation_geometry = None;
+        let err = FittedModel::from_payload(payload)
+            .validate_for_persistence()
+            .expect_err("CTN model without the direct-α geometry record must be rejected");
+        assert!(
+            err.to_string().contains("transformation_geometry"),
+            "message names the field: {err}"
+        );
+        assert!(
+            err.to_string().contains("pre-cutover"),
+            "message explains the pre-cutover rejection: {err}"
+        );
+
+        // A geometry record that disagrees with the persisted response basis is
+        // also rejected (cross-check), so a partially-migrated payload cannot
+        // slip through.
+        let mut mismatched =
+            transformation_normal_payload(MODEL_PAYLOAD_VERSION, transformation_normal_fit());
+        if let Some(geometry) = mismatched.transformation_geometry.as_mut() {
+            geometry.response_knot_count += 1;
+        }
+        let err = FittedModel::from_payload(mismatched)
+            .validate_for_persistence()
+            .expect_err("geometry disagreeing with the persisted knots must be rejected");
+        assert!(
+            err.to_string().contains("response_knot_count"),
+            "message names the mismatch: {err}"
+        );
     }
 
     /// #1030/#1034: a scan-bearing payload must round-trip through JSON +
