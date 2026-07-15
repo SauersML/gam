@@ -27,6 +27,22 @@ impl ExactJointModeCurvatureCertificate {
     }
 }
 
+/// Whether the constrained candidate, rather than an ambient unconstrained
+/// spectrum step, owns trust-region globalization.
+///
+/// A reduced-face candidate already resolved negative curvature inside the
+/// only accessible space, `null(A_active)`. Ambient negative curvature cannot
+/// invalidate that direction: substituting an unconstrained trust step moves
+/// off the certified face while incorrectly retaining its endpoint row ids.
+fn constrained_search_delta_owns_trust_step(
+    exact_face_kind: Option<bool>,
+    has_active_set: bool,
+    ambient_spectrum_has_negative_curvature: Option<bool>,
+) -> bool {
+    exact_face_kind.is_some()
+        || (has_active_set && ambient_spectrum_has_negative_curvature == Some(false))
+}
+
 /// Reduced-space Newton candidate on a certified current inequality face.
 ///
 /// The global constrained step uses a convex model to discover the active
@@ -267,6 +283,30 @@ mod exact_face_newton_tests {
         assert!((candidate[1] - 0.5).abs() <= 2e-8);
         assert_eq!(active, vec![0, 1]);
         assert!(!exact);
+    }
+
+    #[test]
+    fn ambient_negative_curvature_cannot_replace_a_reduced_face_direction() {
+        assert!(constrained_search_delta_owns_trust_step(
+            Some(false),
+            true,
+            Some(true),
+        ));
+        assert!(constrained_search_delta_owns_trust_step(
+            Some(true),
+            true,
+            Some(true),
+        ));
+        assert!(constrained_search_delta_owns_trust_step(
+            None,
+            true,
+            Some(false),
+        ));
+        assert!(!constrained_search_delta_owns_trust_step(
+            None,
+            true,
+            Some(true),
+        ));
     }
 }
 
@@ -1714,7 +1754,12 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // operator's action by construction of `materialize_joint_hessian_source`)
             // and removes the dominant residual per-cycle row work on this path.
             let mut materialized_dense_unpenalized: Option<Array2<f64>> = None;
-            let (candidate_beta, joint_active_set, joint_step_spectral_nullity) =
+            let (
+                candidate_beta,
+                joint_active_set,
+                joint_step_spectral_nullity,
+                joint_reduced_face_kind,
+            ) =
                 if solve_joint_constraints_dense
                     && let Some(constraints) = joint_constraints.as_ref()
                 {
@@ -1957,7 +2002,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 active_set.len(),
                                 beta_new.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
                             );
-                            (beta_new, Some(active_set), 0usize)
+                            (beta_new, Some(active_set), 0usize, exact_face_kind)
                         }
                         Err(error) => {
                             return Err(format!(
@@ -2408,7 +2453,12 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     if !delta.iter().all(|v| v.is_finite()) {
                         break; // Fall back to blockwise
                     }
-                    (beta_joint.clone() + &delta, None, spectral_nullity_for_step)
+                    (
+                        beta_joint.clone() + &delta,
+                        None,
+                        spectral_nullity_for_step,
+                        None,
+                    )
                 };
             // Hessian-source build (and any QP solve immediately above) are
             // done by the time we reach `delta`. Capture the wall-clock
@@ -2856,8 +2906,12 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     // change direction and can leave the cone). The ordinary
                     // family feasibility limiter still runs below for any
                     // additional nonlinear constraint not represented by the QP.
-                    let positive_definite_constrained_qp = search_joint_active_set.is_some()
-                        && !spectrum.has_resolvable_negative_curvature();
+                    let constrained_search_delta_is_authoritative =
+                        constrained_search_delta_owns_trust_step(
+                            joint_reduced_face_kind,
+                            search_joint_active_set.is_some(),
+                            Some(spectrum.has_resolvable_negative_curvature()),
+                        );
                     // CONSTRAINED-PATH REFLECTED-QP RESCUE (gam#979 n3000 grind).
                     //
                     // On the constrained path `search_delta` is the *reflected*
@@ -2903,7 +2957,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             // same Err downstream and shrinks the radius.
                             Err(_) => false,
                         };
-                    if positive_definite_constrained_qp {
+                    if constrained_search_delta_is_authoritative {
+                        // A full-space convex QP direction and a reduced-face
+                        // direction both own their feasible chord. In the latter
+                        // case, ambient negative curvature is inaccessible and
+                        // has already been handled inside the face tangent.
+                        // Scaling the whole chord to the trust radius preserves
+                        // A_active·delta=0 and cone feasibility; replacing it
+                        // with an ambient spectrum step destroys both invariants.
                         trial_delta = search_delta.clone();
                         let qp_norms = joint_trust_region_block_metric_norms(
                             &trial_delta,

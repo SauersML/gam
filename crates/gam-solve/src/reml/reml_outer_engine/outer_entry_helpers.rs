@@ -583,14 +583,29 @@ pub fn active_constraint_tangent_geometry(
     if p == 0 {
         return Ok(ActiveConstraintTangentGeometry::FullyPinned);
     }
-    // Factor the rectangular row block directly. Forming `A_actᵀ A_act`
+    // Normalize each row before factoring. Constraint feasibility, working-face
+    // membership, and every active-set KKT gate are defined in scaled slack
+    // `(a·beta-b)/‖a‖`; tangent rank must be invariant to multiplying an
+    // inequality by an arbitrary positive constant as well. Factoring raw
+    // Khatri–Rao rows lets large-norm rows numerically erase independent
+    // small-norm rows, producing a direction that is tangent only in an
+    // unscaled least-squares aggregate and leaves the solver's actual face.
+    let mut normalized = a_act.clone();
+    for mut row in normalized.rows_mut() {
+        let norm = row.dot(&row).sqrt();
+        if norm.is_finite() && norm > 0.0 {
+            row /= norm;
+        }
+    }
+
+    // Factor the rectangular normalized row block directly. Forming `A_actᵀ A_act`
     // squares its condition number and can erase independent active rows near
     // machine precision. That produces a tangent which leaks in a constraint-
     // normal direction: the next accepted point then falls off the working
     // face and discards the entire warm active set. The thin SVD gives the row
     // rank without normal equations; complete its right-singular row basis to
     // an orthonormal null basis using twice-reorthogonalized coordinate axes.
-    let (_u, singular, vt) = a_act
+    let (_u, singular, vt) = normalized
         .svd(false, true)
         .map_err(|error| format!("active constraint tangent SVD failed: {error}"))?;
     let vt = vt.ok_or_else(|| "active constraint tangent SVD omitted Vᵀ".to_string())?;
@@ -644,7 +659,7 @@ pub fn active_constraint_tangent_geometry(
     // This routine is the shared authority for both optimization and LAML
     // projection. Refuse geometry that cannot preserve the solver's working-
     // face contract instead of silently returning a numerically false tangent.
-    for row in a_act.rows() {
+    for row in normalized.rows() {
         let row_norm = row.dot(&row).sqrt();
         if row_norm == 0.0 {
             continue;
@@ -700,6 +715,20 @@ mod active_constraint_tangent_geometry_tests {
             }
         }
         assert!(a.dot(&z).iter().all(|value| value.abs() < 1e-12));
+    }
+
+    #[test]
+    fn tangent_geometry_is_invariant_to_constraint_row_scaling() {
+        let a = ndarray::array![[1e12, 1e12, 0.0], [1e-12, 1e-12 + 1e-19, 0.0]];
+        let ActiveConstraintTangentGeometry::Tangent(z) =
+            active_constraint_tangent_geometry(&a).expect("row-scaled geometry")
+        else {
+            panic!("two independent normalized rows must leave one tangent dimension");
+        };
+        assert_eq!(z.dim(), (3, 1));
+        for row in a.rows() {
+            assert!(row.dot(&z.column(0)).abs() / row.dot(&row).sqrt() < 1e-12);
+        }
     }
 }
 
