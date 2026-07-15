@@ -18,7 +18,7 @@
 //!
 //! where the m clusters g = 1..m each carry one shared random multiplier.
 //!   * **gam** uses the `survival_likelihood = "latent"` family with
-//!     `FrailtySpec::HazardMultiplier { sigma_fixed: None, loading: Full }`: the
+//!     `FrailtySpec::HazardMultiplier { scale: Learned, loading: Full }`: the
 //!     frailty is lognormal, `exp(U_g)` with `U_g ~ N(0, σ²)`, integrated out
 //!     *exactly* through the K_{k,m}(μ, σ) microcell kernels, and σ is selected
 //!     by the outer (REML/marginal-likelihood) loop. The baseline is a flexible
@@ -67,7 +67,7 @@
 //! source.
 
 use csv::StringRecord;
-use gam::families::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
+use gam::families::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, run_r};
@@ -222,7 +222,7 @@ fn gam_hazard_multiplier_frailty_matches_coxph_frailty() {
         baseline_target: "weibull".to_string(),
         time_basis: "ispline".to_string(),
         frailty: FrailtySpec::HazardMultiplier {
-            sigma_fixed: None,
+            scale: FrailtyScale::Learned { initial_sigma: 0.5 },
             loading: HazardLoading::Full,
         },
         ..FitConfig::default()
@@ -495,7 +495,7 @@ fn gam_hazard_multiplier_frailty_matches_coxph_frailty_on_real_data() {
         baseline_target: "weibull".to_string(),
         time_basis: "ispline".to_string(),
         frailty: FrailtySpec::HazardMultiplier {
-            sigma_fixed: None,
+            scale: FrailtyScale::Learned { initial_sigma: 0.5 },
             loading: HazardLoading::Full,
         },
         ..FitConfig::default()

@@ -46,7 +46,7 @@
 
 use csv::StringRecord;
 use gam::families::survival::lognormal_kernel::{
-    FrailtySpec, HazardLoading, LatentSurvivalRow, LatentSurvivalRowJet,
+    FrailtyScale, FrailtySpec, HazardLoading, LatentSurvivalRow, LatentSurvivalRowJet,
 };
 use gam::quadrature::QuadratureContext;
 use gam::test_support::reference::{Column, run_python};
@@ -165,7 +165,7 @@ fn gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines() {
         baseline_target: "weibull".to_string(),
         time_basis: "ispline".to_string(),
         frailty: FrailtySpec::HazardMultiplier {
-            sigma_fixed: None,
+            scale: FrailtyScale::Learned { initial_sigma: 0.5 },
             loading: HazardLoading::Full,
         },
         ..FitConfig::default()
