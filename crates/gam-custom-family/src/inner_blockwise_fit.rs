@@ -1754,7 +1754,12 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // operator's action by construction of `materialize_joint_hessian_source`)
             // and removes the dominant residual per-cycle row work on this path.
             let mut materialized_dense_unpenalized: Option<Array2<f64>> = None;
-            let (candidate_beta, joint_active_set, joint_step_spectral_nullity) =
+            let (
+                candidate_beta,
+                joint_active_set,
+                joint_step_spectral_nullity,
+                joint_reduced_face_kind,
+            ) =
                 if solve_joint_constraints_dense
                     && let Some(constraints) = joint_constraints.as_ref()
                 {
@@ -1997,7 +2002,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 active_set.len(),
                                 beta_new.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
                             );
-                            (beta_new, Some(active_set), 0usize)
+                            (beta_new, Some(active_set), 0usize, exact_face_kind)
                         }
                         Err(error) => {
                             return Err(format!(
@@ -2448,7 +2453,12 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     if !delta.iter().all(|v| v.is_finite()) {
                         break; // Fall back to blockwise
                     }
-                    (beta_joint.clone() + &delta, None, spectral_nullity_for_step)
+                    (
+                        beta_joint.clone() + &delta,
+                        None,
+                        spectral_nullity_for_step,
+                        None,
+                    )
                 };
             // Hessian-source build (and any QP solve immediately above) are
             // done by the time we reach `delta`. Capture the wall-clock
@@ -2898,7 +2908,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     // additional nonlinear constraint not represented by the QP.
                     let constrained_search_delta_is_authoritative =
                         constrained_search_delta_owns_trust_step(
-                            exact_face_kind,
+                            joint_reduced_face_kind,
                             search_joint_active_set.is_some(),
                             Some(spectrum.has_resolvable_negative_curvature()),
                         );
