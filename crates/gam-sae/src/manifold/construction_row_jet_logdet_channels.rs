@@ -869,7 +869,7 @@ impl SaeManifoldTerm {
                 .iter()
                 .take_while(|&&candidate| candidate == q)
                 .count();
-            let plan = crate::gpu_kernels::sae_rowjet::plan_softmax_row_jets(
+            let plan = crate::gpu_kernels::sae_rowjet::plan_softmax_row_jets_contracted(
                 same_shape_rows,
                 self.k_atoms(),
                 q,
@@ -989,7 +989,7 @@ impl SaeManifoldTerm {
                 .iter()
                 .take_while(|&&candidate| candidate == q)
                 .count();
-            let plan = crate::gpu_kernels::sae_rowjet::plan_softmax_row_jets(
+            let plan = crate::gpu_kernels::sae_rowjet::plan_softmax_row_jets_contracted(
                 same_shape_rows,
                 self.k_atoms(),
                 q,

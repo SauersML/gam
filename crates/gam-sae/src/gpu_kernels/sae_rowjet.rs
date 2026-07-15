@@ -57,6 +57,32 @@ fn scheduled_primary(value: SaeRowJetPrimary) -> SaeRowPrimary {
     }
 }
 
+/// `(is_logit, atom)` for one primary — the discriminant the θ-adjoint trace
+/// reduction branches on.
+fn primary_kind_atom(value: SaeRowJetPrimary) -> (bool, usize) {
+    match value {
+        SaeRowJetPrimary::Logit { atom } => (true, atom),
+        SaeRowJetPrimary::Coordinate { atom, .. } => (false, atom),
+    }
+}
+
+/// Derivative of the softmax data-weight product `z_{atom_a}·z_{atom_b}` with
+/// respect to logit `atom_w`, divided out to a per-pair factor. Mirrors
+/// `SaeManifoldTerm::softmax_data_weight_product_logit_factor` so the contracted
+/// trace oracle differentiates the exact same operator the dense adjoint does.
+fn softmax_data_weight_product_logit_factor(
+    assignments: &[f64],
+    atom_a: usize,
+    atom_b: usize,
+    atom_w: usize,
+    inv_tau: f64,
+) -> f64 {
+    let a_w = assignments[atom_w];
+    let left = if atom_w == atom_a { 1.0 } else { 0.0 } - a_w;
+    let right = if atom_w == atom_b { 1.0 } else { 0.0 } - a_w;
+    (left + right) * inv_tau
+}
+
 /// Complete semantic inputs for one softmax row.
 ///
 /// `decoded_first` is indexed by the live primary slot (`q * p`); logit slots
@@ -498,6 +524,39 @@ pub enum SaeRowJetContraction<'a> {
         /// Row-major `n_rows × n_beta`.
         v_beta: &'a [f64],
     },
+    /// The `Γ = tr(H⁻¹ ∂H/∂θ)` log-det θ-adjoint shape (#2304).
+    ///
+    /// For every t-direction `w` and every β-direction `w_β` the consumer
+    /// (`logdet_theta_adjoint_for_block`) reduces the derivative matrix of the
+    /// tower against the per-row selected inverse. With
+    /// `dh_w[a][b] = ⟨second(a,w),first(b)⟩ + ⟨first(a),second(b,w)⟩` (and the
+    /// softmax data-weight-product substitution below for logit `w` over
+    /// coordinate pairs) the outputs are
+    ///
+    /// `t[r][w]    = Σ_{a,b} E_tt[r][a][b] dh_w[a][b]
+    ///             + Σ_a Σ_c 2·inv_vβ[r][a][c] (⟨second(a,w),β(c)⟩ + ⟨first(a),βderiv(w,c)⟩)
+    ///             + Σ_{i,j} βinv[i][j] (⟨βderiv(w,i),β(j)⟩ + ⟨β(i),βderiv(w,j)⟩)`,
+    /// `β[r][c_w] = Σ_{a,b} E_tt[r][a][b] (⟨βderiv(a,c_w),first(b)⟩ + ⟨first(a),βderiv(b,c_w)⟩)
+    ///             + Σ_a Σ_c 2·inv_vβ[r][a][c] ⟨βderiv(a,c_w),β(c)⟩`.
+    ///
+    /// `E_tt` is the row-local t–t weight with the Daleckii–Krein deflation
+    /// correction already folded in (`E = U(W⊙F)Uᵀ`, `W = Uᵀ inv_vv U`); it
+    /// equals `inv_vv` when the row carries no deflation. The t–β and β–β
+    /// blocks are never deflated, so they contract the raw `inv_vβ` / `βinv`.
+    /// The purely scalar diagonal channels (softmax majorizer, ARD, ordered
+    /// Beta–Bernoulli prior, empirical-mass column pass) are NOT part of this
+    /// tower reduction; the caller adds them as an `E_tt`-weighted host
+    /// post-fold, which is exact because `tr(E·(dh+dh_scalar))` is linear.
+    Trace {
+        /// Row-major `n_rows × q × q` deflation-folded t–t weight `E_tt`.
+        e_tt: &'a [f64],
+        /// Row-major `n_rows × q × n_beta` t–β selected inverse, restricted to
+        /// this tile's border channels.
+        inv_vbeta: &'a [f64],
+        /// Row-major `n_beta × n_beta` β–β selected inverse, shared across the
+        /// same-shape tile (the border layout is identical for every row).
+        beta_inv: &'a [f64],
+    },
 }
 
 /// Reduced outputs of one contracted tile: per-row t and β coefficients only.
@@ -534,6 +593,26 @@ impl<'a> SaeRowJetContraction<'a> {
                 finite_or_err("probe", probe)?;
                 finite_or_err("v_t", v_t)?;
                 finite_or_err("v_beta", v_beta)
+            }
+            SaeRowJetContraction::Trace {
+                e_tt,
+                inv_vbeta,
+                beta_inv,
+            } => {
+                expect("e_tt", e_tt.len(), checked_product(&[n, q, q])?)?;
+                expect(
+                    "inv_vbeta",
+                    inv_vbeta.len(),
+                    checked_product(&[n, q, n_beta])?,
+                )?;
+                expect(
+                    "beta_inv",
+                    beta_inv.len(),
+                    checked_product(&[n_beta, n_beta])?,
+                )?;
+                finite_or_err("e_tt", e_tt)?;
+                finite_or_err("inv_vbeta", inv_vbeta)?;
+                finite_or_err("beta_inv", beta_inv)
             }
         }
     }
@@ -645,6 +724,71 @@ fn cpu_contracted_tile(
                         acc += dot(probe_row, scheduled.beta_deriv(a, border)) * v_t_row[a];
                     }
                     beta[row * n_beta + border] = acc;
+                }
+            }
+            SaeRowJetContraction::Trace {
+                e_tt,
+                inv_vbeta,
+                beta_inv,
+            } => {
+                let e_row = &e_tt[row * q * q..(row + 1) * q * q];
+                let vbeta_row = &inv_vbeta[row * q * n_beta..(row + 1) * q * n_beta];
+                // One t-adjoint direction `w` (a live logit or coordinate slot).
+                for w in 0..q {
+                    let (w_is_logit, atom_w) = primary_kind_atom(input.primaries[w]);
+                    let mut gamma = 0.0_f64;
+                    for a in 0..q {
+                        let (a_is_logit, atom_a) = primary_kind_atom(input.primaries[a]);
+                        for b in 0..q {
+                            let (b_is_logit, atom_b) = primary_kind_atom(input.primaries[b]);
+                            // Under softmax a logit `w` differentiates the
+                            // coordinate-pair data curvature `⟨J_a,J_b⟩` through
+                            // the assignment weights, not through second jets.
+                            let dh = if w_is_logit && !a_is_logit && !b_is_logit {
+                                dot(scheduled.first(a), scheduled.first(b))
+                                    * softmax_data_weight_product_logit_factor(
+                                        &input.gate_values,
+                                        atom_a,
+                                        atom_b,
+                                        atom_w,
+                                        inv_tau,
+                                    )
+                            } else {
+                                dot(scheduled.second(a, w), scheduled.first(b))
+                                    + dot(scheduled.first(a), scheduled.second(b, w))
+                            };
+                            gamma += e_row[a * q + b] * dh;
+                        }
+                        for border in 0..n_beta {
+                            let dh = dot(scheduled.second(a, w), scheduled.beta(border))
+                                + dot(scheduled.first(a), scheduled.beta_deriv(w, border));
+                            gamma += 2.0 * vbeta_row[a * n_beta + border] * dh;
+                        }
+                    }
+                    for i in 0..n_beta {
+                        for j in 0..n_beta {
+                            let dh = dot(scheduled.beta_deriv(w, i), scheduled.beta(j))
+                                + dot(scheduled.beta(i), scheduled.beta_deriv(w, j));
+                            gamma += beta_inv[i * n_beta + j] * dh;
+                        }
+                    }
+                    t[row * q + w] = gamma;
+                }
+                // One β-adjoint direction `w_beta`.
+                for w_beta in 0..n_beta {
+                    let mut gamma = 0.0_f64;
+                    for a in 0..q {
+                        for b in 0..q {
+                            let dh = dot(scheduled.beta_l_deriv(a, w_beta), scheduled.first(b))
+                                + dot(scheduled.first(a), scheduled.beta_l_deriv(b, w_beta));
+                            gamma += e_row[a * q + b] * dh;
+                        }
+                        for border in 0..n_beta {
+                            let dh = dot(scheduled.beta_l_deriv(a, w_beta), scheduled.beta(border));
+                            gamma += 2.0 * vbeta_row[a * n_beta + border] * dh;
+                        }
+                    }
+                    beta[row * n_beta + w_beta] = gamma;
                 }
             }
         }
@@ -812,6 +956,153 @@ impl SaeRowJetMemoryLedger {
         })
     }
 
+    /// Byte accounting for a REDUCED (contracted) same-shape tile (#2304).
+    ///
+    /// The contracted seam never materializes the packed channel tower on
+    /// either wire. Relative to [`Self::for_shape`] the `q²·p` second channel
+    /// and the `q·n_beta·p` mixed channel leave the host download and the
+    /// device output entirely; the device instead keeps the phase-one dot
+    /// tables (`k + q + n_beta + q²`) and the reduced outputs (`q + n_beta`)
+    /// resident, and the only row-varying host↔device traffic is the `p` probe
+    /// upload plus the `q + n_beta` reduced scalars downloaded. This models the
+    /// `Linear`/`Bilinear` contracted tiles — the live contracted callers.
+    pub fn for_contracted_shape(
+        k: usize,
+        q: usize,
+        p: usize,
+        n_beta: usize,
+    ) -> Result<Self, String> {
+        let f64_bytes = std::mem::size_of::<f64>();
+        let i32_bytes = std::mem::size_of::<i32>();
+        let f64_count = |shape: &[usize]| -> Result<usize, String> {
+            checked_product(shape)?
+                .checked_mul(f64_bytes)
+                .ok_or_else(|| format!("SAE row-jet f64 byte count overflow for {shape:?}"))
+        };
+        let i32_count = |shape: &[usize]| -> Result<usize, String> {
+            checked_product(shape)?
+                .checked_mul(i32_bytes)
+                .ok_or_else(|| format!("SAE row-jet i32 byte count overflow for {shape:?}"))
+        };
+        let sum = |terms: &[usize], label: &str| -> Result<usize, String> {
+            terms
+                .iter()
+                .copied()
+                .try_fold(0usize, |acc, value| acc.checked_add(value))
+                .ok_or_else(|| format!("SAE row-jet contracted {label} byte sum overflow"))
+        };
+
+        let elementwise = Self::for_shape(k, q, p, n_beta)?;
+        // Semantic device inputs staged per row (same tensors the elementwise
+        // tile uploads) plus the reduced phase-one/phase-two device state.
+        let input_f64 = sum(
+            &[
+                f64_count(&[k])?,
+                f64_count(&[1])?,
+                f64_count(&[k, p])?,
+                f64_count(&[q, p])?,
+                f64_count(&[q, q, p])?,
+                f64_count(&[n_beta])?,
+                f64_count(&[q, n_beta])?,
+            ],
+            "input-f64",
+        )?;
+        let input_i32 = sum(
+            &[i32_count(&[k])?, i32_count(&[q])?, i32_count(&[q])?],
+            "input-i32",
+        )?;
+        let staging_input = input_f64
+            .checked_add(input_i32)
+            .ok_or_else(|| "SAE row-jet contracted staging-input byte sum overflow".to_string())?;
+        let device_reduced = sum(
+            &[
+                f64_count(&[k])?,      // decoded·probe dots
+                f64_count(&[q])?,      // d1·probe dots
+                f64_count(&[n_beta])?, // beta_output·probe dots
+                f64_count(&[q, q])?,   // d2·probe dots (bilinear)
+                f64_count(&[q])?,      // reduced t output
+                f64_count(&[n_beta])?, // reduced beta output
+                f64_count(&[p])?,      // probe upload
+                f64_count(&[q])?,      // v_t upload (bilinear)
+                f64_count(&[n_beta])?, // v_beta upload (bilinear)
+            ],
+            "device-reduced",
+        )?;
+        let device_bytes_per_row = staging_input
+            .checked_add(device_reduced)
+            .ok_or_else(|| "SAE row-jet contracted device row-byte sum overflow".to_string())?;
+
+        // Host residency drops the packed-channel download and its
+        // `SaeScheduledRowJets` expansion; only the reduced scalars accumulate
+        // per row, and one row's probe/direction operands are live at a time.
+        // `shared_host` is the semantic snapshot + production layout the
+        // contracted tile still holds, WITHOUT the `output` tower.
+        let semantic_input = sum(
+            &[
+                input_f64,
+                f64_count(&[n_beta, p])?,
+                k.checked_mul(std::mem::size_of::<bool>())
+                    .ok_or_else(|| "SAE row-jet contracted active-mask overflow".to_string())?,
+                q.checked_mul(std::mem::size_of::<SaeRowJetPrimary>())
+                    .ok_or_else(|| "SAE row-jet contracted primary overflow".to_string())?,
+                q.checked_mul(std::mem::size_of::<SaeCoordinateSlot>())
+                    .ok_or_else(|| "SAE row-jet contracted coordinate-slot overflow".to_string())?,
+                n_beta
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .ok_or_else(|| "SAE row-jet contracted beta-atom overflow".to_string())?,
+                std::mem::size_of::<SaeSoftmaxRowJetInput>(),
+            ],
+            "semantic-input",
+        )?;
+        let production_layout = q
+            .checked_mul(std::mem::size_of::<SaeRowJetPrimary>())
+            .and_then(|value| value.checked_add(std::mem::size_of::<Vec<SaeRowJetPrimary>>()))
+            .ok_or_else(|| "SAE row-jet contracted production-layout overflow".to_string())?;
+        let shared_host = semantic_input
+            .checked_add(production_layout)
+            .ok_or_else(|| "SAE row-jet contracted shared-host byte sum overflow".to_string())?;
+        let reduced_operands = sum(
+            &[
+                f64_count(&[q])?,
+                f64_count(&[n_beta])?,
+                f64_count(&[p])?,
+                f64_count(&[q])?,
+                f64_count(&[n_beta])?,
+            ],
+            "reduced-operands",
+        )?;
+        let cpu_host_bytes_per_row = shared_host
+            .checked_add(reduced_operands)
+            .ok_or_else(|| "SAE row-jet contracted CPU host row-byte sum overflow".to_string())?;
+        let host_bytes_per_row = shared_host
+            .checked_add(reduced_operands)
+            .and_then(|value| value.checked_add(staging_input.saturating_sub(reduced_operands)))
+            .ok_or_else(|| "SAE row-jet contracted host row-byte sum overflow".to_string())?;
+        // The CPU path materializes exactly one packed row at a time; charge it
+        // once as a fixed cost rather than per tile row.
+        let one_scheduled_row = sum(
+            &[
+                f64_count(&[q, p])?,
+                f64_count(&[q, q, p])?,
+                f64_count(&[n_beta, p])?,
+                f64_count(&[q, n_beta, p])?,
+                std::mem::size_of::<SaeScheduledRowJets>(),
+            ],
+            "one-scheduled-row",
+        )?;
+        let fixed_host_bytes = elementwise
+            .fixed_host_bytes
+            .checked_add(one_scheduled_row)
+            .ok_or_else(|| "SAE row-jet contracted fixed host byte sum overflow".to_string())?;
+        Ok(Self {
+            fixed_device_bytes: elementwise.fixed_device_bytes,
+            device_bytes_per_row,
+            fixed_host_bytes,
+            cpu_host_bytes_per_row,
+            host_bytes_per_row,
+        })
+    }
+
     fn maximum_rows(self, device_budget: usize, host_budget: usize) -> usize {
         let device_rows = device_budget
             .checked_sub(self.fixed_device_bytes)
@@ -851,6 +1142,43 @@ pub fn plan_softmax_row_jets(
         ));
     }
     let ledger = SaeRowJetMemoryLedger::for_shape(k, q, p, n_beta)?;
+    plan_dispatch(total_rows, k, q, p, n_beta, mode, ledger)
+}
+
+/// Decide the backend and bounded tile width for a REDUCED (contracted) tile.
+///
+/// The contracted ledger charges the smaller reduced download plus probe
+/// upload instead of the full packed tower, so a same-shape tile fits more
+/// rows per host/device budget than the elementwise plan admits. Used by the
+/// resident-contraction consumers (`contracted_softmax_linear_rhs`,
+/// `contracted_softmax_bilinear_hvp`).
+pub fn plan_softmax_row_jets_contracted(
+    total_rows: usize,
+    k: usize,
+    q: usize,
+    p: usize,
+    n_beta: usize,
+    mode: gam_gpu::GpuPolicy,
+) -> Result<SaeRowJetExecutionPlan, String> {
+    if k == 0 || p == 0 {
+        return Err(format!(
+            "contracted SAE row-jet plan requires nonzero K and p; got K={k}, p={p}"
+        ));
+    }
+    let ledger = SaeRowJetMemoryLedger::for_contracted_shape(k, q, p, n_beta)?;
+    plan_dispatch(total_rows, k, q, p, n_beta, mode, ledger)
+}
+
+/// Shared backend/tile-width dispatch for an already-computed shape ledger.
+fn plan_dispatch(
+    total_rows: usize,
+    k: usize,
+    q: usize,
+    p: usize,
+    n_beta: usize,
+    mode: gam_gpu::GpuPolicy,
+    ledger: SaeRowJetMemoryLedger,
+) -> Result<SaeRowJetExecutionPlan, String> {
     if total_rows == 0 {
         return Ok(SaeRowJetExecutionPlan {
             path: SaeRowJetPath::Cpu,
@@ -1893,6 +2221,15 @@ mod device {
         let probe = match contraction {
             SaeRowJetContraction::Linear { probe }
             | SaeRowJetContraction::Bilinear { probe, .. } => probe,
+            SaeRowJetContraction::Trace { .. } => {
+                // The θ-adjoint trace reduction has no single-probe device
+                // kernel yet; its resident form (per-row `E_tt`/`inv_vβ`
+                // weighted second-jet reduction) is the hardware-gated
+                // follow-on. The CPU arm is the authoritative oracle.
+                return Err(gam_gpu::gpu_err!(
+                    "SAE row-jet Trace contraction has no device kernel yet; plan the CPU path"
+                ));
+            }
         };
         let probe_dev = stream
             .clone_htod(nonempty_f64(probe).as_ref())
@@ -2643,5 +2980,199 @@ mod tests {
                 "contracted SAE device/CPU {label} reduction error {max_error:e} exceeds 1e-12"
             );
         }
+    }
+
+    /// The `Trace` seam must equal the dense θ-adjoint reduction of the
+    /// materialized channels against a per-row selected inverse — bit for bit,
+    /// because both run the identical row program and identical f64 reduction.
+    /// Uses a symmetric `E_tt` / `beta_inv` (as the true deflation-folded
+    /// selected inverse is), an arbitrary `inv_vbeta`, and guards that every
+    /// output block engages so an all-zeros bug cannot pass.
+    #[test]
+    fn contracted_trace_matches_manual_selected_inverse_reduction_2304() {
+        let rows = complete_fixture(4);
+        let inv_tau = 1.0;
+        let channels =
+            execute_softmax_row_jet_tile(&rows, inv_tau, SaeRowJetPath::Cpu).expect("CPU row jet");
+        let (n, q, n_beta) = (channels.n_rows, channels.q, channels.n_beta);
+        let scheduled = channels.into_scheduled_rows();
+        let dot =
+            |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum() };
+
+        let mut e_tt = vec![0.0_f64; n * q * q];
+        for row in 0..n {
+            for a in 0..q {
+                for b in a..q {
+                    let value = ((row * 13 + a * 7 + b * 3 + 1) as f64 * 0.02).cos();
+                    e_tt[row * q * q + a * q + b] = value;
+                    e_tt[row * q * q + b * q + a] = value;
+                }
+            }
+        }
+        let inv_vbeta: Vec<f64> = (0..n * q * n_beta)
+            .map(|index| ((index * 17 + 3) as f64 * 0.01).sin())
+            .collect();
+        let mut beta_inv = vec![0.0_f64; n_beta * n_beta];
+        for i in 0..n_beta {
+            for j in i..n_beta {
+                let value = ((i * 5 + j * 3 + 2) as f64 * 0.03).cos();
+                beta_inv[i * n_beta + j] = value;
+                beta_inv[j * n_beta + i] = value;
+            }
+        }
+
+        let trace = execute_softmax_row_jet_tile_contracted(
+            &rows,
+            inv_tau,
+            SaeRowJetPath::Cpu,
+            SaeRowJetContraction::Trace {
+                e_tt: &e_tt,
+                inv_vbeta: &inv_vbeta,
+                beta_inv: &beta_inv,
+            },
+        )
+        .expect("CPU trace contraction");
+        assert_eq!((trace.n_rows, trace.q, trace.n_beta), (n, q, n_beta));
+
+        let mut any_logit = false;
+        let mut any_coord = false;
+        let mut any_beta = false;
+        for (row, jets) in scheduled.iter().enumerate() {
+            let e_row = &e_tt[row * q * q..(row + 1) * q * q];
+            let vbeta_row = &inv_vbeta[row * q * n_beta..(row + 1) * q * n_beta];
+            for w in 0..q {
+                let (w_is_logit, atom_w) = primary_kind_atom(rows[row].primaries[w]);
+                let mut expected = 0.0_f64;
+                for a in 0..q {
+                    let (a_is_logit, atom_a) = primary_kind_atom(rows[row].primaries[a]);
+                    for b in 0..q {
+                        let (b_is_logit, atom_b) = primary_kind_atom(rows[row].primaries[b]);
+                        let dh = if w_is_logit && !a_is_logit && !b_is_logit {
+                            dot(jets.first(a), jets.first(b))
+                                * softmax_data_weight_product_logit_factor(
+                                    &rows[row].gate_values,
+                                    atom_a,
+                                    atom_b,
+                                    atom_w,
+                                    inv_tau,
+                                )
+                        } else {
+                            dot(jets.second(a, w), jets.first(b))
+                                + dot(jets.first(a), jets.second(b, w))
+                        };
+                        expected += e_row[a * q + b] * dh;
+                    }
+                    for border in 0..n_beta {
+                        let dh = dot(jets.second(a, w), jets.beta(border))
+                            + dot(jets.first(a), jets.beta_deriv(w, border));
+                        expected += 2.0 * vbeta_row[a * n_beta + border] * dh;
+                    }
+                }
+                for i in 0..n_beta {
+                    for j in 0..n_beta {
+                        let dh = dot(jets.beta_deriv(w, i), jets.beta(j))
+                            + dot(jets.beta(i), jets.beta_deriv(w, j));
+                        expected += beta_inv[i * n_beta + j] * dh;
+                    }
+                }
+                assert_eq!(
+                    trace.t[row * q + w],
+                    expected,
+                    "trace t mismatch row={row}, w={w}"
+                );
+                if trace.t[row * q + w] != 0.0 {
+                    if w_is_logit {
+                        any_logit = true;
+                    } else {
+                        any_coord = true;
+                    }
+                }
+            }
+            for w_beta in 0..n_beta {
+                let mut expected = 0.0_f64;
+                for a in 0..q {
+                    for b in 0..q {
+                        let dh = dot(jets.beta_l_deriv(a, w_beta), jets.first(b))
+                            + dot(jets.first(a), jets.beta_l_deriv(b, w_beta));
+                        expected += e_row[a * q + b] * dh;
+                    }
+                    for border in 0..n_beta {
+                        let dh = dot(jets.beta_l_deriv(a, w_beta), jets.beta(border));
+                        expected += 2.0 * vbeta_row[a * n_beta + border] * dh;
+                    }
+                }
+                assert_eq!(
+                    trace.beta[row * n_beta + w_beta],
+                    expected,
+                    "trace beta mismatch row={row}, w_beta={w_beta}"
+                );
+                if trace.beta[row * n_beta + w_beta] != 0.0 {
+                    any_beta = true;
+                }
+            }
+        }
+        assert!(any_logit, "logit-direction trace must engage");
+        assert!(any_coord, "coordinate-direction trace must engage");
+        assert!(any_beta, "beta-direction trace must engage");
+    }
+
+    /// The contracted ledger must charge the reduced download + probe upload
+    /// and NEVER the `q²·p` second channel or `q·n_beta·p` mixed channel that
+    /// dominates the elementwise tile. Pinned by exact byte arithmetic — not
+    /// weakened to an inequality.
+    #[test]
+    fn contracted_ledger_drops_tower_charges_reduced_download_2304() {
+        let (k, q, p, n_beta) = (3usize, 6usize, 2usize, 3usize);
+        let f = std::mem::size_of::<f64>();
+        let i = std::mem::size_of::<i32>();
+
+        let full = SaeRowJetMemoryLedger::for_shape(k, q, p, n_beta).expect("full ledger");
+        let contracted = SaeRowJetMemoryLedger::for_contracted_shape(k, q, p, n_beta)
+            .expect("contracted ledger");
+
+        let input_f64 = (k + 1 + k * p + q * p + q * q * p + n_beta + q * n_beta) * f;
+        let input_i32 = (k + q + q) * i;
+        // Reduced device state: phase-one dots (k + q + n_beta + q²), reduced
+        // outputs (q + n_beta), probe (p), and v_t/v_beta (q + n_beta).
+        let device_reduced = (k + q + n_beta + q * q + q + n_beta + p + q + n_beta) * f;
+        assert_eq!(
+            contracted.device_bytes_per_row,
+            input_f64 + input_i32 + device_reduced,
+            "contracted device per-row bytes"
+        );
+
+        let semantic_input = input_f64
+            + n_beta * p * f
+            + k * std::mem::size_of::<bool>()
+            + q * std::mem::size_of::<SaeRowJetPrimary>()
+            + q * std::mem::size_of::<SaeCoordinateSlot>()
+            + n_beta * std::mem::size_of::<usize>()
+            + std::mem::size_of::<SaeSoftmaxRowJetInput>();
+        let production_layout = q * std::mem::size_of::<SaeRowJetPrimary>()
+            + std::mem::size_of::<Vec<SaeRowJetPrimary>>();
+        let reduced_operands = (q + n_beta + p + q + n_beta) * f;
+        assert_eq!(
+            contracted.cpu_host_bytes_per_row,
+            semantic_input + production_layout + reduced_operands,
+            "contracted CPU host per-row bytes"
+        );
+
+        // The contracted device output is exactly the elementwise output tower
+        // (`q·p + q²·p + n_beta·p + q·n_beta·p`) swapped for the reduced state,
+        // so the `q²·p` second channel and `q·n_beta·p` mixed channel are gone.
+        let elementwise_output = (q * p + q * q * p + n_beta * p + q * n_beta * p) * f;
+        assert_eq!(
+            full.device_bytes_per_row - contracted.device_bytes_per_row,
+            elementwise_output - device_reduced,
+            "contracted must drop exactly the elementwise output tower"
+        );
+        assert!(
+            device_reduced < q * q * p * f,
+            "reduced device state must be smaller than the q^2 p second channel alone"
+        );
+        assert!(
+            contracted.cpu_host_bytes_per_row < full.cpu_host_bytes_per_row,
+            "contracted host residency must be smaller than the elementwise tile"
+        );
     }
 }
