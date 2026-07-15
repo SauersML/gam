@@ -1940,10 +1940,142 @@ fn certify_outer_optimality_at_terminal_fidelity(
         }
     }
 
+    // Large-step flatness certificate (#2299 fully-saturated smooth). After the
+    // reproducibility floor a coordinate that has collapsed EXACTLY onto its
+    // penalty null space (λ ~ 1e12, edf saturated) can still carry a projected
+    // gradient component that is DETERMINISTIC cancellation bias from the
+    // 1e12-conditioned logdet derivative (≈ ε·κ·scale). Being deterministic it
+    // reproduces run to run, so the spread-keyed reproducibility floor above
+    // cannot see it; and the Newton decrement anti-rescues, because the near-null
+    // Hessian direction inflates gᵀH⁻¹g by design. The decisive question is
+    // second-order-independent: does the criterion actually MOVE along that
+    // coordinate at MACROSCOPIC scale? This block answers it directly — it probes
+    // the objective a full e-fold in λ to either side of a near-null-curvature
+    // coordinate and, for coordinates whose value is provably flat there, removes
+    // their measured gradient component (numerical bias, not slope) from the
+    // projected gradient before the bound test. A coordinate whose large-step
+    // value MOVES is left untouched, so a genuine pseudologdet ramp still refuses.
+    //
+    // Gated as narrowly as possible: it runs only when the certificate would
+    // OTHERWISE refuse on |Pg|, only with an analytic Hessian that is PSD-within-
+    // noise in hand, and only probes coordinates whose curvature row is below the
+    // roundoff floor — so a well-conditioned objective (every scripted mock at its
+    // certification point) probes nothing and pays zero extra evaluations.
+    let mut certified_projected_grad_norm = projected_grad_norm;
+    if projected_grad_norm > stationarity_bound
+        && let Some(hessian) = analytic_hessian.as_ref()
+        && certificate_hessian_is_psd(hessian) == Some(true)
+    {
+        let n = layout.n_params;
+        // Curvature scale of the analytic outer Hessian: its dominant diagonal,
+        // the same ‖H‖ scale `certificate_hessian_is_psd` and
+        // `newton_predicted_decrease` regularize against. A coordinate's curvature
+        // ROW is indistinguishable from the assembly's roundoff — it has no
+        // curvature the arithmetic can resolve and has collapsed onto the penalty
+        // null space — when its largest entry falls below the SAME √ε·‖H‖ margin
+        // those two probes use to separate a real curvature direction from
+        // O(ε·‖H‖) accumulation noise. This is the derivation of the threshold:
+        // NULL_CURVATURE_REL = √ε (machine epsilon's square root, the assembled
+        // Hessian's relative resolution), scaled by the Hessian's own max-diagonal
+        // magnitude, floored at 1 exactly as the PSD/Newton shift is.
+        let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
+        let null_curvature_threshold = f64::EPSILON.sqrt() * max_diag.max(1.0);
+        // The SAME relative cost floor the cost-stall guard and both widenings
+        // above use: certification asserts nothing tighter about this surface's
+        // macroscopic flatness than the loop already proved.
+        let objective_tol = config
+            .rel_cost_tolerance
+            .unwrap_or(config.tolerance * 1.0e-2)
+            .max(COST_STALL_REL_TOL_FLOOR)
+            * (1.0 + evaluation.cost.abs());
+        // One e-fold in log-λ per coordinate (ρ IS log-λ): the +δ/−δ pair spans e²
+        // in λ, a macroscopic move across which no genuine descent slope can hide.
+        const LARGE_STEP_DELTA: f64 = 1.0;
+        let mut saturated_flat: Vec<usize> = Vec::new();
+        let mut probe_reports: Vec<String> = Vec::new();
+        let mut probed_any = false;
+        let mut probe_failed = false;
+        for k in 0..n {
+            let row_inf = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[k, j]].abs()));
+            // Only near-null-curvature coordinates the measured gradient actually
+            // loads on can be responsible for |Pg| exceeding the band; skip every
+            // other coordinate, so no probe fires on a well-conditioned surface.
+            if row_inf > null_curvature_threshold || projected_gradient[k] == 0.0 {
+                continue;
+            }
+            let mut plus = result.rho.clone();
+            plus[k] += LARGE_STEP_DELTA;
+            let mut minus = result.rho.clone();
+            minus[k] -= LARGE_STEP_DELTA;
+            probed_any = true;
+            let (Ok(cost_plus), Ok(cost_minus)) = (obj.eval_cost(&plus), obj.eval_cost(&minus))
+            else {
+                // A failed probe is not evidence of flatness — refuse to classify
+                // (conservative) and leave |Pg| intact for the bound test.
+                probe_failed = true;
+                break;
+            };
+            if !cost_plus.is_finite() || !cost_minus.is_finite() {
+                probe_failed = true;
+                break;
+            }
+            let up = (cost_plus - evaluation.cost).abs();
+            let down = (cost_minus - evaluation.cost).abs();
+            if up <= objective_tol && down <= objective_tol {
+                saturated_flat.push(k);
+                probe_reports.push(format!("k={k} |ΔV|+={up:.3e} |ΔV|-={down:.3e}"));
+            }
+        }
+        if !probe_failed && !saturated_flat.is_empty() {
+            // Recompute |Pg| with the provably macroscopically-flat coordinates
+            // removed: their measured gradient is deterministic cancellation bias,
+            // not slope. Coordinates that moved keep their component and still count
+            // against the bound.
+            let reduced_sq = (0..n)
+                .filter(|k| !saturated_flat.contains(k))
+                .map(|k| projected_gradient[k] * projected_gradient[k])
+                .sum::<f64>();
+            certified_projected_grad_norm = reduced_sq.sqrt();
+            let flat_list = saturated_flat
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let probe_summary = probe_reports.join("; ");
+            log::info!(
+                "[CERTIFICATE] {context}: large-step flatness certificate classified \
+                 coordinate(s) [{flat_list}] saturated-flat (curvature row ≤ \
+                 {null_curvature_threshold:.3e}, probed Δ=±{LARGE_STEP_DELTA} with \
+                 {probe_summary}, cost-flat to tol {objective_tol:.3e}); projected \
+                 gradient reduced from {projected_grad_norm:.3e} to \
+                 {certified_projected_grad_norm:.3e}"
+            );
+        }
+        // `eval_cost` warm-starts the inner solve, so the probes moved the objective
+        // off the certified point. Restore it to ρ̂ once iff we actually probed, so
+        // the downstream state (and the rho-uncertainty diagnostic) sees the fitted
+        // point. A failure to re-evaluate the same ρ that certified moments ago is a
+        // genuinely broken objective and refuses conservatively.
+        if probed_any {
+            obj.eval_cost(&result.rho).map_err(|err| {
+                outer_nonconvergence_error(
+                    context,
+                    &format!(
+                        "failed to restore the objective to the certified point after \
+                         flatness probing: {err}"
+                    ),
+                    result,
+                    Some(certified_projected_grad_norm),
+                    stationarity_bound,
+                )
+            })?;
+        }
+    }
+
     let certificate = OuterCriterionCertificate {
         stationarity: OuterStationarityCertificate::AnalyticGradient {
             grad_norm,
-            projected_grad_norm,
+            projected_grad_norm: certified_projected_grad_norm,
             bound: stationarity_bound,
         },
         hessian_psd: analytic_hessian.as_ref().and_then(certificate_hessian_is_psd),
@@ -1962,7 +2094,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
             context,
             &certificate.summary(),
             result,
-            Some(projected_grad_norm),
+            Some(certified_projected_grad_norm),
             stationarity_bound,
         ));
     }
@@ -1977,9 +2109,11 @@ fn certify_outer_optimality_at_terminal_fidelity(
     // (criterion-flat, #2241).
     result.converged_via = match result.converged_via {
         Some(via @ OuterConvergedVia::RecurrentIncumbent { .. }) => Some(via),
-        _ if projected_grad_norm <= solver_bound => Some(OuterConvergedVia::GradientStationary),
+        _ if certified_projected_grad_norm <= solver_bound => {
+            Some(OuterConvergedVia::GradientStationary)
+        }
         _ => Some(OuterConvergedVia::CriterionFlat {
-            residual_grad_norm: projected_grad_norm,
+            residual_grad_norm: certified_projected_grad_norm,
             certificate_bound: stationarity_bound,
         }),
     };

@@ -767,6 +767,108 @@ fn gradient_only_certificate_rejects_residual_above_roundoff_2269() {
     assert!(audit_gradient_only_roundoff_residual_2269(2.0 * arithmetic_floor).is_err());
 }
 
+/// Slope reported on the saturated coordinate's gradient (#2299). In the bias
+/// case it is deterministic logdet-cancellation noise inconsistent with the flat
+/// value; in the slope case it is the true ramp slope the value actually carries.
+const SATURATED_FLAT_SLOPE_2299: f64 = 3.2e-2;
+
+/// Criterion for a two-coordinate outer surface at ρ̂ = 0. Coordinate 0 is
+/// genuinely curved (½ρ₀²); coordinate 1 is a fully-saturated smooth's log-λ.
+/// With `real_slope == false` the criterion is EXACTLY flat in ρ₁ (its reported
+/// gradient is pure numerical bias); with `real_slope == true` it carries a real
+/// `SATURATED_FLAT_SLOPE_2299` ramp whose value moves under a unit log-λ step.
+fn saturated_flat_cost_2299(real_slope: bool, rho: &Array1<f64>) -> f64 {
+    let base = 0.5 * rho[0] * rho[0] + 1.0;
+    if real_slope {
+        base + SATURATED_FLAT_SLOPE_2299 * rho[1]
+    } else {
+        base
+    }
+}
+
+/// Drive the terminal certifier at ρ̂ = 0 on the #2299 saturated-coordinate
+/// surface. The measured projected gradient is `[0, 3.2e-2]` and the outer
+/// Hessian is `diag(1, 0)` (ρ₁'s curvature collapsed to zero, edf saturated) in
+/// BOTH cases — they differ only in whether the objective VALUE moves along ρ₁
+/// under the large-step probe, which is exactly what the flatness certificate
+/// arbitrates.
+fn certify_saturated_flat_coordinate_2299(
+    real_slope: bool,
+) -> Result<OuterCriterionCertificate, EstimationError> {
+    let problem = OuterProblem::new(2)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_tolerance(1.0e-6);
+    let config = problem.config();
+    let mut obj = problem.build_objective(
+        (),
+        move |_: &mut (), rho: &Array1<f64>| Ok(saturated_flat_cost_2299(real_slope, rho)),
+        move |_: &mut (), rho: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: saturated_flat_cost_2299(real_slope, rho),
+                gradient: array![rho[0], SATURATED_FLAT_SLOPE_2299],
+                hessian: HessianValue::Dense(array![[1.0, 0.0], [0.0, 0.0]]),
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let mut result = OuterResult::new(
+        array![0.0, 0.0],
+        saturated_flat_cost_2299(real_slope, &array![0.0, 0.0]),
+        1,
+        true,
+        OuterPlan {
+            solver: Solver::Arc,
+            hessian_source: HessianSource::Analytic,
+        },
+    );
+    certify_outer_optimality(&mut obj, &config, "large-step-flatness-2299", &mut result)
+}
+
+/// A coordinate whose curvature has collapsed and whose VALUE is flat under a
+/// full e-fold λ move must certify even though its analytic gradient carries a
+/// deterministic 3.2e-2 cancellation bias (the reproducibility floor cannot see
+/// a deterministic bias, and the Newton decrement anti-rescues on the near-null
+/// direction). The large-step probe proves the coordinate is flat and projects
+/// its biased component out of |Pg|.
+#[test]
+fn large_step_flatness_certifies_saturated_coordinate_bias_2299() {
+    let cert = certify_saturated_flat_coordinate_2299(false)
+        .expect("a coordinate flat under a full e-fold λ move must certify despite its biased gradient");
+    assert!(cert.certifies(), "{}", cert.summary());
+    assert!(
+        cert.stationarity.projected_norm() <= cert.stationarity.bound(),
+        "certified residual {:.3e} exceeds bound {:.3e}",
+        cert.stationarity.projected_norm(),
+        cert.stationarity.bound(),
+    );
+    // The bias was PROJECTED OUT — not merely absorbed by a widened bound: the
+    // certified residual is the (vanishing) gradient of the genuinely-curved
+    // coordinate, well below the biased 3.2e-2 the raw gradient reported.
+    assert!(
+        cert.stationarity.projected_norm() < 0.5 * SATURATED_FLAT_SLOPE_2299,
+        "the saturated coordinate's biased gradient was not removed: {}",
+        cert.summary(),
+    );
+}
+
+/// The SAME surface with a REAL slope on the saturated coordinate — its value
+/// moves under the large-step probe — must still refuse: a genuine pseudologdet
+/// ramp is not flat, so its gradient component stays in |Pg| and the point is
+/// non-stationary.
+#[test]
+fn large_step_flatness_rejects_real_slope_coordinate_2299() {
+    let err = certify_saturated_flat_coordinate_2299(true)
+        .expect_err("a coordinate whose value MOVES under a full e-fold λ step is not flat and must refuse");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("stationary") || msg.contains("converge"),
+        "rejection must be a typed stationarity failure, got: {msg}"
+    );
+}
+
 /// The projection must NOT blunt the certificate's real job: genuine
 /// non-stationarity on a FREE (interior) coordinate must still reject the
 /// point even when a different coordinate is railed.
