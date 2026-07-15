@@ -2537,7 +2537,16 @@ mod tests {
         );
         assert!(kernel.loglik.is_finite());
         assert!(kernel.mean_weight.is_finite());
-        assert!((kernel.mean_weight / huge - 0.5).abs() <= 8.0 * f64::EPSILON);
+        // The kernel takes LOG-space inputs and re-exponentiates: its internal
+        // precision is `huge.ln().exp()`, which differs from `huge` by the
+        // exp∘ln round-trip (~|ln huge|·EPSILON ≈ 460·EPSILON relative at
+        // η≈460), so dividing by the pre-log `huge` injects ~50·EPSILON of pure
+        // round-trip noise. Reference the precision the kernel actually sees:
+        // with μ==θ, `mean_weight = θ/(1+θ/μ) = θ/2` is exact (a bit-for-bit
+        // exponent decrement), so `mean_weight / precision == 0.5` exactly and
+        // the tight tolerance stays a genuine balanced-tail geometry guard.
+        let precision = huge.ln().exp();
+        assert!((kernel.mean_weight / precision - 0.5).abs() <= 8.0 * f64::EPSILON);
         assert!(kernel.disp_weight.is_finite() && kernel.disp_weight > 0.0);
 
         let eta_info = nb_log_precision_fisher_jensen(1.0, 1.0e17);
