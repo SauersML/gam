@@ -2218,14 +2218,24 @@ mod device {
         let stream = b.stream.clone();
         let staged = stage_inputs(&stream, rows, k, q, p, n_beta)?;
 
-        let probe = match contraction {
-            SaeRowJetContraction::Linear { probe }
-            | SaeRowJetContraction::Bilinear { probe, .. } => probe,
+        // Narrow the public contraction to the two shapes that have a device
+        // kernel. The θ-adjoint trace reduction has no single-probe device
+        // kernel yet; its resident form (per-row `E_tt`/`inv_vβ` weighted
+        // second-jet reduction) is the hardware-gated follow-on, and the CPU
+        // arm is the authoritative oracle. Refusing it here — and dropping it
+        // from the type the assembly match below consumes — keeps that
+        // impossible branch unexpressible rather than relying on a later
+        // panic/`unreachable!` arm.
+        enum DeviceContraction<'a> {
+            Linear,
+            Bilinear { v_t: &'a [f64], v_beta: &'a [f64] },
+        }
+        let (probe, device) = match contraction {
+            SaeRowJetContraction::Linear { probe } => (probe, DeviceContraction::Linear),
+            SaeRowJetContraction::Bilinear { probe, v_t, v_beta } => {
+                (probe, DeviceContraction::Bilinear { v_t, v_beta })
+            }
             SaeRowJetContraction::Trace { .. } => {
-                // The θ-adjoint trace reduction has no single-probe device
-                // kernel yet; its resident form (per-row `E_tt`/`inv_vβ`
-                // weighted second-jet reduction) is the hardware-gated
-                // follow-on. The CPU arm is the authoritative oracle.
                 return Err(gam_gpu::gpu_err!(
                     "SAE row-jet Trace contraction has no device kernel yet; plan the CPU path"
                 ));
@@ -2314,8 +2324,8 @@ mod device {
         let mut beta_dev = stream
             .alloc_zeros::<f64>(beta_len.max(1))
             .gpu_ctx("SAE row-jet alloc contracted beta")?;
-        match contraction {
-            SaeRowJetContraction::Linear { .. } => {
+        match device {
+            DeviceContraction::Linear => {
                 if t_len != 0 {
                     let function = b
                         .module
@@ -2367,7 +2377,7 @@ mod device {
                         .gpu_ctx("SAE row-jet linear beta launch")?;
                 }
             }
-            SaeRowJetContraction::Bilinear { v_t, v_beta, .. } => {
+            DeviceContraction::Bilinear { v_t, v_beta } => {
                 let d2dot_len = device_length(&[n, q, q])?;
                 let mut d2dot_dev = stream
                     .alloc_zeros::<f64>(d2dot_len.max(1))
