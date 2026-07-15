@@ -11,7 +11,6 @@ import numpy as np
 from ._binding import rust_module
 from ._penalty_bridge import GumbelTemperatureSchedule
 
-
 ManifoldSAE = rust_module().ManifoldSAE
 Tier0SAE = rust_module().Tier0SAE
 _FISHER_SHARD_SCHEMA = "gamfit.FisherHarvest/v1"
@@ -75,7 +74,9 @@ def _optional_array(value: Any, *, dimensions: int) -> np.ndarray | None:
         return None
     array = np.asarray(value, dtype=np.float64)
     if array.ndim != dimensions:
-        raise ValueError(f"expected a {dimensions}-dimensional array; got {array.shape}")
+        raise ValueError(
+            f"expected a {dimensions}-dimensional array; got {array.shape}"
+        )
     return np.ascontiguousarray(array)
 
 
@@ -184,6 +185,7 @@ def sae_manifold_fit(
     fisher_factors: Any = None,
     weights: Any = None,
     separation_barrier_strength: float | None = None,
+    gpu: str = "auto",
     promote_from_residual: bool = False,
     run_structure_search: bool = False,
     structured_residual_passes: int = 0,
@@ -210,7 +212,10 @@ def sae_manifold_fit(
     groups = (
         None
         if decoder_feature_sparsity_groups is None
-        else [[int(feature) for feature in group] for group in decoder_feature_sparsity_groups]
+        else [
+            [int(feature) for feature in group]
+            for group in decoder_feature_sparsity_groups
+        ]
     )
     return rust_module().sae_manifold_fit_model(
         x,
@@ -224,9 +229,7 @@ def sae_manifold_fit(
         native_ard_enabled=bool(ard_per_atom),
         decoder_feature_sparsity_groups=groups,
         max_iter=int(n_iter),
-        sparsity_strength=(
-            None if sparsity_weight is None else float(sparsity_weight)
-        ),
+        sparsity_strength=(None if sparsity_weight is None else float(sparsity_weight)),
         coord_sparsity=str(coord_sparsity),
         scad_mcp_gamma=None if scad_mcp_gamma is None else float(scad_mcp_gamma),
         smoothness=float(smoothness_weight),
@@ -255,6 +258,7 @@ def sae_manifold_fit(
             if separation_barrier_strength is None
             else float(separation_barrier_strength)
         ),
+        gpu_policy=str(gpu),
         promote_from_residual=bool(promote_from_residual),
         run_structure_search=bool(run_structure_search),
         structured_residual_passes=_structured_residual_pass_count(

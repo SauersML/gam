@@ -312,6 +312,7 @@ impl SaeManifoldTerm {
         //    once per refine round — lives inside
         //    `converge_inner_for_undamped_logdet`.
         let options = ArrowSolveOptions::direct()
+            .with_gpu_policy(self.gpu_policy)
             .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
             .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
         let cache = self.converge_inner_for_undamped_logdet(
@@ -2449,6 +2450,7 @@ impl SaeManifoldTerm {
         // `PerRowFactorFailed` at base ridge 0. Sharing the driver also keeps the
         // streaming and dense log-determinants bit-identical (#847).
         let options = ArrowSolveOptions::direct()
+            .with_gpu_policy(self.gpu_policy)
             .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
             .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
         // The converged arrow-factor cache is the per-row factored Hessian
@@ -2725,6 +2727,7 @@ impl SaeManifoldTerm {
             // storage the inner PCG already holds, not the extra O(k²) dense S.
             //
             let options = ArrowSolveOptions::direct()
+                .with_gpu_policy(self.gpu_policy)
                 .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
                 .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
             // Assemble the WHOLE system once (a single "chunk" over all rows) so the
@@ -2781,6 +2784,7 @@ impl SaeManifoldTerm {
         let mut schur_acc = Array2::<f64>::zeros((border_dim, border_dim));
         let mut log_det_tt = 0.0_f64;
         let options = ArrowSolveOptions::direct()
+            .with_gpu_policy(self.gpu_policy)
             .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
             .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
         let mut start = 0usize;
@@ -2861,7 +2865,7 @@ impl SaeManifoldTerm {
                 )
             })
             .collect();
-        let sb_all = batched_smooth_sb(&sb_inputs, true)?;
+        let sb_all = batched_smooth_sb(&sb_inputs, true, self.gpu_policy)?;
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
         for (atom_idx, (atom, sb)) in self.atoms.iter().zip(sb_all.iter()).enumerate() {
             per_atom[atom_idx] = (&atom.decoder_coefficients * sb).sum();

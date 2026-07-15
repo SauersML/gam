@@ -51,7 +51,7 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `ard_per_atom` | `True` | ARD pruning of unused coordinate axes |
 | `decoder_feature_sparsity_groups` | `None` | output-feature partition for decoder group-lasso |
 | `n_iter` | `50` | joint-solve iterations |
-| `sparsity_weight` | `1.0` | strength of the `coord_sparsity` coordinate-shrinkage penalty |
+| `sparsity_weight` | `None` | optional coordinate-shrinkage strength override; omitted delegates to the native neutral log-strength origin (`1.0`) |
 | `coord_sparsity` | `"scad"` | coordinate (latent `t`-block) magnitude penalty: `scad` / `mcp` / `l1` |
 | `scad_mcp_gamma` | `None` | SCAD/MCP concavity (defaults SCAD 3.7, MCP 2.5) |
 | `smoothness_weight` | `1.0` | roughness penalty strength |
@@ -71,6 +71,7 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `fisher_factors` | `None` | per-token Fisher reweighting factors |
 | `weights` | `None` | per-row observation weights |
 | `separation_barrier_strength` | `None` | optional native cross-atom separation strength override |
+| `gpu` | `"auto"` | per-fit backend policy: `"auto"`, `"off"`, or `"required"`; `"off"` never probes CUDA |
 | `promote_from_residual` | `False` | allow residual promotion during an explicitly requested structured-residual stage |
 | `run_structure_search` | `False` | opt into topology/birth/death structure search around the direct fit |
 | `structured_residual_passes` | `0` | number of structured-residual refit stages; each stage is a separate certified outer fit |

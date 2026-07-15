@@ -256,6 +256,9 @@ impl ArrowEvidencePolicy {
 #[derive(Clone)]
 pub struct ArrowSolveOptions {
     pub mode: ArrowSolverMode,
+    /// Backend policy owned by this solve. Keeping it in the immutable solve
+    /// request prevents one fit from changing another fit's device routing.
+    pub gpu_policy: gam_gpu::GpuPolicy,
     pub pcg: ArrowPcgOptions,
     pub trust_region: ArrowTrustRegionOptions,
     /// Row chunk size for streaming direct/Square-Root Schur assembly.
@@ -324,6 +327,7 @@ impl std::fmt::Debug for ArrowSolveOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArrowSolveOptions")
             .field("mode", &self.mode)
+            .field("gpu_policy", &self.gpu_policy)
             .field("pcg", &self.pcg)
             .field("trust_region", &self.trust_region)
             .field("streaming_chunk_size", &self.streaming_chunk_size)
@@ -404,6 +408,7 @@ impl ArrowSolveOptions {
     pub fn automatic(k: usize) -> Self {
         Self {
             mode: ArrowSolverMode::automatic(k),
+            gpu_policy: gam_gpu::GpuPolicy::Auto,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
             streaming_chunk_size: None,
@@ -421,6 +426,7 @@ impl ArrowSolveOptions {
     pub fn direct() -> Self {
         Self {
             mode: ArrowSolverMode::Direct,
+            gpu_policy: gam_gpu::GpuPolicy::Auto,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
             streaming_chunk_size: None,
@@ -437,6 +443,7 @@ impl ArrowSolveOptions {
     pub fn sqrt_ba() -> Self {
         Self {
             mode: ArrowSolverMode::SqrtBA,
+            gpu_policy: gam_gpu::GpuPolicy::Auto,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
             streaming_chunk_size: None,
@@ -453,6 +460,7 @@ impl ArrowSolveOptions {
     pub fn inexact_pcg() -> Self {
         Self {
             mode: ArrowSolverMode::InexactPCG,
+            gpu_policy: gam_gpu::GpuPolicy::Auto,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
             streaming_chunk_size: None,
@@ -467,6 +475,14 @@ impl ArrowSolveOptions {
 
     pub fn with_streaming_chunk_size(mut self, chunk_size: Option<usize>) -> Self {
         self.streaming_chunk_size = chunk_size.filter(|&chunk| chunk > 0);
+        self
+    }
+
+    /// Route every device probe made by this solve under one per-request
+    /// policy. In particular, `Off` returns to the exact CPU implementation
+    /// before touching a possibly broken CUDA installation.
+    pub fn with_gpu_policy(mut self, gpu_policy: gam_gpu::GpuPolicy) -> Self {
+        self.gpu_policy = gpu_policy;
         self
     }
 
@@ -533,6 +549,26 @@ pub trait BatchedBlockSolver {
         d: usize,
         evidence_factorization: bool,
     ) -> Result<ArrowFactorSlab, ArrowSchurError>;
+
+    /// Factor under an explicit request policy. Backends without a device path
+    /// may ignore the policy; the production CPU/GPU hybrid honors it before
+    /// any runtime probe.
+    fn factor_blocks_with_policy(
+        &self,
+        rows: &[ArrowRowBlock],
+        ridge_t: f64,
+        d: usize,
+        evidence_factorization: bool,
+        gpu_policy: gam_gpu::GpuPolicy,
+    ) -> Result<ArrowFactorSlab, ArrowSchurError> {
+        match gpu_policy {
+            gam_gpu::GpuPolicy::Auto
+            | gam_gpu::GpuPolicy::Off
+            | gam_gpu::GpuPolicy::Required => {
+                self.factor_blocks(rows, ridge_t, d, evidence_factorization)
+            }
+        }
+    }
 
     /// Solve one factored point block against a vector RHS.
     fn solve_block_vector(
@@ -735,8 +771,25 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         // CPU loop: a barely-PD but ill-conditioned block forces the whole batch
         // back onto the per-row path so its ridge can lift, never silently using
         // a contaminated factor.
+        self.factor_blocks_with_policy(
+            rows,
+            ridge_t,
+            d,
+            evidence_factorization,
+            gam_gpu::global_policy(),
+        )
+    }
+
+    fn factor_blocks_with_policy(
+        &self,
+        rows: &[ArrowRowBlock],
+        ridge_t: f64,
+        d: usize,
+        evidence_factorization: bool,
+        gpu_policy: gam_gpu::GpuPolicy,
+    ) -> Result<ArrowFactorSlab, ArrowSchurError> {
         if let Some(batched) =
-            try_factor_blocks_batched(rows, ridge_t, d, evidence_factorization)?
+            try_factor_blocks_batched(rows, ridge_t, d, evidence_factorization, gpu_policy)?
         {
             return Ok(batched);
         }

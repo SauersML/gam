@@ -50,6 +50,7 @@ fn sae_manifold_fit_minimal<'py>(
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
     // Per-fit separation-barrier configuration. `None` selects the native default.
     separation_barrier_strength_override: Option<f64>,
+    gpu_policy: gam::gpu::GpuPolicy,
     promote_from_residual: bool,
     // Bundled-pipeline stage toggles (#2267) forwarded to `sae_manifold_fit_inner`.
     run_structure_search: bool,
@@ -121,6 +122,7 @@ fn sae_manifold_fit_minimal<'py>(
         fisher_factor_kind.as_deref(),
         row_w,
         separation_barrier_strength_override,
+        gpu_policy,
         promote_from_residual,
         run_structure_search,
         structured_residual_passes,
@@ -438,6 +440,7 @@ impl Tier0SaeCore {
     fisher_factor_kind=None,
     row_loss_weights=None,
     separation_barrier_strength_override=None,
+    gpu_policy="auto",
     promote_from_residual=false,
     run_structure_search=false,
     structured_residual_passes=0,
@@ -483,12 +486,18 @@ fn sae_manifold_fit_model<'py>(
     fisher_factor_kind: Option<String>,
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
     separation_barrier_strength_override: Option<f64>,
+    gpu_policy: &str,
     promote_from_residual: bool,
     run_structure_search: bool,
     structured_residual_passes: usize,
 ) -> PyResult<PyObject> {
-    let sparsity_strength = sparsity_strength
-        .unwrap_or(gam::terms::sae::manifold::DEFAULT_SAE_SPARSITY_STRENGTH);
+    let sparsity_strength =
+        sparsity_strength.unwrap_or(gam::terms::sae::manifold::DEFAULT_SAE_SPARSITY_STRENGTH);
+    let gpu_policy = gam::gpu::GpuPolicy::parse(gpu_policy).ok_or_else(|| {
+        py_value_error(format!(
+            "sae_manifold_fit gpu must be 'auto', 'off', or 'required'; got {gpu_policy:?}"
+        ))
+    })?;
     if k_atoms == 0 {
         return Err(py_value_error(
             "sae_manifold_fit requires K >= 1".to_string(),
@@ -683,6 +692,7 @@ fn sae_manifold_fit_model<'py>(
         fisher_factor_kind.clone(),
         row_loss_weights,
         separation_barrier_strength_override,
+        gpu_policy,
         promote_from_residual,
         run_structure_search,
         structured_residual_passes,
@@ -3020,8 +3030,7 @@ mod sae_assignment_kind_tests {
 mod sae_linear_atom_tests {
     use super::sae_atom_basis_kind_name;
     use gam::terms::sae::manifold::{
-        EuclideanPatchEvaluator, SaeAtomBasisKind, SaeBasisEvaluator,
-        sae_atom_basis_kind_from_str,
+        EuclideanPatchEvaluator, SaeAtomBasisKind, SaeBasisEvaluator, sae_atom_basis_kind_from_str,
     };
     use ndarray::Array2;
 

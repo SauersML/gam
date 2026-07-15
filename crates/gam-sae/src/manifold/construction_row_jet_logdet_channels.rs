@@ -493,9 +493,7 @@ mod tests_softmax_hand_reference {
             let mut d2: Vec<Vec<Vec<Vec<f64>>>> = self
                 .atoms
                 .iter()
-                .map(|atom| {
-                    vec![vec![vec![0.0_f64; p]; atom.latent_dim()]; atom.latent_dim()]
-                })
+                .map(|atom| vec![vec![vec![0.0_f64; p]; atom.latent_dim()]; atom.latent_dim()])
                 .collect();
             let mut scratch = vec![0.0_f64; p];
             for k in 0..k_atoms {
@@ -769,7 +767,7 @@ impl SaeManifoldTerm {
                 q,
                 self.output_dim(),
                 border.len(),
-                gam_gpu::global_policy(),
+                self.gpu_policy,
             )?;
             let tile_rows = plan.tile_rows;
             if tile_rows == 0 {
@@ -858,9 +856,7 @@ impl SaeManifoldTerm {
         mut emit: impl FnMut(usize, usize, &[f64], &[f64]) -> Result<(), String>,
     ) -> Result<(), String> {
         let AssignmentMode::Softmax { temperature, .. } = self.assignment.mode else {
-            return Err(
-                "contracted softmax row-jet RHS called on a non-softmax gate".to_string(),
-            );
+            return Err("contracted softmax row-jet RHS called on a non-softmax gate".to_string());
         };
         let n = self.n_obs();
         let p = self.output_dim();
@@ -879,7 +875,7 @@ impl SaeManifoldTerm {
                 q,
                 p,
                 n_beta,
-                gam_gpu::global_policy(),
+                self.gpu_policy,
             )?;
             let tile_rows = plan.tile_rows;
             if tile_rows == 0 {
@@ -974,9 +970,7 @@ impl SaeManifoldTerm {
         mut emit: impl FnMut(usize, usize, &[f64], &[f64]) -> Result<(), String>,
     ) -> Result<(), String> {
         let AssignmentMode::Softmax { temperature, .. } = self.assignment.mode else {
-            return Err(
-                "contracted softmax row-jet HVP called on a non-softmax gate".to_string(),
-            );
+            return Err("contracted softmax row-jet HVP called on a non-softmax gate".to_string());
         };
         let n = self.n_obs();
         let p = self.output_dim();
@@ -1001,7 +995,7 @@ impl SaeManifoldTerm {
                 q,
                 p,
                 n_beta,
-                gam_gpu::global_policy(),
+                self.gpu_policy,
             )?;
             let tile_rows = plan.tile_rows;
             if tile_rows == 0 {

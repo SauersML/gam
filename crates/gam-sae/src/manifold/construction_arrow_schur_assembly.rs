@@ -335,7 +335,7 @@ impl SaeManifoldTerm {
                 )
             })
             .collect();
-        let sym_sb_all = batched_smooth_sb(&sym_sb_inputs, true)?;
+        let sym_sb_all = batched_smooth_sb(&sym_sb_inputs, true, self.gpu_policy)?;
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let m = atom.basis_size();
             let off = beta_offsets[atom_idx];

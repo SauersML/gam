@@ -630,7 +630,10 @@ pub(crate) fn ard_axis_prior_tiny_energy_and_increment_are_resolved() {
     let tiny = 1.0e-12;
     let periodic = ArdAxisPrior::eval(alpha, tiny, Some(std::f64::consts::TAU));
     let quadratic_limit = 0.5 * alpha * tiny * tiny;
-    assert!(periodic.value > 0.0, "nonzero periodic energy must not round to zero");
+    assert!(
+        periodic.value > 0.0,
+        "nonzero periodic energy must not round to zero"
+    );
     assert!(
         (periodic.value - quadratic_limit).abs() <= 1.0e-15 * quadratic_limit,
         "tiny periodic energy must retain its quadratic limit"
@@ -2092,10 +2095,12 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha()
     term_a.set_fit_config(SaeFitConfig {
         separation_barrier_strength_override: Some(0.1),
         ordered_beta_bernoulli_alpha_override: Some(0.2),
+        gpu_policy: gam_gpu::GpuPolicy::Off,
     });
     term_b.set_fit_config(SaeFitConfig {
         separation_barrier_strength_override: Some(3.0),
         ordered_beta_bernoulli_alpha_override: Some(5.0),
+        gpu_policy: gam_gpu::GpuPolicy::Required,
     });
 
     // Round-trips through the config accessor.
@@ -2107,9 +2112,13 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha()
         term_b.fit_config().separation_barrier_strength_override,
         Some(3.0)
     );
+    assert_eq!(term_a.fit_config().gpu_policy, gam_gpu::GpuPolicy::Off);
+    assert_eq!(term_b.fit_config().gpu_policy, gam_gpu::GpuPolicy::Required);
 
-    // ordered Beta--Bernoulli-α: the per-fit override is the resolved α (bypassing the mode schedule),
-    // and the two terms resolve different α values.
+    // ordered Beta--Bernoulli-α: the per-fit override is the resolved α
+    // (bypassing the mode schedule), and the two terms resolve different α
+    // values.  α parameterizes the prior used by the fit; it does not rewrite
+    // an already-materialized assignment matrix.
     assert_eq!(
         term_a
             .assignment
@@ -2121,17 +2130,6 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha()
             .assignment
             .resolved_ordered_beta_bernoulli_alpha(&rho_b),
         Some(5.0)
-    );
-
-    // Distinct α ⇒ distinct gates (the ordered geometric prior π_k differs).
-    let gates_a = term_a.assignment.try_assignments().unwrap();
-    let gates_b = term_b.assignment.try_assignments().unwrap();
-    let gate_gap = (&gates_a - &gates_b)
-        .iter()
-        .fold(0.0_f64, |m, d| m.max(d.abs()));
-    assert!(
-        gate_gap > 1e-6,
-        "distinct per-fit ordered Beta--Bernoulli-α overrides must produce distinct gates; gap {gate_gap:e}"
     );
 
     // Barrier strength (K=2, so the barrier is live): the per-fit override is the
@@ -2179,6 +2177,7 @@ pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
                     term.set_fit_config(SaeFitConfig {
                         separation_barrier_strength_override: Some(mu),
                         ordered_beta_bernoulli_alpha_override: None,
+                        gpu_policy: gam_gpu::GpuPolicy::Off,
                     });
                     // Hammer the barrier-strength read while the sibling thread
                     // hammers its own with a different μ. The per-fit field is

@@ -368,12 +368,27 @@ pub fn try_fast_abt_strided_batched(
     linalg_dispatch::try_fast_abt_strided_batched(a, b)
 }
 #[inline]
+pub fn try_fast_abt_strided_batched_with_policy(
+    a: ndarray::ArrayView3<'_, f64>,
+    b: ndarray::ArrayView3<'_, f64>,
+    policy: GpuPolicy,
+) -> Option<ndarray::Array3<f64>> {
+    linalg_dispatch::try_fast_abt_strided_batched_with_policy(a, b, policy)
+}
+#[inline]
 pub fn try_cholesky_lower_inplace(a: &mut ndarray::Array2<f64>) -> Option<()> {
     linalg_dispatch::try_cholesky_lower_inplace(a)
 }
 #[inline]
 pub fn try_cholesky_batched_lower_inplace(matrices: &mut [ndarray::Array2<f64>]) -> Option<()> {
     linalg_dispatch::try_cholesky_batched_lower_inplace(matrices)
+}
+#[inline]
+pub fn try_cholesky_batched_lower_inplace_with_policy(
+    matrices: &mut [ndarray::Array2<f64>],
+    policy: GpuPolicy,
+) -> Option<()> {
+    linalg_dispatch::try_cholesky_batched_lower_inplace_with_policy(matrices, policy)
 }
 #[inline]
 pub fn try_solve_lower_triangular_matrix(

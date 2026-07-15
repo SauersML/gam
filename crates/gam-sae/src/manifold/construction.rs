@@ -721,6 +721,7 @@ impl SaeManifoldTerm {
             atom_inner_fits: None,
             oos_linear_images: None,
             separation_barrier_strength_override: None,
+            gpu_policy: gam_gpu::GpuPolicy::Auto,
             // Rung-2 behavioral block: default None (ordinary single-block term,
             // bit-for-bit unchanged). Attached via `set_behavior_block`.
             behavior: None,
@@ -746,6 +747,7 @@ impl SaeManifoldTerm {
     /// and before fitting; distinct terms remain isolated by construction.
     pub fn set_fit_config(&mut self, config: SaeFitConfig) {
         self.separation_barrier_strength_override = config.separation_barrier_strength_override;
+        self.gpu_policy = config.gpu_policy;
         self.assignment.set_ordered_beta_bernoulli_alpha_override(
             config.ordered_beta_bernoulli_alpha_override,
         );
@@ -761,6 +763,7 @@ impl SaeManifoldTerm {
             ordered_beta_bernoulli_alpha_override: self
                 .assignment
                 .ordered_beta_bernoulli_alpha_override,
+            gpu_policy: self.gpu_policy,
         }
     }
 
@@ -2593,7 +2596,14 @@ impl SaeManifoldTerm {
         } else {
             self.beta_dim()
         };
-        sae_streaming_plan_for_shape(n_obs, total_basis, self.k_atoms(), d_max, border_dim)
+        sae_streaming_plan_for_shape(
+            n_obs,
+            total_basis,
+            self.k_atoms(),
+            d_max,
+            border_dim,
+            self.gpu_policy,
+        )
     }
 
     /// Construction-time validation: every Psi-tier analytic penalty in the
@@ -5347,10 +5357,7 @@ impl SaeManifoldTerm {
         Ok(total)
     }
 
-    pub(crate) fn decoder_smoothness_value(
-        &self,
-        lambda_smooth: &[f64],
-    ) -> Result<f64, String> {
+    pub(crate) fn decoder_smoothness_value(&self, lambda_smooth: &[f64]) -> Result<f64, String> {
         // Smoothness penalty value is `0.5·λ·Σ_oc B[:,oc]ᵀ S B[:,oc]`. Form the
         // `S·B` matrix product once per atom (O(M²·p)) and reduce against `B`
         // with a single O(M·p) Hadamard sum, instead of the previous
@@ -5373,7 +5380,7 @@ impl SaeManifoldTerm {
                 )
             })
             .collect();
-        let sb_all = batched_smooth_sb(&sb_inputs, false)?;
+        let sb_all = batched_smooth_sb(&sb_inputs, false, self.gpu_policy)?;
         let mut acc = 0.0;
         for (atom_idx, (atom, sb)) in self.atoms.iter().zip(sb_all.iter()).enumerate() {
             acc += 0.5 * lambda_smooth[atom_idx] * (&atom.decoder_coefficients * sb).sum();
@@ -5398,7 +5405,7 @@ impl SaeManifoldTerm {
                 )
             })
             .collect();
-        let sb_all = batched_smooth_sb(&sb_inputs, false)?;
+        let sb_all = batched_smooth_sb(&sb_inputs, false, self.gpu_policy)?;
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
         for (atom_idx, (atom, sb)) in self.atoms.iter().zip(sb_all.iter()).enumerate() {
             per_atom[atom_idx] =
