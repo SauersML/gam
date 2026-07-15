@@ -432,10 +432,18 @@ impl GpuRuntime {
 #[cfg(target_os = "linux")]
 fn absence_from_driver_init_error(error: &result::DriverError) -> Option<GpuAbsence> {
     use sys::cudaError_enum as CudaErrorCode;
-    let classification = match error.0 {
+    // Format the raw enum code, NEVER the DriverError itself: cudarc's
+    // Display/Debug for DriverError resolve the error string through its
+    // dynamic loader (`culib()`), which panics via `panic_no_lib_found` on
+    // exactly the driverless hosts this classifier exists for. The enum's
+    // derived Debug is a pure Rust name and is safe everywhere.
+    let code = error.0;
+    let classification = match code {
         CudaErrorCode::CUDA_ERROR_NO_DEVICE => {
             return Some(GpuAbsence::NoDevice {
-                reason: format!("CUDA driver initialized but reports no attached device ({error})"),
+                reason: format!(
+                    "CUDA driver initialized but reports no attached device ({code:?})"
+                ),
             });
         }
         CudaErrorCode::CUDA_ERROR_STUB_LIBRARY => {
@@ -457,7 +465,7 @@ fn absence_from_driver_init_error(error: &result::DriverError) -> Option<GpuAbse
         _ => return None,
     };
     Some(GpuAbsence::DriverUnavailable {
-        reason: format!("CUDA initialization refused: {classification} ({error})"),
+        reason: format!("CUDA initialization refused: {classification} ({code:?})"),
     })
 }
 
