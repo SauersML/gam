@@ -482,6 +482,21 @@ mod amortized_encoder_tests {
             .third_order_forward_sensitivity_hessian(target.view(), &rho, &loss, &cache)
             .expect("CH5 third-order block assembles");
 
+        // Self-check the dense θ-adjoint reproduction against the trusted
+        // production builder BEFORE the FD comparison: if this reds, the dense
+        // `dh` + Daleckii–Krein reconstruction is wrong (not the twist / rank-charge
+        // assembly), which localizes the bug in one read.
+        let (dj, dt) = term
+            .ch5_dense_theta_adjoint_selfcheck(&rho, &cache)
+            .expect("dense θ-adjoint self-check runs");
+        eprintln!("CH5 dense θ-adjoint self-check: max|dense−prod| joint={dj:.3e} tt={dt:.3e}");
+        assert!(
+            dj < 1.0e-7 && dt < 1.0e-7,
+            "CH5 dense θ-adjoint reconstruction diverges from production \
+             (joint={dj:.3e}, tt={dt:.3e}): the dense dh/DK reproduction is wrong — \
+             fix the dense builder before the twist"
+        );
+
         let base = rho.to_flat();
         let h = 1.0e-5;
         // `g3[j]` in isolation at a REBUILT fixed-θ̂ cache (the frozen-cache trap).

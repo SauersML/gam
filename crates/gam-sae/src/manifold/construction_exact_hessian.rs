@@ -1320,8 +1320,7 @@ impl SaeManifoldTerm {
     ) -> Result<SaeArrowVector, String> {
         let target_atom = smooth_flat - rho.smooth_flat_start();
         let residual = self.reconstruction_residual(target, rho)?;
-        let dispersion =
-            self.reconstruction_dispersion(loss, cache, rho, Some(residual.view()))?;
+        let dispersion = self.reconstruction_dispersion(loss, cache, rho, Some(residual.view()))?;
         let mut grams = self.empty_decoder_gram_accumulator();
         self.accumulate_decoder_gram(&mut grams)?;
         let n_eff = self.per_atom_effective_sample_size();
@@ -1467,8 +1466,7 @@ impl SaeManifoldTerm {
                             }
                             let a = assignments[atom];
                             let phi = self.atoms[atom].basis_values.row(row);
-                            let gram_quadratic =
-                                phi.dot(&atom_differentials[atom].gram.dot(&phi));
+                            let gram_quadratic = phi.dot(&atom_differentials[atom].gram.dot(&phi));
                             derivative += 2.0
                                 * a
                                 * da
@@ -1483,6 +1481,46 @@ impl SaeManifoldTerm {
             t: theta_t,
             beta: theta_beta,
         })
+    }
+
+    /// PATH C (#2253) CH5 test-support — the max `|dense − production|` of the
+    /// θ-adjoint reconstruction over the `(t, β)` blocks, for the joint (`inv = G`)
+    /// and coordinate-block (`inv = h_bd`) legs. A failing FD gate uses this to
+    /// separate a bug in the dense `dh` + Daleckii–Krein reproduction (this diverges
+    /// from the trusted production builder) from a bug in the twist / rank-charge
+    /// assembly (this is ~0 but the FD still reds). Both should be at solver noise.
+    pub(crate) fn ch5_dense_theta_adjoint_selfcheck(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+    ) -> Result<(f64, f64), String> {
+        let solver = DeflatedArrowSolver::plain(cache);
+        let g = self.materialize_joint_inverse(cache, &solver)?;
+        let h_bd = self.materialize_block_diag_t_inverse(cache);
+        let dense_joint =
+            self.logdet_theta_adjoint_dense(rho, cache, &g, ThetaAdjointDhChannel::All)?;
+        let dense_tt =
+            self.logdet_theta_adjoint_dense(rho, cache, &h_bd, ThetaAdjointDhChannel::All)?;
+        let prod_joint = self.logdet_theta_adjoint(rho, cache, &solver)?;
+        let prod_tt = self.coordinate_block_logdet_theta_adjoint(rho, cache, &solver)?;
+        let max_diff = |a: &SaeArrowVector, b: &SaeArrowVector| -> f64 {
+            let t =
+                a.t.iter()
+                    .zip(b.t.iter())
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0_f64, f64::max);
+            let beta = a
+                .beta
+                .iter()
+                .zip(b.beta.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0_f64, f64::max);
+            t.max(beta)
+        };
+        Ok((
+            max_diff(&dense_joint, &prod_joint),
+            max_diff(&dense_tt, &prod_tt),
+        ))
     }
 
     /// PATH C (#2253) CH5 — the exact fixed-stratum second derivative of the
@@ -1562,8 +1600,7 @@ impl SaeManifoldTerm {
 
         // Effective adjoint Γ_eff = Γ_joint − Γ_tt + 2∇R, assembled EXACTLY as
         // the gradient does (construction_exact_hessian.rs analytic assembler).
-        let rank_charge = self
-            .production_rank_charge_derivative(target, rho, loss, cache)?;
+        let rank_charge = self.production_rank_charge_derivative(target, rho, loss, cache)?;
         let mut gamma_eff = self.logdet_theta_adjoint(rho, cache, &solver)?;
         let gamma_tt = self.coordinate_block_logdet_theta_adjoint(rho, cache, &solver)?;
         gamma_eff.t -= &gamma_tt.t;
@@ -2528,8 +2565,7 @@ impl SaeManifoldTerm {
             }
         }
         if let Some(sparse) = rho.sparse_flat_index() {
-            if matches!(self.assignment.mode, AssignmentMode::Softmax { .. })
-                && self.k_atoms() > 1
+            if matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) && self.k_atoms() > 1
             {
                 priced.push(sparse);
             }
@@ -2565,8 +2601,7 @@ impl SaeManifoldTerm {
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
     ) -> Result<Array2<f64>, String> {
-        let hessian =
-            self.assemble_exact_fixed_stratum_outer_hessian(target, rho, loss, cache)?;
+        let hessian = self.assemble_exact_fixed_stratum_outer_hessian(target, rho, loss, cache)?;
         Err(format!(
             "PATH C exact fixed-stratum outer Hessian is assembled and validated \
              ({}×{}) but intentionally not advertised in commit 1: the Err→Ok + \
