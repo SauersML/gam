@@ -2467,7 +2467,7 @@ fn nnls_tangent_cone_projection_fallback(
     let active: Vec<usize> = tight
         .iter()
         .zip(lambda.iter())
-        .filter(|(_, &multiplier)| multiplier > 0.0)
+        .filter(|&(_, &multiplier)| multiplier > 0.0)
         .map(|(&row, _)| row)
         .collect();
     log::info!(
