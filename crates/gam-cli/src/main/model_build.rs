@@ -267,6 +267,11 @@ pub(crate) fn core_saved_fit_result(
             constraint_kkt: None,
             artifacts: gam::estimate::FitArtifacts {
                 pirls: None,
+                // Restore the outer-stationarity certificate the live fit carried
+                // so `UnifiedFitResult::try_from_parts` reconstructs the same
+                // `Analytic` convergence evidence. Dropping it here made the gate
+                // reject every location-scale fit that ran outer iterations.
+                criterion_certificate: summary.criterion_certificate,
                 ..Default::default()
             },
             inner_cycles: 0,
@@ -293,6 +298,12 @@ pub(crate) struct SavedFitSummary {
     pub(crate) stable_penalty_term: f64,
     pub(crate) max_abs_eta: f64,
     pub(crate) reml_score: f64,
+    /// Analytic outer-stationarity certificate proving the smoothing coordinate
+    /// converged. `None` only when the fit ran no outer iterations (fixed-λ);
+    /// whenever the fit optimized ρ this must carry the live certificate so the
+    /// reconstructed `UnifiedFitResult` clears the assembly gate in
+    /// `result_types.rs` instead of being rejected as non-stationary.
+    pub(crate) criterion_certificate: Option<gam::estimate::OuterCriterionCertificate>,
 }
 
 impl SavedFitSummary {
@@ -340,6 +351,11 @@ impl SavedFitSummary {
             stable_penalty_term,
             max_abs_eta,
             reml_score: fit.reml_score,
+            // Carry the live analytic certificate forward. Deriving it from the
+            // sealed convergence evidence keeps the reconstructed fit's outer
+            // stationarity proof identical to the one the optimizer minted; a
+            // fixed-λ fit (no outer iterations) legitimately yields `None`.
+            criterion_certificate: fit.convergence_evidence().outer_certificate().cloned(),
         }
         .validated()
     }
@@ -438,4 +454,102 @@ pub(crate) fn set_saved_weight_column(
     weight_column: Option<String>,
 ) {
     payload.weight_column = weight_column;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A live location-scale fit that optimized its smoothing coordinate: it ran
+    /// one outer iteration and carries the analytic outer-stationarity
+    /// certificate the optimizer minted. This is the state that reaches the CLI
+    /// save path for `gam fit --predict-noise --out ...`.
+    fn location_scale_fit_with_outer_certificate() -> UnifiedFitResult {
+        let certificate = gam::estimate::OuterCriterionCertificate {
+            stationarity: gam::estimate::OuterStationarityCertificate::AnalyticGradient {
+                grad_norm: 1e-8,
+                projected_grad_norm: 1e-8,
+                bound: 1e-4,
+            },
+            hessian_psd: Some(true),
+            lambdas_railed: Vec::new(),
+        };
+        UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
+            blocks: vec![gam::estimate::FittedBlock {
+                beta: Array1::from_vec(vec![0.5, -0.25]),
+                role: gam::estimate::BlockRole::Mean,
+                edf: 2.0,
+                lambdas: Array1::from_vec(vec![1.0]),
+            }],
+            log_lambdas: Array1::zeros(1),
+            lambdas: Array1::from_vec(vec![1.0]),
+            likelihood_family: None,
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            used_device: false,
+            outer_iterations: 1,
+            outer_converged: true,
+            outer_gradient_norm: Some(1e-8),
+            standard_deviation: 1.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference: None,
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: gam::pirls::PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: gam::estimate::FitArtifacts {
+                criterion_certificate: Some(certificate),
+                ..Default::default()
+            },
+            inner_cycles: 0,
+        })
+        .expect("fixture certificate certifies outer stationarity")
+    }
+
+    #[test]
+    fn compact_saved_fit_retains_outer_certificate() {
+        let fit = location_scale_fit_with_outer_certificate();
+        // Precondition: the live fit optimized ρ and holds an analytic proof.
+        assert_eq!(fit.outer_iterations, 1);
+        assert!(fit.convergence_evidence().outer_certificate().is_some());
+
+        // The intermediate summary must carry the certificate forward — dropping
+        // it here is exactly what made the compact reconstruction reject the fit.
+        let summary =
+            SavedFitSummary::from_blockwise_fit(&fit).expect("saved summary builds from live fit");
+        assert!(
+            summary.criterion_certificate.is_some(),
+            "SavedFitSummary dropped the live outer certificate"
+        );
+
+        // Reconstructing the compact saved fit must not panic and must preserve
+        // the Analytic outer convergence evidence (before the fix this rebuilt
+        // `FitArtifacts` with `criterion_certificate: None` and the assembly gate
+        // rejected the 1-outer-iteration fit as non-stationary).
+        let reconstructed = compact_saved_multiblock_fit_result(
+            fit.blocks.clone(),
+            fit.lambdas.clone(),
+            1.0,
+            fit.covariance_conditional.clone(),
+            fit.covariance_corrected.clone(),
+            fit.geometry.clone(),
+            summary,
+        );
+        assert_eq!(reconstructed.outer_iterations, 1);
+        assert!(
+            reconstructed
+                .convergence_evidence()
+                .outer_certificate()
+                .is_some(),
+            "compacted saved fit dropped the outer stationarity certificate"
+        );
+    }
 }

@@ -73,7 +73,8 @@ mod summary;
 pub use crate::model_types::result_types::dispersion_from_likelihood;
 pub use crate::model_types::{
     AdaptiveRegularizationOptions, BlockRole, FitArtifacts, FitGeometry, FitInference, FitOptions,
-    FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts, WorkingGeometry,
+    FittedBlock, FittedLinkState, OuterCriterionCertificate, OuterStationarityCertificate,
+    UnifiedFitResult, UnifiedFitResultParts, WorkingGeometry,
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
     validate_dense_hessian_export, validate_explicit_dense_hessian_for_whitening,
 };
