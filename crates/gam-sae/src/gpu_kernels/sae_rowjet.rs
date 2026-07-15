@@ -2315,6 +2315,14 @@ mod device {
             .alloc_zeros::<f64>(beta_len.max(1))
             .gpu_ctx("SAE row-jet alloc contracted beta")?;
         match contraction {
+            SaeRowJetContraction::Trace { .. } => {
+                // The θ-adjoint trace reduction has no device kernel yet; the
+                // planner routes Trace to the CPU oracle, so reaching this
+                // launch dispatcher is a routing defect, not a fallback point.
+                return Err(gam_gpu::gpu_err!(
+                    "SAE row-jet Trace contraction has no device kernel yet; plan the CPU path"
+                ));
+            }
             SaeRowJetContraction::Linear { .. } => {
                 if t_len != 0 {
                     let function = b
