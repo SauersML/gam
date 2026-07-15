@@ -3190,7 +3190,8 @@ mod tests {
             };
 
             // Deterministic symmetric weight on the coupled coordinate slots.
-            let raw_weight = |a: usize, b: usize| -> f64 { ((a * 7 + b * 3 + 1) as f64 * 0.05).cos() };
+            let raw_weight =
+                |a: usize, b: usize| -> f64 { ((a * 7 + b * 3 + 1) as f64 * 0.05).cos() };
             let mut e_tt = vec![0.0_f64; n * q * q];
             for row in 0..n {
                 for &a in &coord_slots {
@@ -3216,14 +3217,10 @@ mod tests {
             )
             .expect("CPU trace contraction");
 
-            let dot =
-                |x: &[f64], y: &[f64]| -> f64 { x.iter().zip(y).map(|(&a, &b)| a * b).sum() };
+            let dot = |x: &[f64], y: &[f64]| -> f64 { x.iter().zip(y).map(|(&a, &b)| a * b).sum() };
             // z(ℓ) = softmax(inv_tau·ℓ), stable.
             let softmax = |logits: &[f64]| -> Vec<f64> {
-                let shift = logits
-                    .iter()
-                    .copied()
-                    .fold(f64::NEG_INFINITY, f64::max);
+                let shift = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 let exps: Vec<f64> = logits
                     .iter()
                     .map(|&l| ((l - shift) * inv_tau).exp())
@@ -3242,8 +3239,11 @@ mod tests {
                 let da = |slot: usize| -> &[f64] { &input.decoded_first[slot * p..(slot + 1) * p] };
                 // Logits consistent with the stored gates: softmax(inv_tau·ℓ)=z
                 // for ℓ_k = ln(z_k)/inv_tau (softmax is shift-invariant and Σz=1).
-                let base_logits: Vec<f64> =
-                    input.gate_values.iter().map(|&z| z.ln() / inv_tau).collect();
+                let base_logits: Vec<f64> = input
+                    .gate_values
+                    .iter()
+                    .map(|&z| z.ln() / inv_tau)
+                    .collect();
                 let phi = |logits: &[f64]| -> f64 {
                     let z = softmax(logits);
                     let mut acc = 0.0_f64;

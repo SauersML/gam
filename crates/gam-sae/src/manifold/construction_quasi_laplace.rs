@@ -789,12 +789,19 @@ impl SaeManifoldTerm {
         // factor failed and the loop kept extending via `saw_refine_progress`
         // from earlier rounds, accumulating minutes of wasted work (#1094).
         let mut consecutive_objective_stalls: usize = 0;
-        // #2228 Stage-2 — terminal exact-Newton invocations remaining for this
-        // criterion evaluation. Each invocation runs a bounded superlinear
-        // polish (`terminal_exact_newton_polish`) from the objective-stall
-        // plateau; two invocations of ≤12 steps bound the extra cost while
-        // covering a re-stall after an intervening refine round.
-        let mut terminal_newton_rounds: usize = 2;
+        // #2228 Stage-2 / #2132 — whether the terminal exact-Newton polish
+        // (`terminal_exact_newton_polish`) is armed for the NEXT objective-stall
+        // plateau. Re-armed by any materially-descending refine round, so a
+        // long solve that alternates MM plateaus with real descent gets one
+        // polish per plateau instead of a fixed ration (the measured K=3
+        // planted-circle fit descended 5793 → 4347 across three plateaus and
+        // was refused at the third purely because a 2-invocation budget was
+        // spent — at a point 100× LESS stationary than the plateaus the budget
+        // had rescued). Runaway is impossible by construction: invoking the
+        // polish disarms it, and only an intervening materially-descending
+        // round re-arms, so a plateau the polish cannot unlock refuses on its
+        // second visit with the polish disarmed.
+        let mut terminal_newton_polish_armed = true;
         loop {
             let mut sys = self
                 .assemble_arrow_schur(target, rho, registry)
@@ -1235,8 +1242,8 @@ impl SaeManifoldTerm {
                     // loop-top KKT gate and the idempotence certificate remain
                     // the sole acceptance authority, exactly as at the stall
                     // branch.
-                    if terminal_newton_rounds > 0 {
-                        terminal_newton_rounds -= 1;
+                    if terminal_newton_polish_armed {
+                        terminal_newton_polish_armed = false;
                         if self.terminal_exact_newton_polish(
                             target,
                             rho_fixed,
@@ -1531,8 +1538,8 @@ impl SaeManifoldTerm {
                 // and the idempotence certificate (the state moved, so
                 // `criterion_fixed_point` is cleared and one evidence re-entry
                 // must recur exactly before acceptance, same as any hook move).
-                if terminal_newton_rounds > 0 {
-                    terminal_newton_rounds -= 1;
+                if terminal_newton_polish_armed {
+                    terminal_newton_polish_armed = false;
                     if self.terminal_exact_newton_polish(
                         target,
                         rho_fixed,
@@ -1577,8 +1584,10 @@ impl SaeManifoldTerm {
                 }
             } else {
                 // The stall streak broke (this round is materially descending or
-                // the fraction baseline is not yet meaningful).
+                // the fraction baseline is not yet meaningful). Material descent
+                // re-arms the terminal polish for the next plateau (#2132).
                 consecutive_objective_stalls = 0;
+                terminal_newton_polish_armed = true;
             }
         }
     }
