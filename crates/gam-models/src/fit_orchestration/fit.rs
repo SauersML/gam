@@ -1697,6 +1697,22 @@ fn optimize_survival_transformation_smoothing(
     // cache (`families::gamlss::builders`).
     let eval_cache: std::cell::RefCell<Option<(Array1<f64>, f64, Array1<f64>)>> =
         std::cell::RefCell::new(None);
+    // Warm-start chaining for the inner PIRLS across outer probes (#2298). The
+    // generic BFGS bridge evaluates this objective at a sequence of spatially
+    // adjacent ρ — line-search probes walk along one direction and accepted steps
+    // advance it — so the last CONVERGED β̂(ρ_prev) is a far better inner seed than
+    // the fixed cold β̂(ρ_seed). As the selector over-smooths the baseline out
+    // toward its box bound the probe ρ drift O(10) log-λ units from the seed,
+    // where the stale cold seed leaves the coupled constrained inner PIRLS
+    // non-convergent: `eval_at` then returns typed inner non-convergence, every
+    // line-search step reads +∞ cost, and BFGS starves — the observed death at ~5
+    // iterations with |Pg| ≫ tol and the baseline coordinate railed. The inner
+    // penalized likelihood is strictly convex on the feasible (monotonicity) cone,
+    // so β̂(ρ) is independent of the feasible seed: the LAML envelope value and
+    // ρ-gradient are unchanged bit-for-bit, only the inner convergence at drifted
+    // ρ is restored. A non-converged probe never advances the seed (see below), so
+    // a bad probe cannot corrupt the warm start for the next attempt.
+    let warm_beta: std::cell::RefCell<Array1<f64>> = std::cell::RefCell::new(beta0.clone());
     // Evaluate the LAML objective and ρ-gradient at a smoothing-ρ proposal:
     // set the smoothing λ, re-run the constrained inner PIRLS, evaluate the
     // unified survival LAML, and project the gradient onto the smoothing
@@ -1737,7 +1753,7 @@ fn optimize_survival_transformation_smoothing(
         };
         let summary = gam_solve::pirls::runworking_model_pirls(
             &mut candidate,
-            gam_problem::Coefficients::new(beta0.clone()),
+            gam_problem::Coefficients::new(warm_beta.borrow().clone()),
             &opts,
             |_| {},
         )?;
@@ -1753,6 +1769,11 @@ fn optimize_survival_transformation_smoothing(
             });
         }
         let beta = summary.beta.as_ref().to_owned();
+        // Advance the warm start: a CERTIFIED inner mode at this ρ (the
+        // convergence gate above already rejected non-certified states) is the
+        // best available seed for the next, adjacent probe. Reached only after
+        // certification, so a refused probe leaves the previous good β̂ in place.
+        *warm_beta.borrow_mut() = beta.clone();
         let state = candidate.update_state(&beta).map_err(|error| {
             gam_solve::estimate::EstimationError::InvalidInput(format!(
                 "survival smoothing inner state evaluation failed: {error}"
