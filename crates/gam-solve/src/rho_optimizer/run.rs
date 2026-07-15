@@ -2257,9 +2257,52 @@ pub(crate) fn run_outer(
     // takes the same typed refusal as before. Bounded to a single retry;
     // only fires when the solver CLAIMED convergence (a budget-exhausted
     // result is not a desync — its refusal is genuine).
+    // CERTIFICATION-LAST FIT OWNERSHIP. The uncertainty diagnostic evaluates
+    // proposal points after theta-hat and the terminal reinstallation
+    // re-evaluates at `result.rho`, so any certificate measured BEFORE them
+    // describes a state the caller never receives: on a nonconvex profile the
+    // certificate-time inner mode and the finally-installed inner mode can sit
+    // in different coefficient basins (measured on the cause-specific survival
+    // gate as a stable bitwise mismatch, terminal 9.1931e2 vs certified
+    // 9.1671e2, because the two paths prime the inner solve under different
+    // eval orders). Running the diagnostic and the terminal installation
+    // FIRST and certifying LAST makes the certificate's own evaluation the
+    // final objective-state installer, so the sealed terminal identity fit
+    // assembly binds against IS the certified evidence — bitwise, by
+    // construction, independent of basin multiplicity.
     let claimed_converged = result.converged;
-    result.criterion_certificate = match certify_outer_optimality(obj, config, context, &mut result)
-    {
+    let certify_diagnose_and_install =
+        |obj: &mut dyn OuterObjective,
+         result: &mut OuterResult|
+         -> Result<OuterCriterionCertificate, EstimationError> {
+            result.rho_uncertainty_diagnostic =
+                Some(compute_rho_uncertainty_diagnostic(obj, config, context, result));
+            // Reinstall the selected point under cap=0 so the certificate below
+            // measures the full-fidelity state belonging to `result.rho`, not
+            // the diagnostic's final proposal (seeding beta alone does not
+            // restore weights, factors, or link state). Reset forces a real
+            // installation instead of an LRU value hit.
+            let terminal_cap_guard = config
+                .outer_inner_cap
+                .as_ref()
+                .map(TerminalInnerCapGuard::lift);
+            obj.reset();
+            let terminal_installation = obj.finalize_outer_result(&result.rho, &result.plan_used);
+            let terminal_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
+            drop(terminal_cap_guard);
+            terminal_installation?;
+            if !terminal_inner_converged {
+                return Err(outer_nonconvergence_error(
+                    context,
+                    "final outer state installation did not converge at full inner fidelity",
+                    result,
+                    result.final_grad_norm,
+                    outer_gradient_tolerance(config).abs,
+                ));
+            }
+            certify_outer_optimality(obj, config, context, result)
+        };
+    result.criterion_certificate = match certify_diagnose_and_install(obj, &mut result) {
         Ok(certificate) => Some(certificate),
         Err(refusal) if claimed_converged => {
             let prior_iterations = result.iterations;
@@ -2282,7 +2325,7 @@ pub(crate) fn run_outer(
                 Ok(mut retried) => {
                     retried.iterations = retried.iterations.saturating_add(prior_iterations);
                     result = retried;
-                    Some(certify_outer_optimality(obj, config, context, &mut result)?)
+                    Some(certify_diagnose_and_install(obj, &mut result)?)
                 }
                 // The retry could not even run (e.g. the checkpoint is a
                 // hard refusal wall for the objective): surface the
@@ -2293,39 +2336,6 @@ pub(crate) fn run_outer(
         }
         Err(refusal) => return Err(refusal),
     };
-    result.rho_uncertainty_diagnostic = Some(compute_rho_uncertainty_diagnostic(
-        obj,
-        config,
-        context,
-        &mut result,
-    ));
-    // The uncertainty diagnostic evaluates proposal points after theta-hat.
-    // Reinstall the certified point once more under cap=0 so callers receive
-    // the inner mode belonging to `result.rho`, not the diagnostic's final
-    // proposal (seeding beta alone does not restore weights, factors, or link
-    // state).  Reset forces a real installation instead of an LRU value hit.
-    let terminal_cap_guard = config
-        .outer_inner_cap
-        .as_ref()
-        .map(TerminalInnerCapGuard::lift);
-    obj.reset();
-    let terminal_installation = obj.finalize_outer_result(&result.rho, &result.plan_used);
-    let terminal_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
-    drop(terminal_cap_guard);
-    terminal_installation?;
-    if !terminal_inner_converged {
-        return Err(outer_nonconvergence_error(
-            context,
-            "final outer state installation did not converge at full inner fidelity",
-            &result,
-            result.final_grad_norm,
-            result
-                .criterion_certificate
-                .as_ref()
-                .map(|certificate| certificate.stationarity.bound())
-                .unwrap_or_else(|| outer_gradient_tolerance(config).abs),
-        ));
-    }
     Ok(result)
 }
 
