@@ -1131,12 +1131,39 @@ impl SaeManifoldTerm {
                 .expect("softmax assignments row must be contiguous");
             let m_log_mean = softmax_majorizer_log_mean(a_soft);
             let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
+            // #2308 — per-row spectral/gauge deflation the criterion factor applied.
+            // It is FROZEN at the fixed stratum (the radial-gauge / ARD-inactive-half
+            // null is ρ-invariant), so contracting the DEFLATED inverse `inv` and
+            // subtracting the SAME Daleckii–Krein correction the production θ-adjoint
+            // subtracts makes `Γ(inv)` — and its twist `Γ(−G Mᵢ G)` — match the
+            // gradient on the deflated circle route (where deflation is the norm, not
+            // an error). `deflation_block_correction` is linear in `inv`, so the twist
+            // rides through it exactly.
+            let defl_dirs = cache
+                .deflated_row_directions
+                .get(row)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let defl_spectrum = cache
+                .deflation_row_spectra
+                .get(row)
+                .and_then(Option::as_ref);
+            let inv_vv_block = if defl_dirs.is_empty() {
+                Array2::<f64>::zeros((0, 0))
+            } else {
+                inv.slice(s![base..base + q, base..base + q]).to_owned()
+            };
             for w in 0..q {
                 let logit_w = match jets.vars[w] {
                     SaeLocalRowVar::Logit { atom } => Some(atom),
                     SaeLocalRowVar::Coord { .. } => None,
                 };
                 let mut gamma = 0.0_f64;
+                let mut dh_mat = if defl_dirs.is_empty() {
+                    Array2::<f64>::zeros((0, 0))
+                } else {
+                    Array2::<f64>::zeros((q, q))
+                };
                 for a in 0..q {
                     for b in 0..q {
                         let mut dh = 0.0_f64;
@@ -1198,8 +1225,19 @@ impl SaeManifoldTerm {
                                 }
                             }
                         }
+                        if !defl_dirs.is_empty() {
+                            dh_mat[[a, b]] = dh;
+                        }
                         gamma += inv[[base + b, base + a]] * dh;
                     }
+                }
+                if !defl_dirs.is_empty() {
+                    gamma -= Self::deflation_block_correction(
+                        &inv_vv_block,
+                        &dh_mat,
+                        defl_dirs,
+                        defl_spectrum,
+                    );
                 }
                 if want_data {
                     for a in 0..q {
@@ -1222,12 +1260,28 @@ impl SaeManifoldTerm {
             if want_data {
                 for (w_beta_pos, w_channel) in border.iter().enumerate() {
                     let mut gamma = 0.0_f64;
+                    let mut dh_mat = if defl_dirs.is_empty() {
+                        Array2::<f64>::zeros((0, 0))
+                    } else {
+                        Array2::<f64>::zeros((q, q))
+                    };
                     for a in 0..q {
                         for b in 0..q {
                             let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
                                 + sae_dot(jets.first(a), jets.beta_l_deriv(b, w_beta_pos));
+                            if !defl_dirs.is_empty() {
+                                dh_mat[[a, b]] = dh;
+                            }
                             gamma += inv[[base + b, base + a]] * dh;
                         }
+                    }
+                    if !defl_dirs.is_empty() {
+                        gamma -= Self::deflation_block_correction(
+                            &inv_vv_block,
+                            &dh_mat,
+                            defl_dirs,
+                            defl_spectrum,
+                        );
                     }
                     for a in 0..q {
                         for (beta_pos, ch) in border.iter().enumerate() {
@@ -1476,12 +1530,17 @@ impl SaeManifoldTerm {
             );
         }
         let solver = DeflatedArrowSolver::plain(cache);
-        if !solver.plain_selected_inverse_available()
-            || cache.deflated_row_directions.iter().any(|d| !d.is_empty())
-        {
+        // Per-row spectral/gauge deflation IS modelled — the dense θ-adjoint
+        // subtracts the same frozen Daleckii–Krein correction the production
+        // builder does (#2308), and the plain deflated inverse is what `a`/`b_j`
+        // and the twist all ride. What the plain solver CANNOT reconstruct is the
+        // rank-R β-Schur Woodbury GAUGE correction: there the materialized inverse
+        // would omit it, so refuse rather than assemble a wrong twist.
+        if !solver.plain_selected_inverse_available() {
             return Err(
-                "third_order_forward_sensitivity_hessian: per-row spectral deflation is present; \
-                 the twisted-inverse reconstruction does not model the Daleckii–Krein deflation map"
+                "third_order_forward_sensitivity_hessian: a β-Schur Woodbury gauge deflation is \
+                 active; the plain selected inverse omits its rank-R correction, so the \
+                 twisted-inverse reconstruction is not the exact operator"
                     .to_string(),
             );
         }
