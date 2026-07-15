@@ -143,13 +143,15 @@ mod amortized_encoder_tests {
                 let se = term
                     .decoder_smoothness_value_per_atom(&lam)
                     .expect("smoothness evaluation must preserve CUDA failures");
-                let s: f64 = se.iter().sum();
+                // TRUE gradient `g_a = renorm·se_a` with `renorm = C/Σse =
+                // penalty_scale` ρ-INVARIANT (`C = loss.smoothness = penalty_scale·
+                // Σse`, construction.rs:4995). The FD must hold `renorm` fixed and
+                // let `se` move — it must NOT re-divide by the moving `Σse`, which
+                // is the frozen-`C` convention that manufactured the spurious Occam
+                // cross term. This fixture uses `C = Σse(base)` (penalty_scale = 1),
+                // so `g_a = se_a`.
                 for a in 0..r.log_lambda_smooth.len() {
-                    v[r.smooth_flat_index(a)] = if s.abs() > 0.0 {
-                        frozen_smoothness * se[a] / s
-                    } else {
-                        se[a]
-                    };
+                    v[r.smooth_flat_index(a)] = se[a];
                 }
                 let ard = term.ard_log_precision_explicit_derivatives(&r).unwrap();
                 for (atom, axes) in ard.iter().enumerate() {

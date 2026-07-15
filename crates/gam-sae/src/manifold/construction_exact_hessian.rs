@@ -2182,13 +2182,13 @@ impl SaeManifoldTerm {
     ///
     /// Math (all at fixed stratum, `s = log α`, `f_k = ⟨B_k, S_k B_k⟩` frozen):
     /// * Smoothness. The gradient renormalizes the per-atom penalty energy
-    ///   `se_k = ½ λ_k f_k` to the frozen scalar `C = loss.smoothness`, i.e.
-    ///   `g_k = C · se_k / Σ_m se_m`. With `∂se_k/∂ρ_j = δ_{jk} se_k`, holding `C`
-    ///   frozen gives the symmetric rank-structured block
-    ///   `∂²/∂ρ_i∂ρ_j = (C/Σ)·(δ_{ij} se_i − se_i se_j / Σ)` — NOT diagonal: the
-    ///   shared normalizer couples every pair of smoothing atoms. (A zero `Σ`
-    ///   leaves the energy unrenormalized, `g_k = se_k`, second derivative the
-    ///   plain diagonal `δ_{ij} se_i`.)
+    ///   `se_k = ½ λ_k f_k` to `C = loss.smoothness`, i.e. `g_k = C · se_k / Σse`.
+    ///   But `C = penalty_scale · Σse` (construction.rs:4995), so the renormalizer
+    ///   `renorm = C/Σse = penalty_scale` is ρ-INVARIANT — the `Σse` cancels — and
+    ///   `g_k = renorm · se_k`. With `∂se_k/∂ρ_j = δ_{jk} se_k` the block is the
+    ///   plain DIAGONAL `∂²/∂ρ_i∂ρ_j = renorm · δ_{ij} se_i`. (Holding `C` frozen
+    ///   while `Σse` moves manufactures a spurious Occam cross term the
+    ///   full-gradient FD reports as zero — the frozen-cache false-green genus.)
     /// * ARD. Per `(atom, axis)` the gradient is `energy_deriv + normalizer_deriv`
     ///   with `energy_deriv = Σ_i w_i · V(α, t_i)` (degree-one in `α`, so its own
     ///   `∂/∂s` is itself) and a normalizer that is `−½ n_eff` (constant → zero)
@@ -2217,16 +2217,22 @@ impl SaeManifoldTerm {
         let smooth_energy = self.decoder_smoothness_value_per_atom(&lambda_smooth)?;
         let energy_sum: f64 = smooth_energy.iter().sum();
         let k_smooth = rho.log_lambda_smooth.len();
+        // The gradient's explicit smooth term is `g_k = C·se_k/Σse` with
+        // `C = loss.smoothness = penalty_scale·Σse` (construction.rs:4995 — the
+        // criterion energy IS the λ-scaled per-atom penalty times the minibatch
+        // `penalty_scale`). So the renormalizer `renorm = C/Σse = penalty_scale`
+        // is ρ-INVARIANT — the `Σse` in `C` cancels the denominator — and
+        // `g_k = renorm·se_k`. Hence `∂g_k/∂ρ_j = renorm·δ_jk·se_k`: the block is
+        // DIAGONAL. Holding `C` frozen while `Σse` moves (the old code) manufac-
+        // tured a spurious Occam cross term `−renorm·se_a·se_b/Σse` that the
+        // full-gradient FD (which recomputes `C` at each ρ) correctly reports as
+        // zero. This is the frozen-cache false-green genus — the renormalizer must
+        // be differentiated, not held constant.
         if energy_sum.abs() > 0.0 {
             let renorm = frozen_smoothness_energy / energy_sum;
             for a in 0..k_smooth {
                 let ia = rho.smooth_flat_index(a);
-                for b in 0..k_smooth {
-                    let ib = rho.smooth_flat_index(b);
-                    let diagonal = if a == b { smooth_energy[a] } else { 0.0 };
-                    hessian[[ia, ib]] +=
-                        renorm * (diagonal - smooth_energy[a] * smooth_energy[b] / energy_sum);
-                }
+                hessian[[ia, ia]] += renorm * smooth_energy[a];
             }
         } else {
             for a in 0..k_smooth {
