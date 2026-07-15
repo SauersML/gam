@@ -1878,14 +1878,14 @@ fn solve_newton_direction_with_linear_constraints_impl(
                         }
                         let anti = row.dot(&projected) / norm;
                         if anti < -tol_dual
-                            && remove_pos
+                            && anti_remove
                                 .map(|(best_pos, best)| {
                                     anti < best
                                         || (anti == best && row_id < active[best_pos])
                                 })
                                 .unwrap_or(true)
                         {
-                            remove_pos = Some((pos, anti));
+                            anti_remove = Some((pos, anti));
                         }
                     }
                     if let Some((active_pos, _)) = anti_remove {

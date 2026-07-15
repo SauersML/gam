@@ -638,26 +638,44 @@ mod cone_boundary_factor_tests {
         );
     }
 
-    /// Closed-form partials against central finite differences of the value
+    /// Closed-form partials against finite differences of the value
     /// (test-only FD; the production gradient consumes the analytic form).
+    /// The domain is `a, b ≥ 0`, so a coordinate sitting exactly on the
+    /// boundary uses a one-sided forward difference instead of stepping
+    /// outside the domain (where the factor is deliberately NaN).
     #[test]
     fn boundary_factor_derivatives_match_finite_differences() {
-        let cases = [(0.3, 0.0), (2.0, 0.5), (0.0, 1.2), (5.0, 0.2), (0.7, 3.0)];
+        let cases: [(f64, f64); 5] = [(0.3, 0.0), (2.0, 0.5), (0.0, 1.2), (5.0, 0.2), (0.7, 3.0)];
         let step = 1e-6;
+        let fd = |lo: f64, mid: f64, hi: f64, coord: f64| -> f64 {
+            if coord >= step {
+                (hi - lo) / (2.0 * step)
+            } else {
+                (hi - mid) / step
+            }
+        };
         for &(a, b) in &cases {
             let (_, d_a, d_b) = cone_boundary_log_factor_and_derivatives(a, b);
-            let fd_a = (cone_boundary_log_factor(a + step, b)
-                - cone_boundary_log_factor(a - step, b))
-                / (2.0 * step);
-            let fd_b = (cone_boundary_log_factor(a, b + step)
-                - cone_boundary_log_factor(a, b - step))
-                / (2.0 * step);
+            let fd_a = fd(
+                cone_boundary_log_factor((a - step).max(0.0), b),
+                cone_boundary_log_factor(a, b),
+                cone_boundary_log_factor(a + step, b),
+                a,
+            );
+            let fd_b = fd(
+                cone_boundary_log_factor(a, (b - step).max(0.0)),
+                cone_boundary_log_factor(a, b),
+                cone_boundary_log_factor(a, b + step),
+                b,
+            );
+            // One-sided differences on boundary coordinates carry O(step)
+            // truncation error, so the band is a few multiples of step.
             assert!(
-                (d_a - fd_a).abs() <= 1e-6 * (1.0 + fd_a.abs()),
+                (d_a - fd_a).abs() <= 5e-6 * (1.0 + fd_a.abs()),
                 "(a={a}, b={b}): ∂a analytic {d_a} vs FD {fd_a}"
             );
             assert!(
-                (d_b - fd_b).abs() <= 1e-6 * (1.0 + fd_b.abs()),
+                (d_b - fd_b).abs() <= 5e-6 * (1.0 + fd_b.abs()),
                 "(a={a}, b={b}): ∂b analytic {d_b} vs FD {fd_b}"
             );
         }
