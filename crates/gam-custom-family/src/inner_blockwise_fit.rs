@@ -111,7 +111,7 @@ fn certified_reduced_face_newton_candidate(
         // Hessian is positive it becomes the exact Newton equation above.
         *coefficient /= eigenvalue.abs();
     }
-    let delta = tangent.dot(&eigenvectors.dot(&spectral_step));
+    let mut delta = tangent.dot(&eigenvectors.dot(&spectral_step));
     if delta.iter().any(|value| !value.is_finite()) {
         return Ok(None);
     }
@@ -120,27 +120,40 @@ fn certified_reduced_face_newton_candidate(
         return Ok(None);
     }
 
-    // The tangent step can meet a previously inactive inequality. That is a
-    // FACE-CHANGE event, and face discovery (release/entry with its ratio
-    // tests and multiplier signs) belongs to the global active-set QP — this
-    // routine owns only the fixed-face Newton endgame. The previous behavior
-    // truncated the step at the first blocker, returned the segment as the
-    // cycle's candidate, and carried the blocker in the returned face; but
-    // that short-circuited the full QP every cycle, and once trust-region
-    // globalization accepted only a subsegment the accepted-face tightness
-    // filter dropped the blocker again — measured on the #2301
-    // transformation-normal fit as a bit-frozen fixed point (cycles 29-45:
-    // warm_rows=21, candidate face 22, β pinned at 4.4377, the same 8.194e-7
-    // proposal every cycle, residual pinned at 1.556 vs tol 4.5e-5,
-    // diagnosis active_set_incomplete). Declining here routes the cycle to
-    // `solve_quadratic_with_constraint_set`, which performs the exchange and
-    // lands ON the new face exactly.
+    // The tangent step can meet a previously inactive inequality. Truncate at
+    // the first blocker and carry that row into the returned face so the next
+    // cycle solves the exchanged face directly — standard gradient-projection
+    // globalization, and the reduced tangent curvature stays exact where the
+    // ambient-convex QP would reflect it into a slow crawl (measured on the
+    // #2301 n=80 CTN fit: routing every blocker cycle to the full reflected
+    // QP marched at ~0.989×/cycle and exhausted the 184-cycle budget with the
+    // residual at 0.82 vs tol 1.3e-4).
+    //
+    // CRITICAL: the truncation lands STRICTLY INSIDE the boundary (fraction
+    // from the raw slack, then a 1e-12 inward shave), never past it. The
+    // previous behavior added ACTIVE_SET_PRIMAL_FEASIBILITY_TOL to the
+    // numerator — deliberately overstepping the boundary by up to 1e-8 so the
+    // blocker would register tight — which collided with the trial
+    // feasibility gate at the SAME 1e-8 tolerance: the trial classified
+    // infeasible, the strictly-interior repair projection failed at the
+    // active face, a silent shrink-retry accepted only the HALF step, and the
+    // blocker (now half a chord away) was dropped by the accepted-face
+    // tightness filter — a bit-frozen fixed point (cycles 29-45: warm_rows=21
+    // vs candidate face 22, β pinned at 4.4377, the same 8.194e-7 proposal
+    // every cycle, residual pinned at 1.556, diagnosis
+    // active_set_incomplete). Landing exactly on the face keeps the trial
+    // feasible (violation ≤ 0 passes the gate), the full chord is accepted,
+    // and the blocker's remaining slack (~1e-12 of the original) classifies
+    // tight under the working-face tolerance, so the exchange completes in
+    // one cycle.
     let values_beta = constraints
         .values(beta.view())
         .map_err(|error| format!("exact active-face value evaluation failed: {error}"))?;
     let values_delta = constraints
         .values(delta.view())
         .map_err(|error| format!("exact active-face direction evaluation failed: {error}"))?;
+    let mut alpha = 1.0_f64;
+    let mut blocking_row = None;
     for row in 0..constraints.nrows() {
         if active_rows.contains(&row) {
             continue;
@@ -160,13 +173,22 @@ fn certified_reduced_face_newton_candidate(
         let scaled_slack = (values_beta[row] - bound) / norm;
         let scaled_rate = values_delta[row] / norm;
         if scaled_rate < 0.0 {
-            let fraction = (scaled_slack
-                + gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL)
-                / -scaled_rate;
-            if fraction.is_finite() && fraction >= 0.0 && fraction < 1.0 {
-                return Ok(None);
+            let fraction = scaled_slack / -scaled_rate;
+            if fraction.is_finite() && fraction >= 0.0 && fraction < alpha {
+                alpha = fraction;
+                blocking_row = Some(row);
             }
         }
+    }
+    if !(alpha.is_finite() && alpha > 0.0) {
+        // The iterate already presses against an unlisted blocker (zero
+        // feasible length along the tangent direction): the working face is a
+        // lie and the full QP owns the resolution.
+        return Ok(None);
+    }
+    if alpha < 1.0 {
+        alpha *= 1.0 - 1e-12;
+        delta *= alpha;
     }
     let candidate = beta + &delta;
     let candidate_values = constraints
@@ -190,7 +212,7 @@ fn certified_reduced_face_newton_candidate(
         }
     }
 
-    let exact_newton = exact_positive_curvature;
+    let exact_newton = exact_positive_curvature && alpha >= 1.0;
     if exact_newton {
         // The full reduced Newton solve certifies tangent stationarity. Certify
         // the other KKT half as well: its remaining quadratic gradient must be
@@ -214,7 +236,13 @@ fn certified_reduced_face_newton_candidate(
             return Ok(None);
         }
     }
-    Ok(Some((candidate, active_rows.to_vec(), exact_newton)))
+    let mut next_active = active_rows.to_vec();
+    if let Some(row) = blocking_row
+        && !next_active.contains(&row)
+    {
+        next_active.push(row);
+    }
+    Ok(Some((candidate, next_active, exact_newton)))
 }
 
 #[cfg(test)]
@@ -247,17 +275,15 @@ mod exact_face_newton_tests {
     }
 
     #[test]
-    fn reduced_face_declines_on_blocker_so_the_full_qp_owns_the_exchange() {
+    fn reduced_face_truncates_strictly_inside_the_blocker_and_carries_it() {
         // x>=0 is the current face. The reduced tangent direction meets the
-        // inactive y<=0.5 row before its full length — a face-change event.
-        // The fast path must DECLINE (return None) so the call site falls
-        // through to the full active-set QP, which performs the exchange and
-        // lands ON the new face exactly. The former behavior returned the
-        // blocker-truncated segment as the cycle's candidate; combined with
-        // trust-region truncation and the tight-at-accepted-β face filter
-        // that produced the #2301 transformation-normal fixed point (cycles
-        // 29-45: the same truncated proposal re-generated every cycle, the
-        // blocker never activating, residual pinned at 1.556).
+        // inactive y<=0.5 row at half its length. The candidate must stop
+        // STRICTLY INSIDE that boundary (never past it — the old
+        // +PRIMAL_FEASIBILITY_TOL overshoot collided with the trial
+        // feasibility gate at the same tolerance and produced the #2301
+        // silent-reject/half-step fixed point), land close enough that the
+        // row classifies tight, and carry the blocker in the returned face
+        // so the next cycle solves the exchanged face directly.
         let hessian = array![[1.0_f64, 0.0], [0.0, -2.0]];
         let rhs = array![0.0_f64, 2.0];
         let beta = array![0.0_f64, 0.0];
@@ -268,14 +294,24 @@ mod exact_face_newton_tests {
             )
             .expect("x>=0 and y<=0.5"),
         );
-        let candidate =
+        let (candidate, active, exact) =
             certified_reduced_face_newton_candidate(&hessian, &rhs, &beta, &constraints, &[0])
-                .expect("reduced face classification");
+                .expect("reduced face classification")
+                .expect("strict tangent descent truncated at the first blocker");
+        assert!(candidate[0].abs() <= 1e-12);
         assert!(
-            candidate.is_none(),
-            "a blocker-truncated tangent step is a face change and must be \
-             handed to the full active-set QP, not returned as the candidate"
+            candidate[1] <= 0.5,
+            "candidate must never overstep the blocker boundary (y={})",
+            candidate[1]
         );
+        assert!(
+            (candidate[1] - 0.5).abs() <= 1e-9,
+            "candidate must land on the blocker face to within the inward \
+             shave (y={})",
+            candidate[1]
+        );
+        assert_eq!(active, vec![0, 1]);
+        assert!(!exact);
     }
 
     #[test]
