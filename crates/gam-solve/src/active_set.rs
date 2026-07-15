@@ -1827,7 +1827,17 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 direction_out.assign(&d_total);
                 return Ok(());
             }
-            if compressed_working.is_degenerate_face() {
+            let remove_pos = compressed_working
+                .reconstructed_active_multipliers(&lambdaw)
+                .into_iter()
+                .filter(|&(_, lambda_true)| lambda_true < -tol_dual)
+                .min_by_key(|(active_pos, _)| (active[*active_pos], *active_pos))
+                .map(|(active_pos, _)| active_pos);
+            // Only consult the existence certificate when a reconstruction-
+            // based removal WOULD fire on a rank-deficient face: healthy faces
+            // and removal-free exits keep the classic path byte-identical
+            // (the reconstruction is exact when the face has full row rank).
+            if remove_pos.is_some() && compressed_working.is_degenerate_face() {
                 // Multipliers on a rank-deficient face are non-unique: the
                 // per-group reconstruction divides one system multiplier by a
                 // single-row alignment coefficient, which explodes for weakly
@@ -1859,7 +1869,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
                     // (near-)tangent descent direction at the NNLS optimum.
                     // The row blocking it — most anti-aligned with the
                     // projected residual in unit-row geometry — must leave.
-                    let mut remove_pos: Option<(usize, f64)> = None;
+                    let mut anti_remove: Option<(usize, f64)> = None;
                     for (pos, &row_id) in active.iter().enumerate() {
                         let row = gathered.a.row(pos);
                         let norm = row.dot(&row).sqrt();
@@ -1878,7 +1888,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
                             remove_pos = Some((pos, anti));
                         }
                     }
-                    if let Some((active_pos, _)) = remove_pos {
+                    if let Some((active_pos, _)) = anti_remove {
                         let idx = active.remove(active_pos);
                         is_active[idx] = false;
                         log_active_set_transition(
@@ -1901,12 +1911,6 @@ fn solve_newton_direction_with_linear_constraints_impl(
                     // through to the reconstruction heuristic below.
                 }
             }
-            let remove_pos = compressed_working
-                .reconstructed_active_multipliers(&lambdaw)
-                .into_iter()
-                .filter(|&(_, lambda_true)| lambda_true < -tol_dual)
-                .min_by_key(|(active_pos, _)| (active[*active_pos], *active_pos))
-                .map(|(active_pos, _)| active_pos);
             if let Some(active_pos) = remove_pos {
                 let idx = active.remove(active_pos);
                 is_active[idx] = false;
@@ -2709,7 +2713,17 @@ fn solve_newton_direction_with_constraint_set_impl(
                 direction_out.assign(&d_total);
                 return Ok(());
             }
-            if compressed_working.is_degenerate_face() {
+            let remove_pos = compressed_working
+                .reconstructed_active_multipliers(&lambdaw)
+                .into_iter()
+                .filter(|&(_, lambda_true)| lambda_true < -tol_dual)
+                .min_by_key(|(active_pos, _)| (active[*active_pos], *active_pos))
+                .map(|(active_pos, _)| active_pos);
+            // Only consult the existence certificate when a reconstruction-
+            // based removal WOULD fire on a rank-deficient face: healthy faces
+            // and removal-free exits keep the classic path byte-identical
+            // (the reconstruction is exact when the face has full row rank).
+            if remove_pos.is_some() && compressed_working.is_degenerate_face() {
                 // Existence-form degenerate-face treatment — see the dense
                 // loop for the full rationale. The active count is small even
                 // when the full row set is factored/enormous, so a dense
@@ -2775,12 +2789,6 @@ fn solve_newton_direction_with_constraint_set_impl(
                     }
                 }
             }
-            let remove_pos = compressed_working
-                .reconstructed_active_multipliers(&lambdaw)
-                .into_iter()
-                .filter(|&(_, lambda_true)| lambda_true < -tol_dual)
-                .min_by_key(|(active_pos, _)| (active[*active_pos], *active_pos))
-                .map(|(active_pos, _)| active_pos);
             if let Some(active_pos) = remove_pos {
                 let idx = active.remove(active_pos);
                 is_active[idx] = false;

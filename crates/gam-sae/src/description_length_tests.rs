@@ -1143,7 +1143,8 @@ fn birth_prescreen_selects_same_winner_as_unscreened_eq4_race() {
 fn per_kind_crossover_table_splits_code_vs_support_classes_2233() {
     // Shared budget: N=2000 tokens, P=8 channels, G=1024 atoms, L0=32 active,
     // firing rate ρ=0.05, noise floor δ=1.
-    let (n_tokens, p_out, g_dict, l0, rho, noise) = (2000.0, 8usize, 1024usize, 32.0, 0.05, 1.0);
+    let (n_tokens, p_out, g_dict, l0, rho, noise) =
+        (2000.0_f64, 8usize, 1024usize, 32.0_f64, 0.05_f64, 1.0_f64);
     let log2_n = n_tokens.log2();
     let log2_g_over_l0 = (g_dict as f64 / l0).log2();
 

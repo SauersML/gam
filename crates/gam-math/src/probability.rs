@@ -592,7 +592,7 @@ mod cone_boundary_factor_tests {
     /// across active (s=0), interior (μ=0), and mixed regimes (gam#2306 §4).
     #[test]
     fn boundary_factor_matches_quadrature_across_regimes() {
-        let cases = [
+        let cases: [(f64, f64, f64); 8] = [
             (0.0, 1.0, 0.0),  // activating row: exactly ln ½
             (0.0, 4.0, 0.0),  // curvature does not move the standardized value
             (2.5, 1.0, 0.0),  // active with a real multiplier
