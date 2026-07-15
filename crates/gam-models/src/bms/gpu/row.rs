@@ -3620,16 +3620,33 @@ mod row_kernel_tests {
         }
 
         #[test]
-        fn full_flex_r20_exact_cache_admits_material_finite_cell_curvature_2321() {
+        fn full_flex_canonical_exact_cache_admits_material_finite_cell_curvature_2321() {
             let (family, states) = make_flex_parity_family(256, 8, 6);
             let cache = family
                 .build_exact_eval_cache(&states)
                 .expect("the full-FLEX host cache must preserve non-affine finite cells");
 
-            assert_eq!(cache.primary.total, 20);
+            let score_width = cache
+                .primary
+                .h
+                .as_ref()
+                .expect("the full-FLEX fixture must retain its score-warp block")
+                .len();
+            let deviation_width = cache
+                .primary
+                .w
+                .as_ref()
+                .expect("the full-FLEX fixture must retain its link-deviation block")
+                .len();
+            assert!(score_width > 0 && deviation_width > 0);
+            assert_eq!(
+                cache.primary.total,
+                2 + score_width + deviation_width,
+                "the canonical primary layout must contain exactly q, logslope, score-warp, and link-deviation coordinates"
+            );
             assert!(
                 cache.row_cell_moments.is_some(),
-                "the production r20 fixture must materialize its exact row-cell cache"
+                "the production full-FLEX fixture must materialize its exact row-cell cache"
             );
         }
 
