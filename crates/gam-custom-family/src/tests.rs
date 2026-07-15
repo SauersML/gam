@@ -171,13 +171,7 @@ pub(crate) fn batched_outer_hessian_terms_materialize_to_exact_small_matrix() {
     let hyper_layout = test_design_hyper_layout(Vec::new());
     // rho.len() must equal sum(spec.penalties.len()); empty specs ⇒ empty rho.
     let terms = family
-        .batched_outer_hessian_terms(
-            &[],
-            &[],
-            &hyper_layout,
-            &Array1::<f64>::zeros(0),
-            None,
-        )
+        .batched_outer_hessian_terms(&[], &[], &hyper_layout, &Array1::<f64>::zeros(0), None)
         .expect("batched Hessian hook succeeds")
         .expect("test family exposes batched HVP terms");
     let operator = match terms.outer_hessian {
@@ -199,7 +193,7 @@ pub(crate) fn batched_outer_hessian_operator_selected_only_for_hessian_eval() {
         &family,
         &[],
         &[],
-        &[],
+        &test_design_hyper_layout(vec![]),
         &Array1::<f64>::zeros(0),
         None,
         EvalMode::ValueGradientHessian,
@@ -214,7 +208,7 @@ pub(crate) fn batched_outer_hessian_operator_selected_only_for_hessian_eval() {
         &family,
         &[],
         &[],
-        &[],
+        &test_design_hyper_layout(vec![]),
         &Array1::<f64>::zeros(0),
         None,
         EvalMode::ValueAndGradient,
@@ -1763,14 +1757,19 @@ pub(crate) fn fused_trial_advertised_missing_workspace_fails_closed() {
         advertises_log_likelihood: true,
         outcome: FusedTrialWorkspaceOutcome::MissingWorkspace,
     };
-    let error = joint_line_search_log_likelihood_with_workspace(
+    let error = match joint_line_search_log_likelihood_with_workspace(
         &family,
         &BlockwiseFitOptions::default(),
         &[],
         &[],
-    )
-    .expect_err("an advertised fused workspace is mandatory");
-    assert!(error.contains("returned no workspace"), "unexpected error: {error}");
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("an advertised fused workspace is mandatory"),
+    };
+    assert!(
+        error.contains("returned no workspace"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -1779,13 +1778,15 @@ pub(crate) fn fused_trial_advertised_missing_likelihood_fails_closed() {
         advertises_log_likelihood: true,
         outcome: FusedTrialWorkspaceOutcome::MissingLogLikelihood,
     };
-    let error = joint_line_search_log_likelihood_with_workspace(
+    let error = match joint_line_search_log_likelihood_with_workspace(
         &family,
         &BlockwiseFitOptions::default(),
         &[],
         &[],
-    )
-    .expect_err("an advertised fused likelihood is mandatory");
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("an advertised fused likelihood is mandatory"),
+    };
     assert!(
         error.contains("returned no log-likelihood"),
         "unexpected error: {error}",
@@ -1798,18 +1799,18 @@ pub(crate) fn fused_trial_workspace_error_is_not_scalarized() {
         advertises_log_likelihood: true,
         outcome: FusedTrialWorkspaceOutcome::LogLikelihoodError,
     };
-    assert_eq!(
-        fused_first_attempt_log_likelihood(
-            &family,
-            &BlockwiseFitOptions::default(),
-            &[],
-            &[],
-            0,
-            true,
-        )
-        .expect_err("the trust-attempt gate must propagate workspace evaluation errors"),
-        "fused-trial-log-likelihood-error",
-    );
+    let error = match fused_first_attempt_log_likelihood(
+        &family,
+        &BlockwiseFitOptions::default(),
+        &[],
+        &[],
+        0,
+        true,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("the trust-attempt gate must propagate workspace evaluation errors"),
+    };
+    assert_eq!(error, "fused-trial-log-likelihood-error");
 }
 
 #[test]
@@ -2544,11 +2545,12 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
         &ZeroFamily,
         &[],
         &[],
-        Arc::new(Vec::new()),
+        Arc::new(test_design_hyper_layout(vec![])),
         false,
         Some(Arc::new(BlockLocalPsiWorkspace)),
     )
-    .expect("non-Gaussian psi drift callback should be available");
+    .expect("non-Gaussian psi drift callback should be available")
+    .expect("workspace-owned drift derivative callback must be installed");
 
     let result = callback(0, &array![1.0, 2.0, 3.0])
         .expect("workspace-backed psi drift derivative should be returned");
@@ -2623,7 +2625,7 @@ pub(crate) fn contracted_psi_hook_declines_partial_axis_coverage_before_pair_tab
         stacked_design: None,
         stacked_offset: None,
     }];
-    let derivative_blocks = Arc::new(vec![vec![
+    let hyper_layout = Arc::new(test_design_hyper_layout(vec![vec![
         CustomFamilyBlockPsiDerivative::new(
             None,
             Array2::zeros((1, 1)),
@@ -2642,10 +2644,10 @@ pub(crate) fn contracted_psi_hook_declines_partial_axis_coverage_before_pair_tab
             None,
             None,
         ),
-    ]]);
+    ]]));
     let hook = build_contracted_psi_hook(
         &specs,
-        derivative_blocks,
+        hyper_layout,
         &array![0.0],
         &[],
         &[0],
@@ -2714,19 +2716,21 @@ pub(crate) fn contracted_psi_hook_rejects_wrong_score_width_before_installing_op
         stacked_design: None,
         stacked_offset: None,
     }];
-    let derivative_blocks = Arc::new(vec![vec![CustomFamilyBlockPsiDerivative::new(
-        None,
-        Array2::zeros((1, 1)),
-        Array2::zeros((1, 1)),
-        None,
-        None,
-        None,
-        None,
-    )]]);
+    let hyper_layout = Arc::new(test_design_hyper_layout(vec![vec![
+        CustomFamilyBlockPsiDerivative::new(
+            None,
+            Array2::zeros((1, 1)),
+            Array2::zeros((1, 1)),
+            None,
+            None,
+            None,
+            None,
+        ),
+    ]]));
 
     let err = match build_contracted_psi_hook(
         &specs,
-        derivative_blocks,
+        hyper_layout,
         &array![0.0],
         &[],
         &[0],
@@ -3459,15 +3463,10 @@ fn value_only_outer_jeffreys_skips_completion_and_drift_construction() {
     let states = vec![jeffreys_seam_state(array![0.0])];
     let ranges = block_param_ranges(&specs);
 
-    let (_, _, value_only_completion) = custom_family_outer_jeffreys_hphi(
-        &family,
-        &states,
-        &specs,
-        &ranges,
-        EvalMode::ValueOnly,
-    )
-    .expect("value-only Jeffreys term")
-    .expect("active value-only Jeffreys term");
+    let (_, _, value_only_completion) =
+        custom_family_outer_jeffreys_hphi(&family, &states, &specs, &ranges, EvalMode::ValueOnly)
+            .expect("value-only Jeffreys term")
+            .expect("active value-only Jeffreys term");
     assert!(value_only_completion.is_none());
     assert_eq!(information_calls.load(Ordering::Relaxed), 1);
     assert_eq!(axis_batch_calls.load(Ordering::Relaxed), 1);
@@ -4061,15 +4060,15 @@ impl CustomFamily for OneBlockConstrainedNaNHessianFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         assert!(!block_spec.name.is_empty());
         if block_idx != 0 {
             return Ok(None);
         }
-        Ok(Some(LinearInequalityConstraints {
+        Ok(Some(ConstraintSet::Dense(LinearInequalityConstraints {
             a: array![[1.0]],
             b: array![0.0],
-        }))
+        })))
     }
 }
 
@@ -4092,15 +4091,15 @@ impl CustomFamily for OneBlockConstrainedIndefiniteHessianFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         assert!(!block_spec.name.is_empty());
         if block_idx != 0 {
             return Ok(None);
         }
-        Ok(Some(LinearInequalityConstraints {
+        Ok(Some(ConstraintSet::Dense(LinearInequalityConstraints {
             a: array![[1.0]],
             b: array![1.0],
-        }))
+        })))
     }
 }
 
@@ -4223,15 +4222,15 @@ impl CustomFamily for TwoBlockJointConstrainedFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
+    ) -> Result<Option<ConstraintSet>, String> {
         assert!(!block_spec.name.is_empty());
         if block_idx >= 2 {
             return Ok(None);
         }
-        Ok(Some(LinearInequalityConstraints {
+        Ok(Some(ConstraintSet::Dense(LinearInequalityConstraints {
             a: array![[1.0]],
             b: array![0.0],
-        }))
+        })))
     }
 }
 
@@ -4295,6 +4294,10 @@ impl ExactNewtonJointHessianWorkspace for ReturnedModeSaddleWorkspace {
 
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(self.hessian.clone()))
+    }
+
+    fn directional_derivative(&self, _: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+        Ok(None)
     }
 }
 
@@ -4531,7 +4534,10 @@ pub(crate) fn certified_test_outer(
     theta: Array1<f64>,
     objective: f64,
 ) -> gam_solve::rho_optimizer::CertifiedOuterResult {
-    assert!(!theta.is_empty(), "certificate fixture requires one real outer coordinate");
+    assert!(
+        !theta.is_empty(),
+        "certificate fixture requires one real outer coordinate"
+    );
     let dimension = theta.len();
     let cost_center = theta.clone();
     let gradient_center = theta.clone();
@@ -4566,10 +4572,7 @@ pub(crate) fn certified_test_outer(
         },
         None::<fn(&mut ())>,
         None::<
-            fn(
-                &mut (),
-                &Array1<f64>,
-            ) -> Result<gam_problem::EfsEval, gam_problem::EstimationError>,
+            fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, gam_problem::EstimationError>,
         >,
     );
     problem
@@ -4678,7 +4681,9 @@ pub(crate) fn terminal_mode_binding_rejects_gradient_substitution() {
         Err(error) => error,
     };
     assert!(
-        error.to_string().contains("gradient does not bitwise match"),
+        error
+            .to_string()
+            .contains("gradient does not bitwise match"),
         "unexpected error: {error}",
     );
 }
@@ -4740,6 +4745,7 @@ pub(crate) fn labeled_terminal_mode_keeps_one_outer_rho_for_two_physical_penalti
     let mode = CustomFamilyOwnedMode {
         objective,
         rho: theta.clone(),
+        hyper_values: Array1::zeros(0),
         inner: eval.inner,
     };
     let mut state = CustomOuterState::new(None);
@@ -4906,7 +4912,7 @@ pub(crate) fn owned_joint_penalty_geometry_uses_terminal_workspace_without_famil
         covariance
             .iter()
             .zip(expected_covariance.iter())
-            .all(|(actual, expected)| (actual - expected).abs() <= 1.0e-12),
+            .all(|(actual, expected): (&f64, &f64)| (actual - expected).abs() <= 1.0e-12),
     );
 }
 
@@ -5005,8 +5011,8 @@ pub(crate) fn owned_mode_finalizer_preserves_prior_and_active_jeffreys_without_r
         EvalMode::ValueOnly,
     )
     .expect("the prior-bearing active-Jeffreys profile should evaluate");
-    let (prior_cost, _, _) = rho_prior_cost_gradient_hessian(&prior, &rho)
-        .expect("normal rho prior should evaluate");
+    let (prior_cost, _, _) =
+        rho_prior_cost_gradient_hessian(&prior, &rho).expect("normal rho prior should evaluate");
     assert_eq!(
         profiled.objective.to_bits(),
         (flat.objective + prior_cost).to_bits(),
@@ -5054,6 +5060,7 @@ pub(crate) fn owned_mode_finalizer_preserves_prior_and_active_jeffreys_without_r
         mode: CustomFamilyOwnedMode {
             objective,
             rho: rho.clone(),
+            hyper_values: Array1::zeros(0),
             inner: profiled.inner,
         },
     };
@@ -5113,6 +5120,7 @@ pub(crate) fn failed_terminal_probe_clears_stale_owned_mode() {
     let mode = CustomFamilyOwnedMode {
         objective,
         rho: theta.clone(),
+        hyper_values: Array1::zeros(0),
         inner: evaluated.mode.inner,
     };
     let mut state = CustomOuterState::new(None);
@@ -5164,8 +5172,10 @@ pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay
     let evaluations_before_finalization = family.evaluations.load(Ordering::Relaxed);
 
     let selected_theta = Array1::zeros(1);
-    let certified_outer =
-        certified_test_outer(selected_theta.clone(), f64::from_bits(selected_objective_bits));
+    let certified_outer = certified_test_outer(
+        selected_theta.clone(),
+        f64::from_bits(selected_objective_bits),
+    );
 
     let fit = fit_custom_family_fixed_log_lambdas_from_mode_selection(
         &family,
@@ -5279,7 +5289,9 @@ pub(crate) fn returned_mode_finalizer_rejects_different_certified_objective() {
     )
     .expect_err("a different certified objective cannot mint the selected-mode fit");
     assert!(
-        error.to_string().contains("does not belong to the certified outer optimum"),
+        error
+            .to_string()
+            .contains("does not belong to the certified outer optimum"),
         "unexpected error: {error}",
     );
 }

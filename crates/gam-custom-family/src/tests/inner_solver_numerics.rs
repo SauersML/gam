@@ -335,16 +335,12 @@ impl CustomFamily for OneBlockCovarianceErrorFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
-        let state = block_states
-            .first()
-            .ok_or_else(|| {
-                "synthetic covariance assembly failure: missing block state".to_string()
-            })?;
-        let spec = specs
-            .first()
-            .ok_or_else(|| {
-                "synthetic covariance assembly failure: missing block spec".to_string()
-            })?;
+        let state = block_states.first().ok_or_else(|| {
+            "synthetic covariance assembly failure: missing block state".to_string()
+        })?;
+        let spec = specs.first().ok_or_else(|| {
+            "synthetic covariance assembly failure: missing block spec".to_string()
+        })?;
         Err(format!(
             "synthetic covariance assembly failure for block '{}' at beta_dim={} design_dim={}",
             spec.name,
@@ -1861,15 +1857,10 @@ pub(crate) fn active_face_logdet_ignores_constraint_normal_indefiniteness() {
         stacked_design: None,
         stacked_offset: None,
     };
-    let penalty_logdet = active_face_penalty_logdet(
-        &[spec],
-        &[(0, 2)],
-        &[array![0.0]],
-        &active,
-        0.0,
-    )
-    .expect("active-face penalty determinant should decompose")
-    .expect("the tangent is non-empty");
+    let penalty_logdet =
+        active_face_penalty_logdet(&[spec], &[(0, 2)], &[array![0.0]], &active, 0.0)
+            .expect("active-face penalty determinant should decompose")
+            .expect("the tangent is non-empty");
     assert!(
         (penalty_logdet - 3.0_f64.ln()).abs() < 1e-12,
         "active-face penalty logdet={penalty_logdet}, expected={}",
@@ -2558,10 +2549,10 @@ pub(crate) fn exact_newton_block_enforces_linear_constraints() {
 
 #[test]
 pub(crate) fn extract_simple_lower_bounds_accepts_axis_aligned_rows() {
-    let constraints = LinearInequalityConstraints {
+    let constraints = ConstraintSet::Dense(LinearInequalityConstraints {
         a: array![[1.0, 0.0], [0.0, 2.0], [3.0, 0.0]],
         b: array![0.25, 1.0, 1.5],
-    };
+    });
     let bounds = extract_simple_lower_bounds(&constraints, 2)
         .expect("lower-bound extraction should succeed")
         .expect("axis-aligned rows should map to lower bounds");
@@ -2572,10 +2563,10 @@ pub(crate) fn extract_simple_lower_bounds_accepts_axis_aligned_rows() {
 
 #[test]
 pub(crate) fn extract_simple_lower_bounds_rejects_coupled_rows() {
-    let constraints = LinearInequalityConstraints {
+    let constraints = ConstraintSet::Dense(LinearInequalityConstraints {
         a: array![[1.0, 1.0]],
         b: array![0.0],
-    };
+    });
     assert!(
         extract_simple_lower_bounds(&constraints, 2)
             .expect("lower-bound extraction should not error on valid shapes")
@@ -2603,10 +2594,10 @@ pub(crate) fn constrained_exact_newton_indefinite_hessian_uses_stabilized_delta_
         beta: array![1.5],
         eta: array![1.5],
     }];
-    let constraints = LinearInequalityConstraints {
+    let constraints = ConstraintSet::Dense(LinearInequalityConstraints {
         a: array![[1.0]],
         b: array![1.0],
-    };
+    });
     let hessian = SymmetricMatrix::Dense(array![[-1.0]]);
     let updater = ExactNewtonBlockUpdater {
         gradient: &array![-1.0],
@@ -2920,10 +2911,10 @@ pub(crate) fn constrained_exact_newton_nan_hessian_returns_feasible_noop_instead
         beta: array![0.0],
         eta: array![0.0],
     }];
-    let constraints = LinearInequalityConstraints {
+    let constraints = ConstraintSet::Dense(LinearInequalityConstraints {
         a: array![[1.0]],
         b: array![0.0],
-    };
+    });
     let hessian = SymmetricMatrix::Dense(array![[f64::NAN]]);
     let updater = ExactNewtonBlockUpdater {
         gradient: &array![0.0],
@@ -3788,19 +3779,19 @@ pub(crate) fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
     // contributes.
     let beta_active = array![0.0, 2.0];
     let residual_active = array![0.5, -0.1];
-    let constraints_lb0 = LinearInequalityConstraints {
+    let constraints_lb0 = ConstraintSet::Dense(LinearInequalityConstraints {
         a: array![[1.0, 0.0], [0.0, 1.0]],
         b: array![0.0, f64::NEG_INFINITY], // only β_0 has a finite lower bound
-    };
+    });
     // Build a minimal single-row constraint first (β_0 ≥ 0) so the
     // "active lower bound + positive residual" branch of the projection
     // is exercised in isolation.  β_1 is left unconstrained relative to
     // this single-row constraint matrix (it's not pinned by any row),
     // so its contribution (|-0.1| = 0.1) stays in the inf-norm.
-    let single = LinearInequalityConstraints {
+    let single = ConstraintSet::Dense(LinearInequalityConstraints {
         a: array![[1.0, 0.0]],
         b: array![0.0],
-    };
+    });
     let inf_projected =
         projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&single), None);
     assert_relative_eq!(inf_projected, 0.1_f64, epsilon = 1e-12);
@@ -3838,10 +3829,10 @@ pub(crate) fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
     // multiplier.
     let beta_wrong_sign = array![0.0];
     let residual_wrong_sign = array![-0.2];
-    let single1 = LinearInequalityConstraints {
+    let single1 = ConstraintSet::Dense(LinearInequalityConstraints {
         a: array![[1.0]],
         b: array![0.0],
-    };
+    });
     let inf_wrong_sign = projected_stationarity_inf_norm(
         &residual_wrong_sign,
         &beta_wrong_sign,
@@ -4118,10 +4109,10 @@ pub(crate) fn joint_newton_math_unconstrained_progress_does_not_match_certificat
 
 #[test]
 pub(crate) fn projected_stationarity_inf_norm_projects_coupled_linear_kkt_multipliers() {
-    let constraints = LinearInequalityConstraints {
+    let constraints = ConstraintSet::Dense(LinearInequalityConstraints {
         a: array![[1.0, 1.0]],
         b: array![1.0],
-    };
+    });
     let beta_active = array![0.25, 0.75];
 
     let residual_valid_multiplier = array![3.0, 3.0];
@@ -4176,23 +4167,15 @@ pub(crate) fn projected_stationarity_uses_the_qp_face_without_expanding_tight_ro
     let beta = array![0.0_f64, 0.0];
     let residual = array![2.0_f64, -3.0];
 
-    let projected = projected_linear_constraint_stationarity_vector(
-        &residual,
-        &beta,
-        &constraints,
-        Some(&[0]),
-    )
-    .expect("authoritative face projection");
+    let projected =
+        projected_linear_constraint_stationarity_vector(&residual, &beta, &constraints, Some(&[0]))
+            .expect("authoritative face projection");
     assert_relative_eq!(projected[0], 0.0_f64, epsilon = 1e-10);
     assert_relative_eq!(projected[1], -3.0_f64, epsilon = 1e-12);
 
-    let explicitly_free = projected_linear_constraint_stationarity_vector(
-        &residual,
-        &beta,
-        &constraints,
-        Some(&[]),
-    )
-    .expect("authoritative empty face");
+    let explicitly_free =
+        projected_linear_constraint_stationarity_vector(&residual, &beta, &constraints, Some(&[]))
+            .expect("authoritative empty face");
     assert_relative_eq!(explicitly_free[0], 2.0_f64, epsilon = 1e-12);
     assert_relative_eq!(explicitly_free[1], -3.0_f64, epsilon = 1e-12);
 }
@@ -4238,10 +4221,10 @@ pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constrain
         beta: array![0.25, 0.75],
         eta: array![0.25, 0.75],
     };
-    let constraints = LinearInequalityConstraints {
+    let constraints = ConstraintSet::Dense(LinearInequalityConstraints {
         a: array![[1.0, 1.0]],
         b: array![1.0],
-    };
+    });
     let s_lambdas = vec![Array2::<f64>::zeros((2, 2))];
 
     // residual = S beta - gradient = [4, 4] = A_active^T lambda,
