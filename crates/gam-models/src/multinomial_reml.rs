@@ -3094,6 +3094,139 @@ mod tests {
                 std::panic::resume_unwind(payload);
             }
         }
+
+        /// #932 release speed gate for the multinomial-logit row. The production
+        /// structure-compiled value/gradient/Hessian lowering
+        /// ([`MultinomialLogitRowProgram::value_gradient_hessian_into`]) is timed
+        /// against the generic gam-math forward-mode jet tower
+        /// ([`program_row_kernel`]) — the naive automatic-differentiation baseline
+        /// the retained specialization must beat, since #932 removed this family's
+        /// `cfg(test)` hand restatement. Emits the harness-parsed
+        /// `hand_over_production` token (generic-tower time over production time)
+        /// per active-class width; the MSI release harness fails closed whenever
+        /// any measured cell is `<= 1`.
+        ///
+        /// The batch of distinct rows supplies genuine per-row input variation, so
+        /// the optimizer cannot hoist the pure row call out of the sweep, and the
+        /// finite checksum over every returned channel keeps the whole sweep live
+        /// without `std::hint::black_box`.
+        #[test]
+        fn release_measure_multinomial_specialized_vs_generic_tower_932() {
+            fn measure<const M: usize>(seed: u64) {
+                use std::time::Instant;
+
+                const ROWS: usize = 512;
+                let mut rng = Lcg(seed);
+                let mut etas: Vec<[f64; M]> = Vec::with_capacity(ROWS);
+                let mut responses: Vec<Vec<f64>> = Vec::with_capacity(ROWS);
+                let mut weights: Vec<f64> = Vec::with_capacity(ROWS);
+                for row in 0..ROWS {
+                    let eta: [f64; M] = std::array::from_fn(|_| rng.uniform(-2.5, 2.5));
+                    let observed = row % (M + 1);
+                    let mut response = vec![0.0; M + 1];
+                    response[observed] = 1.0;
+                    etas.push(eta);
+                    responses.push(response);
+                    weights.push(rng.uniform(0.25, 2.5));
+                }
+                let programs: Vec<MultinomialLogitRowProgram> = (0..ROWS)
+                    .map(|row| {
+                        MultinomialLogitRowProgram::new(&etas[row], &responses[row], weights[row])
+                            .expect("valid multinomial batch row")
+                    })
+                    .collect();
+
+                let mut probabilities = vec![0.0_f64; M + 1];
+                let mut gradient = vec![0.0_f64; M];
+                let mut hessian = vec![0.0_f64; M * M];
+
+                // Warm both paths and pin that the production lowering and the
+                // generic tower emit the same V/G/H, so the two timings measure
+                // equal work.
+                for program in &programs {
+                    let (tower_value, tower_gradient, tower_hessian) =
+                        program_row_kernel::<M, _>(program, 0).expect("tower warm kernel");
+                    let production_value = program.value_gradient_hessian_into(
+                        &mut probabilities,
+                        &mut gradient,
+                        &mut hessian,
+                    );
+                    close(
+                        tower_value,
+                        production_value,
+                        JET_TOL,
+                        &format!("M={M} release-measure value parity"),
+                    );
+                    for a in 0..M {
+                        close(
+                            tower_gradient[a],
+                            gradient[a],
+                            JET_TOL,
+                            &format!("M={M} release-measure gradient[{a}] parity"),
+                        );
+                        for b in 0..M {
+                            close(
+                                tower_hessian[a][b],
+                                hessian[a * M + b],
+                                JET_TOL,
+                                &format!("M={M} release-measure hessian[{a}][{b}] parity"),
+                            );
+                        }
+                    }
+                }
+
+                let best_secs = |sweep: &mut dyn FnMut() -> f64| -> f64 {
+                    let mut best = f64::INFINITY;
+                    for _ in 0..5 {
+                        let started = Instant::now();
+                        let checksum = sweep();
+                        assert!(
+                            checksum.is_finite(),
+                            "multinomial release-measure checksum must stay finite"
+                        );
+                        best = best.min(started.elapsed().as_secs_f64());
+                    }
+                    best
+                };
+
+                let mut production_sweep = || {
+                    let mut checksum = 0.0_f64;
+                    for program in &programs {
+                        let value = program.value_gradient_hessian_into(
+                            &mut probabilities,
+                            &mut gradient,
+                            &mut hessian,
+                        );
+                        checksum += value + gradient[0] + hessian[0];
+                    }
+                    checksum
+                };
+                let production_secs = best_secs(&mut production_sweep);
+
+                let mut tower_sweep = || {
+                    let mut checksum = 0.0_f64;
+                    for program in &programs {
+                        let (value, tower_gradient, tower_hessian) =
+                            program_row_kernel::<M, _>(program, 0).expect("tower kernel");
+                        checksum += value + tower_gradient[0] + tower_hessian[0][0];
+                    }
+                    checksum
+                };
+                let tower_secs = best_secs(&mut tower_sweep);
+
+                let production_ns = production_secs * 1e9 / ROWS as f64;
+                let tower_ns = tower_secs * 1e9 / ROWS as f64;
+                eprintln!(
+                    "MULTINOMIAL-RELEASE-932 M={M} rows={ROWS} production_ns={production_ns:.3} \
+                     generic_tower_ns={tower_ns:.3} hand_over_production={:.6}",
+                    tower_ns / production_ns,
+                );
+            }
+
+            measure::<2>(0x9322_2020_0715_face);
+            measure::<3>(0x0bad_c0de_0715_2020);
+            measure::<8>(0x1234_5678_0715_abcd);
+        }
     }
 
     impl MultinomialFamily {

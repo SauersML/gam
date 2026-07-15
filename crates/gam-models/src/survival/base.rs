@@ -3628,6 +3628,140 @@ mod tests {
                 }
             }
         }
+
+        /// #932 release speed gate for the cause-specific Royston-Parmar row. The
+        /// production structure-compiled order-2 lowering
+        /// ([`cause_specific_row_order2`]) is timed against the generic gam-math
+        /// forward-mode jet tower ([`program_row_kernel`]) — the naive automatic-
+        /// differentiation baseline the retained specialization must beat, since
+        /// #932 emits both from the one [`cause_specific_row`] declaration and
+        /// keeps no separate `cfg(test)` hand restatement. Emits the harness-parsed
+        /// `hand_over_production` token (generic-tower time over production time);
+        /// the MSI release harness fails closed whenever the measured cell is
+        /// `<= 1`.
+        ///
+        /// The batch mixes all four (entry × event) activity corners with distinct
+        /// per-row predictors, so the optimizer cannot hoist the pure row call out
+        /// of the sweep, and the finite checksum over every returned channel keeps
+        /// the whole sweep live without `std::hint::black_box`.
+        #[test]
+        fn release_measure_cause_specific_specialized_vs_generic_tower_932() {
+            use std::time::Instant;
+
+            const ROWS: usize = 512;
+            let mut rows: Vec<([f64; 3], f64, bool, bool)> = Vec::with_capacity(ROWS);
+            for idx in 0..ROWS {
+                let f = idx as f64;
+                let eta_exit = 1.6 * (f * 0.17 + 0.3).sin() - 0.4 * (f * 0.09).cos();
+                let eta_entry = 1.1 * (f * 0.13 + 0.7).cos() + 0.35 * (f * 0.05).sin();
+                // Strictly positive spline derivative for the event ln-derivative term.
+                let derivative = 0.5 + 0.45 * (f * 0.31 + 0.2).sin().abs();
+                let weight = 0.6 + 0.4 * (f * 0.07 + 1.0).sin().abs();
+                let entry_active = idx % 2 == 0;
+                let event = (idx / 2) % 2 == 0;
+                rows.push(([eta_exit, eta_entry, derivative], weight, entry_active, event));
+            }
+            let programs: Vec<crate::survival::CauseSpecificRowProgram> = rows
+                .iter()
+                .map(|&(primary, weight, entry_active, event)| {
+                    crate::survival::CauseSpecificRowProgram::new(
+                        primary,
+                        weight,
+                        entry_active,
+                        event,
+                    )
+                })
+                .collect();
+
+            // Warm both paths and pin equal V/G/H so the two timings measure equal
+            // work.
+            for (row, program) in rows.iter().zip(programs.iter()) {
+                let (primary, weight, entry_active, event) = *row;
+                let atom = cause_specific_row_order2(
+                    primary[0],
+                    primary[1],
+                    primary[2],
+                    weight,
+                    f64::from(entry_active),
+                    f64::from(event),
+                );
+                let (tower_value, tower_gradient, tower_hessian) =
+                    program_row_kernel(program, 0).expect("tower warm kernel");
+                close(
+                    atom.value(),
+                    tower_value,
+                    JET_TOL,
+                    "release-measure value parity",
+                );
+                let production_gradient = atom.gradient();
+                for a in 0..3 {
+                    close(
+                        production_gradient[a],
+                        tower_gradient[a],
+                        JET_TOL,
+                        "release-measure gradient parity",
+                    );
+                    for b in 0..3 {
+                        close(
+                            atom.hessian_at(a, b),
+                            tower_hessian[a][b],
+                            JET_TOL,
+                            "release-measure hessian parity",
+                        );
+                    }
+                }
+            }
+
+            let best_secs = |sweep: &mut dyn FnMut() -> f64| -> f64 {
+                let mut best = f64::INFINITY;
+                for _ in 0..5 {
+                    let started = Instant::now();
+                    let checksum = sweep();
+                    assert!(
+                        checksum.is_finite(),
+                        "cause-specific release-measure checksum must stay finite"
+                    );
+                    best = best.min(started.elapsed().as_secs_f64());
+                }
+                best
+            };
+
+            let mut production_sweep = || {
+                let mut checksum = 0.0_f64;
+                for &(primary, weight, entry_active, event) in &rows {
+                    let atom = cause_specific_row_order2(
+                        primary[0],
+                        primary[1],
+                        primary[2],
+                        weight,
+                        f64::from(entry_active),
+                        f64::from(event),
+                    );
+                    checksum += atom.value() + atom.gradient()[0] + atom.hessian_at(0, 0);
+                }
+                checksum
+            };
+            let production_secs = best_secs(&mut production_sweep);
+
+            let mut tower_sweep = || {
+                let mut checksum = 0.0_f64;
+                for program in &programs {
+                    let (value, gradient, hessian) =
+                        program_row_kernel(program, 0).expect("tower kernel");
+                    checksum += value + gradient[0] + hessian[0][0];
+                }
+                checksum
+            };
+            let tower_secs = best_secs(&mut tower_sweep);
+
+            let production_ns = production_secs * 1e9 / ROWS as f64;
+            let tower_ns = tower_secs * 1e9 / ROWS as f64;
+            eprintln!(
+                "CAUSE-SPECIFIC-RELEASE-932 rows={ROWS} production_ns={production_ns:.3} \
+                 generic_tower_ns={tower_ns:.3} hand_over_production={:.6}",
+                tower_ns / production_ns,
+            );
+        }
     }
 
     #[test]

@@ -4478,7 +4478,6 @@ mod patterned_order2_perf_tests {
     use super::*;
     use gam_math::jet_scalar::Order2;
     use gam_math::nested_dual::JetField;
-    use std::hint::black_box;
 
     /// The exact structural Hessian support of [`sls_row_nll`]. The likelihood is a
     /// sum of three univariate outer functions of:
@@ -4823,8 +4822,14 @@ mod patterned_order2_perf_tests {
         (value, gradient, hessian)
     }
 
+    /// #932 release speed gate for the location-scale row. The production
+    /// structure-compiled channels (`compiled`) and the strongest hand schedule
+    /// (`hand_fused`) both consume the same frozen kernel so timing includes row
+    /// arithmetic only. Emits the harness-parsed `hand_over_production` token
+    /// (strongest-hand time over production time) that the MSI release harness
+    /// fails closed on whenever any measured cell is `<= 1`.
     #[test]
-    fn measure_sls_patterned_vs_dense_932() {
+    fn release_measure_sls_compiled_vs_strongest_hand_932() {
         let (p, kernel) = fixture();
         let want = dense(&p, &kernel);
         let got = patterned(&p, &kernel);
@@ -4942,61 +4947,57 @@ mod patterned_order2_perf_tests {
         }
 
         let iterations = 2_000_000usize;
-        let mut best_dense = f64::INFINITY;
-        let mut best_patterned = f64::INFINITY;
-        let mut best_literal_seeds = f64::INFINITY;
-        let mut best_compiled = f64::INFINITY;
-        let mut best_hand = f64::INFINITY;
-        let mut best_hand_fused = f64::INFINITY;
-        for _ in 0..5 {
-            let started = Instant::now();
-            for _ in 0..iterations {
-                black_box(hand(black_box(&p), black_box(&kernel)));
-            }
-            best_hand = best_hand.min(started.elapsed().as_secs_f64());
 
-            let started = Instant::now();
-            for _ in 0..iterations {
-                black_box(hand_fused(black_box(&p), black_box(&kernel)));
+        // Feedback-coupled timing barrier (no `std::hint::black_box`): each
+        // iteration nudges the primaries by a negligible multiple of the running
+        // checksum, and the checksum folds every returned channel. That
+        // loop-carried recurrence makes iteration `n`'s input depend on iteration
+        // `n-1`'s output, so the compiler can neither hoist the pure row call out
+        // of the loop nor drop it as dead. The `1e-18` scale keeps the perturbed
+        // primaries bit-adjacent to the fixture, so the measured regime is the
+        // fixture regime.
+        fn best_secs<F>(
+            iterations: usize,
+            p: &[f64; SLS_ROW_K],
+            kernel: &SurvivalExactRowKernel,
+            evaluate: F,
+        ) -> f64
+        where
+            F: Fn(&[f64; SLS_ROW_K], &SurvivalExactRowKernel) -> (f64, [f64; 9], [[f64; 9]; 9]),
+        {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let mut checksum = 0.0_f64;
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    let mut perturbed = *p;
+                    perturbed[0] += checksum * 1e-18;
+                    let (value, gradient, hessian) = evaluate(&perturbed, kernel);
+                    checksum += value + gradient[0] + hessian[0][0];
+                }
+                assert!(
+                    checksum.is_finite(),
+                    "SLS release-measure checksum must stay finite"
+                );
+                best = best.min(started.elapsed().as_secs_f64());
             }
-            best_hand_fused = best_hand_fused.min(started.elapsed().as_secs_f64());
-
-            let started = Instant::now();
-            for _ in 0..iterations {
-                black_box(dense(black_box(&p), black_box(&kernel)));
-            }
-            best_dense = best_dense.min(started.elapsed().as_secs_f64());
-
-            let started = Instant::now();
-            for _ in 0..iterations {
-                black_box(patterned(black_box(&p), black_box(&kernel)));
-            }
-            best_patterned = best_patterned.min(started.elapsed().as_secs_f64());
-
-            let started = Instant::now();
-            for _ in 0..iterations {
-                black_box(patterned_literal_seeds(black_box(&p), black_box(&kernel)));
-            }
-            best_literal_seeds = best_literal_seeds.min(started.elapsed().as_secs_f64());
-
-            let started = Instant::now();
-            for _ in 0..iterations {
-                black_box(compiled(black_box(&p), black_box(&kernel)));
-            }
-            best_compiled = best_compiled.min(started.elapsed().as_secs_f64());
+            best
         }
-        let dense_ns = best_dense * 1e9 / iterations as f64;
-        let patterned_ns = best_patterned * 1e9 / iterations as f64;
-        let literal_seeds_ns = best_literal_seeds * 1e9 / iterations as f64;
-        let compiled_ns = best_compiled * 1e9 / iterations as f64;
-        let hand_ns = best_hand * 1e9 / iterations as f64;
-        let hand_fused_ns = best_hand_fused * 1e9 / iterations as f64;
+
+        let hand_ns = best_secs(iterations, &p, &kernel, hand) * 1e9 / iterations as f64;
+        let hand_fused_ns = best_secs(iterations, &p, &kernel, hand_fused) * 1e9 / iterations as f64;
+        let dense_ns = best_secs(iterations, &p, &kernel, dense) * 1e9 / iterations as f64;
+        let patterned_ns = best_secs(iterations, &p, &kernel, patterned) * 1e9 / iterations as f64;
+        let literal_seeds_ns =
+            best_secs(iterations, &p, &kernel, patterned_literal_seeds) * 1e9 / iterations as f64;
+        let compiled_ns = best_secs(iterations, &p, &kernel, compiled) * 1e9 / iterations as f64;
         eprintln!(
-            "SLS-PATTERNED-932 hand={hand_ns:.2} ns/row fused-hand={hand_fused_ns:.2} ns/row dense={dense_ns:.2} ns/row patterned={patterned_ns:.2} ns/row literal-seeds={literal_seeds_ns:.2} ns/row compiled={compiled_ns:.2} ns/row compiled/fused-hand={:.3} patterned/fused-hand={:.3} literal-seeds/fused-hand={:.3} compiled/dense={:.3}",
+            "SLS-PATTERNED-932 hand={hand_ns:.2} ns/row fused-hand={hand_fused_ns:.2} ns/row dense={dense_ns:.2} ns/row patterned={patterned_ns:.2} ns/row literal-seeds={literal_seeds_ns:.2} ns/row compiled={compiled_ns:.2} ns/row compiled/fused-hand={:.3} patterned/fused-hand={:.3} literal-seeds/fused-hand={:.3} compiled/dense={:.3} hand_over_production={:.6}",
             compiled_ns / hand_fused_ns,
             patterned_ns / hand_fused_ns,
             literal_seeds_ns / hand_fused_ns,
             compiled_ns / dense_ns,
+            hand_fused_ns / compiled_ns,
         );
     }
 }
