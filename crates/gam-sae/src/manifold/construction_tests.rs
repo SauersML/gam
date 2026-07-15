@@ -446,6 +446,217 @@ mod amortized_encoder_tests {
         }
     }
 
+    /// PATH C (#2253) CH5 — the third-order forward-sensitivity Hessian block
+    /// `H3[i,j] = ∂g3[j]/∂ρ_i`, `g3 = −½Γ_effᵀθ̂_ρ` (the gradient's
+    /// `third_order_correction`), must equal a central finite difference of that
+    /// EXACT analytic gradient component at a frozen inner state. The cache is
+    /// rebuilt at each ρ±h so the penalty part of `H` moves with ρ while θ̂ stays
+    /// frozen (a frozen cache false-greens the twist). The lifted ρ keeps the
+    /// periodic ARD majorizer well inside its positive branch (`|cos κt| ≳ 0.1`),
+    /// where the `max(·,0)` active set is invariant and the FD is valid.
+    #[test]
+    fn third_order_forward_sensitivity_hessian_matches_finite_difference_2253() {
+        use crate::manifold::arrow_solver::DeflatedArrowSolver;
+        use ndarray::{Array1, array};
+        let (mut term, target, rho, _stationary_cache) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual();
+        let mut rho_eval = rho.clone();
+        rho_eval.log_lambda_sparse = 0.5;
+        for v in rho_eval.log_lambda_smooth.iter_mut() {
+            *v = -2.0;
+        }
+        rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
+        let rho = rho_eval;
+        let (_value, loss, cache) = term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                0,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("fixed-theta base cache");
+        let analytic = term
+            .third_order_forward_sensitivity_hessian(target.view(), &rho, &loss, &cache)
+            .expect("CH5 third-order block assembles");
+
+        let base = rho.to_flat();
+        let h = 1.0e-5;
+        // `g3[j]` in isolation at a REBUILT fixed-θ̂ cache (the frozen-cache trap).
+        let g3_at = |sign: f64, coord: usize| -> Array1<f64> {
+            let mut flat = base.clone();
+            flat[coord] += sign * h;
+            let r = rho.from_flat(flat.view()).unwrap();
+            let mut t = term.clone();
+            let (_v, loss, cache) = t
+                .penalized_quasi_laplace_criterion_with_cache(
+                    target.view(),
+                    &r,
+                    None,
+                    0,
+                    0.4,
+                    1.0e-6,
+                    1.0e-6,
+                )
+                .expect("perturbed fixed-theta cache");
+            let solver = DeflatedArrowSolver::plain(&cache);
+            t.analytic_outer_rho_gradient_components(target.view(), &r, &loss, &cache, &solver)
+                .expect("analytic gradient components")
+                .third_order_correction
+        };
+
+        let mut coords: Vec<usize> = Vec::new();
+        for a in 0..rho.log_lambda_smooth.len() {
+            coords.push(rho.smooth_flat_index(a));
+        }
+        for kk in 0..rho.log_ard.len() {
+            for axis in 0..rho.log_ard[kk].len() {
+                let idx = rho.ard_flat_index(kk, axis);
+                if !coords.contains(&idx) {
+                    coords.push(idx);
+                }
+            }
+        }
+        if let Some(sparse) = rho.sparse_flat_index() {
+            coords.push(sparse);
+        }
+
+        // Non-vacuity: the block must carry real curvature (else the gate would
+        // pass on an all-zero block), and its OFF-diagonal (the twist / mixed
+        // cross terms with no diagonal self-term) must be materially exercised.
+        let max_abs = coords
+            .iter()
+            .flat_map(|&i| coords.iter().map(move |&j| (i, j)))
+            .map(|(i, j)| analytic[[i, j]].abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs > 1.0e-6,
+            "CH5 third-order block must carry real curvature: max|H3|={max_abs}"
+        );
+
+        for &i in &coords {
+            // `H3[i,j] = ∂g3[j]/∂ρ_i`: perturb ρ_i, read the j-th component.
+            let fd_row = (g3_at(1.0, i) - g3_at(-1.0, i)) / (2.0 * h);
+            for &j in &coords {
+                let analytic_ij = analytic[[i, j]];
+                let fd_ij = fd_row[j];
+                if (analytic_ij - fd_ij).abs() >= 1.0e-5 + 1.0e-4 * analytic_ij.abs() {
+                    eprintln!(
+                        "CH5 H3[{i},{j}] mismatch (perturb rho_{i}, component g3[{j}]): \
+                         analytic={analytic_ij:.9e} fd={fd_ij:.9e} \
+                         abs_err={:.3e}",
+                        (analytic_ij - fd_ij).abs()
+                    );
+                }
+                assert!(
+                    (analytic_ij - fd_ij).abs() < 1.0e-5 + 1.0e-4 * analytic_ij.abs(),
+                    "CH5 third-order Hessian [{i},{j}] mismatch: \
+                     analytic={analytic_ij}, fd={fd_ij}"
+                );
+            }
+        }
+    }
+
+    /// PATH C (#2253) — the FULLY assembled exact fixed-stratum outer Hessian
+    /// (`exact_fixed_stratum_outer_hessian`: ch1 explicit + ch2 rank-charge + ch4
+    /// log-determinant + ch5 third-order) must equal a central finite difference
+    /// of the COMPLETE analytic outer gradient (`.gradient()`). This is the gate
+    /// that catches a silently-dropped coordinate or channel: it exercises the
+    /// whole channel set as one, in the symmetric orientation `H[i,j] =
+    /// ∂g[i]/∂ρ_j`, so an asymmetric CH5 sign error also trips it.
+    #[test]
+    fn full_gradient_hessian_channel_set_matches_finite_difference_2253() {
+        use crate::manifold::arrow_solver::DeflatedArrowSolver;
+        use ndarray::{Array1, array};
+        let (mut term, target, rho, _stationary_cache) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual();
+        let mut rho_eval = rho.clone();
+        rho_eval.log_lambda_sparse = 0.5;
+        for v in rho_eval.log_lambda_smooth.iter_mut() {
+            *v = -2.0;
+        }
+        rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
+        let rho = rho_eval;
+        let (_value, loss, cache) = term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                0,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("fixed-theta base cache");
+        let analytic = term
+            .exact_fixed_stratum_outer_hessian(target.view(), &rho, &loss, &cache)
+            .expect("full exact fixed-stratum outer Hessian assembles");
+
+        let base = rho.to_flat();
+        let h = 1.0e-5;
+        let gradient_at = |sign: f64, coord: usize| -> Array1<f64> {
+            let mut flat = base.clone();
+            flat[coord] += sign * h;
+            let r = rho.from_flat(flat.view()).unwrap();
+            let mut t = term.clone();
+            let (_v, loss, cache) = t
+                .penalized_quasi_laplace_criterion_with_cache(
+                    target.view(),
+                    &r,
+                    None,
+                    0,
+                    0.4,
+                    1.0e-6,
+                    1.0e-6,
+                )
+                .expect("perturbed fixed-theta cache");
+            let solver = DeflatedArrowSolver::plain(&cache);
+            t.analytic_outer_rho_gradient_components(target.view(), &r, &loss, &cache, &solver)
+                .expect("analytic gradient components")
+                .gradient()
+        };
+
+        let mut coords: Vec<usize> = Vec::new();
+        for a in 0..rho.log_lambda_smooth.len() {
+            coords.push(rho.smooth_flat_index(a));
+        }
+        for kk in 0..rho.log_ard.len() {
+            for axis in 0..rho.log_ard[kk].len() {
+                let idx = rho.ard_flat_index(kk, axis);
+                if !coords.contains(&idx) {
+                    coords.push(idx);
+                }
+            }
+        }
+        if let Some(sparse) = rho.sparse_flat_index() {
+            coords.push(sparse);
+        }
+
+        for &j in &coords {
+            // `H[i,j] = ∂g[i]/∂ρ_j`: perturb ρ_j, read the i-th component.
+            let fd_col = (gradient_at(1.0, j) - gradient_at(-1.0, j)) / (2.0 * h);
+            for &i in &coords {
+                let analytic_ij = analytic[[i, j]];
+                let fd_ij = fd_col[i];
+                if (analytic_ij - fd_ij).abs() >= 1.0e-5 + 1.0e-4 * analytic_ij.abs() {
+                    eprintln!(
+                        "full Hessian [{i},{j}] mismatch (perturb rho_{j}, component g[{i}]): \
+                         analytic={analytic_ij:.9e} fd={fd_ij:.9e} \
+                         abs_err={:.3e}",
+                        (analytic_ij - fd_ij).abs()
+                    );
+                }
+                assert!(
+                    (analytic_ij - fd_ij).abs() < 1.0e-5 + 1.0e-4 * analytic_ij.abs(),
+                    "full exact fixed-stratum Hessian [{i},{j}] mismatch: \
+                     analytic={analytic_ij}, fd={fd_ij}"
+                );
+            }
+        }
+    }
+
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
     /// coordinates used by reconstruction. Decoder magnitude stays in `B`, so
     /// there is no second radial-scale channel to fold into these values.

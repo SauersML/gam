@@ -26,6 +26,30 @@ fn sae_ift_min_curvature_fraction() -> f64 {
     f64::EPSILON.sqrt()
 }
 
+/// PATH C (#2253) CH5 — which subset of the joint θ-derivative operator
+/// `K_w = ∂H/∂θ_w` a dense θ-adjoint contraction assembles. The FULL set
+/// reconstructs `Γ_w = tr(inv·K_w)` (self-checked against the production
+/// `logdet_theta_adjoint`); the two MIXED subsets isolate the single ρ-scaled
+/// term of `K_w` whose `∂/∂ρ_i` is nonzero (both are degree-one in `e^{ρ_i}`,
+/// so `∂K_w/∂ρ_i` equals the term itself). Keeping them as distinct channels
+/// makes a failing finite-difference gate localize to ONE formula.
+#[derive(Clone, Copy)]
+enum ThetaAdjointDhChannel {
+    /// Every `∂H/∂θ_w` contribution: data residual curvature, the softmax
+    /// data-weight logit factor, the softmax entropy Gershgorin majorizer, and
+    /// the periodic ARD majorizer diagonal.
+    All,
+    /// ONLY the softmax entropy Gershgorin majorizer θ-derivative (logit–logit,
+    /// same atom). This is the `∝ λ_sparse` term, so its `∂/∂ρ_sparse` equals
+    /// itself — the part-(b) mixed channel for the sparse coordinate.
+    SoftmaxSparseMixed,
+    /// ONLY the periodic ARD majorizer diagonal `w_row·(−ακ sin κt)` for the
+    /// coordinate slots whose `ard_flat_index` matches `target_flat`. This is
+    /// `∝ α = e^{ρ_ard}`, so its `∂/∂ρ_ard` equals itself — the part-(b) mixed
+    /// channel for one ARD coordinate.
+    ArdMixed { target_flat: usize },
+}
+
 /// Apply a raw arrow operator on the closed-form gauge quotient represented by
 /// `solver`: `M_Q v = M v + κ Q Qᵀ v`.
 fn apply_gauge_fixed_arrow_operator<F>(
@@ -754,6 +778,831 @@ impl SaeManifoldTerm {
             Ok(SaeArrowVector { t, beta })
         };
         solve_exact_stationarity_preconditioned(rhs, &apply_a, &apply_b, precondition)
+    }
+
+    /// PATH C (#2253) — the per-flat-coordinate penalty curvature operators
+    /// `M_i = ∂H/∂ρ_i` at a frozen inner state, keyed by flat outer coordinate.
+    /// Extracted from [`Self::logdet_daleckii_krein_hessian`] (ch4) so ch4's
+    /// Daleckii–Krein trace and ch5's forward-sensitivity twist read ONE
+    /// operator map (value/gradient/Hessian never differentiate divergent
+    /// curvatures). Each `M_i` is degree-one in `exp(ρ_i)`: `λ_k·½(S_k+S_kᵀ)⊗I`
+    /// on atom `k`'s β-block for smoothing; `w_row·max(α cos κt,0)` on the active
+    /// row-local t-slots for periodic ARD (`w_row·α` Euclidean); the softmax
+    /// Gershgorin majorizer `w_row·diag(Σ_j|H_kj|)` on the logit slots for the
+    /// sparse coordinate. The sparse refusals (compact top-k layout, non-softmax
+    /// prior) match ch4's so both channels decline the same unmodelled cases.
+    pub(crate) fn penalty_curvature_operators_by_flat(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+    ) -> Result<std::collections::BTreeMap<usize, Array2<f64>>, String> {
+        let total_t = cache.delta_t_len();
+        let k = cache.k;
+        let dim = total_t + k;
+        let mut c_by_flat: std::collections::BTreeMap<usize, Array2<f64>> =
+            std::collections::BTreeMap::new();
+
+        // Smoothing: Cₐ = (λ_a·½(Sₐ+Sₐᵀ)) ⊗ I on atom a's β-block.
+        let lambda_smooth = rho.lambda_smooth_vec()?;
+        let p = self.output_dim();
+        let frames_active = self.frames_active();
+        let (beta_offsets, beta_out_dim): (Vec<usize>, Box<dyn Fn(usize) -> usize>) =
+            if frames_active {
+                let ranks: Vec<usize> = self.atoms.iter().map(|a| a.border_frame_rank()).collect();
+                (
+                    self.factored_beta_offsets(),
+                    Box::new(move |kk: usize| ranks[kk]),
+                )
+            } else {
+                (self.beta_offsets(), Box::new(move |_kk: usize| p))
+            };
+        for a in 0..rho.log_lambda_smooth.len() {
+            let atom = &self.atoms[a];
+            let s = atom.smooth_penalty();
+            let m = atom.basis_size();
+            let off = beta_offsets[a];
+            let r = beta_out_dim(a);
+            let lambda = lambda_smooth[a];
+            let flat = rho.smooth_flat_index(a);
+            let c = c_by_flat
+                .entry(flat)
+                .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+            for mu in 0..m {
+                for nu in 0..m {
+                    let s_sym = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
+                    let val = lambda * s_sym;
+                    if val == 0.0 {
+                        continue;
+                    }
+                    for oc in 0..r {
+                        c[[total_t + off + nu * r + oc, total_t + off + mu * r + oc]] += val;
+                    }
+                }
+            }
+        }
+
+        // ARD: C_{k,axis} = w_row·max(α cos κt, 0) (periodic) / w_row·α (Euclidean)
+        // on the row-local t-slot for (atom k, axis).
+        let ard_precisions = self.validated_ard_precisions(rho)?;
+        let row_w = self.row_loss_weights.as_deref();
+        let coord_offsets = self.assignment.coord_offsets();
+        let periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(LatentCoordValues::effective_axis_periods)
+            .collect();
+        for row in 0..self.n_obs() {
+            let w_row = row_w.map_or(1.0, |w| w[row]);
+            let base = cache.row_offsets[row];
+            match self.last_row_layout {
+                Some(ref layout) => {
+                    for (pos, &kk) in layout.active_atoms[row].iter().enumerate() {
+                        if rho.log_ard[kk].is_empty() {
+                            continue;
+                        }
+                        let start = layout.coord_starts[row][pos];
+                        let coord = &self.assignment.coords[kk];
+                        for axis in 0..coord.latent_dim() {
+                            let alpha = ard_precisions[kk][axis];
+                            let t = coord.row(row)[axis];
+                            let hess = w_row
+                                * ArdAxisPrior::eval(alpha, t, periods[kk][axis])
+                                    .psd_majorizer_hess();
+                            if hess == 0.0 {
+                                continue;
+                            }
+                            let flat = rho.ard_flat_index(kk, axis);
+                            let c = c_by_flat
+                                .entry(flat)
+                                .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+                            let g_idx = base + start + axis;
+                            c[[g_idx, g_idx]] += hess;
+                        }
+                    }
+                }
+                None => {
+                    for kk in 0..self.k_atoms() {
+                        if rho.log_ard[kk].is_empty() {
+                            continue;
+                        }
+                        let coord = &self.assignment.coords[kk];
+                        for axis in 0..coord.latent_dim() {
+                            let alpha = ard_precisions[kk][axis];
+                            let t = coord.row(row)[axis];
+                            let hess = w_row
+                                * ArdAxisPrior::eval(alpha, t, periods[kk][axis])
+                                    .psd_majorizer_hess();
+                            if hess == 0.0 {
+                                continue;
+                            }
+                            let flat = rho.ard_flat_index(kk, axis);
+                            let c = c_by_flat
+                                .entry(flat)
+                                .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+                            let g_idx = base + coord_offsets[kk] + axis;
+                            c[[g_idx, g_idx]] += hess;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sparse (assignment log-strength): the softmax Gershgorin PSD majorizer
+        // `w_row·diag(Σ_j|H_kj|)` at `scale = λ_sparse·s/τ²`, written into the
+        // logit slots — degree-one in `λ_sparse = e^ρ` exactly like smoothing/ARD.
+        if let Some(sparse_flat) = rho.sparse_flat_index() {
+            let k_atoms = self.k_atoms();
+            match self.assignment.mode {
+                AssignmentMode::Softmax {
+                    temperature,
+                    sparsity,
+                } if k_atoms > 1 => {
+                    if self.last_row_layout.is_some() {
+                        return Err(
+                            "penalty_curvature_operators_by_flat: the compact top-k softmax row \
+                             layout is not covered by the sparse log-strength operator; refusing \
+                             to assemble a curvature operator with an unmodelled sparse row"
+                                .to_string(),
+                        );
+                    }
+                    let inv_tau = 1.0 / temperature;
+                    let scale = rho.lambda_sparse()? * sparsity * inv_tau * inv_tau;
+                    let penalty =
+                        gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                            k_atoms,
+                            temperature,
+                        );
+                    let assignment_dim = self.assignment.assignment_coord_dim();
+                    let c = c_by_flat
+                        .entry(sparse_flat)
+                        .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+                    for row in 0..self.n_obs() {
+                        let w_row = row_w.map_or(1.0, |w| w[row]);
+                        let base = cache.row_offsets[row];
+                        let q = cache.row_dims[row];
+                        let logit_dim = assignment_dim.min(q);
+                        let row_logits: Vec<f64> = (0..k_atoms)
+                            .map(|atom| self.assignment.logits[[row, atom]])
+                            .collect();
+                        let d = penalty.psd_majorizer_abs_row_sums(&row_logits, scale);
+                        for atom in 0..logit_dim {
+                            c[[base + atom, base + atom]] += w_row * d[atom];
+                        }
+                    }
+                }
+                AssignmentMode::Softmax { .. } => {}
+                _ => {
+                    return Err(
+                        "penalty_curvature_operators_by_flat: rho carries a sparse log-strength \
+                         coordinate under a non-softmax assignment prior, whose ∂H/∂ρ_sparse \
+                         majorizer operator this map does not model; refusing to assemble a \
+                         silently-zero sparse operator"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        Ok(c_by_flat)
+    }
+
+    /// PATH C (#2253) — the full joint arrow inverse `G = H⁻¹` (dim×dim),
+    /// materialized column by column against each unit arrow basis vector and
+    /// symmetrized. Shared by ch4 and ch5's small-dense (circle-mint scale)
+    /// route; `solver` must be [`DeflatedArrowSolver::plain`].
+    pub(crate) fn materialize_joint_inverse(
+        &self,
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let total_t = cache.delta_t_len();
+        let k = cache.k;
+        let dim = total_t + k;
+        let mut g = Array2::<f64>::zeros((dim, dim));
+        let mut rhs_t = Array1::<f64>::zeros(total_t);
+        let rhs_beta_zero = Array1::<f64>::zeros(k);
+        for col in 0..total_t {
+            rhs_t[col] = 1.0;
+            let sol = solver.solve(rhs_t.view(), rhs_beta_zero.view())?;
+            rhs_t[col] = 0.0;
+            for r in 0..total_t {
+                g[[r, col]] = sol.t[r];
+            }
+            for r in 0..k {
+                g[[total_t + r, col]] = sol.beta[r];
+            }
+        }
+        let rhs_t_zero = Array1::<f64>::zeros(total_t);
+        let mut rhs_beta = Array1::<f64>::zeros(k);
+        for col in 0..k {
+            rhs_beta[col] = 1.0;
+            let sol = solver.solve(rhs_t_zero.view(), rhs_beta.view())?;
+            rhs_beta[col] = 0.0;
+            for r in 0..total_t {
+                g[[r, total_t + col]] = sol.t[r];
+            }
+            for r in 0..k {
+                g[[total_t + r, total_t + col]] = sol.beta[r];
+            }
+        }
+        for a in 0..dim {
+            for b in (a + 1)..dim {
+                let avg = 0.5 * (g[[a, b]] + g[[b, a]]);
+                g[[a, b]] = avg;
+                g[[b, a]] = avg;
+            }
+        }
+        Ok(g)
+    }
+
+    /// PATH C (#2253) — the block-diagonal row-local t-inverse `H_bd⁻¹` (dim×dim;
+    /// β block zero) built from the per-row undamped Cholesky factors, the same
+    /// inverse the rank-charge coordinate-block trace subtracts. Shared by ch4
+    /// and ch5.
+    pub(crate) fn materialize_block_diag_t_inverse(&self, cache: &ArrowFactorCache) -> Array2<f64> {
+        let total_t = cache.delta_t_len();
+        let dim = total_t + cache.k;
+        let mut h_bd = Array2::<f64>::zeros((dim, dim));
+        for row in 0..self.n_obs() {
+            let q = cache.row_dims[row];
+            let base = cache.row_offsets[row];
+            let factor = cache.undamped_factor(row);
+            let mut unit = Array1::<f64>::zeros(q);
+            for col in 0..q {
+                unit.fill(0.0);
+                unit[col] = 1.0;
+                let solved = cholesky_solve_vector(factor, unit.view());
+                for r in 0..q {
+                    h_bd[[base + r, base + col]] = solved[r];
+                }
+            }
+        }
+        h_bd
+    }
+
+    /// PATH C (#2253) CH5 — dense reconstruction of the θ-adjoint contraction
+    /// `Γ_w = tr(inv · K_w)`, `K_w = ∂H/∂θ_w`, for an ARBITRARY dense joint
+    /// inverse `inv` (dim×dim over the `(t, β)` blocks) and a chosen subset of
+    /// the `K_w` operator ([`ThetaAdjointDhChannel`]).
+    ///
+    /// With `inv = G` and `ThetaAdjointDhChannel::All` this reproduces the
+    /// production [`Self::logdet_theta_adjoint`] (self-checked by the FD gate);
+    /// with `inv = h_bd` it reproduces [`Self::coordinate_block_logdet_theta_adjoint`].
+    /// Feeding the TWISTED inverse `−G M_i G` gives the part-(a) term
+    /// `−tr(G M_i G K_w)` of `dΓ/dρ_i`; the two MIXED channels give part-(b).
+    ///
+    /// Covered config ONLY (validated by the caller): softmax assignment, dense
+    /// per-atom row layout (`last_row_layout = None`), no per-row deflation, no
+    /// border frames, no ordered Beta--Bernoulli. The `dh` assembly mirrors the
+    /// production builder's inner loop for exactly that config; the softmax
+    /// diagonal `assignment_prior_hdiag_derivative_entry` is 0 for softmax and is
+    /// omitted here for the same reason.
+    fn logdet_theta_adjoint_dense(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        inv: &Array2<f64>,
+        channel: ThetaAdjointDhChannel,
+    ) -> Result<SaeArrowVector, String> {
+        let ard_precisions = self.validated_ard_precisions(rho)?;
+        let total_t = cache.delta_t_len();
+        let k = cache.k;
+        let k_atoms = self.k_atoms();
+        let n = self.n_obs();
+        let mut gamma_t = Array1::<f64>::zeros(total_t);
+        let mut gamma_beta = Array1::<f64>::zeros(k);
+        let second_jets = self.atom_second_jets()?;
+        let border = self.border_channels_for_cache(cache)?;
+        let whiten_row_jets = self.whiten_logdet_row_jets();
+        let want_data = matches!(channel, ThetaAdjointDhChannel::All);
+        let want_entropy = matches!(
+            channel,
+            ThetaAdjointDhChannel::All | ThetaAdjointDhChannel::SoftmaxSparseMixed
+        );
+        let want_ard = matches!(
+            channel,
+            ThetaAdjointDhChannel::All | ThetaAdjointDhChannel::ArdMixed { .. }
+        );
+        // `1/τ` (always, for the softmax data-weight logit factor) and the
+        // entropy Gershgorin majorizer scale `λ_sparse·s/τ²` (only a live free
+        // logit, i.e. `k_atoms > 1`, carries the sparsity penalty).
+        let (entropy_scale, inv_tau) = match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } => {
+                let inv_tau = 1.0 / temperature;
+                let scale = if k_atoms > 1 {
+                    rho.lambda_sparse()? * sparsity * inv_tau * inv_tau
+                } else {
+                    0.0
+                };
+                (scale, inv_tau)
+            }
+            _ => (0.0, 0.0),
+        };
+        let mut jet_window: std::collections::VecDeque<SaeRowJets> =
+            std::collections::VecDeque::new();
+        let mut jet_window_next = 0usize;
+        let mut assignments = Array1::<f64>::zeros(k_atoms);
+        for row in 0..n {
+            let q = cache.row_dims[row];
+            let base = cache.row_offsets[row];
+            let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
+            self.assignment.try_assignments_row_into(row, a_scratch)?;
+            if jet_window.is_empty() {
+                jet_window_next = self.refill_jet_window(
+                    jet_window_next,
+                    cache,
+                    &second_jets,
+                    &border,
+                    &mut jet_window,
+                )?;
+            }
+            let mut jets = jet_window
+                .pop_front()
+                .ok_or_else(|| "logdet_theta_adjoint_dense: empty jet window".to_string())?;
+            if whiten_row_jets {
+                self.apply_whiten_to_logdet_row_jets(row, &mut jets)?;
+            }
+            let a_soft = assignments
+                .as_slice()
+                .expect("softmax assignments row must be contiguous");
+            let m_log_mean = softmax_majorizer_log_mean(a_soft);
+            let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
+            for w in 0..q {
+                let logit_w = match jets.vars[w] {
+                    SaeLocalRowVar::Logit { atom } => Some(atom),
+                    SaeLocalRowVar::Coord { .. } => None,
+                };
+                let mut gamma = 0.0_f64;
+                for a in 0..q {
+                    for b in 0..q {
+                        let mut dh = 0.0_f64;
+                        if want_data {
+                            dh += match (logit_w, jets.vars[a], jets.vars[b]) {
+                                (
+                                    Some(atom_w),
+                                    SaeLocalRowVar::Coord { atom: atom_a, .. },
+                                    SaeLocalRowVar::Coord { atom: atom_b, .. },
+                                ) => {
+                                    sae_dot(jets.first(a), jets.first(b))
+                                        * Self::softmax_data_weight_product_logit_factor(
+                                            a_soft, atom_a, atom_b, atom_w, inv_tau,
+                                        )
+                                }
+                                _ => {
+                                    sae_dot(jets.second(a, w), jets.first(b))
+                                        + sae_dot(jets.first(a), jets.second(b, w))
+                                }
+                            };
+                        }
+                        if want_entropy {
+                            if let (
+                                Some(atom_w),
+                                SaeLocalRowVar::Logit { atom: atom_a },
+                                SaeLocalRowVar::Logit { atom: atom_b },
+                            ) = (logit_w, jets.vars[a], jets.vars[b])
+                            {
+                                if atom_a == atom_b {
+                                    dh += w_row
+                                        * active_softmax_majorizer_logit_derivative_entry(
+                                            a_soft,
+                                            atom_a,
+                                            atom_w,
+                                            m_log_mean,
+                                            entropy_scale,
+                                            inv_tau,
+                                        );
+                                }
+                            }
+                        }
+                        if want_ard && a == b && a == w {
+                            if let SaeLocalRowVar::Coord { atom, axis } = jets.vars[a] {
+                                if !ard_precisions[atom].is_empty() {
+                                    let include = match channel {
+                                        ThetaAdjointDhChannel::ArdMixed { target_flat } => {
+                                            rho.ard_flat_index(atom, axis) == target_flat
+                                        }
+                                        _ => true,
+                                    };
+                                    if include {
+                                        dh += self.ard_majorized_hessian_derivative(
+                                            ard_precisions[atom][axis],
+                                            row,
+                                            atom,
+                                            axis,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        gamma += inv[[base + b, base + a]] * dh;
+                    }
+                }
+                if want_data {
+                    for a in 0..q {
+                        for (beta_pos, ch) in border.iter().enumerate() {
+                            let dh = sae_dot(jets.second(a, w), jets.beta(beta_pos))
+                                + sae_dot(jets.first(a), jets.beta_deriv(w, beta_pos));
+                            gamma += 2.0 * inv[[base + a, total_t + ch.index]] * dh;
+                        }
+                    }
+                    for (beta_i, ch_i) in border.iter().enumerate() {
+                        for (beta_j, ch_j) in border.iter().enumerate() {
+                            let dh = sae_dot(jets.beta_deriv(w, beta_i), jets.beta(beta_j))
+                                + sae_dot(jets.beta(beta_i), jets.beta_deriv(w, beta_j));
+                            gamma += inv[[total_t + ch_i.index, total_t + ch_j.index]] * dh;
+                        }
+                    }
+                }
+                gamma_t[base + w] = gamma;
+            }
+            if want_data {
+                for (w_beta_pos, w_channel) in border.iter().enumerate() {
+                    let mut gamma = 0.0_f64;
+                    for a in 0..q {
+                        for b in 0..q {
+                            let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
+                                + sae_dot(jets.first(a), jets.beta_l_deriv(b, w_beta_pos));
+                            gamma += inv[[base + b, base + a]] * dh;
+                        }
+                    }
+                    for a in 0..q {
+                        for (beta_pos, ch) in border.iter().enumerate() {
+                            let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                            gamma += 2.0 * inv[[base + a, total_t + ch.index]] * dh;
+                        }
+                    }
+                    gamma_beta[w_channel.index] += gamma;
+                }
+            }
+        }
+        Ok(SaeArrowVector {
+            t: gamma_t,
+            beta: gamma_beta,
+        })
+    }
+
+    /// PATH C (#2253) CH5 — the fixed-stratum ρ-derivative of the rank-charge
+    /// θ-adjoint `∇R = production_rank_charge_derivative().theta`, for ONE smooth
+    /// coordinate `smooth_flat`. `∇R` depends on ρ only through the per-atom
+    /// penalized Gram `A = G + λ S` (`λ = e^{ρ_smooth}`), and the θ-assembly is
+    /// LINEAR in each atom's differential blocks (`gram`, `occupancy`), so the
+    /// derivative reruns the SAME assembly with those blocks replaced by their
+    /// λ-derivatives (and zeroed for every other atom). With `A⁻¹ = inv`,
+    /// `S = smooth_penalty`, `dλ/dρ = λ`, `dA⁻¹/dλ = −A⁻¹SA⁻¹`:
+    /// `d(inv − inv G inv)/dρ = λ(−inv S inv + inv S inv G inv + inv G inv S inv)`
+    /// and `d tr(inv G)/dρ = −λ tr(inv S inv G)`. Non-interior-EDF atoms are on a
+    /// locally constant branch (zero derivative), matching the gradient.
+    fn rank_charge_theta_rho_derivative(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+        smooth_flat: usize,
+    ) -> Result<SaeArrowVector, String> {
+        let target_atom = smooth_flat - rho.smooth_flat_start();
+        let residual = self.reconstruction_residual(target, rho)?;
+        let dispersion =
+            self.reconstruction_dispersion(loss, cache, rho, Some(residual.view()))?;
+        let mut grams = self.empty_decoder_gram_accumulator();
+        self.accumulate_decoder_gram(&mut grams)?;
+        let n_eff = self.per_atom_effective_sample_size();
+        let lambda_vec = rho.lambda_smooth_vec()?;
+        let p = self.output_dim() as f64;
+
+        // Per-atom differential BLOCKS (gram, occupancy), zero except the target
+        // atom, whose blocks are the ρ_smooth-derivatives of the gradient's.
+        let mut atom_differentials: Vec<ProductionRankChargeAtomDifferential> =
+            Vec::with_capacity(self.k_atoms());
+        for atom_idx in 0..self.k_atoms() {
+            let atom = &self.atoms[atom_idx];
+            let m = atom.basis_size();
+            if atom_idx != target_atom || m == 0 {
+                atom_differentials.push(ProductionRankChargeAtomDifferential {
+                    gram: Array2::<f64>::zeros((m, m)),
+                    occupancy: 0.0,
+                });
+                continue;
+            }
+            let gram = &grams[atom_idx];
+            let n_atom = n_eff[atom_idx];
+            let lambda = lambda_vec[atom_idx];
+            let spectrum = super::wbic_audit::recon_spectrum(
+                gram,
+                &atom.decoder_coefficients,
+                n_atom,
+                p,
+                dispersion,
+                lambda,
+                Some(atom.smooth_penalty()),
+            )?;
+            let rank = spectrum.production_chargeable_rank() as f64;
+            if !(rank > 0.0) {
+                return Err(format!(
+                    "rank_charge_theta_rho_derivative: atom {atom_idx} is on the rank-zero \
+                     Laplace-invalid branch (vanished decoder)"
+                ));
+            }
+            let log_n = n_atom.max(1.0).ln();
+            if log_n == 0.0 {
+                atom_differentials.push(ProductionRankChargeAtomDifferential {
+                    gram: Array2::<f64>::zeros((m, m)),
+                    occupancy: 0.0,
+                });
+                continue;
+            }
+            let s = atom.smooth_penalty();
+            let mut penalized_gram = gram.clone();
+            for r in 0..m {
+                for c in 0..m {
+                    penalized_gram[[r, c]] += lambda * s[[r, c]];
+                }
+            }
+            let factor = penalized_gram.cholesky(Side::Lower).map_err(|error| {
+                format!(
+                    "rank_charge_theta_rho_derivative: atom {atom_idx} penalized Gram \
+                     factorization failed: {error}"
+                )
+            })?;
+            let inverse = factor.solve_mat(&Array2::<f64>::eye(m));
+            let edf_matrix = factor.solve_mat(gram);
+            let raw_edf = (0..m).map(|i| edf_matrix[[i, i]]).sum::<f64>();
+            let edf = super::construction::certified_basis_edf(
+                raw_edf,
+                m,
+                "rank_charge_theta_rho_derivative",
+            )?;
+            let edf_is_interior = edf > 0.0 && edf < m as f64;
+            // Reused products (all m×m): inv S inv, inv G inv, inv S inv G inv,
+            // inv G inv S inv, and inv S inv G (for the EDF trace).
+            let inv_s_inv = inverse.dot(s).dot(&inverse);
+            let inv_g_inv = inverse.dot(gram).dot(&inverse);
+            let inv_s_inv_g_inv = inv_s_inv.dot(gram).dot(&inverse);
+            let inv_g_inv_s_inv = inv_g_inv.dot(s).dot(&inverse);
+            let mut gram_prime = Array2::<f64>::zeros((m, m));
+            if edf_is_interior {
+                let coeff = lambda * 0.5 * rank * log_n;
+                for r in 0..m {
+                    for c in 0..m {
+                        gram_prime[[r, c]] = coeff
+                            * (-inv_s_inv[[r, c]]
+                                + inv_s_inv_g_inv[[r, c]]
+                                + inv_g_inv_s_inv[[r, c]]);
+                    }
+                }
+            }
+            let occupancy_prime = if n_atom > 1.0 {
+                let edf_prime = if edf_is_interior {
+                    let inv_s_inv_g = inv_s_inv.dot(gram);
+                    -lambda * (0..m).map(|i| inv_s_inv_g[[i, i]]).sum::<f64>()
+                } else {
+                    0.0
+                };
+                0.5 * rank * edf_prime / n_atom
+            } else {
+                0.0
+            };
+            atom_differentials.push(ProductionRankChargeAtomDifferential {
+                gram: gram_prime,
+                occupancy: occupancy_prime,
+            });
+        }
+
+        // The SAME linear θ-assembly as `production_rank_charge_derivative`, now
+        // driven by the differential-of-the-differential blocks.
+        let mut theta_t = Array1::<f64>::zeros(cache.delta_t_len());
+        let theta_beta = Array1::<f64>::zeros(cache.k);
+        let mut assignments = Array1::<f64>::zeros(self.k_atoms());
+        for row in 0..self.n_obs() {
+            self.assignment.try_assignments_row_into(
+                row,
+                assignments
+                    .as_slice_mut()
+                    .expect("rank-charge assignment scratch is contiguous"),
+            )?;
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            let base = cache.row_offsets[row];
+            for (slot, var) in vars.into_iter().enumerate() {
+                theta_t[base + slot] = match var {
+                    SaeLocalRowVar::Coord { atom, axis } => {
+                        let a = assignments[atom];
+                        if a == 0.0 {
+                            0.0
+                        } else {
+                            let phi = self.atoms[atom].basis_values.row(row);
+                            let dphi = self.atoms[atom].basis_jacobian.slice(s![row, .., axis]);
+                            2.0 * a * a * dphi.dot(&atom_differentials[atom].gram.dot(&phi))
+                        }
+                    }
+                    SaeLocalRowVar::Logit { atom: wrt_atom } => {
+                        let mut derivative = 0.0_f64;
+                        for atom in 0..self.k_atoms() {
+                            let da = self.rank_charge_assignment_derivative(
+                                wrt_atom,
+                                atom,
+                                assignments
+                                    .as_slice()
+                                    .expect("rank-charge assignment scratch is contiguous"),
+                            );
+                            if da == 0.0 {
+                                continue;
+                            }
+                            let a = assignments[atom];
+                            let phi = self.atoms[atom].basis_values.row(row);
+                            let gram_quadratic =
+                                phi.dot(&atom_differentials[atom].gram.dot(&phi));
+                            derivative += 2.0
+                                * a
+                                * da
+                                * (gram_quadratic + atom_differentials[atom].occupancy);
+                        }
+                        derivative
+                    }
+                };
+            }
+        }
+        Ok(SaeArrowVector {
+            t: theta_t,
+            beta: theta_beta,
+        })
+    }
+
+    /// PATH C (#2253) CH5 — the exact fixed-stratum second derivative of the
+    /// outer gradient's third-order forward-sensitivity channel
+    /// `g3[j] = −½⟨a, g_ρ,j⟩`, `a = A⁺Γ_eff`.
+    ///
+    /// `H3[i,j] = ∂g3[j]/∂ρ_i = −½( ⟨dΓ_eff/dρ_i − M_i·a, b_j⟩ + δ_ij⟨a, g_ρ,j⟩ )`
+    /// with `b_j = A⁺ g_ρ,j` (self-adjointness of `A⁺`). `Γ_eff = Γ_joint − Γ_tt
+    /// + 2∇R` — the SAME effective adjoint the gradient assembles. Each
+    /// `dΓ_·/dρ_i` splits into part-(a) `−tr(inv M_i inv K_w)` (twisted inverse)
+    /// and part-(b) `tr(inv ∂K_w/∂ρ_i)` (the ARD / softmax-sparse mixed
+    /// channels), and `d∇R/dρ` is nonzero only on the smooth coordinates. The
+    /// returned block is `∂g3[j]/∂ρ_i` verbatim (validated by the FD gate);
+    /// the caller may symmetrize.
+    fn third_order_forward_sensitivity_hessian(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+    ) -> Result<Array2<f64>, String> {
+        // Covered config: the small-dense softmax route with no deflation,
+        // frames, compact layout, or ordered Beta--Bernoulli. Outside it the
+        // dense `dh` reconstruction and the twist are not the exact operator, so
+        // refuse rather than advertise wrong curvature.
+        if !matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
+            return Err(
+                "third_order_forward_sensitivity_hessian: only the softmax assignment route is \
+                 modelled by the dense θ-adjoint reconstruction"
+                    .to_string(),
+            );
+        }
+        if self.last_row_layout.is_some() {
+            return Err(
+                "third_order_forward_sensitivity_hessian: the compact top-k softmax row layout is \
+                 not covered by the dense θ-adjoint reconstruction"
+                    .to_string(),
+            );
+        }
+        if self.frames_active() {
+            return Err(
+                "third_order_forward_sensitivity_hessian: border-frame smoothness offsets are not \
+                 covered by this channel"
+                    .to_string(),
+            );
+        }
+        let solver = DeflatedArrowSolver::plain(cache);
+        if !solver.plain_selected_inverse_available()
+            || cache.deflated_row_directions.iter().any(|d| !d.is_empty())
+        {
+            return Err(
+                "third_order_forward_sensitivity_hessian: per-row spectral deflation is present; \
+                 the twisted-inverse reconstruction does not model the Daleckii–Krein deflation map"
+                    .to_string(),
+            );
+        }
+
+        let n_params = rho.to_flat().len();
+        let total_t = cache.delta_t_len();
+        let k = cache.k;
+        let dim = total_t + k;
+        let flatten = |v: &SaeArrowVector| -> Array1<f64> {
+            let mut out = Array1::<f64>::zeros(dim);
+            out.slice_mut(s![..total_t]).assign(&v.t);
+            out.slice_mut(s![total_t..]).assign(&v.beta);
+            out
+        };
+
+        let g = self.materialize_joint_inverse(cache, &solver)?;
+        let h_bd = self.materialize_block_diag_t_inverse(cache);
+        let operators = self.penalty_curvature_operators_by_flat(rho, cache)?;
+
+        // Effective adjoint Γ_eff = Γ_joint − Γ_tt + 2∇R, assembled EXACTLY as
+        // the gradient does (construction_exact_hessian.rs analytic assembler).
+        let rank_charge = self
+            .production_rank_charge_derivative(target, rho, loss, cache)?;
+        let mut gamma_eff = self.logdet_theta_adjoint(rho, cache, &solver)?;
+        let gamma_tt = self.coordinate_block_logdet_theta_adjoint(rho, cache, &solver)?;
+        gamma_eff.t -= &gamma_tt.t;
+        gamma_eff.beta -= &gamma_tt.beta;
+        gamma_eff.t.scaled_add(2.0, &rank_charge.theta.t);
+        gamma_eff.beta.scaled_add(2.0, &rank_charge.theta.beta);
+
+        // Adjoints: a = A⁺Γ_eff (once) and b_j = A⁺ g_ρ,j (per coordinate).
+        let a_vec = self.solve_exact_stationarity(rho, target, cache, &solver, &gamma_eff)?;
+        let a_flat = flatten(&a_vec);
+        let flats: Vec<usize> = operators.keys().copied().collect();
+        let mut b_flat: std::collections::BTreeMap<usize, Array1<f64>> =
+            std::collections::BTreeMap::new();
+        let mut g_rho_flat: std::collections::BTreeMap<usize, Array1<f64>> =
+            std::collections::BTreeMap::new();
+        for &j in &flats {
+            let g_rho = self.outer_rho_gradient_ift_rhs(rho, j, cache)?;
+            let b_j = self.solve_exact_stationarity(rho, target, cache, &solver, &g_rho)?;
+            g_rho_flat.insert(j, flatten(&g_rho));
+            b_flat.insert(j, flatten(&b_j));
+        }
+
+        let smooth_range =
+            rho.smooth_flat_start()..rho.smooth_flat_start() + rho.log_lambda_smooth.len();
+        let sparse_index = rho.sparse_flat_index();
+
+        let mut hessian = Array2::<f64>::zeros((n_params, n_params));
+        for &i in &flats {
+            let m_i = &operators[&i];
+            // Twisted inverses G_i = −G M_i G and h_bd_i = −h_bd M_i h_bd.
+            let g_i = -g.dot(m_i).dot(&g);
+            let h_bd_i = -h_bd.dot(m_i).dot(&h_bd);
+
+            // dΓ_joint/dρ_i and dΓ_tt/dρ_i = part(a) twist + part(b) mixed.
+            let mut d_gamma_joint =
+                self.logdet_theta_adjoint_dense(rho, cache, &g_i, ThetaAdjointDhChannel::All)?;
+            let mut d_gamma_tt =
+                self.logdet_theta_adjoint_dense(rho, cache, &h_bd_i, ThetaAdjointDhChannel::All)?;
+            if smooth_range.contains(&i) {
+                // Smooth part(b) = 0; the only smooth ρ-derivative of Γ_eff is
+                // through the rank-charge adjoint.
+                let d_rank = self.rank_charge_theta_rho_derivative(target, rho, loss, cache, i)?;
+                d_gamma_joint.t.scaled_add(2.0, &d_rank.t);
+                d_gamma_joint.beta.scaled_add(2.0, &d_rank.beta);
+            } else if sparse_index == Some(i) {
+                let mixed_joint = self.logdet_theta_adjoint_dense(
+                    rho,
+                    cache,
+                    &g,
+                    ThetaAdjointDhChannel::SoftmaxSparseMixed,
+                )?;
+                let mixed_tt = self.logdet_theta_adjoint_dense(
+                    rho,
+                    cache,
+                    &h_bd,
+                    ThetaAdjointDhChannel::SoftmaxSparseMixed,
+                )?;
+                d_gamma_joint.t += &mixed_joint.t;
+                d_gamma_joint.beta += &mixed_joint.beta;
+                d_gamma_tt.t += &mixed_tt.t;
+                d_gamma_tt.beta += &mixed_tt.beta;
+            } else {
+                // ARD coordinate: part(b) mixed channel for this flat index.
+                let mixed_joint = self.logdet_theta_adjoint_dense(
+                    rho,
+                    cache,
+                    &g,
+                    ThetaAdjointDhChannel::ArdMixed { target_flat: i },
+                )?;
+                let mixed_tt = self.logdet_theta_adjoint_dense(
+                    rho,
+                    cache,
+                    &h_bd,
+                    ThetaAdjointDhChannel::ArdMixed { target_flat: i },
+                )?;
+                d_gamma_joint.t += &mixed_joint.t;
+                d_gamma_joint.beta += &mixed_joint.beta;
+                d_gamma_tt.t += &mixed_tt.t;
+                d_gamma_tt.beta += &mixed_tt.beta;
+            }
+
+            // dΓ_eff/dρ_i = dΓ_joint − dΓ_tt (+2∇R' folded into joint above).
+            let mut d_gamma = flatten(&d_gamma_joint);
+            d_gamma -= &flatten(&d_gamma_tt);
+            // resid_i = dΓ_eff/dρ_i − M_i·a.
+            let m_i_a = m_i.dot(&a_flat);
+            let resid_i = &d_gamma - &m_i_a;
+
+            for &j in &flats {
+                let b_j = &b_flat[&j];
+                let mut term = resid_i.dot(b_j);
+                if i == j {
+                    term += a_flat.dot(&g_rho_flat[&j]);
+                }
+                hessian[[i, j]] = -0.5 * term;
+            }
+        }
+        Ok(hessian)
     }
 
     /// Analytic SAE penalized quasi-Laplace outer-ρ gradient components at the already converged
@@ -1589,19 +2438,55 @@ impl SaeManifoldTerm {
                 rho.log_lambda_block.len()
             ));
         }
+        let n_params = rho.to_flat().len();
         let mut hessian = self.outer_explicit_smoothness_ard_hessian(rho, loss.smoothness)?;
         hessian += &self.rank_charge_direct_rho_hessian(target, rho, loss, cache)?;
         hessian += &self.logdet_daleckii_krein_hessian(rho, cache)?;
-        // Landed: explicit smoothness/ARD + rank-charge direct + deflated
-        // log-determinant Daleckii–Krein trace channels. Pending: the third-order
-        // forward-sensitivity channel. Refuse partial curvature until it lands.
-        Err(format!(
-            "PATH C exact fixed-stratum outer Hessian is incomplete: the {}×{} explicit \
-             smoothness/ARD + rank-charge + log-determinant blocks are landed, but the \
-             third-order forward-sensitivity channel is still pending; refusing to \
-             advertise partial curvature",
-            hessian.nrows(),
-            hessian.ncols()
-        ))
+        // CH5 — the third-order forward-sensitivity channel completes the exact
+        // fixed-stratum curvature. It refuses (propagated here) for any config
+        // outside the covered small-dense softmax route, so a Dense Hessian is
+        // never advertised where a sub-channel is unmodelled.
+        hessian += &self.third_order_forward_sensitivity_hessian(target, rho, loss, cache)?;
+
+        // Coordinate-coverage invariant (#2253), checked at assembly time on
+        // EVERY call: every flat coordinate the outer gradient prices must own a
+        // non-zero Hessian row. The priced set is assembled from the SAME
+        // channels the gradient uses (per-atom smoothness, ARD axes, and the
+        // softmax sparse log-strength coordinate when it is structurally live).
+        // A live-gradient coordinate with an identically-zero Hessian row would
+        // hand ARC a singular system, so refuse (naming the gap) rather than
+        // advertise partial curvature. For the covered route ch1+ch4 already
+        // fill every such row, so this passes; it is a guard against an
+        // unhandled coordinate slipping through, not an expected refusal.
+        let mut priced: Vec<usize> = Vec::new();
+        for a in 0..rho.log_lambda_smooth.len() {
+            priced.push(rho.smooth_flat_index(a));
+        }
+        for k in 0..rho.log_ard.len() {
+            for axis in 0..rho.log_ard[k].len() {
+                let idx = rho.ard_flat_index(k, axis);
+                if !priced.contains(&idx) {
+                    priced.push(idx);
+                }
+            }
+        }
+        if let Some(sparse) = rho.sparse_flat_index() {
+            if matches!(self.assignment.mode, AssignmentMode::Softmax { .. })
+                && self.k_atoms() > 1
+            {
+                priced.push(sparse);
+            }
+        }
+        for &c in &priced {
+            let row_is_live = (0..n_params).any(|j| hessian[[c, j]] != 0.0);
+            if !row_is_live {
+                return Err(format!(
+                    "exact_fixed_stratum_outer_hessian: flat coordinate {c} carries a live \
+                     outer-gradient component but an identically-zero Hessian row; refusing \
+                     to advertise a curvature block with an unmodelled coordinate"
+                ));
+            }
+        }
+        Ok(hessian)
     }
 }
