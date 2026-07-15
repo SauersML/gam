@@ -536,27 +536,71 @@ mod amortized_encoder_tests {
             "CH5 third-order block must carry real curvature: max|H3|={max_abs}"
         );
 
+        // Channel label for a flat coordinate, so a failing grid reads as a
+        // sub-channel pattern (a full row i = a `dΓ/dρ_i` bug; a full column j =
+        // a `g_ρ,j` / `b_j` bug; scattered = FD kink noise).
+        let label = |idx: usize| -> String {
+            if rho.sparse_flat_index() == Some(idx) {
+                "sparse".to_string()
+            } else if (rho.smooth_flat_start()
+                ..rho.smooth_flat_start() + rho.log_lambda_smooth.len())
+                .contains(&idx)
+            {
+                format!("smooth{}", idx - rho.smooth_flat_start())
+            } else {
+                format!("ard@{idx}")
+            }
+        };
+        // Kink diagnostic: the periodic ARD majorizer's active set flips at
+        // cos(κt) = 0 (period 1 ⇒ κ = 2π), where a row deflates/undeflates across
+        // ρ±h and the ARD-coordinate FD is invalid. Print any near-kink row so
+        // scattered ARD-row failures can be attributed.
+        for (atom, coord) in term.assignment.coords.iter().enumerate() {
+            for row in 0..coord.n_obs() {
+                let t = coord.row(row)[0];
+                let c = (std::f64::consts::TAU * t).cos();
+                if c.abs() < 0.2 {
+                    eprintln!(
+                        "KINK atom{atom} row{row}: t={t:.4} cos(2πt)={c:.4} (ARD FD invalid here)"
+                    );
+                }
+            }
+        }
+
+        let tol = |a: f64| 1.0e-5 + 1.0e-4 * a.abs();
+        let mut worst: Option<(usize, usize, f64, f64, f64)> = None;
+        let mut n_fail = 0usize;
         for &i in &coords {
             // `H3[i,j] = ∂g3[j]/∂ρ_i`: perturb ρ_i, read the j-th component.
             let fd_row = (g3_at(1.0, i) - g3_at(-1.0, i)) / (2.0 * h);
             for &j in &coords {
-                let analytic_ij = analytic[[i, j]];
+                let a_ij = analytic[[i, j]];
                 let fd_ij = fd_row[j];
-                if (analytic_ij - fd_ij).abs() >= 1.0e-5 + 1.0e-4 * analytic_ij.abs() {
-                    eprintln!(
-                        "CH5 H3[{i},{j}] mismatch (perturb rho_{i}, component g3[{j}]): \
-                         analytic={analytic_ij:.9e} fd={fd_ij:.9e} \
-                         abs_err={:.3e}",
-                        (analytic_ij - fd_ij).abs()
-                    );
-                }
-                assert!(
-                    (analytic_ij - fd_ij).abs() < 1.0e-5 + 1.0e-4 * analytic_ij.abs(),
-                    "CH5 third-order Hessian [{i},{j}] mismatch: \
-                     analytic={analytic_ij}, fd={fd_ij}"
+                let abs_err = (a_ij - fd_ij).abs();
+                let rel = if a_ij.abs() > 0.0 {
+                    abs_err / a_ij.abs()
+                } else {
+                    abs_err
+                };
+                let fail = abs_err >= tol(a_ij);
+                eprintln!(
+                    "CH5 H3[{i}={},{j}={}] analytic={a_ij:.9e} fd={fd_ij:.9e} abs={abs_err:.3e} rel={rel:.3e}{}",
+                    label(i),
+                    label(j),
+                    if fail { "  <== FAIL" } else { "" }
                 );
+                if fail {
+                    n_fail += 1;
+                    if worst.is_none_or(|(_, _, _, _, wr)| rel > wr) {
+                        worst = Some((i, j, a_ij, fd_ij, rel));
+                    }
+                }
             }
         }
+        assert!(
+            n_fail == 0,
+            "CH5 third-order Hessian: {n_fail} pair(s) mismatch (full grid above; row i = perturbed ρ_i, col j = gradient component). Worst: {worst:?}"
+        );
     }
 
     /// PATH C (#2253) — the FULLY assembled exact fixed-stratum outer Hessian
@@ -637,27 +681,52 @@ mod amortized_encoder_tests {
             coords.push(sparse);
         }
 
+        let label = |idx: usize| -> String {
+            if rho.sparse_flat_index() == Some(idx) {
+                "sparse".to_string()
+            } else if (rho.smooth_flat_start()
+                ..rho.smooth_flat_start() + rho.log_lambda_smooth.len())
+                .contains(&idx)
+            {
+                format!("smooth{}", idx - rho.smooth_flat_start())
+            } else {
+                format!("ard@{idx}")
+            }
+        };
+        let tol = |a: f64| 1.0e-5 + 1.0e-4 * a.abs();
+        let mut worst: Option<(usize, usize, f64, f64, f64)> = None;
+        let mut n_fail = 0usize;
         for &j in &coords {
             // `H[i,j] = ∂g[i]/∂ρ_j`: perturb ρ_j, read the i-th component.
             let fd_col = (gradient_at(1.0, j) - gradient_at(-1.0, j)) / (2.0 * h);
             for &i in &coords {
-                let analytic_ij = analytic[[i, j]];
+                let a_ij = analytic[[i, j]];
                 let fd_ij = fd_col[i];
-                if (analytic_ij - fd_ij).abs() >= 1.0e-5 + 1.0e-4 * analytic_ij.abs() {
-                    eprintln!(
-                        "full Hessian [{i},{j}] mismatch (perturb rho_{j}, component g[{i}]): \
-                         analytic={analytic_ij:.9e} fd={fd_ij:.9e} \
-                         abs_err={:.3e}",
-                        (analytic_ij - fd_ij).abs()
-                    );
-                }
-                assert!(
-                    (analytic_ij - fd_ij).abs() < 1.0e-5 + 1.0e-4 * analytic_ij.abs(),
-                    "full exact fixed-stratum Hessian [{i},{j}] mismatch: \
-                     analytic={analytic_ij}, fd={fd_ij}"
+                let abs_err = (a_ij - fd_ij).abs();
+                let rel = if a_ij.abs() > 0.0 {
+                    abs_err / a_ij.abs()
+                } else {
+                    abs_err
+                };
+                let fail = abs_err >= tol(a_ij);
+                eprintln!(
+                    "full H[{i}={},{j}={}] analytic={a_ij:.9e} fd={fd_ij:.9e} abs={abs_err:.3e} rel={rel:.3e}{}",
+                    label(i),
+                    label(j),
+                    if fail { "  <== FAIL" } else { "" }
                 );
+                if fail {
+                    n_fail += 1;
+                    if worst.is_none_or(|(_, _, _, _, wr)| rel > wr) {
+                        worst = Some((i, j, a_ij, fd_ij, rel));
+                    }
+                }
             }
         }
+        assert!(
+            n_fail == 0,
+            "full exact fixed-stratum Hessian: {n_fail} pair(s) mismatch (full grid above; H[i,j]=∂g[i]/∂ρ_j). Worst: {worst:?}"
+        );
     }
 
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
