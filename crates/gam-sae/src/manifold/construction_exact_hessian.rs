@@ -967,6 +967,130 @@ impl SaeManifoldTerm {
         Ok(c_by_flat)
     }
 
+    /// PATH C (#2253) CH5 — the ρ-derivative of the EXACT-minus-majorizer
+    /// stationarity correction, `∂(ΔC)/∂ρ_i` where `ΔC = A − B`
+    /// ([`Self::apply_exact_hessian_minus_b`]), keyed by flat coordinate. The IFT
+    /// sensitivity `∂a/∂ρ_i = A⁺(∂Γ/∂ρ_i − (∂A/∂ρ_i)a)` differentiates the EXACT
+    /// stationarity Hessian `A = B + ΔC`, not the majorized solver operator `B = H`
+    /// (`penalty_curvature_operators_by_flat` = `∂B/∂ρ`). So the `M_i·a` term must
+    /// use `∂A/∂ρ_i = ∂B/∂ρ_i + ∂(ΔC)/∂ρ_i` — this map supplies the second piece.
+    ///
+    /// Both deltas are degree-one in their ρ (so `∂(ΔC)/∂ρ_i` is the delta itself)
+    /// and mirror `apply_exact_hessian_minus_b`'s deltas exactly:
+    /// * periodic ARD: `w_row·min(α cos κt, 0)` (the negative-part remainder the
+    ///   `max(·,0)` majorizer drops) on the coord slot, ALL rows — nonzero only on
+    ///   the inactive half `cos κt < 0`. This is the term the ARD-perturbed
+    ///   `H3[ard,·]` rows need (the transposed smooth-perturbed rows, where
+    ///   `∂A = ∂B`, are already exact).
+    /// * softmax sparse: the exact entropy Hessian minus the Gershgorin majorizer
+    ///   on the row's logit block (dense, off-diagonal + diagonal), `∝ λ_sparse`.
+    /// Smooth is unmajorized (`ΔC` has no smooth part), so its delta is zero and it
+    /// is absent from the map. Covered config only (softmax, dense row layout).
+    pub(crate) fn exact_stationarity_penalty_derivative_delta_by_flat(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+    ) -> Result<std::collections::BTreeMap<usize, Array2<f64>>, String> {
+        let total_t = cache.delta_t_len();
+        let dim = total_t + cache.k;
+        let k_atoms = self.k_atoms();
+        let ard_precisions = self.validated_ard_precisions(rho)?;
+        let row_w = self.row_loss_weights.as_deref();
+        let ard_axis_periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(|coord| coord.effective_axis_periods())
+            .collect();
+        let softmax_delta: Option<(usize, f64)> = match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } if k_atoms > 1 => {
+                let inv_tau = 1.0 / temperature;
+                match rho.sparse_flat_index() {
+                    Some(sparse_flat) => Some((
+                        sparse_flat,
+                        rho.lambda_sparse()? * sparsity * inv_tau * inv_tau,
+                    )),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        let mut deltas: std::collections::BTreeMap<usize, Array2<f64>> =
+            std::collections::BTreeMap::new();
+        let mut assignments = Array1::<f64>::zeros(k_atoms);
+        for row in 0..self.n_obs() {
+            let base = cache.row_offsets[row];
+            self.assignment.try_assignments_row_into(
+                row,
+                assignments
+                    .as_slice_mut()
+                    .expect("assignment scratch is contiguous"),
+            )?;
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            let w_row = row_w.map_or(1.0, |w| w[row]);
+            // Softmax entropy-minus-majorizer delta on the logit block.
+            if let Some((sparse_flat, scale)) = softmax_delta {
+                let assignment_dim = self.assignment.assignment_coord_dim();
+                let a_soft = assignments
+                    .as_slice()
+                    .expect("softmax assignments row must be contiguous");
+                let m = softmax_majorizer_log_mean(a_soft);
+                let c = deltas
+                    .entry(sparse_flat)
+                    .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+                for (a, va) in vars.iter().enumerate() {
+                    let SaeLocalRowVar::Logit { atom: ka } = *va else {
+                        continue;
+                    };
+                    if ka >= assignment_dim {
+                        continue;
+                    }
+                    for (b, vb) in vars.iter().enumerate() {
+                        let SaeLocalRowVar::Logit { atom: kb } = *vb else {
+                            continue;
+                        };
+                        if kb >= assignment_dim {
+                            continue;
+                        }
+                        let h_entropy =
+                            softmax_dense_entropy_hessian_entry(a_soft, ka, kb, m, scale);
+                        let delta = if ka == kb {
+                            h_entropy
+                                - active_softmax_gershgorin_majorizer_entry(a_soft, ka, m, scale)
+                        } else {
+                            h_entropy
+                        };
+                        c[[base + a, base + b]] += w_row * delta;
+                    }
+                }
+            }
+            // Periodic-ARD negative-part remainder on the coord slots.
+            for (a, va) in vars.iter().enumerate() {
+                let SaeLocalRowVar::Coord { atom, axis } = *va else {
+                    continue;
+                };
+                if rho.log_ard[atom].is_empty() {
+                    continue;
+                }
+                let alpha = ard_precisions[atom][axis];
+                let t_val = self.assignment.coords[atom].row(row)[axis];
+                let neg = ArdAxisPrior::eval(alpha, t_val, ard_axis_periods[atom][axis])
+                    .negative_hessian_remainder();
+                if neg != 0.0 {
+                    let flat = rho.ard_flat_index(atom, axis);
+                    let c = deltas
+                        .entry(flat)
+                        .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+                    c[[base + a, base + a]] += w_row * neg;
+                }
+            }
+        }
+        Ok(deltas)
+    }
+
     /// PATH C (#2253) — the full joint arrow inverse `G = H⁻¹` (dim×dim),
     /// materialized column by column against each unit arrow basis vector and
     /// symmetrized. Shared by ch4 and ch5's small-dense (circle-mint scale)
@@ -1597,6 +1721,10 @@ impl SaeManifoldTerm {
         let g = self.materialize_joint_inverse(cache, &solver)?;
         let h_bd = self.materialize_block_diag_t_inverse(cache);
         let operators = self.penalty_curvature_operators_by_flat(rho, cache)?;
+        // `∂A/∂ρᵢ = ∂H/∂ρᵢ (operators) + ∂(ΔC)/∂ρᵢ (this delta)`. The twist uses
+        // `∂H/∂ρ` (G = H⁻¹), but the IFT `Mᵢ·a` term differentiates the EXACT
+        // stationarity Hessian A, so it adds this delta.
+        let exact_deltas = self.exact_stationarity_penalty_derivative_delta_by_flat(rho, cache)?;
 
         // Effective adjoint Γ_eff = Γ_joint − Γ_tt + 2∇R, assembled EXACTLY as
         // the gradient does (construction_exact_hessian.rs analytic assembler).
@@ -1685,9 +1813,13 @@ impl SaeManifoldTerm {
             // dΓ_eff/dρ_i = dΓ_joint − dΓ_tt (+2∇R' folded into joint above).
             let mut d_gamma = flatten(&d_gamma_joint);
             d_gamma -= &flatten(&d_gamma_tt);
-            // resid_i = dΓ_eff/dρ_i − M_i·a.
-            let m_i_a = m_i.dot(&a_flat);
-            let resid_i = &d_gamma - &m_i_a;
+            // resid_i = dΓ_eff/dρ_i − (∂A/∂ρ_i)·a, with ∂A/∂ρ_i = M_i + ΔC-delta_i
+            // (the IFT term differentiates the EXACT A, not the majorized H).
+            let mut a_op_i_a = m_i.dot(&a_flat);
+            if let Some(delta_i) = exact_deltas.get(&i) {
+                a_op_i_a += &delta_i.dot(&a_flat);
+            }
+            let resid_i = &d_gamma - &a_op_i_a;
 
             for &j in &flats {
                 let b_j = &b_flat[&j];
