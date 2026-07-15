@@ -475,7 +475,9 @@ mod tests {
                 |_atom, take| {
                     let mut selected = Array2::zeros((take.len(), contribution.ncols()));
                     for (out_row, &source_row) in take.iter().enumerate() {
-                        selected.row_mut(out_row).assign(&contribution.row(source_row));
+                        selected
+                            .row_mut(out_row)
+                            .assign(&contribution.row(source_row));
                     }
                     Ok(selected)
                 },
@@ -592,10 +594,8 @@ mod tests {
                 small.per_target[target_index].bits - large.per_target[target_index].bits;
             let observed_medium =
                 medium.per_target[target_index].bits - large.per_target[target_index].bits;
-            let tolerance = 1.0e-11
-                * (1.0
-                    + large.per_target[target_index].bits.abs()
-                    + small_drift.abs());
+            let tolerance =
+                1.0e-11 * (1.0 + large.per_target[target_index].bits.abs() + small_drift.abs());
             assert!(
                 (observed_small - small_drift).abs() <= tolerance,
                 "target {target}: 256-row drift {observed_small:.17e} != derived \
@@ -613,8 +613,7 @@ mod tests {
         // above the legitimate finite-n spectral drift.
         let legacy_dictionary =
             |rows: usize| 0.5 * dictionary_params as f64 * (rows as f64).log2() / rows as f64;
-        let legacy_swing =
-            (legacy_dictionary(256) - legacy_dictionary(FULL_ROWS)).abs();
+        let legacy_swing = (legacy_dictionary(256) - legacy_dictionary(FULL_ROWS)).abs();
         assert!((legacy_swing - 60.75).abs() < 1.0e-12);
         assert!(legacy_swing > 1000.0 * small_drift);
     }

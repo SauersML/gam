@@ -1126,3 +1126,106 @@ fn birth_prescreen_selects_same_winner_as_unscreened_eq4_race() {
         "the race must contain both a winner and a loser; eq4_adv={eq4_adv:?}"
     );
 }
+
+/// #2233 Task 2 — the per-kind crossover table over the six zoo geometry
+/// classes. The theorem's split: a kind with ambient span exactly `d+1`
+/// (circle, sphere, Möbius, swiss sheet) wins Eq-4 bits through SUPPORT (+
+/// residual) ONLY — its code coefficient `s−d−1` is zero — while a kind with
+/// `s > d+1` (torus `s=4,d=2`, helix `s=3,d=1`) carries a strictly positive
+/// CODE saving on top.
+///
+/// The code term is the only λ̂-dependent piece of the closed form, so the
+/// class split has a sharp empirical discriminator that needs no term
+/// plumbing: the predicted bits of a support-only kind are INVARIANT to the
+/// birth direction's signal variance, while torus/helix strictly increase in
+/// it by exactly `(s−d−1)·ρN·Δ(½log₂(1+λ̂/δ))`.
+#[test]
+fn per_kind_crossover_table_splits_code_vs_support_classes_2233() {
+    // Shared budget: N=2000 tokens, P=8 channels, G=1024 atoms, L0=32 active,
+    // firing rate ρ=0.05, noise floor δ=1.
+    let (n_tokens, p_out, g_dict, l0, rho, noise) = (2000.0, 8usize, 1024usize, 32.0, 0.05, 1.0);
+    let log2_n = n_tokens.log2();
+    let log2_g_over_l0 = (g_dict as f64 / l0).log2();
+
+    // (label, span s, intrinsic d, basis m): circle/sphere/torus use the
+    // production `curved_topology_for_span` geometry (2H+1 harmonics, sphere
+    // chart 7, torus (2H+1)² at H=2); Möbius and the swiss sheet share the
+    // sphere-chart budget at their common (s=3, d=2); the helix is a d=1
+    // closed curve winding through 3 ambient directions on the circle basis.
+    let kinds: [(&str, f64, usize, usize); 6] = [
+        ("circle", 2.0, 1, 3),
+        ("sphere", 3.0, 2, 7),
+        ("mobius", 3.0, 2, 7),
+        ("swiss_sheet", 3.0, 2, 7),
+        ("torus", 4.0, 2, 25),
+        ("helix", 3.0, 1, 3),
+    ];
+
+    let prescreen = |span: f64, d: usize, m: usize, signal_var: f64| BirthMdlPrescreen {
+        rho,
+        span,
+        intrinsic_dim: d,
+        basis_size: m,
+        signal_var,
+        noise_floor: noise,
+        n_tokens,
+        p_out,
+        g_dict,
+        l0,
+    };
+
+    for &(label, span, d, m) in &kinds {
+        let code_coefficient = span - d as f64 - 1.0;
+        let low = predicted_birth_dl_bits(&prescreen(span, d, m, 3.0));
+        let high = predicted_birth_dl_bits(&prescreen(span, d, m, 300.0));
+        let support_only_value = rho * n_tokens * (span - 1.0) * log2_g_over_l0
+            - (m as f64 - span) * p_out as f64 * 0.5 * log2_n;
+        match label {
+            // s = d+1: SUPPORT-only class. No code saving at any signal level,
+            // and the closed form reduces exactly to support − dictionary.
+            "circle" | "sphere" | "mobius" | "swiss_sheet" => {
+                assert!(
+                    code_coefficient.abs() < 1e-12,
+                    "{label}: span {span} with d={d} must sit exactly at s=d+1"
+                );
+                assert!(
+                    (high - low).abs() < 1e-9,
+                    "{label} is support-only; predicted bits must be invariant \
+                     to signal variance (low={low}, high={high})"
+                );
+                assert!(
+                    (low - support_only_value).abs() < 1e-9,
+                    "{label}: support-only closed form mismatch: got {low}, \
+                     expected {support_only_value}"
+                );
+            }
+            // s > d+1: torus and helix carry a strictly positive CODE term.
+            "torus" | "helix" => {
+                assert!(
+                    code_coefficient >= 1.0 - 1e-12,
+                    "{label}: span {span} with d={d} must have s−d−1 ≥ 1"
+                );
+                let rate_low = scalar_rate_bits(3.0, noise);
+                let rate_high = scalar_rate_bits(300.0, noise);
+                let expected_gain = code_coefficient * rho * n_tokens * (rate_high - rate_low);
+                assert!(
+                    high - low > 0.0,
+                    "{label} must strictly gain code bits with signal variance \
+                     (low={low}, high={high})"
+                );
+                assert!(
+                    ((high - low) - expected_gain).abs() < 1e-9,
+                    "{label}: code gain {} != (s−d−1)·ρN·Δrate {}",
+                    high - low,
+                    expected_gain
+                );
+                assert!(
+                    low - support_only_value > 0.0,
+                    "{label} must beat its own support-only baseline even at \
+                     modest signal (code term strictly positive)"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}

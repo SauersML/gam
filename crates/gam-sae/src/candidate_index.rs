@@ -556,8 +556,7 @@ impl SaeCandidateIndex {
                 // wrong side of its hyperplane) to reach the nearest neighbour
                 // bucket — standard multi-probe LSH, biggest recall win.
                 let flip_bit = lowest_margin_bit(&margins);
-                let neighbour =
-                    canonical_signature(sig ^ (1u64 << flip_bit), bank.nrows());
+                let neighbour = canonical_signature(sig ^ (1u64 << flip_bit), bank.nrows());
                 if let Some(ids) = table.get(&neighbour) {
                     seen.extend(ids.iter().copied());
                 }
@@ -1155,7 +1154,11 @@ fn normalize_in_place(v: &mut Array1<f64>) {
 /// the metric has — at the cost of one bit of table discrimination (bucket
 /// occupancy doubles), which the exact alignment rescore absorbs.
 fn canonical_signature(sig: u64, bits: usize) -> u64 {
-    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mask = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     let complement = (!sig) & mask;
     sig.min(complement)
 }

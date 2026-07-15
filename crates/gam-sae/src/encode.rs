@@ -2364,10 +2364,8 @@ impl EncodeAtlas {
         // available — refuse rather than fabricate. Every Duchon chart is emitted
         // UNCERTIFIED (`certified_radius = 0`, no amortized predictor), so routing
         // skips it and every Duchon row flags for the exact multi-start encode.
-        let duchon_uncertifiable = matches!(
-            atom.basis_kind(),
-            crate::manifold::SaeAtomBasisKind::Duchon
-        );
+        let duchon_uncertifiable =
+            matches!(atom.basis_kind(), crate::manifold::SaeAtomBasisKind::Duchon);
         for c in 0..centers.nrows() {
             let center = centers.row(c).to_owned();
             let nominal_radius = radii[c];
@@ -4268,9 +4266,7 @@ pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Ar
     use crate::manifold::SaeAtomBasisKind::*;
     let d = atom.latent_dim();
     match atom.basis_kind() {
-        Periodic | Torus | KleinBottle => {
-            regular_product_grid(d, resolution, 0.0, 1.0, false)
-        }
+        Periodic | Torus | KleinBottle => regular_product_grid(d, resolution, 0.0, 1.0, false),
         // Cylinder `S¹ × ℝ`: axis 0 is the periodic circle `[0, 1)` (no
         // endpoint, like the harmonic axes); axis 1 is the unbounded line,
         // covered by a strided unit box `[-0.5, 0.5]` about the origin (like the
@@ -4281,13 +4277,7 @@ pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Ar
         Mobius if d == 2 => mobius_chart_center_grid(resolution),
         Mobius => regular_product_grid(d, resolution, -1.0, 1.0, true),
         Sphere | ProjectivePlane if d == 2 => sphere_latlon_grid(resolution),
-        Linear
-        | Sphere
-        | ProjectivePlane
-        | Duchon
-        | EuclideanPatch
-        | Poincare
-        | Precomputed(_)
+        Linear | Sphere | ProjectivePlane | Duchon | EuclideanPatch | Poincare | Precomputed(_)
         | FiniteSet => {
             // Unbounded / non-compact latents (and the finite-set index axis): a
             // strided cover of a unit box about the origin per axis. The certified
@@ -4486,18 +4476,8 @@ pub(crate) fn chart_region(
         }
         // Cylinder has no radial kernel block (it is a harmonic × polynomial
         // tensor, not a Duchon radial basis), so it needs no radial r_min/r_max.
-        Periodic
-        | Sphere
-        | Torus
-        | ProjectivePlane
-        | KleinBottle
-        | Cylinder
-        | Mobius
-        | Linear
-        | EuclideanPatch
-        | Poincare
-        | Precomputed(_)
-        | FiniteSet => region,
+        Periodic | Sphere | Torus | ProjectivePlane | KleinBottle | Cylinder | Mobius | Linear
+        | EuclideanPatch | Poincare | Precomputed(_) | FiniteSet => region,
     }
 }
 

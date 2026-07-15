@@ -116,9 +116,7 @@ use gam_terms::latent::{LatentIdMode, LatentManifold};
 use gam_terms::structure::anova_atom::{
     CarveReport, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
 };
-use opt::{
-    BracketedRootConfig, FirstOrderSample, ObjectiveEvalError, find_root_bracketed,
-};
+use opt::{BracketedRootConfig, FirstOrderSample, ObjectiveEvalError, find_root_bracketed};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Per-row soft-assignment mass below which an atom is treated as INACTIVE on
@@ -3197,9 +3195,7 @@ fn evaluate_torus_metric_profile(
         Some(weights),
         &fit,
     )
-    .map_err(|error| {
-        ObjectiveEvalError::fatal(format!("torus metric REML gradient: {error}"))
-    })?;
+    .map_err(|error| ObjectiveEvalError::fatal(format!("torus metric REML gradient: {error}")))?;
     let coordinate_gradient = penalty_gradient
         .iter()
         .zip(penalty_derivative.iter())
@@ -3231,14 +3227,7 @@ fn optimize_torus_metric_coordinate(
         ));
     }
     let evaluate = |coordinate: f64| {
-        evaluate_torus_metric_profile(
-            phi,
-            target,
-            weights,
-            per_axis_order,
-            family,
-            coordinate,
-        )
+        evaluate_torus_metric_profile(phi, target, weights, per_axis_order, family, coordinate)
     };
     let lower_sample = evaluate(lower)
         .map_err(|error| format!("{family:?} torus lower-endpoint profile: {error}"))?;
@@ -3250,10 +3239,7 @@ fn optimize_torus_metric_coordinate(
     // Scale stationarity by the derivative itself, not by the absolute REML
     // score: adding a constant to an objective must not change which point is
     // considered converged.
-    let gradient_scale = lower_gradient
-        .abs()
-        .max(upper_gradient.abs())
-        .max(1.0);
+    let gradient_scale = lower_gradient.abs().max(upper_gradient.abs()).max(1.0);
     let gradient_tolerance = position_tolerance * gradient_scale;
 
     // This is a scalar constrained problem, so its exact first-order KKT
@@ -6991,8 +6977,7 @@ mod tests {
                 // observation perturbation so this is an evidence comparison,
                 // not an attempt to assign REML to a zero-residual sample.
                 for output in 0..target.ncols() {
-                    target[[row, output]] +=
-                        (((row + 1) * (output + 3)) as f64).sin() / n as f64;
+                    target[[row, output]] += (((row + 1) * (output + 3)) as f64).sin() / n as f64;
                 }
             }
         }

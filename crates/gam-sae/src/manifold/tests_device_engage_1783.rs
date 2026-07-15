@@ -340,8 +340,7 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
         Ok(Some(_)) => {
             let started = std::time::Instant::now();
             let max_q = sys.row_dims.iter().copied().max().unwrap_or(0);
-            let ainv_per_trial_bytes =
-                sys.rows.len() * max_q * max_q * std::mem::size_of::<f64>();
+            let ainv_per_trial_bytes = sys.rows.len() * max_q * max_q * std::mem::size_of::<f64>();
             let frame = gam_solve::arrow_schur::prepare_sae_resident_frame(&sys, &options, None)
                 .expect("resident-frame preparation must not fail")
                 .expect("live CUDA runtime must admit the production resident frame");

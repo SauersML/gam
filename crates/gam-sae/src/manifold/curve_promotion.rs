@@ -326,8 +326,7 @@ pub fn propose_curve_promotion(
         l0: ctx.l0,
     });
 
-    let accept =
-        crossover_prescreen_bits > 0.0 && verdict.recommend_curl && dl_new < dl_old;
+    let accept = crossover_prescreen_bits > 0.0 && verdict.recommend_curl && dl_new < dl_old;
 
     Ok(Some(CurvePromotionProposal {
         block: community.block_id,
@@ -374,7 +373,11 @@ fn gram_schmidt(atoms: ArrayView2<'_, f64>) -> Vec<Array1<f64>> {
 fn participation_ratio(spectrum: &[f64]) -> f64 {
     let sum: f64 = spectrum.iter().map(|&e| e.max(0.0)).sum();
     let sum_sq: f64 = spectrum.iter().map(|&e| e.max(0.0) * e.max(0.0)).sum();
-    if sum_sq > 0.0 { (sum * sum) / sum_sq } else { 0.0 }
+    if sum_sq > 0.0 {
+        (sum * sum) / sum_sq
+    } else {
+        0.0
+    }
 }
 
 /// The curved topology `(intrinsic_dim d, basis_size m)` matched to an ambient

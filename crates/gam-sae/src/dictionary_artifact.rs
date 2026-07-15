@@ -241,9 +241,7 @@ fn residual_finite_gauge(topology: &AtomTopology, chart_canonicalized: bool) -> 
         AtomTopology::ProjectivePlane => {
             "PO(3): round-RP2 isometry residual + antipodal deck".to_string()
         }
-        AtomTopology::KleinBottle => {
-            "U(1)_theta x Z2: axial translation + Klein deck".to_string()
-        }
+        AtomTopology::KleinBottle => "U(1)_theta x Z2: axial translation + Klein deck".to_string(),
     }
 }
 

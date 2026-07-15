@@ -335,9 +335,7 @@ impl ArdAxisPrior {
                 let midpoint = from + 0.5 * delta;
                 let midpoint_phase = kappa * midpoint;
                 let half_delta_phase = 0.5 * kappa * delta;
-                (2.0 * alpha / (kappa * kappa))
-                    * midpoint_phase.sin()
-                    * half_delta_phase.sin()
+                (2.0 * alpha / (kappa * kappa)) * midpoint_phase.sin() * half_delta_phase.sin()
             }
         }
     }

@@ -399,7 +399,6 @@ impl OuterObjective for SaeSupportOuterObjective {
         }
         Ok(SeedOutcome::NoSlot)
     }
-
 }
 
 /// Select topology-grouped smoothing strengths through the shared generic
@@ -657,7 +656,9 @@ mod tests {
         );
 
         let h = 1.0e-4;
-        let energy_scale = energy.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let energy_scale = energy
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
         let mut max_raw_gap = 0.0_f64;
         for g in 0..groups {
             let mut plus = base.clone();
@@ -733,7 +734,11 @@ mod tests {
         let deviance_base = 2.0
             * objective
                 .term
-                .penalized_objective(objective.target.view(), &lambda_base, &objective.ard_precisions)
+                .penalized_objective(
+                    objective.target.view(),
+                    &lambda_base,
+                    &objective.ard_precisions,
+                )
                 .expect("penalized objective");
         let energy = objective.penalty_energy_by_group(&lambda_base);
 
@@ -753,5 +758,4 @@ mod tests {
             );
         }
     }
-
 }

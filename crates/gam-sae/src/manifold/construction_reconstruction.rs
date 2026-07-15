@@ -173,7 +173,7 @@ pub fn reconstruct_persisted_atom_set(
         if atom_coords.nrows() != n_rows {
             return Err(format!(
                 "reconstruct_persisted_atom_set: atom {atom_idx} coords rows {} != {n_rows}",
-                 atom_coords.nrows()
+                atom_coords.nrows()
             ));
         }
         if atom_coords.ncols() != plan.latent_dim() {

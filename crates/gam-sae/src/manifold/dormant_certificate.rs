@@ -392,9 +392,10 @@ fn slot_projector_residual(
             let mut next_dot = 0.0_f64;
             let mut cross_dot = 0.0_f64;
             for column in 0..previous.ncols() {
-                previous_dot +=
-                    previous[[base + left, column]] as f64 * previous[[base + right, column]] as f64;
-                next_dot += next[[base + left, column]] as f64 * next[[base + right, column]] as f64;
+                previous_dot += previous[[base + left, column]] as f64
+                    * previous[[base + right, column]] as f64;
+                next_dot +=
+                    next[[base + left, column]] as f64 * next[[base + right, column]] as f64;
                 cross_dot +=
                     previous[[base + left, column]] as f64 * next[[base + right, column]] as f64;
             }
@@ -406,11 +407,7 @@ fn slot_projector_residual(
     let scale = previous_norm2 + next_norm2;
     let distance2 = (scale - 2.0 * overlap).max(0.0);
     if scale == 0.0 {
-        if distance2 == 0.0 {
-            0.0
-        } else {
-            f64::INFINITY
-        }
+        if distance2 == 0.0 { 0.0 } else { f64::INFINITY }
     } else {
         (distance2 / scale).sqrt()
     }
@@ -469,10 +466,7 @@ pub fn certify_dormant_capacity(
         ));
     }
     active_residuals.validate()?;
-    for (name, margins) in [
-        ("birth", birth_margins),
-        ("structural", structural_margins),
-    ] {
+    for (name, margins) in [("birth", birth_margins), ("structural", structural_margins)] {
         if margins.iter().any(|m| !m.is_finite()) {
             return Err(format!(
                 "certify_dormant_capacity: every {name} margin must be finite"
@@ -502,13 +496,21 @@ pub fn certify_dormant_capacity(
     // dormant slots is computed too, but exclusively for reporting.
     let mut active_frame_residual = 0.0_f64;
     for &slot in &occupancy.active {
-        active_frame_residual = active_frame_residual
-            .max(slot_projector_residual(frames, replayed_frames, slot, frame_dim));
+        active_frame_residual = active_frame_residual.max(slot_projector_residual(
+            frames,
+            replayed_frames,
+            slot,
+            frame_dim,
+        ));
     }
     let mut dormant_frame_residual = 0.0_f64;
     for &slot in &occupancy.dormant {
-        dormant_frame_residual = dormant_frame_residual
-            .max(slot_projector_residual(frames, replayed_frames, slot, frame_dim));
+        dormant_frame_residual = dormant_frame_residual.max(slot_projector_residual(
+            frames,
+            replayed_frames,
+            slot,
+            frame_dim,
+        ));
     }
     let active_residual = active_frame_residual.max(active_residuals.worst());
     let active_kkt_ok = active_residual <= tolerance;
@@ -828,10 +830,9 @@ mod tests {
         woken.effective_rows[7] = 32.0;
         let woken = classify_occupancy(&woken.effective_rows, woken.threshold)
             .expect("identifiability threshold is positive");
-        let open = certify_dormant_capacity(inputs(
-            &decoder, &decoder, &occupancy, &woken, &[-1.0],
-        ))
-        .expect("well-formed certificate inputs");
+        let open =
+            certify_dormant_capacity(inputs(&decoder, &decoder, &occupancy, &woken, &[-1.0]))
+                .expect("well-formed certificate inputs");
         assert!(!open.ledger_recurs);
         assert_eq!(
             open.verdict,

@@ -437,7 +437,8 @@ impl SaeAssignmentState {
             if meta.retraction.is_all_euclidean() {
                 current = meta.manifold.retract(current.view(), step.view());
             } else {
-                meta.retraction.retract(&mut current.view_mut(), step.view());
+                meta.retraction
+                    .retract(&mut current.view_mut(), step.view());
             }
             self.coords[row][cursor..end]
                 .copy_from_slice(current.as_slice().expect("retraction is contiguous"));
@@ -926,8 +927,7 @@ mod tests {
             .expect("coordinate step retracts");
         assert_eq!(state.coords_for_slot(0, 0), &[1.5, -1.0]);
         assert!(
-            (state.coords_for_slot(0, 1)[0] - (-std::f64::consts::PI + 0.25)).abs()
-                < 1.0e-15,
+            (state.coords_for_slot(0, 1)[0] - (-std::f64::consts::PI + 0.25)).abs() < 1.0e-15,
             "explicit circle retraction must wrap the Euclidean-declared atom",
         );
     }

@@ -331,8 +331,7 @@ impl<'a> RowChannels<'a> {
                 return 0.0;
             }
             let diagonal = if coord_atom == logit_atom { 1.0 } else { 0.0 };
-            let coefficient =
-                z[coord_atom] * (diagonal - z[logit_atom]) * self.inv_tau * root;
+            let coefficient = z[coord_atom] * (diagonal - z[logit_atom]) * self.inv_tau * root;
             coefficient * self.input.decoded_first[coord_slot * p + c]
         } else if atom_a == atom_b {
             if !self.input.active_atoms[atom_a] {
@@ -371,7 +370,9 @@ impl<'a> RowChannels<'a> {
         let z = &self.input.gate_values;
         let mut scalar = if is_logit {
             let diagonal = if target == source_atom { 1.0 } else { 0.0 };
-            z[target] * (diagonal - z[source_atom]) * self.inv_tau
+            z[target]
+                * (diagonal - z[source_atom])
+                * self.inv_tau
                 * self.input.beta_basis_values[border]
         } else if source_atom == target {
             z[target] * self.input.beta_basis_first[slot * n_beta + border]
@@ -570,9 +571,7 @@ impl ResidentRowJetHandle {
         };
         #[cfg(not(target_os = "linux"))]
         if path == SaeRowJetPath::Device {
-            return Err(
-                "resident arrow device handle requested on a non-Linux host".to_string()
-            );
+            return Err("resident arrow device handle requested on a non-Linux host".to_string());
         }
         Ok(Self {
             n_atoms,
@@ -602,7 +601,11 @@ impl ResidentRowJetHandle {
         self.path
     }
 
-    fn validate_tile(&self, rows: &[SaeSoftmaxRowJetInput], residual: &[f64]) -> Result<(), String> {
+    fn validate_tile(
+        &self,
+        rows: &[SaeSoftmaxRowJetInput],
+        residual: &[f64],
+    ) -> Result<(), String> {
         if rows.len() > self.capacity_rows {
             return Err(format!(
                 "resident arrow tile has {} rows, exceeding the resident capacity {}",
@@ -629,7 +632,12 @@ impl ResidentRowJetHandle {
         }
         for (index, row) in rows.iter().enumerate() {
             row.validate()?;
-            let shape = (row.n_atoms, row.n_primaries(), row.out_dim, row.n_beta_borders());
+            let shape = (
+                row.n_atoms,
+                row.n_primaries(),
+                row.out_dim,
+                row.n_beta_borders(),
+            );
             if shape != (self.n_atoms, self.q, self.p, self.n_beta) {
                 return Err(format!(
                     "resident arrow row {index} shape {shape:?} != handle shape ({}, {}, {}, {})",
@@ -666,9 +674,10 @@ impl ResidentRowJetHandle {
             SaeRowJetPath::Device => {
                 #[cfg(target_os = "linux")]
                 {
-                    let residency = self.device.as_mut().ok_or_else(|| {
-                        "resident arrow device path has no residency".to_string()
-                    })?;
+                    let residency = self
+                        .device
+                        .as_mut()
+                        .ok_or_else(|| "resident arrow device path has no residency".to_string())?;
                     residency
                         .accumulate(rows, residual, self.inv_tau, curvature)
                         .map_err(|error| error.to_string())
@@ -809,16 +818,16 @@ pub fn arrow_blocks_from_materialized_tower(
             for b in 0..q {
                 let mut acc = 0.0;
                 for c in 0..p {
-                    acc += first(row, a, c) * first(row, b, c)
-                        + scale * (r[c] * second(row, a, b, c));
+                    acc +=
+                        first(row, a, c) * first(row, b, c) + scale * (r[c] * second(row, a, b, c));
                 }
                 out.h_tt[(row * q + a) * q + b] = acc;
             }
             for j in 0..n_beta {
                 let mut acc = 0.0;
                 for c in 0..p {
-                    acc += first(row, a, c) * beta(row, j, c)
-                        + scale * (r[c] * mixed(row, a, j, c));
+                    acc +=
+                        first(row, a, c) * beta(row, j, c) + scale * (r[c] * mixed(row, a, j, c));
                 }
                 out.h_tb[(row * q + a) * n_beta + j] = acc;
             }
@@ -1284,16 +1293,56 @@ mod device {
 
             // Uploads write into the PERSISTENT buffers: no per-call allocation.
             upload_f64(&stream, &z, &mut self.z, "resident arrow htod gates")?;
-            upload_i32(&stream, &active, &mut self.active, "resident arrow htod active")?;
+            upload_i32(
+                &stream,
+                &active,
+                &mut self.active,
+                "resident arrow htod active",
+            )?;
             upload_i32(&stream, &kind, &mut self.kind, "resident arrow htod kinds")?;
             upload_i32(&stream, &atom, &mut self.atom, "resident arrow htod atoms")?;
-            upload_f64(&stream, &decoded, &mut self.decoded, "resident arrow htod decoded")?;
-            upload_f64(&stream, &d1, &mut self.d1, "resident arrow htod decoded first")?;
-            upload_f64(&stream, &d2, &mut self.d2, "resident arrow htod decoded second")?;
-            upload_f64(&stream, &sqrt_w, &mut self.sqrt_w, "resident arrow htod weights")?;
-            upload_f64(&stream, residual, &mut self.residual, "resident arrow htod residual")?;
-            upload_i32(&stream, &beta_atom, &mut self.beta_atom, "resident arrow htod beta atoms")?;
-            upload_f64(&stream, &beta_phi, &mut self.beta_phi, "resident arrow htod beta basis")?;
+            upload_f64(
+                &stream,
+                &decoded,
+                &mut self.decoded,
+                "resident arrow htod decoded",
+            )?;
+            upload_f64(
+                &stream,
+                &d1,
+                &mut self.d1,
+                "resident arrow htod decoded first",
+            )?;
+            upload_f64(
+                &stream,
+                &d2,
+                &mut self.d2,
+                "resident arrow htod decoded second",
+            )?;
+            upload_f64(
+                &stream,
+                &sqrt_w,
+                &mut self.sqrt_w,
+                "resident arrow htod weights",
+            )?;
+            upload_f64(
+                &stream,
+                residual,
+                &mut self.residual,
+                "resident arrow htod residual",
+            )?;
+            upload_i32(
+                &stream,
+                &beta_atom,
+                &mut self.beta_atom,
+                "resident arrow htod beta atoms",
+            )?;
+            upload_f64(
+                &stream,
+                &beta_phi,
+                &mut self.beta_phi,
+                "resident arrow htod beta basis",
+            )?;
             upload_f64(
                 &stream,
                 &beta_first,
@@ -1511,9 +1560,7 @@ mod device {
                 blocks.h_bb.copy_from_slice(&root[nb..]);
             }
 
-            stream
-                .synchronize()
-                .gpu_ctx("resident arrow synchronize")?;
+            stream.synchronize().gpu_ctx("resident arrow synchronize")?;
             Ok(blocks)
         }
     }
@@ -1676,9 +1723,8 @@ mod tests {
             let fused = handle
                 .accumulate_arrow_blocks(&rows, &residual, curvature)
                 .expect("fused arrow blocks");
-            let reference =
-                arrow_blocks_from_materialized_tower(&rows, &residual, 1.3, curvature)
-                    .expect("materialized-tower reference");
+            let reference = arrow_blocks_from_materialized_tower(&rows, &residual, 1.3, curvature)
+                .expect("materialized-tower reference");
             assert_blocks_close(&fused, &reference, 1.0e-12, &format!("{curvature:?}"));
         }
     }
@@ -1699,7 +1745,10 @@ mod tests {
             .accumulate_arrow_blocks(&rows, &residual, ArrowCurvature::ExactNewton)
             .expect("exact-newton blocks");
         assert_eq!(gn.g_t, exact.g_t, "the score must not depend on curvature");
-        assert_eq!(gn.h_bb, exact.h_bb, "β is linear: H_ββ carries no curvature");
+        assert_eq!(
+            gn.h_bb, exact.h_bb,
+            "β is linear: H_ββ carries no curvature"
+        );
         let htt_gap = gn
             .h_tt
             .iter()
@@ -1754,7 +1803,8 @@ mod tests {
             }
             for j in 0..nb {
                 for a in 0..q {
-                    expect_beta[j] += blocks.h_tb[(row * q + a) * nb + j] * direction.t[row * q + a];
+                    expect_beta[j] +=
+                        blocks.h_tb[(row * q + a) * nb + j] * direction.t[row * q + a];
                 }
             }
         }
@@ -1805,7 +1855,10 @@ mod tests {
             let second = resident
                 .accumulate_arrow_blocks(&rows, &residual, curvature)
                 .expect("device blocks (repeat)");
-            assert_eq!(first, second, "resident device reduction is not reproducible");
+            assert_eq!(
+                first, second,
+                "resident device reduction is not reproducible"
+            );
             assert_blocks_close(&first, &expected, 1.0e-12, &format!("device {curvature:?}"));
         }
     }
