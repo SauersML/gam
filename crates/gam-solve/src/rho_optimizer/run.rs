@@ -1876,6 +1876,87 @@ fn certify_outer_optimality_at_terminal_fidelity(
         }
     }
 
+    // Gradient-reproducibility floor (#2299 fully-saturated smooth). A
+    // stationarity certificate cannot resolve below the reproducibility of its
+    // own measuring instrument: at a rail-adjacent optimum (λ ~ 1e12, the term
+    // collapsed onto its penalty null space, edf saturated) the analytic
+    // gradient is a difference of enormous canceling log-det terms whose
+    // evaluation drifts run to run, so |Pg| measures round-off, not slope —
+    // observed as the SAME ρ returning |g| ∈ {2.5e-3 … 4.5e-2} across
+    // consecutive evaluations while the objective stays flat to 1e-7.
+    //
+    // Re-measure the gradient at the terminal ρ (twice) only when the
+    // certificate would otherwise refuse on |Pg| alone. The pairwise spread of
+    // the projected-gradient measurements is the instrument's demonstrated
+    // noise at this point: a REAL residual gradient reproduces (spread ≈ 0, no
+    // widening — this cannot mask genuine descent), while cancellation noise
+    // decorrelates (spread ~ |Pg|). Certification additionally requires the
+    // re-measured objective to agree to the same relative floor the cost-stall
+    // guard used, and the PSD gate below still applies unchanged.
+    if projected_grad_norm > stationarity_bound {
+        const GRADIENT_REPRODUCIBILITY_WIDENING: f64 = 2.0;
+        let objective_tol = config
+            .rel_cost_tolerance
+            .unwrap_or(config.tolerance * 1.0e-2)
+            .max(COST_STALL_REL_TOL_FLOOR)
+            * (1.0 + evaluation.cost.abs());
+        let mut measurements = vec![projected_gradient.clone()];
+        let mut cost_drift = 0.0_f64;
+        let mut remeasure_ok = true;
+        for _ in 0..2 {
+            match obj.eval_with_order(&result.rho, OuterEvalOrder::ValueAndGradient) {
+                Ok(re)
+                    if re.cost.is_finite()
+                        && layout
+                            .validate_gradient_len(
+                                &re.gradient,
+                                "outer certificate reproducibility gradient",
+                            )
+                            .is_ok()
+                        && re.gradient.iter().all(|value| value.is_finite()) =>
+                {
+                    cost_drift = cost_drift.max((re.cost - evaluation.cost).abs());
+                    measurements.push(project_gradient_vector(
+                        &result.rho,
+                        &re.gradient,
+                        Some(&bounds),
+                    ));
+                }
+                _ => {
+                    remeasure_ok = false;
+                    break;
+                }
+            }
+        }
+        if remeasure_ok && cost_drift <= objective_tol {
+            let mut spread = 0.0_f64;
+            for i in 0..measurements.len() {
+                for j in (i + 1)..measurements.len() {
+                    let diff = (&measurements[i] - &measurements[j])
+                        .iter()
+                        .map(|v| v * v)
+                        .sum::<f64>()
+                        .sqrt();
+                    spread = spread.max(diff);
+                }
+            }
+            let repro_bound = GRADIENT_REPRODUCIBILITY_WIDENING * spread;
+            if repro_bound.is_finite()
+                && repro_bound > stationarity_bound
+                && projected_grad_norm <= repro_bound
+            {
+                log::info!(
+                    "[CERTIFICATE] {context}: gradient-reproducibility floor widened the \
+                     stationarity bound to {repro_bound:.3e} (|Pg|={projected_grad_norm:.3e}, \
+                     measured same-ρ gradient spread {spread:.3e} over {} evaluations, \
+                     cost drift {cost_drift:.3e} ≤ tol {objective_tol:.3e})",
+                    measurements.len(),
+                );
+                stationarity_bound = repro_bound;
+            }
+        }
+    }
+
     let certificate = OuterCriterionCertificate {
         stationarity: OuterStationarityCertificate::AnalyticGradient {
             grad_norm,

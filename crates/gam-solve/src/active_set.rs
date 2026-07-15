@@ -1837,9 +1837,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 // #979 CTN faces). Decide in existence form instead: does ANY
                 // λ ≥ 0 on the active rows close stationarity?
                 let gathered = gather_linear_constraint_rows(constraints, &active)?;
-                if let Some((_lambda, projected)) =
-                    nonnegative_cone_multipliers(&gathered.a, &g_cur)
-                {
+                if let Some((_, projected)) = nonnegative_cone_multipliers(&gathered.a, &g_cur) {
                     let closure = projected.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
                     let closure_rel = closure / gradient_inf_norm(&g_cur).max(1.0);
                     if closure <= ACTIVE_SET_KKT_STATIONARITY_TOL
