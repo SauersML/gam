@@ -15,7 +15,6 @@ include = [
     "/src/**/*.pest",
     "/bench/cargo_benches/**/*.rs",
     "/build.rs",
-    "/build_support/derivative_policy.rs",
     "/Cargo.toml",
     "/rust-toolchain.toml",
     "/README.md",

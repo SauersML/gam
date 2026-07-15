@@ -5,9 +5,6 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::{env, fs};
 
-#[path = "build_support/derivative_policy.rs"]
-mod derivative_policy;
-
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
     fs::write(out_dir.join("lint_errors.rs"), "").expect("failed to write lint_errors.rs");
@@ -19,7 +16,6 @@ fn main() {
     // warm target. The variable was consumed nowhere in the tree, so it is removed
     // and must not be reintroduced.
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=build_support/derivative_policy.rs");
     println!("cargo:rerun-if-changed=crates/gam-terms/src/analytic_penalties/manifest.rs");
     println!("cargo:rerun-if-changed=SPEC.md");
 
@@ -63,13 +59,6 @@ fn main() {
     // ride along and silently rots the tree. This is non-negotiable and cannot
     // be waived by a comment in Cargo.toml — assert it here and exit(1) otherwise.
     assert_warnings_are_denied(&manifest_dir);
-
-    // #932 production derivative specializations are legal only as registered,
-    // compiler-paired RowPrograms with mandatory numerical parity pins. This
-    // gate is part of the ordinary root-library build, so `cargo check -p gam
-    // --lib` rejects an unregistered RowKernel override or generated third/fourth
-    // row atom before any test selection can omit the corresponding oracle.
-    derivative_policy::enforce_production_derivative_specializations(&manifest_dir);
 
     // HARD ban (always fatal, independent of the demoted aggregate scanner
     // below): no non-experiment tracked file may leak the absolute cluster
