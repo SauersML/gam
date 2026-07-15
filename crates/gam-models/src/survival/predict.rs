@@ -449,19 +449,10 @@ pub fn predict_latent_window_survival(
         });
     }
     if time_block.beta.len() != prepared.time_design_exit.ncols() {
-        // #2301: the built-in Weibull linear time basis dropped its redundant
-        // constant column (2 → 1 columns). A model saved BEFORE that change has a
-        // 2-coefficient linear time block that no longer matches the rebuilt
-        // 1-column basis; refuse typed-and-named rather than misindexing the stale
-        // constant coefficient as the shape.
-        let stale_weibull_basis = time_build.basisname == "linear"
-            && time_block.beta.len() == prepared.time_design_exit.ncols() + 1;
-        let hint = if stale_weibull_basis {
-            " (this looks like a model saved before the #2301 Weibull time-basis \
-             change, which removed the redundant constant column; refit the model)"
-        } else {
-            ""
-        };
+        let hint = stale_weibull_time_basis_hint(
+            &time_build.basisname,
+            time_block.beta.len() == prepared.time_design_exit.ncols() + 1,
+        );
         return Err(SurvivalPredictError::IncompatibleSchema {
             reason: format!(
                 "latent-window time/design mismatch: beta has {} coefficients but design has {} columns{hint}",
@@ -2766,9 +2757,13 @@ fn evaluate_marginal_slope_row(
         .as_ref()
         .map_or(0, |runtime| runtime.beta.len());
     if beta_time.len() != p_time_base + p_timewiggle {
+        let hint = stale_weibull_time_basis_hint(
+            &row_time.basisname,
+            beta_time.len() == p_time_base + p_timewiggle + 1,
+        );
         return Err(SurvivalPredictError::IncompatibleSchema {
             reason: format!(
-                "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}",
+                "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}{hint}",
                 beta_time.len(),
                 p_time_base,
                 p_timewiggle
@@ -3011,9 +3006,10 @@ fn evaluate_rp_row_with_beta(
     let p_cov = cov_row.len();
     let p = p_time + p_timewiggle + p_cov;
     if beta.len() != p {
+        let hint = stale_weibull_time_basis_hint(&row_time.basisname, beta.len() == p + 1);
         return Err(SurvivalPredictError::IncompatibleSchema {
             reason: format!(
-                "survival RP coefficient mismatch: beta has {} entries but design has {} columns",
+                "survival RP coefficient mismatch: beta has {} entries but design has {} columns{hint}",
                 beta.len(),
                 p
             ),
@@ -4391,9 +4387,13 @@ pub fn build_saved_survival_marginal_slope_predictor(
         .as_ref()
         .map_or(0, |runtime| runtime.beta.len());
     if beta_time.len() != p_time_base + p_timewiggle {
+        let hint = stale_weibull_time_basis_hint(
+            &row_time.basisname,
+            beta_time.len() == p_time_base + p_timewiggle + 1,
+        );
         return Err(SurvivalPredictError::IncompatibleSchema {
             reason: format!(
-                "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}",
+                "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}{hint}",
                 beta_time.len(),
                 p_time_base,
                 p_timewiggle
@@ -4521,6 +4521,21 @@ pub fn build_saved_survival_marginal_slope_predictor(
     };
 
     Ok((predictor, pred_input, predictor_fit))
+}
+
+/// Typed hint appended to a survival time-coefficient / design mismatch when the
+/// saved model looks like a pre-#2301 linear Weibull fit. The built-in Weibull
+/// linear time basis dropped its redundant constant column (2 → 1 columns), so a
+/// model saved before that change carries exactly one extra time coefficient
+/// against the rebuilt 1-column basis. Naming it keeps the load path from
+/// silently misindexing the stale constant coefficient as the shape.
+fn stale_weibull_time_basis_hint(basisname: &str, extra_time_coefficient: bool) -> &'static str {
+    if basisname == "linear" && extra_time_coefficient {
+        " (this looks like a model saved before the #2301 Weibull time-basis \
+         change, which removed the redundant constant column; refit the model)"
+    } else {
+        ""
+    }
 }
 
 #[cfg(test)]
