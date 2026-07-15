@@ -558,8 +558,7 @@ pub fn project_stationarity_residual_on_constraint_cone(
     // solve is an exact fallback: `projected = residual − Aᵀλ*` with
     // `λ* = argmin_{λ≥0} ‖residual − Aᵀλ‖`. Reconstruction is exact by
     // construction here, so no cross-check gate is needed.
-    nonnegative_cone_multipliers(active_a, residual)
-        .map(|(lambda, projected)| (projected, lambda))
+    nonnegative_cone_multipliers(active_a, residual).map(|(lambda, projected)| (projected, lambda))
 }
 
 fn moreau_projection_via_primal_qp(
@@ -569,13 +568,10 @@ fn moreau_projection_via_primal_qp(
     let p = residual.len();
 
     let m = active_a.nrows();
-    let constraints = LinearInequalityConstraints::new(
-        active_a.clone(),
-        Array1::<f64>::zeros(m),
-    )
-    .ok()?
-    .canonicalized()
-    .ok()?;
+    let constraints = LinearInequalityConstraints::new(active_a.clone(), Array1::<f64>::zeros(m))
+        .ok()?
+        .canonicalized()
+        .ok()?;
 
     // Moreau projection onto the tangent cone is the strictly convex primal
     // QP
@@ -1607,9 +1603,7 @@ fn fallback_projected_gradient_direction(
         let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
         let slack = (constraints.a.row(i).dot(x) - constraints.b[i]) * inv;
         let ai_d = constraints.a.row(i).dot(&tangent_direction) * inv;
-        if let Some(candidate) =
-            active_set_boundary_hit_step_fraction(slack, ai_d, alpha)
-        {
+        if let Some(candidate) = active_set_boundary_hit_step_fraction(slack, ai_d, alpha) {
             alpha = candidate;
         }
     }
@@ -1719,9 +1713,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
     // can enter the working set only if it is actually tight at this solve's
     // primal point; the ordinary ratio test rediscovers it when reached.
     if let Some(hint) = active_hint.as_mut() {
-        hint.retain(|&idx| {
-            idx < m && scaled_constraint_slack(&x, constraints, idx) <= tol_active
-        });
+        hint.retain(|&idx| idx < m && scaled_constraint_slack(&x, constraints, idx) <= tol_active);
     }
 
     let has_active_hint = active_hint
@@ -2095,10 +2087,7 @@ impl<'a> ConstraintSetOps<'a> {
     /// their cached norm and bound while retaining the original row indexing.
     /// This avoids materializing the potentially enormous tight submatrix and
     /// keeps returned active ids in the parent [`ConstraintSet`] coordinates.
-    fn tangent_face(
-        set: &'a ConstraintSet,
-        beta: &Array1<f64>,
-    ) -> Result<Self, EstimationError> {
+    fn tangent_face(set: &'a ConstraintSet, beta: &Array1<f64>) -> Result<Self, EstimationError> {
         let mut ops = Self::new(set, 0.0)?;
         let values = ops.values(beta)?;
         for row in 0..ops.nrows() {
@@ -2248,8 +2237,7 @@ pub fn constraint_set_rows_tight_at_point(
         let constraint_row = gathered.a.row(position);
         let norm = constraint_row.dot(&constraint_row).sqrt();
         if norm > 0.0 {
-            let scaled_slack =
-                (constraint_row.dot(beta) - gathered.b[position]) / norm;
+            let scaled_slack = (constraint_row.dot(beta) - gathered.b[position]) / norm;
             if scaled_slack <= ACTIVE_SET_WORKING_FACE_TOL {
                 tight.push(row);
             }
@@ -2276,9 +2264,7 @@ pub fn project_stationarity_residual_on_constraint_set(
         return None;
     }
     match set {
-        ConstraintSet::KhatriRaoCone(cone)
-            if cone.p_left() != 1 || cone.coupled_rows() != &[0] =>
-        {
+        ConstraintSet::KhatriRaoCone(cone) if cone.p_left() != 1 || cone.coupled_rows() != &[0] => {
             // Each coupled response row occupies a disjoint `p_cov` slice,
             // and the projection Hessian is identity. The global projection is
             // therefore the exact direct sum of small row projections. Solving
@@ -2293,9 +2279,7 @@ pub fn project_stationarity_residual_on_constraint_set(
                 let end = start + p_cov;
                 let local_residual = residual.slice(s![start..end]).to_owned();
                 let local_beta = beta.slice(s![start..end]).to_owned();
-                let local_set = ConstraintSet::KhatriRaoCone(
-                    cone.single_coupled_slot(slot).ok()?,
-                );
+                let local_set = ConstraintSet::KhatriRaoCone(cone.single_coupled_slot(slot).ok()?);
                 let row_start = slot * n;
                 let row_end = row_start + n;
                 let local_seed: Vec<usize> = seed_active
@@ -2311,9 +2295,7 @@ pub fn project_stationarity_residual_on_constraint_set(
                         &local_set,
                         &local_seed,
                     )?;
-                projected
-                    .slice_mut(s![start..end])
-                    .assign(&local_projected);
+                projected.slice_mut(s![start..end]).assign(&local_projected);
                 active.extend(local_active.into_iter().map(|row| row_start + row));
             }
             Some((projected, active))
@@ -2345,9 +2327,7 @@ pub fn project_stationarity_residual_on_constraint_set(
                         &block.set,
                         &local_seed,
                     )?;
-                projected
-                    .slice_mut(s![start..end])
-                    .assign(&local_projected);
+                projected.slice_mut(s![start..end]).assign(&local_projected);
                 active.extend(local_active.into_iter().map(|row| row_offset + row));
                 row_offset = row_end;
             }
@@ -2404,19 +2384,103 @@ fn project_stationarity_residual_on_constraint_set_undivided(
     ) {
         log::warn!(
             "factored tangent-cone projection QP failed \
-             (p={p}, rows={}, seed_active_rows={}, residual_inf={:.6e}): {error}",
+             (p={p}, rows={}, seed_active_rows={}, residual_inf={:.6e}): {error}; \
+             attempting the direct Lawson-Hanson Moreau fallback on the final working face",
             ops.nrows(),
             seed_active.len(),
             residual
                 .iter()
                 .fold(0.0_f64, |scale, value| scale.max(value.abs())),
         );
-        return None;
+        return nnls_tangent_cone_projection_fallback(residual, beta, set, &active, seed_active);
     }
     if !array_is_finite(&tangent_direction) {
-        return None;
+        return nnls_tangent_cone_projection_fallback(residual, beta, set, &active, seed_active);
     }
     Some((-tangent_direction, active))
+}
+
+/// Exact Moreau fallback for the operator tangent-cone projection when the
+/// strict-convex primal QP refuses to certify. Degenerate faces defeat that
+/// QP's exit ritual: on the measured #979 CTN shape the projection pins a
+/// fully determined 24-row vertex in R^24 and the single-face multiplier
+/// reconstruction reports a phantom negative dual (KKT dual=1.2 with primal,
+/// complementarity, and stationarity all at round-off), so the caller fell
+/// back to the UNPROJECTED residual (1.447e3) and the convergence certificate
+/// could never fire. Projection onto a finitely generated cone IS
+/// nonnegative least squares (Moreau), so run Lawson-Hanson directly on the
+/// rows of the QP's final working face that are genuinely tight at `beta`:
+/// `projected = residual − Aᵀλ*` with `λ* = argmin_{λ≥0} ‖residual − Aᵀλ‖`.
+///
+/// Two properties make this sound as a certificate input:
+/// - Restricting the generators to a subset of the true tangent-cone rows can
+///   only ENLARGE the projected residual (the minimum runs over a smaller
+///   λ-support), so a lost row biases toward refusal, never acceptance.
+/// - Every generator is verified tight at `beta` before entering, so
+///   `projected ≈ 0` states exactly `residual = Aᵀλ*, λ* ≥ 0` over active
+///   rows — the existence form of the KKT stationarity condition.
+fn nnls_tangent_cone_projection_fallback(
+    residual: &Array1<f64>,
+    beta: &Array1<f64>,
+    set: &ConstraintSet,
+    face_rows: &[usize],
+    seed_active: &[usize],
+) -> Option<(Array1<f64>, Vec<usize>)> {
+    let mut candidates: Vec<usize> = Vec::with_capacity(face_rows.len() + seed_active.len());
+    for &row in face_rows.iter().chain(seed_active.iter()) {
+        if row < set.nrows() && !candidates.contains(&row) {
+            candidates.push(row);
+        }
+    }
+    if candidates.is_empty() {
+        // No tight generators: the local tangent cone is the whole space and
+        // the projected stationarity residual is the raw residual, exactly as
+        // the primal QP would report for an interior point.
+        return Some((residual.clone(), Vec::new()));
+    }
+    let candidate_rows = set.gather_rows(&candidates).ok()?;
+    // Same tightness band the tangent-face carrier itself uses, so the
+    // generator set matches the cone geometry the refused QP was solving.
+    let mut tight = Vec::with_capacity(candidates.len());
+    let mut tight_a = Vec::with_capacity(candidates.len());
+    for (position, &row) in candidates.iter().enumerate() {
+        let constraint_row = candidate_rows.a.row(position);
+        let norm = constraint_row.dot(&constraint_row).sqrt();
+        if norm > 0.0
+            && (constraint_row.dot(beta) - candidate_rows.b[position]) / norm
+                <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+        {
+            tight.push(row);
+            tight_a.push(position);
+        }
+    }
+    if tight.is_empty() {
+        return Some((residual.clone(), Vec::new()));
+    }
+    let mut generators = Array2::<f64>::zeros((tight.len(), residual.len()));
+    for (out_row, &position) in tight_a.iter().enumerate() {
+        generators
+            .row_mut(out_row)
+            .assign(&candidate_rows.a.row(position));
+    }
+    let (lambda, projected) = nonnegative_cone_multipliers(&generators, residual)?;
+    let active: Vec<usize> = tight
+        .iter()
+        .zip(lambda.iter())
+        .filter(|(_, &multiplier)| multiplier > 0.0)
+        .map(|(&row, _)| row)
+        .collect();
+    log::info!(
+        "tangent-cone Moreau fallback certified the projection the primal QP refused: \
+         face_rows={} tight_rows={} supported_rows={} projected_inf={:.6e}",
+        face_rows.len(),
+        tight.len(),
+        active.len(),
+        projected
+            .iter()
+            .fold(0.0_f64, |scale, value| scale.max(value.abs())),
+    );
+    Some((projected, active))
 }
 
 /// First-order escape from a tolerance-band working-set cycle for an operator
@@ -2551,9 +2615,7 @@ fn solve_newton_direction_with_constraint_set_impl(
     // any discarded row exactly when the iterate actually reaches it.
     if let Some(hint) = active_hint.as_mut() {
         hint.retain(|&idx| {
-            idx < m
-                && ops.norms[idx] > 0.0
-                && ops.scaled_slack(&values_x, idx) <= tol_active
+            idx < m && ops.norms[idx] > 0.0 && ops.scaled_slack(&values_x, idx) <= tol_active
         });
     }
 
@@ -2724,10 +2786,7 @@ fn solve_newton_direction_with_constraint_set_impl(
         // leaves the ordinary active-set loop in control. The trigger is a
         // mathematical no-progress event, not an iteration or wall-clock budget.
         let primal_step_norm = alpha.abs() * step_norm;
-        if allow_projected_gradient_fallback
-            && added_new_active
-            && primal_step_norm <= tol_step
-        {
+        if allow_projected_gradient_fallback && added_new_active && primal_step_norm <= tol_step {
             if let Some((fallback_direction, fallback_active)) =
                 fallback_projected_gradient_direction_with_constraint_set(
                     &x, &d_total, &g_cur, &active, ops,
@@ -2804,8 +2863,7 @@ fn solve_newton_direction_with_constraint_set_impl(
     let nnls_certified = worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL && !kkt_strong_ok && {
         let tight: Vec<usize> = (0..m)
             .filter(|&i| {
-                ops.norms[i] > 0.0
-                    && (values_x[i] - ops.bounds[i]) / ops.norms[i] <= tol_active
+                ops.norms[i] > 0.0 && (values_x[i] - ops.bounds[i]) / ops.norms[i] <= tol_active
             })
             .collect();
         match ops.set.gather_rows(&tight) {
@@ -3111,17 +3169,15 @@ mod tests {
         ACTIVE_SET_INTERIOR_SEED_MARGIN, ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintSet,
         ConstraintSetOps, LinearInequalityConstraints, active_set_boundary_hit_step_fraction,
         compute_constraint_kkt_diagnostics, constraint_set_rows_tight_at_point,
-        fallback_projected_gradient_direction, moreau_projection_via_primal_qp,
-        nonnegative_cone_multipliers,
-        fallback_projected_gradient_direction_with_constraint_set,
-        project_point_strictly_into_feasible_cone,
+        fallback_projected_gradient_direction,
+        fallback_projected_gradient_direction_with_constraint_set, moreau_projection_via_primal_qp,
+        nonnegative_cone_multipliers, project_point_strictly_into_feasible_cone,
         project_point_strictly_into_feasible_constraint_set,
         project_stationarity_residual_on_constraint_cone,
         project_stationarity_residual_on_constraint_set,
         rank_reduce_rows_pivoted_qr_with_dependence, record_active_working_set,
-        scaled_constraint_slack,
-        solve_newton_direction_with_linear_constraints_impl, solve_quadratic_with_constraint_set,
-        solve_quadratic_with_linear_constraints,
+        scaled_constraint_slack, solve_newton_direction_with_linear_constraints_impl,
+        solve_quadratic_with_constraint_set, solve_quadratic_with_linear_constraints,
     };
     use approx::assert_relative_eq;
     use gam_problem::KhatriRaoConeConstraints;
@@ -3163,14 +3219,9 @@ mod tests {
         let interior = array![1.0_f64];
         let dense = LinearInequalityConstraints::new(array![[1.0]], array![0.0])
             .expect("one-dimensional half-line");
-        let (dense_solution, dense_active) = solve_quadratic_with_linear_constraints(
-            &hessian,
-            &rhs,
-            &interior,
-            &dense,
-            Some(&[0]),
-        )
-        .expect("dense stale-face solve");
+        let (dense_solution, dense_active) =
+            solve_quadratic_with_linear_constraints(&hessian, &rhs, &interior, &dense, Some(&[0]))
+                .expect("dense stale-face solve");
         assert_relative_eq!(dense_solution[0], 2.0, epsilon = 1e-12);
         assert!(dense_active.is_empty());
 
@@ -3181,14 +3232,9 @@ mod tests {
         let stale_terminal_face = constraint_set_rows_tight_at_point(&operator, &interior, &[0])
             .expect("terminal face classification");
         assert!(stale_terminal_face.is_empty());
-        let (operator_solution, operator_active) = solve_quadratic_with_constraint_set(
-            &hessian,
-            &rhs,
-            &interior,
-            &operator,
-            Some(&[0]),
-        )
-        .expect("operator stale-face solve");
+        let (operator_solution, operator_active) =
+            solve_quadratic_with_constraint_set(&hessian, &rhs, &interior, &operator, Some(&[0]))
+                .expect("operator stale-face solve");
         assert_relative_eq!(operator_solution[0], 2.0, epsilon = 1e-12);
         assert!(operator_active.is_empty());
     }
@@ -3527,6 +3573,72 @@ mod tests {
         );
     }
 
+    /// #979 CTN plateau regression: when the operator-path primal projection
+    /// QP refuses a degenerate fully-pinned vertex (its single-face multiplier
+    /// attribution reports a phantom negative dual), the Lawson-Hanson Moreau
+    /// fallback must certify the projection instead of surrendering to the
+    /// unprojected residual — the measured 1.447e3 eternal plateau was exactly
+    /// `residual` returned raw because this fallback did not exist.
+    #[test]
+    fn nnls_fallback_certifies_pinned_degenerate_vertex_projection_979() {
+        // Four generators in R^3 (degenerate: a4 = a1 + a2), all tight at the
+        // origin. The stationarity residual is a nonnegative combination, so
+        // the projected residual is exactly zero.
+        let a = array![
+            [1.0_f64, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0],
+        ];
+        let b = array![0.0_f64, 0.0, 0.0, 0.0];
+        let set = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(a, b).expect("degenerate vertex cone"),
+        );
+        let beta = array![0.0_f64, 0.0, 0.0];
+        let residual = array![3.0_f64, 2.0, 0.0]; // = a1 + 2·a4
+        let (projected, active) =
+            nnls_tangent_cone_projection_fallback(&residual, &beta, &set, &[0, 1, 2, 3], &[0, 1])
+                .expect("fallback must solve the degenerate vertex");
+        let closure = projected.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(
+            closure <= 1e-9,
+            "residual is in the cone; projection must close to zero, got {closure:.3e}"
+        );
+        assert!(!active.is_empty(), "a supported face must be reported");
+
+        // A component outside the cone must survive the projection exactly.
+        let outside = array![1.0_f64, 0.0, -1.0];
+        let (projected_outside, _) =
+            nnls_tangent_cone_projection_fallback(&outside, &beta, &set, &[0, 1, 2, 3], &[])
+                .expect("fallback must solve the outside-component case");
+        assert_relative_eq!(projected_outside[0], 0.0, epsilon = 1e-9);
+        assert_relative_eq!(projected_outside[1], 0.0, epsilon = 1e-9);
+        assert_relative_eq!(projected_outside[2], -1.0, epsilon = 1e-9);
+    }
+
+    /// The fallback is a KKT certificate input, so a working-set row that is
+    /// NOT tight at `beta` must never enter the generator set: a residual
+    /// aligned with a slack row must stay unprojected rather than be absorbed
+    /// by a constraint that is not active at the iterate.
+    #[test]
+    fn nnls_fallback_excludes_rows_not_tight_at_beta() {
+        let a = array![[1.0_f64, 0.0], [0.0, 1.0]];
+        let b = array![0.0_f64, -1.0]; // row 1 has slack 1 at the origin
+        let set = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(a, b).expect("half-tight system"),
+        );
+        let beta = array![0.0_f64, 0.0];
+        let residual = array![0.0_f64, 1.0];
+        let (projected, active) =
+            nnls_tangent_cone_projection_fallback(&residual, &beta, &set, &[0, 1], &[])
+                .expect("fallback must solve the half-tight system");
+        assert_relative_eq!(projected[1], 1.0, epsilon = 1e-12);
+        assert!(
+            !active.contains(&1),
+            "slack row 1 must not appear in the certified face"
+        );
+    }
+
     #[test]
     fn cone_projection_preserves_original_multiplier_units_after_row_canonicalization() {
         let residual = array![2.0, -1.0];
@@ -3550,7 +3662,11 @@ mod tests {
         let reconstructed_unit = &residual - &unit_row.t().dot(&multiplier_unit);
         let reconstructed_scaled = &residual - &scaled_row.t().dot(&multiplier_scaled);
         assert_relative_eq!(reconstructed_unit[0], projected_unit[0], epsilon = 1e-12);
-        assert_relative_eq!(reconstructed_scaled[0], projected_scaled[0], epsilon = 1e-12);
+        assert_relative_eq!(
+            reconstructed_scaled[0],
+            projected_scaled[0],
+            epsilon = 1e-12
+        );
     }
 
     // #500: the KKT primal residual must be the *geometric* distance to the
