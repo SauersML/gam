@@ -974,8 +974,7 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
         let save_frailty = match (&frailty, solved.gaussian_frailty_sd) {
             (
                 gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
-                    scale:
-                        gam::families::survival::lognormal_kernel::FrailtyScale::Learned { .. },
+                    scale: gam::families::survival::lognormal_kernel::FrailtyScale::Learned { .. },
                 },
                 Some(learned),
             ) => gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {

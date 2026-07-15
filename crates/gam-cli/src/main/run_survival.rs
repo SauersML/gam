@@ -931,10 +931,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         )?;
         let baseline_hyper = match baseline_cfg.target {
             SurvivalBaselineTarget::Linear => SurvivalMarginalSlopeBaselineHyperSpec::Linear {
-                config: survival_marginal_slope_offset_baseline_config(
-                    &age_exit,
-                    &baseline_cfg,
-                ),
+                config: survival_marginal_slope_offset_baseline_config(&age_exit, &baseline_cfg),
             },
             _ => SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear {
                 chart: SurvivalMarginalSlopeFrozenOffsetChart::new(
@@ -1043,9 +1040,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 (
                     gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
                         scale:
-                            gam::families::survival::lognormal_kernel::FrailtyScale::Learned {
-                                ..
-                            },
+                            gam::families::survival::lognormal_kernel::FrailtyScale::Learned { .. },
                     },
                     Some(learned),
                 ) => gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {

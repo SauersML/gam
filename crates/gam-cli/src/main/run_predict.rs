@@ -976,110 +976,111 @@ pub(crate) fn run_predict_unified(
     // --- Compute prediction ---
     // Result-owned covariance provenance (#2296): each arm records what the
     // evaluator reports it actually used, never the CLI request.
-    let (eta, mean, se_opt, mean_lo, mean_hi, point_covariance, uncertainty_covariance) = if args.uncertainty && nonlinear {
-        // Curved inverse link + interval: the point prediction is a property of
-        // the model + inputs, never of whether an interval was requested (#398,
-        // #1787). The default (no-interval) path reports the posterior mean
-        // `E[link⁻¹(X·β)]`, so `--uncertainty` must add SE/bounds *on top of the
-        // same posterior-mean point*, not switch to the plug-in `link⁻¹(η̂)`.
-        // Mirror the Python FFI `(interval, uses_posterior_mean = true)` arm and
-        // the sibling `PosteriorMean` arm below: route through
-        // `predict_posterior_mean` with the requested confidence level, threading
-        // `covariance_mode` so the credible band keeps smoothing-parameter
-        // uncertainty (#812).
-        let pm_options = PosteriorMeanOptions {
-            confidence_level: Some(args.level),
-            covariance_mode: infer_covariance_mode(args.covariance_mode),
-            include_observation_interval: false,
-        };
-        let pm = predictor
-            .predict_posterior_mean(pred_input, &fit_for_predict, &pm_options)
-            .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
-        let point_covariance = Some(pm.point_covariance_source);
-        let uncertainty_covariance = pm.uncertainty_covariance_source;
-        (
-            pm.eta,
-            pm.mean,
-            // Response-scale `std_error` (#1536): the posterior-mean path
-            // populates `mean_standard_error` once a confidence level is
-            // requested (it is here). A missing column means the backend could
-            // not propagate coefficient uncertainty to the response scale
-            // (e.g. transformation models); the link-scale SE is not a
-            // substitute — dimensionally it is a different quantity — so
-            // refuse rather than emit a wrong column.
-            Some(pm.mean_standard_error.clone().ok_or_else(|| {
-                "posterior-mean prediction returned no response-scale standard error; \
+    let (eta, mean, se_opt, mean_lo, mean_hi, point_covariance, uncertainty_covariance) =
+        if args.uncertainty && nonlinear {
+            // Curved inverse link + interval: the point prediction is a property of
+            // the model + inputs, never of whether an interval was requested (#398,
+            // #1787). The default (no-interval) path reports the posterior mean
+            // `E[link⁻¹(X·β)]`, so `--uncertainty` must add SE/bounds *on top of the
+            // same posterior-mean point*, not switch to the plug-in `link⁻¹(η̂)`.
+            // Mirror the Python FFI `(interval, uses_posterior_mean = true)` arm and
+            // the sibling `PosteriorMean` arm below: route through
+            // `predict_posterior_mean` with the requested confidence level, threading
+            // `covariance_mode` so the credible band keeps smoothing-parameter
+            // uncertainty (#812).
+            let pm_options = PosteriorMeanOptions {
+                confidence_level: Some(args.level),
+                covariance_mode: infer_covariance_mode(args.covariance_mode),
+                include_observation_interval: false,
+            };
+            let pm = predictor
+                .predict_posterior_mean(pred_input, &fit_for_predict, &pm_options)
+                .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
+            let point_covariance = Some(pm.point_covariance_source);
+            let uncertainty_covariance = pm.uncertainty_covariance_source;
+            (
+                pm.eta,
+                pm.mean,
+                // Response-scale `std_error` (#1536): the posterior-mean path
+                // populates `mean_standard_error` once a confidence level is
+                // requested (it is here). A missing column means the backend could
+                // not propagate coefficient uncertainty to the response scale
+                // (e.g. transformation models); the link-scale SE is not a
+                // substitute — dimensionally it is a different quantity — so
+                // refuse rather than emit a wrong column.
+                Some(pm.mean_standard_error.clone().ok_or_else(|| {
+                    "posterior-mean prediction returned no response-scale standard error; \
                  this model cannot report --uncertainty SE columns"
-                    .to_string()
-            })?),
-            pm.mean_lower,
-            pm.mean_upper,
-            point_covariance,
-            uncertainty_covariance,
-        )
-    } else if args.uncertainty {
-        // Linear/identity link: plug-in `link⁻¹(η̂)` equals the posterior mean,
-        // so the full-uncertainty (`TransformEta`) path reports the same point as
-        // the default arm while adding the SE/band columns.
-        //
-        // `apply_bias_correction: false` is what makes that promise true: the
-        // point prediction is a property of the model + inputs, never of whether
-        // `--uncertainty` was requested (#398, #2115). Recentring η by
-        // `X·H⁻¹S(λ̂)β̂` here would silently shift the reported `eta`/`mean` the
-        // moment an interval is requested, diverging from the plain arm's
-        // `predict_plugin_response` and from the Python FFI parity arm
-        // (`geometry_ffi`, which pins the same `false`). Bias-aware coverage is
-        // already supplied by the smoothing-corrected covariance.
-        let options = PredictUncertaintyOptions {
-            confidence_level: args.level,
-            covariance_mode: infer_covariance_mode(args.covariance_mode),
-            mean_interval_method: MeanIntervalMethod::TransformEta,
-            includeobservation_interval: false,
-            apply_bias_correction: false,
-            ..PredictUncertaintyOptions::default()
-        };
-        let pred = predictor
-            .predict_full_uncertainty(pred_input, &fit_for_predict, &options)
-            .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
-        let uncertainty_covariance = Some(pred.covariance_source);
-        (
-            pred.eta,
-            pred.mean,
-            // `std_error` is the response-scale SE column, beside the
-            // response-scale mean/band — emit `mean_standard_error`, not the
-            // link-scale `eta_standard_error` (#1536).
-            Some(pred.mean_standard_error),
-            Some(pred.mean_lower),
-            Some(pred.mean_upper),
-            // Linear-link plug-in point consults no coefficient covariance.
-            None,
-            uncertainty_covariance,
-        )
-    } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
-        // Point-only curved-link prediction still needs the posterior mean
-        // `E[link⁻¹(X·β)]`, but it must not ask the posterior-mean backend for
-        // interval quantities. Passing a confidence level is the switch that
-        // populates `mean_standard_error`/bounds, and the CSV writer emits any
-        // populated optionals. Keep the default point estimate identical to the
-        // `--uncertainty` arm while leaving SE/band columns absent unless the
-        // user requested them (#2136).
-        let pm_options = PosteriorMeanOptions {
-            confidence_level: None,
-            covariance_mode: infer_covariance_mode(args.covariance_mode),
-            include_observation_interval: false,
-        };
-        let pm = predictor
-            .predict_posterior_mean(pred_input, &fit_for_predict, &pm_options)
-            .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
-        let point_covariance = Some(pm.point_covariance_source);
-        (pm.eta, pm.mean, None, None, None, point_covariance, None)
-    } else {
-        let pred = predictor
-            .predict_plugin_response(pred_input)
-            .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
+                        .to_string()
+                })?),
+                pm.mean_lower,
+                pm.mean_upper,
+                point_covariance,
+                uncertainty_covariance,
+            )
+        } else if args.uncertainty {
+            // Linear/identity link: plug-in `link⁻¹(η̂)` equals the posterior mean,
+            // so the full-uncertainty (`TransformEta`) path reports the same point as
+            // the default arm while adding the SE/band columns.
+            //
+            // `apply_bias_correction: false` is what makes that promise true: the
+            // point prediction is a property of the model + inputs, never of whether
+            // `--uncertainty` was requested (#398, #2115). Recentring η by
+            // `X·H⁻¹S(λ̂)β̂` here would silently shift the reported `eta`/`mean` the
+            // moment an interval is requested, diverging from the plain arm's
+            // `predict_plugin_response` and from the Python FFI parity arm
+            // (`geometry_ffi`, which pins the same `false`). Bias-aware coverage is
+            // already supplied by the smoothing-corrected covariance.
+            let options = PredictUncertaintyOptions {
+                confidence_level: args.level,
+                covariance_mode: infer_covariance_mode(args.covariance_mode),
+                mean_interval_method: MeanIntervalMethod::TransformEta,
+                includeobservation_interval: false,
+                apply_bias_correction: false,
+                ..PredictUncertaintyOptions::default()
+            };
+            let pred = predictor
+                .predict_full_uncertainty(pred_input, &fit_for_predict, &options)
+                .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
+            let uncertainty_covariance = Some(pred.covariance_source);
+            (
+                pred.eta,
+                pred.mean,
+                // `std_error` is the response-scale SE column, beside the
+                // response-scale mean/band — emit `mean_standard_error`, not the
+                // link-scale `eta_standard_error` (#1536).
+                Some(pred.mean_standard_error),
+                Some(pred.mean_lower),
+                Some(pred.mean_upper),
+                // Linear-link plug-in point consults no coefficient covariance.
+                None,
+                uncertainty_covariance,
+            )
+        } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
+            // Point-only curved-link prediction still needs the posterior mean
+            // `E[link⁻¹(X·β)]`, but it must not ask the posterior-mean backend for
+            // interval quantities. Passing a confidence level is the switch that
+            // populates `mean_standard_error`/bounds, and the CSV writer emits any
+            // populated optionals. Keep the default point estimate identical to the
+            // `--uncertainty` arm while leaving SE/band columns absent unless the
+            // user requested them (#2136).
+            let pm_options = PosteriorMeanOptions {
+                confidence_level: None,
+                covariance_mode: infer_covariance_mode(args.covariance_mode),
+                include_observation_interval: false,
+            };
+            let pm = predictor
+                .predict_posterior_mean(pred_input, &fit_for_predict, &pm_options)
+                .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
+            let point_covariance = Some(pm.point_covariance_source);
+            (pm.eta, pm.mean, None, None, None, point_covariance, None)
+        } else {
+            let pred = predictor
+                .predict_plugin_response(pred_input)
+                .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
 
-        (pred.eta, pred.mean, None, None, None, None, None)
-    };
+            (pred.eta, pred.mean, None, None, None, None, None)
+        };
 
     // --- Write CSV output ---
 
@@ -1232,7 +1233,8 @@ pub(crate) fn run_predict_spline_scan(
         mean.len(),
         covariance_provenance_note(
             None,
-            args.uncertainty.then_some(InferenceCovarianceMode::Conditional),
+            args.uncertainty
+                .then_some(InferenceCovarianceMode::Conditional),
         )
     );
     Ok(())
@@ -1309,7 +1311,8 @@ pub(crate) fn run_predict_residual_cascade(
         mean.len(),
         covariance_provenance_note(
             None,
-            args.uncertainty.then_some(InferenceCovarianceMode::Conditional),
+            args.uncertainty
+                .then_some(InferenceCovarianceMode::Conditional),
         )
     );
     Ok(())

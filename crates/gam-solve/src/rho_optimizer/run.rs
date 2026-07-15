@@ -2286,7 +2286,17 @@ pub(crate) fn run_outer(
                 .outer_inner_cap
                 .as_ref()
                 .map(TerminalInnerCapGuard::lift);
-            obj.reset();
+            // Reset is conditional on the cap contract, mirroring
+            // `certify_outer_optimality`'s own doctrine: REML/mixture
+            // objectives with a cap can hold a coarse search cache that must
+            // not be installed as terminal state, while uncapped stateful
+            // objectives (reactive-domain entries among them) retain the very
+            // state their evaluation at `result.rho` depends on — an
+            // unconditional reset here wiped it and made the certification
+            // evaluation non-finite on the reactive fixture.
+            if terminal_cap_guard.is_some() {
+                obj.reset();
+            }
             let terminal_installation = obj.finalize_outer_result(&result.rho, &result.plan_used);
             let terminal_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
             drop(terminal_cap_guard);

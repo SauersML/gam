@@ -1453,8 +1453,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
     // substring check could pass with reordered/renamed/duplicated columns.
     let header = pred_text.lines().next().unwrap_or("");
     assert_eq!(
-        header,
-        "eta,survival_prob,failure_prob,risk_score,std_error,mean_lower,mean_upper",
+        header, "eta,survival_prob,failure_prob,risk_score,std_error,mean_lower,mean_upper",
         "posterior-mean survival prediction header drifted"
     );
 }
@@ -1712,8 +1711,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "read prediction csv", e));
     let header = pred_text.lines().next().unwrap_or("");
     assert_eq!(
-        header,
-        "eta,survival_prob,failure_prob,risk_score,std_error,mean_lower,mean_upper",
+        header, "eta,survival_prob,failure_prob,risk_score,std_error,mean_lower,mean_upper",
         "posterior-mean marginal-slope prediction header drifted"
     );
 }

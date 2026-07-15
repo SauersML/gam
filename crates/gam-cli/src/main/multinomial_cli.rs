@@ -239,7 +239,8 @@ pub(crate) fn run_predict_multinomial(args: &PredictArgs) -> Result<(), String> 
         saved.class_levels.len(),
         covariance_provenance_note(
             None,
-            args.uncertainty.then_some(InferenceCovarianceMode::Conditional),
+            args.uncertainty
+                .then_some(InferenceCovarianceMode::Conditional),
         )
     );
     Ok(())
