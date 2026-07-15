@@ -7364,11 +7364,7 @@ mod unit_tests {
             .add(&theta_y_cubed)
     }
 
-    fn analytic_family_first<const K: usize, S: JetScalar<K>>(
-        x: &S,
-        y: &S,
-        theta: &S,
-    ) -> S {
+    fn analytic_family_first<const K: usize, S: JetScalar<K>>(x: &S, y: &S, theta: &S) -> S {
         let xy = x.mul(y);
         let exponential = theta.mul(&xy).exp();
         xy.mul(&exponential)
@@ -7376,16 +7372,10 @@ mod unit_tests {
             .add(&y.mul(y).mul(y).scale(-0.2))
     }
 
-    fn analytic_family_second<const K: usize, S: JetScalar<K>>(
-        x: &S,
-        y: &S,
-        theta: &S,
-    ) -> S {
+    fn analytic_family_second<const K: usize, S: JetScalar<K>>(x: &S, y: &S, theta: &S) -> S {
         let xy = x.mul(y);
         let exponential = theta.mul(&xy).exp();
-        xy.mul(&xy)
-            .mul(&exponential)
-            .add(&x.mul(x).scale(0.75))
+        xy.mul(&xy).mul(&exponential).add(&x.mul(x).scale(0.75))
     }
 
     fn assert_channel_close(actual: f64, expected: f64, channel: &str) {
@@ -7434,10 +7424,8 @@ mod unit_tests {
         let reference_x = Order2::variable(x0, 0);
         let reference_y = Order2::variable(y0, 1);
         let reference_theta = Order2::constant(theta0);
-        let expected_first =
-            analytic_family_first(&reference_x, &reference_y, &reference_theta);
-        let expected_second =
-            analytic_family_second(&reference_x, &reference_y, &reference_theta);
+        let expected_first = analytic_family_first(&reference_x, &reference_y, &reference_theta);
+        let expected_second = analytic_family_second(&reference_x, &reference_y, &reference_theta);
 
         assert_order2_channels(&actual.g, &expected_first, "family_first");
         assert_order2_channels(&actual.h, &expected_second, "family_second");

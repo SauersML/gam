@@ -493,6 +493,177 @@ pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
     Ok(x)
 }
 
+/// Log of the standardized one-sided truncated-Gaussian boundary factor for
+/// the constrained-LAML cone correction (gam#2306 §4).
+///
+/// For a constraint coordinate with Lagrange multiplier `μ ≥ 0`, normal
+/// curvature `h > 0`, and signed interior slack `s ≥ 0`, the exact 1-D
+/// boundary integral is
+///
+/// ```text
+///   ∫_{−s}^{∞} exp(−μ·u − ½·h·u²) du
+///     = √(2π/h) · exp(μ²/(2h)) · Φ(s·√h − μ/√h),
+/// ```
+///
+/// and the correction of the Laplace criterion RELATIVE to the unrestricted
+/// Gaussian factor `√(2π/h)` is, in the standardized arguments
+/// `a = μ/√h ≥ 0`, `b = s·√h ≥ 0`:
+///
+/// ```text
+///   corr(a, b) = a²/2 + ln Φ(b − a).
+/// ```
+///
+/// Key limits (the #2306 derivation's continuity contract): an activating
+/// row (`a = 0`, `b = 0`) contributes exactly `ln ½` (the half-Gaussian); a
+/// deep interior row (`b − a → ∞`) contributes `→ 0`, reducing byte-exactly
+/// to the unrestricted LAML; a hard-pushed active row (`a → ∞`, `b = 0`)
+/// follows the exact linear-decay limit `corr → −ln(a·√(2π))`.
+///
+/// Evaluated FUSED: computing `a²/2` and `ln Φ(b−a)` as two separate f64
+/// terms cancels catastrophically once `a ≳ 10⁴` (both grow like `±a²/2`).
+/// On the `b < a` branch the sum collapses analytically to
+/// `a·b − b²/2 + ln(erfcx((a−b)/√2)/2)`, which is cancellation-free (for an
+/// active row, `b = 0`, it is a single `erfcx` evaluation).
+#[must_use]
+pub fn cone_boundary_log_factor(mu_over_sqrt_h: f64, slack_times_sqrt_h: f64) -> f64 {
+    let a = mu_over_sqrt_h;
+    let b = slack_times_sqrt_h;
+    if !(a.is_finite() && b.is_finite()) || a < 0.0 || b < 0.0 {
+        return f64::NAN;
+    }
+    let xi = b - a;
+    if xi >= 0.0 {
+        // Interior-dominant: ln Φ(ξ) is a small negative number and a²/2 is
+        // exact; no cancellation between them (a ≤ b here, so a²/2 ≤ ab −
+        // b²/2 + O(1) stays modest whenever the factor itself is modest).
+        0.5 * a * a + normal_logcdf(xi)
+    } else {
+        // Active-dominant: fused analytic collapse of a²/2 + ln Φ(−(a−b)).
+        let u = (a - b) / std::f64::consts::SQRT_2;
+        a * b - 0.5 * b * b + (0.5 * erfcx_nonnegative(u)).ln()
+    }
+}
+
+/// [`cone_boundary_log_factor`] together with its exact partial derivatives
+/// in the standardized arguments — the pieces the outer ρ-gradient chains
+/// through `(μ̃, h̃, s)(ρ)` (gam#2306 §4 "the g-factors differentiate in
+/// closed form"). With `ξ = b − a` and the Mills ratio `λ(ξ) = φ(ξ)/Φ(ξ)`:
+///
+/// ```text
+///   ∂corr/∂a = a − λ(ξ),      ∂corr/∂b = λ(ξ).
+/// ```
+///
+/// Both are cancellation-free: `λ` comes from the shared `erfcx` evaluation,
+/// and at the linear-decay limit `a − λ(−a) → −1/a` exactly.
+#[must_use]
+pub fn cone_boundary_log_factor_and_derivatives(
+    mu_over_sqrt_h: f64,
+    slack_times_sqrt_h: f64,
+) -> (f64, f64, f64) {
+    let value = cone_boundary_log_factor(mu_over_sqrt_h, slack_times_sqrt_h);
+    let xi = slack_times_sqrt_h - mu_over_sqrt_h;
+    let (_, mills) = signed_probit_logcdf_and_mills_ratio(xi);
+    (value, mu_over_sqrt_h - mills, mills)
+}
+
+#[cfg(test)]
+mod cone_boundary_factor_tests {
+    use super::*;
+
+    /// Adaptive-free Simpson quadrature of the exact 1-D boundary integral
+    /// `∫_{−s}^{U} exp(−μu − ½hu²) du` on a truncation `U` chosen so the
+    /// discarded tail is below 1e-18 of the mass.
+    fn quadrature_log_relative_factor(mu: f64, h: f64, s: f64) -> f64 {
+        let upper = ((-mu / h) + 12.0 / h.sqrt()).max(-s + 12.0 / h.sqrt());
+        let lower = -s;
+        let n = 40_000usize;
+        let step = (upper - lower) / n as f64;
+        let f = |u: f64| (-mu * u - 0.5 * h * u * u).exp();
+        let mut acc = f(lower) + f(upper);
+        for i in 1..n {
+            let u = lower + step * i as f64;
+            acc += if i % 2 == 1 { 4.0 } else { 2.0 } * f(u);
+        }
+        let integral = acc * step / 3.0;
+        (integral / (2.0 * std::f64::consts::PI / h).sqrt()).ln()
+    }
+
+    /// The closed form must match direct quadrature of the defining integral
+    /// across active (s=0), interior (μ=0), and mixed regimes (gam#2306 §4).
+    #[test]
+    fn boundary_factor_matches_quadrature_across_regimes() {
+        let cases = [
+            (0.0, 1.0, 0.0),  // activating row: exactly ln ½
+            (0.0, 4.0, 0.0),  // curvature does not move the standardized value
+            (2.5, 1.0, 0.0),  // active with a real multiplier
+            (30.0, 9.0, 0.0), // deep linear-decay limit
+            (0.0, 1.0, 0.7),  // interior near-boundary
+            (0.0, 2.0, 4.0),  // interior far: → 0
+            (1.5, 0.5, 2.0),  // mixed multiplier + slack
+            (4.0, 2.0, 1.0),  // active-dominant mixed
+        ];
+        for &(mu, h, s) in &cases {
+            let a = mu / h.sqrt();
+            let b = s * h.sqrt();
+            let closed = cone_boundary_log_factor(a, b);
+            let quad = quadrature_log_relative_factor(mu, h, s);
+            assert!(
+                (closed - quad).abs() <= 1e-9 * (1.0 + quad.abs()),
+                "(μ={mu}, h={h}, s={s}): closed {closed} vs quadrature {quad}"
+            );
+        }
+        assert!(
+            (cone_boundary_log_factor(0.0, 0.0) - 0.5_f64.ln()).abs() < 1e-15,
+            "an activating row must contribute exactly the half-Gaussian ln ½"
+        );
+    }
+
+    /// The deep-active limit is the exact linear decay `corr → −ln(a·√(2π))`,
+    /// and the deep-interior limit vanishes — the two continuity anchors that
+    /// make the constrained criterion reduce to the unrestricted LAML away
+    /// from the boundary.
+    #[test]
+    fn boundary_factor_limits_are_exact() {
+        let a = 1.0e6;
+        let expected = -(a * (2.0 * std::f64::consts::PI).sqrt()).ln();
+        let got = cone_boundary_log_factor(a, 0.0);
+        assert!(
+            (got - expected).abs() <= 1e-9 * expected.abs(),
+            "deep-active: got {got}, expected {expected}"
+        );
+        let interior = cone_boundary_log_factor(0.0, 40.0);
+        assert!(
+            interior.abs() < 1e-300 || interior > -1e-12,
+            "deep-interior must vanish; got {interior}"
+        );
+    }
+
+    /// Closed-form partials against central finite differences of the value
+    /// (test-only FD; the production gradient consumes the analytic form).
+    #[test]
+    fn boundary_factor_derivatives_match_finite_differences() {
+        let cases = [(0.3, 0.0), (2.0, 0.5), (0.0, 1.2), (5.0, 0.2), (0.7, 3.0)];
+        let step = 1e-6;
+        for &(a, b) in &cases {
+            let (_, d_a, d_b) = cone_boundary_log_factor_and_derivatives(a, b);
+            let fd_a = (cone_boundary_log_factor(a + step, b)
+                - cone_boundary_log_factor(a - step, b))
+                / (2.0 * step);
+            let fd_b = (cone_boundary_log_factor(a, b + step)
+                - cone_boundary_log_factor(a, b - step))
+                / (2.0 * step);
+            assert!(
+                (d_a - fd_a).abs() <= 1e-6 * (1.0 + fd_a.abs()),
+                "(a={a}, b={b}): ∂a analytic {d_a} vs FD {fd_a}"
+            );
+            assert!(
+                (d_b - fd_b).abs() <= 1e-6 * (1.0 + fd_b.abs()),
+                "(a={a}, b={b}): ∂b analytic {d_b} vs FD {fd_b}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
