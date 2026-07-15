@@ -195,13 +195,35 @@ impl GpuRuntime {
             // cudarc's loader searches a disjoint set of names. Convert any such
             // panic into a typed probe failure so the runtime cleanly disables
             // CUDA and the CPU fallback proceeds without alarming stderr noise.
-            let device_count = catch_unwind(AssertUnwindSafe(CudaContext::device_count))
-                .map_err(|_| GpuError::DriverCallFailed {
-                    reason: "cudarc failed after the CUDA driver preflight succeeded".to_string(),
-                })?
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: err.to_string(),
-                })?;
+            let device_count = match catch_unwind(AssertUnwindSafe(CudaContext::device_count)) {
+                Err(_) => {
+                    return Err(GpuError::DriverCallFailed {
+                        reason: "cudarc failed after the CUDA driver preflight succeeded"
+                            .to_string(),
+                    });
+                }
+                Ok(Ok(count)) => count,
+                Ok(Err(error)) => {
+                    // `device_count` performs `cuInit`, so this is the first
+                    // moment the host's kernel driver actually answers. A
+                    // refusal that is an ENVIRONMENT fact (userland CUDA
+                    // libraries with no matching kernel driver — the container
+                    // / CPU-node case #2267 hit as
+                    // `CUDA_ERROR_SYSTEM_DRIVER_MISMATCH`) is typed absence:
+                    // Auto falls back to CPU, Required still refuses with the
+                    // same diagnosis. Anything else stays a probe fault.
+                    if let Some(absence) = absence_from_driver_init_error(&error) {
+                        let reason = absence.to_string();
+                        Self::record_cpu_reason(reason.clone());
+                        log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                        diagnostics::log_cuda_disabled(&reason);
+                        return Ok(GpuAvailability::Absent(absence));
+                    }
+                    return Err(GpuError::DriverCallFailed {
+                        reason: error.to_string(),
+                    });
+                }
+            };
             if device_count <= 0 {
                 let reason = "CUDA driver reported no devices";
                 Self::record_cpu_reason(reason);
@@ -391,6 +413,51 @@ impl GpuRuntime {
     fn record_cpu_reason(reason: impl Into<String>) {
         CPU_REASON.set(reason.into()).ok();
     }
+}
+
+/// Classify a CUDA driver-*initialization* failure that is a fact about the
+/// host environment rather than a fault of a device that was present.
+///
+/// `cuInit` is the first call the kernel driver answers. The codes below all
+/// mean "CUDA cannot work on this host as configured" — a loaded `libcuda`
+/// userland with a missing, older, or mismatched kernel driver, a linker stub
+/// standing in for the real library, or no attached device. Those states are
+/// [`GpuAbsence`] by this module's own definition (absence is an expected
+/// hardware/platform fact under `GpuPolicy::Auto`): container images and CPU
+/// nodes routinely carry CUDA userland libraries they cannot back with a
+/// driver, and a fit under Auto must fall back to CPU there instead of dying
+/// inside runtime resolution (#2267). Every other code — illegal address,
+/// out-of-memory, ECC faults, ... — still means "a CUDA installation that was
+/// present failed", and stays a probe fault.
+#[cfg(target_os = "linux")]
+fn absence_from_driver_init_error(error: &result::DriverError) -> Option<GpuAbsence> {
+    use sys::cudaError_enum as CudaErrorCode;
+    let classification = match error.0 {
+        CudaErrorCode::CUDA_ERROR_NO_DEVICE => {
+            return Some(GpuAbsence::NoDevice {
+                reason: format!("CUDA driver initialized but reports no attached device ({error})"),
+            });
+        }
+        CudaErrorCode::CUDA_ERROR_STUB_LIBRARY => {
+            "the loaded libcuda is a linker stub, not a real driver"
+        }
+        CudaErrorCode::CUDA_ERROR_INSUFFICIENT_DRIVER => {
+            "the installed CUDA kernel driver is older than this CUDA userland requires"
+        }
+        CudaErrorCode::CUDA_ERROR_SYSTEM_NOT_READY => {
+            "the CUDA system is not ready (kernel driver or fabric daemon not running)"
+        }
+        CudaErrorCode::CUDA_ERROR_SYSTEM_DRIVER_MISMATCH => {
+            "the CUDA userland libraries do not match the host kernel driver"
+        }
+        CudaErrorCode::CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE => {
+            "CUDA forward-compatibility mode is not supported on the visible device"
+        }
+        _ => return None,
+    };
+    Some(GpuAbsence::DriverUnavailable {
+        reason: format!("CUDA initialization refused: {classification} ({error})"),
+    })
 }
 
 /// Make the CUDA **runtime** API usable on `ordinal`.
@@ -732,6 +799,67 @@ mod policy_resolution_contract_tests {
             GpuError::RequiredDeviceUnavailable { ref reason }
                 if reason == "synthetic missing driver"
         ));
+    }
+
+    /// #2267: a CUDA userland whose kernel driver is missing or mismatched is
+    /// an environment fact. `cuInit`-boundary refusals of that class must be
+    /// typed absence — Auto proceeds on CPU, Required refuses with the same
+    /// diagnosis — never a probe fault that kills the fit under Auto.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn driver_mismatch_at_init_is_typed_absence_not_a_fault() {
+        for code in [
+            sys::cudaError_enum::CUDA_ERROR_SYSTEM_DRIVER_MISMATCH,
+            sys::cudaError_enum::CUDA_ERROR_INSUFFICIENT_DRIVER,
+            sys::cudaError_enum::CUDA_ERROR_STUB_LIBRARY,
+            sys::cudaError_enum::CUDA_ERROR_SYSTEM_NOT_READY,
+            sys::cudaError_enum::CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE,
+        ] {
+            let absence = absence_from_driver_init_error(&result::DriverError(code))
+                .unwrap_or_else(|| panic!("{code:?} is an environment fact, not a device fault"));
+            assert!(
+                matches!(absence, GpuAbsence::DriverUnavailable { .. }),
+                "{code:?} must classify as an unavailable driver"
+            );
+            let resolved =
+                GpuRuntime::resolve_availability(GpuPolicy::Auto, Ok(GpuAvailabilityRef::Absent(&absence)))
+                    .expect("Auto must accept driver-environment absence");
+            assert!(resolved.is_none(), "Auto must fall back to CPU on {code:?}");
+            let required_error = GpuRuntime::resolve_availability(
+                GpuPolicy::Required,
+                Ok(GpuAvailabilityRef::Absent(&absence)),
+            )
+            .expect_err("Required must refuse driver-environment absence");
+            assert!(
+                matches!(required_error, GpuError::RequiredDeviceUnavailable { .. }),
+                "Required must carry the environment diagnosis for {code:?}"
+            );
+        }
+        let no_device = absence_from_driver_init_error(&result::DriverError(
+            sys::cudaError_enum::CUDA_ERROR_NO_DEVICE,
+        ))
+        .expect("no attached device is an environment fact");
+        assert!(matches!(no_device, GpuAbsence::NoDevice { .. }));
+    }
+
+    /// Faults of a present CUDA installation must never be reclassified into
+    /// absence — the Auto policy is allowed to hide missing hardware, never a
+    /// broken device.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn present_device_faults_never_classify_as_absence() {
+        for code in [
+            sys::cudaError_enum::CUDA_ERROR_ILLEGAL_ADDRESS,
+            sys::cudaError_enum::CUDA_ERROR_OUT_OF_MEMORY,
+            sys::cudaError_enum::CUDA_ERROR_NOT_INITIALIZED,
+            sys::cudaError_enum::CUDA_ERROR_ECC_UNCORRECTABLE,
+            sys::cudaError_enum::CUDA_ERROR_UNKNOWN,
+        ] {
+            assert!(
+                absence_from_driver_init_error(&result::DriverError(code)).is_none(),
+                "{code:?} is a fault of present hardware and must stay a probe fault"
+            );
+        }
     }
 
     #[test]
