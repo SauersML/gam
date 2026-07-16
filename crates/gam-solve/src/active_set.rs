@@ -1979,7 +1979,15 @@ fn solve_newton_direction_with_linear_constraints_impl(
     // NNLS over the tight rows has exact complementarity by construction
     // (only tight rows enter) and exact dual feasibility, so stationarity
     // closure of its projected residual is the entire remaining KKT question.
-    let nnls_certified = worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL && !kkt_strong_ok && {
+    // Skip it only when the strong path already ACCEPTS (stationarity AND dual
+    // both certified): a strong-stationary point whose particular multiplier
+    // reconstruction has phantom negative duals is exactly the case this
+    // certificate exists for (#979 CTN cycle-95: stat=1.0e-8, comp=4.2e-8,
+    // dual=7.6e4 on a 41-row degenerate face — refused with the old
+    // `!kkt_strong_ok` gate although an NNLS λ ≥ 0 closes the point).
+    let strong_path_accepts =
+        kkt_strong_ok && working_kkt.dual_feasibility <= ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL;
+    let nnls_certified = worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL && !strong_path_accepts && {
         let tight: Vec<usize> = (0..m)
             .filter(|&i| scaled_constraint_slack(&x, constraints, i) <= tol_active)
             .collect();
@@ -2896,9 +2904,14 @@ fn solve_newton_direction_with_constraint_set_impl(
             || stationarity_rel <= ACTIVE_SET_KKT_STATIONARITY_TOL);
     // Existence-form KKT certificate over the tight rows — the operator twin
     // of the dense loop's `nnls_certified` gate (see there for the full
-    // rationale). Tightness is read off the batched values; only the tight
-    // rows are gathered densely, so the factored cone never materializes.
-    let nnls_certified = worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL && !kkt_strong_ok && {
+    // rationale, including why it must run whenever the strong path does not
+    // ACCEPT — strong stationarity with phantom negative duals is the target
+    // case, not an exemption). Tightness is read off the batched values; only
+    // the tight rows are gathered densely, so the factored cone never
+    // materializes.
+    let strong_path_accepts =
+        kkt_strong_ok && working_kkt.dual_feasibility <= ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL;
+    let nnls_certified = worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL && !strong_path_accepts && {
         let tight: Vec<usize> = (0..m)
             .filter(|&i| {
                 ops.norms[i] > 0.0 && (values_x[i] - ops.bounds[i]) / ops.norms[i] <= tol_active
