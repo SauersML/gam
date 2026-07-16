@@ -6,6 +6,16 @@ use gam_problem::{ConstraintSet, KhatriRaoConeConstraints};
 // ---------------------------------------------------------------------------
 
 impl CustomFamily for TransformationNormalFamily {
+    /// The direct-α chart makes `h'` affine in β, so the change-of-variables
+    /// Jacobian `−log h'` is a canonical self-concordant barrier (the `−½h²`
+    /// Gaussian kernel and the quadratic penalty are trivially self-concordant).
+    /// The inner Newton may therefore globalize with the self-concordant damped
+    /// step, which converges to the tiny-positive-`h'` interior optimum instead
+    /// of the trust-region metric's `1/h'²` linear-rate crawl (gam#979).
+    fn inner_objective_is_self_concordant(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         crate::block_layout::block_count::validate_block_count::<TransformationNormalError>(
             "TransformationNormalFamily",
@@ -341,8 +351,7 @@ impl CustomFamily for TransformationNormalFamily {
             return Ok(None);
         }
         let factor = self.covariate_dense_arc()?;
-        let cone =
-            KhatriRaoConeConstraints::new(factor, (1..p_resp).collect(), p_resp)?;
+        let cone = KhatriRaoConeConstraints::new(factor, (1..p_resp).collect(), p_resp)?;
         if cone.ncols() != block_spec.design.ncols() {
             return Err(format!(
                 "CTN factored monotonicity cone width {} != coefficient block width {}",
@@ -412,8 +421,9 @@ impl CustomFamily for TransformationNormalFamily {
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         if hyper_layout.family_axis_count() != 0 {
-            return Err("TransformationNormalFamily does not declare family-owned hyper axes"
-                .to_string());
+            return Err(
+                "TransformationNormalFamily does not declare family-owned hyper axes".to_string(),
+            );
         }
         let psi_derivs = hyper_layout.design_derivative_blocks();
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
@@ -459,8 +469,9 @@ impl CustomFamily for TransformationNormalFamily {
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         if hyper_layout.family_axis_count() != 0 {
-            return Err("TransformationNormalFamily does not declare family-owned hyper axes"
-                .to_string());
+            return Err(
+                "TransformationNormalFamily does not declare family-owned hyper axes".to_string(),
+            );
         }
         let psi_derivs = hyper_layout.design_derivative_blocks();
         if psi_derivs.is_empty() || psi_i >= psi_derivs[0].len() || psi_j >= psi_derivs[0].len() {
@@ -570,8 +581,9 @@ impl CustomFamily for TransformationNormalFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if hyper_layout.family_axis_count() != 0 {
-            return Err("TransformationNormalFamily does not declare family-owned hyper axes"
-                .to_string());
+            return Err(
+                "TransformationNormalFamily does not declare family-owned hyper axes".to_string(),
+            );
         }
         let psi_derivs = hyper_layout.design_derivative_blocks();
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
@@ -633,8 +645,9 @@ impl CustomFamily for TransformationNormalFamily {
         hyper_layout: &CustomFamilyHyperLayout,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         if hyper_layout.family_axis_count() != 0 {
-            return Err("TransformationNormalFamily does not declare family-owned hyper axes"
-                .to_string());
+            return Err(
+                "TransformationNormalFamily does not declare family-owned hyper axes".to_string(),
+            );
         }
         if !self.inner_coefficient_hessian_hvp_available(specs) {
             return Err(TransformationNormalError::InvalidInput {
@@ -677,8 +690,9 @@ impl CustomFamily for TransformationNormalFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         if hyper_layout.family_axis_count() != 0 {
-            return Err("TransformationNormalFamily does not declare family-owned hyper axes"
-                .to_string());
+            return Err(
+                "TransformationNormalFamily does not declare family-owned hyper axes".to_string(),
+            );
         }
         if !self.inner_coefficient_hessian_hvp_available(specs) {
             return Err(TransformationNormalError::InvalidInput {
