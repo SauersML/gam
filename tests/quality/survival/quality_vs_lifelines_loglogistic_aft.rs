@@ -50,7 +50,9 @@ use gam::families::survival::construction::{
 use gam::families::survival::location_scale::{
     SurvivalLocationScalePredictInput, predict_survival_location_scale,
 };
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
+use gam::test_support::reference::{
+    Column, QualityPair, pearson, relative_l2, rmse, run_python,
+};
 use gam::types::InverseLink;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
@@ -330,6 +332,18 @@ emit("a_age", a_age)
          gam_a_age={gam_a_age:.5} true_b_age={b_age:.5} a_age_err={a_age_truth_err:.5} \
          lifelines_a_age={ref_a_age:.5} | context: rel_l2(gam,lifelines)={rel:.5} \
          pearson(gam,lifelines)={corr:.6}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_lifelines_loglogistic_aft",
+            "survival_rmse_to_truth",
+            gam_truth_rmse,
+            "lifelines",
+            ref_truth_rmse,
+        )
+        .line()
     );
 
     // PRIMARY claim: gam's fitted survivor surface recovers the true one to a

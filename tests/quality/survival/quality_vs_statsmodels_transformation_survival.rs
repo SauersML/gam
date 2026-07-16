@@ -59,7 +59,9 @@ use gam::families::survival::construction::{
 };
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
+use gam::test_support::reference::{
+    Column, QualityPair, pearson, relative_l2, rmse, run_python,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -447,6 +449,18 @@ emit("converged", [1.0 if _ok else 0.0])
         cov_pairs.len(),
         t_pts.len()
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_statsmodels_transformation_survival::truth_surface",
+            "survival_rmse_to_truth",
+            gam_rmse_truth,
+            "scipy",
+            scipy_rmse_truth,
+        )
+        .line()
+    );
 
     // (1) TRUTH RECOVERY of the shape exponent against the GENERATING CONSTANT.
     // gam's shape is β_time[1] (slope of log Λ_0 in log t); the true exponent is
@@ -749,6 +763,18 @@ emit("converged", [converged])
          held-out C-index: gam={gam_c:.4} statsmodels(PHReg)={sm_c:.4}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::score(
+            "survival",
+            "quality_vs_statsmodels_transformation_survival::holdout_cindex",
+            "cindex_holdout",
+            gam_c,
+            "statsmodels",
+            sm_c,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam ranks held-out risk well --------

@@ -59,7 +59,7 @@
 use csv::StringRecord;
 use gam::families::survival::construction::evaluate_survival_baseline;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -386,6 +386,18 @@ emit("surv", surv_rows)
          RMSE(S) vs TRUTH: gam={gam_rmse_truth:.4} lifelines={life_rmse_truth:.4}\n  \
          (context) rel_l2(gam, lifelines)={rel_gam_vs_life:.4}"
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "survival",
+            "quality_vs_lifelines_weibull_aft_by::truth_surface",
+            "survival_rmse_to_truth",
+            gam_rmse_truth,
+            "lifelines",
+            life_rmse_truth,
+        )
+        .line()
+    );
 
     // (1) PRIMARY: gam recovers the true generating survival surface. 0.05 RMSE
     // on S in [0,1] is a tight, signal-appropriate bar for a ~100-event,
@@ -660,6 +672,18 @@ emit("cindex", [float(c)])
          held-out C-index: gam={gam_c:.4} lifelines={life_c:.4}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::score(
+            "survival",
+            "quality_vs_lifelines_weibull_aft_by::holdout_cindex",
+            "cindex_holdout",
+            gam_c,
+            "lifelines",
+            life_c,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam ranks held-out risk well --------
