@@ -37,7 +37,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -134,6 +134,18 @@ fn gam_te_2d_smooth_matches_mgcv_on_separable_grid() {
          gam_rmse_vs_truth={gam_err:.6} mgcv_rmse_vs_truth={mgcv_err:.6} \
          gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
          rel_l2(gam,mgcv)={rel_gam_vs_mgcv:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_tensor_te_2d_gaussian",
+            "rmse_to_truth",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
     );
 
     // PRIMARY: gam recovers the generating function to the k=8 `cr`-margin

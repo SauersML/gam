@@ -49,7 +49,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -258,6 +258,18 @@ fn alo_stabilized_reml_matches_or_beats_mgcv_on_high_leverage_gaussian() {
         train_rows.len(),
         test_rows.len(),
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_high_leverage_gaussian_alo_stabilized::high_leverage",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
+    );
 
     // ---- (2) TRUTH RECOVERY: gam tracks the known mean on held-out points ---
     // Held-out points lie in the densely-sampled bulk where the noise SD is
@@ -388,6 +400,18 @@ fn alo_stabilized_reml_is_bit_preserving_on_low_leverage_gaussian() {
     eprintln!(
         "low-leverage control s(x): max_hat={mgcv_hat_max:.4} gam_truth_rmse={gam_truth_rmse:.4} \
          gam_test_rmse={gam_test_rmse:.4} mgcv_test_rmse={mgcv_test_rmse:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_high_leverage_gaussian_alo_stabilized::low_leverage_control",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     assert!(

@@ -37,7 +37,9 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, QualityPair, pad_to, pearson, relative_l2, rmse, run_r,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -175,6 +177,18 @@ fn gam_poisson_tensor_recovers_true_mean_surface() {
          gam_rmse_to_truth={gam_err:.4} mgcv_rmse_to_truth={mgcv_err:.4} \
          gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
          (context: rel_l2_vs_mgcv={rel:.4} pearson_vs_mgcv={corr:.5})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_poisson_tensor",
+            "rmse_to_truth",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
     );
 
     // PRIMARY claim: gam recovers the true mean surface. The absolute bar is a
@@ -373,6 +387,18 @@ fn gam_poisson_tensor_recovers_true_mean_surface_on_real_data() {
          null_dev={null_dev:.4}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_poisson_tensor::real_data",
+            "held_out_poisson_deviance",
+            gam_dev,
+            "mgcv",
+            mgcv_dev,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam beats the null model with margin --

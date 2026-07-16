@@ -51,7 +51,9 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, r_package_available, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, QualityPair, r_package_available, relative_l2, rmse, run_r,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -302,6 +304,18 @@ fn gam_binomial_smooth_recovers_true_probability() {
          +/-2SD coverage of p_true (gam)={coverage:.3}  \
          [context only] rel_l2(gam,inla)={rel_prob_vs_inla:.4}",
         gam_rmse_truth / inla_rmse_truth.max(1e-12)
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_inla_binomial_smooth_probability",
+            "prob_rmse_to_truth",
+            gam_rmse_truth,
+            "inla",
+            inla_rmse_truth,
+        )
+        .line()
     );
 
     // ---- principled, un-weakened objective bounds -------------------------

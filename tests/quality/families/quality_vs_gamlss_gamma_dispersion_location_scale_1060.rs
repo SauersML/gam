@@ -36,7 +36,7 @@ use gam::estimate::BlockRole;
 use gam::gamlss::DispersionFamilyKind;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, rmse, run_r};
 use gam::{
     DispersionLocationScaleFitResult, FitConfig, FitResult, encode_recordswith_inferred_schema,
     fit_from_formula, init_parallelism,
@@ -219,6 +219,30 @@ fn gam_gamma_dispersion_location_scale_recovers_shape_surface_vs_gamlss() {
          RMSE_vs_truth(log mu):    gam={gam_rmse_log_mu:.5} gamlss={gamlss_rmse_log_mu:.5}\n  \
          RMSE_vs_truth(log shape): gam={gam_rmse_log_nu:.5} gamlss={gamlss_rmse_log_nu:.5}\n  \
          dispersion-channel signal pearson(gam log nu, truth)={gam_disp_signal_r:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gamma_dispersion_location_scale_1060::log_mu",
+            "log_mu_rmse_to_truth",
+            gam_rmse_log_mu,
+            "gamlss",
+            gamlss_rmse_log_mu,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gamma_dispersion_location_scale_1060::log_nu",
+            "log_nu_rmse_to_truth",
+            gam_rmse_log_nu,
+            "gamlss",
+            gamlss_rmse_log_nu,
+        )
+        .line()
     );
 
     // 1. TRUTH RECOVERY (mean): the log-mean surface is the well-determined

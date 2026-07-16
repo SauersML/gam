@@ -43,7 +43,7 @@ use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -243,6 +243,18 @@ fn gam_gaussian_location_scale_matches_gamboostlss() {
          pearson(log sigma,truth)={gam_corr_log_sigma:.5} nll={gam_nll:.5} \
          | gamboostLSS: rmse(mu->truth)={boost_rmse_mu:.5} \
          pearson(log sigma,truth)={boost_corr_log_sigma:.5} nll={boost_nll:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamboostlss_gaussian_location_scale::mu",
+            "mu_rmse_to_truth",
+            gam_rmse_mu,
+            "gamboostlss",
+            boost_rmse_mu,
+        )
+        .line()
     );
 
     // PRIMARY claim #1: gam recovers the TRUE mean. The mean is variance-

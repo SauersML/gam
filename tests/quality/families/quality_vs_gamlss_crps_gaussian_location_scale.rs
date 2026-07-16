@@ -48,7 +48,7 @@ use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -320,6 +320,30 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
          gam_mu_rmse={mu_rmse:.5} gam_sigma_rmse={sigma_rmse:.5} sigma_floor={sigma_floor:.4} \
          | baseline gamlss: mean_crps={gamlss_mean_crps:.5} ratio={crps_ratio:.4} \
          mu_rmse={gamlss_mu_rmse:.5} sigma_rmse={gamlss_sigma_rmse:.5} crps_pearson={crps_corr:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_crps_gaussian_location_scale::mu",
+            "mu_rmse_to_truth",
+            mu_rmse,
+            "gamlss",
+            gamlss_mu_rmse,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_crps_gaussian_location_scale::sigma",
+            "sigma_rmse_to_truth",
+            sigma_rmse,
+            "gamlss",
+            gamlss_sigma_rmse,
+        )
+        .line()
     );
 
     // PRIMARY (absolute): gam's predictive distribution is within 15% of the

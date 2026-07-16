@@ -57,7 +57,7 @@ use gam::hmc::{
     run_nuts_sampling_flattened_family,
 };
 use gam::smooth::{build_term_collection_design, weighted_blockwise_penalty_sum};
-use gam::test_support::reference::{Column, max_abs_diff, pearson, run_python};
+use gam::test_support::reference::{Column, QualityPair, max_abs_diff, pearson, run_python};
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
@@ -235,6 +235,30 @@ emit("sd_draws", draws.std(axis=0, ddof=1))
          max|gam_mean - mu_exact| = {mean_abs:.5}  (scipy 10k MC floor = {scipy_mc_floor:.5})\n  \
          pearson(gam_mean, mu_exact) = {mean_corr:.6}\n  \
          max|gam_sd - sd_exact|   = {sd_abs:.5}  (scipy 10k MC floor = {scipy_sd_floor:.5}, max sd_exact = {max_sd_exact:.4})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_scipy_conjugate_gaussian_posterior::mean",
+            "mean_max_abs_diff_to_truth",
+            mean_abs,
+            "scipy",
+            scipy_mc_floor,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_scipy_conjugate_gaussian_posterior::sd",
+            "sd_max_abs_diff_to_truth",
+            sd_abs,
+            "scipy",
+            scipy_sd_floor,
+        )
+        .line()
     );
 
     // ---- OBJECTIVE assertion 1: analytic posterior-mean recovery ----------

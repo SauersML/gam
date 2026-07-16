@@ -29,7 +29,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -155,6 +155,18 @@ fn gam_thin_plate_2d_matches_mgcv_gaussian() {
         "tp-2d s(x,z,bs=tp): n={n} sigma={noise_sigma:.3} signal_range={signal_range:.3} \
          gam_rmse_vs_truth={gam_rmse:.5} mgcv_rmse_vs_truth={mgcv_rmse:.5} \
          rel_l2_gam_vs_mgcv={rel_to_mgcv:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_tensor_tp_2d_gaussian",
+            "rmse_to_truth",
+            gam_rmse,
+            "mgcv",
+            mgcv_rmse,
+        )
+        .line()
     );
 
     // PRIMARY claim: gam recovers the truth. After REML shrinkage the fitted

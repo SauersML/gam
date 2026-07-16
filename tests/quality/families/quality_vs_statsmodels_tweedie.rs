@@ -40,7 +40,9 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_python};
+use gam::test_support::reference::{
+    Column, QualityPair, pad_to, pearson, relative_l2, rmse, run_python,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -232,6 +234,18 @@ emit("eta", np.asarray(eta, dtype=float))
          noise_sigma={noise_sigma:.4} rmse(mu_gam,truth)={gam_err:.4} \
          rmse(mu_sm,truth)={sm_err:.4} | ctx: rel_l2(eta)={rel_eta:.4} \
          pearson(eta)={corr_eta:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_statsmodels_tweedie",
+            "mu_rmse_to_truth",
+            gam_err,
+            "statsmodels",
+            sm_err,
+        )
+        .line()
     );
 
     // ---- offset verification: WITHIN-FIT term contribution -----------------

@@ -43,7 +43,9 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, r_package_available, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, QualityPair, r_package_available, relative_l2, rmse, run_r,
+};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -238,6 +240,18 @@ fn gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla() {
          pred_rel_l2(gam,inla)={pred_rel_l2:.4} train_mean_y={:.4}",
         gam_test_rmse / inla_test_rmse.max(1e-300),
         train_y.iter().sum::<f64>() / (n_train as f64),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_inla_gaussian_smooth_posterior_mean::stride5",
+            "test_rmse",
+            gam_test_rmse,
+            "inla",
+            inla_test_rmse,
+        )
+        .line()
     );
 
     // (1) ABSOLUTE quality: gam explains the majority of held-out variance.
@@ -440,6 +454,18 @@ fn gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla_on_real_data() {
          inla_test_RMSE={inla_test_rmse:.4} rmse_ratio={:.4} \
          pred_rel_l2(gam,inla)={pred_rel_l2:.4}",
         gam_test_rmse / inla_test_rmse.max(1e-300),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_inla_gaussian_smooth_posterior_mean::every4th",
+            "test_rmse",
+            gam_test_rmse,
+            "inla",
+            inla_test_rmse,
+        )
+        .line()
     );
 
     // (1) ABSOLUTE quality: the posterior mean recovers the held-out signal.

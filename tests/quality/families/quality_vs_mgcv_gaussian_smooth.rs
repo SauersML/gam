@@ -23,7 +23,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, r2, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, r2, relative_l2, rmse, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -146,6 +146,18 @@ fn gam_smooth_predicts_lidar_better_than_baseline() {
          mgcv_test_rmse={mgcv_test_rmse:.4} (context: in-sample rel_l2 vs mgcv={insample_rel:.4})",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_gaussian_smooth::default_basis",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts the held-out signal -----
@@ -290,6 +302,18 @@ fn gam_smooth_predicts_lidar_better_than_baseline_on_real_data() {
          mgcv_test_rmse={mgcv_test_rmse:.4}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_gaussian_smooth::ps_basis",
+            "test_rmse",
+            gam_test_rmse,
+            "mgcv",
+            mgcv_test_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts the held-out signal -----

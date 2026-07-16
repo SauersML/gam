@@ -51,7 +51,7 @@
 
 use gam::families::multinomial::{MultinomialFitInputs, fit_penalized_multinomial};
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -263,6 +263,18 @@ emit("nclass", [probs.shape[1]])
          gam_iters={iters} gam_dev={dev:.3}",
         iters = out.iterations,
         dev = out.deviance
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_statsmodels_ordinal_mnlogit",
+            "simplex_rmse_to_truth",
+            gam_truth_rmse,
+            "statsmodels",
+            ref_truth_rmse,
+        )
+        .line()
     );
 
     // PRIMARY claim: gam recovers the true class simplex. The softmax family is

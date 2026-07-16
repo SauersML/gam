@@ -41,7 +41,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, run_python};
+use gam::test_support::reference::{Column, QualityPair, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -247,6 +247,18 @@ emit("mu", mu)
         train_idx.len(),
         n_test
     );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_interpretml_ebm_poisson_log::truth",
+            "truth_deviance",
+            gam_truth_dev,
+            "interpretml",
+            ebm_truth_dev,
+        )
+        .line()
+    );
 
     // (1) PRIMARY — truth recovery: gam's held-out fitted mean tracks the TRUE
     //     mean to well within a fifth of the true-mean amplitude. exp(true_eta)
@@ -437,6 +449,18 @@ emit("mu", mu)
          gam_test_dev={gam_test_dev:.4} ebm_test_dev={ebm_test_dev:.4} (ratio={dev_ratio:.4}) \
          null_test_dev={null_test_dev:.4} train_mean={train_mean:.4}",
         train_rows.len()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_interpretml_ebm_poisson_log::real_data",
+            "test_deviance",
+            gam_test_dev,
+            "interpretml",
+            ebm_test_dev,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam predicts the held-out counts ------

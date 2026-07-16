@@ -42,7 +42,7 @@
 use gam::inference::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, run_python};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -281,6 +281,18 @@ emit("prob_tr", ebm.predict_proba(Xtr)[:, 1])
          in-sample deviance rel_l2(context)={insample_dev_rel:.4}",
         train_rows.len(),
         test_rows.len()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_interpretml_ebm_binomial_logit",
+            "holdout_deviance",
+            gam_dev,
+            "interpretml",
+            ebm_dev,
+        )
+        .line()
     );
 
     // (1) PRIMARY objective bar — gam's out-of-sample discrimination. The

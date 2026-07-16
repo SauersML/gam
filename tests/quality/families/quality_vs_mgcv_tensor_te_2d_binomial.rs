@@ -41,7 +41,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -208,6 +208,18 @@ fn gam_tensor_te_2d_binomial_logit_matches_mgcv() {
         "te(x,z) binomial/logit recovery: n={N} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
          truth_range={truth_range:.3} gam_rmse_vs_truth={gam_rmse:.4} \
          mgcv_rmse_vs_truth={mgcv_rmse:.4} | context rel_l2(gam,mgcv)={rel:.4} pearson={corr:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_tensor_te_2d_binomial",
+            "rmse_to_truth",
+            gam_rmse,
+            "mgcv",
+            mgcv_rmse,
+        )
+        .line()
     );
 
     // PRIMARY CLAIM: gam recovers the true surface. The binomial sampling noise

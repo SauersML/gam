@@ -35,7 +35,7 @@
 use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, rmse, run_python, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, pearson, rmse, run_python, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -197,6 +197,18 @@ fn gam_alo_is_honest_loo_predictive_error_on_lidar() {
          loo_holdout_rmse={loo_holdout_rmse:.5} \
          eta_tilde_vs_exact_rmse={eta_tilde_vs_exact_rmse:.5} loo_spread={loo_spread:.5} \
          (context: elpd_pearson_vs_loo={elpd_pearson_context:.5})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_loo_psis_gaussian_smooth::holdout",
+            "loo_holdout_rmse",
+            alo_holdout_rmse,
+            "mgcv",
+            loo_holdout_rmse,
+        )
+        .line()
     );
 
     // ====================================================================
@@ -538,6 +550,18 @@ emit("n_obs", [float(N)])
          null_test_elpd/pt={null_test_elpd_mean:.5} gam_test_rmse={gam_test_rmse:.5} \
          arviz_elpd_loo/pt={arviz_elpd_per_point:.5} (total={arviz_elpd_total:.3}) \
          max_pareto_k={max_pareto_k:.3}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::score(
+            "families",
+            "quality_vs_loo_psis_gaussian_smooth::elpd",
+            "held_out_elpd_per_point",
+            gam_test_elpd_mean,
+            "arviz_loo",
+            arviz_elpd_per_point,
+        )
+        .line()
     );
 
     // ---- (A) ABSOLUTE held-out bars (gam scored on its own predictions) ----

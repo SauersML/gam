@@ -45,7 +45,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -311,6 +311,54 @@ fn gam_location_scale_by_group_matches_gamlss() {
         "context (rel_l2 gam-vs-gamlss, NOT a gate): \
          A mu_rel={mu_a_rel:.4} logsig_rel={logsig_a_rel:.4} | \
          B mu_rel={mu_b_rel:.4} logsig_rel={logsig_b_rel:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gaussian_location_scale_by_group::mu_a",
+            "mu_rmse_to_truth",
+            gam_mu_a_err,
+            "gamlss",
+            ref_mu_a_err,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gaussian_location_scale_by_group::log_sigma_a",
+            "log_sigma_rmse_to_truth",
+            gam_logsig_a_err,
+            "gamlss",
+            ref_logsig_a_err,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gaussian_location_scale_by_group::mu_b",
+            "mu_rmse_to_truth",
+            gam_mu_b_err,
+            "gamlss",
+            ref_mu_b_err,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gaussian_location_scale_by_group::log_sigma_b",
+            "log_sigma_rmse_to_truth",
+            gam_logsig_b_err,
+            "gamlss",
+            ref_logsig_b_err,
+        )
+        .line()
     );
 
     // ---- PRIMARY: gam recovers the true per-group mean and log-σ functions. --

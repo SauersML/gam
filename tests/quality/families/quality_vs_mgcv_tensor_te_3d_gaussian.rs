@@ -35,7 +35,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -210,6 +210,18 @@ fn gam_te_3d_recovers_nonadditive_surface() {
          gam_rmse={gam_rmse:.5} mgcv_rmse={mgcv_rmse:.5} \
          gam_rmse/range={:.5} rel_l2_vs_mgcv={rel_vs_mgcv:.4}",
         gam_rmse / signal_range
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_tensor_te_3d_gaussian",
+            "rmse_to_truth",
+            gam_rmse,
+            "mgcv",
+            mgcv_rmse,
+        )
+        .line()
     );
 
     // PRIMARY claim: gam reconstructs the non-additive truth to the k=5

@@ -50,7 +50,7 @@ use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -279,6 +279,30 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
          RMSE_vs_truth(mu): gam={gam_rmse_mu:.5} gamlss={gamlss_rmse_mu:.5}\n  \
          RMSE_vs_truth(log sigma): gam={gam_rmse_log_sigma:.5} gamlss={gamlss_rmse_log_sigma:.5}\n  \
          [context] rel_l2_vs_gamlss(mu)={rel_mu:.5} rel_l2_vs_gamlss(log sigma)={rel_log_sigma:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gaussian_multi_smooth::mu",
+            "mu_rmse_to_truth",
+            gam_rmse_mu,
+            "gamlss",
+            gamlss_rmse_mu,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gaussian_multi_smooth::log_sigma",
+            "log_sigma_rmse_to_truth",
+            gam_rmse_log_sigma,
+            "gamlss",
+            gamlss_rmse_log_sigma,
+        )
+        .line()
     );
 
     // PRIMARY claim: gam recovers the known generating surfaces.

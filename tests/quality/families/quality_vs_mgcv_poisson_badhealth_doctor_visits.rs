@@ -38,7 +38,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, QualityPair, pad_to, pearson, relative_l2, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -218,6 +218,18 @@ fn gam_poisson_predicts_badhealth_visits_better_than_baseline() {
          gam_test_corr={gam_test_corr:.4} (context: in-sample rel_l2 vs mgcv={insample_rel:.4})",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_poisson_badhealth_doctor_visits",
+            "test_deviance",
+            gam_test_dev,
+            "mgcv",
+            mgcv_test_dev,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam beats the intercept-only null -----

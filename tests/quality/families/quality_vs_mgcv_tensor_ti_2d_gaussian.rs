@@ -54,7 +54,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -248,6 +248,18 @@ fn gam_ti_2d_interaction_recovers_truth() {
          truth_int_range={truth_int_range:.4} \
          gam_ti_ncoef={ti_coeff_count} mgcv_ti_ncoef={mgcv_ti_ncoef} \
          expected=(k-1)^2={expected_count}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_tensor_ti_2d_gaussian",
+            "interaction_rmse_to_truth",
+            rmse_gam,
+            "mgcv",
+            rmse_mgcv,
+        )
+        .line()
     );
 
     // (1) STRUCTURE: gam's ti block carries exactly (k-1)^2 coefficients.

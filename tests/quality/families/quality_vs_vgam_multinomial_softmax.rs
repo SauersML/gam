@@ -42,7 +42,7 @@ use csv::StringRecord;
 use gam::families::multinomial::{
     MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
 };
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -351,6 +351,18 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
          row_sum_err={worst_row_sum_err:.2e} min_p={min_entry:.4} max_p={max_entry:.4} \
          frob_rel_gam_vs_vgam(context)={frob_rel_gam_vs_vgam:.4} lambdas={:?}",
         model.iterations, model.lambdas
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_vgam_multinomial_softmax::main",
+            "simplex_rmse_to_truth",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
     );
 
     // ---- assertions: STRUCTURE then TRUTH RECOVERY then MATCH-OR-BEAT ------
@@ -746,6 +758,30 @@ fn gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df() {
          vgam_fixeddf_RMSE_vs_truth={vg_err:.5} \
          row_sum_err={worst_row_sum_err:.2e} lambdas={:?}",
         model.iterations, model.lambdas
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_vgam_multinomial_softmax::heterogeneous_mgcv",
+            "simplex_rmse_to_truth",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_vgam_multinomial_softmax::heterogeneous_vgam",
+            "simplex_rmse_to_truth",
+            gam_err,
+            "vgam",
+            vg_err,
+        )
+        .line()
     );
 
     // gam must recover the heterogeneous surface in absolute terms (the bar is

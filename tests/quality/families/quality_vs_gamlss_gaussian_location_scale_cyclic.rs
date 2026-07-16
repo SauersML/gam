@@ -43,7 +43,9 @@ use gam::families::sigma_link::logb_sigma_from_eta_scalar;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::solver::estimate::BlockRole;
-use gam::test_support::reference::{Column, held_out_r2, pad_to, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, QualityPair, held_out_r2, pad_to, relative_l2, rmse, run_r,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -268,6 +270,30 @@ fn gam_cyclic_location_scale_recovers_truth() {
          beta_mu={} beta_sigma={}",
         beta_mu.len(),
         beta_noise.len()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gaussian_location_scale_cyclic::mu",
+            "mu_rmse_to_truth",
+            gam_mu_rmse,
+            "gamlss",
+            gamlss_mu_rmse,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_gaussian_location_scale_cyclic::log_sigma",
+            "log_sigma_rmse_to_truth",
+            gam_log_sigma_rmse,
+            "gamlss",
+            gamlss_log_sigma_rmse,
+        )
+        .line()
     );
 
     // PRIMARY: gam recovers the true cyclic mean. The mean's signal SD is

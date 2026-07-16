@@ -30,7 +30,7 @@
 
 use gam::inference::model::{FittedFamily, FittedModel, FittedModelPayload, ModelKind};
 use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
-use gam::test_support::reference::{Column, rmse, run_python};
+use gam::test_support::reference::{Column, QualityPair, rmse, run_python};
 use gam::types::{LikelihoodSpec, StandardLink};
 use gam::{
     FitConfig, FitResult, fit_from_formula, hmc::NutsConfig, init_parallelism,
@@ -366,6 +366,18 @@ emit("rhat_max", [float(np.nanmax(rhat))])
          TRUTH-RECOVERY rmse: gam={gam_rmse_vs_truth:.4} pymc(baseline)={pymc_rmse_vs_truth:.4}\n\
          CALIBRATION 90% CI coverage of truth: gam={gam_coverage:.3}",
         nuts.rhat
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_pymc_nuts_binomial_logit",
+            "eta_rmse_to_truth",
+            gam_rmse_vs_truth,
+            "pymc",
+            pymc_rmse_vs_truth,
+        )
+        .line()
     );
 
     // (0) Convergence gates. R-hat < 1.1 is the standard Gelman-Rubin bound; a
@@ -770,6 +782,18 @@ emit("rhat_max", [float(np.nanmax(rhat))])
          held-out log-loss: gam={gam_logloss:.4} pymc(baseline)={pymc_logloss:.4} base_rate={base_logloss:.4}\n\
          held-out AUC: gam={gam_auc:.4}",
         nuts.rhat
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_pymc_nuts_binomial_logit::real_data",
+            "held_out_log_loss",
+            gam_logloss,
+            "pymc",
+            pymc_logloss,
+        )
+        .line()
     );
 
     // (A) PRIMARY objective (gam-only, always enforced): gam beats the no-skill

@@ -34,7 +34,7 @@
 use gam::inference::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
-use gam::test_support::reference::{Column, run_python};
+use gam::test_support::reference::{Column, QualityPair, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -490,6 +490,30 @@ emit("n_test", [float(int(te.sum()))])
          (bars: abs<={GAM_MAX_HOLDOUT_NLL:.2}, match-or-beat<=best_ref+{BASELINE_NLL_MARGIN:.2})",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_interpret_ml_pygam_binomial_logit_comparative::ebm",
+            "holdout_nll",
+            gam_nll,
+            "interpretml",
+            ebm_nll,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_interpret_ml_pygam_binomial_logit_comparative::pygam",
+            "holdout_nll",
+            gam_nll,
+            "pygam",
+            pygam_nll,
+        )
+        .line()
     );
 
     // (1) PRIMARY OBJECTIVE CLAIM: gam's own hold-out probabilities are better

@@ -42,7 +42,9 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_python};
+use gam::test_support::reference::{
+    Column, QualityPair, pad_to, pearson, relative_l2, rmse, run_python,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -240,6 +242,18 @@ emit("mu_logit", fit_mean(sm.families.links.Logit()))
          rmse_truth(gam)={gam_err:.4} rmse_truth(sm_probit)={sm_probit_err:.4} \
          rmse_truth(sm_logit)={sm_logit_err:.4} | ctx: pearson(gam,sm_probit)={corr_ref:.5} \
          rel_l2(gam,sm_probit)={rel_ref:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_statsmodels_binomial_probit",
+            "mu_rmse_to_truth",
+            gam_err,
+            "statsmodels",
+            sm_probit_err,
+        )
+        .line()
     );
 
     // PRIMARY CLAIM: gam recovers the data-generating probability curve. With a

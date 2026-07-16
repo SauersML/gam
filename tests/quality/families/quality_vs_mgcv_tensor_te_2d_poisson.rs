@@ -34,7 +34,9 @@ use rand_distr::{Distribution, Poisson, Uniform};
 use std::f64::consts::PI;
 use std::path::Path;
 
-use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, QualityPair, pad_to, pearson, relative_l2, rmse, run_r,
+};
 
 // Source: `badhealth` from the R package `COUNT` (Hilbe, "Negative Binomial
 // Regression", 2nd ed.); German health-survey counts of doctor visits.
@@ -165,6 +167,18 @@ fn gam_tensor_te_2d_poisson_matches_mgcv() {
         "te(x,z) Poisson/log: n={n} mgcv_edf={mgcv_edf:.3} \
          rmse_to_truth(gam)={gam_err:.4} rmse_to_truth(mgcv)={mgcv_err:.4} \
          [context] rel_l2(gam,mgcv)={rel_to_mgcv:.4} pearson(gam,mgcv)={corr_to_mgcv:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_tensor_te_2d_poisson",
+            "eta_rmse_to_truth",
+            gam_err,
+            "mgcv",
+            mgcv_err,
+        )
+        .line()
     );
 
     // PRIMARY: gam must recover the true log-mean surface. The true eta_true =
@@ -334,6 +348,18 @@ fn gam_tensor_te_2d_poisson_matches_mgcv_on_real_data() {
          [context] rel_l2(gam,mgcv)={rel_to_mgcv:.4} pearson(gam,mgcv)={corr_to_mgcv:.5}",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_tensor_te_2d_poisson::real_data",
+            "held_out_poisson_deviance",
+            gam_dev,
+            "mgcv",
+            mgcv_dev,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: gam beats the constant-mean predictor --

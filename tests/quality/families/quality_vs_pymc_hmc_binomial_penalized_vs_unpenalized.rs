@@ -504,6 +504,18 @@ for li, lam in enumerate(LAMBDAS):
          (match-or-beat bound = PyMC * 1.10 = {:.5})",
         pymc_best_rmse * 1.10
     );
+    eprintln!(
+        "{}",
+        gam::test_support::reference::QualityPair::error(
+            "families",
+            "quality_vs_pymc_hmc_binomial_penalized_vs_unpenalized",
+            "eta_rmse_to_truth",
+            gam_best_rmse,
+            "pymc",
+            pymc_best_rmse,
+        )
+        .line()
+    );
     assert!(
         gam_best_rmse <= pymc_best_rmse * 1.10,
         "gam must recover the truth at least as well as the PyMC baseline: \
@@ -747,6 +759,18 @@ emit("rhat", [rhat])
          pymc_auc={pymc_auc:.4} pymc_logloss={pymc_logloss:.4} (R-hat={pm_rhat:.3})",
         train_rows.len(),
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        gam::test_support::reference::QualityPair::error(
+            "families",
+            "quality_vs_pymc_hmc_binomial_penalized_vs_unpenalized::real_data",
+            "held_out_log_loss",
+            gam_logloss,
+            "pymc",
+            pymc_logloss,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertions (gam-only, always enforced) ----------

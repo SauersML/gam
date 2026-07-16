@@ -48,7 +48,7 @@
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::solver::estimate::BlockRole;
-use gam::test_support::reference::{Column, relative_l2, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::{Array2, s};
 use std::path::Path;
@@ -261,6 +261,18 @@ fn gam_gaulss_linear_mean_smooth_sigma_predicts_lidar_at_least_as_well_as_mgcv()
         train_rows.len(),
         test_rows.len(),
         gam_nll - mgcv_nll
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_gaulss_gaussian",
+            "held_out_nll",
+            gam_nll,
+            "mgcv",
+            mgcv_nll,
+        )
+        .line()
     );
 
     // ---- OBJECTIVE assertion 1: gam recovers real held-out signal ---------

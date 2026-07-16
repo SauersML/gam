@@ -33,7 +33,9 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_python};
+use gam::test_support::reference::{
+    Column, QualityPair, pad_to, pearson, relative_l2, rmse, run_python,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -199,6 +201,18 @@ emit("mu", mu_hat)
          recovery_rmse: gam={gam_recovery_rmse:.4} statsmodels={sm_recovery_rmse:.4} \
          | context: pearson(eta,truth)={corr_truth:.5} pearson(mean)={corr_mean:.5} \
          rel_l2(eta,statsmodels)={rel_eta_cross:.4}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_sklearn_poisson_log",
+            "eta_rmse_to_truth",
+            gam_recovery_rmse,
+            "statsmodels",
+            sm_recovery_rmse,
+        )
+        .line()
     );
 
     // (1) PRIMARY OBJECTIVE CLAIM: gam recovers the noise-free truth. The

@@ -39,7 +39,7 @@ use gam::custom_family::{
 use gam::families::gamlss::GaussianLocationScaleFamily;
 use gam::load_csvwith_inferred_schema;
 use gam::matrix::DesignMatrix;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use ndarray::{Array1, Array2};
 use std::path::Path;
 
@@ -337,6 +337,30 @@ fn gam_custom_family_location_scale_matches_gamlss() {
          gam_mu_rmse_to_truth={gam_mu_err:.4} gamlss_mu_rmse_to_truth={gamlss_mu_err:.4} \
          gam_logsig_rmse_to_truth={gam_log_sigma_err:.4} gamlss_logsig_rmse_to_truth={gamlss_log_sigma_err:.4} \
          (ctx: rel_l2_mu_vs_gamlss={rel_mu_vs_gamlss:.4} gam_ll={gam_ll:.3} gamlss_ll={gamlss_ll:.3} ll_rel={ll_abs_rel:.4})"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_custom_family_location_scale_gaussian::mu",
+            "mu_rmse_to_truth",
+            gam_mu_err,
+            "gamlss",
+            gamlss_mu_err,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_gamlss_custom_family_location_scale_gaussian::log_sigma",
+            "log_sigma_rmse_to_truth",
+            gam_log_sigma_err,
+            "gamlss",
+            gamlss_log_sigma_err,
+        )
+        .line()
     );
 
     // (1) ABSOLUTE truth recovery — the primary claim.

@@ -31,7 +31,9 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, pearson, relative_l2, rmse, run_python};
+use gam::test_support::reference::{
+    Column, QualityPair, pad_to, pearson, relative_l2, rmse, run_python,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -195,6 +197,30 @@ emit("te_edf", [float(ten.statistics_["edof"])])
         "Poisson 2-D tensor:   n={n} gam_edf={gam_te_edf:.3} pygam_edf={pygam_te_edf:.3} \
          gam_rmse(truth)={gam_te_rmse:.4} pygam_rmse(truth)={pygam_te_rmse:.4} \
          [context: rel_l2(gam,pygam)={te_rel:.4} pearson={te_corr:.5}]"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_pygam_poisson_2d_shape::additive",
+            "additive_rmse_to_truth",
+            gam_add_rmse,
+            "pygam",
+            pygam_add_rmse,
+        )
+        .line()
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_pygam_poisson_2d_shape::tensor",
+            "tensor_rmse_to_truth",
+            gam_te_rmse,
+            "pygam",
+            pygam_te_rmse,
+        )
+        .line()
     );
 
     // ---- PRIMARY assertion: absolute truth recovery ------------------------
@@ -405,6 +431,18 @@ emit("edf", [float(m.statistics_["edof"])])
          pygam_edf={pygam_edf:.3} gam_dev={gam_test_dev:.4} pygam_dev={pygam_test_dev:.4} \
          null_dev={null_test_dev:.4} [context: rel_l2(gam,pygam)={mu_rel:.4} pearson={mu_corr:.5}]",
         test_rows.len(),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_pygam_poisson_2d_shape::real_data",
+            "held_out_poisson_deviance",
+            gam_test_dev,
+            "pygam",
+            pygam_test_dev,
+        )
+        .line()
     );
 
     // ---- PRIMARY objective assertion: beat the constant-mean predictor -----

@@ -41,7 +41,7 @@ use gam::custom_family::{
 };
 use gam::matrix::{DenseDesignMatrix, DesignMatrix, LinearOperator};
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pad_to, relative_l2, run_python};
+use gam::test_support::reference::{Column, QualityPair, pad_to, relative_l2, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::{Array1, Array2};
 use std::path::Path;
@@ -348,6 +348,18 @@ emit("mu_full", mu_full)
     );
     eprintln!("beta_gam = {beta_gam:?}");
     eprintln!("beta_sm  = {beta_sm:?}");
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_statsmodels_custom_family_poisson_loglink",
+            "mu_rmse_to_truth",
+            rmse_gam_truth,
+            "statsmodels",
+            rmse_sm_truth,
+        )
+        .line()
+    );
 
     // ---- OBJECTIVE assertion 1: held-out predictive accuracy ---------------
     // For a correctly specified Poisson model the per-observation deviance has

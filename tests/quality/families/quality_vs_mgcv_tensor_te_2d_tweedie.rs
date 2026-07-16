@@ -31,7 +31,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -190,6 +190,18 @@ fn gam_tensor_te_2d_tweedie_matches_mgcv() {
          rmse_mu(gam,truth)={gam_mu_err:.4} noise_sigma={noise_sigma:.4} \
          rmse_eta(gam)={gam_eta_err:.4} rmse_eta(mgcv)={mgcv_eta_err:.4} \
          [context] rel_l2(gam,mgcv)={rel_to_mgcv:.4} pearson(gam,mgcv)={corr_to_mgcv:.5}"
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_mgcv_tensor_te_2d_tweedie",
+            "eta_rmse_to_truth",
+            gam_eta_err,
+            "mgcv",
+            mgcv_eta_err,
+        )
+        .line()
     );
 
     // PRIMARY: gam recovers the true log-mean surface to better than the

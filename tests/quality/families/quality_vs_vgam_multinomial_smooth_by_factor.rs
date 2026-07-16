@@ -69,7 +69,7 @@ use gam::data::{EncodedDataset, UnseenCategoryPolicy, encode_recordswith_schema}
 use gam::families::multinomial::{
     MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
 };
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, rmse, run_r};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 use ndarray::Array2;
 use rand::SeedableRng;
@@ -403,6 +403,18 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
          pearson_vs_truth(c0)={corr0:.5} (c1)={corr1:.5} (c2)={corr2:.5} \
          lambdas={:?}",
         model.lambdas
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_vgam_multinomial_smooth_by_factor",
+            "simplex_rmse_to_truth",
+            gam_truth_rmse,
+            "vgam",
+            ref_truth_rmse,
+        )
+        .line()
     );
 
     // The truth-recovery target is scored two ways: reference-relative

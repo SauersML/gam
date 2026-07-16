@@ -44,7 +44,7 @@ use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
 };
 use gam::smooth::{freeze_term_collection_from_design, weighted_blockwise_penalty_sum};
-use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
+use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, run_python};
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Axis;
@@ -453,6 +453,18 @@ emit("p", [float(p)])
         train_idx.len(),
         test_idx.len(),
         fit.fit.edf_total().expect("gam total edf"),
+    );
+    eprintln!(
+        "{}",
+        QualityPair::error(
+            "families",
+            "quality_vs_numpyro_nuts_poisson_loglink",
+            "held_out_poisson_deviance",
+            gam_dev,
+            "numpyro",
+            np_dev,
+        )
+        .line()
     );
 
     // (1) Both posteriors must converge — otherwise their held-out scores are
