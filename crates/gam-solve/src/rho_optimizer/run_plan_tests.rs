@@ -5329,7 +5329,22 @@ fn run_efs_skips_global_cost_screening() {
                 })
             })
         },
-    );
+    )
+    // The EFS run path now requires an analytic fixed-point certificate to
+    // certify stationarity (#1095/#2228); a bare closure objective predates it
+    // and refuses. Supply a fully-covered zero-update certificate — the mock's
+    // EFS step is already the fixed point (all-zero steps) — so the run
+    // certifies through the cert layer WITHOUT any extra cost-screening or EFS
+    // solve (the certificate eval is separate from cost_fn/efs_fn, so the
+    // screening/efs call counts this test pins are unchanged).
+    .with_fixed_point_certificate(|_: &mut (), rho: &Array1<f64>| {
+        Ok(FixedPointCertificateEval {
+            cost: 0.0,
+            coordinates: (0..rho.len())
+                .map(|_| FixedPointCoordinateCertificate::covered(0.0, 1.0))
+                .collect(),
+        })
+    });
     problem
         .run(
             &mut obj,
