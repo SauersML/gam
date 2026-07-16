@@ -832,6 +832,89 @@ mod amortized_encoder_tests {
         }
     }
 
+    /// #2330 — IFT-residual arbiter. The θ-adjoint `Γ_joint` is exact (arbiter
+    /// green), so the g3 non-conservation lives in `θ̂_ρ,j = −A⁺ g_ρ,j`. This
+    /// tests the leading hypothesis: the #2080-d4 pencil deflation drops the
+    /// near-null component of the DEFLATED t-block `g_ρ` (ARD) while the β-block
+    /// `g_ρ` (smooth) is fully resolved — a built-in smooth↔ARD asymmetry.
+    ///
+    /// `x = A⁺ g_ρ,j`; since `A⁺` deflates, `A·x = P·g_ρ,j` and the residual
+    /// `A·x − g_ρ,j = −(deflated component of g_ρ,j)`. A LARGE ARD residual with a
+    /// ~0 smooth residual is the asymmetry root (`θ̂_ρ,ard` drops a response that
+    /// `θ̂_ρ,smooth` keeps). Also confirms the solve uses the EXACT stationarity
+    /// operator `A = H + ΔC` (`|A·x − g|` small) and not the cached majorizer `H`
+    /// (`|H·x − g|` would then be the small one). Diagnostic: prints the norms.
+    #[test]
+    fn third_order_ift_deflation_residual_2330() {
+        use crate::manifold::arrow_solver::{
+            DeflatedArrowSolver, SaeArrowVector, apply_cached_arrow_hessian,
+        };
+        use ndarray::array;
+        let (mut term, target, rho, _stationary_cache) =
+            super::exact_hessian_fixture_tests::converged_state_with_residual();
+        let mut rho_eval = rho.clone();
+        rho_eval.log_lambda_sparse = 0.5;
+        for v in rho_eval.log_lambda_smooth.iter_mut() {
+            *v = -2.0;
+        }
+        rho_eval.log_ard = vec![array![-1.2_f64], array![-1.0_f64]];
+        let rho = rho_eval;
+        let (_value, _loss, cache) = term
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                0,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("deflated fixed-state cache");
+        assert!(
+            cache
+                .deflated_row_directions
+                .iter()
+                .any(|dirs| !dirs.is_empty()),
+            "IFT residual arbiter requires per-row deflation to be present"
+        );
+        let solver = DeflatedArrowSolver::plain(&cache);
+        let norm = |v: &SaeArrowVector| (v.t.dot(&v.t) + v.beta.dot(&v.beta)).sqrt();
+        let smooth0 = rho.smooth_flat_index(0);
+        let ard0 = rho.ard_flat_index(0, 0);
+        for (name, j) in [("smooth0", smooth0), ("ard0", ard0)] {
+            let g_rho = term
+                .outer_rho_gradient_ift_rhs(&rho, j, &cache)
+                .expect("ift rhs");
+            let x = term
+                .solve_exact_stationarity(&rho, target.view(), &cache, &solver, &g_rho)
+                .expect("A+ g_rho");
+            let ax = term
+                .apply_exact_hessian(&rho, target.view(), &cache, &x)
+                .expect("A x");
+            let (hxt, hxb) =
+                apply_cached_arrow_hessian(&cache, x.t.view(), x.beta.view()).expect("H x");
+            let r_exact = SaeArrowVector {
+                t: &ax.t - &g_rho.t,
+                beta: &ax.beta - &g_rho.beta,
+            };
+            let r_maj = SaeArrowVector {
+                t: &hxt - &g_rho.t,
+                beta: &hxb - &g_rho.beta,
+            };
+            eprintln!(
+                "IFT[{name}] |g_rho|={:.6e} |x|={:.6e} |A.x-g|={:.6e} |H.x-g|={:.6e}",
+                norm(&g_rho),
+                norm(&x),
+                norm(&r_exact),
+                norm(&r_maj)
+            );
+            assert!(
+                norm(&r_exact).is_finite() && norm(&r_maj).is_finite(),
+                "IFT residual arbiter [{name}] produced a non-finite residual"
+            );
+        }
+    }
+
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
     /// coordinates used by reconstruction. Decoder magnitude stays in `B`, so
     /// there is no second radial-scale channel to fold into these values.
